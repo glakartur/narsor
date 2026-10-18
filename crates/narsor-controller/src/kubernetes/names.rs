@@ -26,6 +26,9 @@ const HASH_LEN: usize = 16;
 /// Suffix of the storage (PVC) name.
 pub const STORAGE_SUFFIX: &str = "-storage";
 
+/// Suffix of the read-only runner's Pod name (D63).
+pub const READER_SUFFIX: &str = "-reader";
+
 /// Infix of a per-incarnation launch Secret's name.
 pub const LAUNCH_INFIX: &str = "-launch-";
 
@@ -62,6 +65,14 @@ pub fn workload(resource_key: &str) -> String {
     } else {
         format!("{PREFIX}{readable}-{}", key_hash(resource_key))
     }
+}
+
+/// The read-only runner's Pod name of a resource key: the workload's name
+/// and [`READER_SUFFIX`] — still a DNS-1123 label (at most 61 characters),
+/// and recognizably the reader of that very task's storage, which is what
+/// the admission policy lets such a Pod mount.
+pub fn reader(resource_key: &str) -> String {
+    format!("{}{READER_SUFFIX}", workload(resource_key))
 }
 
 /// The storage (PVC) name of a resource key.
@@ -130,6 +141,10 @@ mod tests {
         ] {
             let workload = workload(key);
             let storage = storage(key);
+            let reader = reader(key);
+            assert!(is_dns_label(&reader), "{key} → {reader}");
+            assert_ne!(reader, workload);
+            assert!(is_dns_subdomain(&launch_secret(&reader, "i")));
             assert!(is_dns_label(&workload), "{key} → {workload}");
             assert!(is_dns_label(&storage), "{key} → {storage}");
             let secret = launch_secret(&workload, "incarnation");

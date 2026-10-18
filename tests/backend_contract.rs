@@ -61,6 +61,10 @@ impl ContractTarget for FakeTarget {
         assert!(backend.kill_workload(task), "a workload to kill");
     }
 
+    fn kill_reader(&self, backend: &FakeBackend, task: &TaskResources) -> bool {
+        backend.kill_reader(task)
+    }
+
     fn patience(&self) -> Duration {
         Duration::from_secs(15)
     }
@@ -156,24 +160,51 @@ impl ContractTarget for LocalTarget {
         }
     }
 
+    fn storage_dir(
+        &self,
+        backend: &LocalBackend,
+        task: &TaskResources,
+    ) -> Option<std::path::PathBuf> {
+        Some(backend.storage_dir(task))
+    }
+
+    fn kill_reader(&self, backend: &LocalBackend, task: &TaskResources) -> bool {
+        let Some(pid) = backend.reader_pid(task) else {
+            return false;
+        };
+        // SAFETY: signalling the reader's own process group.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        true
+    }
+
     fn cleanup(&self, backend: &LocalBackend) {
         // Runners outlive their controller by design; a finished scenario
-        // must not leave any behind.
-        let Ok(entries) = fs::read_dir(self.config.root.join("workloads")) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(task_id) = TaskId::parse(&name) else {
+        // must not leave any behind — workers and readers alike.
+        for (directory, suffix) in [("workloads", ""), ("readers", "-reader")] {
+            let Ok(entries) = fs::read_dir(self.config.root.join(directory)) else {
                 continue;
             };
-            let Ok(task) = backend.resources(&task_id, &name) else {
-                continue;
-            };
-            if let Some(pid) = backend.runner_pid(&task) {
-                // SAFETY: as above.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let key = name.strip_suffix(suffix).unwrap_or(&name).to_string();
+                let Ok(task_id) = TaskId::parse(&key) else {
+                    continue;
+                };
+                let Ok(task) = backend.resources(&task_id, &key) else {
+                    continue;
+                };
+                let pid = if suffix.is_empty() {
+                    backend.runner_pid(&task)
+                } else {
+                    backend.reader_pid(&task)
+                };
+                if let Some(pid) = pid {
+                    // SAFETY: as above.
+                    unsafe {
+                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    }
                 }
             }
         }

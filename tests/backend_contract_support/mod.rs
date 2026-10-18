@@ -45,6 +45,7 @@ use narsor_controller_runtime::{Controller, ControllerConfig};
 use narsor_engine::auth::{ControllerCredential, ControllerKey};
 use narsor_engine::backends::{
     BackendErrorKind, ExecutionBackend, TaskObservation, TaskResources, WorkloadPhase,
+    WorkloadState,
 };
 use narsor_engine::controller_protocol::{
     ControllerClient, CreateEnrollmentRequest, OwnerCommandRequest, OwnerCommandResponse,
@@ -82,6 +83,18 @@ pub trait ContractTarget: Send + Sync + Sized + 'static {
 
     /// The platform loses the task's workload unexpectedly.
     fn kill_workload(&self, backend: &Self::Backend, task: &TaskResources);
+
+    /// Where the task's storage lives as a directory the test may read, if
+    /// the target has one (the fake keeps none).
+    fn storage_dir(&self, _backend: &Self::Backend, _task: &TaskResources) -> Option<PathBuf> {
+        None
+    }
+
+    /// The platform loses the task's read-only runner unexpectedly. False
+    /// when the target cannot (its scenario then fails, so none may not).
+    fn kill_reader(&self, _backend: &Self::Backend, _task: &TaskResources) -> bool {
+        false
+    }
 
     /// Stops everything the target started (runner processes, mock
     /// servers). Called when a scenario ends, pass or fail.
@@ -251,6 +264,7 @@ impl<T: ContractTarget> Harness<T> {
         config.retry_interval = Duration::from_millis(100);
         config.heartbeat_interval = Duration::from_secs(1);
         config.observe_failures_before_unknown = 2;
+        config.reader_restart_interval = Duration::from_millis(200);
         let controller = Controller::new(backend, link.clone(), config);
         let (shutdown, stop) = oneshot::channel();
         let task = tokio::spawn(controller.run(async {
@@ -345,6 +359,78 @@ impl<T: ContractTarget> Harness<T> {
         if let Err(error) = self.command(task, command, key) {
             panic!("{command:?} of {task}: {error}");
         }
+    }
+
+    /// An owner starts reading the task: leases a reader for `idle_secs`
+    /// and wakes the controller, as a read of a stopped task does (D63).
+    pub fn lease_reader(&self, task: &str, idle_secs: i64) {
+        let task_id = TaskId::parse(task).unwrap();
+        let leased = self
+            .service
+            .control_plane()
+            .lease_reader(&task_id, chrono::Duration::seconds(idle_secs))
+            .expect("lease a reader");
+        assert!(leased.is_some(), "{task} is not in a state a reader reads");
+        self.service.notify(&task_id);
+    }
+
+    /// The task's read-only runner as the platform shows it, uncounted.
+    pub async fn reader(&self, task: &str) -> Option<WorkloadState> {
+        self.probe
+            .inner()
+            .observe_reader(&self.resources(task))
+            .await
+            .expect("observe the reader")
+    }
+
+    /// Waits for the task's reader to satisfy `check` (`None`: no reader).
+    pub async fn wait_reader(
+        &self,
+        task: &str,
+        what: &str,
+        check: impl Fn(Option<&WorkloadState>) -> bool,
+    ) {
+        let deadline = Instant::now() + self.target.patience();
+        loop {
+            let reader = self.reader(task).await;
+            if check(reader.as_ref()) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{task}: timed out waiting for {what}; the reader is {reader:?}; counters {:?}",
+                self.counters()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Waits for a running reader and returns it.
+    pub async fn running_reader(&self, task: &str) -> WorkloadState {
+        self.wait_reader(task, "a running reader", |reader| {
+            reader.is_some_and(|r| r.phase == WorkloadPhase::Running)
+        })
+        .await;
+        self.reader(task).await.expect("the reader")
+    }
+
+    /// A digest of everything under the task's storage — paths, sizes,
+    /// modification times and contents — if the target shows it.
+    pub fn storage_digest(&self, task: &str) -> Option<String> {
+        let dir = self
+            .target
+            .storage_dir(self.probe.inner(), &self.resources(task))?;
+        let mut lines = Vec::new();
+        digest_tree(&dir, &dir, &mut lines);
+        lines.sort();
+        Some(lines.join("\n"))
+    }
+
+    /// Runs the task and pauses it: it is `Stopped`, with its storage kept.
+    pub async fn stopped(&self, task: &str) {
+        self.running(task).await;
+        self.must(task, OwnerCommand::Pause, "pause-for-reading");
+        self.wait_runner_state(task, RunnerState::Stopped).await;
     }
 
     // -- observation --------------------------------------------------------
@@ -515,9 +601,44 @@ fn spawn_policy(service: Arc<ProtocolService>) -> tokio::task::JoinHandle<()> {
         loop {
             tokio::time::sleep(POLICY_TICK).await;
             let service = Arc::clone(&service);
-            let _ = tokio::task::spawn_blocking(move || service.auto_resume_pass()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                service.auto_resume_pass();
+                service.reader_lease_pass();
+            })
+            .await;
         }
     })
+}
+
+/// One line per file under `dir`: path, length, modification time (to the
+/// nanosecond) and contents.
+fn digest_tree(root: &Path, dir: &Path, lines: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap().display().to_string();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            lines.push(format!("{relative}/"));
+            digest_tree(root, &path, lines);
+        } else {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos());
+            let contents = fs::read(&path).unwrap_or_default();
+            lines.push(format!(
+                "{relative} {} {modified} {}",
+                metadata.len(),
+                String::from_utf8_lossy(&contents)
+            ));
+        }
+    }
 }
 
 /// The automatic resumes in a task's log: `(attempt, limit)`.
@@ -1253,6 +1374,221 @@ pub async fn operator_commands_reach_the_runner_and_come_back_with_a_verdict<T: 
     }
 }
 
+/// AE5: the owner reads a stopped task. The controller starts a read-only
+/// runner beside nothing — no workload, no slot, storage untouched — keeps
+/// it through the owner's lease, and removes it when the lease runs out; the
+/// task stays `Stopped` throughout and nothing is reported lost (R8-R11).
+pub async fn a_reader_reads_a_stopped_task_and_leaves_with_its_lease<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.stopped("task-1").await;
+    let before = h.storage_digest("task-1");
+    let created = h.counters().workloads_created;
+
+    h.lease_reader("task-1", 3);
+    let reader = h.running_reader("task-1").await;
+    assert_eq!(reader.launch_generation, h.record("task-1").generation);
+    let observed = h.observe("task-1").await;
+    assert!(
+        observed.workload.is_none(),
+        "no working runner: {observed:?}"
+    );
+    assert!(observed.storage.exists());
+    assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);
+
+    // It stays for as long as the owner is reading, and the task's
+    // keep-paused reconciliation does not take it for compute to remove.
+    h.settle().await;
+    assert!(h
+        .reader("task-1")
+        .await
+        .is_some_and(|r| r.uid == reader.uid));
+
+    h.wait_reader("task-1", "the lease to end the reader", |r| r.is_none())
+        .await;
+    assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);
+    assert_eq!(
+        h.storage_digest("task-1"),
+        before,
+        "a reader writes nothing"
+    );
+    let counters = h.counters();
+    assert_eq!(counters.readers_created, 1, "{counters:?}");
+    assert_eq!(counters.reader_deletions, 1, "{counters:?}");
+    assert_eq!(counters.workloads_created, created, "{counters:?}");
+    assert!(counters.never_two_runners_on_one_storage(), "{counters:?}");
+    assert!(
+        !h.reported("task-1")
+            .iter()
+            .any(|o| matches!(o, Observation::WorkloadLost { .. })),
+        "a reader is not the task's workload"
+    );
+}
+
+/// AE9: the owner resumes a task a reader is reading. The controller removes
+/// the reader — and waits for it to be gone, however slowly the platform
+/// deletes it — before the working runner is created; the platform never
+/// shows two runners on the storage (R15).
+pub async fn a_resume_removes_the_reader_before_the_work_starts<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.stopped("task-1").await;
+    h.lease_reader("task-1", 60);
+    h.running_reader("task-1").await;
+
+    h.probe.delay_deletions(6);
+    h.must("task-1", OwnerCommand::Resume, "resume-1");
+    h.wait_runner_state("task-1", RunnerState::Running).await;
+
+    h.wait_reader("task-1", "the reader to be gone", |r| r.is_none())
+        .await;
+    let counters = h.counters();
+    assert_eq!(counters.workloads_created, 2, "{counters:?}");
+    assert_eq!(counters.readers_created, 1, "{counters:?}");
+    assert_eq!(counters.reader_deletions, 1, "{counters:?}");
+    assert!(counters.never_two_runners_on_one_storage(), "{counters:?}");
+    assert!(alive(&h.observe("task-1").await));
+
+    // And it is paused and read again the same way.
+    h.probe.clear_faults();
+    h.must("task-1", OwnerCommand::Pause, "pause-2");
+    h.wait_runner_state("task-1", RunnerState::Stopped).await;
+    h.lease_reader("task-1", 60);
+    h.running_reader("task-1").await;
+    assert!(h.counters().never_two_runners_on_one_storage());
+}
+
+/// A task that was interrupted — its workload gone, its owner to decide —
+/// is read like a stopped one, and its resume clears the reader first
+/// (AE7's state, AE9's rule).
+pub async fn an_interrupted_task_is_read_and_resumed_without_a_second_runner<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::without_auto_resume().await else {
+        return;
+    };
+    h.start_controller();
+    h.running("task-1").await;
+    h.kill_workload("task-1");
+    h.wait_runner_state("task-1", RunnerState::Interrupted)
+        .await;
+
+    h.lease_reader("task-1", 60);
+    h.running_reader("task-1").await;
+    assert_eq!(
+        h.runner_state("task-1"),
+        RunnerState::Interrupted,
+        "reading changes nothing"
+    );
+    h.settle().await;
+    assert_eq!(h.runner_state("task-1"), RunnerState::Interrupted);
+    assert_eq!(h.counters().workloads_created, 1, "nothing replaces it");
+
+    h.probe.delay_deletions(4);
+    h.must("task-1", OwnerCommand::Resume, "resume-1");
+    h.wait_runner_state("task-1", RunnerState::Running).await;
+    h.wait_reader("task-1", "the reader to be gone", |r| r.is_none())
+        .await;
+    let counters = h.counters();
+    assert_eq!(counters.workloads_created, 2, "{counters:?}");
+    assert!(counters.never_two_runners_on_one_storage(), "{counters:?}");
+}
+
+/// Archiving a task a reader is reading removes the reader first, then the
+/// workload and the storage under it (R15, R34).
+pub async fn an_archive_removes_the_reader_before_the_storage<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.stopped("task-1").await;
+    h.lease_reader("task-1", 60);
+    h.running_reader("task-1").await;
+
+    h.probe.delay_deletions(4);
+    h.must("task-1", OwnerCommand::Archive, "archive-1");
+    h.wait_runner_state("task-1", RunnerState::Archived).await;
+
+    assert!(h.reader("task-1").await.is_none());
+    let observed = h.observe("task-1").await;
+    assert!(
+        observed.workload.is_none() && !observed.storage.exists(),
+        "{observed:?}"
+    );
+    let counters = h.counters();
+    assert_eq!(counters.reader_deletions, 1, "{counters:?}");
+    assert_eq!(counters.storage_deletions, 1, "{counters:?}");
+    assert_eq!(counters.archives_over_reader, 0, "{counters:?}");
+}
+
+/// A reader that cannot start changes nothing about the task: no loss is
+/// reported, no state moves, and the controller tries again later while the
+/// owner is still reading (R12).
+pub async fn a_reader_that_cannot_start_leaves_the_task_alone<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.stopped("task-1").await;
+    h.probe
+        .fail_reader_starts([BackendErrorKind::Rejected, BackendErrorKind::Transient]);
+
+    h.lease_reader("task-1", 60);
+    h.wait_for("the first reader start to fail", |h| {
+        h.counters().reader_start_calls >= 1
+    })
+    .await;
+    assert!(h.reader("task-1").await.is_none());
+    assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);
+
+    // Later attempts get through.
+    h.running_reader("task-1").await;
+    let counters = h.counters();
+    assert!(counters.reader_start_calls >= 3, "{counters:?}");
+    assert_eq!(counters.readers_created, 1, "{counters:?}");
+    assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);
+    assert!(
+        !h.reported("task-1")
+            .iter()
+            .any(|o| matches!(o, Observation::WorkloadLost { .. })),
+        "a failed reader is no lost workload"
+    );
+}
+
+/// A reader that dies while the owner still reads is replaced — silently:
+/// its death is not the task's (R11).
+pub async fn a_reader_that_dies_is_replaced_while_it_is_wanted<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.stopped("task-1").await;
+    h.lease_reader("task-1", 60);
+    let first = h.running_reader("task-1").await;
+
+    assert!(
+        h.target
+            .kill_reader(h.probe.inner(), &h.resources("task-1")),
+        "a reader to kill"
+    );
+    h.wait_reader("task-1", "a replacement reader", |r| {
+        r.is_some_and(|r| r.uid != first.uid && r.phase.is_alive())
+    })
+    .await;
+    assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);
+    assert!(
+        !h.reported("task-1")
+            .iter()
+            .any(|o| matches!(o, Observation::WorkloadLost { .. })),
+        "the death of a reader is not reported"
+    );
+    let counters = h.counters();
+    assert_eq!(counters.readers_created, 2, "{counters:?}");
+    assert!(counters.never_two_runners_on_one_storage(), "{counters:?}");
+}
+
 /// Expands the whole suite for one target into a module of tests.
 macro_rules! contract_suite {
     ($module:ident, $target:ty) => {
@@ -1276,7 +1612,13 @@ macro_rules! contract_suite {
                 archive_racing_start_creates_nothing,
                 parallel_tasks_are_isolated,
                 the_controller_never_starts_more_than_the_limit,
-                operator_commands_reach_the_runner_and_come_back_with_a_verdict);
+                operator_commands_reach_the_runner_and_come_back_with_a_verdict,
+                a_reader_reads_a_stopped_task_and_leaves_with_its_lease,
+                a_resume_removes_the_reader_before_the_work_starts,
+                an_interrupted_task_is_read_and_resumed_without_a_second_runner,
+                an_archive_removes_the_reader_before_the_storage,
+                a_reader_that_cannot_start_leaves_the_task_alone,
+                a_reader_that_dies_is_replaced_while_it_is_wanted);
         }
     };
     (@tests $target:ty; $($scenario:ident),* $(,)?) => {

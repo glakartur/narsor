@@ -43,6 +43,13 @@ impl ControllerLink for ControllerClient {
     ) -> Result<RunnerCredentialResponse, ClientError> {
         ControllerClient::issue_runner_credential(self, task, request).await
     }
+    async fn issue_reader_credential(
+        &self,
+        task: &str,
+        request: &RunnerCredentialRequest,
+    ) -> Result<RunnerCredentialResponse, ClientError> {
+        ControllerClient::issue_reader_credential(self, task, request).await
+    }
 }
 
 struct ProtocolEnrollment;

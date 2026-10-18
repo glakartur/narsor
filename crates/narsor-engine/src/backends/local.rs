@@ -17,6 +17,7 @@
 //!     credential                      the runner credential, 0600, outside storage
 //!     launch-spec.json                the immutable launch spec, outside storage
 //!     runner.log                      the runner's stdout and stderr
+//! {root}/readers/{reader}/            the task's read-only runner (D63), same files
 //! ```
 //!
 //! A workload directory exists exactly while the workload does, so the
@@ -39,6 +40,18 @@
 //! of that id still has members, so a marked member proves the group ours.
 //! A runner started before the mark existed, or descendants that cleared
 //! their environment, are left alone once the runner is gone, as before.
+//!
+//! # The reader
+//!
+//! A read-only runner (`narsor-runner --read-only`, D63) is a second kind of
+//! workload of the same task: its own directory under `readers/`, its own
+//! process group and its own mark, so removing a task's working runner never
+//! signals the reader and removing the reader never signals a working
+//! runner's group. It takes the storage's lock like any runner, so it cannot
+//! run beside a working one; the controller sees to that first and the lock
+//! is the second guard. It never looks at the process group a dead runner
+//! left behind: should one still hold the lock, the reader cannot read and
+//! says so.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -52,8 +65,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, Removal,
-    StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
+    ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, ReaderStart,
+    Removal, StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase,
+    WorkloadState,
 };
 use crate::domain::{TaskId, TaskLaunchSpec};
 use crate::environment::{BackendCapabilities, BackendKind};
@@ -65,6 +79,31 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 /// The environment variable every runner gets, set to its workload's uid:
 /// what proves a process group still ours after the runner is gone.
 const WORKLOAD_MARK_ENV: &str = "NARSOR_LOCAL_WORKLOAD_UID";
+
+/// Which of a task's two kinds of workload a call is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The runner that works the task.
+    Work,
+    /// The read-only runner (D63).
+    Read,
+}
+
+impl Role {
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Work => "workloads",
+            Self::Read => "readers",
+        }
+    }
+
+    fn name(self, task: &TaskResources) -> &str {
+        match self {
+            Self::Work => &task.workload,
+            Self::Read => &task.reader,
+        }
+    }
+}
 
 /// Configuration of a [`LocalBackend`].
 #[derive(Debug, Clone)]
@@ -151,8 +190,17 @@ impl LocalBackend {
     /// The pid of the task's runner while it runs — what a test kills to
     /// model the host losing the workload.
     pub fn runner_pid(&self, task: &TaskResources) -> Option<u32> {
-        let record = self.read_record(task).ok()??;
-        match self.phase(task, &record) {
+        self.live_pid(task, Role::Work)
+    }
+
+    /// The pid of the task's read-only runner while it runs.
+    pub fn reader_pid(&self, task: &TaskResources) -> Option<u32> {
+        self.live_pid(task, Role::Read)
+    }
+
+    fn live_pid(&self, task: &TaskResources, role: Role) -> Option<u32> {
+        let record = self.read_record(task, role).ok()??;
+        match self.phase(task, role, &record) {
             Ok((phase, _)) if phase.is_alive() => Some(record.pid),
             _ => None,
         }
@@ -163,20 +211,27 @@ impl LocalBackend {
         self.config.root.join("storage").join(&task.storage)
     }
 
-    fn workload_dir(&self, task: &TaskResources) -> PathBuf {
-        self.config.root.join("workloads").join(&task.workload)
+    fn workload_dir(&self, task: &TaskResources, role: Role) -> PathBuf {
+        self.config
+            .root
+            .join(role.directory())
+            .join(role.name(task))
     }
 
-    fn record_path(&self, task: &TaskResources) -> PathBuf {
-        self.workload_dir(task).join("workload.json")
+    fn record_path(&self, task: &TaskResources, role: Role) -> PathBuf {
+        self.workload_dir(task, role).join("workload.json")
     }
 
     fn children(&self) -> MutexGuard<'_, HashMap<String, Child>> {
         self.children.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn read_record(&self, task: &TaskResources) -> BackendResult<Option<WorkloadRecord>> {
-        match fs::read(self.record_path(task)) {
+    fn read_record(
+        &self,
+        task: &TaskResources,
+        role: Role,
+    ) -> BackendResult<Option<WorkloadRecord>> {
+        match fs::read(self.record_path(task, role)) {
             Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
                 BackendError::transient(format!("unreadable workload record: {error}"))
             }),
@@ -185,8 +240,13 @@ impl LocalBackend {
         }
     }
 
-    fn write_record(&self, task: &TaskResources, record: &WorkloadRecord) -> BackendResult<()> {
-        let path = self.record_path(task);
+    fn write_record(
+        &self,
+        task: &TaskResources,
+        role: Role,
+        record: &WorkloadRecord,
+    ) -> BackendResult<()> {
+        let path = self.record_path(task, role);
         let temp = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|error| BackendError::transient(error.to_string()))?;
@@ -199,16 +259,18 @@ impl LocalBackend {
     fn phase(
         &self,
         task: &TaskResources,
+        role: Role,
         record: &WorkloadRecord,
     ) -> BackendResult<(WorkloadPhase, Option<ExitRecord>)> {
         // The parent asks its child first: only it can reap the process and
         // learn the exit code, whatever another instance recorded.
+        let name = role.name(task);
         let mut children = self.children();
-        if let Some(child) = children.get_mut(&task.workload) {
+        if let Some(child) = children.get_mut(name) {
             if child.id() == record.pid {
                 return match child.try_wait() {
                     Ok(Some(status)) => {
-                        children.remove(&task.workload);
+                        children.remove(name);
                         let exit = ExitRecord {
                             code: status.code(),
                         };
@@ -233,18 +295,22 @@ impl LocalBackend {
         }
     }
 
-    fn observe_workload(&self, task: &TaskResources) -> BackendResult<Option<WorkloadState>> {
-        let Some(mut record) = self.read_record(task)? else {
+    fn observe_workload(
+        &self,
+        task: &TaskResources,
+        role: Role,
+    ) -> BackendResult<Option<WorkloadState>> {
+        let Some(mut record) = self.read_record(task, role)? else {
             return Ok(None);
         };
-        let (phase, learned) = self.phase(task, &record)?;
+        let (phase, learned) = self.phase(task, role, &record)?;
         if let Some(exit) = learned {
             record.exited = Some(exit);
             record.resource_generation += 1;
-            if let Err(error) = self.write_record(task, &record) {
+            if let Err(error) = self.write_record(task, role, &record) {
                 // A concurrent removal took the workload while its exit was
                 // being written back: it is gone, not unobservable.
-                if !self.workload_dir(task).exists() {
+                if !self.workload_dir(task, role).exists() {
                     return Ok(None);
                 }
                 return Err(error);
@@ -288,14 +354,14 @@ impl LocalBackend {
             fs::create_dir_all(&storage)
                 .map_err(|error| io_error("create the task storage", error))?;
         }
-        if let Some(existing) = self.observe_workload(task)? {
+        if let Some(existing) = self.observe_workload(task, Role::Work)? {
             return Ok(Provisioned {
                 workload: existing,
                 created_workload: false,
                 created_storage,
             });
         }
-        let workload = self.spawn(task, launch, &storage)?;
+        let workload = self.spawn(task, Role::Work, launch, &storage)?;
         Ok(Provisioned {
             workload,
             created_workload: true,
@@ -303,9 +369,40 @@ impl LocalBackend {
         })
     }
 
+    /// Starts the task's read-only runner on its existing storage.
+    fn create_reader(
+        &self,
+        task: &TaskResources,
+        launch: &WorkloadLaunch,
+    ) -> BackendResult<ReaderStart> {
+        serde_json::from_value::<TaskLaunchSpec>(launch.launch_spec.clone()).map_err(|error| {
+            BackendError::rejected(format!("the launch spec is malformed: {error}"))
+        })?;
+        let storage = self.storage_dir(task);
+        if !storage.is_dir() {
+            // A reader never creates storage: there would be nothing to read.
+            return Err(BackendError::storage_missing(format!(
+                "task storage '{}' does not exist",
+                storage.display()
+            )));
+        }
+        if let Some(existing) = self.observe_workload(task, Role::Read)? {
+            return Ok(ReaderStart {
+                workload: existing,
+                created: false,
+            });
+        }
+        let workload = self.spawn(task, Role::Read, launch, &storage)?;
+        Ok(ReaderStart {
+            workload,
+            created: true,
+        })
+    }
+
     fn spawn(
         &self,
         task: &TaskResources,
+        role: Role,
         launch: &WorkloadLaunch,
         storage: &Path,
     ) -> BackendResult<WorkloadState> {
@@ -314,8 +411,11 @@ impl LocalBackend {
 
         // Written first and removed on failure: a half-made workload
         // directory without a record must not linger as "something exists".
-        let dir = self.workload_dir(task);
+        let dir = self.workload_dir(task, role);
         let staging = dir.with_extension("staging");
+        if let Some(parent) = dir.parent() {
+            fs::create_dir_all(parent).map_err(|error| io_error("create the workload", error))?;
+        }
         let _ = fs::remove_dir_all(&staging);
         // A directory without a record is what a crash between committing
         // the directory and recording the process leaves: no workload.
@@ -356,7 +456,11 @@ impl LocalBackend {
             .args(["--control-plane", &launch.control_plane_url])
             .arg("--credential-file")
             .arg(dir.join("credential"))
-            .args(["--incarnation", &launch.incarnation])
+            .args(["--incarnation", &launch.incarnation]);
+        if role == Role::Read {
+            command.arg("--read-only");
+        }
+        command
             .args(&self.config.runner_args)
             .envs(self.config.env.iter().map(|(k, v)| (k, v)))
             .env(WORKLOAD_MARK_ENV, &uid)
@@ -386,8 +490,8 @@ impl LocalBackend {
             start_ticks: process_start_ticks(child.id()),
             exited: None,
         };
-        self.children().insert(task.workload.clone(), child);
-        self.write_record(task, &record)?;
+        self.children().insert(role.name(task).to_string(), child);
+        self.write_record(task, role, &record)?;
         Ok(WorkloadState {
             uid: record.uid,
             resource_generation: record.resource_generation,
@@ -397,9 +501,9 @@ impl LocalBackend {
         })
     }
 
-    fn remove_workload(&self, task: &TaskResources) -> BackendResult<Removal> {
-        let dir = self.workload_dir(task);
-        let Some(record) = self.read_record(task)? else {
+    fn remove_workload(&self, task: &TaskResources, role: Role) -> BackendResult<Removal> {
+        let dir = self.workload_dir(task, role);
+        let Some(record) = self.read_record(task, role)? else {
             // A staging leftover or an empty directory is not a workload.
             let _ = fs::remove_dir_all(dir.with_extension("staging"));
             return Ok(if dir.exists() {
@@ -409,14 +513,14 @@ impl LocalBackend {
                 Removal::AlreadyAbsent
             });
         };
-        let (phase, _) = self.phase(task, &record)?;
+        let (phase, _) = self.phase(task, role, &record)?;
         if phase.is_alive() {
             // SAFETY: signalling the process group this adapter created;
             // `phase` checked the pid still names that process.
             unsafe {
                 libc::kill(-(record.pid as libc::pid_t), libc::SIGKILL);
             }
-            if !self.wait_gone(task, &record) {
+            if !self.wait_gone(task, role, &record) {
                 return Ok(Removal::Initiated);
             }
         }
@@ -425,16 +529,16 @@ impl LocalBackend {
         if !kill_marked_group(record.pid, &record.uid) {
             return Ok(Removal::Initiated);
         }
-        self.children().remove(&task.workload);
+        self.children().remove(role.name(task));
         fs::remove_dir_all(&dir).map_err(|error| io_error("remove the workload", error))?;
         Ok(Removal::Removed)
     }
 
     /// Waits briefly for a killed runner to go, reaping it when it is ours.
-    fn wait_gone(&self, task: &TaskResources, record: &WorkloadRecord) -> bool {
+    fn wait_gone(&self, task: &TaskResources, role: Role, record: &WorkloadRecord) -> bool {
         let deadline = Instant::now() + KILL_WAIT;
         loop {
-            let gone = match self.children().get_mut(&task.workload) {
+            let gone = match self.children().get_mut(role.name(task)) {
                 Some(child) => child.try_wait().map(|s| s.is_some()).unwrap_or(true),
                 None => !process_alive(record.pid, record.start_ticks),
             };
@@ -467,13 +571,15 @@ impl ExecutionBackend for LocalBackend {
             task_id: task_id.clone(),
             resource_key: resource_key.to_string(),
             workload: key.to_string(),
+            // Another directory, and another name, than the workload's.
+            reader: format!("{key}-reader"),
             storage: key.to_string(),
         })
     }
 
     async fn observe(&self, task: &TaskResources) -> BackendResult<TaskObservation> {
         Ok(TaskObservation {
-            workload: self.observe_workload(task)?,
+            workload: self.observe_workload(task, Role::Work)?,
             storage: self.storage_state(task),
         })
     }
@@ -495,11 +601,11 @@ impl ExecutionBackend for LocalBackend {
     }
 
     async fn release_compute(&self, task: &TaskResources) -> BackendResult<Removal> {
-        self.remove_workload(task)
+        self.remove_workload(task, Role::Work)
     }
 
     async fn archive(&self, task: &TaskResources) -> BackendResult<ArchiveProgress> {
-        let workload = self.remove_workload(task)?;
+        let workload = self.remove_workload(task, Role::Work)?;
         if !workload.is_complete() {
             // Never delete storage under a runner that may still write it.
             return Ok(ArchiveProgress {
@@ -515,6 +621,22 @@ impl ExecutionBackend for LocalBackend {
             Removal::AlreadyAbsent
         };
         Ok(ArchiveProgress { workload, storage })
+    }
+
+    async fn observe_reader(&self, task: &TaskResources) -> BackendResult<Option<WorkloadState>> {
+        self.observe_workload(task, Role::Read)
+    }
+
+    async fn start_reader(
+        &self,
+        task: &TaskResources,
+        launch: &WorkloadLaunch,
+    ) -> BackendResult<ReaderStart> {
+        self.create_reader(task, launch)
+    }
+
+    async fn stop_reader(&self, task: &TaskResources) -> BackendResult<Removal> {
+        self.remove_workload(task, Role::Read)
     }
 }
 
@@ -635,6 +757,201 @@ mod tests {
         let _ = unmarked.kill();
         let _ = stranger.wait();
         let _ = unmarked.wait();
+    }
+
+    /// A scratch backend whose "runner" is a script that records its
+    /// arguments and sleeps; stops everything it started when dropped.
+    struct Scratch {
+        root: PathBuf,
+        backend: LocalBackend,
+    }
+
+    impl Scratch {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("narsor-local-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            let program = root.join("fake-runner");
+            fs::write(
+                &program,
+                "#!/bin/sh\necho \"$@\" >> \"$ARGS_FILE\"\nexec sleep 600\n",
+            )
+            .unwrap();
+            fs::set_permissions(
+                &program,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
+            let mut config = LocalBackendConfig::with_program(root.join("local"), &program);
+            config.env = vec![("ARGS_FILE".into(), root.join("args").into())];
+            Self {
+                root,
+                backend: LocalBackend::new(config),
+            }
+        }
+
+        fn task(&self) -> TaskResources {
+            let id = TaskId::parse("task-1").unwrap();
+            self.backend.resources(&id, "task-1").unwrap()
+        }
+
+        fn launch(&self, incarnation: &str) -> WorkloadLaunch {
+            use crate::domain::{ResolvedEnvironment, ResourceProfile, TaskWorkspace};
+            let spec = TaskLaunchSpec::new(
+                "wf",
+                1,
+                serde_json::json!({}),
+                TaskWorkspace::None,
+                ResolvedEnvironment::harness_only("claude-code"),
+                ResourceProfile::new(1000, 2048),
+            );
+            WorkloadLaunch {
+                task_id: TaskId::parse("task-1").unwrap(),
+                generation: 1,
+                incarnation: incarnation.into(),
+                lease_epoch: 1,
+                launch_spec: serde_json::to_value(spec).unwrap(),
+                control_plane_url: "http://127.0.0.1:9".into(),
+                credential: crate::backends::RunnerCredential::new("nsr.test"),
+            }
+        }
+
+        /// The command lines the script was started with, once `count` of
+        /// them were written.
+        fn invocations(&self, count: usize) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let lines: Vec<String> = fs::read_to_string(self.root.join("args"))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                if lines.len() >= count || Instant::now() >= deadline {
+                    return lines;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let task = self.task();
+            for role in [Role::Work, Role::Read] {
+                let _ = self.backend.remove_workload(&task, role);
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reader_needs_storage_and_never_creates_it() {
+        let scratch = Scratch::new();
+        let task = scratch.task();
+
+        let refused = scratch
+            .backend
+            .start_reader(&task, &scratch.launch("task-1-reader-g1"))
+            .await
+            .expect_err("no storage to read");
+
+        assert_eq!(
+            refused.kind,
+            crate::backends::BackendErrorKind::StorageMissing
+        );
+        assert!(
+            !scratch.backend.storage_dir(&task).exists(),
+            "nothing created"
+        );
+        assert!(scratch
+            .backend
+            .observe_reader(&task)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!scratch
+            .root
+            .join("local/readers")
+            .join(&task.reader)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn a_reader_has_its_own_name_directory_group_and_flag() {
+        let scratch = Scratch::new();
+        let task = scratch.task();
+        assert_ne!(task.reader, task.workload);
+        fs::create_dir_all(scratch.backend.storage_dir(&task)).unwrap();
+
+        let started = scratch
+            .backend
+            .start_reader(&task, &scratch.launch("task-1-reader-g1"))
+            .await
+            .expect("start the reader");
+        assert!(started.created);
+        let again = scratch
+            .backend
+            .start_reader(&task, &scratch.launch("task-1-reader-g1-again"))
+            .await
+            .expect("reconcile");
+        assert!(!again.created, "one reader per task");
+        assert_eq!(again.workload.uid, started.workload.uid);
+
+        let reader_pid = scratch.backend.reader_pid(&task).expect("a live reader");
+        assert_eq!(process_group(reader_pid), Some(reader_pid), "its own group");
+        assert!(scratch
+            .root
+            .join("local/readers")
+            .join(&task.reader)
+            .is_dir());
+        let observed = scratch.backend.observe(&task).await.unwrap();
+        assert!(
+            observed.workload.is_none(),
+            "the reader is not the workload"
+        );
+        assert!(scratch.invocations(1)[0].contains("--read-only"));
+
+        // A working runner beside it (as the controller never does, but the
+        // adapter must still keep them apart): its own group and directory.
+        scratch
+            .backend
+            .provision(&task, &scratch.launch("task-1-g1"))
+            .await
+            .expect("provision");
+        let work_pid = scratch.backend.runner_pid(&task).expect("a live runner");
+        assert_ne!(process_group(work_pid), process_group(reader_pid));
+        assert!(!scratch.invocations(2)[1].contains("--read-only"));
+
+        // Removing the working runner — group kill, marked-group sweep —
+        // leaves the reader alone, and removing the reader leaves the
+        // storage alone.
+        assert!(scratch
+            .backend
+            .release_compute(&task)
+            .await
+            .unwrap()
+            .is_complete());
+        assert!(scratch.backend.runner_pid(&task).is_none());
+        assert_eq!(
+            scratch.backend.reader_pid(&task),
+            Some(reader_pid),
+            "still reading"
+        );
+
+        let removal = scratch.backend.stop_reader(&task).await.unwrap();
+        assert!(removal.is_complete(), "{removal:?}");
+        assert!(scratch.backend.reader_pid(&task).is_none());
+        assert!(!scratch
+            .root
+            .join("local/readers")
+            .join(&task.reader)
+            .exists());
+        assert!(scratch.backend.storage_dir(&task).is_dir(), "storage stays");
+        assert!(scratch
+            .backend
+            .stop_reader(&task)
+            .await
+            .unwrap()
+            .is_complete());
     }
 
     #[test]

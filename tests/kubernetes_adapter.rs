@@ -245,6 +245,14 @@ impl ContractTarget for KubernetesTarget {
         assert!(self.cluster.kill_runner(&task.workload), "a runner to kill");
     }
 
+    fn storage_dir(&self, _backend: &KubernetesBackend, task: &TaskResources) -> Option<PathBuf> {
+        self.cluster.volume_dir(&task.storage)
+    }
+
+    fn kill_reader(&self, _backend: &KubernetesBackend, task: &TaskResources) -> bool {
+        self.cluster.kill_runner(&task.reader)
+    }
+
     fn cleanup(&self, _backend: &KubernetesBackend) {
         self.cluster.shutdown();
     }
@@ -271,6 +279,7 @@ fn generated_pod_with(
         task_id: TaskId::parse("Task_1").unwrap(),
         resource_key: "Task_1".into(),
         workload: names::workload("Task_1"),
+        reader: names::reader("Task_1"),
         storage: names::storage("Task_1"),
     };
     let launch = launch_of("Task_1", 3, spec);
@@ -450,6 +459,7 @@ fn configured_claude_profile_mounts_read_only_for_every_runner() {
         task_id: TaskId::parse("Task_1").unwrap(),
         resource_key: "Task_1".into(),
         workload: names::workload("Task_1"),
+        reader: names::reader("Task_1"),
         storage: names::storage("Task_1"),
     };
     let launch = launch_of("Task_1", 3, spec());
@@ -1053,6 +1063,190 @@ async fn invalid_launches_are_rejected_before_any_api_call() {
     );
 }
 
+/// The reader's Pod is a different object under its own name, mounts the
+/// task's claim read-only, carries nothing that is for work, and passes the
+/// admission rules; a Pod that mounted the claim writable under a reader's
+/// name would not.
+#[test]
+fn the_reader_pod_mounts_the_storage_read_only_and_carries_nothing_for_work() {
+    let (work, task, launch) = generated_pod(spec());
+    let plan = manifest::plan(&config(), &launch).expect("a valid launch");
+    let reader = manifest::reader_pod(&config(), NAMESPACE, &task, &launch, &plan);
+
+    assert_eq!(reader["metadata"]["name"], task.reader.as_str());
+    assert_ne!(task.reader, task.workload);
+    assert_eq!(task.reader, format!("{}-reader", task.workload));
+    assert_eq!(
+        reader["metadata"]["labels"]["narsor.dev/component"],
+        "reader"
+    );
+    assert_eq!(
+        work["metadata"]["labels"]["narsor.dev/component"],
+        "workload"
+    );
+    assert_eq!(reader["spec"]["restartPolicy"], "Never");
+
+    let volumes = reader["spec"]["volumes"].as_array().unwrap();
+    let claim = volumes
+        .iter()
+        .find(|v| v["name"] == "task-storage")
+        .expect("the storage volume");
+    assert_eq!(
+        claim["persistentVolumeClaim"]["claimName"],
+        task.storage.as_str()
+    );
+    assert_eq!(claim["persistentVolumeClaim"]["readOnly"], true);
+    let container = &reader["spec"]["containers"][0];
+    for mount in container["volumeMounts"].as_array().unwrap() {
+        assert_eq!(mount["readOnly"], true, "every mount is read-only: {mount}");
+    }
+    let args: Vec<&str> = container["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert!(args.contains(&"--read-only"), "{args:?}");
+    for work_only in ["--secrets-dir", "--harness-home", "--claude-profile-source"] {
+        assert!(
+            !args.contains(&work_only),
+            "{work_only} is for work: {args:?}"
+        );
+    }
+    let names: Vec<&str> = volumes
+        .iter()
+        .map(|v| v["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["task-storage", "narsor-runtime", "narsor-launch"]);
+    assert_eq!(
+        reader["spec"]["initContainers"].as_array().unwrap().len(),
+        1,
+        "the runtime bundle only, no tool packages"
+    );
+    // Its launch Secret is its own, named after the reader.
+    assert_eq!(
+        volumes[2]["secret"]["secretName"],
+        names::launch_secret(&task.reader, &launch.incarnation).as_str()
+    );
+    let policy = config().shape_policy();
+    check_pod_shape(&reader, &policy).expect("a reader Pod passes the admission rules");
+
+    // The same Pod with a writable claim, or another task's claim, is refused.
+    let mut writable = reader.clone();
+    writable["spec"]["volumes"][0]["persistentVolumeClaim"]["readOnly"] = false.into();
+    assert!(check_pod_shape(&writable, &policy).is_err());
+    let mut foreign = reader.clone();
+    foreign["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] =
+        "narsor-other-0000000000000000-storage".into();
+    assert!(check_pod_shape(&foreign, &policy).is_err());
+}
+
+/// The admission policy lets a `-reader` Pod mount its task's claim only
+/// read-only, and lets the controller delete it like any task Pod.
+#[test]
+fn the_admission_policy_admits_a_read_only_reader_pod() {
+    let documents = deploy_documents();
+    let policies = of_kind(&documents, "ValidatingAdmissionPolicy");
+    let pods = policies
+        .iter()
+        .find(|p| p["metadata"]["name"] == "narsor-task-pods")
+        .expect("the Pod policy");
+    let rules = pods["spec"]["validations"].to_string();
+    assert!(rules.contains("-reader"), "{rules}");
+    assert!(rules.contains("readOnly"), "{rules}");
+    let guard = policies
+        .iter()
+        .find(|p| p["metadata"]["name"] == "narsor-controller-delete-guard")
+        .expect("the delete guard");
+    assert!(guard["spec"]["validations"].to_string().contains("reader"));
+}
+
+/// The adapter starts, observes and stops the reader as a Pod of its own:
+/// the workload and the storage are never touched by it, and it needs the
+/// storage to exist.
+#[tokio::test]
+async fn the_reader_is_a_pod_of_its_own_on_the_same_claim() {
+    let quiet = Quiet::new();
+    let task = task_resources(&quiet.backend, "task-1");
+    let launch = launch_of("task-1", 1, spec());
+
+    // No storage, nothing to read.
+    let refused = quiet
+        .backend
+        .start_reader(&task, &launch)
+        .await
+        .expect_err("no storage");
+    assert_eq!(
+        refused.kind,
+        narsor_engine::backends::BackendErrorKind::StorageMissing
+    );
+    assert!(quiet.cluster.pod_names().is_empty());
+
+    quiet
+        .backend
+        .provision(&task, &launch)
+        .await
+        .expect("provision");
+    quiet.backend.release_compute(&task).await.expect("stopped");
+    wait_until("the workload Pod to go", async || {
+        quiet
+            .backend
+            .observe(&task)
+            .await
+            .unwrap()
+            .workload
+            .is_none()
+    })
+    .await;
+    assert!(quiet.backend.observe_reader(&task).await.unwrap().is_none());
+
+    let reader_launch = launch_of("task-1", 1, spec());
+    let started = quiet
+        .backend
+        .start_reader(&task, &reader_launch)
+        .await
+        .expect("start the reader");
+    assert!(started.created);
+    assert_eq!(started.workload.incarnation, reader_launch.incarnation);
+    let again = quiet
+        .backend
+        .start_reader(&task, &launch_of("task-1", 1, spec()))
+        .await
+        .expect("reconcile");
+    assert!(!again.created);
+    assert_eq!(again.workload.uid, started.workload.uid);
+
+    assert_eq!(
+        quiet.cluster.pod_names(),
+        std::slice::from_ref(&task.reader)
+    );
+    let pod = quiet.cluster.pod(&task.reader).expect("the reader Pod");
+    assert_eq!(
+        pod["spec"]["volumes"][0]["persistentVolumeClaim"]["readOnly"],
+        true
+    );
+    let observed = quiet.backend.observe(&task).await.unwrap();
+    assert!(
+        observed.workload.is_none(),
+        "the reader is not the workload"
+    );
+    assert!(observed.storage.exists());
+
+    let removed = quiet.backend.stop_reader(&task).await.expect("stop");
+    assert!(removed.issued(), "{removed:?}");
+    wait_until("the reader to go", async || {
+        quiet.backend.observe_reader(&task).await.unwrap().is_none()
+    })
+    .await;
+    assert!(quiet.cluster.pvc(&task.storage).is_some(), "storage stays");
+    assert!(quiet
+        .backend
+        .stop_reader(&task)
+        .await
+        .unwrap()
+        .is_complete());
+}
+
 /// The resource names are DNS-1123 labels and stay apart for task ids that
 /// differ only in case or punctuation.
 #[test]
@@ -1078,6 +1272,8 @@ fn resource_names_are_dns_safe_and_injective() {
         let task = task_resources(&backend, key);
         assert!(names::is_dns_label(&task.workload), "{}", task.workload);
         assert!(names::is_dns_label(&task.storage), "{}", task.storage);
+        assert!(names::is_dns_label(&task.reader), "{}", task.reader);
+        assert_ne!(task.reader, task.workload);
         assert_eq!(task.storage, format!("{}-storage", task.workload));
         assert!(seen.insert(task.workload.clone()), "{key} collides");
         assert_eq!(task_resources(&backend, key), task, "deterministic");

@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::backend::{
     ArchiveProgress, BackendError, BackendErrorKind, BackendResult, ExecutionBackend, Provisioned,
-    Removal, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase,
+    ReaderStart, Removal, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase,
+    WorkloadState,
 };
 use crate::backend::{BackendCapabilities, BackendKind};
 use crate::controller::ControllerLink;
@@ -53,6 +54,33 @@ pub struct ProbeCounters {
     pub resume_calls: u64,
     /// `observe` calls, including failed ones.
     pub observe_calls: u64,
+    /// Readers created (a returned existing one is not counted).
+    pub readers_created: u64,
+    /// Reader deletions issued (each removal of a present reader once).
+    pub reader_deletions: u64,
+    /// `start_reader` calls that reached the adapter.
+    pub reader_start_calls: u64,
+    /// Work launches (provision or resume) attempted while a reader of the
+    /// task still existed. A correct controller never does that (R15).
+    pub launches_over_reader: u64,
+    /// Readers started while a working runner of the task was alive. A
+    /// correct controller never does that (R15).
+    pub readers_over_workload: u64,
+    /// Archives attempted while a reader of the task still existed: the
+    /// reader goes before the storage under it (R15).
+    pub archives_over_reader: u64,
+}
+
+impl ProbeCounters {
+    /// Whether the probe ever saw a task's reader and working runner exist
+    /// at once, or a reader under an archive — the invariant of R15: two
+    /// runners never share one storage.
+    pub fn never_two_runners_on_one_storage(&self) -> bool {
+        self.launches_over_reader == 0
+            && self.readers_over_workload == 0
+            && self.archives_over_reader == 0
+            && self.launches_over_existing == 0
+    }
 }
 
 /// Faults to inject, consumed as calls arrive.
@@ -65,6 +93,8 @@ struct Faults {
     lost_launch_answers: u32,
     /// Observations to fail.
     failing_observes: u32,
+    /// Reader starts to fail before reaching the adapter, with how.
+    failing_reader_starts: Vec<BackendErrorKind>,
     /// Extra removal calls every deletion takes before it really happens.
     deletion_delay: u32,
 }
@@ -129,6 +159,12 @@ impl<B: ExecutionBackend> Probed<B> {
         self.lock().faults.lost_launch_answers += count;
     }
 
+    /// The next reader starts fail with these kinds, in order, without
+    /// reaching the adapter.
+    pub fn fail_reader_starts(&self, kinds: impl IntoIterator<Item = BackendErrorKind>) {
+        self.lock().faults.failing_reader_starts.extend(kinds);
+    }
+
     /// The next `count` observations fail transiently.
     pub fn fail_observes(&self, count: u32) {
         self.lock().faults.failing_observes += count;
@@ -179,17 +215,37 @@ impl<B: ExecutionBackend> Probed<B> {
         let mut state = self.lock();
         state.pending_deletions.remove(name);
         state.deleting.remove(name);
+        state.deleting.remove(&format!("{name}/storage"));
     }
 
     /// Counts what a removal did, issuing each resource's deletion once.
     fn count_removal(&self, name: &str, removal: Removal, storage: bool) {
         let mut state = self.lock();
+        // An adapter may name its storage as it names its workload (the
+        // local one does): the two deletions are counted apart.
+        let name = if storage {
+            format!("{name}/storage")
+        } else {
+            name.to_string()
+        };
+        let name = name.as_str();
         if removal.issued() && state.deleting.insert(name.to_string()) {
             if storage {
                 state.counters.storage_deletions += 1;
             } else {
                 state.counters.workload_deletions += 1;
             }
+        }
+        if removal.is_complete() {
+            state.deleting.remove(name);
+        }
+    }
+
+    /// [`Self::count_removal`] for a reader.
+    fn count_reader_removal(&self, name: &str, removal: Removal) {
+        let mut state = self.lock();
+        if removal.issued() && state.deleting.insert(name.to_string()) {
+            state.counters.reader_deletions += 1;
         }
         if removal.is_complete() {
             state.deleting.remove(name);
@@ -224,6 +280,14 @@ impl<B: ExecutionBackend> Probed<B> {
             .is_ok_and(|o| o.workload.is_some())
         {
             self.lock().counters.launches_over_existing += 1;
+        }
+        if self
+            .inner
+            .observe_reader(task)
+            .await
+            .is_ok_and(|r| r.is_some())
+        {
+            self.lock().counters.launches_over_reader += 1;
         }
         let result = if resume {
             self.inner.resume(task, launch).await
@@ -310,6 +374,9 @@ impl<B: ExecutionBackend> ExecutionBackend for Probed<B> {
 
     async fn archive(&self, task: &TaskResources) -> BackendResult<ArchiveProgress> {
         let observed = self.inner.observe(task).await?;
+        if self.inner.observe_reader(task).await?.is_some() {
+            self.lock().counters.archives_over_reader += 1;
+        }
         if observed.workload.is_none() && !observed.storage.exists() {
             self.forget(&task.workload);
             self.forget(&task.storage);
@@ -330,6 +397,62 @@ impl<B: ExecutionBackend> ExecutionBackend for Probed<B> {
         self.count_removal(&task.workload, progress.workload, false);
         self.count_removal(&task.storage, progress.storage, true);
         Ok(progress)
+    }
+
+    async fn observe_reader(&self, task: &TaskResources) -> BackendResult<Option<WorkloadState>> {
+        let mut observed = self.inner.observe_reader(task).await?;
+        // A deletion the probe is still delaying shows as one in progress.
+        if self.lock().pending_deletions.contains_key(&task.reader) {
+            if let Some(reader) = &mut observed {
+                reader.phase = WorkloadPhase::Deleting;
+            }
+        }
+        Ok(observed)
+    }
+
+    async fn start_reader(
+        &self,
+        task: &TaskResources,
+        launch: &WorkloadLaunch,
+    ) -> BackendResult<ReaderStart> {
+        {
+            let mut state = self.lock();
+            state.counters.reader_start_calls += 1;
+            if !state.faults.failing_reader_starts.is_empty() {
+                let kind = state.faults.failing_reader_starts.remove(0);
+                return Err(BackendError {
+                    kind,
+                    message: "injected reader start failure".into(),
+                });
+            }
+        }
+        if self
+            .inner
+            .observe(task)
+            .await
+            .is_ok_and(|o| o.workload.is_some_and(|w| w.phase.is_alive()))
+        {
+            self.lock().counters.readers_over_workload += 1;
+        }
+        let result = self.inner.start_reader(task, launch).await;
+        if let Ok(started) = &result {
+            if started.created {
+                self.lock().counters.readers_created += 1;
+            }
+        }
+        result
+    }
+
+    async fn stop_reader(&self, task: &TaskResources) -> BackendResult<Removal> {
+        if self.inner.observe_reader(task).await?.is_none() {
+            self.forget(&task.reader);
+        } else if let Some(answer) = self.delay(&task.reader) {
+            self.count_reader_removal(&task.reader, answer);
+            return Ok(answer);
+        }
+        let removal = self.inner.stop_reader(task).await?;
+        self.count_reader_removal(&task.reader, removal);
+        Ok(removal)
     }
 }
 
@@ -422,5 +545,14 @@ impl<L: ControllerLink> ControllerLink for SeverableLink<L> {
     ) -> Result<RunnerCredentialResponse, ClientError> {
         self.check()?;
         self.inner.issue_runner_credential(task_id, request).await
+    }
+
+    async fn issue_reader_credential(
+        &self,
+        task_id: &str,
+        request: &RunnerCredentialRequest,
+    ) -> Result<RunnerCredentialResponse, ClientError> {
+        self.check()?;
+        self.inner.issue_reader_credential(task_id, request).await
     }
 }
