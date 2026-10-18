@@ -749,6 +749,7 @@ pub async fn input(
                         denial_index: answer.denial_index,
                         decision,
                         scope,
+                        message: delivery.comment.clone(),
                     },
                 },
             )

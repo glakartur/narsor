@@ -355,6 +355,7 @@ fn permission_wait_survives_reload_and_rejects_ordinary_input() {
             denial_index: Some(0),
             decision: PermissionDecisionKind::Allow,
             scope: Some(PermissionGrantScope::ExactOperation),
+            message: None,
         },
         reloaded.episode_key(),
     )
@@ -438,6 +439,7 @@ fn a_decision_without_an_index_grants_every_denial_or_none() {
         denial_index: None,
         decision: PermissionDecisionKind::Allow,
         scope: Some(PermissionGrantScope::ExactOperation),
+        message: None,
     };
     let both = request(vec![
         denial("cargo fmt --check && cargo test", "asyncAgent"),
@@ -467,6 +469,64 @@ fn a_decision_without_an_index_grants_every_denial_or_none() {
     assert_eq!(
         human::granted_rules(&one_blocked, &only_first).unwrap(),
         vec!["Bash(cargo test)".to_string()]
+    );
+}
+
+/// A command no rule can pin down leaves the operator only a denial. The
+/// agent then learns how to ask again in a form that can be approved, and
+/// gets the operator's own words — otherwise the task has no way forward.
+#[test]
+fn denying_an_ungrantable_command_tells_the_agent_how_to_ask_again() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    let looping = "f=out.log; until grep -q done \"$f\"; do sleep 2; done";
+    let request = HumanInputRequest {
+        action_execution_id: "attempt-permission".to_string(),
+        instruction: "Claude Code needs a permission decision.".to_string(),
+        fields: Vec::new(),
+        question: None,
+        answer_tail: None,
+        agent_harness: Some("claude-code".to_string()),
+        agent_session_id: Some("session-permission".to_string()),
+        prefilled_answer: None,
+        permission: Some(PermissionRequestDetails {
+            denials: vec![PermissionDenialDetails {
+                tool_name: "Bash".to_string(),
+                tool_use_id: "tool-loop".to_string(),
+                input: json!({ "command": looping }),
+                cwd: root.path().to_string_lossy().into_owned(),
+                reason_type: Some("asyncAgent".to_string()),
+                reason: None,
+            }],
+        }),
+    };
+    let pending = PendingHumanInput::for_permission(
+        execution.id.clone(),
+        execution.current_state.clone().unwrap_or_default(),
+        request,
+    );
+    human::suspend(&store, &mut execution, &pending).expect("persist permission wait");
+
+    let resumed = human::resolve_permission(
+        &store,
+        &execution.id,
+        PermissionDecision {
+            denial_index: None,
+            decision: PermissionDecisionKind::Deny,
+            scope: None,
+            message: Some("Run cargo build --workspace --bins first.".to_string()),
+        },
+        pending.episode_key(),
+    )
+    .expect("a denial is always accepted");
+
+    let answer = resumed.result.variables["answer"].as_str().unwrap();
+    assert!(answer.contains(looping), "{answer}");
+    assert!(answer.contains("simple commands"), "{answer}");
+    assert!(
+        answer.contains("Run cargo build --workspace --bins first."),
+        "{answer}"
     );
 }
 

@@ -199,7 +199,8 @@ pub enum Command {
         #[arg(long = "variable", value_name = "NAME=VALUE")]
         variables: Vec<String>,
 
-        /// A remark kept in the event log with the answer.
+        /// A remark kept in the event log with the answer; with
+        /// `--permission`, a message the agent reads along with the decision.
         #[arg(long, value_name = "TEXT")]
         comment: Option<String>,
 

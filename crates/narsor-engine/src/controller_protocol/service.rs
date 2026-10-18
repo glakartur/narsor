@@ -70,6 +70,7 @@ fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> Hum
                         crate::engine::actions::PermissionGrantScope::CommandGroup
                     }
                 }),
+                message: decision.message,
             });
     HumanInputDelivery {
         values: delivery.values,
@@ -114,6 +115,7 @@ fn protocol_delivery(delivery: &HumanInputDelivery) -> narsor_protocol::api::Hum
                         narsor_protocol::api::PermissionGrantScopeDto::CommandGroup
                     }
                 }),
+                message: decision.message.clone(),
             }
         }),
     }

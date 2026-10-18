@@ -1257,6 +1257,7 @@ impl Session {
                         narsor_engine::engine::PermissionGrantScope::CommandGroup
                     }
                 }),
+                message: decision.message,
             }
         });
         let episode = input.delivery.episode.clone();

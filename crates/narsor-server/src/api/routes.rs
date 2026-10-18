@@ -163,6 +163,7 @@ fn engine_delivery(delivery: HumanInputDeliveryDto) -> HumanInputDelivery {
                         narsor_engine::engine::PermissionGrantScope::CommandGroup
                     }
                 }),
+                message: decision.message,
             });
     HumanInputDelivery {
         values: delivery.values,
@@ -208,6 +209,7 @@ fn protocol_delivery(delivery: &HumanInputDelivery) -> HumanInputDeliveryDto {
                         narsor_engine::api::PermissionGrantScopeDto::CommandGroup
                     }
                 }),
+                message: decision.message.clone(),
             }
         }),
     }

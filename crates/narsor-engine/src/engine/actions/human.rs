@@ -211,6 +211,9 @@ pub struct PermissionDecision {
     pub decision: PermissionDecisionKind,
     #[serde(default)]
     pub scope: Option<PermissionGrantScope>,
+    /// What the operator tells the agent along with the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1084,21 +1087,60 @@ pub fn resolve_permission(
             })
         }
     }
-    let listed = commands
-        .iter()
-        .map(|command| format!("- {command}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let answer = match decision.decision {
-        PermissionDecisionKind::Deny => format!(
-            "The operator denied these blocked actions:\n{listed}\n\
-             Choose another approach or explain what is blocked."
-        ),
+    let listed = |commands: &[&String]| {
+        commands
+            .iter()
+            .map(|command| format!("- {command}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut answer = match decision.decision {
+        PermissionDecisionKind::Deny => {
+            // A command no rule can pin down was never the operator's to
+            // approve: say so, and how to ask in a form that can be.
+            let (unpinnable, denied): (Vec<_>, Vec<_>) =
+                denials.iter().zip(&commands).partition(|(denial, _)| {
+                    denial.tool_name == "Bash"
+                        && narsor_protocol::api::is_approvable_permission_reason(
+                            denial.reason_type.as_deref(),
+                        )
+                        && claude_permission_rules(denial, PermissionGrantScope::ExactOperation)
+                            .is_none()
+                });
+            let unpinnable: Vec<_> = unpinnable.into_iter().map(|(_, command)| command).collect();
+            let denied: Vec<_> = denied.into_iter().map(|(_, command)| command).collect();
+            let mut parts = Vec::new();
+            if !denied.is_empty() {
+                parts.push(format!(
+                    "The operator denied these blocked actions:\n{}\n\
+                     Choose another approach or explain what is blocked.",
+                    listed(&denied)
+                ));
+            }
+            if !unpinnable.is_empty() {
+                parts.push(format!(
+                    "The operator could not approve these commands, because no permission \
+                     rule can describe them exactly:\n{}\n\
+                     If you still need them, run what you need as separate simple commands: \
+                     no shell variables, loops, $(...), globs, parentheses or redirection to \
+                     files. The operator can approve such commands when they are blocked.",
+                    listed(&unpinnable)
+                ));
+            }
+            parts.join("\n\n")
+        }
         PermissionDecisionKind::Allow => format!(
-            "The operator approved these blocked actions for this task:\n{listed}\n\
-             Run them again now; they are allowed in this session."
+            "The operator approved these blocked actions for this task:\n{}\n\
+             Run them again now; they are allowed in this session.",
+            listed(&commands.iter().collect::<Vec<_>>())
         ),
     };
+    if let Some(message) = decision.message.as_deref().map(str::trim) {
+        if !message.is_empty() {
+            answer.push_str("\n\nMessage from the operator:\n");
+            answer.push_str(message);
+        }
+    }
     let delivery = HumanInputDelivery {
         agent_message: Some(answer),
         episode: Some(episode.to_string()),

@@ -552,7 +552,13 @@ impl InputPanel {
                 ..HumanInputDeliveryDto::default()
             },
             Plan::Permission(permission_decision) => HumanInputDeliveryDto {
-                permission_decision: Some(permission_decision.clone()),
+                permission_decision: Some(PermissionDecisionDto {
+                    message: Self::value_of(submission, MESSAGE_FIELD)
+                        .map(str::trim)
+                        .filter(|message| !message.is_empty())
+                        .map(str::to_string),
+                    ..permission_decision.clone()
+                }),
                 ..HumanInputDeliveryDto::default()
             },
         };
@@ -925,17 +931,6 @@ impl InputPanel {
         }
 
         let many = denials.len() > 1;
-        self.push(
-            ChooserItem::new(
-                if many { "Odmów wszystkim" } else { "Odmów" },
-                "Agent wznowi tę sesję z informacją, że te operacje są zablokowane.",
-            ),
-            Plan::Permission(PermissionDecisionDto {
-                denial_index: None,
-                decision: PermissionDecisionKindDto::Deny,
-                scope: None,
-            }),
-        );
         let all = |grants: &[Option<Vec<String>>]| -> Option<Vec<String>> {
             let mut rules: Vec<String> = Vec::new();
             for grant in grants {
@@ -947,6 +942,31 @@ impl InputPanel {
             }
             (!rules.is_empty()).then_some(rules)
         };
+        // A command no rule can pin down could still be approved in simpler
+        // parts: the engine asks the agent for them along with the refusal.
+        let unpinnable = denials.iter().any(|denial| {
+            denial.tool_name == "Bash"
+                && is_approvable_permission_reason(denial.reason_type.as_deref())
+                && grant_rules(denial, BashGrantScope::Exact).is_none()
+        });
+        self.push(
+            ChooserItem::new(
+                if many { "Odmów wszystkim" } else { "Odmów" },
+                if unpinnable {
+                    "Agent wznowi tę sesję i dostanie prośbę, aby polecenia bez reguły \
+                     zgody uruchomił jako proste polecenia, na które można dać zgodę."
+                } else {
+                    "Agent wznowi tę sesję z informacją, że te operacje są zablokowane."
+                },
+            )
+            .with_field(ChooserField::multiline(MESSAGE_FIELD)),
+            Plan::Permission(PermissionDecisionDto {
+                denial_index: None,
+                decision: PermissionDecisionKindDto::Deny,
+                scope: None,
+                message: None,
+            }),
+        );
         if let Some(rules) = all(&exact) {
             self.push(
                 ChooserItem::new(
@@ -965,6 +985,7 @@ impl InputPanel {
                     denial_index: None,
                     decision: PermissionDecisionKindDto::Allow,
                     scope: Some(PermissionGrantScopeDto::ExactOperation),
+                    message: None,
                 }),
             );
         } else if many {
@@ -985,6 +1006,7 @@ impl InputPanel {
                         denial_index: Some(index),
                         decision: PermissionDecisionKindDto::Allow,
                         scope: Some(PermissionGrantScopeDto::ExactOperation),
+                        message: None,
                     }),
                 );
             }
@@ -999,6 +1021,7 @@ impl InputPanel {
                     denial_index: None,
                     decision: PermissionDecisionKindDto::Allow,
                     scope: Some(PermissionGrantScopeDto::CommandGroup),
+                    message: None,
                 }),
             );
         }

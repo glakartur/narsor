@@ -47,6 +47,9 @@ pub struct PermissionDecisionDto {
     pub decision: PermissionDecisionKindDto,
     #[serde(default)]
     pub scope: Option<PermissionGrantScopeDto>,
+    /// What the operator tells the agent along with the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Request body for the dedicated permission endpoint.

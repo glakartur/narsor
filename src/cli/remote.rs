@@ -358,7 +358,8 @@ pub enum TaskCommand {
         /// Output label chosen explicitly.
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
-        /// A remark kept with the answer.
+        /// A remark kept with the answer; with `--permission`, a message
+        /// the agent reads along with the decision.
         #[arg(long, value_name = "TEXT")]
         comment: Option<String>,
         /// Resolve a Claude permission wait: deny, allow-exact or allow-group.
@@ -828,6 +829,7 @@ fn input_delivery(
             denial_index,
             decision,
             scope,
+            message: comment.clone(),
         }
     });
     Ok(HumanInputDeliveryDto {

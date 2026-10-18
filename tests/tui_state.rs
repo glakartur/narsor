@@ -4705,6 +4705,44 @@ mod task_app_waiting {
         let unresumable = pending(json!([denial("t1", "cargo test", "asyncAgent")]), None);
         let panel = narsor::tui::input_form::InputPanel::new(&unresumable, &|_| None);
         assert_eq!(labels(&panel), ["Odmów"]);
+
+        // A shell script no rule can pin down leaves only a refusal: it says
+        // the agent will be asked for simple commands, and carries the
+        // operator's message to the agent.
+        let script = pending(
+            json!([denial(
+                "t1",
+                "f=out.log; until grep -q done \"$f\"; do sleep 2; done",
+                "asyncAgent"
+            )]),
+            Some("session-8"),
+        );
+        let panel = narsor::tui::input_form::InputPanel::new(&script, &|_| None);
+        assert_eq!(labels(&panel), ["Odmów"]);
+        assert!(panel.items()[0].description.contains("proste polecenia"));
+        let delivery = panel
+            .delivery(&narsor::tui::chooser::Submission {
+                index: 0,
+                label: "Odmów".to_string(),
+                values: vec![(
+                    narsor::tui::input_form::MESSAGE_FIELD.to_string(),
+                    "  Uruchom cargo build --workspace --bins.  ".to_string(),
+                )],
+            })
+            .unwrap();
+        let refused = delivery.permission_decision.unwrap();
+        assert_eq!(
+            refused.decision,
+            narsor_protocol::api::PermissionDecisionKindDto::Deny
+        );
+        assert_eq!(
+            refused.message.as_deref(),
+            Some("Uruchom cargo build --workspace --bins.")
+        );
+        assert_eq!(
+            decision(&panel, 0).permission_decision.unwrap().message,
+            None
+        );
     }
 
     // -- the panel ------------------------------------------------------------
