@@ -3299,6 +3299,11 @@ fn a_loss_while_pausing_plans_no_resume() {
     assert_eq!(lost.resume.next_attempt_at, None, "waits for the owner");
     assert_eq!(lost.resume.consecutive_losses, 0);
     assert_eq!(lost.resume.exhausted, None);
+    // Nothing runs and nothing is planned: not shown as running.
+    assert_eq!(
+        lost.task_state(),
+        narsor_engine::orchestration::TaskState::Paused
+    );
     assert_eq!(
         lost.resume.last_loss.unwrap().from,
         RunnerState::PauseRequested

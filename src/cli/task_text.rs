@@ -442,6 +442,10 @@ pub fn state_hint(task: &TaskSummary) -> Option<ToneLine> {
              queues first when the backend is full",
             Tone::Warning,
         ),
+        // Lost while pausing: no attempt is planned, the owner decides.
+        TaskState::Paused if task.runner_state == RunnerState::Interrupted => {
+            interrupted_hint(task)
+        }
         TaskState::Paused if task.holds_slot => ToneLine::new(
             "pausing: waiting for the runner to reach a safe point",
             Tone::Normal,

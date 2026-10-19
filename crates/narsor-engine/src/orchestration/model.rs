@@ -87,7 +87,9 @@ impl SlotReleaseClass {
 /// 7. execution `InputNeeded` is `HumanNeeded`;
 /// 8. `Stopped` or `PauseRequested` is `Paused`;
 /// 9. `Provisioning` without a snapshot is `Queued`;
-/// 10. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
+/// 10. `Interrupted` with no attempt planned (lost while a pause was
+///     requested, which the resume policy leaves to the owner) is `Paused`;
+/// 11. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
 ///     `Interrupted` while the resume policy still waits to try again.
 ///
 /// Rules 5 to 7 come before 8, so a task stopped to free its slot keeps the
@@ -117,6 +119,8 @@ pub fn derive_task_state(
             RunnerState::PauseRequested if pause_by_policy => TaskState::Running,
             RunnerState::Stopped | RunnerState::PauseRequested => TaskState::Paused,
             RunnerState::Provisioning if execution.is_none() => TaskState::Queued,
+            // Lost while pausing: no attempt is planned, nothing runs.
+            RunnerState::Interrupted if resume.next_attempt_at.is_none() => TaskState::Paused,
             _ => TaskState::Running,
         },
     }
@@ -419,6 +423,22 @@ impl TaskRecord {
                 .any(|command| command.status == OperatorCommandStatus::Queued)
     }
 
+    /// The idempotency key of the first piece of owner work that waits for
+    /// the runner (an unsettled answer, else a queued operator command): the
+    /// key the work's resume derives from, so a retry resumes once.
+    pub fn pending_work_key(&self) -> Option<&str> {
+        self.inputs
+            .iter()
+            .find(|input| !input.status.is_settled())
+            .map(|input| input.idempotency_key.as_str())
+            .or_else(|| {
+                self.operator_commands
+                    .iter()
+                    .find(|command| command.status == OperatorCommandStatus::Queued)
+                    .map(|command| command.idempotency_key.as_str())
+            })
+    }
+
     /// Whether the slot-release policy may stop the task now: it runs, its
     /// execution still is in a state that frees the slot, the deadline came
     /// and nothing of the owner's waits for the runner.
@@ -485,9 +505,17 @@ impl TaskRecord {
     pub fn task_state(&self) -> TaskState {
         derive_task_state(
             self.runner_state,
-            self.runner
-                .as_ref()
-                .map(|runner| runner.snapshot.execution_status),
+            // While a resumed launch has not reported, the snapshot is the
+            // superseded launch's: it says nothing of the task now.
+            if self.runner_state == RunnerState::Provisioning
+                && self.awaited_launch_generation().is_some()
+            {
+                None
+            } else {
+                self.runner
+                    .as_ref()
+                    .map(|runner| runner.snapshot.execution_status)
+            },
             &self.resume,
             self.pause_requested_by_policy(),
         )
@@ -1131,15 +1159,30 @@ mod tests {
             ),
             T::Error
         );
+        let planned = ResumeState {
+            next_attempt_at: Some(Utc::now()),
+            ..ResumeState::default()
+        };
         assert_eq!(
             derive_task_state(
                 R::Interrupted,
                 Some(ExecutionStatus::Running),
-                &ResumeState::default(),
+                &planned,
                 false
             ),
             T::Running
         );
+    }
+
+    #[test]
+    fn a_task_lost_while_pausing_has_no_attempt_planned_and_is_paused() {
+        // `count_loss` plans nothing for a loss from `PauseRequested`.
+        for execution in [Some(ExecutionStatus::Running), None] {
+            assert_eq!(
+                derive_task_state(R::Interrupted, execution, &ResumeState::default(), false),
+                T::Paused
+            );
+        }
     }
 
     #[test]

@@ -1520,12 +1520,35 @@ impl ProtocolService {
             self.notify(&record.task_id);
             // A pause, a loss, a completed archive may each free a slot.
             self.reschedule(&identity.backend_id);
+            if record.pause_requested_by_policy() {
+                self.resume_for_stranded_work(&outcome.task, request.observation);
+            }
         }
         Ok(ReportResponse {
             applied: outcome.applied,
             runner_state: outcome.task.runner_state,
             generation: outcome.task.generation,
         })
+    }
+
+    /// An answer accepted while the slot-release policy's pause was pending
+    /// (the owner asked for no pause; an owner's own pause stands) is stored on a task that now is `Stopped`: nothing
+    /// else would resume it, so it is resumed here as `submit_input` would
+    /// have, under a key of the work's own (a retry resumes once). A failure
+    /// is logged only: the report is applied, and a retry of the work
+    /// repairs the resume.
+    fn resume_for_stranded_work(&self, task: &TaskRecord, observation: Observation) {
+        if observation != Observation::PausedAtSafePoint
+            || task.runner_state != RunnerState::Stopped
+        {
+            return;
+        }
+        let Some(work_key) = task.pending_work_key() else {
+            return;
+        };
+        if let Err(error) = self.resume_for_work(task, work_key) {
+            tracing::warn!(task = %task.task_id, %error, "resume for work stored during a pause failed");
+        }
     }
 
     /// Issues the credential of a new runner incarnation, replacing the

@@ -5178,6 +5178,130 @@ async fn ae8_an_answer_to_a_stopped_task_waits_for_a_slot_and_reaches_the_runner
     assert_eq!(acked.input.status, InputStatus::Consumed);
 }
 
+/// The first half of [`stop_by_policy`]: the wait of the waiting
+/// `task-1` ran out and the policy's pause waits for the safe point.
+async fn request_pause_by_policy(harness: &Harness, running: &Running, pending: &str) {
+    running
+        .runner
+        .snapshot(&snapshot(2, ExecutionStatus::InputNeeded, 4, Some(pending)))
+        .await
+        .expect("input needed");
+    harness.clock.advance(Duration::minutes(6));
+    running
+        .controller
+        .renew_lease(running.epoch, None)
+        .await
+        .expect("renew the lease");
+    running.runner.renew().await.expect("renew the runner");
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+    assert_eq!(
+        control_task(harness, "task-1").runner_state,
+        RunnerState::PauseRequested
+    );
+}
+
+/// The runner reaches the safe point and the controller reports it.
+async fn confirm_safe_point(harness: &Harness, running: &Running, pending: &str) {
+    let generation = control_task(harness, "task-1").generation;
+    let mut at_safe_point = snapshot(3, ExecutionStatus::InputNeeded, 4, Some(pending));
+    at_safe_point.safe_point = true;
+    running
+        .runner
+        .snapshot(&at_safe_point)
+        .await
+        .expect("safe point");
+    running
+        .controller
+        .report(&report(
+            "task-1",
+            running.epoch,
+            generation,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+}
+
+/// An answer accepted while the policy's pause waits for its safe point is
+/// not stranded: the safe point resumes the task, which starts and hands
+/// the answer to its runner.
+#[tokio::test]
+async fn an_answer_taken_while_the_policy_pause_waits_resumes_the_task_at_the_safe_point() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    request_pause_by_policy(&harness, &running, "ask-1").await;
+    harness
+        .owner
+        .control_input("task-1", &input_request("ask-1", "answer-1"))
+        .await
+        .expect("an answer is taken while the pause is pending");
+    assert_eq!(
+        control_task(&harness, "task-1").runner_state,
+        RunnerState::PauseRequested,
+        "nothing to resume yet"
+    );
+
+    confirm_safe_point(&harness, &running, "ask-1").await;
+
+    let resumed = control_task(&harness, "task-1");
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
+    assert_eq!(resumes_of(&resumed), 1);
+    // A retry of the answer resumes nothing more.
+    let retried = harness
+        .owner
+        .control_input("task-1", &input_request("ask-1", "answer-1"))
+        .await
+        .expect("retry");
+    assert!(retried.replayed);
+    let record = control_task(&harness, "task-1");
+    assert_eq!(resumes_of(&record), 1);
+    assert_eq!(record.generation, resumed.generation);
+
+    let runner = start_runner_of(
+        &harness,
+        &running,
+        record.generation,
+        ExecutionStatus::InputNeeded,
+        Some("ask-1"),
+    )
+    .await;
+    let polled = runner.poll(Some("ask-1"), 0).await.expect("poll");
+    assert_eq!(polled.inputs.len(), 1);
+    assert_eq!(
+        polled.inputs[0].delivery.comment.as_deref(),
+        Some("looks good")
+    );
+}
+
+/// The same on a full backend: the task waits at the front of the queue.
+#[tokio::test]
+async fn an_answer_taken_while_the_policy_pause_waits_queues_the_task_on_a_full_backend() {
+    let harness = Harness::start().await;
+    set_backend_limit(&harness, 2);
+    let running = harness.running("task-1", "k8s").await;
+    run_beside(&harness, &running, "task-2", "pod-b").await;
+    request_pause_by_policy(&harness, &running, "ask-1").await;
+    harness
+        .owner
+        .control_input("task-1", &input_request("ask-1", "answer-1"))
+        .await
+        .expect("an answer is taken while the pause is pending");
+    // The other task keeps the only slot that is left.
+    set_backend_limit(&harness, 1);
+
+    confirm_safe_point(&harness, &running, "ask-1").await;
+
+    let queued = control_task(&harness, "task-1");
+    assert_eq!(queued.runner_state, RunnerState::Queued);
+    assert!(
+        queued.reservation.is_none(),
+        "it never starts without a slot"
+    );
+    assert_eq!(resumes_of(&queued), 1);
+    assert_eq!(queued.inputs[0].status, InputStatus::Queued);
+}
+
 /// A finished task that was stopped, on a backend with room.
 async fn finished_and_stopped(harness: &Harness) -> Running {
     let running = harness.running("task-1", "k8s").await;
@@ -5202,6 +5326,12 @@ async fn a_message_to_the_conductor_of_a_finished_stopped_task_resumes_it_and_is
     assert_eq!(first.command.status, OperatorCommandStatus::Queued);
     let resumed = control_task(&harness, "task-1");
     assert_eq!(resumed.runner_state, RunnerState::Provisioning);
+    // The snapshot is of the launch before: the task starts, it is not
+    // "finished" until the new runner reports.
+    assert_eq!(
+        resumed.task_state(),
+        narsor_engine::orchestration::TaskState::Queued
+    );
     assert_eq!(
         resumed.operator_commands[0].launch_generation,
         resumed.generation
