@@ -21,7 +21,8 @@
 //!
 //! When a workflow runs, the expanded `repository` value is looked up here
 //! **first**. A hit provisions from the entry's `remote` (and its
-//! `default_branch` when the workflow declares no `ref`); a miss falls back to
+//! `default_branch` when the workflow declares no `ref`; an explicit `ref`
+//! always wins, and with neither the remote's `HEAD` is used); a miss falls back to
 //! treating the value as a raw git remote — a URL or a local path — which is
 //! what the CLI did before a registry existed. Nothing that worked before stops
 //! working, and a registered id simply wins over that fallback.

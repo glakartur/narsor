@@ -200,6 +200,7 @@ fn git_workspace() -> narsor_engine::domain::TaskWorkspace {
         remote_url: "https://example.com/narsor.git".to_string(),
         commit: "614c3a8".repeat(5) + "abcde",
         git_ref: None,
+        ref_origin: None,
         credential: None,
     })
 }

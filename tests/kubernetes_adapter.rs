@@ -846,6 +846,7 @@ fn tool_secrets_are_projected_files_never_values() {
             remote_url: "https://git.example/acme.git".into(),
             commit: "a".repeat(40),
             git_ref: None,
+            ref_origin: None,
             credential: Some(SecretReference {
                 name: "git-credential".into(),
                 tool: "git".into(),

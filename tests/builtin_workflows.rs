@@ -276,6 +276,22 @@ fn every_builtin_is_embedded_and_validates_without_a_single_violation() {
     }
 }
 
+/// A shipped workflow must not name a branch: the repository configuration
+/// decides which one is fetched, and `HEAD` is the fallback.
+#[test]
+fn no_builtin_pins_a_branch_for_its_workspace() {
+    for entry in BUILTIN_WORKFLOWS {
+        let definition = narsor_engine::workflow::load_from_str(entry.source)
+            .unwrap_or_else(|error| panic!("the embedded '{}' loads: {error}", entry.name));
+        match definition.workspace {
+            Some(narsor_engine::domain::WorkspaceSpec::Git { git_ref, .. }) => {
+                assert_eq!(git_ref, None, "'{}' names no ref", entry.name)
+            }
+            other => panic!("'{}' has a git workspace, found {other:?}", entry.name),
+        }
+    }
+}
+
 /// Shipped workflows deliberately inherit the daemon's chosen default rather
 /// than pinning every agent action to Claude Code.  That keeps the workflows
 /// portable while explicit `harness:` in a user workflow remains an override.

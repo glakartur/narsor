@@ -666,6 +666,28 @@ pub enum GitIdentityError {
     InvalidCommit(String),
 }
 
+/// Where the name of a branch or tag came from.
+///
+/// It lets a failed fetch tell the user which setting to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefOrigin {
+    /// The `ref` of the workflow workspace.
+    Workflow,
+    /// The `default_branch` of the repository configuration.
+    Repository,
+}
+
+impl RefOrigin {
+    /// Words for an error message, such as "z workflow".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Workflow => "z workflow",
+            Self::Repository => "z konfiguracji repozytorium",
+        }
+    }
+}
+
 /// What a new task clones into its empty task storage (R39).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitIdentity {
@@ -686,6 +708,9 @@ pub struct GitIdentity {
     /// provisioning rather than to task creation (R4, R6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
+    /// Where `git_ref` came from. Records from older versions have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_origin: Option<RefOrigin>,
     /// The credential used to clone, as a reference.
     pub credential: Option<SecretReference>,
 }

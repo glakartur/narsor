@@ -79,8 +79,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::domain::{
-    Context, EventData, ExecutionStatus, WorkflowDefinition, WorkflowExecution, Workspace,
-    WorkspaceInfo, WorkspaceSpec,
+    Context, EventData, ExecutionStatus, RefOrigin, WorkflowDefinition, WorkflowExecution,
+    Workspace, WorkspaceInfo, WorkspaceSpec,
 };
 use crate::engine::{Engine, EngineError};
 use crate::persistence::{write_atomic, ExecutionStore, PersistenceError, StatePaths};
@@ -395,16 +395,20 @@ pub fn resolve_repository(
 
     match registered {
         Some(entry) => {
-            let git_ref = git_ref
-                .map(ToString::to_string)
-                .or_else(|| entry.default_branch.clone());
+            let (git_ref, ref_origin) = match git_ref {
+                Some(git_ref) => (Some(git_ref.to_string()), Some(RefOrigin::Workflow)),
+                None => match entry.default_branch.clone() {
+                    Some(branch) => (Some(branch), Some(RefOrigin::Repository)),
+                    None => (None, None),
+                },
+            };
             tracing::debug!(
                 repository = %repository,
                 remote = %entry.remote,
                 git_ref = git_ref.as_deref().unwrap_or("(clone default)"),
                 "resolved the workspace repository from the registry"
             );
-            Ok(RepositorySpec::git(entry.id, entry.remote, git_ref))
+            Ok(RepositorySpec::git(entry.id, entry.remote, git_ref).with_ref_origin(ref_origin))
         }
         None => {
             tracing::debug!(
@@ -415,7 +419,8 @@ pub fn resolve_repository(
                 repository_name(repository),
                 repository,
                 git_ref.map(ToString::to_string),
-            ))
+            )
+            .with_ref_origin(git_ref.map(|_| RefOrigin::Workflow)))
         }
     }
 }

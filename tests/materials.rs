@@ -505,6 +505,7 @@ fn git_spec(root: &TempRoot) -> (TaskLaunchSpec, String) {
         remote_url: bare.display().to_string(),
         commit: pinned.clone(),
         git_ref: None,
+        ref_origin: None,
         credential: None,
     }));
     (spec, pinned)

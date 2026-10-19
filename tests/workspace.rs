@@ -5,7 +5,7 @@
 //! permissions and actual checkouts, so nothing is mocked and nothing touches
 //! the network.
 
-use narsor_engine::domain::{WorkflowExecution, WorkspaceType};
+use narsor_engine::domain::{RefOrigin, WorkflowExecution, WorkspaceType};
 use narsor_engine::workspace::{
     checked_out_commit, clone_pinned_commit, CleanupOutcome, CleanupPolicy, RepositorySpec,
     WorkspaceError, WorkspaceProvisioner, WorkspaceRequest,
@@ -555,6 +555,81 @@ fn a_missing_git_ref_is_reported_before_the_first_action_starts() {
 
     // Nothing is left behind, so the execution can be retried with a valid ref.
     assert!(!provisioner.task_dir("exec-1").exists());
+}
+
+#[test]
+fn a_missing_git_ref_names_where_the_ref_came_from() {
+    let temp = TempRoot::new();
+    let origin = temp.join("origin");
+    repo_with_feature_branch(&origin);
+    let provisioner = temp.provisioner();
+
+    for (ref_origin, words) in [
+        (Some(RefOrigin::Workflow), "(z workflow)"),
+        (Some(RefOrigin::Repository), "(z konfiguracji repozytorium)"),
+        (None, "'does-not-exist' not found"),
+    ] {
+        let request = WorkspaceRequest::new(
+            RepositorySpec::git(
+                "app",
+                origin.display().to_string(),
+                Some("does-not-exist".to_string()),
+            )
+            .with_ref_origin(ref_origin),
+        );
+        let error = provisioner
+            .provision("exec-1", &request)
+            .expect_err("missing ref must fail provisioning");
+        let message = error.to_string();
+        assert!(message.contains("does-not-exist"), "message: {message}");
+        assert!(message.contains(words), "message: {message}");
+        if ref_origin.is_none() {
+            assert!(!message.contains("(z "), "message: {message}");
+        }
+    }
+}
+
+#[test]
+fn an_admission_clone_names_where_a_missing_ref_came_from() {
+    let temp = TempRoot::new();
+    let origin = temp.join("origin");
+    repo_with_feature_branch(&origin);
+
+    let error = narsor_engine::workspace::clone_resolving_ref(
+        "app",
+        &origin.display().to_string(),
+        Some("does-not-exist"),
+        Some(RefOrigin::Repository),
+        &temp.join("clone"),
+        None,
+    )
+    .expect_err("a missing branch must fail");
+    let message = error.to_string();
+    assert!(message.contains("does-not-exist"), "message: {message}");
+    assert!(
+        message.contains("z konfiguracji repozytorium"),
+        "message: {message}"
+    );
+}
+
+#[test]
+fn without_a_ref_the_clone_takes_the_head_of_the_remote_not_main() {
+    let temp = TempRoot::new();
+    let origin = temp.join("origin");
+    let repo = repo_with_feature_branch(&origin);
+    git(&repo, &["branch", "-m", "trunk"]);
+
+    let target = temp.join("clone");
+    let commit = narsor_engine::workspace::clone_resolving_ref(
+        "app",
+        &origin.display().to_string(),
+        None,
+        None,
+        &target,
+        None,
+    )
+    .expect("the remote HEAD resolves");
+    assert_eq!(commit, git(&repo, &["rev-parse", "trunk"]));
 }
 
 #[test]

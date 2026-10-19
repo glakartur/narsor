@@ -35,7 +35,7 @@
 //! Running the user's own `git` makes their existing authentication simply
 //! work, and lets every failure be reported in git's own words.
 
-use crate::domain::{RepositoryInfo, Workspace};
+use crate::domain::{RefOrigin, RepositoryInfo, Workspace};
 use crate::persistence::paths::WorkPaths;
 use std::fs;
 use std::io;
@@ -86,10 +86,15 @@ pub enum WorkspaceError {
     },
 
     /// The requested git reference does not exist in the cloned repository.
-    #[error("git ref '{git_ref}' not found in repository '{repository}' ({detail})")]
+    #[error(
+        "git ref '{git_ref}'{origin} not found in repository '{repository}' ({detail})",
+        origin = origin_note(*.origin)
+    )]
     RefNotFound {
         /// The branch, tag or commit that was requested.
         git_ref: String,
+        /// Where the name came from, when it is known.
+        origin: Option<RefOrigin>,
         /// The repository the reference was looked up in.
         repository: String,
         /// What `git` said on stderr about the failed lookup.
@@ -203,6 +208,8 @@ pub enum RepositorySource {
         remote: String,
         /// Branch, tag or commit to check out. `None` keeps the clone default.
         git_ref: Option<String>,
+        /// Where `git_ref` came from. Only used to explain a failed checkout.
+        ref_origin: Option<RefOrigin>,
     },
     /// A directory on this machine, copied into the workspace.
     Local {
@@ -232,8 +239,17 @@ impl RepositorySpec {
             source: RepositorySource::Git {
                 remote: remote.into(),
                 git_ref,
+                ref_origin: None,
             },
         }
+    }
+
+    /// Records where the git ref came from, for the error of a failed checkout.
+    pub fn with_ref_origin(mut self, origin: Option<RefOrigin>) -> Self {
+        if let RepositorySource::Git { ref_origin, .. } = &mut self.source {
+            *ref_origin = origin;
+        }
+        self
     }
 
     /// A local directory copied into the workspace.
@@ -442,7 +458,10 @@ impl WorkspaceProvisioner {
             }
             seen.push(&spec.name);
 
-            if let RepositorySource::Git { remote, git_ref } = &spec.source {
+            if let RepositorySource::Git {
+                remote, git_ref, ..
+            } = &spec.source
+            {
                 check_remote(&spec.name, remote)?;
                 if let Some(git_ref) = git_ref {
                     check_ref(&spec.name, git_ref)?;
@@ -520,8 +539,12 @@ impl WorkspaceProvisioner {
         for (spec, read_only) in request.all() {
             let target = self.repository_dir(execution_id, &spec.name);
             match &spec.source {
-                RepositorySource::Git { remote, git_ref } => {
-                    clone_repository(remote, git_ref.as_deref(), &spec.name, &target)?;
+                RepositorySource::Git {
+                    remote,
+                    git_ref,
+                    ref_origin,
+                } => {
+                    clone_repository(remote, git_ref.as_deref(), *ref_origin, &spec.name, &target)?;
                 }
                 RepositorySource::Local { path } => {
                     copy_dir_recursive(path, &target)?;
@@ -739,6 +762,7 @@ pub fn clone_pinned_commit(
     .map_err(|error| match error {
         WorkspaceError::Git { stderr, .. } => WorkspaceError::RefNotFound {
             git_ref: commit.to_string(),
+            origin: None,
             repository: repository.to_string(),
             detail: stderr,
         },
@@ -749,6 +773,7 @@ pub fn clone_pinned_commit(
         Some(head) if head == commit => Ok(()),
         head => Err(WorkspaceError::RefNotFound {
             git_ref: commit.to_string(),
+            origin: None,
             repository: repository.to_string(),
             detail: format!(
                 "the checkout is at {} instead",
@@ -770,6 +795,7 @@ pub fn clone_resolving_ref(
     repository: &str,
     remote: &str,
     git_ref: Option<&str>,
+    ref_origin: Option<RefOrigin>,
     target: &Path,
     credential_file: Option<&Path>,
 ) -> Result<String> {
@@ -802,6 +828,7 @@ pub fn clone_resolving_ref(
                 return head_commit(target, repository)?.ok_or_else(|| {
                     WorkspaceError::RefNotFound {
                         git_ref: wanted.to_string(),
+                        origin: ref_origin.filter(|_| git_ref.is_some()),
                         repository: repository.to_string(),
                         detail: "the checkout has no commit".to_string(),
                     }
@@ -813,6 +840,7 @@ pub fn clone_resolving_ref(
     Err(match last_error {
         Some(WorkspaceError::Git { stderr, .. }) => WorkspaceError::RefNotFound {
             git_ref: wanted.to_string(),
+            origin: ref_origin.filter(|_| git_ref.is_some()),
             repository: repository.to_string(),
             detail: stderr,
         },
@@ -906,6 +934,13 @@ pub(crate) fn check_remote(repository: &str, remote: &str) -> Result<()> {
 }
 
 /// Rejects a reference `git` would read as an option rather than a revision.
+/// The words that say where a ref name came from; empty when that is unknown.
+fn origin_note(origin: Option<RefOrigin>) -> String {
+    origin
+        .map(|origin| format!(" ({})", origin.describe()))
+        .unwrap_or_default()
+}
+
 fn check_ref(repository: &str, git_ref: &str) -> Result<()> {
     let reason = if git_ref.trim().is_empty() {
         Some("it is empty")
@@ -985,6 +1020,7 @@ fn git_succeeds(args: &[&str]) -> bool {
 fn clone_repository(
     remote: &str,
     git_ref: Option<&str>,
+    ref_origin: Option<RefOrigin>,
     repository: &str,
     target: &Path,
 ) -> Result<()> {
@@ -994,7 +1030,7 @@ fn clone_repository(
     let Some(git_ref) = git_ref else {
         return Ok(());
     };
-    checkout_ref(target, git_ref, repository)
+    checkout_ref(target, git_ref, ref_origin, repository)
 }
 
 /// The commit a freshly provisioned checkout sits at, or `None` when the
@@ -1051,7 +1087,12 @@ fn head_commit(path: &Path, repository: &str) -> Result<Option<String>> {
 /// still resolves. A remote branch is materialised as a local branch tracking
 /// it, which is what makes the "unpushed commits" check meaningful later;
 /// anything else (a tag or a commit) lands on a detached HEAD.
-fn checkout_ref(path: &Path, git_ref: &str, repository: &str) -> Result<()> {
+fn checkout_ref(
+    path: &Path,
+    git_ref: &str,
+    ref_origin: Option<RefOrigin>,
+    repository: &str,
+) -> Result<()> {
     let dir = path.to_string_lossy().into_owned();
     let candidates = [git_ref.to_string(), format!("origin/{git_ref}")];
 
@@ -1085,6 +1126,7 @@ fn checkout_ref(path: &Path, git_ref: &str, repository: &str) -> Result<()> {
     let Some(resolved) = resolved else {
         return Err(WorkspaceError::RefNotFound {
             git_ref: git_ref.to_string(),
+            origin: ref_origin,
             repository: repository.to_string(),
             detail,
         });
