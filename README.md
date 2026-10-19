@@ -483,18 +483,18 @@ server. Use `narsor-cli --server https://control.example ...` for CLI commands.
 
 ```text
 narsor · local ● live             harness claude-code (konfiguracja) · sloty 2/3 · ? 1 · ! 1
-┏ Zadania ━━━━━━━━━━━━━━━━━┓┌ Zmiana API zamówień ─────────────────────────────────────────┐
-┃    ●  NAR-14 Edycja pars…┃│ Zmiana API zamówień · NAR-12                    implement v3 │
-┃       edit               ┃│ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
-┃──────────────────────────┃│ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info                 │
-┃│ ? ●  Zmiana API zamówień┃│───────────────────│   Read src/api.rs                        │
-┃│      approval           ┃││ ● review_api     │   Edit src/api.rs  +12 −3                │
-┃──────────────────────────┃│───────────────────│ │ assistant: Zmieniam sygnaturę…         │
-┃  ! ✗  Migracja bazy dany…┃│┌ ? Czeka na Ciebie: approval · 3m ──────────────────────────┐│
-┃       failed             ┃││ the answer panel                                           ││
-┃                          ┃│└────────────────────────────────────────────────────────────┘│
-┃                          ┃│                                                              │
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────────────────────────┘
+╭▸ Zadania ────────────────╮╭ Zmiana API zamówień ─────────────────────────────────────────╮
+│    ●  NAR-14 Edycja pars…││ Zmiana API zamówień · NAR-12                    implement v3 │
+│       edit               ││ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
+│──────────────────────────││ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info                 │
+││ ? ●  Zmiana API zamówień││───────────────────│   Read src/api.rs                        │
+││      approval           │││ ● review_api     │   Edit src/api.rs  +12 −3                │
+│──────────────────────────││───────────────────│ │ assistant: Zmieniam sygnaturę…         │
+│  ! ✗  Migracja bazy dany…││╭ ? Czeka na Ciebie: approval · 3m ──────────────────────────╮│
+│       failed             │││ the answer panel                                           ││
+│                          ││╰────────────────────────────────────────────────────────────╯│
+│                          ││                                                              │
+╰──────────────────────────╯╰──────────────────────────────────────────────────────────────╯
 Enter szczegóły  Space następny czekający  . akcje  n nowe  h harness  ?           powiadom.
 ```
 
@@ -504,10 +504,10 @@ installation's default agent harness (`harness claude-code (konfiguracja)`
 when it comes from the configuration, `harness opencode` when the operator
 chose it, `harness ?` before the first read), the slots and the counters of
 what waits. The last row is the shortcut bar. Every panel between them has a
-frame of its own: thick and in the focus colour (cyan, with a bold title) on
-the panel that has the keys, thin and grey on the others — so the active panel
-reads without colour too. The details frame is named after the task and stays
-thick while the keys are in the answer panel. New task, history and
+frame of its own with rounded corners: in the focus colour (cyan, with a bold
+title and a `▸` before it) on the panel that has the keys, grey on the others —
+so the active panel reads without colour too. The details frame is named after
+the task and keeps the focus look while the keys are in the answer panel. New task, history and
 repositories use the same frames.
 
 **The list** is the queue: tasks stand in the order of the scheduler (`rank`),

@@ -4,10 +4,10 @@
 //!
 //! ```text
 //! │ Zadania            │ Repozytoria (2) · a dodaj · d usuń                  │
-//! │ ● NAR-14  edit     │┌ Akcje ───────────┐ ┌ Opis ───────────────────────┐│
+//! │ ● NAR-14  edit     │╭ Akcje ───────────╮ ╭ Opis ───────────────────────╮│
 //! │                    ││ │ 1 narsor       │ │ narsor                      ││
 //! │                    ││   2 docs         │ │ github · gałąź main         ││
-//! │                    │└──────────────────┘ │ git@github.com:acme/narsor  ││
+//! │                    │╰──────────────────╯ │ git@github.com:acme/narsor  ││
 //! ```
 //!
 //! * `a` opens a form (a chooser with one entry and its fields). The server

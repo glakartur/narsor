@@ -2,17 +2,17 @@
 //!
 //! ```text
 //! narsor · local ● live      harness claude-code (konfiguracja) · sloty 2/3 · ? 1 · ! 1
-//! ┏ Zadania ━━━━━━━━━━━━━━━━┓┌ NAR-14 Edycja ───────────────────────────┐
-//! ┃ ● NAR-14  edit          ┃│ details                                  │
-//! ┃ …                       ┃│                                          │
-//! ┗━━━━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────┘
+//! ╭▸ Zadania ───────────────╮╭ NAR-14 Edycja ───────────────────────────╮
+//! │ ● NAR-14  edit          ││ details                                  │
+//! │ …                       ││                                          │
+//! ╰─────────────────────────╯╰──────────────────────────────────────────╯
 //! keys …                                                    notification
 //! ```
 //!
 //! There is no frame around the screen: the header is the first row, the
 //! bar the last, and each panel between them draws its own frame
-//! ([`Styles::panel`]) — thick in the focus role when it has the keys, thin
-//! and grey when it does not (R1–R3).
+//! ([`Styles::panel`]) — rounded; in the focus role with a `▸` before the title
+//! when it has the keys, grey when it does not (R1–R3).
 //!
 //! # Three layouts (origin §1)
 //!

@@ -160,15 +160,18 @@ impl Styles {
         self.strong(role)
     }
 
+    /// The frame of every panel: rounded corners, one line type for all.
+    pub const FRAME: BorderType = BorderType::Rounded;
+
     /// The frame of a panel titled `title` (R1–R3): the panel with the focus
-    /// gets a thick line in the focus role and a bold title, the others a thin
-    /// one in the background role. Without colour the thickness and the bold
+    /// gets the focus role, a bold title and a `▸` before the title, the
+    /// others the background role. Without colour the marker and the bold
     /// title still tell which panel has the keys.
     pub fn panel(&self, title: impl Into<String>, focused: bool) -> Block<'static> {
-        let (role, border) = if focused {
-            (Role::Focus, BorderType::Thick)
+        let (role, title) = if focused {
+            (Role::Focus, format!("▸{}", title.into()))
         } else {
-            (Role::Done, BorderType::Plain)
+            (Role::Done, title.into())
         };
         let title_style = if focused {
             self.strong(role)
@@ -176,9 +179,9 @@ impl Styles {
             self.of(role)
         };
         Block::bordered()
-            .border_type(border)
+            .border_type(Self::FRAME)
             .border_style(self.of(role))
-            .title(Line::styled(title.into(), title_style))
+            .title(Line::styled(title, title_style))
     }
 
     /// The marks of a selection (R8, R12, R14): the rules above and below the

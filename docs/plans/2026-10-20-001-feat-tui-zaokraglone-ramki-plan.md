@@ -1,7 +1,7 @@
 ---
 title: "feat: Zaokrąglone ramki paneli w TUI"
 type: feat
-status: active
+status: completed
 date: 2026-10-20
 origin: docs/brainstorms/2026-10-20-tui-zaokraglone-ramki-requirements.md
 ---

@@ -7,12 +7,12 @@
 //! all use it, so they look and behave alike.
 //!
 //! ```text
-//! ┌ Akcje ─────────────────┐ ┌ Opis ─────────────────────────────────┐
+//! ╭ Akcje ─────────────────╮ ╭ Opis ─────────────────────────────────╮
 //! │   1 approved           │ │ ↩ wraca do agenta: plan               │
 //! │ | 2 | revise           │ │ ◆ rekomendacja dyrygenta              │
 //! │   3 reject             │ │ Zakres wymaga poprawy. Agent planu    │
 //! │────────────────────────│ │                                       │
-//! └────────────────────────┘ └───────────────────────────────────────┘
+//! ╰────────────────────────╯ ╰───────────────────────────────────────╯
 //! Komentarz dla agenta (wymagany):
 //! > Uwzględnij migrację tabeli orders▏
 //! ```
@@ -1229,6 +1229,7 @@ pub fn render_fields(
 fn pane(title: &str, active: bool, styles: &Styles) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
+        .border_type(Styles::FRAME)
         .border_style(styles.of(if active { Role::Focus } else { Role::Done }))
         .title(format!(" {title} "))
 }

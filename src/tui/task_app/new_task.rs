@@ -3,11 +3,11 @@
 //!
 //! ```text
 //! │ Zadania            │ Nowe zadanie → trafi na koniec kolejki (#3)         │
-//! │ ● NAR-14  edit     │┌ Akcje ─────────────────┐ ┌ Opis ──────────────────┐│
+//! │ ● NAR-14  edit     │╭ Akcje ─────────────────╮ ╭ Opis ──────────────────╮│
 //! │?● NAR-12  approval ││ │ implement-feature    │ │ Pełny cykl: plan,      ││
 //! │ ◷ NAR-16  #1       ││   fix-bug              │ │ implementacja, review. ││
 //! │                    ││   ścieżka…             │ │                        ││
-//! │                    │└────────────────────────┘ └────────────────────────┘│
+//! │                    │╰────────────────────────╯ ╰────────────────────────╯│
 //! │                    │ ticket_id (wymagane) · numer zgłoszenia             │
 //! │                    │ > NAR-18▏                                           │
 //! ```

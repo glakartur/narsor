@@ -207,8 +207,13 @@ fn assert_not_bracketed(buffer: &Buffer, needle: &str) {
 }
 
 /// The corners of a thick frame (the panel with the focus) and of a thin one.
-const THICK: [&str; 4] = ["┏", "┓", "┗", "┛"];
-const THIN: [&str; 4] = ["┌", "┐", "└", "┘"];
+const ROUNDED: [&str; 4] = ["╭", "╮", "╰", "╯"];
+
+/// The screen without its first two rows (the header and the frames' titles),
+/// where a `▸` could only be a selection marker.
+fn below_the_frame_title(buffer: &Buffer) -> String {
+    rows(buffer)[2..].join("\n")
+}
 
 /// The corners of the frame from column `left` to `right`, rows `top` to
 /// `bottom`, with their colours.
@@ -524,7 +529,7 @@ mod chooser_render {
             assert_bracketed(&buffer, "4 out4", true, false);
             let list_bottom = row_of(&buffer, "4 out4") + 2;
             assert!(
-                rows(&buffer)[list_bottom].starts_with('└'),
+                rows(&buffer)[list_bottom].starts_with('╰'),
                 "height {height}: the list pane ends under the bracket:\n{}",
                 screen(&buffer)
             );
@@ -547,7 +552,7 @@ mod chooser_render {
             );
             let last = usize::from(height) - 1;
             assert!(
-                rows(&buffer)[last].starts_with('└'),
+                rows(&buffer)[last].starts_with('╰'),
                 "height {height}: the list fills the area:\n{screen}"
             );
         }
@@ -1006,12 +1011,12 @@ mod task_app_render {
         let corners: Vec<(usize, char)> = top
             .chars()
             .enumerate()
-            .filter(|(_, c)| "┏┓┌┐".contains(*c))
+            .filter(|(_, c)| "╭╮╭╮".contains(*c))
             .collect();
         let list = usize::from(layout::LIST_WIDTH);
         assert_eq!(
             corners,
-            vec![(0, '┏'), (list - 1, '┓'), (list, '┌'), (119, '┐')],
+            vec![(0, '╭'), (list - 1, '╮'), (list, '╭'), (119, '╮')],
             "{top:?}"
         );
     }
@@ -1024,9 +1029,9 @@ mod task_app_render {
         let list_right = layout::LIST_WIDTH - 1;
         let detail_left = layout::LIST_WIDTH;
         let buffer = render(120, 30, &mut app, &Styles::new(false));
-        assert_frame(&buffer, 0, list_right, THICK, Color::Cyan);
-        assert_frame(&buffer, detail_left, 119, THIN, Color::DarkGray);
-        assert_eq!(cell_at(&buffer, 0, 15), ("┃".to_string(), Color::Cyan));
+        assert_frame(&buffer, 0, list_right, ROUNDED, Color::Cyan);
+        assert_frame(&buffer, detail_left, 119, ROUNDED, Color::DarkGray);
+        assert_eq!(cell_at(&buffer, 0, 15), ("│".to_string(), Color::Cyan));
         assert_eq!(
             cell_at(&buffer, 119, 15),
             ("│".to_string(), Color::DarkGray)
@@ -1034,8 +1039,8 @@ mod task_app_render {
 
         press(&mut app, KeyCode::Enter);
         let buffer = render(120, 30, &mut app, &Styles::new(false));
-        assert_frame(&buffer, 0, list_right, THIN, Color::DarkGray);
-        assert_frame(&buffer, detail_left, 119, THICK, Color::Cyan);
+        assert_frame(&buffer, 0, list_right, ROUNDED, Color::DarkGray);
+        assert_frame(&buffer, detail_left, 119, ROUNDED, Color::Cyan);
         // The title has the colour of its frame and, with the focus, is bold.
         let title = column_of(&buffer, 1, detail_left, "N").unwrap();
         assert_eq!(cell_at(&buffer, title, 1).1, Color::Cyan);
@@ -1044,19 +1049,27 @@ mod task_app_render {
         assert!(!bold_at(&buffer, 2, 1));
     }
 
-    /// AE1 without colour: the thickness and the bold title tell the panels
+    /// AE2 without colour: the `▸` marker and the bold title tell the panels
     /// apart.
     #[test]
-    fn without_colour_the_focused_panel_is_thick_with_a_bold_title() {
+    fn without_colour_the_focused_panel_has_a_marker_and_a_bold_title() {
         let mut app = busy_app();
         let buffer = render(120, 30, &mut app, &Styles::new(true));
         let list_right = layout::LIST_WIDTH - 1;
-        assert_frame(&buffer, 0, list_right, THICK, Color::Reset);
-        assert_frame(&buffer, layout::LIST_WIDTH, 119, THIN, Color::Reset);
-        assert_eq!(cell_at(&buffer, 2, 1).0, "Z", "{}", rows(&buffer)[1]);
-        assert!(bold_at(&buffer, 2, 1), "the active title is bold");
+        assert_frame(&buffer, 0, list_right, ROUNDED, Color::Reset);
+        assert_frame(&buffer, layout::LIST_WIDTH, 119, ROUNDED, Color::Reset);
+        assert_eq!(cell_at(&buffer, 1, 1).0, "▸", "{}", rows(&buffer)[1]);
+        assert_eq!(cell_at(&buffer, 2, 1).0, " ", "{}", rows(&buffer)[1]);
+        assert!(bold_at(&buffer, 1, 1), "the active title is bold");
         let title = column_of(&buffer, 1, layout::LIST_WIDTH, "N").unwrap();
         assert!(!bold_at(&buffer, title, 1), "the other title is not");
+        assert!(
+            !rows(&buffer)[1]
+                .chars()
+                .skip(layout::LIST_WIDTH as usize)
+                .any(|c| c == '▸'),
+            "the other panel has no marker"
+        );
         assert!(buffer
             .content()
             .iter()
@@ -1072,7 +1085,7 @@ mod task_app_render {
             assert!(header.contains("narsor"), "{width}: {header:?}");
             assert!(header.contains("? 1 · ! 1"), "{width}: {header:?}");
             assert!(
-                !header.contains(['┌', '┏', '│', '┃', '─', '━']),
+                !header.contains(['╭', '╮', '╰', '╯', '│', '─']),
                 "{width}: {header:?}"
             );
         }
@@ -1084,12 +1097,12 @@ mod task_app_render {
         let mut app = busy_app();
         let buffer = render(80, 24, &mut app, &Styles::new(false));
         assert!(rows(&buffer)[1].contains("Zadania"));
-        assert_frame(&buffer, 0, 79, THICK, Color::Cyan);
+        assert_frame(&buffer, 0, 79, ROUNDED, Color::Cyan);
 
         press(&mut app, KeyCode::Enter);
         let buffer = render(80, 24, &mut app, &Styles::new(false));
         assert!(screen(&buffer).contains("Przebieg"));
-        assert_frame(&buffer, 0, 79, THICK, Color::Cyan);
+        assert_frame(&buffer, 0, 79, ROUNDED, Color::Cyan);
     }
 
     #[test]
@@ -1097,13 +1110,38 @@ mod task_app_render {
         let mut app = busy_app();
         let buffer = render(60, 20, &mut app, &Styles::new(false));
         assert!(rows(&buffer)[0].contains("narsor"));
-        assert_frame(&buffer, 0, 59, THICK, Color::Cyan);
+        assert_frame(&buffer, 0, 59, ROUNDED, Color::Cyan);
         press(&mut app, KeyCode::Char('?'));
         let buffer = render(60, 20, &mut app, &Styles::new(false));
         let help = row_of(&buffer, "Pomoc");
         assert!(help >= 1, "the help leaves the header alone");
         let bar = rows(&buffer).last().cloned().unwrap();
         assert!(!bar.contains("Pomoc"), "{bar}");
+    }
+
+    /// AE1: the help window and the other views draw no square or thick
+    /// corner or edge any more.
+    #[test]
+    fn no_view_draws_a_square_or_thick_frame() {
+        const OLD: [char; 9] = ['┌', '┐', '└', '┘', '┏', '┓', '┗', '┛', '┃'];
+        let mut app = busy_app();
+        for no_color in [false, true] {
+            let buffer = render(120, 30, &mut app, &Styles::new(no_color));
+            assert!(!screen(&buffer).contains(OLD), "{}", screen(&buffer));
+            press(&mut app, KeyCode::Enter);
+            let buffer = render(120, 30, &mut app, &Styles::new(no_color));
+            assert!(!screen(&buffer).contains(OLD), "{}", screen(&buffer));
+            press(&mut app, KeyCode::Esc);
+        }
+        press(&mut app, KeyCode::Char('?'));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        let help = row_of(&buffer, "Pomoc");
+        assert!(rows(&buffer)[help].contains('╭'), "{}", screen(&buffer));
+        assert!(!screen(&buffer).contains(OLD), "{}", screen(&buffer));
+        let mut chooser = review_chooser();
+        let buffer = draw_chooser(80, 24, &mut chooser, &Styles::new(false));
+        assert!(!screen(&buffer).contains(OLD), "{}", screen(&buffer));
+        assert!(screen(&buffer).contains('╭'));
     }
 
     #[test]
@@ -2104,7 +2142,7 @@ mod task_app_detail_render {
         for expected in ["✓ plan #1", "✓ edit #1", "● review #1 w toku"] {
             assert!(screen.contains(expected), "{expected:?} in\n{screen}");
         }
-        assert!(!screen.contains('▸'), "{screen}");
+        assert!(!below_the_frame_title(&buffer).contains('▸'), "{screen}");
         // The axis is the left part of the details: the selected step's own heading is on the right.
         let row = |needle: &str| {
             rows(&buffer)
@@ -3029,7 +3067,7 @@ mod task_app_detail_render {
         for (no_color, colour) in [(false, Color::Cyan), (true, Color::Reset)] {
             let buffer = render(&mut app, &Styles::new(no_color));
             let screen = screen(&buffer);
-            assert!(!screen.contains('▸'), "{screen}");
+            assert!(!below_the_frame_title(&buffer).contains('▸'), "{screen}");
             let x = content_column(&buffer);
             let rows = event_rows(&buffer);
             assert_eq!(rows.len(), 4, "{screen}");
@@ -3379,7 +3417,7 @@ mod task_app_waiting_render {
         let buffer = draw(120, 40, |frame| {
             layout::render(frame, &mut app, &Styles::new(false), Instant::now())
         });
-        assert_frame(&buffer, layout::LIST_WIDTH, 119, THICK, Color::Cyan);
+        assert_frame(&buffer, layout::LIST_WIDTH, 119, ROUNDED, Color::Cyan);
         let heading = row_of(&buffer, "? Pytanie · review_scope");
         let y = u16::try_from(heading).unwrap();
         assert_eq!(buffer[(layout::LIST_WIDTH + 1, y)].symbol(), "│");
@@ -4617,7 +4655,7 @@ mod task_app_create_render {
 
         press(&mut app, KeyCode::Tab);
         let buffer = draw_buffer(&mut app, 130, 34, false);
-        assert_frame(&buffer, 0, layout::LIST_WIDTH - 1, THICK, Color::Cyan);
+        assert_frame(&buffer, 0, layout::LIST_WIDTH - 1, ROUNDED, Color::Cyan);
         assert!(screen(&buffer).contains("implement-feature"));
         press(&mut app, KeyCode::BackTab);
         press(&mut app, KeyCode::Enter);
@@ -4872,8 +4910,8 @@ mod task_app_create_render {
         let mut app = fresh();
         open_form(&mut app);
         let buffer = draw_buffer(&mut app, 130, 34, false);
-        assert_frame(&buffer, 0, list_right, THIN, Color::DarkGray);
-        assert_frame(&buffer, detail_left, 129, THICK, Color::Cyan);
+        assert_frame(&buffer, 0, list_right, ROUNDED, Color::DarkGray);
+        assert_frame(&buffer, detail_left, 129, ROUNDED, Color::Cyan);
         assert!(rows(&buffer)[1].contains("Nowe zadanie"));
 
         let mut app = fresh();
@@ -4884,12 +4922,12 @@ mod task_app_create_render {
         );
         let buffer = draw_buffer(&mut app, 130, 30, false);
         assert!(rows(&buffer)[1].contains("Historia"));
-        assert_frame(&buffer, 0, list_right, THICK, Color::Cyan);
-        assert_frame(&buffer, detail_left, 129, THIN, Color::DarkGray);
+        assert_frame(&buffer, 0, list_right, ROUNDED, Color::Cyan);
+        assert_frame(&buffer, detail_left, 129, ROUNDED, Color::DarkGray);
         press(&mut app, KeyCode::Enter);
         let buffer = draw_buffer(&mut app, 130, 30, false);
-        assert_frame(&buffer, 0, list_right, THIN, Color::DarkGray);
-        assert_frame(&buffer, detail_left, 129, THICK, Color::Cyan);
+        assert_frame(&buffer, 0, list_right, ROUNDED, Color::DarkGray);
+        assert_frame(&buffer, detail_left, 129, ROUNDED, Color::Cyan);
         assert!(rows(&buffer)[1].contains("NAR-9"));
 
         let mut app = fresh();
@@ -4900,8 +4938,8 @@ mod task_app_create_render {
         )]));
         let buffer = draw_buffer(&mut app, 130, 30, false);
         assert!(rows(&buffer)[1].contains("Repozytoria (1)"));
-        assert_frame(&buffer, 0, list_right, THIN, Color::DarkGray);
-        assert_frame(&buffer, detail_left, 129, THICK, Color::Cyan);
+        assert_frame(&buffer, 0, list_right, ROUNDED, Color::DarkGray);
+        assert_frame(&buffer, detail_left, 129, ROUNDED, Color::Cyan);
     }
 
     #[test]
@@ -5232,7 +5270,7 @@ mod task_app_harness_render {
             assert!(text.contains(expected), "{expected:?} is missing:\n{text}");
         }
         let y = u16::try_from(row_of(&buffer, " Domyślny harness ")).unwrap();
-        let x = column_of(&buffer, y, 0, "┌").expect("the list's frame");
+        let x = column_of(&buffer, y, 0, "╭").expect("the list's frame");
         assert_eq!(cell_at(&buffer, x, y).1, Color::Cyan, "the focus frame");
         assert_bracketed(&buffer, "1 ● domyślny z konfiguracji", true, false);
     }
