@@ -648,8 +648,18 @@ pub enum ValidationError {
         field: String,
     },
 
+    #[error("State '{state}' field '{field}' cannot reference script step streams")]
+    StepStreamNotAllowed { state: StateId, field: String },
+
+    #[error("State '{state}' references unknown or non-script step '{step_id}' in '{field}'")]
+    InvalidStepStreamSource {
+        state: StateId,
+        step_id: String,
+        field: String,
+    },
+
     #[error(
-        "State '{state}' field '{field}' references '{reference}'; only steps.<id>.reply is supported"
+        "State '{state}' field '{field}' references '{reference}'; supported fields are steps.<id>.reply, steps.<id>.stdout and steps.<id>.stderr"
     )]
     UnsupportedStepReference {
         state: StateId,

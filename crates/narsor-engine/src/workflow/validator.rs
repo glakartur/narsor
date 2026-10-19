@@ -31,7 +31,9 @@ use crate::domain::{
 
 use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
-use super::template::{check_syntax, step_reply_references, unsupported_step_references};
+use super::template::{
+    check_syntax, step_reply_references, step_stream_references, unsupported_step_references,
+};
 
 /// Validates a compiled workflow definition.
 ///
@@ -549,6 +551,22 @@ fn validate_state_templates(
                 });
             }
         }
+        for (source, _) in step_stream_references(text) {
+            if !allowed {
+                errors.push(ValidationError::StepStreamNotAllowed {
+                    state: state.id.clone(),
+                    field: field.clone(),
+                });
+            } else if !definition.states.get(&source).is_some_and(|source_state| {
+                matches!(source_state.action.as_ref(), Some(ActionConfig::Script(_)))
+            }) {
+                errors.push(ValidationError::InvalidStepStreamSource {
+                    state: state.id.clone(),
+                    step_id: source,
+                    field: field.clone(),
+                });
+            }
+        }
         for reference in unsupported_step_references(text) {
             errors.push(ValidationError::UnsupportedStepReference {
                 state: state.id.clone(),
@@ -585,10 +603,10 @@ fn validate_workflow_templates(definition: &WorkflowDefinition, errors: &mut Vec
             errors.push(ValidationError::UnknownInputReferenceInGlobals { field, variable });
         }
     }
-    if !step_reply_references(text).is_empty() {
+    if !step_reply_references(text).is_empty() || !step_stream_references(text).is_empty() {
         errors.push(ValidationError::InvalidDisplay {
             field: field.to_string(),
-            reason: "step replies are not supported in workspace fields".to_string(),
+            reason: "step values are not supported in workspace fields".to_string(),
         });
     }
 }
@@ -636,10 +654,10 @@ fn validate_display(definition: &WorkflowDefinition, errors: &mut Vec<Validation
                 reason: error.to_string(),
             });
         }
-        if !step_reply_references(text).is_empty() {
+        if !step_reply_references(text).is_empty() || !step_stream_references(text).is_empty() {
             errors.push(ValidationError::InvalidDisplay {
                 field: field.clone(),
-                reason: "step replies are not supported in display fields".to_string(),
+                reason: "step values are not supported in display fields".to_string(),
             });
         }
         for variable in extract_input_references(text) {

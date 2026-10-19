@@ -5,7 +5,7 @@ real agentic development processes rather than invented ones:
 
 | File | Process | Source material |
 |---|---|---|
-| `compound-engineering.yaml` | The compound engineering chain: brainstorm → plan → work → code review → push/PR → human review → compound → push → final review | the `ce-*` skills of the `compound-engineering` plugin |
+| `compound-engineering.yaml` | Brainstorm → PR → plan → PR update → work → code review → PR update → learning → PR update, with review at each gate | the `ce-*` skills of the `compound-engineering` plugin |
 | `open-mercato-sdlc.yaml` | The Open Mercato ticket lifecycle: Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | [`SDLC.md`](https://github.com/open-mercato/skills) and the `om-*` skills |
 
 Both validate with zero violations and both are exercised end to end in
@@ -63,28 +63,71 @@ straight to a merge.
 | Gate | Sits after | Why there |
 |---|---|---|
 | `clarify_direction` | `ce-brainstorm` returned `needs_direction` | Product direction is the one thing an agent has no basis to choose. Rather than guess, the chain stops and asks. |
-| `approve_scope` | `ce-brainstorm` + `ce-doc-review` | The requirements document is what every later step is measured against. A wrong scope caught here costs one conversation; caught after the PR it costs the whole pipeline. An optional note is carried into the plan as `{{ context.scope_notes }}`; `revise` sends `brainstorm_feedback` back to the brainstorm. |
-| `approve_plan` | `ce-plan`, **before a line of code exists** | The cheapest correction point in the whole process. Everything after this gate is an edit to the repository. |
+| `approve_scope` | `ce-brainstorm` + `ce-doc-review` + publication and PR feedback | The reviewed requirements are on the PR before approval. An optional note is carried into the plan as `{{ context.scope_notes }}`; `revise` sends `brainstorm_feedback` back to the brainstorm. |
+| `approve_plan` | `ce-plan` + publication and PR feedback, **before a line of code exists** | The current plan is on the same PR before implementation begins. |
 | `implementation_review` | implementation is pushed to the PR | The person reviews the implementation and can request changes, approve it for learning capture, or stop. |
 | `learning_review` | learning has been pushed to the already reviewed PR | The person reviews the updated PR and gives final approval. Requests for changes return to implementation. |
 
-`ce-compound` runs after the implementation review, when the result and review
-feedback are known. If it writes a learning document, the workflow pushes that
-update to the PR and asks for a final human review. If there is nothing to
-document, the approved PR is complete.
+Each publication runs `ce-commit-push-pr mode:pipeline babysit:off`. It creates
+the PR for the reviewed requirements, then detects and updates that same PR for
+the plan, implementation and learning. The first publication stores `pr_url`;
+PR feedback steps pass that URL to `ce-resolve-pr-feedback mode:pipeline`, so
+forks and GitHub Enterprise repos resolve against the intended PR. The feedback
+skill commits and pushes its fixes. No actionable feedback advances directly;
+fixes go to the next human review of the updated PR, and unresolved decisions
+stay visible for the human gate. Each approval rechecks feedback posted while
+the gate was waiting; a new fix returns to that gate for renewed approval.
+Review requests return to the relevant editing step and are published again.
+
+`ce-work mode:return-to-caller` implements and verifies locally, leaving
+simplification, `ce-code-review mode:agent`, repository checks and publication
+to this workflow.
+`ce-compound` runs after implementation review. If it writes a learning
+document, the workflow pushes that update and asks for final PR review. If
+there is nothing to document, the approved PR is complete.
 
 Loops: `approve_scope → brainstorm`, `approve_plan → plan`,
-`code_review → fix_review_findings → code_review` until clean (the
-residual findings travel as `{{ steps.code_review.reply }}`, and
-`max_entries` on `code_review` asks a person once the loop runs too long),
-`code_review → publish_work → implementation_review → compound →
-publish_learning → learning_review`. A request from either review returns to
-`work_revision → simplify → code_review`; `publish_work` then updates the same
-PR with a comment that describes the new changes. Agent prompts only invoke
-the `ce-*` skill with its arguments and name the variables later steps read;
-`ce-work` ships its own work (review, commit, push, PR). During `ce-work`, the
-agent can also pause its own action with `awaiting_input`; the answer resumes
-that same step.
+`code_review → fix_review_findings → code_review` when fixes changed files.
+If the fix step makes no actionable file changes, it goes straight to
+`verify_work`. Review findings reach the fix step through
+`{{ steps.code_review.reply }}`; `max_entries` on `code_review` asks a person
+once the loop runs too long. The remaining path is
+`code_review → verify_work → publish_work → resolve_work_feedback → implementation_review →
+compound → publish_learning → resolve_learning_feedback → learning_review`.
+`verify_work` runs `scripts/verify.sh` from the target repository if that file
+exists; a missing file skips this gate. A failing script routes to
+`repair_verification → simplify → code_review → verify_work`, with a bounded
+loop. The repair agent receives `{{ steps.verify_work.stdout }}` and
+`{{ steps.verify_work.stderr }}` from the failed run and does not rerun the
+whole script for diagnosis. The workflow never interprets the script's own
+stdout as a routing decision.
+Scope and plan use the same publish → feedback → human review pattern. A request
+from either implementation review returns to `work_revision → simplify →
+code_review`; `publish_work` then updates the same PR. During `ce-work`, the
+agent can pause its own action with `awaiting_input`; the answer resumes that
+same step.
+
+### Optional repository verification script
+
+Add `scripts/verify.sh` to a target repository to opt in to the pre-publication
+gate. It runs from the repository root with `CI=true`. Exit `0` only when
+formatting, build and tests all pass; any nonzero exit means the code needs
+repair. The script may call smaller project scripts internally. For a Rust
+repository, its contents could be:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cargo fmt --all -- --check
+cargo build --workspace
+cargo test --workspace
+```
+
+Use a formatting check here, since the gate runs after code review. If the
+format needs changing, the repair step applies it and the changed code goes
+through review and the complete script again. An existing file that is
+unreadable or is not a regular file fails the gate; only absence skips it.
+Narsor retains up to 64 KiB of each output stream for the repair prompt.
 
 ### `open-mercato-sdlc.yaml` — 5 gates
 

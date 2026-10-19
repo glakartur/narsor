@@ -1,9 +1,10 @@
-//! Template substitution for `{{ inputs.* }}` and `{{ context.variables.* }}`.
+//! Template substitution for inputs, context variables and selected step results.
 //!
 //! The scope is deliberately minimal (D6): the only things recognised inside
-//! `{{ }}` are a workflow input (`inputs.NAME`) and a context variable
+//! `{{ }}` are a workflow input (`inputs.NAME`), a context variable
 //! (`context.variables.NAME`, or the shorthand `context.NAME` used by
-//! `WORKFLOW_SCHEMA.md` §3.3.D). There are no filters, expressions,
+//! `WORKFLOW_SCHEMA.md` §3.3.D), and selected step fields (`reply`, `stdout`,
+//! `stderr`). There are no filters, expressions,
 //! conditionals or loops — a filter such as `{{ context.x | default("y") }}`
 //! is reported as an explicit error rather than silently ignored.
 //!
@@ -86,8 +87,7 @@ pub enum TemplateError {
     /// The reference is syntactically fine but does not name a supported root.
     #[error(
         "unsupported template reference '{reference}' in {location}; \
-         only '{{{{ inputs.NAME }}}}' and '{{{{ context.variables.NAME }}}}' \
-         (shorthand '{{{{ context.NAME }}}}') are supported"
+         supported roots are inputs, context and steps"
     )]
     UnsupportedReference {
         /// The reference exactly as written inside `{{ }}`.
@@ -115,6 +115,7 @@ pub struct TemplateScope<'a> {
     inputs: &'a Map<String, Value>,
     variables: &'a HashMap<String, Value>,
     step_replies: Option<&'a HashMap<String, Value>>,
+    step_streams: Option<&'a HashMap<String, Value>>,
 }
 
 impl<'a> TemplateScope<'a> {
@@ -124,6 +125,7 @@ impl<'a> TemplateScope<'a> {
             inputs,
             variables: &context.variables,
             step_replies: None,
+            step_streams: None,
         }
     }
 
@@ -137,12 +139,19 @@ impl<'a> TemplateScope<'a> {
             inputs,
             variables,
             step_replies: None,
+            step_streams: None,
         }
     }
 
     /// Adds persisted replies keyed by workflow step id.
     pub fn with_step_replies(mut self, replies: &'a HashMap<String, Value>) -> Self {
         self.step_replies = Some(replies);
+        self
+    }
+
+    /// Adds captured script streams keyed by `step.field`.
+    pub fn with_step_streams(mut self, streams: &'a HashMap<String, Value>) -> Self {
+        self.step_streams = Some(streams);
         self
     }
 
@@ -397,12 +406,17 @@ impl<'a> TemplateScope<'a> {
 
             "steps" => {
                 let (step, field) = path.split_once('.').ok_or_else(unsupported)?;
-                if field != "reply" || !plain_name(step).is_some() {
+                if plain_name(step).is_none() {
                     return Err(unsupported());
                 }
-                self.step_replies
-                    .and_then(|replies| replies.get(step))
-                    .ok_or_else(unknown)
+                match field {
+                    "reply" => self.step_replies.and_then(|replies| replies.get(step)),
+                    "stdout" | "stderr" => self
+                        .step_streams
+                        .and_then(|streams| streams.get(&format!("{step}.{field}"))),
+                    _ => return Err(unsupported()),
+                }
+                .ok_or_else(unknown)
             }
 
             _ => Err(unsupported()),
@@ -420,8 +434,13 @@ pub fn check_syntax(template: &str, location: &str) -> Result<(), TemplateError>
         .into_iter()
         .map(|id| (id, Value::String(String::new())))
         .collect();
+    let streams = step_stream_references(template)
+        .into_iter()
+        .map(|(id, field)| (format!("{id}.{field}"), Value::String(String::new())))
+        .collect();
     TemplateScope::from_parts(&inputs, &variables)
         .with_step_replies(&replies)
+        .with_step_streams(&streams)
         .render_with(template, location, Unknown::Blank)
         .map(|_| ())
 }
@@ -454,13 +473,30 @@ pub fn step_reply_references(template: &str) -> Vec<String> {
     ids
 }
 
-/// The `steps.*` expressions of a template that are not `steps.<id>.reply`
+/// Script stream references in first-use order, without repeats.
+pub fn step_stream_references(template: &str) -> Vec<(String, String)> {
+    let mut references = Vec::new();
+    for path in step_paths(template) {
+        if let Some((id, field @ ("stdout" | "stderr"))) = path.split_once('.') {
+            if plain_name(id).is_some()
+                && !references.iter().any(|(existing_id, existing_field)| {
+                    existing_id == id && existing_field == field
+                })
+            {
+                references.push((id.to_string(), field.to_string()));
+            }
+        }
+    }
+    references
+}
+
+/// The `steps.*` expressions of a template that are not supported step fields
 /// (`steps.a.data`, `steps.a`), in order of use.
 pub fn unsupported_step_references(template: &str) -> Vec<String> {
     step_paths(template)
         .into_iter()
         .filter(
-            |path| !matches!(path.split_once('.'), Some((id, "reply")) if plain_name(id).is_some()),
+            |path| !matches!(path.split_once('.'), Some((id, "reply" | "stdout" | "stderr")) if plain_name(id).is_some()),
         )
         .map(|path| format!("steps.{path}"))
         .collect()

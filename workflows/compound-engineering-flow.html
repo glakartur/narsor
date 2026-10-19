@@ -65,7 +65,7 @@
   <header>
     <div class="eyebrow">Workflow · Narsor</div>
     <h1>compound-engineering</h1>
-    <p>Od doprecyzowania zakresu do otwartego PR-u i zapisanej wiedzy. Niebieskie kroki czekają na decyzję człowieka.</p>
+    <p>Wymagania, plan, kod i wiedza trafiają kolejno do tego samego PR-u. Po każdym pushu agent obsługuje uwagi, a niebieskie kroki czekają na decyzję człowieka.</p>
     <div class="legend" aria-label="Legenda diagramu">
       <span class="key"><i class="swatch agent"></i> krok agenta</span>
       <span class="key"><i class="swatch human"></i> bramka człowieka</span>
@@ -77,7 +77,7 @@
     <div class="canvas" role="region" aria-label="Diagram przepływu workflow; na wąskim ekranie można przewijać poziomo" tabindex="0">
       <svg viewBox="0 0 1100 1660" role="img" aria-labelledby="diagram-title diagram-desc">
         <title id="diagram-title">Diagram compound-engineering</title>
-        <desc id="diagram-desc">Workflow prowadzi przez brainstorm, akceptację zakresu i planu, implementację, automatyczne review, push, review człowieka, zapis wiedzy, ponowny push i końcowe review człowieka.</desc>
+        <desc id="diagram-desc">Uproszczony diagram pokazuje brainstorm, plan, implementację i zapis wiedzy. Każdy z tych etapów publikuje zmiany do tego samego PR-u i obsługuje uwagi przed oceną człowieka.</desc>
         <defs>
           <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#9eafa4"/></marker>
         </defs>
@@ -106,6 +106,7 @@
         <!-- automatic review loop, then human implementation review -->
         <path class="edge" d="M680 831H760"/><text class="edge-label" x="695" y="820">findings</text>
         <path class="edge" d="M760 867V890H390V831H420"/><text class="edge-label" x="470" y="885">fixed → review again</text>
+        <path class="edge" d="M1020 831H1040V941H680"/><text class="edge-label" x="790" y="929">bez zmian → publikacja</text>
         <text class="edge-label" x="565" y="892">clean</text>
         <path class="edge" d="M680 1051H1060V611H1020"/><text class="edge-label" x="900" y="1040">revise</text>
         <path class="edge" d="M760 647V721H680"/><text class="edge-label" x="770" y="700">continue</text>
@@ -119,29 +120,29 @@
         <text class="edge-label" x="61" y="1200">abandon</text>
 
         <!-- nodes -->
-        <g class="node agent"><rect x="420" y="65" width="260" height="72"/><text class="title" x="550" y="96">Brainstorm</text><text class="sub" x="550" y="117">ce-brainstorm</text></g>
+        <g class="node agent"><rect x="420" y="65" width="260" height="72"/><text class="title" x="550" y="96">Brainstorm → PR</text><text class="sub" x="550" y="117">ce-brainstorm · doc review</text></g>
         <g class="node human"><rect x="420" y="175" width="260" height="72"/><text class="title" x="550" y="206">Akceptacja zakresu</text><text class="sub" x="550" y="227">approve_scope</text></g>
-        <g class="node agent"><rect x="420" y="285" width="260" height="72"/><text class="title" x="550" y="316">Plan</text><text class="sub" x="550" y="337">ce-plan</text></g>
+        <g class="node agent"><rect x="420" y="285" width="260" height="72"/><text class="title" x="550" y="316">Plan → PR</text><text class="sub" x="550" y="337">ce-plan · publish_plan</text></g>
         <g class="node human"><rect x="420" y="395" width="260" height="72"/><text class="title" x="550" y="426">Akceptacja planu</text><text class="sub" x="550" y="447">approve_plan</text></g>
         <g class="node agent"><rect x="760" y="395" width="260" height="72"/><text class="title" x="890" y="426">Replan</text><text class="sub" x="890" y="447">plan_revision</text></g>
         <g class="node agent"><rect x="420" y="575" width="260" height="72"/><text class="title" x="550" y="606">Implementacja</text><text class="sub" x="550" y="627">ce-work</text></g>
         <g class="node agent"><rect x="420" y="685" width="260" height="72"/><text class="title" x="550" y="716">Uproszczenie</text><text class="sub" x="550" y="737">ce-simplify-code</text></g>
-        <g class="node agent"><rect x="420" y="795" width="260" height="72"/><text class="title" x="550" y="826">Code review</text><text class="sub" x="550" y="847">ce-code-review · autofix</text></g>
-        <g class="node agent"><rect x="420" y="905" width="260" height="72"/><text class="title" x="550" y="936">Commit, push i PR</text><text class="sub" x="550" y="957">publish_work</text></g>
+        <g class="node agent"><rect x="420" y="795" width="260" height="72"/><text class="title" x="550" y="826">Code review</text><text class="sub" x="550" y="847">ce-code-review · mode:agent</text></g>
+        <g class="node agent"><rect x="420" y="905" width="260" height="72"/><text class="title" x="550" y="936">Sprawdzenie i push</text><text class="sub" x="550" y="957">verify_work · publish_work</text></g>
         <g class="node agent"><rect x="760" y="795" width="260" height="72"/><text class="title" x="890" y="826">Automatyczne poprawki</text><text class="sub" x="890" y="847">fix_review_findings</text></g>
         <g class="node agent"><rect x="760" y="575" width="260" height="72"/><text class="title" x="890" y="606">Implementacja · dalszy ciąg</text><text class="sub" x="890" y="627">ce-work · work_revision</text></g>
         <g class="node human"><rect x="420" y="1015" width="260" height="72"/><text class="title" x="550" y="1046">Review człowieka</text><text class="sub" x="550" y="1067">implementation_review</text></g>
         <g class="node agent"><rect x="420" y="1125" width="260" height="72"/><text class="title" x="550" y="1156">Zapis wiedzy</text><text class="sub" x="550" y="1177">ce-compound</text></g>
-        <g class="node agent"><rect x="420" y="1235" width="260" height="72"/><text class="title" x="550" y="1266">Push aktualizacji PR</text><text class="sub" x="550" y="1287">publish_learning</text></g>
+        <g class="node agent"><rect x="420" y="1235" width="260" height="72"/><text class="title" x="550" y="1266">Push i uwagi PR</text><text class="sub" x="550" y="1287">publish_learning · resolve</text></g>
         <g class="node human"><rect x="420" y="1345" width="260" height="72"/><text class="title" x="550" y="1376">Review końcowe</text><text class="sub" x="550" y="1397">learning_review</text></g>
         <g class="node terminal"><rect x="470" y="1455" width="160" height="54"/><text class="title" x="550" y="1488">Finished</text></g>
         <g class="node terminal"><rect x="790" y="1545" width="160" height="54"/><text class="title" x="870" y="1578">Cancelled</text></g>
       </svg>
     </div>
     <section class="notes" aria-label="Opis głównych pętli">
-      <article class="note"><h2>Zakres i plan</h2><p>Zakres można odesłać do brainstormu. Plan wraca do akceptacji po poprawkach albo po decyzji, że nie da się go wykonać zgodnie z założeniami.</p></article>
-      <article class="note"><h2>Implementacja i review</h2><p>Przy niejasności agent pyta w kroku implementacji i po odpowiedzi wznawia ten sam krok. Automatyczne review i poprawki agenta powtarzają się aż do czystego wyniku.</p></article>
-      <article class="note"><h2>Publikacja i PR</h2><p>Po czystym automatycznym review agent publikuje branch, a człowiek przegląda PR. Po akceptacji agent zapisuje wiedzę i wypycha ją do tego samego PR-u, który trafia do końcowego review człowieka.</p></article>
+      <article class="note"><h2>Zakres i plan</h2><p>Po przeglądzie wymagań powstaje PR. Plan i jego poprawki trafiają do tego samego PR-u przed akceptacją. Po każdym pushu agent obsługuje istniejące uwagi.</p></article>
+      <article class="note"><h2>Implementacja i review</h2><p>Po przeglądzie kodu opcjonalny skrypt repozytorium sprawdza format, build i testy. W razie błędu agent dostaje zapisane stdout i stderr, poprawia kod, a potem wraca przez review i weryfikację. Skrypt nie jest uruchamiany drugi raz tylko po to, by odczytać błąd.</p></article>
+      <article class="note"><h2>Publikacja i PR</h2><p>Bez uwag proces idzie dalej. Poprawki z komentarzy są wypychane na PR przed kolejną weryfikacją człowieka. Zapis wiedzy także przechodzi ten cykl.</p></article>
     </section>
     <footer>Diagram oparty na <code>workflows/compound-engineering.yaml</code>. Na wąskim ekranie przewiń diagram poziomo.</footer>
   </main>

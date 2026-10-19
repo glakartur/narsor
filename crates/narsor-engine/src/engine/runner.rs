@@ -107,7 +107,7 @@ use crate::engine::actions::{
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
-use crate::workflow::template::step_reply_references;
+use crate::workflow::template::{step_reply_references, step_stream_references};
 use crate::workflow::{action_context_references, TemplateScope};
 
 mod failure;
@@ -152,6 +152,7 @@ const METADATA_OPERATOR_RECOVERY_NOTE_KEY: &str = "operator_recovery_note";
 const METADATA_AGENT_INPUT_KEY: &str = "agent_input";
 const METADATA_AGENT_SESSIONS_KEY: &str = "completed_agent_sessions";
 const METADATA_STEP_REPLIES_KEY: &str = "step_replies";
+const METADATA_STEP_STREAMS_KEY: &str = "step_streams";
 const METADATA_STATE_ENTRIES_KEY: &str = "state_entries";
 
 /// The one-shot instruction delivered by an operator to an agent step.
@@ -2157,9 +2158,27 @@ impl Engine {
                 }
             }
         }
+        let mut step_streams = HashMap::new();
+        for (source, field) in action_step_stream_sources(action) {
+            if let Some(value) = execution
+                .metadata
+                .get(METADATA_ENGINE_KEY)
+                .and_then(|engine| engine.get(METADATA_STEP_STREAMS_KEY))
+                .and_then(|streams| streams.get(&source))
+                .and_then(|streams| streams.get(&field))
+                .and_then(Value::as_str)
+            {
+                step_streams.insert(
+                    format!("{source}.{field}"),
+                    Value::String(value.to_string()),
+                );
+            }
+        }
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
-        let scope = scope.with_step_replies(&step_replies);
+        let scope = scope
+            .with_step_replies(&step_replies)
+            .with_step_streams(&step_streams);
         let mut rendered = scope
             .render_action(action, &location)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
@@ -2949,6 +2968,26 @@ impl Engine {
                 .insert(
                     state.id.clone(),
                     Value::String(pending.action_execution_id.clone()),
+                );
+        }
+        if matches!(state.action.as_ref(), Some(ActionConfig::Script(_)))
+            && workflow_step_stream_sources(definition).contains(&state.id)
+        {
+            let streams = engine_metadata_mut(execution)
+                .entry(METADATA_STEP_STREAMS_KEY.to_string())
+                .or_insert_with(|| json!({}));
+            if !streams.is_object() {
+                *streams = json!({});
+            }
+            streams
+                .as_object_mut()
+                .expect("streams are an object")
+                .insert(
+                    state.id.clone(),
+                    json!({
+                        "stdout": pending.result.stdout,
+                        "stderr": pending.result.stderr,
+                    }),
                 );
         }
         for artifact in &pending.artifacts {
@@ -4178,12 +4217,39 @@ fn action_step_reply_sources(action: &ActionConfig) -> Vec<String> {
     sources
 }
 
+fn action_step_stream_sources(action: &ActionConfig) -> Vec<(String, String)> {
+    let templates: Vec<&str> = match action {
+        ActionConfig::Agent(config) => vec![config.prompt.as_str()],
+        ActionConfig::Human(config) => vec![config.instruction.as_str()],
+        _ => Vec::new(),
+    };
+    let mut sources = Vec::new();
+    for template in templates {
+        for source in step_stream_references(template) {
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+    }
+    sources
+}
+
 fn workflow_step_reply_sources(definition: &WorkflowDefinition) -> HashSet<String> {
     definition
         .states
         .values()
         .flat_map(|state| state.action.as_ref().into_iter())
         .flat_map(action_step_reply_sources)
+        .collect()
+}
+
+fn workflow_step_stream_sources(definition: &WorkflowDefinition) -> HashSet<String> {
+    definition
+        .states
+        .values()
+        .flat_map(|state| state.action.as_ref().into_iter())
+        .flat_map(action_step_stream_sources)
+        .map(|(source, _)| source)
         .collect()
 }
 
