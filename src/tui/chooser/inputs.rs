@@ -77,6 +77,7 @@ fn render_strip(frame: &mut Frame, area: Rect, item: &ChooserItem, styles: &Styl
     } else {
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(Styles::FRAME)
             .border_style(styles.of(Role::Done))
             .title(format!(" {} ", one_line(&item.label)));
         frame.render_widget(Paragraph::new(summary).block(block), area);

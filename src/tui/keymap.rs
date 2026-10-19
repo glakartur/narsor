@@ -2063,6 +2063,7 @@ fn render_help_entries(frame: &mut Frame, area: Rect, entries: Vec<HelpEntry>, s
     }
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(Styles::FRAME)
         .border_style(styles.of(Role::Focus))
         .title(" Pomoc ");
     frame.render_widget(Clear, area);

@@ -1573,6 +1573,7 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 fn framed(frame: &mut Frame, place: Rect, role: Role, title: &str, styles: &Styles) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(Styles::FRAME)
         .border_style(styles.of(role))
         .title(format!(" {} ", one_line(title)));
     let inner = block.inner(place);
