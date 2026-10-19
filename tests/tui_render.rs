@@ -206,7 +206,7 @@ fn assert_not_bracketed(buffer: &Buffer, needle: &str) {
     );
 }
 
-/// The corners of a thick frame (the panel with the focus) and of a thin one.
+/// The corners of a rounded frame.
 const ROUNDED: [&str; 4] = ["╭", "╮", "╰", "╯"];
 
 /// The screen without its first two rows (the header and the frames' titles),
@@ -1011,7 +1011,7 @@ mod task_app_render {
         let corners: Vec<(usize, char)> = top
             .chars()
             .enumerate()
-            .filter(|(_, c)| "╭╮╭╮".contains(*c))
+            .filter(|(_, c)| "╭╮".contains(*c))
             .collect();
         let list = usize::from(layout::LIST_WIDTH);
         assert_eq!(
