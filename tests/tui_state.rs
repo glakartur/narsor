@@ -6479,7 +6479,7 @@ mod task_app_waiting {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn space_enter_accept_enter_sends_returns_to_the_list_and_says_so() {
+    async fn space_enter_accept_enter_sends_keeps_the_details_and_says_so() {
         let harness = RemoteHarness::start().await;
         let _running = harness
             .running("NAR-12", "local", approval_snapshot(1))
@@ -6505,9 +6505,11 @@ mod task_app_waiting {
 
         assert_eq!(
             app.focus(),
-            Focus::List,
-            "after sending, the focus is on the list"
+            Focus::Details,
+            "after sending, the focus stays in the details"
         );
+        assert!(!app.panel_focused());
+        assert_eq!(app.list().selected_id(), Some("NAR-12"));
         let note = app.notifier().latest().expect("a notification");
         assert_eq!(note.text, "NAR-12: zaakceptowano reviewed");
         assert_eq!(note.severity, Severity::Success);
@@ -6522,7 +6524,7 @@ mod task_app_waiting {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_answer_sent_from_the_steps_conversation_opens_the_details_again_on_the_axis() {
+    async fn an_answer_sent_from_the_steps_conversation_keeps_the_details_on_the_axis() {
         use narsor::tui::task_app::StepFocus;
         let harness = RemoteHarness::start().await;
         let _running = harness
@@ -6546,11 +6548,56 @@ mod task_app_waiting {
         ch(&mut app, '1');
         let request = press(&mut app, KeyCode::Enter);
         app.perform(request).await;
-        assert_eq!(app.focus(), Focus::List, "{:?}", app.notifier().latest());
-
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.focus(), Focus::Details);
+        assert_eq!(app.focus(), Focus::Details, "{:?}", app.notifier().latest());
         assert_eq!(app.step_focus(), StepFocus::Axis);
+        assert!(!app.panel_focused());
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::List);
+    }
+
+    /// An action confirmed in the window (`y`) is sent like one sent with
+    /// Enter: the focus stays in the details on the axis. The window is
+    /// opened on a screen with a failed provisioning, which the harness
+    /// cannot serve; the confirmed request is carried out for the task it
+    /// serves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_action_confirmed_in_the_window_keeps_the_details_on_the_axis() {
+        let failed = waiting_on(
+            task("a", "local", "interrupted", 1),
+            AttentionKind::ProvisioningFailed,
+            "provisioning-1",
+            None,
+        );
+        let mut offline = opened(failed);
+        ch(&mut offline, '2');
+        assert_eq!(press(&mut offline, KeyCode::Enter), Request::None);
+        let mut confirmed = sent(ch(&mut offline, 'y'));
+        assert_eq!(confirmed.submit, Submit::Owner(OwnerCommand::Archive));
+
+        let harness = RemoteHarness::start().await;
+        let _running = harness
+            .running("NAR-12", "local", approval_snapshot(1))
+            .await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        assert!(app.panel_focused());
+        confirmed.task_id = "NAR-12".to_string();
+        confirmed.generation = app.list().selected().unwrap().generation;
+        app.perform(Request::Answer(Box::new(confirmed))).await;
+
+        assert_eq!(
+            app.notifier().latest().unwrap().severity,
+            Severity::Success,
+            "{:?}",
+            app.notifier().latest()
+        );
+        assert_eq!(app.focus(), Focus::Details);
+        assert!(!app.panel_focused());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::List);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6565,6 +6612,7 @@ mod task_app_waiting {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "popraw testy");
+        let focus_before = app.focus();
 
         // The runner moved on: the request the panel shows is gone.
         running
@@ -6591,6 +6639,9 @@ mod task_app_waiting {
             panel.released()
         );
         assert!(app.detail().has_drafts());
+        // A refusal does not move the focus out of the details.
+        assert_eq!(app.focus(), focus_before);
+        assert_eq!(app.focus(), Focus::Details);
     }
 
     /// An answer to the waiting from before the runner was lost, sent once

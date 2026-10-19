@@ -39,7 +39,7 @@
 //! …/operator-commands`) or an owner command (`POST …/commands`) — each with an
 //! idempotency key a retry of the same decision reuses. A refusal (a `409`: the
 //! task moved on) leaves the panel open with what was typed and reads the
-//! tasks again; success returns the focus to the list with a notification.
+//! tasks again; success keeps the focus in the details on the timeline with a notification.
 //!
 //! Text from the agent, the conductor and the runner is passed through
 //! [`sanitize`] before it is drawn; what the operator typed is sent as typed.
@@ -1495,7 +1495,7 @@ impl TaskApp {
         }
     }
 
-    /// Sends a chosen action. Success returns the focus to the list and says
+    /// Sends a chosen action. Success keeps the focus in the details on the timeline and says
     /// what happened; a refusal keeps the panel with the typed text, shows why
     /// and reads the tasks again.
     pub(super) async fn answer(&mut self, request: AnswerRequest) {
@@ -1553,7 +1553,7 @@ impl TaskApp {
         match result {
             Ok(()) => {
                 self.settle_answer(&task_id, &waiting_id, Ok(()));
-                self.focus = super::Focus::List;
+                self.focus = super::Focus::Details;
                 self.panel_focus = false;
                 self.back_to_axis();
                 // An answer to a task without a slot resumes it; the resume
