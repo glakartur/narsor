@@ -1635,7 +1635,7 @@ mod task_app_list {
     use narsor_engine::controller_protocol::MoveTaskRequest;
     use narsor_engine::domain::ExecutionStatus;
     use narsor_engine::orchestration::{
-        AttentionKind, Observation, QueueReason, TaskEventKind, TaskLifecycle,
+        AttentionKind, Observation, QueueReason, RunnerState, TaskEventKind,
     };
     use narsor_protocol::controller::MoveTaskTarget;
 
@@ -1681,7 +1681,7 @@ mod task_app_list {
             "c1",
             "c",
             2,
-            TaskLifecycle::Queued,
+            RunnerState::Queued,
             TaskEventKind::Moved {
                 rank: 1,
                 order: ids(&["c", "a", "b"]),
@@ -1694,7 +1694,7 @@ mod task_app_list {
             "c1",
             "c",
             1,
-            TaskLifecycle::Queued,
+            RunnerState::Queued,
             TaskEventKind::Moved {
                 rank: 3,
                 order: ids(&["a", "b", "c"]),
@@ -1723,10 +1723,29 @@ mod task_app_list {
     fn controlled(
         id: &str,
         backend: &str,
-        lifecycle: &str,
+        runner_state: &str,
         rank: u32,
     ) -> narsor_engine::controller_protocol::TaskSummary {
-        with_controller(task(id, backend, lifecycle, rank))
+        with_controller(task(id, backend, runner_state, rank))
+    }
+
+    /// The read the application does after an event: the task as the control
+    /// plane sees it now, `change` applied and its state derived again.
+    fn reread(
+        app: &mut TaskApp,
+        id: &str,
+        revision: u64,
+        change: impl FnOnce(&mut narsor_engine::controller_protocol::TaskSummary),
+    ) {
+        let mut tasks = app.list().tasks().to_vec();
+        let task = tasks
+            .iter_mut()
+            .find(|task| task.task_id.as_str() == id)
+            .unwrap();
+        change(task);
+        task.state = super::task_app_support::served_state(task);
+        task.revision = revision;
+        app.load(listing(tasks, "read"));
     }
 
     mod order {
@@ -1759,14 +1778,16 @@ mod task_app_list {
                     &format!("p{id}"),
                     id,
                     sequence,
-                    TaskLifecycle::Provisioning,
+                    RunnerState::Provisioning,
                     TaskEventKind::ControllerReported {
                         observation: Observation::StartAccepted,
                         lease_epoch: 1,
                     },
                 ));
                 assert_eq!(titles(&app), order, "{id} provisioning");
-                assert_eq!(row(&app, id).1, StateIcon::Provisioning);
+                assert!(app.refresh_wanted(), "the event carries no state to show");
+                reread(&mut app, id, sequence, |task| task.holds_slot = true);
+                assert_eq!(row(&app, id).1, StateIcon::Queued);
                 // Whoever waits behind moves up in the queue, not on screen.
                 let waiting_behind = ["a", "b", "c"].iter().skip(index + 1).count();
                 if waiting_behind > 0 {
@@ -1779,13 +1800,14 @@ mod task_app_list {
                     &format!("r{id}"),
                     id,
                     sequence,
-                    TaskLifecycle::Running,
+                    RunnerState::Running,
                     TaskEventKind::ControllerReported {
                         observation: Observation::RunnerReady,
                         lease_epoch: 1,
                     },
                 ));
                 assert_eq!(titles(&app), order, "{id} running");
+                reread(&mut app, id, sequence, |task| task.holds_slot = true);
                 assert_eq!(row(&app, id).1, StateIcon::Running);
 
                 // The debounced read brings the runner's step.
@@ -1801,7 +1823,7 @@ mod task_app_list {
                     &format!("d{id}"),
                     id,
                     sequence,
-                    TaskLifecycle::Running,
+                    RunnerState::Running,
                     TaskEventKind::RunnerReported {
                         incarnation: "pod-1".into(),
                         event_cursor: 9,
@@ -1811,6 +1833,9 @@ mod task_app_list {
                     },
                 ));
                 assert_eq!(titles(&app), order, "{id} done");
+                reread(&mut app, id, sequence, |task| {
+                    task.runner.as_mut().unwrap().execution_status = ExecutionStatus::Completed;
+                });
                 assert_eq!(
                     row(&app, id),
                     (Attention::None, StateIcon::Done, "done".into())
@@ -1828,7 +1853,7 @@ mod task_app_list {
                 "old",
                 "a",
                 5,
-                TaskLifecycle::Queued,
+                RunnerState::Queued,
                 TaskEventKind::Created,
             ));
             assert_eq!(row(&app, "a").1, StateIcon::Running);
@@ -1863,7 +1888,7 @@ mod task_app_list {
                 "n",
                 "new",
                 1,
-                TaskLifecycle::Queued,
+                RunnerState::Queued,
                 TaskEventKind::Created,
             ));
             assert!(app.refresh_wanted());
@@ -1887,7 +1912,7 @@ mod task_app_list {
                 "i",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::InputQueued {
                     input_id: "in-1".into(),
                     pending_input_id: waiting_id,
@@ -1900,7 +1925,7 @@ mod task_app_list {
                 "q",
                 "b",
                 2,
-                TaskLifecycle::Queued,
+                RunnerState::Queued,
                 TaskEventKind::QueueChanged {
                     reason: QueueReason::ControllerOffline,
                 },
@@ -2117,7 +2142,7 @@ mod task_app_list {
                 "arch",
                 "b",
                 2,
-                TaskLifecycle::Archived,
+                RunnerState::Archived,
                 TaskEventKind::Created,
             ));
             assert_eq!(titles(&app), ["a", "c"]);
@@ -2545,7 +2570,7 @@ mod task_app_list {
                 "e",
                 "a",
                 2,
-                TaskLifecycle::Provisioning,
+                RunnerState::Provisioning,
                 TaskEventKind::Created,
             ));
             assert_eq!(status(&app), "● live");
@@ -2667,7 +2692,7 @@ mod task_app_detail {
     };
     use narsor_engine::domain::{Event, ExecutionStatus};
     use narsor_engine::engine::{ConversationState, PositionStatus, Timeline};
-    use narsor_engine::orchestration::{Observation, QueueReason, TaskEventKind, TaskLifecycle};
+    use narsor_engine::orchestration::{Observation, QueueReason, RunnerState, TaskEventKind};
 
     use super::remote_support::{report, snapshot, RemoteHarness};
     use super::task_app_support::{
@@ -2768,7 +2793,7 @@ mod task_app_detail {
                 "e",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::Created,
             ));
             assert!(app.detail().view("a").unwrap().progress().needs_read(2));
@@ -3368,7 +3393,7 @@ mod task_app_detail {
             let provisioning = task("b", "local", "provisioning", 2);
             assert_eq!(
                 unstarted_message(&provisioning, None).as_deref(),
-                Some("jeszcze nie wystartowało, provisioning")
+                Some("jeszcze nie wystartowało, w kolejce")
             );
             assert_eq!(unstarted_message(&running("c", 3), None), None);
         }
@@ -4033,7 +4058,7 @@ mod task_app_detail {
             harness.clock.advance(chrono::Duration::minutes(10));
             app.refresh().await;
             let task = app.list().selected().expect("a selected task");
-            assert_eq!(task.lifecycle, TaskLifecycle::Running, "never invented");
+            assert_eq!(task.runner_state, RunnerState::Running, "never invented");
             let stale = sheet(&app);
             assert!(
                 stale.iter().any(|line| line.contains("offline")),
@@ -4083,15 +4108,15 @@ mod task_app_detail {
                     "task-1",
                     running.epoch,
                     1,
-                    Observation::WorkloadLost { state_known: true },
+                    Observation::WorkloadLost { state_known: false },
                     Some(1),
                 ))
                 .await
                 .expect("lost");
             let mut app = app_over(&harness).await;
             assert_eq!(
-                app.list().selected().unwrap().lifecycle,
-                TaskLifecycle::Interrupted
+                app.list().selected().unwrap().runner_state,
+                RunnerState::Unknown
             );
             press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Events);
@@ -4105,6 +4130,198 @@ mod task_app_detail {
                 other => panic!("expected the reason, got {other:?}"),
             }
             assert!(app.connection().is_live());
+        }
+
+        /// D63, R12: a stopped task is read by a reader that is not connected
+        /// yet. The tab says it is loading, asks again after a pause (never
+        /// at once), and shows the events when an answer brings them.
+        #[tokio::test]
+        async fn events_of_a_task_whose_reader_is_starting_load_and_are_asked_again() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("task-1", "k8s", live_snapshot()).await;
+            running
+                .controller
+                .report(&report(
+                    "task-1",
+                    running.epoch,
+                    1,
+                    Observation::WorkloadLost { state_known: true },
+                    Some(1),
+                ))
+                .await
+                .expect("lost");
+            let mut app = app_over(&harness).await;
+            press(&mut app, KeyCode::Char(']'));
+            assert_eq!(app.detail().tab(), DetailTab::Events);
+
+            app.sync_detail().await;
+            let revision = app.list().selected().unwrap().revision;
+            let events = app.detail().view("task-1").unwrap().events();
+            assert!(
+                matches!(
+                    events.availability(),
+                    Availability::Unavailable {
+                        reason: ConversationUnavailableReason::ReaderStarting,
+                        ..
+                    }
+                ),
+                "{:?}",
+                events.availability()
+            );
+            assert!(events.is_starting());
+            let now = std::time::Instant::now();
+            assert!(
+                !events.needs_read_at(revision, now),
+                "no read without a pause"
+            );
+            assert!(
+                events.needs_read_at(revision, now + std::time::Duration::from_secs(60)),
+                "asked again after a pause"
+            );
+            assert!(app.connection().is_live());
+
+            // The next answer brings a page: the events show, nothing is
+            // asked again.
+            let mut events = app.detail().view("task-1").unwrap().events().clone();
+            events.apply_at(
+                revision,
+                0,
+                Ok(ExecutionEventsResponse::Available {
+                    events: execution_events(3),
+                    has_more: false,
+                    source: ExecutionEventsSource::Runner,
+                }),
+                now,
+            );
+            assert_eq!(events.events().len(), 3);
+            assert!(!events.is_starting());
+            assert!(!events.needs_read_at(revision, now + std::time::Duration::from_secs(60)));
+        }
+
+        /// The conversation of such a task: the page is refused with the
+        /// retryable code, which is not a failure — the tab says it is loading
+        /// and asks again after a pause.
+        #[tokio::test]
+        async fn the_conversation_of_a_task_whose_reader_is_starting_loads_and_is_asked_again() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("task-1", "k8s", live_snapshot()).await;
+            running
+                .controller
+                .report(&report(
+                    "task-1",
+                    running.epoch,
+                    1,
+                    Observation::WorkloadLost { state_known: true },
+                    Some(1),
+                ))
+                .await
+                .expect("lost");
+            let mut app = app_over(&harness).await;
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+
+            app.sync_detail().await;
+            let revision = app.list().selected().unwrap().revision;
+            let view = app.detail().view("task-1").unwrap();
+            let failure = view.conversation().failure().expect("a note");
+            assert_eq!(*failure, ReadFailure::Starting);
+            let (text, _) = failure.note(None);
+            assert!(text.contains("wczytywanie"), "{text}");
+            let attempts = view.attempts();
+            let now = std::time::Instant::now();
+            assert!(!attempts.needs_read_at("act-plan", revision, now));
+            assert!(attempts.needs_read_at(
+                "act-plan",
+                revision,
+                now + std::time::Duration::from_secs(60)
+            ));
+        }
+
+        /// Any other reason is shown with what was read last, and is not asked
+        /// again until the task changes.
+        #[test]
+        fn an_unavailable_answer_with_another_reason_keeps_the_last_events_and_does_not_retry() {
+            let now = std::time::Instant::now();
+            let later = now + std::time::Duration::from_secs(3600);
+            let mut events = narsor::tui::task_app::tabs::events::Events::default();
+            events.apply_at(
+                1,
+                0,
+                Ok(ExecutionEventsResponse::Available {
+                    events: execution_events(2),
+                    has_more: false,
+                    source: ExecutionEventsSource::Runner,
+                }),
+                now,
+            );
+            events.apply_at(
+                1,
+                2,
+                Ok(ExecutionEventsResponse::Unavailable {
+                    reason: ConversationUnavailableReason::Archived,
+                    message: "the task is archived".to_string(),
+                }),
+                now,
+            );
+            assert_eq!(events.events().len(), 2, "the last snapshot stays");
+            assert!(!events.is_starting());
+            assert!(!events.needs_read_at(1, later), "no loop");
+            assert!(events.needs_read_at(2, now), "a new revision reads again");
+            match events.availability() {
+                Availability::Unavailable { reason, message } => {
+                    assert_eq!(*reason, ConversationUnavailableReason::Archived);
+                    assert_eq!(message, "the task is archived");
+                }
+                other => panic!("expected the reason, got {other:?}"),
+            }
+
+            let mut attempts = narsor::tui::task_app::tabs::conversation::Attempts::default();
+            attempts.apply_at(
+                "act-1",
+                1,
+                0,
+                Err(ReadFailure::Unavailable("it cannot be read".to_string())),
+                now,
+            );
+            assert!(!attempts.needs_read_at("act-1", 1, later), "no loop");
+        }
+
+        #[test]
+        fn the_conductor_of_a_task_whose_reader_is_starting_loads_and_is_asked_again() {
+            use narsor::tui::task_app::tabs::conductor::{Conductor, Standing};
+            let now = std::time::Instant::now();
+            let later = now + std::time::Duration::from_secs(60);
+            let mut conductor = Conductor::new("task-1");
+            conductor.apply(
+                1,
+                now,
+                Ok(
+                    narsor::controller_protocol::ConductorReadResponse::Unavailable {
+                        reason: ConversationUnavailableReason::ReaderStarting,
+                        message: "starting".to_string(),
+                    },
+                ),
+            );
+            assert!(conductor.is_starting());
+            assert!(conductor.note().is_none());
+            assert!(!conductor.needs_read(1, now), "no read without a pause");
+            assert!(conductor.needs_read(1, later));
+            let mut task = running("task-1", 1);
+            task.runner = None;
+            assert!(matches!(conductor.standing(&task), Standing::Loading));
+
+            conductor.apply(
+                1,
+                later,
+                Ok(
+                    narsor::controller_protocol::ConductorReadResponse::Unavailable {
+                        reason: ConversationUnavailableReason::Paused,
+                        message: "paused".to_string(),
+                    },
+                ),
+            );
+            assert!(!conductor.is_starting());
+            assert_eq!(conductor.note(), Some("paused"));
+            assert!(!conductor.needs_read(1, later + std::time::Duration::from_secs(3600)));
         }
 
         #[tokio::test]
@@ -4173,7 +4390,7 @@ mod task_app_detail {
                     "task-1",
                     running.epoch,
                     1,
-                    Observation::WorkloadLost { state_known: true },
+                    Observation::WorkloadLost { state_known: false },
                     Some(1),
                 ))
                 .await
@@ -4426,7 +4643,7 @@ mod task_app_waiting {
     use narsor_engine::engine::actions::human::HumanInputAction;
     use narsor_engine::engine::PositionStatus;
     use narsor_engine::orchestration::{
-        AttentionKind, OperatorCommand, OwnerCommand, TaskEventKind, TaskLifecycle,
+        AttentionKind, OperatorCommand, OwnerCommand, RunnerState, TaskEventKind,
     };
     use narsor_protocol::controller::ConductorView;
     use narsor_protocol::controller::{ConductorReadResponse, ExecutionEventsSource};
@@ -4434,7 +4651,7 @@ mod task_app_waiting {
     use super::remote_support::{snapshot, RemoteHarness};
     use super::task_app_support::{
         event, listing, position, task, timeline, titled, waiting_on, with_controller,
-        with_pending, with_runner,
+        with_pending, with_runner, without_slot,
     };
     use narsor_engine::domain::ExecutionStatus;
 
@@ -4841,6 +5058,140 @@ mod task_app_waiting {
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(delivery.chosen_label.as_deref(), Some("replan"));
         assert_eq!(delivery.values["ambiguity_decision"], "replan");
+    }
+
+    fn note(app: &TaskApp) -> String {
+        app.notifier()
+            .latest()
+            .map(|note| note.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// A control plane that answers an input with "queued" and every list of
+    /// tasks with `tasks`; anything else is not found.
+    async fn serving(tasks: Vec<narsor_engine::controller_protocol::TaskSummary>) -> ApiClient {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tasks = serde_json::to_string(&listing(tasks, "after")).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let tasks = tasks.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head_end, wanted) = loop {
+                        let read = stream.read(&mut chunk).await.unwrap_or(0);
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&request).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let length = text
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            break (end + 4, length);
+                        }
+                    };
+                    while request.len() < head_end + wanted {
+                        let read = stream.read(&mut chunk).await.unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let head = String::from_utf8_lossy(&request[..head_end]).to_string();
+                    let first = head.lines().next().unwrap_or_default().to_string();
+                    let (status, body) = if first.contains("/input") {
+                        (
+                            "200 OK",
+                            json!({
+                                "input": {
+                                    "input_id": "in-1",
+                                    "pending_input_id": "ep-1",
+                                    "status": "queued",
+                                    "submitted_at": "2026-10-09T12:00:00Z",
+                                    "updated_at": "2026-10-09T12:00:00Z",
+                                    "detail": null
+                                },
+                                "replayed": false
+                            })
+                            .to_string(),
+                        )
+                    } else if first.contains("/control/v1/tasks?") {
+                        ("200 OK", tasks)
+                    } else {
+                        ("404 Not Found", "{}".to_string())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        ApiClient::new(address, "token")
+    }
+
+    /// AE1: a task that waits for an answer holds no slot, and the panel
+    /// still takes the answer. When the backend is full the answer's resume
+    /// waits in the queue, and the bar says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_to_a_task_without_a_slot_is_taken_and_says_when_it_queues() {
+        use narsor_engine::orchestration::TaskState;
+
+        let asking = without_slot(with_pending(running("a", 1), question(None)));
+        assert_eq!(asking.state, TaskState::HumanNeeded);
+        assert!(!asking.holds_slot);
+
+        // After the answer the control plane put the task at the queue's front.
+        let mut resumed = asking.clone();
+        resumed.runner_state = RunnerState::Queued;
+        resumed.state = TaskState::Queued;
+        resumed.revision = 2;
+        let client = serving(vec![titled(resumed, "NAR-12")]).await;
+
+        let mut app = TaskApp::new(client, "local", None);
+        app.load(listing(vec![titled(asking, "NAR-12")], "c"));
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        assert!(app.panel_focused(), "the answer panel is active");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        typed(&mut app, "wersja 2");
+        let request = press(&mut app, KeyCode::Enter);
+        assert!(matches!(request, Request::Answer(_)), "{request:?}");
+        app.perform(request).await;
+        assert!(note(&app).contains("w kolejce"), "{}", note(&app));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_to_a_task_with_a_slot_does_not_say_queued() {
+        let client = serving(Vec::new()).await;
+        let mut app = TaskApp::new(client, "local", None);
+        app.load(listing(
+            vec![titled(
+                with_pending(running("a", 1), question(None)),
+                "NAR-12",
+            )],
+            "c",
+        ));
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "wersja 2");
+        let request = press(&mut app, KeyCode::Enter);
+        app.perform(request).await;
+        assert!(!note(&app).contains("w kolejce"), "{}", note(&app));
     }
 
     #[test]
@@ -5591,7 +5942,7 @@ mod task_app_waiting {
         );
         read_conductor_response(
             &mut app,
-            Ok(ConductorReadResponse::Unavailable {
+            Ok(narsor::controller_protocol::ConductorReadResponse::Unavailable {
                 reason:
                     narsor_engine::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
                 message: "brak harnessu".to_string(),
@@ -5722,7 +6073,7 @@ mod task_app_waiting {
             "e",
             "a",
             2,
-            TaskLifecycle::Running,
+            RunnerState::Running,
             TaskEventKind::Created,
         ));
         app.load(listing(vec![titled(waiting, "NAR-12")], "e"));
@@ -6403,8 +6754,8 @@ mod task_app_actions {
     use narsor_engine::controller_protocol::{OperatorCommandView, RunnerClient, TaskSummary};
     use narsor_engine::domain::ExecutionStatus;
     use narsor_engine::orchestration::{
-        AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef,
-        TaskEventKind, TaskLifecycle,
+        AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, RunnerState,
+        TaskEventKind,
     };
 
     use super::remote_support::{snapshot, RemoteHarness};
@@ -6458,7 +6809,7 @@ mod task_app_actions {
         )
     }
 
-    fn lifecycle(word: &str) -> TaskSummary {
+    fn runner_state(word: &str) -> TaskSummary {
         with_controller(task("a", "local", word, 1))
     }
 
@@ -6524,7 +6875,7 @@ mod task_app_actions {
             assert!(available(&queued("a", 1), TaskAction::Move));
             for word in ["running", "paused", "interrupted", "provisioning"] {
                 assert_eq!(
-                    unavailable(&lifecycle(word), TaskAction::Move),
+                    unavailable(&runner_state(word), TaskAction::Move),
                     "zadanie nie jest w kolejce",
                     "{word}"
                 );
@@ -6536,7 +6887,7 @@ mod task_app_actions {
             let running = running("a", 1);
             assert!(available(&running, TaskAction::PauseResume));
             assert_eq!(verb(&running, TaskAction::PauseResume), "pauza");
-            let paused = lifecycle("paused");
+            let paused = runner_state("paused");
             assert!(available(&paused, TaskAction::PauseResume));
             assert_eq!(verb(&paused, TaskAction::PauseResume), "wznowienie");
             assert_eq!(
@@ -6544,16 +6895,16 @@ mod task_app_actions {
                 "zadanie jest w kolejce"
             );
             assert_eq!(
-                unavailable(&lifecycle("provisioning"), TaskAction::PauseResume),
-                "zadanie jest przygotowywane"
+                unavailable(&runner_state("provisioning"), TaskAction::PauseResume),
+                "zadanie jest w kolejce"
             );
             assert!(
-                unavailable(&lifecycle("interrupted"), TaskAction::PauseResume)
+                unavailable(&runner_state("interrupted"), TaskAction::PauseResume)
                     .contains("uruchom je od nowa")
             );
             assert!(unavailable(&finished("a", 1), TaskAction::PauseResume).contains("zakończone"));
             assert!(
-                unavailable(&lifecycle("pause_requested"), TaskAction::PauseResume)
+                unavailable(&runner_state("pause_requested"), TaskAction::PauseResume)
                     .contains("wstrzymywane")
             );
         }
@@ -6565,10 +6916,10 @@ mod task_app_actions {
                 unavailable(&queued("a", 1), TaskAction::Interrupt),
                 "zadanie jest w kolejce"
             );
-            assert!(unavailable(&lifecycle("paused"), TaskAction::Interrupt).contains("wznów"));
+            assert!(unavailable(&runner_state("paused"), TaskAction::Interrupt).contains("wznów"));
             assert!(unavailable(&finished("a", 1), TaskAction::Interrupt).contains("zakończone"));
             assert_eq!(
-                unavailable(&lifecycle("running"), TaskAction::Interrupt),
+                unavailable(&runner_state("running"), TaskAction::Interrupt),
                 "runner jeszcze się nie zgłosił"
             );
             let mut silent = running("a", 1);
@@ -6603,10 +6954,10 @@ mod task_app_actions {
 
         #[test]
         fn start_again_is_for_interrupted_tasks_and_a_failed_provisioning() {
-            assert!(available(&lifecycle("interrupted"), TaskAction::Restart));
-            assert!(available(&lifecycle("unknown"), TaskAction::Restart));
+            assert!(available(&runner_state("interrupted"), TaskAction::Restart));
+            assert!(available(&runner_state("unknown"), TaskAction::Restart));
             let failed = waiting_on(
-                lifecycle("provisioning"),
+                runner_state("provisioning"),
                 AttentionKind::ProvisioningFailed,
                 "p-1",
                 None,
@@ -6617,25 +6968,25 @@ mod task_app_actions {
                 unavailable(&queued("a", 1), TaskAction::Restart),
                 "zadanie jest w kolejce"
             );
-            assert!(unavailable(&lifecycle("paused"), TaskAction::Restart).contains("wznów"));
+            assert!(unavailable(&runner_state("paused"), TaskAction::Restart).contains("wznów"));
         }
 
         #[test]
         fn archive_is_for_finished_and_interrupted_tasks() {
             assert!(available(&finished("a", 1), TaskAction::Archive));
-            assert!(available(&lifecycle("interrupted"), TaskAction::Archive));
+            assert!(available(&runner_state("interrupted"), TaskAction::Archive));
             let failed = waiting_on(
-                lifecycle("provisioning"),
+                runner_state("provisioning"),
                 AttentionKind::ProvisioningFailed,
                 "p-1",
                 None,
             );
             assert!(available(&failed, TaskAction::Archive));
-            for blocked in [running("a", 1), queued("a", 1), lifecycle("paused")] {
+            for blocked in [running("a", 1), queued("a", 1), runner_state("paused")] {
                 assert!(
                     unavailable(&blocked, TaskAction::Archive).contains("zakończone lub przerwane"),
                     "{:?}",
-                    blocked.lifecycle
+                    blocked.runner_state
                 );
             }
         }
@@ -6823,7 +7174,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Paused,
+                RunnerState::Stopped,
                 TaskEventKind::Created,
             ));
             let chooser = app.overlay().unwrap().chooser().unwrap();
@@ -6838,7 +7189,7 @@ mod task_app_actions {
                 "e",
                 "a",
                 3,
-                TaskLifecycle::Archived,
+                RunnerState::Archived,
                 TaskEventKind::Created,
             ));
             assert!(app.overlay().is_none(), "the task left the list");
@@ -6884,14 +7235,14 @@ mod task_app_actions {
             assert!(!pause.key.is_empty());
             assert!(app.overlay().is_none(), "no window for a plain action");
 
-            let mut app = loaded(lifecycle("paused"));
+            let mut app = loaded(runner_state("paused"));
             let resume = act(ch(&mut app, 'p'));
             assert_eq!(resume.send, ActionSend::Owner(OwnerCommand::Resume));
         }
 
         #[test]
         fn s_starts_an_interrupted_task_again_and_says_why_for_a_running_one() {
-            let mut app = loaded(lifecycle("interrupted"));
+            let mut app = loaded(runner_state("interrupted"));
             let start = act(ch(&mut app, 's'));
             assert_eq!(start.send, ActionSend::Owner(OwnerCommand::Start));
 
@@ -7028,7 +7379,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Archived,
+                RunnerState::Archived,
                 TaskEventKind::Created,
             ));
             assert!(app.overlay().is_none());
@@ -7378,7 +7729,7 @@ mod task_app_actions {
                 ('p', running("a", 1)),
                 ('x', running("a", 1)),
                 ('a', finished("a", 1)),
-                ('s', lifecycle("interrupted")),
+                ('s', runner_state("interrupted")),
                 (
                     't',
                     with_transitions(running("a", 1), "review", &[("ok", "ship", None)], None),
@@ -7426,7 +7777,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::Created,
             ));
             let chooser = app.overlay().unwrap().chooser().unwrap();
@@ -7474,7 +7825,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandQueued {
                     command_id: "command-1".to_string(),
                     command: OperatorCommand::Interrupt,
@@ -7488,7 +7839,7 @@ mod task_app_actions {
                 "e",
                 "a",
                 3,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-1".to_string(),
                     status: OperatorCommandStatus::Applied,
@@ -7508,7 +7859,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandQueued {
                     command_id: "command-1".to_string(),
                     command: OperatorCommand::Transition {
@@ -7523,7 +7874,7 @@ mod task_app_actions {
                 "e",
                 "a",
                 3,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-1".to_string(),
                     status: OperatorCommandStatus::Rejected,
@@ -7553,7 +7904,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-1".to_string(),
                     status: OperatorCommandStatus::Rejected,
@@ -7579,7 +7930,7 @@ mod task_app_actions {
                     cursor,
                     "a",
                     sequence,
-                    TaskLifecycle::Running,
+                    RunnerState::Running,
                     TaskEventKind::OperatorCommandResolved {
                         command_id: "command-1".to_string(),
                         status: OperatorCommandStatus::Applied,
@@ -7592,7 +7943,7 @@ mod task_app_actions {
                 "e",
                 "a",
                 3,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::Created,
             ));
             let before = app.notifier().latest().unwrap().at;
@@ -7611,7 +7962,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-9".to_string(),
                     status: OperatorCommandStatus::Applied,
@@ -7644,7 +7995,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-1".to_string(),
                     status: OperatorCommandStatus::Applied,
@@ -7891,14 +8242,14 @@ mod task_app_actions {
             app.perform(request).await;
             assert_eq!(note(&app), "NAR-12: wstrzymanie zlecone");
             for _ in 0..8 {
-                if app.list().tasks()[0].lifecycle != TaskLifecycle::Running {
+                if app.list().tasks()[0].runner_state != RunnerState::Running {
                     break;
                 }
                 next_event(&mut app, &mut feed).await;
             }
             assert_eq!(
-                app.list().tasks()[0].lifecycle,
-                TaskLifecycle::PauseRequested
+                app.list().tasks()[0].runner_state,
+                RunnerState::PauseRequested
             );
         }
 
@@ -8008,7 +8359,7 @@ mod task_app_conductor {
     };
     use narsor_engine::domain::ExecutionStatus;
     use narsor_engine::orchestration::{
-        AttentionKind, OperatorCommand, OwnerRef, TaskEventKind, TaskLifecycle,
+        AttentionKind, OperatorCommand, OwnerRef, RunnerState, TaskEventKind,
     };
     use narsor_protocol::controller::ConductorReadResponse;
     use narsor_protocol::controller::ConductorView;
@@ -8563,7 +8914,7 @@ mod task_app_conductor {
                 ),
             ] {
                 let sequence = if cursor == "d" { 2 } else { 3 };
-                app.on_stream(event(cursor, "a", sequence, TaskLifecycle::Running, kind));
+                app.on_stream(event(cursor, "a", sequence, RunnerState::Running, kind));
             }
             let text = note(&app);
             assert!(
@@ -8769,10 +9120,12 @@ mod task_app_conductor {
             let mut app = tab_app();
             read_response(
                 &mut app,
-                Ok(ConductorReadResponse::Unavailable {
-                    reason: ConversationUnavailableReason::NotStarted,
-                    message: "zadanie nie ma żywego runnera".to_string(),
-                }),
+                Ok(
+                    narsor::controller_protocol::ConductorReadResponse::Unavailable {
+                        reason: ConversationUnavailableReason::NotStarted,
+                        message: "zadanie nie ma żywego runnera".to_string(),
+                    },
+                ),
             );
             let text = screen(&mut app, 120, 30);
             assert!(text.contains("zadanie nie ma żywego runnera"), "{text}");
@@ -8925,7 +9278,7 @@ mod task_app_conductor {
                     },
                 ),
             ] {
-                app.on_stream(event(cursor, "a", sequence, TaskLifecycle::Running, kind));
+                app.on_stream(event(cursor, "a", sequence, RunnerState::Running, kind));
             }
             let text = note(&app);
             assert!(
@@ -9212,7 +9565,7 @@ mod task_app_create {
         RepositoryListResponse, TaskSummary, ValidateWorkflowResponse, WorkflowListResponse,
     };
     use narsor_engine::domain::ParamType;
-    use narsor_engine::orchestration::TaskLifecycle;
+    use narsor_engine::orchestration::RunnerState;
     use narsor_engine::persistence::ExecutionStore;
     use narsor_protocol::api::LegacyExecutionListResponse;
 
@@ -10748,7 +11101,7 @@ mod task_app_create {
             assert_eq!(app.view_kind(), ViewKind::History);
             assert_eq!(titles(&app), ["NAR-9"]);
             let entry = app.history().unwrap().selected_entry().unwrap();
-            assert_eq!(entry.summary().lifecycle, TaskLifecycle::Archived);
+            assert_eq!(entry.summary().runner_state, RunnerState::Archived);
 
             // The details are read-only and read nothing: the storage is gone.
             press(&mut app, KeyCode::Enter);
@@ -12067,7 +12420,7 @@ mod task_app_auto_resume {
     use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
     use narsor_engine::controller_protocol::{ExecutionEventsSource, TaskSummary};
     use narsor_engine::engine::{ConversationState, PositionStatus};
-    use narsor_engine::orchestration::{TaskEventKind, TaskLifecycle};
+    use narsor_engine::orchestration::{RunnerState, TaskEventKind};
 
     use super::task_app_support::{
         auto_resumed, event, exhausted, interrupted, listing, position, timeline, titled,
@@ -12087,7 +12440,7 @@ mod task_app_auto_resume {
         (1..=count)
             .map(|n| {
                 let mut task = titled(
-                    interrupted(&format!("t{n}"), TaskLifecycle::Running, 1, true),
+                    interrupted(&format!("t{n}"), RunnerState::Running, 1, true),
                     &format!("NAR-{n}"),
                 );
                 task.rank = n;
@@ -12127,7 +12480,7 @@ mod task_app_auto_resume {
         assert_eq!(order(&app), ["t1", "t2", "t3"]);
         assert_eq!(app.list().selected_id().map(str::to_string), selected);
         let row = &app.list().tasks()[1];
-        assert_eq!(row.lifecycle, TaskLifecycle::Provisioning);
+        assert_eq!(row.runner_state, RunnerState::Provisioning);
         assert_eq!(attention_of(row), Attention::None);
     }
 
@@ -12183,7 +12536,7 @@ mod task_app_auto_resume {
             "e3",
             "t1",
             5,
-            TaskLifecycle::Interrupted,
+            RunnerState::Interrupted,
             TaskEventKind::AutoResumeExhausted {
                 attempts: 5,
                 reason: "could not resume automatically: pod evicted".to_string(),
@@ -12202,7 +12555,7 @@ mod task_app_auto_resume {
             "e1",
             "t2",
             2,
-            TaskLifecycle::Interrupted,
+            RunnerState::Interrupted,
             TaskEventKind::AutoResumeExhausted {
                 attempts: 5,
                 reason: "could not resume automatically: pod evicted".to_string(),
@@ -12222,7 +12575,7 @@ mod task_app_auto_resume {
             "e2",
             "t3",
             2,
-            TaskLifecycle::Interrupted,
+            RunnerState::Interrupted,
             TaskEventKind::AutoResumeExhausted {
                 attempts: 5,
                 reason: "could not resume automatically: the workload was lost".to_string(),
@@ -12237,12 +12590,12 @@ mod task_app_auto_resume {
     /// Only the two cases that wait for the owner mark the row.
     #[test]
     fn the_row_is_marked_only_when_the_owner_has_to_act() {
-        let planned = interrupted("a", TaskLifecycle::Running, 2, true);
+        let planned = interrupted("a", RunnerState::Running, 2, true);
         assert_eq!(attention_of(&planned), Attention::None);
-        let pausing = interrupted("a", TaskLifecycle::PauseRequested, 0, false);
+        let pausing = interrupted("a", RunnerState::PauseRequested, 0, false);
         assert_eq!(attention_of(&pausing), Attention::Problem);
         let given_up = exhausted(
-            interrupted("a", TaskLifecycle::Running, 6, false),
+            interrupted("a", RunnerState::Running, 6, false),
             "could not resume automatically: pod evicted",
         );
         assert_eq!(attention_of(&given_up), Attention::Problem);
@@ -12251,7 +12604,7 @@ mod task_app_auto_resume {
     /// The menu's reason for an interrupted task mentions a planned resume.
     #[test]
     fn an_action_of_a_task_resuming_on_its_own_says_so() {
-        let planned = interrupted("a", TaskLifecycle::Running, 2, true);
+        let planned = interrupted("a", RunnerState::Running, 2, true);
         let reason = availability(&planned, TaskAction::Interrupt);
         assert_eq!(
             reason.reason(),
@@ -12259,7 +12612,7 @@ mod task_app_auto_resume {
                 "zadanie jest przerwane — wznowi się samo (próba 2/5) albo uruchom je od nowa (s)"
             )
         );
-        let pausing = interrupted("a", TaskLifecycle::PauseRequested, 0, false);
+        let pausing = interrupted("a", RunnerState::PauseRequested, 0, false);
         assert_eq!(
             availability(&pausing, TaskAction::Interrupt).reason(),
             Some("zadanie jest przerwane — uruchom je od nowa (s)")
@@ -12316,7 +12669,7 @@ mod task_app_auto_resume {
         let mut app = app();
         app.load(listing(
             vec![titled(
-                interrupted("a", TaskLifecycle::Running, 1, true),
+                interrupted("a", RunnerState::Running, 1, true),
                 "NAR-1",
             )],
             "c",
@@ -12345,7 +12698,7 @@ mod task_app_auto_resume {
             "e1",
             "a",
             2,
-            TaskLifecycle::Running,
+            RunnerState::Running,
             TaskEventKind::Created,
         ));
         let revision = app.list().selected().unwrap().revision;

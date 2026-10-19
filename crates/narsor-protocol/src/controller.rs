@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::HumanInputDeliveryDto;
 use crate::api::{ExecutionStatusDto, Timeline};
+use crate::chat::is_false;
 use crate::display::TaskDisplay;
 use crate::event::Event;
 use crate::identifier::BackendId;
@@ -175,7 +176,8 @@ pub struct ReportResponse {
     /// False for an absorbed duplicate.
     pub applied: bool,
     /// Lifecycle afterwards.
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     /// Desired generation afterwards.
     pub generation: u64,
 }
@@ -220,11 +222,19 @@ pub struct RunnerProgress {
 pub struct DesiredCommand {
     pub task_id: TaskId,
     pub generation: u64,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     pub action: DesiredAction,
     pub resource_key: String,
     pub launch_spec: Value,
     pub runner: Option<RunnerProgress>,
+    /// Whether the control plane wants a read-only runner for the task
+    /// alongside (D63): an owner is reading a stopped or interrupted task and
+    /// its reader lease has not run out. The controller starts one, or
+    /// removes the one it started, to match. Absent from an older control
+    /// plane, which never asks for one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reader_needed: bool,
 }
 
 /// Controller command response.
@@ -462,22 +472,46 @@ pub enum ConductorReadResponse {
     },
 }
 
-/// Orchestration state of a task as stored and exposed by the control plane.
+/// State of a task's runner and its resources (slot, workload, storage) as
+/// stored and exposed by the control plane. Older records and events spell
+/// `Stopped` as `paused`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskLifecycle {
+pub enum RunnerState {
     Queued,
     Provisioning,
     Running,
     PauseRequested,
-    Paused,
+    #[serde(alias = "paused")]
+    Stopped,
     Interrupted,
     Unknown,
     Archiving,
     Archived,
 }
 
-impl TaskLifecycle {
+/// The stage of a task's work as the owner sees it, worked out by the control
+/// plane from the runner state, the runner's last execution status and the
+/// resume policy. Clients show it and never work it out themselves.
+///
+/// A client that meets a state it does not know reads `Unrecognized`, which
+/// is also what a summary from before the field existed reads.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Queued,
+    Running,
+    HumanNeeded,
+    Paused,
+    Finished,
+    Error,
+    Archived,
+    #[default]
+    #[serde(other)]
+    Unrecognized,
+}
+
+impl RunnerState {
     /// True for `Archiving` and `Archived`.
     pub fn is_archival(self) -> bool {
         matches!(self, Self::Archiving | Self::Archived)
@@ -576,7 +610,7 @@ impl ResumeState {
 /// Where and when a task lost its workload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkloadLoss {
-    pub from: TaskLifecycle,
+    pub from: RunnerState,
     pub at: DateTime<Utc>,
     pub lease_epoch: u64,
     #[serde(default)]
@@ -717,7 +751,8 @@ pub struct RunnerSnapshotResponse {
     pub applied: bool,
     pub directive: RunnerDirective,
     pub generation: u64,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     pub launch: RunnerLaunchView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_harness: Option<TaskDefaultHarness>,
@@ -745,7 +780,8 @@ pub struct DeliveredOperatorCommand {
 pub struct RunnerPollResponse {
     pub directive: RunnerDirective,
     pub generation: u64,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     pub inputs: Vec<DeliveredInput>,
     #[serde(default)]
     pub commands: Vec<DeliveredOperatorCommand>,
@@ -806,7 +842,14 @@ pub struct ConversationPageAccepted {
 pub struct TaskSummary {
     pub task_id: crate::identifier::TaskId,
     pub backend_id: crate::identifier::BackendId,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
+    /// What the owner sees; see [`TaskState`].
+    #[serde(default)]
+    pub state: TaskState,
+    /// Whether the task occupies one of its backend's capacity slots.
+    #[serde(default)]
+    pub holds_slot: bool,
     pub generation: u64,
     pub revision: u64,
     pub rank: u32,
@@ -843,7 +886,7 @@ pub struct TaskListResponse {
     pub cursor: String,
 }
 
-/// Actor recorded for a lifecycle command receipt.
+/// Actor recorded for a runner state command receipt.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandActor {
@@ -871,7 +914,8 @@ pub struct CommandReceipt {
     pub expected_generation: Option<u64>,
     pub accepted_at: DateTime<Utc>,
     pub generation_after: u64,
-    pub lifecycle_after: TaskLifecycle,
+    #[serde(alias = "lifecycle_after")]
+    pub runner_state_after: RunnerState,
     pub revision: u64,
     #[serde(default)]
     pub actor: CommandActor,
@@ -941,11 +985,42 @@ pub enum TaskEventKind {
         attempts: u32,
         reason: String,
     },
+    /// The control plane planned (or moved) the time at which it frees the
+    /// slot of a task that waits for its owner.
+    SlotReleaseScheduled {
+        due_at: DateTime<Utc>,
+    },
+    /// The control plane freed the task's slot: it asked the runner to stop
+    /// at a safe point.
+    SlotReleased {
+        reason: SlotReleaseReason,
+    },
+    /// An owner is reading a stopped task: the control plane asked for a
+    /// read-only runner until `until` (D63).
+    ReaderLeased {
+        until: DateTime<Utc>,
+    },
+    /// The read-only runner's lease ended, because it ran idle: the control
+    /// plane no longer asks for it.
+    ReaderLeaseEnded,
     #[serde(other)]
     Unrecognized,
 }
 
-/// Material lifecycle change recorded in a task event.
+/// Why the control plane freed a task's slot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotReleaseReason {
+    /// The task's execution ended (completed or cancelled).
+    Terminal,
+    /// The task waited for its owner (input needed, failed) and the wait
+    /// ran out.
+    GraceElapsed,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// Material runner state change recorded in a task event.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MaterialChange {
@@ -969,7 +1044,8 @@ pub struct TaskEvent {
     pub sequence: u64,
     pub task_id: crate::identifier::TaskId,
     pub at: DateTime<Utc>,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     pub generation: u64,
     pub kind: TaskEventKind,
 }
@@ -987,6 +1063,12 @@ pub struct OwnerCommandResponse {
     pub receipt: CommandReceipt,
     pub replayed: bool,
     pub task: TaskSummary,
+    /// The command was a resume that found the backend full: the task waits
+    /// in the queue (at its front) for a slot instead of starting now.
+    /// Derived from the receipt, so a replay says the same. Absent from an
+    /// older control plane, which refused such a resume instead.
+    #[serde(default)]
+    pub queued_for_slot: bool,
 }
 
 /// One attempt's conversation, summarized without transcript content.
@@ -1223,7 +1305,7 @@ pub struct MoveTaskRequest {
     pub expected_generation: Option<u64>,
 }
 
-/// An owner's requested change to a task's desired lifecycle.
+/// An owner's requested change to a task's desired runner state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnerCommand {
@@ -1426,6 +1508,9 @@ pub enum ConversationUnavailableReason {
     RunnerUnreachable,
     RunnerReported,
     StorageUnreadable,
+    /// The task is stopped and the control plane asked for a read-only
+    /// runner to read it; the runner is not connected yet. Retry shortly.
+    ReaderStarting,
     #[serde(other)]
     Unrecognized,
 }
@@ -1688,6 +1773,11 @@ pub struct TransitionExit {
 }
 
 pub const CONVERSATION_UNAVAILABLE: &str = "conversation_unavailable";
+/// The code of the `409` a conversation page is refused with while the
+/// read-only runner of a stopped task is not connected yet (D63): the client
+/// asks again shortly. The page's own form of
+/// [`ConversationUnavailableReason::ReaderStarting`].
+pub const CONVERSATION_READER_STARTING: &str = "conversation_reader_starting";
 pub const CONVERSATION_RECORD_UNREADABLE: &str = "conversation_record_unreadable";
 pub const CONVERSATION_RECORD_UNREADABLE_PREFIX: &str =
     "the conversation record could not be read: ";
@@ -1706,11 +1796,10 @@ mod tests {
         Observation, ObservationView, ObservedSummary, OperatorCommand, OperatorCommandStatus,
         OperatorCommandView, OwnerCommand, OwnerCommandRequest, QueueReason, QueueView,
         RepositoryListResponse, RepositoryView, ResourceIdentity, ResourceProfileRequest,
-        SetDefaultBackendRequest, SubmitInputRequest, SubmitInputResponse,
+        RunnerState, SetDefaultBackendRequest, SubmitInputRequest, SubmitInputResponse,
         SubmitOperatorCommandRequest, SubmitOperatorCommandResponse, TaskDefaultHarness,
-        TaskLifecycle, TimelineResponse, ValidateWorkflowRequest, ValidateWorkflowResponse,
-        WorkflowInputType, WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowView,
-        WorkspaceRequest,
+        TimelineResponse, ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType,
+        WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowView, WorkspaceRequest,
     };
 
     #[test]
@@ -2222,12 +2311,12 @@ mod tests {
     #[test]
     fn task_lifecycle_keeps_snake_case_states_and_archival_classification() {
         assert_eq!(
-            serde_json::to_string(&TaskLifecycle::PauseRequested).unwrap(),
+            serde_json::to_string(&RunnerState::PauseRequested).unwrap(),
             "\"pause_requested\""
         );
-        assert!(!TaskLifecycle::Paused.is_archival());
-        assert!(TaskLifecycle::Archiving.is_archival());
-        assert!(TaskLifecycle::Archived.is_archival());
+        assert!(!RunnerState::Stopped.is_archival());
+        assert!(RunnerState::Archiving.is_archival());
+        assert!(RunnerState::Archived.is_archival());
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub mod resolver;
 
 pub use backend::{
     BackendCapabilities, BackendKind, BackendLimits, BackendRecord, BackendSecret,
-    SecretDeliveryMode, TrustScope, MAX_CONCURRENT_TASKS_LIMIT,
+    SecretDeliveryMode, SlotReleaseTimings, TrustScope, MAX_CONCURRENT_TASKS_LIMIT,
 };
 pub use catalog::{CatalogError, EnvironmentCatalog};
 pub use image::{ImageResolver, NoTagResolution, StaticImageResolver};

@@ -38,9 +38,7 @@ use super::preflight::{find_on_path, is_executable};
 use super::storage::TaskStorage;
 use super::Session;
 use crate::conductor::assembly::{build, restore_at_startup};
-use crate::conductor::{
-    ConductorRegistry, ConductorView, HarnessInvoker, LiveHarness, PassLauncher,
-};
+use crate::conductor::{ConductorRegistry, HarnessInvoker, LiveHarness, PassLauncher};
 use crate::controller_protocol::ConductorReadRequest;
 use crate::domain::{WorkflowDefinition, WorkflowExecution};
 use crate::engine::{Engine, HarnessRegistry};
@@ -311,34 +309,23 @@ impl Session {
 
     /// Uploads the conductor's state an owner waits for.
     pub(super) async fn serve_conductor_read(&mut self, request: ConductorReadRequest) {
-        let (Some(client), Some(execution_id)) = (self.link.client(), self.execution_id.clone())
-        else {
+        let Some(execution_id) = self.execution_id.clone() else {
             return;
         };
-        let read = ConductorView::read(
+        let unavailable = self.conductor.unavailable_reason().map(str::to_string);
+        let harness = self.conductor.harness();
+        super::reader::serve_conductor_read(
+            &mut self.link,
+            &self.timing,
             self.engine.store(),
             &execution_id,
-            request.after,
-            request.limit as usize,
-        );
-        let view = match read {
-            Ok(view) => match self.conductor.unavailable_reason() {
-                None => view.available_on(self.conductor.harness()),
+            request,
+            |view| match unavailable {
+                None => view.available_on(harness),
                 Some(reason) => view.without_conductor(reason),
             },
-            Err(error) => {
-                tracing::warn!(%error, "cannot read the conductor's state");
-                self.fail_read(&request.request_id, &error.to_string())
-                    .await;
-                return;
-            }
-        };
-        if let Err(error) = client
-            .upload_conductor_read(&request.request_id, &view)
-            .await
-        {
-            self.link.failed(&error, &self.timing);
-        }
+        )
+        .await;
     }
 }
 

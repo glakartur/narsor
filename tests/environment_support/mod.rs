@@ -42,11 +42,11 @@ pub fn backend(id: &str) -> BackendRecord {
         id,
         BackendKind::Kubernetes,
         TrustScope::Dedicated,
-        BackendLimits {
-            max_concurrent_tasks: 3,
-            default_resources: ResourceProfile::new(1000, 2048),
-            max_resources: Some(ResourceProfile::new(4000, 8192)),
-        },
+        BackendLimits::new(
+            3,
+            ResourceProfile::new(1000, 2048),
+            Some(ResourceProfile::new(4000, 8192)),
+        ),
     );
     record.secret_delivery = SecretDeliveryMode::Platform;
     record.secrets = vec![BackendSecret {

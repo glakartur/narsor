@@ -61,6 +61,10 @@ impl ContractTarget for FakeTarget {
         assert!(backend.kill_workload(task), "a workload to kill");
     }
 
+    fn kill_reader(&self, backend: &FakeBackend, task: &TaskResources) -> bool {
+        backend.kill_reader(task)
+    }
+
     fn patience(&self) -> Duration {
         Duration::from_secs(15)
     }
@@ -156,24 +160,51 @@ impl ContractTarget for LocalTarget {
         }
     }
 
+    fn storage_dir(
+        &self,
+        backend: &LocalBackend,
+        task: &TaskResources,
+    ) -> Option<std::path::PathBuf> {
+        Some(backend.storage_dir(task))
+    }
+
+    fn kill_reader(&self, backend: &LocalBackend, task: &TaskResources) -> bool {
+        let Some(pid) = backend.reader_pid(task) else {
+            return false;
+        };
+        // SAFETY: signalling the reader's own process group.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        true
+    }
+
     fn cleanup(&self, backend: &LocalBackend) {
         // Runners outlive their controller by design; a finished scenario
-        // must not leave any behind.
-        let Ok(entries) = fs::read_dir(self.config.root.join("workloads")) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(task_id) = TaskId::parse(&name) else {
+        // must not leave any behind — workers and readers alike.
+        for (directory, suffix) in [("workloads", ""), ("readers", "-reader")] {
+            let Ok(entries) = fs::read_dir(self.config.root.join(directory)) else {
                 continue;
             };
-            let Ok(task) = backend.resources(&task_id, &name) else {
-                continue;
-            };
-            if let Some(pid) = backend.runner_pid(&task) {
-                // SAFETY: as above.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let key = name.strip_suffix(suffix).unwrap_or(&name).to_string();
+                let Ok(task_id) = TaskId::parse(&key) else {
+                    continue;
+                };
+                let Ok(task) = backend.resources(&task_id, &key) else {
+                    continue;
+                };
+                let pid = if suffix.is_empty() {
+                    backend.runner_pid(&task)
+                } else {
+                    backend.reader_pid(&task)
+                };
+                if let Some(pid) = pid {
+                    // SAFETY: as above.
+                    unsafe {
+                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    }
                 }
             }
         }
@@ -191,7 +222,7 @@ contract_suite!(local, crate::LocalTarget);
 /// owner resume, and a finished step is never executed again (R13).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_engine_work_survives_loss_and_owner_resume() {
-    use narsor_engine::orchestration::{OwnerCommand, TaskLifecycle};
+    use narsor_engine::orchestration::{OwnerCommand, RunnerState};
 
     let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::without_auto_resume().await
     else {
@@ -201,9 +232,10 @@ async fn local_engine_work_survives_loss_and_owner_resume() {
     let before = finished_work(&h).await;
 
     h.kill_workload("task-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
+    h.wait_runner_state("task-1", RunnerState::Interrupted)
+        .await;
     h.must("task-1", OwnerCommand::Resume, "resume-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
 
     assert_work_continued(&h, &before);
 }
@@ -213,7 +245,7 @@ async fn local_engine_work_survives_loss_and_owner_resume() {
 /// task's history shows the loss and the automatic resume (R1, R2, AE2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_engine_work_survives_loss_and_automatic_resume() {
-    use narsor_engine::orchestration::{Observation, TaskLifecycle};
+    use narsor_engine::orchestration::{Observation, RunnerState};
 
     let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::new().await else {
         return;
@@ -225,7 +257,7 @@ async fn local_engine_work_survives_loss_and_automatic_resume() {
     h.kill_workload("task-1");
     h.wait_for("a new runner", |h| {
         let record = h.record("task-1");
-        record.lifecycle == TaskLifecycle::Running
+        record.runner_state == RunnerState::Running
             && record
                 .runner
                 .is_some_and(|runner| runner.incarnation != first)

@@ -123,6 +123,7 @@ impl ProtocolService {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
+        Self::require_worker(identity)?;
         self.credentials
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;
@@ -136,6 +137,7 @@ impl ProtocolService {
         identity: &RunnerIdentity,
         material_id: &str,
     ) -> ProtocolResult<MaterialView> {
+        Self::require_worker(identity)?;
         Ok(self.materials.get(&identity.task_id, material_id)?.view())
     }
 
@@ -146,6 +148,7 @@ impl ProtocolService {
         material_id: &str,
         sha256: &str,
     ) -> ProtocolResult<PathBuf> {
+        Self::require_worker(identity)?;
         let material = self.materials.get(&identity.task_id, material_id)?;
         Ok(self.materials.blob_file(&material, sha256)?)
     }
@@ -158,6 +161,7 @@ impl ProtocolService {
         material_id: &str,
         request: MaterialAckRequest,
     ) -> ProtocolResult<MaterialAckResponse> {
+        Self::require_worker(identity)?;
         let (record, changed) = self.materials.mark_delivered(
             &identity.task_id,
             material_id,
@@ -311,7 +315,7 @@ impl ProtocolService {
     /// Refuses materials for a task that is archived (or being archived).
     fn admit_material(&self, task_id: &TaskId) -> MaterialResult<()> {
         match self.control.task(task_id) {
-            Ok(record) if record.lifecycle.is_archival() => {
+            Ok(record) if record.runner_state.is_archival() => {
                 Err(MaterialError::TaskArchived(task_id.clone()))
             }
             Ok(_) => Ok(()),

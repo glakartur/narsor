@@ -34,6 +34,8 @@ Bez żywego runnera nie ma też czego czytać. Serwer oddaje treść rozmowy wy�
 - R8. Wznowione zadanie wraca w to samo miejsce przebiegu. Zadanie czekające na decyzję operatora czeka dalej na tę samą decyzję, a odpowiedź, którą operator zaczął pisać, nie ginie.
 
 **Odczyt rozmowy bez żywego runnera**
+> **Przypis (D63):** R9–R11 zastępuje D63 w `ARCHITECTURE_DECISIONS.md`. Zatrzymany lub przerwany task, na każdym backendzie, czyta osobny runner tylko do odczytu (`narsor-runner --read-only`), a nie zapis na dysku daemona. Rozmowa zdalnego zadania bez runnera nie jest już „niedostępna jak dziś” (R11), a odczyt z zapisu (R9) i oznaczenie „zapis sprzed…” (R10) zniknęły razem z odczytem storage przez centralę (D59). Źródło: `docs/brainstorms/2026-10-18-zwalnianie-slotow-wg-stanu-wykonania-requirements.md` (R8–R12).
+
 - R9. Gdy lokalne zadanie nie ma żywego runnera (wstrzymane, w trakcie wznawiania, po wyczerpaniu limitu), jego rozmowy da się czytać z zapisu na dysku. Dotyczy to TUI (zakładka *Rozmowa*, rozmowa kroku na *Przebiegu*) i CLI (`narsor task conversation`).
 - R10. Rozmowa czytana z zapisu jest tylko do odczytu i ma widoczne oznaczenie, że to zapis, a nie odczyt na żywo (np. „zapis sprzed 3 min”). Po powrocie żywego runnera odczyt wraca do niego bez działania operatora.
 - R11. Zadania zdalne bez żywego runnera zachowują się jak dziś: rozmowa jest niedostępna z podanym powodem (KTD4).

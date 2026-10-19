@@ -22,6 +22,7 @@
 //! [`Styles::chat_body`], the conversation scale of the role module.
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
@@ -32,8 +33,9 @@ use ratatui::Frame;
 use crate::api::{ApiClient, ClientError, ConversationResponse as Page};
 use crate::cli::task_text::RecordAge;
 use crate::controller_protocol::{
-    ConversationPageQuery, ExecutionEventsSource, CONVERSATION_RECORD_UNREADABLE,
-    CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
+    ConversationPageQuery, ExecutionEventsSource, CONVERSATION_READER_STARTING,
+    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
+    CONVERSATION_UNAVAILABLE,
 };
 use crate::domain::{Event, EventData};
 use narsor_protocol::api::{ConversationState, Position};
@@ -41,6 +43,7 @@ use narsor_protocol::api::{ConversationState, Position};
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{bar_prefix, PREFIX_WIDTH};
 use super::super::layout::first_row;
+use super::READER_RETRY;
 use crate::tui::conversation::transcript_entries;
 use crate::tui::keymap::Action;
 use crate::tui::style::{Role, Styles};
@@ -166,6 +169,9 @@ where
 /// Why a read of an attempt's conversation failed, as the tab tells it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadFailure {
+    /// The task is stopped and its read-only runner is not connected yet
+    /// (D63): not a failure to show as one, the read is asked again shortly.
+    Starting,
     /// No live runner can serve it and there is no record to read here (a
     /// remote task without its runner): the server's reason.
     Unavailable(String),
@@ -185,6 +191,9 @@ impl ReadFailure {
                     .unwrap_or(message);
                 Self::RecordUnreadable(one_line(detail))
             }
+            ClientError::Refused { code, .. } if code == CONVERSATION_READER_STARTING => {
+                Self::Starting
+            }
             ClientError::Refused { code, .. } if code == CONVERSATION_UNAVAILABLE => {
                 Self::Unavailable(reason)
             }
@@ -195,6 +204,7 @@ impl ReadFailure {
     /// The reason alone.
     pub fn detail(&self) -> &str {
         match self {
+            Self::Starting => "wczytywanie…",
             Self::Unavailable(detail) | Self::RecordUnreadable(detail) | Self::Failed(detail) => {
                 detail
             }
@@ -205,6 +215,11 @@ impl ReadFailure {
     /// step a failed read was of, when the note stands for several.
     pub fn note(&self, step: Option<&str>) -> (String, Role) {
         match self {
+            Self::Starting => (
+                "◌ wczytywanie rozmowy… zadanie jest zatrzymane, czytelnik się uruchamia"
+                    .to_string(),
+                Role::Attention,
+            ),
             Self::Unavailable(detail) => (
                 format!("◌ rozmowa niedostępna: {}", one_line(detail)),
                 Role::Attention,
@@ -266,6 +281,8 @@ pub struct Attempt {
     recorded_at: Option<DateTime<Utc>>,
     failure: Option<ReadFailure>,
     revision: Option<u64>,
+    /// When a read told "the reader is starting" is asked again.
+    retry_at: Option<Instant>,
     transcript: TranscriptState,
 }
 
@@ -281,6 +298,7 @@ impl Attempt {
             recorded_at: None,
             failure: None,
             revision: None,
+            retry_at: None,
             transcript: TranscriptState::new(TranscriptId::from(attempt_id)),
         }
     }
@@ -357,7 +375,17 @@ impl Attempts {
 
     /// Whether the attempt must be read for a task at `revision`.
     pub fn needs_read(&self, attempt_id: &str, revision: u64) -> bool {
+        self.needs_read_at(attempt_id, revision, Instant::now())
+    }
+
+    /// [`Self::needs_read`] as of `now`: a read told "the reader is
+    /// starting" is due again once [`READER_RETRY`] has passed, whatever the
+    /// revision.
+    pub fn needs_read_at(&self, attempt_id: &str, revision: u64, now: Instant) -> bool {
         self.map.get(attempt_id).is_none_or(|attempt| {
+            if attempt.failure == Some(ReadFailure::Starting) {
+                return attempt.retry_at.is_none_or(|at| now >= at);
+            }
             // A closed conversation that was read whole never changes —
             // but one read from the record is read again once the runner
             // may be back, so that its badge goes.
@@ -391,11 +419,24 @@ impl Attempts {
         from: u64,
         result: Result<AttemptRead, ReadFailure>,
     ) {
+        self.apply_at(attempt_id, revision, from, result, Instant::now());
+    }
+
+    /// [`Self::apply`] as of `now`.
+    pub fn apply_at(
+        &mut self,
+        attempt_id: &str,
+        revision: u64,
+        from: u64,
+        result: Result<AttemptRead, ReadFailure>,
+        now: Instant,
+    ) {
         let attempt = self
             .map
             .entry(attempt_id.to_string())
             .or_insert_with(|| Attempt::new(attempt_id));
         attempt.revision = Some(revision);
+        attempt.retry_at = None;
         match result {
             Ok(read) => {
                 attempt.failure = None;
@@ -412,7 +453,12 @@ impl Attempts {
                 attempt.recorded_at = read.recorded_at;
                 attempt.transcript.replace_entries(attempt.entries.clone());
             }
-            Err(failure) => attempt.failure = Some(failure),
+            Err(failure) => {
+                if failure == ReadFailure::Starting {
+                    attempt.retry_at = Some(now + READER_RETRY);
+                }
+                attempt.failure = Some(failure);
+            }
         }
     }
 }
@@ -669,7 +715,7 @@ fn workflow_choices(events: &[Event]) -> Vec<(u64, TranscriptEntry)> {
 }
 
 /// Projects only events that record a person or decision-maker choosing a
-/// workflow output. Routine lifecycle events remain in the dedicated log.
+/// workflow output. Routine runner state events remain in the dedicated log.
 fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
     use crate::domain::event::AnsweredBy;
     use crate::domain::ConductorDecisionKind;

@@ -190,6 +190,10 @@ where
             "/controller/v1/tasks/{task_id}/runner-credentials",
             post(post_runner_credential),
         )
+        .route(
+            "/controller/v1/tasks/{task_id}/reader-credentials",
+            post(post_reader_credential),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&service),
             require_controller,
@@ -677,6 +681,16 @@ async fn post_runner_credential(
     Json(request): Json<RunnerCredentialRequest>,
 ) -> ProtocolResult<(StatusCode, Json<RunnerCredentialResponse>)> {
     let response = service.issue_runner_credential(&identity, &task_id, request)?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn post_reader_credential(
+    State(service): State<Service>,
+    Extension(identity): Extension<ControllerIdentity>,
+    Path(task_id): Path<String>,
+    Json(request): Json<RunnerCredentialRequest>,
+) -> ProtocolResult<(StatusCode, Json<RunnerCredentialResponse>)> {
+    let response = service.issue_reader_credential(&identity, &task_id, request)?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 

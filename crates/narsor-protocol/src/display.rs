@@ -5,7 +5,7 @@
 //! against a task's inputs and variables yields a [`TaskDisplay`], the plain
 //! values a client shows. `WORKFLOW_SCHEMA.md` §3.6 is the external contract.
 
-use crate::controller::{ResumeState, TaskLifecycle};
+use crate::controller::{ResumeState, RunnerState};
 use serde::{Deserialize, Serialize};
 
 /// Appended to captured output when the server truncates it at the byte cap.
@@ -46,10 +46,10 @@ pub fn exhaustion_loss(reason: &str) -> &str {
         .unwrap_or(reason)
 }
 
-/// What a task in `lifecycle` with `resume` waits for, or `None` when it is
+/// What a task in `runner_state` with `resume` waits for, or `None` when it is
 /// not interrupted or its loss is unknown.
-pub fn loss_state(lifecycle: TaskLifecycle, resume: &ResumeState) -> Option<LossState> {
-    if lifecycle != TaskLifecycle::Interrupted {
+pub fn loss_state(runner_state: RunnerState, resume: &ResumeState) -> Option<LossState> {
+    if runner_state != RunnerState::Interrupted {
         return None;
     }
     if let Some(exhausted) = &resume.exhausted {
@@ -62,9 +62,7 @@ pub fn loss_state(lifecycle: TaskLifecycle, resume: &ResumeState) -> Option<Loss
         });
     }
     match &resume.last_loss {
-        Some(loss) if loss.from == TaskLifecycle::PauseRequested => {
-            Some(LossState::LostWhilePausing)
-        }
+        Some(loss) if loss.from == RunnerState::PauseRequested => Some(LossState::LostWhilePausing),
         _ => None,
     }
 }

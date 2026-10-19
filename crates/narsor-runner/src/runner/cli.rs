@@ -8,6 +8,7 @@
 //!               [--launch-spec <file>] [--secrets-dir <dir>] \
 //!               [--home private|host] [--codex-home <dir>] \
 //!               [--claude-config-dir <dir>] [--claude-profile-source <dir>]
+//!               [--read-only]
 //! ```
 //!
 //! * `--task-storage` — the task's persistent volume (R9). Holds the Engine
@@ -29,6 +30,10 @@
 //! * `--claude-profile-source` — the Claude Code profile (in Kubernetes the
 //!   read-only mount of the profile Secret) merged into Claude's work
 //!   directory before every start; see [`super::profile`].
+//!
+//! * `--read-only` — the runner only answers reads of the storage and
+//!   changes nothing on it; see [`super::reader`]. It takes the same lock, so
+//!   it never runs beside a runner that works on the storage.
 //!
 //! Inherited `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `CODEX_API_KEY` are
 //! dropped, so a harness keeps to its subscription login; a task that wants
@@ -119,6 +124,13 @@ pub struct RunnerArgs {
     #[arg(long, value_name = "DIRECTORY")]
     pub claude_profile_source: Option<PathBuf>,
 
+    /// Only answer reads of the storage (conversation pages, events, the
+    /// conductor's chat) and change nothing on it: no preparation,
+    /// initialization, session, snapshot or work. `--launch-spec`,
+    /// `--secrets-dir`, `--home` and the harness directories are ignored.
+    #[arg(long)]
+    pub read_only: bool,
+
     /// Long-poll wait in seconds (the control plane caps it).
     #[arg(long, value_name = "SECONDS", default_value_t = 25, hide = true)]
     pub poll_wait_secs: u64,
@@ -183,6 +195,7 @@ pub async fn run_command(args: RunnerArgs) -> i32 {
             ..defaults
         },
         contract: BaseImageContract::default(),
+        read_only: args.read_only,
     };
 
     match run(config, apply_environment).await {

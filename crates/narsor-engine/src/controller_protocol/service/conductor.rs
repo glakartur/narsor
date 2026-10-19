@@ -1,19 +1,20 @@
-//! The state of a task's conductor for owners (U5): from the live runner
-//! through the relay, or — for the daemon's own local backend, when its
-//! runner is not running — straight from the task's storage.
+//! The state of a task's conductor for owners (U5): from the runner through
+//! the relay — the task's own while it runs, a read-only runner's while it
+//! is stopped (D63).
 //!
 //! The same shape as the execution events (see [`super::events`]); only
 //! the payload differs.
 
-use super::events::{is_safe_component, not_running};
+use super::events::not_running;
+use super::reader::ReaderReady;
 use super::relay::RelayGuard;
-use super::ProtocolService;
+use super::{ProtocolService, ReadBlocker};
 use crate::conductor::{ConductorView, DEFAULT_CHAT_PAGE, MAX_CHAT_PAGE};
 use crate::controller_protocol::credentials::RunnerIdentity;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
-use crate::orchestration::{OwnerRef, TaskRecord};
+use crate::orchestration::OwnerRef;
 
 impl ProtocolService {
     /// The conductor of the task's execution: its chat after `query.after`
@@ -21,10 +22,10 @@ impl ProtocolService {
     /// the diagnosis of a failed step.
     ///
     /// A live runner answers through the relay and may fail to in time
-    /// (`503`, retryable). Every other state is an ordinary answer: the
-    /// daemon's local backend reads the task's own storage, with the
-    /// conductor marked unavailable, and any other backend says why
-    /// nothing can be read.
+    /// (`503`, retryable). A stopped task is read by a read-only runner the
+    /// control plane has the controller start (D63): until it is connected
+    /// the answer is `reader_starting`, and the client asks again. Every
+    /// other state is an ordinary answer saying why nothing can be read.
     pub async fn conductor(
         &self,
         owner: &OwnerRef,
@@ -32,33 +33,44 @@ impl ProtocolService {
         query: ConductorReadQuery,
     ) -> ProtocolResult<ConductorReadResponse> {
         let record = self.owned_task(owner, task_id)?;
+        self.note_details_read(&record);
         let limit = query
             .limit
             .map_or(DEFAULT_CHAT_PAGE, |limit| limit as usize)
             .clamp(1, MAX_CHAT_PAGE);
-        let execution_id = record
+        let has_execution = record
             .runner
             .as_ref()
-            .and_then(|runner| runner.snapshot.execution_cursor.execution_id.clone());
-        let Some(execution_id) = execution_id else {
+            .is_some_and(|runner| runner.snapshot.execution_cursor.execution_id.is_some());
+        if !has_execution {
             return Ok(unavailable(
                 ConversationUnavailableReason::NotStarted,
                 "the task has no execution yet",
             ));
-        };
+        }
         match self.live_read_blocker(&record, self.control.now())? {
             None => {
                 self.relayed_conductor(&record.task_id, query.after, limit)
                     .await
             }
-            Some(ConversationUnavailableReason::Archived) => Ok(unavailable(
-                ConversationUnavailableReason::Archived,
-                "the task is archived: its storage was deleted",
-            )),
-            Some(reason) => {
-                self.stored_conductor(&record, &execution_id, reason, query.after, limit)
-                    .await
+            Some(ReadBlocker::Unavailable(ConversationUnavailableReason::Archived)) => {
+                Ok(unavailable(
+                    ConversationUnavailableReason::Archived,
+                    "the task is archived: its storage was deleted",
+                ))
             }
+            Some(ReadBlocker::Unavailable(reason)) => Ok(unavailable(reason, not_running(reason))),
+            Some(ReadBlocker::Reader(reason)) => match self.reader_ready(&record).await? {
+                ReaderReady::Ready => {
+                    self.relayed_conductor(&record.task_id, query.after, limit)
+                        .await
+                }
+                ReaderReady::Starting => Ok(unavailable(
+                    ConversationUnavailableReason::ReaderStarting,
+                    not_running(ConversationUnavailableReason::ReaderStarting),
+                )),
+                ReaderReady::NotReadable => Ok(unavailable(reason, not_running(reason))),
+            },
         }
     }
 
@@ -97,53 +109,6 @@ impl ProtocolService {
                 "the runner did not answer the conductor request in time",
             )),
         }
-    }
-
-    /// Reads the task's storage, when this host holds it.
-    async fn stored_conductor(
-        &self,
-        record: &TaskRecord,
-        execution_id: &str,
-        reason: ConversationUnavailableReason,
-        after: u64,
-        limit: usize,
-    ) -> ProtocolResult<ConductorReadResponse> {
-        let Some(local) = self
-            .local_storage
-            .as_ref()
-            .filter(|local| local.backend_id == record.assignment.backend_id)
-        else {
-            return Ok(unavailable(reason, not_running(reason)));
-        };
-        // The id comes from a runner's report: it must never walk the path.
-        if !is_safe_component(execution_id) {
-            return Ok(unavailable(
-                reason,
-                "the execution id the runner reported is not valid",
-            ));
-        }
-        let store = local.store_of(&record.task_id);
-        let execution_id = execution_id.to_string();
-        let read = tokio::task::spawn_blocking(move || {
-            if !store.exists(&execution_id) {
-                return Ok(None);
-            }
-            ConductorView::read(&store, &execution_id, after, limit).map(Some)
-        })
-        .await
-        .map_err(|error| ProtocolError::Internal(error.to_string()))?
-        .map_err(|error| ProtocolError::Internal(error.to_string()))?;
-        let Some(view) = read else {
-            return Ok(unavailable(
-                reason,
-                "the task's storage holds no such execution",
-            ));
-        };
-        let view = view.without_conductor(not_running(reason)).cleaned();
-        Ok(ConductorReadResponse::Available {
-            conductor: Box::new(wire_conductor_view(view)?),
-            source: ExecutionEventsSource::Storage,
-        })
     }
 
     /// A conductor view the runner uploads for a waiting owner. Only a

@@ -28,7 +28,7 @@ use axum::Router;
 use chrono::Utc;
 use narsor_engine::controller_protocol::{
     AcquireLeaseRequest, ConductorReadQuery, ConductorReadResponse, ConversationPageQuery,
-    CreateEnrollmentRequest, OwnerCommandRequest, ProtocolService, ReportRequest,
+    CreateEnrollmentRequest, OwnerCommandRequest, ProtocolConfig, ProtocolService, ReportRequest,
     RunnerCredentialRequest, SubmitInputRequest, SubmitOperatorCommandRequest, LOCAL_OWNER,
 };
 use narsor_engine::domain::{
@@ -160,12 +160,22 @@ impl Fixture {
         let state = root.dir("control");
         let control = ControlPlane::new(StatePaths::new(&state));
         let default = Arc::new(LiveDefault::default());
-        let service = Arc::new(ProtocolService::new(
+        // Several scenarios work on a finished task's live runner (undo a
+        // decision, a harness that changes under a task that waits at its
+        // end); the policy that would stop it is off here and has its own
+        // tests. Reading a stopped task needs a read-only runner (D63, see
+        // the reader tests below), but these scenarios need the runner that
+        // works, so they stay off.
+        let service = Arc::new(ProtocolService::with_config(
             control,
             environment_support::seeded_catalog_resolver_with(
                 &state,
                 Arc::clone(&default) as Arc<dyn HarnessDefaults>,
             ),
+            ProtocolConfig {
+                slot_release: false,
+                ..ProtocolConfig::default()
+            },
         ));
         let code = service
             .create_enrollment(BACKEND, CreateEnrollmentRequest::default())
@@ -324,6 +334,30 @@ impl Fixture {
                 },
             )
             .expect("runner credential");
+        let path = self
+            .root
+            .dir("credentials")
+            .join(format!("{task}-{incarnation}"));
+        fs::write(&path, issued.credential).expect("write the credential");
+        path
+    }
+
+    /// Issues the credential of a read-only runner for a stopped task an
+    /// owner is reading, the way a controller asks for it (D63), and writes
+    /// it to a file.
+    fn reader_credential(&self, task: &str, incarnation: &str) -> PathBuf {
+        let issued = self
+            .service
+            .issue_reader_credential(
+                &self.controller,
+                task,
+                RunnerCredentialRequest {
+                    lease_epoch: self.epoch,
+                    generation: self.record(task).generation,
+                    incarnation: incarnation.to_string(),
+                },
+            )
+            .expect("reader credential");
         let path = self
             .root
             .dir("credentials")
@@ -833,9 +867,11 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         "the safe point was acknowledged for the pause"
     );
     fixture.report("task-1", Observation::PausedAtSafePoint);
-    // With its compute gone, the transcript is explicitly unavailable;
-    // nothing was replicated to serve it from.
-    let refused = fixture
+    // With its compute gone, the transcript is read by a read-only runner
+    // the controller starts for the reader's lease (D63): the first read
+    // leases it and is told it is starting, the control plane reads nothing
+    // from the storage itself.
+    let starting = fixture
         .service
         .conversation_page(
             &fixture.owner(),
@@ -844,14 +880,61 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
             ConversationPageQuery::default(),
         )
         .await
-        .expect_err("no live runner to relay from");
+        .expect_err("the reader is not connected yet");
     assert!(
-        refused.to_string().contains("conversation_unavailable"),
-        "{refused}"
+        starting
+            .to_string()
+            .contains("conversation_reader_starting"),
+        "{starting}"
     );
+    let mut reader_launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    reader_launch.storage = launch.storage.clone();
+    reader_launch.args = vec!["--read-only".to_string()];
+    let credential = fixture.reader_credential("task-1", "reader-1");
+    let reader = fixture.spawn(&reader_launch, "reader-1", &credential);
+    // The reader's first poll is what connects it; until then the read is
+    // told to ask again.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let read = loop {
+        match fixture
+            .service
+            .conversation_page(
+                &fixture.owner(),
+                "task-1",
+                &attempt,
+                ConversationPageQuery::default(),
+            )
+            .await
+        {
+            Ok(page) => break page,
+            Err(error)
+                if error.to_string().contains("conversation_reader_starting")
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("the reader's page: {error}"),
+        }
+    };
+    match read {
+        narsor::api::ConversationResponse::Recorded {
+            entries, source, ..
+        } => {
+            assert!(!entries.is_empty());
+            assert_eq!(
+                source,
+                Some(narsor_engine::controller_protocol::ExecutionEventsSource::Runner)
+            );
+        }
+        other => panic!("no record: {other:?}"),
+    }
 
-    // Resume: a new incarnation on the same storage.
+    // Resume: a new incarnation on the same storage. The resume ends the
+    // reader's lease and its credential, and the reader lets go of the
+    // storage before the controller would start the runner (R15).
     fixture.command("task-1", OwnerCommand::Resume, "resume-1");
+    let status = fixture.wait_exit(reader, Duration::from_secs(30));
+    assert!(status.success(), "the reader leaves cleanly: {status:?}");
     let credential = fixture.credential("task-1", "pod-2");
     fixture.spawn(&launch, "pod-2", &credential);
     wait_until_async(Duration::from_secs(30), "the resumed runner", || {
@@ -928,6 +1011,96 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         })
         .collect();
     assert_eq!(harnesses, vec!["claude-code", "claude-code"]);
+}
+
+/// U6 (F4, AE8): the owner's answer to a stopped task is kept, resumes the
+/// task, and the runner of the next start consumes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_to_a_stopped_task_resumes_it_and_the_next_runner_consumes_it() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let (bare, pinned) = origin(&fixture.root);
+    let bin = fake_claude(&fixture.root);
+    let spec = spec(
+        GATED_WORKFLOW,
+        TaskWorkspace::Git(GitIdentity {
+            repository: Some("demo".to_string()),
+            remote_url: bare.display().to_string(),
+            commit: pinned,
+            git_ref: None,
+            credential: None,
+        }),
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    fixture.report("task-1", Observation::StartAccepted);
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    let credential = fixture.credential("task-1", "pod-1");
+    let first = fixture.spawn(&launch, "pod-1", &credential);
+    wait_until_async(Duration::from_secs(30), "the gate", || {
+        fixture.record("task-1").pending_input_id().is_some()
+    })
+    .await;
+    fixture.report("task-1", Observation::RunnerReady);
+
+    // Stopped at the gate, its compute gone.
+    fixture.command("task-1", OwnerCommand::Pause, "pause-1");
+    let status = fixture.wait_exit(first, Duration::from_secs(30));
+    assert!(
+        status.success(),
+        "a paused runner exits cleanly: {status:?}"
+    );
+    fixture.report("task-1", Observation::PausedAtSafePoint);
+    let record = fixture.record("task-1");
+    assert_eq!(
+        record.runner_state,
+        narsor_engine::orchestration::RunnerState::Stopped
+    );
+    let pending = record
+        .pending_input_id()
+        .expect("the last snapshot still shows the gate")
+        .to_string();
+
+    // The answer alone resumes the task: the owner sends no resume.
+    fixture
+        .service
+        .submit_input(
+            &fixture.owner(),
+            "task-1",
+            SubmitInputRequest {
+                pending_input_id: pending,
+                idempotency_key: "answer-1".to_string(),
+                delivery: narsor_protocol::api::HumanInputDeliveryDto {
+                    chosen_label: Some("ok".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .expect("an answer to a stopped task is kept");
+    let record = fixture.record("task-1");
+    assert_eq!(
+        record.runner_state,
+        narsor_engine::orchestration::RunnerState::Provisioning
+    );
+    assert_eq!(
+        record.inputs[0].status,
+        narsor_engine::orchestration::InputStatus::Queued,
+        "kept until a runner takes it"
+    );
+
+    let credential = fixture.credential("task-1", "pod-2");
+    fixture.spawn(&launch, "pod-2", &credential);
+    wait_until_async(Duration::from_secs(30), "completion", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    let record = fixture.record("task-1");
+    assert_eq!(
+        record.inputs[0].status,
+        narsor_engine::orchestration::InputStatus::Consumed
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3293,4 +3466,245 @@ async fn the_conductor_comes_up_once_the_default_is_a_harness_the_task_can_run()
     })
     .await;
     assert_eq!(view.harness.as_deref(), Some("claude-code"));
+}
+
+// ---------------------------------------------------------------------------
+// The read-only runner (phase 2, U8)
+// ---------------------------------------------------------------------------
+
+type TreeEntry = (bool, u64, std::time::SystemTime);
+
+/// Kind, size and modification time of every entry under `root`, `root`
+/// itself and the directories included: a file created and removed again
+/// still moves its directory's time.
+fn storage_tree(root: &Path) -> std::collections::BTreeMap<String, TreeEntry> {
+    fn walk(root: &Path, dir: &Path, tree: &mut std::collections::BTreeMap<String, TreeEntry>) {
+        let meta = fs::symlink_metadata(dir).expect("metadata");
+        let key = dir.strip_prefix(root).unwrap().display().to_string();
+        let size = if meta.is_dir() { 0 } else { meta.len() };
+        tree.insert(key, (meta.is_dir(), size, meta.modified().expect("mtime")));
+        if meta.is_dir() {
+            for entry in fs::read_dir(dir).expect("read the directory") {
+                walk(root, &entry.expect("entry").path(), tree);
+            }
+        }
+    }
+    let mut tree = std::collections::BTreeMap::new();
+    walk(root, root, &mut tree);
+    tree
+}
+
+/// Whether some process holds the storage's runner lock.
+fn storage_locked(storage: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let file = fs::File::open(storage.join("narsor/runner.lock")).expect("the lock file");
+    // SAFETY: `file` owns a valid descriptor for the duration of the call.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    !taken
+}
+
+/// What the owner reads of the task: one conversation page, the events and
+/// the conductor's chat, as JSON so two reads compare field by field.
+async fn owner_reads(
+    fixture: &Fixture,
+    task: &str,
+    attempt: &str,
+) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+    let page = fixture
+        .service
+        .conversation_page(
+            &fixture.owner(),
+            task,
+            attempt,
+            ConversationPageQuery::default(),
+        )
+        .await
+        .expect("a relayed page");
+    let events = fixture
+        .service
+        .execution_events(
+            &fixture.owner(),
+            task,
+            narsor_engine::controller_protocol::ExecutionEventsQuery::default(),
+        )
+        .await
+        .expect("relayed events");
+    let conductor = conductor_view(fixture, task).await;
+    (
+        serde_json::to_value(page).unwrap(),
+        serde_json::to_value(events).unwrap(),
+        serde_json::json!({
+            "chat": conductor.chat,
+            "chat_has_more": conductor.chat_has_more,
+            "proposals": conductor.proposals,
+            "decisions": conductor.decisions,
+        }),
+    )
+}
+
+/// A runner on `task-1` whose agent hangs mid-action, brought to `Running`,
+/// with the id of the agent's attempt (so a conversation page can be asked
+/// for). Returns the launch, the runner's index and the attempt.
+async fn runner_in_an_action(fixture: &mut Fixture) -> (Launch, usize, String) {
+    let bin = hanging_claude(&fixture.root);
+    let spec = spec(
+        AGENT_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(fixture, "task-1", &spec).with_bin_first(&bin);
+    let runner = running_runner(fixture, "task-1", &launch).await;
+    let pids = launch.home().join("claude-pids");
+    wait_until_async(Duration::from_secs(30), "the hanging agent", || {
+        pids.is_file()
+    })
+    .await;
+    let mut attempt = None;
+    wait_until_async(Duration::from_secs(10), "an attempt in a snapshot", || {
+        attempt =
+            fixture
+                .record("task-1")
+                .runner
+                .and_then(|runner| match runner.snapshot.conversation {
+                    narsor_engine::orchestration::ConversationAvailability::Live { attempts } => {
+                        attempts.first().map(|attempt| attempt.attempt_id.clone())
+                    }
+                    _ => None,
+                });
+        attempt.is_some()
+    })
+    .await;
+    (launch, runner, attempt.unwrap())
+}
+
+/// Starts a read-only runner for `task-1` under a fresh incarnation.
+fn spawn_reader(fixture: &mut Fixture, launch: &mut Launch, incarnation: &str) -> usize {
+    launch.args = vec!["--read-only".to_string()];
+    let credential = fixture.credential("task-1", incarnation);
+    fixture.spawn(launch, incarnation, &credential)
+}
+
+/// AE7: a storage whose runner died in the middle of an action, with its
+/// session still open, is read by the read-only runner — the conversation,
+/// the events and the conductor's chat, entry for entry as the live runner
+/// gave them — and not one path, size or time on the storage changes. At
+/// the stop directive it exits and lets go of the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_runner_reads_an_interrupted_storage_and_changes_nothing() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let (mut launch, live, attempt) = runner_in_an_action(&mut fixture).await;
+    let from_live = owner_reads(&fixture, "task-1", &attempt).await;
+
+    // The workload dies in the middle of the action: the session stays
+    // open and the action stays in flight.
+    fixture.kill(live);
+    assert_eq!(launch.status(), Some(ExecutionStatus::Running));
+    let session: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(launch.storage.join("narsor/session.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(session["closed"].is_null(), "the session is open");
+    let before = storage_tree(&launch.storage);
+    let events_before = launch.events().len();
+
+    let reader = spawn_reader(&mut fixture, &mut launch, "reader-1");
+    let from_reader = owner_reads(&fixture, "task-1", &attempt).await;
+    assert_eq!(from_reader.0, from_live.0, "the same conversation page");
+    assert_eq!(from_reader.1, from_live.1, "the same events");
+    assert_eq!(from_reader.2, from_live.2, "the same conductor chat");
+    assert!(storage_locked(&launch.storage), "the reader holds the lock");
+
+    // The directive stops it.
+    fixture.command("task-1", OwnerCommand::Pause, "pause-1");
+    let status = fixture.wait_exit(reader, Duration::from_secs(30));
+    assert!(
+        status.success(),
+        "a stopped reader exits cleanly: {status:?}"
+    );
+    assert!(!storage_locked(&launch.storage), "the lock is let go");
+    assert_eq!(launch.status(), Some(ExecutionStatus::Running));
+    assert_eq!(launch.events().len(), events_before, "no event written");
+    assert_eq!(
+        storage_tree(&launch.storage),
+        before,
+        "not a path, size or time changed"
+    );
+}
+
+/// What an owner's events read comes to while the reader cannot answer it.
+async fn refused_read(fixture: &Fixture) -> String {
+    let service = Arc::clone(&fixture.service);
+    let owner = fixture.owner();
+    tokio::spawn(async move {
+        service
+            .execution_events(
+                &owner,
+                "task-1",
+                narsor_engine::controller_protocol::ExecutionEventsQuery::default(),
+            )
+            .await
+    })
+    .await
+    .expect("the read task")
+    .expect_err("the reader cannot read")
+    .to_string()
+}
+
+/// Runs a reader on the storage as it is and checks that it says why it
+/// cannot read, exits with the problem code and leaves the storage alone.
+async fn unavailable_reader(fixture: &mut Fixture, launch: &mut Launch, incarnation: &str) {
+    let before = storage_tree(&launch.storage);
+    let reader = spawn_reader(fixture, launch, incarnation);
+    let refused = refused_read(fixture).await;
+    assert!(refused.contains("runner_read_failed"), "{refused}");
+    let started = Instant::now();
+    let status = fixture.wait_exit(reader, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(3), "a runner problem: {status:?}");
+    assert!(started.elapsed() < Duration::from_secs(5), "no waiting");
+    assert_eq!(storage_tree(&launch.storage), before, "nothing changed");
+}
+
+/// A storage another runner holds is not waited for: the reader says it
+/// cannot read, exits at once and changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_runner_on_a_busy_storage_says_so_and_exits() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let (mut launch, live, _) = runner_in_an_action(&mut fixture).await;
+    // The live runner still holds the storage: another one cannot have it.
+    assert!(storage_locked(&launch.storage));
+    unavailable_reader(&mut fixture, &mut launch, "reader-1").await;
+    assert!(
+        fixture.runners[live].try_wait().unwrap().is_none(),
+        "the live runner was not disturbed"
+    );
+    assert!(storage_locked(&launch.storage), "and still holds the lock");
+}
+
+/// A storage no runner ever finished initializing is not made into one by a
+/// read, whether its marker or its lock file is what is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_runner_on_an_uninitialized_storage_says_so_and_creates_nothing() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let (mut launch, live, _) = runner_in_an_action(&mut fixture).await;
+    fixture.kill(live);
+
+    fs::remove_file(launch.storage.join("narsor/initialized.json")).unwrap();
+    unavailable_reader(&mut fixture, &mut launch, "reader-1").await;
+
+    fs::remove_dir_all(launch.storage.join("narsor")).unwrap();
+    unavailable_reader(&mut fixture, &mut launch, "reader-2").await;
+    assert!(
+        !launch.storage.join("narsor").exists(),
+        "not even the bookkeeping directory was created"
+    );
 }

@@ -93,6 +93,7 @@ pub mod init;
 mod materials;
 pub mod preflight;
 pub mod profile;
+mod reader;
 pub mod secrets;
 mod snapshot;
 pub mod storage;
@@ -109,9 +110,8 @@ use tokio::time::Instant;
 use crate::api::ClientError;
 use crate::conductor::LiveHarness;
 use crate::controller_protocol::{
-    ConversationPageRequest, DeliveredInput, ExecutionEventsPage, ExecutionEventsRequest,
-    RelayFailure, RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery,
-    RunnerPollResponse, TaskDefaultHarness,
+    ConversationPageRequest, DeliveredInput, ExecutionEventsRequest, RunnerClient, RunnerDirective,
+    RunnerLaunchView, RunnerPollQuery, RunnerPollResponse, TaskDefaultHarness,
 };
 use crate::domain::{
     AnsweredBy, ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec,
@@ -144,6 +144,8 @@ pub const PROBLEM_LAUNCH_SPEC: &str = "launch_spec_invalid";
 pub const PROBLEM_SECRET: &str = "secret_unavailable";
 /// Problem code: the storage could not be initialized (clone, marker).
 pub const PROBLEM_INITIALIZATION: &str = "initialization_failed";
+/// Problem code: a read-only runner could not open the storage to read it.
+pub const PROBLEM_READER_UNAVAILABLE: &str = "reader_unavailable";
 /// Problem code: the storage was left by an unexpected stop and no start or
 /// resume (the owner's or the resume policy's, D58) authorizes this
 /// incarnation to recover it (R13).
@@ -176,6 +178,9 @@ pub enum RunnerError {
     /// Another runner holds the storage.
     #[error("task storage '{0}' is in use by another runner")]
     StorageBusy(PathBuf),
+    /// A read-only runner found a storage no runner ever worked on.
+    #[error("task storage '{0}' was never initialized by a runner")]
+    StorageNotInitialized(PathBuf),
     /// The storage belongs to something else, or is not empty.
     #[error("task storage cannot be used: {0}")]
     ForeignStorage(String),
@@ -279,6 +284,8 @@ pub struct RunnerConfig {
     pub timing: RunnerTiming,
     /// The base-image contract to check.
     pub contract: BaseImageContract,
+    /// Only answer reads of the storage and change nothing on it ([`reader`]).
+    pub read_only: bool,
 }
 
 /// Runs one runner process to its end.
@@ -293,6 +300,9 @@ pub async fn run(
     config: RunnerConfig,
     apply_environment: impl FnOnce(&ProcessEnvironment),
 ) -> Result<RunnerExit, RunnerError> {
+    if config.read_only {
+        return reader::run(config).await;
+    }
     let storage = TaskStorage::new(&config.storage);
     let _lock = storage.lock()?;
     let mut link = Link::new(&config);
@@ -629,6 +639,21 @@ impl Link {
             .min(timing.retry_max);
         self.next_attempt = Instant::now() + delay;
         tracing::debug!(%error, ?delay, "control plane unreachable or refusing; retrying later");
+    }
+
+    /// Renews the credential; a refusal or a failure is handled as in
+    /// [`Link::failed`].
+    async fn renew(&mut self, timing: &RunnerTiming) {
+        let Some(client) = self.client() else {
+            return;
+        };
+        match client.renew().await {
+            Ok(renewed) => {
+                self.succeeded();
+                self.expires_at = Some(renewed.expires_at);
+            }
+            Err(error) => self.failed(&error, timing),
+        }
     }
 
     fn renew_due(&self, margin: Duration) -> bool {
@@ -1181,16 +1206,7 @@ impl Session {
     }
 
     async fn renew(&mut self) {
-        let Some(client) = self.link.client() else {
-            return;
-        };
-        match client.renew().await {
-            Ok(renewed) => {
-                self.link.succeeded();
-                self.link.expires_at = Some(renewed.expires_at);
-            }
-            Err(error) => self.link.failed(&error, &self.timing),
-        }
+        self.link.renew(&self.timing).await;
     }
 
     /// Acts on a poll answer: the default harness first — an action the
@@ -1319,75 +1335,33 @@ impl Session {
 
     /// Uploads one bounded conversation page an owner waits for.
     async fn serve_page(&mut self, request: ConversationPageRequest) {
-        let (Some(client), Some(execution_id)) = (self.link.client(), self.execution_id.clone())
-        else {
+        let Some(execution_id) = self.execution_id.clone() else {
             return;
         };
-        let read = self.engine.store().conversation_store(&execution_id).read(
-            &request.attempt_id,
-            request.from_entry,
-            usize::try_from(request.byte_budget).unwrap_or(usize::MAX),
-        );
-        let page = match read {
-            Ok(snapshot) => crate::api::conversation_response_from_snapshot(snapshot),
-            Err(error) => {
-                tracing::warn!(%error, attempt = %request.attempt_id, "cannot read a conversation page");
-                self.fail_read(&request.request_id, &error.to_string())
-                    .await;
-                return;
-            }
-        };
-        if let Err(error) = client
-            .upload_conversation_page(&request.request_id, &page)
-            .await
-        {
-            self.link.failed(&error, &self.timing);
-        }
-    }
-
-    /// Tells the control plane that the read `request_id` cannot be
-    /// answered, so its owner hears so now and the request stops being
-    /// offered to every poll.
-    pub(super) async fn fail_read(&mut self, request_id: &str, reason: &str) {
-        let Some(client) = self.link.client() else {
-            return;
-        };
-        let failure = RelayFailure {
-            reason: reason.to_string(),
-        };
-        if let Err(error) = client.upload_relay_failure(request_id, &failure).await {
-            self.link.failed(&error, &self.timing);
-        }
+        reader::serve_page(
+            &mut self.link,
+            &self.timing,
+            self.engine.store(),
+            &execution_id,
+            request,
+        )
+        .await;
     }
 
     /// Uploads the execution's events an owner waits for: those after the
     /// requested sequence, at most the requested number.
     async fn serve_events(&mut self, request: ExecutionEventsRequest) {
-        let (Some(client), Some(execution_id)) = (self.link.client(), self.execution_id.clone())
-        else {
+        let Some(execution_id) = self.execution_id.clone() else {
             return;
         };
-        let (events, has_more) = match self
-            .engine
-            .store()
-            .event_log(&execution_id)
-            .read_after(request.after, request.limit as usize)
-        {
-            Ok(page) => page,
-            Err(error) => {
-                tracing::warn!(%error, "cannot read the execution events");
-                self.fail_read(&request.request_id, &error.to_string())
-                    .await;
-                return;
-            }
-        };
-        let page = ExecutionEventsPage { events, has_more };
-        if let Err(error) = client
-            .upload_execution_events(&request.request_id, &page)
-            .await
-        {
-            self.link.failed(&error, &self.timing);
-        }
+        reader::serve_events(
+            &mut self.link,
+            &self.timing,
+            self.engine.store(),
+            &execution_id,
+            request,
+        )
+        .await;
     }
 
     /// Closes the session cleanly, then reports the safe point a pause

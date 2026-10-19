@@ -1,7 +1,7 @@
 //! The objects the adapter creates, and the checks that run before any of
 //! them reaches the API server (KTD2, KTD5, KTD6).
 //!
-//! # One task, three kinds of object
+//! # One task, four kinds of object
 //!
 //! * a **PVC** `narsor-…-storage` — the task storage (R9): Engine state,
 //!   workspace and private HOME. No owner reference: it outlives every Pod
@@ -12,6 +12,11 @@
 //!   copies the pinned runtime bundle (and each tool package) into an
 //!   `emptyDir`; the main container runs the repository's own pinned base
 //!   image with its command replaced by `narsor-runner` (R20, R21);
+//! * a **reader Pod** `narsor-…-reader` (D63) — the task's read-only runner
+//!   while an owner reads a stopped task: the same images and the same
+//!   storage claim, mounted `readOnly`, so the platform itself refuses a
+//!   write whatever the runner does. Never beside the workload Pod: the
+//!   controller removes it first, and the claim is `ReadWriteOnce`;
 //! * a **Secret** `narsor-…-launch-…` per incarnation — the runner
 //!   credential and the launch spec, mounted read-only *outside* the task
 //!   storage and owned by the Pod, so the garbage collector removes it with
@@ -53,6 +58,15 @@ use narsor_engine::config::HarnessHome;
 use narsor_engine::domain::{
     ImageReference, ResolvedImage, SecretReference, TaskLaunchSpec, TaskWorkspace,
 };
+
+/// Component label of a read-only runner's Pod.
+pub const READER_COMPONENT: &str = "reader";
+
+/// What a read-only runner asks of its node. It answers reads of a storage
+/// and does no work, so it needs a fraction of what the task's own profile
+/// gives its working runner.
+const READER_CPU: &str = "250m";
+const READER_MEMORY: &str = "512Mi";
 
 /// Where the task storage is mounted in the main container.
 pub const TASK_MOUNT: &str = "/task";
@@ -531,6 +545,17 @@ pub fn plan(
     })
 }
 
+fn pod_security(config: &KubernetesBackendConfig) -> Value {
+    json!({
+        "runAsNonRoot": true,
+        "runAsUser": config.run_as_user,
+        "runAsGroup": config.run_as_group,
+        "fsGroup": config.fs_group,
+        "fsGroupChangePolicy": "OnRootMismatch",
+        "seccompProfile": { "type": "RuntimeDefault" },
+    })
+}
+
 fn container_security() -> Value {
     json!({
         "privileged": false,
@@ -743,14 +768,7 @@ pub fn pod(
             "hostNetwork": false,
             "hostPID": false,
             "hostIPC": false,
-            "securityContext": {
-                "runAsNonRoot": true,
-                "runAsUser": config.run_as_user,
-                "runAsGroup": config.run_as_group,
-                "fsGroup": config.fs_group,
-                "fsGroupChangePolicy": "OnRootMismatch",
-                "seccompProfile": { "type": "RuntimeDefault" },
-            },
+            "securityContext": pod_security(config),
             "initContainers": init_containers,
             "containers": [{
                 "name": RUNNER_CONTAINER,
@@ -771,10 +789,142 @@ pub fn pod(
     })
 }
 
+/// The read-only runner's Pod for one launch (D63).
+///
+/// What a working Pod is, less everything that is for work: no tool
+/// packages, tool secrets or Claude profile, and a small resource request.
+/// The task storage is mounted `readOnly` — on the claim and on the mount —
+/// and the runner is told `--read-only`, which makes it open nothing for
+/// writing; the mount is what holds even if it did.
+///
+/// No node is chosen here, as none is for the working Pod: the claim is
+/// `ReadWriteOnce`, the reader never runs beside the workload Pod (the
+/// controller removes one before creating the other), and the cluster
+/// places the Pod where the volume can be attached.
+pub fn reader_pod(
+    config: &KubernetesBackendConfig,
+    namespace: &str,
+    task: &TaskResources,
+    launch: &WorkloadLaunch,
+    plan: &LaunchPlan,
+) -> Value {
+    let launch_secret = names::launch_secret(&task.reader, &launch.incarnation);
+    let resources = json!({
+        "requests": { "cpu": READER_CPU, "memory": READER_MEMORY },
+        "limits": { "cpu": READER_CPU, "memory": READER_MEMORY },
+    });
+    let mut labels = labels(task, READER_COMPONENT);
+    labels.insert(GENERATION_KEY.into(), launch.generation.to_string().into());
+    labels.insert(EPOCH_KEY.into(), launch.lease_epoch.to_string().into());
+    let mut annotations = task_annotations(task);
+    annotations.insert(
+        INCARNATION_ANNOTATION.into(),
+        launch.incarnation.clone().into(),
+    );
+    annotations.insert(GENERATION_KEY.into(), launch.generation.to_string().into());
+    annotations.insert(EPOCH_KEY.into(), launch.lease_epoch.to_string().into());
+    annotations.insert(
+        ENVIRONMENT_ANNOTATION.into(),
+        plan.environment_identity.clone().into(),
+    );
+    annotations.insert(
+        SPEC_DIGEST_ANNOTATION.into(),
+        plan.spec_digest.clone().into(),
+    );
+    let args: Vec<String> = [
+        "--task-id",
+        launch.task_id.as_str(),
+        "--task-storage",
+        TASK_MOUNT,
+        "--incarnation",
+        launch.incarnation.as_str(),
+        "--control-plane",
+        launch.control_plane_url.as_str(),
+        "--credential-file",
+        &format!("{LAUNCH_MOUNT}/{CREDENTIAL_KEY}"),
+        "--launch-spec",
+        &format!("{LAUNCH_MOUNT}/{LAUNCH_SPEC_KEY}"),
+        "--read-only",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": task.reader,
+            "namespace": namespace,
+            "labels": labels,
+            "annotations": annotations,
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "serviceAccountName": config.workload_service_account,
+            "automountServiceAccountToken": false,
+            "enableServiceLinks": false,
+            "hostNetwork": false,
+            "hostPID": false,
+            "hostIPC": false,
+            "securityContext": pod_security(config),
+            "initContainers": [{
+                "name": "runtime-bundle",
+                "image": plan.runtime_bundle,
+                "command": INSTALL_COMMAND,
+                "volumeMounts": [{ "name": "narsor-runtime", "mountPath": RUNTIME_MOUNT }],
+                "resources": resources,
+                "securityContext": container_security(),
+            }],
+            "containers": [{
+                "name": RUNNER_CONTAINER,
+                "image": plan.base_image,
+                "command": [format!("{RUNTIME_MOUNT}/bin/narsor-runner")],
+                "args": args,
+                "env": [{
+                    "name": "PATH",
+                    "value": format!("{RUNTIME_MOUNT}/bin:{SYSTEM_PATH}"),
+                }],
+                "volumeMounts": [
+                    { "name": "task-storage", "mountPath": TASK_MOUNT, "readOnly": true },
+                    { "name": "narsor-runtime", "mountPath": RUNTIME_MOUNT, "readOnly": true },
+                    { "name": "narsor-launch", "mountPath": LAUNCH_MOUNT, "readOnly": true },
+                ],
+                "resources": resources,
+                "securityContext": container_security(),
+                "terminationMessagePolicy": "FallbackToLogsOnError",
+            }],
+            "volumes": [
+                {
+                    "name": "task-storage",
+                    "persistentVolumeClaim": { "claimName": task.storage, "readOnly": true },
+                },
+                { "name": "narsor-runtime", "emptyDir": {} },
+                {
+                    "name": "narsor-launch",
+                    "secret": { "secretName": launch_secret, "defaultMode": 0o440 },
+                },
+            ],
+        },
+    })
+}
+
 /// The launch Secret of one incarnation, owned by its Pod.
 pub fn launch_secret(
     namespace: &str,
     task: &TaskResources,
+    launch: &WorkloadLaunch,
+    pod_uid: &str,
+) -> BackendResult<Value> {
+    launch_secret_of(namespace, task, &task.workload, launch, pod_uid)
+}
+
+/// The launch Secret of one incarnation of the Pod `pod_name` — the
+/// workload's or the reader's — owned by that Pod.
+pub fn launch_secret_of(
+    namespace: &str,
+    task: &TaskResources,
+    pod_name: &str,
     launch: &WorkloadLaunch,
     pod_uid: &str,
 ) -> BackendResult<Value> {
@@ -786,14 +936,14 @@ pub fn launch_secret(
         "type": "Opaque",
         "immutable": true,
         "metadata": {
-            "name": names::launch_secret(&task.workload, &launch.incarnation),
+            "name": names::launch_secret(pod_name, &launch.incarnation),
             "namespace": namespace,
             "labels": labels(task, "launch"),
             "annotations": { INCARNATION_ANNOTATION: launch.incarnation },
             "ownerReferences": [{
                 "apiVersion": "v1",
                 "kind": "Pod",
-                "name": task.workload,
+                "name": pod_name,
                 "uid": pod_uid,
                 "blockOwnerDeletion": false,
             }],
@@ -943,9 +1093,21 @@ pub fn check_pod_shape(pod: &Value, policy: &ShapePolicy) -> Result<(), Vec<Stri
                     .pointer("/persistentVolumeClaim/claimName")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if claim != format!("{name}{}", names::STORAGE_SUFFIX) {
+                // A reader Pod (`…-reader`) mounts its task's storage, and
+                // only read-only; any other Pod mounts the claim of its own
+                // name.
+                let reader_of = name.strip_suffix(names::READER_SUFFIX);
+                let own = reader_of.unwrap_or(name);
+                if claim != format!("{own}{}", names::STORAGE_SUFFIX) {
                     problems.push(format!(
                         "volume '{vname}': claim '{claim}' is not this task's storage"
+                    ));
+                }
+                if reader_of.is_some()
+                    && volume.pointer("/persistentVolumeClaim/readOnly") != Some(&Value::Bool(true))
+                {
+                    problems.push(format!(
+                        "volume '{vname}': a reader Pod mounts the task storage read-only"
                     ));
                 }
             }

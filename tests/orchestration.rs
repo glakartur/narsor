@@ -10,7 +10,7 @@ use narsor_engine::orchestration::{
     exhaustion_loss, loss_state, BackendCapacity, BackendLease, Clock, CommandActor,
     CommandRequest, ControlPlane, ControllerReport, LossState, MoveTarget, NewTask, Observation,
     ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
-    ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, TaskEventKind, TaskLifecycle,
+    ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, RunnerState, TaskEventKind,
     TaskRecord, WorkloadLoss,
 };
 use narsor_engine::persistence::paths::{temp_path_for, StatePaths};
@@ -152,7 +152,7 @@ impl Fixture {
     /// for one: the control plane completes a pause only after that (KTD2).
     fn acknowledge_safe_point(&self, id: &str) {
         let record = self.control.task(&task(id)).unwrap();
-        if record.lifecycle != TaskLifecycle::PauseRequested {
+        if record.runner_state != RunnerState::PauseRequested {
             return;
         }
         let launch_generation = record
@@ -280,7 +280,7 @@ fn creating_a_task_records_a_queued_assignment_with_generation_and_queue_order()
     let first = fx.create("task-a");
     let second = fx.control.create_task(new_task("task-b", "k8s")).unwrap();
 
-    assert_eq!(first.lifecycle, TaskLifecycle::Queued);
+    assert_eq!(first.runner_state, RunnerState::Queued);
     assert_eq!(first.generation, 1);
     assert_eq!(first.revision, 1);
     assert_eq!(first.rank, 1, "the first task is first in the queue");
@@ -301,33 +301,33 @@ fn desired_generation_grows_monotonically_through_the_whole_lifecycle() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     let running = fx.running("task-1", &lease);
-    assert_eq!(running.lifecycle, TaskLifecycle::Running);
+    assert_eq!(running.runner_state, RunnerState::Running);
     assert_eq!(running.generation, 1, "observations never bump generation");
 
     let pausing = fx.command("task-1", OwnerCommand::Pause, "pause-1");
-    assert_eq!(pausing.lifecycle, TaskLifecycle::PauseRequested);
+    assert_eq!(pausing.runner_state, RunnerState::PauseRequested);
     assert_eq!(pausing.generation, 2);
 
     let paused = fx
         .observe("task-1", &lease, Observation::PausedAtSafePoint)
         .unwrap();
-    assert_eq!(paused.lifecycle, TaskLifecycle::Paused);
+    assert_eq!(paused.runner_state, RunnerState::Stopped);
 
     let resumed = fx.command("task-1", OwnerCommand::Resume, "resume-1");
-    assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
     assert_eq!(resumed.generation, 3);
     let running = fx
         .observe("task-1", &lease, Observation::RunnerReady)
         .unwrap();
-    assert_eq!(running.lifecycle, TaskLifecycle::Running);
+    assert_eq!(running.runner_state, RunnerState::Running);
 
     let archiving = fx.command("task-1", OwnerCommand::Archive, "archive-1");
-    assert_eq!(archiving.lifecycle, TaskLifecycle::Archiving);
+    assert_eq!(archiving.runner_state, RunnerState::Archiving);
     assert_eq!(archiving.generation, 4);
     let archived = fx
         .observe("task-1", &lease, Observation::ResourcesDeleted)
         .unwrap();
-    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.runner_state, RunnerState::Archived);
     let tombstone = archived.archive.expect("tombstone");
     assert!(tombstone.completed_at.is_some());
     assert!(!tombstone.resources_never_created);
@@ -340,7 +340,7 @@ fn owner_commands_need_no_controller_lease() {
     assert!(fx.control.lease(&backend_id("k8s")).unwrap().is_none());
 
     let archived = fx.command("task-1", OwnerCommand::Archive, "archive-1");
-    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.runner_state, RunnerState::Archived);
     assert!(
         fx.control.lease(&backend_id("k8s")).unwrap().is_none(),
         "an owner command neither needs nor creates a lease"
@@ -374,7 +374,7 @@ fn repeating_a_command_with_its_idempotency_key_leaves_one_receipt_and_one_state
     let replay = fx.control.command(&task("task-1"), resume).unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.receipt, resumed.receipt);
-    assert_eq!(replay.task.lifecycle, TaskLifecycle::Running);
+    assert_eq!(replay.task.runner_state, RunnerState::Running);
 
     let archive = CommandRequest::new(OwnerCommand::Archive, "archive-1");
     fx.control
@@ -415,8 +415,8 @@ fn reusing_an_idempotency_key_for_a_different_command_is_refused() {
         }
     ));
     assert_eq!(
-        fx.control.task(&task("task-1")).unwrap().lifecycle,
-        TaskLifecycle::PauseRequested
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::PauseRequested
     );
 }
 
@@ -463,7 +463,7 @@ fn illegal_transitions_are_rejected_with_a_typed_error_and_change_nothing() {
         assert!(matches!(
             error,
             OrchestrationError::IllegalCommand {
-                lifecycle: TaskLifecycle::Queued,
+                runner_state: RunnerState::Queued,
                 ..
             }
         ));
@@ -475,7 +475,7 @@ fn illegal_transitions_are_rejected_with_a_typed_error_and_change_nothing() {
         error,
         OrchestrationError::IllegalObservation {
             observation: Observation::RunnerReady,
-            lifecycle: TaskLifecycle::Queued,
+            runner_state: RunnerState::Queued,
             ..
         }
     ));
@@ -522,8 +522,8 @@ fn a_stale_backend_lease_epoch_cannot_report() {
         .unwrap_err();
     assert!(matches!(renew, OrchestrationError::StaleLease { .. }));
     assert_eq!(
-        fx.control.task(&task("task-1")).unwrap().lifecycle,
-        TaskLifecycle::Provisioning
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Provisioning
     );
 }
 
@@ -561,7 +561,7 @@ fn an_older_generation_report_cannot_overwrite_an_archival_intent() {
     // The controller fetched the start at generation 1, the owner archives
     // before it claims it: the late claim is fenced.
     let archived = fx.command("task-1", OwnerCommand::Archive, "archive-1");
-    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.runner_state, RunnerState::Archived);
 
     let error = fx
         .control
@@ -639,7 +639,7 @@ fn an_unexpected_workload_loss_interrupts_without_creating_a_replacement() {
             Observation::WorkloadLost { state_known: true },
         )
         .unwrap();
-    assert_eq!(lost.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(lost.runner_state, RunnerState::Interrupted);
     assert_eq!(lost.generation, running.generation, "no new desired work");
 
     // Nothing but the owner leads out of Interrupted.
@@ -648,14 +648,14 @@ fn an_unexpected_workload_loss_interrupts_without_creating_a_replacement() {
         assert!(matches!(
             error,
             OrchestrationError::IllegalObservation {
-                lifecycle: TaskLifecycle::Interrupted,
+                runner_state: RunnerState::Interrupted,
                 ..
             }
         ));
     }
 
     let retried = fx.command("task-1", OwnerCommand::Start, "retry-1");
-    assert_eq!(retried.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(retried.runner_state, RunnerState::Provisioning);
     assert_eq!(retried.generation, running.generation + 1);
 }
 
@@ -671,9 +671,9 @@ fn an_uncertain_workload_loss_becomes_unknown_and_waits_for_resume() {
             Observation::WorkloadLost { state_known: false },
         )
         .unwrap();
-    assert_eq!(unknown.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(unknown.runner_state, RunnerState::Unknown);
     let resumed = fx.command("task-1", OwnerCommand::Resume, "resume-1");
-    assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
 }
 
 #[test]
@@ -684,7 +684,7 @@ fn archiving_queued_provisioning_or_pause_requested_work_fences_it() {
     // Queued: nothing was ever created, so it is clean at once.
     fx.create("queued");
     let queued = fx.command("queued", OwnerCommand::Archive, "archive");
-    assert_eq!(queued.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(queued.runner_state, RunnerState::Archived);
     assert!(queued.archive.as_ref().unwrap().resources_never_created);
 
     // Provisioning: resources may exist, so archive waits for deletion and
@@ -693,7 +693,7 @@ fn archiving_queued_provisioning_or_pause_requested_work_fences_it() {
     fx.observe("provisioning", &lease, Observation::StartAccepted)
         .unwrap();
     let archiving = fx.command("provisioning", OwnerCommand::Archive, "archive");
-    assert_eq!(archiving.lifecycle, TaskLifecycle::Archiving);
+    assert_eq!(archiving.runner_state, RunnerState::Archiving);
     let late = fx
         .control
         .report(report(
@@ -716,7 +716,7 @@ fn archiving_queued_provisioning_or_pause_requested_work_fences_it() {
     let clean = fx
         .observe("provisioning", &lease, Observation::ResourcesDeleted)
         .unwrap();
-    assert_eq!(clean.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(clean.runner_state, RunnerState::Archived);
 
     // PauseRequested: the pending safe point of the pause is fenced.
     fx.running("pausing", &lease);
@@ -734,8 +734,8 @@ fn archiving_queued_provisioning_or_pause_requested_work_fences_it() {
         .unwrap_err();
     assert!(matches!(late, OrchestrationError::StaleGeneration { .. }));
     assert_eq!(
-        fx.control.task(&task("pausing")).unwrap().lifecycle,
-        TaskLifecycle::Archiving
+        fx.control.task(&task("pausing")).unwrap().runner_state,
+        RunnerState::Archiving
     );
 }
 
@@ -748,19 +748,19 @@ fn repeating_archive_converges_on_the_tombstone_and_keeps_the_audit_trail() {
     let tombstone = first.archive.clone().expect("tombstone");
 
     let second = fx.command("task-1", OwnerCommand::Archive, "archive-2");
-    assert_eq!(second.lifecycle, TaskLifecycle::Archiving);
+    assert_eq!(second.runner_state, RunnerState::Archiving);
     assert_eq!(second.generation, first.generation);
     assert_eq!(second.archive, Some(tombstone.clone()));
 
     fx.observe("task-1", &lease, Observation::ResourcesDeleted)
         .unwrap();
     let third = fx.command("task-1", OwnerCommand::Archive, "archive-3");
-    assert_eq!(third.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(third.runner_state, RunnerState::Archived);
     assert_eq!(third.archive.unwrap().idempotency_key, "archive-1");
     let redelivered = fx
         .observe("task-1", &lease, Observation::ResourcesDeleted)
         .unwrap();
-    assert_eq!(redelivered.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(redelivered.runner_state, RunnerState::Archived);
 
     let resume = fx
         .control
@@ -772,7 +772,7 @@ fn repeating_archive_converges_on_the_tombstone_and_keeps_the_audit_trail() {
     assert!(matches!(
         resume,
         OrchestrationError::IllegalCommand {
-            lifecycle: TaskLifecycle::Archived,
+            runner_state: RunnerState::Archived,
             ..
         }
     ));
@@ -929,19 +929,19 @@ fn listing_returns_every_task_in_creation_order_including_tombstones() {
     // A directory without a record is debris, not a task.
     fs::create_dir_all(fx.root.paths().orchestration_task_dir("debris")).unwrap();
 
-    let listed: Vec<(String, TaskLifecycle)> = fx
+    let listed: Vec<(String, RunnerState)> = fx
         .control
         .list_tasks()
         .unwrap()
         .into_iter()
-        .map(|task| (task.task_id.to_string(), task.lifecycle))
+        .map(|task| (task.task_id.to_string(), task.runner_state))
         .collect();
     assert_eq!(
         listed,
         [
-            ("zeta".to_string(), TaskLifecycle::Queued),
-            ("alpha".to_string(), TaskLifecycle::Archived),
-            ("mid".to_string(), TaskLifecycle::Queued),
+            ("zeta".to_string(), RunnerState::Queued),
+            ("alpha".to_string(), RunnerState::Archived),
+            ("mid".to_string(), RunnerState::Queued),
         ]
     );
 }
@@ -1014,8 +1014,8 @@ fn a_pause_completes_only_after_the_runner_acknowledged_a_safe_point() {
         "{refused:?}"
     );
     assert_eq!(
-        fx.control.task(&task("task-1")).unwrap().lifecycle,
-        TaskLifecycle::PauseRequested
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::PauseRequested
     );
 
     fx.acknowledge_safe_point("task-1");
@@ -1029,7 +1029,7 @@ fn a_pause_completes_only_after_the_runner_acknowledged_a_safe_point() {
             None,
         ))
         .expect("acknowledged pause");
-    assert_eq!(paused.task.lifecycle, TaskLifecycle::Paused);
+    assert_eq!(paused.task.runner_state, RunnerState::Stopped);
 }
 
 #[test]
@@ -1259,8 +1259,8 @@ fn a_controller_cannot_start_a_task_the_scheduler_did_not_admit() {
     );
     assert_eq!(reason(&fx, "task-1"), Some(QueueReason::Admitted));
     let started = report_now(&fx, "task-1", &lease, Observation::StartAccepted).unwrap();
-    assert_eq!(started.lifecycle, TaskLifecycle::Provisioning);
-    // Leaving the queue drops the reservation: the lifecycle holds the slot.
+    assert_eq!(started.runner_state, RunnerState::Provisioning);
+    // Leaving the queue drops the reservation: the runner_state holds the slot.
     assert_eq!(started.reservation, None);
     assert_eq!(started.queue, None);
     assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 1);
@@ -1290,7 +1290,7 @@ fn at_capacity_rank_orders_the_waiting_and_a_move_reorders_them_without_preempti
     assert_eq!(reason(&fx, "third"), Some(waiting(3)));
     // A full backend never stops what runs (R11).
     let running = fx.control.task(&task("running")).unwrap();
-    assert_eq!(running.lifecycle, TaskLifecycle::Running);
+    assert_eq!(running.runner_state, RunnerState::Running);
     assert_eq!(running.generation, 1);
 
     // A repeated pass over an unchanged backend writes nothing.
@@ -1434,7 +1434,7 @@ fn archive_releases_an_admitted_or_provisioning_task_deterministically() {
     // An admitted task never accepted by a controller: archived at once,
     // its slot free for the next pass.
     let archived = fx.command("admitted", OwnerCommand::Archive, "archive-a");
-    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.runner_state, RunnerState::Archived);
     assert_eq!(archived.reservation, None);
     fx.control.schedule(&k8s(), &limit(2)).unwrap();
     assert_eq!(reason(&fx, "waiting"), Some(QueueReason::Admitted));
@@ -1570,7 +1570,7 @@ fn tasks_that_hold_a_slot_or_finished_keep_their_place_when_a_queued_one_passes_
     move_to(&fx, "late", MoveTarget::Bottom).unwrap();
     assert_eq!(queue_order(&fx, "k8s"), ["running", "queued", "late"]);
     let finished = fx.control.task(&task("running")).unwrap();
-    assert_eq!(finished.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(finished.runner_state, RunnerState::Archived);
     assert_eq!(
         finished.revision, archived.revision,
         "a task that was passed gets no event"
@@ -1622,7 +1622,7 @@ fn a_move_is_generation_checked_and_only_for_the_queued() {
     assert!(matches!(
         refused,
         OrchestrationError::TaskNotQueued {
-            lifecycle: TaskLifecycle::Running,
+            runner_state: RunnerState::Running,
             ..
         }
     ));
@@ -1997,45 +1997,47 @@ fn a_priority_changed_event_from_an_old_log_still_reads() {
     );
 }
 
+/// Drives `id` to `Running` under a limit of one slot, as the control
+/// plane admits it.
+fn run_in_single_slot(fx: &Fixture, id: &str, lease: &BackendLease) {
+    fx.create(id);
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    report_now(fx, id, lease, Observation::StartAccepted).unwrap();
+    report_now(fx, id, lease, Observation::RunnerReady).unwrap();
+}
+
+/// A task that ran and was paused (`Stopped`), then another one that holds
+/// the only slot.
+fn stopped_beside_a_running_task(fx: &Fixture, lease: &BackendLease) {
+    run_in_single_slot(fx, "paused", lease);
+    fx.command("paused", OwnerCommand::Pause, "pause-1");
+    fx.observe("paused", lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    run_in_single_slot(fx, "other", lease);
+}
+
 #[test]
-fn resuming_a_paused_task_needs_a_free_slot() {
+fn resuming_a_paused_task_with_a_free_slot_provisions_it() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
-    fx.running("paused", &lease);
-    fx.command("paused", OwnerCommand::Pause, "pause-1");
-    fx.observe("paused", &lease, Observation::PausedAtSafePoint)
-        .unwrap();
-    fx.running("other", &lease);
+    stopped_beside_a_running_task(&fx, &lease);
 
     let resume = CommandRequest::new(OwnerCommand::Resume, "resume-1");
-    let refused = fx
-        .control
-        .command_with_capacity(&task("paused"), resume.clone(), &limit(1))
-        .unwrap_err();
-    assert!(matches!(
-        refused,
-        OrchestrationError::BackendAtCapacity {
-            running: 1,
-            limit: 1,
-            ..
-        }
-    ));
-    assert_eq!(
-        fx.control.task(&task("paused")).unwrap().lifecycle,
-        TaskLifecycle::Paused
-    );
-
     let resumed = fx
         .control
         .command_with_capacity(&task("paused"), resume.clone(), &limit(2))
         .expect("a free slot");
-    assert_eq!(resumed.task.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(resumed.task.runner_state, RunnerState::Provisioning);
     // A retry is answered from its receipt, whatever the capacity now.
     let retried = fx
         .control
         .command_with_capacity(&task("paused"), resume, &limit(1))
         .expect("retry");
     assert!(retried.replayed);
+    assert_eq!(
+        retried.receipt.runner_state_after,
+        RunnerState::Provisioning
+    );
 
     // Retrying an interrupted task keeps the slot it holds: no check.
     fx.observe(
@@ -2051,6 +2053,175 @@ fn resuming_a_paused_task_needs_a_free_slot() {
             &limit(2),
         )
         .expect("an interrupted task already holds its slot");
+}
+
+#[test]
+fn resuming_on_a_full_backend_queues_the_task_ahead_of_the_waiting() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    stopped_beside_a_running_task(&fx, &lease);
+    fx.create("older");
+    fx.create("newer");
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    let generation_before = fx.control.task(&task("paused")).unwrap().generation;
+
+    let outcome = fx
+        .control
+        .command_with_capacity(
+            &task("paused"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .expect("a full backend queues the resume instead of refusing it");
+    assert_eq!(outcome.task.runner_state, RunnerState::Queued);
+    assert_eq!(outcome.receipt.runner_state_after, RunnerState::Queued);
+    assert_eq!(outcome.task.generation, generation_before + 1);
+    assert!(outcome.task.reservation.is_none(), "no slot is held yet");
+    assert!(!outcome.task.holds_capacity());
+    assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 1);
+    assert_eq!(
+        queue_order(&fx, "k8s"),
+        ["paused", "other", "older", "newer"]
+    );
+    // The running task is untouched (R11).
+    let other = fx.control.task(&task("other")).unwrap();
+    assert_eq!(other.runner_state, RunnerState::Running);
+
+    // A retry replays the receipt and changes nothing.
+    let retried = fx
+        .control
+        .command_with_capacity(
+            &task("paused"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .expect("retry");
+    assert!(retried.replayed);
+    assert_eq!(retried.task.generation, generation_before + 1);
+
+    // The first slot released goes to the resumed task, not to the older
+    // waiting ones.
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    assert_eq!(
+        reason(&fx, "paused"),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1
+        })
+    );
+    fx.command("other", OwnerCommand::Pause, "pause-other");
+    fx.observe("other", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    assert_eq!(reason(&fx, "paused"), Some(QueueReason::Admitted));
+    assert_eq!(
+        reason(&fx, "older"),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1
+        })
+    );
+    assert!(fx
+        .control
+        .task(&task("paused"))
+        .unwrap()
+        .reservation
+        .is_some());
+}
+
+#[test]
+fn a_resume_through_the_queue_keeps_its_launch_authorization() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    stopped_beside_a_running_task(&fx, &lease);
+    fx.control
+        .command_with_capacity(
+            &task("paused"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .unwrap();
+    fx.command("other", OwnerCommand::Pause, "pause-other");
+    fx.observe("other", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+
+    let queued = fx.control.task(&task("paused")).unwrap();
+    let accepted = report_now(&fx, "paused", &lease, Observation::StartAccepted).unwrap();
+    assert_eq!(accepted.runner_state, RunnerState::Provisioning);
+    // Admission does not move the desired generation, so the launch the
+    // controller orders (`backend.resume`, storage exists) is still the one
+    // the owner's resume authorized.
+    assert_eq!(accepted.generation, queued.generation);
+    let receipt = accepted
+        .launch_receipt(accepted.generation)
+        .expect("the launch finds the resume that authorized it");
+    assert_eq!(receipt.command, OwnerCommand::Resume);
+    assert_eq!(receipt.generation_after, accepted.generation);
+    assert_eq!(receipt.actor, CommandActor::Owner);
+}
+
+#[test]
+fn two_resumes_through_the_queue_put_the_later_one_first() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    stopped_beside_a_running_task(&fx, &lease);
+    // A second stopped task: run it after the first slot holder paused.
+    fx.command("other", OwnerCommand::Pause, "pause-other");
+    fx.observe("other", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    run_in_single_slot(&fx, "holder", &lease);
+    fx.create("waiting");
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+
+    for (id, key) in [("paused", "resume-a"), ("other", "resume-b")] {
+        let outcome = fx
+            .control
+            .command_with_capacity(
+                &task(id),
+                CommandRequest::new(OwnerCommand::Resume, key),
+                &limit(1),
+            )
+            .unwrap();
+        assert_eq!(outcome.task.runner_state, RunnerState::Queued);
+    }
+    assert_eq!(
+        queue_order(&fx, "k8s"),
+        ["other", "paused", "holder", "waiting"]
+    );
+
+    // The owner can still move the queue as usual.
+    move_to(&fx, "waiting", MoveTarget::Top).expect("move");
+    assert_eq!(
+        queue_order(&fx, "k8s"),
+        ["waiting", "other", "paused", "holder"]
+    );
+}
+
+#[test]
+fn resuming_a_task_in_the_wrong_state_still_fails_on_a_full_backend() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    run_in_single_slot(&fx, "running", &lease);
+    let archived = fx.command("running", OwnerCommand::Archive, "archive-1");
+    assert_eq!(archived.runner_state, RunnerState::Archiving);
+    fx.observe("running", &lease, Observation::ResourcesDeleted)
+        .unwrap();
+    run_in_single_slot(&fx, "other", &lease);
+
+    for id in ["running", "other"] {
+        let error = fx
+            .control
+            .command_with_capacity(
+                &task(id),
+                CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+                &limit(1),
+            )
+            .unwrap_err();
+        assert!(matches!(error, OrchestrationError::IllegalCommand { .. }));
+    }
 }
 
 #[test]
@@ -2444,7 +2615,7 @@ fn an_old_event_log_with_a_conductor_harness_command_still_decodes() {
 }
 
 // ---------------------------------------------------------------------------
-// Automatic resume: model and lifecycle
+// Automatic resume: model and runner_state
 // ---------------------------------------------------------------------------
 
 /// Drives a running task to `Unknown`: its controller lost track of the
@@ -2460,13 +2631,13 @@ fn a_confirmed_loss_moves_an_unknown_task_to_interrupted() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     let before = unknown(&fx, "task-1", &lease);
-    assert_eq!(before.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(before.runner_state, RunnerState::Unknown);
 
     let confirmed = fx
         .observe("task-1", &lease, Observation::LossConfirmed)
         .expect("a confirmation on Unknown is legal");
 
-    assert_eq!(confirmed.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(confirmed.runner_state, RunnerState::Interrupted);
     assert_eq!(
         confirmed.generation, before.generation,
         "no new desired work"
@@ -2514,18 +2685,18 @@ fn a_confirmed_loss_changes_no_other_lifecycle() {
     fx.running("archiving", &lease);
     fx.command("archiving", OwnerCommand::Archive, "archive-1");
 
-    for (id, lifecycle) in [
-        ("running", TaskLifecycle::Running),
-        ("paused", TaskLifecycle::Paused),
-        ("interrupted", TaskLifecycle::Interrupted),
-        ("archiving", TaskLifecycle::Archiving),
+    for (id, runner_state) in [
+        ("running", RunnerState::Running),
+        ("paused", RunnerState::Stopped),
+        ("interrupted", RunnerState::Interrupted),
+        ("archiving", RunnerState::Archiving),
     ] {
         let before = fx.control.task(&task(id)).unwrap();
-        assert_eq!(before.lifecycle, lifecycle, "{id} set up");
+        assert_eq!(before.runner_state, runner_state, "{id} set up");
         let after = fx
             .observe(id, &lease, Observation::LossConfirmed)
             .unwrap_or_else(|error| panic!("{id}: a late confirmation is not an error: {error}"));
-        assert_eq!(after.lifecycle, lifecycle, "{id} stays where it was");
+        assert_eq!(after.runner_state, runner_state, "{id} stays where it was");
         assert_eq!(after.generation, before.generation, "{id} gets no new work");
         assert_eq!(after.commands, before.commands, "{id} is not resumed");
     }
@@ -2554,7 +2725,7 @@ fn a_repeated_loss_confirmation_is_absorbed_as_a_redelivery() {
 
     assert!(!outcome.applied);
     assert_eq!(outcome.task.revision, first.revision);
-    assert_eq!(outcome.task.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(outcome.task.runner_state, RunnerState::Interrupted);
 }
 
 #[test]
@@ -2571,7 +2742,7 @@ fn an_observation_this_version_does_not_know_is_refused_in_a_report() {
         error,
         OrchestrationError::IllegalObservation {
             observation: Observation::Unrecognized,
-            lifecycle: TaskLifecycle::Unknown,
+            runner_state: RunnerState::Unknown,
             ..
         }
     ));
@@ -2713,7 +2884,7 @@ fn a_partial_resume_state_fills_the_rest_with_defaults() {
     assert_eq!(state.uncounted_losses, 0);
     assert!(!state.last_loss_uncounted);
     let loss = state.last_loss.expect("the loss");
-    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.from, RunnerState::Running);
     assert_eq!(loss.lease_epoch, 4);
     assert_eq!(loss.reason, None);
 }
@@ -2725,7 +2896,7 @@ fn a_full_resume_state_round_trips() {
         consecutive_losses: 6,
         next_attempt_at: Some(at + Duration::minutes(2)),
         last_loss: Some(WorkloadLoss {
-            from: TaskLifecycle::PauseRequested,
+            from: RunnerState::PauseRequested,
             at,
             lease_epoch: 3,
             reason: Some("pod deleted".to_string()),
@@ -2825,7 +2996,7 @@ fn newer_frame(kind: serde_json::Value) -> String {
             "sequence": 9,
             "task_id": "task-1",
             "at": "2026-10-10T12:00:00Z",
-            "lifecycle": "interrupted",
+            "runner_state": "interrupted",
             "generation": 2,
             "kind": kind
         }
@@ -2843,7 +3014,7 @@ fn a_client_keeps_a_stream_frame_whose_event_or_observation_it_does_not_know() {
         serde_json::from_str(&frame).expect("a newer event type still decodes");
     assert_eq!(envelope.event.kind, TaskEventKind::Unrecognized);
     assert_eq!(envelope.cursor, "task-1:9", "the cursor still advances");
-    assert_eq!(envelope.event.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(envelope.event.runner_state, RunnerState::Interrupted);
 
     // A controller report of an observation from a newer version.
     let frame = newer_frame(serde_json::json!({
@@ -2950,12 +3121,12 @@ fn a_loss_after_a_stable_run_starts_the_count_anew_and_is_due_now() {
 
     let lost = lose(&fx, "task-1", &lease, true, "the runner's workload exited");
 
-    assert_eq!(lost.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(lost.runner_state, RunnerState::Interrupted);
     assert_eq!(lost.resume.consecutive_losses, 1);
     assert_eq!(lost.resume.next_attempt_at, Some(fx.clock.now()));
     assert_eq!(lost.resume.exhausted, None);
     let loss = lost.resume.last_loss.expect("the loss is remembered");
-    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.from, RunnerState::Running);
     assert_eq!(loss.at, fx.clock.now());
     assert_eq!(loss.lease_epoch, lease.epoch);
     assert_eq!(loss.reason.as_deref(), Some("the runner's workload exited"));
@@ -3008,7 +3179,7 @@ fn a_loss_while_provisioning_counts_and_follows_the_delay_table() {
     assert_eq!(first.resume.next_attempt_at, Some(fx.clock.now()));
     assert_eq!(
         first.resume.last_loss.as_ref().unwrap().from,
-        TaskLifecycle::Provisioning
+        RunnerState::Provisioning
     );
 
     let expected = [
@@ -3050,7 +3221,7 @@ fn the_sixth_consecutive_loss_exhausts_the_policy_with_the_last_reason() {
         "the runner's workload failed before it was ready",
     );
 
-    assert_eq!(sixth.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(sixth.runner_state, RunnerState::Interrupted);
     assert_eq!(sixth.resume.consecutive_losses, 6);
     assert_eq!(sixth.resume.next_attempt_at, None, "no further attempt");
     let exhausted = sixth.resume.exhausted.expect("the policy gave up");
@@ -3124,13 +3295,18 @@ fn a_loss_while_pausing_plans_no_resume() {
 
     let lost = lose(&fx, "task-1", &lease, true, "exited before a safe point");
 
-    assert_eq!(lost.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(lost.runner_state, RunnerState::Interrupted);
     assert_eq!(lost.resume.next_attempt_at, None, "waits for the owner");
     assert_eq!(lost.resume.consecutive_losses, 0);
     assert_eq!(lost.resume.exhausted, None);
+    // Nothing runs and nothing is planned: not shown as running.
+    assert_eq!(
+        lost.task_state(),
+        narsor_engine::orchestration::TaskState::Paused
+    );
     assert_eq!(
         lost.resume.last_loss.unwrap().from,
-        TaskLifecycle::PauseRequested
+        RunnerState::PauseRequested
     );
 }
 
@@ -3141,11 +3317,11 @@ fn a_loss_while_pausing_confirmed_through_unknown_plans_no_resume() {
     fx.running("task-1", &lease);
     fx.command("task-1", OwnerCommand::Pause, "pause-1");
     let unknown = lose(&fx, "task-1", &lease, false, "cannot observe");
-    assert_eq!(unknown.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(unknown.runner_state, RunnerState::Unknown);
     assert_eq!(unknown.resume.next_attempt_at, None);
     assert_eq!(
         unknown.resume.last_loss.as_ref().unwrap().from,
-        TaskLifecycle::PauseRequested,
+        RunnerState::PauseRequested,
         "the origin is remembered before the confirmation"
     );
     fx.clock.advance(Duration::minutes(3));
@@ -3154,12 +3330,12 @@ fn a_loss_while_pausing_confirmed_through_unknown_plans_no_resume() {
         .observe("task-1", &lease, Observation::LossConfirmed)
         .unwrap();
 
-    assert_eq!(confirmed.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(confirmed.runner_state, RunnerState::Interrupted);
     assert_eq!(confirmed.resume.next_attempt_at, None);
     assert_eq!(confirmed.resume.consecutive_losses, 0);
     assert_eq!(
         confirmed.resume.last_loss.unwrap().from,
-        TaskLifecycle::PauseRequested
+        RunnerState::PauseRequested
     );
 }
 
@@ -3183,7 +3359,7 @@ fn a_confirmed_loss_is_counted_as_of_when_the_workload_was_lost() {
     assert_eq!(confirmed.resume.consecutive_losses, 1);
     assert_eq!(confirmed.resume.next_attempt_at, Some(fx.clock.now()));
     let loss = confirmed.resume.last_loss.unwrap();
-    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.from, RunnerState::Running);
     assert_eq!(loss.at, lost_at);
     assert_eq!(loss.reason.as_deref(), Some("cannot observe"));
 }
@@ -3381,7 +3557,7 @@ fn an_owner_start_or_resume_resets_an_exhausted_resume_state() {
 
         let resumed = fx.command("task-1", command, "owner-retry");
 
-        assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+        assert_eq!(resumed.runner_state, RunnerState::Provisioning);
         assert!(resumed.resume.is_empty(), "{command:?} resets the count");
         assert_eq!(resumed.running_since, None);
         let lost = lose(&fx, "task-1", &lease, true, "exited");
@@ -3412,7 +3588,7 @@ fn a_policy_resume_keeps_the_count_and_uses_up_the_planned_attempt() {
 
     let resumed = policy_resume(&fx, "task-1");
 
-    assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
     assert_eq!(resumed.resume.consecutive_losses, 2);
     assert_eq!(resumed.resume.next_attempt_at, None);
     assert!(resumed.resume.last_loss.is_some());
@@ -3493,11 +3669,11 @@ fn a_task_interrupted_before_the_policy_is_resumed_unless_lost_while_pausing() {
 
     assert_eq!(recovery.adopted_losses.len(), 2);
     let running = fx.control.task(&task("running-1")).unwrap();
-    assert_eq!(running.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(running.runner_state, RunnerState::Interrupted);
     assert_eq!(running.resume.consecutive_losses, 1, "a fresh loss");
     assert_eq!(running.resume.next_attempt_at, Some(fx.clock.now()));
     let loss = running.resume.last_loss.unwrap();
-    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.from, RunnerState::Running);
     assert_eq!(loss.at, lost_at, "read from the event log");
     assert_eq!(loss.lease_epoch, lease.epoch);
     assert_eq!(loss.reason.as_deref(), Some("the runner's workload exited"));
@@ -3506,7 +3682,7 @@ fn a_task_interrupted_before_the_policy_is_resumed_unless_lost_while_pausing() {
     assert_eq!(pausing.resume.next_attempt_at, None, "waits for the owner");
     assert_eq!(
         pausing.resume.last_loss.unwrap().from,
-        TaskLifecycle::PauseRequested
+        RunnerState::PauseRequested
     );
 
     // Adopted once: a second recovery changes nothing.
@@ -3526,14 +3702,14 @@ fn a_task_unknown_before_the_policy_is_counted_once_confirmed() {
 
     assert_eq!(recovery.adopted_losses, vec![task("task-1")]);
     let adopted = fx.control.task(&task("task-1")).unwrap();
-    assert_eq!(adopted.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(adopted.runner_state, RunnerState::Unknown);
     assert_eq!(
         adopted.resume.next_attempt_at, None,
         "nothing confirmed yet"
     );
     assert_eq!(
         adopted.resume.last_loss.as_ref().unwrap().from,
-        TaskLifecycle::Running
+        RunnerState::Running
     );
 
     let confirmed = fx
@@ -3608,10 +3784,10 @@ fn the_loss_state_tells_what_an_interrupted_task_waits_for() {
     let fx = Fixture::new();
     let lease = long_lease(&fx, "controller-a");
     let running = fx.running("task-1", &lease);
-    assert_eq!(loss_state(running.lifecycle, &running.resume), None);
+    assert_eq!(loss_state(running.runner_state, &running.resume), None);
 
     let lost = lose(&fx, "task-1", &lease, true, "exited");
-    let state = loss_state(lost.lifecycle, &lost.resume).expect("a loss state");
+    let state = loss_state(lost.runner_state, &lost.resume).expect("a loss state");
     assert_eq!(
         state,
         LossState::AutoResume {
@@ -3629,11 +3805,985 @@ fn the_loss_state_tells_what_an_interrupted_task_waits_for() {
         }),
         ..ResumeState::default()
     };
-    let state = loss_state(TaskLifecycle::Interrupted, &exhausted).unwrap();
+    let state = loss_state(RunnerState::Interrupted, &exhausted).unwrap();
     assert!(state.needs_owner());
     let LossState::Exhausted(reason) = state else {
         panic!("exhausted: {state:?}");
     };
     assert_eq!(exhaustion_loss(&reason), "pod evicted");
     assert_eq!(exhaustion_loss("in other words"), "in other words");
+}
+
+// ---------------------------------------------------------------------------
+// Rename compatibility: `lifecycle`/`paused` became `runner_state`/`stopped`
+// ---------------------------------------------------------------------------
+
+/// Drives a task to `Stopped` and returns the fixture.
+fn stopped_fixture() -> Fixture {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("task-1", &lease);
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    let stopped = fx
+        .observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .expect("paused at a safe point");
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    fx
+}
+
+/// Rewrites every `runner_state`/`stopped` in `file` the way a build from
+/// before the rename wrote it.
+fn rewrite_as_old_build(file: &Path) {
+    let text = fs::read_to_string(file).expect("read file");
+    let old = text
+        .replace("\"runner_state_after\"", "\"lifecycle_after\"")
+        .replace("\"runner_state\"", "\"lifecycle\"")
+        .replace("\"stopped\"", "\"paused\"");
+    assert_ne!(old, text, "the file names the runner state");
+    fs::write(file, old).expect("write file");
+}
+
+#[test]
+fn a_task_record_is_written_with_the_new_runner_state_names() {
+    let fx = stopped_fixture();
+    let text = fs::read_to_string(fx.root.paths().orchestration_task_file("task-1")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["runner_state"], "stopped");
+    assert!(json.get("lifecycle").is_none());
+}
+
+#[test]
+fn a_task_record_written_before_the_rename_loads_as_stopped() {
+    let fx = stopped_fixture();
+    let paths = fx.root.paths();
+    rewrite_as_old_build(&paths.orchestration_task_file("task-1"));
+    let text = fs::read_to_string(paths.orchestration_task_file("task-1")).unwrap();
+    assert!(
+        text.contains("\"lifecycle\": \"paused\"") || text.contains("\"lifecycle\":\"paused\"")
+    );
+
+    let reopened = fx.reopen();
+    assert_eq!(
+        reopened.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Stopped
+    );
+}
+
+#[test]
+fn an_event_log_written_before_the_rename_replays_on_recover() {
+    let fx = stopped_fixture();
+    let paths = fx.root.paths();
+    let events = fs::read_dir(paths.orchestration_task_events_dir("task-1"))
+        .expect("event directory")
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert!(!events.is_empty());
+    for event in &events {
+        if fs::read_to_string(event)
+            .unwrap()
+            .contains("\"runner_state\"")
+        {
+            rewrite_as_old_build(event);
+        }
+    }
+    rewrite_as_old_build(&paths.orchestration_task_file("task-1"));
+
+    let reopened = fx.reopen();
+    reopened.recover().expect("recover reads the old records");
+    let replayed = reopened
+        .events_since(&task("task-1"), 0)
+        .expect("old events decode");
+    assert!(replayed
+        .iter()
+        .any(|event| event.runner_state == RunnerState::Stopped));
+    assert_eq!(
+        reopened.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Stopped
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The slot-release policy (U4, D62)
+// ---------------------------------------------------------------------------
+
+/// The launch generation of the task's current runner, as the fixture's
+/// other helpers work it out.
+fn launch_generation_of(record: &TaskRecord) -> u64 {
+    record
+        .commands
+        .iter()
+        .filter(|receipt| matches!(receipt.command, OwnerCommand::Start | OwnerCommand::Resume))
+        .map(|receipt| receipt.generation_after)
+        .max()
+        .unwrap_or(1)
+}
+
+fn pending_input(id: &str) -> narsor_engine::orchestration::PendingInputRef {
+    let form = serde_json::from_value(serde_json::json!({
+        "execution_id": "exec-1",
+        "state_id": "review",
+        "action_execution_id": "act-7",
+        "instruction": "Approve the plan?",
+        "fields": [],
+        "outputs": [],
+        "episode": id,
+        "requested_at": "2026-10-03T12:00:00Z",
+    }))
+    .expect("pending input form");
+    narsor_engine::orchestration::PendingInputRef {
+        id: id.to_string(),
+        attempt_id: Some("act-7".to_string()),
+        form,
+    }
+}
+
+/// The runner of the task reports `status` (waiting on `pending`, if any).
+fn runner_reports(
+    fx: &Fixture,
+    id: &str,
+    status: ExecutionStatus,
+    pending: Option<&str>,
+) -> TaskRecord {
+    let record = fx.control.task(&task(id)).unwrap();
+    let launch_generation = launch_generation_of(&record);
+    let sequence = record
+        .runner
+        .as_ref()
+        .map_or(1, |runner| runner.snapshot.snapshot_sequence + 1);
+    let mut snapshot = safe_point_snapshot(sequence);
+    snapshot.safe_point = false;
+    snapshot.execution_status = status;
+    snapshot.pending_input = pending.map(pending_input);
+    fx.control
+        .record_runner_snapshot(
+            &task(id),
+            &format!("pod-g{launch_generation}"),
+            launch_generation,
+            snapshot,
+        )
+        .expect("runner snapshot")
+        .task
+}
+
+/// What the policy does at `generation` of the task.
+fn release_slot(fx: &Fixture, id: &str) -> Result<TaskRecord, OrchestrationError> {
+    let generation = fx.control.task(&task(id)).unwrap().generation;
+    fx.control
+        .release_slot(&task(id), generation)
+        .map(|outcome| outcome.task)
+}
+
+fn slot_released(fx: &Fixture, id: &str) -> Vec<TaskEventKind> {
+    fx.control
+        .events_since(&task(id), 0)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.kind)
+        .filter(|kind| matches!(kind, TaskEventKind::SlotReleased { .. }))
+        .collect()
+}
+
+#[test]
+fn a_finished_task_frees_its_slot_for_the_next_one_in_the_same_recount() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-a", &lease);
+    fx.create("task-b");
+    fx.control.schedule(&k8s(), &limit(1)).expect("admission");
+    assert_eq!(fx.control.task(&task("task-b")).unwrap().reservation, None);
+
+    let finished = runner_reports(&fx, "task-a", ExecutionStatus::Completed, None);
+    assert_eq!(finished.slot_release_due_at, Some(fx.clock.now()));
+    let stopping = release_slot(&fx, "task-a").expect("a finished task is due at once");
+
+    assert_eq!(stopping.runner_state, RunnerState::PauseRequested);
+    assert!(
+        stopping.holds_capacity(),
+        "the slot stays until the safe point"
+    );
+    assert!(stopping.pause_requested_by_policy());
+    assert_eq!(
+        slot_released(&fx, "task-a"),
+        vec![TaskEventKind::SlotReleased {
+            reason: narsor_engine::orchestration::SlotReleaseReason::Terminal
+        }]
+    );
+    fx.observe("task-a", &lease, Observation::PausedAtSafePoint)
+        .expect("the controller reports the safe point");
+    let stopped = fx.control.task(&task("task-a")).unwrap();
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    assert!(!stopped.holds_capacity());
+    fx.control.schedule(&k8s(), &limit(1)).expect("admission");
+    assert!(fx
+        .control
+        .task(&task("task-b"))
+        .unwrap()
+        .reservation
+        .is_some());
+}
+
+#[test]
+fn a_task_that_waits_for_its_owner_frees_its_slot_only_after_the_wait() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    let waiting = runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    assert_eq!(
+        waiting.slot_release_due_at,
+        Some(fx.clock.now() + Duration::seconds(300))
+    );
+
+    fx.clock.advance(Duration::seconds(299));
+    assert!(matches!(
+        release_slot(&fx, "task-1"),
+        Err(OrchestrationError::IllegalCommand { .. })
+    ));
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Running
+    );
+    assert!(slot_released(&fx, "task-1").is_empty());
+
+    fx.clock.advance(Duration::seconds(2));
+    let stopping = release_slot(&fx, "task-1").expect("the wait ran out");
+    assert_eq!(stopping.runner_state, RunnerState::PauseRequested);
+    assert_eq!(
+        slot_released(&fx, "task-1"),
+        vec![TaskEventKind::SlotReleased {
+            reason: narsor_engine::orchestration::SlotReleaseReason::GraceElapsed
+        }]
+    );
+    assert_eq!(
+        stopping.task_state(),
+        narsor_engine::orchestration::TaskState::HumanNeeded
+    );
+}
+
+#[test]
+fn a_restarted_step_clears_the_wait_of_a_failed_task() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::Failed, None);
+    fx.clock.advance(Duration::minutes(2));
+
+    let running = runner_reports(&fx, "task-1", ExecutionStatus::Running, None);
+    assert_eq!(running.slot_release_due_at, None);
+
+    fx.clock.advance(Duration::minutes(4));
+    assert!(matches!(
+        release_slot(&fx, "task-1"),
+        Err(OrchestrationError::IllegalCommand { .. })
+    ));
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Running
+    );
+}
+
+#[test]
+fn a_read_moves_the_wait_later_and_only_by_more_than_the_threshold() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    let extension = Duration::seconds(180);
+
+    fx.clock.advance(Duration::minutes(4));
+    assert!(fx
+        .control
+        .extend_slot_release(&task("task-1"), extension)
+        .unwrap());
+    let moved = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(moved.slot_release_due_at, Some(fx.clock.now() + extension));
+
+    // Many reads within the threshold write nothing.
+    let revision = moved.revision;
+    for _ in 0..20 {
+        fx.clock.advance(Duration::seconds(1));
+        assert!(!fx
+            .control
+            .extend_slot_release(&task("task-1"), extension)
+            .unwrap());
+    }
+    assert_eq!(fx.control.task(&task("task-1")).unwrap().revision, revision);
+
+    fx.clock.advance(Duration::seconds(70));
+    // 5 min 30 s after the first snapshot: past the original 5-min wait, but
+    // not past the one the read moved.
+    assert!(matches!(
+        release_slot(&fx, "task-1"),
+        Err(OrchestrationError::IllegalCommand { .. })
+    ));
+    // 90 s after the last move (past the threshold) a read moves it again.
+    assert!(fx
+        .control
+        .extend_slot_release(&task("task-1"), extension)
+        .unwrap());
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().revision,
+        revision + 1
+    );
+}
+
+#[test]
+fn a_read_does_not_hold_the_slot_of_a_finished_task() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::Completed, None);
+
+    assert!(!fx
+        .control
+        .extend_slot_release(&task("task-1"), Duration::seconds(180))
+        .unwrap());
+    release_slot(&fx, "task-1").expect("still due at once");
+}
+
+#[test]
+fn repeated_snapshots_of_the_same_wait_do_not_push_the_deadline_back() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    let first = runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+
+    for _ in 0..3 {
+        fx.clock.advance(Duration::seconds(60));
+        let again = runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+        assert_eq!(again.slot_release_due_at, first.slot_release_due_at);
+    }
+    // A failure in place of the question is the same wait.
+    let failed = runner_reports(&fx, "task-1", ExecutionStatus::Failed, None);
+    assert_eq!(failed.slot_release_due_at, first.slot_release_due_at);
+}
+
+#[test]
+fn an_answer_waiting_in_the_queue_keeps_the_slot_past_the_wait() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    fx.clock.advance(Duration::seconds(299));
+    fx.control
+        .queue_input(
+            &task("task-1"),
+            narsor_engine::orchestration::InputRequest {
+                pending_input_id: "ask-1".to_string(),
+                idempotency_key: "answer-1".to_string(),
+                delivery: Default::default(),
+            },
+        )
+        .expect("the owner answers");
+
+    fx.clock.advance(Duration::seconds(2));
+
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(record.owner_work_pending());
+    assert!(!record.slot_release_due(fx.clock.now()));
+    assert!(matches!(
+        release_slot(&fx, "task-1"),
+        Err(OrchestrationError::IllegalCommand { .. })
+    ));
+}
+
+#[test]
+fn an_unsettled_operator_command_keeps_the_slot_past_the_wait() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    let running = fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::Failed, None);
+    fx.clock.advance(Duration::seconds(299));
+    fx.control
+        .queue_operator_command(
+            &task("task-1"),
+            narsor_engine::orchestration::OperatorCommandRequest {
+                command: narsor_engine::orchestration::OperatorCommand::RestartStep {
+                    note: None,
+                    failure_key: None,
+                },
+                idempotency_key: "restart-1".to_string(),
+                expected_generation: Some(running.generation),
+                requested_by: OwnerRef::new("oidc:https://issuer|artur"),
+            },
+        )
+        .expect("the owner restarts the step");
+    fx.clock.advance(Duration::seconds(2));
+
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(record.owner_work_pending());
+    assert!(!record.slot_release_due(fx.clock.now()));
+}
+
+#[test]
+fn the_deadline_survives_a_restart_of_the_daemon() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    fx.clock.advance(Duration::minutes(10));
+
+    let reopened = fx.reopen();
+    reopened.recover().expect("recover");
+    let record = reopened.task(&task("task-1")).unwrap();
+    assert!(record.slot_release_due(fx.clock.now()));
+    let outcome = reopened
+        .release_slot(&task("task-1"), record.generation)
+        .expect("the first pass after the restart frees the slot");
+    assert_eq!(outcome.task.runner_state, RunnerState::PauseRequested);
+}
+
+#[test]
+fn a_record_written_before_the_policy_has_no_deadline_and_still_reads() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    let path = fx.root.paths().orchestration_task_file("task-1");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(json
+        .as_object_mut()
+        .unwrap()
+        .remove("slot_release_due_at")
+        .is_some());
+    fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+    let record = fx
+        .reopen()
+        .task(&task("task-1"))
+        .expect("an old record reads");
+    assert_eq!(record.slot_release_due_at, None);
+}
+
+#[test]
+fn a_running_task_with_a_final_snapshot_but_no_deadline_gets_one_planned() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::Completed, None);
+    let path = fx.root.paths().orchestration_task_file("task-1");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("slot_release_due_at");
+    fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+    let armed = fx
+        .control
+        .arm_slot_release(&task("task-1"), Duration::seconds(300))
+        .unwrap()
+        .expect("a deadline was missing");
+
+    assert_eq!(armed.slot_release_due_at, Some(fx.clock.now()));
+    assert!(fx
+        .control
+        .arm_slot_release(&task("task-1"), Duration::seconds(300))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_final_snapshot_during_the_owners_pause_leaves_the_pause_alone() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+
+    let record = runner_reports(&fx, "task-1", ExecutionStatus::Completed, None);
+
+    assert_eq!(record.runner_state, RunnerState::PauseRequested);
+    assert_eq!(record.slot_release_due_at, None);
+    assert!(!record.pause_requested_by_policy());
+    assert!(matches!(
+        release_slot(&fx, "task-1"),
+        Err(OrchestrationError::IllegalCommand { .. })
+    ));
+    assert_eq!(
+        fx.control
+            .task(&task("task-1"))
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|receipt| receipt.command == OwnerCommand::Pause)
+            .count(),
+        1
+    );
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .expect("safe point");
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Stopped
+    );
+}
+
+#[test]
+fn an_owner_command_between_the_snapshot_and_the_policy_wins() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    let finished = runner_reports(&fx, "task-1", ExecutionStatus::Completed, None);
+    fx.command("task-1", OwnerCommand::Archive, "archive-1");
+
+    let late = fx
+        .control
+        .release_slot(&task("task-1"), finished.generation);
+
+    assert!(matches!(
+        late,
+        Err(OrchestrationError::StaleGeneration { .. })
+    ));
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(record.runner_state, RunnerState::Archiving);
+    assert!(slot_released(&fx, "task-1").is_empty());
+}
+
+#[test]
+fn a_workload_lost_while_the_policy_stops_it_is_not_resumed_by_the_resume_policy() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::Completed, None);
+    release_slot(&fx, "task-1").expect("due");
+
+    let lost = lose(&fx, "task-1", &lease, true, "the node went away");
+
+    assert_eq!(lost.runner_state, RunnerState::Interrupted);
+    assert_eq!(lost.resume.next_attempt_at, None);
+    assert!(!lost.auto_resume_due(fx.clock.now() + Duration::days(1)));
+}
+
+#[test]
+fn a_stop_the_policy_asked_for_does_not_show_as_the_owners_pause() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::Failed, None);
+    fx.clock.advance(Duration::minutes(6));
+    release_slot(&fx, "task-1").expect("due");
+    // The conductor's run after the failure moved the work on meanwhile.
+    let busy = runner_reports(&fx, "task-1", ExecutionStatus::Running, None);
+
+    assert_eq!(busy.runner_state, RunnerState::PauseRequested);
+    assert_eq!(
+        busy.task_state(),
+        narsor_engine::orchestration::TaskState::Running
+    );
+
+    let other = Fixture::new();
+    let other_lease = long_lease(&other, "controller-a");
+    other.running("task-2", &other_lease);
+    other.command("task-2", OwnerCommand::Pause, "pause-1");
+    let owners = runner_reports(&other, "task-2", ExecutionStatus::Running, None);
+    assert_eq!(
+        owners.task_state(),
+        narsor_engine::orchestration::TaskState::Paused
+    );
+}
+
+#[test]
+fn the_slot_release_events_and_their_reasons_decode_in_an_older_reader() {
+    let scheduled: TaskEventKind = serde_json::from_value(serde_json::json!({
+        "type": "slot_release_scheduled", "due_at": "2026-10-03T12:05:00Z"
+    }))
+    .expect("scheduled");
+    assert!(matches!(
+        scheduled,
+        TaskEventKind::SlotReleaseScheduled { .. }
+    ));
+    let released: TaskEventKind = serde_json::from_value(serde_json::json!({
+        "type": "slot_released", "reason": "terminal"
+    }))
+    .expect("released");
+    assert_eq!(
+        released,
+        TaskEventKind::SlotReleased {
+            reason: narsor_engine::orchestration::SlotReleaseReason::Terminal
+        }
+    );
+    let future: TaskEventKind = serde_json::from_value(serde_json::json!({
+        "type": "slot_released", "reason": "operator_asked"
+    }))
+    .expect("a reason of a newer version");
+    assert_eq!(
+        future,
+        TaskEventKind::SlotReleased {
+            reason: narsor_engine::orchestration::SlotReleaseReason::Unrecognized
+        }
+    );
+}
+
+#[test]
+fn the_policys_keys_are_reserved_for_it() {
+    assert_eq!(
+        narsor_engine::orchestration::slot_release_key(7),
+        "slot-release:7"
+    );
+    assert!(narsor_engine::orchestration::slot_release_key(7)
+        .starts_with(narsor_engine::orchestration::SLOT_RELEASE_KEY_PREFIX));
+}
+
+// ---------------------------------------------------------------------------
+// Work for a task without a runner (U6, R13, R14)
+// ---------------------------------------------------------------------------
+
+/// `task-1` ran, waited on `ask-1` and was stopped; nothing else holds a slot.
+fn stopped_waiting_on_input(fx: &Fixture, lease: &BackendLease) {
+    fx.running("task-1", lease);
+    runner_reports(fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    // The runner's last word, at the safe point, still shows the request.
+    let record = fx.control.task(&task("task-1")).unwrap();
+    let runner = record.runner.as_ref().unwrap();
+    let mut at_safe_point = runner.snapshot.clone();
+    at_safe_point.snapshot_sequence += 1;
+    at_safe_point.safe_point = true;
+    fx.control
+        .record_runner_snapshot(
+            &task("task-1"),
+            &runner.incarnation,
+            runner.launch_generation,
+            at_safe_point,
+        )
+        .unwrap();
+    report_now(fx, "task-1", lease, Observation::PausedAtSafePoint).unwrap();
+}
+
+fn answer(pending: &str, key: &str) -> narsor_engine::orchestration::InputRequest {
+    narsor_engine::orchestration::InputRequest {
+        pending_input_id: pending.to_string(),
+        idempotency_key: key.to_string(),
+        delivery: Default::default(),
+    }
+}
+
+#[test]
+fn a_stopped_task_keeps_an_answer_to_the_request_its_last_snapshot_shows() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    stopped_waiting_on_input(&fx, &lease);
+
+    let kept = fx
+        .control
+        .queue_input(&task("task-1"), answer("ask-1", "answer-1"))
+        .expect("kept for the next runner");
+    assert_eq!(
+        kept.input.status,
+        narsor_engine::orchestration::InputStatus::Queued
+    );
+    assert!(matches!(
+        fx.control
+            .queue_input(&task("task-1"), answer("ask-0", "answer-0"))
+            .unwrap_err(),
+        OrchestrationError::ObsoleteInput { .. }
+    ));
+    // The record still says Stopped: only the service resumes the task.
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Stopped
+    );
+}
+
+#[test]
+fn a_task_that_never_started_takes_no_answer() {
+    let fx = Fixture::new();
+    fx.create("task-1");
+    let error = fx
+        .control
+        .queue_input(&task("task-1"), answer("ask-1", "answer-1"))
+        .unwrap_err();
+    assert!(
+        matches!(error, OrchestrationError::ObsoleteInput { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_command_for_a_stopped_task_is_bound_to_the_launch_its_resume_orders() {
+    use narsor_engine::orchestration::{OperatorCommand, OperatorCommandStatus};
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    stopped_waiting_on_input(&fx, &lease);
+    let stopped = fx.control.task(&task("task-1")).unwrap();
+
+    let queued = queue_chat(&fx, "chat-1", "hello").expect("kept for the next start");
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(
+        record.operator_command(&queued).unwrap().launch_generation,
+        stopped.generation + 1
+    );
+    // What needs a live runner is refused with the reason.
+    let error = fx
+        .control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(OperatorCommand::Interrupt, "interrupt-1"),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, OrchestrationError::OperatorCommandRefused { ref reason, .. } if reason.contains("no running runner")),
+        "{error:?}"
+    );
+
+    // The old runner, should it still poll, neither gets the command nor
+    // loses it.
+    let (delivered, changed) = fx
+        .control
+        .deliver_operator_commands(&task("task-1"), "pod-g1", stopped.generation)
+        .unwrap();
+    assert!(delivered.is_empty() && !changed);
+
+    // The resume orders exactly that launch; its runner takes the command,
+    // while the task still provisions.
+    let resumed = fx.command("task-1", OwnerCommand::Resume, "resume-1");
+    let (delivered, _) = fx
+        .control
+        .deliver_operator_commands(&task("task-1"), "pod-g2", resumed.generation)
+        .unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].command_id, queued);
+    assert_eq!(delivered[0].status, OperatorCommandStatus::Queued);
+}
+
+#[test]
+fn a_resumed_task_waiting_for_a_slot_keeps_commands_for_its_start() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    stopped_waiting_on_input(&fx, &lease);
+    // Another task fills the only slot, so the resume has to queue.
+    run_in_single_slot(&fx, "other", &lease);
+    let outcome = fx
+        .control
+        .command_with_capacity(
+            &task("task-1"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .unwrap();
+    assert_eq!(outcome.task.runner_state, RunnerState::Queued);
+
+    let id = queue_chat(&fx, "chat-1", "hello").expect("kept while it waits for a slot");
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(
+        record.operator_command(&id).unwrap().launch_generation,
+        record.generation
+    );
+    // The launch the queue leads to is the one the command is bound to: the
+    // start keeps the generation.
+    fx.command("other", OwnerCommand::Pause, "pause-other");
+    fx.observe("other", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    let started = report_now(&fx, "task-1", &lease, Observation::StartAccepted).unwrap();
+    assert_eq!(started.generation, record.generation);
+}
+
+// ---------------------------------------------------------------------------
+// The reader lease (D63, U9)
+// ---------------------------------------------------------------------------
+
+const READER_IDLE: i64 = 120;
+
+fn lease_reader(
+    fx: &Fixture,
+    id: &str,
+) -> Option<(narsor_engine::orchestration::ReaderLease, bool)> {
+    fx.control
+        .lease_reader(&task(id), Duration::seconds(READER_IDLE))
+        .expect("lease a reader")
+}
+
+#[test]
+fn a_read_of_a_stopped_task_leases_a_reader_and_leaves_one_event() {
+    let fx = stopped_fixture();
+    let (lease, written) = lease_reader(&fx, "task-1").expect("a stopped task is read by a reader");
+    assert!(written);
+    assert_eq!(lease.since, fx.clock.now());
+    assert_eq!(lease.until, fx.clock.now() + Duration::seconds(READER_IDLE));
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(record.reader_lease, Some(lease));
+    assert!(record.reader_lease_active(fx.clock.now()));
+    assert!(!record.holds_capacity(), "a reader is no slot");
+    let leased = fx
+        .control
+        .events_since(&task("task-1"), 0)
+        .unwrap()
+        .into_iter()
+        .filter(|event| matches!(event.kind, TaskEventKind::ReaderLeased { .. }))
+        .count();
+    assert_eq!(leased, 1);
+}
+
+#[test]
+fn only_a_stopped_or_interrupted_task_has_a_reader_lease() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.create("queued");
+    fx.running("running", &lease);
+    fx.running("unknown", &lease);
+    lose(&fx, "unknown", &lease, false, "the node went away");
+    fx.running("interrupted", &lease);
+    lose(&fx, "interrupted", &lease, true, "exited");
+    fx.running("archived", &lease);
+    fx.command("archived", OwnerCommand::Archive, "archive-1");
+
+    for id in ["queued", "running", "unknown", "archived"] {
+        assert!(lease_reader(&fx, id).is_none(), "{id}");
+        assert!(fx.control.task(&task(id)).unwrap().reader_lease.is_none());
+    }
+    assert!(lease_reader(&fx, "interrupted").is_some());
+}
+
+#[test]
+fn reads_extend_the_lease_by_more_than_the_threshold_only() {
+    let fx = stopped_fixture();
+    let (first, _) = lease_reader(&fx, "task-1").unwrap();
+    let revision = fx.control.task(&task("task-1")).unwrap().revision;
+
+    for _ in 0..20 {
+        fx.clock.advance(Duration::seconds(1));
+        let (lease, written) = lease_reader(&fx, "task-1").unwrap();
+        assert!(!written);
+        assert_eq!(lease, first, "unchanged within the threshold");
+    }
+    assert_eq!(fx.control.task(&task("task-1")).unwrap().revision, revision);
+
+    fx.clock.advance(Duration::seconds(20));
+    let (moved, written) = lease_reader(&fx, "task-1").unwrap();
+    assert!(written);
+    assert_eq!(moved.since, first.since, "the same reading");
+    assert!(moved.until > first.until);
+}
+
+#[test]
+fn a_lease_that_ran_out_is_ended_once_and_a_new_read_begins_a_new_one() {
+    let fx = stopped_fixture();
+    let (first, _) = lease_reader(&fx, "task-1").unwrap();
+
+    assert!(
+        !fx.control.end_reader_lease(&task("task-1")).unwrap(),
+        "still held"
+    );
+    fx.clock.advance(Duration::seconds(READER_IDLE + 1));
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(!record.reader_lease_active(fx.clock.now()));
+    assert!(record.reader_lease_stale(fx.clock.now()));
+    assert!(fx.control.end_reader_lease(&task("task-1")).unwrap());
+    assert!(
+        !fx.control.end_reader_lease(&task("task-1")).unwrap(),
+        "once"
+    );
+    assert!(fx
+        .control
+        .task(&task("task-1"))
+        .unwrap()
+        .reader_lease
+        .is_none());
+
+    let (second, written) = lease_reader(&fx, "task-1").unwrap();
+    assert!(written);
+    assert!(
+        second.since > first.since,
+        "a reader of the earlier lease is not this one's"
+    );
+}
+
+#[test]
+fn a_lease_that_ran_out_and_is_read_again_before_the_pass_begins_a_new_reading() {
+    let fx = stopped_fixture();
+    let (first, _) = lease_reader(&fx, "task-1").unwrap();
+    fx.clock.advance(Duration::seconds(READER_IDLE + 5));
+    let (second, written) = lease_reader(&fx, "task-1").unwrap();
+    assert!(written);
+    assert!(second.since > first.since);
+}
+
+/// AE5, the control plane's part: the slot count does not change while a
+/// reader runs, so the queue goes on.
+#[test]
+fn a_reader_holds_no_slot_so_the_queue_goes_on() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-a", &lease);
+    fx.command("task-a", OwnerCommand::Pause, "pause-a");
+    fx.observe("task-a", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.create("task-b");
+    lease_reader(&fx, "task-a").expect("leased");
+
+    let changed = fx.control.schedule(&k8s(), &limit(1)).expect("admission");
+    assert_eq!(
+        changed,
+        vec![task("task-b")],
+        "B is admitted beside the reader"
+    );
+    let a = fx.control.task(&task("task-a")).unwrap();
+    assert!(!a.holds_capacity());
+    assert!(a.reader_lease_active(fx.clock.now()));
+}
+
+/// R15: the command that resumes the task takes the lease away in its own
+/// mutation — one revision, one event — and so does an archive.
+#[test]
+fn a_resume_or_an_archive_ends_the_lease_in_the_same_mutation() {
+    for command in [OwnerCommand::Resume, OwnerCommand::Archive] {
+        let fx = stopped_fixture();
+        lease_reader(&fx, "task-1").unwrap();
+        let before = fx.control.task(&task("task-1")).unwrap();
+
+        let after = fx.command("task-1", command, "k-1");
+
+        assert_eq!(after.reader_lease, None, "{command:?}");
+        assert_eq!(after.revision, before.revision + 1, "{command:?}");
+        assert!(!fx
+            .control
+            .events_since(&task("task-1"), 0)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.kind, TaskEventKind::ReaderLeaseEnded)));
+    }
+}
+
+#[test]
+fn work_that_resumes_a_stopped_task_through_the_queue_ends_the_lease_too() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    stopped_waiting_on_input(&fx, &lease);
+    run_in_single_slot(&fx, "other", &lease);
+    lease_reader(&fx, "task-1").unwrap();
+
+    let queued = fx
+        .control
+        .command_with_capacity(
+            &task("task-1"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .unwrap()
+        .task;
+
+    assert_eq!(queued.runner_state, RunnerState::Queued);
+    assert_eq!(queued.reader_lease, None);
+}
+
+#[test]
+fn a_record_from_before_the_reader_lease_loads_without_one() {
+    let fx = stopped_fixture();
+    let path = fx.root.paths().orchestration_task_file("task-1");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("reader_lease");
+    fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+    let record = fx.reopen().task(&task("task-1")).unwrap();
+    assert_eq!(record.reader_lease, None);
+}
+
+#[test]
+fn the_reader_events_decode_in_an_older_reader_as_unrecognized() {
+    let leased: TaskEventKind = serde_json::from_value(serde_json::json!({
+        "type": "reader_leased", "until": "2026-10-03T12:02:00Z"
+    }))
+    .expect("leased");
+    assert!(matches!(leased, TaskEventKind::ReaderLeased { .. }));
+    let ended: TaskEventKind =
+        serde_json::from_value(serde_json::json!({ "type": "reader_lease_ended" })).expect("ended");
+    assert_eq!(ended, TaskEventKind::ReaderLeaseEnded);
 }

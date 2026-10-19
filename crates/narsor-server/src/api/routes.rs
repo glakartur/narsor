@@ -625,13 +625,7 @@ fn protocol_error_as_api(error: ProtocolError) -> ApiError {
 /// Where the daemon-owned local backend keeps its task storages — under the
 /// configured work root, which is where task workspaces have always lived.
 fn local_storage_root(state: &AppState) -> PathBuf {
-    local_task_storage_root(&state.work_dir)
-}
-
-/// The same root from the work root alone, for whoever wires the control
-/// plane before any request state exists.
-pub fn local_task_storage_root(work_dir: &std::path::Path) -> PathBuf {
-    work_dir.join("local-controller").join("storage")
+    state.work_dir.join("local-controller").join("storage")
 }
 
 fn execution_store_for(state: &AppState, execution_id: &str) -> Result<ExecutionStore, ApiError> {

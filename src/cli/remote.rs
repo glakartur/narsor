@@ -22,8 +22,8 @@ use serde_json::{Map, Value};
 
 use super::task_text::{
     age, awaiting_input, command_outcome, conversation_lines, conversation_origin,
-    default_backend_line, default_harness_line, detail_lines, event_line, lifecycle_name,
-    list_line, next_waiting, record_unreadable_detail, safe_json, status_badge, waiting_summary,
+    default_backend_line, default_harness_line, detail_lines, event_line, list_line, next_waiting,
+    record_unreadable_detail, safe_json, status_badge, task_state_name, waiting_summary,
     PAGE_BYTE_BUDGET,
 };
 use crate::api::{
@@ -256,7 +256,7 @@ pub enum TaskCommand {
         #[arg(long = "task-id", value_name = "ID")]
         task_id: Option<String>,
     },
-    /// Lists your tasks with backend, lifecycle and queue state, the
+    /// Lists your tasks with backend, runner state and queue state, the
     /// attention mark (`?` asks, `!` is wrong) and the title.
     List {
         /// Only the archived tasks, newest archive first (the TUI's history).
@@ -528,7 +528,7 @@ pub enum MaterialsCommand {
     },
 }
 
-/// Arguments of a lifecycle command.
+/// Arguments of a runner state command.
 #[derive(Debug, clap::Args)]
 pub struct CommandArgs {
     /// The task id.
@@ -1093,8 +1093,8 @@ pub async fn task(
                 .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
             let Some(pending) = awaiting_input(&task) else {
                 return Err(CliError::failure(format!(
-                    "Task '{task_id}' is not waiting for input (lifecycle: {}).",
-                    lifecycle_name(task.lifecycle)
+                    "Task '{task_id}' is not waiting for input (state: {}).",
+                    task_state_name(task.state)
                 )));
             };
             if let Some(wanted) = waiting_id.filter(|wanted| *wanted != pending.id) {

@@ -32,7 +32,7 @@
 //!
 //! See [`TaskRecord::holds_capacity`]: everything that has or may have
 //! compute, conservatively including `Interrupted`, `Unknown` and
-//! `Archiving`; a `Paused` task released its compute and its slot.
+//! `Archiving`; a `Stopped` task released its compute and its slot.
 //!
 //! # An offline controller
 //!
@@ -49,7 +49,7 @@ use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, CommandEffect};
 use super::model::{
     BackendCapacity, CapacityReservation, CommandOutcome, CommandRequest, DefaultBackendSelection,
-    MoveTarget, OwnerCommand, QueueReason, QueueStatus, TaskEventKind, TaskLifecycle, TaskRecord,
+    MoveTarget, OwnerCommand, QueueReason, QueueStatus, RunnerState, TaskEventKind, TaskRecord,
     DEFAULT_BACKEND_SELECTION_VERSION,
 };
 use super::{control_plane::Mutation, ControlPlane};
@@ -83,13 +83,13 @@ impl ControlPlane {
 
         let mut waiting: Vec<&TaskRecord> = tasks
             .iter()
-            .filter(|task| task.lifecycle == TaskLifecycle::Queued && task.reservation.is_none())
+            .filter(|task| task.runner_state == RunnerState::Queued && task.reservation.is_none())
             .collect();
         waiting.sort_by_key(|task| (task.rank, task.queue_sequence));
 
         let mut verdicts: Vec<(TaskId, Verdict)> = tasks
             .iter()
-            .filter(|task| task.lifecycle == TaskLifecycle::Queued && task.reservation.is_some())
+            .filter(|task| task.runner_state == RunnerState::Queued && task.reservation.is_some())
             .map(|task| (task.task_id.clone(), Verdict::Admit))
             .collect();
         let mut still_waiting = Vec::new();
@@ -148,15 +148,19 @@ impl ControlPlane {
             .is_some_and(|lease| now < lease.expires_at))
     }
 
-    /// [`ControlPlane::command`], refusing a command that would take a
-    /// capacity slot the backend does not have free.
+    /// [`ControlPlane::command`], deciding what a command that would take a
+    /// capacity slot does when the backend has none free.
     ///
-    /// Only resuming a `Paused` task needs one — every other command keeps
-    /// or frees the task's slot — and it is decided under the backend's
-    /// schedule lock, like an admission. A full backend refuses it with
-    /// [`OrchestrationError::BackendAtCapacity`] rather than stopping
-    /// anything (R11). A retry of an accepted command is answered from its
-    /// receipt as always, whatever the capacity now.
+    /// Only resuming a `Stopped` task needs a slot — every other command
+    /// keeps or frees the task's slot — and it is decided under the
+    /// backend's schedule lock, like an admission. With a free slot the
+    /// resume goes straight to `Provisioning`. On a full backend it does not
+    /// fail and stops nothing (R11): the task goes to `Queued` holding
+    /// nothing, at the front of the queue (like [`MoveTarget::Top`]), and
+    /// the next [`ControlPlane::schedule`] pass gives it the first slot
+    /// released (R20). A second such resume goes in front of the first.
+    /// A retry of an accepted command is answered from its receipt as
+    /// always, whatever the capacity now.
     pub fn command_with_capacity(
         &self,
         task_id: &TaskId,
@@ -171,13 +175,14 @@ impl ControlPlane {
             && matches!(
                 (
                     request.command,
-                    command_effect(record.lifecycle, request.command)
+                    command_effect(record.runner_state, request.command)
                 ),
                 (
                     OwnerCommand::Start | OwnerCommand::Resume,
-                    CommandEffect::Transition(TaskLifecycle::Provisioning)
+                    CommandEffect::Transition(RunnerState::Provisioning)
                 )
             );
+        let mut queue_resume = false;
         if takes_slot {
             match capacity {
                 BackendCapacity::Unavailable(detail) => {
@@ -187,18 +192,37 @@ impl ControlPlane {
                     })
                 }
                 BackendCapacity::Limit(limit) => {
-                    let running = self.capacity_in_use(&backend_id)?;
-                    if running >= *limit {
-                        return Err(OrchestrationError::BackendAtCapacity {
-                            backend_id,
-                            running,
-                            limit: *limit,
-                        });
-                    }
+                    queue_resume = self.capacity_in_use(&backend_id)? >= *limit;
                 }
             }
         }
-        self.command(task_id, request)
+        let outcome = self.command_routed(task_id, request, queue_resume)?;
+        if queue_resume && !outcome.replayed {
+            self.put_first_in_queue(&backend_id, task_id)?;
+            return Ok(CommandOutcome {
+                task: self.task(task_id)?,
+                ..outcome
+            });
+        }
+        Ok(outcome)
+    }
+
+    /// Gives `task_id` (just sent to the queue at rank 0) rank 1 and
+    /// renumbers the others behind it in their queue order. Under the
+    /// backend's schedule lock. The task's own rank is written last, so a
+    /// crash in between leaves at worst equal ranks, which the next pass
+    /// renumbers.
+    fn put_first_in_queue(&self, backend_id: &BackendId, task_id: &TaskId) -> Result<()> {
+        let mut others = self.backend_tasks(backend_id)?;
+        others.retain(|task| task.task_id != *task_id);
+        others.sort_by_key(|task| (task.rank, task.queue_sequence));
+        for (index, task) in others.iter().enumerate() {
+            let rank = u32::try_from(index + 2).unwrap_or(u32::MAX);
+            if task.rank != rank {
+                self.set_rank(&task.task_id, rank)?;
+            }
+        }
+        self.set_rank(task_id, 1)
     }
 
     /// Moves a queued task within its backend's queue.
@@ -393,7 +417,7 @@ impl ControlPlane {
     /// left `Queued` meanwhile (archived, say) is left alone.
     fn apply_verdict(&self, task_id: &TaskId, verdict: Verdict) -> Result<bool> {
         let (_, changed) = self.mutate(task_id, |record, now| {
-            if record.lifecycle != TaskLifecycle::Queued {
+            if record.runner_state != RunnerState::Queued {
                 return Ok(Mutation::Unchanged(false));
             }
             let mut granted = false;
@@ -432,10 +456,10 @@ fn check_movable(record: &TaskRecord, expected_generation: Option<u64>) -> Resul
     if let Some(expected) = expected_generation {
         record.check_generation(expected)?;
     }
-    if record.lifecycle != TaskLifecycle::Queued {
+    if record.runner_state != RunnerState::Queued {
         return Err(OrchestrationError::TaskNotQueued {
             task_id: record.task_id.clone(),
-            lifecycle: record.lifecycle,
+            runner_state: record.runner_state,
         });
     }
     Ok(())

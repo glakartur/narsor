@@ -2590,7 +2590,7 @@ mod remote_cli {
 
         let show = remote(&harness, token, &["task", "show", "t-1"]).await;
         assert_eq!(show.code, EXIT_SUCCESS, "{}", show.output());
-        assert!(show.stdout.contains("Lifecycle  queued"), "{}", show.stdout);
+        assert!(show.stdout.contains("State      queued"), "{}", show.stdout);
 
         // A pause of a queued task is refused readably; archive is accepted.
         let pause = remote(&harness, token, &["task", "pause", "t-1"]).await;
@@ -2963,7 +2963,7 @@ mod remote_cli {
             remote(&harness, token, &["task", "list", "--archived", "--json"]).await;
         let tasks: serde_json::Value = serde_json::from_str(&archived_json.stdout).expect("JSON");
         assert_eq!(tasks.as_array().unwrap().len(), 2);
-        assert_eq!(tasks[0]["lifecycle"], "archived");
+        assert_eq!(tasks[0]["runner_state"], "archived");
         let one = remote(&harness, token, &["task", "show", "t-keep", "--json"]).await;
         let task: serde_json::Value = serde_json::from_str(&one.stdout).expect("JSON");
         assert_eq!(task["task_id"], "t-keep");
@@ -3256,7 +3256,9 @@ mod remote_cli {
         running.runner.snapshot(&empty).await.expect("snapshot");
 
         // The timeline of a task with no steps yet, and the reason an
-        // execution cannot be read once the workload is gone.
+        // execution cannot be read once the workload is gone and nobody
+        // knows whether its runner is (an unknown task is not read by a
+        // reader: the old runner may still hold the storage).
         let steps = remote(&harness, token, &["task", "steps", "t-esc"]).await;
         assert_eq!(steps.code, EXIT_SUCCESS, "{}", steps.output());
         assert!(steps.stdout.contains("No steps."), "{}", steps.stdout);
@@ -3266,7 +3268,7 @@ mod remote_cli {
                 "t-esc",
                 running.epoch,
                 1,
-                narsor_engine::orchestration::Observation::WorkloadLost { state_known: true },
+                narsor_engine::orchestration::Observation::WorkloadLost { state_known: false },
                 Some(1),
             ))
             .await

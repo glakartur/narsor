@@ -124,8 +124,12 @@ spec:
       message: "only emptyDir, the task's PVC, its launch Secret and projected approved secrets"
     - expression: >-
         variables.volumes.all(v, !has(v.persistentVolumeClaim) ||
-        v.persistentVolumeClaim.claimName == object.metadata.name + '-storage')
-      message: "a task Pod mounts only its own task storage"
+        (object.metadata.name.endsWith('-reader') ?
+        (v.persistentVolumeClaim.claimName ==
+        object.metadata.name.substring(0, size(object.metadata.name) - 7) + '-storage' &&
+        has(v.persistentVolumeClaim.readOnly) && v.persistentVolumeClaim.readOnly == true) :
+        v.persistentVolumeClaim.claimName == object.metadata.name + '-storage'))
+      message: "a task Pod mounts only its own task storage; a reader Pod (-reader) mounts it read-only"
     - expression: >-
         variables.volumes.all(v, !has(v.secret) ||
         (v.secret.secretName.startsWith(object.metadata.name + '-launch-') ||
@@ -238,7 +242,8 @@ spec:
     - expression: >-
         (request.resource.resource == 'pods' &&
         'narsor.dev/component' in oldObject.metadata.labels &&
-        oldObject.metadata.labels['narsor.dev/component'] == 'workload') ||
+        (oldObject.metadata.labels['narsor.dev/component'] == 'workload' ||
+        oldObject.metadata.labels['narsor.dev/component'] == 'reader')) ||
         (request.resource.resource == 'persistentvolumeclaims' &&
         'narsor.dev/component' in oldObject.metadata.labels &&
         oldObject.metadata.labels['narsor.dev/component'] == 'storage')

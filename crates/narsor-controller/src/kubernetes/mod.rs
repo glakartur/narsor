@@ -13,6 +13,7 @@
 //! | `incarnation`, `launch_generation` | the Pod's annotations |
 //! | release compute | delete the Pod (UID precondition) |
 //! | archive | delete the Pod, then — once it is gone — the PVC |
+//! | reader (D63) | a second Pod `narsor-{key}-{hash}-reader`, the same PVC mounted `readOnly` |
 //!
 //! Why not a Job or a StatefulSet: both would restart or replace a Pod on
 //! their own, while Narsor replaces a lost workload only for a newer launch
@@ -59,6 +60,21 @@
 //! * The Pod carries the lease epoch and launch generation as labels: an
 //!   operator (or an admission rule) sees which lease holder made it.
 //!
+//! # The reader
+//!
+//! While an owner reads a stopped task, the control plane has the controller
+//! start a read-only runner: a Pod of its own ([`manifest::reader_pod`]) on
+//! the task's PVC, mounted read-only. It is a different object under a
+//! different name, so every rule above about the workload Pod — one name,
+//! UID preconditions on deletion, foreign objects refused — holds for it
+//! separately, and observing, creating and deleting it never touches the
+//! workload Pod. The controller keeps the two apart: it removes the reader
+//! and waits for it to be gone before it launches work or deletes storage.
+//! The claim is `ReadWriteOnce`, which Kubernetes only enforces per node, so
+//! that ordering — not the volume — is what keeps two runners off one
+//! storage; the runner's storage lock is the last guard where the volume
+//! supports locks.
+//!
 //! The controller decides everything else — when a Pod may go, when a new
 //! one may come (KTD2); see [`narsor_engine::backends::Controller`].
 
@@ -81,8 +97,9 @@ pub use self::manifest::KubernetesBackendConfig;
 use self::manifest::{EPOCH_KEY, GENERATION_KEY, INCARNATION_ANNOTATION, RESOURCE_KEY_ANNOTATION};
 use self::objects::{PersistentVolumeClaim, Pod, StorageClass};
 use narsor_engine::backends::{
-    ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, Removal,
-    StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
+    ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, ReaderStart,
+    Removal, StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase,
+    WorkloadState,
 };
 use narsor_engine::domain::TaskId;
 use narsor_engine::environment::{BackendCapabilities, BackendKind};
@@ -219,12 +236,17 @@ impl KubernetesBackend {
     }
 
     async fn get_pod(&self, task: &TaskResources) -> BackendResult<Option<Pod>> {
-        let path = self.client.core_path("pods", Some(&task.workload));
+        self.get_named_pod(task, &task.workload).await
+    }
+
+    /// The Pod `name` of the task: its workload's or its reader's.
+    async fn get_named_pod(&self, task: &TaskResources, name: &str) -> BackendResult<Option<Pod>> {
+        let path = self.client.core_path("pods", Some(name));
         let Some(value) = self.client.get(&path).await? else {
             return Ok(None);
         };
         let pod: Pod = parse("Pod", value)?;
-        check_owner(task, &pod.metadata.annotations, &task.workload)?;
+        check_owner(task, &pod.metadata.annotations, name)?;
         Ok(Some(pod))
     }
 
@@ -400,19 +422,103 @@ impl KubernetesBackend {
     }
 
     async fn remove_pod(&self, task: &TaskResources) -> BackendResult<Removal> {
-        let Some(pod) = self.get_pod(task).await? else {
+        self.remove_named_pod(task, &task.workload).await
+    }
+
+    async fn remove_named_pod(&self, task: &TaskResources, name: &str) -> BackendResult<Removal> {
+        let Some(pod) = self.get_named_pod(task, name).await? else {
             return Ok(Removal::AlreadyAbsent);
         };
         if pod.metadata.deletion_timestamp.is_some() {
             return Ok(Removal::InProgress);
         }
-        let path = self.client.core_path("pods", Some(&task.workload));
+        let path = self.client.core_path("pods", Some(name));
         if !self.client.delete(&path, &pod.metadata.uid).await? {
             return Ok(Removal::AlreadyAbsent);
         }
-        Ok(match self.get_pod(task).await? {
+        Ok(match self.get_named_pod(task, name).await? {
             Some(_) => Removal::Initiated,
             None => Removal::Removed,
+        })
+    }
+
+    /// Creates the task's reader Pod on its existing storage.
+    async fn create_reader(
+        &self,
+        task: &TaskResources,
+        launch: &WorkloadLaunch,
+    ) -> BackendResult<ReaderStart> {
+        let plan = manifest::plan(&self.config, launch)?;
+        let namespace = self.client.namespace();
+        let pod = manifest::reader_pod(&self.config, namespace, task, launch, &plan);
+        if let Err(problems) = manifest::check_pod_shape(&pod, &self.config.shape_policy()) {
+            return Err(BackendError::rejected(format!(
+                "the generated reader Pod violates the admission rules: {}",
+                problems.join("; ")
+            )));
+        }
+        // A reader reads what a runner left: no claim, nothing to read — and
+        // never a claim being deleted.
+        match self.get_pvc(task).await? {
+            Some(pvc) if pvc.metadata.deletion_timestamp.is_some() => {
+                return Err(BackendError::transient(format!(
+                    "task storage '{}' is being deleted",
+                    task.storage
+                )))
+            }
+            Some(_) => {}
+            None => {
+                return Err(BackendError::storage_missing(format!(
+                    "task storage '{}' does not exist",
+                    task.storage
+                )))
+            }
+        }
+        let pods = self.client.core_path("pods", None);
+        let created = match self.client.create(&pods, &pod).await? {
+            Created::Created(value) => parse::<Pod>("Pod", value)?,
+            Created::AlreadyExists => {
+                let existing = self
+                    .get_named_pod(task, &task.reader)
+                    .await?
+                    .ok_or_else(|| {
+                        BackendError::transient(format!(
+                            "Pod '{}' existed and vanished; observe again",
+                            task.reader
+                        ))
+                    })?;
+                return Ok(ReaderStart {
+                    workload: self.workload_state(&existing)?,
+                    created: false,
+                });
+            }
+        };
+        let secret = manifest::launch_secret_of(
+            namespace,
+            task,
+            &task.reader,
+            launch,
+            &created.metadata.uid,
+        )?;
+        let secrets = self.client.core_path("secrets", None);
+        let made = match self.client.create(&secrets, &secret).await {
+            Ok(Created::Created(_)) => Ok(()),
+            Ok(Created::AlreadyExists) => Err(BackendError::transient(format!(
+                "the launch Secret of incarnation '{}' already exists",
+                launch.incarnation
+            ))),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = made {
+            let path = self.client.core_path("pods", Some(&task.reader));
+            if let Err(cleanup) = self.client.delete(&path, &created.metadata.uid).await {
+                tracing::warn!(pod = %task.reader, %cleanup, "kubernetes: could not remove a reader Pod without its launch Secret");
+            }
+            return Err(error);
+        }
+        Ok(ReaderStart {
+            workload: self.workload_state(&created)?,
+            created: true,
         })
     }
 
@@ -465,6 +571,7 @@ impl ExecutionBackend for KubernetesBackend {
             task_id: task_id.clone(),
             resource_key: resource_key.to_string(),
             workload: names::workload(resource_key),
+            reader: names::reader(resource_key),
             storage: names::storage(resource_key),
         })
     }
@@ -513,6 +620,25 @@ impl ExecutionBackend for KubernetesBackend {
         }
         let storage = self.remove_pvc(task).await?;
         Ok(ArchiveProgress { workload, storage })
+    }
+
+    async fn observe_reader(&self, task: &TaskResources) -> BackendResult<Option<WorkloadState>> {
+        match self.get_named_pod(task, &task.reader).await? {
+            Some(pod) => Ok(Some(self.workload_state(&pod)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn start_reader(
+        &self,
+        task: &TaskResources,
+        launch: &WorkloadLaunch,
+    ) -> BackendResult<ReaderStart> {
+        self.create_reader(task, launch).await
+    }
+
+    async fn stop_reader(&self, task: &TaskResources) -> BackendResult<Removal> {
+        self.remove_named_pod(task, &task.reader).await
     }
 }
 

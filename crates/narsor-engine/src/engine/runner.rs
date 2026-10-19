@@ -1587,7 +1587,7 @@ impl Engine {
         }
 
         // A problem form can explicitly return to the agent instead of
-        // settling its output. This is a fresh lifecycle entry: a previously
+        // settling its output. This is a fresh runner state entry: a previously
         // exhausted reprompt or conductor rescue must not be inherited by the
         // next attempt.
         if resumed.pending.continuation == InputContinuation::ResolveOutput

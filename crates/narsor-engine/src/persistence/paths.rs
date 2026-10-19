@@ -201,6 +201,8 @@ pub const ENROLLMENTS_LOCK_FILE: &str = "enroll.lock";
 /// The current runner credential of one task (KTD3), next to its record but
 /// outside it, so the credential hash never travels with the record.
 pub const RUNNER_SESSION_FILE: &str = "runner-session.json";
+/// The file of a task's read-only runner credential.
+pub const READER_SESSION_FILE: &str = "reader-session.json";
 
 /// Directory of immutable task launch specifications on task storage.
 ///
@@ -433,6 +435,14 @@ impl StatePaths {
     pub fn runner_session_file(&self, task_id: &str) -> PathBuf {
         self.orchestration_task_dir(task_id)
             .join(RUNNER_SESSION_FILE)
+    }
+
+    /// `{root}/orchestration/tasks/{task_id}/reader-session.json`: the
+    /// credential of the task's read-only runner, apart from the session of
+    /// the runner that works, so neither replaces the other.
+    pub fn reader_session_file(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id)
+            .join(READER_SESSION_FILE)
     }
 
     /// `{root}/materials`

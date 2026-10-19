@@ -8,7 +8,7 @@
 //! There is one mode and one application, [`task_app::TaskApp`]: the tasks of
 //! the control plane (`/control/v1`) of whichever backend the configuration
 //! names — the local daemon, launched when none runs, or a remote server. This
-//! module is the terminal lifecycle and the event loop that joins the
+//! module is the terminal runner state and the event loop that joins the
 //! application to the terminal: keys and pastes in, control-plane events in,
 //! a redraw out.
 //!

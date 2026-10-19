@@ -9,8 +9,8 @@ use chrono::{Duration, TimeZone, Utc};
 use narsor::api::{ClientError, HarnessSelectionSnapshot};
 use narsor::cli::task_text::{
     age, attention_lines, command_outcome, conversation_lines, conversation_origin,
-    default_harness_line, detail_lines, display_lines, event_line, lifecycle_hint, list_line,
-    next_waiting, queue_badge, record_unreadable_detail, safe_json, Tone,
+    default_harness_line, detail_lines, display_lines, event_line, list_line, next_waiting,
+    queue_badge, record_unreadable_detail, safe_json, state_hint, Tone,
 };
 use narsor_engine::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, ExecutionEventsSource, QueueView,
@@ -20,7 +20,7 @@ use narsor_engine::domain::display::DisplayLink;
 use narsor_engine::domain::{ExecutionStatus, TaskId};
 use narsor_engine::orchestration::{
     AttentionKind, ConversationAttemptSummary, HarnessUnavailable, OwnerCommand, QueueReason,
-    TaskEvent, TaskEventKind, TaskLifecycle, EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
+    RunnerState, TaskEvent, TaskEventKind, EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
 };
 
 mod task_app_support;
@@ -137,7 +137,7 @@ fn a_list_row_shows_the_attention_mark_the_status_and_the_title() {
     let line = list_line(&calm);
     assert!(line.starts_with("t-1"), "{line}");
     assert!(line.contains("#1"), "{line}");
-    assert!(line.contains("paused — NAR-1 login"), "{line}");
+    assert!(line.contains("paused · no slot — NAR-1 login"), "{line}");
 
     let asking = waiting_on(
         task("t-2", "local", "paused", 2),
@@ -146,7 +146,7 @@ fn a_list_row_shows_the_attention_mark_the_status_and_the_title() {
         Some("review"),
     );
     let asking = list_line(&asking);
-    assert!(asking.contains("#2         ? paused"), "{asking}");
+    assert!(asking.contains("#2         ? paused · no slot"), "{asking}");
     assert!(!asking.contains('—'), "no title, no dash: {asking}");
 
     let wrong = waiting_on(
@@ -155,7 +155,7 @@ fn a_list_row_shows_the_attention_mark_the_status_and_the_title() {
         "f-1",
         None,
     );
-    assert!(list_line(&wrong).contains("#3         ! paused"));
+    assert!(list_line(&wrong).contains("#3         ! paused · no slot"));
 }
 
 #[test]
@@ -466,7 +466,7 @@ fn resume_event(kind: TaskEventKind) -> TaskEvent {
         sequence: 7,
         task_id: TaskId::parse("t-1").unwrap(),
         at: at(),
-        lifecycle: TaskLifecycle::Interrupted,
+        runner_state: RunnerState::Interrupted,
         generation: 2,
         kind,
     }
@@ -529,9 +529,9 @@ fn an_exhaustion_event_names_the_attempts_and_the_loss_once() {
 
 #[test]
 fn show_on_an_interrupted_task_tells_what_it_waits_for() {
-    let hint = |subject| lifecycle_hint(&subject).unwrap();
+    let hint = |subject| state_hint(&subject).unwrap();
 
-    let planned = hint(interrupted("t-1", TaskLifecycle::Running, 2, true));
+    let planned = hint(interrupted("t-1", RunnerState::Running, 2, true));
     assert!(
         planned.text.contains("resumed automatically (attempt 2/5)"),
         "{planned:?}"
@@ -539,7 +539,7 @@ fn show_on_an_interrupted_task_tells_what_it_waits_for() {
     assert_eq!(planned.tone, Tone::Warning);
 
     let gave_up = hint(exhausted(
-        interrupted("t-1", TaskLifecycle::Running, 5, false),
+        interrupted("t-1", RunnerState::Running, 5, false),
         &format!("{EXHAUSTION_REASON_PREFIX}pod evicted"),
     ));
     assert!(
@@ -550,7 +550,7 @@ fn show_on_an_interrupted_task_tells_what_it_waits_for() {
     );
     assert_eq!(gave_up.tone, Tone::Error);
 
-    let pausing = hint(interrupted("t-1", TaskLifecycle::PauseRequested, 1, false));
+    let pausing = hint(interrupted("t-1", RunnerState::PauseRequested, 1, false));
     assert!(
         pausing
             .text
@@ -571,7 +571,7 @@ fn show_on_an_interrupted_task_tells_what_it_waits_for() {
     }
 
     let detail = detail_lines(
-        &interrupted("t-1", TaskLifecycle::Running, 3, true),
+        &interrupted("t-1", RunnerState::Running, 3, true),
         None,
         None,
     );
@@ -581,4 +581,106 @@ fn show_on_an_interrupted_task_tells_what_it_waits_for() {
             .any(|line| line.text.contains("(attempt 3/5)")),
         "{detail:?}"
     );
+}
+
+#[test]
+fn the_task_text_shows_the_state_and_whether_a_slot_is_held() {
+    use narsor_engine::orchestration::TaskState;
+    use task_app_support::without_slot;
+
+    let finished = without_slot(titled(
+        with_runner(
+            task("t-1", "local", "running", 1),
+            ExecutionStatus::Completed,
+            "done",
+        ),
+        "NAR-1",
+    ));
+    assert_eq!(finished.state, TaskState::Finished);
+    let line = list_line(&finished);
+    assert!(line.contains("done · no slot — NAR-1"), "{line}");
+    let detail = detail_lines(&finished, None, None);
+    assert!(
+        detail
+            .iter()
+            .any(|line| line.text.starts_with("State      done · no slot")),
+        "{detail:?}"
+    );
+
+    let running = with_runner(
+        task("t-2", "local", "running", 2),
+        ExecutionStatus::Running,
+        "edit",
+    );
+    assert!(list_line(&running).contains("running"), "running");
+    assert!(!list_line(&running).contains("no slot"));
+    let detail = detail_lines(&running, None, None);
+    assert!(
+        detail
+            .iter()
+            .any(|line| line.text.starts_with("State      running · slot held")),
+        "{detail:?}"
+    );
+
+    let asking = without_slot(task_app_support::with_pending(
+        task("t-3", "local", "running", 3),
+        serde_json::json!({
+            "execution_id": "exec-1",
+            "state_id": "plan",
+            "action_execution_id": "act-1",
+            "instruction": "Which one?",
+            "fields": [{ "name": "answer", "type": "text" }],
+            "outputs": [],
+            "episode": "ep-1",
+            "requested_at": "2026-10-09T11:54:00Z"
+        }),
+    ));
+    assert_eq!(asking.state, TaskState::HumanNeeded);
+    let hint = state_hint(&asking).unwrap();
+    assert!(hint.text.contains("holds no slot"), "{hint:?}");
+    assert!(list_line(&asking).contains("awaiting input · no slot"));
+}
+
+#[test]
+fn a_summary_without_a_state_reads_as_unknown_and_never_panics() {
+    let mut value = serde_json::to_value(task("t-1", "local", "running", 1)).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("state");
+    object.remove("holds_slot");
+    let old: narsor_engine::controller_protocol::TaskSummary =
+        serde_json::from_value(value).unwrap();
+    assert!(list_line(&old).contains("unknown"));
+    assert!(state_hint(&old).is_none());
+    assert!(!detail_lines(&old, None, None).is_empty());
+}
+
+#[test]
+fn a_resume_that_waits_for_a_slot_says_so() {
+    use narsor_engine::orchestration::TaskState;
+
+    let mut resumed = task("t-1", "local", "queued", 1);
+    resumed.state = TaskState::Queued;
+    let response = |queued_for_slot| narsor_engine::controller_protocol::OwnerCommandResponse {
+        receipt: serde_json::from_value(serde_json::json!({
+            "idempotency_key": "k",
+            "command": "resume",
+            "expected_generation": 1,
+            "accepted_at": at(),
+            "generation_after": 2,
+            "runner_state_after": "queued",
+            "revision": 5,
+            "actor": "owner",
+        }))
+        .expect("a receipt"),
+        replayed: false,
+        task: resumed.clone(),
+        queued_for_slot,
+    };
+    let waits = command_outcome(OwnerCommand::Resume, &Ok(response(true)));
+    assert!(
+        waits.text.contains("waits first in the queue for a slot"),
+        "{waits:?}"
+    );
+    let starts = command_outcome(OwnerCommand::Resume, &Ok(response(false)));
+    assert!(!starts.text.contains("waits"), "{starts:?}");
 }

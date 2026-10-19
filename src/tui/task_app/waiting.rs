@@ -53,8 +53,8 @@ use ratatui::Frame;
 use crate::api::ClientError;
 use crate::conductor::ConductorView;
 use crate::controller_protocol::{
-    ConductorReadResponse, OwnerCommandRequest, SubmitInputRequest, SubmitOperatorCommandRequest,
-    TaskSummary,
+    ConductorReadResponse, ConversationUnavailableReason, OwnerCommandRequest, SubmitInputRequest,
+    SubmitOperatorCommandRequest, TaskSummary,
 };
 use narsor_protocol::api::{
     HumanInputDeliveryDto, PendingHumanInputView, Position, PositionStatus,
@@ -97,7 +97,7 @@ pub enum Submit {
     },
     /// A command for the runner: a restart, a confirmation of a proposal.
     Operator(OperatorCommand),
-    /// A lifecycle command of the owner: `start`, `archive`.
+    /// A runner state command of the owner: `start`, `archive`.
     Owner(OwnerCommand),
 }
 
@@ -567,6 +567,8 @@ pub struct WaitingPanel {
     released: Vec<Released>,
     conductor: Option<ConductorView>,
     conductor_revision: Option<u64>,
+    /// When a read told "the reader is starting" is asked again (D63).
+    conductor_retry_at: Option<std::time::Instant>,
 }
 
 impl WaitingPanel {
@@ -652,7 +654,11 @@ impl WaitingPanel {
     /// Whether the conductor's state has to be read for `revision` of the
     /// row: a failed step and a proposal are made of it.
     pub fn needs_conductor(&self, revision: u64) -> bool {
-        self.entries.iter().any(Entry::wants_conductor) && self.conductor_revision != Some(revision)
+        self.entries.iter().any(Entry::wants_conductor)
+            && (self.conductor_revision != Some(revision)
+                || self
+                    .conductor_retry_at
+                    .is_some_and(|at| std::time::Instant::now() >= at))
     }
 
     /// Makes the conductor's state due for a new read, keeping what is shown.
@@ -670,9 +676,20 @@ impl WaitingPanel {
         result: Result<ConductorReadResponse, String>,
     ) {
         self.conductor_revision = Some(revision);
+        self.conductor_retry_at = None;
         match result {
             Ok(ConductorReadResponse::Available { conductor, .. }) => {
                 self.conductor = Some(*conductor);
+            }
+            // The reader of a stopped task is starting: keep what the panel
+            // has and ask again after a pause.
+            Ok(ConductorReadResponse::Unavailable {
+                reason: ConversationUnavailableReason::ReaderStarting,
+                ..
+            }) => {
+                self.conductor_retry_at =
+                    Some(std::time::Instant::now() + super::tabs::READER_RETRY);
+                return;
             }
             Ok(ConductorReadResponse::Unavailable { message, .. }) => {
                 self.conductor = Some(ConductorView::unavailable(message));
@@ -1491,6 +1508,7 @@ impl TaskApp {
             summary,
             submit,
         } = request;
+        let had_slot = self.holds_slot(&task_id);
         let result = match submit {
             Submit::Input {
                 pending_input_id,
@@ -1538,7 +1556,14 @@ impl TaskApp {
                 self.focus = super::Focus::List;
                 self.panel_focus = false;
                 self.back_to_axis();
-                self.notify(Severity::Success, format!("{title}: {summary}"));
+                // An answer to a task without a slot resumes it; the resume
+                // waits when the backend is full.
+                let note = if self.queued_after_work(&task_id, had_slot).await {
+                    super::actions::QUEUED_FOR_SLOT
+                } else {
+                    ""
+                };
+                self.notify(Severity::Success, format!("{title}: {summary}{note}"));
             }
             Err(error) => {
                 let retryable = super::is_transport(&error);

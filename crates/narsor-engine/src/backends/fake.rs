@@ -25,11 +25,12 @@ use chrono::Utc;
 use tokio::task::JoinHandle;
 
 use super::{
-    ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, Removal,
-    StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
+    ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, ReaderStart,
+    Removal, StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase,
+    WorkloadState,
 };
 use crate::api::ClientError;
-use crate::controller_protocol::{RunnerClient, RunnerDirective};
+use crate::controller_protocol::{RunnerClient, RunnerDirective, RunnerPollQuery};
 use crate::domain::{ExecutionStatus, TaskId};
 use crate::environment::{BackendCapabilities, BackendKind};
 use crate::orchestration::RunnerSnapshot;
@@ -52,6 +53,8 @@ pub struct FakeBackend {
 struct Platform {
     storages: HashMap<String, FakeStorage>,
     workloads: HashMap<String, FakeWorkload>,
+    /// Read-only runners (D63), by their own names.
+    readers: HashMap<String, FakeWorkload>,
     next_uid: u64,
 }
 
@@ -69,7 +72,7 @@ struct FakeWorkload {
 
 impl Drop for Platform {
     fn drop(&mut self) {
-        for workload in self.workloads.values_mut() {
+        for workload in self.workloads.values_mut().chain(self.readers.values_mut()) {
             if let Some(runner) = workload.runner.take() {
                 runner.abort();
             }
@@ -117,6 +120,24 @@ impl FakeBackend {
         }
         workload.state.phase = WorkloadPhase::Exited { code: None };
         workload.state.resource_generation += 1;
+        true
+    }
+
+    /// The platform loses the task's reader unexpectedly. Returns whether
+    /// there was a live one to lose.
+    pub fn kill_reader(&self, task: &TaskResources) -> bool {
+        let mut platform = self.lock();
+        let Some(reader) = platform.readers.get_mut(&task.reader) else {
+            return false;
+        };
+        if let Some(runner) = reader.runner.take() {
+            runner.abort();
+        }
+        if !reader.state.phase.is_alive() {
+            return false;
+        }
+        reader.state.phase = WorkloadPhase::Exited { code: None };
+        reader.state.resource_generation += 1;
         true
     }
 
@@ -215,6 +236,7 @@ impl ExecutionBackend for FakeBackend {
             task_id: task_id.clone(),
             resource_key: resource_key.to_string(),
             workload: format!("narsor-task-{key}"),
+            reader: format!("narsor-task-{key}-reader"),
             storage: format!("narsor-task-{key}-storage"),
         })
     }
@@ -262,6 +284,138 @@ impl ExecutionBackend for FakeBackend {
             None => Removal::AlreadyAbsent,
         };
         Ok(ArchiveProgress { workload, storage })
+    }
+
+    async fn observe_reader(&self, task: &TaskResources) -> BackendResult<Option<WorkloadState>> {
+        Ok(self
+            .lock()
+            .readers
+            .get(&task.reader)
+            .map(|reader| reader.state.clone()))
+    }
+
+    async fn start_reader(
+        &self,
+        task: &TaskResources,
+        launch: &WorkloadLaunch,
+    ) -> BackendResult<ReaderStart> {
+        let mut platform = self.lock();
+        if !platform.storages.contains_key(&task.storage) {
+            return Err(BackendError::storage_missing(format!(
+                "task storage '{}' does not exist",
+                task.storage
+            )));
+        }
+        if let Some(existing) = platform.readers.get(&task.reader) {
+            return Ok(ReaderStart {
+                workload: existing.state.clone(),
+                created: false,
+            });
+        }
+        platform.next_uid += 1;
+        let state = WorkloadState {
+            uid: format!("fake-{}-{}", task.reader, platform.next_uid),
+            resource_generation: 1,
+            incarnation: launch.incarnation.clone(),
+            launch_generation: launch.generation,
+            phase: WorkloadPhase::Starting,
+        };
+        let runner = self.simulate_runners.then(|| {
+            tokio::spawn(simulated_reader(
+                Arc::downgrade(&self.platform),
+                task.reader.clone(),
+                state.uid.clone(),
+                launch.clone(),
+            ))
+        });
+        platform.readers.insert(
+            task.reader.clone(),
+            FakeWorkload {
+                state: state.clone(),
+                runner,
+            },
+        );
+        Ok(ReaderStart {
+            workload: state,
+            created: true,
+        })
+    }
+
+    async fn stop_reader(&self, task: &TaskResources) -> BackendResult<Removal> {
+        Ok(match self.lock().readers.remove(&task.reader) {
+            Some(mut reader) => {
+                if let Some(runner) = reader.runner.take() {
+                    runner.abort();
+                }
+                Removal::Removed
+            }
+            None => Removal::AlreadyAbsent,
+        })
+    }
+}
+
+/// A read-only runner that answers nothing (no simulated runner has a
+/// storage's worth of conversation) but keeps the promises of the reader
+/// contract: it polls for reads only — which is what tells the control plane
+/// it is connected — and leaves on any directive but `continue` or when its
+/// credential is refused.
+async fn simulated_reader(
+    platform: Weak<Mutex<Platform>>,
+    name: String,
+    uid: String,
+    launch: WorkloadLaunch,
+) {
+    let client = RunnerClient::new(&launch.control_plane_url, launch.credential.expose());
+    let query = RunnerPollQuery {
+        wait_secs: Some(RUNNER_POLL_SECS),
+        defer_materials: true,
+        ..RunnerPollQuery::default()
+    };
+    let mut up = false;
+    let code = loop {
+        match client.poll_with(&query).await {
+            Ok(response) => {
+                if !up {
+                    up = true;
+                    update_reader(&platform, &name, &uid, |state| {
+                        if state.phase == WorkloadPhase::Starting {
+                            state.phase = WorkloadPhase::Running;
+                            state.resource_generation += 1;
+                        }
+                    });
+                }
+                if response.directive != RunnerDirective::Continue {
+                    break 0;
+                }
+            }
+            Err(ClientError::Unauthorized) => break 1,
+            Err(_) => tokio::time::sleep(RUNNER_RETRY).await,
+        }
+    };
+    update_reader(&platform, &name, &uid, |state| {
+        state.phase = WorkloadPhase::Exited { code: Some(code) };
+        state.resource_generation += 1;
+    });
+}
+
+fn update_reader(
+    platform: &Weak<Mutex<Platform>>,
+    name: &str,
+    uid: &str,
+    change: impl FnOnce(&mut WorkloadState),
+) {
+    let Some(platform) = platform.upgrade() else {
+        return;
+    };
+    let mut platform = platform.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(reader) = platform.readers.get_mut(name) {
+        // A replacement under the same name is not this reader's.
+        if reader.state.uid == uid {
+            change(&mut reader.state);
+            if !reader.state.phase.is_alive() {
+                reader.runner = None;
+            }
+        }
     }
 }
 

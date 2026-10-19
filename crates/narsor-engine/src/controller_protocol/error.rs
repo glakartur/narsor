@@ -131,7 +131,6 @@ impl From<OrchestrationError> for ProtocolError {
                 Self::conflict("operator_command_already_settled", message)
             }
             E::NotAdmitted(_) => Self::conflict("not_admitted", message),
-            E::BackendAtCapacity { .. } => Self::conflict("backend_at_capacity", message),
             E::BackendUnavailable { .. } => Self::conflict("backend_unavailable", message),
             E::TaskNotQueued { .. } => Self::conflict("task_not_queued", message),
             E::InvalidMoveAnchor { .. } => Self::bad_request("invalid_move_anchor", message),

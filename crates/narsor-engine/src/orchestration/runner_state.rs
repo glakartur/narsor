@@ -1,7 +1,7 @@
 //! The runner's side of a task record: snapshots and owner input (KTD3,
 //! KTD4).
 //!
-//! A runner never changes the orchestration lifecycle — only a lease-fenced
+//! A runner never changes the orchestration runner state — only a lease-fenced
 //! controller observation does. What it changes is the *last safe summary*
 //! clients read ([`TaskRecord::runner`]) and the queue of owner answers
 //! waiting for it ([`TaskRecord::inputs`]). Both go through the same
@@ -12,16 +12,17 @@
 //! the record *under the task lock*: a resume committed a moment earlier
 //! supersedes the old launch for good, and no report of it slips in after.
 
-use super::control_plane::{ControlPlane, Mutation};
+use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
     InputOutcome, InputRequest, InputStatus, InputUpdate, QueuedInput, RunnerObservation,
-    RunnerReportOutcome, RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord,
+    RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
 };
 use crate::domain::display::bounded_detail;
 use crate::domain::{without_unsafe_chars, TaskId};
 use crate::engine::{ConversationState, EventLink, Timeline};
-use chrono::{DateTime, Utc};
+use crate::environment::backend::DEFAULT_SLOT_RELEASE_GRACE_SECS;
+use chrono::{DateTime, Duration, Utc};
 
 impl ControlPlane {
     /// Accepts a runner snapshot from `incarnation`, launched at
@@ -39,7 +40,29 @@ impl ControlPlane {
         task_id: &TaskId,
         incarnation: &str,
         launch_generation: u64,
+        snapshot: RunnerSnapshot,
+    ) -> Result<RunnerReportOutcome> {
+        self.record_runner_snapshot_with(
+            task_id,
+            incarnation,
+            launch_generation,
+            snapshot,
+            Duration::seconds(i64::try_from(DEFAULT_SLOT_RELEASE_GRACE_SECS).unwrap_or(i64::MAX)),
+        )
+    }
+
+    /// [`Self::record_runner_snapshot`] with the wait `grace` a transient
+    /// execution state (input needed, failed) gets before the task's slot
+    /// is freed, as the backend is configured now. The snapshot also sets
+    /// or clears the task's slot-release deadline (D62, see
+    /// [`refresh_slot_release_due`]).
+    pub fn record_runner_snapshot_with(
+        &self,
+        task_id: &TaskId,
+        incarnation: &str,
+        launch_generation: u64,
         mut snapshot: RunnerSnapshot,
+        grace: Duration,
     ) -> Result<RunnerReportOutcome> {
         // A remote runner's word is not trusted with a terminal: what the
         // attention carries is cleaned before it is stored or announced.
@@ -87,7 +110,7 @@ impl ControlPlane {
             // follow from it are on the record that event points at.
             obsolete_undelivered(record, pending.as_deref(), now);
             let safe_point_generation = if snapshot.safe_point {
-                if record.lifecycle == TaskLifecycle::PauseRequested {
+                if record.runner_state == RunnerState::PauseRequested {
                     Some(record.generation)
                 } else {
                     record
@@ -113,6 +136,7 @@ impl ControlPlane {
                 received_at: now,
                 safe_point_generation,
             });
+            refresh_slot_release_due(record, now, grace);
             Ok(Mutation::Changed(kind, true))
         })?;
         Ok(RunnerReportOutcome { task, applied })
@@ -120,8 +144,11 @@ impl ControlPlane {
 
     /// Queues an owner answer for the request the runner waits on.
     ///
+    /// Also taken while the task is `Stopped` or `Queued` (waiting for a
+    /// slot): the answer waits on the record for the next runner.
+    ///
     /// Refused — without touching the record, let alone the runner — when
-    /// the task cannot take input in its lifecycle, when the last runner
+    /// the task cannot take input in its runner state, when the last runner
     /// snapshot waits on another request (or none), or when another answer
     /// to the same request is already queued. A retry with the same key and
     /// answer returns the original input.
@@ -149,15 +176,21 @@ impl ControlPlane {
                 }
                 return Ok(Mutation::Unchanged((existing.clone(), true)));
             }
+            // A paused task, or one resumed and waiting for a slot, keeps the
+            // answer for the runner of its next start (R13, R14); the
+            // service then resumes it. It still has to answer the request
+            // the last snapshot shows.
             if !matches!(
-                record.lifecycle,
-                TaskLifecycle::Provisioning
-                    | TaskLifecycle::Running
-                    | TaskLifecycle::PauseRequested
+                record.runner_state,
+                RunnerState::Provisioning
+                    | RunnerState::Running
+                    | RunnerState::PauseRequested
+                    | RunnerState::Stopped
+                    | RunnerState::Queued
             ) {
                 return Err(OrchestrationError::TaskNotAcceptingInput {
                     task_id: record.task_id.clone(),
-                    lifecycle: record.lifecycle,
+                    runner_state: record.runner_state,
                 });
             }
             let pending = record.pending_input_id().map(str::to_string);
@@ -315,7 +348,7 @@ pub(super) fn fence_runner(
     incarnation: &str,
     launch_generation: u64,
 ) -> Result<()> {
-    if record.lifecycle == TaskLifecycle::Archived || record.supersedes_launch(launch_generation) {
+    if record.runner_state == RunnerState::Archived || record.supersedes_launch(launch_generation) {
         return Err(OrchestrationError::RunnerSuperseded {
             task_id: record.task_id.clone(),
             incarnation: incarnation.to_string(),

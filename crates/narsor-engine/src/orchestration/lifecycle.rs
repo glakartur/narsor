@@ -5,8 +5,9 @@
 //!
 //! ```text
 //! Queued ──controller accepts──▶ Provisioning ──runner ready──▶ Running
-//! Running ──owner pause──▶ PauseRequested ──safe point + compute removed──▶ Paused
-//! Paused ──owner resume──▶ Provisioning
+//! Running ──owner pause──▶ PauseRequested ──safe point + compute removed──▶ Stopped
+//! Stopped ──owner resume──▶ Provisioning
+//! Stopped ──owner resume, backend full──▶ Queued (front, no reservation)
 //! Provisioning | Running | PauseRequested ──workload lost──▶ Interrupted | Unknown
 //! Unknown ──loss confirmed (workload dead, storage present)──▶ Interrupted
 //! Interrupted ──resume policy──▶ Provisioning                     (automatic)
@@ -17,20 +18,20 @@
 //! The automatic resume is an ordinary `Resume` the control plane's resume
 //! policy issues (with [`super::model::CommandActor::Policy`]); this module
 //! does not tell it from the owner's. *Whether* the policy resumes lives in
-//! the control plane: a task lost while pausing, `Paused` itself, and a task
+//! the control plane: a task lost while pausing, `Stopped` itself, and a task
 //! whose attempts are exhausted still wait for their owner, and `Unknown`
 //! is never resumed before its loss is confirmed.
 //!
 //! Archive wins: once a task is archival, no command or observation leads out
 //! of it again, and a repeated archive converges on the tombstone.
 
-use super::model::{Observation, OwnerCommand, TaskLifecycle};
+use super::model::{Observation, OwnerCommand, RunnerState};
 
-/// What an owner command does to a lifecycle.
+/// What an owner command does to a runner state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandEffect {
     /// Move to this state and bump the desired generation.
-    Transition(TaskLifecycle),
+    Transition(RunnerState),
     /// Archive repeated on an archival task: record it, change nothing else.
     ArchiveConverged,
     /// Not allowed from the current state.
@@ -38,13 +39,13 @@ pub(crate) enum CommandEffect {
 }
 
 /// The effect of `command` on a task in `current`.
-pub(crate) fn command_effect(current: TaskLifecycle, command: OwnerCommand) -> CommandEffect {
-    use TaskLifecycle::*;
+pub(crate) fn command_effect(current: RunnerState, command: OwnerCommand) -> CommandEffect {
+    use RunnerState::*;
     match (command, current) {
         (OwnerCommand::Archive, Archiving | Archived) => CommandEffect::ArchiveConverged,
         (OwnerCommand::Archive, _) => CommandEffect::Transition(Archiving),
         (OwnerCommand::Pause, Running) => CommandEffect::Transition(PauseRequested),
-        (OwnerCommand::Resume, Paused | Interrupted | Unknown) => {
+        (OwnerCommand::Resume, Stopped | Interrupted | Unknown) => {
             CommandEffect::Transition(Provisioning)
         }
         (OwnerCommand::Start, Interrupted | Unknown) => CommandEffect::Transition(Provisioning),
@@ -52,13 +53,13 @@ pub(crate) fn command_effect(current: TaskLifecycle, command: OwnerCommand) -> C
     }
 }
 
-/// What a controller observation does to a lifecycle.
+/// What a controller observation does to a runner state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ObservationEffect {
     /// Move to this state; the desired generation stays.
-    Transition(TaskLifecycle),
-    /// Valid, but the lifecycle is already where the observation leads (a
-    /// redelivery) or the observation carries no lifecycle meaning.
+    Transition(RunnerState),
+    /// Valid, but the runner state is already where the observation leads (a
+    /// redelivery) or the observation carries no runner state meaning.
     Unchanged,
     /// Contradicts the current state.
     Illegal,
@@ -66,10 +67,10 @@ pub(crate) enum ObservationEffect {
 
 /// The effect of `observation` on a task in `current`.
 pub(crate) fn observation_effect(
-    current: TaskLifecycle,
+    current: RunnerState,
     observation: Observation,
 ) -> ObservationEffect {
-    use TaskLifecycle::*;
+    use RunnerState::*;
     match (observation, current) {
         (Observation::Status, _) => ObservationEffect::Unchanged,
 
@@ -79,8 +80,8 @@ pub(crate) fn observation_effect(
         (Observation::RunnerReady, Provisioning) => ObservationEffect::Transition(Running),
         (Observation::RunnerReady, Running) => ObservationEffect::Unchanged,
 
-        (Observation::PausedAtSafePoint, PauseRequested) => ObservationEffect::Transition(Paused),
-        (Observation::PausedAtSafePoint, Paused) => ObservationEffect::Unchanged,
+        (Observation::PausedAtSafePoint, PauseRequested) => ObservationEffect::Transition(Stopped),
+        (Observation::PausedAtSafePoint, Stopped) => ObservationEffect::Unchanged,
 
         // Never a replacement on the controller's word alone: whether the
         // task is resumed is the control plane's resume policy's decision.

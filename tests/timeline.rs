@@ -475,7 +475,7 @@ fn a_template_error_before_the_executor_ran_synthesizes_a_position() {
     );
 }
 
-/// Covers AE3: workflow lifecycle events and human input never belong to an
+/// Covers AE3: workflow runner_state events and human input never belong to an
 /// agent conversation; a script step's own events still get a position (R7
 /// asks for every attempt on the axis), but that position itself carries no
 /// conversation.

@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,7 @@ use std::sync::Arc;
 
 use crate::auth::pop::{self, Proof, ReplayGuard, SignedRequest};
 use crate::domain::{BackendId, TaskId};
-use crate::orchestration::{ControlPlane, OrchestrationError, Result, TaskLifecycle};
+use crate::orchestration::{ControlPlane, OrchestrationError, Result, RunnerState};
 use crate::persistence::{read_json, write_json_atomic_with_mode};
 
 /// Current schema version of [`ControllerRecord`]. Version 1 identities
@@ -49,6 +50,9 @@ pub const RUNNER_SESSION_VERSION: u32 = 1;
 
 const ENROLLMENT_PREFIX: &str = "nse";
 const RUNNER_PREFIX: &str = "nsr";
+/// The prefix of a read-only runner's credential. Not `nsr.`: a reader's
+/// token is never mistaken for a working runner's, nor the other way round.
+const READER_PREFIX: &str = "nsrr";
 
 /// Mode of every file holding a credential digest.
 const CREDENTIAL_FILE_MODE: u32 = 0o600;
@@ -134,9 +138,23 @@ pub struct ControllerIdentity {
     pub backend_id: BackendId,
 }
 
+/// What a runner credential lets its holder do (D63).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunnerRole {
+    /// The runner that works on the task: every runner call.
+    #[default]
+    Worker,
+    /// A read-only runner serving an owner's reads of a stopped task: it
+    /// polls, answers reads and renews; every call that writes the task's
+    /// work state is refused.
+    Reader,
+}
+
 /// Who a runner credential proves: one incarnation of one task launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerIdentity {
+    /// What the credential allows.
+    pub role: RunnerRole,
     /// The task.
     pub task_id: TaskId,
     /// The generation the incarnation was launched at.
@@ -218,8 +236,10 @@ pub struct EnrollmentRecord {
 
 /// The current runner credential of a task.
 ///
-/// One per task: issuing for a new incarnation replaces it, which is what
-/// makes an old incarnation's credential stop working.
+/// One per task and role: issuing for a new incarnation replaces it, which is
+/// what makes an old incarnation's credential stop working. The reader's is
+/// kept apart from the working runner's, so issuing one never invalidates
+/// the other.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunnerSession {
     /// Schema version.
@@ -501,8 +521,13 @@ impl CredentialStore {
     /// Issues the credential of `incarnation`, launched at
     /// `launch_generation`, replacing whatever credential the task had: from
     /// now on only this incarnation authenticates.
+    ///
+    /// A [`RunnerRole::Reader`]'s credential is a session of its own: it
+    /// replaces only an earlier reader's, and the task's working runner
+    /// keeps its own — and the task's record is not touched.
     pub fn issue_runner_session(
         &self,
+        role: RunnerRole,
         task_id: &TaskId,
         incarnation: &str,
         launch_generation: u64,
@@ -510,7 +535,7 @@ impl CredentialStore {
         ttl: Duration,
     ) -> Result<(RunnerSession, BearerToken)> {
         let _lock = self.control.store().lock_task(task_id)?;
-        let credential = BearerToken::issue(RUNNER_PREFIX, task_id.as_str());
+        let credential = BearerToken::issue(prefix_of(role), task_id.as_str());
         let now = self.now();
         let session = RunnerSession {
             record_version: RUNNER_SESSION_VERSION,
@@ -523,13 +548,29 @@ impl CredentialStore {
             expires_at: now + ttl,
             last_contact_at: None,
         };
-        self.save_session(&session)?;
+        self.save_session(role, &session)?;
         Ok((session, credential))
     }
 
-    /// The task's current runner session, if one was ever issued.
+    /// The task's current working runner session, if one was ever issued.
     pub fn runner_session(&self, task_id: &TaskId) -> Result<Option<RunnerSession>> {
-        let path = self.paths().runner_session_file(task_id.as_str());
+        self.session_of(RunnerRole::Worker, task_id)
+    }
+
+    /// The task's current read-only runner session, if one was ever issued.
+    pub fn reader_session(&self, task_id: &TaskId) -> Result<Option<RunnerSession>> {
+        self.session_of(RunnerRole::Reader, task_id)
+    }
+
+    fn session_path(&self, role: RunnerRole, task_id: &TaskId) -> PathBuf {
+        match role {
+            RunnerRole::Worker => self.paths().runner_session_file(task_id.as_str()),
+            RunnerRole::Reader => self.paths().reader_session_file(task_id.as_str()),
+        }
+    }
+
+    fn session_of(&self, role: RunnerRole, task_id: &TaskId) -> Result<Option<RunnerSession>> {
+        let path = self.session_path(role, task_id);
         if !path.exists() {
             return Ok(None);
         }
@@ -552,7 +593,7 @@ impl CredentialStore {
         renew_for: Option<Duration>,
     ) -> Result<Option<RunnerSession>> {
         let _lock = self.control.store().lock_task(&identity.task_id)?;
-        let Some(mut session) = self.runner_session(&identity.task_id)? else {
+        let Some(mut session) = self.session_of(identity.role, &identity.task_id)? else {
             return Ok(None);
         };
         if session.incarnation != identity.incarnation
@@ -565,38 +606,48 @@ impl CredentialStore {
         if let Some(ttl) = renew_for {
             session.expires_at = now + ttl;
         }
-        self.save_session(&session)?;
+        self.save_session(identity.role, &session)?;
         Ok(Some(session))
     }
 
-    fn save_session(&self, session: &RunnerSession) -> Result<()> {
+    fn save_session(&self, role: RunnerRole, session: &RunnerSession) -> Result<()> {
+        let path = self.session_path(role, &session.task_id);
         Ok(write_json_atomic_with_mode(
-            &self.paths().runner_session_file(session.task_id.as_str()),
+            &path,
             session,
             CREDENTIAL_FILE_MODE,
         )?)
     }
 
     fn verify_runner(&self, bearer: &str) -> Result<Option<RunnerIdentity>> {
-        let Some(task_id) = token_id(RUNNER_PREFIX, bearer) else {
+        let Some((role, task_id)) = token_id(RUNNER_PREFIX, bearer)
+            .map(|id| (RunnerRole::Worker, id))
+            .or_else(|| token_id(READER_PREFIX, bearer).map(|id| (RunnerRole::Reader, id)))
+        else {
             return Ok(None);
         };
         let Ok(task_id) = TaskId::parse(task_id) else {
             return Ok(None);
         };
-        let Some(session) = self.runner_session(&task_id)? else {
+        let Some(session) = self.session_of(role, &task_id)? else {
             return Ok(None);
         };
         if !matches_digest(bearer, &session.credential_digest) || self.now() >= session.expires_at {
             return Ok(None);
         }
         let record = self.control.task(&task_id)?;
-        if record.lifecycle == TaskLifecycle::Archived
-            || record.supersedes_launch(session.launch_generation)
-        {
+        let refused = match role {
+            RunnerRole::Worker => record.runner_state == RunnerState::Archived,
+            // A reader is valid only while the task is one it may be read
+            // in: a resume or an archive ends its credential (R15). Whether
+            // the owner's lease still wants it is the directive's business.
+            RunnerRole::Reader => !record.reader_may_read(),
+        };
+        if refused || record.supersedes_launch(session.launch_generation) {
             return Ok(None);
         }
         Ok(Some(RunnerIdentity {
+            role,
             task_id,
             launch_generation: session.launch_generation,
             incarnation: session.incarnation,
@@ -646,6 +697,13 @@ impl RunnerAuthenticator for CredentialStore {
             tracing::warn!(error = %error, "runner protocol: credential check failed");
             None
         })
+    }
+}
+
+fn prefix_of(role: RunnerRole) -> &'static str {
+    match role {
+        RunnerRole::Worker => RUNNER_PREFIX,
+        RunnerRole::Reader => READER_PREFIX,
     }
 }
 

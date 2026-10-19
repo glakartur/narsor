@@ -346,6 +346,22 @@ impl ControllerClient {
             )
             .await
     }
+
+    /// `POST /controller/v1/tasks/:task_id/reader-credentials`: the
+    /// credential of a read-only runner for a stopped task an owner is
+    /// reading (D63). Refused unless the control plane wants the reader.
+    pub async fn issue_reader_credential(
+        &self,
+        task_id: &str,
+        request: &RunnerCredentialRequest,
+    ) -> Result<RunnerCredentialResponse, ClientError> {
+        self.transport
+            .post(
+                &format!("/controller/v1/tasks/{task_id}/reader-credentials"),
+                request,
+            )
+            .await
+    }
 }
 
 /// A client for one runner incarnation.

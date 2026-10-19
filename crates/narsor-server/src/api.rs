@@ -85,7 +85,7 @@ pub use narsor_api_client::api::{
     connect, ensure_daemon_running, reconnect_delay, ApiClient, ClientError, DiscoveryError,
     ServerTarget, TokenSource,
 };
-pub use narsor_engine::api::{conversation_response_from_snapshot, local_task_storage_root};
+pub use narsor_engine::api::conversation_response_from_snapshot;
 pub use narsor_protocol::api::*;
 
 use crate::auth_gate as gate;

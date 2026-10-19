@@ -23,7 +23,7 @@ use crate::tui::task_app::list::{attention_of, Attention};
 use narsor_protocol::controller::PendingInputRefView;
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OperatorCommand,
-    OwnerCommand, QueueReason, TaskEvent, TaskEventKind, TaskLifecycle,
+    OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskEvent, TaskEventKind, TaskState,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState};
 
@@ -70,31 +70,56 @@ impl ToneLine {
 // Pure presentation
 // ---------------------------------------------------------------------------
 
-/// A lifecycle as people read it.
-pub fn lifecycle_name(lifecycle: TaskLifecycle) -> &'static str {
-    match lifecycle {
-        TaskLifecycle::Queued => "queued",
-        TaskLifecycle::Provisioning => "provisioning",
-        TaskLifecycle::Running => "running",
-        TaskLifecycle::PauseRequested => "pausing",
-        TaskLifecycle::Paused => "paused",
-        TaskLifecycle::Interrupted => "interrupted",
-        TaskLifecycle::Unknown => "unknown",
-        TaskLifecycle::Archiving => "archiving",
-        TaskLifecycle::Archived => "archived",
+/// A runner state as people read it.
+pub fn runner_state_name(runner_state: RunnerState) -> &'static str {
+    match runner_state {
+        RunnerState::Queued => "queued",
+        RunnerState::Provisioning => "provisioning",
+        RunnerState::Running => "running",
+        RunnerState::PauseRequested => "pausing",
+        RunnerState::Stopped => "paused",
+        RunnerState::Interrupted => "interrupted",
+        RunnerState::Unknown => "unknown",
+        RunnerState::Archiving => "archiving",
+        RunnerState::Archived => "archived",
     }
 }
 
-/// The tone of a lifecycle on its own.
-pub fn lifecycle_tone(lifecycle: TaskLifecycle) -> Tone {
-    match lifecycle {
-        TaskLifecycle::Running | TaskLifecycle::Provisioning => Tone::Good,
-        TaskLifecycle::Queued | TaskLifecycle::PauseRequested | TaskLifecycle::Paused => {
-            Tone::Normal
-        }
-        TaskLifecycle::Interrupted | TaskLifecycle::Unknown => Tone::Error,
-        TaskLifecycle::Archiving | TaskLifecycle::Archived => Tone::Muted,
+/// A [`TaskState`] as people read it: the one word every list, header and
+/// detail uses for what the owner sees.
+pub fn task_state_name(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Queued => "queued",
+        TaskState::Running => "running",
+        TaskState::HumanNeeded => "awaiting input",
+        TaskState::Paused => "paused",
+        TaskState::Finished => "done",
+        TaskState::Error => "failed",
+        TaskState::Archived => "archived",
+        TaskState::Unrecognized => "unknown",
     }
+}
+
+/// The tone of a [`TaskState`] on its own.
+pub fn task_state_tone(state: TaskState) -> Tone {
+    match state {
+        TaskState::Running => Tone::Good,
+        TaskState::Queued | TaskState::Paused | TaskState::Finished => Tone::Normal,
+        TaskState::HumanNeeded => Tone::Warning,
+        TaskState::Error => Tone::Error,
+        TaskState::Archived | TaskState::Unrecognized => Tone::Muted,
+    }
+}
+
+/// Whether the task is in a state that does not need a slot to be in and
+/// holds none: the owner sees "no slot" next to it. A task that is pausing
+/// still holds its slot, so it has no such note.
+pub fn without_slot(task: &TaskSummary) -> bool {
+    !task.holds_slot
+        && matches!(
+            task.state,
+            TaskState::Finished | TaskState::HumanNeeded | TaskState::Error | TaskState::Paused
+        )
 }
 
 /// The short badge of a queued task's scheduler verdict (U10).
@@ -208,28 +233,26 @@ pub fn record_unreadable_detail(error: &ClientError) -> Option<String> {
     }
 }
 
-/// The one-line status of a task in the list: its lifecycle, then the most
-/// useful detail — the queue verdict, a pending question, a runner problem,
-/// or the runner's status — with staleness marked.
+/// The one-line status of a task in the list: its state, then the most
+/// useful detail — the queue verdict, a runner problem, a missing slot, or
+/// staleness.
 pub fn status_badge(task: &TaskSummary) -> ToneLine {
-    let lifecycle = lifecycle_name(task.lifecycle);
-    if task.lifecycle == TaskLifecycle::Queued {
+    let state = task_state_name(task.state);
+    let tone = task_state_tone(task.state);
+    if task.state == TaskState::Queued {
         if let Some(queue) = &task.queue {
             let badge = queue_badge(queue);
-            return ToneLine::new(format!("{lifecycle} · {}", badge.text), badge.tone);
+            return ToneLine::new(format!("{state} · {}", badge.text), badge.tone);
         }
     }
     if let Some(runner) = &task.runner {
         if let Some(problem) = &runner.problem {
-            return ToneLine::new(format!("{lifecycle} · {}", problem.code), Tone::Error);
+            return ToneLine::new(format!("{state} · {}", problem.code), Tone::Error);
         }
-        if awaiting_input(task).is_some() {
-            return ToneLine::new(format!("{lifecycle} · awaiting input"), Tone::Warning);
-        }
-        if runner.freshness == Freshness::Stale && is_live(task.lifecycle) {
+        if runner.freshness == Freshness::Stale && is_live(task) {
             return ToneLine::new(
                 format!(
-                    "{lifecycle} · stale ({} ago)",
+                    "{state} · stale ({} ago)",
                     age(
                         task.as_of,
                         runner.last_contact_at.unwrap_or(runner.received_at)
@@ -239,7 +262,10 @@ pub fn status_badge(task: &TaskSummary) -> ToneLine {
             );
         }
     }
-    ToneLine::new(lifecycle, lifecycle_tone(task.lifecycle))
+    if without_slot(task) {
+        return ToneLine::new(format!("{state} · no slot"), tone);
+    }
+    ToneLine::new(state, tone)
 }
 
 /// One row of `narsor task list`: id, backend, queue place, the attention
@@ -386,49 +412,68 @@ pub fn safe_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&value)
 }
 
-/// Lifecycles in which a runner is expected to report.
-fn is_live(lifecycle: TaskLifecycle) -> bool {
-    matches!(
-        lifecycle,
-        TaskLifecycle::Provisioning | TaskLifecycle::Running | TaskLifecycle::PauseRequested
-    )
+/// Whether a runner that holds a slot is expected to report.
+fn is_live(task: &TaskSummary) -> bool {
+    task.holds_slot && matches!(task.state, TaskState::Running | TaskState::Paused)
 }
 
 /// What the owner can do about the task now, in words.
-pub fn lifecycle_hint(task: &TaskSummary) -> Option<ToneLine> {
-    let hint = match task.lifecycle {
-        TaskLifecycle::Queued => {
+pub fn state_hint(task: &TaskSummary) -> Option<ToneLine> {
+    let hint = match task.state {
+        TaskState::Queued => {
             let queue = task.queue.as_ref()?;
             let tone = queue_badge(queue).tone;
             return Some(ToneLine::new(queue.message.clone(), tone));
         }
-        TaskLifecycle::Provisioning => ToneLine::new(
-            "the backend is preparing storage and the workload",
-            Tone::Normal,
+        TaskState::Running => {
+            // A lost workload that the policy still tries to resume looks
+            // like work to the owner, and says what it waits for.
+            if task.runner_state != RunnerState::Interrupted {
+                return None;
+            }
+            interrupted_hint(task)
+        }
+        TaskState::HumanNeeded if task.holds_slot => ToneLine::new(
+            "the task waits for your answer",
+            Tone::Warning,
         ),
-        TaskLifecycle::Running => return None,
-        TaskLifecycle::PauseRequested => ToneLine::new(
+        TaskState::HumanNeeded => ToneLine::new(
+            "the task waits for your answer and holds no slot; answering resumes it, and it \
+             queues first when the backend is full",
+            Tone::Warning,
+        ),
+        // Lost while pausing: no attempt is planned, the owner decides.
+        TaskState::Paused if task.runner_state == RunnerState::Interrupted => {
+            interrupted_hint(task)
+        }
+        TaskState::Paused if task.holds_slot => ToneLine::new(
             "pausing: waiting for the runner to reach a safe point",
             Tone::Normal,
         ),
-        TaskLifecycle::Paused => ToneLine::new(
+        TaskState::Paused => ToneLine::new(
             "paused at a safe point; storage is kept and no slot is held — resume (u) or archive (a)",
             Tone::Normal,
         ),
-        TaskLifecycle::Interrupted => interrupted_hint(task),
-        TaskLifecycle::Unknown => ToneLine::new(
-            "the runner is not heard from and its workload may be lost; it still holds its \
-             backend slot — resume (u), start afresh (s) or archive (a)",
+        TaskState::Finished if task.holds_slot => ToneLine::new(
+            "the work ended; the slot is freed shortly — archive (a)",
+            Tone::Normal,
+        ),
+        TaskState::Finished => ToneLine::new(
+            "the work ended; no slot is held — resume (u) or archive (a)",
+            Tone::Normal,
+        ),
+        TaskState::Error if loss_state(task.runner_state, &task.resume).is_some() => {
+            interrupted_hint(task)
+        }
+        TaskState::Error => ToneLine::new(
+            "the task ended with an error; start afresh (s), resume (u) or archive (a)",
             Tone::Error,
         ),
-        TaskLifecycle::Archiving => ToneLine::new(
-            "archiving: deleting the workload and its storage",
-            Tone::Muted,
-        ),
-        TaskLifecycle::Archived => ToneLine::new(
+        TaskState::Archived => ToneLine::new(
             "archived: the workload and its storage were deleted",
             Tone::Muted,
         ),
+        TaskState::Unrecognized => return None,
     };
     Some(hint)
 }
@@ -438,7 +483,7 @@ pub fn lifecycle_hint(task: &TaskSummary) -> Option<ToneLine> {
 fn interrupted_hint(task: &TaskSummary) -> ToneLine {
     const OWNER_CHOICES: &str =
         "it still holds its backend slot — resume (u), start afresh (s) or archive (a)";
-    match loss_state(task.lifecycle, &task.resume) {
+    match loss_state(task.runner_state, &task.resume) {
         Some(LossState::AutoResume { attempt, limit }) => ToneLine::new(
             format!(
                 "the workload was lost; it is resumed automatically (attempt {attempt}/{limit}) \
@@ -463,7 +508,7 @@ fn interrupted_hint(task: &TaskSummary) -> ToneLine {
 /// The input request the runner waits on, unless the owner already
 /// answered it (an answer queued, delivered or consumed for that request).
 pub fn awaiting_input(task: &TaskSummary) -> Option<&PendingInputRefView> {
-    if task.lifecycle.is_archival() {
+    if matches!(task.state, TaskState::Archived | TaskState::Finished) {
         return None;
     }
     let pending = task.runner.as_ref()?.pending_input.as_ref()?;
@@ -490,11 +535,18 @@ pub fn detail_lines(
         ToneLine::new(format!("Backend    {}", task.backend_id), Tone::Normal),
         ToneLine::new(
             format!(
-                "Lifecycle  {} (generation {})",
-                lifecycle_name(task.lifecycle),
+                "State      {}{} (generation {})",
+                task_state_name(task.state),
+                if without_slot(task) {
+                    " · no slot"
+                } else if task.holds_slot {
+                    " · slot held"
+                } else {
+                    ""
+                },
                 task.generation
             ),
-            lifecycle_tone(task.lifecycle),
+            task_state_tone(task.state),
         ),
         ToneLine::new(
             format!(
@@ -505,7 +557,7 @@ pub fn detail_lines(
         ),
     ];
     lines.splice(1..1, display_lines(task));
-    if let Some(hint) = lifecycle_hint(task) {
+    if let Some(hint) = state_hint(task) {
         lines.push(hint);
     }
     lines.extend(attention_lines(task));
@@ -677,6 +729,9 @@ pub fn unavailable_reason(reason: ConversationUnavailableReason) -> &'static str
         }
         ConversationUnavailableReason::RunnerReported => "the runner cannot serve it right now",
         ConversationUnavailableReason::StorageUnreadable => "its record could not be read",
+        ConversationUnavailableReason::ReaderStarting => {
+            "the task is stopped; its read-only runner is starting"
+        }
         ConversationUnavailableReason::Unrecognized => {
             "the server gave a reason this version does not know"
         }
@@ -768,7 +823,7 @@ fn attempt_line(attempt: &ConversationAttemptSummary) -> ToneLine {
     )
 }
 
-/// One line of `narsor task events`: sequence, time, task, lifecycle and
+/// One line of `narsor task events`: sequence, time, task, runner state and
 /// what happened.
 pub fn event_line(event: &TaskEvent) -> String {
     let kind = match &event.kind {
@@ -836,6 +891,29 @@ pub fn event_line(event: &TaskEvent) -> String {
             },
             exhaustion_loss(reason)
         ),
+        TaskEventKind::SlotReleaseScheduled { due_at } => format!(
+            "the slot is freed at {} unless the task gets work before",
+            due_at.format("%H:%M:%S")
+        ),
+        TaskEventKind::SlotReleased { reason } => match reason {
+            SlotReleaseReason::Terminal => {
+                "slot freed: the task's work ended; the runner is asked to stop".to_string()
+            }
+            SlotReleaseReason::GraceElapsed => {
+                "slot freed: the task waited for its owner too long; the runner is asked to stop"
+                    .to_string()
+            }
+            SlotReleaseReason::Unrecognized => {
+                "slot freed for a reason this version does not know".to_string()
+            }
+        },
+        TaskEventKind::ReaderLeased { until } => format!(
+            "a read-only runner is wanted for the stopped task until {}",
+            until.format("%H:%M:%S")
+        ),
+        TaskEventKind::ReaderLeaseEnded => {
+            "the read-only runner ran idle and is no longer wanted".to_string()
+        }
         TaskEventKind::Unrecognized => "an event this version does not know".to_string(),
     };
     // Notes, reasons and details come from operators and runners: nothing a
@@ -846,7 +924,7 @@ pub fn event_line(event: &TaskEvent) -> String {
         event.sequence,
         event.at.to_rfc3339(),
         event.task_id,
-        lifecycle_name(event.lifecycle)
+        runner_state_name(event.runner_state)
     )
 }
 
@@ -912,11 +990,16 @@ pub fn command_outcome(
             } else {
                 ""
             };
+            let queued = if response.queued_for_slot {
+                " and waits first in the queue for a slot"
+            } else {
+                ""
+            };
             ToneLine::new(
                 format!(
-                    "{verb} accepted{replay}: task {} is now {} (generation {})",
+                    "{verb} accepted{replay}: task {} is now {}{queued} (generation {})",
                     response.task.task_id,
-                    lifecycle_name(response.task.lifecycle),
+                    task_state_name(response.task.state),
                     response.task.generation
                 ),
                 Tone::Good,

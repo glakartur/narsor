@@ -29,6 +29,7 @@
 //! may be stored, listed and shown freely.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,18 @@ use crate::domain::{BackendId, ResourceProfile, SecretDelivery, SecretReference}
 /// Most concurrent tasks a backend record may declare. A sanity bound, not a
 /// scheduling policy: Narsor targets a handful of parallel tasks (R6).
 pub const MAX_CONCURRENT_TASKS_LIMIT: u32 = 1024;
+
+/// Default wait before the control plane frees the slot of a task that waits
+/// in a transient state (`slot_release_grace_secs`).
+pub const DEFAULT_SLOT_RELEASE_GRACE_SECS: u64 = 300;
+/// Default extension of that wait when the owner reads the task's details
+/// (`slot_release_read_extension_secs`).
+pub const DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS: u64 = 180;
+/// Default idle time after which a reader no longer extends the wait
+/// (`slot_reader_idle_secs`).
+pub const DEFAULT_SLOT_READER_IDLE_SECS: u64 = 120;
+/// Longest period a slot-release setting may have: one day.
+pub const MAX_SLOT_PERIOD_SECS: u64 = 86_400;
 
 pub use narsor_controller_runtime::backend::{BackendCapabilities, BackendKind};
 
@@ -79,9 +92,74 @@ pub struct BackendLimits {
     /// The most one task may ask for; `default_resources` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_resources: Option<ResourceProfile>,
+    /// Seconds a task waits in a transient state before its slot is freed.
+    #[serde(default = "default_slot_release_grace_secs")]
+    pub slot_release_grace_secs: u64,
+    /// Seconds a read of the task's details adds to that wait.
+    #[serde(default = "default_slot_release_read_extension_secs")]
+    pub slot_release_read_extension_secs: u64,
+    /// Seconds without a read after which a reader stops extending the wait.
+    #[serde(default = "default_slot_reader_idle_secs")]
+    pub slot_reader_idle_secs: u64,
+}
+
+fn default_slot_release_grace_secs() -> u64 {
+    DEFAULT_SLOT_RELEASE_GRACE_SECS
+}
+fn default_slot_release_read_extension_secs() -> u64 {
+    DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS
+}
+fn default_slot_reader_idle_secs() -> u64 {
+    DEFAULT_SLOT_READER_IDLE_SECS
+}
+
+/// The periods that decide when a slot is freed, as read from one backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotReleaseTimings {
+    /// Wait before a task in a transient state frees its slot.
+    pub grace: Duration,
+    /// Time a read of the task's details adds to that wait.
+    pub read_extension: Duration,
+    /// Idle time after which a reader no longer extends the wait.
+    pub reader_idle: Duration,
+}
+
+impl Default for SlotReleaseTimings {
+    fn default() -> Self {
+        Self {
+            grace: Duration::from_secs(DEFAULT_SLOT_RELEASE_GRACE_SECS),
+            read_extension: Duration::from_secs(DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS),
+            reader_idle: Duration::from_secs(DEFAULT_SLOT_READER_IDLE_SECS),
+        }
+    }
 }
 
 impl BackendLimits {
+    /// Limits with the given capacity and resources and default slot periods.
+    pub fn new(
+        max_concurrent_tasks: u32,
+        default_resources: ResourceProfile,
+        max_resources: Option<ResourceProfile>,
+    ) -> Self {
+        Self {
+            max_concurrent_tasks,
+            default_resources,
+            max_resources,
+            slot_release_grace_secs: DEFAULT_SLOT_RELEASE_GRACE_SECS,
+            slot_release_read_extension_secs: DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS,
+            slot_reader_idle_secs: DEFAULT_SLOT_READER_IDLE_SECS,
+        }
+    }
+
+    /// The slot-release periods.
+    pub fn slot_release_timings(&self) -> SlotReleaseTimings {
+        SlotReleaseTimings {
+            grace: Duration::from_secs(self.slot_release_grace_secs),
+            read_extension: Duration::from_secs(self.slot_release_read_extension_secs),
+            reader_idle: Duration::from_secs(self.slot_reader_idle_secs),
+        }
+    }
+
     /// The most one task may ask for.
     pub fn max_resources(&self) -> ResourceProfile {
         self.max_resources.unwrap_or(self.default_resources)
@@ -146,11 +224,7 @@ impl BackendRecord {
             Self::LOCAL_ID,
             BackendKind::Local,
             TrustScope::Workstation,
-            BackendLimits {
-                max_concurrent_tasks: 1,
-                default_resources: ResourceProfile::new(1000, 2048),
-                max_resources: None,
-            },
+            BackendLimits::new(1, ResourceProfile::new(1000, 2048), None),
         )
     }
 
@@ -193,6 +267,21 @@ impl BackendRecord {
                  not {}",
                 limits.max_concurrent_tasks
             ));
+        }
+        for (name, secs) in [
+            ("slot_release_grace_secs", limits.slot_release_grace_secs),
+            (
+                "slot_release_read_extension_secs",
+                limits.slot_release_read_extension_secs,
+            ),
+            ("slot_reader_idle_secs", limits.slot_reader_idle_secs),
+        ] {
+            if secs == 0 || secs > MAX_SLOT_PERIOD_SECS {
+                problems.push(format!(
+                    "limits.{name} must be between 1 and {MAX_SLOT_PERIOD_SECS} seconds, \
+                     not {secs}"
+                ));
+            }
         }
         for problem in limits.default_resources.problems() {
             problems.push(format!("limits.default_resources: {problem}"));
@@ -298,4 +387,62 @@ pub(crate) fn is_reference_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = "kind: kubernetes\ntrust_scope: dedicated\nlimits:\n  max_concurrent_tasks: 2\n  default_resources: { cpu_millicores: 1000, memory_mib: 2048 }\n";
+
+    fn parse(extra: &str) -> Result<BackendRecord, serde_yaml::Error> {
+        let mut record: BackendRecord = serde_yaml::from_str(&format!("{BASE}{extra}"))?;
+        record.id = "k8s".to_string();
+        Ok(record)
+    }
+
+    #[test]
+    fn a_config_without_the_new_fields_gets_the_defaults() {
+        let record = parse("").unwrap();
+        assert!(record.problems().is_empty());
+        let timings = record.limits.slot_release_timings();
+        assert_eq!(timings.grace, Duration::from_secs(300));
+        assert_eq!(timings.read_extension, Duration::from_secs(180));
+        assert_eq!(timings.reader_idle, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_config_with_the_fields_uses_them() {
+        let record = parse(
+            "  slot_release_grace_secs: 60\n  slot_release_read_extension_secs: 30\n  slot_reader_idle_secs: 10\n",
+        )
+        .unwrap();
+        assert!(record.problems().is_empty());
+        let timings = record.limits.slot_release_timings();
+        assert_eq!(timings.grace, Duration::from_secs(60));
+        assert_eq!(timings.read_extension, Duration::from_secs(30));
+        assert_eq!(timings.reader_idle, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_negative_or_non_numeric_period_is_a_config_error() {
+        for bad in ["-5", "soon", "1.5"] {
+            let error = parse(&format!("  slot_release_grace_secs: {bad}\n")).unwrap_err();
+            assert!(
+                error.to_string().contains("slot_release_grace_secs")
+                    || error.to_string().contains("invalid"),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_or_huge_period_is_a_problem() {
+        for bad in [0, MAX_SLOT_PERIOD_SECS + 1] {
+            let record = parse(&format!("  slot_reader_idle_secs: {bad}\n")).unwrap();
+            let problems = record.problems();
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(problems[0].contains("limits.slot_reader_idle_secs"));
+        }
+    }
 }

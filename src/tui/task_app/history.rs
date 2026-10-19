@@ -169,7 +169,7 @@ fn legacy_summary(view: &LegacyExecutionView) -> TaskSummary {
         .or_else(|_| TaskId::parse("execution"))
         .expect("a plain word is an identifier");
     let at = view.completed_at.unwrap_or(view.started_at);
-    let lifecycle = if matches!(
+    let runner_state = if matches!(
         view.status,
         ExecutionStatus::Failed | ExecutionStatus::Cancelled | ExecutionStatus::Unknown
     ) {
@@ -180,7 +180,7 @@ fn legacy_summary(view: &LegacyExecutionView) -> TaskSummary {
     let summary = json!({
         "task_id": id,
         "backend_id": "local",
-        "lifecycle": lifecycle,
+        "runner_state": runner_state,
         "generation": 1,
         "revision": 1,
         "rank": 1,

@@ -19,12 +19,15 @@
 use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, observation_effect, CommandEffect, ObservationEffect};
 use super::model::{
-    ArchiveTombstone, BackendLease, CommandActor, CommandOutcome, CommandReceipt, CommandRequest,
-    ControllerReport, LeaseToken, MaterialChange, NewTask, Observation, ObservedState,
-    OwnerCommand, ReportOutcome, ResumeState, TaskAssignment, TaskEvent, TaskEventKind,
-    TaskLifecycle, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
+    slot_release_extension_threshold, ArchiveTombstone, BackendLease, CommandActor, CommandOutcome,
+    CommandReceipt, CommandRequest, ControllerReport, LeaseToken, MaterialChange, NewTask,
+    Observation, ObservedState, OwnerCommand, ReaderLease, ReportOutcome, ResumeState, RunnerState,
+    SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent, TaskEventKind, TaskRecord,
+    WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
-use super::resume::{auto_resume_key, count_loss, loss_from_history, ResumePolicy};
+use super::resume::{
+    auto_resume_key, count_loss, loss_from_history, slot_release_key, ResumePolicy,
+};
 use super::store::OrchestrationStore;
 use crate::domain::{BackendId, TaskId};
 use crate::persistence::{ExecutionStore, StatePaths};
@@ -172,7 +175,7 @@ impl ControlPlane {
             legacy_priority: None,
             created_at: now,
             queue_sequence,
-            lifecycle: TaskLifecycle::Queued,
+            runner_state: RunnerState::Queued,
             generation: 1,
             revision: 1,
             resources_may_exist: false,
@@ -191,11 +194,13 @@ impl ControlPlane {
             running_since: None,
             workload_epoch: None,
             resume: ResumeState::default(),
+            slot_release_due_at: None,
+            reader_lease: None,
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),
                 at: now,
-                lifecycle: TaskLifecycle::Queued,
+                runner_state: RunnerState::Queued,
                 generation: 1,
                 kind: TaskEventKind::Created,
             },
@@ -244,6 +249,20 @@ impl ControlPlane {
     /// announced as [`TaskEventKind::AutoResumed`] instead of
     /// `OwnerCommandAccepted`, in the same mutation.
     pub fn command(&self, task_id: &TaskId, request: CommandRequest) -> Result<CommandOutcome> {
+        self.command_routed(task_id, request, false)
+    }
+
+    /// [`Self::command`] with the scheduler's decision on where a resume of
+    /// a `Stopped` task goes: `queue_resume` sends it to the front of the
+    /// queue (`Queued`, no reservation) instead of straight to
+    /// `Provisioning`, because the backend has no free slot (R20). Decided
+    /// by the caller under the backend's schedule lock.
+    pub(crate) fn command_routed(
+        &self,
+        task_id: &TaskId,
+        request: CommandRequest,
+        queue_resume: bool,
+    ) -> Result<CommandOutcome> {
         let (task, (receipt, replayed)) = self.mutate(task_id, |record, now| {
             if let Some(receipt) = record.receipt(&request.idempotency_key) {
                 if receipt.command != request.command
@@ -261,13 +280,16 @@ impl ControlPlane {
             if let Some(expected) = request.expected_generation {
                 record.check_generation(expected)?;
             }
-            let policy_may_act =
-                request.command == OwnerCommand::Resume && record.auto_resume_due(now);
+            let policy_may_act = match request.command {
+                OwnerCommand::Resume => record.auto_resume_due(now),
+                OwnerCommand::Pause => record.slot_release_due(now),
+                _ => false,
+            };
             if request.actor == CommandActor::Policy && !policy_may_act {
                 return Err(OrchestrationError::IllegalCommand {
                     task_id: record.task_id.clone(),
                     command: request.command,
-                    lifecycle: record.lifecycle,
+                    runner_state: record.runner_state,
                 });
             }
             let event = match request.actor {
@@ -275,6 +297,14 @@ impl ControlPlane {
                     command: request.command,
                     idempotency_key: request.idempotency_key.clone(),
                 },
+                CommandActor::Policy if request.command == OwnerCommand::Pause => {
+                    TaskEventKind::SlotReleased {
+                        reason: record
+                            .slot_release_class()
+                            .map(SlotReleaseClass::release_reason)
+                            .unwrap_or(SlotReleaseReason::GraceElapsed),
+                    }
+                }
                 CommandActor::Policy => TaskEventKind::AutoResumed {
                     attempt: if record.resume.last_loss_uncounted {
                         0
@@ -290,27 +320,46 @@ impl ControlPlane {
                 },
             };
 
-            match command_effect(record.lifecycle, request.command) {
+            match command_effect(record.runner_state, request.command) {
                 CommandEffect::Illegal => {
                     return Err(OrchestrationError::IllegalCommand {
                         task_id: record.task_id.clone(),
                         command: request.command,
-                        lifecycle: record.lifecycle,
+                        runner_state: record.runner_state,
                     })
                 }
                 // Recorded for the audit trail; the tombstone already holds.
                 CommandEffect::ArchiveConverged => {}
                 CommandEffect::Transition(next) => {
-                    let previous = record.lifecycle;
+                    let previous = record.runner_state;
+                    // No free slot: the resume waits in the queue, ahead of
+                    // everyone, holding nothing (R20). The ranks of the
+                    // others are shifted by the caller under the schedule
+                    // lock; rank 0 is before every dense rank.
+                    let next = if queue_resume
+                        && previous == RunnerState::Stopped
+                        && next == RunnerState::Provisioning
+                    {
+                        record.rank = 0;
+                        record.reservation = None;
+                        record.queue = None;
+                        RunnerState::Queued
+                    } else {
+                        next
+                    };
                     record.generation += 1;
-                    record.lifecycle = next;
-                    if matches!(
-                        previous,
-                        TaskLifecycle::Interrupted | TaskLifecycle::Unknown
-                    ) {
+                    record.runner_state = next;
+                    // A new desired state ends whatever the last snapshot
+                    // made the policy wait for.
+                    record.slot_release_due_at = None;
+                    // Nothing else may read the storage the task's own
+                    // runner is about to take (R15): the reader's lease
+                    // ends in the very mutation that resumes or archives.
+                    record.reader_lease = None;
+                    if matches!(previous, RunnerState::Interrupted | RunnerState::Unknown) {
                         leave_loss(record, request.actor);
                     }
-                    if next == TaskLifecycle::Provisioning {
+                    if matches!(next, RunnerState::Provisioning | RunnerState::Queued) {
                         self.order_launch(record)?;
                     }
                     if request.command == OwnerCommand::Archive {
@@ -325,7 +374,7 @@ impl ControlPlane {
                 expected_generation: request.expected_generation,
                 accepted_at: now,
                 generation_after: record.generation,
-                lifecycle_after: record.lifecycle,
+                runner_state_after: record.runner_state,
                 revision: record.revision + 1,
                 actor: request.actor,
             };
@@ -355,6 +404,125 @@ impl ControlPlane {
                 .expecting_generation(generation)
                 .issued_by(CommandActor::Policy),
         )
+    }
+
+    /// The slot-release policy frees the slot of the task running at
+    /// `generation`: a `Pause` with [`CommandActor::Policy`], keyed
+    /// [`slot_release_key`]`(generation)` and expecting that generation.
+    ///
+    /// Allowed only while [`TaskRecord::slot_release_due`]; the pause then
+    /// goes the owner's way (`Running → PauseRequested`, a safe point, the
+    /// compute removed, `Stopped`) and `holds_capacity` is unchanged until
+    /// the safe point is acknowledged. A command of the owner that came
+    /// first moved the generation or the state, so the policy's is refused
+    /// with `StaleGeneration` or `IllegalCommand`. Needs no capacity.
+    pub fn release_slot(&self, task_id: &TaskId, generation: u64) -> Result<CommandOutcome> {
+        self.command(
+            task_id,
+            CommandRequest::new(OwnerCommand::Pause, slot_release_key(generation))
+                .expecting_generation(generation)
+                .issued_by(CommandActor::Policy),
+        )
+    }
+
+    /// Plans the slot release of a running task whose last snapshot is in a
+    /// state that frees the slot but whose deadline was never set (a task
+    /// that was `Provisioning` when the snapshot came, or a record from
+    /// before the policy existed). `grace` is the wait for a transient
+    /// state. Announces the deadline; `None` when nothing was missing.
+    pub fn arm_slot_release(
+        &self,
+        task_id: &TaskId,
+        grace: Duration,
+    ) -> Result<Option<TaskRecord>> {
+        let (record, armed) = self.mutate(task_id, |record, now| {
+            if record.slot_release_due_at.is_some() {
+                return Ok(Mutation::Unchanged(false));
+            }
+            refresh_slot_release_due(record, now, grace);
+            match record.slot_release_due_at {
+                Some(due_at) => Ok(Mutation::Changed(
+                    TaskEventKind::SlotReleaseScheduled { due_at },
+                    true,
+                )),
+                None => Ok(Mutation::Unchanged(false)),
+            }
+        })?;
+        Ok(armed.then_some(record))
+    }
+
+    /// A read of the task's details moves its slot-release deadline to
+    /// `read_extension` from now, if the task waits in a transient state
+    /// and that is later than the deadline by more than
+    /// [`slot_release_extension_threshold`]. Returns whether it moved it,
+    /// so frequent reads write the record at most once per threshold.
+    pub fn extend_slot_release(&self, task_id: &TaskId, read_extension: Duration) -> Result<bool> {
+        let (_, moved) = self.mutate(task_id, |record, now| {
+            let Some(due_at) = record.slot_release_waiting() else {
+                return Ok(Mutation::Unchanged(false));
+            };
+            let extended = now + read_extension;
+            if extended - due_at <= slot_release_extension_threshold() {
+                return Ok(Mutation::Unchanged(false));
+            }
+            record.slot_release_due_at = Some(extended);
+            Ok(Mutation::Changed(
+                TaskEventKind::SlotReleaseScheduled { due_at: extended },
+                true,
+            ))
+        })?;
+        Ok(moved)
+    }
+
+    /// A read of the stopped task's details wants a read-only runner (D63):
+    /// leases it until `idle` from now, or moves a lease already there later,
+    /// unless that would move it by no more than
+    /// [`slot_release_extension_threshold`] (a client that refreshes often
+    /// does not write the record each time). Returns the lease in force
+    /// afterwards, and whether this call wrote it; `None` for a task that
+    /// may not be read this way (running, queued, `Unknown`, archival).
+    pub fn lease_reader(
+        &self,
+        task_id: &TaskId,
+        idle: Duration,
+    ) -> Result<Option<(ReaderLease, bool)>> {
+        let (_, leased) = self.mutate(task_id, |record, now| {
+            if !record.reader_may_read() {
+                return Ok(Mutation::Unchanged(None));
+            }
+            let until = now + idle;
+            let current = record
+                .reader_lease
+                .filter(|_| record.reader_lease_active(now));
+            if let Some(current) = current {
+                if until - current.until <= slot_release_extension_threshold() {
+                    return Ok(Mutation::Unchanged(Some((current, false))));
+                }
+            }
+            let lease = ReaderLease {
+                since: current.map_or(now, |current| current.since),
+                until,
+            };
+            record.reader_lease = Some(lease);
+            Ok(Mutation::Changed(
+                TaskEventKind::ReaderLeased { until },
+                Some((lease, true)),
+            ))
+        })?;
+        Ok(leased)
+    }
+
+    /// Removes the reader lease of a task that has a stale one (see
+    /// [`TaskRecord::reader_lease_stale`]). Returns whether it did.
+    pub fn end_reader_lease(&self, task_id: &TaskId) -> Result<bool> {
+        let (_, ended) = self.mutate(task_id, |record, now| {
+            if !record.reader_lease_stale(now) {
+                return Ok(Mutation::Unchanged(false));
+            }
+            record.reader_lease = None;
+            Ok(Mutation::Changed(TaskEventKind::ReaderLeaseEnded, true))
+        })?;
+        Ok(ended)
     }
 
     /// Publishes [`TaskEventKind::AutoResumeExhausted`] for the task's
@@ -489,7 +657,7 @@ impl ControlPlane {
     /// not older than the last accepted report; the desired generation is the
     /// current one; the resource version is not older than the last accepted
     /// one of the same incarnation; and the observation is legal from the
-    /// current lifecycle; `PausedAtSafePoint` additionally needs the runner's
+    /// current runner state; `PausedAtSafePoint` additionally needs the runner's
     /// safe-point acknowledgement for the current generation
     /// ([`OrchestrationError::SafePointNotAcknowledged`]). A pure redelivery
     /// is absorbed with `applied: false`.
@@ -522,7 +690,7 @@ impl ControlPlane {
             record.check_generation(report.desired_generation)?;
             check_resource_order(record, &report)?;
 
-            let effect = observation_effect(record.lifecycle, report.observation);
+            let effect = observation_effect(record.runner_state, report.observation);
             let observed = ObservedState {
                 observation: report.observation,
                 summary: report.summary.clone(),
@@ -537,7 +705,7 @@ impl ControlPlane {
                     return Err(OrchestrationError::IllegalObservation {
                         task_id: record.task_id.clone(),
                         observation: report.observation,
-                        lifecycle: record.lifecycle,
+                        runner_state: record.runner_state,
                     })
                 }
                 ObservationEffect::Unchanged if is_redelivery(record, &observed) => {
@@ -565,8 +733,8 @@ impl ControlPlane {
                     {
                         return Err(OrchestrationError::NotAdmitted(record.task_id.clone()));
                     }
-                    let previous = record.lifecycle;
-                    record.lifecycle = next;
+                    let previous = record.runner_state;
+                    record.runner_state = next;
                     match report.observation {
                         Observation::StartAccepted => record.resources_may_exist = true,
                         Observation::RunnerReady => record.running_since = Some(now),
@@ -593,12 +761,12 @@ impl ControlPlane {
                             reason: report.summary.detail.clone(),
                         });
                     }
-                    if next == TaskLifecycle::Interrupted {
+                    if next == RunnerState::Interrupted {
                         count_loss(record, &self.resume_policy, now);
                     }
                 }
             }
-            if holds_workload(record.lifecycle) && !reports_loss(report.observation) {
+            if holds_workload(record.runner_state) && !reports_loss(report.observation) {
                 record.workload_epoch = record.workload_epoch.max(Some(report.lease.epoch));
             }
             record.observed = Some(observed);
@@ -625,11 +793,11 @@ impl ControlPlane {
         task_storage: &ExecutionStore,
     ) -> Result<bool> {
         let record = self.store.load_task(task_id)?;
-        if record.lifecycle.is_archival() {
+        if record.runner_state.is_archival() {
             return Err(OrchestrationError::IllegalCommand {
                 task_id: task_id.clone(),
                 command: OwnerCommand::Start,
-                lifecycle: record.lifecycle,
+                runner_state: record.runner_state,
             });
         }
         Ok(task_storage.initialize_task_launch_spec(task_id, &record.launch_spec)?)
@@ -666,7 +834,7 @@ impl ControlPlane {
     ///
     /// Removes orphaned temporary files and appends any event a record
     /// committed but a crash kept out of the log. Nothing else is judged:
-    /// unlike local recovery, a remote task's lifecycle changes only through
+    /// unlike local recovery, a remote task's runner state changes only through
     /// controller reconciliation, never because this process restarted.
     ///
     /// The material store (U9) is repaired here too, so the one startup
@@ -703,7 +871,7 @@ impl ControlPlane {
         );
         let removed_material_leftovers = materials
             .recover(|task_id| match self.store.load_task(task_id) {
-                Ok(record) => record.lifecycle.is_archival(),
+                Ok(record) => record.runner_state.is_archival(),
                 // Materials of a task that does not exist belong to nobody.
                 Err(OrchestrationError::TaskNotFound(_)) => true,
                 // An unreadable record is no proof of archival: keep them.
@@ -725,18 +893,18 @@ impl ControlPlane {
     /// the loss its event log shows, counted as a fresh one, so the resume
     /// policy resumes it — unless it was lost while pausing. Call under the
     /// task's lock. Like rank repair, it announces nothing: the record's
-    /// lifecycle does not change, and clients' next read shows the state.
+    /// runner state does not change, and clients' next read shows the state.
     fn adopt_loss(&self, record: &mut TaskRecord) -> Result<bool> {
         let lost = matches!(
-            record.lifecycle,
-            TaskLifecycle::Interrupted | TaskLifecycle::Unknown
+            record.runner_state,
+            RunnerState::Interrupted | RunnerState::Unknown
         );
         if !lost || record.resume.last_loss.is_some() {
             return Ok(false);
         }
         let events = self.store.events_since(&record.task_id, 0)?;
         record.resume.last_loss = Some(loss_from_history(record, &events));
-        if record.lifecycle == TaskLifecycle::Interrupted {
+        if record.runner_state == RunnerState::Interrupted {
             count_loss(record, &self.resume_policy, self.clock.now());
         }
         self.store.save_task(record)?;
@@ -775,9 +943,9 @@ impl ControlPlane {
             Mutation::Unchanged(value) => Ok((record, value)),
             Mutation::Changed(kind, value) => {
                 // A reservation and a queue verdict mean something only
-                // while queued: once the task leaves `Queued` its lifecycle
+                // while queued: once the task leaves `Queued` its runner state
                 // holds (or releases) the slot by itself (U10).
-                if record.lifecycle != TaskLifecycle::Queued {
+                if record.runner_state != RunnerState::Queued {
                     record.reservation = None;
                     record.queue = None;
                 }
@@ -786,7 +954,7 @@ impl ControlPlane {
                     sequence: record.revision,
                     task_id: record.task_id.clone(),
                     at: now,
-                    lifecycle: record.lifecycle,
+                    runner_state: record.runner_state,
                     generation: record.generation,
                     kind,
                 };
@@ -835,6 +1003,32 @@ impl ControlPlane {
     }
 }
 
+/// Sets or clears the slot-release deadline from the runner state and the
+/// last snapshot (D62). Only a `Running` task has one:
+///
+/// * a final execution state makes it due now (or keeps an earlier one);
+/// * a transient one plans `now + grace`, unless a deadline exists already,
+///   so repeated snapshots of the same wait do not push it back;
+/// * anything else clears it.
+pub(crate) fn refresh_slot_release_due(
+    record: &mut TaskRecord,
+    now: DateTime<Utc>,
+    grace: Duration,
+) {
+    let class = record.slot_release_class();
+    record.slot_release_due_at = match (record.runner_state, class) {
+        (RunnerState::Running, Some(SlotReleaseClass::Final)) => Some(
+            record
+                .slot_release_due_at
+                .map_or(now, |due_at| due_at.min(now)),
+        ),
+        (RunnerState::Running, Some(SlotReleaseClass::Transient)) => {
+            record.slot_release_due_at.or(Some(now + grace))
+        }
+        _ => None,
+    };
+}
+
 /// A command takes the task out of `Interrupted`/`Unknown`: the planned
 /// attempt is used up either way, and the owner's decision forgets the
 /// losses altogether (R6).
@@ -845,11 +1039,11 @@ fn leave_loss(record: &mut TaskRecord, actor: CommandActor) {
     }
 }
 
-/// Whether a task in `lifecycle` has (or is getting) a workload.
-fn holds_workload(lifecycle: TaskLifecycle) -> bool {
+/// Whether a task in `runner_state` has (or is getting) a workload.
+fn holds_workload(runner_state: RunnerState) -> bool {
     matches!(
-        lifecycle,
-        TaskLifecycle::Provisioning | TaskLifecycle::Running | TaskLifecycle::PauseRequested
+        runner_state,
+        RunnerState::Provisioning | RunnerState::Running | RunnerState::PauseRequested
     )
 }
 
@@ -872,7 +1066,7 @@ fn archive(record: &mut TaskRecord, idempotency_key: &str, now: DateTime<Utc>) {
         resources_never_created: never_created,
     });
     if never_created {
-        record.lifecycle = TaskLifecycle::Archived;
+        record.runner_state = RunnerState::Archived;
     }
 }
 

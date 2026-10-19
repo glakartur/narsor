@@ -195,6 +195,30 @@ impl TaskStorage {
             .truncate(false)
             .open(&path)
             .map_err(|source| RunnerError::io(&path, source))?;
+        self.flock_exclusive(file, &path)
+    }
+
+    /// Takes the same exclusive lock for a runner that only reads.
+    ///
+    /// Nothing is created or opened for writing: the lock file must be there
+    /// already, which only a runner that worked on the storage leaves, so a
+    /// missing one says the storage was never used
+    /// ([`RunnerError::StorageNotInitialized`]). `flock(2)` needs no write
+    /// access, so a read-only mount takes the lock too, and the file's
+    /// contents and times stay as they were.
+    pub fn lock_for_reading(&self) -> Result<StorageLock, RunnerError> {
+        let path = self.lock_file();
+        let file = fs::File::open(&path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                RunnerError::StorageNotInitialized(self.root.clone())
+            } else {
+                RunnerError::io(&path, source)
+            }
+        })?;
+        self.flock_exclusive(file, &path)
+    }
+
+    fn flock_exclusive(&self, file: fs::File, path: &Path) -> Result<StorageLock, RunnerError> {
         // SAFETY: `file` owns a valid descriptor for the duration of the call.
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
@@ -202,7 +226,7 @@ impl TaskStorage {
             return Err(if source.kind() == std::io::ErrorKind::WouldBlock {
                 RunnerError::StorageBusy(self.root.clone())
             } else {
-                RunnerError::io(&path, source)
+                RunnerError::io(path, source)
             });
         }
         Ok(StorageLock { _file: file })
@@ -526,4 +550,69 @@ fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T
         return Ok(None);
     }
     read_json(path).map(Some).map_err(RunnerError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("narsor-storage-{name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_read_lock_on_an_unused_storage_creates_nothing() {
+        let root = temp("unused");
+        let storage = TaskStorage::new(&root);
+        let error = storage.lock_for_reading().unwrap_err();
+        assert!(matches!(error, RunnerError::StorageNotInitialized(_)));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_read_lock_excludes_a_working_runner_and_the_other_way_round() {
+        let root = temp("exclusion");
+        let storage = TaskStorage::new(&root);
+        let working = storage.lock().unwrap();
+        assert!(matches!(
+            storage.lock_for_reading().unwrap_err(),
+            RunnerError::StorageBusy(_)
+        ));
+        drop(working);
+        let reading = storage.lock_for_reading().unwrap();
+        assert!(matches!(
+            storage.lock().unwrap_err(),
+            RunnerError::StorageBusy(_)
+        ));
+        drop(reading);
+        assert!(storage.lock().is_ok(), "the lock is let go on drop");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_read_lock_leaves_the_lock_file_as_it_was_and_needs_no_write_access() {
+        let root = temp("untouched");
+        let storage = TaskStorage::new(&root);
+        drop(storage.lock().unwrap());
+        let lock_file = storage.bookkeeping_dir().join("runner.lock");
+        let before = fs::metadata(&lock_file).unwrap();
+
+        // As on a volume mounted read-only: nothing here may be written.
+        fs::set_permissions(&lock_file, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(storage.bookkeeping_dir(), fs::Permissions::from_mode(0o555)).unwrap();
+        let held = storage.lock_for_reading();
+        let after = fs::metadata(&lock_file).unwrap();
+        fs::set_permissions(storage.bookkeeping_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(held.is_ok(), "{held:?}");
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        drop(held);
+        let _ = fs::remove_dir_all(root);
+    }
 }

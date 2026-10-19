@@ -1,5 +1,5 @@
 //! The generic environment controller: reconciles a backend with the
-//! control plane's desired task lifecycle over the controller protocol
+//! control plane's desired task runner state over the controller protocol
 //! (R3-R5, R12-R14, R34, R37; KTD1-KTD3).
 //!
 //! # One step
@@ -26,6 +26,20 @@
 //! runner starting, a deletion finishing, a safe point awaited) and
 //! otherwise long-polls for new commands, which also paces the periodic
 //! observation that notices a dead workload.
+//!
+//! # The reader
+//!
+//! A stopped or interrupted task an owner is reading has a read-only runner
+//! beside nothing (D63): [`DesiredCommand::reader_needed`] says so, and the
+//! controller starts one as a workload of its own — under its own name, with
+//! a credential of its own for the task's current generation — and removes it
+//! when the control plane stops asking. It takes no slot and is not the
+//! task's workload: a dead reader is no lost workload and is never reported;
+//! while the lease lasts it is replaced, not more often than
+//! [`ControllerConfig::reader_restart_interval`]. The order that matters is
+//! R15's: before a task's work is started or provisioned, or its storage
+//! archived, the reader is removed and confirmed gone; and a reader never
+//! starts while a working runner of the task may live.
 //!
 //! # What a lost connection means
 //!
@@ -71,7 +85,7 @@ use crate::backend::{
 use narsor_protocol::controller::{
     AckResponse, CommandAck, CommandsResponse, DesiredAction, DesiredCommand, HeartbeatResponse,
     LeaseView, Observation, ObservedSummary, ReportRequest, ReportResponse, ResourceIdentity,
-    RunnerCredentialRequest, RunnerCredentialResponse, TaskLifecycle,
+    RunnerCredentialRequest, RunnerCredentialResponse, RunnerState,
 };
 use narsor_protocol::identifier::TaskId;
 use narsor_shared::api_error::ClientError;
@@ -131,6 +145,15 @@ pub trait ControllerLink: Send + Sync + 'static {
         task_id: &str,
         request: &RunnerCredentialRequest,
     ) -> impl Future<Output = Result<RunnerCredentialResponse, ClientError>> + Send;
+    /// `POST /controller/v1/tasks/:task_id/reader-credentials`: the
+    /// credential of a read-only runner (D63). Refused with
+    /// `reader_not_wanted` unless the control plane wants a reader for the
+    /// task right now.
+    fn issue_reader_credential(
+        &self,
+        task_id: &str,
+        request: &RunnerCredentialRequest,
+    ) -> impl Future<Output = Result<RunnerCredentialResponse, ClientError>> + Send;
 }
 
 /// Timing and policy of a controller.
@@ -155,6 +178,11 @@ pub struct ControllerConfig {
     /// Consecutive failed observations of a task that should be running
     /// before it is reported Unknown (R13). At least 1.
     pub observe_failures_before_unknown: u32,
+    /// Least time between two attempts to start a task's read-only runner
+    /// after one died or could not start: a reader that cannot read (its
+    /// storage is busy, its image will not start) is not restarted in a
+    /// tight loop while the owner's lease lasts.
+    pub reader_restart_interval: Duration,
 }
 
 impl ControllerConfig {
@@ -168,6 +196,7 @@ impl ControllerConfig {
             retry_interval: Duration::from_secs(2),
             heartbeat_interval: Duration::from_secs(15),
             observe_failures_before_unknown: 3,
+            reader_restart_interval: Duration::from_secs(5),
         }
     }
 
@@ -281,6 +310,13 @@ pub struct Controller<B, L> {
     /// Tasks whose loss confirmation the control plane refused (one that
     /// predates `LossConfirmed`): said once at warn, then only at debug.
     loss_confirmation_refused: OncePerTask,
+    /// Tasks seen to have no reader, and none started since: their reader is
+    /// not looked for again until one is wanted, so a backend holding many
+    /// stopped tasks is not asked about each one's reader at every step.
+    readers_clear: HashSet<TaskId>,
+    /// When a task's reader may be started again (see
+    /// [`ControllerConfig::reader_restart_interval`]).
+    reader_retry_at: HashMap<TaskId, Instant>,
 }
 
 impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
@@ -296,6 +332,8 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             last_status: HashMap::new(),
             exited_before_ack: HashSet::new(),
             loss_confirmation_refused: OncePerTask::default(),
+            readers_clear: HashSet::new(),
+            reader_retry_at: HashMap::new(),
         }
     }
 
@@ -399,6 +437,8 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         self.observe_failures.retain(|task, _| live.contains(task));
         self.last_status.retain(|task, _| live.contains(task));
         self.exited_before_ack.retain(|task| live.contains(task));
+        self.readers_clear.retain(|task| live.contains(task));
+        self.reader_retry_at.retain(|task, _| live.contains(task));
         self.acknowledge(&response.commands).await?;
 
         let mut progress = Progress::Settled;
@@ -523,20 +563,38 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             command,
             task,
         };
+        // A reader and a working runner never share a task's storage (R15):
+        // whatever creates the task's work compute, or deletes its storage,
+        // finds the reader gone first — removed, and confirmed gone.
+        if matches!(
+            command.action,
+            DesiredAction::Start | DesiredAction::Provision | DesiredAction::Archive
+        ) && !self.clear_reader(&context).await
+        {
+            return Ok(Progress::Settling);
+        }
         match command.action {
             DesiredAction::Start => self.start(&context).await,
             DesiredAction::Provision => self.provision(&context).await,
             DesiredAction::Run => self.keep_running(&context).await,
             DesiredAction::PauseAtSafePoint => self.pause_at_safe_point(&context).await,
-            DesiredAction::KeepPaused => self.keep_paused(&context).await,
+            DesiredAction::KeepPaused => {
+                // No compute may exist; only then may a reader.
+                match self.keep_paused(&context).await? {
+                    Progress::Settled => self.tend_reader(&context, false).await,
+                    settling => Ok(settling),
+                }
+            }
             // Unknown: is the runner really gone? Nothing here creates or
             // removes anything; a confirmed loss only makes the task
             // Interrupted.
-            DesiredAction::Hold if command.lifecycle == TaskLifecycle::Unknown => {
+            DesiredAction::Hold if command.runner_state == RunnerState::Unknown => {
                 self.confirm_loss(&context).await
             }
-            // Interrupted: the owner or the resume policy decides (R13).
-            DesiredAction::Hold => Ok(Progress::Settled),
+            // Interrupted: the owner or the resume policy decides (R13). The
+            // dead runner's workload may still be on the platform, so a
+            // reader waits for it to be no longer alive.
+            DesiredAction::Hold => self.tend_reader(&context, true).await,
             DesiredAction::Archive => self.archive(&context).await,
         }
     }
@@ -553,9 +611,9 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             .report(context, Observation::StartAccepted, None, summary)
             .await?;
         match accepted {
-            Some(response) if response.lifecycle == TaskLifecycle::Provisioning => {
+            Some(response) if response.runner_state == RunnerState::Provisioning => {
                 let provisioning = DesiredCommand {
-                    lifecycle: TaskLifecycle::Provisioning,
+                    runner_state: RunnerState::Provisioning,
                     action: DesiredAction::Provision,
                     ..context.command.clone()
                 };
@@ -635,12 +693,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             _ => {}
         }
 
-        let incarnation = format!(
-            "{}-g{}-{}",
-            context.task.workload,
-            command.generation,
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        );
+        let incarnation = new_incarnation(&context.task.workload, command.generation);
         let issued = self
             .call(self.link.issue_runner_credential(
                 command.task_id.as_str(),
@@ -852,7 +905,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         Ok(Progress::Settled)
     }
 
-    /// Paused: no compute may exist; storage stays.
+    /// Stopped: no compute may exist; storage stays.
     async fn keep_paused(&mut self, context: &TaskContext<'_>) -> Result<Progress, Interrupt> {
         let Some(observed) = self.observe(context, false).await? else {
             return Ok(Progress::Settling);
@@ -864,6 +917,171 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             Some(removal) if removal.is_complete() => Progress::Settled,
             _ => Progress::Settling,
         })
+    }
+
+    /// Brings the task's reader to what the control plane wants: one for a
+    /// stopped or interrupted task an owner is reading, none otherwise (D63).
+    ///
+    /// A reader is a workload of its own — it is not the task's compute, it
+    /// takes no slot, and `keep_paused` and `keep_running` neither remove it
+    /// nor take its absence for a lost workload. A reader that died, or that
+    /// belongs to an older generation, is replaced after a pause
+    /// ([`ControllerConfig::reader_restart_interval`]); its failures are not
+    /// reported — the control plane's read answers "starting" until a reader
+    /// connects, and the owner asks again. `work_may_live` is true when the
+    /// task's working runner may still be on the platform (Interrupted): no
+    /// reader starts beside one that lives.
+    async fn tend_reader(
+        &mut self,
+        context: &TaskContext<'_>,
+        work_may_live: bool,
+    ) -> Result<Progress, Interrupt> {
+        let command = context.command;
+        let task_id = &command.task_id;
+        if !command.reader_needed {
+            return Ok(if self.clear_reader(context).await {
+                Progress::Settled
+            } else {
+                Progress::Settling
+            });
+        }
+        self.readers_clear.remove(task_id);
+        let reader = match self.backend.observe_reader(&context.task).await {
+            Ok(reader) => reader,
+            Err(error) => {
+                tracing::warn!(task = %task_id, %error, "controller: the reader cannot be observed");
+                return Ok(Progress::Settling);
+            }
+        };
+        match reader {
+            Some(reader)
+                if reader.phase.is_alive() && reader.launch_generation == command.generation =>
+            {
+                Ok(Progress::Settled)
+            }
+            Some(reader) => {
+                // Dead, being deleted, or from an older generation (its
+                // credential no longer works): it goes, a new one follows.
+                if matches!(reader.phase, WorkloadPhase::Exited { .. }) {
+                    tracing::debug!(task = %task_id, phase = %reader.phase, "controller: replacing the reader");
+                    self.hold_reader_back(task_id);
+                }
+                self.stop_reader(context).await;
+                Ok(Progress::Settling)
+            }
+            None => self.start_reader(context, work_may_live).await,
+        }
+    }
+
+    /// Starts the task's reader, unless one started or died too recently, or
+    /// the task's working runner may still live.
+    async fn start_reader(
+        &mut self,
+        context: &TaskContext<'_>,
+        work_may_live: bool,
+    ) -> Result<Progress, Interrupt> {
+        let command = context.command;
+        let task_id = &command.task_id;
+        if self
+            .reader_retry_at
+            .get(task_id)
+            .is_some_and(|at| Instant::now() < *at)
+        {
+            return Ok(Progress::Settling);
+        }
+        if work_may_live {
+            match self.backend.observe(&context.task).await {
+                Ok(observed)
+                    if observed
+                        .workload
+                        .as_ref()
+                        .is_some_and(|w| w.phase.is_alive()) =>
+                {
+                    return Ok(Progress::Settling)
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(task = %task_id, %error, "controller: the task cannot be observed; no reader yet");
+                    return Ok(Progress::Settling);
+                }
+            }
+        }
+        let incarnation = new_incarnation(&context.task.reader, command.generation);
+        let issued = self
+            .call(self.link.issue_reader_credential(
+                task_id.as_str(),
+                &RunnerCredentialRequest {
+                    lease_epoch: context.epoch,
+                    generation: command.generation,
+                    incarnation: incarnation.clone(),
+                },
+            ))
+            .await?;
+        let issued = match issued {
+            Ok(issued) => issued,
+            // The owner stopped reading meanwhile: nothing to start.
+            Err(reason) if reason.starts_with("reader_not_wanted") => return Ok(Progress::Settled),
+            Err(reason) => {
+                tracing::debug!(task = %task_id, %reason, "controller: no reader credential");
+                return Ok(Progress::Settling);
+            }
+        };
+        let launch = WorkloadLaunch {
+            task_id: task_id.clone(),
+            generation: command.generation,
+            incarnation,
+            lease_epoch: context.epoch,
+            launch_spec: command.launch_spec.clone(),
+            control_plane_url: self.config.runner_control_plane_url.clone(),
+            credential: RunnerCredential::new(issued.credential),
+        };
+        match self.backend.start_reader(&context.task, &launch).await {
+            Ok(started) => {
+                self.reader_retry_at.remove(task_id);
+                tracing::debug!(task = %task_id, created = started.created, "controller: reader started");
+                Ok(Progress::Settled)
+            }
+            Err(error) => {
+                tracing::warn!(task = %task_id, %error, "controller: the reader could not start");
+                self.hold_reader_back(task_id);
+                Ok(Progress::Settling)
+            }
+        }
+    }
+
+    /// Removes the task's reader and says whether it is gone — confirmed,
+    /// not merely asked to go. A task with no reader is remembered as such.
+    async fn clear_reader(&mut self, context: &TaskContext<'_>) -> bool {
+        let task_id = &context.command.task_id;
+        if self.readers_clear.contains(task_id) {
+            return true;
+        }
+        let gone = self
+            .stop_reader(context)
+            .await
+            .is_some_and(Removal::is_complete);
+        if gone {
+            self.readers_clear.insert(task_id.clone());
+        }
+        gone
+    }
+
+    /// Removes the task's reader; `None` when the backend failed.
+    async fn stop_reader(&self, context: &TaskContext<'_>) -> Option<Removal> {
+        match self.backend.stop_reader(&context.task).await {
+            Ok(removal) => Some(removal),
+            Err(error) => {
+                tracing::warn!(task = %context.command.task_id, %error, "controller: removing the reader failed");
+                None
+            }
+        }
+    }
+
+    fn hold_reader_back(&mut self, task_id: &TaskId) {
+        self.reader_retry_at.insert(
+            task_id.clone(),
+            Instant::now() + self.config.reader_restart_interval,
+        );
     }
 
     /// Archiving: delete workload and storage; report once both are gone.
@@ -1046,6 +1264,8 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         self.observe_failures.clear();
         self.last_status.clear();
         self.loss_confirmation_refused.clear();
+        self.readers_clear.clear();
+        self.reader_retry_at.clear();
     }
 }
 
@@ -1083,6 +1303,14 @@ struct TaskContext<'a> {
     task: TaskResources,
 }
 
+/// A fresh incarnation name for a workload of `pod_name` at `generation`.
+fn new_incarnation(pod_name: &str, generation: u64) -> String {
+    format!(
+        "{pod_name}-g{generation}-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    )
+}
+
 /// Whether the workload's own runner incarnation reported to the control
 /// plane — "the runner is up".
 fn runner_reported(command: &DesiredCommand, workload: &WorkloadState) -> bool {
@@ -1111,6 +1339,510 @@ fn summary(observed: &TaskObservation, detail: &str) -> ObservedSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{
+        ArchiveProgress, BackendCapabilities, BackendKind, BackendResult, Provisioned, ReaderStart,
+        StorageState,
+    };
+    use narsor_protocol::controller::ReportResponse;
+    use std::sync::{Arc, Mutex};
+
+    /// What a scripted platform and control plane did, in order.
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    fn said(log: &Log) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    fn position(log: &Log, entry: &str) -> Option<usize> {
+        said(log).iter().position(|line| line == entry)
+    }
+
+    fn count(log: &Log, entry: &str) -> usize {
+        said(log).iter().filter(|line| *line == entry).count()
+    }
+
+    fn workload(launch_generation: u64, phase: WorkloadPhase) -> WorkloadState {
+        WorkloadState {
+            uid: "uid".into(),
+            resource_generation: 1,
+            incarnation: "inc".into(),
+            launch_generation,
+            phase,
+        }
+    }
+
+    /// A platform whose state the test sets and whose calls it reads back.
+    #[derive(Clone)]
+    struct StubBackend {
+        log: Log,
+        state: Arc<Mutex<StubState>>,
+    }
+
+    struct StubState {
+        work: Option<WorkloadState>,
+        reader: Option<WorkloadState>,
+        /// Reader removals that answer "in progress" before one completes.
+        slow_removals: u32,
+        /// Reader starts that fail before one works.
+        failing_starts: u32,
+    }
+
+    impl StubBackend {
+        fn new(log: &Log) -> Self {
+            Self {
+                log: Arc::clone(log),
+                state: Arc::new(Mutex::new(StubState {
+                    work: None,
+                    reader: None,
+                    slow_removals: 0,
+                    failing_starts: 0,
+                })),
+            }
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, StubState> {
+            self.state.lock().unwrap()
+        }
+
+        fn say(&self, entry: &str) {
+            self.log.lock().unwrap().push(entry.to_string());
+        }
+    }
+
+    impl ExecutionBackend for StubBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Fake
+        }
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::default()
+        }
+        fn resources(&self, task_id: &TaskId, key: &str) -> BackendResult<TaskResources> {
+            Ok(TaskResources {
+                task_id: task_id.clone(),
+                resource_key: key.into(),
+                workload: format!("w-{key}"),
+                reader: format!("r-{key}"),
+                storage: format!("s-{key}"),
+            })
+        }
+        async fn observe(&self, _task: &TaskResources) -> BackendResult<TaskObservation> {
+            Ok(TaskObservation {
+                workload: self.state().work.clone(),
+                storage: StorageState::Present,
+            })
+        }
+        async fn provision(
+            &self,
+            _task: &TaskResources,
+            launch: &WorkloadLaunch,
+        ) -> BackendResult<Provisioned> {
+            self.say("provision");
+            let created = workload(launch.generation, WorkloadPhase::Running);
+            self.state().work = Some(created.clone());
+            Ok(Provisioned {
+                workload: created,
+                created_workload: true,
+                created_storage: false,
+            })
+        }
+        async fn resume(
+            &self,
+            task: &TaskResources,
+            launch: &WorkloadLaunch,
+        ) -> BackendResult<Provisioned> {
+            self.say("resume");
+            self.provision(task, launch).await
+        }
+        async fn release_compute(&self, _task: &TaskResources) -> BackendResult<Removal> {
+            self.say("release_compute");
+            Ok(match self.state().work.take() {
+                Some(_) => Removal::Removed,
+                None => Removal::AlreadyAbsent,
+            })
+        }
+        async fn archive(&self, _task: &TaskResources) -> BackendResult<ArchiveProgress> {
+            self.say("archive");
+            self.state().work = None;
+            Ok(ArchiveProgress {
+                workload: Removal::AlreadyAbsent,
+                storage: Removal::Removed,
+            })
+        }
+        async fn observe_reader(
+            &self,
+            _task: &TaskResources,
+        ) -> BackendResult<Option<WorkloadState>> {
+            Ok(self.state().reader.clone())
+        }
+        async fn start_reader(
+            &self,
+            _task: &TaskResources,
+            launch: &WorkloadLaunch,
+        ) -> BackendResult<ReaderStart> {
+            self.say("start_reader");
+            let mut state = self.state();
+            if state.failing_starts > 0 {
+                state.failing_starts -= 1;
+                return Err(BackendError::rejected("the reader will not start"));
+            }
+            let started = workload(launch.generation, WorkloadPhase::Running);
+            state.reader = Some(started.clone());
+            Ok(ReaderStart {
+                workload: started,
+                created: true,
+            })
+        }
+        async fn stop_reader(&self, _task: &TaskResources) -> BackendResult<Removal> {
+            self.say("stop_reader");
+            let mut state = self.state();
+            if state.reader.is_none() {
+                return Ok(Removal::AlreadyAbsent);
+            }
+            if state.slow_removals > 0 {
+                state.slow_removals -= 1;
+                return Ok(Removal::InProgress);
+            }
+            state.reader = None;
+            Ok(Removal::Removed)
+        }
+    }
+
+    /// A control plane that serves one scripted desired command.
+    #[derive(Clone)]
+    struct StubLink {
+        log: Log,
+        command: Arc<Mutex<DesiredCommand>>,
+        /// Whether the control plane refuses a reader credential.
+        refuse_reader: Arc<Mutex<bool>>,
+    }
+
+    impl StubLink {
+        fn say(&self, entry: &str) {
+            self.log.lock().unwrap().push(entry.to_string());
+        }
+    }
+
+    fn lease() -> LeaseView {
+        LeaseView {
+            backend_id: narsor_protocol::identifier::BackendId::parse("b").unwrap(),
+            controller_id: "c".into(),
+            epoch: 1,
+            acquired_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+        }
+    }
+
+    impl ControllerLink for StubLink {
+        async fn acquire_lease(&self, _ttl: Option<u64>) -> Result<LeaseView, ClientError> {
+            Ok(lease())
+        }
+        async fn renew_lease(
+            &self,
+            _epoch: u64,
+            _ttl: Option<u64>,
+        ) -> Result<LeaseView, ClientError> {
+            Ok(lease())
+        }
+        async fn release_lease(&self, _epoch: u64) -> Result<LeaseView, ClientError> {
+            Ok(lease())
+        }
+        async fn heartbeat(&self) -> Result<HeartbeatResponse, ClientError> {
+            unreachable!("a fresh lease is not heartbeated")
+        }
+        async fn commands(&self, _wait: u64, _all: bool) -> Result<CommandsResponse, ClientError> {
+            Ok(CommandsResponse {
+                lease_epoch: 1,
+                commands: vec![self.command.lock().unwrap().clone()],
+            })
+        }
+        async fn acknowledge(&self, acks: Vec<CommandAck>) -> Result<AckResponse, ClientError> {
+            Ok(AckResponse { acknowledged: acks })
+        }
+        async fn report(&self, report: &ReportRequest) -> Result<ReportResponse, ClientError> {
+            self.say(&format!("report {:?}", report.observation));
+            Ok(ReportResponse {
+                applied: true,
+                runner_state: match report.observation {
+                    Observation::StartAccepted => RunnerState::Provisioning,
+                    _ => self.command.lock().unwrap().runner_state,
+                },
+                generation: report.desired_generation,
+            })
+        }
+        async fn issue_runner_credential(
+            &self,
+            task_id: &str,
+            request: &RunnerCredentialRequest,
+        ) -> Result<RunnerCredentialResponse, ClientError> {
+            self.say("issue_runner_credential");
+            Ok(credential(task_id, request))
+        }
+        async fn issue_reader_credential(
+            &self,
+            task_id: &str,
+            request: &RunnerCredentialRequest,
+        ) -> Result<RunnerCredentialResponse, ClientError> {
+            self.say("issue_reader_credential");
+            if *self.refuse_reader.lock().unwrap() {
+                return Err(ClientError::Refused {
+                    code: "reader_not_wanted".into(),
+                    message: "nobody is reading it".into(),
+                });
+            }
+            Ok(credential(task_id, request))
+        }
+    }
+
+    fn credential(task_id: &str, request: &RunnerCredentialRequest) -> RunnerCredentialResponse {
+        RunnerCredentialResponse {
+            task_id: TaskId::parse(task_id).unwrap(),
+            generation: request.generation,
+            incarnation: request.incarnation.clone(),
+            credential: "nsr.test".into(),
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+        }
+    }
+
+    fn launch_spec() -> serde_json::Value {
+        serde_json::json!({
+            "version": 3, "workflow_id": "wf", "workflow_version": 1, "inputs": {},
+            "workspace": {}, "environment": {}, "resources": {}, "digest": "d",
+        })
+    }
+
+    fn desired(
+        runner_state: RunnerState,
+        action: DesiredAction,
+        reader_needed: bool,
+    ) -> DesiredCommand {
+        DesiredCommand {
+            task_id: TaskId::parse("task-1").unwrap(),
+            generation: 2,
+            runner_state,
+            action,
+            resource_key: "task-1".into(),
+            launch_spec: launch_spec(),
+            runner: None,
+            reader_needed,
+        }
+    }
+
+    struct Rig {
+        log: Log,
+        backend: StubBackend,
+        link: StubLink,
+        controller: Controller<StubBackend, StubLink>,
+    }
+
+    impl Rig {
+        fn new(command: DesiredCommand) -> Self {
+            Self::with_restart_interval(command, Duration::from_secs(60))
+        }
+
+        fn with_restart_interval(command: DesiredCommand, interval: Duration) -> Self {
+            let log: Log = Arc::default();
+            let backend = StubBackend::new(&log);
+            let link = StubLink {
+                log: Arc::clone(&log),
+                command: Arc::new(Mutex::new(command)),
+                refuse_reader: Arc::new(Mutex::new(false)),
+            };
+            let mut config = ControllerConfig::new("http://cp.test");
+            config.reader_restart_interval = interval;
+            Self {
+                controller: Controller::new(backend.clone(), link.clone(), config),
+                log,
+                backend,
+                link,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reader_is_started_for_a_stopped_task_an_owner_reads() {
+        let mut rig = Rig::new(desired(
+            RunnerState::Stopped,
+            DesiredAction::KeepPaused,
+            true,
+        ));
+
+        rig.controller.step().await;
+
+        assert_eq!(
+            said(&rig.log),
+            ["issue_reader_credential", "start_reader"],
+            "no report: a reader says nothing about the task"
+        );
+        let reader = rig.backend.state().reader.clone().expect("a reader");
+        assert_eq!(
+            reader.launch_generation, 2,
+            "bound to the current generation"
+        );
+        // Wanted and running: a later step starts nothing more.
+        rig.controller.step().await;
+        assert_eq!(count(&rig.log, "start_reader"), 1);
+        assert_eq!(count(&rig.log, "stop_reader"), 0, "keep-paused spares it");
+    }
+
+    #[tokio::test]
+    async fn an_unwanted_reader_is_removed_and_a_task_without_one_is_not_asked_again() {
+        let mut rig = Rig::new(desired(
+            RunnerState::Stopped,
+            DesiredAction::KeepPaused,
+            false,
+        ));
+        rig.backend.state().reader = Some(workload(2, WorkloadPhase::Running));
+
+        rig.controller.step().await;
+        assert!(rig.backend.state().reader.is_none());
+        assert_eq!(count(&rig.log, "stop_reader"), 1);
+
+        rig.controller.step().await;
+        rig.controller.step().await;
+        assert_eq!(count(&rig.log, "stop_reader"), 1, "known to have none");
+    }
+
+    #[tokio::test]
+    async fn the_work_starts_only_after_the_reader_is_confirmed_gone() {
+        let mut rig = Rig::new(desired(RunnerState::Queued, DesiredAction::Start, false));
+        rig.backend.state().reader = Some(workload(2, WorkloadPhase::Running));
+        rig.backend.state().slow_removals = 2;
+
+        for _ in 0..2 {
+            rig.controller.step().await;
+            assert_eq!(count(&rig.log, "provision"), 0, "{:?}", said(&rig.log));
+            assert_eq!(count(&rig.log, "report StartAccepted"), 0);
+        }
+        rig.controller.step().await;
+
+        let log = said(&rig.log);
+        let removed = log.iter().rposition(|l| l == "stop_reader").unwrap();
+        let accepted = position(&rig.log, "report StartAccepted").expect("accepted");
+        let provisioned = position(&rig.log, "provision").expect("provisioned");
+        assert!(removed < accepted && accepted < provisioned, "{log:?}");
+        assert!(rig.backend.state().reader.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_archive_removes_the_reader_before_the_storage() {
+        let mut rig = Rig::new(desired(
+            RunnerState::Archiving,
+            DesiredAction::Archive,
+            false,
+        ));
+        rig.backend.state().reader = Some(workload(2, WorkloadPhase::Running));
+        rig.backend.state().slow_removals = 1;
+
+        rig.controller.step().await;
+        assert_eq!(count(&rig.log, "archive"), 0);
+        rig.controller.step().await;
+
+        let removed = said(&rig.log)
+            .iter()
+            .rposition(|l| l == "stop_reader")
+            .unwrap();
+        assert!(removed < position(&rig.log, "archive").expect("archived"));
+        assert!(position(&rig.log, "report ResourcesDeleted").is_some());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_tasks_live_workload_keeps_a_reader_from_starting() {
+        let mut rig = Rig::new(desired(RunnerState::Interrupted, DesiredAction::Hold, true));
+        rig.backend.state().work = Some(workload(1, WorkloadPhase::Running));
+
+        rig.controller.step().await;
+        assert_eq!(count(&rig.log, "start_reader"), 0, "{:?}", said(&rig.log));
+        assert_eq!(count(&rig.log, "issue_reader_credential"), 0);
+
+        // Once the dead runner's workload is no longer alive, a reader may.
+        rig.backend.state().work = Some(workload(1, WorkloadPhase::Exited { code: None }));
+        rig.controller.step().await;
+        assert_eq!(count(&rig.log, "start_reader"), 1);
+        assert_eq!(
+            count(&rig.log, "release_compute"),
+            0,
+            "the dead one is not ours to touch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reader_the_control_plane_no_longer_wants_is_not_started() {
+        let mut rig = Rig::new(desired(
+            RunnerState::Stopped,
+            DesiredAction::KeepPaused,
+            true,
+        ));
+        *rig.link.refuse_reader.lock().unwrap() = true;
+
+        rig.controller.step().await;
+
+        assert_eq!(count(&rig.log, "issue_reader_credential"), 1);
+        assert_eq!(count(&rig.log, "start_reader"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_dead_reader_is_retried_only_after_the_restart_interval() {
+        let mut rig = Rig::new(desired(
+            RunnerState::Stopped,
+            DesiredAction::KeepPaused,
+            true,
+        ));
+        rig.backend.state().failing_starts = 1;
+
+        rig.controller.step().await;
+        rig.controller.step().await;
+        rig.controller.step().await;
+        assert_eq!(
+            count(&rig.log, "start_reader"),
+            1,
+            "held back after a failure"
+        );
+        assert!(rig.backend.state().reader.is_none());
+
+        // With no wait, the same failure is retried at once, and a reader
+        // that then dies is replaced.
+        let mut rig = Rig::with_restart_interval(
+            desired(RunnerState::Stopped, DesiredAction::KeepPaused, true),
+            Duration::ZERO,
+        );
+        rig.backend.state().failing_starts = 1;
+        rig.controller.step().await;
+        rig.controller.step().await;
+        assert!(rig.backend.state().reader.is_some());
+        rig.backend.state().reader = Some(workload(2, WorkloadPhase::Exited { code: Some(1) }));
+        rig.controller.step().await;
+        rig.controller.step().await;
+        let replacement = rig.backend.state().reader.clone().unwrap();
+        assert!(replacement.phase.is_alive());
+        assert_eq!(count(&rig.log, "start_reader"), 3);
+        assert!(
+            !said(&rig.log)
+                .iter()
+                .any(|l| l.starts_with("report WorkloadLost")),
+            "a reader's death is not reported: {:?}",
+            said(&rig.log)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reader_of_an_older_generation_is_replaced_without_waiting() {
+        let mut rig = Rig::new(desired(
+            RunnerState::Stopped,
+            DesiredAction::KeepPaused,
+            true,
+        ));
+        rig.backend.state().reader = Some(workload(1, WorkloadPhase::Running));
+
+        rig.controller.step().await;
+        assert!(
+            rig.backend.state().reader.is_none(),
+            "its credential is stale"
+        );
+        rig.controller.step().await;
+
+        let replacement = rig.backend.state().reader.clone().expect("a new reader");
+        assert_eq!(replacement.launch_generation, 2);
+    }
 
     #[test]
     fn a_refusal_is_said_loudly_once_per_task_until_accepted() {

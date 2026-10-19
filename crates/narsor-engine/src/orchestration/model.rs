@@ -14,7 +14,8 @@ pub use narsor_protocol::controller::{
     ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
     InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary, OperatorCommand,
     OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion,
-    ResumeState, RunnerProblem, TaskEvent, TaskEventKind, TaskLifecycle, WorkloadLoss,
+    ResumeState, RunnerProblem, RunnerState, SlotReleaseReason, TaskEvent, TaskEventKind,
+    TaskState, WorkloadLoss,
 };
 
 /// Current schema version of [`TaskRecord`].
@@ -23,6 +24,107 @@ pub use narsor_protocol::controller::{
 /// [`TaskRecord::rank`]; the store migrates a version 1 record when it first
 /// reads it (see [`super::store`]).
 pub const TASK_RECORD_VERSION: u32 = 2;
+
+/// How much a read of a task's details adds to its slot-release wait at
+/// least: a read that would move the deadline by less changes nothing, so
+/// a client that refreshes often does not write the record each time.
+pub fn slot_release_extension_threshold() -> chrono::Duration {
+    chrono::Duration::seconds(30)
+}
+
+/// An owner's reading of a stopped task, as the control plane remembers it
+/// (D63).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReaderLease {
+    /// When the lease began: a reader credential issued before this belongs
+    /// to an earlier reading and is not the one an owner now waits for.
+    pub since: DateTime<Utc>,
+    /// The lease holds until then, unless a read moves it later.
+    pub until: DateTime<Utc>,
+}
+
+/// What the execution status of a task's last snapshot means for its slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotReleaseClass {
+    /// The execution ended (`Completed`, `Cancelled`): the slot is freed at
+    /// once. Not [`ExecutionStatus::is_terminal`], which also counts
+    /// `Failed`.
+    Final,
+    /// The execution waits for its owner (`InputNeeded`, `Failed`): the slot
+    /// is freed after a wait.
+    Transient,
+}
+
+impl SlotReleaseClass {
+    /// The class of an execution status; `None` for any other status: the
+    /// slot is kept.
+    pub fn of(status: ExecutionStatus) -> Option<Self> {
+        match status {
+            ExecutionStatus::Completed | ExecutionStatus::Cancelled => Some(Self::Final),
+            ExecutionStatus::InputNeeded | ExecutionStatus::Failed => Some(Self::Transient),
+            _ => None,
+        }
+    }
+
+    /// Why a slot was freed in this class.
+    pub fn release_reason(self) -> SlotReleaseReason {
+        match self {
+            Self::Final => SlotReleaseReason::Terminal,
+            Self::Transient => SlotReleaseReason::GraceElapsed,
+        }
+    }
+}
+
+/// Works out the [`TaskState`] of a task from its runner state, the execution
+/// status of the runner's last snapshot (`None`: no snapshot yet) and the
+/// resume policy (D58). The first matching rule wins:
+///
+/// 1. `Archived` is `Archived`; 2. `Archiving` is `Finished`;
+/// 3. `Queued` is `Queued`, whatever the last snapshot says;
+/// 4. `Unknown`, or `Interrupted` with the resume limit used up, is `Error`;
+/// 5. execution `Completed` or `Cancelled` is `Finished`;
+/// 6. execution `Failed` is `Error`;
+/// 7. execution `InputNeeded` is `HumanNeeded`;
+/// 8. `Stopped` or `PauseRequested` is `Paused`;
+/// 9. `Provisioning` without a snapshot is `Queued`;
+/// 10. `Interrupted` with no attempt planned (lost while a pause was
+///     requested, which the resume policy leaves to the owner) is `Paused`;
+/// 11. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
+///     `Interrupted` while the resume policy still waits to try again.
+///
+/// Rules 5 to 7 come before 8, so a task stopped to free its slot keeps the
+/// state its work reached. Rule 8 reads `PauseRequested` as the owner's
+/// pause only when `pause_by_policy` is false: a stop the slot-release
+/// policy asked for is no decision of the owner, so a task whose work moved
+/// on meanwhile (execution `Running`) stays `Running`.
+pub fn derive_task_state(
+    runner_state: RunnerState,
+    execution: Option<ExecutionStatus>,
+    resume: &ResumeState,
+    pause_by_policy: bool,
+) -> TaskState {
+    match runner_state {
+        RunnerState::Archived => return TaskState::Archived,
+        RunnerState::Archiving => return TaskState::Finished,
+        RunnerState::Queued => return TaskState::Queued,
+        RunnerState::Unknown => return TaskState::Error,
+        RunnerState::Interrupted if resume.exhausted.is_some() => return TaskState::Error,
+        _ => {}
+    }
+    match execution {
+        Some(ExecutionStatus::Completed | ExecutionStatus::Cancelled) => TaskState::Finished,
+        Some(ExecutionStatus::Failed) => TaskState::Error,
+        Some(ExecutionStatus::InputNeeded) => TaskState::HumanNeeded,
+        _ => match runner_state {
+            RunnerState::PauseRequested if pause_by_policy => TaskState::Running,
+            RunnerState::Stopped | RunnerState::PauseRequested => TaskState::Paused,
+            RunnerState::Provisioning if execution.is_none() => TaskState::Queued,
+            // Lost while pausing: no attempt is planned, nothing runs.
+            RunnerState::Interrupted if resume.next_attempt_at.is_none() => TaskState::Paused,
+            _ => TaskState::Running,
+        },
+    }
+}
 
 /// Current schema version of [`BackendLease`].
 pub const BACKEND_LEASE_VERSION: u32 = 1;
@@ -140,7 +242,8 @@ pub struct TaskRecord {
     /// (U10). Strictly increasing, never reused.
     pub queue_sequence: u64,
     /// Current orchestration state.
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     /// Desired generation: starts at 1, grows with every owner command that
     /// changes desired state. Controllers must report against the current one.
     pub generation: u64,
@@ -186,7 +289,7 @@ pub struct TaskRecord {
     /// The capacity slot the scheduler granted while the task is queued
     /// (U10). Only a task holding one is offered `Start`, and only such a
     /// task may be accepted by its controller; cleared once the task leaves
-    /// `Queued`, from where its lifecycle itself holds the slot.
+    /// `Queued`, from where its runner state itself holds the slot.
     #[serde(default)]
     pub reservation: Option<CapacityReservation>,
     /// Why the queued task waits, or that it was admitted; `None` outside
@@ -215,6 +318,19 @@ pub struct TaskRecord {
     /// Automatic resume after a workload loss.
     #[serde(default)]
     pub resume: ResumeState,
+    /// When the control plane frees the slot of the running task, because
+    /// its work ended or waits for its owner (D62). Set by the runner
+    /// snapshot that shows such a state, cleared by any other; lives in the
+    /// record so a restart of the daemon neither loses nor shortens it.
+    #[serde(default)]
+    pub slot_release_due_at: Option<DateTime<Utc>>,
+    /// The control plane's want of a read-only runner for the stopped task
+    /// (D63): set by a read of its details, moved later by the next one,
+    /// removed when it ran out and by any command that resumes or archives
+    /// the task, in that command's own mutation (R15). The controller starts
+    /// and removes the reader by it; the reader is no slot.
+    #[serde(default)]
+    pub reader_lease: Option<ReaderLease>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
@@ -239,9 +355,109 @@ impl TaskRecord {
     /// interrupted, its planned attempt is due and the policy has not given
     /// up on it.
     pub fn auto_resume_due(&self, now: DateTime<Utc>) -> bool {
-        self.lifecycle == TaskLifecycle::Interrupted
+        self.runner_state == RunnerState::Interrupted
             && self.resume.exhausted.is_none()
             && self.resume.next_attempt_at.is_some_and(|at| at <= now)
+    }
+
+    /// How the last runner snapshot classifies the task's execution for
+    /// its slot; `None` before the first snapshot, and for a status that
+    /// keeps the slot.
+    pub fn slot_release_class(&self) -> Option<SlotReleaseClass> {
+        self.runner
+            .as_ref()
+            .and_then(|runner| SlotReleaseClass::of(runner.snapshot.execution_status))
+    }
+
+    /// The deadline of a running task whose execution waits in a transient
+    /// state (the only one a read of its details moves later); `None` when
+    /// it is not waiting so, or has no deadline yet.
+    pub fn slot_release_waiting(&self) -> Option<DateTime<Utc>> {
+        if self.runner_state == RunnerState::Running
+            && self.slot_release_class() == Some(SlotReleaseClass::Transient)
+        {
+            self.slot_release_due_at
+        } else {
+            None
+        }
+    }
+
+    /// Whether a read-only runner is wanted for the task now: its lease
+    /// has not run out and the task has no workload of its own (`Stopped`,
+    /// `Interrupted`). The same test decides what the controller is told and
+    /// whether the reader's credential is issued and its directive
+    /// `Continue`, so they never disagree.
+    pub fn reader_lease_active(&self, now: DateTime<Utc>) -> bool {
+        self.reader_may_read()
+            && self
+                .reader_lease
+                .as_ref()
+                .is_some_and(|lease| lease.until > now)
+    }
+
+    /// Whether the task is in a state a read-only runner may read it in:
+    /// stopped, or interrupted with its workload known to be gone. `Unknown`
+    /// is not: its previous runner may still be alive.
+    pub fn reader_may_read(&self) -> bool {
+        matches!(
+            self.runner_state,
+            RunnerState::Stopped | RunnerState::Interrupted
+        )
+    }
+
+    /// Whether a lease is recorded that no longer wants a reader (it ran
+    /// out, or the task left the states it is read in): the periodic pass
+    /// removes it.
+    pub fn reader_lease_stale(&self, now: DateTime<Utc>) -> bool {
+        self.reader_lease.is_some() && !self.reader_lease_active(now)
+    }
+
+    /// Whether the owner's work waits for the runner: an answer not yet
+    /// settled or an operator command not yet resolved. The slot is never
+    /// freed under it.
+    pub fn owner_work_pending(&self) -> bool {
+        self.inputs.iter().any(|input| !input.status.is_settled())
+            || self
+                .operator_commands
+                .iter()
+                .any(|command| command.status == OperatorCommandStatus::Queued)
+    }
+
+    /// The idempotency key of the first piece of owner work that waits for
+    /// the runner (an unsettled answer, else a queued operator command): the
+    /// key the work's resume derives from, so a retry resumes once.
+    pub fn pending_work_key(&self) -> Option<&str> {
+        self.inputs
+            .iter()
+            .find(|input| !input.status.is_settled())
+            .map(|input| input.idempotency_key.as_str())
+            .or_else(|| {
+                self.operator_commands
+                    .iter()
+                    .find(|command| command.status == OperatorCommandStatus::Queued)
+                    .map(|command| command.idempotency_key.as_str())
+            })
+    }
+
+    /// Whether the slot-release policy may stop the task now: it runs, its
+    /// execution still is in a state that frees the slot, the deadline came
+    /// and nothing of the owner's waits for the runner.
+    pub fn slot_release_due(&self, now: DateTime<Utc>) -> bool {
+        self.runner_state == RunnerState::Running
+            && self.slot_release_due_at.is_some_and(|at| at <= now)
+            && self.slot_release_class().is_some()
+            && !self.owner_work_pending()
+    }
+
+    /// Whether the pause the task now waits to complete is the slot-release
+    /// policy's, not the owner's.
+    pub fn pause_requested_by_policy(&self) -> bool {
+        self.runner_state == RunnerState::PauseRequested
+            && self.commands.iter().rev().any(|receipt| {
+                receipt.command == OwnerCommand::Pause
+                    && receipt.generation_after == self.generation
+                    && receipt.actor == CommandActor::Policy
+            })
     }
 
     /// The receipt of the start or resume that produced `launch_generation`
@@ -269,20 +485,40 @@ impl TaskRecord {
     ///   explicitly, so a retry never has to wait for capacity;
     /// * `Archiving` — deletion is requested but not confirmed.
     ///
-    /// `Paused` releases its slot: the safe point was acknowledged and the
+    /// `Stopped` releases its slot: the safe point was acknowledged and the
     /// compute removed (R12). `Archived` and an unadmitted `Queued` task
     /// hold nothing.
     pub fn holds_capacity(&self) -> bool {
-        match self.lifecycle {
-            TaskLifecycle::Queued => self.reservation.is_some(),
-            TaskLifecycle::Provisioning
-            | TaskLifecycle::Running
-            | TaskLifecycle::PauseRequested
-            | TaskLifecycle::Interrupted
-            | TaskLifecycle::Unknown
-            | TaskLifecycle::Archiving => true,
-            TaskLifecycle::Paused | TaskLifecycle::Archived => false,
+        match self.runner_state {
+            RunnerState::Queued => self.reservation.is_some(),
+            RunnerState::Provisioning
+            | RunnerState::Running
+            | RunnerState::PauseRequested
+            | RunnerState::Interrupted
+            | RunnerState::Unknown
+            | RunnerState::Archiving => true,
+            RunnerState::Stopped | RunnerState::Archived => false,
         }
+    }
+
+    /// What the owner sees of the task; see [`derive_task_state`].
+    pub fn task_state(&self) -> TaskState {
+        derive_task_state(
+            self.runner_state,
+            // While a resumed launch has not reported, the snapshot is the
+            // superseded launch's: it says nothing of the task now.
+            if self.runner_state == RunnerState::Provisioning
+                && self.awaited_launch_generation().is_some()
+            {
+                None
+            } else {
+                self.runner
+                    .as_ref()
+                    .map(|runner| runner.snapshot.execution_status)
+            },
+            &self.resume,
+            self.pause_requested_by_policy(),
+        )
     }
 
     /// Finds the receipt of an idempotency key.
@@ -341,32 +577,87 @@ impl TaskRecord {
             .find(|command| command.command_id == command_id)
     }
 
-    /// Why an operator command cannot be queued for this task's runner
-    /// right now, or `None` when it can: only a running task with a runner
-    /// of its current launch has someone to carry it out.
-    pub fn operator_command_refusal(&self) -> Option<String> {
-        let reason = match self.lifecycle {
-            TaskLifecycle::Running => None,
-            TaskLifecycle::Queued | TaskLifecycle::Provisioning => {
-                Some("the task has not started yet")
-            }
-            TaskLifecycle::PauseRequested => Some("the task is pausing"),
-            TaskLifecycle::Paused => Some("the task is paused; resume it first"),
-            TaskLifecycle::Interrupted | TaskLifecycle::Unknown => {
+    /// The launch generation of a launch that was ordered and whose runner
+    /// has not reported yet: the task was resumed (by its owner or by work
+    /// sent to it) and the runner of the older launch is superseded.
+    /// `None` when no such launch waits.
+    pub fn awaited_launch_generation(&self) -> Option<u64> {
+        let previous = self.runner.as_ref()?;
+        if !matches!(
+            self.runner_state,
+            RunnerState::Queued | RunnerState::Provisioning | RunnerState::Running
+        ) || !self.supersedes_launch(previous.launch_generation)
+        {
+            return None;
+        }
+        self.commands
+            .iter()
+            .rev()
+            .find(|receipt| matches!(receipt.command, OwnerCommand::Start | OwnerCommand::Resume))
+            .map(|receipt| receipt.generation_after)
+    }
+
+    /// The launch generation an operator command accepted now is meant for:
+    /// the running runner's, or that of the launch it waits for — for a
+    /// `Stopped` task the one its resume will order (every resume raises
+    /// the desired generation by one). `None` when nothing can take it.
+    pub fn operator_command_launch(&self) -> Option<u64> {
+        match self.runner_state {
+            RunnerState::Stopped => Some(self.generation + 1),
+            _ => self.awaited_launch_generation().or_else(|| {
+                (self.runner_state == RunnerState::Running)
+                    .then(|| self.runner.as_ref().map(|runner| runner.launch_generation))
+                    .flatten()
+            }),
+        }
+    }
+
+    /// Why `command` cannot be queued for this task right now, or `None`
+    /// when it can.
+    ///
+    /// A running task with a runner of its current launch carries out
+    /// anything. A task without a runner — paused, or resumed and waiting
+    /// for its new runner or a slot — takes the work an owner can send it
+    /// (a message to the conductor, an undo, a restart, a transition): it
+    /// is kept and carried out after the next start (R13, R14). What acts
+    /// on a live runner (interrupt, confirm or reject a proposal) is
+    /// refused, with the reason.
+    pub fn operator_command_refusal(&self, command: &OperatorCommand) -> Option<String> {
+        let reason = match self.runner_state {
+            RunnerState::Running | RunnerState::Stopped => None,
+            RunnerState::Queued | RunnerState::Provisioning => self
+                .awaited_launch_generation()
+                .is_none()
+                .then_some("the task has not started yet"),
+            RunnerState::PauseRequested => Some("the task is pausing"),
+            RunnerState::Interrupted | RunnerState::Unknown => {
                 Some("the task's runner is gone; start or resume the task first")
             }
-            TaskLifecycle::Archiving | TaskLifecycle::Archived => Some("the task is archived"),
+            RunnerState::Archiving | RunnerState::Archived => Some("the task is archived"),
         };
         if let Some(reason) = reason {
-            return Some(format!("{reason} (lifecycle: {:?})", self.lifecycle));
+            return Some(format!("{reason} (runner state: {:?})", self.runner_state));
         }
-        match &self.runner {
-            None => Some("the task's runner has not reported yet".to_string()),
-            Some(runner) if self.supersedes_launch(runner.launch_generation) => {
-                Some("the task's new runner has not reported yet".to_string())
+        if self.runner.is_none() {
+            return Some("the task's runner has not reported yet".to_string());
+        }
+        if self.runner_state != RunnerState::Running || self.awaited_launch_generation().is_some() {
+            // No live runner to act on: only work that waits for the next
+            // start can be taken.
+            if matches!(
+                command,
+                OperatorCommand::Interrupt
+                    | OperatorCommand::ConfirmProposal { .. }
+                    | OperatorCommand::RejectProposal { .. }
+            ) {
+                return Some(format!(
+                    "the task has no running runner; this command acts on a live runner \
+                     (runner state: {:?})",
+                    self.runner_state
+                ));
             }
-            Some(_) => None,
         }
+        None
     }
 }
 
@@ -765,4 +1056,185 @@ pub enum MoveTarget {
     Top,
     /// Last of the backend's tasks.
     Bottom,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use RunnerState as R;
+    use TaskState as T;
+
+    fn exhausted() -> ResumeState {
+        ResumeState {
+            exhausted: Some(ResumeExhaustion {
+                reason: "the limit was used up".to_string(),
+                at: Utc::now(),
+                announced: false,
+            }),
+            ..ResumeState::default()
+        }
+    }
+
+    fn derive(runner: RunnerState, execution: Option<ExecutionStatus>) -> TaskState {
+        derive_task_state(runner, execution, &ResumeState::default(), false)
+    }
+
+    #[test]
+    fn a_finished_run_is_finished_with_or_without_a_runner() {
+        assert_eq!(
+            derive(R::Running, Some(ExecutionStatus::Completed)),
+            T::Finished
+        );
+        assert_eq!(
+            derive(R::Stopped, Some(ExecutionStatus::Completed)),
+            T::Finished
+        );
+        assert_eq!(
+            derive(R::Running, Some(ExecutionStatus::Cancelled)),
+            T::Finished
+        );
+        assert_eq!(
+            derive(R::PauseRequested, Some(ExecutionStatus::Completed)),
+            T::Finished
+        );
+    }
+
+    #[test]
+    fn a_run_waiting_for_a_human_needs_one_with_or_without_a_runner() {
+        assert_eq!(
+            derive(R::Running, Some(ExecutionStatus::InputNeeded)),
+            T::HumanNeeded
+        );
+        assert_eq!(
+            derive(R::Stopped, Some(ExecutionStatus::InputNeeded)),
+            T::HumanNeeded
+        );
+    }
+
+    #[test]
+    fn a_stopped_task_with_work_left_is_paused() {
+        assert_eq!(
+            derive(R::Stopped, Some(ExecutionStatus::Running)),
+            T::Paused
+        );
+        assert_eq!(derive(R::Stopped, None), T::Paused);
+        assert_eq!(
+            derive(R::PauseRequested, Some(ExecutionStatus::Running)),
+            T::Paused
+        );
+    }
+
+    #[test]
+    fn a_queued_task_is_queued_whatever_its_last_snapshot_says() {
+        assert_eq!(
+            derive(R::Queued, Some(ExecutionStatus::InputNeeded)),
+            T::Queued
+        );
+        assert_eq!(
+            derive(R::Queued, Some(ExecutionStatus::Completed)),
+            T::Queued
+        );
+        assert_eq!(derive(R::Queued, None), T::Queued);
+    }
+
+    #[test]
+    fn provisioning_is_queued_until_the_runner_has_reported() {
+        assert_eq!(derive(R::Provisioning, None), T::Queued);
+        assert_eq!(
+            derive(R::Provisioning, Some(ExecutionStatus::Running)),
+            T::Running
+        );
+    }
+
+    #[test]
+    fn a_lost_or_failed_task_is_an_error_unless_the_policy_still_retries() {
+        assert_eq!(derive(R::Unknown, Some(ExecutionStatus::Running)), T::Error);
+        assert_eq!(derive(R::Running, Some(ExecutionStatus::Failed)), T::Error);
+        assert_eq!(
+            derive_task_state(
+                R::Interrupted,
+                Some(ExecutionStatus::Running),
+                &exhausted(),
+                false
+            ),
+            T::Error
+        );
+        let planned = ResumeState {
+            next_attempt_at: Some(Utc::now()),
+            ..ResumeState::default()
+        };
+        assert_eq!(
+            derive_task_state(
+                R::Interrupted,
+                Some(ExecutionStatus::Running),
+                &planned,
+                false
+            ),
+            T::Running
+        );
+    }
+
+    #[test]
+    fn a_task_lost_while_pausing_has_no_attempt_planned_and_is_paused() {
+        // `count_loss` plans nothing for a loss from `PauseRequested`.
+        for execution in [Some(ExecutionStatus::Running), None] {
+            assert_eq!(
+                derive_task_state(R::Interrupted, execution, &ResumeState::default(), false),
+                T::Paused
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_the_policy_asked_for_does_not_read_as_a_pause() {
+        let derive = |pause_by_policy| {
+            derive_task_state(
+                R::PauseRequested,
+                Some(ExecutionStatus::Running),
+                &ResumeState::default(),
+                pause_by_policy,
+            )
+        };
+        assert_eq!(derive(false), T::Paused);
+        assert_eq!(derive(true), T::Running);
+        // The state the work reached still wins over both.
+        assert_eq!(
+            derive_task_state(
+                R::PauseRequested,
+                Some(ExecutionStatus::InputNeeded),
+                &ResumeState::default(),
+                true
+            ),
+            T::HumanNeeded
+        );
+    }
+
+    #[test]
+    fn only_completed_and_cancelled_free_a_slot_at_once() {
+        use SlotReleaseClass as C;
+        assert_eq!(C::of(ExecutionStatus::Completed), Some(C::Final));
+        assert_eq!(C::of(ExecutionStatus::Cancelled), Some(C::Final));
+        assert_eq!(C::of(ExecutionStatus::InputNeeded), Some(C::Transient));
+        assert_eq!(C::of(ExecutionStatus::Failed), Some(C::Transient));
+        for other in [
+            ExecutionStatus::Running,
+            ExecutionStatus::Paused,
+            ExecutionStatus::WaitingForEvent,
+            ExecutionStatus::Unknown,
+        ] {
+            assert_eq!(C::of(other), None);
+        }
+    }
+
+    #[test]
+    fn archival_wins_over_everything() {
+        assert_eq!(
+            derive(R::Archiving, Some(ExecutionStatus::Running)),
+            T::Finished
+        );
+        assert_eq!(
+            derive(R::Archived, Some(ExecutionStatus::Failed)),
+            T::Archived
+        );
+    }
 }

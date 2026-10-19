@@ -310,7 +310,7 @@ pub enum Command {
 
     /// Stops the local server through its discovery record.
     Daemon {
-        /// The lifecycle operation to perform.
+        /// The runner_state operation to perform.
         #[command(subcommand)]
         command: DaemonCommand,
     },

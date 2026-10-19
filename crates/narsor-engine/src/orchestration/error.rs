@@ -1,6 +1,6 @@
 //! Errors of the orchestration control plane.
 
-use super::model::{Observation, OwnerCommand, TaskLifecycle};
+use super::model::{Observation, OwnerCommand, RunnerState};
 use crate::domain::{BackendId, InvalidIdentifier, TaskId};
 use crate::persistence::PersistenceError;
 use chrono::{DateTime, Utc};
@@ -75,26 +75,26 @@ pub enum OrchestrationError {
         presented: u64,
     },
 
-    /// The owner command is not legal from the current lifecycle.
-    #[error("task '{task_id}' cannot {command:?} while {lifecycle:?}")]
+    /// The owner command is not legal from the current runner state.
+    #[error("task '{task_id}' cannot {command:?} while {runner_state:?}")]
     IllegalCommand {
         /// The task.
         task_id: TaskId,
         /// The command.
         command: OwnerCommand,
-        /// Its lifecycle.
-        lifecycle: TaskLifecycle,
+        /// Its runner state.
+        runner_state: RunnerState,
     },
 
-    /// The observation contradicts the current lifecycle.
-    #[error("task '{task_id}' cannot accept observation {observation:?} while {lifecycle:?}")]
+    /// The observation contradicts the current runner state.
+    #[error("task '{task_id}' cannot accept observation {observation:?} while {runner_state:?}")]
     IllegalObservation {
         /// The task.
         task_id: TaskId,
         /// The observation.
         observation: Observation,
-        /// Its lifecycle.
-        lifecycle: TaskLifecycle,
+        /// Its runner state.
+        runner_state: RunnerState,
     },
 
     /// The report's resource version is older than one already accepted.
@@ -243,13 +243,13 @@ pub enum OrchestrationError {
         status: super::model::InputStatus,
     },
 
-    /// The task's lifecycle does not let a runner take input.
-    #[error("task '{task_id}' does not accept input while {lifecycle:?}")]
+    /// The task's runner state does not let a runner take input.
+    #[error("task '{task_id}' does not accept input while {runner_state:?}")]
     TaskNotAcceptingInput {
         /// The task.
         task_id: TaskId,
-        /// Its lifecycle.
-        lifecycle: TaskLifecycle,
+        /// Its runner state.
+        runner_state: RunnerState,
     },
 
     /// An operator command cannot be queued for the task's runner right now.
@@ -299,19 +299,6 @@ pub enum OrchestrationError {
     #[error("task '{0}' has not been admitted by the scheduler yet")]
     NotAdmitted(TaskId),
 
-    /// Resuming would take a capacity slot the backend does not have free
-    /// (U10). Queued tasks never preempt running ones, and neither does a
-    /// resume: the owner retries once a slot is released.
-    #[error("backend '{backend_id}' has no free capacity ({running} of {limit} slots in use)")]
-    BackendAtCapacity {
-        /// The backend.
-        backend_id: BackendId,
-        /// Slots in use.
-        running: u32,
-        /// Its limit.
-        limit: u32,
-    },
-
     /// The backend cannot take tasks right now (not registered, misconfigured).
     #[error("backend '{backend_id}' is unavailable: {detail}")]
     BackendUnavailable {
@@ -323,12 +310,12 @@ pub enum OrchestrationError {
 
     /// Only a queued task can be moved: the queue order decides who is
     /// admitted next, it never touches a task that already holds compute.
-    #[error("task '{task_id}' is {lifecycle:?}; only a queued task can be moved")]
+    #[error("task '{task_id}' is {runner_state:?}; only a queued task can be moved")]
     TaskNotQueued {
         /// The task.
         task_id: TaskId,
-        /// Its lifecycle.
-        lifecycle: TaskLifecycle,
+        /// Its runner state.
+        runner_state: RunnerState,
     },
 
     /// A move names a task that is not on the same backend, or the moved

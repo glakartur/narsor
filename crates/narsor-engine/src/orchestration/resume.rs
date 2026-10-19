@@ -20,8 +20,7 @@
 //! `ControlPlane::auto_resume`.
 
 use super::model::{
-    Observation, ResumeExhaustion, TaskEvent, TaskEventKind, TaskLifecycle, TaskRecord,
-    WorkloadLoss,
+    Observation, ResumeExhaustion, RunnerState, TaskEvent, TaskEventKind, TaskRecord, WorkloadLoss,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -33,6 +32,37 @@ pub const AUTO_RESUME_KEY_PREFIX: &str = "auto-resume:";
 /// `generation`: one per interruption, however often the pass sees it.
 pub fn auto_resume_key(generation: u64) -> String {
     format!("{AUTO_RESUME_KEY_PREFIX}{generation}")
+}
+
+/// The prefix of the idempotency keys of the slot-release policy's commands
+/// (`slot-release:<generation>`), reserved like [`AUTO_RESUME_KEY_PREFIX`].
+pub const SLOT_RELEASE_KEY_PREFIX: &str = "slot-release:";
+
+/// The idempotency key of the policy's pause of the task running at
+/// `generation`: one per run, however often a trigger sees it due.
+pub fn slot_release_key(generation: u64) -> String {
+    format!("{SLOT_RELEASE_KEY_PREFIX}{generation}")
+}
+
+/// The prefix of the idempotency keys of the resume that work sent to a
+/// paused task causes (`work-resume:<key of the work>`), reserved like
+/// [`AUTO_RESUME_KEY_PREFIX`]: a retry of the work resumes the task once.
+pub const WORK_RESUME_KEY_PREFIX: &str = "work-resume:";
+
+/// The idempotency key prefixes only a policy may use, each with what it is
+/// reserved for: an owner's command may not carry one.
+pub const RESERVED_KEY_PREFIXES: [(&str, &str); 3] = [
+    (AUTO_RESUME_KEY_PREFIX, "the resume policy"),
+    (SLOT_RELEASE_KEY_PREFIX, "the slot-release policy"),
+    (
+        WORK_RESUME_KEY_PREFIX,
+        "the resume that work sent to a paused task causes",
+    ),
+];
+
+/// The idempotency key of the resume caused by the work with `work_key`.
+pub fn work_resume_key(work_key: &str) -> String {
+    format!("{WORK_RESUME_KEY_PREFIX}{work_key}")
 }
 
 /// How the control plane resumes a task after its workload was lost.
@@ -83,7 +113,7 @@ pub(crate) fn count_loss(record: &mut TaskRecord, policy: &ResumePolicy, now: Da
     let Some(loss) = record.resume.last_loss.clone() else {
         return;
     };
-    let started_successfully = loss.from != TaskLifecycle::Provisioning
+    let started_successfully = loss.from != RunnerState::Provisioning
         && record
             .running_since
             .is_some_and(|since| loss.at - since >= policy.stability_window);
@@ -94,7 +124,7 @@ pub(crate) fn count_loss(record: &mut TaskRecord, policy: &ResumePolicy, now: Da
     resume.next_attempt_at = None;
     resume.last_loss_uncounted = false;
     // Lost before a safe point: what the owner wanted was a pause.
-    if loss.from == TaskLifecycle::PauseRequested {
+    if loss.from == RunnerState::PauseRequested {
         return;
     }
     // A runner that stayed up starts the count anew, whatever lost it.
@@ -141,20 +171,20 @@ fn exhaustion_reason(loss_reason: Option<&str>) -> String {
 }
 
 /// The loss of a task that went `Interrupted` or `Unknown` before losses
-/// were remembered, read from its event log: the lifecycle before the last
+/// were remembered, read from its event log: the runner state before the last
 /// move into either. A log that does not show it reads as a loss while
 /// running, which the policy resumes.
 pub(crate) fn loss_from_history(record: &TaskRecord, events: &[TaskEvent]) -> WorkloadLoss {
-    let lost = |lifecycle: TaskLifecycle| {
+    let lost = |runner_state: RunnerState| {
         matches!(
-            lifecycle,
-            TaskLifecycle::Interrupted | TaskLifecycle::Unknown
+            runner_state,
+            RunnerState::Interrupted | RunnerState::Unknown
         )
     };
     let entered = events
         .windows(2)
         .rev()
-        .find(|pair| lost(pair[1].lifecycle) && !lost(pair[0].lifecycle));
+        .find(|pair| lost(pair[1].runner_state) && !lost(pair[0].runner_state));
     let reason = record
         .observed
         .as_ref()
@@ -162,7 +192,7 @@ pub(crate) fn loss_from_history(record: &TaskRecord, events: &[TaskEvent]) -> Wo
         .and_then(|observed| observed.summary.detail.clone());
     match entered {
         Some(pair) => WorkloadLoss {
-            from: pair[0].lifecycle,
+            from: pair[0].runner_state,
             at: pair[1].at,
             lease_epoch: match pair[1].kind {
                 TaskEventKind::ControllerReported { lease_epoch, .. } => lease_epoch,
@@ -171,7 +201,7 @@ pub(crate) fn loss_from_history(record: &TaskRecord, events: &[TaskEvent]) -> Wo
             reason,
         },
         None => WorkloadLoss {
-            from: TaskLifecycle::Running,
+            from: RunnerState::Running,
             at: record.last_event.at,
             lease_epoch: record.last_report_epoch.unwrap_or(0),
             reason,

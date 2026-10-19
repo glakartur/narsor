@@ -1,6 +1,6 @@
 //! Durable, backend-neutral orchestration of remote tasks (KTD1, KTD3).
 //!
-//! The control plane owns *assignment*, *desired lifecycle*, the *fenced
+//! The control plane owns *assignment*, *desired runner state*, the *fenced
 //! controller leases* and the *last observed* backend/runner summary of every
 //! task. It never reads or writes a `WorkflowExecution`: the runner's work
 //! state stays authoritative on task storage, and nothing here can be used to
@@ -32,7 +32,8 @@ pub use control_plane::{Clock, ControlPlane, OrchestrationRecovery, SystemClock}
 pub use error::{OrchestrationError, Result};
 pub use model::*;
 pub use resume::{
-    auto_resume_key, exhaustion_loss, loss_state, LossState, ResumePolicy, AUTO_RESUME_KEY_PREFIX,
-    EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
+    auto_resume_key, exhaustion_loss, loss_state, slot_release_key, work_resume_key, LossState,
+    ResumePolicy, AUTO_RESUME_KEY_PREFIX, EXHAUSTION_REASON_PREFIX, RESERVED_KEY_PREFIXES,
+    SLOT_RELEASE_KEY_PREFIX, UNSPECIFIED_LOSS, WORK_RESUME_KEY_PREFIX,
 };
 pub use store::OrchestrationStore;

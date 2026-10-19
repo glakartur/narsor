@@ -82,8 +82,8 @@ pub mod wire;
 pub use client::{ControllerClient, RunnerClient};
 pub use credentials::{
     ControllerAuthenticator, ControllerIdentity, CredentialStore, RunnerAuthenticator,
-    RunnerIdentity,
+    RunnerIdentity, RunnerRole,
 };
 pub use error::{ProtocolError, ProtocolResult};
-pub use service::{AutoResumePass, ProtocolConfig, ProtocolService, LOCAL_OWNER};
+pub use service::{AutoResumePass, ProtocolConfig, ProtocolService, SlotReleasePass, LOCAL_OWNER};
 pub use wire::*;

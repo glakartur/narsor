@@ -21,6 +21,11 @@ pub struct TaskResources {
     pub resource_key: String,
     /// Name of the compute resource (a Pod, a process slot).
     pub workload: String,
+    /// Name of the read-only runner's compute resource (D63): deterministic
+    /// like the others and never the workload's name, so a reader and a
+    /// working runner are two resources the platform keeps apart, and one of
+    /// them is never mistaken for the other.
+    pub reader: String,
     /// Name of the task storage (a PVC, a directory).
     pub storage: String,
 }
@@ -210,6 +215,16 @@ pub struct Provisioned {
     pub created_storage: bool,
 }
 
+/// What [`ExecutionBackend::start_reader`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaderStart {
+    /// The reader under the task's reader name afterwards.
+    pub workload: WorkloadState,
+    /// False when a reader of that name already existed and was returned as
+    /// is.
+    pub created: bool,
+}
+
 /// What a removal did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Removal {
@@ -307,7 +322,7 @@ pub type BackendResult<T> = Result<T, BackendError>;
 ///
 /// Every operation is idempotent and safe to repeat after a crash or a lost
 /// response: the controller observes before it acts and retries what it
-/// could not confirm. An adapter never decides lifecycle — it never
+/// could not confirm. An adapter never decides runner state — it never
 /// recreates a lost workload, never removes compute on its own and never
 /// deletes storage outside [`Self::archive`].
 pub trait ExecutionBackend: Send + Sync + 'static {
@@ -362,6 +377,35 @@ pub trait ExecutionBackend: Send + Sync + 'static {
         &self,
         task: &TaskResources,
     ) -> impl Future<Output = BackendResult<ArchiveProgress>> + Send;
+
+    /// The task's read-only runner, if one exists under its reader name
+    /// (D63). The reader is a workload of its own: it is never the task's
+    /// [`TaskObservation::workload`], and it neither takes a slot nor counts
+    /// as the task's compute.
+    fn observe_reader(
+        &self,
+        task: &TaskResources,
+    ) -> impl Future<Output = BackendResult<Option<WorkloadState>>> + Send;
+
+    /// Starts a read-only runner on the task's *existing* storage: the
+    /// launch's runner invocation plus `--read-only` (see
+    /// [`crate::runner::cli`]), with storage mounted read-only where the
+    /// platform can. Fails with [`BackendErrorKind::StorageMissing`] when
+    /// there is no storage — a reader never creates one. A reader that
+    /// already exists is returned unchanged. The controller never calls it
+    /// while a working runner of the task lives (R15).
+    fn start_reader(
+        &self,
+        task: &TaskResources,
+        launch: &WorkloadLaunch,
+    ) -> impl Future<Output = BackendResult<ReaderStart>> + Send;
+
+    /// Removes the task's reader and nothing else: the workload and the
+    /// storage stay. Idempotent; complete once the reader is gone.
+    fn stop_reader(
+        &self,
+        task: &TaskResources,
+    ) -> impl Future<Output = BackendResult<Removal>> + Send;
 }
 /// What platform a backend runs task workloads on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

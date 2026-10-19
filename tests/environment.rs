@@ -880,3 +880,32 @@ fn a_backend_record_round_trips_through_its_file() {
     assert_eq!(root.catalog().backend("k8s").unwrap(), Some(record));
     assert_eq!(root.catalog().backend("../k8s").unwrap(), None);
 }
+
+#[test]
+fn slot_release_timings_are_read_fresh_from_the_backend_file() {
+    use std::time::Duration;
+    let root = TempRoot::new();
+    let resolver = resolver(&root.path);
+    let id = narsor_engine::domain::BackendId::parse("k8s").unwrap();
+
+    let mut record = backend("k8s");
+    root.catalog().save_backend(&record).unwrap();
+    let defaults = resolver.slot_release_timings(&id).expect("defaults");
+    assert_eq!(defaults.grace, Duration::from_secs(300));
+    assert_eq!(defaults.read_extension, Duration::from_secs(180));
+    assert_eq!(defaults.reader_idle, Duration::from_secs(120));
+
+    record.limits.slot_release_grace_secs = 42;
+    root.catalog().save_backend(&record).unwrap();
+    let changed = resolver.slot_release_timings(&id).expect("changed");
+    assert_eq!(changed.grace, Duration::from_secs(42));
+
+    let yaml = std::fs::read_to_string(root.path().join("backends/k8s.yaml")).unwrap();
+    std::fs::write(
+        root.path().join("backends/k8s.yaml"),
+        yaml.replace("slot_reader_idle_secs: 120", "slot_reader_idle_secs: 0"),
+    )
+    .unwrap();
+    let error = resolver.slot_release_timings(&id).expect_err("refused");
+    assert_eq!(error.code(), "invalid_backend");
+}
