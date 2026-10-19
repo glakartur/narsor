@@ -6479,7 +6479,7 @@ mod task_app_waiting {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn space_enter_accept_enter_sends_returns_to_the_list_and_says_so() {
+    async fn space_enter_accept_enter_sends_keeps_the_details_and_says_so() {
         let harness = RemoteHarness::start().await;
         let _running = harness
             .running("NAR-12", "local", approval_snapshot(1))
@@ -6505,9 +6505,11 @@ mod task_app_waiting {
 
         assert_eq!(
             app.focus(),
-            Focus::List,
-            "after sending, the focus is on the list"
+            Focus::Details,
+            "after sending, the focus stays in the details"
         );
+        assert!(!app.panel_focused());
+        assert_eq!(app.list().selected_id(), Some("NAR-12"));
         let note = app.notifier().latest().expect("a notification");
         assert_eq!(note.text, "NAR-12: zaakceptowano reviewed");
         assert_eq!(note.severity, Severity::Success);
@@ -6522,7 +6524,7 @@ mod task_app_waiting {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_answer_sent_from_the_steps_conversation_opens_the_details_again_on_the_axis() {
+    async fn an_answer_sent_from_the_steps_conversation_keeps_the_details_on_the_axis() {
         use narsor::tui::task_app::StepFocus;
         let harness = RemoteHarness::start().await;
         let _running = harness
@@ -6546,11 +6548,12 @@ mod task_app_waiting {
         ch(&mut app, '1');
         let request = press(&mut app, KeyCode::Enter);
         app.perform(request).await;
-        assert_eq!(app.focus(), Focus::List, "{:?}", app.notifier().latest());
-
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.focus(), Focus::Details);
+        assert_eq!(app.focus(), Focus::Details, "{:?}", app.notifier().latest());
         assert_eq!(app.step_focus(), StepFocus::Axis);
+        assert!(!app.panel_focused());
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::List);
     }
 
     #[tokio::test(flavor = "multi_thread")]

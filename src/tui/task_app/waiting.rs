@@ -1553,7 +1553,7 @@ impl TaskApp {
         match result {
             Ok(()) => {
                 self.settle_answer(&task_id, &waiting_id, Ok(()));
-                self.focus = super::Focus::List;
+                self.focus = super::Focus::Details;
                 self.panel_focus = false;
                 self.back_to_axis();
                 // An answer to a task without a slot resumes it; the resume
