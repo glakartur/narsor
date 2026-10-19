@@ -443,7 +443,7 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             if text.trim().is_empty() {
                 return Err("a directory path was expected, but the value is empty".to_string());
             }
-            Ok(SettingValue::Path(PathBuf::from(text)))
+            Ok(SettingValue::Path(PathBuf::from(expand_home(text)?)))
         }
 
         SettingKey::AgentHarness => {
@@ -527,14 +527,17 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
 
         SettingKey::LocalWorkspaceRoots => {
             let items = split_list(text);
+            let mut roots = Vec::with_capacity(items.len());
             for item in &items {
-                if !std::path::Path::new(item).is_absolute() {
+                let root = expand_home(item)?;
+                if !std::path::Path::new(&root).is_absolute() {
                     return Err(format!(
                         "'{item}' is not an absolute path; list absolute directories"
                     ));
                 }
+                roots.push(root);
             }
-            Ok(SettingValue::Text(items.join(",")))
+            Ok(SettingValue::Text(roots.join(",")))
         }
 
         SettingKey::LocalHome => one_of(text, "local HOME mode", &settings::LOCAL_HOME_MODES),
@@ -542,14 +545,15 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
         SettingKey::LocalCodexHome
         | SettingKey::LocalClaudeConfigDir
         | SettingKey::LocalClaudeProfileSource => {
-            let dir = text.trim();
-            if !dir.is_empty() && !std::path::Path::new(dir).is_absolute() {
+            let written = text.trim();
+            let dir = expand_home(written)?;
+            if !dir.is_empty() && !std::path::Path::new(&dir).is_absolute() {
                 return Err(format!(
-                    "'{dir}' is not an absolute path; name the directory absolutely, \
+                    "'{written}' is not an absolute path; name the directory absolutely, \
                      or leave it empty for the harness's own"
                 ));
             }
-            Ok(SettingValue::Text(dir.to_string()))
+            Ok(SettingValue::Text(dir))
         }
 
         SettingKey::LogLevel => {
@@ -564,6 +568,39 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             }
         }
     }
+}
+
+/// A path setting with a leading `~` spelled out against `$HOME`.
+///
+/// No shell reads a configuration file or an environment variable, so nobody
+/// else expands the `~`; left alone it would be the name of a directory under
+/// the working directory.
+fn expand_home(text: &str) -> Result<String, String> {
+    expand_home_with(text, std::env::var_os("HOME").as_deref())
+}
+
+/// [`expand_home`] with `$HOME` passed in, so a test needs no process state.
+///
+/// Only `~` and `~/…` are expanded. `~user` and a `~` inside the path are
+/// ordinary text.
+fn expand_home_with(text: &str, home: Option<&std::ffi::OsStr>) -> Result<String, String> {
+    let rest = match text {
+        "~" => "",
+        _ => match text.strip_prefix("~/") {
+            Some(rest) => rest,
+            None => return Ok(text.to_string()),
+        },
+    };
+    let home = home
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| {
+            format!("'{text}' starts with '~', but $HOME is not set to a usable path")
+        })?;
+    if rest.is_empty() {
+        return Ok(home.to_string());
+    }
+    Ok(Path::new(home).join(rest).to_string_lossy().into_owned())
 }
 
 /// One word out of a closed set, compared without regard to case.
@@ -610,5 +647,69 @@ fn describe(value: &serde_yaml::Value) -> String {
         serde_yaml::Value::Sequence(_) => "a list".to_string(),
         serde_yaml::Value::Mapping(_) => "a mapping".to_string(),
         serde_yaml::Value::Tagged(_) => "a tagged value".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PATH_SETTINGS: [SettingKey; 3] = [
+        SettingKey::CatalogDir,
+        SettingKey::StateDir,
+        SettingKey::WorkDir,
+    ];
+
+    fn home() -> Option<&'static std::ffi::OsStr> {
+        Some(std::ffi::OsStr::new("/home/artur"))
+    }
+
+    #[test]
+    fn a_leading_tilde_is_spelled_out_against_home() {
+        assert_eq!(
+            expand_home_with("~/blebleble", home()).unwrap(),
+            "/home/artur/blebleble"
+        );
+        assert_eq!(expand_home_with("~", home()).unwrap(), "/home/artur");
+    }
+
+    #[test]
+    fn only_a_leading_tilde_of_the_current_user_is_expanded() {
+        for text in ["~artur/x", "/srv/~/x", "./~/x", "~x", "/abs"] {
+            assert_eq!(expand_home_with(text, home()).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn a_tilde_without_a_usable_home_is_refused() {
+        assert!(expand_home_with("~/x", None).is_err());
+        assert!(expand_home_with("~/x", Some(std::ffi::OsStr::new(""))).is_err());
+        // Nothing to expand, so nothing needs $HOME.
+        assert_eq!(expand_home_with("/abs", None).unwrap(), "/abs");
+    }
+
+    #[test]
+    fn a_root_home_does_not_double_the_slash() {
+        let root = Some(std::ffi::OsStr::new("/"));
+        assert_eq!(expand_home_with("~/x", root).unwrap(), "/x");
+        assert_eq!(expand_home_with("~", root).unwrap(), "/");
+    }
+
+    #[test]
+    fn a_directory_written_with_a_tilde_never_stays_relative() {
+        for setting in PATH_SETTINGS {
+            // Without $HOME a refusal is the right answer; what must never
+            // happen is a `~` kept as the name of a directory under the
+            // working directory.
+            if let Ok(value) = value_from_text(setting, "~/blebleble") {
+                let path = value.as_path().expect("a root is a path");
+                assert!(
+                    path.is_absolute(),
+                    "{} kept '{}' relative",
+                    setting.key(),
+                    path.display()
+                );
+            }
+        }
     }
 }
