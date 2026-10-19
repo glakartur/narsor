@@ -2,12 +2,12 @@ name: compound-engineering
 version: 1
 description: >
   The compound engineering chain, end to end: ce-brainstorm to ce-plan to
-  ce-work to ce-code-review to ce-commit-push-pr to human review to
-  ce-compound and a final push/review, with
+  ce-work to ce-code-review to human review to ce-compound, publishing the
+  requirements, plan, implementation and learning to one pull request, with
   ce-doc-review over the requirements, ce-simplify-code before review and
   ce-resolve-pr-feedback on the open pull request. The pipeline stops for a
-  person at scope and plan approval, and reviews the pushed PR after
-  implementation and again after any learning document is added. During
+  person at scope and plan approval. PR feedback is resolved after each push;
+  the person reviews the current PR at each gate. During
   implementation an agent can pause and ask a question, then resume the same
   action with the person's answer.
 
@@ -108,11 +108,46 @@ states:
         description: the document was reviewed and the findings recorded.
         requires_human_approval: true
     transitions:
-      reviewed: approve_scope
+      reviewed: publish_scope
     timeout: 30m
     retry_policy:
       max_attempts: 2
       backoff: 30s
+
+  publish_scope:
+    description: Publish the reviewed requirements to the pull request.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. Open a PR if this branch has none, or push the reviewed requirements to its existing PR without rewriting the description. Report the PR URL.
+    outputs:
+      - label: published
+        description: the reviewed requirements are available on the PR.
+        requires_variables:
+          - name: pr_url
+            description: URL of the open pull request for this branch.
+    transitions:
+      published: resolve_scope_feedback
+    timeout: 30m
+
+  resolve_scope_feedback:
+    description: Address feedback already posted on the requirements PR.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
+    outputs:
+      - label: no_feedback
+        description: no actionable PR feedback remains.
+      - label: fixed
+        description: PR feedback was addressed and pushed for review.
+      - label: needs_human
+        description: unresolved feedback needs a decision on the PR.
+    transitions:
+      no_feedback: approve_scope
+      fixed: approve_scope
+      needs_human: approve_scope
+    timeout: 1h
 
   approve_scope:
     description: >
@@ -122,7 +157,8 @@ states:
     action:
       type: human
       message: >
-        Read the requirements document and its review. Approve the scope, send
+        Read the requirements document and its review on the PR. Address any
+        unresolved PR thread that needs your decision. Approve the scope, send
         it back for another brainstorm, or stop. An optional note is carried
         into the plan; a revision request goes back to the brainstorm.
       inputs:
@@ -153,9 +189,28 @@ states:
       - label: abandon
         description: stop the pipeline here.
     transitions:
-      approved: plan
+      approved: confirm_scope_feedback
       revise: brainstorm
       abandon: cancelled
+
+  confirm_scope_feedback:
+    description: Recheck PR feedback posted while scope approval was pending.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while the scope review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to scope approval.
+    outputs:
+      - label: no_feedback
+        description: scope approval stands and planning can begin.
+      - label: fixed
+        description: requirements changed on the PR and need renewed approval.
+      - label: needs_human
+        description: an unresolved PR decision needs renewed human review.
+    transitions:
+      no_feedback: plan
+      fixed: approve_scope
+      needs_human: approve_scope
+    timeout: 1h
 
   # -------------------------------------------------------------------------
   # HOW to build it
@@ -185,12 +240,44 @@ states:
         description: >-
           the approved requirements cannot be planned as written.
     transitions:
-      plan_ready: approve_plan
+      plan_ready: publish_plan
       needs_scope_revision: approve_scope
     timeout: 1h
     retry_policy:
       max_attempts: 2
       backoff: 1m
+
+  publish_plan:
+    description: Push the plan to the same pull request before approval.
+    action:
+      type: agent
+      prompt: |
+        Run the full `ce-commit-push-pr` workflow with `mode:pipeline babysit:off`. Push the plan to the existing PR on this branch, {{ context.pr_url }}, without rewriting its description. Report the PR URL.
+    outputs:
+      - label: updated
+        description: the current plan is available on the PR.
+    transitions:
+      updated: resolve_plan_feedback
+    timeout: 30m
+
+  resolve_plan_feedback:
+    description: Address feedback already posted on the plan PR.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
+    outputs:
+      - label: no_feedback
+        description: no actionable PR feedback remains.
+      - label: fixed
+        description: PR feedback was addressed and pushed for review.
+      - label: needs_human
+        description: unresolved feedback needs a decision on the PR.
+    transitions:
+      no_feedback: approve_plan
+      fixed: approve_plan
+      needs_human: approve_plan
+    timeout: 1h
 
   approve_plan:
     description: >
@@ -200,7 +287,8 @@ states:
     action:
       type: human
       message: >
-        Read the plan. Approve it and the agent starts writing code; send it
+        Read the plan on the PR and address any unresolved thread needing your
+        decision. Approve it and the agent starts writing code; send it
         back and it replans; abandon and nothing is written. This is the
         cheapest place in the pipeline to change your mind.
       inputs:
@@ -223,9 +311,28 @@ states:
       - label: abandon
         description: stop before any code is written.
     transitions:
-      approved: work
+      approved: confirm_plan_feedback
       revise: plan_revision
       abandon: cancelled
+
+  confirm_plan_feedback:
+    description: Recheck PR feedback posted while plan approval was pending.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while the plan review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to plan approval.
+    outputs:
+      - label: no_feedback
+        description: plan approval stands and implementation can begin.
+      - label: fixed
+        description: the plan changed on the PR and needs renewed approval.
+      - label: needs_human
+        description: an unresolved PR decision needs renewed human review.
+    transitions:
+      no_feedback: work
+      fixed: approve_plan
+      needs_human: approve_plan
+    timeout: 1h
 
   # -------------------------------------------------------------------------
   # Doing the work
@@ -251,7 +358,7 @@ states:
           - name: plan_doc
             description: repo-relative path of the revised plan.
     transitions:
-      plan_ready: approve_plan
+      plan_ready: publish_plan
     timeout: 1h
     retry_policy:
       max_attempts: 2
@@ -260,17 +367,14 @@ states:
   work:
     description: >
       ce-work — execute the approved plan, following existing patterns and
-      keeping the tests green. The skill ships its own work: it reviews,
-      commits, pushes and opens the pull request.
+      keeping the tests green. The workflow owns review and publication.
     action:
       type: agent
       prompt: |
-        Run the `ce-work` skill with these arguments: {{ context.plan_doc }}
+        Run the `ce-work` skill with these arguments: mode:return-to-caller {{ context.plan_doc }}
 
         Run the plan's relevant checks before implementation and record their concise result as `test_baseline` in the final output. Preserve that baseline: do not repair pre-existing failures or investigate them as part of this plan.
 
-        ---
-        Set `variables.pr_url` to the pull request URL, if one was opened.
     outputs:
       - label: implemented
         description: the plan is implemented and the checks pass.
@@ -285,11 +389,13 @@ states:
     description: >
       Shared continuation of implementation for changes from human review or
       PR feedback. Both routes re-enter here before simplify and automated
-      review; ce-resolve-pr-feedback pushes its own fixes.
+      review.
     action:
       type: agent
       prompt: |
-        Run the `ce-work` skill with these arguments: {{ context.plan_doc }}
+        First run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}` to address review comments already on the PR. It commits and pushes its fixes. If it reports a decision needed, leave that thread open for the human gate.
+
+        Run the `ce-work` skill with these arguments: mode:return-to-caller {{ context.plan_doc }}
 
         Test baseline captured before implementation:
         {{ context.test_baseline }}
@@ -298,7 +404,7 @@ states:
         Changes requested in review:
         {{ context.revision_notes }}
 
-        If the current branch has an open pull request, then also run the `ce-resolve-pr-feedback` skill.
+        Implement any remaining changes requested in the review note. Include fixes pushed by the resolver in the subsequent simplify and code review.
     outputs:
       - label: revised
         description: requested changes are made and checks pass.
@@ -333,22 +439,20 @@ states:
 
   code_review:
     description: >
-      ce-code-review in autofix mode — tiered persona agents, confidence
-      gating, merged and deduplicated findings. Safe fixes are applied in
-      bounded rounds; the residual findings are passed to the fix step and
+      ce-code-review in report mode — findings are passed to the fix step and
       another review cycle.
     action:
       type: agent
       prompt: |
-        Run the `ce-code-review` skill with these arguments: mode:autofix plan:{{ context.plan_doc }}
+        Run the `ce-code-review` skill with these arguments: mode:agent plan:{{ context.plan_doc }}
 
     outputs:
       - label: clean
         description: no actionable findings survived the confidence gate.
       - label: findings
-        description: findings need automatic fixes before another review cycle.
+        description: findings need assessment and possible fixes before publication.
     transitions:
-      clean: publish_work
+      clean: verify_work
       findings: fix_review_findings
     timeout: 1h
     max_entries: 5
@@ -388,11 +492,30 @@ states:
         description: stop the pipeline here.
     transitions:
       revise: work_revision
-      approve: compound
+      approve: confirm_work_feedback
       abandon: cancelled
 
+  confirm_work_feedback:
+    description: Recheck PR feedback posted while implementation review was pending.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while implementation review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to implementation review.
+    outputs:
+      - label: no_feedback
+        description: implementation approval stands and learning can be captured.
+      - label: fixed
+        description: implementation changed on the PR and needs renewed review.
+      - label: needs_human
+        description: an unresolved PR decision needs renewed human review.
+    transitions:
+      no_feedback: compound
+      fixed: implementation_review
+      needs_human: implementation_review
+    timeout: 1h
+
   fix_review_findings:
-    description: Automatically address findings from the code review.
+    description: Address code-review findings, repeating review only if files changed.
     action:
       type: agent
       prompt: |
@@ -403,21 +526,93 @@ states:
         Test baseline captured before implementation:
         {{ context.test_baseline }}
         Preserve this baseline: do not repair pre-existing failures or investigate them as part of this plan.
+
+        Compare repository file content before and after this step, including any committed edits. If you changed files, report `fixed`. If no files changed because the findings need no actionable edit, report `unchanged` with a concise reason. Do not use `unchanged` when a required fix remains unresolved.
     outputs:
       - label: fixed
-        description: findings are fixed; run automated review again.
+        description: files changed while addressing findings; run automated review again.
+      - label: unchanged
+        description: no actionable file changes were needed; run repository checks.
     transitions:
       fixed: code_review
+      unchanged: verify_work
     timeout: 1h
 
-  publish_work:
+  verify_work:
     description: >
-      Publish the implementation: open a PR for a new branch, or push to the
-      existing PR and describe the new changes in a PR comment.
+      Run the repository's optional formatting, build and test checks before
+      publishing code. Only a missing script skips the checks.
+    action:
+      type: script
+      command: bash
+      args:
+        - -c
+        - |
+          if [ ! -e scripts/verify.sh ] && [ ! -L scripts/verify.sh ]; then
+            exit 2
+          fi
+          if [ ! -f scripts/verify.sh ]; then
+            echo 'scripts/verify.sh exists but is not a regular file' >&2
+            exit 1
+          fi
+          printf '[verify_work] repository checks\n'
+          bash scripts/verify.sh
+          result=$?
+          printf '\n[verify_work] finished with exit code %s\n' "$result"
+          if [ "$result" -eq 0 ]; then
+            exit 0
+          fi
+          exit 1
+      env:
+        CI: "true"
+      exit_codes:
+        0: passed
+        1: failed
+        2: skipped
+    outputs:
+      - label: passed
+        description: the repository's formatting, build and test checks passed.
+      - label: failed
+        description: an existing verification script failed and needs repair.
+      - label: skipped
+        description: the repository has no scripts/verify.sh.
+    transitions:
+      passed: publish_work
+      failed: repair_verification
+      skipped: publish_work
+    timeout: 2h
+
+  repair_verification:
+    description: Fix a failed repository check before review and publication.
     action:
       type: agent
       prompt: |
-        Run the `ce-commit-push-pr` skill. If the branch already has an open pull request, do not rewrite its description: add a pull request comment that describes the new changes.
+        The repository's `scripts/verify.sh` failed in `verify_work`. Diagnose the failure from this captured output; do not rerun the complete script in this step. Fix the cause. The workflow will simplify, review and rerun the complete script before publishing.
+
+        Captured stdout from verify_work:
+        {{ steps.verify_work.stdout }}
+
+        Captured stderr from verify_work:
+        {{ steps.verify_work.stderr }}
+
+        Approved plan: {{ context.plan_doc }}
+        Test baseline before implementation: {{ context.test_baseline }}
+        Preserve that baseline: do not repair pre-existing failures unrelated to this work. If the script or environment is broken independently of this change, report the blocker instead of removing or bypassing the check.
+    outputs:
+      - label: repaired
+        description: the check failure was repaired; simplify and review the changes.
+    transitions:
+      repaired: simplify
+    timeout: 1h
+    max_entries: 5
+
+  publish_work:
+    description: >
+      Publish the reviewed implementation to the existing PR.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. It detects the existing open PR on this branch; do not rewrite its description. Publish only the reviewed implementation changes and report its URL.
 
     outputs:
       - label: published
@@ -426,8 +621,27 @@ states:
           - name: pr_url
             description: URL of the current pull request.
     transitions:
-      published: implementation_review
+      published: resolve_work_feedback
     timeout: 30m
+
+  resolve_work_feedback:
+    description: Address feedback already posted on the implementation PR.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
+    outputs:
+      - label: no_feedback
+        description: no actionable PR feedback remains.
+      - label: fixed
+        description: PR feedback was addressed and pushed for review.
+      - label: needs_human
+        description: unresolved feedback needs a decision on the PR.
+    transitions:
+      no_feedback: implementation_review
+      fixed: implementation_review
+      needs_human: implementation_review
+    timeout: 1h
 
   publish_learning:
     description: >
@@ -436,13 +650,32 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-commit-push-pr` skill. If the branch already has an open pull request, do not rewrite its description: add a pull request comment that describes the new changes.
+        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. Update the existing open PR on this branch without rewriting its description. Report its URL.
     outputs:
       - label: updated
         description: the learning is pushed to the existing pull request.
     transitions:
-      updated: learning_review
+      updated: resolve_learning_feedback
     timeout: 30m
+
+  resolve_learning_feedback:
+    description: Address feedback already posted on the updated PR.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
+    outputs:
+      - label: no_feedback
+        description: no actionable PR feedback remains.
+      - label: fixed
+        description: PR feedback was addressed and pushed for review.
+      - label: needs_human
+        description: unresolved feedback needs a decision on the PR.
+    transitions:
+      no_feedback: learning_review
+      fixed: learning_review
+      needs_human: learning_review
+    timeout: 1h
 
   learning_review:
     description: >
@@ -473,9 +706,28 @@ states:
       - label: abandon
         description: stop the pipeline here.
     transitions:
-      approve: finished
+      approve: confirm_learning_feedback
       revise: work_revision
       abandon: cancelled
+
+  confirm_learning_feedback:
+    description: Recheck PR feedback posted while final review was pending.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while final review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to final review.
+    outputs:
+      - label: no_feedback
+        description: final approval stands and the workflow can finish.
+      - label: fixed
+        description: the PR changed and needs renewed final review.
+      - label: needs_human
+        description: an unresolved PR decision needs renewed human review.
+    transitions:
+      no_feedback: finished
+      fixed: learning_review
+      needs_human: learning_review
+    timeout: 1h
 
   compound:
     description: >

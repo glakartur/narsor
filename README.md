@@ -1267,7 +1267,7 @@ and modelled on real agentic development processes rather than invented ones:
 
 | File | Process | Modelled on |
 |---|---|---|
-| `workflows/compound-engineering.yaml` | brainstorm → plan → work → code review → commit/push/PR → compound | the `ce-*` skills of the compound-engineering plugin |
+| `workflows/compound-engineering.yaml` | brainstorm → PR → plan → PR update → work → review → PR update → learning → PR update | the `ce-*` skills of the compound-engineering plugin |
 | `workflows/open-mercato-sdlc.yaml` | Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | Open Mercato's `SDLC.md` and the `om-*` skills |
 
 ```sh
@@ -1286,12 +1286,14 @@ Neither pipeline is autonomous end to end, and that is the point: both stop for 
 person wherever a decision is irreversible, outward-facing, or beyond what an
 agent can settle from the repository alone.
 
-**Compound engineering** stops seven times — when the brainstorm finds no
-direction it can take; on the scope, before planning; **on the plan, before a
-line of code exists**, which is the cheapest correction point in the process;
-when `ce-work` hits a genuine ambiguity, so it asks instead of guessing; on what
-to do with the code-review findings; before the push and PR, the first
-outward-facing act; and on the open pull request, where the review loop turns.
+**Compound engineering** opens a PR for the reviewed requirements, then pushes
+the plan, implementation and learning to that same PR. After every push it
+handles existing PR feedback: fixes are pushed for another review, while no
+actionable feedback advances the workflow. A person approves the scope, plan,
+implementation and final learning on the current PR; implementation can pause
+to ask for missing input. Before pushing implementation, it runs the target
+repository's optional `scripts/verify.sh`; a failure returns to repair and
+review, while a missing script skips the check.
 
 **Open Mercato** stops five times, at the gates `SDLC.md` names itself: the
 ticket-level Definition of Ready that only a human can supply (with a

@@ -14,7 +14,7 @@
 //! action error, not a quiet `failure`: nothing about it says the workflow
 //! should take the failure transition rather than stop and be looked at.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -46,7 +46,7 @@ pub const TRUNCATION_MARKER: &str = "\n… [truncated by narsor]";
 /// prints without bound exhaust narsor's memory before any cap could
 /// be applied — the captured-output limit would give a false sense of safety.
 /// Past this ceiling the pipe is still drained, so the child never blocks on a
-/// full pipe, but the surplus bytes are dropped rather than buffered.
+/// full pipe. Old bytes are dropped to retain the latest diagnostics.
 pub const MAX_BUFFERED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Label for exit code 0 when `exit_codes` does not say otherwise.
@@ -222,7 +222,7 @@ async fn run(
     Ok(ActionOutcome::Completed(result))
 }
 
-/// Drains `pipe` to its end, buffering at most [`MAX_BUFFERED_OUTPUT_BYTES`].
+/// Drains `pipe` to its end, retaining at most the latest [`MAX_BUFFERED_OUTPUT_BYTES`].
 ///
 /// Reading continues past the ceiling so a chatty child is never blocked by a
 /// full pipe; only the retained bytes are bounded.
@@ -230,18 +230,19 @@ pub(crate) async fn read_capped<R>(pipe: &mut R) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut buffer = Vec::new();
+    let mut buffer = VecDeque::new();
     let mut chunk = [0_u8; 16 * 1024];
 
     loop {
         let read = pipe.read(&mut chunk).await?;
         if read == 0 {
-            return Ok(buffer);
+            return Ok(buffer.into_iter().collect());
         }
-
-        if buffer.len() < MAX_BUFFERED_OUTPUT_BYTES {
-            let room = MAX_BUFFERED_OUTPUT_BYTES - buffer.len();
-            buffer.extend_from_slice(&chunk[..read.min(room)]);
+        for byte in &chunk[..read] {
+            if buffer.len() == MAX_BUFFERED_OUTPUT_BYTES {
+                buffer.pop_front();
+            }
+            buffer.push_back(*byte);
         }
     }
 }
@@ -306,21 +307,21 @@ fn parse_json_output(stdout: &str) -> Option<JsonOutput> {
     })
 }
 
-/// Cuts captured output down to [`MAX_CAPTURED_OUTPUT_BYTES`], marking the cut.
+/// Keeps the tail of captured output within [`MAX_CAPTURED_OUTPUT_BYTES`].
 ///
-/// The cut lands on a character boundary, so the result stays valid UTF-8 and
-/// the marker is always visible at the end.
+/// Build and test failures commonly appear at the end of a long log. The cut
+/// lands on a character boundary, so the result stays valid UTF-8.
 pub(crate) fn truncate(output: &str) -> String {
     if output.len() <= MAX_CAPTURED_OUTPUT_BYTES {
         return output.to_string();
     }
 
-    let mut end = MAX_CAPTURED_OUTPUT_BYTES;
-    while end > 0 && !output.is_char_boundary(end) {
-        end -= 1;
+    let mut start = output.len() - MAX_CAPTURED_OUTPUT_BYTES;
+    while !output.is_char_boundary(start) {
+        start += 1;
     }
 
-    format!("{}{TRUNCATION_MARKER}", &output[..end])
+    format!("{}{TRUNCATION_MARKER}", &output[start..])
 }
 
 /// The command could not be started at all.

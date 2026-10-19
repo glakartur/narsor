@@ -349,13 +349,15 @@ Szablony są podstawiane tuż przed wykonaniem akcji. Obsługiwane są następuj
 - `{{ inputs.NAZWA }}` — wejście workflow zadeklarowane w sekcji `inputs`,
 - `{{ context.variables.NAZWA }}` — zmienna kontekstu, wraz ze skrótem `{{ context.NAZWA }}`, który znaczy dokładnie to samo.
 - `{{ steps.ID.reply }}` — końcowa odpowiedź tekstowa udanej próby kroku agenta `ID`.
+- `{{ steps.ID.stdout }}` i `{{ steps.ID.stderr }}` — przechwycone wyjście ostatniego zakończonego uruchomienia kroku skryptowego `ID`.
 
-Odwołanie `steps.ID.reply` dozwolone jest tylko w promptach agentów i treści
-akcji `human`; krok źródłowy musi istnieć i być akcją `agent`. Odpowiedź jest
-zapisywana tylko dla kroków faktycznie użytych jako źródło. Brak wcześniejszej
-udanej odpowiedzi jest błędem szablonu. `max_entries` jest opcjonalnym limitem
-wejść w krok agentowy (wartość co najmniej 1); po osiągnięciu limitu workflow
-czeka na decyzję operatora.
+Odwołania do `steps.ID.*` dozwolone są tylko w promptach agentów i treści akcji
+`human`. Źródło `reply` musi być akcją `agent`, a źródło `stdout`/`stderr` akcją
+`script`. Brak wcześniejszego wyniku jest błędem szablonu. Wyjście skryptu jest
+ograniczone do przechwyconych przez silnik 64 KiB na strumień; ucięcie jest
+oznaczone. `max_entries` jest opcjonalnym limitem wejść w krok agentowy
+(wartość co najmniej 1); po osiągnięciu limitu workflow czeka na decyzję
+operatora.
 
 Białe znaki wewnątrz `{{ }}` są ignorowane. Nie ma filtrów (`| default(...)`), wyrażeń, warunków ani pętli — to świadomie prosty mechanizm podstawiania, a nie silnik szablonów. Odwołanie do nieistniejącego wejścia lub nieistniejącej zmiennej jest **błędem**, który przerywa akcję; narsor nigdy nie podstawia po cichu pustego stringa. Podstawianie jest jednoprzebiegowe: jeśli wartość zmiennej sama zawiera `{{ ... }}`, nie jest rozwijana ponownie.
 
@@ -635,8 +637,8 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
 
 4.  **Zmienne i Kontekst:**
     *   Odwołania do zmiennych (np. `{{ inputs.xxx }}`) muszą dotyczyć zdefiniowanych wejść lub pól kontekstu.
-    *   `steps.ID.reply` musi wskazywać istniejący krok `agent`; jest dozwolone tylko w promptach agentów i treści akcji `human`.
-    *   Po `steps.ID.` może być tylko pole `reply`. Inne pole (np. `steps.ID.data`) jest błędem.
+    *   `steps.ID.reply` musi wskazywać istniejący krok `agent`, a `steps.ID.stdout`/`stderr` istniejący krok `script`; są dozwolone tylko w promptach agentów i treści akcji `human`.
+    *   Inne pole po `steps.ID.` (np. `steps.ID.data`) jest błędem.
 
 5.  **Display (§3.6):**
     *   `{{ inputs.xxx }}` w `title`, `text` i `url` musi dotyczyć zdefiniowanego wejścia; zmienna kontekstu bez wartości nie jest błędem.
