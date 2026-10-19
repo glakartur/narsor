@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::{ImageError, ImageSpec, RepositoryInfo, RepositoryReference};
+use crate::domain::{ImageError, ImageSpec, RefOrigin, RepositoryInfo, RepositoryReference};
 use crate::persistence::{write_atomic, write_atomic_exclusive, PersistenceError};
 use crate::workspace::provisioner::{check_remote, is_usable_directory_name};
 
@@ -268,6 +268,22 @@ impl RepositoryEntry {
     pub fn with_default_branch(mut self, branch: impl Into<String>) -> Self {
         self.default_branch = Some(branch.into());
         self
+    }
+
+    /// The branch or ref to fetch and where it came from.
+    ///
+    /// An explicit workflow `ref` wins; otherwise the trimmed `default_branch`
+    /// of the entry; with neither, `None` — the clone takes the remote's `HEAD`.
+    pub fn named_ref(&self, workflow_ref: Option<&str>) -> Option<(String, RefOrigin)> {
+        match workflow_ref {
+            Some(git_ref) => Some((git_ref.to_string(), RefOrigin::Workflow)),
+            None => self
+                .default_branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|branch| !branch.is_empty())
+                .map(|branch| (branch.to_string(), RefOrigin::Repository)),
+        }
     }
 
     /// Sets the free-form description.

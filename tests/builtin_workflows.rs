@@ -292,6 +292,42 @@ fn no_builtin_pins_a_branch_for_its_workspace() {
     }
 }
 
+/// A builtin names no `ref`, so the `default_branch` of the registered
+/// repository decides which branch its workspace checks out.
+#[test]
+fn a_builtin_workspace_checks_out_the_registered_default_branch() {
+    let root = TempRoot::new();
+    narsor_engine::registry::RepositoryRegistry::new(root.path())
+        .add(
+            narsor_engine::registry::RepositoryEntry::new(
+                "acme-api",
+                "https://example.test/acme/api.git",
+            )
+            .with_default_branch("develop"),
+        )
+        .expect("register the repository");
+    for entry in BUILTIN_WORKFLOWS {
+        let definition = narsor_engine::workflow::load_from_str(entry.source)
+            .unwrap_or_else(|error| panic!("the embedded '{}' loads: {error}", entry.name));
+        let Some(narsor_engine::domain::WorkspaceSpec::Git { git_ref, .. }) = definition.workspace
+        else {
+            panic!("'{}' has a git workspace", entry.name);
+        };
+        let spec =
+            narsor_engine::tasks::resolve_repository(root.path(), "acme-api", git_ref.as_deref())
+                .expect("resolve the repository");
+        match spec.source {
+            narsor_engine::workspace::RepositorySource::Git { git_ref, .. } => assert_eq!(
+                git_ref.as_deref(),
+                Some("develop"),
+                "'{}' follows the registry",
+                entry.name
+            ),
+            other => panic!("expected a git repository, got {other:?}"),
+        }
+    }
+}
+
 /// Shipped workflows deliberately inherit the daemon's chosen default rather
 /// than pinning every agent action to Claude Code.  That keeps the workflows
 /// portable while explicit `harness:` in a user workflow remains an override.

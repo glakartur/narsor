@@ -933,7 +933,6 @@ pub(crate) fn check_remote(repository: &str, remote: &str) -> Result<()> {
     }
 }
 
-/// Rejects a reference `git` would read as an option rather than a revision.
 /// The words that say where a ref name came from; empty when that is unknown.
 fn origin_note(origin: Option<RefOrigin>) -> String {
     origin
@@ -941,6 +940,7 @@ fn origin_note(origin: Option<RefOrigin>) -> String {
         .unwrap_or_default()
 }
 
+/// Rejects a reference `git` would read as an option rather than a revision.
 fn check_ref(repository: &str, git_ref: &str) -> Result<()> {
     let reason = if git_ref.trim().is_empty() {
         Some("it is empty")

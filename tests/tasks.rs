@@ -631,6 +631,20 @@ fn resolve_repository_records_where_the_ref_came_from() {
     assert_eq!(origin(&raw), None);
 }
 
+/// A blank `default_branch` is no branch: the clone takes the remote's `HEAD`.
+#[test]
+fn resolve_repository_ignores_a_blank_default_branch() {
+    let root = TempRoot::new();
+    RepositoryRegistry::new(root.path())
+        .add(
+            RepositoryEntry::new("acme-api", "https://example.test/acme/api.git")
+                .with_default_branch("  "),
+        )
+        .expect("register the repository");
+    let spec = tasks::resolve_repository(root.path(), "acme-api", None).unwrap();
+    assert_eq!(git_source(&spec).1, None);
+}
+
 /// The remote and ref of a resolved git repository.
 fn git_source(spec: &RepositorySpec) -> (String, Option<String>) {
     match &spec.source {

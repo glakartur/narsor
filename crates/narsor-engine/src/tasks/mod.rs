@@ -395,12 +395,9 @@ pub fn resolve_repository(
 
     match registered {
         Some(entry) => {
-            let (git_ref, ref_origin) = match git_ref {
-                Some(git_ref) => (Some(git_ref.to_string()), Some(RefOrigin::Workflow)),
-                None => match entry.default_branch.clone() {
-                    Some(branch) => (Some(branch), Some(RefOrigin::Repository)),
-                    None => (None, None),
-                },
+            let (git_ref, ref_origin) = match entry.named_ref(git_ref) {
+                Some((git_ref, origin)) => (Some(git_ref), Some(origin)),
+                None => (None, None),
             };
             tracing::debug!(
                 repository = %repository,

@@ -731,15 +731,7 @@ impl CatalogLaunchResolver {
         // images always needs the commit up front.
         // Without a workflow `ref`, the branch of the repository configuration
         // is used; with neither, the clone takes the remote's `HEAD`.
-        let named_ref = match workflow_ref {
-            Some(git_ref) => Some((git_ref, RefOrigin::Workflow)),
-            None => entry
-                .default_branch
-                .as_deref()
-                .map(str::trim)
-                .filter(|branch| !branch.is_empty())
-                .map(|branch| (branch.to_string(), RefOrigin::Repository)),
-        };
+        let named_ref = entry.named_ref(workflow_ref.as_deref());
         let (commit, git_ref, ref_origin) = match (&intent.commit, named_ref) {
             (Some(commit), _) => (commit.clone(), None, None),
             (None, Some((git_ref, RefOrigin::Workflow)))

@@ -180,7 +180,11 @@ fn add_form(local_paths: bool) -> Chooser {
     .with_field(ChooserField::text(REMOTE).required().described(remote))
     .with_field(ChooserField::text(NAME).described("nazwa wyświetlana; domyślnie id"))
     .with_field(ChooserField::text(PROVIDER).described("github, gitlab, …; domyślnie z adresu"))
-    .with_field(ChooserField::text(BRANCH).described("gałąź, gdy workflow nie podaje `ref`"))
+    .with_field(
+        ChooserField::text(BRANCH).described(
+            "gałąź, gdy workflow nie podaje `ref`; jawny `ref` workflow ma pierwszeństwo",
+        ),
+    )
     .with_field(
         ChooserField::text(DESCRIPTION).described("dowolna notatka"),
     )])

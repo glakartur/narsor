@@ -463,7 +463,8 @@ pub enum RepoCommand {
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
 
-        /// Branch used when a workflow declares no `ref` of its own.
+        /// Branch used when a workflow declares no `ref` of its own; an explicit
+        /// `ref` in the workflow takes precedence.
         #[arg(long = "default-branch", value_name = "BRANCH")]
         default_branch: Option<String>,
 
