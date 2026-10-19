@@ -132,6 +132,7 @@ pub fn initialize(
                         &repository,
                         &identity.remote_url,
                         identity.git_ref.as_deref(),
+                        identity.ref_origin,
                         &partial,
                         credential.as_deref(),
                     )?

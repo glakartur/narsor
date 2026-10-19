@@ -40,8 +40,9 @@ pub use narsor_protocol::controller::TaskDefaultHarness;
 
 use crate::domain::{
     ActionConfig, BackendId, Context, DecisionConfig, GitIdentity, GitIdentityError, ImageError,
-    ImageSource, ImageSpec, InvalidIdentifier, ResolvedEnvironment, ResolvedImage, ResourceProfile,
-    SecretReference, TaskLaunchSpec, TaskWorkspace, WorkflowDefinition, WorkspaceSpec,
+    ImageSource, ImageSpec, InvalidIdentifier, RefOrigin, ResolvedEnvironment, ResolvedImage,
+    ResourceProfile, SecretReference, TaskLaunchSpec, TaskWorkspace, WorkflowDefinition,
+    WorkspaceSpec,
 };
 use crate::persistence::{DefaultHarnessSelector, HarnessSelectionSnapshot};
 use crate::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
@@ -716,6 +717,7 @@ impl CatalogLaunchResolver {
                         remote_url: repository,
                         commit,
                         git_ref: None,
+                        ref_origin: None,
                         credential: None,
                     }),
                 ));
@@ -727,10 +729,20 @@ impl CatalogLaunchResolver {
         // pins it at admission: resolving a branch, a tag or `HEAD` needs the
         // network, which creation must not wait for (R6). A backend running
         // images always needs the commit up front.
-        let (commit, git_ref) = match (&intent.commit, workflow_ref) {
-            (Some(commit), _) => (commit.clone(), None),
-            (None, Some(git_ref)) if GitIdentity::check_commit(&git_ref).is_ok() => (git_ref, None),
-            (None, git_ref) if !backend.kind.runs_container_images() => (String::new(), git_ref),
+        // Without a workflow `ref`, the branch of the repository configuration
+        // is used; with neither, the clone takes the remote's `HEAD`.
+        let named_ref = entry.named_ref(workflow_ref.as_deref());
+        let (commit, git_ref, ref_origin) = match (&intent.commit, named_ref) {
+            (Some(commit), _) => (commit.clone(), None, None),
+            (None, Some((git_ref, RefOrigin::Workflow)))
+                if GitIdentity::check_commit(&git_ref).is_ok() =>
+            {
+                (git_ref, None, None)
+            }
+            (None, named) if !backend.kind.runs_container_images() => match named {
+                Some((git_ref, origin)) => (String::new(), Some(git_ref), Some(origin)),
+                None => (String::new(), None, None),
+            },
             (None, _) => return Err(LaunchError::MissingCommit(repository)),
         };
         if !commit.is_empty() {
@@ -750,6 +762,7 @@ impl CatalogLaunchResolver {
             remote_url: entry.remote.clone(),
             commit,
             git_ref,
+            ref_origin,
             credential,
         });
         Ok((Some(entry), workspace))

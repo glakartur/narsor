@@ -111,9 +111,9 @@ Opcjonalna sekcja określająca domyślne zachowanie dla całego workflow.
     *   `max_attempts`: Liczba prób (domyślnie 1).
     *   `backoff`: Czas oczekiwania między próbami (np. "10s").
 *   `workspace`: Domyślna konfiguracja środowiska pracy.
-    *   `type`: `git` (wymaga `repository` i `ref`) lub `local` (wymaga `path`).
+    *   `type`: `git` (wymaga `repository`; `ref` jest opcjonalne) lub `local` (wymaga `path`).
     *   `repository`: ID repozytorium zarejestrowanego w systemie.
-    *   `ref`: Gałąź, tag lub commit.
+    *   `ref`: Gałąź, tag lub commit. Ma pierwszeństwo przed gałęzią z konfiguracji repozytorium. Bez `ref` zadanie pobiera tę gałąź, a bez niej `HEAD` zdalnego repozytorium.
     *   `path`: Ścieżka do folderu lokalnego (dla typu `local`).
     *   `preserve_paths` (dla obu typów, `git` i `local`): Lista ścieżek, które mają trafić do
         checkpointu mimo że `.gitignore` repozytorium je ignoruje — jedyny wyjątek od zasady

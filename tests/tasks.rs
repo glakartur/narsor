@@ -19,7 +19,7 @@ use std::process::Command;
 
 use serde_json::{json, Map, Value};
 
-use narsor_engine::domain::{EventData, ExecutionStatus, WorkflowDefinition};
+use narsor_engine::domain::{EventData, ExecutionStatus, RefOrigin, WorkflowDefinition};
 use narsor_engine::engine::Engine;
 use narsor_engine::persistence::ExecutionStore;
 use narsor_engine::registry::{RepositoryEntry, RepositoryRegistry};
@@ -604,10 +604,53 @@ fn resolve_repository_prefers_the_registry_and_lets_the_workflow_override_the_br
     );
 }
 
+/// The error of a failed checkout names where the branch came from.
+#[test]
+fn resolve_repository_records_where_the_ref_came_from() {
+    let root = TempRoot::new();
+    RepositoryRegistry::new(root.path())
+        .add(
+            RepositoryEntry::new("acme-api", "https://example.test/acme/api.git")
+                .with_default_branch("develop"),
+        )
+        .expect("register the repository");
+    let origin = |spec: &RepositorySpec| match &spec.source {
+        RepositorySource::Git { ref_origin, .. } => *ref_origin,
+        other => panic!("expected a git repository, got {other:?}"),
+    };
+
+    let from_entry = tasks::resolve_repository(root.path(), "acme-api", None).unwrap();
+    assert_eq!(origin(&from_entry), Some(RefOrigin::Repository));
+    let from_workflow =
+        tasks::resolve_repository(root.path(), "acme-api", Some("release")).unwrap();
+    assert_eq!(origin(&from_workflow), Some(RefOrigin::Workflow));
+    let raw_with_ref =
+        tasks::resolve_repository(root.path(), "https://example.test/x.git", Some("v1")).unwrap();
+    assert_eq!(origin(&raw_with_ref), Some(RefOrigin::Workflow));
+    let raw = tasks::resolve_repository(root.path(), "https://example.test/x.git", None).unwrap();
+    assert_eq!(origin(&raw), None);
+}
+
+/// A blank `default_branch` is no branch: the clone takes the remote's `HEAD`.
+#[test]
+fn resolve_repository_ignores_a_blank_default_branch() {
+    let root = TempRoot::new();
+    RepositoryRegistry::new(root.path())
+        .add(
+            RepositoryEntry::new("acme-api", "https://example.test/acme/api.git")
+                .with_default_branch("  "),
+        )
+        .expect("register the repository");
+    let spec = tasks::resolve_repository(root.path(), "acme-api", None).unwrap();
+    assert_eq!(git_source(&spec).1, None);
+}
+
 /// The remote and ref of a resolved git repository.
 fn git_source(spec: &RepositorySpec) -> (String, Option<String>) {
     match &spec.source {
-        RepositorySource::Git { remote, git_ref } => (remote.clone(), git_ref.clone()),
+        RepositorySource::Git {
+            remote, git_ref, ..
+        } => (remote.clone(), git_ref.clone()),
         other => panic!("expected a git repository, got {other:?}"),
     }
 }

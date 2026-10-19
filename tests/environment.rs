@@ -16,8 +16,8 @@ use environment_support::{
     workflow_yaml,
 };
 use narsor_engine::domain::{
-    ImageDigest, ImageSource, ImageSpec, ResolvedEnvironment, ResourceProfile, SecretDelivery,
-    TaskLaunchSpec, TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
+    ImageDigest, ImageSource, ImageSpec, RefOrigin, ResolvedEnvironment, ResourceProfile,
+    SecretDelivery, TaskLaunchSpec, TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
 };
 use narsor_engine::environment::{
     BackendKind, BackendLimits, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent,
@@ -658,6 +658,137 @@ fn a_local_backend_pins_an_unpinned_workspace_at_admission_not_creation() {
     };
     assert!(git.is_pinned());
     assert_eq!(git.commit, COMMIT);
+}
+
+/// Resolves `workflow` on the local backend and returns the git identity.
+fn resolve_git_on_local(
+    root: &TempRoot,
+    entry: RepositoryEntry,
+    ref_line: &str,
+    intent_commit: Option<&str>,
+    repository: Option<&str>,
+) -> narsor_engine::domain::GitIdentity {
+    root.registry().add(entry).unwrap();
+    root.write_workflow("on-app", &repository_workflow(ref_line, ""));
+    let launch = root
+        .resolve(&LaunchIntent {
+            backend: Some("local".to_string()),
+            commit: intent_commit.map(ToString::to_string),
+            repository: repository.map(ToString::to_string),
+            ..intent("on-app")
+        })
+        .unwrap();
+    let TaskWorkspace::Git(git) = launch.spec.workspace else {
+        panic!("git workspace expected");
+    };
+    git
+}
+
+fn app_entry() -> RepositoryEntry {
+    RepositoryEntry::new("app", "https://example.invalid/app.git")
+}
+
+#[test]
+fn the_repository_branch_is_used_when_the_workflow_names_no_ref() {
+    let root = TempRoot::new();
+    let git = resolve_git_on_local(
+        &root,
+        app_entry().with_default_branch("develop"),
+        "",
+        None,
+        None,
+    );
+    assert_eq!(git.git_ref.as_deref(), Some("develop"));
+    assert_eq!(git.ref_origin, Some(RefOrigin::Repository));
+}
+
+#[test]
+fn no_branch_and_no_ref_leave_the_remote_head_to_the_clone() {
+    let root = TempRoot::new();
+    let git = resolve_git_on_local(&root, app_entry(), "", None, None);
+    assert_eq!(git.git_ref, None);
+    assert_eq!(git.ref_origin, None);
+}
+
+#[test]
+fn a_blank_repository_branch_counts_as_no_branch() {
+    let root = TempRoot::new();
+    let git = resolve_git_on_local(&root, app_entry().with_default_branch("  "), "", None, None);
+    assert_eq!(git.git_ref, None);
+    assert_eq!(git.ref_origin, None);
+}
+
+#[test]
+fn an_explicit_workflow_ref_wins_over_the_repository_branch() {
+    let root = TempRoot::new();
+    let git = resolve_git_on_local(
+        &root,
+        app_entry().with_default_branch("develop"),
+        "    ref: release/1.0\n",
+        None,
+        None,
+    );
+    assert_eq!(git.git_ref.as_deref(), Some("release/1.0"));
+    assert_eq!(git.ref_origin, Some(RefOrigin::Workflow));
+}
+
+#[test]
+fn a_repository_chosen_by_the_caller_uses_its_branch_not_the_workflow_ref() {
+    let root = TempRoot::new();
+    let git = resolve_git_on_local(
+        &root,
+        app_entry().with_default_branch("develop"),
+        "    ref: release/1.0\n",
+        None,
+        Some("app"),
+    );
+    assert_eq!(git.git_ref.as_deref(), Some("develop"));
+    assert_eq!(git.ref_origin, Some(RefOrigin::Repository));
+}
+
+#[test]
+fn an_explicit_commit_wins_over_the_repository_branch() {
+    let root = TempRoot::new();
+    let git = resolve_git_on_local(
+        &root,
+        app_entry().with_default_branch("develop"),
+        "",
+        Some(COMMIT),
+        None,
+    );
+    assert_eq!(git.commit, COMMIT);
+    assert_eq!(git.git_ref, None);
+    assert_eq!(git.ref_origin, None);
+}
+
+#[test]
+fn a_workflow_ref_that_is_a_commit_pins_it() {
+    let root = TempRoot::new();
+    let git = resolve_git_on_local(
+        &root,
+        app_entry().with_default_branch("develop"),
+        &format!("    ref: {COMMIT}\n"),
+        None,
+        None,
+    );
+    assert_eq!(git.commit, COMMIT);
+    assert_eq!(git.git_ref, None);
+    assert_eq!(git.ref_origin, None);
+}
+
+#[test]
+fn a_git_identity_saved_before_the_ref_origin_existed_still_reads() {
+    let old = serde_json::json!({
+        "repository": "app",
+        "remote_url": "https://example.invalid/app.git",
+        "commit": "",
+        "git_ref": "develop",
+        "credential": null
+    });
+    let git: narsor_engine::domain::GitIdentity = serde_json::from_value(old).unwrap();
+    assert_eq!(git.git_ref.as_deref(), Some("develop"));
+    assert_eq!(git.ref_origin, None);
+    assert!(!serde_json::to_string(&git).unwrap().contains("ref_origin"));
 }
 
 #[test]

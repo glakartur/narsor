@@ -32,8 +32,8 @@ use narsor_engine::controller_protocol::{
     RunnerCredentialRequest, SubmitInputRequest, SubmitOperatorCommandRequest, LOCAL_OWNER,
 };
 use narsor_engine::domain::{
-    BackendId, EventData, ExecutionStatus, GitIdentity, ResolvedEnvironment, ResourceProfile,
-    SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskWorkspace,
+    BackendId, EventData, ExecutionStatus, GitIdentity, RefOrigin, ResolvedEnvironment,
+    ResourceProfile, SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskWorkspace,
 };
 use narsor_engine::environment::HarnessDefaults;
 use narsor_engine::orchestration::{
@@ -673,6 +673,7 @@ async fn an_unpinned_workspace_is_pinned_by_the_admitted_clone() {
             remote_url: bare.display().to_string(),
             commit: String::new(),
             git_ref: None,
+            ref_origin: None,
             credential: None,
         }),
         ResolvedEnvironment::harness_only("claude-code"),
@@ -696,6 +697,51 @@ async fn an_unpinned_workspace_is_pinned_by_the_admitted_clone() {
     );
 }
 
+/// A branch that does not exist fails the admitted clone, and the problem says
+/// which setting named it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_branch_names_the_setting_it_came_from() {
+    if running_as_root() {
+        return;
+    }
+    for (origin_of_ref, words) in [
+        (Some(RefOrigin::Repository), "z konfiguracji repozytorium"),
+        (None, "not found in repository"),
+    ] {
+        let mut fixture = Fixture::served().await;
+        let (bare, _) = origin(&fixture.root);
+        let spec = spec(
+            GATED_WORKFLOW,
+            TaskWorkspace::Git(GitIdentity {
+                repository: Some("demo".to_string()),
+                remote_url: bare.display().to_string(),
+                commit: String::new(),
+                git_ref: Some("missing".to_string()),
+                ref_origin: origin_of_ref,
+                credential: None,
+            }),
+            ResolvedEnvironment::harness_only("claude-code"),
+        );
+        fixture.create("task-1", spec.clone());
+        fixture.report("task-1", Observation::StartAccepted);
+        let launch = Launch::new(&fixture, "task-1", &spec);
+        let credential = fixture.credential("task-1", "pod-1");
+        let runner = fixture.spawn(&launch, "pod-1", &credential);
+
+        let status = fixture.wait_exit(runner, Duration::from_secs(30));
+        assert_eq!(status.code(), Some(3), "a reported problem");
+        let problem = fixture
+            .record("task-1")
+            .runner
+            .and_then(|runner| runner.snapshot.problem)
+            .expect("the problem reached the control plane");
+        assert!(problem.message.contains(words), "{}", problem.message);
+        if origin_of_ref.is_none() {
+            assert!(!problem.message.contains("(z "), "{}", problem.message);
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
     if running_as_root() {
@@ -711,6 +757,7 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
             remote_url: bare.display().to_string(),
             commit: pinned.clone(),
             git_ref: None,
+            ref_origin: None,
             credential: None,
         }),
         ResolvedEnvironment::harness_only("claude-code"),
@@ -1030,6 +1077,7 @@ async fn an_answer_to_a_stopped_task_resumes_it_and_the_next_runner_consumes_it(
             remote_url: bare.display().to_string(),
             commit: pinned,
             git_ref: None,
+            ref_origin: None,
             credential: None,
         }),
         ResolvedEnvironment::harness_only("claude-code"),
@@ -1313,6 +1361,7 @@ async fn an_automatically_resumed_task_waits_for_the_same_approval() {
             remote_url: bare.display().to_string(),
             commit: pinned,
             git_ref: None,
+            ref_origin: None,
             credential: None,
         }),
         ResolvedEnvironment::harness_only("claude-code"),
@@ -1514,6 +1563,7 @@ async fn a_base_image_without_git_fails_before_any_work() {
             remote_url: bare.display().to_string(),
             commit: pinned,
             git_ref: None,
+            ref_origin: None,
             credential: None,
         }),
         ResolvedEnvironment::harness_only("claude-code"),

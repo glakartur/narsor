@@ -43,7 +43,6 @@ globals:
   workspace:
     type: git
     repository: "{{ inputs.target_repo }}"
-    ref: main
 
 states:
   # -------------------------------------------------------------------------

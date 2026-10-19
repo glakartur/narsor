@@ -456,7 +456,9 @@ is resolved in this order:
 
 1. **A registered id.** The entry's `remote` is cloned, its `default_branch` is
    checked out when the workflow declares no `ref` of its own, and the checkout
-   directory is named after the id.
+   directory is named after the id. An explicit `ref` in the workflow wins over
+   `default_branch`. The bundled workflows declare no `ref`, so they use the
+   branch of the repository. With neither, the clone takes the remote's `HEAD`.
 2. **A raw remote.** Anything not found in the registry is handed to `git clone`
    unchanged — a URL or a local path — which is what the CLI did before a
    registry existed. Every workflow that carried a URL keeps working untouched.

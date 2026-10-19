@@ -21,6 +21,10 @@ when present, otherwise `agent_harness` from configuration, otherwise
 change the daemon selection in the TUI with `h`, or through
 `GET`/`PUT`/`DELETE /settings/agent-harness` on its authenticated local API.
 
+The bundled workflows do not set `ref` for the workspace. A task fetches the
+branch of the repository configuration, or the remote's `HEAD` when none is
+set. A `ref` in your own workflow wins over that branch.
+
 These are prompts for external skill packages, not bundled implementations:
 the compound-engineering workflow needs the referenced `ce-*` skills and the
 Open Mercato workflow needs the referenced `om-*` skills available to the
