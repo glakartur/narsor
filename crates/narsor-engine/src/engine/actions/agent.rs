@@ -1626,6 +1626,7 @@ fn build_result(
     run: &HarnessRun,
     finished: &FinishedRun,
 ) -> ActionResult {
+    let reply = run_reply(run).or_else(|| data_reply(&output.data));
     let mut data = output.data;
     let session_record = serde_json::to_value(session).unwrap_or(Value::Null);
 
@@ -1654,8 +1655,28 @@ fn build_result(
         exit_code: Some(finished.exit_code),
         stdout: truncate(&run.text),
         stderr: truncate(&finished.stderr),
-        reply: run_reply(run),
+        reply,
     }
+}
+
+/// The contract's `data`, as pretty-printed JSON, standing in for the reply
+/// of an agent that answered with the output-contract object alone. Without
+/// it, a step whose findings live only in `data` hands nothing to
+/// `{{ steps.NAME.reply }}`, and the step reading it fails. `None` when
+/// `data` carries nothing.
+fn data_reply(data: &Value) -> Option<String> {
+    let carries_nothing = match data {
+        Value::Null => true,
+        Value::Object(fields) => fields.is_empty(),
+        Value::String(text) => text.trim().is_empty(),
+        _ => false,
+    };
+    if carries_nothing {
+        return None;
+    }
+    serde_json::to_string_pretty(data)
+        .ok()
+        .map(|text| truncate(&text))
 }
 
 /// Adds the attempt's reply to the details of an extraction failure, so a
@@ -1845,7 +1866,7 @@ mod json_object_tests {
 
 #[cfg(test)]
 mod reply_tests {
-    use super::clean_reply;
+    use super::{clean_reply, data_reply};
     use crate::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
 
     #[test]
@@ -1929,5 +1950,19 @@ mod reply_tests {
             clean_reply("Report.\n{\"output\":\"findings\"}\nThanks."),
             Some("Report.\n\nThanks.".to_string())
         );
+    }
+
+    #[test]
+    fn data_stands_in_for_the_reply_of_a_contract_alone() {
+        let data = serde_json::json!({ "findings": [{ "title": "Whitespace aborts startup" }] });
+        let reply = data_reply(&data).expect("a reply from data");
+        assert!(reply.contains("Whitespace aborts startup"));
+    }
+
+    #[test]
+    fn empty_data_gives_no_reply() {
+        assert_eq!(data_reply(&serde_json::Value::Null), None);
+        assert_eq!(data_reply(&serde_json::json!({})), None);
+        assert_eq!(data_reply(&serde_json::json!("  ")), None);
     }
 }
