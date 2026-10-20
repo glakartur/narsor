@@ -212,7 +212,6 @@ where
     Router::new()
         .route("/runner/v1/snapshots", post(post_snapshot))
         .route("/runner/v1/poll", get(get_poll))
-        .route("/runner/v1/renew", post(post_renew))
         .route("/runner/v1/inputs/{input_id}/ack", post(post_input_ack))
         .route(
             "/runner/v1/commands/{command_id}/ack",
@@ -251,6 +250,15 @@ where
             Arc::clone(&service),
             require_runner,
         ))
+        .merge(
+            // Its own gate: a credential that ran out may still renew.
+            Router::new()
+                .route("/runner/v1/renew", post(post_renew))
+                .layer(middleware::from_fn_with_state(
+                    Arc::clone(&service),
+                    require_runner_renewal,
+                )),
+        )
         .with_state(service)
 }
 
@@ -303,6 +311,22 @@ fn require_operator(operator: Option<Extension<Operator>>) -> ProtocolResult<()>
     operator
         .map(|_| ())
         .ok_or_else(|| ProtocolError::Forbidden.into())
+}
+
+/// The renewal gate: [`require_runner`], but a credential that expired
+/// within the renewal grace still passes.
+async fn require_runner_renewal(
+    State(service): State<Service>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    match bearer(&request).and_then(|token| service.authenticate_runner_renewal(token)) {
+        Some(identity) => {
+            request.extensions_mut().insert(identity);
+            next.run(request).await
+        }
+        None => StatusCode::UNAUTHORIZED.into_response(),
+    }
 }
 
 /// The runner credential gate: a bare `401` for anything but the current,

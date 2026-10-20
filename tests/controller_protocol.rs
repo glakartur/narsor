@@ -5586,3 +5586,44 @@ async fn an_owner_cannot_use_the_work_resume_keys() {
 
     assert_eq!(bad_request_code(refused), "reserved_idempotency_key");
 }
+
+#[tokio::test]
+async fn a_runner_whose_credential_ran_out_may_still_renew_it_and_only_that() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+
+    // The host sleeps past the credential's validity: nothing renews it.
+    harness.clock.advance(Duration::minutes(20));
+    assert!(
+        matches!(
+            runner
+                .snapshot(&snapshot(2, ExecutionStatus::Running, 4, None))
+                .await,
+            Err(ClientError::Unauthorized)
+        ),
+        "an expired credential reports nothing"
+    );
+
+    let renewed = runner.renew().await.expect("renewal within the grace");
+    assert_eq!(
+        renewed.expires_at,
+        harness.clock.now() + ProtocolConfig::default().runner_credential_ttl
+    );
+    runner
+        .snapshot(&snapshot(2, ExecutionStatus::Running, 4, None))
+        .await
+        .expect("the runner is heard again");
+}
+
+#[tokio::test]
+async fn a_credential_expired_past_the_grace_cannot_be_renewed() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+
+    harness.clock.advance(Duration::hours(25));
+
+    assert!(matches!(
+        runner.renew().await,
+        Err(ClientError::Unauthorized)
+    ));
+}
