@@ -224,6 +224,10 @@ pub struct ProtocolConfig {
     pub max_lease_ttl: Duration,
     /// Validity of a runner credential, from issue or renewal.
     pub runner_credential_ttl: Duration,
+    /// How long after its expiry a runner credential may still be renewed
+    /// (and only renewed): longer than a host sleeps or the control plane
+    /// is down, after which the runner could never be heard again.
+    pub runner_renewal_grace: Duration,
     /// Enrollment code validity when the operator does not ask for one.
     pub default_enrollment_ttl: Duration,
     /// Longest enrollment code validity granted.
@@ -257,6 +261,7 @@ impl Default for ProtocolConfig {
             default_lease_ttl: Duration::seconds(60),
             max_lease_ttl: Duration::minutes(10),
             runner_credential_ttl: Duration::minutes(15),
+            runner_renewal_grace: Duration::hours(24),
             default_enrollment_ttl: Duration::minutes(15),
             max_enrollment_ttl: Duration::hours(24),
             runner_stale_after: Duration::seconds(90),
@@ -401,6 +406,13 @@ impl ProtocolService {
     /// The runner a bearer token proves, if any.
     pub fn authenticate_runner(&self, bearer: &str) -> Option<RunnerIdentity> {
         self.runner_auth.authenticate_runner(bearer)
+    }
+
+    /// Authenticates a runner renewing its credential, which may have
+    /// expired within [`ProtocolConfig::runner_renewal_grace`].
+    pub fn authenticate_runner_renewal(&self, bearer: &str) -> Option<RunnerIdentity> {
+        self.runner_auth
+            .authenticate_runner_renewal(bearer, self.config.runner_renewal_grace)
     }
 
     // -----------------------------------------------------------------

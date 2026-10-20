@@ -156,6 +156,14 @@ impl Fixture {
     /// A fixture whose address nobody listens on yet: a control plane the
     /// runner cannot reach.
     fn unserved() -> Self {
+        Self::unserved_with(ProtocolConfig {
+            slot_release: false,
+            ..ProtocolConfig::default()
+        })
+    }
+
+    /// [`Self::unserved`] under `config`.
+    fn unserved_with(config: ProtocolConfig) -> Self {
         let root = TempRoot::new();
         let state = root.dir("control");
         let control = ControlPlane::new(StatePaths::new(&state));
@@ -172,10 +180,7 @@ impl Fixture {
                 &state,
                 Arc::clone(&default) as Arc<dyn HarnessDefaults>,
             ),
-            ProtocolConfig {
-                slot_release: false,
-                ..ProtocolConfig::default()
-            },
+            config,
         ));
         let code = service
             .create_enrollment(BACKEND, CreateEnrollmentRequest::default())
@@ -1476,6 +1481,42 @@ async fn an_offline_runner_keeps_working_and_reports_the_latest_cursor_later() {
         "one\ntwo\n",
         "no step ran twice"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_whose_credential_ran_out_offline_renews_it_and_reports_again() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::unserved_with(ProtocolConfig {
+        slot_release: false,
+        runner_credential_ttl: chrono::Duration::seconds(2),
+        ..ProtocolConfig::default()
+    });
+    let spec = spec(
+        TWO_STEP_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-3", spec.clone());
+    fixture.report("task-3", Observation::StartAccepted);
+    let launch = Launch::new(&fixture, "task-3", &spec);
+    let credential = fixture.credential("task-3", "pod-1");
+    fixture.spawn(&launch, "pod-1", &credential);
+
+    // The control plane stays away longer than the credential is valid.
+    wait_until(Duration::from_secs(30), "offline completion", || {
+        launch.status() == Some(ExecutionStatus::Completed)
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    fixture.serve().await;
+    wait_until_async(Duration::from_secs(30), "the report after renewal", || {
+        fixture.record("task-3").runner.is_some_and(|runner| {
+            runner.snapshot.execution_status == ExecutionStatus::Completed
+        })
+    })
+    .await;
 }
 
 const DISPLAY_WORKFLOW: &str = r#"

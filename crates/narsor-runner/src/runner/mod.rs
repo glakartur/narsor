@@ -575,6 +575,9 @@ struct Link {
     failures: u32,
     next_attempt: Instant,
     expires_at: Option<chrono::DateTime<Utc>>,
+    /// The control plane refused the credential: renewing comes first, as
+    /// it is the one call a credential that ran out may still make.
+    renewal_wanted: bool,
     launch: Option<RunnerLaunchView>,
 }
 
@@ -587,6 +590,7 @@ impl Link {
             failures: 0,
             next_attempt: Instant::now(),
             expires_at: None,
+            renewal_wanted: false,
             launch: None,
         }
     }
@@ -628,8 +632,10 @@ impl Link {
         if matches!(error, ClientError::Unauthorized) {
             // Expired, superseded or revoked: the control plane does not
             // say which. Work goes on regardless (R14); the file is read
-            // again in case a newer credential was mounted.
+            // again in case a newer credential was mounted, and a renewal
+            // revives one that merely ran out.
             self.client = None;
+            self.renewal_wanted = true;
         }
         self.failures = self.failures.saturating_add(1);
         let factor = 2u32.saturating_pow(self.failures.saturating_sub(1).min(16));
@@ -651,16 +657,18 @@ impl Link {
             Ok(renewed) => {
                 self.succeeded();
                 self.expires_at = Some(renewed.expires_at);
+                self.renewal_wanted = false;
             }
             Err(error) => self.failed(&error, timing),
         }
     }
 
     fn renew_due(&self, margin: Duration) -> bool {
-        self.expires_at.is_some_and(|expires| {
-            let margin = chrono::Duration::from_std(margin).unwrap_or_default();
-            Utc::now() + margin >= expires
-        })
+        self.renewal_wanted
+            || self.expires_at.is_some_and(|expires| {
+                let margin = chrono::Duration::from_std(margin).unwrap_or_default();
+                Utc::now() + margin >= expires
+            })
     }
 }
 
@@ -1059,6 +1067,12 @@ impl Session {
                 RunnerDirective::Continue => pause_asked = false,
             }
 
+            // Before the report: a refused one would otherwise hold the
+            // link back each time, and the renewal it needs never be made.
+            if self.link.renew_due(self.timing.renew_margin) && self.link.ready() {
+                self.renew().await;
+            }
+
             let now = Instant::now();
             let report_due = last_report.is_none_or(|at| {
                 (dirty && now >= at + self.timing.report_interval)
@@ -1072,10 +1086,6 @@ impl Session {
             }
             if std::mem::take(&mut self.report_forced) {
                 dirty = true;
-            }
-
-            if self.link.renew_due(self.timing.renew_margin) && self.link.ready() {
-                self.renew().await;
             }
 
             let pending = self.pending_input_id()?;

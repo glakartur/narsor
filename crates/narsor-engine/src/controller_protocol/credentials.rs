@@ -178,6 +178,17 @@ pub trait ControllerAuthenticator: Send + Sync {
 pub trait RunnerAuthenticator: Send + Sync {
     /// The identity `bearer` proves, if any.
     fn authenticate_runner(&self, bearer: &str) -> Option<RunnerIdentity>;
+
+    /// The identity `bearer` proves for a renewal: like
+    /// [`Self::authenticate_runner`], but a credential that expired at most
+    /// `grace` ago still counts. A runner cannot renew while its host
+    /// sleeps or the control plane is down; past either it would be locked
+    /// out for good. Being current is still required, so a superseded or
+    /// replaced credential is never revived.
+    fn authenticate_runner_renewal(&self, bearer: &str, grace: Duration) -> Option<RunnerIdentity> {
+        let _ = grace;
+        self.authenticate_runner(bearer)
+    }
 }
 
 /// The durable record of one controller identity.
@@ -619,7 +630,9 @@ impl CredentialStore {
         )?)
     }
 
-    fn verify_runner(&self, bearer: &str) -> Result<Option<RunnerIdentity>> {
+    /// The identity of `bearer` when it is the current credential of a
+    /// current launch that expired no longer than `grace` ago.
+    fn verify_runner(&self, bearer: &str, grace: Duration) -> Result<Option<RunnerIdentity>> {
         let Some((role, task_id)) = token_id(RUNNER_PREFIX, bearer)
             .map(|id| (RunnerRole::Worker, id))
             .or_else(|| token_id(READER_PREFIX, bearer).map(|id| (RunnerRole::Reader, id)))
@@ -632,7 +645,9 @@ impl CredentialStore {
         let Some(session) = self.session_of(role, &task_id)? else {
             return Ok(None);
         };
-        if !matches_digest(bearer, &session.credential_digest) || self.now() >= session.expires_at {
+        if !matches_digest(bearer, &session.credential_digest)
+            || self.now() >= session.expires_at + grace
+        {
             return Ok(None);
         }
         let record = self.control.task(&task_id)?;
@@ -693,7 +708,11 @@ impl ControllerAuthenticator for CredentialStore {
 
 impl RunnerAuthenticator for CredentialStore {
     fn authenticate_runner(&self, bearer: &str) -> Option<RunnerIdentity> {
-        self.verify_runner(bearer).unwrap_or_else(|error| {
+        self.authenticate_runner_renewal(bearer, Duration::zero())
+    }
+
+    fn authenticate_runner_renewal(&self, bearer: &str, grace: Duration) -> Option<RunnerIdentity> {
+        self.verify_runner(bearer, grace).unwrap_or_else(|error| {
             tracing::warn!(error = %error, "runner protocol: credential check failed");
             None
         })
