@@ -11,6 +11,8 @@ states:
       command: ./print_json.sh
       args:
         - '{"choice": "rejected", "variables": {"reason": "reviewer said no"}}'
+    variables:
+      - { name: reason, description: What the step reports as reason. }
     choices:
       - ok
       - rejected

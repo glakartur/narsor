@@ -628,7 +628,9 @@ pub enum AgentTurn {
     /// says whether the harness reported a session.
     Label {
         label: &'static str,
+        reason: &'static str,
         variables: Value,
+        artifacts: Value,
         reply: Option<&'static str>,
         session: bool,
     },
@@ -651,7 +653,9 @@ impl AgentTurn {
     pub fn label(label: &'static str, reply: &'static str) -> Self {
         Self::Label {
             label,
+            reason: "",
             variables: json!({}),
+            artifacts: json!({}),
             reply: Some(reply),
             session: true,
         }
@@ -661,7 +665,9 @@ impl AgentTurn {
     pub fn sessionless(label: &'static str) -> Self {
         Self::Label {
             label,
+            reason: "",
             variables: json!({}),
+            artifacts: json!({}),
             reply: None,
             session: false,
         }
@@ -671,7 +677,33 @@ impl AgentTurn {
     pub fn with_variables(label: &'static str, variables: Value) -> Self {
         Self::Label {
             label,
+            reason: "",
             variables,
+            artifacts: json!({}),
+            reply: None,
+            session: true,
+        }
+    }
+
+    /// The output `label` with these named `artifacts` (name → path).
+    pub fn with_artifacts(label: &'static str, artifacts: Value) -> Self {
+        Self::Label {
+            label,
+            reason: "",
+            variables: json!({}),
+            artifacts,
+            reply: None,
+            session: true,
+        }
+    }
+
+    /// The output `label` with this `reason`.
+    pub fn with_reason(label: &'static str, reason: &'static str) -> Self {
+        Self::Label {
+            label,
+            reason,
+            variables: json!({}),
+            artifacts: json!({}),
             reply: None,
             session: true,
         }
@@ -759,11 +791,16 @@ impl ActionExecutor for ScriptedAgentExecutor {
         let outcome = match turn {
             AgentTurn::Label {
                 label,
+                reason,
                 variables,
+                artifacts,
                 reply,
                 session,
             } => Ok(ActionOutcome::Completed(ActionResult {
                 output_label: label.to_string(),
+                reason: reason.to_string(),
+                artifacts: serde_json::from_value(artifacts)
+                    .expect("scripted artifacts are a name → path object"),
                 // The session a reprompt of a rejected result resumes.
                 data: if session {
                     json!({

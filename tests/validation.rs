@@ -517,6 +517,20 @@ fn a_choice_requiring_an_undefined_artifact_is_rejected() {
 }
 
 #[test]
+fn an_artifact_reference_no_step_defines_is_rejected() {
+    let errors = errors_of("unknown_artifact_reference.yaml");
+    assert!(
+        matches!(
+            errors.as_slice(),
+            [ValidationError::UnknownArtifactReference { state, field, artifact }]
+                if state == "work" && field == "action.prompt" && artifact == "unknown"
+        ),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
 fn a_local_variable_on_a_script_step_is_rejected() {
     let errors = errors_of("local_variable_on_script_step.yaml");
     assert!(

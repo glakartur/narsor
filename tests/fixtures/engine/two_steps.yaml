@@ -11,6 +11,8 @@ states:
       command: ./print_json.sh
       args:
         - '{"choice": "done", "variables": {"first": "yes"}}'
+    variables:
+      - { name: first, description: What the step reports as first. }
     choices:
       - done
     transitions:
@@ -22,6 +24,8 @@ states:
       command: ./print_json.sh
       args:
         - '{"choice": "done", "variables": {"second": "yes"}}'
+    variables:
+      - { name: second, description: What the step reports as second. }
     choices:
       - done
     transitions:

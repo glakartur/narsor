@@ -764,6 +764,16 @@ pub enum ValidationError {
         variable: String,
     },
 
+    #[error(
+        "State '{state}' references artifact '{artifact}' in field '{field}', \
+         which no step defines"
+    )]
+    UnknownArtifactReference {
+        state: StateId,
+        field: String,
+        artifact: String,
+    },
+
     #[error("Field '{field}' references unknown input '{variable}'")]
     UnknownInputReferenceInGlobals {
         field: &'static str,

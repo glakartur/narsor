@@ -12,6 +12,8 @@ states:
       command: ./print_json.sh
       args:
         - '{"choice": "broken", "variables": {"reason": "nothing compiles"}}'
+    variables:
+      - { name: reason, description: What the step reports as reason. }
     choices:
       - ok
       - broken

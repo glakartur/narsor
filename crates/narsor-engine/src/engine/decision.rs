@@ -4,7 +4,8 @@
 //! in this version:
 //!
 //! * **`rules`** (the default, and what a state without a `decision` block
-//!   gets): the label the action returned *is* the decision. There is no
+//!   gets): the label the action returned *is* the decision, and its
+//!   `reason` the reasoning. There is no
 //!   expression engine — D6 makes the mapping static on purpose.
 //! * **`human`**: the execution suspends and a person picks one of the state's
 //!   declared outputs.
@@ -141,7 +142,9 @@ pub fn decide(state: &State, result: &ActionResult) -> Result<DecisionRequest, D
         None | Some(DecisionConfig::Rules) => Ok(DecisionRequest::Resolved(DecisionOutcome {
             label: result.output_label.clone(),
             provider: DecisionProviderType::Rules,
-            reasoning: None,
+            reasoning: Some(result.reason.trim())
+                .filter(|reason| !reason.is_empty())
+                .map(ToString::to_string),
         })),
 
         Some(DecisionConfig::Human(config)) => Ok(DecisionRequest::AwaitHuman {

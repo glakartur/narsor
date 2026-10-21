@@ -390,7 +390,7 @@ async fn a_sure_choice_completes_the_step_on_the_conductors_word() {
     assert!(decided.2.is_some());
     assert!(events.iter().any(|data| matches!(
         data,
-        EventData::ActionCompleted { action_execution_id, output_label }
+        EventData::ActionCompleted { action_execution_id, output_label, .. }
             if *action_execution_id == second_attempt && output_label == "implemented"
     )));
     assert!(events.iter().any(|data| matches!(

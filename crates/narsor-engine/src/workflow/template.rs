@@ -3,8 +3,9 @@
 //! The scope is deliberately minimal (D6): the only things recognised inside
 //! `{{ }}` are a workflow input (`inputs.NAME`), a context variable
 //! (`context.variables.NAME`, or the shorthand `context.NAME` used by
-//! `WORKFLOW_SCHEMA.md` §3.3.D), and selected step fields (`reply`, `stdout`,
-//! `stderr`). There are no filters, expressions,
+//! `WORKFLOW_SCHEMA.md` §3.3.D), a named artifact (`artifacts.NAME`, the path
+//! it was last written to, KTD7), and selected step fields (`reply`,
+//! `stdout`, `stderr`). There are no filters, expressions,
 //! conditionals or loops — a filter such as `{{ context.x | default("y") }}`
 //! is reported as an explicit error rather than silently ignored.
 //!
@@ -12,7 +13,9 @@
 //!
 //! * An unknown variable is an error, never an empty string. A prompt handed
 //!   to an agent with half a sentence missing is far harder to diagnose than
-//!   a failed action naming the variable and the place it was used.
+//!   a failed action naming the variable and the place it was used. A name
+//!   the workflow declares ([`DeclaredNames`]) is not unknown, only unset:
+//!   it renders as empty text (KTD6).
 //! * The `display` section is the one exception to the first rule
 //!   ([`TemplateScope::render_display`]): a title or link is shown while the
 //!   task is still queued, before the variables it names exist, so there an
@@ -25,13 +28,14 @@
 //! `{{ context.variables.x }}` picks up the value current at that moment and
 //! the workflow definition itself stays immutable (D31).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
 use crate::domain::{
-    safe_link_url, ActionConfig, AgentActionConfig, Context, DisplayLink, DisplaySpec,
-    HumanActionConfig, ScriptActionConfig, TaskDisplay, WaitActionConfig, EMPTY_LINK_TEXT,
+    safe_link_url, ActionConfig, AgentActionConfig, ArtifactReference, Context, DisplayLink,
+    DisplaySpec, HumanActionConfig, ScriptActionConfig, TaskDisplay, WaitActionConfig,
+    WorkflowDefinition, EMPTY_LINK_TEXT,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -87,7 +91,7 @@ pub enum TemplateError {
     /// The reference is syntactically fine but does not name a supported root.
     #[error(
         "unsupported template reference '{reference}' in {location}; \
-         supported roots are inputs, context and steps"
+         supported roots are inputs, context, artifacts and steps"
     )]
     UnsupportedReference {
         /// The reference exactly as written inside `{{ }}`.
@@ -114,8 +118,57 @@ pub enum TemplateError {
 pub struct TemplateScope<'a> {
     inputs: &'a Map<String, Value>,
     variables: &'a HashMap<String, Value>,
+    artifacts: Option<&'a HashMap<String, ArtifactReference>>,
+    declared: Option<&'a DeclaredNames>,
     step_replies: Option<&'a HashMap<String, Value>>,
     step_streams: Option<&'a HashMap<String, Value>>,
+}
+
+/// The context variables and artifacts a workflow declares: the names whose
+/// missing value renders as empty text rather than as an unknown variable
+/// (KTD6).
+///
+/// A context variable is declared by a step that defines it, or by a gate
+/// that asks for a field of that name; an artifact by a step that defines
+/// it. A step's own `local.*` variables are not context variables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredNames {
+    variables: HashSet<String>,
+    artifacts: HashSet<String>,
+}
+
+impl DeclaredNames {
+    /// The names `definition` declares.
+    pub fn of(definition: &WorkflowDefinition) -> Self {
+        let mut declared = Self::default();
+        for state in definition.states.values() {
+            let step_variables = state
+                .variables
+                .iter()
+                .filter(|variable| !variable.is_local())
+                .map(|variable| variable.name.clone());
+            declared.variables.extend(step_variables);
+            if let Some(ActionConfig::Human(gate)) = &state.action {
+                declared
+                    .variables
+                    .extend(gate.inputs.iter().map(|field| field.name.clone()));
+            }
+            declared
+                .artifacts
+                .extend(state.artifacts.iter().map(|artifact| artifact.name.clone()));
+        }
+        declared
+    }
+
+    /// Whether some step or gate declares the context variable `name`.
+    pub fn declares_variable(&self, name: &str) -> bool {
+        self.variables.contains(name)
+    }
+
+    /// Whether some step defines the artifact `name`.
+    pub fn declares_artifact(&self, name: &str) -> bool {
+        self.artifacts.contains(name)
+    }
 }
 
 impl<'a> TemplateScope<'a> {
@@ -124,6 +177,8 @@ impl<'a> TemplateScope<'a> {
         Self {
             inputs,
             variables: &context.variables,
+            artifacts: Some(&context.artifacts),
+            declared: None,
             step_replies: None,
             step_streams: None,
         }
@@ -138,9 +193,18 @@ impl<'a> TemplateScope<'a> {
         Self {
             inputs,
             variables,
+            artifacts: None,
+            declared: None,
             step_replies: None,
             step_streams: None,
         }
+    }
+
+    /// Adds the names the workflow declares, so that a declared variable or
+    /// artifact without a value renders as empty text (KTD6).
+    pub fn with_declared(mut self, declared: &'a DeclaredNames) -> Self {
+        self.declared = Some(declared);
+        self
     }
 
     /// Adds persisted replies keyed by workflow step id.
@@ -372,13 +436,13 @@ impl<'a> TemplateScope<'a> {
             });
         }
 
-        let value = self.lookup(reference, location)?;
-        Ok(render_scalar(value))
+        self.lookup(reference, location)
     }
 
-    /// Looks a reference up in the scope, distinguishing "path I do not
-    /// understand" from "path I understand but no such variable".
-    fn lookup(&self, reference: &str, location: &str) -> Result<&'a Value, TemplateError> {
+    /// Looks a reference up in the scope and renders its value, distinguishing
+    /// "path I do not understand" from "path I understand but no such
+    /// variable".
+    fn lookup(&self, reference: &str, location: &str) -> Result<String, TemplateError> {
         let unknown = || TemplateError::UnknownVariable {
             reference: reference.to_string(),
             location: location.to_string(),
@@ -393,7 +457,7 @@ impl<'a> TemplateScope<'a> {
         match root {
             "inputs" => {
                 let name = plain_name(path).ok_or_else(unsupported)?;
-                self.inputs.get(name).ok_or_else(unknown)
+                self.inputs.get(name).map(render_scalar).ok_or_else(unknown)
             }
 
             "context" => {
@@ -401,7 +465,20 @@ impl<'a> TemplateScope<'a> {
                 // shorthand from §3.3.D address the same map.
                 let name = path.strip_prefix("variables.").unwrap_or(path);
                 let name = plain_name(name).ok_or_else(unsupported)?;
-                self.variables.get(name).ok_or_else(unknown)
+                match self.variables.get(name) {
+                    Some(value) => Ok(render_scalar(value)),
+                    None if self.declares_variable(name) => Ok(String::new()),
+                    None => Err(unknown()),
+                }
+            }
+
+            "artifacts" => {
+                let name = plain_name(path).ok_or_else(unsupported)?;
+                match self.artifact_location(name) {
+                    Some(location) => Ok(location.to_string()),
+                    None if self.declares_artifact(name) => Ok(String::new()),
+                    None => Err(unknown()),
+                }
             }
 
             "steps" => {
@@ -416,11 +493,30 @@ impl<'a> TemplateScope<'a> {
                         .and_then(|streams| streams.get(&format!("{step}.{field}"))),
                     _ => return Err(unsupported()),
                 }
+                .map(render_scalar)
                 .ok_or_else(unknown)
             }
 
             _ => Err(unsupported()),
         }
+    }
+
+    /// Where the artifact `name` was last written. Only a named artifact
+    /// counts: an unnamed one is kept under its id, which is not a name a
+    /// workflow could have defined.
+    fn artifact_location(&self, name: &str) -> Option<&'a str> {
+        self.artifacts?
+            .get(name)
+            .filter(|artifact| artifact.name.as_deref() == Some(name))
+            .map(|artifact| artifact.location.as_str())
+    }
+
+    fn declares_variable(&self, name: &str) -> bool {
+        self.declared.is_some_and(|declared| declared.declares_variable(name))
+    }
+
+    fn declares_artifact(&self, name: &str) -> bool {
+        self.declared.is_some_and(|declared| declared.declares_artifact(name))
     }
 }
 
@@ -457,6 +553,24 @@ pub fn check_syntax(template: &str, location: &str) -> Result<(), TemplateError>
 pub fn context_references(template: &str) -> Vec<String> {
     let mut names = Vec::new();
     collect_context_references(template, &mut names);
+    names
+}
+
+/// The artifact names a template refers to through `artifacts.NAME`, in
+/// first-use order and without repeats (KTD7).
+pub fn artifact_references(template: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for expression in expressions(template) {
+        let name = expression
+            .strip_prefix("artifacts.")
+            .and_then(plain_name)
+            .filter(|name| !name.contains(char::is_whitespace));
+        if let Some(name) = name {
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
     names
 }
 
@@ -504,19 +618,25 @@ pub fn unsupported_step_references(template: &str) -> Vec<String> {
 
 /// What follows `steps.` in each `{{ steps.… }}` expression of a template.
 fn step_paths(template: &str) -> Vec<&str> {
-    let mut paths = Vec::new();
+    expressions(template)
+        .into_iter()
+        .filter_map(|expression| expression.strip_prefix("steps."))
+        .collect()
+}
+
+/// The trimmed contents of each closed `{{ … }}` of a template, in order.
+fn expressions(template: &str) -> Vec<&str> {
+    let mut expressions = Vec::new();
     let mut rest = template;
     while let Some(start) = rest.find(OPEN) {
         let after_open = &rest[start + OPEN.len()..];
         let Some(end) = after_open.find(CLOSE) else {
             break;
         };
-        if let Some(path) = after_open[..end].trim().strip_prefix("steps.") {
-            paths.push(path);
-        }
+        expressions.push(after_open[..end].trim());
         rest = &after_open[end + CLOSE.len()..];
     }
-    paths
+    expressions
 }
 
 /// The context variables an action's templates refer to, over exactly the

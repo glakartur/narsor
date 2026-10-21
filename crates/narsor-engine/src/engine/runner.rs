@@ -89,6 +89,7 @@ use crate::domain::{
     ArtifactReference, DecisionProviderType, Event, EventData, ExecutionId, ExecutionStatus,
     HumanInputField, HumanInputType, InputCloseReason, ChoiceDefinition, ProblemKind, RepromptedBy,
     State, StateId, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
+    LOCAL_VARIABLE_PREFIX,
 };
 use crate::engine::actions::agent::{
     self, DefaultHarnessSource, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL, SESSION_DATA_KEY,
@@ -108,7 +109,7 @@ use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequ
 use crate::engine::retry::RetrySchedule;
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
 use crate::workflow::template::{step_reply_references, step_stream_references};
-use crate::workflow::{action_context_references, TemplateScope};
+use crate::workflow::{action_context_references, DeclaredNames, TemplateScope};
 
 mod failure;
 mod operations;
@@ -365,28 +366,11 @@ impl OutputRejection {
         let reason = match decision::check_label(state, &result.output_label) {
             Err(error @ DecisionError::LabelNotDeclared { .. }) => error.to_string(),
             Ok(_) => {
-                let missing = state
+                let choice = state
                     .choices
                     .iter()
-                    .find(|output| output.label == result.output_label)
-                    .into_iter()
-                    .flat_map(|output| output.requires_variables.iter())
-                    .filter(|required| {
-                        result
-                            .variables
-                            .get(required.as_str())
-                            .is_none_or(human::is_blank)
-                    })
-                    .map(String::as_str)
-                    .collect::<Vec<_>>();
-                if missing.is_empty() {
-                    return None;
-                }
-                format!(
-                    "output '{}' is missing required variables: {}",
-                    result.output_label,
-                    missing.join(", ")
-                )
+                    .find(|choice| choice.label == result.output_label)?;
+                unmet_requirements(choice, result)?
             }
             Err(_) => return None,
         };
@@ -425,6 +409,95 @@ impl OutputRejection {
             harness_session_id: None,
         }
     }
+}
+
+/// What `result` lacks of what `choice` requires, as the reason to ask the
+/// agent again — `None` when nothing is missing.
+fn unmet_requirements(choice: &ChoiceDefinition, result: &ActionResult) -> Option<String> {
+    let missing_variables: Vec<&str> = choice
+        .requires_variables
+        .iter()
+        .filter(|required| {
+            result
+                .variables
+                .get(required.as_str())
+                .is_none_or(human::is_blank)
+        })
+        .map(String::as_str)
+        .collect();
+    let missing_artifacts: Vec<&str> = choice
+        .requires_artifacts
+        .iter()
+        .filter(|required| {
+            result
+                .artifacts
+                .get(required.as_str())
+                .is_none_or(|path| path.trim().is_empty())
+        })
+        .map(String::as_str)
+        .collect();
+
+    let mut missing = Vec::new();
+    if !missing_variables.is_empty() {
+        missing.push(format!(
+            "is missing required variables: {}",
+            missing_variables.join(", ")
+        ));
+    }
+    if !missing_artifacts.is_empty() {
+        missing.push(format!(
+            "is missing required artifacts: {}",
+            missing_artifacts.join(", ")
+        ));
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!("output '{}' {}", choice.label, missing.join(" and ")))
+}
+
+/// Moves the variables of an agent or script `result` that its step does not
+/// define into its `additional_data` (KTD5): kept, but never written to the
+/// context. Returns a warning for each one moved.
+///
+/// The engine's own [`agent::SESSION_ID_VARIABLE`] stays where it is, and so
+/// does whatever a gate or a person gave: only a step that can define
+/// variables is held to its definitions.
+fn set_aside_undeclared_variables(state: &State, result: &mut ActionResult) -> Vec<String> {
+    if !matches!(state.action, Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_))) {
+        return Vec::new();
+    }
+    let is_kept = |name: &String| {
+        name == agent::SESSION_ID_VARIABLE
+            || state.variables.iter().any(|variable| &variable.name == name)
+    };
+    let (kept, undeclared): (Map<String, Value>, Map<String, Value>) =
+        std::mem::take(&mut result.variables)
+            .into_iter()
+            .partition(|(name, _)| is_kept(name));
+    result.variables = kept;
+    undeclared
+        .into_iter()
+        .map(|(name, value)| {
+            let warning = format!(
+                "variable '{name}' is not defined on step '{}'; it was kept as additional \
+                 data and not written to the context",
+                state.id
+            );
+            result.additional_data.entry(name).or_insert(value);
+            warning
+        })
+        .collect()
+}
+
+/// The variables of a result that belong in the shared context: all but the
+/// step's own `local.*` memory, which never leaves its step (R12).
+fn shared_variables(variables: &Map<String, Value>) -> Map<String, Value> {
+    variables
+        .iter()
+        .filter(|(name, _)| !name.starts_with(LOCAL_VARIABLE_PREFIX))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 /// A step whose agent gave no usable output label, even when asked again,
@@ -752,6 +825,8 @@ enum RepromptFailure {
 struct AttemptFailure {
     /// The message that ends up in `ActionFailed`.
     message: String,
+    /// The kind of error the action named, for `ActionFailed` (KTD13).
+    error_type: Option<String>,
     /// Whether trying again could plausibly give a different answer.
     retriable: bool,
     /// Whether the attempt cannot have had a side effect (KTD14): nothing
@@ -765,6 +840,7 @@ impl AttemptFailure {
     fn retriable(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            error_type: None,
             retriable: true,
             side_effect_free: false,
         }
@@ -776,8 +852,18 @@ impl AttemptFailure {
     fn permanent(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            error_type: None,
             retriable: false,
             side_effect_free: true,
+        }
+    }
+
+    /// The failure an action reported itself: worth another attempt, and of
+    /// the kind it named.
+    fn of_action(error: ActionError) -> Self {
+        Self {
+            error_type: error.error_type,
+            ..Self::retriable(error.message)
         }
     }
 
@@ -785,6 +871,21 @@ impl AttemptFailure {
     fn side_effect_free_if(mut self, clean: bool) -> Self {
         self.side_effect_free = clean;
         self
+    }
+}
+
+/// What `ActionFailed` says about the action that failed.
+struct FailedAction {
+    message: String,
+    error_type: Option<String>,
+}
+
+impl From<AttemptFailure> for FailedAction {
+    fn from(failure: AttemptFailure) -> Self {
+        Self {
+            message: failure.message,
+            error_type: failure.error_type,
+        }
     }
 }
 
@@ -2013,6 +2114,7 @@ impl Engine {
         // The default harness this action runs on when it names none: read
         // at its first attempt, kept for every retry (R16a).
         let mut pinned_harness = None;
+        let declared = DeclaredNames::of(definition);
 
         execution.current_action_execution = Some(action_execution_id.clone());
         self.emit(
@@ -2030,6 +2132,7 @@ impl Engine {
                     execution,
                     state,
                     action,
+                    &declared,
                     &action_execution_id,
                     timeout,
                     &mut pinned_harness,
@@ -2073,12 +2176,7 @@ impl Engine {
 
             side_effect_free &= failure.side_effect_free;
             if !failure.retriable || single_attempt || !schedule.permits_another(attempt) {
-                self.fail_attempts(
-                    execution,
-                    &action_execution_id,
-                    failure.message,
-                    side_effect_free,
-                )?;
+                self.fail_attempts(execution, &action_execution_id, failure, side_effect_free)?;
                 return Ok(ActionUpshot::Stopped);
             }
 
@@ -2122,13 +2220,17 @@ impl Engine {
     /// One attempt: expand the templates, hand the action to its executor,
     /// translate what comes back.
     ///
-    /// `pinned_harness` is the action's default harness, shared by all its
-    /// attempts: [`Engine::pin_harness`] fills it in at the first one.
+    /// `declared` are the workflow's declared names, which render empty
+    /// while unset (KTD6). `pinned_harness` is the action's default harness,
+    /// shared by all its attempts: [`Engine::pin_harness`] fills it in at the
+    /// first one.
+    #[allow(clippy::too_many_arguments)]
     async fn attempt_action(
         &self,
         execution: &mut WorkflowExecution,
         state: &State,
         action: &ActionConfig,
+        declared: &DeclaredNames,
         action_execution_id: &str,
         timeout: Option<Duration>,
         pinned_harness: &mut Option<String>,
@@ -2177,6 +2279,7 @@ impl Engine {
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
         let scope = scope
+            .with_declared(declared)
             .with_step_replies(&step_replies)
             .with_step_streams(&step_streams);
         let mut rendered = scope
@@ -2239,7 +2342,7 @@ impl Engine {
             Ok(ActionOutcome::TimedOut(timed_out)) => {
                 match timed_out.resolve(&decision::permitted_labels(state)) {
                     Ok(result) => Ok(AttemptOutcome::Completed(result)),
-                    Err(error) => Err(AttemptFailure::retriable(error.message)),
+                    Err(error) => Err(AttemptFailure::of_action(error)),
                 }
             }
 
@@ -2285,7 +2388,7 @@ impl Engine {
                         action_execution_id,
                         &error,
                     );
-                    Err(AttemptFailure::retriable(error.message).side_effect_free_if(clean))
+                    Err(AttemptFailure::of_action(error).side_effect_free_if(clean))
                 }
             },
         }
@@ -2561,7 +2664,7 @@ impl Engine {
         {
             Ok(outcome) => outcome,
             Err(failure) => {
-                self.fail_action(execution, &action_execution_id, failure.message)?;
+                self.fail_attempts(execution, &action_execution_id, failure, false)?;
                 return Ok(RepromptEnd::Stopped);
             }
         };
@@ -2778,7 +2881,7 @@ impl Engine {
         execution: &mut WorkflowExecution,
         state: &State,
         action_execution_id: String,
-        result: ActionResult,
+        mut result: ActionResult,
     ) -> Result<Option<PendingStep>, EngineError> {
         // A label the state does not declare is the engine's call, never the
         // executor's — this is the message the operator sees.
@@ -2787,11 +2890,15 @@ impl Engine {
             return Ok(None);
         }
 
+        let warnings = set_aside_undeclared_variables(state, &mut result);
         self.emit(
             &execution.id,
             EventData::ActionCompleted {
                 action_execution_id: action_execution_id.clone(),
                 output_label: result.output_label.clone(),
+                reason: non_blank(Some(result.reason.as_str())),
+                additional_data: result.additional_data.clone(),
+                warnings,
             },
         )?;
 
@@ -2945,7 +3052,7 @@ impl Engine {
         // authority; writing `context.json` alone would leave a stale copy.
         execution
             .context
-            .update_variables(pending.result.variables.clone());
+            .update_variables(shared_variables(&pending.result.variables));
         if pending
             .result
             .reply
@@ -3213,7 +3320,11 @@ impl Engine {
         action_execution_id: &str,
         message: impl Into<String>,
     ) -> Result<(), EngineError> {
-        self.fail_attempts(execution, action_execution_id, message, false)
+        let failure = FailedAction {
+            message: message.into(),
+            error_type: None,
+        };
+        self.fail_attempts(execution, action_execution_id, failure, false)
     }
 
     /// Records the failed action whose last attempt was `action_execution_id`
@@ -3223,21 +3334,22 @@ impl Engine {
         &self,
         execution: &mut WorkflowExecution,
         action_execution_id: &str,
-        message: impl Into<String>,
+        failure: impl Into<FailedAction>,
         side_effect_free: bool,
     ) -> Result<(), EngineError> {
-        let message = message.into();
+        let failure = failure.into();
         self.emit(
             &execution.id,
             EventData::ActionFailed {
                 action_execution_id: action_execution_id.to_string(),
-                error: message.clone(),
+                error: failure.message.clone(),
+                error_type: failure.error_type,
             },
         )?;
         self.fail_step(
             execution,
             Some(action_execution_id),
-            message,
+            failure.message,
             side_effect_free,
         )
     }

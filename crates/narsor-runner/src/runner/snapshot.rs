@@ -301,6 +301,9 @@ states:
             EventData::ActionCompleted {
                 action_execution_id: "act-2".to_string(),
                 output_label: "done".to_string(),
+                reason: None,
+                additional_data: Default::default(),
+                warnings: Vec::new(),
             },
         )
         .expect("event");

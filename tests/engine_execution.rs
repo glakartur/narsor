@@ -813,6 +813,57 @@ async fn an_undeclared_label_fails_the_action_and_names_the_permitted_ones() {
 }
 
 #[tokio::test]
+async fn the_reason_of_a_choice_is_recorded_with_the_action_and_the_decision() {
+    let harness = Harness::new();
+    let execution = harness
+        .engine()
+        .start_and_run(&workflow("reasoned_choice"), json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+
+    let events = harness.events(&execution.id);
+    let completed: Vec<Option<String>> = events
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::ActionCompleted { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    let decided: Vec<Option<String>> = events
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::DecisionMade { reasoning, .. } => Some(reasoning.clone()),
+            _ => None,
+        })
+        .collect();
+    let expected = vec![Some("all checks are green".to_string()), None];
+    assert_eq!(completed, expected);
+    assert_eq!(decided, expected);
+}
+
+#[tokio::test]
+async fn a_failed_action_records_the_type_of_its_error() {
+    let harness = Harness::new();
+    let execution = harness
+        .engine()
+        .start_and_run(&workflow("missing_script"), json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+
+    let error_type = harness
+        .events(&execution.id)
+        .into_iter()
+        .find_map(|event| match event.data {
+            EventData::ActionFailed { error_type, .. } => Some(error_type),
+            _ => None,
+        })
+        .expect("an ActionFailed event");
+    assert_eq!(error_type.as_deref(), Some("spawn_failed"));
+}
+
+#[tokio::test]
 async fn an_agent_decision_is_refused_explicitly() {
     let harness = Harness::new();
     let engine = harness.engine();
@@ -1888,6 +1939,7 @@ mod problems {
                 EventData::ActionCompleted {
                     action_execution_id,
                     output_label,
+                    ..
                 } => Some((action_execution_id.clone(), output_label.clone())),
                 _ => None,
             })

@@ -30,6 +30,8 @@ states:
       command: ./print_json.sh
       args:
         - '{"choice": "ok", "variables": {"echoed": "[{{ context.note }}]"}}'
+    variables:
+      - { name: echoed, description: What the step reports as echoed. }
     choices:
       - ok
     transitions:

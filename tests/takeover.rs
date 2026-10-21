@@ -119,6 +119,8 @@ states:
       command: ./record_step.sh
       args:
         - first
+    variables:
+      - { name: first, description: What the step reports as first. }
     choices:
       - done
     transitions:
@@ -130,6 +132,8 @@ states:
       command: ./drop.sh
       args:
         - doomed.txt
+    variables:
+      - { name: dropped, description: What the step reports as dropped. }
     choices:
       - done
     transitions:
@@ -139,6 +143,9 @@ states:
     action:
       type: script
       command: ./list_tree.sh
+    variables:
+      - { name: tree, description: What the step reports as tree. }
+      - { name: readme, description: What the step reports as readme. }
     choices:
       - done
     transitions:

@@ -13,6 +13,8 @@ states:
       args:
         - "0.4"
         - '{"choice": "done", "variables": {"slow": "finished"}}'
+    variables:
+      - { name: slow, description: What the step reports as slow. }
     choices:
       - done
     transitions:
@@ -24,6 +26,8 @@ states:
       command: ./print_json.sh
       args:
         - '{"choice": "done", "variables": {"fast": "finished"}}'
+    variables:
+      - { name: fast, description: What the step reports as fast. }
     choices:
       - done
     transitions:

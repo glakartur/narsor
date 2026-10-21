@@ -13,5 +13,7 @@ pub mod validator;
 
 pub use loader::{compile, load_from_file, load_from_str, LoadError};
 pub use schema::{parse_duration, DurationParseError, DurationSecs, WorkflowFile};
-pub use template::{action_context_references, context_references, TemplateError, TemplateScope};
+pub use template::{
+    action_context_references, context_references, DeclaredNames, TemplateError, TemplateScope,
+};
 pub use validator::{validate, validate_path, validate_source};

@@ -114,10 +114,14 @@ fn every_event_data_variant() -> Vec<EventData> {
         EventData::ActionCompleted {
             action_execution_id: "a1".to_string(),
             output_label: "success".to_string(),
+            reason: None,
+            additional_data: Default::default(),
+            warnings: Vec::new(),
         },
         EventData::ActionFailed {
             action_execution_id: "a1".to_string(),
             error: "boom".to_string(),
+            error_type: None,
         },
         EventData::ActionAttemptFailed {
             action_execution_id: "a1".to_string(),
@@ -10884,6 +10888,9 @@ mod task_app_create {
                 EventData::ActionCompleted {
                     action_execution_id: "attempt-1".to_string(),
                     output_label: "success".to_string(),
+                    reason: None,
+                    additional_data: Default::default(),
+                    warnings: Vec::new(),
                 },
             ] {
                 log.append_next(&id_string, data).expect("append");

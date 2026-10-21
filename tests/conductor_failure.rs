@@ -885,6 +885,7 @@ fn fail_on(store: &ExecutionStore, execution: &mut WorkflowExecution, failure: &
         EventData::ActionFailed {
             action_execution_id: failure.action_execution_id.clone(),
             error: failure.error.clone(),
+            error_type: None,
         },
         EventData::WorkflowFailed {
             error: failure.error.clone(),

@@ -1,0 +1,30 @@
+name: artifact-contract
+version: 1
+description: >
+  A plan step whose `ready` choice needs the artifact `plan_doc`, and a work
+  step that reads the plan by its artifact name. The plan's own prompt names
+  its artifact and a variable another step declares: neither has a value on
+  the first entry.
+states:
+  plan:
+    action:
+      type: agent
+      prompt: "Plan. Previous plan: [{{ artifacts.plan_doc }}]. Blocker: [{{ context.requirements_blocker }}]."
+    variables:
+      - { name: local.notes, description: The plan step's own notes. }
+    artifacts:
+      - { name: plan_doc, description: The plan document. }
+    choices:
+      - label: ready
+        requires_artifacts: [plan_doc]
+    transitions: { ready: work }
+  work:
+    action:
+      type: agent
+      prompt: "Work from {{ artifacts.plan_doc }}."
+    variables:
+      - { name: requirements_blocker, description: What blocks the requirements. }
+    choices: [done]
+    transitions: { done: completed }
+  completed: { description: done }
+terminal_states: [completed]

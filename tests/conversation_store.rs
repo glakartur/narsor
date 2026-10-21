@@ -80,6 +80,9 @@ fn action_completed(action_execution_id: &str) -> EventData {
     EventData::ActionCompleted {
         action_execution_id: action_execution_id.to_string(),
         output_label: "success".to_string(),
+        reason: None,
+        additional_data: Default::default(),
+        warnings: Vec::new(),
     }
 }
 

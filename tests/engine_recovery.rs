@@ -249,6 +249,9 @@ async fn a_crash_after_the_action_resumes_at_the_decision() {
         EventData::ActionCompleted {
             action_execution_id: "action-1".to_string(),
             output_label: "done".to_string(),
+            reason: None,
+            additional_data: Default::default(),
+            warnings: Vec::new(),
         },
     )
     .expect("append");
@@ -918,6 +921,9 @@ async fn a_restart_after_the_choices_result_takes_only_the_decision() {
             EventData::ActionCompleted {
                 action_execution_id: "attempt-rejected".to_string(),
                 output_label: "implemented".to_string(),
+                reason: None,
+                additional_data: Default::default(),
+                warnings: Vec::new(),
             },
         )
         .expect("append");

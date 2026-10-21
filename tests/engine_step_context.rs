@@ -607,6 +607,137 @@ async fn an_incomplete_result_is_never_offered_for_approval() {
 }
 
 // ---------------------------------------------------------------------------
+// The step contract: required artifacts, undeclared variables, new roots
+// ---------------------------------------------------------------------------
+
+async fn run_artifact_contract(
+    harness: &Harness,
+    turns: Vec<AgentTurn>,
+) -> (Arc<ScriptedAgentExecutor>, WorkflowExecution) {
+    let agent = Arc::new(ScriptedAgentExecutor::new(turns));
+    let execution = engine_with(harness, &agent)
+        .start_and_run(
+            &workflow("artifact_contract"),
+            json!({}),
+            harness.workspace(),
+        )
+        .await
+        .expect("run");
+    (agent, execution)
+}
+
+fn output_rejections(harness: &Harness, execution_id: &str) -> Vec<String> {
+    events(harness, execution_id)
+        .into_iter()
+        .filter_map(|data| match data {
+            EventData::ActionOutputRejected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A choice without its required artifact is asked for again, naming it.
+#[tokio::test]
+async fn a_missing_required_artifact_is_asked_for_again_by_name() {
+    let harness = Harness::new();
+    let (agent, execution) = run_artifact_contract(
+        &harness,
+        vec![
+            AgentTurn::with_artifacts("ready", json!({})),
+            AgentTurn::with_artifacts("ready", json!({ "plan_doc": "docs/plan.md" })),
+            AgentTurn::label("done", "worked"),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let reasons = output_rejections(&harness, &execution.id);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(reasons[0].contains("plan_doc"), "{}", reasons[0]);
+    let calls = agent.calls();
+    assert_eq!(calls[1].resume_session.as_deref(), Some("agent-session"));
+    assert!(calls[1].prompt.contains("plan_doc"), "{}", calls[1].prompt);
+}
+
+/// `{{ artifacts.NAME }}` is the path the artifact was written to; before
+/// any write, a defined artifact and a declared variable render empty.
+#[tokio::test]
+async fn artifacts_and_declared_variables_reach_the_prompt() {
+    let harness = Harness::new();
+    let (agent, execution) = run_artifact_contract(
+        &harness,
+        vec![
+            AgentTurn::with_artifacts("ready", json!({ "plan_doc": "docs/plan.md" })),
+            AgentTurn::label("done", "worked"),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let prompts = agent.prompts();
+    assert_eq!(prompts[0], "Plan. Previous plan: []. Blocker: [].");
+    assert_eq!(prompts[1], "Work from docs/plan.md.");
+}
+
+/// A step's `local.*` variable is its own: it never reaches the context.
+#[tokio::test]
+async fn a_local_variable_stays_out_of_the_context() {
+    let harness = Harness::new();
+    let (_agent, execution) = run_artifact_contract(
+        &harness,
+        vec![
+            AgentTurn::Label {
+                label: "ready",
+                reason: "",
+                variables: json!({ "local.notes": "tried the short plan" }),
+                artifacts: json!({ "plan_doc": "docs/plan.md" }),
+                reply: None,
+                session: true,
+            },
+            AgentTurn::label("done", "worked"),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert!(
+        !execution.context.variables.contains_key("local.notes"),
+        "{:?}",
+        execution.context.variables
+    );
+}
+
+/// A variable the step does not define is kept as additional data with a
+/// warning, never written to the context, and never reprompted for.
+#[tokio::test]
+async fn an_undeclared_variable_goes_to_additional_data_not_the_context() {
+    let harness = Harness::new();
+    let (_engine, agent, execution) = run_required(
+        &harness,
+        vec![AgentTurn::with_variables("clean", json!({ "extra": "kept aside" }))],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(agent.calls().len(), 1);
+    assert!(!execution.context.variables.contains_key("extra"));
+    let (additional_data, warnings) = events(&harness, &execution.id)
+        .into_iter()
+        .find_map(|data| match data {
+            EventData::ActionCompleted {
+                additional_data,
+                warnings,
+                ..
+            } => Some((additional_data, warnings)),
+            _ => None,
+        })
+        .expect("the step completes");
+    assert_eq!(additional_data.get("extra"), Some(&json!("kept aside")));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("extra"), "{}", warnings[0]);
+}
+
+// ---------------------------------------------------------------------------
 // U6: the entry count and the limit
 // ---------------------------------------------------------------------------
 

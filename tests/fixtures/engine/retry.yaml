@@ -16,6 +16,8 @@ states:
     retry_policy:
       max_attempts: 3
       backoff: 0s
+    variables:
+      - { name: attempts, description: What the step reports as attempts. }
     choices:
       - success
     transitions:

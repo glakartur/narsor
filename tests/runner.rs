@@ -1537,6 +1537,9 @@ states:
         - -c
         - |
           printf '{"choice": "done", "variables": {"pr_number": 42, "pr_url": "https://git.example/pr/42"}}'
+    variables:
+      - { name: pr_number, description: What the step reports as pr_number. }
+      - { name: pr_url, description: What the step reports as pr_url. }
     choices: [done]
     transitions:
       done: completed

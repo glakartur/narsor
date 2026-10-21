@@ -119,6 +119,8 @@ states:
       args:
         - "--title"
         - "Feature: {{ inputs.feature_description }}"
+    variables:
+      - { name: pr_number, description: What the step reports as pr_number. }
     choices:
       - created
     transitions:

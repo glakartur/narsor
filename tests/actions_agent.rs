@@ -1775,6 +1775,8 @@ states:
       type: agent
       harness: claude-code
       prompt: "Analyse {{ inputs.subject }}"
+    variables:
+      - { name: plan, description: What the step reports as plan. }
     choices: [ready, ambiguous]
     transitions:
       ready: done

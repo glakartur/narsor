@@ -190,6 +190,9 @@ fn seed_execution_with_retry(store: &ExecutionStore, execution_id: &str) {
         EventData::ActionCompleted {
             action_execution_id: "attempt-2".to_string(),
             output_label: "success".to_string(),
+            reason: None,
+            additional_data: Default::default(),
+            warnings: Vec::new(),
         },
     )
     .expect("append ActionCompleted");

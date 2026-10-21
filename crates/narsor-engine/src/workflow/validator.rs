@@ -17,7 +17,8 @@
 //! its labels, which must be non-empty and unique.
 //!
 //! Template references are only checked where they can be checked statically.
-//! `{{ inputs.x }}` must name a declared input; `{{ context.* }}` and anything
+//! `{{ inputs.x }}` must name a declared input and `{{ artifacts.x }}` an
+//! artifact some step defines; `{{ context.* }}` and anything
 //! with filters or other expression syntax is passed through untouched and
 //! resolved at runtime (U4).
 
@@ -32,7 +33,8 @@ use crate::domain::{
 use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
 use super::template::{
-    check_syntax, step_reply_references, step_stream_references, unsupported_step_references,
+    artifact_references, check_syntax, step_reply_references, step_stream_references,
+    unsupported_step_references,
 };
 
 /// Validates a compiled workflow definition.
@@ -652,7 +654,24 @@ fn validate_state_templates(
                 });
             }
         }
+        for artifact in artifact_references(text) {
+            if !defines_artifact(definition, &artifact) {
+                errors.push(ValidationError::UnknownArtifactReference {
+                    state: state.id.clone(),
+                    field: field.clone(),
+                    artifact,
+                });
+            }
+        }
     }
+}
+
+/// Whether some step defines the artifact `name` (KTD7): several may.
+fn defines_artifact(definition: &WorkflowDefinition, name: &str) -> bool {
+    definition
+        .states
+        .values()
+        .any(|state| state.artifacts.iter().any(|artifact| artifact.name == name))
 }
 
 fn validate_workflow_templates(definition: &WorkflowDefinition, errors: &mut Vec<ValidationError>) {

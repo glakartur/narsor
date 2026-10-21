@@ -72,10 +72,31 @@ pub enum EventData {
     ActionCompleted {
         action_execution_id: String,
         output_label: String,
+        /// Why the action made its choice, when it said.
+        ///
+        /// `#[serde(default)]` on this and the next two fields so an event
+        /// log written before they existed still deserializes, with nothing
+        /// said, kept or warned about.
+        #[serde(default)]
+        reason: Option<String>,
+        /// What the action kept outside its step's definitions (R5): never
+        /// interpreted, only recorded.
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        additional_data: serde_json::Map<String, serde_json::Value>,
+        /// What the engine noticed about the answer without rejecting it,
+        /// such as a variable the step does not define (KTD5).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
     },
     ActionFailed {
         action_execution_id: String,
         error: String,
+        /// The kind of error, when the action named one.
+        ///
+        /// `#[serde(default)]` so an event log written before this field
+        /// existed still deserializes, with `None` standing for "unknown".
+        #[serde(default)]
+        error_type: Option<String>,
     },
     /// A failed attempt that still has retries left (R4, R7, R11).
     ///
@@ -929,6 +950,29 @@ mod tests {
         let data: EventData =
             serde_json::from_value(serde_json::json!({"type":"future_event","value":1})).unwrap();
         assert!(matches!(data, EventData::Unrecognized));
+    }
+
+    #[test]
+    fn an_action_event_written_before_reason_and_error_type_still_decodes() {
+        let completed: EventData = serde_json::from_value(serde_json::json!({
+            "type": "action_completed",
+            "action_execution_id": "act-1",
+            "output_label": "done",
+        }))
+        .unwrap();
+        let failed: EventData = serde_json::from_value(serde_json::json!({
+            "type": "action_failed",
+            "action_execution_id": "act-1",
+            "error": "boom",
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            completed,
+            EventData::ActionCompleted { reason: None, ref additional_data, ref warnings, .. }
+                if additional_data.is_empty() && warnings.is_empty()
+        ));
+        assert!(matches!(failed, EventData::ActionFailed { error_type: None, .. }));
     }
 
     #[test]

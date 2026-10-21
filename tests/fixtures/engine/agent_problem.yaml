@@ -11,6 +11,8 @@ states:
     action:
       type: agent
       prompt: Implement the feature.
+    variables:
+      - { name: summary, description: What the step reports as summary. }
     choices:
       - label: implemented
         description: The feature is implemented.
