@@ -25,7 +25,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "ok"}'
+        - '{"choice": "ok"}'
       env:
         SUMMARY: "{{ context.summary }}"
     choices:

@@ -5,4 +5,4 @@
 # still there, which is what makes it a witness of the workspace surviving.
 printf '%s\n' "$1" > "$1.step"
 seen=$(ls ./*.step | sed 's|^\./||; s|\.step$||' | sort | tr '\n' ' ' | sed 's/ $//')
-printf '{"output": "done", "variables": {"%s": "%s"}}\n' "$1" "$seen"
+printf '{"choice": "done", "variables": {"%s": "%s"}}\n' "$1" "$seen"

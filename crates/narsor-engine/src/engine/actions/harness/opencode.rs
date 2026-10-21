@@ -334,7 +334,7 @@ mod tests {
             serde_json::json!({
                 "type": "text",
                 "sessionID": "ses-1",
-                "text": "P1: validate the request body.\n```json\n{\"output\":\"findings\"}\n```",
+                "text": "P1: validate the request body.\n```json\n{\"choice\":\"findings\"}\n```",
             }),
         ] {
             parser.on_stdout_line(line.to_string().as_bytes());

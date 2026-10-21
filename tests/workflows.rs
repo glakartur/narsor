@@ -23,6 +23,7 @@ use narsor_engine::domain::{
     Workspace,
 };
 use narsor_engine::engine::actions::agent::output_contract;
+use narsor_engine::engine::StepContract;
 use narsor_engine::engine::{
     ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry, HumanInputDelivery,
 };
@@ -99,13 +100,13 @@ impl FakeHarness {
     fn installed_in(dir: PathBuf, labels: &[&str]) -> Self {
         let answers: Vec<Value> = labels
             .iter()
-            .map(|label| json!({ "output": label, "data": {} }))
+            .map(|label| json!({ "choice": label }))
             .collect();
         Self::answering_in(dir, &answers)
     }
 
-    /// Installs the fixture script and scripts one whole answer object (label,
-    /// `data`, `variables`) per call, in order.
+    /// Installs the fixture script and scripts one whole answer object (choice,
+    /// `variables`, ...) per call, in order.
     fn answering_in(dir: PathBuf, answers: &[Value]) -> Self {
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
@@ -203,7 +204,7 @@ fn built_prompt(state: &State) -> String {
     let Some(ActionConfig::Agent(config)) = &state.action else {
         panic!("built_prompt is only defined for agent states");
     };
-    format!("{}{}", config.prompt, output_contract(&state.choices))
+    format!("{}{}", config.prompt, output_contract(&StepContract::of(state)))
 }
 
 /// The declared output labels of a state.
@@ -542,37 +543,37 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
     let harness_dir = root.dir("harness");
     let requirements_doc = "docs/brainstorms/2026-10-16-subscribe-requirements.md";
     let plan_doc = "docs/plans/2026-10-16-subscribe-plan.md";
-    let label = |label: &str| json!({ "output": label, "data": {} });
+    let label = |label: &str| json!({ "choice": label });
     // Every agent call of the path below, in order.
     let harness = FakeHarness::answering_in(
         harness_dir.clone(),
         &[
             // 1. brainstorm
             json!({
-                "output": "requirements_drafted",
+                "choice": "requirements_drafted",
                 "variables": { "requirements_doc": requirements_doc },
             }),
             label("reviewed"), // 2. doc_review
-            json!({ "output": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_scope
+            json!({ "choice": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_scope
             label("no_feedback"), // resolve_scope_feedback
             label("no_feedback"), // confirm_scope_feedback after approval
             // 6. plan
-            json!({ "output": "plan_ready", "variables": { "plan_doc": plan_doc } }),
+            json!({ "choice": "plan_ready", "variables": { "plan_doc": plan_doc } }),
             label("updated"),     // publish_plan
             label("no_feedback"), // resolve_plan_feedback
             label("no_feedback"), // confirm_plan_feedback after approval
             json!({
-                "output": "implemented",
+                "choice": "implemented",
                 "variables": { "test_baseline": "all relevant checks passed before changes" },
             }), // 10. work — ambiguity uses awaiting_input in place
             label("simplified"),  // simplify
             label("clean"),       // code_review
-            json!({ "output": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_work
+            json!({ "choice": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_work
             label("no_feedback"), // resolve_work_feedback
             label("revised"),     // work_revision — addresses human review
             label("simplified"),  // simplify
             label("clean"),       // code_review
-            json!({ "output": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_work
+            json!({ "choice": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_work
             label("fixed"),       // resolve_work_feedback — fixes are already pushed
             label("no_feedback"), // confirm_work_feedback after approval
             label("documented"),  // compound — after implementation review

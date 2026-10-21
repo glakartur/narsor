@@ -11,7 +11,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "ok", "variables": {"greeting": "{{ context.variables.nobody_set_this }}"}}'
+        - '{"choice": "ok", "variables": {"greeting": "{{ context.variables.nobody_set_this }}"}}'
     choices:
       - ok
     transitions:

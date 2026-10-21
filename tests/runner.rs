@@ -576,7 +576,7 @@ fn fake_claude(root: &TempRoot) -> PathBuf {
     let script = "#!/bin/sh\n\
         printf '%s\\n' \"$HOME\" >> \"$HOME/claude-homes\"\n\
         printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
-        \"session_id\":\"fake\",\"result\":\"Done.\\n{\\\"output\\\": \\\"done\\\"}\"}'\n";
+        \"session_id\":\"fake\",\"result\":\"Done.\\n{\\\"choice\\\": \\\"done\\\"}\"}'\n";
     let temp = bin.join(".claude.tmp");
     fs::write(&temp, script).unwrap();
     fs::set_permissions(&temp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -625,7 +625,7 @@ states:
         - |
           echo first >> steps.log
           printf '%s' "$HOME" > "$HOME/home-seen-by-first"
-          printf '{"output": "done"}'
+          printf '{"choice": "done"}'
     choices: [done]
     transitions:
       done: gate
@@ -633,7 +633,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "printf '{\"output\": \"ok\"}'"]
+      args: [-c, "printf '{\"choice\": \"ok\"}'"]
     choices: [ok, rejected]
     transitions:
       ok: review
@@ -1174,7 +1174,7 @@ states:
           tries=$(cat "$HOME/attempts" 2>/dev/null | wc -l)
           echo try >> "$HOME/attempts"
           if [ "$tries" -eq 0 ]; then sleep 60; fi
-          printf '{"output": "done"}'
+          printf '{"choice": "done"}'
     choices: [done]
     transitions:
       done: completed
@@ -1425,7 +1425,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "echo one >> \"$HOME/steps\"; printf '{\"output\": \"done\"}'"]
+      args: [-c, "echo one >> \"$HOME/steps\"; printf '{\"choice\": \"done\"}'"]
     choices: [done]
     transitions:
       done: two
@@ -1433,7 +1433,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "echo two >> \"$HOME/steps\"; printf '{\"output\": \"done\"}'"]
+      args: [-c, "echo two >> \"$HOME/steps\"; printf '{\"choice\": \"done\"}'"]
     choices: [done]
     transitions:
       done: completed
@@ -1536,7 +1536,7 @@ states:
       args:
         - -c
         - |
-          printf '{"output": "done", "variables": {"pr_number": 42, "pr_url": "https://git.example/pr/42"}}'
+          printf '{"choice": "done", "variables": {"pr_number": 42, "pr_url": "https://git.example/pr/42"}}'
     choices: [done]
     transitions:
       done: completed
@@ -1673,7 +1673,7 @@ states:
             printf 'anthropic=%s\n' "${ANTHROPIC_API_KEY-unset}"
             printf 'openai=%s\n' "${OPENAI_API_KEY-unset}"
           } > "$NARSOR_OUTBOX_DIR/../seen"
-          printf '{"output": "done"}'
+          printf '{"choice": "done"}'
     choices: [done]
     transitions:
       done: completed
@@ -1827,7 +1827,7 @@ states:
         - |
           printf '%s' "$GH_TOKEN" | sha256sum > "$HOME/token.sha256"
           sha256sum < "$HOME/.config/gh/hosts.yml" > "$HOME/hosts.sha256"
-          printf '{"output": "done"}'
+          printf '{"choice": "done"}'
     choices: [done]
     transitions:
       done: completed
@@ -1994,7 +1994,7 @@ fn hanging_claude(root: &TempRoot) -> PathBuf {
         printf '%s\\n' \"$@\" >> \"$HOME/claude-args\"\n\
         if [ \"$tries\" -eq 0 ]; then sleep 60; fi\n\
         printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
-        \"session_id\":\"fake\",\"result\":\"Done.\\n{\\\"output\\\": \\\"done\\\"}\"}'\n";
+        \"session_id\":\"fake\",\"result\":\"Done.\\n{\\\"choice\\\": \\\"done\\\"}\"}'\n";
     let temp = bin.join(".claude.tmp");
     fs::write(&temp, script).unwrap();
     fs::set_permissions(&temp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2381,7 +2381,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "echo ran >> \"$HOME/next-ran\"; printf '{\"output\": \"done\"}'"]
+      args: [-c, "echo ran >> \"$HOME/next-ran\"; printf '{\"choice\": \"done\"}'"]
     choices: [done]
     transitions:
       done: completed
@@ -2534,7 +2534,7 @@ states:
       args:
         - -c
         - |
-          if [ -f retried ]; then printf '{"output": "done"}'; else touch retried; echo boom >&2; exit 3; fi
+          if [ -f retried ]; then printf '{"choice": "done"}'; else touch retried; echo boom >&2; exit 3; fi
     choices: [done]
     transitions:
       done: completed
@@ -2553,7 +2553,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "sleep 60; printf '{\"output\": \"done\"}'"]
+      args: [-c, "sleep 60; printf '{\"choice\": \"done\"}'"]
     choices: [done]
     transitions:
       done: completed
@@ -3154,7 +3154,7 @@ fn fake_harnesses(root: &TempRoot, programs: &[&str]) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let bin = root.dir("bin");
     let answers = root.dir("harness-answers");
-    let text = "Done.\n{\"output\": \"done\"}";
+    let text = "Done.\n{\"choice\": \"done\"}";
     for program in programs {
         let lines: Vec<serde_json::Value> = match *program {
             "claude" => vec![serde_json::json!({
@@ -3224,7 +3224,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "printf '{\"output\": \"ok\"}'"]
+      args: [-c, "printf '{\"choice\": \"ok\"}'"]
     choices: [ok, rejected]
     transitions:
       ok: b
@@ -3243,7 +3243,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "printf '{\"output\": \"ok\"}'"]
+      args: [-c, "printf '{\"choice\": \"ok\"}'"]
     choices: [ok, rejected]
     transitions:
       ok: c

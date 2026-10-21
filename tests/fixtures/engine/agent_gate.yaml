@@ -44,7 +44,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "ok"}'
+        - '{"choice": "ok"}'
     choices:
       - ok
     transitions:

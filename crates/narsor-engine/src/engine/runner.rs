@@ -101,7 +101,7 @@ use crate::engine::actions::human::{
     ENTRY_LIMIT_CONTINUE_LABEL, ENTRY_LIMIT_RESET_LABEL, RESUME_AGENT_LABEL,
 };
 use crate::engine::actions::{
-    ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
+    ActionExecutor, ActionOutcome, ActionRequest, StepContract, AgentExecutor, HumanExecutor, LoggingEventSink,
     ScriptExecutor, SuspendedAction,
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
@@ -2343,7 +2343,7 @@ impl Engine {
             .with_timeout(timeout)
             .with_execution_id(&execution.id)
             .with_conversation_store(&conversation_store)
-            .with_outputs(&state.choices)
+            .with_contract(StepContract::of(state))
             .with_purpose(purpose);
 
         let outcome = executor.execute(request).await;
@@ -3374,30 +3374,39 @@ impl Engine {
     // Artifacts
     // -----------------------------------------------------------------------
 
-    /// Turns the `artifacts` list a script reported into artifact records.
+    /// Turns the artifacts a result reports into artifact records: an
+    /// action's named `artifacts` and its `additional_artifacts`, and the
+    /// `data.artifacts` list a person or the conductor delivered.
     ///
-    /// [`ActionResult`] has no artifacts field, so `ScriptExecutor` passes the
-    /// §3.3.B list through as `data.artifacts`. Each entry becomes an
-    /// `ArtifactCreated` event here and an entry in `context.artifacts` when the
-    /// context is written. An entry that names no location is skipped rather
-    /// than failing the action: a malformed artifact note is not a reason to
-    /// discard work that succeeded.
+    /// Each one becomes an `ArtifactCreated` event here and an entry in
+    /// `context.artifacts` when the context is written. An entry that names
+    /// no location is skipped rather than failing the action: a malformed
+    /// artifact note is not a reason to discard work that succeeded.
     fn register_artifacts(
         &self,
         execution: &WorkflowExecution,
         action_execution_id: &str,
         result: &ActionResult,
     ) -> Result<Vec<Artifact>, EngineError> {
-        let Some(entries) = result.data.get("artifacts").and_then(Value::as_array) else {
-            return Ok(Vec::new());
-        };
+        let named = result
+            .artifacts
+            .iter()
+            .map(|(name, path)| (Some(name.as_str()), path));
+        let additional = result.additional_artifacts.iter().map(|path| (None, path));
+
+        let reported = named
+            .chain(additional)
+            .filter_map(|(name, path)| artifact_at(name, path, action_execution_id));
+        let delivered = result
+            .data
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| artifact_from(entry, action_execution_id));
 
         let mut artifacts = Vec::new();
-        for entry in entries {
-            let Some(artifact) = artifact_from(entry, action_execution_id) else {
-                continue;
-            };
-
+        for artifact in reported.chain(delivered) {
             self.emit(
                 &execution.id,
                 EventData::ArtifactCreated {
@@ -3753,7 +3762,23 @@ fn agent_reply(values: &Map<String, Value>) -> Option<String> {
     Some(reply)
 }
 
-/// Builds an artifact record from one entry of a `data.artifacts` list.
+/// Builds the record of a file artifact at `path`, named when it is one of
+/// the step's artifacts. `None` for an empty path.
+fn artifact_at(name: Option<&str>, path: &str, action_execution_id: &str) -> Option<Artifact> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut artifact = Artifact::new(
+        "file".to_string(),
+        path.to_string(),
+        action_execution_id.to_string(),
+    );
+    artifact.name = name.map(ToString::to_string);
+    Some(artifact)
+}
+
+/// Builds an artifact record from one entry of a delivered `data.artifacts`
+/// list.
 ///
 /// Accepts either a bare path or an object with `path`/`location`, and
 /// optionally `name` and `type`.

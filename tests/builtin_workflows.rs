@@ -31,6 +31,7 @@ use std::process::Command;
 
 use narsor_engine::domain::ActionConfig;
 use narsor_engine::engine::actions::agent::output_contract;
+use narsor_engine::engine::StepContract;
 use narsor_engine::workflows::{
     builtin, builtin_names, WorkflowOrigin, WorkflowResolver, BUILTIN_WORKFLOWS,
 };
@@ -442,7 +443,7 @@ fn the_work_prompt_uses_agent_input_for_ambiguity() {
         "the prompt of 'work' repeats what the engine's output contract says"
     );
     assert!(
-        output_contract(&work.choices).contains("awaiting_input"),
+        output_contract(&StepContract::of(work)).contains("awaiting_input"),
         "the output contract tells the agent to ask and resume in place"
     );
     assert_eq!(work.choices.len(), 1);
@@ -661,7 +662,7 @@ fn install_fake_claude(root: &TempRoot, label: &str) -> PathBuf {
     let script = format!(
         "#!/bin/sh\n\
          printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
-         \"session_id\":\"fake\",\"result\":\"Done.\\n{{\\\"output\\\": \\\"{label}\\\"}}\"}}'\n"
+         \"session_id\":\"fake\",\"result\":\"Done.\\n{{\\\"choice\\\": \\\"{label}\\\"}}\"}}'\n"
     );
     fs::write(&program, script).expect("write the fake harness");
     make_executable(&program);

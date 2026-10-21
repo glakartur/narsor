@@ -1573,7 +1573,7 @@ async fn a_gate_after_an_agent_carries_the_agents_question() {
         vec![(
             "needs_human_decision",
             json!({ "question": LIMIT_QUESTION }),
-            "I looked at the limits.\n{\"output\": \"needs_human_decision\"}",
+            "I looked at the limits.\n{\"choice\": \"needs_human_decision\"}",
         )],
     );
     let definition = workflow("agent_gate");
@@ -1595,7 +1595,7 @@ async fn a_gate_after_an_agent_carries_the_agents_question() {
     assert_eq!(pending.request.question.as_deref(), Some(LIMIT_QUESTION));
     assert_eq!(
         pending.request.answer_tail.as_deref(),
-        Some("I looked at the limits.\n{\"output\": \"needs_human_decision\"}")
+        Some("I looked at the limits.\n{\"choice\": \"needs_human_decision\"}")
     );
     assert_eq!(
         pending.instruction(),

@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn the_reply_is_the_final_message_without_the_contract() {
         let mut parser: Box<dyn HarnessStreamParser> = Box::new(CodexStreamParser::default());
-        let message = "P1: validate the request body.\n\n{\"output\":\"findings\"}";
+        let message = "P1: validate the request body.\n\n{\"choice\":\"findings\"}";
         for line in [
             serde_json::json!({ "type": "thread.started", "thread_id": "thread-1" }),
             serde_json::json!({

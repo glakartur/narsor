@@ -928,10 +928,7 @@ async fn a_restart_after_the_choices_result_takes_only_the_decision() {
             output_label: "implemented".to_string(),
             data: decision.data.clone(),
             variables: decision.variables.as_object().cloned().unwrap_or_default(),
-            exit_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            reply: None,
+            ..Default::default()
         },
         artifacts: Vec::new(),
     };

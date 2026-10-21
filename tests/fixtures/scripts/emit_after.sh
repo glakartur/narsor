@@ -9,7 +9,7 @@ count=$((count + 1))
 printf '%s' "$count" > "$1"
 
 if [ "$count" -lt 2 ]; then
-    printf '{"output": "%s", "variables": {"passes": %s}}\n' "$2" "$count"
+    printf '{"choice": "%s", "variables": {"passes": %s}}\n' "$2" "$count"
 else
-    printf '{"output": "%s", "variables": {"passes": %s}}\n' "$3" "$count"
+    printf '{"choice": "%s", "variables": {"passes": %s}}\n' "$3" "$count"
 fi

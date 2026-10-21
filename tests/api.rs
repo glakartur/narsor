@@ -2375,11 +2375,10 @@ impl ActionExecutor for AgentReply {
                 Self::Finish => ActionOutcome::Completed(ActionResult {
                     output_label: "done".to_string(),
                     data: serde_json::json!({ "question": "Account or user limit?" }),
-                    variables: serde_json::Map::new(),
                     exit_code: Some(0),
                     stdout: "the agent's answer".to_string(),
-                    stderr: String::new(),
                     reply: Some("the agent's answer".to_string()),
+                    ..Default::default()
                 }),
                 Self::Ask => ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(
                     HumanInputRequest {

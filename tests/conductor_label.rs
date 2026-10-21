@@ -118,10 +118,7 @@ impl ActionExecutor for ScriptedAgent {
                     output_label: label.to_string(),
                     data: json!({}),
                     variables: Map::from_iter([("summary".to_string(), json!("by the agent"))]),
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    reply: None,
+                    ..ActionResult::default()
                 })),
             }
         })

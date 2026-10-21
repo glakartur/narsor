@@ -286,11 +286,7 @@ impl ActionExecutor for StubAgentExecutor {
             Ok(ActionOutcome::Completed(ActionResult {
                 output_label: label,
                 data: json!({}),
-                variables: Map::new(),
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                reply: None,
+                ..ActionResult::default()
             }))
         })
     }
@@ -344,11 +340,10 @@ impl ActionExecutor for AnsweringAgentExecutor {
             Ok(ActionOutcome::Completed(ActionResult {
                 output_label,
                 data,
-                variables: Map::new(),
                 exit_code: Some(0),
                 stdout: stdout.clone(),
-                stderr: String::new(),
                 reply: Some(stdout),
+                ..ActionResult::default()
             }))
         })
     }
@@ -415,11 +410,7 @@ impl ActionExecutor for ResumeRejectingAgentExecutor {
                 _ => Ok(ActionOutcome::Completed(ActionResult {
                     output_label: "done".to_string(),
                     data: json!({}),
-                    variables: Map::new(),
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    reply: None,
+                    ..ActionResult::default()
                 })),
             }
         })
@@ -488,11 +479,7 @@ impl ActionExecutor for QuestioningAgentExecutor {
             Ok(ActionOutcome::Completed(ActionResult {
                 output_label: "done".to_string(),
                 data: json!({}),
-                variables: Map::new(),
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                reply: None,
+                ..ActionResult::default()
             }))
         })
     }
@@ -570,11 +557,7 @@ impl ActionExecutor for TimeoutRecorder {
             Ok(ActionOutcome::Completed(ActionResult {
                 output_label: label,
                 data: json!({}),
-                variables: Map::new(),
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                reply: None,
+                ..ActionResult::default()
             }))
         })
     }
@@ -796,10 +779,9 @@ impl ActionExecutor for ScriptedAgentExecutor {
                     Value::Object(variables) => variables,
                     _ => Map::new(),
                 },
-                exit_code: None,
                 stdout: reply.unwrap_or_default().to_string(),
-                stderr: String::new(),
                 reply: reply.map(ToString::to_string),
+                ..ActionResult::default()
             })),
             AgentTurn::NoLabel { reply, session } => {
                 let mut details = json!({ "answer_tail": reply.unwrap_or_default() });

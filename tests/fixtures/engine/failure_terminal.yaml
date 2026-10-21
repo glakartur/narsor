@@ -10,7 +10,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "broken", "variables": {"reason": "nothing compiles"}}'
+        - '{"choice": "broken", "variables": {"reason": "nothing compiles"}}'
     choices:
       - ok
       - broken

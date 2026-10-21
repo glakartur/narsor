@@ -11,7 +11,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "ok", "variables": {"checked": true}}'
+        - '{"choice": "ok", "variables": {"checked": true}}'
     choices:
       - ok
       - rejected

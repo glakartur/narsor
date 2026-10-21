@@ -9,7 +9,8 @@
 //! 1. **Ask properly.** The state's prompt is sent with the
 //!    [`output_contract`] appended, so the agent is told — in the same
 //!    breath as the task — that it has to finish with a JSON object carrying
-//!    `output`, and which labels (with their descriptions) it may use. D19
+//!    `choice`, which labels (with their descriptions) it may use, and what
+//!    the step's variables and artifacts are. D19
 //!    calls this "forcing structure on the agent"; forcing it starts with
 //!    saying it.
 //! 2. **Read robustly, guess never.** A harness that enforces
@@ -17,7 +18,8 @@
 //!    output, which is read first and checked by the same rules. Otherwise —
 //!    or when it is unusable — the text is read. Agents wrap JSON in prose,
 //!    in fences, or in both. [`extract_output`] takes the *last* JSON object anywhere in the
-//!    answer that has an `output` key. When there is none, the action fails
+//!    answer that has a `choice` key, read by the parser scripts share
+//!    ([`super::answer`]). When there is none, the action fails
 //!    ([`ActionError`]) — it never falls back to `success`. In an unattended
 //!    pipeline a guessed label is a silently wrong transition, which is a far
 //!    worse outcome than a failure an operator can see. D20's tolerance for a
@@ -65,13 +67,14 @@ use super::harness::{
 };
 use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
 use super::script::{truncate, MAX_BUFFERED_OUTPUT_BYTES};
+use super::answer::{self, ChoiceAnswer};
 use super::{
-    ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction,
+    ActionExecutor, ActionOutcome, ActionRequest, StepContract, SuspendedAction, TimedOutAction,
     ACTION_ID_ENV_VAR,
 };
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, AgentSessionStatus,
-    Event, EventData, ChoiceDefinition, WorkspaceAccess,
+    ChoiceDefinition, Event, EventData, WorkspaceAccess,
 };
 use crate::persistence::{
     ConversationSource, ConversationStore, ConversationWriter, DefaultHarnessSelector,
@@ -84,78 +87,125 @@ use crate::persistence::{
 /// Kept deliberately short and imperative: it competes for attention with the
 /// state's own prompt, and a long preamble is the first thing a model drops.
 ///
-/// The permitted labels come from the state itself (`choices`, in declaration
-/// order), each followed by its description when the workflow gives one. The
-/// engine is therefore the single source of the list: a prompt no longer has
-/// to repeat the labels for the agent to know them. With no outputs to list
-/// (a direct call with nothing wired up) the agent is pointed at the label
-/// the task asks for instead.
-pub fn output_contract(outputs: &[ChoiceDefinition]) -> String {
-    let labels = if outputs.is_empty() {
-        "`output` is required and must be the label the task asks for.\n".to_string()
-    } else {
-        let mut list =
-            "`output` is required and must be exactly one of these labels:\n".to_string();
-        for output in outputs {
-            match output.description.as_deref().map(str::trim) {
-                Some(description) if !description.is_empty() => {
-                    list.push_str(&format!("- `{}` — {description}\n", output.label));
-                }
-                _ => list.push_str(&format!("- `{}`\n", output.label)),
-            }
-            for required in &output.requires_variables {
-                list.push_str(&format!("  - Set `variables.{required}`\n"));
-            }
-        }
-        list
-    };
-
+/// Everything listed comes from the state itself (KTD1): its variables and
+/// artifacts, each described once, then its choices in declaration order,
+/// each with its description and with the variables and the artifacts it
+/// requires (R10). The engine is therefore the single source of the list: a
+/// prompt no longer has to repeat the labels for the agent to know them.
+/// With no choices to list (a direct call with nothing wired up) the agent
+/// is pointed at the label the task asks for instead.
+pub fn output_contract(contract: &StepContract<'_>) -> String {
     format!(
         "\n\n\
 ---\n\
 When you are done, end your reply with a single JSON object on its own, and \
 nothing after it:\n\
-{{\"output\": \"<label>\", \"data\": {{}}, \"variables\": {{}}, \"artifacts\": []}}\n\
-{labels}\
-`data`, `variables` and `artifacts` are optional. If, and only if, you need a \
+{{\"choice\": \"<label>\", \"reason\": \"<one line>\", \"variables\": {{}}, \
+\"artifacts\": {{}}, \"additional_data\": {{}}, \"additional_artifacts\": []}}\n\
+{definitions}\
+{choices}\
+`reason` is required: one line saying why you made this choice.\n\
+`additional_data` (any object) and `additional_artifacts` (a list of paths) hold \
+anything else worth keeping; the workflow does not interpret them. The other \
+fields are optional unless your choice requires them. If, and only if, you need a \
 person to answer a question before continuing this same task, return instead:\n\
 {{\"status\":\"awaiting_input\",\"question\":\"<question>\",\"options\":[\"<optional choice>\"]}}\n\
 Do not use `awaiting_input` for a harness, sandbox, permission, or tool error; \
 those are action failures. Do not omit the JSON object: without it the workflow \
-cannot continue."
+cannot continue.",
+        definitions = step_definitions(contract),
+        choices = choice_list(contract.choices),
     )
+}
+
+/// The step's variables and artifacts, each with what it is.
+fn step_definitions(contract: &StepContract<'_>) -> String {
+    let mut text = String::new();
+    if !contract.variables.is_empty() {
+        text.push_str("The step's variables (in `variables`, name → value):\n");
+        for variable in contract.variables {
+            text.push_str(&described_item(&variable.name, Some(&variable.description)));
+        }
+    }
+    if !contract.artifacts.is_empty() {
+        text.push_str("The step's artifacts (in `artifacts`, name → path):\n");
+        for artifact in contract.artifacts {
+            text.push_str(&described_item(&artifact.name, Some(&artifact.description)));
+        }
+    }
+    text
+}
+
+/// The labels `choice` may take, each with what it requires.
+fn choice_list(choices: &[ChoiceDefinition]) -> String {
+    if choices.is_empty() {
+        return "`choice` is required and must be the label the task asks for.\n".to_string();
+    }
+    let mut text = "`choice` is required and must be exactly one of these labels:\n".to_string();
+    for choice in choices {
+        text.push_str(&described_item(&choice.label, choice.description.as_deref()));
+        text.push_str(&required_names("variables", &choice.requires_variables));
+        text.push_str(&required_names("artifacts", &choice.requires_artifacts));
+    }
+    text
+}
+
+/// `- `name` — description`, or the bare name when the description is blank.
+fn described_item(name: &str, description: Option<&str>) -> String {
+    match description.map(str::trim) {
+        Some(description) if !description.is_empty() => {
+            format!("- `{name}` — {description}\n")
+        }
+        _ => format!("- `{name}`\n"),
+    }
+}
+
+/// The line naming what a choice requires of one kind, empty for none.
+fn required_names(kind: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+    format!("  - Required {kind}: {}\n", names.join(", "))
 }
 
 /// Builds the JSON Schema of the answer [`output_contract`] describes, for a
 /// harness that can enforce one (`claude-code` passes it as `--json-schema`).
 ///
-/// One flat object with the optional fields of both answers — a label with
-/// `data`, `variables` and `artifacts`, or `status: awaiting_input` with a
-/// `question` and `options` — and nothing required. The two answers are not
-/// two `anyOf` branches because the API refuses `anyOf`, `oneOf` and `allOf`
-/// at the top level of a schema (measured on `claude` 2.1.302, see
+/// One flat object with the optional fields of both answers — a `choice`
+/// with its `reason`, `variables`, `artifacts`, `additional_data` and
+/// `additional_artifacts`, or `status: awaiting_input` with a `question` and
+/// `options` — and nothing required (KTD2). The two answers are not two
+/// `anyOf` branches because the API refuses `anyOf`, `oneOf` and `allOf` at
+/// the top level of a schema (measured on `claude` 2.1.302, see
 /// `tests/fixtures/claude-code/README.md`). So the schema only narrows the
-/// answer: which of the two it is, and whether it is complete, is checked by
-/// narsor itself, the same way as an answer read from text.
+/// answer: which of the two it is, and whether it is complete — `reason`
+/// and what a choice requires included — is checked by narsor itself, the
+/// same way as an answer read from text.
 ///
-/// `output` is limited to the declared labels; with none declared, any
+/// `choice` is limited to the declared labels; with none declared, any
 /// string is allowed, as the text contract then asks for the label the task
-/// names. `artifacts` is an array of anything, because an entry may be a path
-/// or an object (see the engine's artifact registration).
-pub fn output_schema(outputs: &[ChoiceDefinition]) -> Value {
-    let mut output = serde_json::json!({ "type": "string" });
-    if !outputs.is_empty() {
-        let labels: Vec<&str> = outputs.iter().map(|output| output.label.as_str()).collect();
-        output["enum"] = serde_json::json!(labels);
+/// names.
+pub fn output_schema(contract: &StepContract<'_>) -> Value {
+    let mut choice = serde_json::json!({ "type": "string" });
+    if !contract.choices.is_empty() {
+        let labels: Vec<&str> = contract
+            .choices
+            .iter()
+            .map(|choice| choice.label.as_str())
+            .collect();
+        choice["enum"] = serde_json::json!(labels);
     }
 
     serde_json::json!({
         "type": "object",
         "properties": {
-            "output": output,
-            "data": { "type": "object" },
+            "choice": choice,
+            "reason": { "type": "string" },
             "variables": { "type": "object" },
-            "artifacts": { "type": "array" },
+            "artifacts": { "type": "object", "additionalProperties": { "type": "string" } },
+            "additional_data": { "type": "object" },
+            "additional_artifacts": { "type": "array", "items": { "type": "string" } },
             "status": { "type": "string", "enum": [AWAITING_INPUT] },
             "question": { "type": "string" },
             "options": { "type": "array", "items": { "type": "string" } },
@@ -561,8 +611,8 @@ impl AgentExecutor {
 
         let mut session = new_session(config, harness, request.execution_id);
 
-        let prompt = format!("{}{}", config.prompt, output_contract(request.outputs));
-        let schema = output_schema(request.outputs);
+        let prompt = format!("{}{}", config.prompt, output_contract(&request.contract));
+        let schema = output_schema(&request.contract);
         let workspace = Path::new(&request.workspace.path);
 
         // Opened before `invocation` (Key Technical Decisions): even an
@@ -1280,24 +1330,9 @@ fn harness_error(
     }
 }
 
-/// The §3.3.A payload an agent finished with.
-#[derive(Debug, Clone)]
-pub struct AgentOutput {
-    /// The raw label, exactly as the agent wrote it. Whether the state declares
-    /// it is the engine's judgement, never the executor's.
-    pub output_label: String,
-
-    /// The `data` object, with `artifacts` folded in the way the script
-    /// executor folds it, so the engine registers them the same way.
-    pub data: Value,
-
-    /// The `variables` the agent proposes.
-    pub variables: Map<String, Value>,
-}
-
 #[derive(Debug, Clone)]
 enum AgentResponse {
-    Completed(AgentOutput),
+    Completed(ChoiceAnswer),
     AwaitingInput {
         question: String,
         options: Vec<String>,
@@ -1348,14 +1383,14 @@ fn agent_input_fields(options: Vec<String>) -> Vec<crate::domain::HumanInputFiel
 /// Extracts the output payload from whatever the agent said (D19/D20).
 ///
 /// Accepts a bare JSON object, a fenced `json` code block, and a JSON object
-/// trailing any amount of prose — the last object with an `output` key wins,
+/// trailing any amount of prose — the last object with a `choice` key wins,
 /// because an agent that restates its answer restates it at the end.
 ///
 /// Both failures are deliberate errors and not a default label:
 ///
 /// * nothing in the answer parses as a JSON object;
-/// * objects are there, but none carries a string `output`.
-pub fn extract_output(text: &str) -> Result<AgentOutput, ActionError> {
+/// * objects are there, but none carries a string `choice`.
+pub fn extract_output(text: &str) -> Result<ChoiceAnswer, ActionError> {
     match extract_response(text)? {
         AgentResponse::Completed(output) => Ok(output),
         AgentResponse::AwaitingInput { .. } => Err(no_label_error(
@@ -1369,7 +1404,7 @@ pub fn extract_output(text: &str) -> Result<AgentOutput, ActionError> {
 /// first, when the harness reported one that makes a usable answer, then the
 /// text, as [`extract_response`] always did.
 ///
-/// A `structured_output` that is unusable — no `output` label and no
+/// A `structured_output` that is unusable — no `choice` label and no
 /// complete `awaiting_input` question — is not an error of its own: the text
 /// is read instead, and only its failure is reported. A label the state does
 /// not declare is not unusable here; like a label read from text, it is the
@@ -1395,7 +1430,7 @@ fn structured_response(value: &Value) -> Result<AgentResponse, ActionError> {
         .filter(|object| is_answer_object(object))
         .ok_or_else(|| {
             no_label_error(
-                "the structured output has neither a string 'output' nor an 'awaiting_input' status",
+                "the structured output has neither a string 'choice' nor an 'awaiting_input' status",
                 &value.to_string(),
             )
         })?;
@@ -1447,7 +1482,7 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         .find_map(|value| value.as_object().filter(|object| is_answer_object(object)))
     else {
         return Err(no_label_error(
-            "the agent's answer contains JSON, but no object with a string 'output' key",
+            "the agent's answer contains JSON, but no object with a string 'choice' key",
             text,
         ));
     };
@@ -1455,75 +1490,53 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
     response_from_object(object).map_err(|reason| no_label_error(reason, text))
 }
 
-/// Whether `object` is an answer at all: a question, or a string `output`.
+/// Whether `object` is an answer at all: a question, or a string `choice`.
 fn is_answer_object(object: &Map<String, Value>) -> bool {
+    is_question(object) || answer::has_choice(object)
+}
+
+/// Whether `object` asks a person before the task continues.
+fn is_question(object: &Map<String, Value>) -> bool {
     object.get("status").and_then(Value::as_str) == Some(AWAITING_INPUT)
-        || object.get("output").and_then(Value::as_str).is_some()
 }
 
 /// Turns an answer object into the response it stands for. An error is the
 /// reason the object is unusable; the caller quotes the answer it came
 /// from (the agent's text, or the structured output) with it.
 fn response_from_object(object: &Map<String, Value>) -> Result<AgentResponse, &'static str> {
-    if object.get("status").and_then(Value::as_str) == Some(AWAITING_INPUT) {
-        let Some(question) = object.get("question").and_then(Value::as_str) else {
-            return Err("the agent requested human input without a string 'question'");
-        };
-        if question.trim().is_empty() {
-            return Err("the agent requested human input with an empty question");
-        }
-        let options = match object.get("options") {
-            None => Vec::new(),
-            Some(Value::Array(options)) => options
-                .iter()
-                .map(Value::as_str)
-                .collect::<Option<Vec<_>>>()
-                .filter(|options| {
-                    !options.is_empty() && options.iter().all(|option| !option.trim().is_empty())
-                })
-                .map(|options| options.into_iter().map(ToString::to_string).collect())
-                .ok_or(
-                    "the agent's input options must be a non-empty array of non-empty strings",
-                )?,
-            Some(_) => return Err("the agent's input options must be an array of strings"),
-        };
-        return Ok(AgentResponse::AwaitingInput {
-            question: question.to_string(),
-            options,
-        });
+    if is_question(object) {
+        return question_from_object(object);
     }
+    answer::read_choice_answer(object)
+        .expect("the object was selected for having a choice")
+        .map(AgentResponse::Completed)
+}
 
-    let output_label = object
-        .get("output")
-        .and_then(Value::as_str)
-        .expect("the object was selected for having one")
-        .to_string();
-
-    let mut data = object.get("data").cloned().unwrap_or(Value::Null);
-
-    // `ActionResult` has no artifacts field; keep the list where the engine
-    // looks for it, exactly as the script executor does.
-    if let Some(artifacts) = object.get("artifacts") {
-        match &mut data {
-            Value::Object(map) => {
-                map.insert("artifacts".to_string(), artifacts.clone());
-            }
-            Value::Null => data = serde_json::json!({ "artifacts": artifacts.clone() }),
-            _ => {}
-        }
+/// Reads an `awaiting_input` object: its question and its optional menu.
+fn question_from_object(object: &Map<String, Value>) -> Result<AgentResponse, &'static str> {
+    let Some(question) = object.get("question").and_then(Value::as_str) else {
+        return Err("the agent requested human input without a string 'question'");
+    };
+    if question.trim().is_empty() {
+        return Err("the agent requested human input with an empty question");
     }
-
-    let variables = object
-        .get("variables")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-
-    Ok(AgentResponse::Completed(AgentOutput {
-        output_label,
-        data,
-        variables,
-    }))
+    let options = match object.get("options") {
+        None => Vec::new(),
+        Some(Value::Array(options)) => options
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .filter(|options| {
+                !options.is_empty() && options.iter().all(|option| !option.trim().is_empty())
+            })
+            .map(|options| options.into_iter().map(ToString::to_string).collect())
+            .ok_or("the agent's input options must be a non-empty array of non-empty strings")?,
+        Some(_) => return Err("the agent's input options must be an array of strings"),
+    };
+    Ok(AgentResponse::AwaitingInput {
+        question: question.to_string(),
+        options,
+    })
 }
 
 /// How much of the agent's answer an extraction failure quotes back.
@@ -1534,7 +1547,7 @@ fn no_label_error(reason: &str, text: &str) -> ActionError {
     ActionError {
         message: format!(
             "no output label could be extracted from the agent's answer: {reason}. \
-             The agent must end with a JSON object carrying an 'output' key \
+             The agent must end with a JSON object carrying a 'choice' key \
              (WORKFLOW_SCHEMA.md §3.3.A)"
         ),
         error_type: Some(MISSING_OUTPUT_LABEL.to_string()),
@@ -1611,62 +1624,51 @@ fn top_level_objects(text: &str) -> Vec<(usize, usize)> {
 
 /// Builds the action result of a successful run.
 fn build_result(
-    output: AgentOutput,
+    answer: ChoiceAnswer,
     session: &AgentSession,
     run: &HarnessRun,
     finished: &FinishedRun,
 ) -> ActionResult {
-    let reply = run_reply(run).or_else(|| data_reply(&output.data));
-    let mut data = output.data;
+    let reply = run_reply(run).or_else(|| contract_reply(&answer.reason, &answer.additional_data));
     let session_record = serde_json::to_value(session).unwrap_or(Value::Null);
 
-    match &mut data {
-        Value::Object(map) => {
-            map.insert(SESSION_DATA_KEY.to_string(), session_record);
-        }
-        Value::Null => data = serde_json::json!({ SESSION_DATA_KEY: session_record }),
-        _ => {}
-    }
-
-    let mut variables = output.variables;
+    let mut result = answer.into_result();
+    result.data = serde_json::json!({ SESSION_DATA_KEY: session_record });
     if let Some(session_id) = &run.session_id {
         // Never over an agent's own variable of that name: the agent's context
         // is the agent's to write (D10 keeps the engine the only writer, and
         // the engine writes what it is given).
-        variables
+        result
+            .variables
             .entry(SESSION_ID_VARIABLE.to_string())
             .or_insert_with(|| Value::String(session_id.clone()));
     }
-
-    ActionResult {
-        output_label: output.output_label,
-        data,
-        variables,
-        exit_code: Some(finished.exit_code),
-        stdout: truncate(&run.text),
-        stderr: truncate(&finished.stderr),
-        reply,
-    }
+    result.exit_code = Some(finished.exit_code);
+    result.stdout = truncate(&run.text);
+    result.stderr = truncate(&finished.stderr);
+    result.reply = reply;
+    result
 }
 
-/// The contract's `data`, as pretty-printed JSON, standing in for the reply
-/// of an agent that answered with the output-contract object alone. Without
-/// it, a step whose findings live only in `data` hands nothing to
-/// `{{ steps.NAME.reply }}`, and the step reading it fails. `None` when
-/// `data` carries nothing.
-fn data_reply(data: &Value) -> Option<String> {
-    let carries_nothing = match data {
-        Value::Null => true,
-        Value::Object(fields) => fields.is_empty(),
-        Value::String(text) => text.trim().is_empty(),
-        _ => false,
-    };
-    if carries_nothing {
+/// The reply of an agent that answered with the output-contract object
+/// alone (KTD17): its `reason`, and below it its `additional_data` as
+/// pretty-printed JSON. Without it, a step whose findings live only in the
+/// object hands nothing to `{{ steps.NAME.reply }}`, and the step reading
+/// it fails. `None` when both are empty.
+fn contract_reply(reason: &str, additional_data: &Map<String, Value>) -> Option<String> {
+    let mut parts = Vec::new();
+    if !reason.is_empty() {
+        parts.push(reason.to_string());
+    }
+    if !additional_data.is_empty() {
+        if let Ok(json) = serde_json::to_string_pretty(additional_data) {
+            parts.push(json);
+        }
+    }
+    if parts.is_empty() {
         return None;
     }
-    serde_json::to_string_pretty(data)
-        .ok()
-        .map(|text| truncate(&text))
+    Some(truncate(&parts.join("\n\n")))
 }
 
 /// Adds the attempt's reply to the details of an extraction failure, so a
@@ -1804,7 +1806,7 @@ mod json_object_tests {
 
     fn label_of(text: &str) -> String {
         match extract_response(text).expect("a response") {
-            AgentResponse::Completed(output) => output.output_label,
+            AgentResponse::Completed(answer) => answer.choice,
             AgentResponse::AwaitingInput { .. } => panic!("not an output"),
         }
     }
@@ -1812,11 +1814,11 @@ mod json_object_tests {
     #[test]
     fn an_unbalanced_brace_in_the_prose_does_not_hide_the_label() {
         assert_eq!(
-            label_of("The parser misses a `{` on line 3.\n{\"output\":\"findings\"}"),
+            label_of("The parser misses a `{` on line 3.\n{\"choice\":\"findings\"}"),
             "findings"
         );
         assert_eq!(
-            label_of("Open { and a \"quote.\n```json\n{\"output\":\"clean\"}\n```"),
+            label_of("Open { and a \"quote.\n```json\n{\"choice\":\"clean\"}\n```"),
             "clean"
         );
     }
@@ -1824,17 +1826,17 @@ mod json_object_tests {
     #[test]
     fn braces_in_strings_stay_inside_their_object() {
         let objects = json_objects(
-            "Report.\n{\"output\":\"findings\",\"data\":{\"note\":\"a } and a {\",\
-             \"nested\":{\"output\":\"inner\"}}}",
+            "Report.\n{\"choice\":\"findings\",\"additional_data\":{\"note\":\"a } and a {\",\
+             \"nested\":{\"choice\":\"inner\"}}}",
         );
         assert_eq!(objects.len(), 1);
-        assert_eq!(objects[0]["output"], json!("findings"));
-        assert_eq!(objects[0]["data"]["note"], json!("a } and a {"));
+        assert_eq!(objects[0]["choice"], json!("findings"));
+        assert_eq!(objects[0]["additional_data"]["note"], json!("a } and a {"));
     }
 
     #[test]
     fn a_text_full_of_unclosed_braces_is_read_in_linear_time() {
-        let text = format!("{}\n{{\"output\":\"findings\"}}", "{".repeat(200_000));
+        let text = format!("{}\n{{\"choice\":\"findings\"}}", "{".repeat(200_000));
         let started = std::time::Instant::now();
         let _ = json_objects(&text);
         let _ = super::clean_reply(&text);
@@ -1848,7 +1850,7 @@ mod json_object_tests {
     #[test]
     fn the_last_object_still_wins() {
         assert_eq!(
-            label_of("{\"output\":\"first\"} then { and {\"output\":\"second\"}"),
+            label_of("{\"choice\":\"first\"} then { and {\"choice\":\"second\"}"),
             "second"
         );
     }
@@ -1856,12 +1858,12 @@ mod json_object_tests {
 
 #[cfg(test)]
 mod reply_tests {
-    use super::{clean_reply, data_reply};
+    use super::{clean_reply, contract_reply};
     use crate::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
 
     #[test]
     fn a_long_reply_keeps_its_beginning_and_is_marked_cut() {
-        let text = format!("{}\n{{\"output\":\"findings\"}}", "a".repeat(70 * 1024));
+        let text = format!("{}\n{{\"choice\":\"findings\"}}", "a".repeat(70 * 1024));
         let reply = clean_reply(&text).expect("a reply");
         assert!(reply.ends_with(TRUNCATION_MARKER));
         assert_eq!(
@@ -1874,20 +1876,20 @@ mod reply_tests {
     #[test]
     fn reply_removes_the_contract_object_and_json_fence() {
         assert_eq!(
-            clean_reply("Report here.\n```json\n{\"output\":\"findings\"}\n```"),
+            clean_reply("Report here.\n```json\n{\"choice\":\"findings\"}\n```"),
             Some("Report here.".to_string())
         );
     }
 
     #[test]
     fn contract_only_text_has_no_reply() {
-        assert_eq!(clean_reply("{\"output\":\"clean\"}"), None);
+        assert_eq!(clean_reply("{\"choice\":\"clean\"}"), None);
     }
 
     #[test]
     fn an_unbalanced_brace_in_the_prose_does_not_hide_the_contract() {
         assert_eq!(
-            clean_reply("The parser misses a `{` on line 3.\n{\"output\":\"findings\"}"),
+            clean_reply("The parser misses a `{` on line 3.\n{\"choice\":\"findings\"}"),
             Some("The parser misses a `{` on line 3.".to_string())
         );
     }
@@ -1896,8 +1898,8 @@ mod reply_tests {
     fn braces_inside_the_contract_are_part_of_it() {
         assert_eq!(
             clean_reply(
-                "Report.\n{\"output\":\"findings\",\"data\":{\"note\":\"a } and a {\",\
-                 \"nested\":{\"output\":\"inner\"}}}"
+                "Report.\n{\"choice\":\"findings\",\"additional_data\":{\"note\":\"a } and a {\",\
+                 \"nested\":{\"choice\":\"inner\"}}}"
             ),
             Some("Report.".to_string())
         );
@@ -1906,11 +1908,11 @@ mod reply_tests {
     #[test]
     fn a_fenced_json_block_goes_with_the_contract() {
         assert_eq!(
-            clean_reply("Report.\n\n```JSON\n{\"output\":\"clean\"}\n```\n"),
+            clean_reply("Report.\n\n```JSON\n{\"choice\":\"clean\"}\n```\n"),
             Some("Report.".to_string())
         );
         assert_eq!(
-            clean_reply("Report.\n```\n{\"output\":\"clean\"}\n```"),
+            clean_reply("Report.\n```\n{\"choice\":\"clean\"}\n```"),
             Some("Report.".to_string())
         );
     }
@@ -1918,7 +1920,7 @@ mod reply_tests {
     #[test]
     fn an_earlier_code_block_stays_in_the_reply() {
         let text = "Fix it like this:\n```rust\nfn main() { println!(\"{}\", 1); }\n```\n\
-                    Done.\n{\"output\":\"findings\"}";
+                    Done.\n{\"choice\":\"findings\"}";
         assert_eq!(
             clean_reply(text),
             Some(
@@ -1930,29 +1932,37 @@ mod reply_tests {
 
     #[test]
     fn a_reply_that_is_a_code_block_keeps_its_fences() {
-        let text = "```text\nreport\n```\n{\"output\":\"findings\"}";
+        let text = "```text\nreport\n```\n{\"choice\":\"findings\"}";
         assert_eq!(clean_reply(text), Some("```text\nreport\n```".to_string()));
     }
 
     #[test]
     fn a_contract_followed_by_prose_is_still_removed() {
         assert_eq!(
-            clean_reply("Report.\n{\"output\":\"findings\"}\nThanks."),
+            clean_reply("Report.\n{\"choice\":\"findings\"}\nThanks."),
             Some("Report.\n\nThanks.".to_string())
         );
     }
 
     #[test]
-    fn data_stands_in_for_the_reply_of_a_contract_alone() {
+    fn the_reason_and_the_additional_data_stand_in_for_the_reply_of_a_contract_alone() {
         let data = serde_json::json!({ "findings": [{ "title": "Whitespace aborts startup" }] });
-        let reply = data_reply(&data).expect("a reply from data");
-        assert!(reply.contains("Whitespace aborts startup"));
+        let reply = contract_reply("one finding", data.as_object().expect("an object"))
+            .expect("a reply from the contract");
+        assert!(reply.starts_with("one finding\n\n"), "{reply}");
+        assert!(reply.contains("Whitespace aborts startup"), "{reply}");
     }
 
     #[test]
-    fn empty_data_gives_no_reply() {
-        assert_eq!(data_reply(&serde_json::Value::Null), None);
-        assert_eq!(data_reply(&serde_json::json!({})), None);
-        assert_eq!(data_reply(&serde_json::json!("  ")), None);
+    fn the_reason_alone_is_the_reply() {
+        assert_eq!(
+            contract_reply("all checks", &serde_json::Map::new()),
+            Some("all checks".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_contract_gives_no_reply() {
+        assert_eq!(contract_reply("", &serde_json::Map::new()), None);
     }
 }

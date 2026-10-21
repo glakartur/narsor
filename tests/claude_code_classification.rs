@@ -589,7 +589,7 @@ fn structured_output_calls_summarise_the_answer() {
         .filter(|(_, tool, _)| tool == "StructuredOutput")
         .map(|(_, _, summary)| summary)
         .collect();
-    assert_eq!(summaries, ["output: finished", "output: done"]);
+    assert_eq!(summaries, ["choice: finished", "choice: done"]);
 
     let awaiting = tool_calls(&classify_all(&recording("schema_awaiting.ndjson")))
         .into_iter()
@@ -759,7 +759,7 @@ fn the_harness_run_is_still_accumulated() {
     }
     let run = parser.finish(0, "");
     assert_eq!(run.failure, None);
-    assert_eq!(run.text, r#"{"output":"done","data":{"lines":3}}"#);
+    assert_eq!(run.text, r#"{"choice":"done","additional_data":{"lines":3}}"#);
     assert_eq!(run.reply.as_deref(), Some("Plik `notes.txt` ma 3 linie (`wc -l` zwróciło 3). Treść: `alpha`, `beta`, `gamma needle`."));
     assert!(run.session_id.is_some());
 
@@ -790,8 +790,8 @@ fn a_schema_run_reports_its_structured_output() {
 
     assert_eq!(run.failure, None);
     let output = run.structured_output.expect("a structured output");
-    assert_eq!(output["output"], "done");
-    assert!(output["data"].is_object(), "{output}");
+    assert_eq!(output["choice"], "done");
+    assert!(output["additional_data"].is_object(), "{output}");
 }
 
 #[test]
@@ -893,7 +893,7 @@ fn a_subagents_messages_are_not_the_reply() {
             subagent,
             assistant(json!([{"type": "text", "text": "The final report."}])),
         ],
-        r#"{"output":"done"}"#,
+        r#"{"choice":"done"}"#,
     );
 
     assert_eq!(run.reply.as_deref(), Some("The final report."));
@@ -909,7 +909,7 @@ fn only_the_prose_after_the_last_tool_call_is_the_reply() {
             ])),
             assistant(json!([{"type": "text", "text": "All green."}])),
         ],
-        r#"{"output":"done"}"#,
+        r#"{"choice":"done"}"#,
     );
 
     assert_eq!(run.reply.as_deref(), Some("All green."));

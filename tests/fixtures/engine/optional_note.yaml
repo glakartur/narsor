@@ -29,7 +29,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "ok", "variables": {"echoed": "[{{ context.note }}]"}}'
+        - '{"choice": "ok", "variables": {"echoed": "[{{ context.note }}]"}}'
     choices:
       - ok
     transitions:

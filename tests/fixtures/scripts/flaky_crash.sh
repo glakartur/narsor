@@ -12,4 +12,4 @@ if [ "$count" -le "$2" ]; then
     kill -9 $$
 fi
 
-printf '{"output": "success", "variables": {"attempts": %s}}\n' "$count"
+printf '{"choice": "success", "variables": {"attempts": %s}}\n' "$count"

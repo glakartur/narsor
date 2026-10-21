@@ -10,7 +10,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "weird"}'
+        - '{"choice": "weird"}'
     choices:
       - ok
       - broken

@@ -17,4 +17,4 @@ if [ "$count" -le "$3" ]; then
     kill -9 $$
 fi
 
-printf '{"output": "success"}\n'
+printf '{"choice": "success"}\n'

@@ -1505,13 +1505,9 @@ fn resume_inner(
     store.clear_pending_input(execution_id)?;
 
     let result = ActionResult {
-        output_label: label,
         data,
         variables,
-        exit_code: None,
-        stdout: String::new(),
-        stderr: String::new(),
-        reply: None,
+        ..ActionResult::new(label)
     };
 
     Ok(ResumedHumanAction {

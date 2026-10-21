@@ -792,7 +792,7 @@ fn slow_definition(root: &TempRoot) -> (WorkflowDefinition, PathBuf) {
     let script_path = root.join("slow.sh");
     fs::write(
         &script_path,
-        "#!/bin/sh\nsleep 0.3\nprintf '{\"output\": \"done\"}\\n'\nexit 0\n",
+        "#!/bin/sh\nsleep 0.3\nprintf '{\"choice\": \"done\"}\\n'\nexit 0\n",
     )
     .expect("write the slow script");
     #[cfg(unix)]

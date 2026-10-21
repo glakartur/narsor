@@ -686,7 +686,7 @@ states:
       command: "{command}"
       args:
         - "{seconds}"
-        - '{{"output": "done"}}'
+        - '{{"choice": "done"}}'
     choices:
       - done
     transitions:
@@ -1063,7 +1063,7 @@ async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
             "subtype": "success",
             "is_error": false,
             "session_id": "fake-session-1",
-            "result": r#"{"output":"implemented"}"#,
+            "result": r#"{"choice":"implemented"}"#,
         })
         .to_string(),
     )
@@ -1502,7 +1502,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "printf '{\"output\": \"ok\"}'"]
+      args: [-c, "printf '{\"choice\": \"ok\"}'"]
     choices: [ok, rejected]
     transitions:
       ok: completed

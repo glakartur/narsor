@@ -10,7 +10,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "rejected", "variables": {"reason": "reviewer said no"}}'
+        - '{"choice": "rejected", "variables": {"reason": "reviewer said no"}}'
     choices:
       - ok
       - rejected

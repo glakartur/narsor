@@ -458,7 +458,7 @@ states:
         - |
           mkdir -p "$NARSOR_OUTBOX_DIR/report"
           printf 'temporary documentation' > "$NARSOR_OUTBOX_DIR/report/notes.md"
-          printf '{"output": "done"}'
+          printf '{"choice": "done"}'
     choices: [done]
     transitions:
       done: gate
@@ -466,7 +466,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "printf '{\"output\": \"ok\"}'"]
+      args: [-c, "printf '{\"choice\": \"ok\"}'"]
     choices: [ok, rejected]
     transitions:
       ok: completed

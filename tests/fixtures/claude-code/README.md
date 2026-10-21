@@ -23,8 +23,14 @@ ich nazw. Narsor tej flagi nie przekazuje. Kształt linii jest taki sam.
 Schemat dla scenariuszy `schema_*` (wersja płaska, patrz niżej):
 
 ```json
-{"type":"object","properties":{"output":{"type":"string","enum":["done","blocked"]},"data":{"type":"object"},"variables":{"type":"object"},"artifacts":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["awaiting_input"]},"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}
+{"type":"object","properties":{"choice":{"type":"string","enum":["done","blocked"]},"reason":{"type":"string"},"variables":{"type":"object"},"artifacts":{"type":"object","additionalProperties":{"type":"string"}},"additional_data":{"type":"object"},"additional_artifacts":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["awaiting_input"]},"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}
 ```
+
+Nagrania powstały ze starym kontraktem (klucze `output` i `data`). Po zmianie kontraktu odpowiedzi
+w nagraniach zmieniono tylko nazwy kluczy odpowiedzi agenta: `output` na `choice` i `data` na
+`additional_data` (w `StructuredOutput.input`, w `structured_output`, w tekście `result` i w
+komunikacie błędu schematu). Pole `output` w liniach `hook_response` jest polem CLI i zostało bez
+zmian. Kształt linii się nie zmienił.
 
 Prompty `schema_*` mają na końcu skrócony tekstowy kontrakt wyjścia (label `done` albo `blocked`,
 albo `awaiting_input`).
@@ -39,7 +45,7 @@ albo `awaiting_input`).
 | `max_turns.ndjson` | `--max-turns 1 --permission-mode acceptEdits` | `result` z `subtype: error_max_turns`, `is_error: true`, `errors[]`, bez pola `result`; kod wyjścia 1 |
 | `ask_user_question.ndjson` | `--permission-mode acceptEdits` | prośba o `AskUserQuestion`: agent woła `ToolSearch`, narzędzia nie ma, agent pyta tekstem |
 | `plan_mode.ndjson` | `--permission-mode plan` | tryb `plan`: agent pisze plan przez `Write` do `~/.claude/plans/…`, nie zmienia projektu |
-| `schema_done.ndjson` | `--json-schema <schemat> --permission-mode acceptEdits` | `structured_output` z `output: done` i `data` |
+| `schema_done.ndjson` | `--json-schema <schemat> --permission-mode acceptEdits` | `structured_output` z `choice: done` i `additional_data` |
 | `schema_awaiting.ndjson` | `--json-schema <schemat> --permission-mode acceptEdits` | `structured_output` z `status: awaiting_input`, `question`, `options` |
 | `schema_resume.ndjson` | `--json-schema <schemat> --resume <sesja schema_done> --permission-mode acceptEdits` | schemat działa po `--resume`; hooki `SessionStart:resume` |
 | `schema_plan_resume.ndjson` | `--json-schema <schemat> --resume <sesja schema_done> --permission-mode plan` | kształt repromptu narsora (tekst `OUTPUT_REPROMPT`) |
@@ -57,7 +63,7 @@ albo `awaiting_input`).
    linię `user` z `isSynthetic: true` i tekstem `[structured-output-enforce] You MUST call the
    StructuredOutput tool…`.
 3. **Niezgodność ze schematem.** CLI waliduje `input`. Przy niezgodności `tool_result` ma
-   `is_error: true` i treść `Output does not match required schema: /output: must be equal to one of
+   `is_error: true` i treść `Output does not match required schema: /choice: must be equal to one of
    the allowed values: [...]`. Model próbuje ponownie (`schema_mismatch.ndjson`). Narsor musi nadal
    sprawdzić wynik sam (R11), bo nie wiemy, co CLI robi po wyczerpaniu prób.
 4. **Słowa kluczowe schematu.** `anyOf`, `oneOf` i `allOf` na najwyższym poziomie są odrzucane przez

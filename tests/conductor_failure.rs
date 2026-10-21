@@ -509,7 +509,7 @@ async fn the_conductors_retry_is_one_attempt_that_can_complete_the_step() {
     fixture
         .fake
         .fails(1, HARNESS_DOWN)
-        .on_call(3, 0, &envelope(r#"{"output": "implemented"}"#));
+        .on_call(3, 0, &envelope(r#"{"choice": "implemented"}"#));
 
     let execution = fixture.run().await;
     assert_eq!(execution.status, ExecutionStatus::Failed);
@@ -676,7 +676,7 @@ async fn an_operators_recovery_before_the_conductors_retry_leaves_it_stale() {
     fixture
         .fake
         .fails(1, HARNESS_DOWN)
-        .on_call(3, 0, &envelope(r#"{"output": "implemented"}"#));
+        .on_call(3, 0, &envelope(r#"{"choice": "implemented"}"#));
 
     let started = fixture.conductor.started.notified();
     let execution = fixture.run().await;

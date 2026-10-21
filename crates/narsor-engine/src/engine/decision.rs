@@ -225,15 +225,7 @@ mod tests {
     }
 
     fn result(label: &str) -> ActionResult {
-        ActionResult {
-            output_label: label.to_string(),
-            data: serde_json::Value::Null,
-            variables: serde_json::Map::new(),
-            exit_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            reply: None,
-        }
+        ActionResult::new(label)
     }
 
     #[test]

@@ -382,6 +382,7 @@ impl Engine {
                     // The conductor settles the label, not what the agent
                     // said (R3).
                     reply: rescue.reply.clone(),
+                    ..ActionResult::default()
                 };
                 match self.record_result(execution, state, rescue.episode().to_string(), result)? {
                     Some(pending) => {

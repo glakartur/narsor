@@ -18,7 +18,7 @@ use narsor_engine::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATI
 use narsor_engine::engine::actions::TIMEOUT_LABEL;
 use narsor_engine::engine::{ActionExecutor, ActionOutcome, ActionRequest, ScriptExecutor};
 use narsor_engine::workflow::TemplateScope;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -142,7 +142,7 @@ async fn unmapped_non_zero_exit_code_falls_back_to_failure() {
 async fn json_on_stdout_supplies_the_label_and_its_variables() {
     let root = TempRoot::new();
 
-    let payload = r#"{"output":"success","variables":{"pr_number":123}}"#;
+    let payload = r#"{"choice":"success","variables":{"pr_number":123}}"#;
     let result = complete(script("print_json.sh", &[payload]), &root.workspace()).await;
 
     assert_eq!(result.output_label, "success");
@@ -153,7 +153,7 @@ async fn json_on_stdout_supplies_the_label_and_its_variables() {
 async fn json_on_stdout_beats_the_exit_code_mapping() {
     let root = TempRoot::new();
 
-    let payload = r#"{"output":"needs_human","data":{"findings":3}}"#;
+    let payload = r#"{"choice":"needs_human","additional_data":{"findings":3}}"#;
     let mut config = script("print_json.sh", &[payload, "3"]);
     config.exit_codes.insert(3, "failure".to_string());
 
@@ -161,7 +161,64 @@ async fn json_on_stdout_beats_the_exit_code_mapping() {
 
     assert_eq!(result.output_label, "needs_human");
     assert_eq!(result.exit_code, Some(3));
-    assert_eq!(result.data, json!({"findings": 3}));
+    assert_eq!(result.additional_data.get("findings"), Some(&json!(3)));
+}
+
+/// KTD3: a script answers with the agent's contract, `reason` included.
+#[tokio::test]
+async fn a_script_choice_brings_its_reason() {
+    let root = TempRoot::new();
+
+    let payload = r#"{"choice":"green","reason":"all checks"}"#;
+    let result = complete(script("print_json.sh", &[payload]), &root.workspace()).await;
+
+    assert_eq!(result.output_label, "green");
+    assert_eq!(result.reason, "all checks");
+}
+
+#[tokio::test]
+async fn a_script_names_its_artifacts_and_lists_additional_ones() {
+    let root = TempRoot::new();
+
+    let payload = r#"{"choice":"created","artifacts":{"pull_request":"https://example.invalid/pr/1"},
+                      "additional_artifacts":["logs/build.txt"]}"#;
+    let result = complete(script("print_json.sh", &[payload]), &root.workspace()).await;
+
+    assert_eq!(
+        result.artifacts.get("pull_request").map(String::as_str),
+        Some("https://example.invalid/pr/1")
+    );
+    assert_eq!(result.additional_artifacts, vec!["logs/build.txt".to_string()]);
+}
+
+/// A choice whose other fields have the wrong shape is an error, not a
+/// quiet fall-back that would lose part of the answer.
+#[tokio::test]
+async fn a_choice_with_malformed_artifacts_is_an_action_error() {
+    let root = TempRoot::new();
+
+    let payload = r#"{"choice":"created","artifacts":["logs/build.txt"]}"#;
+    let error = execute(script("print_json.sh", &[payload]), &root.workspace(), None)
+        .await
+        .expect_err("a malformed answer is an error");
+
+    assert_eq!(error.error_type.as_deref(), Some("invalid_script_output"));
+    assert!(error.message.contains("'artifacts'"), "{}", error.message);
+}
+
+/// R22: the old `output` key is not the contract any more; the exit code
+/// decides.
+#[tokio::test]
+async fn the_old_output_key_falls_back_to_the_exit_code() {
+    let root = TempRoot::new();
+
+    let result = complete(
+        script("print_json.sh", &[r#"{"output":"needs_human"}"#]),
+        &root.workspace(),
+    )
+    .await;
+
+    assert_eq!(result.output_label, "success");
 }
 
 #[tokio::test]
@@ -212,7 +269,7 @@ async fn non_json_stdout_falls_back_to_the_exit_code() {
 }
 
 #[tokio::test]
-async fn json_without_an_output_key_falls_back_to_the_exit_code() {
+async fn json_without_a_choice_key_falls_back_to_the_exit_code() {
     let root = TempRoot::new();
 
     let mut config = script("print_json.sh", &[r#"{"status":"ok","count":2}"#, "5"]);
@@ -221,7 +278,7 @@ async fn json_without_an_output_key_falls_back_to_the_exit_code() {
     let result = complete(config, &root.workspace()).await;
 
     assert_eq!(result.output_label, "needs_human");
-    assert_eq!(result.data, Value::Null);
+    assert!(result.additional_data.is_empty());
 }
 
 #[tokio::test]

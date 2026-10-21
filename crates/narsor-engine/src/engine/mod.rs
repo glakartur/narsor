@@ -39,11 +39,11 @@ pub use timeline::{
 };
 
 pub use actions::{
-    ActionExecutor, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor, AgentOutput,
+    ActionExecutor, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor, ChoiceAnswer,
     ClaudeCodeAdapter, CodexAdapter, ConductorAnalysis, DefaultHarnessSource, HarnessAdapter,
     HarnessInvocation, HarnessRegistry, HarnessRequest, HarnessRun, HumanActionError,
     HumanExecutor, HumanInputDelivery, HumanInputRequest, InputContinuation, LoggingEventSink,
     OpenCodeAdapter, OutputProblem, OutputRequirement, PendingHumanInput, PermissionDecision,
     PermissionDecisionKind, PermissionGrantScope, RejectedAnswer, ResumedHumanAction,
-    ScriptExecutor, SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR,
+    ScriptExecutor, StepContract, SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR,
 };

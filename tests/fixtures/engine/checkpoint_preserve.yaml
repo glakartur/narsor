@@ -19,7 +19,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "done"}'
+        - '{"choice": "done"}'
     choices:
       - done
     transitions:

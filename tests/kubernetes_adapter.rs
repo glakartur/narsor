@@ -56,7 +56,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"output\": \"done\"}'"]
+      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"choice\": \"done\"}'"]
     choices: [done]
     transitions:
       done: completed
@@ -1774,7 +1774,7 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"output\": \"ok\"}'"]
+      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"choice\": \"ok\"}'"]
     choices: [ok, rejected]
     transitions:
       ok: completed

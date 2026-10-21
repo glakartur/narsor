@@ -15,7 +15,7 @@ states:
       command: ./sleep_then_emit.sh
       args:
         - '2'
-        - '{"output": "done"}'
+        - '{"choice": "done"}'
     choices:
       - done
     transitions:

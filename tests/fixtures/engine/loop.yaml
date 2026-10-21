@@ -26,7 +26,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "fixed", "variables": {"fixed": true}}'
+        - '{"choice": "fixed", "variables": {"fixed": true}}'
     choices:
       - fixed
     transitions:
