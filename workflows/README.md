@@ -5,11 +5,11 @@ real agentic development processes rather than invented ones:
 
 | File | Process | Source material |
 |---|---|---|
-| `compound-engineering.yaml` | Five stages on one Draft merge request: requirements → plan → implementation → learning → finalize (auto-merge after a green pipeline), with a person at the end of each stage | the `ce-*` skills of the `compound-engineering` plugin, and `glab` |
+| `compound-engineering.yaml` | Five stages on one Draft pull request (merge request on GitLab): requirements → plan → implementation → learning → finalize (auto-merge after a green pipeline), with a person at the end of each stage | the `ce-*` skills of the `compound-engineering` plugin, and `gh` (GitHub) or `glab` (GitLab) |
 | `open-mercato-sdlc.yaml` | The Open Mercato ticket lifecycle: Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | [`SDLC.md`](https://github.com/open-mercato/skills) and the `om-*` skills |
 
 Both validate with zero violations and both are exercised end to end in
-`tests/workflows.rs` against a fake harness and a fake `glab` — no real
+`tests/workflows.rs` against a fake harness and no real
 `claude`, `git`, `gh` or `glab` is ever run by the tests.
 
 ## Harness and skills prerequisites
@@ -31,11 +31,17 @@ Open Mercato workflow needs the referenced `om-*` skills available to the
 selected harness. Narsor does not install, translate, or migrate those skills;
 an operator should install compatible packages before running the workflow.
 
-The compound-engineering workflow targets GitLab. Its `finalize` and
-`disarm_merge` steps are scripts that call `glab` directly, so the place where
-the steps run needs `glab` authenticated for the project, under an identity
-that may approve the merge request and set auto-merge. Without that,
+The compound-engineering workflow works on GitHub and on GitLab. Its `finalize`
+and `disarm_merge` steps are agent steps: the agent finds the host from `pr_url`
+and the `origin` remote, then uses `gh` (GitHub) or `glab` (GitLab). The place
+where the steps run needs that tool authenticated, under an identity that may
+approve the pull request and set auto-merge. GitHub also needs auto-merge
+enabled in the repository, with branch protection rules. Without that,
 `finalize` stops at `finalize_blocked` with the reason.
+
+The agent keeps to the limits written in the prompt (validated `pr_url`, a
+closed list of host operations, no `git merge`, no push). The prompt is not a
+technical barrier. For this workflow, use an account with minimal permissions.
 
 ## Running one
 
@@ -136,16 +142,16 @@ Learning: `compound` either documents (`documented` → publish) or has nothing
 to document and goes straight to `finalize`. `drop` at the gate removes the
 document through `drop_learning` and then finalizes.
 
-Finalize is a script with `glab`, not an agent: it marks the merge request
-ready, approves it and sets auto-merge, which merges when the pipeline
-succeeds. It then reads the merge request until it is merged, the pipeline
-fails, it conflicts with its target branch, or an hour has passed
-(`FINALIZE_WAIT_SECS`, `FINALIZE_POLL_SECS`). The merge request number, project
-and target branch come from `pr_url` and the merge request, never from a branch
-name. On any result other than `merged`, the script cancels auto-merge,
-restores the Draft and reads the merge request once more, so it never merges
-without a person; if it merged meanwhile, the result is `merged`. A retried
-finalize first checks whether the merge request is already merged.
+Finalize is an agent step (`workspace_access: read-only`): it takes the pull
+request out of Draft, approves it and sets auto-merge, which merges when the
+checks succeed. It then reads the pull request until it is merged, the checks
+fail, it conflicts with its target branch, or an hour has passed (the 60-minute
+wait limit is written in the prompt and must stay below the step timeout). The
+number, repository and target branch come from `pr_url` and the pull request,
+never from a branch name. On any result other than `merged`, the agent cancels
+auto-merge, restores the Draft and reads the pull request once more, so it never
+merges without a person; if it merged meanwhile, the result is `merged`. A
+retried finalize first checks whether the pull request is already merged.
 `pipeline_failed` and `conflict` go to `repair_merge`, `blocked` to the
 `finalize_blocked` gate. The step has `timeout: 70m`: if the engine stops it,
 its clean-up never runs, so the `timeout` choice goes to `disarm_merge`, which
@@ -154,7 +160,7 @@ cancels auto-merge, restores the Draft and reads the state.
 Loop limits (`max_entries`): `code_review` 10, `repair_verification` 5,
 `repair_merge` 3. Terminals: `finished` (merged, completed), `cancelled`
 (`abandon` at a gate) and `not_merged` (`finish_unmerged`, cancelled).
-`abandon` does not close the merge request.
+`abandon` does not close the pull request.
 
 The graph is drawn in `compound-engineering-flow.html`.
 

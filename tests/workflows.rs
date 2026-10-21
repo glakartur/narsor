@@ -8,13 +8,15 @@
 //! contract names every declared label with its description, and each one runs
 //! end to end.
 //!
-//! **No real harness and no real `git`/`glab` is ever run here.** The agent
-//! states are driven by `tests/fixtures/harness/fake_harness.sh` through
+//! **No real harness and no real `git`, `gh` or `glab` is ever run here.** The
+//! agent states, `finalize` and `disarm_merge` included, are driven by
+//! `tests/fixtures/harness/fake_harness.sh` through
 //! [`ClaudeCodeAdapter::with_program`], the way `tests/actions_agent.rs` does
-//! it. The script states run in a temporary workspace: `verify_work` finds no
-//! `scripts/verify.sh` there, and `finalize` and `disarm_merge` find
-//! `tests/fixtures/glab/fake_glab.sh` first on their `PATH` (it needs `jq`).
-//! Nothing is ever written into the repository.
+//! it. A test cannot check what a real agent does on a repository host, so the
+//! `finalize` tests check the prompt contract and the transitions that follow
+//! each answer. The script states run in a temporary workspace: `verify_work`
+//! finds no `scripts/verify.sh` there. Nothing is ever written into the
+//! repository.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -558,9 +560,11 @@ async fn run_to_terminal(
 // The compound engineering pipeline
 // ---------------------------------------------------------------------------
 
-/// The merge request every publish step reports. `finalize` reads its number
+/// The pull request every publish step reports. `finalize` reads its number
 /// and project from this URL, never from a branch name.
 const PR_URL: &str = "https://gitlab.example.test/acme/web/-/merge_requests/7";
+/// The same pull request on GitHub.
+const GITHUB_PR_URL: &str = "https://github.com/acme/web/pull/12";
 const REQUIREMENTS_DOC: &str = "docs/brainstorms/2026-10-21-subscribe-requirements.md";
 const PLAN_DOC: &str = "docs/plans/2026-10-21-subscribe-plan.md";
 const LEARNING_DOC: &str = "docs/solutions/2026-10-21-subscribe-learning.md";
@@ -680,136 +684,28 @@ fn gates_up_to_compound() -> Vec<Answer> {
     .concat()
 }
 
-/// The merge request as `glab mr view -F json` prints it.
-fn merge_request(state: &str, pipeline: &str) -> Value {
-    json!({
-        "iid": 7,
-        "project_id": 42,
-        "state": state,
-        "draft": false,
-        "target_branch": "develop",
-        "has_conflicts": false,
-        "detailed_merge_status": "ci_still_running",
-        "merge_when_pipeline_succeeds": true,
-        "head_pipeline": { "status": pipeline },
-    })
-}
-
-fn open_merge_request() -> Value {
-    merge_request("opened", "running")
-}
-
-fn merged_merge_request() -> Value {
-    merge_request("merged", "success")
-}
-
-/// The fake `glab` of `tests/fixtures/glab/fake_glab.sh`, installed as `glab`
-/// in a directory of its own.
-struct FakeGlab {
-    dir: PathBuf,
-}
-
-impl FakeGlab {
-    /// Installs the fixture and has the n-th `glab mr view` print the n-th
-    /// merge request, and the last one from then on.
-    fn serving(dir: PathBuf, views: &[Value]) -> Self {
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glab/fake_glab.sh");
-        let temp = dir.join(format!(".glab.{}.tmp", uuid::Uuid::new_v4()));
-        fs::copy(&source, &temp).expect("copy the fake glab");
-        fs::rename(&temp, dir.join("glab")).expect("move the fake glab into place");
-
-        for (index, view) in views.iter().enumerate() {
-            fs::write(dir.join(format!("view.{}", index + 1)), view.to_string())
-                .expect("write a merge request view");
-        }
-        let last = views.last().expect("at least one merge request view");
-        fs::write(dir.join("view"), last.to_string()).expect("write the fallback view");
-
-        Self { dir }
-    }
-
-    /// Makes `glab mr <command>` sleep before it answers.
-    fn hanging_on(self, command: &str, seconds: u32) -> Self {
-        fs::write(self.dir.join(format!("hang.{command}")), seconds.to_string())
-            .expect("write the hang file");
-        self
-    }
-
-    /// The `PATH` a step sees: this directory first.
-    fn path(&self) -> String {
-        format!(
-            "{}:{}",
-            self.dir.display(),
-            std::env::var("PATH").unwrap_or_default()
-        )
-    }
-
-    /// Every call so far, one line of arguments each.
-    fn calls(&self) -> Vec<String> {
-        fs::read_to_string(self.dir.join("calls"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// How many calls start with `prefix` (e.g. `mr approve`).
-    fn count(&self, prefix: &str) -> usize {
-        self.calls()
-            .iter()
-            .filter(|call| call.starts_with(prefix))
-            .count()
-    }
-
-    /// Whether auto-merge was cancelled and the Draft flag restored.
-    fn disarmed(&self) -> bool {
-        let calls = self.calls();
-        calls
-            .iter()
-            .any(|call| call.contains("cancel_merge_when_pipeline_succeeds"))
-            && calls
-                .iter()
-                .any(|call| call.starts_with("mr update") && call.contains("--draft"))
-    }
-}
-
-/// One run of the shipped compound pipeline against the fake harness and the
-/// fake `glab`.
+/// One run of the shipped compound pipeline against the fake harness.
 struct CompoundRun {
     root: TempRoot,
     harness_dir: PathBuf,
-    glab: FakeGlab,
     engine: Engine,
     definition: WorkflowDefinition,
 }
 
 impl CompoundRun {
-    /// `replies` answers the agent calls in order; `views` is what `glab`
-    /// reports about the merge request. `finalize` waits for no result at all
-    /// (`FINALIZE_WAIT_SECS=0`): it reads the merge request once after setting
-    /// auto-merge, so every outcome is decided by `views`.
-    fn new(replies: &[Value], views: &[Value]) -> Self {
+    /// `replies` answers the agent calls in order, `finalize` and
+    /// `disarm_merge` among them.
+    fn new(replies: &[Value]) -> Self {
         let root = TempRoot::new();
         let harness_dir = root.dir("harness");
         let harness = FakeHarness::answering_in(harness_dir.clone(), replies);
         let engine = harness.engine(root.dir("store"));
-        let glab = FakeGlab::serving(root.dir("glab"), views);
-
-        let mut definition = shipped("compound-engineering.yaml");
-        for step in ["finalize", "disarm_merge"] {
-            let env = &mut script_config(&mut definition, step).env;
-            env.insert("PATH".to_string(), glab.path());
-            env.insert("FINALIZE_WAIT_SECS".to_string(), "0".to_string());
-            env.insert("FINALIZE_POLL_SECS".to_string(), "0".to_string());
-        }
 
         Self {
             root,
             harness_dir,
-            glab,
             engine,
-            definition,
+            definition: shipped("compound-engineering.yaml"),
         }
     }
 
@@ -823,8 +719,10 @@ impl CompoundRun {
         self
     }
 
-    fn with_glab(mut self, configure: impl FnOnce(FakeGlab) -> FakeGlab) -> Self {
-        self.glab = configure(self.glab);
+    /// Makes the n-th agent call sleep after it answers, past a time limit.
+    fn with_call_hanging(self, call: usize, seconds: u32) -> Self {
+        fs::write(self.harness_dir.join(format!("sleep.{call}")), seconds.to_string())
+            .expect("write the sleep file");
         self
     }
 
@@ -881,25 +779,19 @@ impl CompoundRun {
     }
 }
 
-/// The script configuration of a step, to point it at the fake `glab`.
-fn script_config<'a>(
-    definition: &'a mut WorkflowDefinition,
-    step: &str,
-) -> &'a mut narsor_engine::domain::ScriptActionConfig {
-    match definition.states.get_mut(step).map(|state| &mut state.action) {
-        Some(Some(ActionConfig::Script(config))) => config,
-        _ => panic!("'{step}' is a script step"),
-    }
-}
-
 #[tokio::test]
 async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates_and_merges() {
     let replies = [
         replies_up_to_compound(),
-        vec![documented(), published(), reply("no_feedback")],
+        vec![
+            documented(),
+            published(),
+            reply("no_feedback"),
+            reply("merged"),
+        ],
     ]
     .concat();
-    let run = CompoundRun::new(&replies, &[open_merge_request(), merged_merge_request()]);
+    let run = CompoundRun::new(&replies);
     let gates = [
         gates_up_to_compound(),
         vec![Answer::new(
@@ -918,21 +810,10 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates_and_mer
     assert_eq!(
         execution.context.variables.get("pr_url"),
         Some(&json!(PR_URL)),
-        "the display reads the merge request from the context"
+        "the display reads the pull request from the context"
     );
-    // finalize takes the merge request out of Draft, approves it and sets
-    // auto-merge — and, merged, leaves it armed.
-    assert_eq!(run.glab.count("mr update 7"), 1, "{:?}", run.glab.calls());
-    assert!(run.glab.calls().iter().any(|call| call.contains("--ready")));
-    assert_eq!(run.glab.count("mr approve 7"), 1);
-    assert_eq!(run.glab.count("mr merge 7"), 1);
-    assert!(run
-        .glab
-        .calls()
-        .iter()
-        .any(|call| call.starts_with("mr merge") && call.contains("--auto-merge")));
-    assert!(!run.glab.disarmed(), "a merged request is not disarmed");
     // The documents the agents returned are named in the later prompts.
+    assert!(run.prompt(17).contains(PR_URL), "finalize names the pull request");
     assert!(run.prompt(2).contains(REQUIREMENTS_DOC), "doc_review names the requirements");
     assert!(run.prompt(5).contains(REQUIREMENTS_DOC), "plan names the requirements");
     assert!(run.prompt(6).contains(PLAN_DOC), "plan_review names the plan");
@@ -942,8 +823,12 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates_and_mer
 /// Covers AE8.
 #[tokio::test]
 async fn covers_ae8_nothing_to_document_goes_to_finalize_not_to_finished() {
-    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
-    let run = CompoundRun::new(&replies, &[open_merge_request(), merged_merge_request()]);
+    let replies = [
+        replies_up_to_compound(),
+        vec![reply("nothing_to_document"), reply("merged")],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies);
 
     let execution = run.run(&gates_up_to_compound()).await;
 
@@ -991,7 +876,7 @@ async fn blockers_reach_the_author_of_the_stage_and_do_not_come_back() {
         )],
     ]
     .concat();
-    let run = CompoundRun::new(&replies, &[open_merge_request()]);
+    let run = CompoundRun::new(&replies);
 
     let execution = run
         .run(&[requirements_gates(), plan_gates(), requirements_gates()].concat())
@@ -1019,7 +904,7 @@ async fn revise_requirements_at_the_plan_gate_resumes_the_brainstorm_session() {
         // 8. brainstorm, resumed: no answer, the run stops there
     ]
     .concat();
-    let run = CompoundRun::new(&replies, &[open_merge_request()]);
+    let run = CompoundRun::new(&replies);
 
     let execution = run
         .run(
@@ -1059,7 +944,7 @@ async fn a_skipped_requirements_review_goes_straight_to_publication() {
     );
     // brainstorm, publish_requirements; the run stops at the feedback check.
     let replies = [ready, published()];
-    let run = CompoundRun::new(&replies, &[open_merge_request()]);
+    let run = CompoundRun::new(&replies);
 
     let execution = run.run(&requirements_gates()).await;
 
@@ -1075,10 +960,10 @@ async fn a_skipped_requirements_review_goes_straight_to_publication() {
 async fn dropping_the_learning_removes_it_and_goes_on_to_finalize() {
     let replies = [
         replies_up_to_compound(),
-        vec![documented(), published(), reply("dropped")],
+        vec![documented(), published(), reply("dropped"), reply("merged")],
     ]
     .concat();
-    let run = CompoundRun::new(&replies, &[open_merge_request(), merged_merge_request()]);
+    let run = CompoundRun::new(&replies);
     let gates = [
         gates_up_to_compound(),
         vec![Answer::new("approve_learning", &[("learning_decision", "drop")])],
@@ -1096,61 +981,72 @@ async fn dropping_the_learning_removes_it_and_goes_on_to_finalize() {
     assert_eq!(execution.current_state.as_deref(), Some("finished"));
 }
 
-/// Covers AE7: a failed pipeline is a repair, and the merge is disarmed first.
+/// The agent calls up to `finalize`, which is call 15 when `compound` finds
+/// nothing to document.
+fn replies_up_to_finalize() -> Vec<Value> {
+    [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat()
+}
+
+/// Covers AE4: a failed pipeline is a repair, and `repair_merge` reads why
+/// `finalize` stopped.
 #[tokio::test]
-async fn covers_ae7_a_failed_pipeline_disarms_the_merge_and_goes_to_repair() {
-    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
-    let run = CompoundRun::new(
-        &replies,
-        &[
-            open_merge_request(),
-            merge_request("opened", "failed"),
-            merge_request("opened", "failed"),
-        ],
+async fn covers_ae4_a_failed_pipeline_goes_to_repair_with_the_reason() {
+    let failed = reply_with(
+        "pipeline_failed",
+        json!({ "reason": "the pipeline of the pull request ended failed" }),
     );
+    let replies = [replies_up_to_finalize(), vec![failed]].concat();
+    let run = CompoundRun::new(&replies);
 
     let execution = run.run(&gates_up_to_compound()).await;
 
     assert!(run.took(&execution.id, "finalize", "pipeline_failed", "repair_merge"));
-    assert!(run.glab.disarmed(), "{:?}", run.glab.calls());
     assert!(
-        run.prompt(15).contains("pipeline"),
-        "repair_merge reads why finalize stopped"
+        run.prompt(16).contains("the pipeline of the pull request ended failed"),
+        "repair_merge reads why finalize stopped: {}",
+        run.prompt(16)
     );
 }
 
-/// Covers AE7: no result within the limit is `blocked`, and the gate after
-/// it shows the reason `finalize` gave.
 #[tokio::test]
-async fn covers_ae7_no_result_within_the_limit_stops_at_the_blocked_gate_with_its_reason() {
-    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
-    let run = CompoundRun::new(&replies, &[open_merge_request()]);
+async fn a_conflict_goes_to_repair() {
+    let replies = [replies_up_to_finalize(), vec![reply("conflict")]].concat();
+    let run = CompoundRun::new(&replies);
+
+    let execution = run.run(&gates_up_to_compound()).await;
+    eprintln!("DEBUG {execution:#?}");
+
+    assert!(run.took(&execution.id, "finalize", "conflict", "repair_merge"));
+}
+
+/// Covers AE3: a missing tool is `blocked`, and the gate after it shows the
+/// reason `finalize` gave.
+#[tokio::test]
+async fn covers_ae3_a_blocked_finalize_stops_at_the_gate_with_its_reason() {
+    let blocked = reply_with("blocked", json!({ "reason": "gh is not installed where the step runs" }));
+    let replies = [replies_up_to_finalize(), vec![blocked]].concat();
+    let run = CompoundRun::new(&replies);
 
     let execution = run.run(&gates_up_to_compound()).await;
 
     assert!(run.took(&execution.id, "finalize", "blocked", "finalize_blocked"));
-    assert!(run.glab.disarmed(), "{:?}", run.glab.calls());
     let pending = run.pending(&execution.id);
     assert_eq!(pending.state_id, "finalize_blocked");
     let reason = pending.request.reason.unwrap_or_default();
     assert!(
-        reason.contains("not merged within"),
+        reason.contains("gh is not installed"),
         "the gate shows why finalize stopped: {reason:?}"
     );
 }
 
 #[tokio::test]
 async fn a_retried_finalize_finds_the_request_already_merged() {
-    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
-    let run = CompoundRun::new(
-        &replies,
-        &[
-            open_merge_request(),
-            open_merge_request(),
-            open_merge_request(),
-            merged_merge_request(),
-        ],
-    );
+    let replies = [
+        replies_up_to_finalize(),
+        vec![reply("blocked"), reply("merged")],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies);
     let gates = [
         gates_up_to_compound(),
         vec![Answer::new(
@@ -1164,49 +1060,152 @@ async fn a_retried_finalize_finds_the_request_already_merged() {
 
     assert!(run.took(&execution.id, "finalize_blocked", "retry", "finalize"));
     assert!(run.took(&execution.id, "finalize", "merged", "finished"));
-    assert_eq!(
-        run.glab.count("mr approve"),
-        1,
-        "a merged request is not approved again: {:?}",
-        run.glab.calls()
-    );
-    assert_eq!(run.glab.count("mr merge"), 1);
-}
-
-#[tokio::test]
-async fn a_request_that_merged_while_being_disarmed_is_merged() {
-    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
-    let run = CompoundRun::new(
-        &replies,
-        &[
-            open_merge_request(),
-            open_merge_request(),
-            merged_merge_request(),
-        ],
-    );
-
-    let execution = run.run(&gates_up_to_compound()).await;
-
-    assert!(run.glab.disarmed(), "{:?}", run.glab.calls());
-    assert!(run.took(&execution.id, "finalize", "merged", "finished"));
     assert_eq!(execution.status, ExecutionStatus::Completed);
 }
 
-/// The engine kills a `finalize` that outlives its step limit, so its own
-/// clean-up never runs: `disarm_merge` does it instead.
+/// The engine stops a `finalize` that outlives its step limit, so the agent
+/// never gets to cancel auto-merge: `disarm_merge` does it instead. Covers AE5.
 #[tokio::test]
-async fn a_finalize_killed_by_its_time_limit_is_disarmed_by_its_own_step() {
-    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
-    let run = CompoundRun::new(&replies, &[open_merge_request()])
-        .with_glab(|glab| glab.hanging_on("merge", 30))
+async fn covers_ae5_a_finalize_stopped_by_its_time_limit_is_disarmed_by_its_own_step() {
+    let replies = [
+        replies_up_to_finalize(),
+        vec![reply("merged"), reply("disarmed")],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies)
+        .with_call_hanging(15, 30)
         .with_finalize_timeout(3);
 
     let execution = run.run(&gates_up_to_compound()).await;
 
     assert!(run.took(&execution.id, "finalize", "timeout", "disarm_merge"));
     assert!(run.took(&execution.id, "disarm_merge", "disarmed", "finalize_blocked"));
-    assert!(run.glab.disarmed(), "{:?}", run.glab.calls());
     assert_eq!(run.pending(&execution.id).state_id, "finalize_blocked");
+}
+
+#[tokio::test]
+async fn a_request_that_merged_while_being_disarmed_is_merged() {
+    let replies = [
+        replies_up_to_finalize(),
+        vec![reply("merged"), reply("merged")],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies)
+        .with_call_hanging(15, 30)
+        .with_finalize_timeout(3);
+
+    let execution = run.run(&gates_up_to_compound()).await;
+
+    assert!(run.took(&execution.id, "finalize", "timeout", "disarm_merge"));
+    assert!(run.took(&execution.id, "disarm_merge", "merged", "finished"));
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+}
+
+/// What the prompt of `finalize` promises, whichever host the pull request
+/// is on. A test cannot check what an agent does with it; it can check that
+/// every guarantee is written down.
+#[test]
+fn the_finalize_prompt_carries_every_guarantee_and_names_both_tools() {
+    let definition = shipped("compound-engineering.yaml");
+    let prompt = built_prompt(&definition.states["finalize"]);
+
+    for needle in [
+        "{{ context.pr_url }}",
+        "60 minutes",
+        "equal the host of the `origin` remote",
+        "Allowed operations on this pull request only",
+        "never `gh pr merge` without `--auto`",
+        "`gh`",
+        "`glab`",
+        "git remote -v",
+        "Do not run `git merge`",
+        "Do not push to the target branch",
+        "already merged",
+        "cancel auto-merge, restore the Draft and read the pull request again",
+        "gh pr merge <url> --auto",
+        "glab mr merge <n> --auto-merge",
+    ] {
+        assert!(prompt.contains(needle), "the finalize prompt lacks `{needle}`");
+    }
+}
+
+#[test]
+fn the_disarm_prompt_cancels_auto_merge_restores_the_draft_and_reads_again() {
+    let definition = shipped("compound-engineering.yaml");
+    let prompt = built_prompt(&definition.states["disarm_merge"]);
+
+    for needle in [
+        "{{ context.pr_url }}",
+        "Cancel auto-merge",
+        "Restore the Draft",
+        "Read the pull request again",
+        "gh pr merge <url> --disable-auto",
+        "cancel_merge_when_pipeline_succeeds",
+    ] {
+        assert!(prompt.contains(needle), "the disarm prompt lacks `{needle}`");
+    }
+}
+
+/// Covers AE1 as far as a test can: a GitHub URL renders into the prompt.
+#[tokio::test]
+async fn covers_ae1_a_github_pull_request_url_reaches_the_finalize_prompt() {
+    let github = reply_with(
+        "published",
+        json!({ "variables": { "pr_url": GITHUB_PR_URL } }),
+    );
+    // work stage ends with its publish step; replace that answer.
+    let mut replies = replies_up_to_finalize();
+    for call in [3, 7, 12] {
+        replies[call - 1] = github.clone();
+    }
+    replies.push(reply("merged"));
+    let run = CompoundRun::new(&replies);
+
+    let execution = run.run(&gates_up_to_compound()).await;
+
+    assert!(run.prompt(15).contains(GITHUB_PR_URL), "{}", run.prompt(15));
+    assert!(run.took(&execution.id, "finalize", "merged", "finished"));
+}
+
+/// Covers R10: nothing outside `finalize` and `disarm_merge` assumes GitLab.
+#[test]
+fn covers_r10_the_other_prompts_do_not_assume_gitlab() {
+    let definition = shipped("compound-engineering.yaml");
+    for id in [
+        "publish_requirements",
+        "publish_plan",
+        "publish_work",
+        "publish_learning",
+        "repair_merge",
+        "finalize_blocked",
+    ] {
+        let Some(ActionConfig::Agent(action)) = &definition.states[id].action else {
+            if let Some(ActionConfig::Human(human)) = &definition.states[id].action {
+                assert!(!human.instruction.contains("GitLab"), "'{id}' names GitLab");
+            }
+            continue;
+        };
+        assert!(
+            !action.prompt.contains("This is a GitLab repository"),
+            "'{id}' assumes GitLab"
+        );
+    }
+    let Some(ActionConfig::Agent(repair)) = &definition.states["repair_merge"].action else {
+        panic!("repair_merge is an agent step");
+    };
+    assert!(repair.prompt.contains("gh pr checks"), "repair_merge names the GitHub tool too");
+}
+
+/// The engine does not apply input defaults, so the wait limit lives in the
+/// prompt and the workflow declares no input for it.
+#[test]
+fn finalize_needs_no_input_of_its_own() {
+    let definition = shipped("compound-engineering.yaml");
+    assert!(definition.inputs.iter().all(|input| input.name != "finalize_wait_minutes"));
+    for id in ["finalize", "disarm_merge"] {
+        let prompt = built_prompt(&definition.states[id]);
+        assert!(!prompt.contains("inputs."), "'{id}' reads an input");
+    }
 }
 
 /// The graph of `workflows/compound-engineering.yaml` as the plan draws it:
