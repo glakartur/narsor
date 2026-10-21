@@ -303,13 +303,13 @@ array: send one with `--field option=...`, optionally with `--field comment=...`
 
 An agent step whose answer carried no usable output label — even after the
 engine asked it once more — waits as a **problem**: you supply the output the
-agent did not give. Pick it with `--label`, and give the step's `data` and
-context `variables` with `--data` and `--variable` (a value that reads as JSON,
-such as `3` or `true`, is taken as that; anything else is text). The request
-lists each label with its description and the keys it needs: a label leading
-to a `human` gate needs `--data question=...`, and one leading to a state whose
-templates use `{{ context.NAME }}` needs `--variable NAME=...` unless the
-context already holds it. `--comment` is kept in the event log with the answer.
+agent did not give. Pick it with `--label`, and give the step's artifacts and
+context `variables` with `--artifact NAME=PATH` and `--variable` (a value that
+reads as JSON, such as `3` or `true`, is taken as that; anything else is text).
+The request lists each label with its description and the names it needs: the
+variables and artifacts the choice requires, and any `{{ context.NAME }}` the
+next state's templates use that no step declares and the context does not hold
+yet. `--comment` is kept in the event log with the answer.
 
 The answer is bound to the request `input` read: if the request was answered or
 closed in the meantime (another window, a transition), it is refused rather
@@ -766,7 +766,7 @@ analyze:
       max_turns: 20
     read_only_paths:              # optional, relative to the workspace
       - ../other-repo/src
-  outputs: [ready, ambiguous]
+  choices: [ready, ambiguous]
   transitions:
     ready: implement
     ambiguous: human_clarification

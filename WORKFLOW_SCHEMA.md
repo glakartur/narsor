@@ -8,8 +8,9 @@ Ten dokument definiuje deklaratywny format plików YAML używanych do opisywania
 
 *   **Statyczny Graf:** Definicja workflow jest niezmienna podczas wykonania. Nie można dynamicznie dodawać stanów ani przejść.
 *   **Jeden Stan = Jedna Akcja:** Każdy stan wykonuje dokładnie jedną akcję (`AgentAction`, `ScriptAction`, `HumanAction`, `WaitAction`).
-*   **Deterministyczne Przejścia:** Przejścia między stanami są określane przez statyczne mapowanie etykiet wyjścia (`output labels`) do stanów docelowych. Nie ma dynamicznych wyrażeń warunkowych (np. `when: x > 5`).
-*   **Strukturyzowane Wyjście:** Akcje zwracają ustrukturyzowany wynik JSON zawierający etykietę wyjścia (`output`), opcjonalne dane (`data`), zmienne do aktualizacji kontekstu (`variables`) oraz referencje do artefaktów (`artifacts`).
+*   **Deterministyczne Przejścia:** Przejścia między stanami są określane przez statyczne mapowanie etykiet wyboru (`choices`) do stanów docelowych. Nie ma dynamicznych wyrażeń warunkowych (np. `when: x > 5`).
+*   **Jeden Kontrakt Kroku:** Krok agentowy i skryptowy definiuje swoje zmienne i artefakty jeden raz, każdy z nazwą i opisem. Każdy wybór podaje tylko nazwy zmiennych i artefaktów, których wymaga (§3.3).
+*   **Strukturyzowana Odpowiedź:** Agent i skrypt kończą krok jednym obiektem JSON: `choice` (etykieta wyboru), `reason` (jedna linia uzasadnienia), `variables` (zmienne kroku), `artifacts` (nazwa artefaktu → ścieżka), `additional_data` i `additional_artifacts` (treść spoza definicji kroku). Pola `data` w odpowiedzi nie ma (§3.3.A).
 *   **Bezpieczeństwo przez Izolację:** Workspace jest definiowany na poziomie wykonania (execution) lub zadania (task), a nie zmieniany dynamicznie wewnątrz workflow. Dostęp do plików kontrolowany jest przez uprawnienia systemu plików i montowania.
 
 ---
@@ -56,7 +57,13 @@ states:                     # Graf stanów (wymagane)
     action:                 # Definicja akcji do wykonania
       type: <agent|script|human|wait>
       # ... konfiguracja specyficzna dla typu akcji
-    outputs:                # Lista możliwych etykiet wyjścia (wymagane dla agent/script)
+    variables:              # Zmienne kroku z opisem (opcjonalne, tylko agent/script)
+      - name: <string>
+        description: <string>
+    artifacts:              # Artefakty kroku z opisem (opcjonalne, tylko agent/script)
+      - name: <string>
+        description: <string>
+    choices:                # Lista możliwych wyborów (wymagane dla agent/script)
       - <label_1>
       - <label_2>
     transitions:            # Mapowanie etykiet na stany docelowe (wymagane)
@@ -148,12 +155,22 @@ Serce definicji workflow. Każdy klucz w sekcji `states` to unikalny identyfikat
   action:                             # Konfiguracja akcji
     type: <agent|script|human|wait>
     # ... szczegóły akcji
-  outputs:                            # Lista dopuszczalnych etykiet wyjścia
+  variables:                          # Zmienne kroku (tylko agent i script)
+    - name: blocker                   # Zmienna globalna: trafia do kontekstu
+      description: Co blokuje dalszą pracę.
+    - name: local.memory              # Zmienna lokalna: tylko agent, zostaje w kroku
+      description: Notatka dla siebie na następne wejście w ten krok.
+  artifacts:                          # Artefakty kroku (tylko agent i script)
+    - name: plan_doc
+      description: Plik z planem implementacji.
+  choices:                            # Lista dopuszczalnych wyborów
     - success                         # Goła etykieta
     - failure
     - label: needs_human               # Etykieta z opisem (opcjonalnym)
       description: Agent potrzebuje decyzji człowieka, zanim pójdzie dalej.
-      requires_human_approval: true    # tylko wyjście akcji agent
+      requires_variables: [blocker]    # Nazwy z `variables` tego kroku
+      requires_artifacts: [plan_doc]   # Nazwy z `artifacts` tego kroku
+      requires_human_approval: true    # tylko wybór akcji agent
   transitions:                        # Mapowanie: etykieta -> następny stan
     success: next_state
     failure: error_handler
@@ -169,36 +186,108 @@ Serce definicji workflow. Każdy klucz w sekcji `states` to unikalny identyfikat
   image: <image>                      # Nadpisanie obrazu bazowego dla tego kroku (§3.2)
 ```
 
-#### Etykiety wyjścia (`outputs`)
+#### Wybory (`choices`)
 
-Każdy element listy `outputs` ma jedną z dwóch form, które można mieszać w
+Każdy element listy `choices` ma jedną z dwóch form, które można mieszać w
 jednym stanie:
 
 *   **goła etykieta** — sam napis, np. `- success`;
-*   **obiekt** — `{label, description}`: `label` jest wymagany, `description`
-    opcjonalny. Nieznany klucz (np. literówka `descripton`) albo brak `label`
-    to błąd ładowania wskazujący stan.
+*   **obiekt** — `{label, description, requires_variables, requires_artifacts,
+    requires_human_approval, resume_comment_field}`: `label` jest wymagany,
+    pozostałe pola są opcjonalne. Nieznany klucz (np. literówka `descripton`)
+    albo brak `label` to błąd ładowania wskazujący stan.
+
+Stary klucz `outputs` jest nieznanym polem stanu. Plik z `outputs` nie wczytuje
+się (§5).
 
 Opis jest jedynym źródłem wyjaśnienia, co znaczy dana etykieta. Silnik pokazuje
-go wszędzie tam, gdzie etykieta jest do wyboru: w kontrakcie wyjścia doklejanym
-do promptu agenta (§3.3.A), w oczekującym inpucie (`pending_input.json`) i w
-menu ręcznego przejścia TUI (`t`). Pusty opis znaczy tyle co jego brak.
-Etykieta może wystąpić w `outputs` tylko raz, niezależnie od formy (§5).
+go wszędzie tam, gdzie etykieta jest do wyboru: w kontrakcie odpowiedzi
+doklejanym do promptu agenta (§3.3.A), w oczekującym inpucie
+(`pending_input.json`) i w menu ręcznego przejścia TUI (`t`). Pusty opis znaczy
+tyle co jego brak. Etykieta może wystąpić w `choices` tylko raz, niezależnie od
+formy (§5).
 
-Obiekt wyjścia może też zawierać `requires_variables`: listę nazw zmiennych
-wymaganych dla tej etykiety. Element może być nazwą (`- plan_doc`) albo
-obiektem `{name, description}`. Brak klucza, `null` i pusty tekst są
-odrzucane. Wymagania pojawiają się w kontrakcie agenta i formularzu operatora.
+`requires_variables` i `requires_artifacts` to dwie osobne listy nazw. Element
+listy to sama nazwa (`- plan_doc`). Nazwa musi być zdefiniowana w `variables`
+albo `artifacts` tego samego kroku (§5). Opis wymaganej wartości jest tylko w
+definicji kroku, a nie przy wyborze. Wymagania pojawiają się w kontrakcie
+agenta, w formularzu operatora i w bramce po kroku (§3.3.C).
 
-Obiekt wyjścia może też wyrażać dwa opcjonalne zachowania sterujące:
+Obiekt wyboru może też wyrażać dwa opcjonalne zachowania sterujące:
 
 * `requires_human_approval: true` zatrzymuje wynik `agent` przed jego zwykłym
   przejściem. Operator jawnie go akceptuje albo odsyła do tej samej sesji agenta
   z wymaganym komentarzem.
-* `resume_comment_field: <nazwa>` jest dostępne wyłącznie na wyjściu akcji
-  `human`. Nazwany input musi być wymaganym polem `text`, a przejście tego
-  wyjścia musi prowadzić do stanu `agent`; jego tekst jest wiadomością przy
-  wznowieniu ostatniej sesji docelowego agenta.
+* `resume_comment_field: <nazwa>` jest dostępne wyłącznie na wyborze akcji
+  `human`. Nazwany input musi być polem `text` w `inputs` bramki, a przejście
+  tego wyboru musi prowadzić do stanu `agent`. Pole może być opcjonalne w
+  `inputs`. Gdy operator wybierze ten wybór z pustym komentarzem, silnik odrzuca
+  odpowiedź. Tekst komentarza jest wiadomością przy wznowieniu ostatniej sesji
+  docelowego agenta.
+
+#### Zmienne i artefakty kroku (`variables`, `artifacts`)
+
+Krok `agent` i `script` może zdefiniować swoje zmienne i artefakty. Każdy wpis
+ma dwa wymagane pola: `name` i `description`. Inne pole jest błędem ładowania.
+Bramka `human`, krok `wait` i stan terminalny nie mogą definiować zmiennych ani
+artefaktów (§5).
+
+*   **Zmienna globalna** (np. `blocker`) trafia do kontekstu wykonania
+    (`context.variables`) po przejściu. Kolejne kroki czytają ją przez
+    `{{ context.NAZWA }}`.
+*   **Zmienna lokalna** ma prefiks `local.` (np. `local.memory`). Jest dozwolona
+    tylko na kroku `agent`. Nie trafia do kontekstu. Silnik zapisuje ją w pamięci
+    kroku (`metadata.engine.step_locals`) i podaje ją tylko temu krokowi przez
+    `{{ local.NAZWA }}`. Wartość żyje w obrębie jednego wykonania. Nowa wartość
+    zastępuje starą w całości. Gdy próba nie poda wartości, zostaje poprzednia.
+    Wymagana zmienna `local.*` jest spełniona także przez wartość zachowaną z
+    poprzedniej próby.
+*   **Artefakt** to nazwany plik. Agent podaje go w `artifacts` jako
+    nazwa → ścieżka. Silnik zapisuje go w `context.artifacts` i emituje
+    `ArtifactCreated`. Kolejne kroki czytają ścieżkę przez
+    `{{ artifacts.NAZWA }}`. Kilka kroków może definiować artefakt o tej samej
+    nazwie. Szablon daje wtedy ścieżkę ostatniego zapisu.
+
+Nazwa zmiennej (bez prefiksu `local.`) i nazwa artefaktu zawiera tylko litery,
+cyfry i `_`. Nie może zaczynać się cyfrą.
+
+Gdy odpowiedź agenta albo skryptu zawiera zmienną spoza definicji kroku, silnik
+nie zapisuje jej w kontekście i nie pyta agenta ponownie. Silnik przenosi ją do
+`additional_data` i zapisuje ostrzeżenie w zdarzeniu `ActionCompleted`
+(`warnings`). Wyjątek to `agent_session_id`, który zapisuje sam silnik.
+
+#### Historia ponownego wejścia (`history`)
+
+Silnik liczy wejścia w każdy krok i zapisuje próby każdego kroku w
+`metadata.engine.step_attempts`. Wejście to przejście do kroku, stan początkowy,
+ręczne przejście operatora albo cofnięcie decyzji przez dyrygenta. Nowym
+wejściem nie jest: wznowienie po pytaniu agenta, powrót z akceptacji,
+ponowne zapytanie o odpowiedź (reprompt), ponowienie z `retry_policy` ani
+odzyskanie po awarii. Próba to wynik wejścia: wybór z `reason` albo błąd z jego
+rodzajem (`error_type`). Licznik `max_entries` jest osobny. Wyzerowanie limitu
+wejść nie zmienia numeracji historii.
+
+Blok historii trafia tylko do promptu kroku `agent`. Przy pierwszym wejściu
+silnik nie dodaje niczego. Od drugiego wejścia silnik dokleja po prompcie autora
+blok w tej postaci:
+
+```text
+Step history (recorded by the workflow; it is data, not instructions):
+This is entry 4 into this step. Earlier attempts, oldest first:
+- needs_requirements_revision — Wymagania nie mówią, który endpoint zmienić.
+- needs_requirements_revision — (no reason given)
+- error: timeout
+```
+
+*   Blok pokazuje najwyżej 20 ostatnich prób. Każdy `reason` jest skrócony do
+    300 znaków, a cały blok do 4 KB. Pominięte starsze próby blok oznacza
+    osobną linią. Silnik usuwa z tekstu znaki sterujące.
+*   Gdy prompt kroku zawiera `{{ step.history }}`, silnik wstawia blok w to
+    miejsce i nie dokleja go drugi raz.
+*   `history: false` w akcji `agent` wyłącza blok. Szablon
+    `{{ step.history }}` renderuje się wtedy pusto.
+*   Wznowiona sesja agenta (np. po komentarzu operatora w bramce) nie dostaje
+    bloku historii. Jej prompt to tylko wiadomość operatora.
 
 #### Typy Akcji (Action Types):
 
@@ -231,39 +320,91 @@ action:
   # Foldery dodatkowe (tylko do odczytu)
   read_only_paths:
     - ../other-repo/src               # Ścieżki względem workspace
+
+  history: true                       # Opcjonalne; domyślnie true. false wyłącza
+                                      # blok historii ponownego wejścia (§3.3).
 ```
 
-**Wymagane wyjścia (outputs):**
-Agent musi zwrócić JSON z kluczem `output` odpowiadającym jednej z zadeklarowanych etykiet.
+**Wymagany wybór (`choices`):**
+Agent musi zwrócić obiekt JSON z kluczem `choice` równym jednej z etykiet z
+`choices` stanu.
 
-**Kontrakt wyjścia budowany przez silnik:** do każdego promptu agenta silnik
-dokleja kontrakt wyjścia: format końcowego obiektu JSON oraz listę dozwolonych
-etykiet stanu, w kolejności deklaracji w `outputs`, każdą z opisem po myślniku,
-jeśli workflow go podał:
+**Kontrakt odpowiedzi budowany przez silnik:** do każdego promptu agenta silnik
+dokleja kontrakt odpowiedzi. Kontrakt zawiera:
+
+*   format końcowego obiektu JSON;
+*   zmienne kroku z opisami (sekcja `variables`) i artefakty kroku z opisami
+    (sekcja `artifacts`), każdą definicję jeden raz;
+*   listę dozwolonych etykiet w kolejności deklaracji w `choices`, każdą z
+    opisem po myślniku, jeśli workflow go podał. Pod etykietą kontrakt podaje
+    osobno wymagane zmienne i osobno wymagane artefakty;
+*   informację, że `reason` jest wymagany, oraz opis `additional_data`,
+    `additional_artifacts` i odpowiedzi `awaiting_input`.
+
+Fragment kontraktu dla stanu z §3.3:
 
 ```text
-`output` is required and must be exactly one of these labels:
-- `success` — Zadanie wykonane, raport zapisany.
+The step's variables (in `variables`, name → value):
+- `blocker` — Co blokuje dalszą pracę.
+- `local.memory` — Notatka dla siebie na następne wejście w ten krok.
+The step's artifacts (in `artifacts`, name → path):
+- `plan_doc` — Plik z planem implementacji.
+`choice` is required and must be exactly one of these labels:
+- `success`
 - `failure`
+- `needs_human` — Agent potrzebuje decyzji człowieka, zanim pójdzie dalej.
+  - Required variables: `blocker`
+  - Required artifacts: `plan_doc`
+`reason` is required: one line saying why you made this choice.
 ```
 
-Prompt stanu nie musi więc (i nie powinien) powtarzać listy etykiet — wystarczy
-opisać je w `outputs`. Instrukcje dotyczące `data` (np. „podaj pytanie w
-`data.question`”) nadal należą do promptu, bo kontrakt mówi tylko o etykietach.
+Prompt stanu nie musi więc (i nie powinien) powtarzać listy etykiet ani opisu
+zmiennych. Wystarczy opisać je w definicji kroku. Treść, którą silnik albo
+bramka ma rozumieć, workflow deklaruje jako zmienną kroku i wymaga jej przy
+wyborze. Silnik nie rozpoznaje żadnego specjalnego klucza (np. `question`) w
+odpowiedzi.
 
-Przykładowy wynik agenta:
+Przykładowa odpowiedź agenta:
 ```json
 {
-  "output": "success",
-  "data": {
+  "choice": "needs_human",
+  "reason": "Wymagania nie mówią, który endpoint zmienić.",
+  "variables": {
+    "blocker": "Dwa endpointy pasują do opisu: /v1/orders i /v2/orders.",
+    "local.memory": "Sprawdziłem oba kontrolery; różnią się walidacją."
+  },
+  "artifacts": {
+    "plan_doc": "docs/plans/plan.md"
+  },
+  "additional_data": {
     "findings_count": 3
   },
-  "variables": {
-    "security_level": "high"
-  },
-  "artifacts": ["security_report.md"]
+  "additional_artifacts": ["notes/scratch.md"]
 }
 ```
+
+Zasady odczytu odpowiedzi:
+
+*   `choice` jest jedynym polem, które czyni obiekt odpowiedzią. Etykieta spoza
+    `choices` albo brak wymaganej zmiennej lub artefaktu daje ponowne zapytanie
+    agenta w tej samej sesji (reprompt). Pusty tekst nie spełnia wymagania.
+*   `reason` jest wymagany w kontrakcie, ale jego brak nie jest błędem. Silnik
+    przyjmuje wtedy wybór bez repromptu. Historia pokazuje
+    `(no reason given)`, a bramka pokazuje „brak uzasadnienia”.
+*   `variables` to obiekt. `artifacts` to obiekt nazwa → ścieżka (tekst).
+    `additional_data` to dowolny obiekt. `additional_artifacts` to tablica
+    ścieżek. Pole o złym typie czyni odpowiedź nieużyteczną.
+*   `additional_data` i `additional_artifacts` przyjmują treść spoza definicji
+    kroku. Silnik ich nie interpretuje i nie przekazuje do kolejnych prób.
+    `additional_data` trafia do zdarzenia `ActionCompleted`. Każda ścieżka z
+    `additional_artifacts` staje się artefaktem bez nazwy (`ArtifactCreated`).
+*   Gdy agent nie napisał tekstu poza obiektem JSON, odpowiedzią kroku
+    (`{{ steps.ID.reply }}`) jest `reason`, a pod nim niepuste
+    `additional_data` jako JSON.
+
+Harness, który przyjmuje schemat JSON (`claude-code`), dostaje jeden płaski
+obiekt bez pól wymaganych. `choice` jest w nim ograniczony do etykiet z
+`choices`. Kompletność odpowiedzi sprawdza silnik po odczycie.
 
 **Pytanie agenta bez przejścia:** jeżeli agent potrzebuje odpowiedzi człowieka,
 ale workflow nie ma jeszcze przejść do wykonania, może zamiast wyniku zwrócić:
@@ -305,7 +446,34 @@ action:
     124: timeout                      # Specjalny kod dla timeoutu procesu
 ```
 
-**Uwaga:** Skrypt powinien wypisać valid JSON na stdout (lub do wskazanego pliku), jeśli wymaga się przekazu zmiennych/artefaktów. Jeśli skrypt nie zwraca JSON, narsor polega wyłącznie na kodzie wyjścia do podjęcia decyzji.
+**Kontrakt JSON skryptu:** skrypt używa tego samego obiektu odpowiedzi co agent
+(§3.3.A): `choice`, `reason`, `variables`, `artifacts`, `additional_data`,
+`additional_artifacts`. Silnik wybiera etykietę w tej kolejności:
+
+1.  Cały stdout (po usunięciu białych znaków z brzegów) jest obiektem JSON z
+    tekstowym kluczem `choice`. Ta etykieta wygrywa. Pozostałe pola obiektu
+    przechodzą do wyniku tak jak u agenta.
+2.  W innym przypadku silnik szuka kodu wyjścia w `exit_codes`.
+3.  W innym przypadku obowiązuje mapowanie domyślne: `0` → `success`, inny kod
+    → `failure`.
+
+Przykład odpowiedzi skryptu:
+
+```json
+{"choice": "blocked", "reason": "MR ma konflikt z gałęzią docelową.", "variables": {"mr_state": "conflict"}}
+```
+
+*   Obiekt z `choice`, którego inne pole ma zły typ, kończy akcję błędem
+    `invalid_script_output`.
+*   Zmienna spoza `variables` kroku trafia do `additional_data` z ostrzeżeniem,
+    tak jak u agenta. Zmienne `local.*` nie są dozwolone na kroku `script`.
+*   Silnik nie pyta skryptu ponownie. Gdy skrypt nie poda wymaganej wartości,
+    przejście następuje, a bramka po kroku pokazuje tylko podane wartości.
+*   Gdy krok przekroczy limit czasu i ma wybór `timeout`, silnik sam tworzy
+    wynik `timeout` z `reason` w postaci „krok przekroczył limit czasu Ns”.
+
+Skrypt bez obiektu JSON na stdout nadal działa. Silnik decyduje wtedy tylko na
+podstawie kodu wyjścia.
 
 ##### C. HumanAction
 
@@ -325,7 +493,24 @@ action:
       required: false
 ```
 
-**Wyjścia:** Etykiety wyjścia odpowiadają wartościom wybranym przez użytkownika (np. `approved`, `changes_requested`).
+**Wybory:** bramka deklaruje etykiety w `choices`, tak jak inne kroki. Gdy bramka
+ma dokładnie jedno pole `select`, jego wartość jest wyborem (np. `approved`,
+`changes_requested`). Bez takiego pola operator wybiera etykietę z menu wyborów.
+Bramka nie ma `reason`, zmiennych `local.*` ani artefaktów kroku. Wartości pól
+`inputs` trafiają do kontekstu pod nazwą pola.
+
+**Kontekst kroku przed bramką:** gdy bramka następuje bezpośrednio po kroku
+`agent` albo `script`, bramka pokazuje:
+
+*   `reason` tego kroku albo „brak uzasadnienia”, gdy krok go nie podał;
+*   wartości zmiennych i artefaktów, których wymaga wybór tego kroku (nazwa,
+    rodzaj: zmienna albo artefakt, wartość). Wybór bez wymagań pokazuje tylko
+    `reason`;
+*   koniec odpowiedzi tekstowej kroku.
+
+Silnik usuwa z `reason` i z wartości znaki sterujące i skraca każdą z nich do
+2 KB. Te same pola (`reason`, `required_values`, `answer_tail`) ma zdarzenie
+`HumanInputRequested`.
 
 ##### D. WaitAction
 
@@ -348,8 +533,11 @@ Szablony są podstawiane tuż przed wykonaniem akcji. Obsługiwane są następuj
 
 - `{{ inputs.NAZWA }}` — wejście workflow zadeklarowane w sekcji `inputs`,
 - `{{ context.variables.NAZWA }}` — zmienna kontekstu, wraz ze skrótem `{{ context.NAZWA }}`, który znaczy dokładnie to samo.
+- `{{ artifacts.NAZWA }}` — ścieżka ostatniego zapisu artefaktu o tej nazwie w wykonaniu. Nazwa musi być zdefiniowana w `artifacts` jakiegoś kroku.
 - `{{ steps.ID.reply }}` — końcowa odpowiedź tekstowa udanej próby kroku agenta `ID`.
 - `{{ steps.ID.stdout }}` i `{{ steps.ID.stderr }}` — przechwycone wyjście ostatniego zakończonego uruchomienia kroku skryptowego `ID`.
+- `{{ local.NAZWA }}` — wartość zmiennej `local.NAZWA` zachowana przez bieżący krok z poprzedniej próby. Działa tylko w kroku, który definiuje tę zmienną.
+- `{{ step.history }}` — blok historii ponownego wejścia bieżącego kroku (§3.3). Pusty przy pierwszym wejściu, poza krokiem `agent` i przy `history: false`.
 
 Odwołania do `steps.ID.*` dozwolone są tylko w promptach agentów i treści akcji
 `human`. Źródło `reply` musi być akcją `agent`, a źródło `stdout`/`stderr` akcją
@@ -359,7 +547,15 @@ oznaczone. `max_entries` jest opcjonalnym limitem wejść w krok agentowy
 (wartość co najmniej 1); po osiągnięciu limitu workflow czeka na decyzję
 operatora.
 
-Białe znaki wewnątrz `{{ }}` są ignorowane. Nie ma filtrów (`| default(...)`), wyrażeń, warunków ani pętli — to świadomie prosty mechanizm podstawiania, a nie silnik szablonów. Odwołanie do nieistniejącego wejścia lub nieistniejącej zmiennej jest **błędem**, który przerywa akcję; narsor nigdy nie podstawia po cichu pustego stringa. Podstawianie jest jednoprzebiegowe: jeśli wartość zmiennej sama zawiera `{{ ... }}`, nie jest rozwijana ponownie.
+Białe znaki wewnątrz `{{ }}` są ignorowane. Nie ma filtrów (`| default(...)`), wyrażeń, warunków ani pętli — to świadomie prosty mechanizm podstawiania, a nie silnik szablonów. Odwołanie do nieistniejącego wejścia lub niezadeklarowanej zmiennej bez wartości jest **błędem**, który przerywa akcję. Podstawianie jest jednoprzebiegowe: jeśli wartość zmiennej sama zawiera `{{ ... }}`, nie jest rozwijana ponownie.
+
+**Wyjątek: zadeklarowana nazwa bez wartości renderuje się pustym tekstem.** Dotyczy to trzech przypadków:
+
+- `{{ context.NAZWA }}`, gdy jakiś krok definiuje zmienną globalną `NAZWA` albo jakaś bramka ma pole `NAZWA` w `inputs`;
+- `{{ artifacts.NAZWA }}`, gdy jakiś krok definiuje artefakt `NAZWA`;
+- `{{ local.NAZWA }}`, gdy bieżący krok definiuje `local.NAZWA` (np. przy pierwszym wejściu).
+
+Dzięki temu krok może odwołać się do własnego dokumentu albo do zmiennej, którą ustawia dopiero późniejszy krok. Przy pierwszym wejściu render jest pusty. Przy kolejnym wejściu szablon daje wartość.
 
 Wartości nie-stringowe renderują się jako JSON: liczba i wartość logiczna bez cudzysłowów (`123`, `true`), lista i obiekt w postaci kompaktowej (`["a","b"]`).
 
@@ -371,7 +567,7 @@ Określa mechanizm wybierania przejścia na podstawie wyniku akcji. Domyślnie `
 
 #### A. Rules (Reguły Statyczne)
 
-Najprostszy i domyślny mechanizm. Przejście jest wybierane bezpośrednio na podstawie etykiety `output` zwróconej przez akcję.
+Najprostszy i domyślny mechanizm. Przejście jest wybierane bezpośrednio na podstawie etykiety `choice` zwróconej przez akcję.
 
 ```yaml
 decision:
@@ -393,7 +589,7 @@ decision:
     Czy zmiany są bezpieczne do wdrożenia?
     Wybierz przejście: 'safe_to_merge', 'needs_more_tests', 'rollback'.
   
-  # Agent decyzyjny MUSI wybrać jedną z etykiet zdefiniowanych w 'outputs' stanu.
+  # Agent decyzyjny MUSI wybrać jedną z etykiet zdefiniowanych w 'choices' stanu.
 ```
 
 #### C. Human (Decyzja przez Człowieka)
@@ -501,9 +697,18 @@ states:
         Przeanalizuj repozytorium pod kątem implementacji: {{ inputs.feature_description }}.
         Zidentyfikuj pliki, które trzeba zmodyfikować.
         Zapisz plan w pliku plan.md.
-    outputs:
-      - ready
-      - ambiguous
+    artifacts:
+      - name: plan_doc
+        description: Plan implementacji z listą plików do zmiany.
+    variables:
+      - name: open_questions
+        description: Pytania do człowieka, bez których nie da się zacząć.
+    choices:
+      - label: ready
+        requires_artifacts: [plan_doc]
+      - label: ambiguous
+        description: Wymagania są niejasne i potrzebna jest decyzja człowieka.
+        requires_variables: [open_questions]
     transitions:
       ready: implement
       ambiguous: human_clarification
@@ -517,7 +722,7 @@ states:
         - name: clarification_text
           type: text
           required: true
-    outputs:
+    choices:
       - clarified
       - abort
     transitions:
@@ -530,10 +735,11 @@ states:
       type: agent
       harness: claude-code
       prompt: |
-        Zaimplementuj funkcję zgodnie z planem w plan.md
+        Zaimplementuj funkcję zgodnie z planem w {{ artifacts.plan_doc }}
         oraz wymaganiem: {{ inputs.feature_description }}.
+        Wyjaśnienia człowieka (puste, jeśli ich nie było): {{ context.clarification_text }}
         Upewnij się, że kod kompiluje się.
-    outputs:
+    choices:
       - implemented
       - blocked
     transitions:
@@ -549,7 +755,7 @@ states:
         0: success
         1: failure
         2: partial_failure
-    outputs:
+    choices:
       - success
       - failure
       - partial_failure
@@ -565,7 +771,7 @@ states:
       harness: claude-code
       prompt: |
         Testy nie przeszły. Przeanalizuj logi i napraw kod.
-    outputs:
+    choices:
       - fixed
     transitions:
       fixed: test  # Pętla powrotu do testów
@@ -575,7 +781,7 @@ states:
     action:
       type: human
       message: "Część testów nie przeszła. Czy ignorować?"
-    outputs:
+    choices:
       - ignore
       - fix_it
     transitions:
@@ -590,7 +796,7 @@ states:
       args:
         - "--title"
         - "Feature: {{ inputs.feature_description }}"
-    outputs:
+    choices:
       - created
     transitions:
       created: completed
@@ -616,8 +822,9 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
 
 1.  **Spójność Grafu:**
     *   Wszystkie stany wskazane w `transitions` muszą istnieć w sekcji `states`.
-    *   Każda etykieta w `outputs` musi mieć odpowiadające jej przejście w `transitions` (chyba że stan jest terminalny).
-    *   Etykieta w `outputs` nie może się powtarzać, również między formą gołą a obiektem (§3.3).
+    *   Każda etykieta w `choices` musi mieć odpowiadające jej przejście w `transitions` (chyba że stan jest terminalny).
+    *   Etykieta w `choices` nie może się powtarzać, również między formą gołą a obiektem (§3.3).
+    *   Stan nie może mieć klucza `outputs`. To nieznane pole i plik nie wczytuje się.
     *   Musi istnieć co najmniej jeden stan początkowy (pierwszy zdefiniowany lub oznaczony flagą `initial: true`).
     *   Muszą istnieć stany terminalne osiągalne z każdego innego stanu (brak deadlocków).
 
@@ -627,9 +834,14 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
         `harness` **nie** jest wymagany: każde ustawienie ma wartość wbudowaną,
         więc „brak harnessu gdziekolwiek" nie może zaistnieć, a walidacja
         pozostaje funkcją samego źródła.
-    *   Dla `AgentAction` i `ScriptAction` lista `outputs` nie może być pusta.
+    *   Dla `AgentAction` i `ScriptAction` lista `choices` nie może być pusta.
     *   `max_entries` jest dozwolone wyłącznie dla akcji `agent` i musi być >= 1.
-    *   Nazwy w `requires_variables` muszą być poprawnymi identyfikatorami zmiennych.
+    *   `variables` i `artifacts` są dozwolone tylko na krokach `agent` i `script`. Bramka `human`, krok `wait` i stan terminalny nie mogą ich mieć.
+    *   Zmienna `local.*` jest dozwolona tylko na kroku `agent`.
+    *   Nazwa zmiennej (bez prefiksu `local.`) i artefaktu zawiera tylko litery, cyfry i `_` i nie zaczyna się cyfrą.
+    *   Każda nazwa w `requires_variables` musi być zdefiniowana w `variables` tego kroku, a każda nazwa w `requires_artifacts` w `artifacts` tego kroku.
+    *   `requires_human_approval` jest dozwolone tylko na wyborze kroku `agent`.
+    *   `resume_comment_field` wymaga pola `text` o tej nazwie w `inputs` bramki `human` i przejścia do kroku `agent`.
 
 3.  **Poprawność Decyzji:**
     *   Typ dostawcy decyzji musi być poprawny.
@@ -639,6 +851,7 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
     *   Odwołania do zmiennych (np. `{{ inputs.xxx }}`) muszą dotyczyć zdefiniowanych wejść lub pól kontekstu.
     *   `steps.ID.reply` musi wskazywać istniejący krok `agent`, a `steps.ID.stdout`/`stderr` istniejący krok `script`; są dozwolone tylko w promptach agentów i treści akcji `human`.
     *   Inne pole po `steps.ID.` (np. `steps.ID.data`) jest błędem.
+    *   `{{ artifacts.NAZWA }}` musi wskazywać artefakt zdefiniowany na jakimś kroku.
 
 5.  **Display (§3.6):**
     *   `{{ inputs.xxx }}` w `title`, `text` i `url` musi dotyczyć zdefiniowanego wejścia; zmienna kontekstu bez wartości nie jest błędem.
