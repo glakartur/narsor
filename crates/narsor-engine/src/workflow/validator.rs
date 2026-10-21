@@ -34,7 +34,7 @@ use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
 use super::template::{
     artifact_references, check_syntax, step_reply_references, step_stream_references,
-    unsupported_step_references,
+    unsupported_step_references, DeclaredNames,
 };
 
 /// Validates a compiled workflow definition.
@@ -43,6 +43,7 @@ use super::template::{
 /// by sorted id), so that the same definition always produces the same report.
 pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
+    let declared = DeclaredNames::of(definition);
 
     validate_graph(definition, &mut errors);
     for state_id in sorted_state_ids(definition) {
@@ -51,7 +52,7 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_choice_behavior(definition, state, &mut errors);
         validate_step_contract(state, &mut errors);
         validate_decision(state, &mut errors);
-        validate_state_templates(definition, state, &mut errors);
+        validate_state_templates(definition, &declared, state, &mut errors);
         validate_state_image(state, &mut errors);
     }
     validate_workflow_templates(definition, &mut errors);
@@ -547,6 +548,7 @@ fn validate_image(field: &str, image: &ImageSpec, errors: &mut Vec<ValidationErr
 
 fn validate_state_templates(
     definition: &WorkflowDefinition,
+    declared: &DeclaredNames,
     state: &State,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -655,7 +657,7 @@ fn validate_state_templates(
             }
         }
         for artifact in artifact_references(text) {
-            if !defines_artifact(definition, &artifact) {
+            if !declared.declares_artifact(&artifact) {
                 errors.push(ValidationError::UnknownArtifactReference {
                     state: state.id.clone(),
                     field: field.clone(),
@@ -664,14 +666,6 @@ fn validate_state_templates(
             }
         }
     }
-}
-
-/// Whether some step defines the artifact `name` (KTD7): several may.
-fn defines_artifact(definition: &WorkflowDefinition, name: &str) -> bool {
-    definition
-        .states
-        .values()
-        .any(|state| state.artifacts.iter().any(|artifact| artifact.name == name))
 }
 
 fn validate_workflow_templates(definition: &WorkflowDefinition, errors: &mut Vec<ValidationError>) {

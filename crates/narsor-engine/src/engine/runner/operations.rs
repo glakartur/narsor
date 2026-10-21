@@ -541,9 +541,8 @@ impl Engine {
         execution.context = context;
         // The decision's transition counted an entry into its target.
         restore_state_entries(&mut execution, &undo.state_entries_before)?;
-        // The decision's attempt goes, and so do the notes it kept; going
-        // back to its step is an entry of its own (KTD8).
         step_memory::restore_step_memory(&mut execution, &undo.step_memory_before)?;
+        // Going back to its step is an entry of its own (KTD8).
         step_memory::count_step_entry(&mut execution, &undo.state_id)?;
         execution.completed_at = None;
         execution.current_state = Some(undo.state_id.clone());

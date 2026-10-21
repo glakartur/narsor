@@ -495,7 +495,7 @@ fn unmet_requirements(
 /// does whatever a gate or a person gave: only a step that can define
 /// variables is held to its definitions.
 fn set_aside_undeclared_variables(state: &State, result: &mut ActionResult) -> Vec<String> {
-    if !matches!(state.action, Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_))) {
+    if !has_step_contract(state) {
         return Vec::new();
     }
     let is_kept = |name: &String| {
@@ -3051,8 +3051,6 @@ impl Engine {
         let outcome = match request {
             DecisionRequest::Resolved(outcome) => outcome,
             DecisionRequest::AwaitHuman { message } => {
-                // The context comes straight from the step that just
-                // answered: its result is still at hand.
                 let kept_locals = step_memory::step_locals(execution, &state.id)?;
                 let context = GateContext::of(state, &pending.result, &kept_locals);
                 let request = HumanInputRequest {

@@ -6,10 +6,7 @@
 
 use super::*;
 use crate::engine::actions::human::{RequiredValue, RequiredValueKind};
-use narsor_protocol::display::{without_unsafe_chars, without_unsafe_chars_multiline};
-
-/// What a gate shows for a step that gave no reason.
-pub(super) const NO_REASON: &str = "brak uzasadnienia";
+use narsor_protocol::display::{without_unsafe_chars, without_unsafe_chars_multiline, NO_REASON};
 
 /// The longest reason or required value a gate shows, in bytes.
 const MAX_SHOWN_BYTES: usize = 2 * 1024;

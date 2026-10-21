@@ -129,8 +129,7 @@ pub(super) fn keep_locals(
     if given.is_empty() {
         return Ok(());
     }
-    let mut locals: LocalsByStep =
-        read_engine_record(execution, METADATA_STEP_LOCALS_KEY)?.unwrap_or_default();
+    let mut locals = read_locals(execution)?;
     let kept = locals.entry(state_id.to_string()).or_default();
     for (name, value) in given {
         kept.insert(name.clone(), value.clone());
@@ -143,8 +142,7 @@ pub(super) fn step_locals(
     execution: &WorkflowExecution,
     state_id: &str,
 ) -> Result<Map<String, Value>, EngineError> {
-    let mut locals: LocalsByStep =
-        read_engine_record(execution, METADATA_STEP_LOCALS_KEY)?.unwrap_or_default();
+    let mut locals = read_locals(execution)?;
     Ok(locals.remove(state_id).unwrap_or_default())
 }
 
@@ -153,8 +151,7 @@ pub(super) fn history_block(
     execution: &WorkflowExecution,
     state_id: &str,
 ) -> Result<String, EngineError> {
-    let mut attempts: AttemptsByStep =
-        read_engine_record(execution, METADATA_STEP_ATTEMPTS_KEY)?.unwrap_or_default();
+    let mut attempts = read_attempts(execution)?;
     let record = attempts.remove(state_id).unwrap_or_default();
     if record.entries < 2 {
         return Ok(String::new());
@@ -174,10 +171,8 @@ pub(super) fn add_history(config: &mut AgentActionConfig, template: &str, histor
 
 /// Both records, as a decision saves them for an undo to restore.
 pub(super) fn step_memory_value(execution: &WorkflowExecution) -> Result<Value, EngineError> {
-    let attempts: AttemptsByStep =
-        read_engine_record(execution, METADATA_STEP_ATTEMPTS_KEY)?.unwrap_or_default();
-    let locals: LocalsByStep =
-        read_engine_record(execution, METADATA_STEP_LOCALS_KEY)?.unwrap_or_default();
+    let attempts = read_attempts(execution)?;
+    let locals = read_locals(execution)?;
     Ok(json!({
         METADATA_STEP_ATTEMPTS_KEY: attempts,
         METADATA_STEP_LOCALS_KEY: locals,
@@ -205,13 +200,20 @@ pub(super) fn restore_step_memory(
     write_engine_record(execution, METADATA_STEP_LOCALS_KEY, &locals)
 }
 
+fn read_attempts(execution: &WorkflowExecution) -> Result<AttemptsByStep, EngineError> {
+    Ok(read_engine_record(execution, METADATA_STEP_ATTEMPTS_KEY)?.unwrap_or_default())
+}
+
+fn read_locals(execution: &WorkflowExecution) -> Result<LocalsByStep, EngineError> {
+    Ok(read_engine_record(execution, METADATA_STEP_LOCALS_KEY)?.unwrap_or_default())
+}
+
 fn update_attempts(
     execution: &mut WorkflowExecution,
     state_id: &str,
     change: impl FnOnce(&mut StepAttempts),
 ) -> Result<(), EngineError> {
-    let mut attempts: AttemptsByStep =
-        read_engine_record(execution, METADATA_STEP_ATTEMPTS_KEY)?.unwrap_or_default();
+    let mut attempts = read_attempts(execution)?;
     change(attempts.entry(state_id.to_string()).or_default());
     write_engine_record(execution, METADATA_STEP_ATTEMPTS_KEY, &attempts)
 }
@@ -219,10 +221,14 @@ fn update_attempts(
 /// The block for `record`: its entry number and its latest attempts, as
 /// many as fit in [`MAX_HISTORY_BYTES`].
 fn render_history(record: &StepAttempts) -> String {
-    let lines: Vec<String> = record.attempts.iter().map(attempt_line).collect();
-    let mut shown = &lines[lines.len().saturating_sub(SHOWN_ATTEMPTS)..];
+    let total = record.attempts.len();
+    let lines: Vec<String> = record.attempts[total.saturating_sub(SHOWN_ATTEMPTS)..]
+        .iter()
+        .map(attempt_line)
+        .collect();
+    let mut shown = &lines[..];
     loop {
-        let block = compose_history(record.entries, lines.len() - shown.len(), shown);
+        let block = compose_history(record.entries, total - shown.len(), shown);
         if block.len() <= MAX_HISTORY_BYTES || shown.is_empty() {
             return block;
         }

@@ -48,6 +48,7 @@ use narsor_protocol::api::{
     ENTRY_LIMIT_DECISION_FIELD, ENTRY_LIMIT_RESET_COUNTER,
 };
 use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView};
+use narsor_protocol::display::NO_REASON;
 use narsor_protocol::event::{AnsweredBy, EventData, InputCloseReason};
 
 /// What kind of wait the form answers, as the operator reads it.
@@ -1319,10 +1320,6 @@ impl InputPanel {
         self.selected = 1;
     }
 }
-
-/// What an approval says when the agent gave no reason (R3), as the engine
-/// says it at a gate.
-const NO_REASON: &str = "brak uzasadnienia";
 
 /// The field a message to the agent is typed into.
 pub const MESSAGE_FIELD: &str = "Wiadomość dla agenta";

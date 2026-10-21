@@ -458,8 +458,6 @@ fn answer_delivery(
     let values = proposal.values.clone();
     let mut delivery = match pending.continuation {
         InputContinuation::ResolveOutput => {
-            // A problem's answer is the step's output: `values` holds its
-            // `variables` and `artifacts`, or is the `variables` itself.
             let object = |key: &str| match values.get(key) {
                 Some(Value::Object(map)) => Some(map.clone()),
                 _ => None,

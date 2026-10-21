@@ -14,6 +14,9 @@ pub const TRUNCATION_MARKER: &str = "\n… [truncated by narsor]";
 /// What a link shows when it has no text to show.
 pub const EMPTY_LINK_TEXT: &str = "—";
 
+/// What a gate shows for a step that gave no reason.
+pub const NO_REASON: &str = "brak uzasadnienia";
+
 /// Prefix attached to an automatic-resume exhaustion reason.
 pub const EXHAUSTION_REASON_PREFIX: &str = "could not resume automatically: ";
 
