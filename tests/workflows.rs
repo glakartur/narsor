@@ -173,14 +173,6 @@ impl Answer {
             delivery
         }
     }
-
-    fn approval(state: &'static str) -> Self {
-        Self {
-            state,
-            values: Vec::new(),
-            approve: true,
-        }
-    }
 }
 
 /// Every `agent` state of a definition, by id.
@@ -668,20 +660,14 @@ fn replies_up_to_compound() -> Vec<Value> {
 }
 
 fn requirements_gates() -> Vec<Answer> {
-    vec![
-        Answer::approval("doc_review"),
-        Answer::new(
-            "approve_requirements",
-            &[("requirements_decision", "approve")],
-        ),
-    ]
+    vec![Answer::new(
+        "approve_requirements",
+        &[("requirements_decision", "approve")],
+    )]
 }
 
 fn plan_gates() -> Vec<Answer> {
-    vec![
-        Answer::approval("plan_review"),
-        Answer::new("approve_plan", &[("plan_decision", "approve")]),
-    ]
+    vec![Answer::new("approve_plan", &[("plan_decision", "approve")])]
 }
 
 /// Every gate from the start up to `compound`, each one approved.
@@ -1039,16 +1025,13 @@ async fn revise_requirements_at_the_plan_gate_resumes_the_brainstorm_session() {
         .run(
             &[
                 requirements_gates(),
-                vec![
-                    Answer::approval("plan_review"),
-                    Answer::new(
-                        "approve_plan",
-                        &[
-                            ("plan_decision", "revise_requirements"),
-                            ("plan_feedback", comment),
-                        ],
-                    ),
-                ],
+                vec![Answer::new(
+                    "approve_plan",
+                    &[
+                        ("plan_decision", "revise_requirements"),
+                        ("plan_feedback", comment),
+                    ],
+                )],
             ]
             .concat(),
         )
@@ -1061,6 +1044,31 @@ async fn revise_requirements_at_the_plan_gate_resumes_the_brainstorm_session() {
         "brainstorm continues its own session: {resumed}"
     );
     assert!(resumed.contains(comment), "the comment is the message: {resumed}");
+}
+
+/// The agent may skip the requirements review: the document goes straight to
+/// publication and the reason travels in `review_summary`.
+#[tokio::test]
+async fn a_skipped_requirements_review_goes_straight_to_publication() {
+    let ready = reply_with(
+        "requirements_ready",
+        json!({
+            "artifacts": { "requirements_doc": REQUIREMENTS_DOC },
+            "variables": { "review_summary": "Przegląd pominięto: zmiana jednej etykiety" },
+        }),
+    );
+    // brainstorm, publish_requirements; the run stops at the feedback check.
+    let replies = [ready, published()];
+    let run = CompoundRun::new(&replies, &[open_merge_request()]);
+
+    let execution = run.run(&requirements_gates()).await;
+
+    assert!(run.took(&execution.id, "brainstorm", "requirements_ready", "publish_requirements"));
+    assert!(run.took(&execution.id, "publish_requirements", "published", "approve_requirements"));
+    assert!(
+        run.prompt(2).contains("Przegląd pominięto: zmiana jednej etykiety"),
+        "the publish step reads the reason for the skipped review"
+    );
 }
 
 #[tokio::test]
@@ -1238,8 +1246,9 @@ const COMPOUND_STATES: [&str; 32] = [
     "not_merged",
 ];
 
-const COMPOUND_EDGES: [(&str, &str, &str); 62] = [
+const COMPOUND_EDGES: [(&str, &str, &str); 63] = [
     ("brainstorm", "requirements_drafted", "doc_review"),
+    ("brainstorm", "requirements_ready", "publish_requirements"),
     ("doc_review", "reviewed", "publish_requirements"),
     ("publish_requirements", "published", "approve_requirements"),
     ("approve_requirements", "approve", "check_requirements_feedback"),

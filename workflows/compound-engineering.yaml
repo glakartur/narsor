@@ -40,9 +40,10 @@ states:
 
   brainstorm:
     description: >
-      ce-brainstorm — explore the request with the person and write a
-      right-sized requirements document. Also the author of every revision of
-      that document.
+      ce-brainstorm — write a right-sized requirements document without
+      asking the person anything: assumptions and open questions go into the
+      document and the person answers on the merge request. Also the author of
+      every revision of that document.
     action:
       type: agent
       prompt: |
@@ -50,7 +51,9 @@ states:
 
         {{ inputs.feature_description }}
 
-        When the direction is unclear, ask the person; do not guess the product direction.
+        Do not ask the person anything. Do not use a tool that asks questions. Do not return `awaiting_input`. When the direction is unclear, take the safest assumption and continue. Write each assumption in a section named "Założenia do potwierdzenia". Write each question that needs the person in a separate section named "Pytania otwarte dla użytkownika". The person answers on the merge request.
+
+        The requirements review is the default: choose `requirements_drafted`. Choose `requirements_ready` only when the change is small and obvious and a review adds nothing. When in doubt, choose `requirements_drafted`. With `requirements_ready`, set `review_summary` to one sentence: "Przegląd pominięto: <reason>".
 
         Requirements document from an earlier pass, to revise rather than rewrite (empty on the first pass): {{ artifacts.requirements_doc }}
         Why the plan step could not plan the requirements (empty when it could): {{ context.requirements_blocker }}
@@ -62,6 +65,10 @@ states:
         description: >-
           why the plan step could not plan the requirements. Set it to an empty
           text: the document you wrote answers it.
+      - name: review_summary
+        description: >-
+          only with `requirements_ready`: one sentence with the reason the
+          review was skipped.
     artifacts:
       - name: requirements_doc
         description: repo-relative path of the requirements document you wrote or revised.
@@ -69,14 +76,20 @@ states:
       - label: requirements_drafted
         description: the requirements document is written.
         requires_artifacts: [requirements_doc]
+      - label: requirements_ready
+        description: the requirements document is written and a review adds nothing.
+        requires_artifacts: [requirements_doc]
+        requires_variables: [review_summary]
     transitions:
       requirements_drafted: doc_review
+      requirements_ready: publish_requirements
     timeout: 45m
 
   doc_review:
     description: >
       ce-doc-review — persona agents read the requirements document and fix
-      what they find. A person accepts the result before it is published.
+      what they find. The result goes to the merge request, where a person
+      reads it at the gate.
     action:
       type: agent
       prompt: |
@@ -92,7 +105,6 @@ states:
       - label: reviewed
         description: the document was reviewed and the findings recorded.
         requires_variables: [review_summary]
-        requires_human_approval: true
     transitions:
       reviewed: publish_requirements
     timeout: 30m
@@ -109,6 +121,7 @@ states:
       prompt: |
         Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. This is a GitLab repository: the pull request is a merge request.
         If this branch has no open merge request, open one as a Draft against the repository's default branch. If it has one ({{ context.pr_url }}), push the reviewed requirements to it without rewriting its description.
+        Add `{{ context.review_summary }}` as a comment on the merge request. Add it only when the merge request has no identical comment. Do not change the description.
         Report the merge request URL in `pr_url`.
     variables:
       - name: pr_url
@@ -129,7 +142,8 @@ states:
       type: human
       message: >
         Read the requirements document and its review on the merge request.
-        Approve it, send it back to its author with a comment, or stop. A note
+        Answer the open questions on the merge request or in
+        `requirements_feedback`. Approve it, send it back to its author with a comment, or stop. A note
         given with an approval is carried into the plan.
       inputs:
         - name: requirements_decision
@@ -234,8 +248,8 @@ states:
 
   plan_review:
     description: >
-      ce-doc-review over the plan. A person accepts the result before it is
-      published.
+      ce-doc-review over the plan. The result goes to the merge request, where
+      a person reads it at the gate.
     action:
       type: agent
       prompt: |
@@ -252,7 +266,6 @@ states:
       - label: reviewed
         description: the plan was reviewed and the findings recorded.
         requires_variables: [review_summary]
-        requires_human_approval: true
     transitions:
       reviewed: publish_plan
     timeout: 30m
@@ -267,6 +280,7 @@ states:
       prompt: |
         Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. This is a GitLab repository: the pull request is a merge request.
         Push the reviewed plan to the open merge request of this branch ({{ context.pr_url }}) without rewriting its description. If the branch has none, open one as a Draft against the repository's default branch.
+        Add `{{ context.review_summary }}` as a comment on the merge request. Add it only when the merge request has no identical comment. Do not change the description.
         Report the merge request URL in `pr_url`.
     variables:
       - name: pr_url

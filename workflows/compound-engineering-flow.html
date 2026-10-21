@@ -102,6 +102,7 @@
         <path class="edge" d="M425 520H360V432H425"/>
         <path class="edge" d="M675 510H720V320H675"/>
         <path class="edge" d="M675 534H780V220H675"/>
+        <path class="edge" d="M675 105H830V305H675"/>
         <path class="edge" d="M550 550V646"/>
         <path class="edge" d="M550 706V746"/>
         <path class="edge" d="M550 806V846"/>
@@ -154,6 +155,7 @@
         <path class="edge" d="M425 954H60V2644H110"/>
         <path class="edge" d="M425 1710H60V2644H110"/>
         <text class="edge-label" x="560" y="174" text-anchor="start">requirements_drafted</text>
+        <text class="edge-label" x="838" y="210" text-anchor="start">requirements_ready</text>
         <text class="edge-label" x="560" y="274" text-anchor="start">reviewed · akceptacja</text>
         <text class="edge-label" x="560" y="374" text-anchor="start">published</text>
         <text class="edge-label" x="560" y="474" text-anchor="start">approve</text>
@@ -246,7 +248,7 @@
       </svg>
     </div>
     <section class="notes" aria-label="Opis głównych pętli">
-      <article class="note"><h2>Wymagania i plan</h2><p>Review poprawia dokument i podsumowuje uwagi. Człowiek akceptuje ten wynik, zanim trafi do MR. Pierwsza publikacja tworzy Draft MR. Po bramce agent ocenia skalę poprawek z uwag: mała wraca do bramki, duża do review. Blokada planu wraca do autora wymagań.</p></article>
+      <article class="note"><h2>Wymagania i plan</h2><p>Review poprawia dokument i podsumowuje uwagi. Wynik nie czeka na akceptację: publikacja dodaje podsumowanie do MR jako komentarz, a człowiek czyta je przy bramce. Brainstorm nie zadaje pytań. Założenia i pytania otwarte są w dokumencie, a człowiek odpowiada w MR. Dla małej i oczywistej zmiany agent może pominąć review wymagań (<code>requirements_ready</code>) i podać powód w MR. Pierwsza publikacja tworzy Draft MR. Po bramce agent ocenia skalę poprawek z uwag: mała wraca do bramki, duża do review. Blokada planu wraca do autora wymagań.</p></article>
       <article class="note"><h2>Implementacja</h2><p>Uproszczenie działa raz. Każda późniejsza zmiana kodu przechodzi przez code review, sprawdzenie i publikację, zanim wróci do człowieka. Blokada implementacji wraca do autora planu. Pętle napraw mają limity wejść.</p></article>
       <article class="note"><h2>Wiedza i scalenie</h2><p>Bez nowej wiedzy proces idzie od razu do scalenia. Skrypt zdejmuje Draft, zatwierdza MR i ustawia scalenie po pipeline, a potem czeka do 1 h. Przy innym wyniku niż scalenie wyłącza scalenie automatyczne i przywraca Draft.</p></article>
     </section>
