@@ -13,7 +13,7 @@ Krok `finalize` w `workflows/compound-engineering.yaml` ma działać co najmniej
 
 ## Problem Frame
 
-Krok „Scalenie" (`finalize`) jest skryptem bash. Zweryfikowane w `workflows/compound-engineering.yaml`:
+Krok `finalize` jest skryptem bash. Zweryfikowane w `workflows/compound-engineering.yaml`:
 
 - Skrypt akceptuje tylko adres w formie `…/-/merge_requests/N`. Inny adres kończy się wynikiem `blocked` z komunikatem „not a GitLab merge request URL".
 - Skrypt wywołuje tylko `glab` (`mr view`, `mr update --ready`, `mr approve`, `mr merge --auto-merge`, `api …cancel_merge_when_pipeline_succeeds`).
