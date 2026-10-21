@@ -1026,6 +1026,26 @@ async fn a_task_permission_grant_reaches_claude_as_its_allowed_tool_rules() {
     );
 }
 
+/// A pending `ScheduleWakeup` or `CronCreate` keeps `claude --print` running
+/// until it fires: an agent that scheduled a 20-minute fallback while its
+/// subagents ran held its step that long after it had answered.
+#[tokio::test]
+async fn claude_is_denied_the_tools_that_defer_work_past_the_answer() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+
+    complete(&executor(&fake), agent_action("continue"), &root.workspace()).await;
+
+    let args = fake.args(1);
+    let deny = args
+        .iter()
+        .position(|arg| arg == "--disallowedTools")
+        .expect("the deferring tools are denied");
+    assert_eq!(args[deny + 1..deny + 3], ["ScheduleWakeup", "CronCreate"]);
+    assert!(args[deny + 3].starts_with("--"), "{args:?}");
+}
+
 /// `--allowedTools` and `--add-dir` take any number of values: right before
 /// the prompt they would swallow it, and `--resume` without a prompt makes
 /// Claude Code look for a deferred tool call and fail ("No deferred tool

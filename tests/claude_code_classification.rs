@@ -808,6 +808,36 @@ fn a_run_without_a_schema_has_no_structured_output() {
     assert_eq!(run_of("tools.ndjson").structured_output, None);
 }
 
+/// An agent that answers while its background subagents still run gets one
+/// more turn per subagent hand-back, each ending in its own prose-only
+/// `result` line (seen with `claude` 2.1.306).
+#[test]
+fn a_later_prose_result_keeps_the_structured_output_of_an_earlier_one() {
+    let mut parser = parser();
+    let answered = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "session-1",
+        "result": r#"{"choice":"done"}"#,
+        "structured_output": {"choice": "done"},
+    });
+    let hand_back = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "session-1",
+        "result": "The last reviewer found two advisory issues.",
+    });
+    for line in [&answered, &hand_back, &hand_back] {
+        parser.on_stdout_line(line.to_string().as_bytes());
+    }
+
+    let run = parser.finish(0, "");
+
+    assert_eq!(run.structured_output, Some(json!({"choice": "done"})));
+}
+
 #[test]
 fn a_result_preserves_structured_permission_denials_and_correlation() {
     let mut parser = parser();

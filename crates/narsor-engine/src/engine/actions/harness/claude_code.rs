@@ -6,6 +6,7 @@
 //! ```text
 //! claude --print --verbose --permission-prompts none \
 //!        [--add-dir <read_only_paths…>] [--allowedTools <rule>] \
+//!        --disallowedTools ScheduleWakeup CronCreate \
 //!        [--model <model>] [--max-turns <n>] \
 //!        [--append-system-prompt <text>] [--resume <session-id>] \
 //!        [--json-schema <schema>] \
@@ -42,6 +43,9 @@
 //!   `--add-dir` and `--allowedTools` are variadic and come first: right
 //!   before the prompt either would swallow it, and `--resume` without a
 //!   prompt makes the CLI look for a deferred tool call to continue and fail.
+//! * `--disallowedTools` denies the tools that schedule a later turn: a
+//!   pending one keeps the `--print` process alive until it fires, so a step
+//!   would wait for it (20 minutes, in the case seen) after its answer.
 //! * `--resume <id>` is always passed *with* its value: the flag's value is
 //!   optional, and a bare `--resume` would consume the prompt.
 //!
@@ -80,6 +84,11 @@ pub const DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
 
 /// How much of stderr is quoted in a failure message.
 const FAILURE_DETAIL_BYTES: usize = 2 * 1024;
+
+/// Tools that schedule a later turn. Under `--print` the CLI does not exit
+/// while one is pending, so the step waits for it long after the answer;
+/// subagent hand-backs already wake the agent without them.
+const DEFERRING_TOOLS: [&str; 2] = ["ScheduleWakeup", "CronCreate"];
 
 /// Adapter for the `claude` CLI.
 #[derive(Debug, Clone)]
@@ -148,6 +157,9 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             args.push("--allowedTools".to_string());
             args.extend(config.permission_grants.iter().cloned());
         }
+
+        args.push("--disallowedTools".to_string());
+        args.extend(DEFERRING_TOOLS.iter().map(|tool| tool.to_string()));
 
         if let Some(model) = &config.model {
             reject_option_like(model, "model", CLAUDE_CODE)?;
@@ -232,7 +244,7 @@ struct ClaudeCodeStreamParser {
     reported_error: bool,
     /// The `result` line's `subtype`, for the failure message.
     subtype: Option<String>,
-    /// The `result` line's `structured_output`, when it carried one.
+    /// The latest `structured_output` any `result` line carried.
     structured_output: Option<Value>,
     permission_denials: Vec<PermissionDenial>,
     denial_reasons: std::collections::HashMap<String, (Option<String>, Option<String>)>,
@@ -297,7 +309,11 @@ impl ClaudeCodeStreamParser {
         }
         self.subtype = result.subtype.clone();
         self.reported_error = result.is_error;
-        self.structured_output = result.structured_output.clone();
+        // A subagent hand-back after the answer ends in a prose-only
+        // `result`; it must not drop the answer.
+        if result.structured_output.is_some() {
+            self.structured_output = result.structured_output.clone();
+        }
         self.permission_denials = result.permission_denials.clone();
         self.result_text = result.text.clone().unwrap_or_default();
     }
