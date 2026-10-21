@@ -420,6 +420,48 @@ fn compound_engineering_uses_step_replies_required_variables_and_a_review_limit(
     assert_eq!(required("publish_work", "published"), vec!["pr_url"]);
 }
 
+/// The engine appends the reply contract to every agent prompt, so no
+/// open-mercato prompt carries a hand-written JSON format of its own. The PR
+/// the display shows is a declared variable of `open_pr`; everything else an
+/// agent reports goes to `additional_data`.
+#[test]
+fn open_mercato_prompts_leave_the_reply_format_to_the_engine() {
+    let entry = builtin("open-mercato-sdlc").expect("open-mercato-sdlc is built in");
+    let definition = narsor_engine::workflow::load_from_str(entry.source).expect("it loads");
+
+    let mut agent_states = 0;
+    for (id, state) in &definition.states {
+        let Some(ActionConfig::Agent(action)) = &state.action else {
+            continue;
+        };
+        agent_states += 1;
+        for old_format in ["\"output\"", "\"data\"", "awaiting_input"] {
+            assert!(
+                !action.prompt.contains(old_format),
+                "the prompt of '{id}' still carries `{old_format}`, which the engine's \
+                 contract covers"
+            );
+        }
+    }
+    assert_eq!(agent_states, 15, "open-mercato has fifteen agent steps");
+
+    let declared: Vec<&str> = definition.states["open_pr"]
+        .variables
+        .iter()
+        .map(|variable| variable.name.as_str())
+        .collect();
+    assert_eq!(declared, vec!["pr_number", "pr_url"]);
+    for (id, state) in &definition.states {
+        if id != "open_pr" {
+            assert!(
+                state.variables.is_empty() && state.artifacts.is_empty(),
+                "only 'open_pr' sets a value a later step or the display reads; '{id}' \
+                 declares one"
+            );
+        }
+    }
+}
+
 /// The implementation agent asks questions through `awaiting_input`, then
 /// resumes the same action; it does not route ambiguity through a workflow gate.
 /// The engine's output contract teaches `awaiting_input`, so the prompt leaves

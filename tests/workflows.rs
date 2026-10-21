@@ -647,25 +647,43 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
 #[tokio::test]
 async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates() {
     let root = TempRoot::new();
-    let harness = FakeHarness::installed_in(
+    let pr_url = "https://example.test/open-mercato/app/pull/42";
+    // Every agent call of the path below, in order, in the reply format the
+    // engine's contract asks for. Informational fields go to
+    // `additional_data`; only the PR, which the display shows, is a variable.
+    let reply = |choice: &str, additional_data: Value| {
+        json!({
+            "choice": choice,
+            "reason": format!("{choice}: the step's work is done"),
+            "additional_data": additional_data,
+        })
+    };
+    let harness = FakeHarness::answering_in(
         root.dir("harness"),
         &[
-            "routed",            // discover
-            "ready",             // intake
-            "actionable",        // triage
-            "claimed",           // claim
-            "user_facing",       // assess_surface
-            "shaped",            // shape_design
-            "implemented",       // implement
-            "pr_opened",         // open_pr
-            "changes_requested", // code_review
-            "updated",           // address_feedback
-            "approved",          // code_review again
-            "needs_qa",          // qa_routing
-            "evidence_ready",    // qa_run
-            "mergeable",         // premerge_check
-            "merged",            // merge_pr
-            "reconciled",        // housekeeping
+            reply("routed", json!({ "brief": null })), // discover
+            reply("ready", json!({ "ready_status": "READY", "gaps": [] })), // intake
+            reply("actionable", json!({ "evidence": "empty list renders blank" })), // triage
+            reply("claimed", json!({ "claimed_by": "narsor" })), // claim
+            json!({
+                "choice": "user_facing",
+                "reason": "the orders list is a screen a merchant sees",
+            }), // assess_surface
+            reply("shaped", json!({ "states_covered": ["empty"] })), // shape_design
+            reply("implemented", json!({ "files_changed": 2 })), // implement
+            json!({
+                "choice": "pr_opened",
+                "reason": "the pull request is open and labelled",
+                "variables": { "pr_number": "42", "pr_url": pr_url },
+            }), // open_pr
+            reply("changes_requested", json!({ "findings": 1, "blockers": 0 })), // code_review
+            reply("updated", json!({ "threads_addressed": 1 })), // address_feedback
+            reply("approved", json!({ "findings": 0, "blockers": 0 })), // code_review again
+            reply("needs_qa", json!({ "qa_label": "needs-qa" })), // qa_routing
+            reply("evidence_ready", json!({ "scenarios": 7, "qa_head": "deadbeef" })), // qa_run
+            reply("mergeable", json!({ "blockers": [] })), // premerge_check
+            reply("merged", json!({ "merge_commit": "c0ffee" })), // merge_pr
+            reply("reconciled", json!({ "closed": 1, "follow_ups": 0 })), // housekeeping
         ],
     );
     let engine = harness.engine(root.dir("store"));
@@ -714,6 +732,131 @@ async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates(
         Some(&json!("deadbeef")),
         "the QA head the reviewer pinned the approval to is kept in the context"
     );
+    // `open_pr` declares the PR, so it reaches the context the display reads
+    // (`{{ context.variables.pr_number }}`, `{{ context.variables.pr_url }}`).
+    assert_eq!(
+        execution.context.variables.get("pr_number"),
+        Some(&json!("42"))
+    );
+    assert_eq!(
+        execution.context.variables.get("pr_url"),
+        Some(&json!(pr_url))
+    );
+    // Informational fields stay out of the context (KTD5).
+    for informational in ["brief", "evidence", "findings", "merge_commit"] {
+        assert!(
+            execution.context.variables.get(informational).is_none(),
+            "'{informational}' is additional data, not a variable"
+        );
+    }
+}
+
+/// The graph of the Open Mercato pipeline before its prompts moved to the
+/// reply contract: every state, and every `(state, label, target)` edge.
+/// Moving to the new contract changes how agents answer, never where the
+/// process goes (R23).
+const OPEN_MERCATO_STATES: [&str; 23] = [
+    "discover",
+    "intake",
+    "confirm_readiness",
+    "triage",
+    "claim",
+    "assess_surface",
+    "shape_design",
+    "approve_design",
+    "implement",
+    "validation_gate",
+    "open_pr",
+    "code_review",
+    "address_feedback",
+    "qa_routing",
+    "qa_run",
+    "qa_signoff",
+    "premerge_check",
+    "approve_merge",
+    "merge_pr",
+    "housekeeping",
+    "finished",
+    "closed_no_action",
+    "cancelled",
+];
+
+const OPEN_MERCATO_EDGES: [(&str, &str, &str); 38] = [
+    ("discover", "routed", "intake"),
+    ("discover", "no_action", "closed_no_action"),
+    ("intake", "ready", "confirm_readiness"),
+    ("intake", "gaps_found", "confirm_readiness"),
+    ("confirm_readiness", "confirmed", "triage"),
+    ("confirm_readiness", "waived", "triage"),
+    ("confirm_readiness", "not_ready", "intake"),
+    ("confirm_readiness", "abandon", "cancelled"),
+    ("triage", "actionable", "claim"),
+    ("triage", "no_action", "closed_no_action"),
+    ("triage", "already_claimed", "closed_no_action"),
+    ("claim", "claimed", "assess_surface"),
+    ("claim", "claim_lost", "closed_no_action"),
+    ("assess_surface", "user_facing", "shape_design"),
+    ("assess_surface", "not_user_facing", "implement"),
+    ("shape_design", "shaped", "approve_design"),
+    ("approve_design", "approved", "implement"),
+    ("approve_design", "reshape", "shape_design"),
+    ("approve_design", "abandon", "cancelled"),
+    ("implement", "implemented", "validation_gate"),
+    ("validation_gate", "green", "open_pr"),
+    ("validation_gate", "red", "implement"),
+    ("open_pr", "pr_opened", "code_review"),
+    ("code_review", "approved", "qa_routing"),
+    ("code_review", "changes_requested", "address_feedback"),
+    ("address_feedback", "updated", "code_review"),
+    ("qa_routing", "needs_qa", "qa_run"),
+    ("qa_routing", "skip_qa", "premerge_check"),
+    ("qa_run", "evidence_ready", "qa_signoff"),
+    ("qa_signoff", "qa_approved", "premerge_check"),
+    ("qa_signoff", "qa_failed", "implement"),
+    ("qa_signoff", "abandon", "cancelled"),
+    ("premerge_check", "mergeable", "approve_merge"),
+    ("approve_merge", "merge", "merge_pr"),
+    ("approve_merge", "hold", "approve_merge"),
+    ("approve_merge", "abandon", "cancelled"),
+    ("merge_pr", "merged", "housekeeping"),
+    ("housekeeping", "reconciled", "finished"),
+];
+
+#[test]
+fn the_open_mercato_graph_keeps_its_states_and_transitions() {
+    let definition = shipped("open-mercato-sdlc.yaml");
+
+    let mut states: Vec<&str> = definition.states.keys().map(String::as_str).collect();
+    states.sort_unstable();
+    let mut expected_states = OPEN_MERCATO_STATES.to_vec();
+    expected_states.sort_unstable();
+    assert_eq!(states, expected_states);
+
+    let mut edges: Vec<(&str, &str, &str)> = definition
+        .states
+        .iter()
+        .flat_map(|(id, state)| {
+            state
+                .transitions
+                .iter()
+                .map(move |(label, target)| (id.as_str(), label.as_str(), target.as_str()))
+        })
+        .collect();
+    edges.sort_unstable();
+    let mut expected_edges = OPEN_MERCATO_EDGES.to_vec();
+    expected_edges.sort_unstable();
+    assert_eq!(edges, expected_edges);
+
+    // No choice gained a requirement: the gates decide as they did before.
+    for (id, state) in &definition.states {
+        for choice in &state.choices {
+            assert!(
+                choice.requires_variables.is_empty() && choice.requires_artifacts.is_empty(),
+                "state '{id}' choice '{}' gained a requirement",
+                choice.label
+            );
+        }
+    }
 }
 
 /// The QA gate really does route a failure back into implementation, and the
