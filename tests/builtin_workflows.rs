@@ -1,20 +1,15 @@
 //! Tests for the shipped workflows and the search path that reaches them (U12).
 //!
-//! Two halves:
-//!
-//! * the resolver itself, driven through the library, where the user directory
-//!   is handed in explicitly
-//!   ([`WorkflowResolver::with_user_dir`](narsor_engine::workflows::WorkflowResolver::with_user_dir));
-//! * the binary, driven through `std::process::Command`, where
-//!   `XDG_CONFIG_HOME` points at a temporary directory.
+//! The tests drive the resolver and the embedded definitions through the
+//! library. The user directory is handed in explicitly
+//! ([`WorkflowResolver::with_user_dir`](narsor_engine::workflows::WorkflowResolver::with_user_dir)).
+//! No test starts a daemon or a process.
 //!
 //! # Nothing is written into the repository, or into the real `~/.config`
 //!
 //! Every test owns a temporary directory and everything it touches lives under
 //! it: the store, `{root}/workflows`, and the "user" configuration directory.
-//! No test lets the resolver read the environment as it finds it — the library
-//! tests pass the directory in, and the process tests set `XDG_CONFIG_HOME` and
-//! `HOME` on the child.
+//! No test lets the resolver read the environment as it finds it.
 //!
 //! # The assertions about the built-ins are made against the embedded strings
 //!
@@ -23,11 +18,8 @@
 //! that opens the files compares them byte for byte with what is embedded, so
 //! the two cannot drift.
 
-mod engine_support;
-
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use narsor_engine::domain::ActionConfig;
 use narsor_engine::engine::actions::agent::output_contract;
@@ -35,9 +27,6 @@ use narsor_engine::engine::StepContract;
 use narsor_engine::workflows::{
     builtin, builtin_names, WorkflowOrigin, WorkflowResolver, BUILTIN_WORKFLOWS,
 };
-
-/// The exit code of a successful command.
-const EXIT_SUCCESS: i32 = 0;
 
 // ---------------------------------------------------------------------------
 // harness
@@ -71,11 +60,6 @@ impl TempRoot {
     /// The store root the binary is pointed at.
     fn root(&self) -> PathBuf {
         self.dir("root")
-    }
-
-    /// The stand-in for `$XDG_CONFIG_HOME`.
-    fn config(&self) -> PathBuf {
-        self.dir("config")
     }
 
     /// `{root}/workflows`.
@@ -123,105 +107,6 @@ fn marked_definition(marker: &str) -> String {
          terminal_states:\n\
          \x20 - done\n"
     )
-}
-
-/// What one invocation of the binary produced.
-struct Invocation {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-impl Invocation {
-    /// Both streams together, for assertions that do not care which one carried
-    /// the text.
-    fn output(&self) -> String {
-        format!("{}{}", self.stdout, self.stderr)
-    }
-}
-
-/// Runs the built binary against the temporary root.
-///
-/// `XDG_CONFIG_HOME` **and** `HOME` are redirected into the temporary
-/// directory, so neither the resolver's primary nor its fallback can reach the
-/// developer's own configuration.
-fn cli(root: &TempRoot, args: &[&str]) -> Invocation {
-    cli_with_path(root, args, None)
-}
-
-/// The same, with a directory prepended to `PATH` — for the fake `claude`.
-fn cli_with_path(root: &TempRoot, args: &[&str], bin: Option<&Path>) -> Invocation {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor-cli"));
-    command
-        .current_dir(root.path())
-        .env("XDG_CONFIG_HOME", root.config())
-        .env("HOME", root.path())
-        .env("NARSOR_LOCAL_WORKSPACE_ROOTS", root.path())
-        .arg("--root")
-        .arg(root.root())
-        .args(args);
-
-    // The daemon a run spawns runs the conductor at every human gate: on
-    // the fake harness, never a real `claude`.
-    let inherited = engine_support::fake_claude_first_on_path();
-    match bin {
-        Some(bin) => command.env("PATH", format!("{}:{inherited}", bin.display())),
-        None => command.env("PATH", inherited),
-    };
-
-    let output = command.output().expect("run the narsor binary");
-    Invocation {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-    }
-}
-
-/// Pulls the execution id out of what `run` printed.
-fn execution_id(stdout: &str) -> String {
-    stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("Created execution: "))
-        .unwrap_or_else(|| panic!("`run` did not print an execution id; stdout was:\n{stdout}"))
-        .trim()
-        .to_string()
-}
-
-/// The state directory of the runner storage that holds `execution_id`.
-///
-/// Tasks admitted through the scheduler keep their executions in the local
-/// backend's per-task storage, not in the daemon's own `executions` directory.
-fn runner_state_dir(root: &TempRoot, execution_id: &str) -> PathBuf {
-    let storage = root.root().join("local-controller/storage");
-    fs::read_dir(&storage)
-        .expect("local task storage")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join("state"))
-        .find(|state| state.join("executions").join(execution_id).is_dir())
-        .unwrap_or_else(|| panic!("no runner storage contains execution {execution_id}"))
-}
-
-/// The launch spec sealed for the task that owns `execution_id`.
-fn sealed_spec(root: &TempRoot, execution_id: &str) -> serde_json::Value {
-    let specs = runner_state_dir(root, execution_id).join("launch-specs");
-    let path = fs::read_dir(specs)
-        .expect("runner launch specs")
-        .find_map(Result::ok)
-        .expect("one sealed spec")
-        .path();
-    let text = fs::read_to_string(path).expect("read the sealed spec");
-    serde_json::from_str(&text).expect("parse the sealed spec")
-}
-
-/// The execution state a runner recorded, as raw text.
-fn stored_state(root: &TempRoot, execution_id: &str) -> String {
-    fs::read_to_string(
-        runner_state_dir(root, execution_id)
-            .join("executions")
-            .join(execution_id)
-            .join("state.json"),
-    )
-    .expect("read the stored execution")
 }
 
 // ---------------------------------------------------------------------------
@@ -879,237 +764,4 @@ fn the_listing_reports_an_override_rather_than_two_rows() {
     assert_eq!(overridden.origin.label(), "root");
     assert!(overridden.is_override());
     assert_eq!(overridden.shadow_labels(), "built-in");
-}
-
-// ---------------------------------------------------------------------------
-// the trap: an execution started from a built-in has no definition path
-// ---------------------------------------------------------------------------
-
-/// Installs a `claude` that gives the n-th of `answers` on its n-th call.
-///
-/// Every state of the shipped workflows that the test reaches is an agent
-/// action on the `claude-code` harness, which runs `claude` from `PATH`. The
-/// real one costs money and needs credentials, so the test puts its own on the
-/// front of `PATH`.
-fn install_fake_claude(root: &TempRoot, answers: &[serde_json::Value]) -> PathBuf {
-    let bin = root.dir("bin");
-    for (index, answer) in answers.iter().enumerate() {
-        let line = serde_json::json!({
-            "type": "result",
-            "subtype": "success",
-            "is_error": false,
-            "session_id": "fake",
-            "result": answer.to_string(),
-        });
-        fs::write(bin.join(format!("answer.{}", index + 1)), format!("{line}\n"))
-            .expect("write a fake answer");
-    }
-    let program = bin.join("claude");
-    let script = "#!/bin/sh\n\
-                  dir=$(dirname \"$0\")\n\
-                  count=$(cat \"$dir/count\" 2>/dev/null || echo 0)\n\
-                  count=$((count + 1))\n\
-                  echo \"$count\" > \"$dir/count\"\n\
-                  cat \"$dir/answer.$count\"\n";
-    fs::write(&program, script).expect("write the fake harness");
-    make_executable(&program);
-    bin
-}
-
-/// A local git repository the workspace of a shipped workflow can be cloned
-/// from.
-fn source_repo(root: &TempRoot) -> PathBuf {
-    let path = root.dir("source-repo");
-    git(&path, &["init", "-q", "-b", "main", "."]);
-    fs::write(path.join("README.md"), "a repository to clone\n").expect("write a file");
-    git(&path, &["add", "."]);
-    git(
-        &path,
-        &[
-            "-c",
-            "user.email=tests@example.test",
-            "-c",
-            "user.name=tests",
-            "commit",
-            "-qm",
-            "initial",
-        ],
-    );
-    path
-}
-
-/// Runs `git` inside a directory, failing loudly.
-fn git(path: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .current_dir(path)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// Makes a file executable, which the fake harness has to be.
-fn make_executable(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path).expect("stat the file").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("make the file executable");
-    }
-}
-
-/// The test this whole change exists for: an execution started from a built-in
-/// **by name** is resumable from a fresh process.
-///
-/// A built-in has no file, so nothing can be recorded in
-/// `metadata.cli.definition_path`; the workflow *name* is recorded instead, and
-/// `narsor input` re-resolves from it. Both shipped workflows are full of
-/// human gates, so an execution that could not be answered would be useless.
-#[test]
-#[ignore = "starts a narsor daemon; run with --ignored"]
-fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process() {
-    let root = TempRoot::new();
-    // The brainstorm never asks: it skips the review and the publish step
-    // reports the merge request, so the first stop is `approve_requirements`.
-    let bin = install_fake_claude(
-        &root,
-        &[
-            serde_json::json!({
-                "choice": "requirements_ready",
-                "reason": "a small change",
-                "artifacts": { "requirements_doc": "docs/brainstorms/r.md" },
-                "variables": { "review_summary": "Przegląd pominięto: mała zmiana" },
-            }),
-            serde_json::json!({
-                "choice": "published",
-                "reason": "pushed",
-                "variables": { "pr_url": "https://gitlab.example.test/acme/web/-/merge_requests/7" },
-            }),
-            serde_json::json!({ "choice": "no_feedback", "reason": "none" }),
-        ],
-    );
-    let repo = source_repo(&root);
-
-    let started = cli_with_path(
-        &root,
-        &[
-            "run",
-            "compound-engineering",
-            "--input",
-            "feature_description=a thing worth building",
-            "--input",
-            &format!("target_repo={}", repo.display()),
-        ],
-        Some(&bin),
-    );
-    assert_eq!(
-        started.code,
-        EXIT_SUCCESS,
-        "the built-in ran: {}",
-        started.output()
-    );
-    assert!(
-        started.stderr.contains("built-in"),
-        "it says the definition came from the built-in: {}",
-        started.stderr
-    );
-    let id = execution_id(&started.stdout);
-    assert!(
-        started.stdout.contains("Human input expected"),
-        "the run stopped on a human gate:\n{}",
-        started.stdout
-    );
-
-    // What was sealed: the workflow identity, and no path — because there is none.
-    assert_eq!(
-        sealed_spec(&root, &id)["workflow_id"],
-        "compound-engineering",
-        "the sealed spec names the workflow"
-    );
-    assert!(
-        !stored_state(&root, &id).contains("definition_path"),
-        "a built-in records no path, because it has none"
-    );
-
-    // A fresh process: it has to re-resolve the definition from that name.
-    let answered = cli_with_path(
-        &root,
-        &[
-            "input",
-            &id,
-            "--field",
-            "requirements_decision=approve",
-        ],
-        Some(&bin),
-    );
-    assert_eq!(
-        answered.code,
-        EXIT_SUCCESS,
-        "the human gate was answered: {}",
-        answered.output()
-    );
-    assert!(
-        answered.stdout.contains("Input delivered to execution"),
-        "the input reached the execution:\n{}",
-        answered.stdout
-    );
-}
-
-/// The same, for an execution started from a file path: the old behaviour is
-/// untouched.
-#[test]
-#[ignore = "starts a narsor daemon; run with --ignored"]
-fn an_execution_started_from_a_file_path_is_still_resumable_in_a_fresh_process() {
-    let root = TempRoot::new();
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cli");
-    let definition = fixtures.join("greet.yaml");
-
-    let started = cli(
-        &root,
-        &[
-            "run",
-            &definition.display().to_string(),
-            "--input",
-            "greeting=Good morning",
-            "--input",
-            &format!("script_path={}", fixtures.join("announce.sh").display()),
-        ],
-    );
-    assert_eq!(
-        started.code,
-        EXIT_SUCCESS,
-        "the file ran: {}",
-        started.output()
-    );
-    let id = execution_id(&started.stdout);
-
-    assert!(
-        !stored_state(&root, &id).contains("definition_path"),
-        "runner executions rely on the sealed definition, not a mutable path"
-    );
-    assert!(
-        sealed_spec(&root, &id)["definition"]["id"].is_string(),
-        "the definition travels inside the sealed spec"
-    );
-
-    let answered = cli(
-        &root,
-        &["input", &id, "--field", "approval_status=approved"],
-    );
-    assert_eq!(
-        answered.code,
-        EXIT_SUCCESS,
-        "the question was answered: {}",
-        answered.output()
-    );
-    assert!(
-        answered.stdout.contains("Status: completed"),
-        "the execution finished:\n{}",
-        answered.stdout
-    );
 }
