@@ -1410,6 +1410,7 @@ async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() 
                 reason: None,
                 reply: None,
                 state_entries_before: serde_json::Value::Null,
+                step_memory_before: serde_json::Value::Null,
                 saved_at: chrono::Utc::now(),
             }],
             ..ConductorState::default()

@@ -109,11 +109,14 @@ use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequ
 use crate::engine::retry::RetrySchedule;
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
 use crate::workflow::template::{step_reply_references, step_stream_references};
-use crate::workflow::{action_context_references, DeclaredNames, TemplateScope};
+use crate::workflow::{
+    action_context_references, places_step_history, DeclaredNames, StepMemory, TemplateScope,
+};
 
 mod failure;
 mod operations;
 mod rescue;
+mod step_memory;
 
 pub use failure::{
     step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
@@ -121,6 +124,9 @@ pub use failure::{
 pub use operations::{
     execution_episode, plan_operator_transition, ManualTransition, OperatorTransition,
     OutputDecisionUndo, TransitionPlan, UndoneOutputDecision,
+};
+pub use step_memory::{
+    StepAttempt, StepAttempts, METADATA_STEP_ATTEMPTS_KEY, METADATA_STEP_LOCALS_KEY,
 };
 
 /// How many events the in-process broadcast channel buffers per receiver.
@@ -356,12 +362,14 @@ impl OutputRejection {
         })
     }
 
-    /// The rejection of a result whose label the state does not declare,
-    /// when it is one — `None` for a declared label.
+    /// The rejection of a result whose label the state does not declare, or
+    /// that lacks what its choice requires (with `kept_locals`, the step's
+    /// `local.*` values from earlier attempts) — `None` for a complete one.
     fn from_result(
         state: &State,
         action_execution_id: &str,
         result: &ActionResult,
+        kept_locals: &Map<String, Value>,
     ) -> Option<Self> {
         let reason = match decision::check_label(state, &result.output_label) {
             Err(error @ DecisionError::LabelNotDeclared { .. }) => error.to_string(),
@@ -370,7 +378,7 @@ impl OutputRejection {
                     .choices
                     .iter()
                     .find(|choice| choice.label == result.output_label)?;
-                unmet_requirements(choice, result)?
+                unmet_requirements(choice, result, kept_locals)?
             }
             Err(_) => return None,
         };
@@ -413,7 +421,14 @@ impl OutputRejection {
 
 /// What `result` lacks of what `choice` requires, as the reason to ask the
 /// agent again — `None` when nothing is missing.
-fn unmet_requirements(choice: &ChoiceDefinition, result: &ActionResult) -> Option<String> {
+///
+/// A `local.*` variable the result does not give is met by the value its
+/// step kept from an earlier attempt (`kept_locals`, KTD10).
+fn unmet_requirements(
+    choice: &ChoiceDefinition,
+    result: &ActionResult,
+    kept_locals: &Map<String, Value>,
+) -> Option<String> {
     let missing_variables: Vec<&str> = choice
         .requires_variables
         .iter()
@@ -421,6 +436,7 @@ fn unmet_requirements(choice: &ChoiceDefinition, result: &ActionResult) -> Optio
             result
                 .variables
                 .get(required.as_str())
+                .or_else(|| kept_locals.get(required.as_str()))
                 .is_none_or(human::is_blank)
         })
         .map(String::as_str)
@@ -1174,6 +1190,7 @@ impl Engine {
                 count_entry(&mut execution, &initial.id)?;
             }
         }
+        step_memory::count_step_entry(&mut execution, &definition.initial_state)?;
 
         if let Some(object) = execution.inputs.as_object() {
             execution.context.update_variables(object.clone());
@@ -2276,12 +2293,26 @@ impl Engine {
                 );
             }
         }
+        let unreadable_memory = |error: EngineError| AttemptFailure::permanent(error.to_string());
+        let kept_locals =
+            step_memory::step_locals(execution, &state.id).map_err(unreadable_memory)?;
+        let history = match action {
+            ActionConfig::Agent(config) if config.history => {
+                step_memory::history_block(execution, &state.id).map_err(unreadable_memory)?
+            }
+            _ => String::new(),
+        };
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
         let scope = scope
             .with_declared(declared)
             .with_step_replies(&step_replies)
-            .with_step_streams(&step_streams);
+            .with_step_streams(&step_streams)
+            .with_step_memory(StepMemory {
+                locals: &kept_locals,
+                definitions: &state.variables,
+                history: &history,
+            });
         let mut rendered = scope
             .render_action(action, &location)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
@@ -2290,7 +2321,12 @@ impl Engine {
         // explicit recovery. It remains durable until this point, so a daemon
         // restart before the attempt begins cannot silently discard it.
         let mut resumed_input = None;
-        if let ActionConfig::Agent(config) = &mut rendered {
+        if let (ActionConfig::Agent(config), ActionConfig::Agent(template)) =
+            (&mut rendered, action)
+        {
+            // Before a resumed session replaces the prompt: a session that
+            // goes on already knows its history (KTD9).
+            step_memory::add_history(config, &template.prompt, &history);
             self.pin_harness(config, pinned_harness);
             if let Some(input) = self.take_agent_input(execution, state)? {
                 if let (Some(harness), Some(session)) =
@@ -2330,9 +2366,12 @@ impl Engine {
                 // agent, answered with a reprompt (KTD7); for any other action
                 // it stays the permanent failure `record_completion` reports.
                 if kind == ActionKind::Agent {
-                    if let Some(rejection) =
-                        OutputRejection::from_result(state, action_execution_id, &result)
-                    {
+                    if let Some(rejection) = OutputRejection::from_result(
+                        state,
+                        action_execution_id,
+                        &result,
+                        &kept_locals,
+                    ) {
                         return Ok(AttemptOutcome::OutputRejected(rejection));
                     }
                 }
@@ -2669,9 +2708,15 @@ impl Engine {
             }
         };
 
+        let kept_locals = step_memory::step_locals(execution, &state.id)?;
         let failure = match outcome {
             Ok(ActionOutcome::Completed(result)) => {
-                match OutputRejection::from_result(state, &action_execution_id, &result) {
+                match OutputRejection::from_result(
+                    state,
+                    &action_execution_id,
+                    &result,
+                    &kept_locals,
+                ) {
                     None => {
                         return Ok(RepromptEnd::Labelled {
                             action_execution_id,
@@ -3053,6 +3098,8 @@ impl Engine {
         execution
             .context
             .update_variables(shared_variables(&pending.result.variables));
+        step_memory::keep_locals(execution, &state.id, &pending.result.variables)?;
+        step_memory::record_choice(execution, &state.id, &outcome.label, &pending.result.reason)?;
         if pending
             .result
             .reply
@@ -3137,6 +3184,7 @@ impl Engine {
             },
         )?;
 
+        step_memory::count_step_entry(execution, &target)?;
         execution.current_state = Some(target);
         execution.current_action_execution = Some(pending.action_execution_id);
         let target_state = definition
@@ -3337,7 +3385,10 @@ impl Engine {
         failure: impl Into<FailedAction>,
         side_effect_free: bool,
     ) -> Result<(), EngineError> {
-        let failure = failure.into();
+        let failure: FailedAction = failure.into();
+        if let Some(state_id) = execution.current_state.clone() {
+            step_memory::record_failure(execution, &state_id, failure.error_type.as_deref())?;
+        }
         self.emit(
             &execution.id,
             EventData::ActionFailed {

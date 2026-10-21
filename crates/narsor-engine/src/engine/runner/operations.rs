@@ -197,6 +197,9 @@ pub struct OutputDecisionUndo {
     /// The entry counts (R10) from before it; `null` leaves them as they
     /// are.
     pub state_entries_before: Value,
+    /// The steps' entries, attempts and `local.*` values (KTD8) from
+    /// before it; `null` leaves them as they are.
+    pub step_memory_before: Value,
     /// The choice being undone, shown on the problem as the conductor's
     /// reading of the answers.
     pub analysis: ConductorAnalysis,
@@ -404,6 +407,7 @@ impl Engine {
         if is_agent(target_state) && target_state.max_entries.is_some() {
             count_entry(&mut execution, &target_state.id)?;
         }
+        step_memory::count_step_entry(&mut execution, &target_state.id)?;
 
         // What the agent in the state being left said, for a gate the target
         // may be (KTD8). Read before anything is written: the pending request
@@ -537,6 +541,10 @@ impl Engine {
         execution.context = context;
         // The decision's transition counted an entry into its target.
         restore_state_entries(&mut execution, &undo.state_entries_before)?;
+        // The decision's attempt goes, and so do the notes it kept; going
+        // back to its step is an entry of its own (KTD8).
+        step_memory::restore_step_memory(&mut execution, &undo.step_memory_before)?;
+        step_memory::count_step_entry(&mut execution, &undo.state_id)?;
         execution.completed_at = None;
         execution.current_state = Some(undo.state_id.clone());
         if let Some(last) = undo.answers.last() {

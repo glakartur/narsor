@@ -181,6 +181,7 @@ impl Engine {
                                 reason: Some(rescue.reason.clone()),
                                 reply: rescue.reply.clone(),
                                 state_entries_before: state_entries_value(execution)?,
+                                step_memory_before: step_memory::step_memory_value(execution)?,
                                 saved_at: Utc::now(),
                             };
                             conductor.save_decision(
@@ -576,6 +577,7 @@ fn unsaved_decision(
         reason: None,
         reply: None,
         state_entries_before: Value::Null,
+        step_memory_before: Value::Null,
         saved_at: Utc::now(),
     }
 }

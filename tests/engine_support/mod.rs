@@ -642,6 +642,8 @@ pub enum AgentTurn {
     },
     /// An action failure.
     Fail,
+    /// An action failure of this error type (`timeout`, …).
+    FailOfType(&'static str),
     /// A question to the person.
     Ask(&'static str),
     /// A permission request for one Bash command.
@@ -841,6 +843,11 @@ impl ActionExecutor for ScriptedAgentExecutor {
             AgentTurn::Fail => Err(ActionError {
                 message: "the scripted agent failed on purpose".to_string(),
                 error_type: None,
+                details: None,
+            }),
+            AgentTurn::FailOfType(error_type) => Err(ActionError {
+                message: format!("the scripted agent failed with {error_type}"),
+                error_type: Some(error_type.to_string()),
                 details: None,
             }),
             AgentTurn::Ask(instruction) => Ok(ActionOutcome::Suspended(

@@ -1184,6 +1184,83 @@ async fn undoing_a_chosen_output_keeps_the_reply_and_takes_back_the_entry() {
     assert!(prompts[3].contains("The original prose."), "{}", prompts[3]);
 }
 
+/// U5, KTD8: undoing a chosen output takes back the attempt it recorded and
+/// puts back the step's notes from before it.
+#[tokio::test]
+async fn undoing_a_chosen_output_takes_back_its_attempt_and_notes() {
+    let agent = Arc::new(ScriptedAgentExecutor::new(vec![
+        AgentTurn::Label {
+            label: "needs_requirements_revision",
+            reason: "no API named",
+            variables: json!({ "local.memory": "A" }),
+            artifacts: json!({}),
+            reply: None,
+            session: true,
+        },
+        AgentTurn::label("drafted", "drafted"),
+        AgentTurn::NoLabel {
+            reply: Some("The plan is ready."),
+            session: true,
+        },
+        AgentTurn::NoLabel {
+            reply: None,
+            session: true,
+        },
+    ]));
+    let fixture = Fixture::new(
+        "step_history",
+        Some(agent.clone()),
+        vec![(
+            ConductorPurpose::ChooseOutput,
+            Script::Answer(json!({
+                "decision": "choose_output",
+                "label": "plan_ready",
+                "variables": { "local.memory": "B" },
+                "confidence": "high",
+            })),
+        )],
+    );
+    let execution = fixture.run(json!({})).await;
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let attempts = |execution: &WorkflowExecution| {
+        execution.metadata["engine"]["step_attempts"]["plan"]["attempts"].clone()
+    };
+    let memory = |execution: &WorkflowExecution| {
+        execution.metadata["engine"]["step_locals"]["plan"]["local.memory"].clone()
+    };
+    assert_eq!(attempts(&execution).as_array().map(Vec::len), Some(2));
+    assert_eq!(memory(&execution), json!("B"));
+    let decision_id = fixture
+        .events(&execution.id)
+        .iter()
+        .find_map(|data| match data {
+            EventData::ConductorDecision {
+                decision_id,
+                kind: ConductorDecisionKind::ChooseOutput,
+                ..
+            } => Some(decision_id.clone()),
+            _ => None,
+        })
+        .expect("the conductor chose the output");
+
+    fixture
+        .registry
+        .undo_decision(&fixture.definition, &execution.id, &decision_id, || {})
+        .await
+        .expect("undo the decision");
+
+    let now = fixture.load(&execution.id);
+    assert_eq!(
+        attempts(&now),
+        json!([{
+            "ended": "choice",
+            "choice": "needs_requirements_revision",
+            "reason": "no API named",
+        }])
+    );
+    assert_eq!(memory(&now), json!("A"));
+}
+
 /// The `agent_problem` fixture whose conductor completes the step with its
 /// choice (a); runs it and returns the execution with the decision's id.
 async fn completed_by_a_chosen_output() -> (Fixture, WorkflowExecution, String) {

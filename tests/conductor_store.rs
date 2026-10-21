@@ -241,6 +241,7 @@ async fn state_chat_and_annotations_survive_reopening_the_store() {
         reason: None,
         reply: None,
         state_entries_before: serde_json::Value::Null,
+        step_memory_before: serde_json::Value::Null,
         saved_at: Utc::now(),
     });
     store.save_state(&state).expect("save the state");
@@ -902,6 +903,7 @@ async fn a_rescue_left_for_an_execution_that_moved_on_is_discarded() {
         reason: None,
         reply: None,
         state_entries_before: serde_json::Value::Null,
+        step_memory_before: serde_json::Value::Null,
         saved_at: Utc::now(),
     });
     store.save_state(&state).expect("save the state");

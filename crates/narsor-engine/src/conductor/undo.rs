@@ -123,6 +123,7 @@ impl ConductorRegistry {
             reason: decision.reason.clone(),
             reply: decision.reply.clone(),
             state_entries_before: decision.state_entries_before.clone(),
+            step_memory_before: decision.step_memory_before.clone(),
             analysis: ConductorAnalysis {
                 label: decision.output_label.clone(),
                 data: object_of(&decision.data),

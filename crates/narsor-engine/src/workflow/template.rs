@@ -4,8 +4,10 @@
 //! `{{ }}` are a workflow input (`inputs.NAME`), a context variable
 //! (`context.variables.NAME`, or the shorthand `context.NAME` used by
 //! `WORKFLOW_SCHEMA.md` §3.3.D), a named artifact (`artifacts.NAME`, the path
-//! it was last written to, KTD7), and selected step fields (`reply`,
-//! `stdout`, `stderr`). There are no filters, expressions,
+//! it was last written to, KTD7), selected step fields (`reply`,
+//! `stdout`, `stderr`), the current step's own memory (`local.NAME`, R13)
+//! and the history of its earlier attempts (`step.history`, R18). There are
+//! no filters, expressions,
 //! conditionals or loops — a filter such as `{{ context.x | default("y") }}`
 //! is reported as an explicit error rather than silently ignored.
 //!
@@ -34,8 +36,8 @@ use serde_json::{Map, Value};
 
 use crate::domain::{
     safe_link_url, ActionConfig, AgentActionConfig, ArtifactReference, Context, DisplayLink,
-    DisplaySpec, HumanActionConfig, ScriptActionConfig, TaskDisplay, WaitActionConfig,
-    WorkflowDefinition, EMPTY_LINK_TEXT,
+    DisplaySpec, HumanActionConfig, ScriptActionConfig, TaskDisplay, VariableDefinition,
+    WaitActionConfig, WorkflowDefinition, EMPTY_LINK_TEXT, LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -91,7 +93,7 @@ pub enum TemplateError {
     /// The reference is syntactically fine but does not name a supported root.
     #[error(
         "unsupported template reference '{reference}' in {location}; \
-         supported roots are inputs, context, artifacts and steps"
+         supported roots are inputs, context, artifacts, steps, local and step"
     )]
     UnsupportedReference {
         /// The reference exactly as written inside `{{ }}`.
@@ -122,6 +124,33 @@ pub struct TemplateScope<'a> {
     declared: Option<&'a DeclaredNames>,
     step_replies: Option<&'a HashMap<String, Value>>,
     step_streams: Option<&'a HashMap<String, Value>>,
+    step_memory: Option<StepMemory<'a>>,
+}
+
+/// What the step being rendered keeps for itself: its `local.*` values, the
+/// `local.*` names it defines, and the history of its earlier attempts.
+#[derive(Debug, Clone, Copy)]
+pub struct StepMemory<'a> {
+    /// The values kept from earlier attempts, keyed by the full name
+    /// (`local.memory`).
+    pub locals: &'a Map<String, Value>,
+    /// The step's variable definitions: a `local.*` one without a value
+    /// renders as empty text (R14).
+    pub definitions: &'a [VariableDefinition],
+    /// The history block, empty when the step gets none (R17, R19).
+    pub history: &'a str,
+}
+
+impl StepMemory<'_> {
+    fn local(&self, name: &str) -> Option<&Value> {
+        self.locals.get(&format!("{LOCAL_VARIABLE_PREFIX}{name}"))
+    }
+
+    fn defines_local(&self, name: &str) -> bool {
+        self.definitions
+            .iter()
+            .any(|variable| variable.name.strip_prefix(LOCAL_VARIABLE_PREFIX) == Some(name))
+    }
 }
 
 /// The context variables and artifacts a workflow declares: the names whose
@@ -181,6 +210,7 @@ impl<'a> TemplateScope<'a> {
             declared: None,
             step_replies: None,
             step_streams: None,
+            step_memory: None,
         }
     }
 
@@ -197,6 +227,7 @@ impl<'a> TemplateScope<'a> {
             declared: None,
             step_replies: None,
             step_streams: None,
+            step_memory: None,
         }
     }
 
@@ -216,6 +247,13 @@ impl<'a> TemplateScope<'a> {
     /// Adds captured script streams keyed by `step.field`.
     pub fn with_step_streams(mut self, streams: &'a HashMap<String, Value>) -> Self {
         self.step_streams = Some(streams);
+        self
+    }
+
+    /// Adds the memory of the step being rendered: `{{ local.NAME }}` and
+    /// `{{ step.history }}`.
+    pub fn with_step_memory(mut self, memory: StepMemory<'a>) -> Self {
+        self.step_memory = Some(memory);
         self
     }
 
@@ -497,6 +535,21 @@ impl<'a> TemplateScope<'a> {
                 .ok_or_else(unknown)
             }
 
+            "local" => {
+                let name = plain_name(path).ok_or_else(unsupported)?;
+                let memory = self.step_memory.ok_or_else(unknown)?;
+                match memory.local(name) {
+                    Some(value) => Ok(render_scalar(value)),
+                    None if memory.defines_local(name) => Ok(String::new()),
+                    None => Err(unknown()),
+                }
+            }
+
+            "step" if path == "history" => Ok(self
+                .step_memory
+                .map(|memory| memory.history.to_string())
+                .unwrap_or_default()),
+
             _ => Err(unsupported()),
         }
     }
@@ -572,6 +625,12 @@ pub fn artifact_references(template: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// Whether a template places the step's history itself (`{{ step.history }}`,
+/// R18), so that the engine does not add it a second time.
+pub fn places_step_history(template: &str) -> bool {
+    expressions(template).contains(&"step.history")
 }
 
 /// Workflow step ids referenced through `steps.<id>.reply`, in first-use order.

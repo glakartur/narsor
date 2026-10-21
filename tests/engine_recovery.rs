@@ -10,7 +10,7 @@ mod engine_support;
 
 use std::sync::Arc;
 
-use engine_support::{workflow, Harness};
+use engine_support::{workflow, AgentTurn, Harness, ScriptedAgentExecutor};
 use narsor_engine::conductor::assembly::assemble;
 use narsor_engine::conductor::{
     ConductorInvoker, ConductorRegistry, ConductorState, ConductorStore, Invocation,
@@ -824,6 +824,7 @@ fn saved_choice() -> SavedDecision {
         reason: None,
         reply: None,
         state_entries_before: serde_json::Value::Null,
+        step_memory_before: serde_json::Value::Null,
         saved_at: chrono::Utc::now(),
     }
 }
@@ -1297,4 +1298,79 @@ async fn an_explicit_recovery_runs_the_interrupted_action_again_as_a_new_attempt
     let sequences: Vec<u64> = events.iter().map(|event| event.sequence).collect();
     assert!(sequences.windows(2).all(|pair| pair[1] == pair[0] + 1));
     assert!(*sequences.last().unwrap() > before);
+}
+
+// ---------------------------------------------------------------------------
+// U5: a step's history and notes survive a restart
+// ---------------------------------------------------------------------------
+
+/// A restart while `plan` runs its second entry: the recovered attempt
+/// sees the same note and the same history, and is not a new entry.
+#[tokio::test]
+async fn a_recovered_step_keeps_its_history_and_notes() {
+    let harness = Harness::new();
+    let definition = workflow("step_history");
+    let before_the_crash = Arc::new(ScriptedAgentExecutor::new(vec![
+        AgentTurn::Label {
+            label: "needs_requirements_revision",
+            reason: "no API named",
+            variables: json!({ "local.memory": "A" }),
+            artifacts: json!({}),
+            reply: None,
+            session: true,
+        },
+        AgentTurn::label("drafted", "drafted"),
+    ]));
+    let engine = harness
+        .engine()
+        .with_executor(ActionKind::Agent, before_the_crash);
+    let started = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let execution = engine
+        .run_steps(&definition, &started.id, 2)
+        .await
+        .expect("run up to the second entry into plan");
+    assert_eq!(execution.current_state.as_deref(), Some("plan"));
+
+    let log = harness.store().event_log(&execution.id);
+    for data in [
+        EventData::StateEntered {
+            state_id: "plan".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "plan-under-way".to_string(),
+            state_id: "plan".to_string(),
+            action_type: "agent".to_string(),
+        },
+    ] {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    let reconciliation = reconcile(&harness.store(), &execution.id).expect("reconcile");
+    assert_eq!(reconciliation.status, ExecutionStatus::Unknown);
+
+    let after_the_restart = Arc::new(ScriptedAgentExecutor::new(vec![AgentTurn::label(
+        "plan_ready",
+        "planned",
+    )]));
+    let reopened = Arc::new(
+        harness
+            .engine()
+            .with_executor(ActionKind::Agent, after_the_restart.clone()),
+    );
+    let finished = reopened
+        .try_begin_recover(&execution.id, None)
+        .expect("recover")
+        .run_to_completion(&definition)
+        .await
+        .expect("run after the recovery");
+
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    let prompt = &after_the_restart.prompts()[0];
+    assert!(prompt.starts_with("Plan. Memory: [A]."), "{prompt}");
+    assert!(prompt.contains("This is entry 2 into this step."), "{prompt}");
+    assert!(
+        prompt.contains("- needs_requirements_revision — no API named"),
+        "{prompt}"
+    );
 }
