@@ -119,7 +119,9 @@ states:
       command: ./record_step.sh
       args:
         - first
-    outputs:
+    variables:
+      - { name: first, description: What the step reports as first. }
+    choices:
       - done
     transitions:
       done: second
@@ -130,7 +132,9 @@ states:
       command: ./drop.sh
       args:
         - doomed.txt
-    outputs:
+    variables:
+      - { name: dropped, description: What the step reports as dropped. }
+    choices:
       - done
     transitions:
       done: third
@@ -139,7 +143,10 @@ states:
     action:
       type: script
       command: ./list_tree.sh
-    outputs:
+    variables:
+      - { name: tree, description: What the step reports as tree. }
+      - { name: readme, description: What the step reports as readme. }
+    choices:
       - done
     transitions:
       done: completed
@@ -154,14 +161,14 @@ terminal_states:
 /// Deletes the file named by the first argument.
 const DROP_SCRIPT: &str = r#"#!/bin/sh
 rm -f "$1"
-printf '{"output": "done", "variables": {"dropped": "%s"}}\n' "$1"
+printf '{"choice": "done", "variables": {"dropped": "%s"}}\n' "$1"
 "#;
 
 /// Reports every file of the work tree (outside `.git`) and the README text.
 const LIST_TREE_SCRIPT: &str = r#"#!/bin/sh
 tree=$(find . -path ./.git -prune -o -type f -print | sed 's|^\./||' | sort | tr '\n' ' ' | sed 's/ $//')
 readme=$(cat README.md)
-printf '{"output": "done", "variables": {"tree": "%s", "readme": "%s"}}\n' "$tree" "$readme"
+printf '{"choice": "done", "variables": {"tree": "%s", "readme": "%s"}}\n' "$tree" "$readme"
 "#;
 
 /// Runs `git` in `dir` with a fixed identity and returns its trimmed stdout.

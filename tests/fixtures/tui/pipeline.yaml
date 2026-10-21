@@ -31,7 +31,7 @@ states:
       exit_codes:
         0: prepared
         1: broken
-    outputs:
+    choices:
       - prepared
       - broken
     transitions:
@@ -55,7 +55,7 @@ states:
           type: text
           required: true
           description: Note for the record; the reviewer must write one.
-    outputs:
+    choices:
       - label: approved
         description: The change is ready to land.
       - rejected

@@ -18,7 +18,7 @@ states:
       args:
         - attempts.txt
         - "99"
-    outputs:
+    choices:
       - success
     transitions:
       success: completed

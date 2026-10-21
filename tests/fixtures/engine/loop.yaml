@@ -14,7 +14,9 @@ states:
         - passes.txt
         - failure
         - success
-    outputs:
+    variables:
+      - { name: passes, description: What the step reports as passes. }
+    choices:
       - success
       - failure
     transitions:
@@ -26,8 +28,10 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "fixed", "variables": {"fixed": true}}'
-    outputs:
+        - '{"choice": "fixed", "variables": {"fixed": true}}'
+    variables:
+      - { name: fixed, description: What the step reports as fixed. }
+    choices:
       - fixed
     transitions:
       fixed: test

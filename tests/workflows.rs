@@ -8,21 +8,24 @@
 //! contract names every declared label with its description, and each one runs
 //! end to end.
 //!
-//! **No real harness and no real `git`/`gh` is ever run here.** The agent
+//! **No real harness and no real `git`/`glab` is ever run here.** The agent
 //! states are driven by `tests/fixtures/harness/fake_harness.sh` through
 //! [`ClaudeCodeAdapter::with_program`], the way `tests/actions_agent.rs` does
-//! it, and the one script state is pointed at a two-line fixture written into
-//! a temporary directory. Nothing is ever written into the repository.
+//! it. The script states run in a temporary workspace: `verify_work` finds no
+//! `scripts/verify.sh` there, and `finalize` and `disarm_merge` find
+//! `tests/fixtures/glab/fake_glab.sh` first on their `PATH` (it needs `jq`).
+//! Nothing is ever written into the repository.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use narsor_engine::domain::{
-    ActionConfig, ExecutionStatus, HumanInputType, State, TerminalStatus, WorkflowDefinition,
-    Workspace,
+    ActionConfig, EventData, ExecutionStatus, HumanInputType, State, TerminalStatus,
+    WorkflowDefinition, Workspace,
 };
 use narsor_engine::engine::actions::agent::output_contract;
+use narsor_engine::engine::StepContract;
 use narsor_engine::engine::{
     ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry, HumanInputDelivery,
 };
@@ -99,13 +102,13 @@ impl FakeHarness {
     fn installed_in(dir: PathBuf, labels: &[&str]) -> Self {
         let answers: Vec<Value> = labels
             .iter()
-            .map(|label| json!({ "output": label, "data": {} }))
+            .map(|label| json!({ "choice": label }))
             .collect();
         Self::answering_in(dir, &answers)
     }
 
-    /// Installs the fixture script and scripts one whole answer object (label,
-    /// `data`, `variables`) per call, in order.
+    /// Installs the fixture script and scripts one whole answer object (choice,
+    /// `variables`, ...) per call, in order.
     fn answering_in(dir: PathBuf, answers: &[Value]) -> Self {
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
@@ -142,6 +145,7 @@ impl FakeHarness {
 }
 
 /// An answer to one human gate: the state it belongs to and the field values.
+#[derive(Clone)]
 struct Answer {
     state: &'static str,
     values: Vec<(&'static str, &'static str)>,
@@ -203,16 +207,38 @@ fn built_prompt(state: &State) -> String {
     let Some(ActionConfig::Agent(config)) = &state.action else {
         panic!("built_prompt is only defined for agent states");
     };
-    format!("{}{}", config.prompt, output_contract(&state.outputs))
+    format!("{}{}", config.prompt, output_contract(&StepContract::of(state)))
 }
 
 /// The declared output labels of a state.
 fn labels(state: &State) -> Vec<String> {
     state
-        .outputs
+        .choices
         .iter()
         .map(|output| output.label.clone())
         .collect()
+}
+
+/// Every `(state, label, target)` edge of a definition, sorted.
+fn edges(definition: &WorkflowDefinition) -> Vec<(&str, &str, &str)> {
+    let mut edges: Vec<(&str, &str, &str)> = definition
+        .states
+        .iter()
+        .flat_map(|(id, state)| {
+            state
+                .transitions
+                .iter()
+                .map(move |(label, target)| (id.as_str(), label.as_str(), target.as_str()))
+        })
+        .collect();
+    edges.sort_unstable();
+    edges
+}
+
+fn sorted<'a>(edges: &[(&'a str, &'a str, &'a str)]) -> Vec<(&'a str, &'a str, &'a str)> {
+    let mut edges = edges.to_vec();
+    edges.sort_unstable();
+    edges
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +347,7 @@ fn every_built_agent_prompt_names_every_label_with_its_description() {
         let definition = shipped(file);
         for (id, state) in agent_states(&definition) {
             let prompt = built_prompt(state);
-            for output in &state.outputs {
+            for output in &state.choices {
                 let description = output.description.as_deref().unwrap_or_else(|| {
                     panic!(
                         "'{name}' state '{id}': label '{}' has no description",
@@ -536,135 +562,805 @@ async fn run_to_terminal(
     execution
 }
 
-#[tokio::test]
-async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
-    let root = TempRoot::new();
-    let harness_dir = root.dir("harness");
-    let requirements_doc = "docs/brainstorms/2026-10-16-subscribe-requirements.md";
-    let plan_doc = "docs/plans/2026-10-16-subscribe-plan.md";
-    let label = |label: &str| json!({ "output": label, "data": {} });
-    // Every agent call of the path below, in order.
-    let harness = FakeHarness::answering_in(
-        harness_dir.clone(),
-        &[
-            // 1. brainstorm
-            json!({
-                "output": "requirements_drafted",
-                "variables": { "requirements_doc": requirements_doc },
-            }),
-            label("reviewed"), // 2. doc_review
-            json!({ "output": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_scope
-            label("no_feedback"), // resolve_scope_feedback
-            label("no_feedback"), // confirm_scope_feedback after approval
-            // 6. plan
-            json!({ "output": "plan_ready", "variables": { "plan_doc": plan_doc } }),
-            label("updated"),     // publish_plan
-            label("no_feedback"), // resolve_plan_feedback
-            label("no_feedback"), // confirm_plan_feedback after approval
-            json!({
-                "output": "implemented",
-                "variables": { "test_baseline": "all relevant checks passed before changes" },
-            }), // 10. work — ambiguity uses awaiting_input in place
-            label("simplified"),  // simplify
-            label("clean"),       // code_review
-            json!({ "output": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_work
-            label("no_feedback"), // resolve_work_feedback
-            label("revised"),     // work_revision — addresses human review
-            label("simplified"),  // simplify
-            label("clean"),       // code_review
-            json!({ "output": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_work
-            label("fixed"),       // resolve_work_feedback — fixes are already pushed
-            label("no_feedback"), // confirm_work_feedback after approval
-            label("documented"),  // compound — after implementation review
-            label("updated"),     // publish_learning — push the knowledge doc
-            label("no_feedback"), // resolve_learning_feedback
-            label("no_feedback"), // confirm_learning_feedback after approval
-        ],
-    );
-    let engine = harness.engine(root.dir("store"));
-    let definition = shipped("compound-engineering.yaml");
+// ---------------------------------------------------------------------------
+// The compound engineering pipeline
+// ---------------------------------------------------------------------------
 
-    let execution = run_to_terminal(
-        &engine,
-        &definition,
+/// The merge request every publish step reports. `finalize` reads its number
+/// and project from this URL, never from a branch name.
+const PR_URL: &str = "https://gitlab.example.test/acme/web/-/merge_requests/7";
+const REQUIREMENTS_DOC: &str = "docs/brainstorms/2026-10-21-subscribe-requirements.md";
+const PLAN_DOC: &str = "docs/plans/2026-10-21-subscribe-plan.md";
+const LEARNING_DOC: &str = "docs/solutions/2026-10-21-subscribe-learning.md";
+
+/// One agent answer in the reply contract: a choice with its reason.
+fn reply(choice: &str) -> Value {
+    json!({ "choice": choice, "reason": format!("{choice}: the step's work is done") })
+}
+
+/// One agent answer that also sets `variables` or names `artifacts`.
+fn reply_with(choice: &str, fields: Value) -> Value {
+    let mut answer = reply(choice);
+    for (key, value) in fields.as_object().expect("the fields are an object") {
+        answer[key] = value.clone();
+    }
+    answer
+}
+
+fn requirements_drafted() -> Value {
+    reply_with(
+        "requirements_drafted",
         json!({
-            "feature_description": "let a reviewer subscribe to a workflow run",
-            "target_repo": "acme/web",
+            "artifacts": { "requirements_doc": REQUIREMENTS_DOC },
+            "variables": { "requirements_blocker": "" },
         }),
-        root.workspace(),
-        &[
-            Answer::approval("doc_review"),
-            // No note: an approval without one must still reach the plan.
-            Answer::new("approve_scope", &[("scope_decision", "approved")]),
-            // No feedback: the note on the plan is optional.
-            Answer::new("approve_plan", &[("plan_decision", "approved")]),
-            Answer::new(
-                "implementation_review",
-                &[
-                    ("review_decision", "revise"),
-                    ("revision_notes", "Handle the reviewer's requested change"),
-                ],
-            ),
-            Answer::new(
-                "implementation_review",
-                &[("review_decision", "approve"), ("revision_notes", "none")],
-            ),
-            Answer::new(
-                "learning_review",
-                &[
-                    ("learning_review_decision", "approve"),
-                    ("revision_notes", "none"),
-                ],
-            ),
-        ],
     )
-    .await;
+}
+
+fn reviewed() -> Value {
+    reply_with(
+        "reviewed",
+        json!({ "variables": { "review_summary": "2 minor findings, both fixed, none left" } }),
+    )
+}
+
+fn published() -> Value {
+    reply_with("published", json!({ "variables": { "pr_url": PR_URL } }))
+}
+
+fn plan_ready() -> Value {
+    reply_with(
+        "plan_ready",
+        json!({
+            "artifacts": { "plan_doc": PLAN_DOC },
+            "variables": { "plan_blocker": "" },
+        }),
+    )
+}
+
+fn implemented() -> Value {
+    reply_with(
+        "implemented",
+        json!({ "variables": { "test_baseline": "all relevant checks passed before changes" } }),
+    )
+}
+
+fn documented() -> Value {
+    reply_with(
+        "documented",
+        json!({ "artifacts": { "learning_doc": LEARNING_DOC } }),
+    )
+}
+
+/// The agent calls of the requirements stage, approved at once: brainstorm,
+/// doc_review, publish_requirements, check_requirements_feedback.
+fn requirements_stage() -> Vec<Value> {
+    vec![
+        requirements_drafted(),
+        reviewed(),
+        published(),
+        reply("no_feedback"),
+    ]
+}
+
+/// The agent calls of the plan stage, approved at once: plan, plan_review,
+/// publish_plan, check_plan_feedback.
+fn plan_stage() -> Vec<Value> {
+    vec![plan_ready(), reviewed(), published(), reply("no_feedback")]
+}
+
+/// The agent calls of the work stage, approved at once: work, simplify,
+/// code_review, publish_work, check_work_feedback. `verify_work` is a script
+/// and skips: the temporary workspace has no `scripts/verify.sh`.
+fn work_stage() -> Vec<Value> {
+    vec![
+        implemented(),
+        reply("simplified"),
+        reply("clean"),
+        published(),
+        reply("no_feedback"),
+    ]
+}
+
+/// Every agent call from the start up to `compound`, on the shortest path.
+fn replies_up_to_compound() -> Vec<Value> {
+    [requirements_stage(), plan_stage(), work_stage()].concat()
+}
+
+fn requirements_gates() -> Vec<Answer> {
+    vec![
+        Answer::approval("doc_review"),
+        Answer::new(
+            "approve_requirements",
+            &[("requirements_decision", "approve")],
+        ),
+    ]
+}
+
+fn plan_gates() -> Vec<Answer> {
+    vec![
+        Answer::approval("plan_review"),
+        Answer::new("approve_plan", &[("plan_decision", "approve")]),
+    ]
+}
+
+/// Every gate from the start up to `compound`, each one approved.
+fn gates_up_to_compound() -> Vec<Answer> {
+    [
+        requirements_gates(),
+        plan_gates(),
+        vec![Answer::new("approve_work", &[("work_decision", "approve")])],
+    ]
+    .concat()
+}
+
+/// The merge request as `glab mr view -F json` prints it.
+fn merge_request(state: &str, pipeline: &str) -> Value {
+    json!({
+        "iid": 7,
+        "project_id": 42,
+        "state": state,
+        "draft": false,
+        "target_branch": "develop",
+        "has_conflicts": false,
+        "detailed_merge_status": "ci_still_running",
+        "merge_when_pipeline_succeeds": true,
+        "head_pipeline": { "status": pipeline },
+    })
+}
+
+fn open_merge_request() -> Value {
+    merge_request("opened", "running")
+}
+
+fn merged_merge_request() -> Value {
+    merge_request("merged", "success")
+}
+
+/// The fake `glab` of `tests/fixtures/glab/fake_glab.sh`, installed as `glab`
+/// in a directory of its own.
+struct FakeGlab {
+    dir: PathBuf,
+}
+
+impl FakeGlab {
+    /// Installs the fixture and has the n-th `glab mr view` print the n-th
+    /// merge request, and the last one from then on.
+    fn serving(dir: PathBuf, views: &[Value]) -> Self {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glab/fake_glab.sh");
+        let temp = dir.join(format!(".glab.{}.tmp", uuid::Uuid::new_v4()));
+        fs::copy(&source, &temp).expect("copy the fake glab");
+        fs::rename(&temp, dir.join("glab")).expect("move the fake glab into place");
+
+        for (index, view) in views.iter().enumerate() {
+            fs::write(dir.join(format!("view.{}", index + 1)), view.to_string())
+                .expect("write a merge request view");
+        }
+        let last = views.last().expect("at least one merge request view");
+        fs::write(dir.join("view"), last.to_string()).expect("write the fallback view");
+
+        Self { dir }
+    }
+
+    /// Makes `glab mr <command>` sleep before it answers.
+    fn hanging_on(self, command: &str, seconds: u32) -> Self {
+        fs::write(self.dir.join(format!("hang.{command}")), seconds.to_string())
+            .expect("write the hang file");
+        self
+    }
+
+    /// The `PATH` a step sees: this directory first.
+    fn path(&self) -> String {
+        format!(
+            "{}:{}",
+            self.dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+
+    /// Every call so far, one line of arguments each.
+    fn calls(&self) -> Vec<String> {
+        fs::read_to_string(self.dir.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// How many calls start with `prefix` (e.g. `mr approve`).
+    fn count(&self, prefix: &str) -> usize {
+        self.calls()
+            .iter()
+            .filter(|call| call.starts_with(prefix))
+            .count()
+    }
+
+    /// Whether auto-merge was cancelled and the Draft flag restored.
+    fn disarmed(&self) -> bool {
+        let calls = self.calls();
+        calls
+            .iter()
+            .any(|call| call.contains("cancel_merge_when_pipeline_succeeds"))
+            && calls
+                .iter()
+                .any(|call| call.starts_with("mr update") && call.contains("--draft"))
+    }
+}
+
+/// One run of the shipped compound pipeline against the fake harness and the
+/// fake `glab`.
+struct CompoundRun {
+    root: TempRoot,
+    harness_dir: PathBuf,
+    glab: FakeGlab,
+    engine: Engine,
+    definition: WorkflowDefinition,
+}
+
+impl CompoundRun {
+    /// `replies` answers the agent calls in order; `views` is what `glab`
+    /// reports about the merge request. `finalize` waits for no result at all
+    /// (`FINALIZE_WAIT_SECS=0`): it reads the merge request once after setting
+    /// auto-merge, so every outcome is decided by `views`.
+    fn new(replies: &[Value], views: &[Value]) -> Self {
+        let root = TempRoot::new();
+        let harness_dir = root.dir("harness");
+        let harness = FakeHarness::answering_in(harness_dir.clone(), replies);
+        let engine = harness.engine(root.dir("store"));
+        let glab = FakeGlab::serving(root.dir("glab"), views);
+
+        let mut definition = shipped("compound-engineering.yaml");
+        for step in ["finalize", "disarm_merge"] {
+            let env = &mut script_config(&mut definition, step).env;
+            env.insert("PATH".to_string(), glab.path());
+            env.insert("FINALIZE_WAIT_SECS".to_string(), "0".to_string());
+            env.insert("FINALIZE_POLL_SECS".to_string(), "0".to_string());
+        }
+
+        Self {
+            root,
+            harness_dir,
+            glab,
+            engine,
+            definition,
+        }
+    }
+
+    /// Shortens the time limit of the `finalize` step itself.
+    fn with_finalize_timeout(mut self, seconds: u64) -> Self {
+        self.definition
+            .states
+            .get_mut("finalize")
+            .expect("finalize exists")
+            .timeout_secs = Some(seconds);
+        self
+    }
+
+    fn with_glab(mut self, configure: impl FnOnce(FakeGlab) -> FakeGlab) -> Self {
+        self.glab = configure(self.glab);
+        self
+    }
+
+    async fn run(&self, gates: &[Answer]) -> narsor_engine::domain::WorkflowExecution {
+        run_to_terminal(
+            &self.engine,
+            &self.definition,
+            json!({
+                "feature_description": "let a reviewer subscribe to a workflow run",
+                "target_repo": "acme/web",
+            }),
+            self.root.workspace(),
+            gates,
+        )
+        .await
+    }
+
+    /// The prompt of the n-th agent call.
+    fn prompt(&self, call: usize) -> String {
+        fs::read_to_string(self.harness_dir.join(format!("args.{call}")))
+            .unwrap_or_else(|error| panic!("read the prompt of call {call}: {error}"))
+    }
+
+    /// Every transition taken, as `(from, label, to)`.
+    fn transitions(&self, execution_id: &str) -> Vec<(String, String, String)> {
+        narsor_engine::persistence::ExecutionStore::new(self.root.dir("store"))
+            .event_log(execution_id)
+            .read_all()
+            .expect("read the event log")
+            .into_iter()
+            .filter_map(|event| match event.data {
+                EventData::TransitionTaken {
+                    from_state,
+                    to_state,
+                    output_label,
+                } => Some((from_state, output_label, to_state)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn took(&self, execution_id: &str, from: &str, label: &str, to: &str) -> bool {
+        self.transitions(execution_id)
+            .iter()
+            .any(|(f, l, t)| f == from && l == label && t == to)
+    }
+
+    /// The gate the run waits at, with the request it shows.
+    fn pending(&self, execution_id: &str) -> narsor_engine::engine::actions::human::PendingHumanInput {
+        self.engine
+            .pending_input(execution_id)
+            .expect("read the pending request")
+            .expect("a request is pending")
+    }
+}
+
+/// The script configuration of a step, to point it at the fake `glab`.
+fn script_config<'a>(
+    definition: &'a mut WorkflowDefinition,
+    step: &str,
+) -> &'a mut narsor_engine::domain::ScriptActionConfig {
+    match definition.states.get_mut(step).map(|state| &mut state.action) {
+        Some(Some(ActionConfig::Script(config))) => config,
+        _ => panic!("'{step}' is a script step"),
+    }
+}
+
+#[tokio::test]
+async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates_and_merges() {
+    let replies = [
+        replies_up_to_compound(),
+        vec![documented(), published(), reply("no_feedback")],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies, &[open_merge_request(), merged_merge_request()]);
+    let gates = [
+        gates_up_to_compound(),
+        vec![Answer::new(
+            "approve_learning",
+            &[("learning_decision", "approve")],
+        )],
+    ]
+    .concat();
+
+    let execution = run.run(&gates).await;
 
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(execution.current_state.as_deref(), Some("finished"));
-    // A blank optional note is an empty answer, not a missing variable.
+    assert!(run.took(&execution.id, "check_learning_feedback", "no_feedback", "finalize"));
+    assert!(run.took(&execution.id, "finalize", "merged", "finished"));
     assert_eq!(
-        execution.context.variables.get("scope_notes"),
-        Some(&json!(""))
+        execution.context.variables.get("pr_url"),
+        Some(&json!(PR_URL)),
+        "the display reads the merge request from the context"
     );
-    // The documents the agents returned are named in the later prompts, so no
-    // step has to guess which file in `docs/` is meant.
-    let prompt = |call: usize| {
-        fs::read_to_string(harness_dir.join(format!("args.{call}"))).expect("read the prompt")
-    };
+    // finalize takes the merge request out of Draft, approves it and sets
+    // auto-merge — and, merged, leaves it armed.
+    assert_eq!(run.glab.count("mr update 7"), 1, "{:?}", run.glab.calls());
+    assert!(run.glab.calls().iter().any(|call| call.contains("--ready")));
+    assert_eq!(run.glab.count("mr approve 7"), 1);
+    assert_eq!(run.glab.count("mr merge 7"), 1);
+    assert!(run
+        .glab
+        .calls()
+        .iter()
+        .any(|call| call.starts_with("mr merge") && call.contains("--auto-merge")));
+    assert!(!run.glab.disarmed(), "a merged request is not disarmed");
+    // The documents the agents returned are named in the later prompts.
+    assert!(run.prompt(2).contains(REQUIREMENTS_DOC), "doc_review names the requirements");
+    assert!(run.prompt(5).contains(REQUIREMENTS_DOC), "plan names the requirements");
+    assert!(run.prompt(6).contains(PLAN_DOC), "plan_review names the plan");
+    assert!(run.prompt(9).contains(PLAN_DOC), "work names the plan");
+}
+
+/// Covers AE8.
+#[tokio::test]
+async fn covers_ae8_nothing_to_document_goes_to_finalize_not_to_finished() {
+    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
+    let run = CompoundRun::new(&replies, &[open_merge_request(), merged_merge_request()]);
+
+    let execution = run.run(&gates_up_to_compound()).await;
+
+    assert!(run.took(&execution.id, "compound", "nothing_to_document", "finalize"));
+    assert!(run.took(&execution.id, "finalize", "merged", "finished"));
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+}
+
+/// A blocker travels with the process: `work` hands its blocker to `plan`,
+/// `plan` hands its own to `brainstorm`, and each step that read a blocker
+/// clears it — so the third pass of `plan`, after the requirements came back
+/// approved, no longer sees the stale one.
+#[tokio::test]
+async fn blockers_reach_the_author_of_the_stage_and_do_not_come_back() {
+    let plan_blocker = "the plan names a table that does not exist";
+    let requirements_blocker = "the requirements never say who may subscribe";
+    let replies = [
+        requirements_stage(), // calls 1–4
+        plan_stage(),         // calls 5–8
+        vec![
+            // 9. work
+            reply_with(
+                "needs_plan_revision",
+                json!({ "variables": { "plan_blocker": plan_blocker } }),
+            ),
+            // 10. plan, second entry
+            reply_with(
+                "needs_requirements_revision",
+                json!({ "variables": {
+                    "requirements_blocker": requirements_blocker,
+                    "plan_blocker": "",
+                } }),
+            ),
+        ],
+        requirements_stage(), // calls 11–14
+        // 15. plan, third entry. It sends the requirements back once more, so
+        // the run stops at `brainstorm`, which has no answer and no retry
+        // policy to wait out.
+        vec![reply_with(
+            "needs_requirements_revision",
+            json!({ "variables": {
+                "requirements_blocker": "still unclear",
+                "plan_blocker": "",
+            } }),
+        )],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies, &[open_merge_request()]);
+
+    let execution = run
+        .run(&[requirements_gates(), plan_gates(), requirements_gates()].concat())
+        .await;
+
+    assert!(run.took(&execution.id, "work", "needs_plan_revision", "plan"));
+    assert!(run.took(&execution.id, "plan", "needs_requirements_revision", "brainstorm"));
+    assert!(run.prompt(10).contains(plan_blocker), "plan reads the blocker of work");
     assert!(
-        prompt(2).contains(requirements_doc),
-        "doc_review names the requirements"
+        run.prompt(11).contains(requirements_blocker),
+        "brainstorm reads the blocker of plan"
     );
     assert!(
-        prompt(6).contains(requirements_doc),
-        "plan names the requirements"
+        !run.prompt(15).contains(plan_blocker),
+        "the third plan pass must not see the blocker it already handled"
     );
-    assert!(prompt(10).contains(plan_doc), "work names the plan");
+}
+
+#[tokio::test]
+async fn revise_requirements_at_the_plan_gate_resumes_the_brainstorm_session() {
+    let comment = "the plan shows the requirements miss the unsubscribe case";
+    let replies = [
+        requirements_stage(),
+        vec![plan_ready(), reviewed(), published()],
+        // 8. brainstorm, resumed: no answer, the run stops there
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies, &[open_merge_request()]);
+
+    let execution = run
+        .run(
+            &[
+                requirements_gates(),
+                vec![
+                    Answer::approval("plan_review"),
+                    Answer::new(
+                        "approve_plan",
+                        &[
+                            ("plan_decision", "revise_requirements"),
+                            ("plan_feedback", comment),
+                        ],
+                    ),
+                ],
+            ]
+            .concat(),
+        )
+        .await;
+
+    assert!(run.took(&execution.id, "approve_plan", "revise_requirements", "brainstorm"));
+    let resumed = run.prompt(8);
+    assert!(
+        resumed.contains("--resume\n--%ARG%--\nfake-session-1\n"),
+        "brainstorm continues its own session: {resumed}"
+    );
+    assert!(resumed.contains(comment), "the comment is the message: {resumed}");
+}
+
+#[tokio::test]
+async fn dropping_the_learning_removes_it_and_goes_on_to_finalize() {
+    let replies = [
+        replies_up_to_compound(),
+        vec![documented(), published(), reply("dropped")],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies, &[open_merge_request(), merged_merge_request()]);
+    let gates = [
+        gates_up_to_compound(),
+        vec![Answer::new("approve_learning", &[("learning_decision", "drop")])],
+    ]
+    .concat();
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(&execution.id, "approve_learning", "drop", "drop_learning"));
+    assert!(run.took(&execution.id, "drop_learning", "dropped", "finalize"));
+    assert!(
+        run.prompt(16).contains(LEARNING_DOC),
+        "drop_learning names the document to remove"
+    );
+    assert_eq!(execution.current_state.as_deref(), Some("finished"));
+}
+
+/// Covers AE7: a failed pipeline is a repair, and the merge is disarmed first.
+#[tokio::test]
+async fn covers_ae7_a_failed_pipeline_disarms_the_merge_and_goes_to_repair() {
+    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
+    let run = CompoundRun::new(
+        &replies,
+        &[
+            open_merge_request(),
+            merge_request("opened", "failed"),
+            merge_request("opened", "failed"),
+        ],
+    );
+
+    let execution = run.run(&gates_up_to_compound()).await;
+
+    assert!(run.took(&execution.id, "finalize", "pipeline_failed", "repair_merge"));
+    assert!(run.glab.disarmed(), "{:?}", run.glab.calls());
+    assert!(
+        run.prompt(15).contains("pipeline"),
+        "repair_merge reads why finalize stopped"
+    );
+}
+
+/// Covers AE7: no result within the limit is `blocked`, and the gate after
+/// it shows the reason `finalize` gave.
+#[tokio::test]
+async fn covers_ae7_no_result_within_the_limit_stops_at_the_blocked_gate_with_its_reason() {
+    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
+    let run = CompoundRun::new(&replies, &[open_merge_request()]);
+
+    let execution = run.run(&gates_up_to_compound()).await;
+
+    assert!(run.took(&execution.id, "finalize", "blocked", "finalize_blocked"));
+    assert!(run.glab.disarmed(), "{:?}", run.glab.calls());
+    let pending = run.pending(&execution.id);
+    assert_eq!(pending.state_id, "finalize_blocked");
+    let reason = pending.request.reason.unwrap_or_default();
+    assert!(
+        reason.contains("not merged within"),
+        "the gate shows why finalize stopped: {reason:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retried_finalize_finds_the_request_already_merged() {
+    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
+    let run = CompoundRun::new(
+        &replies,
+        &[
+            open_merge_request(),
+            open_merge_request(),
+            open_merge_request(),
+            merged_merge_request(),
+        ],
+    );
+    let gates = [
+        gates_up_to_compound(),
+        vec![Answer::new(
+            "finalize_blocked",
+            &[("finalize_decision", "retry")],
+        )],
+    ]
+    .concat();
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(&execution.id, "finalize_blocked", "retry", "finalize"));
+    assert!(run.took(&execution.id, "finalize", "merged", "finished"));
+    assert_eq!(
+        run.glab.count("mr approve"),
+        1,
+        "a merged request is not approved again: {:?}",
+        run.glab.calls()
+    );
+    assert_eq!(run.glab.count("mr merge"), 1);
+}
+
+#[tokio::test]
+async fn a_request_that_merged_while_being_disarmed_is_merged() {
+    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
+    let run = CompoundRun::new(
+        &replies,
+        &[
+            open_merge_request(),
+            open_merge_request(),
+            merged_merge_request(),
+        ],
+    );
+
+    let execution = run.run(&gates_up_to_compound()).await;
+
+    assert!(run.glab.disarmed(), "{:?}", run.glab.calls());
+    assert!(run.took(&execution.id, "finalize", "merged", "finished"));
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+}
+
+/// The engine kills a `finalize` that outlives its step limit, so its own
+/// clean-up never runs: `disarm_merge` does it instead.
+#[tokio::test]
+async fn a_finalize_killed_by_its_time_limit_is_disarmed_by_its_own_step() {
+    let replies = [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat();
+    let run = CompoundRun::new(&replies, &[open_merge_request()])
+        .with_glab(|glab| glab.hanging_on("merge", 30))
+        .with_finalize_timeout(3);
+
+    let execution = run.run(&gates_up_to_compound()).await;
+
+    assert!(run.took(&execution.id, "finalize", "timeout", "disarm_merge"));
+    assert!(run.took(&execution.id, "disarm_merge", "disarmed", "finalize_blocked"));
+    assert!(run.glab.disarmed(), "{:?}", run.glab.calls());
+    assert_eq!(run.pending(&execution.id).state_id, "finalize_blocked");
+}
+
+/// The graph of `workflows/compound-engineering.yaml` as the plan draws it:
+/// every state, and every `(state, label, target)` edge.
+const COMPOUND_STATES: [&str; 32] = [
+    "brainstorm",
+    "doc_review",
+    "publish_requirements",
+    "approve_requirements",
+    "check_requirements_feedback",
+    "plan",
+    "plan_review",
+    "publish_plan",
+    "approve_plan",
+    "check_plan_feedback",
+    "work",
+    "simplify",
+    "code_review",
+    "fix_findings",
+    "verify_work",
+    "repair_verification",
+    "publish_work",
+    "approve_work",
+    "work_revision",
+    "check_work_feedback",
+    "compound",
+    "publish_learning",
+    "approve_learning",
+    "drop_learning",
+    "check_learning_feedback",
+    "finalize",
+    "repair_merge",
+    "disarm_merge",
+    "finalize_blocked",
+    "finished",
+    "cancelled",
+    "not_merged",
+];
+
+const COMPOUND_EDGES: [(&str, &str, &str); 62] = [
+    ("brainstorm", "requirements_drafted", "doc_review"),
+    ("doc_review", "reviewed", "publish_requirements"),
+    ("publish_requirements", "published", "approve_requirements"),
+    ("approve_requirements", "approve", "check_requirements_feedback"),
+    ("approve_requirements", "revise", "brainstorm"),
+    ("approve_requirements", "abandon", "cancelled"),
+    ("check_requirements_feedback", "no_feedback", "plan"),
+    ("check_requirements_feedback", "fixed_minor", "publish_requirements"),
+    ("check_requirements_feedback", "fixed_major", "doc_review"),
+    ("check_requirements_feedback", "needs_human", "approve_requirements"),
+    ("plan", "plan_ready", "plan_review"),
+    ("plan", "needs_requirements_revision", "brainstorm"),
+    ("plan_review", "reviewed", "publish_plan"),
+    ("publish_plan", "published", "approve_plan"),
+    ("approve_plan", "approve", "check_plan_feedback"),
+    ("approve_plan", "revise", "plan"),
+    ("approve_plan", "revise_requirements", "brainstorm"),
+    ("approve_plan", "abandon", "cancelled"),
+    ("check_plan_feedback", "no_feedback", "work"),
+    ("check_plan_feedback", "fixed_minor", "publish_plan"),
+    ("check_plan_feedback", "fixed_major", "plan_review"),
+    ("check_plan_feedback", "needs_human", "approve_plan"),
+    ("work", "implemented", "simplify"),
+    ("work", "needs_plan_revision", "plan"),
+    ("simplify", "simplified", "code_review"),
+    ("simplify", "unchanged", "code_review"),
+    ("code_review", "clean", "verify_work"),
+    ("code_review", "findings", "fix_findings"),
+    ("fix_findings", "fixed", "code_review"),
+    ("verify_work", "passed", "publish_work"),
+    ("verify_work", "skipped", "publish_work"),
+    ("verify_work", "failed", "repair_verification"),
+    ("repair_verification", "repaired", "code_review"),
+    ("publish_work", "published", "approve_work"),
+    ("approve_work", "approve", "check_work_feedback"),
+    ("approve_work", "revise", "work_revision"),
+    ("approve_work", "revise_plan", "plan"),
+    ("approve_work", "abandon", "cancelled"),
+    ("work_revision", "revised", "code_review"),
+    ("check_work_feedback", "no_feedback", "compound"),
+    ("check_work_feedback", "fixed", "code_review"),
+    ("check_work_feedback", "needs_human", "approve_work"),
+    ("compound", "documented", "publish_learning"),
+    ("compound", "nothing_to_document", "finalize"),
+    ("publish_learning", "published", "approve_learning"),
+    ("approve_learning", "approve", "check_learning_feedback"),
+    ("approve_learning", "revise", "compound"),
+    ("approve_learning", "drop", "drop_learning"),
+    ("drop_learning", "dropped", "finalize"),
+    ("check_learning_feedback", "no_feedback", "finalize"),
+    ("check_learning_feedback", "fixed", "publish_learning"),
+    ("check_learning_feedback", "needs_human", "approve_learning"),
+    ("finalize", "merged", "finished"),
+    ("finalize", "pipeline_failed", "repair_merge"),
+    ("finalize", "conflict", "repair_merge"),
+    ("finalize", "blocked", "finalize_blocked"),
+    ("finalize", "timeout", "disarm_merge"),
+    ("repair_merge", "repaired", "code_review"),
+    ("disarm_merge", "merged", "finished"),
+    ("disarm_merge", "disarmed", "finalize_blocked"),
+    ("finalize_blocked", "retry", "finalize"),
+    ("finalize_blocked", "finish_unmerged", "not_merged"),
+];
+
+#[test]
+fn the_compound_graph_is_the_one_the_plan_draws() {
+    let definition = shipped("compound-engineering.yaml");
+
+    let mut states: Vec<&str> = definition.states.keys().map(String::as_str).collect();
+    states.sort_unstable();
+    let mut expected_states = COMPOUND_STATES.to_vec();
+    expected_states.sort_unstable();
+    assert_eq!(states, expected_states);
+
+    assert_eq!(edges(&definition), sorted(&COMPOUND_EDGES));
+    assert_eq!(
+        definition.states["not_merged"].terminal_status,
+        Some(TerminalStatus::Cancelled),
+        "work that never reached the target branch did not complete"
+    );
 }
 
 #[tokio::test]
 async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates() {
     let root = TempRoot::new();
-    let harness = FakeHarness::installed_in(
+    let pr_url = "https://example.test/open-mercato/app/pull/42";
+    // Every agent call of the path below, in order, in the reply format the
+    // engine's contract asks for. Informational fields go to
+    // `additional_data`; only the PR, which the display shows, is a variable.
+    let reply = |choice: &str, additional_data: Value| {
+        json!({
+            "choice": choice,
+            "reason": format!("{choice}: the step's work is done"),
+            "additional_data": additional_data,
+        })
+    };
+    let harness = FakeHarness::answering_in(
         root.dir("harness"),
         &[
-            "routed",            // discover
-            "ready",             // intake
-            "actionable",        // triage
-            "claimed",           // claim
-            "user_facing",       // assess_surface
-            "shaped",            // shape_design
-            "implemented",       // implement
-            "pr_opened",         // open_pr
-            "changes_requested", // code_review
-            "updated",           // address_feedback
-            "approved",          // code_review again
-            "needs_qa",          // qa_routing
-            "evidence_ready",    // qa_run
-            "mergeable",         // premerge_check
-            "merged",            // merge_pr
-            "reconciled",        // housekeeping
+            reply("routed", json!({ "brief": null })), // discover
+            reply("ready", json!({ "ready_status": "READY", "gaps": [] })), // intake
+            reply("actionable", json!({ "evidence": "empty list renders blank" })), // triage
+            reply("claimed", json!({ "claimed_by": "narsor" })), // claim
+            json!({
+                "choice": "user_facing",
+                "reason": "the orders list is a screen a merchant sees",
+            }), // assess_surface
+            reply("shaped", json!({ "states_covered": ["empty"] })), // shape_design
+            reply("implemented", json!({ "files_changed": 2 })), // implement
+            json!({
+                "choice": "pr_opened",
+                "reason": "the pull request is open and labelled",
+                "variables": { "pr_number": "42", "pr_url": pr_url },
+            }), // open_pr
+            reply("changes_requested", json!({ "findings": 1, "blockers": 0 })), // code_review
+            reply("updated", json!({ "threads_addressed": 1 })), // address_feedback
+            reply("approved", json!({ "findings": 0, "blockers": 0 })), // code_review again
+            reply("needs_qa", json!({ "qa_label": "needs-qa" })), // qa_routing
+            reply("evidence_ready", json!({ "scenarios": 7, "qa_head": "deadbeef" })), // qa_run
+            reply("mergeable", json!({ "blockers": [] })), // premerge_check
+            reply("merged", json!({ "merge_commit": "c0ffee" })), // merge_pr
+            reply("reconciled", json!({ "closed": 1, "follow_ups": 0 })), // housekeeping
         ],
     );
     let engine = harness.engine(root.dir("store"));
@@ -713,6 +1409,118 @@ async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates(
         Some(&json!("deadbeef")),
         "the QA head the reviewer pinned the approval to is kept in the context"
     );
+    // `open_pr` declares the PR, so it reaches the context the display reads
+    // (`{{ context.variables.pr_number }}`, `{{ context.variables.pr_url }}`).
+    assert_eq!(
+        execution.context.variables.get("pr_number"),
+        Some(&json!("42"))
+    );
+    assert_eq!(
+        execution.context.variables.get("pr_url"),
+        Some(&json!(pr_url))
+    );
+    // Informational fields stay out of the context (KTD5).
+    for informational in ["brief", "evidence", "findings", "merge_commit"] {
+        assert!(
+            execution.context.variables.get(informational).is_none(),
+            "'{informational}' is additional data, not a variable"
+        );
+    }
+}
+
+/// The graph of the Open Mercato pipeline before its prompts moved to the
+/// reply contract: every state, and every `(state, label, target)` edge.
+/// Moving to the new contract changes how agents answer, never where the
+/// process goes (R23).
+const OPEN_MERCATO_STATES: [&str; 23] = [
+    "discover",
+    "intake",
+    "confirm_readiness",
+    "triage",
+    "claim",
+    "assess_surface",
+    "shape_design",
+    "approve_design",
+    "implement",
+    "validation_gate",
+    "open_pr",
+    "code_review",
+    "address_feedback",
+    "qa_routing",
+    "qa_run",
+    "qa_signoff",
+    "premerge_check",
+    "approve_merge",
+    "merge_pr",
+    "housekeeping",
+    "finished",
+    "closed_no_action",
+    "cancelled",
+];
+
+const OPEN_MERCATO_EDGES: [(&str, &str, &str); 38] = [
+    ("discover", "routed", "intake"),
+    ("discover", "no_action", "closed_no_action"),
+    ("intake", "ready", "confirm_readiness"),
+    ("intake", "gaps_found", "confirm_readiness"),
+    ("confirm_readiness", "confirmed", "triage"),
+    ("confirm_readiness", "waived", "triage"),
+    ("confirm_readiness", "not_ready", "intake"),
+    ("confirm_readiness", "abandon", "cancelled"),
+    ("triage", "actionable", "claim"),
+    ("triage", "no_action", "closed_no_action"),
+    ("triage", "already_claimed", "closed_no_action"),
+    ("claim", "claimed", "assess_surface"),
+    ("claim", "claim_lost", "closed_no_action"),
+    ("assess_surface", "user_facing", "shape_design"),
+    ("assess_surface", "not_user_facing", "implement"),
+    ("shape_design", "shaped", "approve_design"),
+    ("approve_design", "approved", "implement"),
+    ("approve_design", "reshape", "shape_design"),
+    ("approve_design", "abandon", "cancelled"),
+    ("implement", "implemented", "validation_gate"),
+    ("validation_gate", "green", "open_pr"),
+    ("validation_gate", "red", "implement"),
+    ("open_pr", "pr_opened", "code_review"),
+    ("code_review", "approved", "qa_routing"),
+    ("code_review", "changes_requested", "address_feedback"),
+    ("address_feedback", "updated", "code_review"),
+    ("qa_routing", "needs_qa", "qa_run"),
+    ("qa_routing", "skip_qa", "premerge_check"),
+    ("qa_run", "evidence_ready", "qa_signoff"),
+    ("qa_signoff", "qa_approved", "premerge_check"),
+    ("qa_signoff", "qa_failed", "implement"),
+    ("qa_signoff", "abandon", "cancelled"),
+    ("premerge_check", "mergeable", "approve_merge"),
+    ("approve_merge", "merge", "merge_pr"),
+    ("approve_merge", "hold", "approve_merge"),
+    ("approve_merge", "abandon", "cancelled"),
+    ("merge_pr", "merged", "housekeeping"),
+    ("housekeeping", "reconciled", "finished"),
+];
+
+#[test]
+fn the_open_mercato_graph_keeps_its_states_and_transitions() {
+    let definition = shipped("open-mercato-sdlc.yaml");
+
+    let mut states: Vec<&str> = definition.states.keys().map(String::as_str).collect();
+    states.sort_unstable();
+    let mut expected_states = OPEN_MERCATO_STATES.to_vec();
+    expected_states.sort_unstable();
+    assert_eq!(states, expected_states);
+
+    assert_eq!(edges(&definition), sorted(&OPEN_MERCATO_EDGES));
+
+    // No choice gained a requirement: the gates decide as they did before.
+    for (id, state) in &definition.states {
+        for choice in &state.choices {
+            assert!(
+                choice.requires_variables.is_empty() && choice.requires_artifacts.is_empty(),
+                "state '{id}' choice '{}' gained a requirement",
+                choice.label
+            );
+        }
+    }
 }
 
 /// The QA gate really does route a failure back into implementation, and the

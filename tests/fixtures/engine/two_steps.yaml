@@ -10,8 +10,10 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "done", "variables": {"first": "yes"}}'
-    outputs:
+        - '{"choice": "done", "variables": {"first": "yes"}}'
+    variables:
+      - { name: first, description: What the step reports as first. }
+    choices:
       - done
     transitions:
       done: second
@@ -21,8 +23,10 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "done", "variables": {"second": "yes"}}'
-    outputs:
+        - '{"choice": "done", "variables": {"second": "yes"}}'
+    variables:
+      - { name: second, description: What the step reports as second. }
+    choices:
       - done
     transitions:
       done: completed

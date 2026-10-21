@@ -10,7 +10,7 @@
 //!
 //! ```json
 //! {"decision": "choose_output", "label": "implemented",
-//!  "data": {}, "variables": {}, "confidence": "high",
+//!  "artifacts": {}, "variables": {}, "confidence": "high",
 //!  "rationale": "…", "message": "…", "proposals": []}
 //! ```
 //!
@@ -34,6 +34,7 @@
 //! validation, which turns a bad (a) into (c) rather than into a failure
 //! (U10).
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -121,9 +122,9 @@ pub enum Decision {
     ChooseOutput {
         /// The output label chosen.
         label: String,
-        /// The step's `data`, filled in by the conductor.
-        #[serde(default)]
-        data: Value,
+        /// The step's artifacts, name → path, filled in by the conductor.
+        #[serde(default, deserialize_with = "nullable_paths")]
+        artifacts: BTreeMap<String, String>,
         /// The step's `variables`, filled in by the conductor.
         #[serde(default, deserialize_with = "nullable_map")]
         variables: Map<String, Value>,
@@ -139,9 +140,9 @@ pub enum Decision {
         /// The label it would propose, if it has one.
         #[serde(default)]
         label: Option<String>,
-        /// The `data` it would propose.
-        #[serde(default)]
-        data: Value,
+        /// The artifacts it would propose, name → path.
+        #[serde(default, deserialize_with = "nullable_paths")]
+        artifacts: BTreeMap<String, String>,
         /// The `variables` it would propose.
         #[serde(default, deserialize_with = "nullable_map")]
         variables: Map<String, Value>,
@@ -393,11 +394,8 @@ impl ConductorResponse {
         }
 
         match &self.decision {
-            Decision::ChooseOutput { label, data, .. } => {
-                required_text("label", label)?;
-                object_or_null("data", data)?;
-            }
-            Decision::Escalate { data, .. } => object_or_null("data", data)?,
+            Decision::ChooseOutput { label, .. } => required_text("label", label)?,
+            Decision::Escalate { .. } => {}
             Decision::Reprompt { prompt } => required_text("prompt", prompt)?,
             Decision::Retry { note, .. } => required_text("note", note)?,
             Decision::Diagnose { diagnosis } => required_text("diagnosis", diagnosis)?,
@@ -443,19 +441,18 @@ fn required_text(field: &str, value: &str) -> Result<(), ResponseError> {
     Ok(())
 }
 
-fn object_or_null(field: &str, value: &Value) -> Result<(), ResponseError> {
-    match value {
-        Value::Null | Value::Object(_) => Ok(()),
-        _ => Err(ResponseError::Schema(format!(
-            "'{field}' must be an object"
-        ))),
-    }
-}
-
 /// A map that may also be written as `null`.
 fn nullable_map<'de, D>(deserializer: D) -> Result<Map<String, Value>, D::Error>
 where
     D: Deserializer<'de>,
 {
     Ok(Option::<Map<String, Value>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Artifact paths by name, which may also be written as `null`.
+fn nullable_paths<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<BTreeMap<String, String>>::deserialize(deserializer)?.unwrap_or_default())
 }

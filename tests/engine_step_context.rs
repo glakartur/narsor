@@ -607,6 +607,137 @@ async fn an_incomplete_result_is_never_offered_for_approval() {
 }
 
 // ---------------------------------------------------------------------------
+// The step contract: required artifacts, undeclared variables, new roots
+// ---------------------------------------------------------------------------
+
+async fn run_artifact_contract(
+    harness: &Harness,
+    turns: Vec<AgentTurn>,
+) -> (Arc<ScriptedAgentExecutor>, WorkflowExecution) {
+    let agent = Arc::new(ScriptedAgentExecutor::new(turns));
+    let execution = engine_with(harness, &agent)
+        .start_and_run(
+            &workflow("artifact_contract"),
+            json!({}),
+            harness.workspace(),
+        )
+        .await
+        .expect("run");
+    (agent, execution)
+}
+
+fn output_rejections(harness: &Harness, execution_id: &str) -> Vec<String> {
+    events(harness, execution_id)
+        .into_iter()
+        .filter_map(|data| match data {
+            EventData::ActionOutputRejected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A choice without its required artifact is asked for again, naming it.
+#[tokio::test]
+async fn a_missing_required_artifact_is_asked_for_again_by_name() {
+    let harness = Harness::new();
+    let (agent, execution) = run_artifact_contract(
+        &harness,
+        vec![
+            AgentTurn::with_artifacts("ready", json!({})),
+            AgentTurn::with_artifacts("ready", json!({ "plan_doc": "docs/plan.md" })),
+            AgentTurn::label("done", "worked"),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let reasons = output_rejections(&harness, &execution.id);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(reasons[0].contains("plan_doc"), "{}", reasons[0]);
+    let calls = agent.calls();
+    assert_eq!(calls[1].resume_session.as_deref(), Some("agent-session"));
+    assert!(calls[1].prompt.contains("plan_doc"), "{}", calls[1].prompt);
+}
+
+/// `{{ artifacts.NAME }}` is the path the artifact was written to; before
+/// any write, a defined artifact and a declared variable render empty.
+#[tokio::test]
+async fn artifacts_and_declared_variables_reach_the_prompt() {
+    let harness = Harness::new();
+    let (agent, execution) = run_artifact_contract(
+        &harness,
+        vec![
+            AgentTurn::with_artifacts("ready", json!({ "plan_doc": "docs/plan.md" })),
+            AgentTurn::label("done", "worked"),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let prompts = agent.prompts();
+    assert_eq!(prompts[0], "Plan. Previous plan: []. Blocker: [].");
+    assert_eq!(prompts[1], "Work from docs/plan.md.");
+}
+
+/// A step's `local.*` variable is its own: it never reaches the context.
+#[tokio::test]
+async fn a_local_variable_stays_out_of_the_context() {
+    let harness = Harness::new();
+    let (_agent, execution) = run_artifact_contract(
+        &harness,
+        vec![
+            AgentTurn::Label {
+                label: "ready",
+                reason: "",
+                variables: json!({ "local.notes": "tried the short plan" }),
+                artifacts: json!({ "plan_doc": "docs/plan.md" }),
+                reply: None,
+                session: true,
+            },
+            AgentTurn::label("done", "worked"),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert!(
+        !execution.context.variables.contains_key("local.notes"),
+        "{:?}",
+        execution.context.variables
+    );
+}
+
+/// A variable the step does not define is kept as additional data with a
+/// warning, never written to the context, and never reprompted for.
+#[tokio::test]
+async fn an_undeclared_variable_goes_to_additional_data_not_the_context() {
+    let harness = Harness::new();
+    let (_engine, agent, execution) = run_required(
+        &harness,
+        vec![AgentTurn::with_variables("clean", json!({ "extra": "kept aside" }))],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(agent.calls().len(), 1);
+    assert!(!execution.context.variables.contains_key("extra"));
+    let (additional_data, warnings) = events(&harness, &execution.id)
+        .into_iter()
+        .find_map(|data| match data {
+            EventData::ActionCompleted {
+                additional_data,
+                warnings,
+                ..
+            } => Some((additional_data, warnings)),
+            _ => None,
+        })
+        .expect("the step completes");
+    assert_eq!(additional_data.get("extra"), Some(&json!("kept aside")));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("extra"), "{}", warnings[0]);
+}
+
+// ---------------------------------------------------------------------------
 // U6: the entry count and the limit
 // ---------------------------------------------------------------------------
 
@@ -1051,4 +1182,367 @@ async fn a_manual_transition_runs_a_step_on_its_limit() {
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(agent.calls().len(), 5);
     assert_eq!(entries(&execution, "review"), json!(3));
+}
+
+// ---------------------------------------------------------------------------
+// U5: the step's memory (`local.*`) and the history of its entries
+// ---------------------------------------------------------------------------
+
+/// The first line of the history block the engine adds to a prompt.
+const HISTORY_HEADING: &str = "Step history (recorded by the workflow";
+
+/// The prompt of `plan` in `step_history` on an entry with no memory.
+const PLAN_PROMPT: &str = "Plan. Memory: [].";
+
+/// The choice `label` with `reason` and `variables`.
+fn choice(label: &'static str, reason: &str, variables: Value) -> AgentTurn {
+    AgentTurn::Label {
+        label,
+        reason: Box::leak(reason.to_string().into_boxed_str()),
+        variables,
+        artifacts: json!({}),
+        reply: None,
+        session: true,
+    }
+}
+
+/// `plan` sends the work back with `reason`; brainstorm drafts again.
+fn revision(reason: &str, variables: Value) -> [AgentTurn; 2] {
+    [
+        choice("needs_requirements_revision", reason, variables),
+        AgentTurn::label("drafted", "drafted"),
+    ]
+}
+
+/// `step_history`, changed by `change`, run on `turns`.
+async fn run_history(
+    harness: &Harness,
+    change: impl FnOnce(&mut narsor_engine::domain::AgentActionConfig),
+    turns: Vec<AgentTurn>,
+) -> (Arc<ScriptedAgentExecutor>, WorkflowExecution) {
+    let mut definition = workflow("step_history");
+    let plan = definition.states.get_mut("plan").expect("a plan step");
+    let Some(narsor_engine::domain::ActionConfig::Agent(config)) = plan.action.as_mut() else {
+        panic!("plan is an agent step");
+    };
+    change(config);
+    let agent = Arc::new(ScriptedAgentExecutor::new(turns));
+    let execution = engine_with(harness, &agent)
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run");
+    (agent, execution)
+}
+
+/// The prompts `plan` was given, in order.
+fn plan_prompts(agent: &ScriptedAgentExecutor) -> Vec<String> {
+    agent
+        .prompts()
+        .into_iter()
+        .filter(|prompt| prompt.starts_with("Plan."))
+        .collect()
+}
+
+fn step_attempts(execution: &WorkflowExecution, state_id: &str) -> Value {
+    execution.metadata["engine"]["step_attempts"][state_id].clone()
+}
+
+/// Covers AE1. The first entry gets the author's prompt and nothing else;
+/// the contract is the executor's to add.
+#[tokio::test]
+async fn the_first_entry_gets_only_the_authors_prompt() {
+    let harness = Harness::new();
+    let (agent, execution) = run_history(
+        &harness,
+        |_| {},
+        vec![choice("plan_ready", "the plan is done", json!({}))],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(agent.prompts(), vec![PLAN_PROMPT.to_string()]);
+}
+
+/// Covers AE1. The fourth entry after three revisions names its number and
+/// lists the three earlier choices with their reasons.
+#[tokio::test]
+async fn the_fourth_entry_lists_the_three_earlier_choices() {
+    let harness = Harness::new();
+    let mut turns = Vec::new();
+    for reason in ["no API named", "no users named", "no limits named"] {
+        turns.extend(revision(reason, json!({})));
+    }
+    turns.push(choice("plan_ready", "planned", json!({})));
+    let (agent, execution) = run_history(&harness, |_| {}, turns).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let prompts = plan_prompts(&agent);
+    assert_eq!(prompts.len(), 4);
+    let fourth = &prompts[3];
+    assert!(fourth.starts_with(PLAN_PROMPT), "{fourth}");
+    assert!(fourth.contains(HISTORY_HEADING), "{fourth}");
+    assert!(fourth.contains("This is entry 4 into this step."), "{fourth}");
+    for reason in ["no API named", "no users named", "no limits named"] {
+        let line = format!("- needs_requirements_revision — {reason}\n");
+        assert!(fourth.contains(&line), "{line:?} in {fourth}");
+    }
+    assert!(
+        prompts[1].contains("This is entry 2 into this step."),
+        "{}",
+        prompts[1]
+    );
+}
+
+/// Covers AE2. A note kept by one attempt survives an attempt that does
+/// not set it, and a new note replaces it whole. It never reaches the
+/// context.
+#[tokio::test]
+async fn a_local_note_survives_until_it_is_replaced() {
+    let harness = Harness::new();
+    let mut turns = Vec::new();
+    turns.extend(revision("first", json!({ "local.memory": "A" })));
+    turns.extend(revision("second", json!({})));
+    turns.extend(revision("third", json!({ "local.memory": "B" })));
+    turns.push(choice("plan_ready", "planned", json!({})));
+    let (agent, execution) = run_history(&harness, |_| {}, turns).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let prompts = plan_prompts(&agent);
+    assert!(prompts[1].starts_with("Plan. Memory: [A]."), "{}", prompts[1]);
+    assert!(prompts[2].starts_with("Plan. Memory: [A]."), "{}", prompts[2]);
+    assert!(prompts[3].starts_with("Plan. Memory: [B]."), "{}", prompts[3]);
+    assert_eq!(
+        execution.metadata["engine"]["step_locals"]["plan"],
+        json!({ "local.memory": "B" })
+    );
+}
+
+/// Covers AE3. A declared note with no value yet renders empty, and the
+/// action starts.
+#[tokio::test]
+async fn a_declared_note_without_a_value_renders_empty() {
+    let harness = Harness::new();
+    let (agent, execution) = run_history(
+        &harness,
+        |_| {},
+        vec![choice("plan_ready", "planned", json!({}))],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(agent.calls().len(), 1);
+    assert!(action_failures(&harness, &execution.id).is_empty());
+    assert_eq!(agent.prompts()[0], PLAN_PROMPT);
+}
+
+/// Covers AE5. A prompt that places `{{ step.history }}` gets the history
+/// there, once.
+#[tokio::test]
+async fn the_history_goes_where_the_prompt_places_it_once() {
+    let harness = Harness::new();
+    let mut turns = Vec::new();
+    turns.extend(revision("no API named", json!({})));
+    turns.push(choice("plan_ready", "planned", json!({})));
+    let (agent, _execution) = run_history(
+        &harness,
+        |config| config.prompt = "Plan.\n{{ step.history }}\nEnd of plan.".to_string(),
+        turns,
+    )
+    .await;
+
+    let second = &plan_prompts(&agent)[1];
+    assert_eq!(second.matches(HISTORY_HEADING).count(), 1, "{second}");
+    assert!(second.starts_with("Plan.\nStep history"), "{second}");
+    assert!(second.ends_with("\nEnd of plan."), "{second}");
+    assert!(
+        second.contains("- needs_requirements_revision — no API named"),
+        "{second}"
+    );
+}
+
+/// `history: false` leaves the second entry's prompt as the author wrote it.
+#[tokio::test]
+async fn a_step_without_history_gets_none_on_its_second_entry() {
+    let harness = Harness::new();
+    let mut turns = Vec::new();
+    turns.extend(revision("no API named", json!({})));
+    turns.push(choice("plan_ready", "planned", json!({})));
+    let (agent, _execution) = run_history(&harness, |config| config.history = false, turns).await;
+
+    assert_eq!(plan_prompts(&agent)[1], PLAN_PROMPT);
+}
+
+/// An attempt that failed with a timeout is in the history of the next
+/// entry as an error of that type; the recovery itself is the same entry.
+#[tokio::test]
+async fn a_failed_attempt_is_shown_with_its_error_type() {
+    let harness = Harness::new();
+    let mut turns = vec![AgentTurn::FailOfType("timeout")];
+    turns.extend(revision("no API named", json!({})));
+    turns.push(choice("plan_ready", "planned", json!({})));
+    let agent = Arc::new(ScriptedAgentExecutor::new(turns));
+    let engine = Arc::new(engine_with(&harness, &agent));
+    let definition = workflow("step_history");
+    let failed = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run");
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+
+    let execution = engine
+        .try_begin_recover(&failed.id, None)
+        .expect("recover")
+        .run_to_completion(&definition)
+        .await
+        .expect("run after the recovery");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let prompts = plan_prompts(&agent);
+    assert_eq!(prompts[1], PLAN_PROMPT, "the recovery is the first entry still");
+    let second_entry = &prompts[2];
+    assert!(
+        second_entry.contains("This is entry 2 into this step."),
+        "{second_entry}"
+    );
+    assert!(second_entry.contains("- error: timeout\n"), "{second_entry}");
+    assert!(
+        second_entry.contains("- needs_requirements_revision — no API named"),
+        "{second_entry}"
+    );
+}
+
+/// A question answered by the person resumes the agent's session: the
+/// resumed prompt carries no history, and the entry number does not move.
+#[tokio::test]
+async fn an_answered_question_is_not_an_entry_and_gets_no_history() {
+    let harness = Harness::new();
+    let mut turns = Vec::new();
+    turns.extend(revision("no API named", json!({})));
+    turns.push(AgentTurn::Ask("Which API?"));
+    turns.extend(revision("still no users", json!({})));
+    turns.push(choice("plan_ready", "planned", json!({})));
+    let agent = Arc::new(ScriptedAgentExecutor::new(turns));
+    let engine = engine_with(&harness, &agent);
+    let waiting = engine
+        .start_and_run(&workflow("step_history"), json!({}), harness.workspace())
+        .await
+        .expect("run");
+    assert_eq!(waiting.status, ExecutionStatus::InputNeeded);
+
+    let execution = deliver(
+        &engine,
+        &harness,
+        "step_history",
+        &waiting.id,
+        HumanInputDelivery::with_values(answer("The billing API.")),
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let calls = agent.calls();
+    assert_eq!(calls[3].resume_session.as_deref(), Some("agent-session"));
+    assert!(!calls[3].prompt.contains(HISTORY_HEADING), "{}", calls[3].prompt);
+    let last = plan_prompts(&agent).pop().expect("a last plan prompt");
+    assert!(last.contains("This is entry 3 into this step."), "{last}");
+}
+
+/// A reprompt for a missing required note is part of the same attempt: the
+/// history has one line for it.
+#[tokio::test]
+async fn a_reprompt_adds_no_attempt() {
+    let harness = Harness::new();
+    let (agent, execution) = run_history(
+        &harness,
+        |_| {},
+        vec![
+            choice("noted", "kept a note", json!({})),
+            choice("noted", "kept a note", json!({ "local.note": "n" })),
+            AgentTurn::label("drafted", "drafted"),
+            choice("plan_ready", "planned", json!({})),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(output_rejections(&harness, &execution.id).len(), 1);
+    let second_entry = agent.prompts().pop().expect("the second entry");
+    assert_eq!(
+        second_entry.matches("- noted — kept a note").count(),
+        1,
+        "{second_entry}"
+    );
+    assert_eq!(
+        step_attempts(&execution, "plan")["attempts"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+}
+
+/// KTD10: a required note kept from an earlier attempt satisfies the
+/// choice, without a reprompt.
+#[tokio::test]
+async fn a_required_note_kept_from_an_earlier_attempt_satisfies_the_choice() {
+    let harness = Harness::new();
+    let mut turns = Vec::new();
+    turns.extend(revision("no API named", json!({ "local.note": "kept" })));
+    turns.push(choice("noted", "the note still holds", json!({})));
+    turns.push(AgentTurn::label("drafted", "drafted"));
+    turns.push(choice("plan_ready", "planned", json!({})));
+    let (agent, execution) = run_history(&harness, |_| {}, turns).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert!(output_rejections(&harness, &execution.id).is_empty());
+    assert_eq!(agent.calls().len(), 5);
+}
+
+/// A step's note stays in the step's own record, not in the context.
+#[tokio::test]
+async fn a_local_note_is_not_a_context_variable() {
+    let harness = Harness::new();
+    let mut turns = Vec::new();
+    turns.extend(revision("no API named", json!({ "local.memory": "A" })));
+    turns.push(choice("plan_ready", "planned", json!({})));
+    let (_agent, execution) = run_history(&harness, |_| {}, turns).await;
+
+    assert!(
+        !execution.context.variables.contains_key("local.memory"),
+        "{:?}",
+        execution.context.variables
+    );
+    assert_eq!(
+        execution.metadata["engine"]["step_locals"]["plan"]["local.memory"],
+        json!("A")
+    );
+}
+
+/// A reason of 2000 characters with control characters is cut to 300 clean
+/// characters, and the whole block stays within 4 KB however many
+/// attempts there are.
+#[tokio::test]
+async fn the_history_is_cleaned_and_bounded() {
+    let harness = Harness::new();
+    let reason = format!("\u{1b}[31mred\u{7}\nline{}", "x".repeat(2000));
+    let mut turns = Vec::new();
+    for _ in 0..15 {
+        turns.extend(revision(&reason, json!({})));
+    }
+    turns.push(choice("plan_ready", "planned", json!({})));
+    let (agent, execution) = run_history(&harness, |_| {}, turns).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let last = plan_prompts(&agent).pop().expect("a last plan prompt");
+    let block = &last[last.find(HISTORY_HEADING).expect("a history block")..];
+    assert!(block.len() <= 4 * 1024, "{} bytes", block.len());
+    assert!(block.contains("This is entry 16 into this step."), "{block}");
+    let reasons: Vec<&str> = block
+        .lines()
+        .filter_map(|line| line.strip_prefix("- needs_requirements_revision — "))
+        .collect();
+    assert!(!reasons.is_empty(), "{block}");
+    for shown in reasons {
+        assert!(shown.chars().count() <= 300, "{} chars", shown.chars().count());
+        assert!(shown.starts_with("[31mredline"), "{shown}");
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+    }
 }

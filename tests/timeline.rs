@@ -54,6 +54,9 @@ fn action_completed(id: &str, label: &str) -> EventData {
     EventData::ActionCompleted {
         action_execution_id: id.to_string(),
         output_label: label.to_string(),
+        reason: None,
+        additional_data: Default::default(),
+        warnings: Vec::new(),
     }
 }
 
@@ -61,6 +64,7 @@ fn action_failed(id: &str, error: &str) -> EventData {
     EventData::ActionFailed {
         action_execution_id: id.to_string(),
         error: error.to_string(),
+        error_type: None,
     }
 }
 

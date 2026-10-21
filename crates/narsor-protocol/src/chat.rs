@@ -536,7 +536,7 @@ mod tests {
             },
             ChatElement::RunResult {
                 text: Some("ok".into()),
-                structured_output: Some(json!({"output": "done"})),
+                structured_output: Some(json!({"choice": "done"})),
                 stop_reason: Some("end_turn".into()),
                 is_error: true,
                 cost_usd: Some(0.125),

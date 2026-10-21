@@ -4,6 +4,7 @@
 
 use crate::domain::{Artifact, Context, StateId, WorkflowDefinition, Workspace};
 use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -110,18 +111,36 @@ pub struct ActionExecution {
 }
 
 /// Result from an action execution
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ActionResult {
     /// The output label (determines transition)
     pub output_label: String,
 
-    /// Data returned by the action
+    /// Why the action made its choice, in one line. Empty when it gave none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+
+    /// Records only the engine writes (`agent_session`, `timeout_secs`); an
+    /// agent or a script never writes here.
     #[serde(default)]
     pub data: serde_json::Value,
 
     /// Variables to update in the workflow context
     #[serde(default)]
     pub variables: serde_json::Map<String, serde_json::Value>,
+
+    /// The step's named artifacts the action produced: name → path.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifacts: BTreeMap<String, String>,
+
+    /// Anything else the action wanted kept, outside the step's definitions.
+    /// The engine does not interpret it.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub additional_data: serde_json::Map<String, serde_json::Value>,
+
+    /// Paths of files the action produced beyond the step's named artifacts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_artifacts: Vec<String>,
 
     /// Exit code (for script actions)
     pub exit_code: Option<i32>,
@@ -137,6 +156,16 @@ pub struct ActionResult {
     /// Final human-readable agent response, with the output-contract object removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<String>,
+}
+
+impl ActionResult {
+    /// A result with `output_label` and nothing else.
+    pub fn new(output_label: impl Into<String>) -> Self {
+        Self {
+            output_label: output_label.into(),
+            ..Self::default()
+        }
+    }
 }
 
 /// Error information for a failed action

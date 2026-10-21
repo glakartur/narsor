@@ -98,7 +98,7 @@ states:
           options:
             - approved
             - rejected
-    outputs:
+    choices:
       - approved
       - rejected
     transitions:
@@ -678,7 +678,7 @@ states:
           options:
             - approved
             - rejected
-    outputs:
+    choices:
       - approved
       - rejected
     transitions:
@@ -711,7 +711,7 @@ states:
           options:
             - approved
             - rejected
-    outputs:
+    choices:
       - approved
       - rejected
     transitions:
@@ -792,7 +792,7 @@ fn slow_definition(root: &TempRoot) -> (WorkflowDefinition, PathBuf) {
     let script_path = root.join("slow.sh");
     fs::write(
         &script_path,
-        "#!/bin/sh\nsleep 0.3\nprintf '{\"output\": \"done\"}\\n'\nexit 0\n",
+        "#!/bin/sh\nsleep 0.3\nprintf '{\"choice\": \"done\"}\\n'\nexit 0\n",
     )
     .expect("write the slow script");
     #[cfg(unix)]
@@ -822,7 +822,7 @@ states:
       args: []
       exit_codes:
         0: done
-    outputs:
+    choices:
       - done
     transitions:
       done: finished

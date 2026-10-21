@@ -8,7 +8,7 @@ states:
       type: agent
       harness: claude-code
       prompt: Przejrzyj zmiany.
-    outputs:
+    choices:
       - findings
     transitions:
       findings: work
@@ -18,7 +18,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Popraw: {{ steps.review.data }}"
-    outputs:
+    choices:
       - done
     transitions:
       done: finished

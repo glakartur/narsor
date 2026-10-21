@@ -1,0 +1,20 @@
+name: script-gate
+version: 1
+description: >
+  A finalize script that chooses `blocked` with a reason, and a gate after it
+  that shows that reason.
+states:
+  finalize:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"choice": "blocked", "reason": "the pull request has merge conflicts"}'
+    choices: [blocked, merged]
+    transitions: { blocked: finalize_blocked, merged: completed }
+  finalize_blocked:
+    action: { type: human, message: Finalize is blocked. }
+    choices: [accept]
+    transitions: { accept: completed }
+  completed: { description: done }
+terminal_states: [completed]

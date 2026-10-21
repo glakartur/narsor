@@ -65,7 +65,7 @@ version: 1
 states:
   agent:
     action: { type: agent, prompt: do it }
-    outputs:
+    choices:
       - label: reviewed
         requires_human_approval: true
     transitions: { reviewed: gate }
@@ -75,7 +75,7 @@ states:
       message: review
       inputs:
         - { name: note, type: text, required: true }
-    outputs:
+    choices:
       - label: revise
         resume_comment_field: note
       - done
@@ -84,10 +84,10 @@ states:
 terminal_states: [finished]
 "#;
     let definition = load_from_str(yaml).expect("metadata is valid");
-    let output = &state(&definition, "agent").outputs[0];
+    let output = &state(&definition, "agent").choices[0];
     assert!(output.requires_human_approval);
     assert_eq!(
-        state(&definition, "gate").outputs[0]
+        state(&definition, "gate").choices[0]
             .resume_comment_field
             .as_deref(),
         Some("note")
@@ -95,7 +95,7 @@ terminal_states: [finished]
 }
 
 #[test]
-fn required_variables_and_entry_limit_load() {
+fn a_step_contract_with_variables_artifacts_and_choices_loads() {
     let yaml = r#"
 name: entry-contract
 version: 1
@@ -103,21 +103,114 @@ states:
   agent:
     max_entries: 3
     action: { type: agent, prompt: return data }
-    outputs:
+    variables:
+      - { name: summary, description: One-line summary }
+      - { name: local.memory, description: Notes for the next attempt }
+    artifacts:
+      - { name: plan_doc, description: The plan document }
+    choices:
       - label: ready
-        requires_variables:
-          - summary
-          - { name: report, description: Full report text }
-    transitions: { ready: done }
+        requires_variables: [summary, local.memory]
+        requires_artifacts: [plan_doc]
+      - blocked
+    transitions: { ready: done, blocked: done }
   done: { description: done }
 terminal_states: [done]
 "#;
-    let definition = load_from_str(yaml).expect("new metadata is valid");
-    assert_eq!(state(&definition, "agent").max_entries, Some(3));
-    let required = &state(&definition, "agent").outputs[0].requires_variables;
-    assert_eq!(required.len(), 2);
-    assert_eq!(required[0].name(), "summary");
-    assert_eq!(required[1].description(), Some("Full report text"));
+    let definition = load_from_str(yaml).expect("the step contract is valid");
+    let agent = state(&definition, "agent");
+    assert_eq!(agent.max_entries, Some(3));
+
+    let variables: Vec<(&str, &str)> = agent
+        .variables
+        .iter()
+        .map(|variable| (variable.name.as_str(), variable.description.as_str()))
+        .collect();
+    assert_eq!(
+        variables,
+        [
+            ("summary", "One-line summary"),
+            ("local.memory", "Notes for the next attempt")
+        ]
+    );
+    assert_eq!(agent.artifacts[0].name, "plan_doc");
+    assert_eq!(agent.artifacts[0].description, "The plan document");
+
+    let ready = &agent.choices[0];
+    assert_eq!(ready.requires_variables, ["summary", "local.memory"]);
+    assert_eq!(ready.requires_artifacts, ["plan_doc"]);
+    assert_eq!(agent.choices[1].label, "blocked");
+    assert!(agent.choices[1].requires_artifacts.is_empty());
+}
+
+#[test]
+fn the_retired_outputs_key_is_an_unknown_field() {
+    let yaml = r#"
+name: old-format
+version: 1
+states:
+  work:
+    action: { type: agent, prompt: do it }
+    outputs: [done]
+    transitions: { done: finished }
+  finished: { description: done }
+terminal_states: [finished]
+"#;
+    let message = load_from_str(yaml)
+        .expect_err("the old key must be rejected")
+        .to_string();
+    assert!(
+        message.contains("unknown field `outputs`"),
+        "names the retired key: {message}"
+    );
+}
+
+#[test]
+fn a_described_required_variable_is_no_longer_accepted() {
+    let yaml = r#"
+name: old-requirement
+version: 1
+states:
+  work:
+    action: { type: agent, prompt: do it }
+    variables: [{ name: report, description: Full report }]
+    choices:
+      - label: done
+        requires_variables: [{ name: report, description: Full report }]
+    transitions: { done: finished }
+  finished: { description: done }
+terminal_states: [finished]
+"#;
+    assert!(
+        load_from_str(yaml).is_err(),
+        "a requirement names a step variable; its description lives on the step"
+    );
+}
+
+#[test]
+fn an_agent_action_keeps_history_unless_it_turns_it_off() {
+    let yaml = r#"
+name: history-switch
+version: 1
+states:
+  default_history:
+    action: { type: agent, prompt: one }
+    choices: [done]
+    transitions: { done: no_history }
+  no_history:
+    action: { type: agent, prompt: two, history: false }
+    choices: [done]
+    transitions: { done: finished }
+  finished: { description: done }
+terminal_states: [finished]
+"#;
+    let definition = load_from_str(yaml).expect("history is a valid agent field");
+    let history = |id: &str| match &state(&definition, id).action {
+        Some(ActionConfig::Agent(agent)) => agent.history,
+        other => panic!("'{id}' is an agent step, got {other:?}"),
+    };
+    assert!(history("default_history"));
+    assert!(!history("no_history"));
 }
 
 #[test]
@@ -146,7 +239,7 @@ inputs:
 states:
   start:
     action: { type: agent, prompt: do it }
-    outputs: [done]
+    choices: [done]
     transitions: { done: end }
 terminal_states:
   end: completed
@@ -202,7 +295,7 @@ states:
     action:
       type: script
       command: ./a.sh
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -241,7 +334,7 @@ states:
     action:
       type: script
       command: ./a.sh
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -278,7 +371,7 @@ states:
     action:
       type: script
       command: ./a.sh
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -319,7 +412,7 @@ states:
     action:
       type: script
       command: ./a.sh
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -354,7 +447,7 @@ states:
     action:
       type: script
       command: ./a.sh
-    outputs: [success]
+    choices: [success]
     transitions:
       success: overrides
   overrides:
@@ -363,7 +456,7 @@ states:
       command: ./b.sh
     retry_policy:
       max_attempts: 3
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -491,7 +584,7 @@ states:
         - name: comments
           type: text
           required: false
-    outputs: [approved, changes_requested, rejected]
+    choices: [approved, changes_requested, rejected]
     transitions:
       approved: done
       changes_requested: done
@@ -526,7 +619,7 @@ states:
     action:
       type: script
       command: ./a.sh
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   real_start:
@@ -534,7 +627,7 @@ states:
     action:
       type: script
       command: ./b.sh
-    outputs: [success]
+    choices: [success]
     transitions:
       success: first_in_file
   done:
@@ -556,7 +649,7 @@ states:
     action:
       type: script
       command: ./a.sh
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -587,7 +680,7 @@ states:
       filter:
         pr_number: "{{ context.pr_number }}"
       timeout: 24h
-    outputs: [received, timeout]
+    choices: [received, timeout]
     transitions:
       received: done
       timeout: done
@@ -632,7 +725,7 @@ states:
         temperature: 0.7
       read_only_paths:
         - ../other-repo/src
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -667,7 +760,7 @@ states:
     decision:
       type: human
       message: "Wybierz kolejny krok na podstawie wyników testów."
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -699,7 +792,7 @@ states:
       command: ./a.sh
     decision:
       type: rules
-    outputs: [success]
+    choices: [success]
     transitions:
       success: judged
   judged:
@@ -711,7 +804,7 @@ states:
       harness: claude-code
       prompt: |
         Czy zmiany są bezpieczne?
-    outputs: [safe_to_merge]
+    choices: [safe_to_merge]
     transitions:
       safe_to_merge: done
   done:
@@ -743,7 +836,7 @@ states:
     action:
       type: script
       commnad: ./a.sh
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -769,7 +862,7 @@ states:
     action:
       type: docker
       image: alpine
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -853,7 +946,7 @@ states:
     action:
       type: script
       command: /bin/true
-    outputs: [ok]
+    choices: [ok]
     transitions:
       ok: completed
   completed:
@@ -901,7 +994,7 @@ states:
     action:
       type: script
       command: /bin/true
-    outputs: [ok]
+    choices: [ok]
     transitions:
       ok: completed
   completed:
@@ -1009,14 +1102,14 @@ states:
     action:
       type: agent
       prompt: write a report
-    outputs: [done]
+    choices: [done]
     transitions: { done: read }
   read:
     action:
       type: agent
       workspace_access: read-only
       prompt: inspect a report
-    outputs: [done]
+    choices: [done]
     transitions: { done: completed }
   completed:
     description: end
@@ -1047,7 +1140,7 @@ states:
     action:
       type: script
       command: ./review.sh
-    outputs:
+    choices:
 {outputs}
     transitions:
       approved: done
@@ -1066,7 +1159,7 @@ fn outputs_mix_bare_labels_and_described_ones() {
     );
 
     let definition = load_from_str(&yaml).expect("the mixed form should load");
-    let outputs = &state(&definition, "review").outputs;
+    let outputs = &state(&definition, "review").choices;
 
     let labels: Vec<&str> = outputs.iter().map(|o| o.label.as_str()).collect();
     assert_eq!(
@@ -1087,7 +1180,7 @@ fn a_described_output_without_a_description_is_a_bare_label() {
         with_outputs("      - label: approved\n      - label: rejected\n        description: '  '");
 
     let definition = load_from_str(&yaml).expect("the object form without a description loads");
-    let outputs = &state(&definition, "review").outputs;
+    let outputs = &state(&definition, "review").choices;
 
     assert_eq!(outputs[0].description, None);
     assert_eq!(outputs[1].description, None, "a blank description is none");
@@ -1149,7 +1242,7 @@ states:
     action:
       type: script
       command: make
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -1202,7 +1295,7 @@ fn display_section_compiles_into_the_definition() {
         "name: shown\nversion: 1\ndisplay:\n  title: T\n  links:\n    - label: A\n      \
          text: a\n      url: \"https://a.example\"\n    - label: B\n      url: \"{{ inputs.u }}\"\n\
          states:\n  work:\n    action:\n      type: script\n      command: \"true\"\n    \
-         outputs: [ok]\n    transitions:\n      ok: done\n  done:\n    description: end\n\
+         choices: [ok]\n    transitions:\n      ok: done\n  done:\n    description: end\n\
          terminal_states: [done]\n",
     )
     .expect("loads");

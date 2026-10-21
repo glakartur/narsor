@@ -18,7 +18,7 @@
 //!   rendered again would expand a `{{ ... }}` that a variable's *value*
 //!   happened to contain, which §3.3 forbids (substitution is single-pass).
 //! * **No label validation.** An executor reports the raw output label it
-//!   observed, even one the state does not declare in its `outputs`. The
+//!   observed, even one the state does not declare in its `choices`. The
 //!   engine (U7) compares it against the state and produces the error message,
 //!   because only the engine knows the state.
 //!
@@ -32,6 +32,7 @@
 //! [`ScriptExecutor::execute`] for the shape to copy.
 
 pub mod agent;
+pub mod answer;
 pub mod harness;
 pub mod human;
 pub mod script;
@@ -43,12 +44,13 @@ use std::time::Duration;
 use narsor_protocol::chat::PromptPurpose;
 
 use crate::domain::{
-    ActionConfig, ActionError, ActionResult, OutputDefinition, OutputLabel, Workspace,
+    ActionConfig, ActionError, ActionResult, ArtifactDefinition, ChoiceDefinition, OutputLabel,
+    State, VariableDefinition, Workspace,
 };
 use crate::persistence::ConversationStore;
 
 pub use agent::{
-    AgentEventSink, AgentExecutor, AgentOutput, DefaultHarnessSource, LoggingEventSink,
+    AgentEventSink, AgentExecutor, DefaultHarnessSource, LoggingEventSink,
 };
 pub use harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry,
@@ -60,6 +62,7 @@ pub use human::{
     PermissionDecisionKind, PermissionDenialDetails, PermissionGrantScope,
     PermissionRequestDetails, RejectedAnswer, ResumedHumanAction,
 };
+pub use answer::ChoiceAnswer;
 pub use script::ScriptExecutor;
 
 /// Environment variable carrying the [`crate::domain::ActionExecution`] id into
@@ -109,15 +112,16 @@ pub struct ActionRequest<'a> {
     /// nowhere meaningful to land.
     pub conversation_store: Option<&'a ConversationStore>,
 
-    /// The outputs the state declares, in declaration order.
+    /// What the state lets its action answer with (KTD1).
     ///
     /// Informational only — the "no label validation" rule above still
-    /// holds. [`AgentExecutor`] lists them in the output contract it appends
-    /// to the prompt, so the agent is told the permitted labels (and what
-    /// each one means) by the engine rather than by the prompt's author.
-    /// Empty means the caller supplied none, and the contract then asks for
-    /// whatever label the task names.
-    pub outputs: &'a [OutputDefinition],
+    /// holds. [`AgentExecutor`] describes it in the output contract it
+    /// appends to the prompt, so the agent is told the permitted choices,
+    /// the step's variables and artifacts (and what each one means) by the
+    /// engine rather than by the prompt's author. Empty means the caller
+    /// supplied none, and the contract then asks for whatever label the task
+    /// names.
+    pub contract: StepContract<'a>,
 
     /// Why this attempt's prompt is sent: the step's own prompt
     /// ([`PromptPurpose::Step`], the default) or a reprompt asking the agent
@@ -140,7 +144,7 @@ impl<'a> ActionRequest<'a> {
             action_execution_id,
             execution_id: None,
             conversation_store: None,
-            outputs: &[],
+            contract: StepContract::default(),
             purpose: PromptPurpose::Step,
         }
     }
@@ -163,9 +167,9 @@ impl<'a> ActionRequest<'a> {
         self
     }
 
-    /// Returns the same request carrying the state's declared outputs.
-    pub fn with_outputs(mut self, outputs: &'a [OutputDefinition]) -> Self {
-        self.outputs = outputs;
+    /// Returns the same request carrying the state's contract.
+    pub fn with_contract(mut self, contract: StepContract<'a>) -> Self {
+        self.contract = contract;
         self
     }
 
@@ -173,6 +177,29 @@ impl<'a> ActionRequest<'a> {
     pub fn with_purpose(mut self, purpose: PromptPurpose) -> Self {
         self.purpose = purpose;
         self
+    }
+}
+
+/// The answer a step accepts: its variables and artifacts, each with what it
+/// is, and its choices, each with what it requires (KTD1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StepContract<'a> {
+    /// The variables the step defines, in declaration order.
+    pub variables: &'a [VariableDefinition],
+    /// The artifacts the step defines, in declaration order.
+    pub artifacts: &'a [ArtifactDefinition],
+    /// The choices that end the step, in declaration order.
+    pub choices: &'a [ChoiceDefinition],
+}
+
+impl<'a> StepContract<'a> {
+    /// The contract `state` declares.
+    pub fn of(state: &'a State) -> Self {
+        Self {
+            variables: &state.variables,
+            artifacts: &state.artifacts,
+            choices: &state.choices,
+        }
     }
 }
 
@@ -185,10 +212,10 @@ pub enum ActionOutcome {
     /// The time limit ran out and the action was stopped.
     ///
     /// This is deliberately *not* resolved to a label inside the executor: an
-    /// executor does not know the state's `outputs`, and §3.3.B makes the
+    /// executor does not know the state's `choices`, and §3.3.B makes the
     /// `timeout` label conditional on the state declaring it. The engine calls
     /// [`TimedOutAction::resolve`] with the declared labels in hand, which
-    /// keeps all `outputs` knowledge in one place (U7).
+    /// keeps all `choices` knowledge in one place (U7).
     TimedOut(TimedOutAction),
 
     /// The action neither finished nor ran out of time: it is waiting for
@@ -251,7 +278,8 @@ pub struct TimedOutAction {
 
 impl TimedOutAction {
     /// Turns the timeout into a `timeout` result when the state declares that
-    /// label, and into an action error when it does not.
+    /// label — with a reason naming the limit, for the gate it may lead to
+    /// (KTD11) — and into an action error when it does not.
     ///
     /// A state that maps exit code 124 to some label is unaffected: that is an
     /// ordinary exit-code mapping of a process that finished on its own, and
@@ -261,13 +289,9 @@ impl TimedOutAction {
 
         if declared_outputs.iter().any(|label| label == TIMEOUT_LABEL) {
             return Ok(ActionResult {
-                output_label: TIMEOUT_LABEL.to_string(),
+                reason: format!("krok przekroczył limit czasu {seconds}s"),
                 data: serde_json::json!({ "timeout_secs": seconds }),
-                variables: serde_json::Map::new(),
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                reply: None,
+                ..ActionResult::new(TIMEOUT_LABEL)
             });
         }
 

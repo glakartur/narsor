@@ -66,9 +66,10 @@ states:
         the id of anything this work touches. Weigh the alternatives,
         including building nothing, and end in a routing decision.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"brief": "<repo-relative path or null>"}}
-    outputs:
+        In `additional_artifacts`, list the repo-relative path of the brief,
+        if you wrote one.
+
+    choices:
       - label: routed
         description: the work is worth continuing and a brief exists.
       - label: no_action
@@ -97,9 +98,10 @@ states:
         and post a not-ready comment naming exactly what is missing. Author no
         code.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"ready_status": "<READY|NOT_READY>", "gaps": []}}
-    outputs:
+        In `additional_data`, put `ready_status` (`READY` or `NOT_READY`) and
+        `gaps`, the list of missing items.
+
+    choices:
       - label: ready
         description: >-
           every Definition of Ready item is on the ticket or in a spec it links.
@@ -144,7 +146,7 @@ states:
           description: >
             The ticket-level answers, or the item you are waiving and why, or
             what is still missing.
-    outputs:
+    choices:
       - label: confirmed
         description: the ticket-level Definition of Ready is met.
       - label: waived
@@ -174,9 +176,9 @@ states:
 
         {{ context.readiness_notes }}
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"evidence": "<what you observed>"}}
-    outputs:
+        In `additional_data`, put `evidence`: what you observed.
+
+    choices:
       - label: actionable
         description: real, unfixed and unclaimed.
       - label: no_action
@@ -203,9 +205,9 @@ states:
         post a claim comment saying what you are about to do. If you find an
         existing claim, back off instead of colliding.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"claimed_by": "<handle>"}}
-    outputs:
+        In `additional_data`, put `claimed_by`: the handle that holds the claim.
+
+    choices:
       - label: claimed
         description: all three signals are on the ticket.
       - label: claim_lost
@@ -230,9 +232,9 @@ states:
         code it will touch: does it change a screen, a flow, or anything a
         user sees or operates? Do not start implementing.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"reason": "<one sentence>"}}
-    outputs:
+        Give the deciding fact as your `reason`, in one sentence.
+
+    choices:
       - label: user_facing
         description: the Design stage applies.
       - label: not_user_facing
@@ -259,12 +261,11 @@ states:
         does not do. Record the design contract where the repository keeps it
         (`.uxproof/` when it has one). Write no implementation code.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"states_covered": []}}
-        If the flow cannot be settled without a person's direction, request
-        `awaiting_input` and ask the question. A tool, sandbox, permission, or
-        harness problem is an action failure, not a workflow output.
-    outputs:
+        In `additional_data`, put `states_covered`: the list of states the
+        design covers. If the flow cannot be settled without a person's
+        direction, ask the person.
+
+    choices:
       - label: shaped
         description: the flow and its states are written down.
     transitions:
@@ -299,7 +300,7 @@ states:
           type: text
           required: false
           description: What the flow still gets wrong, if anything.
-    outputs:
+    choices:
       - label: approved
         description: the design contract is signed off; implement it.
       - label: reshape
@@ -329,12 +330,10 @@ states:
         `.ai/specs/product-brief.md` without a superseding entry in the same
         change.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"files_changed": <count>}}
-        If the work needs a human decision, request `awaiting_input` and ask
-        the question. A tool, sandbox, permission, or harness problem is an
-        action failure, not a workflow output.
-    outputs:
+        In `additional_data`, put `files_changed`: the number of files you
+        changed. If the work needs a human decision, ask the person.
+
+    choices:
       - label: implemented
         description: the change is complete with its tests.
     transitions:
@@ -355,7 +354,7 @@ states:
       exit_codes:
         0: green
         1: red
-    outputs:
+    choices:
       - label: green
         description: every validation command passed.
       - label: red
@@ -384,11 +383,15 @@ states:
         touched* section in the body. Swap `in-progress` for `ci-monitoring`
         if you still owe the CI follow-up.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"pr": "<number>"}, "variables": {"pr_number": "<number>", "pr_url": "<url>"}}
         A failed commit, push, or pull-request creation is an action failure,
         not a workflow output.
-    outputs:
+
+    variables:
+      - name: pr_number
+        description: the number of the pull request you opened.
+      - name: pr_url
+        description: the web URL of the pull request you opened.
+    choices:
       - label: pr_opened
         description: the pull request is open and labelled.
     transitions:
@@ -413,12 +416,10 @@ states:
         maintainer waived it on the PR. Move the pipeline label: approval →
         `merge-queue`, requested changes → `changes-requested`.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"findings": <count>, "blockers": <count>}}
-        If the review needs a human decision, request `awaiting_input` and ask
-        the question. A tool, sandbox, permission, or harness problem is an
-        action failure, not a workflow output.
-    outputs:
+        In `additional_data`, put `findings` and `blockers`: the number of
+        each. If the review needs a human decision, ask the person.
+
+    choices:
       - label: approved
         description: an approving review is submitted.
       - label: changes_requested
@@ -443,12 +444,11 @@ states:
         threads, and move the pipeline label back to `review`. A push stales a
         pinned `qa-approved`: say so on the PR if one is in place.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"threads_addressed": <count>}}
-        If a requested change needs a human decision, request `awaiting_input`
-        and ask the question. A tool, sandbox, permission, or harness problem
-        is an action failure, not a workflow output.
-    outputs:
+        In `additional_data`, put `threads_addressed`: the number of
+        threads. If a requested change needs a human decision, ask the
+        person.
+
+    choices:
       - label: updated
         description: the changes are pushed and the PR is back in `review`.
     transitions:
@@ -473,9 +473,9 @@ states:
         combined. Correct the label if the diff disagrees with it, and leave a
         comment saying why.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"qa_label": "<needs-qa|skip-qa>"}}
-    outputs:
+        In `additional_data`, put `qa_label`: `needs-qa` or `skip-qa`.
+
+    choices:
       - label: needs_qa
         description: the PR must be exercised before it merges.
       - label: skip_qa
@@ -505,13 +505,11 @@ states:
         `QA head: <sha>` line. Touch no labels: only a QA reviewer sets `qa`,
         and `qa-approved` is not yours to apply.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"scenarios": <count>, "qa_head": "<sha>"}}
-        If QA cannot proceed until a person resolves an environmental or
-        product question, request `awaiting_input` and ask the question. A
-        tool, sandbox, permission, or harness problem is an action failure,
-        not a workflow output.
-    outputs:
+        In `additional_data`, put `scenarios`, the number of scenarios you
+        walked, and `qa_head`, the sha you tested. If QA cannot proceed until a
+        person resolves an environmental or product question, ask the person.
+
+    choices:
       - label: evidence_ready
         description: the evidence is attached for a QA reviewer.
     transitions:
@@ -553,7 +551,7 @@ states:
           type: text
           required: false
           description: The scenario exercised, the environment, what failed.
-    outputs:
+    choices:
       - label: qa_approved
         description: QA passes; `qa-approved` is pinned to the tested head.
       - label: qa_failed
@@ -582,12 +580,11 @@ states:
         an `in-progress` claim. QA evidence older than the head is reported as
         stale rather than silently accepted.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"blockers": []}}
-        If a blocking gate needs a person's decision, request `awaiting_input`
-        and name it in the question. A tool, sandbox, permission, or harness
-        problem is an action failure, not a workflow output.
-    outputs:
+        In `additional_data`, put `blockers`: the list of blocking gates.
+        If a blocking gate needs a person's decision, name it in your
+        question to the person.
+
+    choices:
       - label: mergeable
         description: every gate is satisfied and the checks are green.
     transitions:
@@ -621,7 +618,7 @@ states:
           type: text
           required: false
           description: Why you are holding it, if you are.
-    outputs:
+    choices:
       - label: merge
         description: squash-merge the pull request into `main`.
       - label: hold
@@ -647,12 +644,10 @@ states:
         rather than merge if any gate fails or the QA evidence is older than
         the head.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"merge_commit": "<sha or null>"}}
-        If a gate needs a person's decision, request `awaiting_input` and ask
-        the question. A tool, sandbox, permission, or harness problem is an
-        action failure, not a workflow output.
-    outputs:
+        In `additional_data`, put `merge_commit`: the sha, or null. If a gate
+        needs a person's decision, ask the person.
+
+    choices:
       - label: merged
         description: squash-merged into main.
     transitions:
@@ -673,12 +668,11 @@ states:
         into tracked follow-up issues. Stop at the tracker: deployment, smoke
         tests and monitoring belong to the release process, not this one.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"closed": <count>, "follow_ups": <count>}}
-        If a person must decide how to reconcile something, request
-        `awaiting_input` and ask the question. A tool, sandbox, permission, or
-        harness problem is an action failure, not a workflow output.
-    outputs:
+        In `additional_data`, put `closed` and `follow_ups`: the number of
+        each. If a person must decide how to reconcile something, ask the
+        person.
+
+    choices:
       - label: reconciled
         description: the tracker matches reality and follow-ups are filed.
     transitions:

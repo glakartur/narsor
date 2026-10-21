@@ -12,8 +12,10 @@ states:
       command: ./sleep_then_emit.sh
       args:
         - "0.4"
-        - '{"output": "done", "variables": {"slow": "finished"}}'
-    outputs:
+        - '{"choice": "done", "variables": {"slow": "finished"}}'
+    variables:
+      - { name: slow, description: What the step reports as slow. }
+    choices:
       - done
     transitions:
       done: fast
@@ -23,8 +25,10 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "done", "variables": {"fast": "finished"}}'
-    outputs:
+        - '{"choice": "done", "variables": {"fast": "finished"}}'
+    variables:
+      - { name: fast, description: What the step reports as fast. }
+    choices:
       - done
     transitions:
       done: completed

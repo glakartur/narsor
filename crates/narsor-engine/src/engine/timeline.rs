@@ -314,6 +314,7 @@ pub fn build_timeline(
             EventData::ActionFailed {
                 action_execution_id,
                 error,
+                ..
             } => {
                 if let Some(&idx) = by_attempt.get(action_execution_id) {
                     drafts[idx].outcome = Some(Outcome::Failed);

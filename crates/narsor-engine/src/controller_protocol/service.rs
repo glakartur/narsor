@@ -90,7 +90,7 @@ fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> Hum
     HumanInputDelivery {
         values: delivery.values,
         chosen_label: delivery.chosen_label,
-        data: delivery.data,
+        artifacts: delivery.artifacts,
         variables: delivery.variables,
         comment: delivery.comment,
         agent_message: delivery.agent_message,
@@ -105,7 +105,7 @@ fn protocol_delivery(delivery: &HumanInputDelivery) -> narsor_protocol::api::Hum
     narsor_protocol::api::HumanInputDeliveryDto {
         values: delivery.values.clone(),
         chosen_label: delivery.chosen_label.clone(),
-        data: delivery.data.clone(),
+        artifacts: delivery.artifacts.clone(),
         variables: delivery.variables.clone(),
         comment: delivery.comment.clone(),
         agent_message: delivery.agent_message.clone(),
@@ -2355,7 +2355,7 @@ fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
             label: label.clone(),
             target: target.clone(),
             description: state
-                .outputs
+                .choices
                 .iter()
                 .find(|output| output.label == *label)
                 .and_then(|output| output.description.clone()),

@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use narsor_engine::domain::{
     ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus,
-    OutputDefinition, RepromptedBy, Workspace, WorkspaceAccess,
+    ArtifactDefinition, ChoiceDefinition, RepromptedBy, VariableDefinition, Workspace,
+    WorkspaceAccess,
 };
 use narsor_engine::engine::actions::agent::{
     output_contract, output_schema, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
@@ -28,7 +29,7 @@ use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry, InputContinuation,
     LoggingEventSink, OpenCodeAdapter, OutputProblem, OutputRejection, PendingHumanInput,
-    SuspendedAction, METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
+    StepContract, SuspendedAction, METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
 };
 use narsor_engine::persistence::{
     recover, ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
@@ -400,6 +401,7 @@ fn agent_action(prompt: &str) -> AgentActionConfig {
         workspace: None,
         parameters: HashMap::new(),
         read_only_paths: Vec::new(),
+        history: true,
     }
 }
 
@@ -505,7 +507,7 @@ async fn a_json_object_gives_the_label_and_its_variables() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(
-        r#"{"output":"ready","variables":{"plan":"plan.md"}}"#,
+        r#"{"choice":"ready","variables":{"plan":"plan.md"}}"#,
     ));
 
     let result = complete(
@@ -582,7 +584,7 @@ async fn a_fenced_json_block_is_extracted() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(
-        "Here is what I found.\n\n```json\n{\"output\": \"ready\", \
+        "Here is what I found.\n\n```json\n{\"choice\": \"ready\", \
          \"variables\": {\"plan\": \"plan.md\"}}\n```\n",
     ));
 
@@ -602,9 +604,9 @@ async fn the_last_json_object_wins_when_the_agent_rambled_first() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(
-        "I considered answering {\"output\": \"ambiguous\"} but then I read \
+        "I considered answering {\"choice\": \"ambiguous\"} but then I read \
          plan.md — a config file holds {\"unrelated\": true} — and settled on:\n\
-         {\"output\": \"ready\", \"data\": {\"files\": 3}}",
+         {\"choice\": \"ready\", \"additional_data\": {\"files\": 3}}",
     ));
 
     let result = complete(
@@ -615,7 +617,7 @@ async fn the_last_json_object_wins_when_the_agent_rambled_first() {
     .await;
 
     assert_eq!(result.output_label, "ready");
-    assert_eq!(result.data.get("files"), Some(&json!(3)));
+    assert_eq!(result.additional_data.get("files"), Some(&json!(3)));
 }
 
 #[tokio::test]
@@ -647,7 +649,7 @@ async fn an_answer_without_any_json_is_an_error_and_never_a_guessed_label() {
 }
 
 #[tokio::test]
-async fn json_without_an_output_key_is_an_error() {
+async fn json_without_a_choice_key_is_an_error() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(
@@ -663,7 +665,7 @@ async fn json_without_an_output_key_is_an_error() {
 
     assert_eq!(error.error_type.as_deref(), Some("missing_output_label"));
     assert!(
-        error.message.contains("'output'"),
+        error.message.contains("'choice'"),
         "the message names the missing key: {}",
         error.message
     );
@@ -674,13 +676,109 @@ async fn json_without_an_output_key_is_an_error() {
     assert_eq!(details["harness_session_id"], json!("fake-session-1"));
 }
 
+#[tokio::test]
+async fn a_choice_brings_its_reason_and_its_named_artifacts() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(
+        r#"{"choice":"done","reason":"ok","artifacts":{"plan_doc":"docs/p.md"}}"#,
+    ));
+
+    let result = complete(&executor(&fake), agent_action("plan it"), &root.workspace()).await;
+
+    assert_eq!(result.output_label, "done");
+    assert_eq!(result.reason, "ok");
+    assert_eq!(
+        result.artifacts.get("plan_doc").map(String::as_str),
+        Some("docs/p.md")
+    );
+}
+
+/// R22: the old `output` key is no answer; the engine asks again.
+#[tokio::test]
+async fn the_old_output_key_is_no_choice_and_is_asked_for_again() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"output":"done"}"#));
+
+    let error = fail(&executor(&fake), agent_action("plan it"), &root.workspace()).await;
+
+    assert_eq!(error.error_type.as_deref(), Some("missing_output_label"));
+    assert!(error.message.contains("'choice'"), "{}", error.message);
+}
+
+/// Covers AE4. A choice without `reason` is accepted, with an empty reason.
+#[tokio::test]
+async fn covers_ae4_a_choice_without_a_reason_is_no_error() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"done"}"#));
+
+    let result = complete(&executor(&fake), agent_action("plan it"), &root.workspace()).await;
+
+    assert_eq!(result.output_label, "done");
+    assert_eq!(result.reason, "");
+}
+
+/// R5: what lies outside the step's definitions is kept as it came.
+#[tokio::test]
+async fn additional_data_and_artifacts_reach_the_result_untouched() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(
+        r#"Done.
+{"choice":"done","additional_data":{"findings":[{"title":"x"}]},
+ "additional_artifacts":["notes/a.md","notes/b.md"]}"#,
+    ));
+
+    let result = complete(&executor(&fake), agent_action("plan it"), &root.workspace()).await;
+
+    assert_eq!(
+        result.additional_data.get("findings"),
+        Some(&json!([{ "title": "x" }]))
+    );
+    assert_eq!(result.additional_artifacts, vec!["notes/a.md", "notes/b.md"]);
+    assert!(result.artifacts.is_empty());
+}
+
+/// A field of the wrong shape is not silently dropped: the agent is asked
+/// again, told what is wrong.
+#[tokio::test]
+async fn artifacts_given_as_a_list_are_asked_for_again() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"done","artifacts":["docs/p.md"]}"#));
+
+    let error = fail(&executor(&fake), agent_action("plan it"), &root.workspace()).await;
+
+    assert_eq!(error.error_type.as_deref(), Some("missing_output_label"));
+    assert!(error.message.contains("'artifacts'"), "{}", error.message);
+}
+
+/// KTD17: an agent that wrote no text hands on its `reason` and, below it,
+/// its `additional_data` as JSON.
+#[tokio::test]
+async fn without_text_the_reply_is_the_reason_and_the_additional_data() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(
+        r#"{"choice":"findings","reason":"two problems","additional_data":{"count":2}}"#,
+    ));
+
+    let result = complete(&executor(&fake), agent_action("review"), &root.workspace()).await;
+
+    let reply = result.reply.expect("a reply from the contract");
+    assert!(reply.starts_with("two problems\n\n"), "{reply}");
+    assert!(reply.contains("\"count\": 2"), "{reply}");
+}
+
 /// The session config records the harness the attempt ran on, even when the
 /// action named none, so the session can be resumed where it lives (KTD7).
 #[tokio::test]
 async fn the_session_config_records_the_harness_that_ran() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("do the thing");
     config.harness = None;
@@ -698,7 +796,7 @@ async fn the_session_config_records_the_harness_that_ran() {
 async fn a_failing_harness_is_an_error_naming_its_stderr() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#))
+    fake.answers(&envelope(r#"{"choice":"ready"}"#))
         .fails(2, "credit balance too low\n");
 
     let error = fail(
@@ -724,7 +822,7 @@ async fn a_failing_harness_is_an_error_naming_its_stderr() {
 async fn the_session_events_are_emitted_and_the_harness_session_id_is_captured() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let sink = Arc::new(RecordingSink::default());
     let executor = executor(&fake).with_event_sink(sink.clone());
@@ -819,7 +917,7 @@ async fn a_failed_run_ends_the_session_with_a_failure_event() {
 async fn a_session_to_resume_reaches_the_argv() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("carry on");
     config
@@ -856,7 +954,7 @@ async fn a_session_to_resume_reaches_the_argv() {
 async fn the_model_and_the_read_only_paths_reach_the_argv() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
     config.model = Some("opus".to_string());
@@ -911,7 +1009,7 @@ async fn the_model_and_the_read_only_paths_reach_the_argv() {
 async fn a_task_permission_grant_reaches_claude_as_its_allowed_tool_rules() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
     let mut config = agent_action("continue");
     config.permission_grants = vec!["Bash(cargo build)".to_string(), "Bash(tail -5)".to_string()];
 
@@ -928,6 +1026,26 @@ async fn a_task_permission_grant_reaches_claude_as_its_allowed_tool_rules() {
     );
 }
 
+/// A pending `ScheduleWakeup` or `CronCreate` keeps `claude --print` running
+/// until it fires: an agent that scheduled a 20-minute fallback while its
+/// subagents ran held its step that long after it had answered.
+#[tokio::test]
+async fn claude_is_denied_the_tools_that_defer_work_past_the_answer() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+
+    complete(&executor(&fake), agent_action("continue"), &root.workspace()).await;
+
+    let args = fake.args(1);
+    let deny = args
+        .iter()
+        .position(|arg| arg == "--disallowedTools")
+        .expect("the deferring tools are denied");
+    assert_eq!(args[deny + 1..deny + 3], ["ScheduleWakeup", "CronCreate"]);
+    assert!(args[deny + 3].starts_with("--"), "{args:?}");
+}
+
 /// `--allowedTools` and `--add-dir` take any number of values: right before
 /// the prompt they would swallow it, and `--resume` without a prompt makes
 /// Claude Code look for a deferred tool call and fail ("No deferred tool
@@ -938,7 +1056,7 @@ async fn a_resumed_grant_never_swallows_the_prompt() {
     for workspace_access in [None, Some(WorkspaceAccess::ReadWrite)] {
         let root = TempRoot::new();
         let fake = FakeHarness::install(root.dir("bin"));
-        fake.answers(&envelope(r#"{"output":"ready"}"#));
+        fake.answers(&envelope(r#"{"choice":"ready"}"#));
         let mut config = agent_action("The operator approved this action.");
         config.workspace_access = workspace_access;
         config.permission_grants = vec!["Bash(git checkout -b feat/x)".to_string()];
@@ -973,7 +1091,7 @@ async fn a_resumed_grant_never_swallows_the_prompt() {
 async fn claude_rejects_harness_specific_workspace_permissions() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
     config
@@ -994,7 +1112,7 @@ async fn claude_rejects_harness_specific_workspace_permissions() {
 async fn claude_maps_read_only_workspace_access_to_plan_mode() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
     config.workspace_access = Some(WorkspaceAccess::ReadOnly);
@@ -1013,7 +1131,7 @@ async fn claude_maps_read_only_workspace_access_to_plan_mode() {
 async fn claude_omits_the_mode_when_workspace_access_was_not_set() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
     config.workspace_access = None;
@@ -1075,7 +1193,7 @@ async fn claude_structured_permission_denial_suspends_instead_of_becoming_failur
 async fn the_opencode_adapter_builds_its_own_command_line() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&json!({ "sessionID": "ses_7", "text": "{\"output\":\"ready\"}" }).to_string());
+    fake.answers(&json!({ "sessionID": "ses_7", "text": "{\"choice\":\"ready\"}" }).to_string());
 
     let executor = AgentExecutor::with_harnesses(
         HarnessRegistry::defaults()
@@ -1109,7 +1227,7 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
 async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thread() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&codex_stream("thread-7", r#"{"output":"ready"}"#));
+    fake.answers(&codex_stream("thread-7", r#"{"choice":"ready"}"#));
 
     let executor = AgentExecutor::with_harnesses(
         HarnessRegistry::defaults()
@@ -1157,7 +1275,7 @@ async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thre
 async fn codex_resume_uses_the_exec_resume_grammar() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&codex_stream("thread-42", r#"{"output":"ready"}"#));
+    fake.answers(&codex_stream("thread-42", r#"{"choice":"ready"}"#));
     let executor = AgentExecutor::with_harnesses(
         HarnessRegistry::defaults()
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
@@ -1211,7 +1329,7 @@ async fn codex_rejects_unsafe_sandbox_before_spawn() {
 async fn codex_maps_read_only_workspace_access_to_its_native_sandbox() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&codex_stream("thread-7", r#"{"output":"ready"}"#));
+    fake.answers(&codex_stream("thread-7", r#"{"choice":"ready"}"#));
     let executor = AgentExecutor::with_harnesses(
         HarnessRegistry::defaults()
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
@@ -1234,7 +1352,7 @@ async fn codex_requires_a_completed_turn_after_its_agent_message() {
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&ndjson(&[
         json!({ "type": "thread.started", "thread_id": "thread-7" }),
-        json!({ "type": "item.completed", "item": { "type": "agent_message", "text": "{\\\"output\\\":\\\"ready\\\"}" } }),
+        json!({ "type": "item.completed", "item": { "type": "agent_message", "text": "{\\\"choice\\\":\\\"ready\\\"}" } }),
     ]));
     let executor = AgentExecutor::with_harnesses(
         HarnessRegistry::defaults()
@@ -1258,7 +1376,7 @@ async fn codex_terminal_failure_dominates_an_earlier_agent_message() {
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&ndjson(&[
         json!({ "type": "thread.started", "thread_id": "thread-7" }),
-        json!({ "type": "item.completed", "item": { "type": "agent_message", "text": "{\\\"output\\\":\\\"ready\\\"}" } }),
+        json!({ "type": "item.completed", "item": { "type": "agent_message", "text": "{\\\"choice\\\":\\\"ready\\\"}" } }),
         json!({ "type": "turn.failed", "error": { "message": "permission denied" } }),
     ]));
     let executor = AgentExecutor::with_harnesses(
@@ -1285,7 +1403,7 @@ async fn codex_terminal_failure_dominates_an_earlier_agent_message() {
 async fn the_harness_receives_the_expanded_prompt_and_the_output_contract() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     // What the engine does before it calls an executor (U4): expand once.
     let action = ActionConfig::Agent(agent_action(
@@ -1317,43 +1435,53 @@ async fn the_harness_receives_the_expanded_prompt_and_the_output_contract() {
     );
     assert!(!prompt.contains("{{"), "{prompt}");
     assert!(
-        prompt.contains("\"output\""),
+        prompt.contains("\"choice\""),
         "the output contract is appended: {prompt}"
     );
 }
 
-/// The prompt a request with `outputs` sends to the fake harness.
-async fn prompt_sent_with_outputs(outputs: &[OutputDefinition]) -> String {
+/// The prompt a request carrying `contract` sends to the fake harness.
+async fn prompt_sent_with_contract(contract: StepContract<'_>) -> String {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let action = ActionConfig::Agent(agent_action("do the thing"));
     let workspace = root.workspace();
     executor(&fake)
-        .execute(ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_outputs(outputs))
+        .execute(ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_contract(contract))
         .await
         .expect("the action runs");
 
     fake.args(1).last().expect("a prompt").clone()
 }
 
+/// The prompt a request with only `choices` sends to the fake harness.
+async fn prompt_sent_with_choices(choices: &[ChoiceDefinition]) -> String {
+    prompt_sent_with_contract(StepContract {
+        choices,
+        ..StepContract::default()
+    })
+    .await
+}
+
 /// The declared labels are listed by the engine, in declaration order, each
 /// with its description where the workflow gives one.
 #[tokio::test]
 async fn the_output_contract_lists_the_declared_labels_with_their_descriptions() {
-    let outputs = [
-        OutputDefinition {
+    let choices = [
+        ChoiceDefinition {
             label: "ready".to_string(),
             requires_variables: Vec::new(),
+            requires_artifacts: Vec::new(),
             description: Some("The plan is written and nothing is unclear.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
         },
-        OutputDefinition::new("ambiguous"),
+        ChoiceDefinition::new("ambiguous"),
     ];
 
-    let prompt = prompt_sent_with_outputs(&outputs).await;
+    let prompt = prompt_sent_with_choices(&choices).await;
 
     let ready = prompt
         .find("- `ready` — The plan is written and nothing is unclear.\n")
@@ -1368,52 +1496,109 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
     );
 }
 
+fn variable(name: &str, description: &str) -> VariableDefinition {
+    VariableDefinition {
+        name: name.to_string(),
+        description: description.to_string(),
+    }
+}
+
+/// R10: the step's variables and artifacts are described once, and every
+/// choice names what it requires — variables and artifacts apart.
 #[tokio::test]
-async fn output_contract_lists_required_variables_only_at_their_label() {
-    use narsor_engine::domain::RequiredVariable;
-    let outputs = [
-        OutputDefinition {
-            label: "findings".to_string(),
-            requires_variables: vec![RequiredVariable::Described {
-                name: "report".to_string(),
-                description: "Complete review report".to_string(),
-            }],
-            description: None,
-            requires_human_approval: false,
-            resume_comment_field: None,
-        },
-        OutputDefinition::new("clean"),
+async fn the_contract_describes_step_values_once_and_lists_requirements_per_choice() {
+    let variables = [
+        variable("summary", "One paragraph on what changed."),
+        variable("local.notes", "What to remember for the next attempt."),
     ];
-    let prompt = prompt_sent_with_outputs(&outputs).await;
-    assert!(prompt.contains("Set `variables.report`: Complete review report"));
-    let clean = prompt.split("- `clean`").nth(1).unwrap();
-    assert!(!clean.contains("variables.report"));
+    let artifacts = [ArtifactDefinition {
+        name: "plan_doc".to_string(),
+        description: "The plan document.".to_string(),
+    }];
+    let choices = [
+        ChoiceDefinition {
+            requires_variables: vec!["summary".to_string()],
+            requires_artifacts: vec!["plan_doc".to_string()],
+            ..ChoiceDefinition::new("done")
+        },
+        ChoiceDefinition {
+            requires_variables: vec!["local.notes".to_string()],
+            ..ChoiceDefinition::new("blocked")
+        },
+    ];
+
+    let prompt = prompt_sent_with_contract(StepContract {
+        variables: &variables,
+        artifacts: &artifacts,
+        choices: &choices,
+    })
+    .await;
+
+    for description in [
+        "- `summary` — One paragraph on what changed.\n",
+        "- `local.notes` — What to remember for the next attempt.\n",
+        "- `plan_doc` — The plan document.\n",
+    ] {
+        assert_eq!(prompt.matches(description).count(), 1, "{description}: {prompt}");
+    }
+    let done = prompt.split("- `done`").nth(1).expect("done is listed");
+    let done = done.split("- `blocked`").next().expect("done's section");
+    assert!(done.contains("Required variables: `summary`\n"), "{prompt}");
+    assert!(done.contains("Required artifacts: `plan_doc`\n"), "{prompt}");
+    let blocked = prompt.split("- `blocked`").nth(1).expect("blocked is listed");
+    assert!(blocked.contains("Required variables: `local.notes`\n"), "{prompt}");
+    assert!(!blocked.contains("Required artifacts"), "{prompt}");
+}
+
+/// R3 and R6: `reason` is asked for, and the question instructions stay.
+#[test]
+fn the_contract_requires_a_reason_and_keeps_the_question_instructions() {
+    let choices = [ChoiceDefinition::new("done")];
+    let contract = output_contract(&StepContract {
+        choices: &choices,
+        ..StepContract::default()
+    });
+
+    assert!(contract.contains("`reason` is required"), "{contract}");
+    assert!(contract.contains("\"choice\""), "{contract}");
+    assert!(!contract.contains("\"output\""), "{contract}");
+    assert!(
+        contract.contains(
+            "{\"status\":\"awaiting_input\",\"question\":\"<question>\",\"options\":[\"<optional choice>\"]}"
+        ),
+        "{contract}"
+    );
 }
 
 /// A state without descriptions gets a plain list — no dangling dashes.
 #[test]
 fn a_contract_without_descriptions_lists_bare_labels_only() {
-    let contract = output_contract(&[
-        OutputDefinition::new("approved"),
-        OutputDefinition {
+    let choices = [
+        ChoiceDefinition::new("approved"),
+        ChoiceDefinition {
             label: "rejected".to_string(),
             requires_variables: Vec::new(),
+            requires_artifacts: Vec::new(),
             // Blank is treated as no description at all.
             description: Some("   ".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
         },
-    ]);
+    ];
+    let contract = output_contract(&StepContract {
+        choices: &choices,
+        ..StepContract::default()
+    });
 
     assert!(contract.contains("- `approved`\n"), "{contract}");
     assert!(contract.contains("- `rejected`\n"), "{contract}");
     assert!(!contract.contains(" — "), "{contract}");
 }
 
-/// With no outputs to list, the agent is pointed at the label the task names.
+/// With no choices to list, the agent is pointed at the label the task names.
 #[tokio::test]
-async fn a_request_without_outputs_asks_for_the_label_the_task_names() {
-    let prompt = prompt_sent_with_outputs(&[]).await;
+async fn a_request_without_choices_asks_for_the_label_the_task_names() {
+    let prompt = prompt_sent_with_choices(&[]).await;
 
     assert!(
         prompt.contains("the label the task asks for"),
@@ -1433,7 +1618,7 @@ async fn a_request_without_outputs_asks_for_the_label_the_task_names() {
 async fn the_harness_runs_in_the_workspace_with_the_action_id_in_its_environment() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     complete(
         &executor(&fake),
@@ -1453,7 +1638,7 @@ async fn the_harness_runs_in_the_workspace_with_the_action_id_in_its_environment
 async fn a_timeout_kills_the_harness_and_is_reported_as_a_timeout() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#)).sleeps(30);
+    fake.answers(&envelope(r#"{"choice":"ready"}"#)).sleeps(30);
 
     let outcome = execute(
         &executor(&fake),
@@ -1597,7 +1782,7 @@ impl EngineFixture {
 async fn an_agent_state_transitions_on_the_label_the_agent_returned() {
     let fixture = EngineFixture::new();
     fixture.fake.answers(&envelope(
-        r#"{"output":"ready","variables":{"plan":"plan.md"}}"#,
+        r#"{"choice":"ready","variables":{"plan":"plan.md"}}"#,
     ));
 
     let definition = fixture.workflow(
@@ -1610,7 +1795,9 @@ states:
       type: agent
       harness: claude-code
       prompt: "Analyse {{ inputs.subject }}"
-    outputs: [ready, ambiguous]
+    variables:
+      - { name: plan, description: What the step reports as plan. }
+    choices: [ready, ambiguous]
     transitions:
       ready: done
       ambiguous: stopped
@@ -1667,7 +1854,7 @@ inputs:
 #[tokio::test]
 async fn the_engine_appends_the_states_labels_and_descriptions_to_the_prompt() {
     let fixture = EngineFixture::new();
-    fixture.fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fixture.fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let definition = fixture.workflow(
         r#"
@@ -1679,7 +1866,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Analyse the module."
-    outputs:
+    choices:
       - label: ready
         description: The analysis is complete.
       - ambiguous
@@ -1722,8 +1909,8 @@ async fn the_reference_workflow_runs_end_to_end_on_the_fake_harness() {
     fixture.install_scripts();
     fixture
         .fake
-        .answers_on_call(1, &envelope(r#"{"output":"ready"}"#))
-        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#));
+        .answers_on_call(1, &envelope(r#"{"choice":"ready"}"#))
+        .answers_on_call(2, &envelope(r#"{"choice":"implemented"}"#));
 
     let definition = load_from_file(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/implement_feature.yaml"),
@@ -1784,7 +1971,7 @@ async fn a_retried_agent_state_gets_one_compressed_conversation_file_per_attempt
     fixture
         .fake
         .answers_on_call(1, &failed_envelope("the model is overloaded"))
-        .answers_on_call(2, &envelope(r#"{"output":"ready"}"#));
+        .answers_on_call(2, &envelope(r#"{"choice":"ready"}"#));
 
     let definition = fixture.workflow(
         r#"
@@ -1796,7 +1983,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Analyse {{ inputs.subject }}"
-    outputs: [ready]
+    choices: [ready]
     retry_policy:
       max_attempts: 2
       backoff: 0
@@ -1869,7 +2056,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Implement the feature."
-    outputs:
+    choices:
       - label: implemented
         description: The feature is implemented.
       - label: needs_human_decision
@@ -1907,7 +2094,7 @@ fn has_flag(args: &[String], flag: &str, value: &str) -> bool {
         .any(|pair| pair[0] == flag && pair[1] == value)
 }
 
-/// AE7: an answer without `output` is not an action failure. The engine asks
+/// AE7: an answer without `choice` is not an action failure. The engine asks
 /// the same session again, read-only, as a new attempt — and the state's
 /// `retry_policy` never moves.
 #[tokio::test]
@@ -1915,8 +2102,8 @@ async fn a_missing_label_is_asked_for_again_in_the_same_read_only_session() {
     let fixture = EngineFixture::new();
     fixture
         .fake
-        .answers_on_call(1, &envelope(r#"Done. {"data": {"units_completed": 3}}"#))
-        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#));
+        .answers_on_call(1, &envelope(r#"Done. {"additional_data": {"units_completed": 3}}"#))
+        .answers_on_call(2, &envelope(r#"{"choice":"implemented"}"#));
 
     let definition = fixture.workflow(REPROMPT_WORKFLOW);
     let execution = fixture
@@ -1940,7 +2127,7 @@ async fn a_missing_label_is_asked_for_again_in_the_same_read_only_session() {
 
     // The reprompt says what is wrong and lists the labels again.
     let prompt = second.last().expect("a prompt");
-    assert!(prompt.contains("output"), "{prompt}");
+    assert!(prompt.contains("choice"), "{prompt}");
     assert!(
         prompt.contains("- `implemented` — The feature is implemented.\n"),
         "{prompt}"
@@ -1972,7 +2159,7 @@ async fn a_missing_label_is_asked_for_again_in_the_same_read_only_session() {
         })
         .expect("an ActionOutputRejected event");
     assert_eq!(rejected.0, fixture.fake.action_id(1));
-    assert!(rejected.1.contains("'output'"), "{}", rejected.1);
+    assert!(rejected.1.contains("'choice'"), "{}", rejected.1);
     assert!(
         rejected
             .2
@@ -2041,7 +2228,7 @@ fn reply_reading_reprompt_workflow() -> String {
       type: agent
       harness: claude-code
       prompt: "Check: {{ steps.work.reply }}"
-    outputs:
+    choices:
       - label: checked
         description: Checked.
     transitions:
@@ -2074,8 +2261,8 @@ async fn a_format_reprompt_keeps_the_reply_of_the_earlier_attempt() {
     fixture
         .fake
         .answers_on_call(1, &envelope("Review report: two findings."))
-        .answers_on_call(2, &envelope(r#"Here is JSON {"output":"implemented"}"#))
-        .answers_on_call(3, &envelope(r#"{"output":"checked"}"#));
+        .answers_on_call(2, &envelope(r#"Here is JSON {"choice":"implemented"}"#))
+        .answers_on_call(3, &envelope(r#"{"choice":"checked"}"#));
 
     let definition = fixture.workflow(&reply_reading_reprompt_workflow());
     let execution = fixture
@@ -2099,12 +2286,12 @@ async fn a_format_reprompt_supplies_the_reply_when_the_earlier_attempt_had_none(
     let fixture = EngineFixture::new();
     fixture
         .fake
-        .answers_on_call(1, &envelope(r#"{"output":"finished"}"#))
+        .answers_on_call(1, &envelope(r#"{"choice":"finished"}"#))
         .answers_on_call(
             2,
-            &envelope(r#"Review report: one finding. {"output":"implemented"}"#),
+            &envelope(r#"Review report: one finding. {"choice":"implemented"}"#),
         )
-        .answers_on_call(3, &envelope(r#"{"output":"checked"}"#));
+        .answers_on_call(3, &envelope(r#"{"choice":"checked"}"#));
 
     let definition = fixture.workflow(&reply_reading_reprompt_workflow());
     let execution = fixture
@@ -2162,8 +2349,8 @@ async fn an_undeclared_label_is_asked_for_again_instead_of_failing_at_once() {
     let fixture = EngineFixture::new();
     fixture
         .fake
-        .answers_on_call(1, &envelope(r#"{"output":"finished"}"#))
-        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#));
+        .answers_on_call(1, &envelope(r#"{"choice":"finished"}"#))
+        .answers_on_call(2, &envelope(r#"{"choice":"implemented"}"#));
 
     let execution = run_reprompt_workflow(&fixture).await;
 
@@ -2377,7 +2564,7 @@ async fn a_timeout_without_a_label_still_uses_the_retry_policy() {
         .fake
         .answers_on_call(1, "")
         .sleeps_on_call(1, 30)
-        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#));
+        .answers_on_call(2, &envelope(r#"{"choice":"implemented"}"#));
 
     let definition = fixture.workflow(
         &REPROMPT_WORKFLOW.replace("    retry_policy:\n", "    timeout: 1\n    retry_policy:\n"),
@@ -2407,7 +2594,7 @@ async fn the_reprompt_runs_on_the_harness_of_the_rejected_attempt() {
         .fake
         .answers_on_call(1, &envelope("Done, no JSON."))
         .sleeps_on_call(1, 1)
-        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#));
+        .answers_on_call(2, &envelope(r#"{"choice":"implemented"}"#));
     let selector = Arc::new(
         DefaultHarnessSelector::load(
             StatePaths::new(fixture.root.path()),
@@ -2477,7 +2664,7 @@ states:
     action:
       type: agent
       prompt: "Implement the feature."
-    outputs: [implemented]
+    choices: [implemented]
     retry_policy:
       max_attempts: {implement_attempts}
       backoff: 0
@@ -2487,7 +2674,7 @@ states:
     action:
       type: agent
       prompt: "Review the change."
-    outputs: [reviewed]
+    choices: [reviewed]
     transitions:
       reviewed: analyze
   analyze:
@@ -2495,7 +2682,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Analyse the result."
-    outputs: [analysed]
+    choices: [analysed]
     transitions:
       analysed: done
   done:
@@ -2571,9 +2758,9 @@ async fn covers_ae5_a_retry_stays_on_the_harness_its_action_started_with() {
         .fake
         .answers_on_call(1, &failed_envelope("the model is overloaded"))
         .sleeps_on_call(1, 1)
-        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#))
-        .answers_on_call(3, &opencode_stream("oc-1", r#"{"output":"reviewed"}"#))
-        .answers_on_call(4, &envelope(r#"{"output":"analysed"}"#));
+        .answers_on_call(2, &envelope(r#"{"choice":"implemented"}"#))
+        .answers_on_call(3, &opencode_stream("oc-1", r#"{"choice":"reviewed"}"#))
+        .answers_on_call(4, &envelope(r#"{"choice":"analysed"}"#));
     let (engine, selector) = engine_with_live_default(&fixture).await;
     let definition = fixture.workflow(&pinned_harness_workflow(2));
     let workspace = fixture.workspace();
@@ -2611,9 +2798,9 @@ async fn a_default_changed_twice_during_an_action_leaves_its_retries_on_the_orig
         .sleeps_on_call(1, 1)
         .answers_on_call(2, &failed_envelope("the model is still overloaded"))
         .sleeps_on_call(2, 1)
-        .answers_on_call(3, &envelope(r#"{"output":"implemented"}"#))
-        .answers_on_call(4, &codex_stream("thread-1", r#"{"output":"reviewed"}"#))
-        .answers_on_call(5, &envelope(r#"{"output":"analysed"}"#));
+        .answers_on_call(3, &envelope(r#"{"choice":"implemented"}"#))
+        .answers_on_call(4, &codex_stream("thread-1", r#"{"choice":"reviewed"}"#))
+        .answers_on_call(5, &envelope(r#"{"choice":"analysed"}"#));
     let (engine, selector) = engine_with_live_default(&fixture).await;
     let definition = fixture.workflow(&pinned_harness_workflow(3));
     let workspace = fixture.workspace();
@@ -2653,7 +2840,7 @@ async fn a_reprompt_after_a_restart_runs_on_the_recorded_harness_not_the_new_def
     let fixture = EngineFixture::new();
     fixture
         .fake
-        .answers(&envelope(r#"{"output":"implemented"}"#));
+        .answers(&envelope(r#"{"choice":"implemented"}"#));
     let (engine, selector) = engine_with_live_default(&fixture).await;
     let definition =
         fixture.workflow(&REPROMPT_WORKFLOW.replace("      harness: claude-code\n", ""));
@@ -2721,7 +2908,7 @@ async fn a_restart_between_rejection_and_reprompt_continues_with_the_reprompt() 
     let fixture = EngineFixture::new();
     fixture
         .fake
-        .answers(&envelope(r#"{"output":"implemented"}"#));
+        .answers(&envelope(r#"{"choice":"implemented"}"#));
     let store = fixture.store();
     let engine = fixture.engine();
     let definition = fixture.workflow(REPROMPT_WORKFLOW);
@@ -2810,7 +2997,7 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     let conversation = ConversationFixture::new(&root);
-    fake.answers(&claude_stream("fake-session-1", r#"{"output":"ready"}"#));
+    fake.answers(&claude_stream("fake-session-1", r#"{"choice":"ready"}"#));
 
     let result = execute_with_conversation(
         &executor(&fake),
@@ -2833,7 +3020,7 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
     assert_eq!(entries[0].source, ConversationSource::Narsor);
     assert!(entry_text(&entries[0]).contains("look around"));
     let (prompt, resumed, purpose) = prompt_element(&entries[0]);
-    assert_eq!(prompt, format!("look around{}", output_contract(&[])));
+    assert_eq!(prompt, format!("look around{}", output_contract(&StepContract::default())));
     assert_eq!(resumed, None);
     assert_eq!(purpose, PromptPurpose::Step);
 
@@ -2881,7 +3068,7 @@ async fn an_opencode_stream_is_captured_and_the_label_comes_from_its_text_line()
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     let conversation = ConversationFixture::new(&root);
-    fake.answers(&opencode_stream("ses_7", r#"{"output":"ready"}"#));
+    fake.answers(&opencode_stream("ses_7", r#"{"choice":"ready"}"#));
 
     let executor = AgentExecutor::with_harnesses(
         HarnessRegistry::defaults()
@@ -2934,9 +3121,9 @@ fn the_opencode_and_codex_parsers_leave_every_line_unclassified() {
         reason: UnclassifiedReason::HarnessNotClassified,
     }];
     let lines = |stream: String| -> Vec<String> { stream.lines().map(str::to_string).collect() };
-    let mut lines_opencode = lines(opencode_stream("ses_7", r#"{"output":"ready"}"#));
+    let mut lines_opencode = lines(opencode_stream("ses_7", r#"{"choice":"ready"}"#));
     lines_opencode.push("not json".to_string());
-    let mut lines_codex = lines(codex_stream("thread-1", r#"{"output":"ready"}"#));
+    let mut lines_codex = lines(codex_stream("thread-1", r#"{"choice":"ready"}"#));
     lines_codex.push(String::new());
 
     for elements in parsed_elements(&OpenCodeAdapter::with_program("opencode"), &lines_opencode)
@@ -2959,7 +3146,7 @@ async fn every_stdout_line_is_stored_with_the_elements_its_parser_returned() {
         json!({ "type": "system", "subtype": "init", "session_id": "s1" }).to_string(),
         json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "on it" }] } })
             .to_string(),
-        envelope(r#"{"output":"ready"}"#),
+        envelope(r#"{"choice":"ready"}"#),
     ];
     fake.answers(&lines.join("\n"));
 
@@ -2997,7 +3184,7 @@ async fn a_line_past_the_parse_limit_is_stored_whole_as_too_large_to_parse() {
     let huge_line = "y".repeat(PARSE_LINE_LIMIT + 1);
     fake.answers(&format!(
         "{huge_line}\n{}",
-        envelope(r#"{"output":"ready"}"#)
+        envelope(r#"{"choice":"ready"}"#)
     ));
 
     let outcome = execute_with_conversation(
@@ -3217,7 +3404,7 @@ async fn an_oversized_tool_result_line_does_not_truncate_the_capture_or_break_th
         "message": { "content": [{ "type": "tool_result", "content": huge_content }] },
     })
     .to_string();
-    let result_line = envelope(r#"{"output":"ready"}"#);
+    let result_line = envelope(r#"{"choice":"ready"}"#);
     fake.answers(&format!("{huge_line}\n{result_line}"));
 
     let result = execute_with_conversation(
@@ -3250,7 +3437,7 @@ async fn a_non_json_line_is_captured_raw_and_does_not_abort_parsing() {
     let conversation = ConversationFixture::new(&root);
     fake.answers(&format!(
         "this is not JSON at all\n{}",
-        envelope(r#"{"output":"ready"}"#)
+        envelope(r#"{"choice":"ready"}"#)
     ));
 
     let result = execute_with_conversation(
@@ -3282,7 +3469,7 @@ async fn stderr_on_a_successful_run_is_captured_without_affecting_the_result() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     let conversation = ConversationFixture::new(&root);
-    fake.answers(&envelope(r#"{"output":"ready"}"#))
+    fake.answers(&envelope(r#"{"choice":"ready"}"#))
         .fails(0, "a warning the harness printed on stderr\n");
 
     let result = execute_with_conversation(
@@ -3325,7 +3512,7 @@ async fn a_resumed_session_reaches_the_argv_and_the_prompt_entry() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     let conversation = ConversationFixture::new(&root);
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("carry on");
     config
@@ -3380,10 +3567,10 @@ fn structured_envelope(text: &str, structured: Value) -> String {
 }
 
 /// The `done`/`blocked` outputs of the schema tests.
-fn two_labels() -> [OutputDefinition; 2] {
+fn two_labels() -> [ChoiceDefinition; 2] {
     [
-        OutputDefinition::new("done"),
-        OutputDefinition::new("blocked"),
+        ChoiceDefinition::new("done"),
+        ChoiceDefinition::new("blocked"),
     ]
 }
 
@@ -3398,18 +3585,21 @@ fn json_schema_arg(args: &[String]) -> (usize, Value) {
     (flag, schema)
 }
 
-/// Runs an agent action with `outputs` declared.
-async fn execute_with_outputs(
+/// Runs an agent action with `choices` declared.
+async fn execute_with_choices(
     executor: &AgentExecutor,
     config: AgentActionConfig,
     workspace: &Workspace,
-    outputs: &[OutputDefinition],
+    choices: &[ChoiceDefinition],
     conversation: Option<&ConversationFixture>,
 ) -> Result<ActionOutcome, ActionError> {
     let action = ActionConfig::Agent(config);
     let mut request = ActionRequest::new(&action, workspace, ACTION_EXECUTION_ID)
         .with_execution_id(EXECUTION_ID)
-        .with_outputs(outputs);
+        .with_contract(StepContract {
+            choices,
+            ..StepContract::default()
+        });
     if let Some(conversation) = conversation {
         request = request.with_conversation_store(&conversation.store);
     }
@@ -3434,9 +3624,9 @@ fn agent_questions(entries: &[ConversationEntry]) -> Vec<(ConversationSource, Ch
 async fn a_claude_step_passes_its_labels_as_a_json_schema_before_the_permission_mode() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"done"}"#));
+    fake.answers(&envelope(r#"{"choice":"done"}"#));
 
-    execute_with_outputs(
+    execute_with_choices(
         &executor(&fake),
         agent_action("do the thing"),
         &root.workspace(),
@@ -3450,7 +3640,7 @@ async fn a_claude_step_passes_its_labels_as_a_json_schema_before_the_permission_
     let (flag, schema) = json_schema_arg(&args);
     assert_eq!(schema["type"], "object");
     assert_eq!(
-        schema["properties"]["output"]["enum"],
+        schema["properties"]["choice"]["enum"],
         json!(["done", "blocked"])
     );
     assert_eq!(
@@ -3458,6 +3648,20 @@ async fn a_claude_step_passes_its_labels_as_a_json_schema_before_the_permission_
         json!(["awaiting_input"])
     );
     assert_eq!(schema["additionalProperties"], false);
+    let properties = &schema["properties"];
+    assert_eq!(properties["reason"], json!({ "type": "string" }));
+    assert_eq!(
+        properties["artifacts"],
+        json!({ "type": "object", "additionalProperties": { "type": "string" } })
+    );
+    assert_eq!(properties["additional_data"], json!({ "type": "object" }));
+    assert_eq!(
+        properties["additional_artifacts"],
+        json!({ "type": "array", "items": { "type": "string" } })
+    );
+    for old in ["output", "data"] {
+        assert!(properties.get(old).is_none(), "{old} in {schema}");
+    }
     for keyword in ["anyOf", "oneOf", "allOf", "required"] {
         assert!(schema.get(keyword).is_none(), "{keyword} in {schema}");
     }
@@ -3476,21 +3680,26 @@ async fn a_claude_step_passes_its_labels_as_a_json_schema_before_the_permission_
 
 #[test]
 fn without_declared_outputs_the_schema_allows_any_label() {
-    let schema = output_schema(&[]);
+    let schema = output_schema(&StepContract::default());
 
-    assert_eq!(schema["properties"]["output"], json!({ "type": "string" }));
+    assert_eq!(schema["properties"]["choice"], json!({ "type": "string" }));
 }
 
 #[tokio::test]
-async fn a_structured_output_gives_the_label_and_data_when_the_text_has_no_json() {
+async fn a_structured_output_gives_the_choice_and_its_values_when_the_text_has_no_json() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&structured_envelope(
         "The work is finished.",
-        json!({ "output": "done", "data": { "units": 3 }, "variables": { "plan": "plan.md" } }),
+        json!({
+            "choice": "done",
+            "reason": "all units are in",
+            "additional_data": { "units": 3 },
+            "variables": { "plan": "plan.md" },
+        }),
     ));
 
-    let outcome = execute_with_outputs(
+    let outcome = execute_with_choices(
         &executor(&fake),
         agent_action("do the thing"),
         &root.workspace(),
@@ -3504,7 +3713,8 @@ async fn a_structured_output_gives_the_label_and_data_when_the_text_has_no_json(
         panic!("expected a completed action, got {outcome:?}");
     };
     assert_eq!(result.output_label, "done");
-    assert_eq!(result.data["units"], 3);
+    assert_eq!(result.reason, "all units are in");
+    assert_eq!(result.additional_data.get("units"), Some(&json!(3)));
     assert_eq!(result.variables.get("plan"), Some(&json!("plan.md")));
 }
 
@@ -3513,11 +3723,11 @@ async fn an_unusable_structured_output_falls_back_to_the_text() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&structured_envelope(
-        r#"Done. {"output":"blocked"}"#,
-        json!({ "data": { "units": 3 } }),
+        r#"Done. {"choice":"blocked"}"#,
+        json!({ "additional_data": { "units": 3 } }),
     ));
 
-    let outcome = execute_with_outputs(
+    let outcome = execute_with_choices(
         &executor(&fake),
         agent_action("do the thing"),
         &root.workspace(),
@@ -3585,7 +3795,7 @@ async fn a_question_in_the_text_is_recorded_as_a_narsor_agent_question() {
         r#"I need to know. {"status":"awaiting_input","question":"Choose a version","options":["v1","v2"]}"#,
     ));
 
-    let outcome = execute_with_outputs(
+    let outcome = execute_with_choices(
         &executor(&fake),
         agent_action("do the thing"),
         &root.workspace(),
@@ -3631,7 +3841,7 @@ async fn covers_ae5_without_any_answer_the_reprompt_also_carries_the_schema() {
         .answers_on_call(1, &envelope("Done, nothing more to say."))
         .answers_on_call(
             2,
-            &structured_envelope("Here it is.", json!({ "output": "implemented" })),
+            &structured_envelope("Here it is.", json!({ "choice": "implemented" })),
         );
 
     let execution = run_reprompt_workflow(&fixture).await;
@@ -3641,7 +3851,7 @@ async fn covers_ae5_without_any_answer_the_reprompt_also_carries_the_schema() {
     for call in [1, 2] {
         let (_, schema) = json_schema_arg(&fixture.fake.args(call));
         assert_eq!(
-            schema["properties"]["output"]["enum"],
+            schema["properties"]["choice"]["enum"],
             json!(["implemented", "needs_human_decision"]),
             "call {call}"
         );
@@ -3663,13 +3873,13 @@ async fn a_structured_label_outside_the_list_is_asked_for_again_like_a_text_labe
         .fake
         .answers_on_call(
             1,
-            &structured_envelope(r#"{"output":"finished"}"#, json!({ "output": "finished" })),
+            &structured_envelope(r#"{"choice":"finished"}"#, json!({ "choice": "finished" })),
         )
         .answers_on_call(
             2,
             &structured_envelope(
-                r#"{"output":"implemented"}"#,
-                json!({ "output": "implemented" }),
+                r#"{"choice":"implemented"}"#,
+                json!({ "choice": "implemented" }),
             ),
         );
 
@@ -3693,7 +3903,7 @@ async fn a_structured_label_outside_the_list_is_asked_for_again_like_a_text_labe
 async fn an_opencode_step_gets_no_schema_but_still_the_text_contract() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&opencode_stream("ses_7", r#"{"output":"done"}"#));
+    fake.answers(&opencode_stream("ses_7", r#"{"choice":"done"}"#));
     let executor = AgentExecutor::with_harnesses(
         HarnessRegistry::defaults()
             .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
@@ -3701,7 +3911,7 @@ async fn an_opencode_step_gets_no_schema_but_still_the_text_contract() {
     let mut config = agent_action("do the thing");
     config.harness = Some("opencode".to_string());
 
-    execute_with_outputs(&executor, config, &root.workspace(), &two_labels(), None)
+    execute_with_choices(&executor, config, &root.workspace(), &two_labels(), None)
         .await
         .expect("the action runs");
 
@@ -3766,7 +3976,7 @@ async fn the_real_claude_binary_answers_through_the_json_schema() {
     config.workspace_access = Some(WorkspaceAccess::ReadOnly);
     let conversation = ConversationFixture::new(&root);
 
-    let outcome = execute_with_outputs(
+    let outcome = execute_with_choices(
         &AgentExecutor::new(),
         config,
         &root.workspace(),
@@ -3791,7 +4001,7 @@ async fn the_real_claude_binary_answers_through_the_json_schema() {
             _ => None,
         })
         .expect("the run result carries a structured output");
-    assert_eq!(structured["output"], "done");
+    assert_eq!(structured["choice"], "done");
 }
 
 /// The first entry of `PATH` holding an executable called `name`.
@@ -3813,7 +4023,7 @@ fn which(name: &str) -> Option<PathBuf> {
 async fn a_model_that_would_be_read_as_a_flag_is_refused() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("do the thing");
     config.model = Some("--allow-dangerously-skip-permissions".to_string());
@@ -3844,7 +4054,7 @@ states:
     action:
       type: agent
 {harness}      prompt: "Do the thing."
-    outputs: [done]
+    choices: [done]
     transitions:
       done: finished
   finished:
@@ -3880,7 +4090,7 @@ async fn an_action_without_a_harness_uses_the_configured_default() {
     let fixture = EngineFixture::new();
     fixture
         .fake
-        .answers(&opencode_stream("oc-1", r#"{"output":"done"}"#));
+        .answers(&opencode_stream("oc-1", r#"{"choice":"done"}"#));
 
     // The default points at `opencode`, and that adapter is the one wired to
     // the fake harness — so a run proves which name was chosen.
@@ -3903,7 +4113,7 @@ async fn an_action_without_a_harness_uses_the_configured_default() {
 #[tokio::test]
 async fn a_resumed_session_without_a_harness_is_not_given_the_default() {
     let fixture = EngineFixture::new();
-    fixture.fake.answers(&envelope(r#"{"output":"done"}"#));
+    fixture.fake.answers(&envelope(r#"{"choice":"done"}"#));
     let workflow = single_agent_workflow(None).replace(
         "      prompt: \"Do the thing.\"\n",
         "      prompt: \"Do the thing.\"\n      parameters:\n        resume_session: session-42\n",
@@ -3938,7 +4148,7 @@ async fn a_resumed_session_without_a_harness_is_not_given_the_default() {
 async fn an_action_without_a_harness_falls_back_to_the_built_in_one() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope("{\"output\": \"done\"}"));
+    fake.answers(&envelope("{\"choice\": \"done\"}"));
 
     // `claude-code` is the built-in default and the adapter wired to the fake.
     let executor = executor(&fake);
@@ -3959,7 +4169,7 @@ async fn the_workflow_wins_over_the_configured_harness() {
     // AE4 / R13: a setting is a default, never an instruction the workflow
     // cannot override.
     let fixture = EngineFixture::new();
-    fixture.fake.answers(&envelope("{\"output\": \"done\"}"));
+    fixture.fake.answers(&envelope("{\"choice\": \"done\"}"));
 
     // The action says claude-code, which is the adapter pointed at the fake;
     // the configured opencode adapter is the stock one and would not answer.
@@ -3980,7 +4190,7 @@ async fn the_workflow_wins_over_the_configured_harness() {
 #[tokio::test]
 async fn an_explicit_harness_wins_over_the_live_default_selector() {
     let fixture = EngineFixture::new();
-    fixture.fake.answers(&envelope("{\"output\": \"done\"}"));
+    fixture.fake.answers(&envelope("{\"choice\": \"done\"}"));
     let selector = Arc::new(
         DefaultHarnessSelector::load(
             StatePaths::new(fixture.root.path()),
@@ -4037,7 +4247,7 @@ async fn resuming_a_session_requires_an_explicit_harness() {
 async fn the_session_event_records_the_harness_that_ran_not_the_absence_of_one() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope("{\"output\": \"done\"}"));
+    fake.answers(&envelope("{\"choice\": \"done\"}"));
 
     let sink = Arc::new(RecordingSink::default());
     let executor = executor(&fake).with_event_sink(Arc::clone(&sink) as Arc<dyn AgentEventSink>);
@@ -4083,7 +4293,7 @@ async fn the_harness_inherits_the_environment_of_the_runner_process() {
         format!(
             "#!/bin/sh\nprintf '%s' \"$HOME\" > '{}'\nprintf '%s\\n' '{}'\n",
             bin.join("home.out").display(),
-            envelope("{\"output\": \"done\"}")
+            envelope("{\"choice\": \"done\"}")
         ),
     )
     .expect("write the harness");

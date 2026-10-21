@@ -8,7 +8,7 @@
 //! conductor with it. The conductor answers with one of three paths (R17):
 //!
 //! * **(a) choose the output**: the step completes with the conductor's
-//!   label, `data` and `variables`, as if the agent had given them —
+//!   label, `variables` and `artifacts`, as if the agent had given them —
 //!   `ActionCompleted` on the last attempt, then `DecisionMade` with the
 //!   `conductor` provider. Only a sure choice (`high` confidence) of a label
 //!   the state declares, with every value the next step needs (KTD15), is
@@ -155,12 +155,12 @@ impl Engine {
             match response.decision.clone() {
                 Decision::ChooseOutput {
                     label,
-                    data,
+                    artifacts,
                     variables,
                 } => {
                     let choice = Choice {
                         label,
-                        data: object_of(data),
+                        artifacts,
                         variables,
                     };
                     return match check_choice(definition, execution, state, &response, &choice) {
@@ -171,7 +171,7 @@ impl Engine {
                                 episode: Some(rescue.episode().to_string()),
                                 state_id: Some(state.id.clone()),
                                 output_label: Some(choice.label),
-                                data: Value::Object(choice.data),
+                                artifacts: choice.artifacts,
                                 variables: Value::Object(choice.variables),
                                 confidence: response.confidence,
                                 rationale: response.rationale.clone(),
@@ -181,6 +181,7 @@ impl Engine {
                                 reason: Some(rescue.reason.clone()),
                                 reply: rescue.reply.clone(),
                                 state_entries_before: state_entries_value(execution)?,
+                                step_memory_before: step_memory::step_memory_value(execution)?,
                                 saved_at: Utc::now(),
                             };
                             conductor.save_decision(
@@ -294,7 +295,7 @@ impl Engine {
                 }
                 Decision::Escalate {
                     label,
-                    data,
+                    artifacts,
                     variables,
                 } => {
                     let why = response
@@ -305,7 +306,7 @@ impl Engine {
                         label: label
                             .filter(|label| decision::check_label(state, label).is_ok())
                             .unwrap_or_default(),
-                        data: object_of(data),
+                        artifacts,
                         variables,
                     };
                     return self.escalate_output(
@@ -361,10 +362,7 @@ impl Engine {
                 self.emit(&execution.id, decision_event(&decision))?;
                 let result = ActionResult {
                     output_label: label,
-                    data: match &decision.data {
-                        Value::Object(data) => Value::Object(data.clone()),
-                        _ => json!({}),
-                    },
+                    artifacts: decision.artifacts.clone(),
                     variables: match &decision.variables {
                         Value::Object(variables) => variables.clone(),
                         _ => Map::new(),
@@ -382,6 +380,7 @@ impl Engine {
                     // The conductor settles the label, not what the agent
                     // said (R3).
                     reply: rescue.reply.clone(),
+                    ..ActionResult::default()
                 };
                 match self.record_result(execution, state, rescue.episode().to_string(), result)? {
                     Some(pending) => {
@@ -425,7 +424,7 @@ impl Engine {
         };
         let analysis = ConductorAnalysis {
             label: (!choice.label.is_empty()).then(|| choice.label.clone()),
-            data: choice.data.clone(),
+            artifacts: choice.artifacts.clone(),
             variables: choice.variables.clone(),
             rationale: Some(rationale.clone()),
         };
@@ -490,8 +489,8 @@ impl Engine {
 struct Choice {
     /// The label; empty for none.
     label: String,
-    /// The step's `data`.
-    data: Map<String, Value>,
+    /// The step's artifacts, name → path.
+    artifacts: BTreeMap<String, String>,
     /// The step's `variables`.
     variables: Map<String, Value>,
 }
@@ -526,26 +525,27 @@ fn check_choice(
     else {
         return Ok(());
     };
-    let held = |map: &Map<String, Value>, key: &str| {
-        map.get(key).is_some_and(|value| !human::is_blank(value))
+    let variable_held = |key: &&String| {
+        choice
+            .variables
+            .get(key.as_str())
+            .or_else(|| execution.context.variables.get(key.as_str()))
+            .is_some_and(|value| !human::is_blank(value))
     };
-    if let Some(key) = requirement.data.iter().find(|key| !held(&choice.data, key)) {
+    let artifact_given = |name: &&String| {
+        choice
+            .artifacts
+            .get(name.as_str())
+            .is_some_and(|path| !path.trim().is_empty())
+    };
+    if let Some(key) = requirement.variables.iter().find(|key| !variable_held(key)) {
         return Err(format!(
-            "the conductor chose the output '{label}' without data.{key}, which the next step \
-             needs"
+            "the conductor chose the output '{label}' without variables.{key}, which it requires"
         ));
     }
-    if let Some(key) = requirement.variables.iter().find(|key| {
-        !held(&choice.variables, key)
-            && !execution
-                .context
-                .variables
-                .get(key.as_str())
-                .is_some_and(|value| !human::is_blank(value))
-    }) {
+    if let Some(name) = requirement.artifacts.iter().find(|name| !artifact_given(name)) {
         return Err(format!(
-            "the conductor chose the output '{label}' without variables.{key}, which the next \
-             step needs"
+            "the conductor chose the output '{label}' without artifacts.{name}, which it requires"
         ));
     }
     Ok(())
@@ -566,7 +566,7 @@ fn unsaved_decision(
         episode: Some(rescue.episode().to_string()),
         state_id: Some(state.id.clone()),
         output_label: (!choice.label.is_empty()).then_some(choice.label),
-        data: Value::Object(choice.data),
+        artifacts: choice.artifacts,
         variables: Value::Object(choice.variables),
         confidence: response.confidence,
         rationale,
@@ -575,6 +575,7 @@ fn unsaved_decision(
         reason: None,
         reply: None,
         state_entries_before: Value::Null,
+        step_memory_before: Value::Null,
         saved_at: Utc::now(),
     }
 }
@@ -605,18 +606,10 @@ fn rescue_payload(
         "state_id": state.id,
         "reason": rescue.reason,
         "answers": rescue.answers,
-        "outputs": state.outputs,
+        "outputs": state.choices,
         "requirements": output_requirements(definition, execution, state),
         "agent_can_be_asked_again": rescue.can_reprompt(),
     })
-}
-
-/// `value` as an object; anything else is no values at all.
-fn object_of(value: Value) -> Map<String, Value> {
-    match value {
-        Value::Object(map) => map,
-        _ => Map::new(),
-    }
 }
 
 /// Writes `rescue` into the execution's record, without saving it.

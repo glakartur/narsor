@@ -5,12 +5,12 @@ real agentic development processes rather than invented ones:
 
 | File | Process | Source material |
 |---|---|---|
-| `compound-engineering.yaml` | Brainstorm → PR → plan → PR update → work → code review → PR update → learning → PR update, with review at each gate | the `ce-*` skills of the `compound-engineering` plugin |
+| `compound-engineering.yaml` | Five stages on one Draft merge request: requirements → plan → implementation → learning → finalize (auto-merge after a green pipeline), with a person at the end of each stage | the `ce-*` skills of the `compound-engineering` plugin, and `glab` |
 | `open-mercato-sdlc.yaml` | The Open Mercato ticket lifecycle: Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | [`SDLC.md`](https://github.com/open-mercato/skills) and the `om-*` skills |
 
 Both validate with zero violations and both are exercised end to end in
-`tests/workflows.rs` against a fake harness — no real `claude`, `git` or `gh` is
-ever run by the tests.
+`tests/workflows.rs` against a fake harness and a fake `glab` — no real
+`claude`, `git`, `gh` or `glab` is ever run by the tests.
 
 ## Harness and skills prerequisites
 
@@ -30,6 +30,12 @@ the compound-engineering workflow needs the referenced `ce-*` skills and the
 Open Mercato workflow needs the referenced `om-*` skills available to the
 selected harness. Narsor does not install, translate, or migrate those skills;
 an operator should install compatible packages before running the workflow.
+
+The compound-engineering workflow targets GitLab. Its `finalize` and
+`disarm_merge` steps are scripts that call `glab` directly, so the place where
+the steps run needs `glab` authenticated for the project, under an identity
+that may approve the merge request and set auto-merge. Without that,
+`finalize` stops at `finalize_blocked` with the reason.
 
 ## Running one
 
@@ -58,54 +64,90 @@ decision is **irreversible**, **outward-facing**, or **beyond what an agent can
 settle from the repository alone**. An autonomous pipeline without them drives
 straight to a merge.
 
-### `compound-engineering.yaml` — 5 gates
+### `compound-engineering.yaml` — five stages
 
-| Gate | Sits after | Why there |
+Every stage has the same shape: an author step, publication to one Draft merge
+request, a gate where a person decides, and a feedback check after the gate.
+The first publication opens the Draft merge request against the repository's
+default branch and stores its URL as `pr_url`; every later one pushes to it.
+
+```
+1 requirements  brainstorm → doc_review* → publish_requirements → approve_requirements → check_requirements_feedback
+2 plan          plan → plan_review* → publish_plan → approve_plan → check_plan_feedback
+3 implementation work → simplify → code_review → verify_work → publish_work → approve_work → check_work_feedback
+4 learning      compound → publish_learning → approve_learning → check_learning_feedback
+5 finalize      finalize → finished
+```
+
+`*` — the review step fixes what it finds and reports `review_summary`; a
+person accepts that result before it is published, or returns it to the same
+review session with a comment.
+
+| Gate | Choices | Why there |
 |---|---|---|
-| `clarify_direction` | `ce-brainstorm` returned `needs_direction` | Product direction is the one thing an agent has no basis to choose. Rather than guess, the chain stops and asks. |
-| `approve_scope` | `ce-brainstorm` + `ce-doc-review` + publication and PR feedback | The reviewed requirements are on the PR before approval. An optional note is carried into the plan as `{{ context.scope_notes }}`; `revise` sends `brainstorm_feedback` back to the brainstorm. |
-| `approve_plan` | `ce-plan` + publication and PR feedback, **before a line of code exists** | The current plan is on the same PR before implementation begins. |
-| `implementation_review` | implementation is pushed to the PR | The person reviews the implementation and can request changes, approve it for learning capture, or stop. |
-| `learning_review` | learning has been pushed to the already reviewed PR | The person reviews the updated PR and gives final approval. Requests for changes return to implementation. |
+| `approve_requirements` | `approve`, `revise`, `abandon` | Every later step is measured against the requirements; a wrong scope corrected here costs one conversation. |
+| `approve_plan` | `approve`, `revise`, `revise_requirements`, `abandon` | The last point before code exists. The plan can also show that the requirements are wrong. |
+| `approve_work` | `approve`, `revise`, `revise_plan`, `abandon` | The person reviews the published implementation. |
+| `approve_learning` | `approve`, `revise`, `drop` | The implementation is already approved, so this gate keeps, revises or drops the learning; it cannot stop the pipeline. |
+| `finalize_blocked` | `retry`, `finish_unmerged` | Finalize could not merge; the gate shows its reason. |
 
-Each publication runs `ce-commit-push-pr mode:pipeline babysit:off`. It creates
-the PR for the reviewed requirements, then detects and updates that same PR for
-the plan, implementation and learning. The first publication stores `pr_url`;
-PR feedback steps pass that URL to `ce-resolve-pr-feedback mode:pipeline`, so
-forks and GitHub Enterprise repos resolve against the intended PR. The feedback
-skill commits and pushes its fixes. No actionable feedback advances directly;
-fixes go to the next human review of the updated PR, and unresolved decisions
-stay visible for the human gate. Each approval rechecks feedback posted while
-the gate was waiting; a new fix returns to that gate for renewed approval.
-Review requests return to the relevant editing step and are published again.
+Every `revise` needs a comment and continues the session of the stage's author
+with it (`resume_comment_field`): `brainstorm` for the requirements, `plan` for
+the plan, `work_revision` for the implementation, `compound` for the learning.
+The comment field is optional for the other choices; a note given with an
+approval reaches the next stage as a context variable.
 
-`ce-work mode:return-to-caller` implements and verifies locally, leaving
-simplification, `ce-code-review mode:agent`, repository checks and publication
-to this workflow.
-`ce-compound` runs after implementation review. If it writes a learning
-document, the workflow pushes that update and asks for final PR review. If
-there is nothing to document, the approved PR is complete.
+After each gate a `check_*_feedback` step runs `ce-resolve-pr-feedback` on
+`pr_url` for the feedback posted while the person was reading. For requirements
+and plan it judges the size of a fix: `fixed_minor` publishes and asks for
+approval again, `fixed_major` goes back to the review step. For implementation,
+`fixed` goes back to `code_review`; for learning, it publishes again.
+`needs_human` returns to the gate, which shows the agent's `reason`.
 
-Loops: `approve_scope → brainstorm`, `approve_plan → plan`,
-`code_review → fix_review_findings → code_review` when fixes changed files.
-If the fix step makes no actionable file changes, it goes straight to
-`verify_work`. Review findings reach the fix step through
-`{{ steps.code_review.reply }}`; `max_entries` on `code_review` asks a person
-once the loop runs too long. The remaining path is
-`code_review → verify_work → publish_work → resolve_work_feedback → implementation_review →
-compound → publish_learning → resolve_learning_feedback → learning_review`.
-`verify_work` runs `scripts/verify.sh` from the target repository if that file
-exists; a missing file skips this gate. A failing script routes to
-`repair_verification → simplify → code_review → verify_work`, with a bounded
-loop. The repair agent receives `{{ steps.verify_work.stdout }}` and
-`{{ steps.verify_work.stderr }}` from the failed run and does not rerun the
-whole script for diagnosis. The workflow never interprets the script's own
-stdout as a routing decision.
-Scope and plan use the same publish → feedback → human review pattern. A request
-from either implementation review returns to `work_revision → simplify →
-code_review`; `publish_work` then updates the same PR. During `ce-work`, the
-agent can pause its own action with `awaiting_input`; the answer resumes that
-same step.
+Blockers go back to the author of the earlier stage. `plan` chooses
+`needs_requirements_revision` with `requirements_blocker`, and `brainstorm`
+reads it; `work` chooses `needs_plan_revision` with `plan_blocker`, and `plan`
+reads it. The step that reads a blocker also defines it and clears it in its
+answer, so an old blocker does not come back on a later pass. `plan` and
+`compound` read their own earlier document through `{{ artifacts.plan_doc }}`
+and `{{ artifacts.learning_doc }}`, empty on the first pass.
+
+Implementation: `simplify` runs once, after `work`. Every later change of code
+— `fix_findings`, `repair_verification`, `work_revision`, a fix from
+`check_work_feedback` or `repair_merge` — goes through `code_review →
+verify_work → publish_work → approve_work`. Review findings reach `fix_findings`
+through `{{ steps.code_review.reply }}`. `verify_work` runs `scripts/verify.sh`
+from the target repository when that file exists; a missing file skips the
+check, and a failure goes to `repair_verification`, which receives
+`{{ steps.verify_work.stdout }}` and `{{ steps.verify_work.stderr }}`. During
+`ce-work`, the agent can ask the person a question and resume the same step
+with the answer.
+
+Learning: `compound` either documents (`documented` → publish) or has nothing
+to document and goes straight to `finalize`. `drop` at the gate removes the
+document through `drop_learning` and then finalizes.
+
+Finalize is a script with `glab`, not an agent: it marks the merge request
+ready, approves it and sets auto-merge, which merges when the pipeline
+succeeds. It then reads the merge request until it is merged, the pipeline
+fails, it conflicts with its target branch, or an hour has passed
+(`FINALIZE_WAIT_SECS`, `FINALIZE_POLL_SECS`). The merge request number, project
+and target branch come from `pr_url` and the merge request, never from a branch
+name. On any result other than `merged`, the script cancels auto-merge,
+restores the Draft and reads the merge request once more, so it never merges
+without a person; if it merged meanwhile, the result is `merged`. A retried
+finalize first checks whether the merge request is already merged.
+`pipeline_failed` and `conflict` go to `repair_merge`, `blocked` to the
+`finalize_blocked` gate. The step has `timeout: 70m`: if the engine stops it,
+its clean-up never runs, so the `timeout` choice goes to `disarm_merge`, which
+cancels auto-merge, restores the Draft and reads the state.
+
+Loop limits (`max_entries`): `code_review` 10, `repair_verification` 5,
+`repair_merge` 3. Terminals: `finished` (merged, completed), `cancelled`
+(`abandon` at a gate) and `not_merged` (`finish_unmerged`, cancelled).
+`abandon` does not close the merge request.
+
+The graph is drawn in `compound-engineering-flow.html`.
 
 ### Optional repository verification script
 
@@ -163,10 +205,11 @@ clean stop, not a failure), `failed` and `cancelled`.
   TUI shows a `text` input as a large multi-line field and every other input in
   a narrow bar; a workflow without a `text` input gets a bar and nothing else.
   For the CLI and the API both are plain strings.
-* **Templates are substitution, not a language.** Only `{{ inputs.X }}` and
-  `{{ context.X }}`; no filters, no defaults. A `{{ context.X }}` that is not
-  set when the state is entered fails the action, so a variable is only quoted
-  on a path where the gate that sets it has certainly run.
+* **Templates are substitution, not a language.** No filters, no defaults. A
+  `{{ context.X }}` or `{{ artifacts.X }}` that some step or gate declares
+  renders empty until it is set; a name nobody declares fails the action.
+  Declare every variable a later step or `display` reads on the step that sets
+  it — an undeclared one never reaches the context.
 * `terminal_states` uses the mapping form. The list form would report a failure
   as a success.
 * Every agent state carries a timeout; a stalled agent would otherwise hang the

@@ -8,7 +8,7 @@ states:
     action:
       type: script
       command: ./run.sh
-    outputs:
+    choices:
       - finish
       - loop
     transitions:
@@ -19,7 +19,7 @@ states:
     action:
       type: script
       command: ./a.sh
-    outputs:
+    choices:
       - next
     transitions:
       next: b
@@ -28,7 +28,7 @@ states:
     action:
       type: script
       command: ./b.sh
-    outputs:
+    choices:
       - back
     transitions:
       back: a

@@ -1,0 +1,23 @@
+name: revise-gate
+version: 1
+description: >
+  An agent step reviewed at a gate with an optional comment: `revise` resumes
+  the agent's session with the comment and needs one, `approve` does not.
+states:
+  work:
+    action: { type: agent, prompt: Do the work. }
+    choices: [done]
+    transitions: { done: review }
+  review:
+    action:
+      type: human
+      message: Review the work.
+      inputs:
+        - { name: comment, type: text, required: false }
+    choices:
+      - label: approve
+      - label: revise
+        resume_comment_field: comment
+    transitions: { approve: completed, revise: work }
+  completed: { description: done }
+terminal_states: [completed]

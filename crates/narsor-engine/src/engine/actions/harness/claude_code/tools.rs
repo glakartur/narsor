@@ -45,16 +45,16 @@ fn unbounded_summary(tool: &str, input: &Value) -> String {
     }
 }
 
-/// `output: <label>`, or `awaiting_input: <question>` — what the agent
+/// `choice: <label>`, or `awaiting_input: <question>` — what the agent
 /// answered through the output schema.
 fn structured_output_summary(input: &Value) -> String {
     let field = |name: &str| input.get(name).and_then(Value::as_str);
-    match (field("status"), field("output")) {
+    match (field("status"), field("choice")) {
         (Some(status), _) => match field("question") {
             Some(question) => format!("{status}: {question}"),
             None => status.to_string(),
         },
-        (None, Some(output)) => format!("output: {output}"),
+        (None, Some(choice)) => format!("choice: {choice}"),
         (None, None) => String::new(),
     }
 }

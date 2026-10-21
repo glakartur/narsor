@@ -114,10 +114,14 @@ fn every_event_data_variant() -> Vec<EventData> {
         EventData::ActionCompleted {
             action_execution_id: "a1".to_string(),
             output_label: "success".to_string(),
+            reason: None,
+            additional_data: Default::default(),
+            warnings: Vec::new(),
         },
         EventData::ActionFailed {
             action_execution_id: "a1".to_string(),
             error: "boom".to_string(),
+            error_type: None,
         },
         EventData::ActionAttemptFailed {
             action_execution_id: "a1".to_string(),
@@ -163,7 +167,8 @@ fn every_event_data_variant() -> Vec<EventData> {
         },
         EventData::HumanInputRequested {
             instruction: "approve?".to_string(),
-            question: None,
+            reason: None,
+            required_values: Vec::new(),
             answer_tail: None,
             episode: None,
         },
@@ -3700,6 +3705,32 @@ mod task_app_detail {
         }
 
         #[test]
+        fn an_agents_choice_shows_its_reason_without_control_characters() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let events = vec![
+                entered(1, "plan"),
+                ev(
+                    2,
+                    EventData::DecisionMade {
+                        provider: "claude".to_string(),
+                        output_label: "plan_ready".to_string(),
+                        reasoning: Some("Plan gotowy\u{1b}[31m, testy opisane.".to_string()),
+                    },
+                ),
+            ];
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild_with_events(&positions, &attempts(&["p"]), &events);
+            let choice = conversation.transcript().entries().last().unwrap();
+            assert_eq!(
+                choice.rendered_lines,
+                [
+                    "agent · claude wybrał opcję: plan_ready".to_string(),
+                    "uzasadnienie: Plan gotowy[31m, testy opisane.".to_string()
+                ]
+            );
+        }
+
+        #[test]
         fn an_unread_attempt_is_loading_and_its_choices_are_kept() {
             let positions = vec![recorded("plan", 1, "p"), recorded("fix", 1, "f")];
             let events = vec![
@@ -4903,12 +4934,12 @@ mod task_app_waiting {
                 "reason": "Odpowiedź agenta nie zawiera etykiety.",
                 "answers": [{ "action_execution_id": "act-9", "reason": "brak etykiety", "answer_tail": "Done, all tests pass." }],
                 "requirements": [
-                    { "label": "implemented", "data": [], "variables": ["summary"] },
-                    { "label": "needs_human_decision", "data": ["question"], "variables": [] }
+                    { "label": "implemented", "variables": ["summary"], "artifacts": [] },
+                    { "label": "needs_human_decision", "variables": [], "artifacts": ["decision_doc"] }
                 ],
                 "analysis": if proposed { json!({
                     "label": "implemented",
-                    "data": {},
+                    "artifacts": {},
                     "variables": { "summary": "all units done", "files": 3 },
                     "rationale": "Odpowiedź mówi, że testy przechodzą."
                 }) } else { Value::Null }
@@ -4938,8 +4969,8 @@ mod task_app_waiting {
             "problem": {
                 "reason": "entry limit reached (5/5)",
                 "requirements": [
-                    { "label": "clean", "data": [], "variables": [] },
-                    { "label": "findings", "data": [], "variables": ["manual_note"] }
+                    { "label": "clean", "variables": [] },
+                    { "label": "findings", "variables": ["manual_note"] }
                 ]
             },
             "entry_limit": { "entries": 5, "max_entries": 5 },
@@ -5006,6 +5037,52 @@ mod task_app_waiting {
             Some("ep-1"),
             "the answer names its request"
         );
+    }
+
+    /// The `revise` gate of a workflow whose comment field is optional
+    /// (KTD12): only the choice that resumes the agent needs it.
+    fn optional_comment_gate() -> Value {
+        json!({
+            "execution_id": "exec-1",
+            "state_id": "review_scope",
+            "action_execution_id": "act-7",
+            "instruction": "Przejrzyj pracę.",
+            "fields": [{ "name": "comment", "type": "text", "required": false }],
+            "outputs": [
+                { "label": "approve" },
+                { "label": "revise", "resume_comment_field": "comment" }
+            ],
+            "episode": "ep-r",
+            "requested_at": "2026-10-09T11:54:00Z"
+        })
+    }
+
+    #[test]
+    fn revise_with_an_empty_optional_comment_is_refused_at_the_field() {
+        let mut app = opened(with_pending(running("a", 1), optional_comment_gate()));
+        ch(&mut app, '2');
+        assert_eq!(selected_label(&app), "revise");
+        assert!(chooser_of(&app).items()[1].fields[0].required);
+
+        assert!(enter_until_error(&mut app), "the empty comment is refused");
+        let field = &chooser_of(&app).fields_of(1)[0];
+        assert_eq!(field.name, "comment");
+        assert!(
+            field.error().is_some_and(|error| error.contains("comment")),
+            "{:?}",
+            field.error()
+        );
+    }
+
+    #[test]
+    fn approve_with_an_empty_optional_comment_is_sent() {
+        let mut app = opened(with_pending(running("a", 1), optional_comment_gate()));
+        ch(&mut app, '1');
+        assert_eq!(selected_label(&app), "approve");
+        assert!(!chooser_of(&app).items()[0].fields[0].required);
+        let delivery = delivery(enter_until_answer(&mut app));
+        assert_eq!(delivery.chosen_label.as_deref(), Some("approve"));
+        assert!(delivery.values.is_empty());
     }
 
     #[test]
@@ -5565,17 +5642,28 @@ mod task_app_waiting {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
         ch(&mut app, '2');
         assert_eq!(selected_label(&app), "needs_human_decision");
-        assert!(enter_until_error(&mut app), "data.question is required");
+        assert!(enter_until_error(&mut app), "artifacts.decision_doc is required");
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
         let field = &chooser_of(&app).fields_of(1)[0];
-        assert_eq!(field.name, "data.question");
+        assert_eq!(field.name, "artifacts.decision_doc");
         assert!(field
             .error()
-            .is_some_and(|error| error.contains("data.question")));
+            .is_some_and(|error| error.contains("artifacts.decision_doc")));
 
-        typed(&mut app, "Konto czy użytkownik?");
+        // The required artifact, a field for more variables and the comment:
+        // no field for artifacts the step does not require.
+        let names: Vec<&str> = chooser_of(&app)
+            .fields_of(1)
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["artifacts.decision_doc", "variables (klucz=wartość)", "komentarz"]
+        );
+
+        typed(&mut app, "docs/decision.md");
         // A key of the operator's own, beside the ones the label needs.
-        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         typed(&mut app, "scope=account");
         let delivery = delivery(enter_until_answer(&mut app));
@@ -5583,7 +5671,7 @@ mod task_app_waiting {
             delivery.chosen_label.as_deref(),
             Some("needs_human_decision")
         );
-        assert_eq!(delivery.data["question"], "Konto czy użytkownik?");
+        assert_eq!(delivery.artifacts["decision_doc"], "docs/decision.md");
         assert_eq!(delivery.variables["scope"], "account");
     }
 
@@ -5593,8 +5681,6 @@ mod task_app_waiting {
         ch(&mut app, '1');
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "x");
-        press(&mut app, KeyCode::Down);
-        typed(&mut app, "x=1");
         press(&mut app, KeyCode::Down);
         typed(&mut app, "summary=again");
         assert!(enter_until_error(&mut app), "duplicate keys are refused");
@@ -6521,6 +6607,49 @@ mod task_app_waiting {
         );
         assert_eq!(summary.inputs[0].pending_input_id, "ep-a");
         assert!(!app.detail().has_drafts());
+    }
+
+    /// A gate after an agent step, with its reason and required value.
+    fn gate_snapshot(sequence: u64) -> narsor_engine::orchestration::RunnerSnapshot {
+        let mut gate = optional_comment_gate();
+        gate["reason"] = json!("Praca gotowa do przeglądu.");
+        gate["required_values"] =
+            json!([{ "name": "summary", "kind": "variable", "value": "login działa" }]);
+        let mut snapshot = snapshot(sequence, None);
+        snapshot.pending_input = Some(narsor_engine::orchestration::PendingInputRef {
+            id: "ep-r".to_string(),
+            attempt_id: None,
+            form: serde_json::from_value(gate).unwrap(),
+        });
+        snapshot.attention = vec![narsor_engine::orchestration::AttentionItem {
+            kind: AttentionKind::Question,
+            state_id: Some("review_scope".to_string()),
+            since: chrono::Utc::now(),
+            waiting_id: "ep-r".to_string(),
+        }];
+        snapshot
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answering_a_gate_keeps_the_focus_in_the_task_details() {
+        let harness = RemoteHarness::start().await;
+        let _running = harness.running("NAR-12", "local", gate_snapshot(1)).await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        assert!(app.panel_focused());
+        ch(&mut app, '1');
+        let request = enter_until_answer(&mut app);
+        app.perform(request).await;
+
+        assert_eq!(app.focus(), Focus::Details, "{:?}", app.notifier().latest());
+        assert!(!app.panel_focused());
+        assert_eq!(app.list().selected_id(), Some("NAR-12"));
+        let summary = harness.owner.control_task("NAR-12").await.unwrap();
+        assert_eq!(summary.inputs.len(), 1, "the answer was queued");
+        assert_eq!(summary.inputs[0].pending_input_id, "ep-r");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10884,6 +11013,9 @@ mod task_app_create {
                 EventData::ActionCompleted {
                     action_execution_id: "attempt-1".to_string(),
                     output_label: "success".to_string(),
+                    reason: None,
+                    additional_data: Default::default(),
+                    warnings: Vec::new(),
                 },
             ] {
                 log.append_next(&id_string, data).expect("append");
@@ -11545,7 +11677,7 @@ mod task_app_create {
         async fn a_path_with_violations_lists_all_of_them_and_a_good_one_creates_a_task() {
             let (harness, _controller) = harness().await;
             let broken = "name: broken\nversion: 1\nstates:\n  work:\n    action:\n      type: script\n      \
-                command: \"true\"\n    outputs: [success]\n    transitions:\n      success: nowhere\n  \
+                command: \"true\"\n    choices: [success]\n    transitions:\n      success: nowhere\n  \
                 island:\n    description: nobody comes here\nterminal_states: [done]\n";
             let expected: Vec<String> = narsor_engine::workflow::validate_source(broken)
                 .expect("the YAML loads")

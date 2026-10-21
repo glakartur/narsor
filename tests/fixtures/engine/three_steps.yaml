@@ -14,7 +14,9 @@ states:
       command: ./record_step.sh
       args:
         - first
-    outputs:
+    variables:
+      - { name: first, description: What the step reports as first. }
+    choices:
       - done
     transitions:
       done: second
@@ -25,7 +27,9 @@ states:
       command: ./record_step.sh
       args:
         - second
-    outputs:
+    variables:
+      - { name: second, description: What the step reports as second. }
+    choices:
       - done
     transitions:
       done: third
@@ -36,7 +40,9 @@ states:
       command: ./record_step.sh
       args:
         - third
-    outputs:
+    variables:
+      - { name: third, description: What the step reports as third. }
+    choices:
       - done
     transitions:
       done: completed

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::{ConductorPurposeDto, ConductorTriggerDto, ProblemKindDto};
+use crate::api::{ConductorPurposeDto, ConductorTriggerDto, ProblemKindDto, RequiredValue};
 
 /// Unique identifier for an event
 pub type EventId = String;
@@ -72,10 +72,31 @@ pub enum EventData {
     ActionCompleted {
         action_execution_id: String,
         output_label: String,
+        /// Why the action made its choice, when it said.
+        ///
+        /// `#[serde(default)]` on this and the next two fields so an event
+        /// log written before they existed still deserializes, with nothing
+        /// said, kept or warned about.
+        #[serde(default)]
+        reason: Option<String>,
+        /// What the action kept outside its step's definitions (R5): never
+        /// interpreted, only recorded.
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        additional_data: serde_json::Map<String, serde_json::Value>,
+        /// What the engine noticed about the answer without rejecting it,
+        /// such as a variable the step does not define (KTD5).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
     },
     ActionFailed {
         action_execution_id: String,
         error: String,
+        /// The kind of error, when the action named one.
+        ///
+        /// `#[serde(default)]` so an event log written before this field
+        /// existed still deserializes, with `None` standing for "unknown".
+        #[serde(default)]
+        error_type: Option<String>,
     },
     /// A failed attempt that still has retries left (R4, R7, R11).
     ///
@@ -198,12 +219,15 @@ pub enum EventData {
     // Human interaction events
     HumanInputRequested {
         instruction: String,
-        /// The `data.question` of the agent step the request follows, if any.
-        /// `#[serde(default)]` so an event log written before this field
-        /// still reads.
+        /// Why the agent or script step the request follows made its
+        /// choice. `#[serde(default)]` so an event log written before this
+        /// field still reads.
         #[serde(default)]
-        question: Option<String>,
-        /// The end of that agent step's answer.
+        reason: Option<String>,
+        /// The values that choice required.
+        #[serde(default)]
+        required_values: Vec<RequiredValue>,
+        /// The end of that step's answer.
         #[serde(default)]
         answer_tail: Option<String>,
         /// The key of the pending input this request opened (KTD9): a
@@ -233,9 +257,9 @@ pub enum EventData {
         /// The output label the answer chose explicitly, if it chose one.
         #[serde(default)]
         output_label: Option<String>,
-        /// The step's `data`, when the answer resolved a problem.
+        /// The step's artifacts, when the answer resolved a problem.
         #[serde(default)]
-        data: Option<serde_json::Value>,
+        artifacts: Option<serde_json::Value>,
         /// The step's `variables`, when the answer resolved a problem.
         #[serde(default)]
         variables: Option<serde_json::Value>,
@@ -631,7 +655,7 @@ impl EventData {
             close_reason: None,
             episode: None,
             output_label: None,
-            data: None,
+            artifacts: None,
             variables: None,
             comment: None,
         }
@@ -929,6 +953,29 @@ mod tests {
         let data: EventData =
             serde_json::from_value(serde_json::json!({"type":"future_event","value":1})).unwrap();
         assert!(matches!(data, EventData::Unrecognized));
+    }
+
+    #[test]
+    fn an_action_event_written_before_reason_and_error_type_still_decodes() {
+        let completed: EventData = serde_json::from_value(serde_json::json!({
+            "type": "action_completed",
+            "action_execution_id": "act-1",
+            "output_label": "done",
+        }))
+        .unwrap();
+        let failed: EventData = serde_json::from_value(serde_json::json!({
+            "type": "action_failed",
+            "action_execution_id": "act-1",
+            "error": "boom",
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            completed,
+            EventData::ActionCompleted { reason: None, ref additional_data, ref warnings, .. }
+                if additional_data.is_empty() && warnings.is_empty()
+        ));
+        assert!(matches!(failed, EventData::ActionFailed { error_type: None, .. }));
     }
 
     #[test]

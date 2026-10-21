@@ -20,9 +20,9 @@ The agent of the current state finished without a usable output label, and the e
 End your reply with a single JSON object on its own, and nothing after it:
 {"decision": "<decision>", "confidence": "<high|low>", "rationale": "<why>", "message": "<for the operator>"}
 `decision` must be exactly one of:
-- `choose_output` — complete the step: add "label": "<output label>", and "data": {} and "variables": {} with the values the label needs
+- `choose_output` — complete the step: add "label": "<output label>", and "variables": {} and "artifacts": {"<name>": "<path>"} with the values the label needs
 - `reprompt` — ask the agent again: add "prompt": "<what to ask>"
-- `escalate` — hand the step to the operator: optionally add the "label", "data" and "variables" you would propose
+- `escalate` — hand the step to the operator: optionally add the "label", "variables" and "artifacts" you would propose
 `confidence` is `high` only when the snapshot leaves no real doubt; otherwise `low`. Without it, your decision counts as `low`.
 `rationale` says why, in a few sentences the operator will read.
 `message` is optional: a note for the operator's chat.

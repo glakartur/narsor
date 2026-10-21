@@ -13,7 +13,7 @@ states:
       type: agent
       harness: claude-code
       prompt: Zaimplementuj {{ inputs.nonexistent }}.
-    outputs:
+    choices:
       - done
     transitions:
       done: finished

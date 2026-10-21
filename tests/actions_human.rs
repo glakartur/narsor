@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use narsor_engine::domain::{
     ActionConfig, Event, EventData, ExecutionStatus, HumanActionConfig, HumanInputField,
-    HumanInputType, OutputDefinition, WorkflowExecution, Workspace,
+    HumanInputType, ChoiceDefinition, WorkflowExecution, Workspace,
 };
 use narsor_engine::engine::actions::human::{
     self, HumanActionError, HumanInputRequest, PendingHumanInput, PermissionDecision,
@@ -117,8 +117,8 @@ fn no_fields_action() -> ActionConfig {
 }
 
 /// Outputs without descriptions, as a state declaring bare labels has them.
-fn labels(labels: &[&str]) -> Vec<OutputDefinition> {
-    labels.iter().copied().map(OutputDefinition::new).collect()
+fn labels(labels: &[&str]) -> Vec<ChoiceDefinition> {
+    labels.iter().copied().map(ChoiceDefinition::new).collect()
 }
 
 /// A fresh running execution, saved in the store.
@@ -300,7 +300,8 @@ fn permission_wait_survives_reload_and_rejects_ordinary_input() {
         action_execution_id: "attempt-permission".to_string(),
         instruction: "Claude Code needs a permission decision.".to_string(),
         fields: Vec::new(),
-        question: None,
+        reason: None,
+        required_values: Vec::new(),
         answer_tail: Some("The command was blocked.".to_string()),
         agent_harness: Some("claude-code".to_string()),
         agent_session_id: Some("session-permission".to_string()),
@@ -429,7 +430,8 @@ fn a_decision_without_an_index_grants_every_denial_or_none() {
         action_execution_id: "attempt".to_string(),
         instruction: String::new(),
         fields: Vec::new(),
-        question: None,
+        reason: None,
+        required_values: Vec::new(),
         answer_tail: None,
         agent_harness: Some("claude-code".to_string()),
         agent_session_id: Some("session".to_string()),
@@ -491,7 +493,8 @@ fn a_typed_pattern_grants_one_rule_but_never_lifts_a_policy_block() {
         action_execution_id: "attempt".to_string(),
         instruction: String::new(),
         fields: Vec::new(),
-        question: None,
+        reason: None,
+        required_values: Vec::new(),
         answer_tail: None,
         agent_harness: Some("claude-code".to_string()),
         agent_session_id: Some("session".to_string()),
@@ -552,7 +555,8 @@ fn denying_an_ungrantable_command_tells_the_agent_how_to_ask_again() {
         action_execution_id: "attempt-permission".to_string(),
         instruction: "Claude Code needs a permission decision.".to_string(),
         fields: Vec::new(),
-        question: None,
+        reason: None,
+        required_values: Vec::new(),
         answer_tail: None,
         agent_harness: Some("claude-code".to_string()),
         agent_session_id: Some("session-permission".to_string()),
@@ -978,14 +982,15 @@ async fn output_descriptions_survive_in_the_pending_record() {
         panic!("a human action must request human input");
     };
     let outputs = vec![
-        OutputDefinition {
+        ChoiceDefinition {
             label: "ignore".to_string(),
             requires_variables: Vec::new(),
+            requires_artifacts: Vec::new(),
             description: Some("The failures are known and harmless.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
         },
-        OutputDefinition::new("fix_it"),
+        ChoiceDefinition::new("fix_it"),
     ];
     let pending = PendingHumanInput::new(
         execution.id.clone(),
@@ -1036,9 +1041,10 @@ async fn a_pending_record_with_bare_output_labels_still_loads() {
 }
 
 /// A `pending_input.json` written before requests carried the preceding
-/// agent's question still loads, with neither the question nor the tail.
+/// step's reason — with the agent's `question` instead, or with neither —
+/// still loads (KTD16), without a reason.
 #[tokio::test]
-async fn a_pending_record_without_an_agent_question_still_loads() {
+async fn a_pending_record_with_the_old_agent_question_still_loads() {
     let root = TempRoot::new();
     let store = root.store();
     let mut execution = start_execution(&store, root.path());
@@ -1055,14 +1061,25 @@ async fn a_pending_record_without_an_agent_question_still_loads() {
     let mut record: Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("read the record")).expect("json");
     let object = record.as_object_mut().expect("an object");
-    object.remove("question");
-    object.remove("answer_tail");
+    object.remove("reason");
+    object.remove("required_values");
+    object.insert("question".to_string(), json!("Account or user limit?"));
     fs::write(&path, record.to_string()).expect("write the old shape");
 
     let pending = human::pending_input(&store, &execution.id)
         .expect("the old shape still reads")
         .expect("the request is pending");
-    assert_eq!(pending.request.question, None);
+    assert_eq!(pending.request.reason, None);
+    assert!(pending.request.required_values.is_empty());
+
+    let object = record.as_object_mut().expect("an object");
+    object.remove("question");
+    object.remove("answer_tail");
+    fs::write(&path, record.to_string()).expect("write the oldest shape");
+    let pending = human::pending_input(&store, &execution.id)
+        .expect("the oldest shape still reads")
+        .expect("the request is pending");
+    assert_eq!(pending.request.reason, None);
     assert_eq!(pending.request.answer_tail, None);
 }
 
@@ -1101,14 +1118,15 @@ use narsor_engine::engine::actions::human::{
 };
 
 /// Suspends `execution` on a problem of state `work`: labels `implemented`
-/// (needs `variables.summary`) and `needs_human_decision` (needs
-/// `data.question`), after one rejected agent answer.
+/// (needs `variables.summary`) and `planned` (needs `artifacts.plan_doc`),
+/// after one rejected agent answer.
 fn raise_problem(store: &ExecutionStore, execution: &mut WorkflowExecution) -> PendingHumanInput {
     let request = HumanInputRequest {
         action_execution_id: "attempt-1".to_string(),
         instruction: "Choose the label the step ends with.".to_string(),
         fields: Vec::new(),
-        question: None,
+        reason: None,
+        required_values: Vec::new(),
         answer_tail: Some("All done, tests pass.".to_string()),
         agent_harness: None,
         agent_session_id: None,
@@ -1125,13 +1143,13 @@ fn raise_problem(store: &ExecutionStore, execution: &mut WorkflowExecution) -> P
         requirements: vec![
             OutputRequirement {
                 label: "implemented".to_string(),
-                data: Vec::new(),
                 variables: vec!["summary".to_string()],
+                artifacts: Vec::new(),
             },
             OutputRequirement {
-                label: "needs_human_decision".to_string(),
-                data: vec!["question".to_string()],
+                label: "planned".to_string(),
                 variables: Vec::new(),
+                artifacts: vec!["plan_doc".to_string()],
             },
         ],
         analysis: None,
@@ -1141,7 +1159,7 @@ fn raise_problem(store: &ExecutionStore, execution: &mut WorkflowExecution) -> P
         execution.id.clone(),
         "work".to_string(),
         request,
-        labels(&["implemented", "needs_human_decision"]),
+        labels(&["implemented", "planned"]),
         problem,
     );
     human::suspend(store, execution, &pending).expect("suspend");
@@ -1153,14 +1171,14 @@ fn object(value: Value) -> Map<String, Value> {
 }
 
 #[test]
-fn a_problem_is_answered_with_a_label_its_data_and_its_variables() {
+fn a_problem_is_answered_with_a_label_its_artifacts_and_its_variables() {
     let root = TempRoot::new();
     let store = root.store();
     let mut execution = start_execution(&store, root.path());
     let pending = raise_problem(&store, &mut execution);
 
     let delivery = HumanInputDelivery::label("implemented")
-        .with_data(object(json!({ "units_completed": 3 })))
+        .with_artifacts([("report".to_string(), "docs/report.md".to_string())].into())
         .with_variables(object(json!({ "summary": "login works" })))
         .with_comment("  read the answer myself  ")
         .for_episode(pending.episode_key());
@@ -1171,7 +1189,10 @@ fn a_problem_is_answered_with_a_label_its_data_and_its_variables() {
         InputContinuation::ResolveOutput
     );
     assert_eq!(resumed.result.output_label, "implemented");
-    assert_eq!(resumed.result.data, json!({ "units_completed": 3 }));
+    assert_eq!(
+        resumed.result.artifacts,
+        [("report".to_string(), "docs/report.md".to_string())].into()
+    );
     assert_eq!(
         resumed.result.variables,
         object(json!({ "summary": "login works" }))
@@ -1194,7 +1215,7 @@ fn a_problem_is_answered_with_a_label_its_data_and_its_variables() {
         close_reason,
         episode,
         output_label,
-        data,
+        artifacts,
         variables,
         comment,
         ..
@@ -1206,7 +1227,7 @@ fn a_problem_is_answered_with_a_label_its_data_and_its_variables() {
     assert_eq!(close_reason, Some(InputCloseReason::Answered));
     assert_eq!(episode.as_deref(), Some(pending.episode_key()));
     assert_eq!(output_label.as_deref(), Some("implemented"));
-    assert_eq!(data, Some(json!({ "units_completed": 3 })));
+    assert_eq!(artifacts, Some(json!({ "report": "docs/report.md" })));
     assert_eq!(variables, Some(json!({ "summary": "login works" })));
     assert_eq!(comment.as_deref(), Some("read the answer myself"));
 }
@@ -1244,11 +1265,11 @@ fn a_problem_answer_without_a_required_key_names_the_key_and_changes_nothing() {
     let error = human::resume(
         &store,
         &execution.id,
-        &HumanInputDelivery::label("needs_human_decision"),
+        &HumanInputDelivery::label("planned"),
     )
-    .expect_err("the gate needs a question");
+    .expect_err("the plan needs its document");
     assert!(
-        matches!(&error, HumanActionError::MissingRequiredKey { key, .. } if key == "data.question"),
+        matches!(&error, HumanActionError::MissingRequiredKey { key, .. } if key == "artifacts.plan_doc"),
         "{error:?}"
     );
     assert!(error.is_invalid_delivery());
@@ -1330,7 +1351,7 @@ fn a_problem_answer_needs_a_declared_label() {
 }
 
 #[tokio::test]
-async fn data_and_variables_are_refused_by_a_request_that_is_not_a_problem() {
+async fn artifacts_and_variables_are_refused_by_a_request_that_is_not_a_problem() {
     let root = TempRoot::new();
     let store = root.store();
     let mut execution = start_execution(&store, root.path());
@@ -1346,9 +1367,10 @@ async fn data_and_variables_are_refused_by_a_request_that_is_not_a_problem() {
     let error = human::resume(
         &store,
         &execution.id,
-        &HumanInputDelivery::label("ignore").with_data(object(json!({ "x": 1 }))),
+        &HumanInputDelivery::label("ignore")
+            .with_artifacts([("x".to_string(), "x.md".to_string())].into()),
     )
-    .expect_err("nothing would read the data");
+    .expect_err("nothing would read the artifacts");
     assert!(
         matches!(error, HumanActionError::UnexpectedStepValues),
         "{error:?}"

@@ -576,7 +576,7 @@ fn fake_claude(root: &TempRoot) -> PathBuf {
     let script = "#!/bin/sh\n\
         printf '%s\\n' \"$HOME\" >> \"$HOME/claude-homes\"\n\
         printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
-        \"session_id\":\"fake\",\"result\":\"Done.\\n{\\\"output\\\": \\\"done\\\"}\"}'\n";
+        \"session_id\":\"fake\",\"result\":\"Done.\\n{\\\"choice\\\": \\\"done\\\"}\"}'\n";
     let temp = bin.join(".claude.tmp");
     fs::write(&temp, script).unwrap();
     fs::set_permissions(&temp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -613,7 +613,7 @@ states:
     action:
       type: agent
       prompt: Think about it.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: first
   first:
@@ -625,16 +625,16 @@ states:
         - |
           echo first >> steps.log
           printf '%s' "$HOME" > "$HOME/home-seen-by-first"
-          printf '{"output": "done"}'
-    outputs: [done]
+          printf '{"choice": "done"}'
+    choices: [done]
     transitions:
       done: gate
   gate:
     action:
       type: script
       command: sh
-      args: [-c, "printf '{\"output\": \"ok\"}'"]
-    outputs: [ok, rejected]
+      args: [-c, "printf '{\"choice\": \"ok\"}'"]
+    choices: [ok, rejected]
     transitions:
       ok: review
       rejected: failed
@@ -645,7 +645,7 @@ states:
     action:
       type: agent
       prompt: Review it.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1174,8 +1174,8 @@ states:
           tries=$(cat "$HOME/attempts" 2>/dev/null | wc -l)
           echo try >> "$HOME/attempts"
           if [ "$tries" -eq 0 ]; then sleep 60; fi
-          printf '{"output": "done"}'
-    outputs: [done]
+          printf '{"choice": "done"}'
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1425,16 +1425,16 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "echo one >> \"$HOME/steps\"; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+      args: [-c, "echo one >> \"$HOME/steps\"; printf '{\"choice\": \"done\"}'"]
+    choices: [done]
     transitions:
       done: two
   two:
     action:
       type: script
       command: sh
-      args: [-c, "echo two >> \"$HOME/steps\"; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+      args: [-c, "echo two >> \"$HOME/steps\"; printf '{\"choice\": \"done\"}'"]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1536,8 +1536,11 @@ states:
       args:
         - -c
         - |
-          printf '{"output": "done", "variables": {"pr_number": 42, "pr_url": "https://git.example/pr/42"}}'
-    outputs: [done]
+          printf '{"choice": "done", "variables": {"pr_number": 42, "pr_url": "https://git.example/pr/42"}}'
+    variables:
+      - { name: pr_number, description: What the step reports as pr_number. }
+      - { name: pr_url, description: What the step reports as pr_url. }
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1673,8 +1676,8 @@ states:
             printf 'anthropic=%s\n' "${ANTHROPIC_API_KEY-unset}"
             printf 'openai=%s\n' "${OPENAI_API_KEY-unset}"
           } > "$NARSOR_OUTBOX_DIR/../seen"
-          printf '{"output": "done"}'
-    outputs: [done]
+          printf '{"choice": "done"}'
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1827,8 +1830,8 @@ states:
         - |
           printf '%s' "$GH_TOKEN" | sha256sum > "$HOME/token.sha256"
           sha256sum < "$HOME/.config/gh/hosts.yml" > "$HOME/hosts.sha256"
-          printf '{"output": "done"}'
-    outputs: [done]
+          printf '{"choice": "done"}'
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1973,7 +1976,7 @@ states:
     action:
       type: agent
       prompt: Think about it.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1994,7 +1997,7 @@ fn hanging_claude(root: &TempRoot) -> PathBuf {
         printf '%s\\n' \"$@\" >> \"$HOME/claude-args\"\n\
         if [ \"$tries\" -eq 0 ]; then sleep 60; fi\n\
         printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
-        \"session_id\":\"fake\",\"result\":\"Done.\\n{\\\"output\\\": \\\"done\\\"}\"}'\n";
+        \"session_id\":\"fake\",\"result\":\"Done.\\n{\\\"choice\\\": \\\"done\\\"}\"}'\n";
     let temp = bin.join(".claude.tmp");
     fs::write(&temp, script).unwrap();
     fs::set_permissions(&temp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2374,15 +2377,15 @@ states:
     action:
       type: agent
       prompt: Think about it.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: next
   next:
     action:
       type: script
       command: sh
-      args: [-c, "echo ran >> \"$HOME/next-ran\"; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+      args: [-c, "echo ran >> \"$HOME/next-ran\"; printf '{\"choice\": \"done\"}'"]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -2534,8 +2537,8 @@ states:
       args:
         - -c
         - |
-          if [ -f retried ]; then printf '{"output": "done"}'; else touch retried; echo boom >&2; exit 3; fi
-    outputs: [done]
+          if [ -f retried ]; then printf '{"choice": "done"}'; else touch retried; echo boom >&2; exit 3; fi
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -2553,8 +2556,8 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "sleep 60; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+      args: [-c, "sleep 60; printf '{\"choice\": \"done\"}'"]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -2571,7 +2574,7 @@ states:
     action:
       type: agent
       prompt: Do the work.
-    outputs: [implemented]
+    choices: [implemented]
     transitions:
       implemented: completed
   completed:
@@ -3154,7 +3157,7 @@ fn fake_harnesses(root: &TempRoot, programs: &[&str]) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let bin = root.dir("bin");
     let answers = root.dir("harness-answers");
-    let text = "Done.\n{\"output\": \"done\"}";
+    let text = "Done.\n{\"choice\": \"done\"}";
     for program in programs {
         let lines: Vec<serde_json::Value> = match *program {
             "claude" => vec![serde_json::json!({
@@ -3217,15 +3220,15 @@ states:
     action:
       type: agent
       prompt: First.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: g1
   g1:
     action:
       type: script
       command: sh
-      args: [-c, "printf '{\"output\": \"ok\"}'"]
-    outputs: [ok, rejected]
+      args: [-c, "printf '{\"choice\": \"ok\"}'"]
+    choices: [ok, rejected]
     transitions:
       ok: b
       rejected: failed
@@ -3236,15 +3239,15 @@ states:
     action:
       type: agent
       prompt: Second.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: g2
   g2:
     action:
       type: script
       command: sh
-      args: [-c, "printf '{\"output\": \"ok\"}'"]
-    outputs: [ok, rejected]
+      args: [-c, "printf '{\"choice\": \"ok\"}'"]
+    choices: [ok, rejected]
     transitions:
       ok: c
       rejected: failed
@@ -3255,7 +3258,7 @@ states:
     action:
       type: agent
       prompt: Third.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:

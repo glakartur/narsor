@@ -351,10 +351,18 @@ pub struct StateSchema {
     #[serde(default)]
     pub action: Option<ActionSchema>,
 
-    /// Possible output labels, each optionally described — see
-    /// [`OutputSchema`].
+    /// Variables the step's action may set (agent and script steps only).
     #[serde(default)]
-    pub outputs: Vec<OutputSchema>,
+    pub variables: Vec<DefinitionSchema>,
+
+    /// Artifacts the step's action may produce (agent and script steps
+    /// only).
+    #[serde(default)]
+    pub artifacts: Vec<DefinitionSchema>,
+
+    /// Possible choices, each optionally described — see [`ChoiceSchema`].
+    #[serde(default)]
+    pub choices: Vec<ChoiceSchema>,
 
     /// Mapping from output label to target state.
     #[serde(default)]
@@ -386,96 +394,119 @@ pub struct StateSchema {
     pub image: Option<crate::domain::ImageSpec>,
 }
 
-/// One entry of a state's `outputs` list (§3.3), in either of its two forms.
+/// One entry of a state's `variables` or `artifacts` list: a name and what
+/// it means.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefinitionSchema {
+    pub name: String,
+    pub description: String,
+}
+
+/// One entry of a state's `choices` list (§3.3), in either of its two forms.
 ///
-/// A bare label is the original contract; the object form adds a description
-/// the engine shows wherever the label is offered — the agent's output
-/// contract, the input form, the transition menu:
+/// A bare label is the short form; the object form adds a description the
+/// engine shows wherever the label is offered — the agent's output contract,
+/// the input form, the transition menu — and what the choice requires:
 ///
 /// ```yaml
-/// outputs:
+/// choices:
 ///   - success                                   # bare label
 ///   - label: needs_human
 ///     description: A person has to decide first  # described label
+///     requires_variables: [summary]
+///     requires_artifacts: [plan_doc]
 /// ```
 ///
-/// Both compile to the same [`crate::domain::OutputDefinition`]; a bare label
-/// simply has no description.
+/// Both compile to the same [`crate::domain::ChoiceDefinition`]; a bare label
+/// simply has no description and no requirements.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputSchema {
+pub struct ChoiceSchema {
     pub label: String,
-    pub requires_variables: Vec<RequiredVariableSchema>,
     pub description: Option<String>,
+    pub requires_variables: Vec<String>,
+    pub requires_artifacts: Vec<String>,
     pub requires_human_approval: bool,
     pub resume_comment_field: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
-pub enum RequiredVariableSchema {
-    Name(String),
-    Described { name: String, description: String },
-}
-
-/// The object form of an [`OutputSchema`]. `deny_unknown_fields` keeps a
+/// The object form of a [`ChoiceSchema`]. `deny_unknown_fields` keeps a
 /// misspelled `descripton:` from being dropped silently.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutputObjectSchema {
+struct ChoiceObjectSchema {
     label: String,
     #[serde(default)]
-    requires_variables: Vec<RequiredVariableSchema>,
-    #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    requires_variables: Vec<String>,
+    #[serde(default)]
+    requires_artifacts: Vec<String>,
     #[serde(default)]
     requires_human_approval: bool,
     #[serde(default)]
     resume_comment_field: Option<String>,
 }
 
-impl<'de> Deserialize<'de> for OutputSchema {
+impl ChoiceSchema {
+    fn bare(label: &str) -> Self {
+        ChoiceSchema {
+            label: label.to_string(),
+            description: None,
+            requires_variables: Vec::new(),
+            requires_artifacts: Vec::new(),
+            requires_human_approval: false,
+            resume_comment_field: None,
+        }
+    }
+}
+
+impl From<ChoiceObjectSchema> for ChoiceSchema {
+    fn from(object: ChoiceObjectSchema) -> Self {
+        ChoiceSchema {
+            label: object.label,
+            description: object.description,
+            requires_variables: object.requires_variables,
+            requires_artifacts: object.requires_artifacts,
+            requires_human_approval: object.requires_human_approval,
+            resume_comment_field: object.resume_comment_field,
+        }
+    }
+}
+
+/// A hand-written visitor rather than `#[serde(untagged)]`: an untagged enum
+/// replaces the object form's own error (a misspelled key, a missing label)
+/// with a generic one.
+impl<'de> Deserialize<'de> for ChoiceSchema {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct OutputVisitor;
+        struct ChoiceVisitor;
 
-        impl<'de> Visitor<'de> for OutputVisitor {
-            type Value = OutputSchema;
+        impl<'de> Visitor<'de> for ChoiceVisitor {
+            type Value = ChoiceSchema;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str(
-                    "an output label, or a mapping with 'label' and an optional 'description'",
+                    "a choice label, or a mapping with 'label' and an optional 'description'",
                 )
             }
 
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(OutputSchema {
-                    label: value.to_string(),
-                    requires_variables: Vec::new(),
-                    description: None,
-                    requires_human_approval: false,
-                    resume_comment_field: None,
-                })
+                Ok(ChoiceSchema::bare(value))
             }
 
             fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
             where
                 A: MapAccess<'de>,
             {
-                let object =
-                    OutputObjectSchema::deserialize(de::value::MapAccessDeserializer::new(map))?;
-                Ok(OutputSchema {
-                    label: object.label,
-                    requires_variables: object.requires_variables,
-                    description: object.description,
-                    requires_human_approval: object.requires_human_approval,
-                    resume_comment_field: object.resume_comment_field,
-                })
+                ChoiceObjectSchema::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(ChoiceSchema::from)
             }
         }
 
-        deserializer.deserialize_any(OutputVisitor)
+        deserializer.deserialize_any(ChoiceVisitor)
     }
 }
 
@@ -517,6 +548,15 @@ pub struct AgentActionSchema {
     /// Extra folders mounted read-only, relative to the workspace.
     #[serde(default)]
     pub read_only_paths: Vec<String>,
+
+    /// Whether the engine adds earlier attempts to the prompt when the step
+    /// is entered again. On unless turned off.
+    #[serde(default = "default_history")]
+    pub history: bool,
+}
+
+fn default_history() -> bool {
+    true
 }
 
 /// `type: script` (§3.3.B).

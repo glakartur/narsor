@@ -14,11 +14,13 @@ use engine_support::{
     event_type, workflow, workflow_file, AnsweringAgentExecutor, Harness, LabellessAgentExecutor,
     QuestioningAgentExecutor, ResumeRejectingAgentExecutor, StubAgentExecutor, TimeoutRecorder,
 };
-use narsor_engine::domain::{EventData, ExecutionStatus};
+use narsor_engine::domain::{ActionResult, EventData, ExecutionStatus};
+use narsor_engine::engine::actions::human::{RequiredValue, RequiredValueKind};
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, AgentDefaults, Engine, EngineError, HumanInputDelivery,
     ManualTransition,
 };
+use narsor_protocol::api::PendingHumanInputView;
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -813,6 +815,57 @@ async fn an_undeclared_label_fails_the_action_and_names_the_permitted_ones() {
 }
 
 #[tokio::test]
+async fn the_reason_of_a_choice_is_recorded_with_the_action_and_the_decision() {
+    let harness = Harness::new();
+    let execution = harness
+        .engine()
+        .start_and_run(&workflow("reasoned_choice"), json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+
+    let events = harness.events(&execution.id);
+    let completed: Vec<Option<String>> = events
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::ActionCompleted { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    let decided: Vec<Option<String>> = events
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::DecisionMade { reasoning, .. } => Some(reasoning.clone()),
+            _ => None,
+        })
+        .collect();
+    let expected = vec![Some("all checks are green".to_string()), None];
+    assert_eq!(completed, expected);
+    assert_eq!(decided, expected);
+}
+
+#[tokio::test]
+async fn a_failed_action_records_the_type_of_its_error() {
+    let harness = Harness::new();
+    let execution = harness
+        .engine()
+        .start_and_run(&workflow("missing_script"), json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+
+    let error_type = harness
+        .events(&execution.id)
+        .into_iter()
+        .find_map(|event| match event.data {
+            EventData::ActionFailed { error_type, .. } => Some(error_type),
+            _ => None,
+        })
+        .expect("an ActionFailed event");
+    assert_eq!(error_type.as_deref(), Some("spawn_failed"));
+}
+
+#[tokio::test]
 async fn an_agent_decision_is_refused_explicitly() {
     let harness = Harness::new();
     let engine = harness.engine();
@@ -1533,130 +1586,208 @@ async fn an_engine_without_checkpoints_writes_none() {
 }
 
 // ---------------------------------------------------------------------------
-// The agent's question in the input request that follows it (KTD8)
+// The gate after an agent or script step: its reason and required values (U4)
 // ---------------------------------------------------------------------------
 
-const LIMIT_QUESTION: &str = "Czy limit ma dotyczyć konta czy użytkownika?";
+const NO_REASON: &str = "brak uzasadnienia";
 
-/// An engine whose agent states answer with `replies`, in order.
-fn engine_answering(harness: &Harness, replies: Vec<(&str, Value, &str)>) -> Engine {
+/// An engine whose agent states answer with `results`, in order.
+fn engine_answering(harness: &Harness, results: Vec<ActionResult>) -> Engine {
     Engine::new(harness.store()).with_executor(
         ActionKind::Agent,
-        Arc::new(AnsweringAgentExecutor::new(replies)),
+        Arc::new(AnsweringAgentExecutor::from_results(results)),
     )
 }
 
-/// The `question` and `answer_tail` of every `HumanInputRequested`, in order.
-fn requested_questions(
-    harness: &Harness,
-    execution_id: &str,
-) -> Vec<(Option<String>, Option<String>)> {
+/// An agent's answer: `choice` with `reason` and `variables`, after `answer`.
+fn agent_choice(choice: &str, reason: &str, variables: Value, answer: &str) -> ActionResult {
+    ActionResult {
+        output_label: choice.to_string(),
+        reason: reason.to_string(),
+        variables: variables.as_object().cloned().expect("an object"),
+        exit_code: Some(0),
+        stdout: answer.to_string(),
+        reply: Some(answer.to_string()),
+        ..ActionResult::default()
+    }
+}
+
+/// The `reason` and `required_values` of every `HumanInputRequested`, in
+/// order.
+fn requested_gates(harness: &Harness, execution_id: &str) -> Vec<(Option<String>, Vec<RequiredValue>)> {
     harness
         .events(execution_id)
         .into_iter()
         .filter_map(|event| match event.data {
             EventData::HumanInputRequested {
-                question,
-                answer_tail,
+                reason,
+                required_values,
                 ..
-            } => Some((question, answer_tail)),
+            } => Some((reason, required_values)),
             _ => None,
         })
         .collect()
 }
 
+/// The pending input of `execution_id` as clients see it.
+fn pending_view(engine: &Engine, execution_id: &str) -> PendingHumanInputView {
+    let pending = engine
+        .pending_input(execution_id)
+        .expect("read pending input")
+        .expect("a gate is pending");
+    serde_json::from_value(serde_json::to_value(&pending).expect("serialize"))
+        .expect("the view reads the pending record")
+}
+
+fn variable(name: &str, value: &str) -> RequiredValue {
+    RequiredValue {
+        name: name.to_string(),
+        kind: RequiredValueKind::Variable,
+        value: value.to_string(),
+    }
+}
+
+/// Covers AE6. The choice's reason and the value of the variable it requires
+/// reach the gate: in its event and in the view of the pending input.
 #[tokio::test]
-async fn a_gate_after_an_agent_carries_the_agents_question() {
+async fn a_gate_after_an_agent_shows_its_reason_and_the_required_variable() {
     let harness = Harness::new();
     let engine = engine_answering(
         &harness,
-        vec![(
-            "needs_human_decision",
-            json!({ "question": LIMIT_QUESTION }),
-            "I looked at the limits.\n{\"output\": \"needs_human_decision\"}",
+        vec![agent_choice(
+            "needs_requirements_revision",
+            "the requirements name no API",
+            json!({ "requirements_blocker": "which API version is in scope?" }),
+            "I could not plan it.",
         )],
     );
-    let definition = workflow("agent_gate");
 
     let execution = engine
-        .start_and_run(&definition, json!({}), harness.workspace())
+        .start_and_run(&workflow("plan_gate"), json!({}), harness.workspace())
         .await
         .expect("run up to the gate");
 
     assert_eq!(execution.status, ExecutionStatus::InputNeeded);
-    assert_eq!(
-        execution.current_state.as_deref(),
-        Some("resolve_ambiguity")
+    assert_eq!(execution.current_state.as_deref(), Some("review"));
+    let expected = (
+        Some("the requirements name no API".to_string()),
+        vec![variable(
+            "requirements_blocker",
+            "which API version is in scope?",
+        )],
     );
-    let pending = engine
-        .pending_input(&execution.id)
-        .expect("read pending input")
-        .expect("the gate is pending");
-    assert_eq!(pending.request.question.as_deref(), Some(LIMIT_QUESTION));
-    assert_eq!(
-        pending.request.answer_tail.as_deref(),
-        Some("I looked at the limits.\n{\"output\": \"needs_human_decision\"}")
-    );
-    assert_eq!(
-        pending.instruction(),
-        "The agent needs a decision.",
-        "the gate's own message is left as the workflow wrote it"
+    assert_eq!(requested_gates(&harness, &execution.id), vec![expected.clone()]);
+    let view = pending_view(&engine, &execution.id);
+    assert_eq!((view.reason, view.required_values), expected);
+    assert_eq!(view.answer_tail.as_deref(), Some("I could not plan it."));
+    assert_eq!(view.instruction, "Review the plan.");
+}
+
+#[tokio::test]
+async fn a_choice_without_required_values_shows_only_its_reason() {
+    let harness = Harness::new();
+    let engine = engine_answering(
+        &harness,
+        vec![agent_choice(
+            "needs_human_decision",
+            "two designs fit equally well",
+            json!({ "requirements_blocker": "not required by this choice" }),
+            "",
+        )],
     );
 
+    let execution = engine
+        .start_and_run(&workflow("plan_gate"), json!({}), harness.workspace())
+        .await
+        .expect("run up to the gate");
+
+    let view = pending_view(&engine, &execution.id);
+    assert_eq!(view.reason.as_deref(), Some("two designs fit equally well"));
+    assert!(view.required_values.is_empty(), "{:?}", view.required_values);
+}
+
+#[tokio::test]
+async fn a_choice_without_a_reason_shows_the_placeholder() {
+    let harness = Harness::new();
+    let engine = engine_answering(
+        &harness,
+        vec![agent_choice("needs_human_decision", "  ", json!({}), "")],
+    );
+
+    let execution = engine
+        .start_and_run(&workflow("plan_gate"), json!({}), harness.workspace())
+        .await
+        .expect("run up to the gate");
+
     assert_eq!(
-        requested_questions(&harness, &execution.id),
-        vec![(
-            Some(LIMIT_QUESTION.to_string()),
-            pending.request.answer_tail.clone()
-        )]
+        pending_view(&engine, &execution.id).reason.as_deref(),
+        Some(NO_REASON)
+    );
+    assert_eq!(
+        requested_gates(&harness, &execution.id),
+        vec![(Some(NO_REASON.to_string()), Vec::new())]
     );
 }
 
 #[tokio::test]
-async fn without_a_question_the_gate_carries_the_end_of_the_answer() {
+async fn a_required_value_reaches_the_gate_cut_to_two_kilobytes_and_cleaned() {
     let harness = Harness::new();
-    let answer = format!("{}THE END", "x".repeat(5000));
+    let long = format!("\u{1b}[31m{}", "x".repeat(10 * 1024));
     let engine = engine_answering(
         &harness,
-        vec![("needs_human_decision", json!({}), answer.as_str())],
+        vec![agent_choice(
+            "needs_requirements_revision",
+            "blocked\u{1b}[2J",
+            json!({ "requirements_blocker": long }),
+            "",
+        )],
     );
-    let definition = workflow("agent_gate");
 
     let execution = engine
-        .start_and_run(&definition, json!({}), harness.workspace())
+        .start_and_run(&workflow("plan_gate"), json!({}), harness.workspace())
+        .await
+        .expect("run up to the gate");
+
+    let view = pending_view(&engine, &execution.id);
+    assert_eq!(view.reason.as_deref(), Some("blocked[2J"));
+    let value = &view.required_values[0].value;
+    assert!(value.len() <= 2 * 1024, "got {} bytes", value.len());
+    assert!(value.starts_with("[31mxxx"), "{value:.20}");
+    assert!(!value.contains('\u{1b}'));
+}
+
+#[tokio::test]
+async fn a_question_in_additional_data_is_not_shown_on_the_gate() {
+    let harness = Harness::new();
+    let mut answer = agent_choice("needs_human_decision", "", json!({}), "");
+    answer
+        .additional_data
+        .insert("question".to_string(), json!("Account or user limit?"));
+    let engine = engine_answering(&harness, vec![answer]);
+
+    let execution = engine
+        .start_and_run(&workflow("plan_gate"), json!({}), harness.workspace())
         .await
         .expect("run up to the gate");
 
     let pending = engine
         .pending_input(&execution.id)
-        .expect("read pending input")
+        .expect("read")
         .expect("the gate is pending");
-    assert_eq!(pending.request.question, None);
-    let tail = pending.request.answer_tail.expect("the answer's end");
-    assert!(tail.ends_with("THE END"), "{tail}");
-    assert!(
-        tail.len() <= 2 * 1024 + '…'.len_utf8(),
-        "only the tail travels, got {} bytes",
-        tail.len()
-    );
+    let record = serde_json::to_string(&pending).expect("serialize");
+    assert!(!record.contains("Account or user limit?"), "{record}");
+    assert_eq!(pending.request.reason.as_deref(), Some(NO_REASON));
+    assert!(pending.request.required_values.is_empty());
 }
 
 #[tokio::test]
-async fn a_gate_reached_again_shows_the_newest_question() {
+async fn a_gate_reached_again_shows_the_newest_reason() {
     let harness = Harness::new();
     let engine = engine_answering(
         &harness,
         vec![
-            (
-                "needs_human_decision",
-                json!({ "question": "first question" }),
-                "first answer",
-            ),
-            (
-                "needs_human_decision",
-                json!({ "question": "second question" }),
-                "second answer",
-            ),
+            agent_choice("needs_human_decision", "first reason", json!({}), "first answer"),
+            agent_choice("needs_human_decision", "second reason", json!({}), "second answer"),
         ],
     );
     let definition = workflow("agent_gate");
@@ -1674,90 +1805,203 @@ async fn a_gate_reached_again_shows_the_newest_question() {
         .await
         .expect("loop through apply_clarification back to the gate");
 
-    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
     assert_eq!(
         execution.current_state.as_deref(),
         Some("resolve_ambiguity")
     );
-    let pending = engine
-        .pending_input(&execution.id)
-        .expect("read pending input")
-        .expect("the gate is pending again");
-    assert_eq!(pending.request.question.as_deref(), Some("second question"));
+    let view = pending_view(&engine, &execution.id);
+    assert_eq!(view.reason.as_deref(), Some("second reason"));
+    assert_eq!(view.answer_tail.as_deref(), Some("second answer"));
     assert_eq!(
-        pending.request.answer_tail.as_deref(),
-        Some("second answer")
-    );
-    assert_eq!(
-        requested_questions(&harness, &execution.id),
+        requested_gates(&harness, &execution.id),
         vec![
-            (
-                Some("first question".to_string()),
-                Some("first answer".to_string())
-            ),
-            (
-                Some("second question".to_string()),
-                Some("second answer".to_string())
-            ),
+            (Some("first reason".to_string()), Vec::new()),
+            (Some("second reason".to_string()), Vec::new()),
         ]
     );
 }
 
 #[tokio::test]
-async fn a_gate_after_a_script_carries_no_question() {
-    // The agent did state a question, but a script ran between it and the
-    // gate: the gate follows the script, not the agent.
+async fn a_gate_after_a_script_shows_the_scripts_reason_not_the_agents() {
+    // The agent gave a reason, but a script ran between it and the gate.
     let harness = Harness::new();
     let engine = engine_answering(
         &harness,
-        vec![(
-            "done",
-            json!({ "question": "stale question" }),
-            "stale answer",
-        )],
+        vec![agent_choice("done", "stale reason", json!({}), "stale answer")],
     );
-    let definition = workflow("agent_gate");
 
     let execution = engine
-        .start_and_run(&definition, json!({}), harness.workspace())
+        .start_and_run(&workflow("agent_gate"), json!({}), harness.workspace())
         .await
         .expect("run up to the review gate");
 
     assert_eq!(execution.current_state.as_deref(), Some("review"));
-    let pending = engine
-        .pending_input(&execution.id)
-        .expect("read pending input")
-        .expect("the review gate is pending");
-    assert_eq!(pending.request.question, None);
-    assert_eq!(pending.request.answer_tail, None);
+    let view = pending_view(&engine, &execution.id);
+    assert_eq!(view.reason.as_deref(), Some(NO_REASON));
+    assert!(view
+        .answer_tail
+        .as_deref()
+        .is_some_and(|tail| !tail.contains("stale")));
+}
+
+#[tokio::test]
+async fn a_human_decision_on_an_agent_shows_its_reason() {
+    let harness = Harness::new();
+    let engine = engine_answering(
+        &harness,
+        vec![agent_choice("done", "every test passes", json!({}), "the answer")],
+    );
+
+    let execution = engine
+        .start_and_run(
+            &workflow("agent_human_decision"),
+            json!({}),
+            harness.workspace(),
+        )
+        .await
+        .expect("run up to the decision");
+
+    assert_eq!(execution.current_state.as_deref(), Some("work"));
+    let view = pending_view(&engine, &execution.id);
+    assert_eq!(view.reason.as_deref(), Some("every test passes"));
+    assert_eq!(view.answer_tail.as_deref(), Some("the answer"));
+}
+
+#[tokio::test]
+async fn a_script_choosing_blocked_leads_to_a_gate_with_its_reason() {
+    let harness = Harness::new();
+
+    let execution = harness
+        .engine()
+        .start_and_run(&workflow("script_gate"), json!({}), harness.workspace())
+        .await
+        .expect("run up to the gate");
+
     assert_eq!(
-        requested_questions(&harness, &execution.id),
-        vec![(None, None)]
+        execution.current_state.as_deref(),
+        Some("finalize_blocked")
+    );
+    assert_eq!(
+        requested_gates(&harness, &execution.id),
+        vec![(
+            Some("the pull request has merge conflicts".to_string()),
+            Vec::new()
+        )]
     );
 }
 
 #[tokio::test]
-async fn a_human_decision_on_an_agent_carries_its_question() {
+async fn a_script_out_of_time_leads_to_a_gate_with_a_reason_naming_the_limit() {
     let harness = Harness::new();
-    let engine = engine_answering(
-        &harness,
-        vec![("done", json!({ "question": LIMIT_QUESTION }), "the answer")],
-    );
-    let definition = workflow("agent_human_decision");
 
-    let execution = engine
-        .start_and_run(&definition, json!({}), harness.workspace())
+    let execution = harness
+        .engine()
+        .start_and_run(
+            &workflow("script_timeout_gate"),
+            json!({}),
+            harness.workspace(),
+        )
         .await
-        .expect("run up to the decision");
+        .expect("run up to the gate");
 
-    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
-    assert_eq!(execution.current_state.as_deref(), Some("work"));
-    let pending = engine
-        .pending_input(&execution.id)
-        .expect("read pending input")
-        .expect("the decision is pending");
-    assert_eq!(pending.request.question.as_deref(), Some(LIMIT_QUESTION));
-    assert_eq!(pending.request.answer_tail.as_deref(), Some("the answer"));
+    assert_eq!(execution.current_state.as_deref(), Some("merge_timed_out"));
+    let gates = requested_gates(&harness, &execution.id);
+    let reason = gates[0].0.clone().expect("a reason");
+    assert_ne!(reason, NO_REASON);
+    assert!(reason.contains("1s"), "{reason}");
+}
+
+/// KTD12: `revise` resumes the agent's session with the comment and needs
+/// one; `approve`, on the same optional comment field, does not.
+mod revise_comment {
+    use super::*;
+
+    use narsor_engine::engine::HumanActionError;
+
+    const SESSION: &str = "work-session";
+
+    async fn run_to_review(harness: &Harness) -> (Arc<AnsweringAgentExecutor>, Engine, String) {
+        let mut first = agent_choice("done", "done", json!({}), "first");
+        first.data = json!({
+            "agent_session": { "harness": "fake", "config": { "harness_session_id": SESSION } }
+        });
+        let agent = Arc::new(AnsweringAgentExecutor::from_results(vec![
+            first,
+            agent_choice("done", "revised", json!({}), "second"),
+        ]));
+        let engine = Engine::new(harness.store()).with_executor(ActionKind::Agent, agent.clone());
+        let execution = engine
+            .start_and_run(&workflow("revise_gate"), json!({}), harness.workspace())
+            .await
+            .expect("run up to the review");
+        assert_eq!(execution.current_state.as_deref(), Some("review"));
+        (agent, engine, execution.id)
+    }
+
+    #[tokio::test]
+    async fn revise_without_a_comment_is_refused_and_with_one_resumes_the_author() {
+        let harness = Harness::new();
+        let (agent, engine, execution_id) = run_to_review(&harness).await;
+        let definition = workflow("revise_gate");
+
+        let error = engine
+            .deliver_human_input(
+                &definition,
+                &execution_id,
+                &HumanInputDelivery::with_values(Map::from_iter([(
+                    "comment".to_string(),
+                    json!("  "),
+                )]))
+                .choosing("revise"),
+            )
+            .await
+            .expect_err("revise needs a comment");
+        assert!(
+            matches!(
+                &error,
+                EngineError::HumanInput(HumanActionError::MissingRequiredField { field })
+                    if field == "comment"
+            ),
+            "{error:?}"
+        );
+        assert!(harness.store().has_pending_input(&execution_id));
+
+        let execution = engine
+            .deliver_human_input(
+                &definition,
+                &execution_id,
+                &HumanInputDelivery::with_values(Map::from_iter([(
+                    "comment".to_string(),
+                    json!("cover the error path"),
+                )]))
+                .choosing("revise"),
+            )
+            .await
+            .expect("revise with a comment");
+
+        assert_eq!(execution.current_state.as_deref(), Some("review"));
+        let prompts = agent.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("cover the error path"), "{}", prompts[1]);
+        assert_eq!(agent.resumed_sessions(), vec![None, Some(SESSION.to_string())]);
+    }
+
+    #[tokio::test]
+    async fn approve_without_a_comment_goes_through() {
+        let harness = Harness::new();
+        let (_agent, engine, execution_id) = run_to_review(&harness).await;
+
+        let execution = engine
+            .deliver_human_input(
+                &workflow("revise_gate"),
+                &execution_id,
+                &HumanInputDelivery::label("approve"),
+            )
+            .await
+            .expect("approve needs no comment");
+
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,12 +2053,12 @@ mod problems {
         let problem = pending.problem.as_ref().expect("the problem record");
         let implemented = problem.requirement_for("implemented").expect("implemented");
         assert_eq!(implemented.variables, vec!["summary".to_string()]);
-        assert!(implemented.data.is_empty());
+        assert!(implemented.artifacts.is_empty());
         let decision = problem
             .requirement_for("needs_human_decision")
             .expect("needs_human_decision");
-        assert_eq!(decision.data, vec!["question".to_string()]);
-        assert!(decision.variables.is_empty());
+        assert!(decision.variables.is_empty(), "a gate needs nothing");
+        assert!(decision.artifacts.is_empty());
         assert_eq!(problem.answers.len(), 1);
         assert_eq!(problem.answers[0].answer_tail.as_deref(), Some(ANSWER));
 
@@ -1866,7 +2110,6 @@ mod problems {
         let (engine, definition, execution_id, pending) = raise_problem(&harness, json!({})).await;
 
         let delivery = HumanInputDelivery::label("implemented")
-            .with_data(object(json!({ "units_completed": 3 })))
             .with_variables(object(json!({ "summary": "login works" })))
             .with_comment("the answer says it is done")
             .for_episode(pending.episode_key());
@@ -1888,6 +2131,7 @@ mod problems {
                 EventData::ActionCompleted {
                     action_execution_id,
                     output_label,
+                    ..
                 } => Some((action_execution_id.clone(), output_label.clone())),
                 _ => None,
             })
@@ -1916,79 +2160,92 @@ mod problems {
     }
 
     #[tokio::test]
-    async fn a_label_leading_to_a_gate_needs_the_question_the_gate_shows() {
+    async fn a_label_leading_to_a_gate_needs_nothing_and_the_gate_shows_the_settled_answer() {
         let harness = Harness::new();
         let (engine, definition, execution_id, _pending) = raise_problem(&harness, json!({})).await;
 
-        let error = engine
+        let execution = engine
             .deliver_human_input(
                 &definition,
                 &execution_id,
                 &HumanInputDelivery::label("needs_human_decision"),
             )
             .await
-            .expect_err("the gate needs data.question");
-        assert!(
-            matches!(
-                &error,
-                EngineError::HumanInput(HumanActionError::MissingRequiredKey { key, .. })
-                    if key == "data.question"
-            ),
-            "{error:?}"
-        );
-        assert_eq!(
-            harness
-                .store()
-                .load_execution(&execution_id)
-                .expect("reload")
-                .status,
-            ExecutionStatus::InputNeeded,
-            "a refused answer changes nothing"
-        );
-
-        let execution = engine
-            .deliver_human_input(
-                &definition,
-                &execution_id,
-                &HumanInputDelivery::label("needs_human_decision")
-                    .with_data(object(json!({ "question": "Which API version?" }))),
-            )
-            .await
-            .expect("resolve with the question");
+            .expect("a gate needs no value");
         assert_eq!(execution.status, ExecutionStatus::InputNeeded);
         assert_eq!(
             execution.current_state.as_deref(),
             Some("resolve_ambiguity")
         );
 
-        // The gate shows the question the operator supplied beside what the
-        // agent actually said (KTD8).
         let gate = engine
             .pending_input(&execution_id)
             .expect("read")
             .expect("the gate is pending");
         assert_eq!(gate.continuation, InputContinuation::CompleteStep);
-        assert_eq!(gate.request.question.as_deref(), Some("Which API version?"));
+        assert_eq!(gate.request.reason.as_deref(), Some(NO_REASON));
         assert_eq!(gate.request.answer_tail.as_deref(), Some(ANSWER));
     }
 
-    #[tokio::test]
-    async fn artifacts_in_the_delivered_data_are_registered_like_an_agents() {
-        let harness = Harness::new();
-        let (engine, definition, execution_id, _pending) =
-            raise_problem(&harness, json!({ "summary": "done" })).await;
+    /// Runs `plan_problem` until its plan step becomes a problem.
+    async fn raise_plan_problem(harness: &Harness) -> (Engine, WorkflowDefinition, PendingHumanInput) {
+        let engine = Engine::new(harness.store()).with_executor(
+            ActionKind::Agent,
+            Arc::new(LabellessAgentExecutor::answering(ANSWER)),
+        );
+        let definition = workflow("plan_problem");
+        let execution = engine
+            .start_and_run(&definition, json!({}), harness.workspace())
+            .await
+            .expect("run to the problem");
+        let pending = engine
+            .pending_input(&execution.id)
+            .expect("read the pending input")
+            .expect("a problem is pending");
+        (engine, definition, pending)
+    }
 
-        engine
+    #[tokio::test]
+    async fn the_operator_supplies_a_missing_artifact_and_the_step_goes_on() {
+        let harness = Harness::new();
+        let (engine, definition, pending) = raise_plan_problem(&harness).await;
+        let execution_id = pending.execution_id.clone();
+        let requirement = pending
+            .problem
+            .as_ref()
+            .and_then(|problem| problem.requirement_for("plan_ready"))
+            .expect("plan_ready");
+        assert_eq!(requirement.artifacts, vec!["plan_doc".to_string()]);
+
+        let error = engine
             .deliver_human_input(
                 &definition,
                 &execution_id,
-                &HumanInputDelivery::label("implemented").with_data(object(json!({
-                    "artifacts": [{ "name": "plan", "path": "docs/plan.md" }]
-                }))),
+                &HumanInputDelivery::label("plan_ready"),
             )
             .await
-            .expect("resolve the problem");
+            .expect_err("the artifact is missing");
+        assert!(
+            matches!(
+                &error,
+                EngineError::HumanInput(HumanActionError::MissingRequiredKey { key, .. })
+                    if key == "artifacts.plan_doc"
+            ),
+            "{error:?}"
+        );
 
+        let execution = engine
+            .deliver_human_input(
+                &definition,
+                &execution_id,
+                &HumanInputDelivery::label("plan_ready").with_artifacts(
+                    [("plan_doc".to_string(), "docs/plan.md".to_string())].into(),
+                ),
+            )
+            .await
+            .expect("resolve with the artifact");
+
+        assert_eq!(execution.status, ExecutionStatus::Completed);
         let created = harness
             .events(&execution_id)
             .into_iter()
@@ -1999,9 +2256,32 @@ mod problems {
             .expect("ArtifactCreated");
         assert_eq!(created, "docs/plan.md");
         assert_eq!(
-            harness.stored_context(&execution_id)["artifacts"]["plan"]["location"],
+            harness.stored_context(&execution_id)["artifacts"]["plan_doc"]["location"],
             json!("docs/plan.md")
         );
+    }
+
+    #[tokio::test]
+    async fn a_declared_variable_the_next_step_renders_is_not_required() {
+        let harness = Harness::new();
+        let (engine, definition, pending) = raise_plan_problem(&harness).await;
+        let requirement = pending
+            .problem
+            .as_ref()
+            .and_then(|problem| problem.requirement_for("blocked"))
+            .expect("blocked");
+        assert!(requirement.variables.is_empty(), "{requirement:?}");
+
+        let execution = engine
+            .deliver_human_input(
+                &definition,
+                &pending.execution_id,
+                &HumanInputDelivery::label("blocked"),
+            )
+            .await
+            .expect("plan_blocker renders empty");
+
+        assert_eq!(execution.status, ExecutionStatus::Completed);
     }
 
     #[tokio::test]
@@ -2076,7 +2356,7 @@ states:
     action:
       type: script
       command: "true"
-    outputs: [a, b, c]
+    choices: [a, b, c]
     transitions:
       a: review
       b: review
@@ -2085,7 +2365,7 @@ states:
     action:
       type: script
       command: "true"
-    outputs: [done]
+    choices: [done]
     transitions:
       done: closed
   closed:

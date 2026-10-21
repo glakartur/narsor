@@ -686,8 +686,8 @@ states:
       command: "{command}"
       args:
         - "{seconds}"
-        - '{{"output": "done"}}'
-    outputs:
+        - '{{"choice": "done"}}'
+    choices:
       - done
     transitions:
       done: completed
@@ -1029,7 +1029,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Implement the feature."
-    outputs:
+    choices:
       - label: implemented
         description: The feature is implemented.
       - label: needs_human_decision
@@ -1063,7 +1063,7 @@ async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
             "subtype": "success",
             "is_error": false,
             "session_id": "fake-session-1",
-            "result": r#"{"output":"implemented"}"#,
+            "result": r#"{"choice":"implemented"}"#,
         })
         .to_string(),
     )
@@ -1401,7 +1401,7 @@ async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() 
                 episode: Some("attempt-rejected".to_string()),
                 state_id: Some("work".to_string()),
                 output_label: Some("implemented".to_string()),
-                data: serde_json::json!({}),
+                artifacts: Default::default(),
                 variables: serde_json::json!({}),
                 confidence: narsor_engine::domain::Confidence::High,
                 rationale: Some("the agent said all tests pass".to_string()),
@@ -1410,6 +1410,7 @@ async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() 
                 reason: None,
                 reply: None,
                 state_entries_before: serde_json::Value::Null,
+                step_memory_before: serde_json::Value::Null,
                 saved_at: chrono::Utc::now(),
             }],
             ..ConductorState::default()
@@ -1502,8 +1503,8 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "printf '{\"output\": \"ok\"}'"]
-    outputs: [ok, rejected]
+      args: [-c, "printf '{\"choice\": \"ok\"}'"]
+    choices: [ok, rejected]
     transitions:
       ok: completed
       rejected: failed

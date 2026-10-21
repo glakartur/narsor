@@ -1,0 +1,28 @@
+# A template may name only an artifact some step defines (KTD7).
+name: unknown-artifact-reference
+version: 1
+
+states:
+  plan:
+    action:
+      type: agent
+      prompt: Zaplanuj.
+    artifacts:
+      - { name: plan_doc, description: Dokument planu. }
+    choices: [ready]
+    transitions:
+      ready: work
+
+  work:
+    action:
+      type: agent
+      prompt: "Pracuj według {{ artifacts.plan_doc }} i {{ artifacts.unknown }}."
+    choices: [done]
+    transitions:
+      done: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

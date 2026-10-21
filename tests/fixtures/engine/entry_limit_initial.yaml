@@ -5,7 +5,7 @@ states:
   review:
     action: { type: agent, prompt: review }
     max_entries: 1
-    outputs: [again, done]
+    choices: [again, done]
     transitions: { again: review, done: completed }
   completed: { description: done }
 terminal_states: [completed]

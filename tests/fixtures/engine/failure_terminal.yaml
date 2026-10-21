@@ -10,8 +10,10 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "broken", "variables": {"reason": "nothing compiles"}}'
-    outputs:
+        - '{"choice": "broken", "variables": {"reason": "nothing compiles"}}'
+    variables:
+      - { name: reason, description: What the step reports as reason. }
+    choices:
       - ok
       - broken
     transitions:

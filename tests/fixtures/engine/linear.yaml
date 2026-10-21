@@ -16,8 +16,10 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "done", "variables": {"first": "one"}}'
-    outputs:
+        - '{"choice": "done", "variables": {"first": "one"}}'
+    variables:
+      - { name: first, description: What the step reports as first. }
+    choices:
       - done
     transitions:
       done: second
@@ -27,8 +29,10 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "done", "variables": {"second": "{{ inputs.subject }}"}}'
-    outputs:
+        - '{"choice": "done", "variables": {"second": "{{ inputs.subject }}"}}'
+    variables:
+      - { name: second, description: What the step reports as second. }
+    choices:
       - done
     transitions:
       done: third
@@ -38,8 +42,10 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "done", "variables": {"third": "after {{ context.variables.first }}"}}'
-    outputs:
+        - '{"choice": "done", "variables": {"third": "after {{ context.variables.first }}"}}'
+    variables:
+      - { name: third, description: What the step reports as third. }
+    choices:
       - done
     transitions:
       done: completed

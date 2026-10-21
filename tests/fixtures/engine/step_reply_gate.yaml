@@ -5,19 +5,19 @@ description: >
 states:
   review:
     action: { type: agent, prompt: review the changes }
-    outputs: [findings]
+    choices: [findings]
     transitions: { findings: gate }
   gate:
     action:
       type: human
       message: "The review says: {{ steps.review.reply }}"
-    outputs: [fix]
+    choices: [fix]
     transitions: { fix: fix }
   fix:
     action:
       type: agent
       prompt: "Fix these findings: {{ steps.review.reply }}"
-    outputs: [done]
+    choices: [done]
     transitions: { done: completed }
   completed: { description: done }
 terminal_states: [completed]

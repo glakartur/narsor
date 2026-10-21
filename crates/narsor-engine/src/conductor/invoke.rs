@@ -54,7 +54,7 @@ use crate::conductor::response::ConductorResponse;
 use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
 use crate::conductor::store::ConductorStore;
 use crate::domain::{
-    AgentActionConfig, OutputDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
+    AgentActionConfig, ChoiceDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
 };
 use crate::engine::actions::agent::{
     run_harness_process, DefaultHarnessSource, SpawnEnding, BUILT_IN_HARNESS,
@@ -308,7 +308,7 @@ impl HarnessInvoker {
     fn definition(
         &self,
         execution: &WorkflowExecution,
-    ) -> Result<(String, Vec<OutputDefinition>), String> {
+    ) -> Result<(String, Vec<ChoiceDefinition>), String> {
         if let Some(definition) = &self.pinned_definition {
             return Ok(pinned_source(definition, execution));
         }
@@ -323,7 +323,7 @@ impl HarnessInvoker {
                 definition
                     .states
                     .get(state)
-                    .map(|state| state.outputs.clone())
+                    .map(|state| state.choices.clone())
             })
             .unwrap_or_default();
         Ok((resolved.source, outputs))
@@ -367,7 +367,7 @@ impl ConductorInvoker for HarnessInvoker {
 fn pinned_source(
     definition: &WorkflowDefinition,
     execution: &WorkflowExecution,
-) -> (String, Vec<OutputDefinition>) {
+) -> (String, Vec<ChoiceDefinition>) {
     let source = serde_yaml::to_string(definition)
         .or_else(|_| serde_json::to_string_pretty(definition))
         .unwrap_or_default();
@@ -375,7 +375,7 @@ fn pinned_source(
         .current_state
         .as_ref()
         .and_then(|state| definition.states.get(state))
-        .map(|state| state.outputs.clone())
+        .map(|state| state.choices.clone())
         .unwrap_or_default();
     (source, outputs)
 }
@@ -392,5 +392,7 @@ fn conductor_config(prompt: &str) -> AgentActionConfig {
         workspace: None,
         parameters: Default::default(),
         read_only_paths: Vec::new(),
+        // The conductor is not a step: it has no earlier attempts to show.
+        history: false,
     }
 }

@@ -63,11 +63,12 @@ use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction};
 use crate::domain::{
     ActionConfig, ActionError, ActionExecutionId, ActionResult, AnsweredBy, Artifact, EventData,
     ExecutionId, ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType,
-    InputCloseReason, OutputDefinition, OutputLabel, StateId, WorkflowExecution,
+    InputCloseReason, ChoiceDefinition, OutputLabel, StateId, WorkflowExecution,
 };
 use crate::persistence::{ExecutionStore, PersistenceError};
 
 pub use narsor_protocol::api::HumanInputActionDto as HumanInputAction;
+pub use narsor_protocol::api::{RequiredValue, RequiredValueKind};
 
 /// Executes `HumanAction` states.
 ///
@@ -95,7 +96,8 @@ impl ActionExecutor for HumanExecutor {
                     action_execution_id: request.action_execution_id.to_string(),
                     instruction: config.instruction.clone(),
                     fields: config.inputs.clone(),
-                    question: None,
+                    reason: None,
+                    required_values: Vec::new(),
                     answer_tail: None,
                     agent_harness: None,
                     agent_session_id: None,
@@ -149,14 +151,18 @@ pub struct HumanInputRequest {
     #[serde(default)]
     pub fields: Vec<HumanInputField>,
 
-    /// The question the agent step right before this request stated in its
-    /// `data.question`, if it stated one. Set by the engine, never by an
-    /// executor; absent in records written before the engine carried it.
+    /// Why the agent or script step right before this request made its
+    /// choice (KTD11). Set by the engine, never by an executor; absent in
+    /// records written before the engine carried it, which may hold the
+    /// agent's `question` instead (KTD16).
     #[serde(default)]
-    pub question: Option<String>,
+    pub reason: Option<String>,
 
-    /// The end of that agent step's answer — the only context there is when
-    /// it stated no question.
+    /// The values that choice required, cleaned and bounded.
+    #[serde(default)]
+    pub required_values: Vec<RequiredValue>,
+
+    /// The end of that step's answer.
     #[serde(default)]
     pub answer_tail: Option<String>,
 
@@ -352,7 +358,7 @@ pub struct PendingHumanInput {
     /// Records written before labels had descriptions hold plain strings;
     /// [`deserialize_outputs`] reads those as labels without a description.
     #[serde(default, deserialize_with = "deserialize_outputs")]
-    pub outputs: Vec<OutputDefinition>,
+    pub outputs: Vec<ChoiceDefinition>,
 
     /// Whether the submitted form completes a human step or resumes the
     /// agent action that asked the question. Older pending records were all
@@ -447,24 +453,25 @@ pub struct RejectedAnswer {
     pub answer_tail: Option<String>,
 }
 
-/// The keys a delivery choosing `label` must supply (KTD15, R18).
+/// The values a delivery choosing `label` must supply (KTD15, R18).
 ///
-/// Worked out when the problem is raised, from the state the label leads to:
-/// `data` holds `question` when that state is a `human` gate, which shows the
-/// question the agent left open; `variables` holds every `context.NAME` its
-/// templates use that the context does not hold yet.
+/// Worked out when the problem is raised: `variables` holds the variables
+/// the choice requires and every `context.NAME` the templates of the state
+/// it leads to use without a declaration (KTD6), less those the context or
+/// the step's kept memory already holds; `artifacts` holds the artifacts the
+/// choice requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputRequirement {
     /// The label this is about.
     pub label: OutputLabel,
 
-    /// Keys the delivery's `data` must hold.
-    #[serde(default)]
-    pub data: Vec<String>,
-
-    /// Keys the delivery's `variables` (or the context) must hold.
+    /// Names the delivery's `variables` (or the context) must hold.
     #[serde(default)]
     pub variables: Vec<String>,
+
+    /// Names the delivery's `artifacts` must hold.
+    #[serde(default)]
+    pub artifacts: Vec<String>,
 }
 
 /// The conductor's proposal for a problem (U10): shown on the form and
@@ -475,9 +482,9 @@ pub struct ConductorAnalysis {
     #[serde(default)]
     pub label: Option<OutputLabel>,
 
-    /// The `data` it would supply.
+    /// The artifacts it would supply, name → path.
     #[serde(default)]
-    pub data: Map<String, Value>,
+    pub artifacts: BTreeMap<String, String>,
 
     /// The `variables` it would supply.
     #[serde(default)]
@@ -498,7 +505,7 @@ pub enum InputContinuation {
     /// The answer is fed back to the same agent state; no transition occurs.
     ResumeAgent,
     /// A problem (KTD3): the answer is the output the agent step did not
-    /// give — a label with its `data` and `variables` — and completes the
+    /// give — a label with its `artifacts` and `variables` — and completes the
     /// step as if the agent had kept to its output contract.
     ResolveOutput,
     ApproveOutput,
@@ -535,7 +542,7 @@ impl PendingHumanInput {
         execution_id: impl Into<ExecutionId>,
         state_id: impl Into<StateId>,
         request: HumanInputRequest,
-        outputs: Vec<OutputDefinition>,
+        outputs: Vec<ChoiceDefinition>,
     ) -> Self {
         Self {
             execution_id: execution_id.into(),
@@ -601,7 +608,7 @@ impl PendingHumanInput {
         execution_id: impl Into<ExecutionId>,
         state_id: impl Into<StateId>,
         request: HumanInputRequest,
-        outputs: Vec<OutputDefinition>,
+        outputs: Vec<ChoiceDefinition>,
         problem: OutputProblem,
     ) -> Self {
         Self {
@@ -644,7 +651,7 @@ impl PendingHumanInput {
         execution_id: impl Into<ExecutionId>,
         state_id: impl Into<StateId>,
         request: HumanInputRequest,
-        outputs: Vec<OutputDefinition>,
+        outputs: Vec<ChoiceDefinition>,
         problem: OutputProblem,
         details: EntryLimitDetails,
     ) -> Self {
@@ -698,7 +705,7 @@ fn new_episode() -> String {
 /// Reads [`PendingHumanInput::outputs`] in either shape it was ever written
 /// in: the current `{label, description}` objects, or the bare labels of
 /// records written before outputs had descriptions.
-fn deserialize_outputs<'de, D>(deserializer: D) -> Result<Vec<OutputDefinition>, D::Error>
+fn deserialize_outputs<'de, D>(deserializer: D) -> Result<Vec<ChoiceDefinition>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -706,14 +713,14 @@ where
     #[serde(untagged)]
     enum StoredOutput {
         Label(OutputLabel),
-        Defined(OutputDefinition),
+        Defined(ChoiceDefinition),
     }
 
     let stored = Vec::<StoredOutput>::deserialize(deserializer)?;
     Ok(stored
         .into_iter()
         .map(|output| match output {
-            StoredOutput::Label(label) => OutputDefinition::new(label),
+            StoredOutput::Label(label) => ChoiceDefinition::new(label),
             StoredOutput::Defined(definition) => definition,
         })
         .collect())
@@ -727,10 +734,10 @@ where
 /// * a form with fields — [`HumanInputDelivery::with_values`], optionally
 ///   pinned to a label with [`HumanInputDelivery::choosing`];
 /// * no fields at all — [`HumanInputDelivery::label`], which picks straight
-///   from the state's `outputs`.
+///   from the state's `choices`.
 ///
 /// A problem ([`InputContinuation::ResolveOutput`]) takes the third shape: a
-/// label with the step's `data` and `variables`, which no other request
+/// label with the step's `artifacts` and `variables`, which no other request
 /// accepts.
 ///
 /// Every field is optional on the wire, so a client written before a field
@@ -746,9 +753,9 @@ pub struct HumanInputDelivery {
     #[serde(default)]
     pub chosen_label: Option<OutputLabel>,
 
-    /// The step's `data`, for a problem.
+    /// The step's named artifacts, name → path, for a problem.
     #[serde(default)]
-    pub data: Map<String, Value>,
+    pub artifacts: BTreeMap<String, String>,
 
     /// The step's `variables`, for a problem.
     #[serde(default)]
@@ -808,9 +815,9 @@ impl HumanInputDelivery {
         self
     }
 
-    /// The same delivery carrying the step's `data`.
-    pub fn with_data(mut self, data: Map<String, Value>) -> Self {
-        self.data = data;
+    /// The same delivery carrying the step's artifacts.
+    pub fn with_artifacts(mut self, artifacts: BTreeMap<String, String>) -> Self {
+        self.artifacts = artifacts;
         self
     }
 
@@ -979,20 +986,20 @@ pub enum HumanActionError {
         current: String,
     },
 
-    /// A problem's answer chose a label without a key the state it leads to
-    /// needs (KTD15).
-    #[error("label '{label}' needs '{key}': the state it leads to uses it")]
+    /// A problem's answer chose a label without a value it requires
+    /// (KTD15).
+    #[error("label '{label}' needs '{key}'")]
     MissingRequiredKey {
         /// The label that was chosen.
         label: OutputLabel,
-        /// The missing key, as `data.NAME` or `variables.NAME`.
+        /// The missing value, as `variables.NAME` or `artifacts.NAME`.
         key: String,
     },
 
-    /// `data` or `variables` were delivered to a request that is not a
+    /// `artifacts` or `variables` were delivered to a request that is not a
     /// problem, where nothing would read them.
     #[error(
-        "data and variables can only be delivered to resolve a step's output; \
+        "artifacts and variables can only be delivered to resolve a step's output; \
          this request takes field values and a label"
     )]
     UnexpectedStepValues,
@@ -1059,7 +1066,8 @@ pub fn suspend(
         &execution.id,
         EventData::HumanInputRequested {
             instruction: pending.instruction().to_string(),
-            question: pending.request.question.clone(),
+            reason: pending.request.reason.clone(),
+            required_values: pending.request.required_values.clone(),
             answer_tail: pending.request.answer_tail.clone(),
             episode: Some(pending.episode_key().to_string()),
         },
@@ -1091,7 +1099,7 @@ pub fn pending_input(
 /// delivery naming another request than the pending one (KTD9) — both on the
 /// same read the answer is applied to. For a problem
 /// ([`InputContinuation::ResolveOutput`]) the answer is the step's output:
-/// the result carries the chosen label with the delivered `data` and
+/// the result carries the chosen label with the delivered `artifacts` and
 /// `variables`. On success
 /// the execution is back to `Running` on disk, `HumanInputReceived` is in the
 /// log, the pending file is gone, and the caller gets the [`ActionResult`] the
@@ -1290,7 +1298,7 @@ fn resume_inner(
         && (pending.continuation != InputContinuation::ResolveOutput
             && !(allow_permission && pending.continuation == InputContinuation::ResolvePermission)
             || delivery.chosen_label.is_some()
-            || !delivery.data.is_empty()
+            || !delivery.artifacts.is_empty()
             || !delivery.variables.is_empty()
             || !values.is_empty())
     {
@@ -1313,6 +1321,7 @@ fn resume_inner(
         InputContinuation::CompleteStep => {
             reject_step_values(delivery)?;
             let label = resolve_label(&pending, delivery, &values)?;
+            require_resume_comment(&pending, &label, &values)?;
             let answered = with_blank_optional_text(pending.fields(), &values);
             (label, Value::Object(answered.clone()), answered)
         }
@@ -1346,7 +1355,7 @@ fn resume_inner(
             let label = resolve_output(&pending, delivery, &execution)?;
             (
                 label,
-                Value::Object(delivery.data.clone()),
+                Value::Object(Map::new()),
                 delivery.variables.clone(),
             )
         }
@@ -1373,7 +1382,7 @@ fn resume_inner(
                 let label = resolve_output(&pending, delivery, &execution)?;
                 (
                     label,
-                    Value::Object(delivery.data.clone()),
+                    Value::Object(Map::new()),
                     delivery.variables.clone(),
                 )
             }
@@ -1417,6 +1426,11 @@ fn resume_inner(
     let resolves_output = pending.continuation == InputContinuation::ResolveOutput
         || (pending.continuation == InputContinuation::EntryLimit
             && delivery.chosen_label.is_some());
+    let artifacts = if resolves_output {
+        delivery.artifacts.clone()
+    } else {
+        BTreeMap::new()
+    };
     store.event_log(execution_id).append_next(
         &execution.id,
         EventData::HumanInputReceived {
@@ -1432,7 +1446,7 @@ fn resume_inner(
             ) && label != ENTRY_LIMIT_CONTINUE_LABEL
                 && label != ENTRY_LIMIT_RESET_LABEL)
                 .then(|| label.clone()),
-            data: resolves_output.then(|| data.clone()),
+            artifacts: resolves_output.then(|| json_object(&artifacts)),
             variables: resolves_output.then(|| Value::Object(variables.clone())),
             comment: delivery
                 .comment
@@ -1505,13 +1519,10 @@ fn resume_inner(
     store.clear_pending_input(execution_id)?;
 
     let result = ActionResult {
-        output_label: label,
         data,
         variables,
-        exit_code: None,
-        stdout: String::new(),
-        stderr: String::new(),
-        reply: None,
+        artifacts,
+        ..ActionResult::new(label)
     };
 
     Ok(ResumedHumanAction {
@@ -1536,7 +1547,7 @@ pub fn closing_event(
         close_reason: Some(reason),
         episode: Some(pending.episode_key().to_string()),
         output_label: None,
-        data: None,
+        artifacts: None,
         variables: None,
         comment: None,
     }
@@ -1574,11 +1585,11 @@ pub use narsor_protocol::api::{
     ENTRY_LIMIT_CONTINUE, ENTRY_LIMIT_DECISION_FIELD, ENTRY_LIMIT_RESET_COUNTER,
 };
 
-/// Refuses `data`/`variables` on a request that is not a problem: nothing
-/// would read them, and silently dropping an operator's values is worse than
-/// saying so.
+/// Refuses `artifacts`/`variables` on a request that is not a problem:
+/// nothing would read them, and silently dropping an operator's values is
+/// worse than saying so.
 fn reject_step_values(delivery: &HumanInputDelivery) -> Result<(), HumanActionError> {
-    if delivery.data.is_empty() && delivery.variables.is_empty() {
+    if delivery.artifacts.is_empty() && delivery.variables.is_empty() {
         Ok(())
     } else {
         Err(HumanActionError::UnexpectedStepValues)
@@ -1588,9 +1599,9 @@ fn reject_step_values(delivery: &HumanInputDelivery) -> Result<(), HumanActionEr
 /// Validates the answer to a problem and returns the label it chooses.
 ///
 /// The label must be one the state declares, and the delivery must hold
-/// every key the problem recorded for it (KTD15): a `data` key in `data`, a
-/// `variables` key in `variables` or already in the execution's context —
-/// the context is read from the same record the answer is applied to.
+/// every value the problem recorded for it (KTD15): a variable in
+/// `variables` or already in the execution's context — read from the same
+/// record the answer is applied to — and an artifact in `artifacts`.
 fn resolve_output(
     pending: &PendingHumanInput,
     delivery: &HumanInputDelivery,
@@ -1612,36 +1623,77 @@ fn resolve_output(
         .problem
         .as_ref()
         .and_then(|problem| problem.requirement_for(&label));
-    if let Some(requirement) = requirement {
-        let held = |map: &Map<String, Value>, key: &str| {
-            map.get(key).is_some_and(|value| !is_blank(value))
-        };
-        if let Some(key) = requirement
-            .data
-            .iter()
-            .find(|key| !held(&delivery.data, key))
-        {
-            return Err(HumanActionError::MissingRequiredKey {
-                label,
-                key: format!("data.{key}"),
-            });
-        }
-        if let Some(key) = requirement.variables.iter().find(|key| {
-            !held(&delivery.variables, key)
-                && !execution
-                    .context
-                    .variables
-                    .get(key.as_str())
-                    .is_some_and(|value| !is_blank(value))
-        }) {
-            return Err(HumanActionError::MissingRequiredKey {
-                label,
-                key: format!("variables.{key}"),
-            });
-        }
+    match requirement.and_then(|requirement| missing_value(requirement, delivery, execution)) {
+        Some(key) => Err(HumanActionError::MissingRequiredKey { label, key }),
+        None => Ok(label),
     }
+}
 
-    Ok(label)
+/// The first value `requirement` names that neither the delivery nor the
+/// context holds, as `variables.NAME` or `artifacts.NAME`.
+fn missing_value(
+    requirement: &OutputRequirement,
+    delivery: &HumanInputDelivery,
+    execution: &WorkflowExecution,
+) -> Option<String> {
+    let variable_held = |name: &&String| {
+        delivery
+            .variables
+            .get(name.as_str())
+            .or_else(|| execution.context.variables.get(name.as_str()))
+            .is_some_and(|value| !is_blank(value))
+    };
+    let artifact_given = |name: &&String| {
+        delivery
+            .artifacts
+            .get(name.as_str())
+            .is_some_and(|path| !path.trim().is_empty())
+    };
+    let missing_variable = requirement
+        .variables
+        .iter()
+        .find(|name| !variable_held(name))
+        .map(|name| format!("variables.{name}"));
+    missing_variable.or_else(|| {
+        requirement
+            .artifacts
+            .iter()
+            .find(|name| !artifact_given(name))
+            .map(|name| format!("artifacts.{name}"))
+    })
+}
+
+/// Refuses a gate's choice that resumes an agent's session with its comment
+/// when the comment is blank (KTD12): the field may be optional for the
+/// gate's other choices, never for this one.
+fn require_resume_comment(
+    pending: &PendingHumanInput,
+    label: &str,
+    values: &Map<String, Value>,
+) -> Result<(), HumanActionError> {
+    let comment_field = pending
+        .outputs
+        .iter()
+        .find(|output| output.label == label)
+        .and_then(|output| output.resume_comment_field.as_deref());
+    match comment_field {
+        Some(field) if values.get(field).is_none_or(is_blank) => {
+            Err(HumanActionError::MissingRequiredField {
+                field: field.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `artifacts` as a JSON object, for the event log.
+fn json_object(artifacts: &BTreeMap<String, String>) -> Value {
+    Value::Object(
+        artifacts
+            .iter()
+            .map(|(name, path)| (name.clone(), Value::String(path.clone())))
+            .collect(),
+    )
 }
 
 /// Checks the delivered values against the declared fields.
@@ -1766,7 +1818,7 @@ pub(crate) fn is_blank(value: &Value) -> bool {
 ///   has already been checked against the field's own `options`, so it is not
 ///   checked against `outputs` here — matching a label to a state is U7's job.
 /// * **Without fields.** `human_review_tests` declares no `inputs` at all and
-///   the user simply picks `ignore` or `fix_it` from the state's `outputs`.
+///   the user simply picks `ignore` or `fix_it` from the state's `choices`.
 ///   There is nothing to infer from, so the label must be delivered explicitly
 ///   through [`HumanInputDelivery::label`], and it *is* checked against the
 ///   recorded menu — with no fields, that menu is the whole form.

@@ -91,8 +91,8 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"choice\": \"done\"}'"]
+    choices: [done]
     transitions:
       done: completed
   completed:

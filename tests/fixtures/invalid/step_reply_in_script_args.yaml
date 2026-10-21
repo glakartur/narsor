@@ -8,7 +8,7 @@ states:
       type: agent
       harness: claude-code
       prompt: Zaimplementuj.
-    outputs:
+    choices:
       - done
     transitions:
       done: check
@@ -19,7 +19,7 @@ states:
       command: echo
       args:
         - "{{ steps.work.reply }}"
-    outputs:
+    choices:
       - success
     transitions:
       success: finished

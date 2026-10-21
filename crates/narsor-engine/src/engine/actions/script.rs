@@ -3,9 +3,10 @@
 //! Runs a command in the workspace and turns the way it ended into an output
 //! label. The label is decided in the order §3.3.B prescribes:
 //!
-//! 1. stdout parses as a JSON object carrying an `output` key — that label
-//!    wins, and brings its `variables` and `data` (and `artifacts`, see
-//!    [`ScriptExecutor`]) along;
+//! 1. stdout parses as a JSON object carrying a `choice` key — the answer an
+//!    agent gives (KTD3, [`super::answer`]): that label wins, and brings its
+//!    `reason`, `variables`, `artifacts`, `additional_data` and
+//!    `additional_artifacts` along;
 //! 2. otherwise the exit code is looked up in `exit_codes`;
 //! 3. otherwise the documented default applies: `0` → `success`, anything
 //!    else → `failure`.
@@ -21,10 +22,11 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use super::answer::{read_choice_answer, ChoiceAnswer};
 use super::{ActionExecutor, ActionOutcome, ActionRequest, TimedOutAction, ACTION_ID_ENV_VAR};
 use crate::domain::{ActionConfig, ActionError, ActionResult, ScriptActionConfig};
 
@@ -58,11 +60,6 @@ pub const DEFAULT_FAILURE_LABEL: &str = "failure";
 /// Executes `ScriptAction` states.
 ///
 /// Stateless — one instance serves the whole engine.
-///
-/// JSON on stdout may carry `artifacts` alongside `output`, `data` and
-/// `variables`. [`ActionResult`] has no artifacts field of its own (artifacts
-/// are recorded on the [`crate::domain::ActionExecution`]), so the list is
-/// carried through as `data.artifacts` for the engine to register.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScriptExecutor;
 
@@ -200,24 +197,15 @@ async fn run(
         return Err(signal_error(config, &status, &stderr));
     };
 
-    let mut result = ActionResult {
-        output_label: String::new(),
-        data: Value::Null,
-        variables: Map::new(),
-        exit_code: Some(exit_code),
-        stdout: truncate(&stdout),
-        stderr: truncate(&stderr),
-        reply: None,
+    let mut result = match parse_json_output(&stdout) {
+        Some(answer) => answer
+            .map_err(|reason| invalid_output_error(config, reason))?
+            .into_result(),
+        None => ActionResult::new(label_from_exit_code(exit_code, &config.exit_codes)),
     };
-
-    match parse_json_output(&stdout) {
-        Some(payload) => {
-            result.output_label = payload.output_label;
-            result.data = payload.data;
-            result.variables = payload.variables;
-        }
-        None => result.output_label = label_from_exit_code(exit_code, &config.exit_codes),
-    }
+    result.exit_code = Some(exit_code);
+    result.stdout = truncate(&stdout);
+    result.stderr = truncate(&stderr);
 
     Ok(ActionOutcome::Completed(result))
 }
@@ -261,50 +249,16 @@ fn label_from_exit_code(exit_code: i32, exit_codes: &HashMap<i32, String>) -> St
     }
 }
 
-/// What a script hands back on stdout, once it parsed as the documented JSON.
-struct JsonOutput {
-    output_label: String,
-    data: Value,
-    variables: Map<String, Value>,
-}
-
-/// Reads the §3.3.B JSON payload from stdout.
+/// Reads the answer object (KTD3) from stdout.
 ///
 /// Returns `None` — never an error — when stdout is not JSON at all (an
-/// ordinary log line) or is JSON without a usable `output` key. Scripts are
-/// explicitly allowed to print whatever they like and let the exit code decide.
-fn parse_json_output(stdout: &str) -> Option<JsonOutput> {
+/// ordinary log line) or is JSON without a string `choice`. Scripts are
+/// explicitly allowed to print whatever they like and let the exit code
+/// decide. An answer with a `choice` but a field of the wrong shape is an
+/// error: it was meant as an answer, and part of it would be lost.
+fn parse_json_output(stdout: &str) -> Option<Result<ChoiceAnswer, &'static str>> {
     let payload: Value = serde_json::from_str(stdout.trim()).ok()?;
-    let object = payload.as_object()?;
-    let output_label = object.get("output")?.as_str()?.to_string();
-
-    let mut data = object.get("data").cloned().unwrap_or(Value::Null);
-
-    // `ActionResult` has no artifacts field; keep the list reachable for the
-    // engine instead of dropping it.
-    if let Some(artifacts) = object.get("artifacts") {
-        match &mut data {
-            Value::Object(map) => {
-                map.insert("artifacts".to_string(), artifacts.clone());
-            }
-            Value::Null => {
-                data = serde_json::json!({ "artifacts": artifacts.clone() });
-            }
-            _ => {}
-        }
-    }
-
-    let variables = object
-        .get("variables")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-
-    Some(JsonOutput {
-        output_label,
-        data,
-        variables,
-    })
+    read_choice_answer(payload.as_object()?)
 }
 
 /// Keeps the tail of captured output within [`MAX_CAPTURED_OUTPUT_BYTES`].
@@ -343,6 +297,19 @@ fn spawn_error(
             "working_dir": working_dir.display().to_string(),
             "os_error": error.raw_os_error(),
         })),
+    }
+}
+
+/// The script answered with a `choice`, but the rest of its answer is not
+/// usable.
+fn invalid_output_error(config: &ScriptActionConfig, reason: &str) -> ActionError {
+    ActionError {
+        message: format!(
+            "the answer '{}' printed could not be used: {reason}",
+            config.command
+        ),
+        error_type: Some("invalid_script_output".to_string()),
+        details: Some(serde_json::json!({ "command": config.command })),
     }
 }
 

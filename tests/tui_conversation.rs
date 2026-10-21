@@ -396,7 +396,7 @@ fn a_run_result_shows_its_text_and_expands_to_its_metadata() {
         "{}",
         vec![ChatElement::RunResult {
             text: Some("All done.".to_string()),
-            structured_output: Some(json!({"output": "done"})),
+            structured_output: Some(json!({"choice": "done"})),
             stop_reason: Some("end_turn".to_string()),
             is_error: false,
             cost_usd: Some(0.5),
@@ -422,7 +422,7 @@ fn a_run_result_shows_its_text_and_expands_to_its_metadata() {
     assert!(
         expanded
             .iter()
-            .any(|line| line.contains("\"output\": \"done\"")),
+            .any(|line| line.contains("\"choice\": \"done\"")),
         "{expanded:?}"
     );
 }

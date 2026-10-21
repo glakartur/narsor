@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 
-use narsor_engine::domain::{ActionConfig, Context};
+use narsor_engine::domain::{ActionConfig, ArtifactReference, Context};
 use narsor_engine::workflow::load_from_file;
-use narsor_engine::workflow::template::{TemplateError, TemplateScope};
+use narsor_engine::workflow::template::{DeclaredNames, TemplateError, TemplateScope};
 use serde_json::{json, Map, Value};
 
 const WHERE: &str = "state 'implement', prompt";
@@ -560,4 +560,130 @@ fn check_syntax_ignores_unset_variables_but_reports_broken_syntax() {
         check_syntax("{{ nope.x }}", "f"),
         Err(TemplateError::UnsupportedReference { .. })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Artifacts and declared names (KTD6, KTD7)
+// ---------------------------------------------------------------------------
+
+/// A workflow whose `plan` step defines the artifact `plan_doc`, whose
+/// `work` step declares the variable `requirements_blocker`, and whose gate
+/// asks for the field `comment`.
+fn declaring_workflow() -> narsor_engine::domain::WorkflowDefinition {
+    narsor_engine::workflow::load_from_str(
+        r#"
+name: declared-names
+version: 1
+states:
+  plan:
+    action: { type: agent, prompt: plan }
+    artifacts:
+      - { name: plan_doc, description: The plan document. }
+    choices: [ready]
+    transitions: { ready: work }
+  work:
+    action: { type: agent, prompt: work }
+    variables:
+      - { name: requirements_blocker, description: What blocks the requirements. }
+    choices: [done]
+    transitions: { done: gate }
+  gate:
+    action:
+      type: human
+      message: Review.
+      inputs:
+        - { name: comment, type: text, required: false }
+    choices: [approve]
+    transitions: { approve: finished }
+  finished: { description: done }
+terminal_states: [finished]
+"#,
+    )
+    .expect("the workflow loads")
+}
+
+fn render_declared(template: &str, context: &Context) -> Result<String, TemplateError> {
+    let definition = declaring_workflow();
+    let declared = DeclaredNames::of(&definition);
+    let inputs = Map::new();
+    TemplateScope::new(&inputs, context)
+        .with_declared(&declared)
+        .render(template, WHERE)
+}
+
+fn with_artifact(name: &str, location: &str) -> Context {
+    let mut context = Context::new();
+    context.add_artifact(
+        name.to_string(),
+        ArtifactReference {
+            id: "artifact-1".to_string(),
+            name: Some(name.to_string()),
+            location: location.to_string(),
+            metadata: Value::Null,
+        },
+    );
+    context
+}
+
+#[test]
+fn an_artifact_renders_the_path_it_was_last_written_to() {
+    let context = with_artifact("plan_doc", "docs/plan.md");
+
+    let rendered = render("Read {{ artifacts.plan_doc }}.", &Map::new(), &context);
+
+    assert_eq!(rendered, "Read docs/plan.md.");
+}
+
+#[test]
+fn a_defined_artifact_without_a_write_renders_empty() {
+    let rendered = render_declared("[{{ artifacts.plan_doc }}]", &Context::new());
+
+    assert_eq!(rendered.expect("a defined artifact renders"), "[]");
+}
+
+#[test]
+fn an_artifact_no_step_defines_is_unknown() {
+    let error = render_declared("{{ artifacts.unknown }}", &Context::new())
+        .expect_err("an undefined artifact has no value");
+
+    assert!(
+        matches!(error, TemplateError::UnknownVariable { ref reference, .. } if reference == "artifacts.unknown"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_context_variable_declared_by_another_step_renders_empty_while_unset() {
+    let rendered = render_declared("[{{ context.requirements_blocker }}]", &Context::new());
+
+    assert_eq!(rendered.expect("a declared variable renders"), "[]");
+}
+
+#[test]
+fn a_gate_input_field_counts_as_a_declared_context_variable() {
+    let rendered = render_declared("[{{ context.variables.comment }}]", &Context::new());
+
+    assert_eq!(rendered.expect("a gate field renders"), "[]");
+}
+
+#[test]
+fn an_undeclared_unset_context_variable_is_still_unknown() {
+    let error = render_declared("{{ context.typo }}", &Context::new())
+        .expect_err("nothing declares the variable");
+
+    assert!(
+        matches!(error, TemplateError::UnknownVariable { ref reference, .. } if reference == "context.typo"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn check_syntax_and_reference_collectors_know_the_artifacts_root() {
+    use narsor_engine::workflow::template::{artifact_references, check_syntax};
+
+    assert!(check_syntax("{{ artifacts.plan_doc }}", "f").is_ok());
+    assert_eq!(
+        artifact_references("{{ artifacts.plan_doc }} {{ artifacts.review }} {{ artifacts.plan_doc }}"),
+        vec!["plan_doc".to_string(), "review".to_string()]
+    );
 }

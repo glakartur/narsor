@@ -21,7 +21,7 @@ states:
         - "{{ inputs.undeclared_input }}"
       exit_codes:
         0: done
-    outputs:
+    choices:
       - done
     transitions:
       done: nowhere

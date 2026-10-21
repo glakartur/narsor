@@ -491,6 +491,9 @@ async fn a_human_gate_is_summarized_and_still_waits_for_the_operator() {
         calls[0].request.payload["instruction"],
         "Is this good enough to ship?"
     );
+    assert_eq!(calls[0].request.payload["reason"], "every check passed");
+    assert_eq!(calls[0].request.payload["required_values"], json!([]));
+    assert!(calls[0].request.payload.get("question").is_none());
 
     // The gate still waits, on the same input, and nobody answered it.
     fixture.wait_until_idle(&execution.id).await;
@@ -975,7 +978,7 @@ async fn undoing_a_chosen_output_makes_the_step_a_problem_again() {
             Script::Answer(json!({
                 "decision": "choose_output",
                 "label": "implemented",
-                "data": {"units_completed": 3},
+                "artifacts": {"report": "docs/report.md"},
                 "variables": {"summary": "three units"},
                 "confidence": "high",
                 "rationale": "the agent said it finished three units",
@@ -1035,6 +1038,10 @@ async fn undoing_a_chosen_output_makes_the_step_a_problem_again() {
     );
     let analysis = problem.analysis.expect("the undone choice as the analysis");
     assert_eq!(analysis.label.as_deref(), Some("implemented"));
+    assert_eq!(
+        analysis.artifacts.get("report").map(String::as_str),
+        Some("docs/report.md")
+    );
     assert_eq!(
         analysis.variables.get("summary"),
         Some(&json!("three units"))
@@ -1184,6 +1191,83 @@ async fn undoing_a_chosen_output_keeps_the_reply_and_takes_back_the_entry() {
     assert!(prompts[3].contains("The original prose."), "{}", prompts[3]);
 }
 
+/// U5, KTD8: undoing a chosen output takes back the attempt it recorded and
+/// puts back the step's notes from before it.
+#[tokio::test]
+async fn undoing_a_chosen_output_takes_back_its_attempt_and_notes() {
+    let agent = Arc::new(ScriptedAgentExecutor::new(vec![
+        AgentTurn::Label {
+            label: "needs_requirements_revision",
+            reason: "no API named",
+            variables: json!({ "local.memory": "A" }),
+            artifacts: json!({}),
+            reply: None,
+            session: true,
+        },
+        AgentTurn::label("drafted", "drafted"),
+        AgentTurn::NoLabel {
+            reply: Some("The plan is ready."),
+            session: true,
+        },
+        AgentTurn::NoLabel {
+            reply: None,
+            session: true,
+        },
+    ]));
+    let fixture = Fixture::new(
+        "step_history",
+        Some(agent.clone()),
+        vec![(
+            ConductorPurpose::ChooseOutput,
+            Script::Answer(json!({
+                "decision": "choose_output",
+                "label": "plan_ready",
+                "variables": { "local.memory": "B" },
+                "confidence": "high",
+            })),
+        )],
+    );
+    let execution = fixture.run(json!({})).await;
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let attempts = |execution: &WorkflowExecution| {
+        execution.metadata["engine"]["step_attempts"]["plan"]["attempts"].clone()
+    };
+    let memory = |execution: &WorkflowExecution| {
+        execution.metadata["engine"]["step_locals"]["plan"]["local.memory"].clone()
+    };
+    assert_eq!(attempts(&execution).as_array().map(Vec::len), Some(2));
+    assert_eq!(memory(&execution), json!("B"));
+    let decision_id = fixture
+        .events(&execution.id)
+        .iter()
+        .find_map(|data| match data {
+            EventData::ConductorDecision {
+                decision_id,
+                kind: ConductorDecisionKind::ChooseOutput,
+                ..
+            } => Some(decision_id.clone()),
+            _ => None,
+        })
+        .expect("the conductor chose the output");
+
+    fixture
+        .registry
+        .undo_decision(&fixture.definition, &execution.id, &decision_id, || {})
+        .await
+        .expect("undo the decision");
+
+    let now = fixture.load(&execution.id);
+    assert_eq!(
+        attempts(&now),
+        json!([{
+            "ended": "choice",
+            "choice": "needs_requirements_revision",
+            "reason": "no API named",
+        }])
+    );
+    assert_eq!(memory(&now), json!("A"));
+}
+
 /// The `agent_problem` fixture whose conductor completes the step with its
 /// choice (a); runs it and returns the execution with the decision's id.
 async fn completed_by_a_chosen_output() -> (Fixture, WorkflowExecution, String) {
@@ -1195,7 +1279,7 @@ async fn completed_by_a_chosen_output() -> (Fixture, WorkflowExecution, String) 
             Script::Answer(json!({
                 "decision": "choose_output",
                 "label": "implemented",
-                "data": {"units_completed": 3},
+                "artifacts": {"report": "docs/report.md"},
                 "variables": {"summary": "three units"},
                 "confidence": "high",
             })),
@@ -1322,7 +1406,7 @@ states:
     action:
       type: agent
       prompt: Implement the feature.
-    outputs:
+    choices:
       - implemented
     transitions:
       implemented: slow
@@ -1332,7 +1416,7 @@ states:
       command: sleep
       args:
         - "30"
-    outputs:
+    choices:
       - ok
     transitions:
       ok: finished
@@ -1761,7 +1845,7 @@ async fn the_view_tells_whether_a_decision_can_still_be_undone() {
             Script::Answer(json!({
                 "decision": "choose_output",
                 "label": "implemented",
-                "data": {"units_completed": 3},
+                "artifacts": {"report": "docs/report.md"},
                 "variables": {"summary": "three units"},
                 "confidence": "high",
                 "rationale": "the agent said it finished three units",

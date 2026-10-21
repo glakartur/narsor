@@ -53,7 +53,8 @@ variables and a reachable cluster.
 The workspace build keeps `narsor`, `narsor-cli`, `narsor-server`,
 `narsor-runner`, and `narsor-controller` together in `target/debug` (or
 `target/release`), so the client can find the server and the server can find
-the local runner. To install all process binaries into the same directory:
+the local runner. To install all process binaries into the same directory, run
+`./install.sh` (add `--root DIR` to install into `DIR/bin`), or by hand:
 
 ```bash
 cargo install --path . --bins
@@ -288,7 +289,7 @@ $ narsor-cli conversation 4f1c8f0e-...-9b21 3f9c2e10-...-77aa
     4  2026-09-26T10:00:05+00:00  result     {"subtype":"success","result":"done"}
 ```
 
-### `input <EXECUTION_ID> [--field NAME=VALUE]… [--label LABEL] [--data NAME=VALUE]… [--variable NAME=VALUE]… [--comment TEXT]`
+### `input <EXECUTION_ID> [--field NAME=VALUE]… [--label LABEL] [--artifact NAME=PATH]… [--variable NAME=VALUE]… [--comment TEXT]`
 
 Delivers a human answer to an `input_needed` execution and resumes it. `--field` fills in
 the form fields declared by the `human` action; `--label` names the output label
@@ -303,20 +304,20 @@ array: send one with `--field option=...`, optionally with `--field comment=...`
 
 An agent step whose answer carried no usable output label — even after the
 engine asked it once more — waits as a **problem**: you supply the output the
-agent did not give. Pick it with `--label`, and give the step's `data` and
-context `variables` with `--data` and `--variable` (a value that reads as JSON,
-such as `3` or `true`, is taken as that; anything else is text). The request
-lists each label with its description and the keys it needs: a label leading
-to a `human` gate needs `--data question=...`, and one leading to a state whose
-templates use `{{ context.NAME }}` needs `--variable NAME=...` unless the
-context already holds it. `--comment` is kept in the event log with the answer.
+agent did not give. Pick it with `--label`, and give the step's artifacts and
+context `variables` with `--artifact NAME=PATH` and `--variable` (a value that
+reads as JSON, such as `3` or `true`, is taken as that; anything else is text).
+The request lists each label with its description and the names it needs: the
+variables and artifacts the choice requires, and any `{{ context.NAME }}` the
+next state's templates use that no step declares and the context does not hold
+yet. `--comment` is kept in the event log with the answer.
 
 The answer is bound to the request `input` read: if the request was answered or
 closed in the meantime (another window, a transition), it is refused rather
 than applied to whatever the execution waits on next.
 
 ```console
-$ narsor-cli input 4f1c8f0e-...-9b21 --label implemented --data units_completed=3
+$ narsor-cli input 4f1c8f0e-...-9b21 --label implemented --variable units_completed=3
 Input delivered to execution 4f1c8f0e-...-9b21.
 ```
 
@@ -588,7 +589,7 @@ reason. An action marked `!` asks `y` / `n` first.
 | `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor-cli task conductor undo` |
 | the panel | confirm / reject a proposal, restart a failed step with a note | `narsor-cli task conductor confirm` / `reject`, `narsor-cli task restart-step` |
 | `n` | new task (a catalogue workflow, or the path of a definition) | `narsor-cli task create <workflow>`, `narsor-cli task create --file <path>`; the catalogue is `narsor-cli task workflows`, the check of a file `narsor-cli task validate <path>` |
-| `i` / the panel | answer what waits: fields, `data`, `variables`, label, comment | `narsor-cli task input <task> --field … --data … --variable … [--waiting-id ID]` |
+| `i` / the panel | answer what waits: fields, `artifacts`, `variables`, label, comment | `narsor-cli task input <task> --field … --artifact … --variable … [--waiting-id ID]` |
 | `Space` | the next task that waits | `narsor-cli task show` ends with `Next       waiting: <task>` |
 | `H` | history: archived tasks, and executions from before the scheduler (`w` recovers a failed one) | `narsor-cli task list --archived`; `narsor-cli task history list` / `show` / `events` / `steps` / `conversation` / `conductor` / `recover` |
 | `R` | repositories: `a` registers, `d` removes (`!`) | `narsor-cli task repo list` / `add` / `remove` (the same registry on any server; `narsor-cli repo …` is the local one) |
@@ -673,7 +674,7 @@ narsor-cli task list [--archived] [--json]        # queue position (#n), `?`/`!`
 narsor-cli task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
 narsor-cli task show <task> [--json]              # title and links, what it waits on, observations with their age, timeline, conversation
 narsor-cli task pause|resume|start|archive <task> # archive deletes the workload and its storage
-narsor-cli task input <task> --field reason=ok [--data k=v] [--variable k=v] [--label L] [--waiting-id ID]   # answer the input the runner waits for
+narsor-cli task input <task> --field reason=ok [--artifact name=path] [--variable k=v] [--label L] [--waiting-id ID]   # answer the input the runner waits for
 narsor-cli task interrupt <task>                      # cut short the step the runner works on
 narsor-cli task transition <task> <state> [--override --reason <why>]   # manual transition; an override is audited
 narsor-cli task restart-step <task> [--note <text>] [--failure-key K]   # run the failed or interrupted step again
@@ -766,7 +767,7 @@ analyze:
       max_turns: 20
     read_only_paths:              # optional, relative to the workspace
       - ../other-repo/src
-  outputs: [ready, ambiguous]
+  choices: [ready, ambiguous]
   transitions:
     ready: implement
     ambiguous: human_clarification
@@ -883,16 +884,18 @@ The agent is asked — the contract is appended to every prompt — to finish wi
 a single JSON object:
 
 ```json
-{ "output": "ready", "data": {}, "variables": { "plan": "plan.md" }, "artifacts": ["plan.md"] }
+{ "choice": "ready", "reason": "the plan covers every requirement", "variables": { "summary": "3 units" }, "artifacts": { "plan_doc": "plan.md" } }
 ```
 
-`output` is the only required key, and it must be one of the state's declared
-`outputs`; `variables` reach the context, `artifacts` are registered, exactly
-as for a script action.
+`choice` must be one of the state's declared `choices`, and `reason` is one
+line that explains it (asked for, but not enforced). `variables` reach the
+context when the step declares them, named `artifacts` are registered, and
+`additional_data` / `additional_artifacts` carry anything else — exactly as for
+a script action. See WORKFLOW_SCHEMA.md §3.3.A for the full contract.
 
 Agents do not reliably emit clean JSON, so the answer is read robustly: a bare
 object, a fenced `json` code block, or an object trailing any amount of prose all
-work, and the **last** object carrying an `output` key wins. But **when no
+work, and the **last** object carrying a `choice` key wins. But **when no
 usable label can be found, the action fails** — it is never guessed, and never
 defaults to `success`. In an unattended pipeline a guessed label is a silently
 wrong transition, which is worse than a failure an operator can see. The state's
@@ -1267,7 +1270,7 @@ and modelled on real agentic development processes rather than invented ones:
 
 | File | Process | Modelled on |
 |---|---|---|
-| `workflows/compound-engineering.yaml` | brainstorm → PR → plan → PR update → work → review → PR update → learning → PR update | the `ce-*` skills of the compound-engineering plugin |
+| `workflows/compound-engineering.yaml` | five stages on one Draft merge request — requirements → plan → implementation → learning → finalize (auto-merge after a green pipeline), with a person at the end of each stage | the `ce-*` skills of the compound-engineering plugin, and `glab` |
 | `workflows/open-mercato-sdlc.yaml` | Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | Open Mercato's `SDLC.md` and the `om-*` skills |
 
 ```sh

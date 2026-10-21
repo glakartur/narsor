@@ -40,7 +40,9 @@ Reprezentuje szablon procesu biznesowego. Jest niezmienny po utworzeniu (wersjon
 **Struktura stanu (w definicji):**
 - `id`: Identyfikator stanu.
 - `action`: Definicja akcji do wykonania (typ, konfiguracja).
-- `outputs`: Lista możliwych etykiet wyjścia (np. `SUCCESS`, `FAILURE`).
+- `variables`: Zmienne kroku (`name`, `description`). Nazwa z prefiksem `local.` oznacza zmienną lokalną kroku. Tylko kroki `agent` i `script`; `local.*` tylko `agent`.
+- `artifacts`: Nazwane artefakty kroku (`name`, `description`). Tylko kroki `agent` i `script`.
+- `choices`: Lista możliwych wyborów. Każdy ma `label`, opcjonalny `description`, listę `requires_variables` i listę `requires_artifacts` (nazwy z definicji kroku) oraz opcjonalne `requires_human_approval` i `resume_comment_field`.
 - `transitions`: Mapa etykieta -> ID następnego stanu.
 - `decision_provider`: Typ dostarczyciela decyzji (`rule`, `human`, `agent`).
 - `allow_manual_override`: Czy użytkownik może wymusić przejście ręczne.
@@ -88,7 +90,9 @@ Abstrakcja operacji do wykonania. W modelu domenowym Action jest częścią defi
 - `type`: Typ akcji.
 - `config`: Specyficzne parametry (np. prompt, command, timeout).
 - `workspace_scope`: Określenie, które repozytoria są RW, a które RO.
-- `outputs`: Deklaracja możliwych wyników (etykiety).
+- `history` (tylko `AgentAction`): Czy silnik dodaje do promptu historię ponownego wejścia (domyślnie `true`).
+
+Możliwe wyniki akcji deklaruje stan w `choices`, a nie akcja.
 
 ### 2.5 ActionExecution
 
@@ -101,10 +105,15 @@ Reprezentuje pojedyncze wykonanie akcji w ramach stanu.
 - `action_type`: Typ wykonanej akcji.
 - `status`: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `UNKNOWN`.
 - `started_at`, `finished_at`: Timestampy.
-- `result`: Ustrukturyzowany wynik JSON (zgodny z kontraktem D6).
-  - `output_label`: Etykieta przejścia (np. `SUCCESS`).
-  - `variables`: Zmienne do aktualizacji kontekstu.
-  - `artifacts`: Lista wygenerowanych artefaktów.
+- `result`: Ustrukturyzowany wynik (`ActionResult`, kontrakt D64).
+  - `output_label`: Etykieta przejścia. Agent i skrypt podają ją w polu `choice` odpowiedzi.
+  - `reason`: Jedna linia uzasadnienia wyboru. Pusty tekst, gdy akcja go nie podała. Wynik `timeout` dostaje `reason` od silnika.
+  - `variables`: Zmienne zdefiniowane na kroku (globalne i `local.*`). Silnik usuwa z nich zmienne spoza definicji kroku przed zapisem wyniku (wyjątek: `agent_session_id`).
+  - `artifacts`: Nazwane artefakty kroku, mapa nazwa → ścieżka.
+  - `additional_data`: Dowolny obiekt spoza definicji kroku. Silnik go nie interpretuje. Trafiają tu też zmienne spoza definicji kroku.
+  - `additional_artifacts`: Lista ścieżek plików spoza definicji kroku.
+  - `data`: Tylko zapisy silnika (`agent_session`, `timeout_secs`). Agent i skrypt nie piszą do tego pola.
+  - `exit_code`, `stdout`, `stderr`, `reply`: Dane obserwowane przez executor.
 - `error`: Komunikat błędu (jeśli wystąpił).
 - `agent_session_id`: Referencja do sesji agenta (jeśli dotyczy).
 
@@ -115,11 +124,13 @@ Magazyn danych współdzielonych przez wszystkie kroki workflow. Przechowywany j
 **Struktura:**
 - `variables`: Płaska mapa kluczy i wartości prostych typów (string, int, bool, list).
   - Przykład: `{ "branch_name": "feature/login", "pr_number": 123 }`.
-- `artifacts_index`: Mapa nazw artefaktów do ich lokalizacji/metadanych.
+  - Nie zawiera zmiennych `local.*` (patrz niżej).
+- `artifacts_index`: Mapa nazw artefaktów do ich lokalizacji/metadanych. Nazwany artefakt kroku jest dostępny w szablonie jako `{{ artifacts.NAZWA }}` (ścieżka ostatniego zapisu).
 - `workspace_info`: Informacje o aktywnym workspace (ścieżki do repo).
 
 **Zasady:**
-- Aktualizowany wyłącznie przez Workflow Engine na podstawie pola `variables` z wyniku Action.
+- Aktualizowany wyłącznie przez Workflow Engine na podstawie pola `variables` z wyniku Action. Silnik zapisuje tylko zmienne globalne zdefiniowane na kroku i wartości pól bramki `human`.
+- Zmienne `local.*` nie trafiają do kontekstu. Silnik trzyma je w `metadata.engine.step_locals` wykonania (`state.json`), osobno dla każdego kroku (`state_id → { "local.NAZWA": wartość }`). Wartość żyje w obrębie jednego wykonania. Nowa wartość zastępuje starą w całości. Gdy próba nie poda wartości, zostaje poprzednia. Szablon `{{ local.NAZWA }}` czyta ją tylko w tym samym kroku.
 - Nie przechowuje dużych blobów danych (tylko referencje do Artifact).
 - Nie przechowuje historii rozmów agentów.
 
@@ -170,9 +181,10 @@ Niezmienny rekord faktu, który wydarzył się w systemie. Podstawa obserwowalno
   próbie, przed uśpieniem backoffu; ostatnia, wyczerpująca próba wciąż emituje tylko
   `ActionFailed`, bez tego zdarzenia. Neutralne dla `reconcile` (D23): akcja pozostaje
   niedomknięta do `ActionFailed` albo `ActionCompleted`.
-- `ActionCompleted` (z payloadem result)
-- `ActionFailed`
-- `DecisionMade` (z wybraną transition)
+- `ActionCompleted` (`action_execution_id`, `output_label`, `reason`, `additional_data`,
+  `warnings`): `warnings` zawiera m.in. ostrzeżenie o zmiennej spoza definicji kroku.
+- `ActionFailed` (`action_execution_id`, `error`, `error_type`)
+- `DecisionMade` (z wybraną transition; `reasoning` to `reason` kroku albo komentarz człowieka)
 - `TransitionTaken`
 - `EntryLimitReached` (`state_id`, `entries`, `max_entries`): przejście doszło do kroku,
   który osiągnął `max_entries`; krok nie startuje. Kolejność opisuje sekcja 6.
@@ -181,7 +193,12 @@ Niezmienny rekord faktu, który wydarzył się w systemie. Podstawa obserwowalno
   operatora na limicie.
 - `WorkflowPaused` / `WorkflowResumed`
 - `WorkflowCompleted` / `WorkflowFailed`
-- `HumanInputRequested` / `HumanInputProvided`
+- `HumanInputRequested` (`instruction`, `reason`, `required_values`, `answer_tail`, `episode`):
+  bramka po kroku `agent` albo `script` pokazuje `reason` kroku i wartości, których wymagał
+  jego wybór. Pola `question` nie ma.
+- `HumanInputReceived` (`input`, `output_label`, `artifacts`, `variables`, `comment` i inne):
+  `artifacts` to nazwane artefakty kroku podane przez operatora przy rozwiązaniu problemu
+  (dawniej pole `data`).
 - `ExternalEventReceived`
 
 U1 dodał też opcjonalne pola `#[serde(default)]` do zdarzeń istniejących, bez zmiany ich
@@ -211,7 +228,7 @@ Reprezentuje akt wyboru ścieżki przejścia. Może być podjęty przez reguły,
 - `provider_type`: `rule`, `agent`, `human`.
 - `input_result`: Wynik akcji, na podstawie którego podjęto decyzję.
 - `selected_transition`: Wybrana etykieta przejścia.
-- `reason`: Uzasadnienie (opcjonalne, np. komentarz człowieka lub output agenta).
+- `reason`: Uzasadnienie (opcjonalne). Dla decyzji reguł po kroku `agent` albo `script` to `reason` z odpowiedzi kroku (pole `DecisionMade.reasoning`). Dla decyzji człowieka to jego komentarz.
 - `timestamp`: Czas podjęcia decyzji.
 
 ### 2.11 AgentSession
@@ -360,7 +377,8 @@ przejściem i przetrwa restart procesu.
 Oczekiwanie na limicie pozostaje w statusie `InputNeeded` i używa trwałego
 `pending_input.json`. Historia zdarzeń opisuje zatrzymanie, decyzję operatora
 i ewentualne wyzerowanie licznika. Wybór etykiety na limicie rozstrzyga wynik
-kroku przez ścieżkę `ResolveOutput`, z walidacją wymaganych zmiennych.
+kroku przez ścieżkę `ResolveOutput`, z walidacją wymaganych zmiennych i
+artefaktów.
 
 Kolejność zdarzeń na limicie:
 
@@ -375,10 +393,39 @@ Kolejność zdarzeń na limicie:
 Wybór etykiety na limicie nie emituje `EntryLimitDecision`: krok kończy się
 wybranym wynikiem i nie startuje.
 
-Cofnięcie wyboru wyjścia przez dyrygenta (KTD13) przywraca `context` i
-`metadata.engine.state_entries` sprzed decyzji. Problem otwarty ponownie
+Cofnięcie wyboru wyjścia przez dyrygenta (KTD13) przywraca `context`,
+`metadata.engine.state_entries`, `metadata.engine.step_attempts` i
+`metadata.engine.step_locals` sprzed decyzji. Problem otwarty ponownie
 zawiera odpowiedź kroku (`reply`), więc nowe rozstrzygnięcie zapisuje ją
 znowu we wskaźniku `metadata.engine.step_replies`.
+
+### Wejścia, próby i pamięć kroku
+
+`metadata.engine.step_attempts` przechowuje dla każdego kroku liczbę wejść
+(`entries`) i listę prób (`attempts`), od najstarszej:
+
+```json
+{"plan": {"entries": 3, "attempts": [
+  {"ended": "choice", "choice": "needs_requirements_revision", "reason": "…"},
+  {"ended": "failure", "error_type": "timeout"}
+]}}
+```
+
+Wejście to przejście do kroku (`TransitionTaken`), stan początkowy, ręczne
+przejście operatora albo cofnięcie decyzji przez dyrygenta. Nowym wejściem nie
+jest: wznowienie po pytaniu agenta, powrót z akceptacji, reprompt, ponowienie z
+`retry_policy` ani odzyskanie po awarii. Próba to wynik wejścia: wybór z
+`reason` (`ended: choice`) albo błąd kończący krok z rodzajem błędu
+(`ended: failure`). Silnik zapisuje wejścia i próby dla każdego kroku, ale blok
+historii renderuje tylko w prompcie kroku `agent` (`WORKFLOW_SCHEMA.md` §3.3).
+
+`metadata.engine.step_locals` przechowuje wartości `local.*` każdego kroku
+(§2.6).
+
+Oba zapisy powstają w tym samym zapisie `state.json` co kontekst (albo co
+oznaczenie wykonania jako nieudanego), więc po awarii nie różnią się od
+kontekstu. Licznik `state_entries` i `max_entries` są osobne. Wyzerowanie
+licznika `state_entries` nie zmienia numeracji historii.
 
 Model został zaprojektowany z myślą o przyszłych rozszerzeniach:
 

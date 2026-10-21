@@ -185,8 +185,8 @@ states:
       command: "{script}"
       args:
         - "{seconds}"
-        - '{{"output": "done"}}'
-    outputs:
+        - '{{"choice": "done"}}'
+    choices:
       - done
     transitions:
       done: completed

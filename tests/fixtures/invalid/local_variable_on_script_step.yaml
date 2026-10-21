@@ -1,0 +1,21 @@
+# A step memory (`local.*`) lives only on an agent step.
+name: local-variable-on-script-step
+version: 1
+
+states:
+  check:
+    action:
+      type: script
+      command: ./check.sh
+    variables:
+      - name: local.memory
+        description: Notatka dla kolejnej próby.
+    choices: [success]
+    transitions:
+      success: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

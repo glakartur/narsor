@@ -98,7 +98,7 @@ fn wire_delivery(delivery: HumanInputDelivery) -> HumanInputDeliveryDto {
     HumanInputDeliveryDto {
         values: delivery.values,
         chosen_label: delivery.chosen_label,
-        data: delivery.data,
+        artifacts: delivery.artifacts,
         variables: delivery.variables,
         comment: delivery.comment,
         agent_message: delivery.agent_message,
@@ -190,6 +190,9 @@ fn seed_execution_with_retry(store: &ExecutionStore, execution_id: &str) {
         EventData::ActionCompleted {
             action_execution_id: "attempt-2".to_string(),
             output_label: "success".to_string(),
+            reason: None,
+            additional_data: Default::default(),
+            warnings: Vec::new(),
         },
     )
     .expect("append ActionCompleted");
@@ -373,7 +376,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -418,7 +421,7 @@ states:
           options:
             - approved
             - rejected
-    outputs:
+    choices:
       - approve
       - reject
     transitions:
@@ -1224,7 +1227,8 @@ async fn ordinary_input_cannot_resolve_permission_and_unapprovable_denial_stays_
         action_execution_id: "attempt-permission".to_string(),
         instruction: "Claude Code needs a permission decision.".to_string(),
         fields: Vec::new(),
-        question: None,
+        reason: None,
+        required_values: Vec::new(),
         answer_tail: None,
         agent_harness: Some("claude-code".to_string()),
         agent_session_id: Some("session-permission".to_string()),
@@ -1463,7 +1467,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -1571,7 +1575,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -2017,7 +2021,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -2188,7 +2192,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -2347,7 +2351,7 @@ async fn client_stream_all_does_not_end_when_only_one_of_several_executions_fini
 }
 
 // ---------------------------------------------------------------------------
-// U3: a manual transition carries the agent's question to the gate after it
+// A manual transition carries the agent's reason to the gate after it (U4)
 // ---------------------------------------------------------------------------
 
 use narsor_engine::domain::{ActionError, ActionResult};
@@ -2355,8 +2359,8 @@ use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, SuspendedAction,
 };
 
-/// An agent that either finishes with a question in its `data` or stops to
-/// ask one of its own (`awaiting_input`).
+/// An agent that either finishes with a reason and a value its choice
+/// requires, or stops to ask a question of its own (`awaiting_input`).
 enum AgentReply {
     Finish,
     Ask,
@@ -2374,19 +2378,23 @@ impl ActionExecutor for AgentReply {
             Ok(match self {
                 Self::Finish => ActionOutcome::Completed(ActionResult {
                     output_label: "done".to_string(),
-                    data: serde_json::json!({ "question": "Account or user limit?" }),
-                    variables: serde_json::Map::new(),
+                    reason: "the limit scope is open".to_string(),
+                    variables: serde_json::Map::from_iter([(
+                        "limit_scope".to_string(),
+                        serde_json::json!("account or user?"),
+                    )]),
                     exit_code: Some(0),
                     stdout: "the agent's answer".to_string(),
-                    stderr: String::new(),
                     reply: Some("the agent's answer".to_string()),
+                    ..Default::default()
                 }),
                 Self::Ask => ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(
                     HumanInputRequest {
                         action_execution_id,
                         instruction: "Which API version?".to_string(),
                         fields: Vec::new(),
-                        question: None,
+                        reason: None,
+                        required_values: Vec::new(),
                         answer_tail: None,
                         agent_harness: None,
                         agent_session_id: None,
@@ -2415,8 +2423,11 @@ states:
     action:
       type: agent
       prompt: Do the work.
-    outputs:
-      - done
+    variables:
+      - { name: limit_scope, description: Which limit the work applies. }
+    choices:
+      - label: done
+        requires_variables: [limit_scope]
       - needs_human_decision
     transitions:
       done: finished
@@ -2428,7 +2439,7 @@ states:
     action:
       type: human
       message: Decide.
-    outputs:
+    choices:
       - go
     transitions:
       go: finished
@@ -2498,18 +2509,27 @@ terminal_states:
 }
 
 #[tokio::test]
-async fn post_transition_from_a_finished_agent_carries_its_question() {
+async fn post_transition_from_a_finished_agent_carries_its_reason() {
     let request = manual_transition_to_gate(AgentReply::Finish).await;
 
-    assert_eq!(request.question.as_deref(), Some("Account or user limit?"));
+    assert_eq!(request.reason.as_deref(), Some("the limit scope is open"));
+    assert_eq!(
+        request.required_values,
+        vec![narsor_engine::engine::actions::human::RequiredValue {
+            name: "limit_scope".to_string(),
+            kind: narsor_engine::engine::actions::human::RequiredValueKind::Variable,
+            value: "account or user?".to_string(),
+        }]
+    );
     assert_eq!(request.answer_tail.as_deref(), Some("the agent's answer"));
 }
 
 #[tokio::test]
-async fn post_transition_from_an_asking_agent_carries_its_question() {
+async fn post_transition_from_an_asking_agent_carries_its_question_as_the_reason() {
     let request = manual_transition_to_gate(AgentReply::Ask).await;
 
-    assert_eq!(request.question.as_deref(), Some("Which API version?"));
+    assert_eq!(request.reason.as_deref(), Some("Which API version?"));
+    assert!(request.required_values.is_empty());
     assert_eq!(request.answer_tail, None);
 }
 
@@ -2612,14 +2632,14 @@ mod problems {
     }
 
     #[tokio::test]
-    async fn post_input_resolves_a_problem_with_label_data_and_variables() {
+    async fn post_input_resolves_a_problem_with_label_artifacts_and_variables() {
         let problem = problem_over_http().await;
 
         let response = post_input(
             &problem,
             &serde_json::json!({
                 "chosen_label": "implemented",
-                "data": { "units_completed": 3 },
+                "artifacts": { "report": "docs/report.md" },
                 "variables": { "summary": "login works" },
                 "episode": problem.pending.episode_key(),
                 // Not on the wire: whoever calls the API is the operator.
@@ -2645,6 +2665,10 @@ mod problems {
         )));
         assert!(events.iter().any(|event| matches!(
             &event.data,
+            EventData::ArtifactCreated { location, .. } if location == "docs/report.md"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
             EventData::HumanInputReceived {
                 answered_by: Some(AnsweredBy::Operator),
                 ..
@@ -2662,16 +2686,16 @@ mod problems {
             .deliver_input(
                 &problem.execution_id,
                 wire_delivery(
-                    HumanInputDelivery::label("needs_human_decision")
+                    HumanInputDelivery::label("implemented")
                         .for_episode(problem.pending.episode_key()),
                 ),
             )
             .await
-            .expect_err("the gate needs data.question");
+            .expect_err("implemented needs variables.summary");
         match error {
             ClientError::Request { code, message } => {
                 assert_eq!(code, "invalid_input");
-                assert!(message.contains("data.question"), "{message}");
+                assert!(message.contains("variables.summary"), "{message}");
             }
             other => panic!("expected a 400 with a reason, got {other:?}"),
         }
@@ -2728,7 +2752,6 @@ mod problems {
         let problem = problem_over_http().await;
         let body = serde_json::json!({
             "chosen_label": "needs_human_decision",
-            "data": { "question": "Which API version?" },
             "episode": problem.pending.episode_key(),
         });
 

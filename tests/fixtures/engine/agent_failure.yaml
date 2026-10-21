@@ -16,7 +16,7 @@ states:
       type: agent
       harness: claude-code
       prompt: Implement the feature.
-    outputs:
+    choices:
       - label: implemented
         description: The feature is implemented.
     transitions:

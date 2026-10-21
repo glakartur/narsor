@@ -1,0 +1,28 @@
+name: step-history
+version: 1
+description: >
+  A plan step sent back to brainstorm and entered again. Its prompt reads its
+  own memory, and the engine adds the history of its earlier attempts.
+states:
+  plan:
+    action:
+      type: agent
+      prompt: "Plan. Memory: [{{ local.memory }}]."
+    variables:
+      - { name: local.memory, description: What the plan step keeps for its next entry. }
+      - { name: local.note, description: A note the plan step keeps. }
+    choices:
+      - needs_requirements_revision
+      - label: noted
+        requires_variables: [local.note]
+      - plan_ready
+    transitions:
+      needs_requirements_revision: brainstorm
+      noted: brainstorm
+      plan_ready: completed
+  brainstorm:
+    action: { type: agent, prompt: Brainstorm. }
+    choices: [drafted]
+    transitions: { drafted: plan }
+  completed: { description: done }
+terminal_states: [completed]

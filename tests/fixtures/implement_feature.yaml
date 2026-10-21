@@ -30,7 +30,7 @@ states:
         Przeanalizuj repozytorium pod kątem implementacji: {{ inputs.feature_description }}.
         Zidentyfikuj pliki, które trzeba zmodyfikować.
         Zapisz plan w pliku plan.md.
-    outputs:
+    choices:
       - ready
       - ambiguous
     transitions:
@@ -46,7 +46,7 @@ states:
         - name: clarification_text
           type: text
           required: true
-    outputs:
+    choices:
       - clarified
       - abort
     transitions:
@@ -62,7 +62,7 @@ states:
         Zaimplementuj funkcję zgodnie z planem w plan.md
         oraz wymaganiem: {{ inputs.feature_description }}.
         Upewnij się, że kod kompiluje się.
-    outputs:
+    choices:
       - implemented
       - blocked
     transitions:
@@ -78,7 +78,7 @@ states:
         0: success
         1: failure
         2: partial_failure
-    outputs:
+    choices:
       - success
       - failure
       - partial_failure
@@ -94,7 +94,7 @@ states:
       harness: claude-code
       prompt: |
         Testy nie przeszły. Przeanalizuj logi i napraw kod.
-    outputs:
+    choices:
       - fixed
     transitions:
       fixed: test  # Pętla powrotu do testów
@@ -104,7 +104,7 @@ states:
     action:
       type: human
       message: "Część testów nie przeszła. Czy ignorować?"
-    outputs:
+    choices:
       - ignore
       - fix_it
     transitions:
@@ -119,7 +119,9 @@ states:
       args:
         - "--title"
         - "Feature: {{ inputs.feature_description }}"
-    outputs:
+    variables:
+      - { name: pr_number, description: What the step reports as pr_number. }
+    choices:
       - created
     transitions:
       created: completed

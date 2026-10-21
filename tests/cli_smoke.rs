@@ -1290,7 +1290,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -1453,7 +1453,12 @@ mod remote_support;
 /// without a label and cannot be asked again — before any daemon runs, and
 /// returns its id.
 fn stop_on_a_problem(root: &TempRoot) -> String {
-    let definition_path = engine_support::fixtures().join("engine/agent_problem.yaml");
+    stop_on_the_problem_of(root, "agent_problem")
+}
+
+/// The same for the engine fixture `workflow`.
+fn stop_on_the_problem_of(root: &TempRoot, workflow: &str) -> String {
+    let definition_path = engine_support::fixtures().join(format!("engine/{workflow}.yaml"));
     let definition = load_from_file(&definition_path).expect("load the fixture");
     let workspace_path = root.path().join("workspace");
     fs::create_dir_all(&workspace_path).expect("create workspace dir");
@@ -1499,14 +1504,14 @@ fn stop_on_a_problem(root: &TempRoot) -> String {
 
 #[test]
 #[ignore = "starts a narsor daemon; run with --ignored"]
-fn input_resolves_a_problem_with_a_label_data_and_variables() {
+fn input_resolves_a_problem_with_a_label_artifacts_and_variables() {
     let root = TempRoot::new();
     let id = stop_on_a_problem(&root);
 
-    // The label leading to the gate needs the question it shows.
-    let refused = cli(&root, &["input", &id, "--label", "needs_human_decision"]);
+    // The label requires the summary.
+    let refused = cli(&root, &["input", &id, "--label", "implemented"]);
     assert_eq!(refused.code, EXIT_FAILURE, "{refused:?}");
-    assert!(refused.output().contains("data.question"), "{refused:?}");
+    assert!(refused.output().contains("variables.summary"), "{refused:?}");
 
     let resolved = cli(
         &root,
@@ -1515,8 +1520,8 @@ fn input_resolves_a_problem_with_a_label_data_and_variables() {
             &id,
             "--label",
             "implemented",
-            "--data",
-            "units_completed=3",
+            "--artifact",
+            "report=docs/report.md",
             "--variable",
             "summary=login works",
             "--comment",
@@ -1542,7 +1547,36 @@ fn input_resolves_a_problem_with_a_label_data_and_variables() {
 }
 
 #[test]
-fn input_with_a_malformed_data_pair_is_a_usage_error() {
+#[ignore = "starts a narsor daemon; run with --ignored"]
+fn input_supplies_the_artifact_a_problem_is_missing() {
+    let root = TempRoot::new();
+    let id = stop_on_the_problem_of(&root, "plan_problem");
+
+    let refused = cli(&root, &["input", &id, "--label", "plan_ready"]);
+    assert_eq!(refused.code, EXIT_FAILURE, "{refused:?}");
+    assert!(refused.output().contains("artifacts.plan_doc"), "{refused:?}");
+
+    let resolved = cli(
+        &root,
+        &[
+            "input",
+            &id,
+            "--label",
+            "plan_ready",
+            "--artifact",
+            "plan_doc=docs/p.md",
+        ],
+    );
+    assert_eq!(resolved.code, EXIT_SUCCESS, "{resolved:?}");
+    let shown = cli(&root, &["show", &id]);
+    assert!(
+        shown.stdout.contains("Status:        completed"),
+        "{shown:?}"
+    );
+}
+
+#[test]
+fn input_with_a_malformed_artifact_pair_is_a_usage_error() {
     let root = TempRoot::new();
     let invocation = cli(
         &root,
@@ -1551,12 +1585,12 @@ fn input_with_a_malformed_data_pair_is_a_usage_error() {
             "any-id",
             "--label",
             "implemented",
-            "--data",
+            "--artifact",
             "no-equals-sign",
         ],
     );
     assert_eq!(invocation.code, EXIT_USAGE, "{invocation:?}");
-    assert!(invocation.output().contains("--data"), "{invocation:?}");
+    assert!(invocation.output().contains("--artifact"), "{invocation:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1906,8 +1940,8 @@ states:
     action:
       type: script
       command: sh
-      args: [-c, "echo started >> \"$HOME/started\"; sleep 60; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+      args: [-c, "echo started >> \"$HOME/started\"; sleep 60; printf '{\"choice\": \"done\"}'"]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -2868,7 +2902,7 @@ mod remote_cli {
             "{}",
             refused.stderr
         );
-        let malformed = remote(&harness, token, &["task", "input", "t-ask", "--data", "n"]).await;
+        let malformed = remote(&harness, token, &["task", "input", "t-ask", "--artifact", "n"]).await;
         assert_eq!(malformed.code, EXIT_USAGE, "{}", malformed.output());
 
         let answered = remote(
@@ -2884,12 +2918,10 @@ mod remote_cli {
                 "numbers=3",
                 "--field",
                 r#"extra={"a":[1,2]}"#,
-                "--data",
-                "n=3",
-                "--data",
-                "s=plain text",
-                "--data",
-                r#"list=["a","b"]"#,
+                "--artifact",
+                "plan=docs/plan.md",
+                "--artifact",
+                "notes=docs/notes 1.md",
                 "--variable",
                 "v=true",
                 "--label",
@@ -2912,9 +2944,8 @@ mod remote_cli {
             "a form field is text unless it is an object or an array"
         );
         assert_eq!(delivery.values["extra"], serde_json::json!({"a": [1, 2]}));
-        assert_eq!(delivery.data["n"], serde_json::json!(3));
-        assert_eq!(delivery.data["s"], serde_json::json!("plain text"));
-        assert_eq!(delivery.data["list"], serde_json::json!(["a", "b"]));
+        assert_eq!(delivery.artifacts["plan"], "docs/plan.md");
+        assert_eq!(delivery.artifacts["notes"], "docs/notes 1.md");
         assert_eq!(delivery.variables["v"], serde_json::json!(true));
         assert_eq!(delivery.chosen_label.as_deref(), Some("approved"));
         assert_eq!(delivery.comment.as_deref(), Some("looks fine"));

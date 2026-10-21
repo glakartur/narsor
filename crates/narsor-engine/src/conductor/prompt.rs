@@ -136,13 +136,13 @@ Without it, your decision counts as `low`.\n\
 fn decision_fields(kind: DecisionKind) -> &'static str {
     match kind {
         DecisionKind::ChooseOutput => {
-            "complete the step: add \"label\": \"<output label>\", and \"data\": {} and \
-\"variables\": {} with the values the label needs"
+            "complete the step: add \"label\": \"<output label>\", and \"variables\": {} \
+and \"artifacts\": {\"<name>\": \"<path>\"} with the values the label needs"
         }
         DecisionKind::Reprompt => "ask the agent again: add \"prompt\": \"<what to ask>\"",
         DecisionKind::Escalate => {
-            "hand the step to the operator: optionally add the \"label\", \"data\" and \
-\"variables\" you would propose"
+            "hand the step to the operator: optionally add the \"label\", \"variables\" and \
+\"artifacts\" you would propose"
         }
         DecisionKind::Retry => {
             "restart the failed step once: add \"note\": \"<note for the agent>\" and \
@@ -205,11 +205,12 @@ pub fn answer_schema(purpose: ConductorPurpose) -> Value {
 fn decision_properties(kind: DecisionKind) -> Vec<(&'static str, Value)> {
     let text = || json!({ "type": "string" });
     let object = || json!({ "type": "object" });
+    let paths = || json!({ "type": "object", "additionalProperties": { "type": "string" } });
     match kind {
         DecisionKind::ChooseOutput | DecisionKind::Escalate => vec![
             ("label", text()),
-            ("data", object()),
             ("variables", object()),
+            ("artifacts", paths()),
         ],
         DecisionKind::Reprompt => vec![("prompt", text())],
         DecisionKind::Retry => vec![("note", text()), ("diagnosis", text())],

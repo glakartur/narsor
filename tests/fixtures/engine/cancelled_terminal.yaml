@@ -10,8 +10,10 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"output": "rejected", "variables": {"reason": "reviewer said no"}}'
-    outputs:
+        - '{"choice": "rejected", "variables": {"reason": "reviewer said no"}}'
+    variables:
+      - { name: reason, description: What the step reports as reason. }
+    choices:
       - ok
       - rejected
     transitions:

@@ -721,16 +721,20 @@ fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
     use crate::domain::ConductorDecisionKind;
     use TranscriptPresentation::{Agent, Conductor, Operator};
 
+    let mut reason = None;
     let (actor, choice, presentation) = match &event.data {
         EventData::DecisionMade {
             provider,
             output_label,
-            ..
-        } => (
-            format!("agent · {}", one_line(provider)),
-            output_label.clone(),
-            Agent,
-        ),
+            reasoning,
+        } => {
+            reason = reasoning.as_deref().filter(|text| !text.trim().is_empty());
+            (
+                format!("agent · {}", one_line(provider)),
+                output_label.clone(),
+                Agent,
+            )
+        }
         EventData::ConductorDecision {
             kind,
             output_label: Some(output),
@@ -751,10 +755,17 @@ fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
         _ => return None,
     };
 
+    let mut lines = vec![format!("{actor} wybrał opcję: {}", one_line(&choice))];
+    if let Some(reason) = reason {
+        lines.push(format!(
+            "uzasadnienie: {}",
+            crate::domain::display::without_unsafe_chars(reason)
+        ));
+    }
     Some(
         TranscriptEntry::new(
             TranscriptEntryId::from(format!("workflow-choice/{}", event.sequence)),
-            vec![format!("{actor} wybrał opcję: {}", one_line(&choice))],
+            lines,
             Vec::new(),
         )
         .with_header(format!(

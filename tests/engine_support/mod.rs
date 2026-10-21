@@ -286,39 +286,54 @@ impl ActionExecutor for StubAgentExecutor {
             Ok(ActionOutcome::Completed(ActionResult {
                 output_label: label,
                 data: json!({}),
-                variables: Map::new(),
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                reply: None,
+                ..ActionResult::default()
             }))
         })
     }
 }
 
-/// An `agent` executor that answers from a fixed list of replies: each one a
-/// label together with the `data` and the answer text a real agent returns.
+/// An `agent` executor that answers from a fixed list of results, and records
+/// the prompt and the resumed session of every call.
 pub struct AnsweringAgentExecutor {
-    replies: Mutex<VecDeque<(String, Value, String)>>,
+    results: Mutex<VecDeque<ActionResult>>,
     prompts: Mutex<Vec<String>>,
+    resumed_sessions: Mutex<Vec<Option<String>>>,
 }
 
 impl AnsweringAgentExecutor {
     /// An executor that returns these `(label, data, answer)` replies, in order.
     pub fn new(replies: Vec<(&str, Value, &str)>) -> Self {
+        Self::from_results(
+            replies
+                .into_iter()
+                .map(|(label, data, answer)| ActionResult {
+                    output_label: label.to_string(),
+                    data,
+                    exit_code: Some(0),
+                    stdout: answer.to_string(),
+                    reply: Some(answer.to_string()),
+                    ..ActionResult::default()
+                })
+                .collect(),
+        )
+    }
+
+    /// An executor that returns these results, in order.
+    pub fn from_results(results: Vec<ActionResult>) -> Self {
         Self {
-            replies: Mutex::new(
-                replies
-                    .into_iter()
-                    .map(|(label, data, answer)| (label.to_string(), data, answer.to_string()))
-                    .collect(),
-            ),
+            results: Mutex::new(results.into()),
             prompts: Mutex::new(Vec::new()),
+            resumed_sessions: Mutex::new(Vec::new()),
         }
     }
 
     pub fn prompts(&self) -> Vec<String> {
         self.prompts.lock().expect("prompts").clone()
+    }
+
+    /// The `resume_session` each call was handed, in order.
+    pub fn resumed_sessions(&self) -> Vec<Option<String>> {
+        self.resumed_sessions.lock().expect("sessions").clone()
     }
 }
 
@@ -333,23 +348,21 @@ impl ActionExecutor for AnsweringAgentExecutor {
                     .lock()
                     .expect("prompts")
                     .push(config.prompt.clone());
+                self.resumed_sessions.lock().expect("sessions").push(
+                    config
+                        .parameters
+                        .get("resume_session")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                );
             }
-            let (output_label, data, stdout) = self
-                .replies
+            let result = self
+                .results
                 .lock()
-                .expect("replies")
+                .expect("results")
                 .pop_front()
-                .unwrap_or_else(|| ("unexpected".to_string(), json!({}), String::new()));
-
-            Ok(ActionOutcome::Completed(ActionResult {
-                output_label,
-                data,
-                variables: Map::new(),
-                exit_code: Some(0),
-                stdout: stdout.clone(),
-                stderr: String::new(),
-                reply: Some(stdout),
-            }))
+                .unwrap_or_else(|| ActionResult::new("unexpected"));
+            Ok(ActionOutcome::Completed(result))
         })
     }
 }
@@ -399,7 +412,8 @@ impl ActionExecutor for ResumeRejectingAgentExecutor {
                             description: None,
                             options: Vec::new(),
                         }],
-                        question: None,
+                        reason: None,
+                        required_values: Vec::new(),
                         answer_tail: None,
                         agent_harness: Some("fake".to_string()),
                         agent_session_id: Some("gone-session".to_string()),
@@ -415,11 +429,7 @@ impl ActionExecutor for ResumeRejectingAgentExecutor {
                 _ => Ok(ActionOutcome::Completed(ActionResult {
                     output_label: "done".to_string(),
                     data: json!({}),
-                    variables: Map::new(),
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    reply: None,
+                    ..ActionResult::default()
                 })),
             }
         })
@@ -476,7 +486,8 @@ impl ActionExecutor for QuestioningAgentExecutor {
                             description: None,
                             options: Vec::new(),
                         }],
-                        question: None,
+                        reason: None,
+                        required_values: Vec::new(),
                         answer_tail: None,
                         agent_harness: None,
                         agent_session_id: None,
@@ -488,11 +499,7 @@ impl ActionExecutor for QuestioningAgentExecutor {
             Ok(ActionOutcome::Completed(ActionResult {
                 output_label: "done".to_string(),
                 data: json!({}),
-                variables: Map::new(),
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                reply: None,
+                ..ActionResult::default()
             }))
         })
     }
@@ -570,11 +577,7 @@ impl ActionExecutor for TimeoutRecorder {
             Ok(ActionOutcome::Completed(ActionResult {
                 output_label: label,
                 data: json!({}),
-                variables: Map::new(),
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                reply: None,
+                ..ActionResult::default()
             }))
         })
     }
@@ -645,7 +648,9 @@ pub enum AgentTurn {
     /// says whether the harness reported a session.
     Label {
         label: &'static str,
+        reason: &'static str,
         variables: Value,
+        artifacts: Value,
         reply: Option<&'static str>,
         session: bool,
     },
@@ -657,6 +662,8 @@ pub enum AgentTurn {
     },
     /// An action failure.
     Fail,
+    /// An action failure of this error type (`timeout`, …).
+    FailOfType(&'static str),
     /// A question to the person.
     Ask(&'static str),
     /// A permission request for one Bash command.
@@ -668,7 +675,9 @@ impl AgentTurn {
     pub fn label(label: &'static str, reply: &'static str) -> Self {
         Self::Label {
             label,
+            reason: "",
             variables: json!({}),
+            artifacts: json!({}),
             reply: Some(reply),
             session: true,
         }
@@ -678,7 +687,9 @@ impl AgentTurn {
     pub fn sessionless(label: &'static str) -> Self {
         Self::Label {
             label,
+            reason: "",
             variables: json!({}),
+            artifacts: json!({}),
             reply: None,
             session: false,
         }
@@ -688,7 +699,33 @@ impl AgentTurn {
     pub fn with_variables(label: &'static str, variables: Value) -> Self {
         Self::Label {
             label,
+            reason: "",
             variables,
+            artifacts: json!({}),
+            reply: None,
+            session: true,
+        }
+    }
+
+    /// The output `label` with these named `artifacts` (name → path).
+    pub fn with_artifacts(label: &'static str, artifacts: Value) -> Self {
+        Self::Label {
+            label,
+            reason: "",
+            variables: json!({}),
+            artifacts,
+            reply: None,
+            session: true,
+        }
+    }
+
+    /// The output `label` with this `reason`.
+    pub fn with_reason(label: &'static str, reason: &'static str) -> Self {
+        Self::Label {
+            label,
+            reason,
+            variables: json!({}),
+            artifacts: json!({}),
             reply: None,
             session: true,
         }
@@ -766,7 +803,8 @@ impl ActionExecutor for ScriptedAgentExecutor {
                     options: Vec::new(),
                 }]
             },
-            question: None,
+            reason: None,
+            required_values: Vec::new(),
             answer_tail: None,
             agent_harness: Some("claude-code".to_string()),
             agent_session_id: Some("agent-session".to_string()),
@@ -776,11 +814,16 @@ impl ActionExecutor for ScriptedAgentExecutor {
         let outcome = match turn {
             AgentTurn::Label {
                 label,
+                reason,
                 variables,
+                artifacts,
                 reply,
                 session,
             } => Ok(ActionOutcome::Completed(ActionResult {
                 output_label: label.to_string(),
+                reason: reason.to_string(),
+                artifacts: serde_json::from_value(artifacts)
+                    .expect("scripted artifacts are a name → path object"),
                 // The session a reprompt of a rejected result resumes.
                 data: if session {
                     json!({
@@ -796,10 +839,9 @@ impl ActionExecutor for ScriptedAgentExecutor {
                     Value::Object(variables) => variables,
                     _ => Map::new(),
                 },
-                exit_code: None,
                 stdout: reply.unwrap_or_default().to_string(),
-                stderr: String::new(),
                 reply: reply.map(ToString::to_string),
+                ..ActionResult::default()
             })),
             AgentTurn::NoLabel { reply, session } => {
                 let mut details = json!({ "answer_tail": reply.unwrap_or_default() });
@@ -822,6 +864,11 @@ impl ActionExecutor for ScriptedAgentExecutor {
             AgentTurn::Fail => Err(ActionError {
                 message: "the scripted agent failed on purpose".to_string(),
                 error_type: None,
+                details: None,
+            }),
+            AgentTurn::FailOfType(error_type) => Err(ActionError {
+                message: format!("the scripted agent failed with {error_type}"),
+                error_type: Some(error_type.to_string()),
                 details: None,
             }),
             AgentTurn::Ask(instruction) => Ok(ActionOutcome::Suspended(

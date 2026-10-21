@@ -2,7 +2,7 @@
 #   1. `start` references an input that is not declared,
 #   2. `start` declares the output `extra` without a transition,
 #   3. `middle` has a script action with an empty command,
-#   4. `middle` has a transition for `failure`, which is not among its outputs,
+#   4. `middle` has a transition for `failure`, which is not among its choices,
 #   5. `orphan` is unreachable from the initial state.
 name: five-violations
 version: 1
@@ -18,7 +18,7 @@ states:
       type: agent
       harness: claude-code
       prompt: Zaimplementuj {{ inputs.missing }}.
-    outputs:
+    choices:
       - ok
       - extra
     transitions:
@@ -28,7 +28,7 @@ states:
     action:
       type: script
       command: ""
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -38,7 +38,7 @@ states:
     action:
       type: script
       command: ./orphan.sh
-    outputs:
+    choices:
       - success
     transitions:
       success: done

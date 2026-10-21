@@ -1,0 +1,34 @@
+name: reasoned-choice
+version: 1
+description: >
+  One script state that gives its choice with a reason, and one that gives
+  none.
+
+states:
+  check:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"choice": "done", "reason": "all checks are green"}'
+    choices:
+      - done
+    transitions:
+      done: quiet
+
+  quiet:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"choice": "done"}'
+    choices:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed
