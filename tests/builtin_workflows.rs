@@ -475,18 +475,23 @@ fn compound_engineering_revisions_continue_the_author_session() {
 /// `finalize` has its own time limit and a `timeout` choice, because the
 /// engine kills it on the limit and its own clean-up never runs (KTD14).
 #[test]
-fn compound_engineering_finalize_is_a_script_with_a_timeout_choice() {
+fn compound_engineering_finalize_steps_are_read_only_agents_with_a_timeout_choice() {
     let definition = compound_engineering();
     for step in ["finalize", "disarm_merge"] {
-        let Some(ActionConfig::Script(script)) = &definition.states[step].action else {
-            panic!("'{step}' is a script step");
+        let Some(ActionConfig::Agent(agent)) = &definition.states[step].action else {
+            panic!("'{step}' is an agent step");
         };
-        assert!(script.args.iter().any(|arg| arg.contains("glab")));
+        assert_eq!(
+            agent.workspace_access,
+            Some(narsor_engine::domain::WorkspaceAccess::ReadOnly),
+            "'{step}' must not change the workspace"
+        );
         assert!(
-            !script.args.iter().any(|arg| arg
+            !agent
+                .prompt
                 .split(|c: char| !c.is_alphanumeric() && c != '_')
-                .any(|word| word == "main")),
-            "'{step}' takes the target branch from the merge request, not a literal"
+                .any(|word| word == "main"),
+            "'{step}' takes the target branch from the pull request, not a literal"
         );
     }
     let finalize = &definition.states["finalize"];
