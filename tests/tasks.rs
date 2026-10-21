@@ -98,7 +98,7 @@ states:
           options:
             - approved
             - rejected
-    outputs:
+    choices:
       - approved
       - rejected
     transitions:
@@ -678,7 +678,7 @@ states:
           options:
             - approved
             - rejected
-    outputs:
+    choices:
       - approved
       - rejected
     transitions:
@@ -711,7 +711,7 @@ states:
           options:
             - approved
             - rejected
-    outputs:
+    choices:
       - approved
       - rejected
     transitions:
@@ -822,7 +822,7 @@ states:
       args: []
       exit_codes:
         0: done
-    outputs:
+    choices:
       - done
     transitions:
       done: finished

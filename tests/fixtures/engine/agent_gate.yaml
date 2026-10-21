@@ -10,7 +10,7 @@ states:
     action:
       type: agent
       prompt: Do the work.
-    outputs:
+    choices:
       - needs_human_decision
       - done
     transitions:
@@ -21,7 +21,7 @@ states:
     action:
       type: human
       message: The agent needs a decision.
-    outputs:
+    choices:
       - clarified
       - accept
     transitions:
@@ -32,7 +32,7 @@ states:
     action:
       type: agent
       prompt: Apply the clarification.
-    outputs:
+    choices:
       - needs_human_decision
       - done
     transitions:
@@ -45,7 +45,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "ok"}'
-    outputs:
+    choices:
       - ok
     transitions:
       ok: review
@@ -54,7 +54,7 @@ states:
     action:
       type: human
       message: Ship it?
-    outputs:
+    choices:
       - ship
     transitions:
       ship: finished

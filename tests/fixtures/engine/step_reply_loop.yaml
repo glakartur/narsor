@@ -6,13 +6,13 @@ description: >
 states:
   review:
     action: { type: agent, prompt: review the changes }
-    outputs: [findings, clean]
+    choices: [findings, clean]
     transitions: { findings: fix, clean: completed }
   fix:
     action:
       type: agent
       prompt: "Fix these findings: {{ steps.review.reply }}"
-    outputs: [fixed]
+    choices: [fixed]
     transitions: { fixed: review }
   completed: { description: done }
 terminal_states: [completed]

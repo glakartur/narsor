@@ -98,7 +98,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done

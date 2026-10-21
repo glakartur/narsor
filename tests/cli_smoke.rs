@@ -1290,7 +1290,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -1907,7 +1907,7 @@ states:
       type: script
       command: sh
       args: [-c, "echo started >> \"$HOME/started\"; sleep 60; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:

@@ -9,7 +9,7 @@ states:
     action:
       type: agent
       prompt: Do the work.
-    outputs:
+    choices:
       - done
       - rework
     transitions:

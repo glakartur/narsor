@@ -20,7 +20,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "done"}'
-    outputs:
+    choices:
       - done
     transitions:
       done: completed

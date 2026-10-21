@@ -11,7 +11,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "ok"}'
-    outputs:
+    choices:
       - ok
     transitions:
       ok: completed

@@ -11,7 +11,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "broken", "variables": {"reason": "nothing compiles"}}'
-    outputs:
+    choices:
       - ok
       - broken
     transitions:

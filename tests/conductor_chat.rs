@@ -1322,7 +1322,7 @@ states:
     action:
       type: agent
       prompt: Implement the feature.
-    outputs:
+    choices:
       - implemented
     transitions:
       implemented: slow
@@ -1332,7 +1332,7 @@ states:
       command: sleep
       args:
         - "30"
-    outputs:
+    choices:
       - ok
     transitions:
       ok: finished

@@ -24,7 +24,7 @@ use narsor_engine::conductor::{
 };
 use narsor_engine::domain::{
     ArtifactReference, ConductorOutcome, ConductorPurpose, ConductorTrigger, Confidence, Event,
-    EventData, OutputDefinition,
+    EventData, ChoiceDefinition,
 };
 use narsor_engine::engine::actions::harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessRegistry, OpenCodeAdapter,
@@ -1071,9 +1071,10 @@ fn a_long_tasks_snapshot_fits_its_budget_with_the_definition_and_pending_input_w
         workflow_id: "long".to_string(),
         status: "input_needed".to_string(),
         current_state: Some("implement".to_string()),
-        state_outputs: vec![OutputDefinition {
+        state_outputs: vec![ChoiceDefinition {
             label: "implemented".to_string(),
             requires_variables: Vec::new(),
+            requires_artifacts: Vec::new(),
             description: Some("The work is done.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,

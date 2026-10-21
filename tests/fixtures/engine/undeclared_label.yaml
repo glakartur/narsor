@@ -2,7 +2,7 @@ name: undeclared-label
 version: 1
 description: >
   A script that reports a label the state does not declare. Executors report
-  whatever they observe; judging it against `outputs` is the engine's job.
+  whatever they observe; judging it against `choices` is the engine's job.
 
 states:
   check:
@@ -11,7 +11,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "weird"}'
-    outputs:
+    choices:
       - ok
       - broken
     transitions:

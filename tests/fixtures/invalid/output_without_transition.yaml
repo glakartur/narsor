@@ -1,4 +1,4 @@
-# §5.1: every label in `outputs` needs a matching entry in `transitions`.
+# §5.1: every label in `choices` needs a matching entry in `transitions`.
 name: output-without-transition
 version: 1
 
@@ -7,7 +7,7 @@ states:
     action:
       type: script
       command: ./run.sh
-    outputs:
+    choices:
       - success
       - partial_failure
     transitions:

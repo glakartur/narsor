@@ -1,0 +1,23 @@
+# A choice may require only a variable its step defines.
+name: undefined-required-variable
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Zaimplementuj.
+    variables:
+      - name: summary
+        description: Krótkie podsumowanie.
+    choices:
+      - label: done
+        requires_variables: [summary, missing]
+    transitions:
+      done: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

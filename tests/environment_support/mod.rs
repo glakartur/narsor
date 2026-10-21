@@ -65,7 +65,7 @@ pub fn workflow_yaml(name: &str, image: Option<&str>) -> String {
         .unwrap_or_default();
     format!(
         "name: {name}\nversion: 1\n{globals}states:\n  work:\n    action:\n      type: script\n      \
-         command: \"true\"\n    outputs: [success]\n    transitions:\n      success: done\n  \
+         command: \"true\"\n    choices: [success]\n    transitions:\n      success: done\n  \
          done:\n    description: finished\nterminal_states: [done]\n"
     )
 }

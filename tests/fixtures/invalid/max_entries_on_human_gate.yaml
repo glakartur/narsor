@@ -8,7 +8,7 @@ states:
     action:
       type: human
       message: Zatwierdź.
-    outputs:
+    choices:
       - approved
     transitions:
       approved: finished

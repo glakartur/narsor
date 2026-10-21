@@ -7,7 +7,7 @@ states:
     action:
       type: script
       command: cargo test
-    outputs:
+    choices:
       - success
     transitions:
       success: work
@@ -17,7 +17,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Popraw: {{ steps.check.reply }}"
-    outputs:
+    choices:
       - done
     transitions:
       done: finished

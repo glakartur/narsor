@@ -687,7 +687,7 @@ states:
       args:
         - "{seconds}"
         - '{{"output": "done"}}'
-    outputs:
+    choices:
       - done
     transitions:
       done: completed
@@ -1029,7 +1029,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Implement the feature."
-    outputs:
+    choices:
       - label: implemented
         description: The feature is implemented.
       - label: needs_human_decision
@@ -1503,7 +1503,7 @@ states:
       type: script
       command: sh
       args: [-c, "printf '{\"output\": \"ok\"}'"]
-    outputs: [ok, rejected]
+    choices: [ok, rejected]
     transitions:
       ok: completed
       rejected: failed

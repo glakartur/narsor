@@ -19,7 +19,7 @@ states:
         - name: note
           type: text
           required: false
-    outputs:
+    choices:
       - approved
     transitions:
       approved: echo
@@ -30,7 +30,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "ok", "variables": {"echoed": "[{{ context.note }}]"}}'
-    outputs:
+    choices:
       - ok
     transitions:
       ok: completed

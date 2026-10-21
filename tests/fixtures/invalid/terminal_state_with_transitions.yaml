@@ -7,14 +7,14 @@ states:
     action:
       type: script
       command: ./run.sh
-    outputs:
+    choices:
       - success
     transitions:
       success: done
 
   done:
     description: Koniec, ale z wyjściem.
-    outputs:
+    choices:
       - again
     transitions:
       again: start

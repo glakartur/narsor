@@ -358,7 +358,7 @@ fn every_builtin_label_has_a_description() {
         let definition = narsor_engine::workflow::load_from_str(entry.source)
             .unwrap_or_else(|error| panic!("the embedded '{}' loads: {error}", entry.name));
         for (state_id, state) in &definition.states {
-            for output in &state.outputs {
+            for output in &state.choices {
                 let described = output
                     .description
                     .as_deref()
@@ -397,13 +397,13 @@ fn compound_engineering_uses_step_replies_required_variables_and_a_review_limit(
 
     let required = |state: &str, label: &str| {
         definition.states[state]
-            .outputs
+            .choices
             .iter()
             .find(|output| output.label == label)
             .expect("output exists")
             .requires_variables
             .iter()
-            .map(|variable| variable.name())
+            .map(String::as_str)
             .collect::<Vec<_>>()
     };
     assert_eq!(
@@ -442,11 +442,11 @@ fn the_work_prompt_uses_agent_input_for_ambiguity() {
         "the prompt of 'work' repeats what the engine's output contract says"
     );
     assert!(
-        output_contract(&work.outputs).contains("awaiting_input"),
+        output_contract(&work.choices).contains("awaiting_input"),
         "the output contract tells the agent to ask and resume in place"
     );
-    assert_eq!(work.outputs.len(), 1);
-    assert_eq!(work.outputs[0].label, "implemented");
+    assert_eq!(work.choices.len(), 1);
+    assert_eq!(work.choices[0].label, "implemented");
 }
 
 /// The embedded text is the file in `workflows/`, byte for byte.

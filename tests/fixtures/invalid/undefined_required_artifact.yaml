@@ -1,0 +1,20 @@
+# A choice may require only an artifact its step defines.
+name: undefined-required-artifact
+version: 1
+
+states:
+  plan:
+    action:
+      type: agent
+      prompt: Zaplanuj.
+    choices:
+      - label: ready
+        requires_artifacts: [plan_doc]
+    transitions:
+      ready: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

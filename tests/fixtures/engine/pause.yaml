@@ -13,7 +13,7 @@ states:
       args:
         - "0.4"
         - '{"output": "done", "variables": {"slow": "finished"}}'
-    outputs:
+    choices:
       - done
     transitions:
       done: fast
@@ -24,7 +24,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "done", "variables": {"fast": "finished"}}'
-    outputs:
+    choices:
       - done
     transitions:
       done: completed

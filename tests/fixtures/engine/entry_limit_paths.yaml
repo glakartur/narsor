@@ -9,7 +9,7 @@ states:
     action: { type: agent, prompt: work }
     max_entries: 2
     retry_policy: { max_attempts: 2, backoff: 0s }
-    outputs:
+    choices:
       - label: done
         requires_human_approval: true
       - checked
@@ -20,7 +20,7 @@ states:
       message: review the work
       inputs:
         - { name: note, type: text, required: true }
-    outputs:
+    choices:
       - label: revise
         resume_comment_field: note
       - finish

@@ -26,7 +26,7 @@ use std::path::Path;
 
 use crate::domain::{
     ActionConfig, DecisionConfig, ImageSpec, OutputLabel, State, StateId, ValidationError,
-    WorkflowDefinition, WorkspaceSpec,
+    WorkflowDefinition, WorkspaceSpec, LOCAL_VARIABLE_PREFIX,
 };
 
 use super::loader::{compile, LoadError};
@@ -46,7 +46,8 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
     for state_id in sorted_state_ids(definition) {
         let state = &definition.states[state_id];
         validate_action(state, &mut errors);
-        validate_output_behavior(definition, state, &mut errors);
+        validate_choice_behavior(definition, state, &mut errors);
+        validate_step_contract(state, &mut errors);
         validate_decision(state, &mut errors);
         validate_state_templates(definition, state, &mut errors);
         validate_state_image(state, &mut errors);
@@ -64,41 +65,124 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
     }
 }
 
-fn validate_output_behavior(
+fn validate_choice_behavior(
     definition: &WorkflowDefinition,
     state: &State,
     errors: &mut Vec<ValidationError>,
 ) {
-    for output in &state.outputs {
-        if output.requires_human_approval && !matches!(state.action, Some(ActionConfig::Agent(_))) {
-            errors.push(ValidationError::InvalidOutputBehavior {
+    for choice in &state.choices {
+        if choice.requires_human_approval && !matches!(state.action, Some(ActionConfig::Agent(_))) {
+            errors.push(ValidationError::InvalidChoiceBehavior {
                 state: state.id.clone(),
-                label: output.label.clone(),
-                reason: "requires_human_approval is only valid on an agent output".to_string(),
+                label: choice.label.clone(),
+                reason: "requires_human_approval is only valid on an agent choice".to_string(),
             });
         }
-        let Some(field_name) = output.resume_comment_field.as_deref() else {
+        let Some(field_name) = choice.resume_comment_field.as_deref() else {
             continue;
         };
+        // The field may be optional: the engine demands a comment only when
+        // this choice is made (KTD12).
         let valid_field = match &state.action {
             Some(ActionConfig::Human(human)) => human.inputs.iter().any(|field| {
-                field.name == field_name
-                    && field.required
-                    && field.field_type == crate::domain::HumanInputType::Text
+                field.name == field_name && field.field_type == crate::domain::HumanInputType::Text
             }),
             _ => false,
         };
-        let valid_target = state.transitions.get(&output.label).is_some_and(|target| {
+        let valid_target = state.transitions.get(&choice.label).is_some_and(|target| {
             definition.states.get(target).is_some_and(|target_state| {
                 matches!(target_state.action, Some(ActionConfig::Agent(_)))
             })
         });
         if !valid_field || !valid_target {
-            errors.push(ValidationError::InvalidOutputBehavior {
-                state: state.id.clone(), label: output.label.clone(),
-                reason: "resume_comment_field requires a required text input and an agent transition target".to_string(),
+            errors.push(ValidationError::InvalidChoiceBehavior {
+                state: state.id.clone(),
+                label: choice.label.clone(),
+                reason: "resume_comment_field requires a text input and an agent transition target"
+                    .to_string(),
             });
         }
+    }
+}
+
+/// The step contract: what a step defines, and that each choice requires
+/// only what its step defines (R9, R11, R21).
+fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
+    let defines_anything = !state.variables.is_empty() || !state.artifacts.is_empty();
+    match &state.action {
+        Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_)) => {}
+        _ if !defines_anything => {}
+        other => errors.push(ValidationError::DefinitionsNotAllowed {
+            state: state.id.clone(),
+            action_type: other.as_ref().map_or("terminal", action_type_name),
+        }),
+    }
+
+    let is_agent = matches!(state.action, Some(ActionConfig::Agent(_)));
+    for variable in &state.variables {
+        let bare_name = variable
+            .name
+            .strip_prefix(LOCAL_VARIABLE_PREFIX)
+            .unwrap_or(&variable.name);
+        if !is_plain_name(bare_name) {
+            errors.push(invalid_name(state, "variable", &variable.name));
+        }
+        if variable.is_local() && !is_agent {
+            errors.push(ValidationError::LocalVariableOutsideAgent {
+                state: state.id.clone(),
+                name: variable.name.clone(),
+            });
+        }
+    }
+    for artifact in &state.artifacts {
+        if !is_plain_name(&artifact.name) {
+            errors.push(invalid_name(state, "artifact", &artifact.name));
+        }
+    }
+
+    for choice in &state.choices {
+        for name in &choice.requires_variables {
+            if !state.variables.iter().any(|variable| &variable.name == name) {
+                errors.push(ValidationError::UndefinedRequiredVariable {
+                    state: state.id.clone(),
+                    label: choice.label.clone(),
+                    name: name.clone(),
+                });
+            }
+        }
+        for name in &choice.requires_artifacts {
+            if !state.artifacts.iter().any(|artifact| &artifact.name == name) {
+                errors.push(ValidationError::UndefinedRequiredArtifact {
+                    state: state.id.clone(),
+                    label: choice.label.clone(),
+                    name: name.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Letters, digits and `_`, not starting with a digit.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.as_bytes()[0].is_ascii_digit()
+}
+
+fn invalid_name(state: &State, kind: &'static str, name: &str) -> ValidationError {
+    ValidationError::InvalidDefinitionName {
+        state: state.id.clone(),
+        kind,
+        name: name.to_string(),
+    }
+}
+
+fn action_type_name(action: &ActionConfig) -> &'static str {
+    match action {
+        ActionConfig::Agent(_) => "agent",
+        ActionConfig::Script(_) => "script",
+        ActionConfig::Human(_) => "human",
+        ActionConfig::Wait(_) => "wait",
     }
 }
 
@@ -175,8 +259,8 @@ fn validate_graph(definition: &WorkflowDefinition, errors: &mut Vec<ValidationEr
                     target.clone(),
                 ));
             }
-            if !state.outputs.iter().any(|output| &output.label == label) {
-                errors.push(ValidationError::TransitionWithoutOutput {
+            if !state.choices.iter().any(|choice| &choice.label == label) {
+                errors.push(ValidationError::TransitionWithoutChoice {
                     state: state_id.clone(),
                     label: label.clone(),
                 });
@@ -187,12 +271,12 @@ fn validate_graph(definition: &WorkflowDefinition, errors: &mut Vec<ValidationEr
         // as an object is caught the same as a plain repeat.
         let mut declared = HashSet::new();
         let mut reported = HashSet::new();
-        for output in &state.outputs {
-            let label = output.label.as_str();
+        for choice in &state.choices {
+            let label = choice.label.as_str();
             if !declared.insert(label) && reported.insert(label) {
-                errors.push(ValidationError::DuplicateOutput {
+                errors.push(ValidationError::DuplicateChoice {
                     state: state_id.clone(),
-                    label: output.label.clone(),
+                    label: choice.label.clone(),
                 });
             }
         }
@@ -206,13 +290,13 @@ fn validate_graph(definition: &WorkflowDefinition, errors: &mut Vec<ValidationEr
             continue;
         }
 
-        // Every declared output needs somewhere to go — unless the state is
+        // Every declared choice needs somewhere to go — unless the state is
         // terminal, which the contract exempts explicitly (§5.1).
-        for output in &state.outputs {
-            if !state.transitions.contains_key(&output.label) {
-                errors.push(ValidationError::OutputWithoutTransition {
+        for choice in &state.choices {
+            if !state.transitions.contains_key(&choice.label) {
+                errors.push(ValidationError::ChoiceWithoutTransition {
                     state: state_id.clone(),
-                    label: output.label.clone(),
+                    label: choice.label.clone(),
                 });
             }
         }
@@ -331,21 +415,6 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             });
         }
     }
-    for output in &state.outputs {
-        for variable in &output.requires_variables {
-            let name = variable.name();
-            if name.is_empty()
-                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                || name.as_bytes()[0].is_ascii_digit()
-            {
-                errors.push(ValidationError::InvalidRequiredVariable {
-                    state: state.id.clone(),
-                    label: output.label.clone(),
-                    name: name.to_string(),
-                });
-            }
-        }
-    }
     let Some(action) = &state.action else {
         return;
     };
@@ -373,8 +442,8 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             if agent.prompt.trim().is_empty() {
                 errors.push(missing_field(state, "agent", "prompt"));
             }
-            if state.outputs.is_empty() {
-                errors.push(ValidationError::EmptyOutputs {
+            if state.choices.is_empty() {
+                errors.push(ValidationError::EmptyChoices {
                     state: state.id.clone(),
                     action_type: "agent",
                 });
@@ -384,8 +453,8 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             if script.command.trim().is_empty() {
                 errors.push(missing_field(state, "script", "command"));
             }
-            if state.outputs.is_empty() {
-                errors.push(ValidationError::EmptyOutputs {
+            if state.choices.is_empty() {
+                errors.push(ValidationError::EmptyChoices {
                     state: state.id.clone(),
                     action_type: "script",
                 });

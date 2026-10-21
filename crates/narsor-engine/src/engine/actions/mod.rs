@@ -18,7 +18,7 @@
 //!   rendered again would expand a `{{ ... }}` that a variable's *value*
 //!   happened to contain, which §3.3 forbids (substitution is single-pass).
 //! * **No label validation.** An executor reports the raw output label it
-//!   observed, even one the state does not declare in its `outputs`. The
+//!   observed, even one the state does not declare in its `choices`. The
 //!   engine (U7) compares it against the state and produces the error message,
 //!   because only the engine knows the state.
 //!
@@ -43,7 +43,7 @@ use std::time::Duration;
 use narsor_protocol::chat::PromptPurpose;
 
 use crate::domain::{
-    ActionConfig, ActionError, ActionResult, OutputDefinition, OutputLabel, Workspace,
+    ActionConfig, ActionError, ActionResult, ChoiceDefinition, OutputLabel, Workspace,
 };
 use crate::persistence::ConversationStore;
 
@@ -117,7 +117,7 @@ pub struct ActionRequest<'a> {
     /// each one means) by the engine rather than by the prompt's author.
     /// Empty means the caller supplied none, and the contract then asks for
     /// whatever label the task names.
-    pub outputs: &'a [OutputDefinition],
+    pub outputs: &'a [ChoiceDefinition],
 
     /// Why this attempt's prompt is sent: the step's own prompt
     /// ([`PromptPurpose::Step`], the default) or a reprompt asking the agent
@@ -164,7 +164,7 @@ impl<'a> ActionRequest<'a> {
     }
 
     /// Returns the same request carrying the state's declared outputs.
-    pub fn with_outputs(mut self, outputs: &'a [OutputDefinition]) -> Self {
+    pub fn with_outputs(mut self, outputs: &'a [ChoiceDefinition]) -> Self {
         self.outputs = outputs;
         self
     }
@@ -185,10 +185,10 @@ pub enum ActionOutcome {
     /// The time limit ran out and the action was stopped.
     ///
     /// This is deliberately *not* resolved to a label inside the executor: an
-    /// executor does not know the state's `outputs`, and §3.3.B makes the
+    /// executor does not know the state's `choices`, and §3.3.B makes the
     /// `timeout` label conditional on the state declaring it. The engine calls
     /// [`TimedOutAction::resolve`] with the declared labels in hand, which
-    /// keeps all `outputs` knowledge in one place (U7).
+    /// keeps all `choices` knowledge in one place (U7).
     TimedOut(TimedOutAction),
 
     /// The action neither finished nor ran out of time: it is waiting for

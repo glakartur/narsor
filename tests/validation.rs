@@ -94,7 +94,7 @@ fn output_without_a_transition_is_rejected() {
     assert!(
         errors.iter().any(|err| matches!(
             err,
-            ValidationError::OutputWithoutTransition { state, label }
+            ValidationError::ChoiceWithoutTransition { state, label }
                 if state == "start" && label == "partial_failure"
         )),
         "got: {}",
@@ -108,7 +108,7 @@ fn transition_for_an_undeclared_label_is_rejected() {
     assert!(
         errors.iter().any(|err| matches!(
             err,
-            ValidationError::TransitionWithoutOutput { state, label }
+            ValidationError::TransitionWithoutChoice { state, label }
                 if state == "start" && label == "failure"
         )),
         "got: {}",
@@ -121,12 +121,12 @@ fn an_output_declared_twice_in_mixed_forms_is_rejected() {
     let errors = errors_of("duplicate_output.yaml");
     let duplicates: Vec<_> = errors
         .iter()
-        .filter(|err| matches!(err, ValidationError::DuplicateOutput { .. }))
+        .filter(|err| matches!(err, ValidationError::DuplicateChoice { .. }))
         .collect();
     assert!(
         matches!(
             duplicates[..],
-            [ValidationError::DuplicateOutput { state, label }]
+            [ValidationError::DuplicateChoice { state, label }]
                 if state == "start" && label == "success"
         ),
         "exactly one duplicate is reported, got: {}",
@@ -145,7 +145,7 @@ states:
     action:
       type: script
       command: ./run.sh
-    outputs:
+    choices:
       - success
       - label: failure
         description: The run did not finish.
@@ -251,7 +251,7 @@ states:
     action:
       type: script
       command: ./run.sh
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -287,7 +287,9 @@ fn initial_state_that_does_not_exist_is_rejected() {
             max_entries: None,
             description: None,
             action: None,
-            outputs: Vec::new(),
+            variables: Vec::new(),
+            artifacts: Vec::new(),
+            choices: Vec::new(),
             transitions: HashMap::new(),
             decision: None,
             timeout_secs: None,
@@ -331,14 +333,14 @@ version: 1
 states:
   review:
     action: { type: agent, prompt: review }
-    outputs: [done]
+    choices: [done]
     transitions: { done: fix }
   fix:
     max_entries: 3
     action:
       type: agent
       prompt: "Fix: {{ steps.review.reply }}"
-    outputs: [done]
+    choices: [done]
     transitions: { done: finished }
   finished: { description: done }
 terminal_states: [finished]
@@ -468,17 +470,106 @@ fn max_entries_on_a_human_gate_is_rejected() {
 }
 
 #[test]
-fn an_invalid_required_variable_name_is_rejected() {
+fn an_invalid_variable_name_is_rejected() {
     let errors = errors_of("invalid_required_variable_name.yaml");
     assert!(
         errors.iter().any(|err| matches!(
             err,
-            ValidationError::InvalidRequiredVariable { state, label, name }
-                if state == "work" && label == "done" && name == "pr-url"
+            ValidationError::InvalidDefinitionName { state, kind, name }
+                if state == "work" && *kind == "variable" && name == "pr-url"
         )),
         "got: {}",
         describe(&errors)
     );
+}
+
+#[test]
+fn a_choice_requiring_an_undefined_variable_is_rejected() {
+    let errors = errors_of("undefined_required_variable.yaml");
+    assert!(
+        matches!(
+            errors.as_slice(),
+            [ValidationError::UndefinedRequiredVariable { state, label, name }]
+                if state == "work" && label == "done" && name == "missing"
+        ),
+        "got: {}",
+        describe(&errors)
+    );
+    let message = errors[0].to_string();
+    assert!(
+        message.contains("work") && message.contains("missing"),
+        "names the step and the variable: {message}"
+    );
+}
+
+#[test]
+fn a_choice_requiring_an_undefined_artifact_is_rejected() {
+    let errors = errors_of("undefined_required_artifact.yaml");
+    assert!(
+        matches!(
+            errors.as_slice(),
+            [ValidationError::UndefinedRequiredArtifact { state, label, name }]
+                if state == "plan" && label == "ready" && name == "plan_doc"
+        ),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_local_variable_on_a_script_step_is_rejected() {
+    let errors = errors_of("local_variable_on_script_step.yaml");
+    assert!(
+        matches!(
+            errors.as_slice(),
+            [ValidationError::LocalVariableOutsideAgent { state, name }]
+                if state == "check" && name == "local.memory"
+        ),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn variables_on_a_human_gate_are_rejected() {
+    let errors = errors_of("variables_on_human_gate.yaml");
+    assert!(
+        matches!(
+            errors.as_slice(),
+            [ValidationError::DefinitionsNotAllowed { state, action_type }]
+                if state == "gate" && *action_type == "human"
+        ),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_resume_comment_field_may_point_to_an_optional_text_input() {
+    let yaml = r#"
+name: optional-comment
+version: 1
+states:
+  work:
+    action: { type: agent, prompt: do it }
+    choices: [done]
+    transitions: { done: gate }
+  gate:
+    action:
+      type: human
+      message: review
+      inputs:
+        - { name: comment, type: text }
+    choices:
+      - approve
+      - label: revise
+        resume_comment_field: comment
+    transitions: { approve: finished, revise: work }
+  finished: { description: done }
+terminal_states: [finished]
+"#;
+    let errors = narsor_engine::workflow::validate_source(yaml).expect("the file must compile");
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
 }
 
 #[test]
@@ -491,7 +582,7 @@ states:
     action:
       type: agent
       prompt: "Review again. Last time: {{ steps.review.reply }}"
-    outputs: [again, done]
+    choices: [again, done]
     transitions: { again: review, done: finished }
   finished: { description: done }
 terminal_states: [finished]
@@ -534,7 +625,7 @@ states:
   start:
     action:
       type: script
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -554,7 +645,7 @@ fn agent_action_with_empty_outputs_is_rejected() {
     assert!(
         errors.iter().any(|err| matches!(
             err,
-            ValidationError::EmptyOutputs { state, action_type }
+            ValidationError::EmptyChoices { state, action_type }
                 if state == "work" && *action_type == "agent"
         )),
         "got: {}",
@@ -634,7 +725,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "{{ context.clarification_text | default(inputs.feature_description) }} {{ context.anything }}"
-    outputs: [done]
+    choices: [done]
     transitions:
       done: finished
   finished:
@@ -690,7 +781,7 @@ fn five_violations_are_reported_as_five_errors() {
             if state == "start" && variable == "missing")
         },
         |err| {
-            matches!(err, ValidationError::OutputWithoutTransition { state, label }
+            matches!(err, ValidationError::ChoiceWithoutTransition { state, label }
             if state == "start" && label == "extra")
         },
         |err| {
@@ -698,7 +789,7 @@ fn five_violations_are_reported_as_five_errors() {
             if state == "middle" && *field == "command")
         },
         |err| {
-            matches!(err, ValidationError::TransitionWithoutOutput { state, label }
+            matches!(err, ValidationError::TransitionWithoutChoice { state, label }
             if state == "middle" && label == "failure")
         },
         |err| matches!(err, ValidationError::UnreachableState(state) if state == "orphan"),
@@ -729,7 +820,7 @@ states:
     action:
       type: agent
       prompt: Do the thing.
-    outputs:
+    choices:
       - done
     transitions:
       done: completed
@@ -763,7 +854,7 @@ states:
       type: agent
       harnes: claude-code
       prompt: Do the thing.
-    outputs:
+    choices:
       - done
     transitions:
       done: completed
@@ -798,7 +889,7 @@ states:
       type: agent
       harness: {written}
       prompt: Do the thing.
-    outputs:
+    choices:
       - done
     transitions:
       done: completed
@@ -839,7 +930,7 @@ states:
     action:
       type: script
       command: make
-    outputs: [success]
+    choices: [success]
     transitions:
       success: done
   done:
@@ -903,7 +994,7 @@ fn with_display(display: &str, extra: &str) -> String {
     format!(
         "name: shown\nversion: 1\ninputs:\n  - name: ticket\n    type: string\n    required: true\n\
          {display}\n{extra}states:\n  work:\n    action:\n      type: script\n      command: \"true\"\n\
-         \x20   outputs: [ok]\n    transitions:\n      ok: done\n  done:\n    description: end\n\
+         \x20   choices: [ok]\n    transitions:\n      ok: done\n  done:\n    description: end\n\
          terminal_states: [done]\n"
     )
 }

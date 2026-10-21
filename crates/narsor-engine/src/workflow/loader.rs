@@ -20,16 +20,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{
-    ActionConfig, AgentActionConfig, AgentDecisionConfig, DecisionConfig, DisplayLinkSpec,
-    DisplaySpec, GlobalsConfig, HumanActionConfig, HumanDecisionConfig, HumanInputField,
-    HumanInputType, InputParameter, OutputDefinition, ParamType, RetryPolicy, ScriptActionConfig,
-    State, TerminalStatus, WaitActionConfig, WorkflowDefinition, WorkspaceSpec,
+    ActionConfig, AgentActionConfig, AgentDecisionConfig, ArtifactDefinition, ChoiceDefinition,
+    DecisionConfig, DisplayLinkSpec, DisplaySpec, GlobalsConfig, HumanActionConfig,
+    HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter, ParamType, RetryPolicy,
+    ScriptActionConfig, State, TerminalStatus, VariableDefinition, WaitActionConfig,
+    WorkflowDefinition, WorkspaceSpec,
 };
 
 use super::schema::{
-    ActionSchema, DecisionSchema, DisplaySchema, GlobalsSchema, HumanInputTypeSchema, InputSchema,
-    ParamTypeSchema, RetryPolicySchema, StateSchema, TerminalStatusSchema, WorkflowFile,
-    WorkspaceSchema,
+    ActionSchema, ChoiceSchema, DecisionSchema, DisplaySchema, GlobalsSchema, HumanInputTypeSchema,
+    InputSchema, ParamTypeSchema, RetryPolicySchema, StateSchema, TerminalStatusSchema,
+    WorkflowFile, WorkspaceSchema,
 };
 
 /// Errors that can occur while loading a workflow definition from YAML.
@@ -222,37 +223,23 @@ fn compile_state(
         max_entries: state.max_entries,
         description: state.description,
         action: state.action.map(compile_action),
-        outputs: state
-            .outputs
+        variables: state
+            .variables
             .into_iter()
-            .map(|output| OutputDefinition {
-                label: output.label,
-                requires_variables: output
-                    .requires_variables
-                    .into_iter()
-                    .map(|variable| match variable {
-                        crate::workflow::schema::RequiredVariableSchema::Name(name) => {
-                            crate::domain::RequiredVariable::Name(name)
-                        }
-                        crate::workflow::schema::RequiredVariableSchema::Described {
-                            name,
-                            description,
-                        } => crate::domain::RequiredVariable::Described { name, description },
-                    })
-                    .collect(),
-                // A blank description says nothing; treating it as absent
-                // keeps an empty dash out of every place labels are listed.
-                description: output
-                    .description
-                    .map(|text| text.trim().to_string())
-                    .filter(|text| !text.is_empty()),
-                requires_human_approval: output.requires_human_approval,
-                resume_comment_field: output
-                    .resume_comment_field
-                    .map(|text| text.trim().to_string())
-                    .filter(|text| !text.is_empty()),
+            .map(|variable| VariableDefinition {
+                name: variable.name,
+                description: variable.description,
             })
             .collect(),
+        artifacts: state
+            .artifacts
+            .into_iter()
+            .map(|artifact| ArtifactDefinition {
+                name: artifact.name,
+                description: artifact.description,
+            })
+            .collect(),
+        choices: state.choices.into_iter().map(compile_choice).collect(),
         transitions: state.transitions,
         decision: state.decision.map(compile_decision),
         timeout_secs,
@@ -262,6 +249,24 @@ fn compile_state(
         allow_manual_override: state.allow_manual_override,
         image: state.image,
     }
+}
+
+fn compile_choice(choice: ChoiceSchema) -> ChoiceDefinition {
+    ChoiceDefinition {
+        label: choice.label,
+        requires_variables: choice.requires_variables,
+        requires_artifacts: choice.requires_artifacts,
+        // A blank description says nothing; treating it as absent keeps an
+        // empty dash out of every place labels are listed.
+        description: non_blank(choice.description),
+        requires_human_approval: choice.requires_human_approval,
+        resume_comment_field: non_blank(choice.resume_comment_field),
+    }
+}
+
+fn non_blank(text: Option<String>) -> Option<String> {
+    text.map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 fn compile_action(action: ActionSchema) -> ActionConfig {
@@ -277,6 +282,7 @@ fn compile_action(action: ActionSchema) -> ActionConfig {
             workspace: None,
             parameters: agent.parameters,
             read_only_paths: agent.read_only_paths,
+            history: agent.history,
         }),
         ActionSchema::Script(script) => ActionConfig::Script(ScriptActionConfig {
             command: script.command,

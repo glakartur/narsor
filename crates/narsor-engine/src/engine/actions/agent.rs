@@ -71,7 +71,7 @@ use super::{
 };
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, AgentSessionStatus,
-    Event, EventData, OutputDefinition, WorkspaceAccess,
+    Event, EventData, ChoiceDefinition, WorkspaceAccess,
 };
 use crate::persistence::{
     ConversationSource, ConversationStore, ConversationWriter, DefaultHarnessSelector,
@@ -84,13 +84,13 @@ use crate::persistence::{
 /// Kept deliberately short and imperative: it competes for attention with the
 /// state's own prompt, and a long preamble is the first thing a model drops.
 ///
-/// The permitted labels come from the state itself (`outputs`, in declaration
+/// The permitted labels come from the state itself (`choices`, in declaration
 /// order), each followed by its description when the workflow gives one. The
 /// engine is therefore the single source of the list: a prompt no longer has
 /// to repeat the labels for the agent to know them. With no outputs to list
 /// (a direct call with nothing wired up) the agent is pointed at the label
 /// the task asks for instead.
-pub fn output_contract(outputs: &[OutputDefinition]) -> String {
+pub fn output_contract(outputs: &[ChoiceDefinition]) -> String {
     let labels = if outputs.is_empty() {
         "`output` is required and must be the label the task asks for.\n".to_string()
     } else {
@@ -104,17 +104,7 @@ pub fn output_contract(outputs: &[OutputDefinition]) -> String {
                 _ => list.push_str(&format!("- `{}`\n", output.label)),
             }
             for required in &output.requires_variables {
-                match required
-                    .description()
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                {
-                    Some(description) => list.push_str(&format!(
-                        "  - Set `variables.{}`: {description}\n",
-                        required.name()
-                    )),
-                    None => list.push_str(&format!("  - Set `variables.{}`\n", required.name())),
-                }
+                list.push_str(&format!("  - Set `variables.{required}`\n"));
             }
         }
         list
@@ -152,7 +142,7 @@ cannot continue."
 /// string is allowed, as the text contract then asks for the label the task
 /// names. `artifacts` is an array of anything, because an entry may be a path
 /// or an object (see the engine's artifact registration).
-pub fn output_schema(outputs: &[OutputDefinition]) -> Value {
+pub fn output_schema(outputs: &[ChoiceDefinition]) -> Value {
     let mut output = serde_json::json!({ "type": "string" });
     if !outputs.is_empty() {
         let labels: Vec<&str> = outputs.iter().map(|output| output.label.as_str()).collect();

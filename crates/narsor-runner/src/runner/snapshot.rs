@@ -244,7 +244,7 @@ states:
     action:
       type: script
       command: "true"
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
 "#;

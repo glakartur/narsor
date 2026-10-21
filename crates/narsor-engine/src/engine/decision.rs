@@ -23,7 +23,7 @@
 //! where D20 (an agent that has to be told to pick again) will hook in.
 
 use crate::domain::{
-    ActionResult, DecisionConfig, DecisionProviderType, OutputDefinition, OutputLabel, State,
+    ActionResult, DecisionConfig, DecisionProviderType, ChoiceDefinition, OutputLabel, State,
     StateId,
 };
 
@@ -98,7 +98,7 @@ pub enum DecisionError {
         state: StateId,
         /// The label that came back.
         label: OutputLabel,
-        /// The labels the state declares in `outputs`.
+        /// The labels the state declares in `choices`.
         permitted: Vec<OutputLabel>,
     },
 
@@ -118,7 +118,7 @@ pub enum DecisionError {
 /// The labels a state declares, in declaration order.
 pub fn permitted_labels(state: &State) -> Vec<OutputLabel> {
     state
-        .outputs
+        .choices
         .iter()
         .map(|output| output.label.clone())
         .collect()
@@ -128,8 +128,8 @@ pub fn permitted_labels(state: &State) -> Vec<OutputLabel> {
 ///
 /// The same set as [`permitted_labels`], for the places that offer the labels
 /// to someone choosing between them and should say what each one means.
-pub fn permitted_outputs(state: &State) -> Vec<OutputDefinition> {
-    state.outputs.clone()
+pub fn permitted_outputs(state: &State) -> Vec<ChoiceDefinition> {
+    state.choices.clone()
 }
 
 /// Asks the state's decision provider which label the transition follows.
@@ -181,7 +181,7 @@ pub fn check_label<'a>(state: &'a State, label: &str) -> Result<&'a StateId, Dec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AgentDecisionConfig, HumanDecisionConfig, OutputDefinition};
+    use crate::domain::{AgentDecisionConfig, HumanDecisionConfig, ChoiceDefinition};
     use std::collections::HashMap;
 
     fn state_with(decision: Option<DecisionConfig>) -> State {
@@ -193,17 +193,21 @@ mod tests {
             max_entries: None,
             description: None,
             action: None,
-            outputs: vec![
-                OutputDefinition {
+            variables: Vec::new(),
+            artifacts: Vec::new(),
+            choices: vec![
+                ChoiceDefinition {
                     label: "success".to_string(),
                     requires_variables: Vec::new(),
+                    requires_artifacts: Vec::new(),
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,
                 },
-                OutputDefinition {
+                ChoiceDefinition {
                     label: "orphan".to_string(),
                     requires_variables: Vec::new(),
+                    requires_artifacts: Vec::new(),
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,

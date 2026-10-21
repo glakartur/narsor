@@ -189,9 +189,17 @@ pub struct State {
     #[serde(default)]
     pub action: Option<ActionConfig>,
 
-    /// Possible outputs from this state's action
+    /// Variables the step's action may set, each with what it means.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<VariableDefinition>,
+
+    /// Artifacts the step's action may produce, each with what it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactDefinition>,
+
+    /// The choices that end this state's action (`choices` in YAML).
     #[serde(default)]
-    pub outputs: Vec<OutputDefinition>,
+    pub choices: Vec<ChoiceDefinition>,
 
     /// Transitions from this state based on decision results
     #[serde(default)]
@@ -286,6 +294,15 @@ pub struct AgentActionConfig {
     /// Extra paths mounted read-only, relative to the workspace
     #[serde(default)]
     pub read_only_paths: Vec<String>,
+
+    /// Whether the engine adds the history of earlier attempts to the prompt
+    /// when the step is entered again (`history` in YAML).
+    #[serde(default = "default_history")]
+    pub history: bool,
+}
+
+fn default_history() -> bool {
+    true
 }
 
 fn legacy_workspace_access() -> Option<WorkspaceAccess> {
@@ -440,14 +457,49 @@ pub enum WorkspaceRef {
     Path(String),
 }
 
-/// Definition of a possible output from an action
+/// A variable a step defines: its name and what its value means.
+///
+/// A name with the [`LOCAL_VARIABLE_PREFIX`] is the step's own memory and
+/// never reaches the shared context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutputDefinition {
+pub struct VariableDefinition {
+    pub name: String,
+    pub description: String,
+}
+
+impl VariableDefinition {
+    /// Whether this variable is the step's own memory (`local.*`).
+    pub fn is_local(&self) -> bool {
+        self.name.starts_with(LOCAL_VARIABLE_PREFIX)
+    }
+}
+
+/// The prefix of a variable that stays with its step (`local.memory`).
+pub const LOCAL_VARIABLE_PREFIX: &str = "local.";
+
+/// An artifact a step defines: its name and what the file is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactDefinition {
+    pub name: String,
+    pub description: String,
+}
+
+/// One choice that ends a step, and what it needs to be accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoiceDefinition {
     pub label: OutputLabel,
-    /// Variables that must be present when this output is selected.
+    /// Names of step variables that must have a value when this choice is
+    /// made.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_required_names"
+    )]
+    pub requires_variables: Vec<String>,
+    /// Names of step artifacts that must be given when this choice is made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requires_variables: Vec<RequiredVariable>,
-    /// What choosing this label means, shown wherever the label is offered
+    pub requires_artifacts: Vec<String>,
+    /// What making this choice means, shown wherever the choice is offered
     /// (the agent's output contract, the input form, the transition menu).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -455,40 +507,43 @@ pub struct OutputDefinition {
     /// ordinary transition is applied.
     #[serde(default)]
     pub requires_human_approval: bool,
-    /// A required text input whose value continues the transition target
-    /// agent's prior session after this human output is selected.
+    /// A text input whose value continues the transition target agent's
+    /// prior session after this human choice is made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_comment_field: Option<String>,
 }
 
-/// A variable required for one output, optionally with prompt guidance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RequiredVariable {
-    Name(String),
-    Described { name: String, description: String },
+/// Reads `requires_variables` of a stored record (`pending_input.json`) in
+/// either shape it was ever written in: plain names, or the
+/// `{name, description}` objects of records written before descriptions
+/// moved to the step (KTD16: stored engine records stay readable).
+fn deserialize_required_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredName {
+        Name(String),
+        Described { name: String },
+    }
+
+    let stored = Vec::<StoredName>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .map(|entry| match entry {
+            StoredName::Name(name) | StoredName::Described { name } => name,
+        })
+        .collect())
 }
 
-impl RequiredVariable {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Name(name) | Self::Described { name, .. } => name,
-        }
-    }
-    pub fn description(&self) -> Option<&str> {
-        match self {
-            Self::Name(_) => None,
-            Self::Described { description, .. } => Some(description),
-        }
-    }
-}
-
-impl OutputDefinition {
-    /// An output with no description.
+impl ChoiceDefinition {
+    /// A choice with no description and no requirements.
     pub fn new(label: impl Into<OutputLabel>) -> Self {
         Self {
             label: label.into(),
             requires_variables: Vec::new(),
+            requires_artifacts: Vec::new(),
             description: None,
             requires_human_approval: false,
             resume_comment_field: None,
@@ -591,14 +646,14 @@ pub enum ValidationError {
     #[error("Workflow must have at least one terminal state")]
     NoTerminalState,
 
-    #[error("State '{state}' declares output '{label}' but has no transition for it")]
-    OutputWithoutTransition { state: StateId, label: OutputLabel },
+    #[error("State '{state}' declares choice '{label}' but has no transition for it")]
+    ChoiceWithoutTransition { state: StateId, label: OutputLabel },
 
-    #[error("State '{state}' has a transition for label '{label}', which is not declared in its outputs")]
-    TransitionWithoutOutput { state: StateId, label: OutputLabel },
+    #[error("State '{state}' has a transition for label '{label}', which is not declared in its choices")]
+    TransitionWithoutChoice { state: StateId, label: OutputLabel },
 
-    #[error("State '{state}' declares output '{label}' more than once")]
-    DuplicateOutput { state: StateId, label: OutputLabel },
+    #[error("State '{state}' declares choice '{label}' more than once")]
+    DuplicateChoice { state: StateId, label: OutputLabel },
 
     #[error("State '{0}' is not reachable from the initial state")]
     UnreachableState(StateId),
@@ -620,8 +675,8 @@ pub enum ValidationError {
         field: &'static str,
     },
 
-    #[error("State '{state}' has a {action_type} action with an empty 'outputs' list")]
-    EmptyOutputs {
+    #[error("State '{state}' has a {action_type} action with an empty 'choices' list")]
+    EmptyChoices {
         state: StateId,
         action_type: &'static str,
     },
@@ -631,11 +686,34 @@ pub enum ValidationError {
     )]
     InvalidMaxEntries { state: StateId, value: u32 },
 
-    #[error("Output '{label}' in state '{state}' has invalid required variable name '{name}'")]
-    InvalidRequiredVariable {
+    #[error("State '{state}' defines {kind} with invalid name '{name}'")]
+    InvalidDefinitionName {
+        state: StateId,
+        kind: &'static str,
+        name: String,
+    },
+
+    #[error("Choice '{label}' in state '{state}' requires variable '{name}', which the state does not define")]
+    UndefinedRequiredVariable {
         state: StateId,
         label: OutputLabel,
         name: String,
+    },
+
+    #[error("Choice '{label}' in state '{state}' requires artifact '{name}', which the state does not define")]
+    UndefinedRequiredArtifact {
+        state: StateId,
+        label: OutputLabel,
+        name: String,
+    },
+
+    #[error("State '{state}' defines local variable '{name}', but only an agent step keeps local variables")]
+    LocalVariableOutsideAgent { state: StateId, name: String },
+
+    #[error("State '{state}' is a {action_type} step and cannot define variables or artifacts; only agent and script steps can")]
+    DefinitionsNotAllowed {
+        state: StateId,
+        action_type: &'static str,
     },
 
     #[error("State '{state}' field '{field}' cannot reference step replies")]
@@ -667,8 +745,8 @@ pub enum ValidationError {
         reference: String,
     },
 
-    #[error("Output '{label}' in state '{state}' has invalid approval/resume behavior: {reason}")]
-    InvalidOutputBehavior {
+    #[error("Choice '{label}' in state '{state}' has invalid approval/resume behavior: {reason}")]
+    InvalidChoiceBehavior {
         state: StateId,
         label: OutputLabel,
         reason: String,

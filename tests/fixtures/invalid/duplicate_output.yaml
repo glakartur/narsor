@@ -1,4 +1,4 @@
-# §5.1: every label in `outputs` is declared once, whichever form it takes — a
+# §5.1: every label in `choices` is declared once, whichever form it takes — a
 # bare label and a described one naming the same label are a duplicate.
 name: duplicate-output
 version: 1
@@ -8,7 +8,7 @@ states:
     action:
       type: script
       command: ./run.sh
-    outputs:
+    choices:
       - success
       - label: success
         description: The same label again, now with a description.

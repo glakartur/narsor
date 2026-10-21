@@ -4,7 +4,9 @@ states:
   review:
     action: { type: agent, prompt: review }
     max_entries: 2
-    outputs:
+    variables:
+      - { name: summary, description: What the operator completed by hand. }
+    choices:
       - label: findings
       - clean
       - label: manual_complete
@@ -13,7 +15,7 @@ states:
   fix:
     action: { type: agent, prompt: "fix {{ steps.review.reply }}" }
     max_entries: 2
-    outputs: [fixed]
+    choices: [fixed]
     transitions: { fixed: review }
   completed: { description: done }
 terminal_states: [completed]

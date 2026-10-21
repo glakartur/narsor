@@ -7,7 +7,7 @@ states:
     action:
       type: human
       message: Zatwierdź.
-    outputs:
+    choices:
       - approved
     transitions:
       approved: work
@@ -17,7 +17,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Popraw: {{ steps.gate.reply }}"
-    outputs:
+    choices:
       - done
     transitions:
       done: finished

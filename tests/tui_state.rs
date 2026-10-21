@@ -11545,7 +11545,7 @@ mod task_app_create {
         async fn a_path_with_violations_lists_all_of_them_and_a_good_one_creates_a_task() {
             let (harness, _controller) = harness().await;
             let broken = "name: broken\nversion: 1\nstates:\n  work:\n    action:\n      type: script\n      \
-                command: \"true\"\n    outputs: [success]\n    transitions:\n      success: nowhere\n  \
+                command: \"true\"\n    choices: [success]\n    transitions:\n      success: nowhere\n  \
                 island:\n    description: nobody comes here\nterminal_states: [done]\n";
             let expected: Vec<String> = narsor_engine::workflow::validate_source(broken)
                 .expect("the YAML loads")

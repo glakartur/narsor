@@ -3,7 +3,7 @@ version: 1
 description: >
   Workflow fixture for the TUI's input form: a gate shaped like the bundled
   `resolve_ambiguity` — a required `select` whose options are exactly the
-  state's outputs, and a required answer — then a script standing in for the
+  state's choices, and a required answer — then a script standing in for the
   agent that applies the answer, and a second gate that declares no fields at
   all. The script is reached through an absolute path handed in as an input,
   so the test never writes into the repository.
@@ -32,7 +32,7 @@ states:
           type: text
           required: true
           description: The answer to the agent's question.
-    outputs:
+    choices:
       - label: answered
         description: the agent's question is answered; carry on with the work.
       - label: replan
@@ -48,7 +48,7 @@ states:
       command: "{{ inputs.apply_path }}"
       args:
         - "{{ context.ambiguity_answer }}"
-    outputs:
+    choices:
       - applied
     transitions:
       applied: confirm
@@ -58,7 +58,7 @@ states:
     action:
       type: human
       message: Ship it?
-    outputs:
+    choices:
       - ship
       - hold
     transitions:

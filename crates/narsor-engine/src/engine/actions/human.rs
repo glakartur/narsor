@@ -63,7 +63,7 @@ use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction};
 use crate::domain::{
     ActionConfig, ActionError, ActionExecutionId, ActionResult, AnsweredBy, Artifact, EventData,
     ExecutionId, ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType,
-    InputCloseReason, OutputDefinition, OutputLabel, StateId, WorkflowExecution,
+    InputCloseReason, ChoiceDefinition, OutputLabel, StateId, WorkflowExecution,
 };
 use crate::persistence::{ExecutionStore, PersistenceError};
 
@@ -352,7 +352,7 @@ pub struct PendingHumanInput {
     /// Records written before labels had descriptions hold plain strings;
     /// [`deserialize_outputs`] reads those as labels without a description.
     #[serde(default, deserialize_with = "deserialize_outputs")]
-    pub outputs: Vec<OutputDefinition>,
+    pub outputs: Vec<ChoiceDefinition>,
 
     /// Whether the submitted form completes a human step or resumes the
     /// agent action that asked the question. Older pending records were all
@@ -535,7 +535,7 @@ impl PendingHumanInput {
         execution_id: impl Into<ExecutionId>,
         state_id: impl Into<StateId>,
         request: HumanInputRequest,
-        outputs: Vec<OutputDefinition>,
+        outputs: Vec<ChoiceDefinition>,
     ) -> Self {
         Self {
             execution_id: execution_id.into(),
@@ -601,7 +601,7 @@ impl PendingHumanInput {
         execution_id: impl Into<ExecutionId>,
         state_id: impl Into<StateId>,
         request: HumanInputRequest,
-        outputs: Vec<OutputDefinition>,
+        outputs: Vec<ChoiceDefinition>,
         problem: OutputProblem,
     ) -> Self {
         Self {
@@ -644,7 +644,7 @@ impl PendingHumanInput {
         execution_id: impl Into<ExecutionId>,
         state_id: impl Into<StateId>,
         request: HumanInputRequest,
-        outputs: Vec<OutputDefinition>,
+        outputs: Vec<ChoiceDefinition>,
         problem: OutputProblem,
         details: EntryLimitDetails,
     ) -> Self {
@@ -698,7 +698,7 @@ fn new_episode() -> String {
 /// Reads [`PendingHumanInput::outputs`] in either shape it was ever written
 /// in: the current `{label, description}` objects, or the bare labels of
 /// records written before outputs had descriptions.
-fn deserialize_outputs<'de, D>(deserializer: D) -> Result<Vec<OutputDefinition>, D::Error>
+fn deserialize_outputs<'de, D>(deserializer: D) -> Result<Vec<ChoiceDefinition>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -706,14 +706,14 @@ where
     #[serde(untagged)]
     enum StoredOutput {
         Label(OutputLabel),
-        Defined(OutputDefinition),
+        Defined(ChoiceDefinition),
     }
 
     let stored = Vec::<StoredOutput>::deserialize(deserializer)?;
     Ok(stored
         .into_iter()
         .map(|output| match output {
-            StoredOutput::Label(label) => OutputDefinition::new(label),
+            StoredOutput::Label(label) => ChoiceDefinition::new(label),
             StoredOutput::Defined(definition) => definition,
         })
         .collect())
@@ -727,7 +727,7 @@ where
 /// * a form with fields — [`HumanInputDelivery::with_values`], optionally
 ///   pinned to a label with [`HumanInputDelivery::choosing`];
 /// * no fields at all — [`HumanInputDelivery::label`], which picks straight
-///   from the state's `outputs`.
+///   from the state's `choices`.
 ///
 /// A problem ([`InputContinuation::ResolveOutput`]) takes the third shape: a
 /// label with the step's `data` and `variables`, which no other request
@@ -1766,7 +1766,7 @@ pub(crate) fn is_blank(value: &Value) -> bool {
 ///   has already been checked against the field's own `options`, so it is not
 ///   checked against `outputs` here — matching a label to a state is U7's job.
 /// * **Without fields.** `human_review_tests` declares no `inputs` at all and
-///   the user simply picks `ignore` or `fix_it` from the state's `outputs`.
+///   the user simply picks `ignore` or `fix_it` from the state's `choices`.
 ///   There is nothing to infer from, so the label must be delivered explicitly
 ///   through [`HumanInputDelivery::label`], and it *is* checked against the
 ///   recorded menu — with no fields, that menu is the whole form.

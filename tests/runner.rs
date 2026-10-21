@@ -613,7 +613,7 @@ states:
     action:
       type: agent
       prompt: Think about it.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: first
   first:
@@ -626,7 +626,7 @@ states:
           echo first >> steps.log
           printf '%s' "$HOME" > "$HOME/home-seen-by-first"
           printf '{"output": "done"}'
-    outputs: [done]
+    choices: [done]
     transitions:
       done: gate
   gate:
@@ -634,7 +634,7 @@ states:
       type: script
       command: sh
       args: [-c, "printf '{\"output\": \"ok\"}'"]
-    outputs: [ok, rejected]
+    choices: [ok, rejected]
     transitions:
       ok: review
       rejected: failed
@@ -645,7 +645,7 @@ states:
     action:
       type: agent
       prompt: Review it.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1175,7 +1175,7 @@ states:
           echo try >> "$HOME/attempts"
           if [ "$tries" -eq 0 ]; then sleep 60; fi
           printf '{"output": "done"}'
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1426,7 +1426,7 @@ states:
       type: script
       command: sh
       args: [-c, "echo one >> \"$HOME/steps\"; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+    choices: [done]
     transitions:
       done: two
   two:
@@ -1434,7 +1434,7 @@ states:
       type: script
       command: sh
       args: [-c, "echo two >> \"$HOME/steps\"; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1537,7 +1537,7 @@ states:
         - -c
         - |
           printf '{"output": "done", "variables": {"pr_number": 42, "pr_url": "https://git.example/pr/42"}}'
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1674,7 +1674,7 @@ states:
             printf 'openai=%s\n' "${OPENAI_API_KEY-unset}"
           } > "$NARSOR_OUTBOX_DIR/../seen"
           printf '{"output": "done"}'
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1828,7 +1828,7 @@ states:
           printf '%s' "$GH_TOKEN" | sha256sum > "$HOME/token.sha256"
           sha256sum < "$HOME/.config/gh/hosts.yml" > "$HOME/hosts.sha256"
           printf '{"output": "done"}'
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1973,7 +1973,7 @@ states:
     action:
       type: agent
       prompt: Think about it.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -2374,7 +2374,7 @@ states:
     action:
       type: agent
       prompt: Think about it.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: next
   next:
@@ -2382,7 +2382,7 @@ states:
       type: script
       command: sh
       args: [-c, "echo ran >> \"$HOME/next-ran\"; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -2535,7 +2535,7 @@ states:
         - -c
         - |
           if [ -f retried ]; then printf '{"output": "done"}'; else touch retried; echo boom >&2; exit 3; fi
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -2554,7 +2554,7 @@ states:
       type: script
       command: sh
       args: [-c, "sleep 60; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -2571,7 +2571,7 @@ states:
     action:
       type: agent
       prompt: Do the work.
-    outputs: [implemented]
+    choices: [implemented]
     transitions:
       implemented: completed
   completed:
@@ -3217,7 +3217,7 @@ states:
     action:
       type: agent
       prompt: First.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: g1
   g1:
@@ -3225,7 +3225,7 @@ states:
       type: script
       command: sh
       args: [-c, "printf '{\"output\": \"ok\"}'"]
-    outputs: [ok, rejected]
+    choices: [ok, rejected]
     transitions:
       ok: b
       rejected: failed
@@ -3236,7 +3236,7 @@ states:
     action:
       type: agent
       prompt: Second.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: g2
   g2:
@@ -3244,7 +3244,7 @@ states:
       type: script
       command: sh
       args: [-c, "printf '{\"output\": \"ok\"}'"]
-    outputs: [ok, rejected]
+    choices: [ok, rejected]
     transitions:
       ok: c
       rejected: failed
@@ -3255,7 +3255,7 @@ states:
     action:
       type: agent
       prompt: Third.
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:

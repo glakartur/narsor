@@ -11,7 +11,7 @@ states:
     action:
       type: agent
       prompt: Implement the feature.
-    outputs:
+    choices:
       - label: implemented
         description: The feature is implemented.
       - label: needs_human_decision
@@ -28,7 +28,7 @@ states:
         - '{"output": "ok"}'
       env:
         SUMMARY: "{{ context.summary }}"
-    outputs:
+    choices:
       - ok
     transitions:
       ok: finished
@@ -37,7 +37,7 @@ states:
     action:
       type: human
       message: The agent needs a decision.
-    outputs:
+    choices:
       - accept
     transitions:
       accept: finished

@@ -1802,9 +1802,9 @@ fn write_override_workflow(harness: &Harness) {
     let yaml = format!(
         "name: implement-feature\nversion: 1\nglobals:\n  image: \"{}\"\nstates:\n  \
          work:\n    allow_manual_override: true\n    action:\n      type: script\n      \
-         command: \"true\"\n    outputs: [success]\n    transitions:\n      success: locked\n  \
+         command: \"true\"\n    choices: [success]\n    transitions:\n      success: locked\n  \
          locked:\n    action:\n      type: script\n      command: \"true\"\n    \
-         outputs: [success]\n    transitions:\n      success: done\n  \
+         choices: [success]\n    transitions:\n      success: done\n  \
          done:\n    description: finished\nterminal_states: [done]\n",
         environment_support::workflow_image()
     );

@@ -7,11 +7,11 @@ states:
   plan:
     action: { type: agent, prompt: plan the work }
     max_entries: 5
-    outputs:
+    variables:
+      - { name: plan_doc, description: Path of the plan document. }
+    choices:
       - label: plan_ready
-        requires_variables:
-          - name: plan_doc
-            description: Path of the plan document.
+        requires_variables: [plan_doc]
       - label: approved_plan
         requires_variables: [plan_doc]
         requires_human_approval: true

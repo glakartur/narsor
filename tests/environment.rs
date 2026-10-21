@@ -85,7 +85,7 @@ fn repository_workflow(image_line: &str, step_image_line: &str) -> String {
     format!(
         "name: on-app\nversion: 1\nglobals:\n  workspace:\n    type: git\n    repository: app\n\
          {image_line}states:\n  work:\n{step_image_line}    action:\n      type: script\n      \
-         command: \"true\"\n    outputs: [success]\n    transitions:\n      success: done\n  \
+         command: \"true\"\n    choices: [success]\n    transitions:\n      success: done\n  \
          done:\n    description: finished\nterminal_states: [done]\n"
     )
 }

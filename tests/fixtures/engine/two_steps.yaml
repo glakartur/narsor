@@ -11,7 +11,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "done", "variables": {"first": "yes"}}'
-    outputs:
+    choices:
       - done
     transitions:
       done: second
@@ -22,7 +22,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "done", "variables": {"second": "yes"}}'
-    outputs:
+    choices:
       - done
     transitions:
       done: completed

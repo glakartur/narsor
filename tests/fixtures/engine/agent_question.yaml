@@ -5,7 +5,7 @@ states:
     action:
       type: agent
       prompt: Implement the requested change.
-    outputs:
+    choices:
       - done
     transitions:
       done: finished

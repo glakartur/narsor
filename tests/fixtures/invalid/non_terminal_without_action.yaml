@@ -5,7 +5,7 @@ version: 1
 states:
   start:
     description: Brak akcji, a stan nie jest terminalny.
-    outputs:
+    choices:
       - success
     transitions:
       success: done

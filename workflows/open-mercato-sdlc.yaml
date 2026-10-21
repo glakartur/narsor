@@ -68,7 +68,7 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"brief": "<repo-relative path or null>"}}
-    outputs:
+    choices:
       - label: routed
         description: the work is worth continuing and a brief exists.
       - label: no_action
@@ -99,7 +99,7 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"ready_status": "<READY|NOT_READY>", "gaps": []}}
-    outputs:
+    choices:
       - label: ready
         description: >-
           every Definition of Ready item is on the ticket or in a spec it links.
@@ -144,7 +144,7 @@ states:
           description: >
             The ticket-level answers, or the item you are waiving and why, or
             what is still missing.
-    outputs:
+    choices:
       - label: confirmed
         description: the ticket-level Definition of Ready is met.
       - label: waived
@@ -176,7 +176,7 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"evidence": "<what you observed>"}}
-    outputs:
+    choices:
       - label: actionable
         description: real, unfixed and unclaimed.
       - label: no_action
@@ -205,7 +205,7 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"claimed_by": "<handle>"}}
-    outputs:
+    choices:
       - label: claimed
         description: all three signals are on the ticket.
       - label: claim_lost
@@ -232,7 +232,7 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"reason": "<one sentence>"}}
-    outputs:
+    choices:
       - label: user_facing
         description: the Design stage applies.
       - label: not_user_facing
@@ -264,7 +264,7 @@ states:
         If the flow cannot be settled without a person's direction, request
         `awaiting_input` and ask the question. A tool, sandbox, permission, or
         harness problem is an action failure, not a workflow output.
-    outputs:
+    choices:
       - label: shaped
         description: the flow and its states are written down.
     transitions:
@@ -299,7 +299,7 @@ states:
           type: text
           required: false
           description: What the flow still gets wrong, if anything.
-    outputs:
+    choices:
       - label: approved
         description: the design contract is signed off; implement it.
       - label: reshape
@@ -334,7 +334,7 @@ states:
         If the work needs a human decision, request `awaiting_input` and ask
         the question. A tool, sandbox, permission, or harness problem is an
         action failure, not a workflow output.
-    outputs:
+    choices:
       - label: implemented
         description: the change is complete with its tests.
     transitions:
@@ -355,7 +355,7 @@ states:
       exit_codes:
         0: green
         1: red
-    outputs:
+    choices:
       - label: green
         description: every validation command passed.
       - label: red
@@ -388,7 +388,7 @@ states:
           {"output": "<label>", "data": {"pr": "<number>"}, "variables": {"pr_number": "<number>", "pr_url": "<url>"}}
         A failed commit, push, or pull-request creation is an action failure,
         not a workflow output.
-    outputs:
+    choices:
       - label: pr_opened
         description: the pull request is open and labelled.
     transitions:
@@ -418,7 +418,7 @@ states:
         If the review needs a human decision, request `awaiting_input` and ask
         the question. A tool, sandbox, permission, or harness problem is an
         action failure, not a workflow output.
-    outputs:
+    choices:
       - label: approved
         description: an approving review is submitted.
       - label: changes_requested
@@ -448,7 +448,7 @@ states:
         If a requested change needs a human decision, request `awaiting_input`
         and ask the question. A tool, sandbox, permission, or harness problem
         is an action failure, not a workflow output.
-    outputs:
+    choices:
       - label: updated
         description: the changes are pushed and the PR is back in `review`.
     transitions:
@@ -475,7 +475,7 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"qa_label": "<needs-qa|skip-qa>"}}
-    outputs:
+    choices:
       - label: needs_qa
         description: the PR must be exercised before it merges.
       - label: skip_qa
@@ -511,7 +511,7 @@ states:
         product question, request `awaiting_input` and ask the question. A
         tool, sandbox, permission, or harness problem is an action failure,
         not a workflow output.
-    outputs:
+    choices:
       - label: evidence_ready
         description: the evidence is attached for a QA reviewer.
     transitions:
@@ -553,7 +553,7 @@ states:
           type: text
           required: false
           description: The scenario exercised, the environment, what failed.
-    outputs:
+    choices:
       - label: qa_approved
         description: QA passes; `qa-approved` is pinned to the tested head.
       - label: qa_failed
@@ -587,7 +587,7 @@ states:
         If a blocking gate needs a person's decision, request `awaiting_input`
         and name it in the question. A tool, sandbox, permission, or harness
         problem is an action failure, not a workflow output.
-    outputs:
+    choices:
       - label: mergeable
         description: every gate is satisfied and the checks are green.
     transitions:
@@ -621,7 +621,7 @@ states:
           type: text
           required: false
           description: Why you are holding it, if you are.
-    outputs:
+    choices:
       - label: merge
         description: squash-merge the pull request into `main`.
       - label: hold
@@ -652,7 +652,7 @@ states:
         If a gate needs a person's decision, request `awaiting_input` and ask
         the question. A tool, sandbox, permission, or harness problem is an
         action failure, not a workflow output.
-    outputs:
+    choices:
       - label: merged
         description: squash-merged into main.
     transitions:
@@ -678,7 +678,7 @@ states:
         If a person must decide how to reconcile something, request
         `awaiting_input` and ask the question. A tool, sandbox, permission, or
         harness problem is an action failure, not a workflow output.
-    outputs:
+    choices:
       - label: reconciled
         description: the tracker matches reality and follow-ups are filed.
     transitions:

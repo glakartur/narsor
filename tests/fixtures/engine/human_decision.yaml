@@ -12,7 +12,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "ok", "variables": {"checked": true}}'
-    outputs:
+    choices:
       - ok
       - rejected
     transitions:

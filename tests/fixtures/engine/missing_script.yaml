@@ -15,7 +15,7 @@ states:
     action:
       type: script
       command: ./no_such_script.sh
-    outputs:
+    choices:
       - success
     transitions:
       success: completed

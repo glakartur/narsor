@@ -87,7 +87,7 @@ use crate::config::AgentDefaults;
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy, Artifact,
     ArtifactReference, DecisionProviderType, Event, EventData, ExecutionId, ExecutionStatus,
-    HumanInputField, HumanInputType, InputCloseReason, OutputDefinition, ProblemKind, RepromptedBy,
+    HumanInputField, HumanInputType, InputCloseReason, ChoiceDefinition, ProblemKind, RepromptedBy,
     State, StateId, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
 };
 use crate::engine::actions::agent::{
@@ -366,7 +366,7 @@ impl OutputRejection {
             Err(error @ DecisionError::LabelNotDeclared { .. }) => error.to_string(),
             Ok(_) => {
                 let missing = state
-                    .outputs
+                    .choices
                     .iter()
                     .find(|output| output.label == result.output_label)
                     .into_iter()
@@ -374,10 +374,10 @@ impl OutputRejection {
                     .filter(|required| {
                         result
                             .variables
-                            .get(required.name())
+                            .get(required.as_str())
                             .is_none_or(human::is_blank)
                     })
-                    .map(|required| required.name())
+                    .map(String::as_str)
                     .collect::<Vec<_>>();
                 if missing.is_empty() {
                     return None;
@@ -1675,7 +1675,7 @@ impl Engine {
         // instead of an ordinary fresh prompt with no operator context.
         if resumed.pending.continuation == InputContinuation::CompleteStep {
             if let Some(field) = state
-                .outputs
+                .choices
                 .iter()
                 .find(|output| output.label == resumed.result.output_label)
                 .and_then(|output| output.resume_comment_field.as_deref())
@@ -1694,7 +1694,7 @@ impl Engine {
                     .ok_or_else(|| {
                         EngineError::HumanInput(HumanActionError::NoLabelChosen {
                             outputs: state
-                                .outputs
+                                .choices
                                 .iter()
                                 .map(|output| output.label.clone())
                                 .collect(),
@@ -2343,7 +2343,7 @@ impl Engine {
             .with_timeout(timeout)
             .with_execution_id(&execution.id)
             .with_conversation_store(&conversation_store)
-            .with_outputs(&state.outputs)
+            .with_outputs(&state.choices)
             .with_purpose(purpose);
 
         let outcome = executor.execute(request).await;
@@ -2826,7 +2826,7 @@ impl Engine {
         pending: PendingStep,
     ) -> Result<Flow, EngineError> {
         if is_agent(state)
-            && state.outputs.iter().any(|output| {
+            && state.choices.iter().any(|output| {
                 output.label == pending.result.output_label && output.requires_human_approval
             })
         {
@@ -2927,7 +2927,7 @@ impl Engine {
             }
         };
         let continues_target_session = state
-            .outputs
+            .choices
             .iter()
             .any(|output| output.label == outcome.label && output.resume_comment_field.is_some());
 
@@ -3106,7 +3106,7 @@ impl Engine {
             execution.id.clone(),
             state.id.clone(),
             request,
-            state.outputs.clone(),
+            state.choices.clone(),
             problem,
             EntryLimitDetails {
                 entries,
@@ -3322,7 +3322,7 @@ impl Engine {
         execution: &mut WorkflowExecution,
         state: &State,
         request: HumanInputRequest,
-        outputs: Vec<OutputDefinition>,
+        outputs: Vec<ChoiceDefinition>,
     ) -> Result<(), EngineError> {
         let mut pending =
             PendingHumanInput::new(execution.id.clone(), state.id.clone(), request, outputs);
@@ -3977,7 +3977,7 @@ fn output_requirements(
     state: &State,
 ) -> Vec<OutputRequirement> {
     state
-        .outputs
+        .choices
         .iter()
         .map(|output| {
             let target = state
@@ -3989,11 +3989,7 @@ fn output_requirements(
                 Some(ActionConfig::Human(_)) => vec!["question".to_string()],
                 _ => Vec::new(),
             };
-            let mut variables = output
-                .requires_variables
-                .iter()
-                .map(|required| required.name().to_string())
-                .collect::<Vec<_>>();
+            let mut variables = output.requires_variables.clone();
             variables.extend(
                 action
                     .map(action_context_references)
@@ -4265,7 +4261,9 @@ mod tests {
             max_entries: None,
             description: None,
             action: None,
-            outputs: Vec::new(),
+            variables: Vec::new(),
+            artifacts: Vec::new(),
+            choices: Vec::new(),
             transitions: HashMap::new(),
             decision: None,
             timeout_secs: None,

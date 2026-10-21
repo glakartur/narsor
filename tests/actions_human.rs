@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use narsor_engine::domain::{
     ActionConfig, Event, EventData, ExecutionStatus, HumanActionConfig, HumanInputField,
-    HumanInputType, OutputDefinition, WorkflowExecution, Workspace,
+    HumanInputType, ChoiceDefinition, WorkflowExecution, Workspace,
 };
 use narsor_engine::engine::actions::human::{
     self, HumanActionError, HumanInputRequest, PendingHumanInput, PermissionDecision,
@@ -117,8 +117,8 @@ fn no_fields_action() -> ActionConfig {
 }
 
 /// Outputs without descriptions, as a state declaring bare labels has them.
-fn labels(labels: &[&str]) -> Vec<OutputDefinition> {
-    labels.iter().copied().map(OutputDefinition::new).collect()
+fn labels(labels: &[&str]) -> Vec<ChoiceDefinition> {
+    labels.iter().copied().map(ChoiceDefinition::new).collect()
 }
 
 /// A fresh running execution, saved in the store.
@@ -978,14 +978,15 @@ async fn output_descriptions_survive_in_the_pending_record() {
         panic!("a human action must request human input");
     };
     let outputs = vec![
-        OutputDefinition {
+        ChoiceDefinition {
             label: "ignore".to_string(),
             requires_variables: Vec::new(),
+            requires_artifacts: Vec::new(),
             description: Some("The failures are known and harmless.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
         },
-        OutputDefinition::new("fix_it"),
+        ChoiceDefinition::new("fix_it"),
     ];
     let pending = PendingHumanInput::new(
         execution.id.clone(),

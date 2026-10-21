@@ -17,7 +17,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "done", "variables": {"first": "one"}}'
-    outputs:
+    choices:
       - done
     transitions:
       done: second
@@ -28,7 +28,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "done", "variables": {"second": "{{ inputs.subject }}"}}'
-    outputs:
+    choices:
       - done
     transitions:
       done: third
@@ -39,7 +39,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "done", "variables": {"third": "after {{ context.variables.first }}"}}'
-    outputs:
+    choices:
       - done
     transitions:
       done: completed

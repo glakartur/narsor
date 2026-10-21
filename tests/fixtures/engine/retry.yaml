@@ -16,7 +16,7 @@ states:
     retry_policy:
       max_attempts: 3
       backoff: 0s
-    outputs:
+    choices:
       - success
     transitions:
       success: completed

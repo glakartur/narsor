@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use narsor_engine::domain::{
     ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus,
-    OutputDefinition, RepromptedBy, Workspace, WorkspaceAccess,
+    ChoiceDefinition, RepromptedBy, Workspace, WorkspaceAccess,
 };
 use narsor_engine::engine::actions::agent::{
     output_contract, output_schema, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
@@ -400,6 +400,7 @@ fn agent_action(prompt: &str) -> AgentActionConfig {
         workspace: None,
         parameters: HashMap::new(),
         read_only_paths: Vec::new(),
+        history: true,
     }
 }
 
@@ -1323,7 +1324,7 @@ async fn the_harness_receives_the_expanded_prompt_and_the_output_contract() {
 }
 
 /// The prompt a request with `outputs` sends to the fake harness.
-async fn prompt_sent_with_outputs(outputs: &[OutputDefinition]) -> String {
+async fn prompt_sent_with_outputs(outputs: &[ChoiceDefinition]) -> String {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(r#"{"output":"ready"}"#));
@@ -1343,14 +1344,15 @@ async fn prompt_sent_with_outputs(outputs: &[OutputDefinition]) -> String {
 #[tokio::test]
 async fn the_output_contract_lists_the_declared_labels_with_their_descriptions() {
     let outputs = [
-        OutputDefinition {
+        ChoiceDefinition {
             label: "ready".to_string(),
             requires_variables: Vec::new(),
+            requires_artifacts: Vec::new(),
             description: Some("The plan is written and nothing is unclear.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
         },
-        OutputDefinition::new("ambiguous"),
+        ChoiceDefinition::new("ambiguous"),
     ];
 
     let prompt = prompt_sent_with_outputs(&outputs).await;
@@ -1370,22 +1372,15 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
 
 #[tokio::test]
 async fn output_contract_lists_required_variables_only_at_their_label() {
-    use narsor_engine::domain::RequiredVariable;
     let outputs = [
-        OutputDefinition {
-            label: "findings".to_string(),
-            requires_variables: vec![RequiredVariable::Described {
-                name: "report".to_string(),
-                description: "Complete review report".to_string(),
-            }],
-            description: None,
-            requires_human_approval: false,
-            resume_comment_field: None,
+        ChoiceDefinition {
+            requires_variables: vec!["report".to_string()],
+            ..ChoiceDefinition::new("findings")
         },
-        OutputDefinition::new("clean"),
+        ChoiceDefinition::new("clean"),
     ];
     let prompt = prompt_sent_with_outputs(&outputs).await;
-    assert!(prompt.contains("Set `variables.report`: Complete review report"));
+    assert!(prompt.contains("Set `variables.report`"));
     let clean = prompt.split("- `clean`").nth(1).unwrap();
     assert!(!clean.contains("variables.report"));
 }
@@ -1394,10 +1389,11 @@ async fn output_contract_lists_required_variables_only_at_their_label() {
 #[test]
 fn a_contract_without_descriptions_lists_bare_labels_only() {
     let contract = output_contract(&[
-        OutputDefinition::new("approved"),
-        OutputDefinition {
+        ChoiceDefinition::new("approved"),
+        ChoiceDefinition {
             label: "rejected".to_string(),
             requires_variables: Vec::new(),
+            requires_artifacts: Vec::new(),
             // Blank is treated as no description at all.
             description: Some("   ".to_string()),
             requires_human_approval: false,
@@ -1610,7 +1606,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Analyse {{ inputs.subject }}"
-    outputs: [ready, ambiguous]
+    choices: [ready, ambiguous]
     transitions:
       ready: done
       ambiguous: stopped
@@ -1679,7 +1675,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Analyse the module."
-    outputs:
+    choices:
       - label: ready
         description: The analysis is complete.
       - ambiguous
@@ -1796,7 +1792,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Analyse {{ inputs.subject }}"
-    outputs: [ready]
+    choices: [ready]
     retry_policy:
       max_attempts: 2
       backoff: 0
@@ -1869,7 +1865,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Implement the feature."
-    outputs:
+    choices:
       - label: implemented
         description: The feature is implemented.
       - label: needs_human_decision
@@ -2041,7 +2037,7 @@ fn reply_reading_reprompt_workflow() -> String {
       type: agent
       harness: claude-code
       prompt: "Check: {{ steps.work.reply }}"
-    outputs:
+    choices:
       - label: checked
         description: Checked.
     transitions:
@@ -2477,7 +2473,7 @@ states:
     action:
       type: agent
       prompt: "Implement the feature."
-    outputs: [implemented]
+    choices: [implemented]
     retry_policy:
       max_attempts: {implement_attempts}
       backoff: 0
@@ -2487,7 +2483,7 @@ states:
     action:
       type: agent
       prompt: "Review the change."
-    outputs: [reviewed]
+    choices: [reviewed]
     transitions:
       reviewed: analyze
   analyze:
@@ -2495,7 +2491,7 @@ states:
       type: agent
       harness: claude-code
       prompt: "Analyse the result."
-    outputs: [analysed]
+    choices: [analysed]
     transitions:
       analysed: done
   done:
@@ -3380,10 +3376,10 @@ fn structured_envelope(text: &str, structured: Value) -> String {
 }
 
 /// The `done`/`blocked` outputs of the schema tests.
-fn two_labels() -> [OutputDefinition; 2] {
+fn two_labels() -> [ChoiceDefinition; 2] {
     [
-        OutputDefinition::new("done"),
-        OutputDefinition::new("blocked"),
+        ChoiceDefinition::new("done"),
+        ChoiceDefinition::new("blocked"),
     ]
 }
 
@@ -3403,7 +3399,7 @@ async fn execute_with_outputs(
     executor: &AgentExecutor,
     config: AgentActionConfig,
     workspace: &Workspace,
-    outputs: &[OutputDefinition],
+    outputs: &[ChoiceDefinition],
     conversation: Option<&ConversationFixture>,
 ) -> Result<ActionOutcome, ActionError> {
     let action = ActionConfig::Agent(config);
@@ -3844,7 +3840,7 @@ states:
     action:
       type: agent
 {harness}      prompt: "Do the thing."
-    outputs: [done]
+    choices: [done]
     transitions:
       done: finished
   finished:

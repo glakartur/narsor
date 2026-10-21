@@ -50,12 +50,13 @@ states:
 
         {{ inputs.feature_description }}
 
-    outputs:
+    variables:
+      - name: requirements_doc
+        description: repo-relative path of the requirements document you wrote or revised.
+    choices:
       - label: requirements_drafted
         description: the requirements document is written.
-        requires_variables:
-          - name: requirements_doc
-            description: repo-relative path of the requirements document you wrote or revised.
+        requires_variables: [requirements_doc]
       - label: needs_direction
         description: >-
           the request is too open to write requirements for without a human
@@ -86,7 +87,7 @@ states:
           type: text
           required: true
           description: The direction to explore, in your own words.
-    outputs:
+    choices:
       - label: retry_brainstorm
         description: brainstorm again, in the direction given in the note.
       - label: abandon
@@ -103,7 +104,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-doc-review` skill with these arguments: mode:headless {{ context.requirements_doc }}
-    outputs:
+    choices:
       - label: reviewed
         description: the document was reviewed and the findings recorded.
         requires_human_approval: true
@@ -120,12 +121,13 @@ states:
       type: agent
       prompt: |
         Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. Open a PR if this branch has none, or push the reviewed requirements to its existing PR without rewriting the description. Report the PR URL.
-    outputs:
+    variables:
+      - name: pr_url
+        description: URL of the open pull request for this branch.
+    choices:
       - label: published
         description: the reviewed requirements are available on the PR.
-        requires_variables:
-          - name: pr_url
-            description: URL of the open pull request for this branch.
+        requires_variables: [pr_url]
     transitions:
       published: resolve_scope_feedback
     timeout: 30m
@@ -136,7 +138,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
-    outputs:
+    choices:
       - label: no_feedback
         description: no actionable PR feedback remains.
       - label: fixed
@@ -180,7 +182,7 @@ states:
           required: true
           description: >
             Only for revise — what the requirements document gets wrong.
-    outputs:
+    choices:
       - label: approved
         description: the scope is right; plan against it.
       - label: revise
@@ -199,7 +201,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while the scope review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to scope approval.
-    outputs:
+    choices:
       - label: no_feedback
         description: scope approval stands and planning can begin.
       - label: fixed
@@ -230,12 +232,13 @@ states:
 
         ---
         For `needs_scope_revision`, put the contradiction or missing dependency in `data.question`.
-    outputs:
+    variables:
+      - name: plan_doc
+        description: repo-relative path of the plan.
+    choices:
       - label: plan_ready
         description: the plan is written and an implementer could start.
-        requires_variables:
-          - name: plan_doc
-            description: repo-relative path of the plan.
+        requires_variables: [plan_doc]
       - label: needs_scope_revision
         description: >-
           the approved requirements cannot be planned as written.
@@ -253,7 +256,7 @@ states:
       type: agent
       prompt: |
         Run the full `ce-commit-push-pr` workflow with `mode:pipeline babysit:off`. Push the plan to the existing PR on this branch, {{ context.pr_url }}, without rewriting its description. Report the PR URL.
-    outputs:
+    choices:
       - label: updated
         description: the current plan is available on the PR.
     transitions:
@@ -266,7 +269,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
-    outputs:
+    choices:
       - label: no_feedback
         description: no actionable PR feedback remains.
       - label: fixed
@@ -303,7 +306,7 @@ states:
           type: text
           required: false
           description: Optional — what the plan gets wrong.
-    outputs:
+    choices:
       - label: approved
         description: the plan is right; start writing code.
       - label: revise
@@ -321,7 +324,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while the plan review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to plan approval.
-    outputs:
+    choices:
       - label: no_feedback
         description: plan approval stands and implementation can begin.
       - label: fixed
@@ -351,12 +354,13 @@ states:
         {{ context.plan_feedback }}
 
         ---
-    outputs:
+    variables:
+      - name: plan_doc
+        description: repo-relative path of the revised plan.
+    choices:
       - label: plan_ready
         description: the revised plan is ready for approval.
-        requires_variables:
-          - name: plan_doc
-            description: repo-relative path of the revised plan.
+        requires_variables: [plan_doc]
     transitions:
       plan_ready: publish_plan
     timeout: 1h
@@ -375,12 +379,13 @@ states:
 
         Run the plan's relevant checks before implementation and record their concise result as `test_baseline` in the final output. Preserve that baseline: do not repair pre-existing failures or investigate them as part of this plan.
 
-    outputs:
+    variables:
+      - name: test_baseline
+        description: concise result of checks run before implementation, including pre-existing failures or “all passed”.
+    choices:
       - label: implemented
         description: the plan is implemented and the checks pass.
-        requires_variables:
-          - name: test_baseline
-            description: concise result of checks run before implementation, including pre-existing failures or “all passed”.
+        requires_variables: [test_baseline]
     transitions:
       implemented: simplify
     timeout: 2h
@@ -405,7 +410,7 @@ states:
         {{ context.revision_notes }}
 
         Implement any remaining changes requested in the review note. Include fixes pushed by the resolver in the subsequent simplify and code review.
-    outputs:
+    choices:
       - label: revised
         description: requested changes are made and checks pass.
     transitions:
@@ -420,7 +425,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-simplify-code` skill.
-    outputs:
+    choices:
       - label: simplified
         description: simplifications were applied and the checks pass.
       - label: unchanged
@@ -446,7 +451,7 @@ states:
       prompt: |
         Run the `ce-code-review` skill with these arguments: mode:agent plan:{{ context.plan_doc }}
 
-    outputs:
+    choices:
       - label: clean
         description: no actionable findings survived the confidence gate.
       - label: findings
@@ -483,7 +488,7 @@ states:
           type: text
           required: true
           description: What to change, or "none" if approving or abandoning.
-    outputs:
+    choices:
       - label: revise
         description: send the PR back for changes named in the note.
       - label: approve
@@ -501,7 +506,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while implementation review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to implementation review.
-    outputs:
+    choices:
       - label: no_feedback
         description: implementation approval stands and learning can be captured.
       - label: fixed
@@ -528,7 +533,7 @@ states:
         Preserve this baseline: do not repair pre-existing failures or investigate them as part of this plan.
 
         Compare repository file content before and after this step, including any committed edits. If you changed files, report `fixed`. If no files changed because the findings need no actionable edit, report `unchanged` with a concise reason. Do not use `unchanged` when a required fix remains unresolved.
-    outputs:
+    choices:
       - label: fixed
         description: files changed while addressing findings; run automated review again.
       - label: unchanged
@@ -569,7 +574,7 @@ states:
         0: passed
         1: failed
         2: skipped
-    outputs:
+    choices:
       - label: passed
         description: the repository's formatting, build and test checks passed.
       - label: failed
@@ -598,7 +603,7 @@ states:
         Approved plan: {{ context.plan_doc }}
         Test baseline before implementation: {{ context.test_baseline }}
         Preserve that baseline: do not repair pre-existing failures unrelated to this work. If the script or environment is broken independently of this change, report the blocker instead of removing or bypassing the check.
-    outputs:
+    choices:
       - label: repaired
         description: the check failure was repaired; simplify and review the changes.
     transitions:
@@ -614,12 +619,13 @@ states:
       prompt: |
         Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. It detects the existing open PR on this branch; do not rewrite its description. Publish only the reviewed implementation changes and report its URL.
 
-    outputs:
+    variables:
+      - name: pr_url
+        description: URL of the current pull request.
+    choices:
       - label: published
         description: the branch is pushed and the new or existing PR is current.
-        requires_variables:
-          - name: pr_url
-            description: URL of the current pull request.
+        requires_variables: [pr_url]
     transitions:
       published: resolve_work_feedback
     timeout: 30m
@@ -630,7 +636,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
-    outputs:
+    choices:
       - label: no_feedback
         description: no actionable PR feedback remains.
       - label: fixed
@@ -651,7 +657,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. Update the existing open PR on this branch without rewriting its description. Report its URL.
-    outputs:
+    choices:
       - label: updated
         description: the learning is pushed to the existing pull request.
     transitions:
@@ -664,7 +670,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
-    outputs:
+    choices:
       - label: no_feedback
         description: no actionable PR feedback remains.
       - label: fixed
@@ -698,7 +704,7 @@ states:
           type: text
           required: true
           description: What to change, or "none" if approving or abandoning.
-    outputs:
+    choices:
       - label: approve
         description: the updated pull request is approved; finish the workflow.
       - label: revise
@@ -716,7 +722,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while final review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to final review.
-    outputs:
+    choices:
       - label: no_feedback
         description: final approval stands and the workflow can finish.
       - label: fixed
@@ -737,7 +743,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-compound` skill with these arguments: mode:headless
-    outputs:
+    choices:
       - label: documented
         description: a learning document was written.
       - label: nothing_to_document

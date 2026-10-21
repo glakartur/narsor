@@ -8,7 +8,7 @@ states:
     action:
       type: script
       command: ./run.sh
-    outputs:
+    choices:
       - success
     transitions:
       success: work

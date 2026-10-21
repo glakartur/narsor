@@ -1,0 +1,21 @@
+# A human gate has choices and inputs, but no variables or artifacts.
+name: variables-on-human-gate
+version: 1
+
+states:
+  gate:
+    action:
+      type: human
+      message: Zatwierdź.
+    variables:
+      - name: verdict
+        description: Werdykt.
+    choices: [approve]
+    transitions:
+      approve: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

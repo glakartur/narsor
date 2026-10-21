@@ -203,13 +203,13 @@ fn built_prompt(state: &State) -> String {
     let Some(ActionConfig::Agent(config)) = &state.action else {
         panic!("built_prompt is only defined for agent states");
     };
-    format!("{}{}", config.prompt, output_contract(&state.outputs))
+    format!("{}{}", config.prompt, output_contract(&state.choices))
 }
 
 /// The declared output labels of a state.
 fn labels(state: &State) -> Vec<String> {
     state
-        .outputs
+        .choices
         .iter()
         .map(|output| output.label.clone())
         .collect()
@@ -321,7 +321,7 @@ fn every_built_agent_prompt_names_every_label_with_its_description() {
         let definition = shipped(file);
         for (id, state) in agent_states(&definition) {
             let prompt = built_prompt(state);
-            for output in &state.outputs {
+            for output in &state.choices {
                 let description = output.description.as_deref().unwrap_or_else(|| {
                     panic!(
                         "'{name}' state '{id}': label '{}' has no description",

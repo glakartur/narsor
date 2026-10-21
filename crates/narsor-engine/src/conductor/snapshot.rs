@@ -34,7 +34,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::conductor::store::{Annotation, ChatEntry, ConductorStore, QueuedRequest};
-use crate::domain::{Event, EventData, OutputDefinition, WorkflowExecution};
+use crate::domain::{Event, EventData, ChoiceDefinition, WorkflowExecution};
 use crate::engine::actions::human::PendingHumanInput;
 use crate::persistence::{ConversationSource, ConversationStore, ExecutionStore};
 
@@ -146,7 +146,7 @@ pub struct SnapshotInput {
     /// Its current state.
     pub current_state: Option<String>,
     /// The outputs the current state declares.
-    pub state_outputs: Vec<OutputDefinition>,
+    pub state_outputs: Vec<ChoiceDefinition>,
     /// The pinned definition's YAML, or why there is none.
     pub definition: Result<String, String>,
     /// The request the conductor serves.
@@ -212,7 +212,7 @@ impl SnapshotInput {
         store: &ExecutionStore,
         conductor: &ConductorStore,
         execution: &WorkflowExecution,
-        definition: Result<(String, Vec<OutputDefinition>), String>,
+        definition: Result<(String, Vec<ChoiceDefinition>), String>,
         budget: &SnapshotBudget,
         with_artifacts: bool,
     ) -> Self {

@@ -57,7 +57,7 @@ states:
       type: script
       command: sh
       args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"output\": \"done\"}'"]
-    outputs: [done]
+    choices: [done]
     transitions:
       done: completed
   completed:
@@ -1775,7 +1775,7 @@ states:
       type: script
       command: sh
       args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"output\": \"ok\"}'"]
-    outputs: [ok, rejected]
+    choices: [ok, rejected]
     transitions:
       ok: completed
       rejected: failed

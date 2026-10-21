@@ -2355,7 +2355,7 @@ fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
             label: label.clone(),
             target: target.clone(),
             description: state
-                .outputs
+                .choices
                 .iter()
                 .find(|output| output.label == *label)
                 .and_then(|output| output.description.clone()),

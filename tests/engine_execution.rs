@@ -2076,7 +2076,7 @@ states:
     action:
       type: script
       command: "true"
-    outputs: [a, b, c]
+    choices: [a, b, c]
     transitions:
       a: review
       b: review
@@ -2085,7 +2085,7 @@ states:
     action:
       type: script
       command: "true"
-    outputs: [done]
+    choices: [done]
     transitions:
       done: closed
   closed:

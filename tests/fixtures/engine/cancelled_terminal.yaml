@@ -11,7 +11,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "rejected", "variables": {"reason": "reviewer said no"}}'
-    outputs:
+    choices:
       - ok
       - rejected
     transitions:

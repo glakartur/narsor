@@ -33,7 +33,7 @@ states:
       exit_codes:
         0: success
         1: failure
-    outputs:
+    choices:
       - success
       - failure
     transitions:
@@ -52,7 +52,7 @@ states:
           options:
             - approved
             - rejected
-    outputs:
+    choices:
       - approved
       - rejected
     transitions:

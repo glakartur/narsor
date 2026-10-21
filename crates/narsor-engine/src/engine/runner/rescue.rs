@@ -605,7 +605,7 @@ fn rescue_payload(
         "state_id": state.id,
         "reason": rescue.reason,
         "answers": rescue.answers,
-        "outputs": state.outputs,
+        "outputs": state.choices,
         "requirements": output_requirements(definition, execution, state),
         "agent_can_be_asked_again": rescue.can_reprompt(),
     })

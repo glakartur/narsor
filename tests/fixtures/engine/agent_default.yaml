@@ -10,7 +10,7 @@ states:
     action:
       type: agent
       prompt: Do the thing.
-    outputs:
+    choices:
       - done
     transitions:
       done: completed

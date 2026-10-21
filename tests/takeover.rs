@@ -119,7 +119,7 @@ states:
       command: ./record_step.sh
       args:
         - first
-    outputs:
+    choices:
       - done
     transitions:
       done: second
@@ -130,7 +130,7 @@ states:
       command: ./drop.sh
       args:
         - doomed.txt
-    outputs:
+    choices:
       - done
     transitions:
       done: third
@@ -139,7 +139,7 @@ states:
     action:
       type: script
       command: ./list_tree.sh
-    outputs:
+    choices:
       - done
     transitions:
       done: completed

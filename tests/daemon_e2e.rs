@@ -186,7 +186,7 @@ states:
       args:
         - "{seconds}"
         - '{{"output": "done"}}'
-    outputs:
+    choices:
       - done
     transitions:
       done: completed

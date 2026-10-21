@@ -373,7 +373,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -418,7 +418,7 @@ states:
           options:
             - approved
             - rejected
-    outputs:
+    choices:
       - approve
       - reject
     transitions:
@@ -1463,7 +1463,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -1571,7 +1571,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -2017,7 +2017,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -2188,7 +2188,7 @@ states:
     action:
       type: script
       command: "{command}"
-    outputs:
+    choices:
       - success
     transitions:
       success: done
@@ -2415,7 +2415,7 @@ states:
     action:
       type: agent
       prompt: Do the work.
-    outputs:
+    choices:
       - done
       - needs_human_decision
     transitions:
@@ -2428,7 +2428,7 @@ states:
     action:
       type: human
       message: Decide.
-    outputs:
+    choices:
       - go
     transitions:
       go: finished

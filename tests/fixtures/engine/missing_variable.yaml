@@ -12,7 +12,7 @@ states:
       command: ./print_json.sh
       args:
         - '{"output": "ok", "variables": {"greeting": "{{ context.variables.nobody_set_this }}"}}'
-    outputs:
+    choices:
       - ok
     transitions:
       ok: completed
