@@ -173,14 +173,6 @@ impl Answer {
             delivery
         }
     }
-
-    fn approval(state: &'static str) -> Self {
-        Self {
-            state,
-            values: Vec::new(),
-            approve: true,
-        }
-    }
 }
 
 /// Every `agent` state of a definition, by id.
