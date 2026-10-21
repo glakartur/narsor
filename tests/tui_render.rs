@@ -2854,7 +2854,15 @@ mod task_app_detail_render {
         focused: bool,
     ) -> Buffer {
         draw(width, height, |frame| {
-            conversation::render(frame, frame.area(), styles, conversation, stale, focused);
+            conversation::render(
+                frame,
+                frame.area(),
+                styles,
+                conversation,
+                stale,
+                focused,
+                "⠋",
+            );
         })
     }
 
@@ -3244,6 +3252,7 @@ mod task_app_detail_render {
                 &mut record,
                 false,
                 true,
+                "⠋",
             );
         });
         assert!(
@@ -3559,16 +3568,25 @@ mod task_app_waiting_render {
             "plan_blocker: Brak decyzji o migracji.",
             "plan_doc: docs/plan.md",
         ] {
-            assert!(screen.contains(expected), "{expected:?} is missing:\n{screen}");
+            assert!(
+                screen.contains(expected),
+                "{expected:?} is missing:\n{screen}"
+            );
         }
     }
 
     #[test]
     fn a_gate_whose_agent_gave_no_reason_says_so() {
         // The engine writes the placeholder when the agent gave none (R3).
-        let mut app = opened(with_pending(running(), gate_after_agent("brak uzasadnienia")));
+        let mut app = opened(with_pending(
+            running(),
+            gate_after_agent("brak uzasadnienia"),
+        ));
         let screen = draw_app(&mut app, 120, 40, false);
-        assert!(screen.contains("uzasadnienie: brak uzasadnienia"), "{screen}");
+        assert!(
+            screen.contains("uzasadnienie: brak uzasadnienia"),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -3605,7 +3623,11 @@ mod task_app_waiting_render {
         let view: narsor_protocol::api::PendingHumanInputView =
             serde_json::from_value(pending.clone()).unwrap();
         let panel = narsor::tui::input_form::InputPanel::new(&view, &|_| None);
-        let context: Vec<&str> = panel.context().iter().map(|line| line.text.as_str()).collect();
+        let context: Vec<&str> = panel
+            .context()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
         assert_eq!(
             context,
             [
@@ -3636,7 +3658,10 @@ mod task_app_waiting_render {
             })),
         ));
         let screen = draw_app(&mut app, 120, 40, false);
-        assert!(screen.contains("uzasadnienie: brak uzasadnienia"), "{screen}");
+        assert!(
+            screen.contains("uzasadnienie: brak uzasadnienia"),
+            "{screen}"
+        );
     }
 
     #[test]

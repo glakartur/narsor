@@ -49,6 +49,7 @@ use super::super::keymap::{self, Action, Context, Stack};
 use super::super::scroll::one_line;
 use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
+use super::background::{JobKey, OpeningKind, Outcome};
 use super::detail::{
     panel_title, recorded_attempt, render_view, KeysAt, StepLevel, TaskDetail, ViewOptions,
 };
@@ -405,12 +406,14 @@ impl TaskApp {
         }
     }
 
-    /// `H`: reads the archived tasks and the old executions, then opens the
-    /// history. Without the old executions (a server that has none, or that
-    /// cannot be asked) the archived tasks are shown with the reason.
-    pub(super) async fn read_and_open_history(&mut self) {
-        let archived = self.client.control_tasks_archived(true).await;
-        let legacy = self.client.control_history().await;
+    /// The read `H` started is back: opens the history over it. Without the
+    /// old executions (a server that has none, or that cannot be asked) the
+    /// archived tasks are shown with the reason.
+    pub(super) fn on_history_read(
+        &mut self,
+        archived: Result<TaskListResponse, ClientError>,
+        legacy: Result<LegacyExecutionListResponse, ClientError>,
+    ) {
         match archived {
             Ok(archived) => self.open_history(archived, legacy),
             Err(error) => {
@@ -576,7 +579,7 @@ impl TaskApp {
                     Severity::Success,
                     format!("execution {} wznawia się w tle", one_line(execution_id)),
                 );
-                self.reload_history().await;
+                self.reload_history();
             }
             Err(error) => {
                 self.note_transport(&error);
@@ -592,30 +595,71 @@ impl TaskApp {
         }
     }
 
-    async fn reload_history(&mut self) {
-        let archived = self.client.control_tasks_archived(true).await;
-        let legacy = self.client.control_history().await;
-        if let Ok(archived) = archived {
-            self.open_history(archived, legacy);
-        }
+    /// Starts the read that brings the open history up to date.
+    pub(super) fn reload_history(&mut self) {
+        let client = self.client.clone();
+        self.background
+            .start(JobKey::Reload(OpeningKind::History), async move {
+                let (archived, legacy) = tokio::join!(
+                    client.control_tasks_archived(true),
+                    client.control_history()
+                );
+                Outcome::new(move |app: &mut TaskApp| {
+                    if let (Ok(archived), true) = (archived, app.history().is_some()) {
+                        app.open_history(archived, legacy);
+                    }
+                })
+            });
     }
 
     // -----------------------------------------------------------------
     // Reading
     // -----------------------------------------------------------------
 
-    /// Reads what the visible tab of the selected old execution needs and has
-    /// not got. An archived task has nothing to read: its tabs say its storage
-    /// is gone.
-    pub(super) async fn sync_history(&mut self) {
-        let client = self.client.clone();
+    /// Starts the reads the visible tab of the selected old execution needs
+    /// and has not got. An archived task has nothing to read: its tabs say its
+    /// storage is gone. The second round (the tab's) waits for the first (the
+    /// timeline says what there is to read), as it always did.
+    pub(super) fn start_history_reads(&mut self) {
+        let selected = match &self.view {
+            View::History(history) => history.selected_entry().map(HistoryEntry::key),
+            _ => None,
+        };
+        // Only the selected entry's reads are wanted.
+        self.abort_history_jobs_but(selected.as_deref());
         if let Some(plan) = self.plan_history_reads(false) {
-            let fetched = fetch_first(&client, &plan).await;
-            self.apply_fetched(&plan, fetched);
+            let key = JobKey::HistoryFirst(plan.key.clone());
+            let client = self.client.clone();
+            self.background.start(key, async move {
+                let fetched = fetch_first(&client, &plan).await;
+                Outcome::new(move |app: &mut TaskApp| app.apply_fetched(&plan, fetched))
+            });
+            return;
+        }
+        let Some(key) = selected else {
+            return;
+        };
+        if self.background.history_running(&key) {
+            return;
         }
         if let Some(plan) = self.plan_history_reads(true) {
-            let fetched = fetch_tab(&client, &plan).await;
-            self.apply_fetched(&plan, fetched);
+            let client = self.client.clone();
+            self.background
+                .start(JobKey::HistoryTab(plan.key.clone()), async move {
+                    let fetched = fetch_tab(&client, &plan).await;
+                    Outcome::new(move |app: &mut TaskApp| app.apply_fetched(&plan, fetched))
+                });
+        }
+    }
+
+    /// Whether the history's selected entry waits for a read the marker
+    /// should show for.
+    pub(super) fn history_entry_loading(&self) -> bool {
+        match &self.view {
+            View::History(history) => history
+                .selected_entry()
+                .is_some_and(|entry| self.background.history_running(&entry.key())),
+            _ => false,
         }
     }
 
@@ -948,6 +992,8 @@ pub fn render_details(
     focused: bool,
     stale: bool,
     hyperlinks: bool,
+    glyph: &'static str,
+    loading: bool,
 ) {
     let tab = history.tab;
     let keys = if focused {
@@ -968,12 +1014,12 @@ pub fn render_details(
     };
     let key = entry.key();
     let task = entry.summary();
-    let inner = styles.render_panel(
-        frame,
-        area,
-        panel_title(&title_of(task), area.width),
-        focused,
-    );
+    let title = if loading {
+        format!("{} {glyph}", title_of(task))
+    } else {
+        title_of(task)
+    };
+    let inner = styles.render_panel(frame, area, panel_title(&title, area.width), focused);
     let detail = history
         .details
         .entry(key.clone())
@@ -988,6 +1034,7 @@ pub fn render_details(
         stale,
         keys,
         hyperlinks,
+        glyph,
     };
     render_view(frame, inner, view, styles, options);
 }

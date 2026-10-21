@@ -459,6 +459,8 @@ pub struct TaskList {
     /// The first row in view, kept between frames so that a refresh does not
     /// scroll the list.
     top: usize,
+    /// A mark in the title while the list is read again, with the rows kept.
+    title_mark: Option<&'static str>,
 }
 
 impl Default for TaskList {
@@ -477,7 +479,14 @@ impl TaskList {
             hide_done: false,
             moving: None,
             top: 0,
+            title_mark: None,
         }
+    }
+
+    /// Puts a mark after the title (the loading marker's glyph) or takes it
+    /// off.
+    pub fn set_title_mark(&mut self, mark: Option<&'static str>) {
+        self.title_mark = mark;
     }
 
     /// Every task, in the server's order, finished ones included.
@@ -1160,10 +1169,15 @@ impl TaskList {
         focused: bool,
         stale: bool,
     ) {
-        let title = match self.hidden_count() {
-            0 => " Zadania ".to_string(),
-            hidden => format!(" Zadania · ✓ ukryte {hidden} "),
+        let mut title = match self.hidden_count() {
+            0 => " Zadania".to_string(),
+            hidden => format!(" Zadania · ✓ ukryte {hidden}"),
         };
+        if let Some(mark) = self.title_mark {
+            title.push(' ');
+            title.push_str(mark);
+        }
+        title.push(' ');
         let inner = styles.render_panel(frame, area, title, focused);
 
         let shown = self.visible();

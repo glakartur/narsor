@@ -280,6 +280,7 @@ pub fn render(
     events: &mut Events,
     stale: bool,
     focused: bool,
+    glyph: &str,
 ) {
     let grey = |role: Role| if stale { Role::Done } else { role };
     let mut notes: Vec<Line<'static>> = Vec::new();
@@ -319,9 +320,9 @@ pub fn render(
     );
     if events.events.is_empty() {
         let text = match (&events.availability, &events.failure) {
-            (Availability::NotRead, None) => "wczytuję zdarzenia…",
-            (Availability::Available(_), _) => "brak zdarzeń",
-            _ => "",
+            (Availability::NotRead, None) => format!("{glyph} wczytuję zdarzenia…"),
+            (Availability::Available(_), _) => "brak zdarzeń".to_string(),
+            _ => String::new(),
         };
         frame.render_widget(
             Paragraph::new(Line::styled(text, styles.of(Role::Done))),

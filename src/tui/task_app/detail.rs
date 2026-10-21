@@ -66,6 +66,7 @@ use narsor_protocol::controller::{QueueReason, TaskState};
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
+use super::background::{DetailJob, JobKey, Outcome};
 use super::list::{describe_loss, fit, state_icon, title_of};
 use super::notify::Severity;
 use super::tabs::conductor::{self, Conductor};
@@ -604,12 +605,27 @@ impl TaskApp {
         })
     }
 
-    /// Reads what the selected task's visible tab needs and has not got. Cheap
-    /// when nothing is due: no request is made. Call it after a key, an event
-    /// and a refresh.
+    /// Starts the reads the selected task's visible tab needs and has not
+    /// got, and waits for them — all of them, the ones the answers make due
+    /// too. The loop does not wait: it calls [`Self::start_detail_reads`]
+    /// and applies the answers as they come.
     pub async fn sync_detail(&mut self) {
+        for _ in 0..SYNC_ROUNDS {
+            self.start_detail_reads();
+            if !self.has_running() {
+                return;
+            }
+            self.drain_jobs().await;
+        }
+    }
+
+    /// Starts the reads the selected task's visible tab needs and has not
+    /// got. Cheap when nothing is due: no request is made, and a read that
+    /// runs is not started again. Call it after a key, an event, a refresh and
+    /// an answer: what an answer makes due starts then.
+    pub fn start_detail_reads(&mut self) {
         if matches!(self.view, super::View::History(_)) {
-            self.sync_history().await;
+            self.start_history_reads();
             return;
         }
         let Some(task) = self.list.selected() else {
@@ -620,14 +636,14 @@ impl TaskApp {
         }
         let id = task.task_id.to_string();
         let revision = task.revision;
-        let client = self.client.clone();
         let tab = self.detail.tab();
 
+        // The timeline first: the other reads are made of what it says.
         if self.detail.view_mut(&id).progress.needs_read(revision) {
-            let result = client.control_timeline(&id).await;
-            self.on_detail_read(&id, revision, DetailRead::Timeline(result));
+            self.start_timeline_read(&id, revision);
+            return;
         }
-        self.sync_conductor(&id, revision).await;
+        self.start_conductor_read(&id, revision);
         match tab {
             DetailTab::Progress => {
                 let attempt = self
@@ -637,90 +653,172 @@ impl TaskApp {
                     .selected_position()
                     .and_then(recorded_attempt);
                 if let Some(attempt) = attempt {
-                    self.sync_attempt(&id, revision, &attempt).await;
+                    self.start_attempt_read(&id, revision, &attempt);
                 }
             }
-            DetailTab::Conversation => self.sync_conversation(&id, revision).await,
-            DetailTab::Events => {
-                self.sync_events(&id, revision).await;
+            DetailTab::Conversation => {
+                self.start_events_read(&id, revision);
+                let attempts: Vec<String> = self
+                    .detail
+                    .view_mut(&id)
+                    .progress
+                    .positions()
+                    .iter()
+                    .filter_map(recorded_attempt)
+                    .collect();
+                for attempt in &attempts {
+                    self.start_attempt_read(&id, revision, attempt);
+                }
+                if !self.background.task_running(&id) {
+                    let view = self.detail.view_mut(&id);
+                    if !view.conversation.is_built() {
+                        rebuild_conversation(view);
+                    }
+                }
             }
+            DetailTab::Events => self.start_events_read(&id, revision),
             DetailTab::Conductor | DetailTab::Info => {}
         }
     }
 
-    /// Reads one attempt's conversation when it is due. Returns whether a read
-    /// was made.
-    async fn sync_attempt(&mut self, id: &str, revision: u64, attempt_id: &str) -> bool {
+    /// Whether a read of the selected task's details runs: what a tab shows
+    /// the loading marker for while it has nothing yet.
+    pub fn detail_loading(&self) -> bool {
+        match &self.view {
+            super::View::History(_) => self.history_entry_loading(),
+            _ => self
+                .list
+                .selected_id()
+                .is_some_and(|id| self.background.task_running(id)),
+        }
+    }
+
+    fn start_timeline_read(&mut self, id: &str, revision: u64) {
+        let client = self.client.clone();
+        let task_id = id.to_string();
+        self.background.start(
+            JobKey::Detail(task_id.clone(), DetailJob::Timeline),
+            async move {
+                let result = client.control_timeline(&task_id).await;
+                Outcome::new(move |app: &mut TaskApp| {
+                    app.on_detail_reads(&task_id, revision, vec![DetailRead::Timeline(result)]);
+                })
+            },
+        );
+    }
+
+    /// Starts the read of one attempt's conversation when it is due.
+    fn start_attempt_read(&mut self, id: &str, revision: u64, attempt_id: &str) {
         let view = self.detail.view_mut(id);
         if !view.attempts.needs_read(attempt_id, revision) {
-            return false;
+            return;
         }
         let from = view.attempts.from(attempt_id);
         let client = self.client.clone();
-        let result = conversation::read_attempt(&client, id, attempt_id, from).await;
-        self.on_detail_read(
-            id,
-            revision,
-            DetailRead::Attempt {
-                attempt_id: attempt_id.to_string(),
-                from,
-                result,
+        let (task_id, attempt_id) = (id.to_string(), attempt_id.to_string());
+        self.background.start(
+            JobKey::Detail(task_id.clone(), DetailJob::Attempt(attempt_id.clone())),
+            async move {
+                let result = conversation::read_attempt(&client, &task_id, &attempt_id, from).await;
+                Outcome::new(move |app: &mut TaskApp| {
+                    let read = DetailRead::Attempt {
+                        attempt_id,
+                        from,
+                        result,
+                    };
+                    app.on_detail_reads(&task_id, revision, vec![read]);
+                })
             },
         );
-        true
     }
 
-    async fn sync_conversation(&mut self, id: &str, revision: u64) {
-        let mut changed = self.sync_events(id, revision).await;
-        let attempts: Vec<String> = self
-            .detail
-            .view_mut(id)
-            .progress
-            .positions()
-            .iter()
-            .filter_map(recorded_attempt)
-            .collect();
-        for attempt in &attempts {
-            changed |= self.sync_attempt(id, revision, attempt).await;
-        }
-        let view = self.detail.view_mut(id);
-        if changed || !view.conversation.is_built() {
-            let positions = view.progress.positions().to_vec();
-            view.conversation
-                .rebuild_with_events(&positions, &view.attempts, view.events.events());
-        }
-    }
-
-    async fn sync_events(&mut self, id: &str, revision: u64) -> bool {
-        if !self.detail.view_mut(id).events.needs_read(revision) {
-            return false;
-        }
-        let client = self.client.clone();
-        let mut read = false;
-        for _ in 0..events::MAX_PAGES {
-            let after = self.detail.view_mut(id).events.after();
-            let query = ExecutionEventsQuery {
-                after,
-                limit: Some(events::PAGE_LIMIT),
-            };
-            let result = bounded_read(
-                RELAYED_READ_LIMIT,
-                client.control_execution_events(id, &query),
-            )
-            .await;
-            let more = matches!(
-                &result,
-                Ok(ExecutionEventsResponse::Available { events, has_more: true, .. })
-                    if !events.is_empty()
-            );
-            self.on_detail_read(id, revision, DetailRead::Events { after, result });
-            read = true;
-            if !more {
-                break;
+    /// Starts the read of the events when it is due: the pages up to
+    /// [`events::MAX_PAGES`] of them, one answer after the other.
+    fn start_events_read(&mut self, id: &str, revision: u64) {
+        let first = {
+            let view = self.detail.view_mut(id);
+            if !view.events.needs_read(revision) {
+                return;
             }
-        }
-        read
+            view.events.after()
+        };
+        let client = self.client.clone();
+        let task_id = id.to_string();
+        self.background.start(
+            JobKey::Detail(task_id.clone(), DetailJob::Events),
+            async move {
+                let mut reads = Vec::new();
+                let mut after = first;
+                for _ in 0..events::MAX_PAGES {
+                    let query = ExecutionEventsQuery {
+                        after,
+                        limit: Some(events::PAGE_LIMIT),
+                    };
+                    let result = bounded_read(
+                        RELAYED_READ_LIMIT,
+                        client.control_execution_events(&task_id, &query),
+                    )
+                    .await;
+                    let next = match &result {
+                        Ok(ExecutionEventsResponse::Available {
+                            events,
+                            has_more: true,
+                            ..
+                        }) => events.last().map(|event| event.sequence),
+                        _ => None,
+                    };
+                    reads.push(DetailRead::Events { after, result });
+                    match next {
+                        Some(next) => after = next,
+                        None => break,
+                    }
+                }
+                Outcome::new(move |app: &mut TaskApp| {
+                    app.on_detail_reads(&task_id, revision, reads)
+                })
+            },
+        );
     }
+
+    /// Takes the answers of one job of `task_id`'s details in, in the order
+    /// they were read. A task that left the list has no details to put them in.
+    fn on_detail_reads(&mut self, task_id: &str, revision: u64, reads: Vec<DetailRead>) {
+        if !self
+            .list
+            .tasks()
+            .iter()
+            .any(|task| task.task_id.as_str() == task_id)
+        {
+            return;
+        }
+        let rebuild = reads.iter().any(|read| {
+            matches!(
+                read,
+                DetailRead::Timeline(_) | DetailRead::Events { .. } | DetailRead::Attempt { .. }
+            )
+        });
+        for read in reads {
+            self.on_detail_read(task_id, revision, read);
+        }
+        if rebuild
+            && self.detail.tab() == DetailTab::Conversation
+            && self.list.selected_id() == Some(task_id)
+        {
+            rebuild_conversation(self.detail.view_mut(task_id));
+        }
+    }
+}
+
+/// How many times [`TaskApp::sync_detail`] starts reads and waits for them: the
+/// answers make more due (the timeline, then what it names), and a bound keeps
+/// a read that never settles from holding it for ever.
+const SYNC_ROUNDS: usize = 64;
+
+/// Puts the conversation together again from what was read.
+fn rebuild_conversation(view: &mut TaskDetail) {
+    let positions = view.progress.positions().to_vec();
+    view.conversation
+        .rebuild_with_events(&positions, &view.attempts, view.events.events());
 }
 
 /// The attempt of a position whose conversation can be read.
@@ -764,6 +862,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         (true, false) => KeysAt::Content(app.step_focus()),
     };
     let hyperlinks = app.detail().hyperlinks();
+    let glyph = app.loading_glyph();
+    let loading = app.detail_loading();
     // A task created here that the server has not confirmed has no summary
     // yet: its row says where it stands (the new-task form).
     if let Some(pending) = app.list().selected_pending().cloned() {
@@ -793,16 +893,18 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         );
         return;
     };
-    let inner = styles.render_panel(
-        frame,
-        area,
-        panel_title(&title_of(view.task), area.width),
-        frame_focused,
-    );
+    let title = title_of(view.task);
+    let title = if loading {
+        format!("{title} {glyph}")
+    } else {
+        title
+    };
+    let inner = styles.render_panel(frame, area, panel_title(&title, area.width), frame_focused);
     let options = ViewOptions {
         stale,
         keys,
         hyperlinks,
+        glyph,
     };
     render_view(frame, inner, view, styles, options);
 }
@@ -827,6 +929,8 @@ pub(super) struct ViewOptions {
     pub(super) keys: KeysAt,
     /// Links are written as OSC 8 hyperlinks.
     pub(super) hyperlinks: bool,
+    /// The glyph of the loading marker at the current frame.
+    pub(super) glyph: &'static str,
 }
 
 /// Draws `view` — the details of a task, or of an entry of the history —
@@ -842,6 +946,7 @@ pub(super) fn render_view(
         stale,
         keys,
         hyperlinks,
+        glyph,
     } = options;
     let content_keys = match keys {
         KeysAt::Content(step) => Some(step),
@@ -955,6 +1060,7 @@ pub(super) fn render_view(
             &mut view.detail.attempts,
             stale,
             content_keys,
+            glyph,
         ),
         (DetailTab::Conversation, None) => {
             conversation::render(
@@ -964,6 +1070,7 @@ pub(super) fn render_view(
                 &mut view.detail.conversation,
                 stale,
                 focused,
+                glyph,
             );
         }
         (DetailTab::Events, None) => {
@@ -974,6 +1081,7 @@ pub(super) fn render_view(
                 &mut view.detail.events,
                 stale,
                 focused,
+                glyph,
             );
         }
         (DetailTab::Conductor, None) => {
@@ -985,6 +1093,7 @@ pub(super) fn render_view(
                 view.task,
                 stale,
                 focused,
+                glyph,
             );
         }
         (DetailTab::Info, _) => {

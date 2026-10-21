@@ -163,6 +163,9 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
         if let View::History(open) = &mut app.view {
             history::render_list(frame, list_area, open, styles, list_focused, stale);
         } else {
+            let mark = (app.is_refreshing() && !app.list().tasks().is_empty())
+                .then(|| app.loading_glyph());
+            app.list_mut().set_title_mark(mark);
             app.list_mut()
                 .render(frame, list_area, styles, list_focused, stale);
             if app.list().tasks().is_empty() && app.list().pending().is_empty() {
@@ -202,11 +205,25 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
     let place = app.list.next_queue_place();
     let focused = app.focus == Focus::Details;
     let hyperlinks = app.detail.hyperlinks();
+    let glyph = app.loading_glyph();
+    let loading = app.history_entry_loading();
+    if let View::Opening(kind) = app.view {
+        let text = app.loading_label("wczytuję…");
+        let inner = styles.render_panel(frame, area, kind.title(), focused);
+        frame.render_widget(
+            Paragraph::new(Line::styled(text, styles.of(Role::Done))),
+            inner,
+        );
+        return;
+    }
     match &mut app.view {
+        View::Opening(_) => {}
         View::Tasks => detail::render(frame, area, app, styles, stale),
         View::NewTask(form) => new_task::render(frame, area, form, place, styles, focused),
         View::History(open) => {
-            history::render_details(frame, area, open, styles, focused, stale, hyperlinks);
+            history::render_details(
+                frame, area, open, styles, focused, stale, hyperlinks, glyph, loading,
+            );
         }
         View::Repositories(open) => repositories::render(frame, area, open, styles, focused),
     }
@@ -394,10 +411,12 @@ fn header_right(app: &TaskApp, styles: &Styles, fit: Fit, room: usize) -> Line<'
 }
 
 fn render_empty(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles) {
-    let text = if app.connection().is_live() {
-        "brak zadań"
+    let text = if app.is_refreshing() {
+        app.loading_label("wczytuję zadania…")
+    } else if app.connection().is_live() {
+        "brak zadań".to_string()
     } else {
-        "brak danych"
+        "brak danych".to_string()
     };
     let line = Line::styled(format!(" {text}"), styles.of(Role::Done));
     // Inside the list's frame, on its first row.
@@ -419,6 +438,16 @@ fn render_bar(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, now
             Span::raw("wyjdź  "),
             Span::styled("Esc ", styles.key_cap()),
             Span::raw("anuluj"),
+        ]);
+        frame.render_widget(Paragraph::new(hints), area);
+        return;
+    }
+    if matches!(app.view, View::Opening(_)) {
+        let hints = Line::from(vec![
+            Span::styled(" Esc ", styles.key_cap()),
+            Span::raw("wróć  "),
+            Span::styled("q ", styles.key_cap()),
+            Span::raw("wyjdź"),
         ]);
         frame.render_widget(Paragraph::new(hints), area);
         return;

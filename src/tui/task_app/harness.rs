@@ -167,21 +167,22 @@ impl TaskApp {
         }
     }
 
-    /// Reads the snapshot. A failure keeps what was known and is only
-    /// returned: the header is the only place it shows, and the connection is
-    /// judged by the task list, not by this.
-    pub(super) async fn read_harness_selection(&mut self) -> Result<(), ClientError> {
-        self.harness_selection = Some(self.client.harness_selection().await?);
-        Ok(())
-    }
-
-    /// `h`: reads the snapshot and opens the list over what is known.
-    pub(super) async fn read_and_open_harness(&mut self) {
-        let read = self.read_harness_selection().await;
+    /// The read `h` started is back: the list opens over what is known — the
+    /// snapshot just read, or the one before it when the read failed. A
+    /// failure keeps what was known and is told only when there is nothing to
+    /// open the list over.
+    pub(super) fn on_harness_read(&mut self, read: Result<HarnessSelectionSnapshot, ClientError>) {
+        let failure = match read {
+            Ok(snapshot) => {
+                self.harness_selection = Some(snapshot);
+                None
+            }
+            Err(error) => Some(error),
+        };
         if self.open_harness() {
             return;
         }
-        if let Err(error) = read {
+        if let Some(error) = failure {
             self.notify(
                 Severity::Error,
                 format!(

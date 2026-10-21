@@ -1208,8 +1208,6 @@ impl TaskApp {
                 self.action_keys.remove(&signature);
                 // Work for a task without a slot resumes it, and the resume
                 // waits when the backend is full.
-                let queued = command.status != OperatorCommandStatus::Rejected
-                    && self.queued_after_work(&task_id, had_slot).await;
                 if let Some(sent) = conductor {
                     self.conductor_command_sent(&task_id, sent, command.status);
                 }
@@ -1223,9 +1221,14 @@ impl TaskApp {
                         rejection_text(&verb, command.detail.as_deref()),
                     ),
                 };
+                let work = command.status != OperatorCommandStatus::Rejected;
                 self.list.note_operator_command(&task_id, command);
-                let note = if queued { QUEUED_FOR_SLOT } else { "" };
-                self.notify(severity, format!("{title}: {text}{note}"));
+                self.after_work_check(
+                    &task_id,
+                    had_slot || !work,
+                    severity,
+                    format!("{title}: {text}"),
+                );
             }
             Err(error) => {
                 let retryable = is_transport(&error);
@@ -1233,15 +1236,17 @@ impl TaskApp {
                     self.action_keys.remove(&signature);
                 }
                 self.note_transport(&error);
+                let (severity, text) = refusal_notice(&title, &verb, &error);
                 if matches!(
                     error,
                     ClientError::Refused { .. } | ClientError::Conflict | ClientError::NotFound
                 ) {
-                    // First the read, so the reason is the last word on the bar.
-                    self.refresh().await;
+                    // The read changes the list; the reason is the last word
+                    // on the bar once it is in.
+                    self.notify_after_refresh(severity, text);
+                } else {
+                    self.notify(severity, text);
                 }
-                let (severity, text) = refusal_notice(&title, &verb, &error);
-                self.notify(severity, text);
             }
         }
     }
@@ -1254,20 +1259,6 @@ impl TaskApp {
             .iter()
             .find(|task| task.task_id.as_str() == task_id)
             .is_none_or(|task| task.holds_slot)
-    }
-
-    /// After work was sent to a task that had no slot: whether the task now
-    /// waits in the queue (the backend is full), which only a read tells.
-    pub(super) async fn queued_after_work(&mut self, task_id: &str, had_slot: bool) -> bool {
-        if had_slot {
-            return false;
-        }
-        self.refresh().await;
-        self.list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == task_id)
-            .is_some_and(|task| task.state == TaskState::Queued)
     }
 
     /// Points the browser at a link.

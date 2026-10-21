@@ -68,6 +68,7 @@ use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::scroll::{wrap_line, ScrollState};
 use super::super::style::{Role, Styles};
+use super::background::{DetailJob, JobKey, Outcome};
 use super::detail::short_age;
 use super::list::title_of;
 use super::notify::Severity;
@@ -1558,23 +1559,26 @@ impl TaskApp {
                 self.back_to_axis();
                 // An answer to a task without a slot resumes it; the resume
                 // waits when the backend is full.
-                let note = if self.queued_after_work(&task_id, had_slot).await {
-                    super::actions::QUEUED_FOR_SLOT
-                } else {
-                    ""
-                };
-                self.notify(Severity::Success, format!("{title}: {summary}{note}"));
+                self.after_work_check(
+                    &task_id,
+                    had_slot,
+                    Severity::Success,
+                    format!("{title}: {summary}"),
+                );
             }
             Err(error) => {
                 let retryable = super::is_transport(&error);
                 let reason = failure_reason(&error);
                 self.note_transport(&error);
                 self.settle_answer(&task_id, &waiting_id, Err((reason.clone(), retryable)));
-                if !retryable {
-                    // First the read, so the reason is the last word on the bar.
-                    self.refresh().await;
+                let text = format!("{title}: nie wysłano — {reason}");
+                if retryable {
+                    self.notify(Severity::Error, text);
+                } else {
+                    // The read changes the list; the reason is the last word
+                    // on the bar once it is in.
+                    self.notify_after_refresh(Severity::Error, text);
                 }
-                self.notify(Severity::Error, format!("{title}: nie wysłano — {reason}"));
             }
         }
     }
@@ -1592,43 +1596,66 @@ impl TaskApp {
         }
     }
 
-    /// Reads the conductor's state when the answer panel is made of it, or
-    /// the *Dyrygent* tab is shown, and the task has not got it for this
-    /// revision. One read serves both. The tab's chat is read from the last
-    /// entry held, a page at a time, up to [`conductor::MAX_PAGES`] pages.
-    pub(super) async fn sync_conductor(&mut self, id: &str, revision: u64) {
+    /// Starts the read of the conductor's state when the answer panel is made
+    /// of it, or the *Dyrygent* tab is shown, and the task has not got it for
+    /// this revision. One read serves both. The tab's chat is read from the
+    /// last entry held, a page at a time, up to [`conductor::MAX_PAGES`] pages.
+    pub(super) fn start_conductor_read(&mut self, id: &str, revision: u64) {
         let shown = self.detail.tab() == super::DetailTab::Conductor;
-        let client = self.client.clone();
-        for page in 0..conductor::MAX_PAGES {
-            let Some(view) = self.detail.views.get(id) else {
-                return;
-            };
-            let panel = page == 0 && view.waiting.needs_conductor(revision);
-            let tab = shown
-                && if page == 0 {
-                    view.conductor
-                        .needs_read(revision, std::time::Instant::now())
-                } else {
-                    view.conductor.has_more()
-                };
-            if !panel && !tab {
-                return;
-            }
-            let query = crate::controller_protocol::ConductorReadQuery {
-                after: view.conductor.last_sequence(),
-                limit: None,
-            };
-            let result = super::detail::bounded_read(
-                super::detail::RELAYED_READ_LIMIT,
-                client.control_conductor(id, &query),
-            )
-            .await;
-            let failed = result.is_err();
-            self.on_detail_read(id, revision, super::detail::DetailRead::Conductor(result));
-            if failed || !shown {
-                return;
-            }
+        let Some(view) = self.detail.views.get(id) else {
+            return;
+        };
+        let panel = view.waiting.needs_conductor(revision);
+        let tab = shown
+            && view
+                .conductor
+                .needs_read(revision, std::time::Instant::now());
+        if !panel && !tab {
+            return;
         }
+        let first = view.conductor.last_sequence();
+        let client = self.client.clone();
+        let task_id = id.to_string();
+        self.background.start(
+            JobKey::Detail(task_id.clone(), DetailJob::Conductor),
+            async move {
+                let mut reads = Vec::new();
+                let mut after = first;
+                for _ in 0..conductor::MAX_PAGES {
+                    let query =
+                        crate::controller_protocol::ConductorReadQuery { after, limit: None };
+                    let result = super::detail::bounded_read(
+                        super::detail::RELAYED_READ_LIMIT,
+                        client.control_conductor(&task_id, &query),
+                    )
+                    .await;
+                    // The next page, when this one was read, the tab shows
+                    // the chat and there is more of it.
+                    let next = match &result {
+                        Ok(ConductorReadResponse::Available { conductor, .. })
+                            if shown && conductor.chat_has_more =>
+                        {
+                            conductor
+                                .chat
+                                .last()
+                                .map(|entry| entry.sequence)
+                                .filter(|last| *last > after)
+                        }
+                        _ => None,
+                    };
+                    reads.push(super::detail::DetailRead::Conductor(result));
+                    match next {
+                        Some(next) => after = next,
+                        None => break,
+                    }
+                }
+                Outcome::new(move |app: &mut TaskApp| {
+                    for read in reads {
+                        app.on_detail_read(&task_id, revision, read);
+                    }
+                })
+            },
+        );
     }
 
     /// Takes a read of the conductor's state in: the panel and the tab both.

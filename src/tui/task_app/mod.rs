@@ -24,19 +24,23 @@
 //! # Keys → request → perform
 //!
 //! [`TaskApp::on_key`] folds a key into the state and says
-//! what needs the API ([`Request`]); [`TaskApp::perform`] does it. A loop,
+//! what needs the API ([`Request`]); [`TaskApp::dispatch`] does it. A write is
+//! awaited; a read is a job of [`background`] whose answer the loop applies when
+//! it comes ([`TaskApp::perform`], [`TaskApp::refresh`] and
+//! [`TaskApp::sync_detail`] wait for the jobs they start, for a test). A loop,
 //! given a terminal, is this and nothing more:
 //!
 //! ```text
 //! select! {
-//!     key   => { let request = app.on_key(key); app.perform(request).await; }
+//!     key   => { let request = app.on_key(key); app.dispatch(request).await; } // a write waits, a read starts
 //!     event = feed.next() => app.on_stream(event),
-//!     _ = tick => {}
+//!     outcome = app.next_outcome(), if app.has_running() => app.on_outcome(outcome),
+//!     _ = tick => app.advance_animation(),
 //! }
 //! feed.ensure_open(&app);            // once a read gave it a cursor
-//! app.refresh_if_due(Instant::now()).await;
+//! app.start_refresh_if_due(Instant::now());
 //! app.retry_outgoing_if_due(Instant::now()).await; // a new task whose answer was lost
-//! app.sync_detail().await;           // what the visible tab of the selected task lacks
+//! app.start_detail_reads();          // what the visible tab of the selected task lacks
 //! // the tick also wakes at `app.next_refresh_due()` and `app.next_outgoing_due()`
 //! terminal.draw(|frame| layout::render(frame, &mut app, &styles, Instant::now()))
 //! ```
@@ -87,6 +91,7 @@
 //!   typed is a draft ([`DetailState::set_draft`]), so `q` asks first.
 
 pub mod actions;
+pub mod background;
 pub mod detail;
 pub mod harness;
 pub mod history;
@@ -109,13 +114,15 @@ use crate::controller_protocol::{
     CapabilitiesView, ControlEventEnvelope, CreateRepositoryRequest, MoveTaskRequest,
     TaskListResponse,
 };
-use narsor_protocol::controller::MoveTaskTarget;
+use narsor_protocol::controller::{MoveTaskTarget, TaskState};
 
 use super::connection::Connection;
 use super::keymap::{self, Action, Context, Stack};
 use super::refresh::RefreshSchedule;
 use super::scroll::one_line;
+use super::spinner::Spinner;
 use actions::{availability, ActionRequest, Availability, LinkRequest, Overlay, TaskAction};
+use background::{read_for_opening, Background, JobKey, OpeningKind, OpeningRead, Outcome};
 use detail::{StepLevel, TaskDetail};
 use history::History;
 use list::{title_of, MoveRequest, Removal, ResumeNotice, ResumeNoticeKind, TaskList};
@@ -330,6 +337,9 @@ pub enum View {
     History(Box<History>),
     /// The registered repositories, over the details.
     Repositories(Box<Repositories>),
+    /// A view whose read has not come back: the details area shows the
+    /// loading marker, `Esc` gives the list back and the answer opens the view.
+    Opening(OpeningKind),
 }
 
 /// Which [`View`] is open.
@@ -343,6 +353,8 @@ pub enum ViewKind {
     History,
     /// The repositories.
     Repositories,
+    /// A view that waits for its read.
+    Opening(OpeningKind),
 }
 
 /// What a key asked for that needs the API.
@@ -431,6 +443,32 @@ pub struct TaskApp {
     stream_failures: u32,
     /// The stream ended for good: no reconnect will come.
     stream_ended: bool,
+    /// The reads that run apart from the loop.
+    background: Background,
+    /// The frames of the loading marker.
+    spinner: Spinner,
+    /// The frame the marker shows; the loop raises it while a read runs.
+    animation_frame: usize,
+    /// Counts the views that began to open, so the answer of one that was
+    /// left is not taken for the answer of the one that is shown.
+    open_ticket: u64,
+    /// Work was sent to a task that had no slot: once the list is read, the
+    /// bar tells whether the task waits for one.
+    queue_check: Option<QueueCheck>,
+    /// What the bar says last, once the read that follows a refused write is
+    /// in: the reason, not the notice of a row that left the list.
+    last_word: Option<(Severity, String)>,
+    /// A write asked for a read while one ran: that one began before the
+    /// write, so its answer settles nothing and one more read follows it.
+    refresh_again: bool,
+}
+
+/// What a read of the list must tell after work was sent to a task without a
+/// slot: the text the bar showed, and the task to look for in the queue.
+struct QueueCheck {
+    task_id: String,
+    severity: Severity,
+    text: String,
 }
 
 impl TaskApp {
@@ -466,6 +504,13 @@ impl TaskApp {
             outbox: Vec::new(),
             stream_failures: 0,
             stream_ended: false,
+            background: Background::default(),
+            spinner: Spinner::default(),
+            animation_frame: 0,
+            open_ticket: 0,
+            queue_check: None,
+            last_word: None,
+            refresh_again: false,
         }
     }
 
@@ -564,6 +609,11 @@ impl TaskApp {
     /// When the next read is due: the debounce after an event, the period, or
     /// the retry after a failure.
     pub fn next_refresh_due(&self) -> Option<Instant> {
+        // A read that runs is not due again: the loop would wake at once, for
+        // as long as the server takes to answer.
+        if self.is_refreshing() {
+            return None;
+        }
         self.schedule.next_due()
     }
 
@@ -574,6 +624,7 @@ impl TaskApp {
             View::NewTask(_) => ViewKind::NewTask,
             View::History(_) => ViewKind::History,
             View::Repositories(_) => ViewKind::Repositories,
+            View::Opening(kind) => ViewKind::Opening(kind),
         }
     }
 
@@ -582,6 +633,9 @@ impl TaskApp {
     pub fn key_context(&self) -> Stack {
         if let Some(overlay) = &self.overlay {
             return overlay.context().into();
+        }
+        if matches!(self.view, View::Opening(_)) {
+            return Context::Global.into();
         }
         if self.focus == Focus::Details {
             if let Some(context) = self
@@ -712,6 +766,7 @@ impl TaskApp {
         }
         match self.view {
             View::Tasks => {}
+            View::Opening(kind) => return self.on_opening_key(key, kind),
             View::NewTask(_) if self.focus == Focus::Details => return self.on_new_task_key(key),
             View::History(_) => return self.on_history_key(key),
             View::Repositories(_) if self.focus == Focus::Details => {
@@ -869,6 +924,10 @@ impl TaskApp {
         let answer = change(&mut self.list);
         if self.list.selected_id() != before.as_deref() {
             self.back_to_axis();
+            // The reads of the task that was left are not wanted any more.
+            if let Some(before) = &before {
+                self.abort_detail_jobs(before);
+            }
         }
         answer
     }
@@ -967,13 +1026,23 @@ impl TaskApp {
     // API
     // -----------------------------------------------------------------
 
-    /// Carries a request out.
+    /// Carries a request out and waits for every read it started: what a test
+    /// and a caller without a loop use. The loop uses [`Self::dispatch`].
     pub async fn perform(&mut self, request: Request) {
+        self.dispatch(request).await;
+        self.drain_jobs().await;
+    }
+
+    /// Carries a request out without waiting for a read. A write is awaited
+    /// (R2); a read — the ones that open a view, and what a write follows
+    /// with — is started and its answer comes back through
+    /// [`Self::next_outcome`].
+    pub async fn dispatch(&mut self, request: Request) {
         match request {
             Request::None => {}
-            Request::OpenNewTask => self.read_and_open_new_task().await,
-            Request::OpenHistory => self.read_and_open_history().await,
-            Request::OpenRepositories => self.read_and_open_repositories().await,
+            Request::OpenNewTask => self.start_opening(OpeningKind::NewTask),
+            Request::OpenHistory => self.start_opening(OpeningKind::History),
+            Request::OpenRepositories => self.start_opening(OpeningKind::Repositories),
             Request::SendTask(id) => self.send_task(&id).await,
             Request::ValidatePath(path) => self.validate_path(&path).await,
             Request::Recover(id) => self.recover_execution(&id).await,
@@ -983,8 +1052,90 @@ impl TaskApp {
             Request::Answer(request) => self.answer(*request).await,
             Request::Act(request) => self.act(*request).await,
             Request::OpenLink(link) => self.open_link(link),
-            Request::OpenHarness => self.read_and_open_harness().await,
+            Request::OpenHarness => self.start_opening(OpeningKind::Harness),
             Request::SetHarness(harness) => self.change_harness(harness).await,
+        }
+    }
+
+    /// `Esc` and `q` are the keys of a view that waits for its read: nothing
+    /// else can be done in it, and neither can it be got stuck in.
+    fn on_opening_key(&mut self, key: KeyEvent, kind: OpeningKind) -> Request {
+        match key.code {
+            KeyCode::Esc => self.cancel_opening(kind),
+            KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => self.on_quit(),
+            _ => {}
+        }
+        Request::None
+    }
+
+    /// Opens `kind`'s view at once, in its waiting form, and starts the read
+    /// that fills it. A second key for the same view does nothing.
+    fn start_opening(&mut self, kind: OpeningKind) {
+        if !matches!(self.view, View::Tasks) {
+            // The view is open already: the read brings it up to date.
+            match (&self.view, kind) {
+                (View::History(_), OpeningKind::History) => self.reload_history(),
+                (View::Repositories(_), OpeningKind::Repositories) => {
+                    self.reload_repositories(None)
+                }
+                _ => {}
+            }
+            return;
+        }
+        self.open_ticket += 1;
+        let ticket = self.open_ticket;
+        self.enter_view(View::Opening(kind), Focus::Details);
+        let client = self.client.clone();
+        let want_capabilities = self.capabilities.is_none();
+        let started = self.background.start(JobKey::Open(kind), async move {
+            let read = read_for_opening(&client, kind, want_capabilities).await;
+            Outcome::new(move |app: &mut TaskApp| app.on_opened(ticket, kind, read))
+        });
+        debug_assert!(started, "an opening view has no other read of its own");
+    }
+
+    /// `Esc` in a view that waits: the list is back, and what the read brings
+    /// is not wanted.
+    fn cancel_opening(&mut self, kind: OpeningKind) {
+        self.open_ticket += 1;
+        self.abort_open_job(kind);
+        self.leave_view();
+    }
+
+    /// The read of a view that opens is back. Taken in only when that view is
+    /// still the one that waits.
+    fn on_opened(&mut self, ticket: u64, kind: OpeningKind, read: OpeningRead) {
+        if ticket != self.open_ticket || !matches!(self.view, View::Opening(open) if open == kind) {
+            return;
+        }
+        // Back to where the view was entered from, so the real view remembers
+        // that place and not the waiting one.
+        self.leave_view();
+        match read {
+            OpeningRead::History { archived, legacy } => self.on_history_read(archived, legacy),
+            OpeningRead::Repositories {
+                capabilities,
+                listing,
+            } => {
+                self.take_capabilities(capabilities);
+                self.on_repositories_read(listing);
+            }
+            OpeningRead::NewTask {
+                capabilities,
+                workflows,
+                repositories,
+            } => {
+                self.take_capabilities(capabilities);
+                self.on_new_task_read(workflows, repositories);
+            }
+            OpeningRead::Harness(snapshot) => self.on_harness_read(snapshot),
+        }
+    }
+
+    /// Takes in what a read of the capabilities brought, when it was asked.
+    fn take_capabilities(&mut self, capabilities: Option<Result<CapabilitiesView, ClientError>>) {
+        if let Some(Ok(capabilities)) = capabilities {
+            self.set_capabilities(capabilities);
         }
     }
 
@@ -1019,65 +1170,169 @@ impl TaskApp {
             Err(error) => {
                 self.note_transport(&error);
                 let reloaded = !is_transport(&error);
-                if reloaded {
-                    // First the read, so the reason is the last word on the
-                    // bar, not the notice of a row that left the list.
-                    self.refresh().await;
-                }
                 let tail = if reloaded {
                     "; lista wczytana na nowo"
                 } else {
                     ""
                 };
-                self.notify(
-                    Severity::Error,
-                    format!(
-                        "{}: przesunięcie odrzucone — {}{tail}",
-                        request.title,
-                        failure_reason(&error)
-                    ),
+                let text = format!(
+                    "{}: przesunięcie odrzucone — {}{tail}",
+                    request.title,
+                    failure_reason(&error)
                 );
+                if reloaded {
+                    // The read changes the list; the reason is the last word
+                    // on the bar once it is in, not the notice of a row that
+                    // left the list.
+                    self.notify_after_refresh(Severity::Error, text);
+                } else {
+                    self.notify(Severity::Error, text);
+                }
             }
         }
     }
 
     /// Re-reads the task list (and the server's name, once) and the default
-    /// harness, both at once. The selection, the focus, the tab, the drafts
-    /// and the move mode are not touched; the selection stays on its
-    /// `task_id`. The harness is taken in only with the list, and a failed
-    /// read of it keeps the last value known.
+    /// harness, and waits for the answer. The selection, the focus, the tab,
+    /// the drafts and the move mode are not touched; the selection stays on
+    /// its `task_id`. The harness is taken in only with the list, and a failed
+    /// read of it keeps the last value known. The loop uses
+    /// [`Self::start_refresh`], which does not wait.
     pub async fn refresh(&mut self) {
+        self.start_refresh();
+        self.drain_jobs().await;
+    }
+
+    /// Starts the read of the task list, the harness and, once, the
+    /// capabilities. Does nothing while one runs: the answer of that one is
+    /// the newest there will be.
+    pub fn start_refresh(&mut self) {
+        let client = self.client.clone();
+        let want_capabilities = self.capabilities.is_none();
+        self.background.start(JobKey::Refresh, async move {
+            let (listing, harness) = tokio::join!(
+                client.control_tasks_archived(false),
+                client.harness_selection()
+            );
+            let capabilities = match &listing {
+                Ok(_) if want_capabilities => Some(client.control_capabilities().await),
+                _ => None,
+            };
+            Outcome::new(move |app: &mut TaskApp| {
+                app.on_refresh_read(listing, harness, capabilities)
+            })
+        });
+    }
+
+    /// The read of the list is back.
+    fn on_refresh_read(
+        &mut self,
+        listing: Result<TaskListResponse, ClientError>,
+        harness: Result<HarnessSelectionSnapshot, ClientError>,
+        capabilities: Option<Result<CapabilitiesView, ClientError>>,
+    ) {
         let now = Instant::now();
-        let (listing, harness) = tokio::join!(
-            self.client.control_tasks_archived(false),
-            self.client.harness_selection()
-        );
+        let stale = std::mem::take(&mut self.refresh_again);
         match listing {
             Ok(listing) => {
                 self.load(listing);
-                if self.capabilities.is_none() {
-                    self.read_capabilities().await;
-                }
+                self.take_capabilities(capabilities);
                 if let Ok(snapshot) = harness {
                     self.set_harness_selection(snapshot);
+                }
+                if !stale {
+                    self.settle_queue_check();
                 }
             }
             Err(error) => self.on_read_failure(&error, now),
         }
+        if stale {
+            self.start_refresh();
+        } else {
+            self.settle_last_word();
+        }
     }
 
-    /// Reads a due refresh. Returns whether one ran.
-    pub async fn refresh_if_due(&mut self, now: Instant) -> bool {
-        if !self.schedule.is_due(now) {
+    /// Asks for a read that begins after a write: starts one, or, when one
+    /// runs, marks it stale and has one more follow it.
+    fn refresh_after_write(&mut self) {
+        if self.is_refreshing() {
+            self.refresh_again = true;
+        } else {
+            self.start_refresh();
+        }
+    }
+
+    /// Starts a due read. Returns whether one was started.
+    pub fn start_refresh_if_due(&mut self, now: Instant) -> bool {
+        if !self.schedule.is_due(now) || self.is_refreshing() {
             return false;
         }
-        self.refresh().await;
+        self.start_refresh();
         true
     }
 
-    async fn read_capabilities(&mut self) {
-        if let Ok(capabilities) = self.client.control_capabilities().await {
-            self.set_capabilities(capabilities);
+    /// Reads a due refresh and waits for it. Returns whether one ran.
+    pub async fn refresh_if_due(&mut self, now: Instant) -> bool {
+        if !self.start_refresh_if_due(now) {
+            return false;
+        }
+        self.drain_jobs().await;
+        true
+    }
+
+    /// Work was sent to `task_id`, which had no slot: the bar says `text` at
+    /// once, and once the list is read says it again with the wait for a slot
+    /// when the task is queued now — which only a read tells.
+    pub(super) fn after_work_check(
+        &mut self,
+        task_id: &str,
+        had_slot: bool,
+        severity: Severity,
+        text: String,
+    ) {
+        self.notify(severity, &text);
+        if had_slot {
+            return;
+        }
+        self.queue_check = Some(QueueCheck {
+            task_id: task_id.to_string(),
+            severity,
+            text,
+        });
+        self.refresh_after_write();
+    }
+
+    /// Says `text` now and again once the list is read, which a refused write
+    /// asks for: the read may say more (a task left the list), and the reason
+    /// of the refusal must stay the last word.
+    pub(super) fn notify_after_refresh(&mut self, severity: Severity, text: String) {
+        self.notify(severity, &text);
+        self.last_word = Some((severity, text));
+        self.refresh_after_write();
+    }
+
+    fn settle_last_word(&mut self) {
+        if let Some((severity, text)) = self.last_word.take() {
+            self.notify(severity, text);
+        }
+    }
+
+    fn settle_queue_check(&mut self) {
+        let Some(check) = self.queue_check.take() else {
+            return;
+        };
+        let queued = self
+            .list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == check.task_id)
+            .is_some_and(|task| task.state == TaskState::Queued);
+        if queued {
+            self.notify(
+                check.severity,
+                format!("{}{}", check.text, actions::QUEUED_FOR_SLOT),
+            );
         }
     }
 

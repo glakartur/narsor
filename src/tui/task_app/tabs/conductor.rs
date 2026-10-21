@@ -432,12 +432,15 @@ pub fn render(
     task: &TaskSummary,
     stale: bool,
     focused: bool,
+    glyph: &str,
 ) {
     let grey = |role: Role| if stale { Role::Done } else { role };
     let standing = conductor.standing(task);
     let ready = standing == Standing::Ready;
 
-    let mut top = vec![standing_line(&standing, conductor, task, styles, stale)];
+    let mut top = vec![standing_line(
+        &standing, conductor, task, styles, stale, glyph,
+    )];
     if ready {
         if let Some(reason) = conductor.failure() {
             top.push(Line::styled(
@@ -516,13 +519,17 @@ fn standing_line(
     task: &TaskSummary,
     styles: &Styles,
     stale: bool,
+    glyph: &str,
 ) -> Line<'static> {
     let grey = |role: Role| if stale { Role::Done } else { role };
     let mark = Span::styled("◆ ", styles.of(grey(Role::Conductor)));
     match standing {
         Standing::Loading => Line::from(vec![
             mark,
-            Span::styled("wczytuję dyrygenta…", styles.of(Role::Done)),
+            Span::styled(
+                format!("{glyph} wczytuję dyrygenta…"),
+                styles.of(Role::Done),
+            ),
         ]),
         Standing::Failed(reason) => Line::styled(
             format!("✗ nie udało się wczytać dyrygenta ({})", one_line(reason)),
