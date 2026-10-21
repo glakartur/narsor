@@ -73,15 +73,24 @@ default branch and stores its URL as `pr_url`; every later one pushes to it.
 
 ```
 1 requirements  brainstorm → doc_review* → publish_requirements → approve_requirements → check_requirements_feedback
+                brainstorm → publish_requirements (the agent skipped the review)
 2 plan          plan → plan_review* → publish_plan → approve_plan → check_plan_feedback
 3 implementation work → simplify → code_review → verify_work → publish_work → approve_work → check_work_feedback
 4 learning      compound → publish_learning → approve_learning → check_learning_feedback
 5 finalize      finalize → finished
 ```
 
-`*` — the review step fixes what it finds and reports `review_summary`; a
-person accepts that result before it is published, or returns it to the same
-review session with a comment.
+`*` — the review step fixes what it finds and reports `review_summary`. The
+result is not held for approval: the publish step pushes it and adds the
+summary to the merge request as a comment, and the person reads it at the gate.
+
+`brainstorm` never asks the person. It writes its assumptions in the section
+"Założenia do potwierdzenia" and its questions in "Pytania otwarte dla
+użytkownika"; the person answers on the merge request. For a small and obvious
+change the agent may skip the requirements review (choice `requirements_ready`).
+It then gives the reason in `review_summary`, which the publish step puts on the
+merge request, and the reason stays in the task history. `plan_review` always
+runs.
 
 | Gate | Choices | Why there |
 |---|---|---|

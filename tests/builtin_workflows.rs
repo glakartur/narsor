@@ -437,11 +437,18 @@ fn compound_engineering_choices_require_their_variables_and_artifacts() {
         requires("brainstorm", "requirements_drafted"),
         artifacts(&["requirements_doc"])
     );
+    assert_eq!(
+        requires("brainstorm", "requirements_ready"),
+        (
+            vec!["review_summary".to_string()],
+            vec!["requirements_doc".to_string()]
+        )
+    );
     for review in ["doc_review", "plan_review"] {
         assert_eq!(requires(review, "reviewed"), variables(&["review_summary"]));
         assert!(
-            choice(&definition, review, "reviewed").requires_human_approval,
-            "a person accepts the result of '{review}' before it is published"
+            !choice(&definition, review, "reviewed").requires_human_approval,
+            "the result of '{review}' goes to the merge request without a stop"
         );
     }
     for publish in [
@@ -463,6 +470,66 @@ fn compound_engineering_choices_require_their_variables_and_artifacts() {
         variables(&["plan_blocker"])
     );
     assert_eq!(requires("compound", "documented"), artifacts(&["learning_doc"]));
+}
+
+/// `brainstorm` has two ways out and never asks the person; the review result
+/// reaches the merge request through the publish steps.
+#[test]
+fn brainstorm_does_not_ask_and_can_skip_the_review() {
+    let definition = compound_engineering();
+    let brainstorm = &definition.states["brainstorm"];
+    assert_eq!(brainstorm.transitions["requirements_drafted"], "doc_review");
+    assert_eq!(
+        brainstorm.transitions["requirements_ready"],
+        "publish_requirements"
+    );
+    assert!(
+        brainstorm
+            .variables
+            .iter()
+            .any(|variable| variable.name == "review_summary"),
+        "'brainstorm' defines the reason for skipping the review"
+    );
+    assert!(
+        choice(&definition, "brainstorm", "requirements_drafted")
+            .requires_variables
+            .is_empty()
+    );
+
+    let Some(ActionConfig::Agent(action)) = &brainstorm.action else {
+        panic!("'brainstorm' is an agent step");
+    };
+    assert!(!action.prompt.contains("ask the person;"));
+    assert!(action.prompt.contains("Do not ask the person anything"));
+    assert!(action.prompt.contains("Założenia do potwierdzenia"));
+    assert!(action
+        .prompt
+        .contains("Pytania otwarte dla użytkownika"));
+
+    for publish in ["publish_requirements", "publish_plan"] {
+        let Some(ActionConfig::Agent(action)) = &definition.states[publish].action else {
+            panic!("'{publish}' is an agent step");
+        };
+        assert!(
+            action.prompt.contains("{{ context.review_summary }}"),
+            "'{publish}' puts the review summary on the merge request"
+        );
+    }
+}
+
+/// No step of `compound-engineering` stops for a person before publishing.
+#[test]
+fn compound_engineering_has_no_choice_that_requires_human_approval() {
+    let definition = compound_engineering();
+    for (state_id, state) in &definition.states {
+        for choice in &state.choices {
+            assert!(
+                !choice.requires_human_approval,
+                "'{state_id}' choice '{}' stops for a person",
+                choice.label
+            );
+        }
+    }
 }
 
 /// A step that reads a blocker also defines it, so it can clear it (KTD6).
@@ -907,18 +974,23 @@ fn make_executable(path: &Path) {
 #[ignore = "starts a narsor daemon; run with --ignored"]
 fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process() {
     let root = TempRoot::new();
-    // The brainstorm asks the person which way to go — the first step of the
-    // workflow asks in place, there is no separate direction gate — and,
-    // answered, asks a follow-up question.
-    let question = "Should a subscriber see failed runs too?";
+    // The brainstorm never asks: it skips the review and the publish step
+    // reports the merge request, so the first stop is `approve_requirements`.
     let bin = install_fake_claude(
         &root,
         &[
-            serde_json::json!({ "status": "awaiting_input", "question": question }),
             serde_json::json!({
-                "status": "awaiting_input",
-                "question": "Should the subscription survive a retry?",
+                "choice": "requirements_ready",
+                "reason": "a small change",
+                "artifacts": { "requirements_doc": "docs/brainstorms/r.md" },
+                "variables": { "review_summary": "Przegląd pominięto: mała zmiana" },
             }),
+            serde_json::json!({
+                "choice": "published",
+                "reason": "pushed",
+                "variables": { "pr_url": "https://gitlab.example.test/acme/web/-/merge_requests/7" },
+            }),
+            serde_json::json!({ "choice": "no_feedback", "reason": "none" }),
         ],
     );
     let repo = source_repo(&root);
@@ -971,7 +1043,7 @@ fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process()
             "input",
             &id,
             "--field",
-            "answer=yes, failed runs too",
+            "requirements_decision=approve",
         ],
         Some(&bin),
     );
@@ -984,11 +1056,6 @@ fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process()
     assert!(
         answered.stdout.contains("Input delivered to execution"),
         "the input reached the execution:\n{}",
-        answered.stdout
-    );
-    assert!(
-        !answered.stdout.contains(question),
-        "the execution moved past the first brainstorm question:\n{}",
         answered.stdout
     );
 }
