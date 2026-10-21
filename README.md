@@ -1267,7 +1267,7 @@ and modelled on real agentic development processes rather than invented ones:
 
 | File | Process | Modelled on |
 |---|---|---|
-| `workflows/compound-engineering.yaml` | brainstorm → PR → plan → PR update → work → review → PR update → learning → PR update | the `ce-*` skills of the compound-engineering plugin |
+| `workflows/compound-engineering.yaml` | five stages on one Draft merge request — requirements → plan → implementation → learning → finalize (auto-merge after a green pipeline), with a person at the end of each stage | the `ce-*` skills of the compound-engineering plugin, and `glab` |
 | `workflows/open-mercato-sdlc.yaml` | Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | Open Mercato's `SDLC.md` and the `om-*` skills |
 
 ```sh

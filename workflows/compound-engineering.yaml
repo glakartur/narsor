@@ -1,15 +1,14 @@
 name: compound-engineering
 version: 1
 description: >
-  The compound engineering chain, end to end: ce-brainstorm to ce-plan to
-  ce-work to ce-code-review to human review to ce-compound, publishing the
-  requirements, plan, implementation and learning to one pull request, with
-  ce-doc-review over the requirements, ce-simplify-code before review and
-  ce-resolve-pr-feedback on the open pull request. The pipeline stops for a
-  person at scope and plan approval. PR feedback is resolved after each push;
-  the person reviews the current PR at each gate. During
-  implementation an agent can pause and ask a question, then resume the same
-  action with the person's answer.
+  The compound engineering chain in five stages, from requirements to a merged
+  merge request: requirements (ce-brainstorm, ce-doc-review), plan (ce-plan,
+  ce-doc-review), implementation (ce-work, ce-simplify-code, ce-code-review,
+  the repository checks), learning (ce-compound) and finalize. Each stage
+  publishes to one Draft merge request, stops for a person, and then checks
+  the feedback posted while the person was reading. Finalize takes the merge
+  request out of Draft, approves it and merges it after a green pipeline, with
+  glab on GitLab.
 
 inputs:
   - name: feature_description
@@ -36,13 +35,14 @@ globals:
 
 states:
   # -------------------------------------------------------------------------
-  # WHAT to build
+  # 1. Requirements — WHAT to build
   # -------------------------------------------------------------------------
 
   brainstorm:
     description: >
-      ce-brainstorm — explore the request through dialogue and write a
-      right-sized requirements document.
+      ce-brainstorm — explore the request with the person and write a
+      right-sized requirements document. Also the author of every revision of
+      that document.
     action:
       type: agent
       prompt: |
@@ -50,323 +50,305 @@ states:
 
         {{ inputs.feature_description }}
 
+        When the direction is unclear, ask the person; do not guess the product direction.
+
+        Requirements document from an earlier pass, to revise rather than rewrite (empty on the first pass): {{ artifacts.requirements_doc }}
+        Why the plan step could not plan the requirements (empty when it could): {{ context.requirements_blocker }}
+        Feedback from the requirements approval (may be empty): {{ context.requirements_feedback }}
+
+        Set `requirements_blocker` to an empty text in your answer: the revised document answers it.
     variables:
+      - name: requirements_blocker
+        description: >-
+          why the plan step could not plan the requirements. Set it to an empty
+          text: the document you wrote answers it.
+    artifacts:
       - name: requirements_doc
         description: repo-relative path of the requirements document you wrote or revised.
     choices:
       - label: requirements_drafted
         description: the requirements document is written.
-        requires_variables: [requirements_doc]
-      - label: needs_direction
-        description: >-
-          the request is too open to write requirements for without a human
-          choosing a direction first.
+        requires_artifacts: [requirements_doc]
     transitions:
       requirements_drafted: doc_review
-      needs_direction: clarify_direction
     timeout: 45m
-
-  clarify_direction:
-    description: >
-      HUMAN GATE — the brainstorm found no direction it could take on its own.
-      Only the person who wants the feature can pick one.
-    action:
-      type: human
-      message: >
-        The brainstorm could not settle a direction. Say which way to go, or
-        stop here — an agent guessing the product direction is exactly the
-        decision it has no basis to make.
-      inputs:
-        - name: direction_decision
-          type: select
-          required: true
-          options:
-            - retry_brainstorm
-            - abandon
-        - name: direction_note
-          type: text
-          required: true
-          description: The direction to explore, in your own words.
-    choices:
-      - label: retry_brainstorm
-        description: brainstorm again, in the direction given in the note.
-      - label: abandon
-        description: stop the pipeline here.
-    transitions:
-      retry_brainstorm: brainstorm
-      abandon: cancelled
 
   doc_review:
     description: >
-      ce-doc-review — parallel persona agents read the requirements document
-      and surface role-specific issues before anyone plans against it.
+      ce-doc-review — persona agents read the requirements document and fix
+      what they find. A person accepts the result before it is published.
     action:
       type: agent
       prompt: |
-        Run the `ce-doc-review` skill with these arguments: mode:headless {{ context.requirements_doc }}
+        Run the `ce-doc-review` skill with these arguments: mode:headless {{ artifacts.requirements_doc }}
+
+        Apply the fixes the review supports. Summarise the review in `review_summary`.
+    variables:
+      - name: review_summary
+        description: >-
+          the number of findings by severity, what you fixed and what is left
+          open.
     choices:
       - label: reviewed
         description: the document was reviewed and the findings recorded.
+        requires_variables: [review_summary]
         requires_human_approval: true
     transitions:
-      reviewed: publish_scope
+      reviewed: publish_requirements
     timeout: 30m
     retry_policy:
       max_attempts: 2
       backoff: 30s
 
-  publish_scope:
-    description: Publish the reviewed requirements to the pull request.
+  publish_requirements:
+    description: >
+      Publish the reviewed requirements. The first publication opens the Draft
+      merge request every later stage pushes to.
     action:
       type: agent
       prompt: |
-        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. Open a PR if this branch has none, or push the reviewed requirements to its existing PR without rewriting the description. Report the PR URL.
+        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. This is a GitLab repository: the pull request is a merge request.
+        If this branch has no open merge request, open one as a Draft against the repository's default branch. If it has one ({{ context.pr_url }}), push the reviewed requirements to it without rewriting its description.
+        Report the merge request URL in `pr_url`.
     variables:
       - name: pr_url
-        description: URL of the open pull request for this branch.
+        description: URL of the open merge request for this branch.
     choices:
       - label: published
-        description: the reviewed requirements are available on the PR.
+        description: the reviewed requirements are on the merge request.
         requires_variables: [pr_url]
     transitions:
-      published: resolve_scope_feedback
+      published: approve_requirements
     timeout: 30m
 
-  resolve_scope_feedback:
-    description: Address feedback already posted on the requirements PR.
-    action:
-      type: agent
-      prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
-    choices:
-      - label: no_feedback
-        description: no actionable PR feedback remains.
-      - label: fixed
-        description: PR feedback was addressed and pushed for review.
-      - label: needs_human
-        description: unresolved feedback needs a decision on the PR.
-    transitions:
-      no_feedback: approve_scope
-      fixed: approve_scope
-      needs_human: approve_scope
-    timeout: 1h
-
-  approve_scope:
+  approve_requirements:
     description: >
-      HUMAN GATE — is the scope right? The requirements document is what every
-      later step is measured against; a wrong scope corrected here costs one
-      conversation, corrected after the PR it costs the whole pipeline.
+      HUMAN GATE — is the scope right? Every later step is measured against
+      the requirements; a wrong scope corrected here costs one conversation.
     action:
       type: human
       message: >
-        Read the requirements document and its review on the PR. Address any
-        unresolved PR thread that needs your decision. Approve the scope, send
-        it back for another brainstorm, or stop. An optional note is carried
-        into the plan; a revision request goes back to the brainstorm.
+        Read the requirements document and its review on the merge request.
+        Approve it, send it back to its author with a comment, or stop. A note
+        given with an approval is carried into the plan.
       inputs:
-        - name: scope_decision
+        - name: requirements_decision
           type: select
           required: true
           options:
-            - approved
+            - approve
             - revise
             - abandon
-        - name: scope_notes
+        - name: requirements_feedback
           type: text
           required: false
           description: >
-            Optional — what the plan must respect beyond the requirements
-            document: constraints or non-goals.
-        - name: brainstorm_feedback
-          type: text
-          required: true
-          description: >
-            Only for revise — what the requirements document gets wrong.
+            Required for revise — what the requirements get wrong. Optional
+            for approve — what the plan must respect beyond the document.
     choices:
-      - label: approved
-        description: the scope is right; plan against it.
+      - label: approve
+        description: the scope is right; check the feedback and plan against it.
       - label: revise
-        description: send the requirements back for another brainstorm.
-        resume_comment_field: brainstorm_feedback
+        description: the author of the requirements revises them, with the comment.
+        resume_comment_field: requirements_feedback
       - label: abandon
         description: stop the pipeline here.
     transitions:
-      approved: confirm_scope_feedback
+      approve: check_requirements_feedback
       revise: brainstorm
       abandon: cancelled
 
-  confirm_scope_feedback:
-    description: Recheck PR feedback posted while scope approval was pending.
+  check_requirements_feedback:
+    description: >
+      Check the feedback posted on the merge request while the requirements
+      waited for approval, and judge how large any fix was.
     action:
       type: agent
       prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while the scope review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to scope approval.
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process the feedback posted while the requirements waited for approval.
+        If you pushed fixes, judge their size and say why in `reason`: a minor fix changes wording or detail and not what is built; a major fix changes scope or behaviour and needs another review.
     choices:
       - label: no_feedback
-        description: scope approval stands and planning can begin.
-      - label: fixed
-        description: requirements changed on the PR and need renewed approval.
+        description: no actionable feedback remains; plan against the approved requirements.
+      - label: fixed_minor
+        description: small fixes were pushed; publish them and ask for approval again.
+      - label: fixed_major
+        description: fixes changed scope or behaviour; review the document again.
       - label: needs_human
-        description: an unresolved PR decision needs renewed human review.
+        description: a feedback thread needs a decision by the person.
     transitions:
       no_feedback: plan
-      fixed: approve_scope
-      needs_human: approve_scope
+      fixed_minor: publish_requirements
+      fixed_major: doc_review
+      needs_human: approve_requirements
     timeout: 1h
 
   # -------------------------------------------------------------------------
-  # HOW to build it
+  # 2. Plan — HOW to build it
   # -------------------------------------------------------------------------
 
   plan:
     description: >
-      ce-plan — turn the approved requirements into a durable implementation
-      plan with files, test scenarios and sequencing.
+      ce-plan — turn the approved requirements into an implementation plan.
+      Also the author of every revision of the plan.
     action:
       type: agent
       prompt: |
-        Run the `ce-plan` skill with these arguments: {{ context.requirements_doc }}
+        Run the `ce-plan` skill with these arguments: {{ artifacts.requirements_doc }}
 
-        Reviewer's note on scope:
-        {{ context.scope_notes }}
+        Your plan from an earlier pass, to revise rather than start over (empty on the first pass): {{ artifacts.plan_doc }}
+        Note from the requirements approval (may be empty): {{ context.requirements_feedback }}
+        Feedback on the plan (may be empty): {{ context.plan_feedback }}
+        Why the implementation could not follow the plan (empty when it could): {{ context.plan_blocker }}
 
-        ---
-        For `needs_scope_revision`, put the contradiction or missing dependency in `data.question`.
+        If the requirements cannot be planned as written, choose `needs_requirements_revision` and put the contradiction or the missing decision in `requirements_blocker`. The requirements go back to their author.
+        Set `plan_blocker` to an empty text in your answer, whatever you choose: this pass has taken it into account.
     variables:
+      - name: requirements_blocker
+        description: >-
+          the contradiction or missing decision that keeps the requirements
+          from being planned as written.
+      - name: plan_blocker
+        description: >-
+          why the implementation could not follow the plan. Set it to an empty
+          text: this pass has taken it into account.
+    artifacts:
       - name: plan_doc
-        description: repo-relative path of the plan.
+        description: repo-relative path of the plan you wrote or revised.
     choices:
       - label: plan_ready
         description: the plan is written and an implementer could start.
-        requires_variables: [plan_doc]
-      - label: needs_scope_revision
+        requires_artifacts: [plan_doc]
+      - label: needs_requirements_revision
         description: >-
-          the approved requirements cannot be planned as written.
+          the approved requirements cannot be planned as written; their author
+          revises them.
+        requires_variables: [requirements_blocker]
     transitions:
-      plan_ready: publish_plan
-      needs_scope_revision: approve_scope
+      plan_ready: plan_review
+      needs_requirements_revision: brainstorm
     timeout: 1h
     retry_policy:
       max_attempts: 2
       backoff: 1m
 
-  publish_plan:
-    description: Push the plan to the same pull request before approval.
+  plan_review:
+    description: >
+      ce-doc-review over the plan. A person accepts the result before it is
+      published.
     action:
       type: agent
       prompt: |
-        Run the full `ce-commit-push-pr` workflow with `mode:pipeline babysit:off`. Push the plan to the existing PR on this branch, {{ context.pr_url }}, without rewriting its description. Report the PR URL.
-    choices:
-      - label: updated
-        description: the current plan is available on the PR.
-    transitions:
-      updated: resolve_plan_feedback
-    timeout: 30m
+        Run the `ce-doc-review` skill with these arguments: mode:headless {{ artifacts.plan_doc }}
 
-  resolve_plan_feedback:
-    description: Address feedback already posted on the plan PR.
+        The plan implements these requirements: {{ artifacts.requirements_doc }}
+        Apply the fixes the review supports. Summarise the review in `review_summary`.
+    variables:
+      - name: review_summary
+        description: >-
+          the number of findings by severity, what you fixed and what is left
+          open.
+    choices:
+      - label: reviewed
+        description: the plan was reviewed and the findings recorded.
+        requires_variables: [review_summary]
+        requires_human_approval: true
+    transitions:
+      reviewed: publish_plan
+    timeout: 30m
+    retry_policy:
+      max_attempts: 2
+      backoff: 30s
+
+  publish_plan:
+    description: Push the reviewed plan to the merge request.
     action:
       type: agent
       prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
+        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. This is a GitLab repository: the pull request is a merge request.
+        Push the reviewed plan to the open merge request of this branch ({{ context.pr_url }}) without rewriting its description. If the branch has none, open one as a Draft against the repository's default branch.
+        Report the merge request URL in `pr_url`.
+    variables:
+      - name: pr_url
+        description: URL of the open merge request for this branch.
     choices:
-      - label: no_feedback
-        description: no actionable PR feedback remains.
-      - label: fixed
-        description: PR feedback was addressed and pushed for review.
-      - label: needs_human
-        description: unresolved feedback needs a decision on the PR.
+      - label: published
+        description: the reviewed plan is on the merge request.
+        requires_variables: [pr_url]
     transitions:
-      no_feedback: approve_plan
-      fixed: approve_plan
-      needs_human: approve_plan
-    timeout: 1h
+      published: approve_plan
+    timeout: 30m
 
   approve_plan:
     description: >
-      HUMAN GATE — the last point before code exists. Everything after this is
-      an edit to the repository; a correction made here is free, and the same
-      correction made after the work is a rewrite.
+      HUMAN GATE — the last point before code exists. A correction made here
+      is free; the same correction made after the work is a rewrite.
     action:
       type: human
       message: >
-        Read the plan on the PR and address any unresolved thread needing your
-        decision. Approve it and the agent starts writing code; send it
-        back and it replans; abandon and nothing is written. This is the
-        cheapest place in the pipeline to change your mind.
+        Read the plan and its review on the merge request. Approve it and the
+        agent writes code; send the plan back to its author, send the
+        requirements back to theirs, or stop.
       inputs:
         - name: plan_decision
           type: select
           required: true
           options:
-            - approved
+            - approve
             - revise
+            - revise_requirements
             - abandon
         - name: plan_feedback
           type: text
           required: false
-          description: Optional — what the plan gets wrong.
+          description: >
+            Required for revise and revise_requirements — what is wrong.
+            Optional for approve.
     choices:
-      - label: approved
-        description: the plan is right; start writing code.
+      - label: approve
+        description: the plan is right; check the feedback and start writing code.
       - label: revise
-        description: send the plan back to be replanned.
+        description: the author of the plan revises it, with the comment.
+        resume_comment_field: plan_feedback
+      - label: revise_requirements
+        description: the plan shows the requirements are wrong; their author revises them.
+        resume_comment_field: plan_feedback
       - label: abandon
         description: stop before any code is written.
     transitions:
-      approved: confirm_plan_feedback
-      revise: plan_revision
+      approve: check_plan_feedback
+      revise: plan
+      revise_requirements: brainstorm
       abandon: cancelled
 
-  confirm_plan_feedback:
-    description: Recheck PR feedback posted while plan approval was pending.
+  check_plan_feedback:
+    description: >
+      Check the feedback posted on the merge request while the plan waited for
+      approval, and judge how large any fix was.
     action:
       type: agent
       prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while the plan review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to plan approval.
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process the feedback posted while the plan waited for approval.
+        If you pushed fixes, judge their size and say why in `reason`: a minor fix changes wording or detail and not what is built; a major fix changes the approach, the scope or the sequencing and needs another review.
     choices:
       - label: no_feedback
-        description: plan approval stands and implementation can begin.
-      - label: fixed
-        description: the plan changed on the PR and needs renewed approval.
+        description: no actionable feedback remains; implement the approved plan.
+      - label: fixed_minor
+        description: small fixes were pushed; publish them and ask for approval again.
+      - label: fixed_major
+        description: fixes changed the plan's substance; review the plan again.
       - label: needs_human
-        description: an unresolved PR decision needs renewed human review.
+        description: a feedback thread needs a decision by the person.
     transitions:
       no_feedback: work
-      fixed: approve_plan
+      fixed_minor: publish_plan
+      fixed_major: plan_review
       needs_human: approve_plan
     timeout: 1h
 
   # -------------------------------------------------------------------------
-  # Doing the work
+  # 3. Implementation
   # -------------------------------------------------------------------------
-
-  plan_revision:
-    description: >
-      Replan after the human's feedback on the proposed implementation plan.
-    action:
-      type: agent
-      prompt: |
-        Run the `ce-plan` skill with these arguments: {{ context.plan_doc }}
-
-        Requirements: {{ context.requirements_doc }}
-        Feedback on the plan:
-        {{ context.plan_feedback }}
-
-        ---
-    variables:
-      - name: plan_doc
-        description: repo-relative path of the revised plan.
-    choices:
-      - label: plan_ready
-        description: the revised plan is ready for approval.
-        requires_variables: [plan_doc]
-    transitions:
-      plan_ready: publish_plan
-    timeout: 1h
-    retry_policy:
-      max_attempts: 2
-      backoff: 1m
 
   work:
     description: >
@@ -375,52 +357,33 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-work` skill with these arguments: mode:return-to-caller {{ context.plan_doc }}
+        Run the `ce-work` skill with these arguments: mode:return-to-caller {{ artifacts.plan_doc }}
 
-        Run the plan's relevant checks before implementation and record their concise result as `test_baseline` in the final output. Preserve that baseline: do not repair pre-existing failures or investigate them as part of this plan.
+        Run the plan's relevant checks before implementation and record their concise result as `test_baseline`. Preserve that baseline: do not repair pre-existing failures or investigate them as part of this plan.
 
+        If the plan cannot be implemented as written, choose `needs_plan_revision` and put what blocks it in `plan_blocker`. The plan goes back to its author.
     variables:
       - name: test_baseline
         description: concise result of checks run before implementation, including pre-existing failures or “all passed”.
+      - name: plan_blocker
+        description: what in the plan cannot be implemented as written, and why.
     choices:
       - label: implemented
         description: the plan is implemented and the checks pass.
         requires_variables: [test_baseline]
+      - label: needs_plan_revision
+        description: the plan cannot be implemented as written; its author revises it.
+        requires_variables: [plan_blocker]
     transitions:
       implemented: simplify
+      needs_plan_revision: plan
     timeout: 2h
-
-  work_revision:
-    description: >
-      Shared continuation of implementation for changes from human review or
-      PR feedback. Both routes re-enter here before simplify and automated
-      review.
-    action:
-      type: agent
-      prompt: |
-        First run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}` to address review comments already on the PR. It commits and pushes its fixes. If it reports a decision needed, leave that thread open for the human gate.
-
-        Run the `ce-work` skill with these arguments: mode:return-to-caller {{ context.plan_doc }}
-
-        Test baseline captured before implementation:
-        {{ context.test_baseline }}
-        Preserve this baseline: do not repair pre-existing failures or investigate them as part of this plan.
-
-        Changes requested in review:
-        {{ context.revision_notes }}
-
-        Implement any remaining changes requested in the review note. Include fixes pushed by the resolver in the subsequent simplify and code review.
-    choices:
-      - label: revised
-        description: requested changes are made and checks pass.
-    transitions:
-      revised: simplify
-    timeout: 1h
 
   simplify:
     description: >
       ce-simplify-code — refine what was just written for clarity, reuse and
-      efficiency, without changing behaviour.
+      efficiency, without changing behaviour. Runs once, after the first
+      implementation.
     action:
       type: agent
       prompt: |
@@ -438,109 +401,45 @@ states:
       max_attempts: 2
       backoff: 1m
 
-  # -------------------------------------------------------------------------
-  # Review, and going public
-  # -------------------------------------------------------------------------
-
   code_review:
     description: >
-      ce-code-review in report mode — findings are passed to the fix step and
-      another review cycle.
+      ce-code-review in report mode. Every change of code passes here before
+      it is verified and published.
     action:
       type: agent
       prompt: |
-        Run the `ce-code-review` skill with these arguments: mode:agent plan:{{ context.plan_doc }}
-
+        Run the `ce-code-review` skill with these arguments: mode:agent plan:{{ artifacts.plan_doc }}
     choices:
       - label: clean
         description: no actionable findings survived the confidence gate.
       - label: findings
-        description: findings need assessment and possible fixes before publication.
+        description: findings need fixes before the code is verified and published.
     transitions:
       clean: verify_work
-      findings: fix_review_findings
+      findings: fix_findings
     timeout: 1h
-    max_entries: 5
+    max_entries: 10
     retry_policy:
       max_attempts: 2
       backoff: 1m
 
-  implementation_review:
-    description: >
-      HUMAN GATE — reached after the implementation has been pushed to the
-      pull request. The person reviews that published PR and decides whether
-      to request changes, approve it, or stop.
-    action:
-      type: human
-      message: >
-        The implementation has been pushed to the pull request. Review the PR,
-        including feedback from its reviewers. Request changes with actionable
-        notes, approve it, or stop.
-      inputs:
-        - name: review_decision
-          type: select
-          required: true
-          options:
-            - revise
-            - approve
-            - abandon
-        - name: revision_notes
-          type: text
-          required: true
-          description: What to change, or "none" if approving or abandoning.
-    choices:
-      - label: revise
-        description: send the PR back for changes named in the note.
-      - label: approve
-        description: the person approves the PR after reviewing the pushed changes.
-      - label: abandon
-        description: stop the pipeline here.
-    transitions:
-      revise: work_revision
-      approve: confirm_work_feedback
-      abandon: cancelled
-
-  confirm_work_feedback:
-    description: Recheck PR feedback posted while implementation review was pending.
+  fix_findings:
+    description: Address the code-review findings; the review then runs again.
     action:
       type: agent
       prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while implementation review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to implementation review.
-    choices:
-      - label: no_feedback
-        description: implementation approval stands and learning can be captured.
-      - label: fixed
-        description: implementation changed on the PR and needs renewed review.
-      - label: needs_human
-        description: an unresolved PR decision needs renewed human review.
-    transitions:
-      no_feedback: compound
-      fixed: implementation_review
-      needs_human: implementation_review
-    timeout: 1h
-
-  fix_review_findings:
-    description: Address code-review findings, repeating review only if files changed.
-    action:
-      type: agent
-      prompt: |
-        Fix these findings from the code review. Do not perform an independent review of the diff; only address the listed residual actionable work.
+        Fix these findings from the code review. Do not perform an independent review of the diff; only address the listed actionable work.
 
         {{ steps.code_review.reply }}
 
         Test baseline captured before implementation:
         {{ context.test_baseline }}
         Preserve this baseline: do not repair pre-existing failures or investigate them as part of this plan.
-
-        Compare repository file content before and after this step, including any committed edits. If you changed files, report `fixed`. If no files changed because the findings need no actionable edit, report `unchanged` with a concise reason. Do not use `unchanged` when a required fix remains unresolved.
     choices:
       - label: fixed
-        description: files changed while addressing findings; run automated review again.
-      - label: unchanged
-        description: no actionable file changes were needed; run repository checks.
+        description: the findings are addressed; review the code again.
     transitions:
       fixed: code_review
-      unchanged: verify_work
     timeout: 1h
 
   verify_work:
@@ -588,11 +487,11 @@ states:
     timeout: 2h
 
   repair_verification:
-    description: Fix a failed repository check before review and publication.
+    description: Fix a failed repository check; the fix goes through review again.
     action:
       type: agent
       prompt: |
-        The repository's `scripts/verify.sh` failed in `verify_work`. Diagnose the failure from this captured output; do not rerun the complete script in this step. Fix the cause. The workflow will simplify, review and rerun the complete script before publishing.
+        The repository's `scripts/verify.sh` failed in `verify_work`. Diagnose the failure from this captured output; do not rerun the complete script in this step. Fix the cause. The workflow reviews the fix and reruns the complete script before publishing.
 
         Captured stdout from verify_work:
         {{ steps.verify_work.stdout }}
@@ -600,140 +499,126 @@ states:
         Captured stderr from verify_work:
         {{ steps.verify_work.stderr }}
 
-        Approved plan: {{ context.plan_doc }}
+        Approved plan: {{ artifacts.plan_doc }}
         Test baseline before implementation: {{ context.test_baseline }}
         Preserve that baseline: do not repair pre-existing failures unrelated to this work. If the script or environment is broken independently of this change, report the blocker instead of removing or bypassing the check.
     choices:
       - label: repaired
-        description: the check failure was repaired; simplify and review the changes.
+        description: the check failure was repaired; review the fix.
     transitions:
-      repaired: simplify
+      repaired: code_review
     timeout: 1h
     max_entries: 5
 
   publish_work:
-    description: >
-      Publish the reviewed implementation to the existing PR.
+    description: Push the reviewed and verified implementation to the merge request.
     action:
       type: agent
       prompt: |
-        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. It detects the existing open PR on this branch; do not rewrite its description. Publish only the reviewed implementation changes and report its URL.
-
+        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. This is a GitLab repository: the pull request is a merge request.
+        Push the reviewed implementation to the open merge request of this branch ({{ context.pr_url }}) without rewriting its description. If the branch has none, open one as a Draft against the repository's default branch.
+        Report the merge request URL in `pr_url`.
     variables:
       - name: pr_url
-        description: URL of the current pull request.
+        description: URL of the open merge request for this branch.
     choices:
       - label: published
-        description: the branch is pushed and the new or existing PR is current.
+        description: the reviewed implementation is on the merge request.
         requires_variables: [pr_url]
     transitions:
-      published: resolve_work_feedback
+      published: approve_work
     timeout: 30m
 
-  resolve_work_feedback:
-    description: Address feedback already posted on the implementation PR.
-    action:
-      type: agent
-      prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
-    choices:
-      - label: no_feedback
-        description: no actionable PR feedback remains.
-      - label: fixed
-        description: PR feedback was addressed and pushed for review.
-      - label: needs_human
-        description: unresolved feedback needs a decision on the PR.
-    transitions:
-      no_feedback: implementation_review
-      fixed: implementation_review
-      needs_human: implementation_review
-    timeout: 1h
-
-  publish_learning:
+  approve_work:
     description: >
-      Push the learning written after human review to the existing pull
-      request, then ask for a final human review of the updated PR.
-    action:
-      type: agent
-      prompt: |
-        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. Update the existing open PR on this branch without rewriting its description. Report its URL.
-    choices:
-      - label: updated
-        description: the learning is pushed to the existing pull request.
-    transitions:
-      updated: resolve_learning_feedback
-    timeout: 30m
-
-  resolve_learning_feedback:
-    description: Address feedback already posted on the updated PR.
-    action:
-      type: agent
-      prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process all unresolved PR feedback. If there is no actionable feedback, report `no_feedback`; if fixes were pushed, report `fixed`; if a decision or pending review prevents resolution, report `needs_human` with the PR thread URL and reason. The person reviews the current PR next.
-    choices:
-      - label: no_feedback
-        description: no actionable PR feedback remains.
-      - label: fixed
-        description: PR feedback was addressed and pushed for review.
-      - label: needs_human
-        description: unresolved feedback needs a decision on the PR.
-    transitions:
-      no_feedback: learning_review
-      fixed: learning_review
-      needs_human: learning_review
-    timeout: 1h
-
-  learning_review:
-    description: >
-      HUMAN GATE — final review after the learning document was pushed to the
-      already reviewed pull request.
+      HUMAN GATE — the implementation is on the merge request. The person
+      reviews it and approves it, asks for changes, sends the plan back, or
+      stops.
     action:
       type: human
       message: >
-        The learning document has been added to the approved pull request and
-        pushed. Review the updated PR. Approve it, request changes, or stop.
+        The implementation has been pushed to the merge request. Review it,
+        including feedback from its reviewers. Approve it, ask for changes,
+        send the plan back to its author, or stop.
       inputs:
-        - name: learning_review_decision
+        - name: work_decision
           type: select
           required: true
           options:
             - approve
             - revise
+            - revise_plan
             - abandon
-        - name: revision_notes
+        - name: work_feedback
           type: text
-          required: true
-          description: What to change, or "none" if approving or abandoning.
+          required: false
+          description: >
+            Required for revise and revise_plan — what to change. Optional for
+            approve.
     choices:
       - label: approve
-        description: the updated pull request is approved; finish the workflow.
+        description: the implementation is right; check the feedback and capture the learning.
       - label: revise
-        description: send the updated pull request back for changes.
+        description: make the changes named in the comment; they go through review again.
+        resume_comment_field: work_feedback
+      - label: revise_plan
+        description: the implementation shows the plan is wrong; its author revises it.
+        resume_comment_field: work_feedback
       - label: abandon
         description: stop the pipeline here.
     transitions:
-      approve: confirm_learning_feedback
+      approve: check_work_feedback
       revise: work_revision
+      revise_plan: plan
       abandon: cancelled
 
-  confirm_learning_feedback:
-    description: Recheck PR feedback posted while final review was pending.
+  work_revision:
+    description: >
+      Make the changes the person asked for at the implementation gate. They
+      go through code review, verification and publication again, without a
+      second simplify.
     action:
       type: agent
       prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Check feedback added while final review was pending. Report `no_feedback` if nothing actionable remains; report `fixed` if fixes were pushed; report `needs_human` if a decision or pending review prevents resolution, with its PR URL and reason. Any change returns the PR to final review.
+        Run the `ce-work` skill with these arguments: mode:return-to-caller {{ artifacts.plan_doc }}
+
+        Make the changes requested in review:
+        {{ context.work_feedback }}
+
+        Test baseline captured before implementation:
+        {{ context.test_baseline }}
+        Preserve this baseline: do not repair pre-existing failures or investigate them as part of this plan.
+    choices:
+      - label: revised
+        description: the requested changes are made and the checks pass.
+    transitions:
+      revised: code_review
+    timeout: 1h
+
+  check_work_feedback:
+    description: >
+      Check the feedback posted on the merge request while the implementation
+      waited for approval.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process the feedback posted while the implementation waited for approval. Fixes you make go through code review, verification and approval again.
     choices:
       - label: no_feedback
-        description: final approval stands and the workflow can finish.
+        description: no actionable feedback remains; capture the learning.
       - label: fixed
-        description: the PR changed and needs renewed final review.
+        description: code changed to address feedback; review it again.
       - label: needs_human
-        description: an unresolved PR decision needs renewed human review.
+        description: a feedback thread needs a decision by the person.
     transitions:
-      no_feedback: finished
-      fixed: learning_review
-      needs_human: learning_review
+      no_feedback: compound
+      fixed: code_review
+      needs_human: approve_work
     timeout: 1h
+
+  # -------------------------------------------------------------------------
+  # 4. Learning
+  # -------------------------------------------------------------------------
 
   compound:
     description: >
@@ -743,29 +628,340 @@ states:
       type: agent
       prompt: |
         Run the `ce-compound` skill with these arguments: mode:headless
+
+        Your learning document from an earlier pass, to update rather than duplicate (empty if there is none): {{ artifacts.learning_doc }}
+        Feedback on the learning (may be empty): {{ context.learning_feedback }}
+    artifacts:
+      - name: learning_doc
+        description: repo-relative path of the learning document you wrote or updated.
     choices:
       - label: documented
-        description: a learning document was written.
+        description: a learning document was written or updated.
+        requires_artifacts: [learning_doc]
       - label: nothing_to_document
         description: this run taught nothing that is not already written down.
     transitions:
       documented: publish_learning
-      nothing_to_document: finished
+      nothing_to_document: finalize
     timeout: 30m
     retry_policy:
       max_attempts: 2
       backoff: 30s
+
+  publish_learning:
+    description: Push the learning document to the merge request.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off`. This is a GitLab repository: the pull request is a merge request.
+        Push the learning document to the open merge request of this branch ({{ context.pr_url }}) without rewriting its description.
+        Report the merge request URL in `pr_url`.
+    variables:
+      - name: pr_url
+        description: URL of the open merge request for this branch.
+    choices:
+      - label: published
+        description: the learning document is on the merge request.
+        requires_variables: [pr_url]
+    transitions:
+      published: approve_learning
+    timeout: 30m
+
+  approve_learning:
+    description: >
+      HUMAN GATE — is the learning worth keeping? The implementation is
+      already approved, so this gate cannot stop the pipeline: it keeps,
+      revises or drops the learning.
+    action:
+      type: human
+      message: >
+        The learning document has been pushed to the merge request. Approve
+        it, send it back to its author with a comment, or drop it.
+      inputs:
+        - name: learning_decision
+          type: select
+          required: true
+          options:
+            - approve
+            - revise
+            - drop
+        - name: learning_feedback
+          type: text
+          required: false
+          description: Required for revise — what to change. Optional otherwise.
+    choices:
+      - label: approve
+        description: keep the learning; check the feedback and finalize.
+      - label: revise
+        description: the author of the learning revises it, with the comment.
+        resume_comment_field: learning_feedback
+      - label: drop
+        description: remove the learning document and finalize without it.
+    transitions:
+      approve: check_learning_feedback
+      revise: compound
+      drop: drop_learning
+
+  drop_learning:
+    description: Remove the dropped learning document from the merge request.
+    action:
+      type: agent
+      prompt: |
+        The person dropped the learning document {{ artifacts.learning_doc }}. Delete it, then run the `ce-commit-push-pr` skill with `mode:pipeline babysit:off` to push the removal to the open merge request of this branch ({{ context.pr_url }}) without rewriting its description.
+    choices:
+      - label: dropped
+        description: the learning document is removed from the merge request.
+    transitions:
+      dropped: finalize
+    timeout: 30m
+
+  check_learning_feedback:
+    description: >
+      Check the feedback posted on the merge request while the learning
+      waited for approval.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process the feedback posted while the learning waited for approval.
+    choices:
+      - label: no_feedback
+        description: no actionable feedback remains; finalize.
+      - label: fixed
+        description: the learning changed to address feedback; publish it and ask again.
+      - label: needs_human
+        description: a feedback thread needs a decision by the person.
+    transitions:
+      no_feedback: finalize
+      fixed: publish_learning
+      needs_human: approve_learning
+    timeout: 1h
+
+  # -------------------------------------------------------------------------
+  # 5. Finalize — merge on GitLab
+  # -------------------------------------------------------------------------
+
+  finalize:
+    description: >
+      Take the merge request out of Draft, approve it and merge it when its
+      pipeline succeeds, then wait up to an hour for the result. Any result
+      other than a merge cancels auto-merge and restores the Draft, so the
+      merge request never merges without a person.
+    action:
+      type: script
+      command: bash
+      args:
+        - -c
+        - |
+          wait_limit=${FINALIZE_WAIT_SECS:-3600}
+          poll_every=${FINALIZE_POLL_SECS:-30}
+          state=unknown target=unknown pipeline=unknown merge_status=unknown project_id=
+          log() { printf '[finalize] %s\n' "$*" >&2; }
+          answer() {
+            reason=$(printf '%s' "$2" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+            printf '{"choice":"%s","reason":"%s"}\n' "$1" "$reason"
+            exit 0
+          }
+          case "$MR_URL" in
+            http*://*/-/merge_requests/*) ;;
+            *) answer blocked "context.pr_url is not a GitLab merge request URL: '$MR_URL'" ;;
+          esac
+          repo=${MR_URL%%/-/merge_requests/*}
+          host=${repo#*://}
+          host=${host%%/*}
+          iid=${MR_URL##*/-/merge_requests/}
+          iid=${iid%%[/?#]*}
+          case "$iid" in
+            ''|*[!0-9]*) answer blocked "no merge request number in '$MR_URL'" ;;
+          esac
+          command -v glab >/dev/null 2>&1 || answer blocked "glab is not installed where the step runs"
+          read_mr() {
+            line=$(glab mr view "$iid" -R "$repo" -F json --jq '[.state, .target_branch, (.has_conflicts // false), (.detailed_merge_status // "unknown"), (.head_pipeline.status // "none"), .project_id] | map(tostring) | join("|")') || return 1
+            IFS='|' read -r state target conflicts merge_status pipeline project_id <<< "$line"
+          }
+          disarm() {
+            if [ -n "$project_id" ]; then
+              glab api --hostname "$host" -X POST "projects/$project_id/merge_requests/$iid/cancel_merge_when_pipeline_succeeds" >&2 || log "auto-merge was not cancelled"
+            fi
+            glab mr update "$iid" -R "$repo" --draft >&2 || log "the Draft flag was not restored"
+          }
+          stop_unmerged() {
+            disarm
+            if read_mr && [ "$state" = merged ]; then
+              answer merged "!$iid merged into $target while auto-merge was being cancelled"
+            fi
+            answer "$1" "$2"
+          }
+          read_mr || answer blocked "glab could not read merge request !$iid"
+          if [ "$state" = merged ]; then
+            answer merged "!$iid is already merged into $target"
+          fi
+          if [ "$state" != opened ]; then
+            answer blocked "!$iid is $state, not open"
+          fi
+          log "merging !$iid into $target"
+          glab mr update "$iid" -R "$repo" --ready >&2 || answer blocked "glab could not take !$iid out of Draft"
+          if ! approval=$(glab mr approve "$iid" -R "$repo" 2>&1); then
+            case "$approval" in
+              *[Aa]lready*) log "!$iid is already approved" ;;
+              *) stop_unmerged blocked "glab could not approve !$iid: $approval" ;;
+            esac
+          fi
+          glab mr merge "$iid" -R "$repo" --auto-merge --yes >&2 || stop_unmerged blocked "glab could not set auto-merge on !$iid"
+          deadline=$(( $(date +%s) + wait_limit ))
+          while :; do
+            if read_mr; then
+              case "$state" in
+                merged) answer merged "!$iid merged into $target" ;;
+                closed) stop_unmerged blocked "!$iid was closed before it merged" ;;
+              esac
+              if [ "$conflicts" = true ] || [ "$merge_status" = conflict ]; then
+                stop_unmerged conflict "!$iid conflicts with $target"
+              fi
+              case "$pipeline" in
+                failed|canceled) stop_unmerged pipeline_failed "the pipeline of !$iid ended $pipeline" ;;
+              esac
+            else
+              log "glab could not read !$iid; trying again"
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              stop_unmerged blocked "!$iid was not merged within $wait_limit s (pipeline: $pipeline, merge status: $merge_status)"
+            fi
+            sleep "$poll_every"
+          done
+      env:
+        MR_URL: "{{ context.pr_url }}"
+    choices:
+      - label: merged
+        description: the merge request is merged into its target branch.
+      - label: pipeline_failed
+        description: the pipeline failed; auto-merge is cancelled and the code needs a repair.
+      - label: conflict
+        description: the merge request conflicts with its target branch and needs a repair.
+      - label: blocked
+        description: something else stopped the merge; auto-merge is cancelled and a person decides.
+      - label: timeout
+        description: the step outlived its time limit and was stopped before it could cancel auto-merge.
+    transitions:
+      merged: finished
+      pipeline_failed: repair_merge
+      conflict: repair_merge
+      blocked: finalize_blocked
+      timeout: disarm_merge
+    timeout: 70m
+
+  repair_merge:
+    description: >
+      Fix what kept the merge request from merging — a failed pipeline or a
+      conflict. The fix goes through review, verification and approval again.
+    action:
+      type: agent
+      prompt: |
+        Finalize could not merge {{ context.pr_url }}. Its answer, with the reason:
+        {{ steps.finalize.stdout }}
+
+        Its log:
+        {{ steps.finalize.stderr }}
+
+        Find the cause — the failed pipeline jobs with `glab ci`, or the conflict with the target branch — and fix it in this branch. Do not push: the workflow reviews, verifies and publishes the fix.
+        Approved plan: {{ artifacts.plan_doc }}
+        Test baseline before implementation: {{ context.test_baseline }}
+    choices:
+      - label: repaired
+        description: the cause is fixed; review the fix.
+    transitions:
+      repaired: code_review
+    timeout: 1h
+    max_entries: 3
+
+  disarm_merge:
+    description: >
+      Clean up after a finalize the engine stopped at its time limit: cancel
+      auto-merge, restore the Draft and read the merge request once more.
+    action:
+      type: script
+      command: bash
+      args:
+        - -c
+        - |
+          state=unknown target=unknown project_id=
+          log() { printf '[disarm_merge] %s\n' "$*" >&2; }
+          answer() {
+            reason=$(printf '%s' "$2" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+            printf '{"choice":"%s","reason":"%s"}\n' "$1" "$reason"
+            exit 0
+          }
+          repo=${MR_URL%%/-/merge_requests/*}
+          host=${repo#*://}
+          host=${host%%/*}
+          iid=${MR_URL##*/-/merge_requests/}
+          iid=${iid%%[/?#]*}
+          read_mr() {
+            line=$(glab mr view "$iid" -R "$repo" -F json --jq '[.state, .target_branch, .project_id] | map(tostring) | join("|")') || return 1
+            IFS='|' read -r state target project_id <<< "$line"
+          }
+          read_mr || log "glab could not read !$iid"
+          if [ "$state" = merged ]; then
+            answer merged "!$iid merged into $target before finalize was stopped"
+          fi
+          if [ -n "$project_id" ]; then
+            glab api --hostname "$host" -X POST "projects/$project_id/merge_requests/$iid/cancel_merge_when_pipeline_succeeds" >&2 || log "auto-merge was not cancelled"
+          fi
+          glab mr update "$iid" -R "$repo" --draft >&2 || log "the Draft flag was not restored"
+          if read_mr && [ "$state" = merged ]; then
+            answer merged "!$iid merged into $target while auto-merge was being cancelled"
+          fi
+          answer disarmed "finalize hit its time limit; auto-merge on !$iid is cancelled and the Draft flag restored (state: $state)"
+      env:
+        MR_URL: "{{ context.pr_url }}"
+    choices:
+      - label: merged
+        description: the merge request merged before auto-merge could be cancelled.
+      - label: disarmed
+        description: auto-merge is cancelled and the Draft flag restored; a person decides.
+    transitions:
+      merged: finished
+      disarmed: finalize_blocked
+    timeout: 10m
+
+  finalize_blocked:
+    description: >
+      HUMAN GATE — finalize could not merge. Its reason is shown with the
+      request. The merge request is back in Draft with auto-merge cancelled.
+    action:
+      type: human
+      message: >
+        Finalize could not merge the merge request; its reason is shown above.
+        Fix what blocks it on GitLab and retry, or finish without merging.
+      inputs:
+        - name: finalize_decision
+          type: select
+          required: true
+          options:
+            - retry
+            - finish_unmerged
+    choices:
+      - label: retry
+        description: run finalize again.
+      - label: finish_unmerged
+        description: end the pipeline without merging; the merge request stays open as a Draft.
+    transitions:
+      retry: finalize
+      finish_unmerged: not_merged
 
   # -------------------------------------------------------------------------
   # Terminals
   # -------------------------------------------------------------------------
 
   finished:
-    description: Merged-ready work, reviewed, published and its learning written down.
+    description: The merge request is merged, with its requirements, plan, code and learning.
 
   cancelled:
     description: A person stopped the pipeline.
 
+  not_merged:
+    description: A person ended the pipeline without merging; the work never reached the target branch.
+
 terminal_states:
   finished: completed
   cancelled: cancelled
+  not_merged: cancelled

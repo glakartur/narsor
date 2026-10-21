@@ -38,14 +38,14 @@
     .swatch { width: 16px; height: 16px; border: 1px solid; border-radius: 5px; }
     .swatch.agent { background: var(--green); border-color: var(--green-line); }
     .swatch.human { background: var(--blue); border-color: var(--blue-line); }
-    .swatch.decision { background: var(--amber); border-color: var(--amber-line); }
+    .swatch.script { background: var(--amber); border-color: var(--amber-line); }
     .swatch.terminal { background: var(--red); border-color: var(--red-line); }
     .canvas { overflow-x: auto; border: 1px solid #dce3dc; border-radius: 18px; background: #fbfcfa; box-shadow: 0 12px 40px #22372b0d; }
-    svg { display: block; width: 100%; min-width: 880px; height: auto; }
+    svg { display: block; width: 100%; min-width: 960px; height: auto; }
     .node rect { stroke-width: 2; rx: 14; }
     .node.agent rect { fill: var(--green); stroke: var(--green-line); }
     .node.human rect { fill: var(--blue); stroke: var(--blue-line); }
-    .node.decision rect { fill: var(--amber); stroke: var(--amber-line); }
+    .node.script rect { fill: var(--amber); stroke: var(--amber-line); }
     .node.terminal rect { fill: var(--red); stroke: var(--red-line); }
     .node .title { fill: var(--ink); font-size: 16px; font-weight: 720; text-anchor: middle; }
     .node .sub { fill: var(--muted); font-size: 12px; text-anchor: middle; }
@@ -65,84 +65,190 @@
   <header>
     <div class="eyebrow">Workflow · Narsor</div>
     <h1>compound-engineering</h1>
-    <p>Wymagania, plan, kod i wiedza trafiają kolejno do tego samego PR-u. Po każdym pushu agent obsługuje uwagi, a niebieskie kroki czekają na decyzję człowieka.</p>
+    <p>Pięć etapów na jednym Draft MR: wymagania, plan, implementacja, wiedza i zakończenie. Każdy etap kończy się decyzją człowieka (niebieskie kroki), a potem agent sprawdza uwagi z MR. Zakończenie scala MR przez <code>glab</code> po udanym pipeline.</p>
     <div class="legend" aria-label="Legenda diagramu">
       <span class="key"><i class="swatch agent"></i> krok agenta</span>
       <span class="key"><i class="swatch human"></i> bramka człowieka</span>
-      <span class="key"><i class="swatch decision"></i> wybór / poprawki</span>
-      <span class="key"><i class="swatch terminal"></i> zakończenie</span>
+      <span class="key"><i class="swatch script"></i> skrypt</span>
+      <span class="key"><i class="swatch terminal"></i> stan końcowy</span>
+      <span class="key">* akceptacja wyniku review · ✎ wymaga komentarza i wznawia sesję autora</span>
     </div>
   </header>
   <main>
     <div class="canvas" role="region" aria-label="Diagram przepływu workflow; na wąskim ekranie można przewijać poziomo" tabindex="0">
-      <svg viewBox="0 0 1100 1660" role="img" aria-labelledby="diagram-title diagram-desc">
+      <svg viewBox="0 0 1160 2730" role="img" aria-labelledby="diagram-title diagram-desc">
         <title id="diagram-title">Diagram compound-engineering</title>
-        <desc id="diagram-desc">Uproszczony diagram pokazuje brainstorm, plan, implementację i zapis wiedzy. Każdy z tych etapów publikuje zmiany do tego samego PR-u i obsługuje uwagi przed oceną człowieka.</desc>
+        <desc id="diagram-desc">Pięć etapów: wymagania, plan, implementacja, wiedza i zakończenie. Każdy etap publikuje zmiany do tego samego Draft MR, czeka na decyzję człowieka i sprawdza uwagi z MR. Zakończenie scala MR przez glab po udanym pipeline.</desc>
         <defs>
           <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#9eafa4"/></marker>
         </defs>
-        <rect class="section" x="24" y="32" width="1052" height="470" rx="18"/>
-        <text class="section-label" x="48" y="60">ZAKRES I PLAN</text>
-        <rect class="section" x="24" y="520" width="1052" height="570" rx="18"/>
-        <text class="section-label" x="48" y="548">IMPLEMENTACJA I REVIEW</text>
-        <rect class="section" x="24" y="1100" width="1052" height="500" rx="18"/>
-        <text class="section-label" x="48" y="1128">ZAPIS WIEDZY I REVIEW KOŃCOWE</text>
+        <rect class="section" x="24" y="40" width="1112" height="536" rx="18"/>
+        <text class="section-label" x="48" y="68">1 · WYMAGANIA</text>
+        <rect class="section" x="24" y="596" width="1112" height="536" rx="18"/>
+        <text class="section-label" x="48" y="624">2 · PLAN</text>
+        <rect class="section" x="24" y="1152" width="1112" height="736" rx="18"/>
+        <text class="section-label" x="48" y="1180">3 · IMPLEMENTACJA</text>
+        <rect class="section" x="24" y="1908" width="1112" height="436" rx="18"/>
+        <text class="section-label" x="48" y="1936">4 · WIEDZA</text>
+        <rect class="section" x="24" y="2364" width="1112" height="336" rx="18"/>
+        <text class="section-label" x="48" y="2392">5 · ZAKOŃCZENIE</text>
 
         <!-- connectors -->
-        <path class="edge" d="M550 137V175"/><path class="edge" d="M550 247V285"/>
-        <path class="edge" d="M550 357V395"/>
-        <path class="edge" d="M550 467V575"/><path class="edge" d="M550 647V685"/>
-        <path class="edge" d="M550 757V795"/><path class="edge" d="M550 867V905"/>
-        <path class="edge" d="M550 977V1015"/><path class="edge" d="M550 1087V1125"/>
-        <path class="edge" d="M550 1197V1235"/><path class="edge" d="M550 1307V1345"/>
-        <path class="edge" d="M550 1417V1455"/><text class="edge-label" x="565" y="1445">approve</text>
-        <!-- scope revision loop -->
-        <path class="edge" d="M420 211H340V103H420"/><text class="edge-label" x="286" y="160">revise</text>
-        <!-- scope / planning returns -->
-        <path class="edge" d="M680 321H790V211H680"/><text class="edge-label" x="800" y="275">needs scope revision</text>
-        <path class="edge" d="M680 431H760V465"/><text class="edge-label" x="690" y="458">revise</text>
-        <path class="edge" d="M760 465V431H680"/><text class="edge-label" x="770" y="450">plan ready</text>
-        <!-- ambiguity -->
-        <!-- automatic review loop, then human implementation review -->
-        <path class="edge" d="M680 831H760"/><text class="edge-label" x="695" y="820">findings</text>
-        <path class="edge" d="M760 867V890H390V831H420"/><text class="edge-label" x="470" y="885">fixed → review again</text>
-        <path class="edge" d="M1020 831H1040V941H680"/><text class="edge-label" x="790" y="929">bez zmian → publikacja</text>
-        <text class="edge-label" x="565" y="892">clean</text>
-        <path class="edge" d="M680 1051H1060V611H1020"/><text class="edge-label" x="900" y="1040">revise</text>
-        <path class="edge" d="M760 647V721H680"/><text class="edge-label" x="770" y="700">continue</text>
-        <path class="edge" d="M680 1381H1060V611H1020"/><text class="edge-label" x="900" y="1370">revise</text>
-        <path class="edge" d="M680 1161H730V1482H630"/><text class="edge-label" x="740" y="1205">nic do zapisania</text>
-        <!-- abandon collector -->
-        <path class="edge" d="M420 211H55V1572H790"/>
-        <path class="edge" d="M420 431H55V1572H790"/>
-        <path class="edge" d="M420 1051H55V1572H790"/>
-        <path class="edge" d="M420 1381H55V1572H790"/>
-        <text class="edge-label" x="61" y="1200">abandon</text>
+        <path class="edge" d="M550 150V190"/>
+        <path class="edge" d="M550 250V290"/>
+        <path class="edge" d="M550 350V390"/>
+        <path class="edge" d="M550 450V490"/>
+        <path class="edge" d="M425 410H300V120H425"/>
+        <path class="edge" d="M425 520H360V432H425"/>
+        <path class="edge" d="M675 510H720V320H675"/>
+        <path class="edge" d="M675 534H780V220H675"/>
+        <path class="edge" d="M550 550V646"/>
+        <path class="edge" d="M550 706V746"/>
+        <path class="edge" d="M550 806V846"/>
+        <path class="edge" d="M550 906V946"/>
+        <path class="edge" d="M550 1006V1046"/>
+        <path class="edge" d="M425 966H300V676H425"/>
+        <path class="edge" d="M425 1076H360V988H425"/>
+        <path class="edge" d="M675 1066H720V876H675"/>
+        <path class="edge" d="M675 1090H780V776H675"/>
+        <path class="edge" d="M675 666H1080V110H675"/>
+        <path class="edge" d="M675 990H1060V134H675"/>
+        <path class="edge" d="M550 1106V1202"/>
+        <path class="edge" d="M550 1262V1302"/>
+        <path class="edge" d="M550 1362V1402"/>
+        <path class="edge" d="M550 1462V1502"/>
+        <path class="edge" d="M550 1562V1602"/>
+        <path class="edge" d="M550 1662V1702"/>
+        <path class="edge" d="M550 1762V1802"/>
+        <path class="edge" d="M425 1232H240V690H425"/>
+        <path class="edge" d="M425 1722H270V698H425"/>
+        <path class="edge" d="M675 1420H775"/>
+        <path class="edge" d="M775 1446H675"/>
+        <path class="edge" d="M675 1532H775"/>
+        <path class="edge" d="M1025 1532H1080V1408H675"/>
+        <path class="edge" d="M675 1732H775"/>
+        <path class="edge" d="M1025 1732H1100V1404H675"/>
+        <path class="edge" d="M425 1832H360V1744H425"/>
+        <path class="edge" d="M425 1846H330V1452H425"/>
+        <path class="edge" d="M550 1862V1958"/>
+        <path class="edge" d="M550 2018V2058"/>
+        <path class="edge" d="M550 2118V2158"/>
+        <path class="edge" d="M550 2218V2258"/>
+        <path class="edge" d="M425 2178H300V1988H425"/>
+        <path class="edge" d="M425 2288H360V2200H425"/>
+        <path class="edge" d="M675 2288H720V2102H675"/>
+        <path class="edge" d="M675 2188H775"/>
+        <path class="edge" d="M550 2318V2414"/>
+        <path class="edge" d="M425 2002H240V2434H425"/>
+        <path class="edge" d="M900 2218V2384H715V2424H675"/>
+        <path class="edge" d="M675 2454H775"/>
+        <path class="edge" d="M1025 2444H1120V1460H675"/>
+        <path class="edge" d="M550 2474V2514"/>
+        <path class="edge" d="M620 2474V2488H840V2514"/>
+        <path class="edge" d="M775 2554H675"/>
+        <path class="edge" d="M425 2534H385V2444H425"/>
+        <path class="edge" d="M550 2574V2594H900V2614"/>
+        <path class="edge" d="M960 2574V2644H679"/>
+        <path class="edge" d="M675 2466H695V2628H679"/>
+        <path class="edge" d="M425 398H60V2644H110"/>
+        <path class="edge" d="M425 954H60V2644H110"/>
+        <path class="edge" d="M425 1710H60V2644H110"/>
+        <text class="edge-label" x="560" y="174" text-anchor="start">requirements_drafted</text>
+        <text class="edge-label" x="560" y="274" text-anchor="start">reviewed · akceptacja</text>
+        <text class="edge-label" x="560" y="374" text-anchor="start">published</text>
+        <text class="edge-label" x="560" y="474" text-anchor="start">approve</text>
+        <text class="edge-label" x="292" y="265" text-anchor="start">revise ✎</text>
+        <text class="edge-label" x="352" y="476" text-anchor="start">needs_human</text>
+        <text class="edge-label" x="726" y="415" text-anchor="start">fixed_minor</text>
+        <text class="edge-label" x="786" y="377" text-anchor="start">fixed_major</text>
+        <text class="edge-label" x="560" y="602" text-anchor="start">no_feedback</text>
+        <text class="edge-label" x="560" y="730" text-anchor="start">plan_ready</text>
+        <text class="edge-label" x="560" y="830" text-anchor="start">reviewed · akceptacja</text>
+        <text class="edge-label" x="560" y="930" text-anchor="start">published</text>
+        <text class="edge-label" x="560" y="1030" text-anchor="start">approve</text>
+        <text class="edge-label" x="292" y="821" text-anchor="start">revise ✎</text>
+        <text class="edge-label" x="352" y="1032" text-anchor="start">needs_human</text>
+        <text class="edge-label" x="726" y="971" text-anchor="start">fixed_minor</text>
+        <text class="edge-label" x="786" y="933" text-anchor="start">fixed_major</text>
+        <text class="edge-label" x="1074" y="290" text-anchor="end">needs_requirements_revision</text>
+        <text class="edge-label" x="1054" y="520" text-anchor="end">revise_requirements ✎</text>
+        <text class="edge-label" x="560" y="1158" text-anchor="start">no_feedback</text>
+        <text class="edge-label" x="560" y="1286" text-anchor="start">implemented</text>
+        <text class="edge-label" x="560" y="1486" text-anchor="start">clean</text>
+        <text class="edge-label" x="560" y="1586" text-anchor="start">passed / skipped</text>
+        <text class="edge-label" x="560" y="1686" text-anchor="start">published</text>
+        <text class="edge-label" x="560" y="1786" text-anchor="start">approve</text>
+        <text class="edge-label" x="232" y="961" text-anchor="start">needs_plan_revision</text>
+        <text class="edge-label" x="262" y="1210" text-anchor="start">revise_plan ✎</text>
+        <text class="edge-label" x="683" y="1414" text-anchor="start">findings</text>
+        <text class="edge-label" x="683" y="1462" text-anchor="start">fixed</text>
+        <text class="edge-label" x="683" y="1526" text-anchor="start">failed</text>
+        <text class="edge-label" x="1074" y="1470" text-anchor="end">repaired</text>
+        <text class="edge-label" x="683" y="1726" text-anchor="start">revise ✎</text>
+        <text class="edge-label" x="1094" y="1568" text-anchor="end">revised</text>
+        <text class="edge-label" x="352" y="1788" text-anchor="start">needs_human</text>
+        <text class="edge-label" x="322" y="1649" text-anchor="start">fixed</text>
+        <text class="edge-label" x="560" y="1914" text-anchor="start">no_feedback</text>
+        <text class="edge-label" x="560" y="2042" text-anchor="start">documented</text>
+        <text class="edge-label" x="560" y="2142" text-anchor="start">published</text>
+        <text class="edge-label" x="560" y="2242" text-anchor="start">approve</text>
+        <text class="edge-label" x="292" y="2083" text-anchor="start">revise ✎</text>
+        <text class="edge-label" x="352" y="2244" text-anchor="start">needs_human</text>
+        <text class="edge-label" x="726" y="2195" text-anchor="start">fixed</text>
+        <text class="edge-label" x="683" y="2182" text-anchor="start">drop</text>
+        <text class="edge-label" x="560" y="2370" text-anchor="start">no_feedback</text>
+        <text class="edge-label" x="232" y="2218" text-anchor="start">nothing_to_document</text>
+        <text class="edge-label" x="908" y="2238" text-anchor="start">dropped</text>
+        <text class="edge-label" x="683" y="2448" text-anchor="start">pipeline_failed / conflict</text>
+        <text class="edge-label" x="1114" y="1952" text-anchor="end">repaired</text>
+        <text class="edge-label" x="560" y="2498" text-anchor="start">blocked</text>
+        <text class="edge-label" x="660" y="2484" text-anchor="start">timeout</text>
+        <text class="edge-label" x="683" y="2570" text-anchor="start">disarmed</text>
+        <text class="edge-label" x="345" y="2493" text-anchor="start">retry</text>
+        <text class="edge-label" x="560" y="2590" text-anchor="start">finish_unmerged</text>
+        <text class="edge-label" x="968" y="2604" text-anchor="start">merged</text>
+        <text class="edge-label" x="701" y="2556" text-anchor="start">merged</text>
+        <text class="edge-label" x="66" y="2584">abandon</text>
 
         <!-- nodes -->
-        <g class="node agent"><rect x="420" y="65" width="260" height="72"/><text class="title" x="550" y="96">Brainstorm → PR</text><text class="sub" x="550" y="117">ce-brainstorm · doc review</text></g>
-        <g class="node human"><rect x="420" y="175" width="260" height="72"/><text class="title" x="550" y="206">Akceptacja zakresu</text><text class="sub" x="550" y="227">approve_scope</text></g>
-        <g class="node agent"><rect x="420" y="285" width="260" height="72"/><text class="title" x="550" y="316">Plan → PR</text><text class="sub" x="550" y="337">ce-plan · publish_plan</text></g>
-        <g class="node human"><rect x="420" y="395" width="260" height="72"/><text class="title" x="550" y="426">Akceptacja planu</text><text class="sub" x="550" y="447">approve_plan</text></g>
-        <g class="node agent"><rect x="760" y="395" width="260" height="72"/><text class="title" x="890" y="426">Replan</text><text class="sub" x="890" y="447">plan_revision</text></g>
-        <g class="node agent"><rect x="420" y="575" width="260" height="72"/><text class="title" x="550" y="606">Implementacja</text><text class="sub" x="550" y="627">ce-work</text></g>
-        <g class="node agent"><rect x="420" y="685" width="260" height="72"/><text class="title" x="550" y="716">Uproszczenie</text><text class="sub" x="550" y="737">ce-simplify-code</text></g>
-        <g class="node agent"><rect x="420" y="795" width="260" height="72"/><text class="title" x="550" y="826">Code review</text><text class="sub" x="550" y="847">ce-code-review · mode:agent</text></g>
-        <g class="node agent"><rect x="420" y="905" width="260" height="72"/><text class="title" x="550" y="936">Sprawdzenie i push</text><text class="sub" x="550" y="957">verify_work · publish_work</text></g>
-        <g class="node agent"><rect x="760" y="795" width="260" height="72"/><text class="title" x="890" y="826">Automatyczne poprawki</text><text class="sub" x="890" y="847">fix_review_findings</text></g>
-        <g class="node agent"><rect x="760" y="575" width="260" height="72"/><text class="title" x="890" y="606">Implementacja · dalszy ciąg</text><text class="sub" x="890" y="627">ce-work · work_revision</text></g>
-        <g class="node human"><rect x="420" y="1015" width="260" height="72"/><text class="title" x="550" y="1046">Review człowieka</text><text class="sub" x="550" y="1067">implementation_review</text></g>
-        <g class="node agent"><rect x="420" y="1125" width="260" height="72"/><text class="title" x="550" y="1156">Zapis wiedzy</text><text class="sub" x="550" y="1177">ce-compound</text></g>
-        <g class="node agent"><rect x="420" y="1235" width="260" height="72"/><text class="title" x="550" y="1266">Push i uwagi PR</text><text class="sub" x="550" y="1287">publish_learning · resolve</text></g>
-        <g class="node human"><rect x="420" y="1345" width="260" height="72"/><text class="title" x="550" y="1376">Review końcowe</text><text class="sub" x="550" y="1397">learning_review</text></g>
-        <g class="node terminal"><rect x="470" y="1455" width="160" height="54"/><text class="title" x="550" y="1488">Finished</text></g>
-        <g class="node terminal"><rect x="790" y="1545" width="160" height="54"/><text class="title" x="870" y="1578">Cancelled</text></g>
+        <g class="node agent"><rect x="425" y="90" width="250" height="60"/><text class="title" x="550" y="117">Wymagania</text><text class="sub" x="550" y="136">brainstorm · ce-brainstorm</text></g>
+        <g class="node agent"><rect x="425" y="190" width="250" height="60"/><text class="title" x="550" y="217">Review wymagań *</text><text class="sub" x="550" y="236">doc_review · ce-doc-review</text></g>
+        <g class="node agent"><rect x="425" y="290" width="250" height="60"/><text class="title" x="550" y="317">Publikacja · Draft MR</text><text class="sub" x="550" y="336">publish_requirements</text></g>
+        <g class="node human"><rect x="425" y="390" width="250" height="60"/><text class="title" x="550" y="417">Akceptacja wymagań</text><text class="sub" x="550" y="436">approve_requirements</text></g>
+        <g class="node agent"><rect x="425" y="490" width="250" height="60"/><text class="title" x="550" y="517">Uwagi z MR</text><text class="sub" x="550" y="536">check_requirements_feedback</text></g>
+        <g class="node agent"><rect x="425" y="646" width="250" height="60"/><text class="title" x="550" y="673">Plan</text><text class="sub" x="550" y="692">plan · ce-plan</text></g>
+        <g class="node agent"><rect x="425" y="746" width="250" height="60"/><text class="title" x="550" y="773">Review planu *</text><text class="sub" x="550" y="792">plan_review · ce-doc-review</text></g>
+        <g class="node agent"><rect x="425" y="846" width="250" height="60"/><text class="title" x="550" y="873">Publikacja</text><text class="sub" x="550" y="892">publish_plan</text></g>
+        <g class="node human"><rect x="425" y="946" width="250" height="60"/><text class="title" x="550" y="973">Akceptacja planu</text><text class="sub" x="550" y="992">approve_plan</text></g>
+        <g class="node agent"><rect x="425" y="1046" width="250" height="60"/><text class="title" x="550" y="1073">Uwagi z MR</text><text class="sub" x="550" y="1092">check_plan_feedback</text></g>
+        <g class="node agent"><rect x="425" y="1202" width="250" height="60"/><text class="title" x="550" y="1229">Implementacja</text><text class="sub" x="550" y="1248">work · ce-work</text></g>
+        <g class="node agent"><rect x="425" y="1302" width="250" height="60"/><text class="title" x="550" y="1329">Uproszczenie</text><text class="sub" x="550" y="1348">simplify · ce-simplify-code</text></g>
+        <g class="node agent"><rect x="425" y="1402" width="250" height="60"/><text class="title" x="550" y="1429">Code review</text><text class="sub" x="550" y="1448">code_review · max 10</text></g>
+        <g class="node agent"><rect x="775" y="1402" width="250" height="60"/><text class="title" x="900" y="1429">Poprawki z review</text><text class="sub" x="900" y="1448">fix_findings</text></g>
+        <g class="node script"><rect x="425" y="1502" width="250" height="60"/><text class="title" x="550" y="1529">Sprawdzenie</text><text class="sub" x="550" y="1548">verify_work · scripts/verify.sh</text></g>
+        <g class="node agent"><rect x="775" y="1502" width="250" height="60"/><text class="title" x="900" y="1529">Naprawa sprawdzenia</text><text class="sub" x="900" y="1548">repair_verification · max 5</text></g>
+        <g class="node agent"><rect x="425" y="1602" width="250" height="60"/><text class="title" x="550" y="1629">Publikacja</text><text class="sub" x="550" y="1648">publish_work</text></g>
+        <g class="node human"><rect x="425" y="1702" width="250" height="60"/><text class="title" x="550" y="1729">Akceptacja kodu</text><text class="sub" x="550" y="1748">approve_work</text></g>
+        <g class="node agent"><rect x="775" y="1702" width="250" height="60"/><text class="title" x="900" y="1729">Zmiany z akceptacji</text><text class="sub" x="900" y="1748">work_revision</text></g>
+        <g class="node agent"><rect x="425" y="1802" width="250" height="60"/><text class="title" x="550" y="1829">Uwagi z MR</text><text class="sub" x="550" y="1848">check_work_feedback</text></g>
+        <g class="node agent"><rect x="425" y="1958" width="250" height="60"/><text class="title" x="550" y="1985">Zapis wiedzy</text><text class="sub" x="550" y="2004">compound · ce-compound</text></g>
+        <g class="node agent"><rect x="425" y="2058" width="250" height="60"/><text class="title" x="550" y="2085">Publikacja</text><text class="sub" x="550" y="2104">publish_learning</text></g>
+        <g class="node human"><rect x="425" y="2158" width="250" height="60"/><text class="title" x="550" y="2185">Akceptacja wiedzy</text><text class="sub" x="550" y="2204">approve_learning</text></g>
+        <g class="node agent"><rect x="775" y="2158" width="250" height="60"/><text class="title" x="900" y="2185">Usunięcie dokumentu</text><text class="sub" x="900" y="2204">drop_learning</text></g>
+        <g class="node agent"><rect x="425" y="2258" width="250" height="60"/><text class="title" x="550" y="2285">Uwagi z MR</text><text class="sub" x="550" y="2304">check_learning_feedback</text></g>
+        <g class="node script"><rect x="425" y="2414" width="250" height="60"/><text class="title" x="550" y="2441">Scalenie</text><text class="sub" x="550" y="2460">finalize · glab · ≤ 60 min</text></g>
+        <g class="node agent"><rect x="775" y="2414" width="250" height="60"/><text class="title" x="900" y="2441">Naprawa scalenia</text><text class="sub" x="900" y="2460">repair_merge · max 3</text></g>
+        <g class="node human"><rect x="425" y="2514" width="250" height="60"/><text class="title" x="550" y="2541">Scalenie zablokowane</text><text class="sub" x="550" y="2560">finalize_blocked</text></g>
+        <g class="node script"><rect x="775" y="2514" width="250" height="60"/><text class="title" x="900" y="2541">Rozbrojenie scalenia</text><text class="sub" x="900" y="2560">disarm_merge · glab</text></g>
+        <g class="node terminal"><rect x="460" y="2614" width="180" height="60"/><text class="title" x="550" y="2641">finished</text><text class="sub" x="550" y="2660">scalone</text></g>
+        <g class="node terminal"><rect x="810" y="2614" width="180" height="60"/><text class="title" x="900" y="2641">not_merged</text><text class="sub" x="900" y="2660">bez scalenia</text></g>
+        <g class="node terminal"><rect x="110" y="2614" width="180" height="60"/><text class="title" x="200" y="2641">cancelled</text><text class="sub" x="200" y="2660">abandon</text></g>
       </svg>
     </div>
     <section class="notes" aria-label="Opis głównych pętli">
-      <article class="note"><h2>Zakres i plan</h2><p>Po przeglądzie wymagań powstaje PR. Plan i jego poprawki trafiają do tego samego PR-u przed akceptacją. Po każdym pushu agent obsługuje istniejące uwagi.</p></article>
-      <article class="note"><h2>Implementacja i review</h2><p>Po przeglądzie kodu opcjonalny skrypt repozytorium sprawdza format, build i testy. W razie błędu agent dostaje zapisane stdout i stderr, poprawia kod, a potem wraca przez review i weryfikację. Skrypt nie jest uruchamiany drugi raz tylko po to, by odczytać błąd.</p></article>
-      <article class="note"><h2>Publikacja i PR</h2><p>Bez uwag proces idzie dalej. Poprawki z komentarzy są wypychane na PR przed kolejną weryfikacją człowieka. Zapis wiedzy także przechodzi ten cykl.</p></article>
+      <article class="note"><h2>Wymagania i plan</h2><p>Review poprawia dokument i podsumowuje uwagi. Człowiek akceptuje ten wynik, zanim trafi do MR. Pierwsza publikacja tworzy Draft MR. Po bramce agent ocenia skalę poprawek z uwag: mała wraca do bramki, duża do review. Blokada planu wraca do autora wymagań.</p></article>
+      <article class="note"><h2>Implementacja</h2><p>Uproszczenie działa raz. Każda późniejsza zmiana kodu przechodzi przez code review, sprawdzenie i publikację, zanim wróci do człowieka. Blokada implementacji wraca do autora planu. Pętle napraw mają limity wejść.</p></article>
+      <article class="note"><h2>Wiedza i scalenie</h2><p>Bez nowej wiedzy proces idzie od razu do scalenia. Skrypt zdejmuje Draft, zatwierdza MR i ustawia scalenie po pipeline, a potem czeka do 1 h. Przy innym wyniku niż scalenie wyłącza scalenie automatyczne i przywraca Draft.</p></article>
     </section>
     <footer>Diagram oparty na <code>workflows/compound-engineering.yaml</code>. Na wąskim ekranie przewiń diagram poziomo.</footer>
   </main>

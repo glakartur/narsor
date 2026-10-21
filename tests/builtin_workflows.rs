@@ -374,50 +374,172 @@ fn every_builtin_label_has_a_description() {
     }
 }
 
-#[test]
-fn compound_engineering_uses_step_replies_required_variables_and_a_review_limit() {
-    let definition = narsor_engine::workflow::load_from_str(
-        BUILTIN_WORKFLOWS
-            .iter()
-            .find(|entry| entry.name == "compound-engineering")
-            .expect("built-in")
-            .source,
-    )
-    .expect("workflow loads");
-    assert_eq!(definition.states["code_review"].max_entries, Some(5));
-    let narsor_engine::domain::ActionConfig::Agent(fix) = definition.states["fix_review_findings"]
-        .action
-        .as_ref()
-        .expect("agent action")
-    else {
-        panic!("fix step is an agent")
-    };
-    assert!(fix.prompt.contains("{{ steps.code_review.reply }}"));
-    assert!(!fix.prompt.contains("context.review_findings"));
-    assert!(fix.prompt.contains("{{ context.test_baseline }}"));
+/// The compound engineering workflow, compiled from its embedded text.
+fn compound_engineering() -> narsor_engine::domain::WorkflowDefinition {
+    let entry = builtin("compound-engineering").expect("compound-engineering is built in");
+    narsor_engine::workflow::load_from_str(entry.source).expect("it loads")
+}
 
-    let required = |state: &str, label: &str| {
-        definition.states[state]
-            .choices
-            .iter()
-            .find(|output| output.label == label)
-            .expect("output exists")
-            .requires_variables
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        required("brainstorm", "requirements_drafted"),
-        vec!["requirements_doc"]
-    );
-    assert_eq!(required("plan", "plan_ready"), vec!["plan_doc"]);
-    assert_eq!(required("plan_revision", "plan_ready"), vec!["plan_doc"]);
-    assert_eq!(required("work", "implemented"), vec!["test_baseline"]);
-    assert!(required("work", "implemented")
+/// The choice `label` of `state`.
+fn choice<'a>(
+    definition: &'a narsor_engine::domain::WorkflowDefinition,
+    state: &str,
+    label: &str,
+) -> &'a narsor_engine::domain::ChoiceDefinition {
+    definition.states[state]
+        .choices
         .iter()
-        .all(|name| *name != "pr_url"));
-    assert_eq!(required("publish_work", "published"), vec!["pr_url"]);
+        .find(|choice| choice.label == label)
+        .unwrap_or_else(|| panic!("'{state}' has no choice '{label}'"))
+}
+
+/// The repair loops have limits, and only they do (KTD15).
+#[test]
+fn compound_engineering_limits_its_repair_loops() {
+    let definition = compound_engineering();
+    let limits: Vec<(&str, u32)> = definition
+        .states
+        .iter()
+        .filter_map(|(id, state)| state.max_entries.map(|limit| (id.as_str(), limit)))
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        limits,
+        vec![
+            ("code_review", 10),
+            ("repair_merge", 3),
+            ("repair_verification", 5),
+        ]
+    );
+}
+
+/// Each choice requires what the table of step contracts in the plan says:
+/// variables and artifacts by name, each one defined on its step.
+#[test]
+fn compound_engineering_choices_require_their_variables_and_artifacts() {
+    let definition = compound_engineering();
+    let requires = |state: &str, label: &str| {
+        let choice = choice(&definition, state, label);
+        (
+            choice.requires_variables.clone(),
+            choice.requires_artifacts.clone(),
+        )
+    };
+    let variables = |names: &[&str]| -> (Vec<String>, Vec<String>) {
+        (names.iter().map(ToString::to_string).collect(), Vec::new())
+    };
+    let artifacts = |names: &[&str]| -> (Vec<String>, Vec<String>) {
+        (Vec::new(), names.iter().map(ToString::to_string).collect())
+    };
+
+    assert_eq!(
+        requires("brainstorm", "requirements_drafted"),
+        artifacts(&["requirements_doc"])
+    );
+    for review in ["doc_review", "plan_review"] {
+        assert_eq!(requires(review, "reviewed"), variables(&["review_summary"]));
+        assert!(
+            choice(&definition, review, "reviewed").requires_human_approval,
+            "a person accepts the result of '{review}' before it is published"
+        );
+    }
+    for publish in [
+        "publish_requirements",
+        "publish_plan",
+        "publish_work",
+        "publish_learning",
+    ] {
+        assert_eq!(requires(publish, "published"), variables(&["pr_url"]));
+    }
+    assert_eq!(requires("plan", "plan_ready"), artifacts(&["plan_doc"]));
+    assert_eq!(
+        requires("plan", "needs_requirements_revision"),
+        variables(&["requirements_blocker"])
+    );
+    assert_eq!(requires("work", "implemented"), variables(&["test_baseline"]));
+    assert_eq!(
+        requires("work", "needs_plan_revision"),
+        variables(&["plan_blocker"])
+    );
+    assert_eq!(requires("compound", "documented"), artifacts(&["learning_doc"]));
+}
+
+/// A step that reads a blocker also defines it, so it can clear it (KTD6).
+#[test]
+fn compound_engineering_steps_that_read_a_blocker_can_clear_it() {
+    let definition = compound_engineering();
+    for (state, blocker) in [
+        ("brainstorm", "requirements_blocker"),
+        ("plan", "plan_blocker"),
+    ] {
+        let Some(ActionConfig::Agent(action)) = &definition.states[state].action else {
+            panic!("'{state}' is an agent step");
+        };
+        assert!(action.prompt.contains(&format!("{{{{ context.{blocker} }}}}")));
+        assert!(
+            definition.states[state]
+                .variables
+                .iter()
+                .any(|variable| variable.name == blocker),
+            "'{state}' reads '{blocker}' and must define it to clear it"
+        );
+    }
+    for (state, document) in [("plan", "plan_doc"), ("compound", "learning_doc")] {
+        let Some(ActionConfig::Agent(action)) = &definition.states[state].action else {
+            panic!("'{state}' is an agent step");
+        };
+        assert!(
+            action
+                .prompt
+                .contains(&format!("{{{{ artifacts.{document} }}}}")),
+            "'{state}' revises its own document on a later pass"
+        );
+    }
+}
+
+/// Every `revise` at a gate continues the session of the stage's author with
+/// the comment (R26).
+#[test]
+fn compound_engineering_revisions_continue_the_author_session() {
+    let definition = compound_engineering();
+    for (gate, label) in [
+        ("approve_requirements", "revise"),
+        ("approve_plan", "revise"),
+        ("approve_plan", "revise_requirements"),
+        ("approve_work", "revise"),
+        ("approve_work", "revise_plan"),
+        ("approve_learning", "revise"),
+    ] {
+        assert!(
+            choice(&definition, gate, label)
+                .resume_comment_field
+                .is_some(),
+            "'{gate}' choice '{label}' must carry the comment to the author"
+        );
+    }
+}
+
+/// `finalize` has its own time limit and a `timeout` choice, because the
+/// engine kills it on the limit and its own clean-up never runs (KTD14).
+#[test]
+fn compound_engineering_finalize_is_a_script_with_a_timeout_choice() {
+    let definition = compound_engineering();
+    for step in ["finalize", "disarm_merge"] {
+        let Some(ActionConfig::Script(script)) = &definition.states[step].action else {
+            panic!("'{step}' is a script step");
+        };
+        assert!(script.args.iter().any(|arg| arg.contains("glab")));
+        assert!(
+            !script.args.iter().any(|arg| arg
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == "main")),
+            "'{step}' takes the target branch from the merge request, not a literal"
+        );
+    }
+    let finalize = &definition.states["finalize"];
+    assert_eq!(finalize.timeout_secs, Some(70 * 60));
+    assert_eq!(finalize.transitions["timeout"], "disarm_merge");
 }
 
 /// The engine appends the reply contract to every agent prompt, so no
@@ -488,8 +610,12 @@ fn the_work_prompt_uses_agent_input_for_ambiguity() {
         output_contract(&StepContract::of(work)).contains("awaiting_input"),
         "the output contract tells the agent to ask and resume in place"
     );
-    assert_eq!(work.choices.len(), 1);
-    assert_eq!(work.choices[0].label, "implemented");
+    let labels: Vec<&str> = work
+        .choices
+        .iter()
+        .map(|choice| choice.label.as_str())
+        .collect();
+    assert_eq!(labels, vec!["implemented", "needs_plan_revision"]);
 }
 
 /// The embedded text is the file in `workflows/`, byte for byte.
@@ -692,20 +818,32 @@ fn the_listing_reports_an_override_rather_than_two_rows() {
 // the trap: an execution started from a built-in has no definition path
 // ---------------------------------------------------------------------------
 
-/// Installs a `claude` that answers with one fixed label, and nothing else.
+/// Installs a `claude` that gives the n-th of `answers` on its n-th call.
 ///
 /// Every state of the shipped workflows that the test reaches is an agent
 /// action on the `claude-code` harness, which runs `claude` from `PATH`. The
 /// real one costs money and needs credentials, so the test puts its own on the
 /// front of `PATH`.
-fn install_fake_claude(root: &TempRoot, label: &str) -> PathBuf {
+fn install_fake_claude(root: &TempRoot, answers: &[serde_json::Value]) -> PathBuf {
     let bin = root.dir("bin");
+    for (index, answer) in answers.iter().enumerate() {
+        let line = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "fake",
+            "result": answer.to_string(),
+        });
+        fs::write(bin.join(format!("answer.{}", index + 1)), format!("{line}\n"))
+            .expect("write a fake answer");
+    }
     let program = bin.join("claude");
-    let script = format!(
-        "#!/bin/sh\n\
-         printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
-         \"session_id\":\"fake\",\"result\":\"Done.\\n{{\\\"choice\\\": \\\"{label}\\\"}}\"}}'\n"
-    );
+    let script = "#!/bin/sh\n\
+                  dir=$(dirname \"$0\")\n\
+                  count=$(cat \"$dir/count\" 2>/dev/null || echo 0)\n\
+                  count=$((count + 1))\n\
+                  echo \"$count\" > \"$dir/count\"\n\
+                  cat \"$dir/answer.$count\"\n";
     fs::write(&program, script).expect("write the fake harness");
     make_executable(&program);
     bin
@@ -769,7 +907,20 @@ fn make_executable(path: &Path) {
 #[ignore = "starts a narsor daemon; run with --ignored"]
 fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process() {
     let root = TempRoot::new();
-    let bin = install_fake_claude(&root, "needs_direction");
+    // The brainstorm asks the person which way to go — the first step of the
+    // workflow asks in place, there is no separate direction gate — and,
+    // answered, asks a follow-up question.
+    let question = "Should a subscriber see failed runs too?";
+    let bin = install_fake_claude(
+        &root,
+        &[
+            serde_json::json!({ "status": "awaiting_input", "question": question }),
+            serde_json::json!({
+                "status": "awaiting_input",
+                "question": "Should the subscription survive a retry?",
+            }),
+        ],
+    );
     let repo = source_repo(&root);
 
     let started = cli_with_path(
@@ -820,9 +971,7 @@ fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process()
             "input",
             &id,
             "--field",
-            "direction_decision=abandon",
-            "--field",
-            "direction_note=not now",
+            "answer=yes, failed runs too",
         ],
         Some(&bin),
     );
@@ -838,8 +987,8 @@ fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process()
         answered.stdout
     );
     assert!(
-        !answered.stdout.contains("clarify_direction"),
-        "the execution moved off the gate:\n{}",
+        !answered.stdout.contains(question),
+        "the execution moved past the first brainstorm question:\n{}",
         answered.stdout
     );
 }
