@@ -152,7 +152,7 @@ fn codex_answer(text: &str) -> String {
 }
 
 const CHOOSE_DONE: &str = r#"The agent ran the step to the end; its last message says the work is done.
-{"decision": "choose_output", "label": "done", "data": {"units": 3}, "variables": {"ok": true},
+{"decision": "choose_output", "label": "done", "artifacts": {"report": "docs/report.md"}, "variables": {"ok": true},
  "confidence": "high", "rationale": "The conversation ends with the work finished."}"#;
 
 /// A started execution of `two_steps`, with its definition pinned, and the
@@ -299,7 +299,7 @@ async fn a_valid_answer_parses_to_a_decision_with_high_confidence_and_a_rational
         response.decision,
         Decision::ChooseOutput {
             label: "done".to_string(),
-            data: json!({"units": 3}),
+            artifacts: [("report".to_string(), "docs/report.md".to_string())].into(),
             variables: json!({"ok": true}).as_object().cloned().unwrap(),
         }
     );
@@ -844,12 +844,13 @@ async fn a_claude_conductor_gets_the_schema_of_its_purpose() {
         rescue["properties"]["decision"]["enum"],
         json!(["choose_output", "reprompt", "escalate"])
     );
-    for field in ["label", "data", "variables", "prompt"] {
+    for field in ["label", "variables", "artifacts", "prompt"] {
         assert!(
             rescue["properties"].get(field).is_some(),
             "{field}: {rescue}"
         );
     }
+    assert!(rescue["properties"].get("data").is_none(), "{rescue}");
     assert!(
         rescue["properties"].get("proposals").is_none(),
         "a label rescue proposes nothing: {rescue}"
@@ -878,7 +879,7 @@ async fn a_claude_conductors_answer_is_read_from_its_structured_output() {
         json!({
             "decision": "choose_output",
             "label": "done",
-            "data": { "units": 3 },
+            "artifacts": { "report": "docs/report.md" },
             "confidence": "high",
             "rationale": "The conversation ends with the work finished.",
         }),
@@ -894,7 +895,7 @@ async fn a_claude_conductors_answer_is_read_from_its_structured_output() {
         response.decision,
         Decision::ChooseOutput {
             label: "done".to_string(),
-            data: json!({ "units": 3 }),
+            artifacts: [("report".to_string(), "docs/report.md".to_string())].into(),
             variables: Default::default(),
         }
     );

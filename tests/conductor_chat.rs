@@ -491,6 +491,9 @@ async fn a_human_gate_is_summarized_and_still_waits_for_the_operator() {
         calls[0].request.payload["instruction"],
         "Is this good enough to ship?"
     );
+    assert_eq!(calls[0].request.payload["reason"], "every check passed");
+    assert_eq!(calls[0].request.payload["required_values"], json!([]));
+    assert!(calls[0].request.payload.get("question").is_none());
 
     // The gate still waits, on the same input, and nobody answered it.
     fixture.wait_until_idle(&execution.id).await;
@@ -975,7 +978,7 @@ async fn undoing_a_chosen_output_makes_the_step_a_problem_again() {
             Script::Answer(json!({
                 "decision": "choose_output",
                 "label": "implemented",
-                "data": {"units_completed": 3},
+                "artifacts": {"report": "docs/report.md"},
                 "variables": {"summary": "three units"},
                 "confidence": "high",
                 "rationale": "the agent said it finished three units",
@@ -1035,6 +1038,10 @@ async fn undoing_a_chosen_output_makes_the_step_a_problem_again() {
     );
     let analysis = problem.analysis.expect("the undone choice as the analysis");
     assert_eq!(analysis.label.as_deref(), Some("implemented"));
+    assert_eq!(
+        analysis.artifacts.get("report").map(String::as_str),
+        Some("docs/report.md")
+    );
     assert_eq!(
         analysis.variables.get("summary"),
         Some(&json!("three units"))
@@ -1272,7 +1279,7 @@ async fn completed_by_a_chosen_output() -> (Fixture, WorkflowExecution, String) 
             Script::Answer(json!({
                 "decision": "choose_output",
                 "label": "implemented",
-                "data": {"units_completed": 3},
+                "artifacts": {"report": "docs/report.md"},
                 "variables": {"summary": "three units"},
                 "confidence": "high",
             })),
@@ -1838,7 +1845,7 @@ async fn the_view_tells_whether_a_decision_can_still_be_undone() {
             Script::Answer(json!({
                 "decision": "choose_output",
                 "label": "implemented",
-                "data": {"units_completed": 3},
+                "artifacts": {"report": "docs/report.md"},
                 "variables": {"summary": "three units"},
                 "confidence": "high",
                 "rationale": "the agent said it finished three units",

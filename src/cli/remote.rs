@@ -346,13 +346,13 @@ pub enum TaskCommand {
         /// as a JSON object or array is taken as that; anything else is text.
         #[arg(long = "field", value_name = "NAME=VALUE")]
         fields: Vec<String>,
-        /// A key of the step's `data`, `name=value`, when resolving a
-        /// problem (repeatable). A value that reads as JSON (`3`, `true`,
-        /// `["a"]`) is taken as that; anything else is text.
-        #[arg(long = "data", value_name = "NAME=VALUE")]
-        data: Vec<String>,
+        /// An artifact of the step's result, `name=path`, when resolving a
+        /// problem (repeatable).
+        #[arg(long = "artifact", value_name = "NAME=PATH")]
+        artifacts: Vec<String>,
         /// A context variable of the step's result, `name=value`, when
-        /// resolving a problem (repeatable). Values read as for `--data`.
+        /// resolving a problem (repeatable). A value that reads as JSON
+        /// (`3`, `true`, `["a"]`) is taken as that; anything else is text.
         #[arg(long = "variable", value_name = "NAME=VALUE")]
         variables: Vec<String>,
         /// Output label chosen explicitly.
@@ -809,10 +809,11 @@ pub(super) async fn require_local_daemon(client: &ApiClient, what: &str) -> Resu
 }
 
 /// The answer of `task input` from its command-line pieces: the form's
-/// fields, the step's `data` and `variables`, the chosen label and a remark.
+/// fields, the step's `artifacts` and `variables`, the chosen label and a
+/// remark.
 fn input_delivery(
     fields: &[String],
-    data: &[String],
+    artifacts: &[String],
     variables: &[String],
     label: &Option<String>,
     comment: &Option<String>,
@@ -820,7 +821,10 @@ fn input_delivery(
 ) -> Result<HumanInputDeliveryDto> {
     Ok(HumanInputDeliveryDto {
         values: field_values(fields)?,
-        data: parse_pairs("data", data)?,
+        artifacts: artifacts
+            .iter()
+            .map(|pair| split_pair("artifact", pair).map(|(name, path)| (name.to_string(), path.to_string())))
+            .collect::<Result<_>>()?,
         variables: parse_pairs("variable", variables)?,
         chosen_label: label.clone(),
         comment: comment.clone(),
@@ -916,7 +920,7 @@ pub async fn task(
     let delivery = match &command {
         TaskCommand::Input {
             fields,
-            data,
+            artifacts,
             variables,
             label,
             comment,
@@ -926,7 +930,7 @@ pub async fn task(
             ..
         } => Some(input_delivery(
             fields,
-            data,
+            artifacts,
             variables,
             label,
             comment,

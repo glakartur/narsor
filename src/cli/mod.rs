@@ -187,15 +187,15 @@ pub enum Command {
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
 
-        /// A key of the step's `data`, written `name=value`, when resolving a
-        /// problem (may be given more than once). A value that reads as JSON
-        /// (`3`, `true`, `["a"]`) is taken as that; anything else is text.
-        #[arg(long = "data", value_name = "NAME=VALUE")]
-        data: Vec<String>,
+        /// An artifact of the step's result, written `name=path`, when
+        /// resolving a problem (may be given more than once).
+        #[arg(long = "artifact", value_name = "NAME=PATH")]
+        artifacts: Vec<String>,
 
         /// A context variable of the step's result, written `name=value`, when
-        /// resolving a problem (may be given more than once). Values read as
-        /// for `--data`.
+        /// resolving a problem (may be given more than once). A value that
+        /// reads as JSON (`3`, `true`, `["a"]`) is taken as that; anything
+        /// else is text.
         #[arg(long = "variable", value_name = "NAME=VALUE")]
         variables: Vec<String>,
 
@@ -614,7 +614,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             execution_id,
             fields,
             label,
-            data,
+            artifacts,
             variables,
             comment,
             permission,
@@ -625,7 +625,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             let answer = commands::InputAnswer {
                 fields,
                 label,
-                data,
+                artifacts,
                 variables,
                 comment,
                 permission,
@@ -716,7 +716,7 @@ mod tests {
             "problem": {
                 "reason": "entry limit reached (2/2)",
                 "answers": [],
-                "requirements": [{"label": "manual_complete", "data": [], "variables": ["summary"]}],
+                "requirements": [{"label": "manual_complete", "variables": ["summary"], "artifacts": []}],
             },
         });
         let text = commands::pending_input_lines(&pending).join("\n");

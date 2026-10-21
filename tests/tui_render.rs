@@ -3360,8 +3360,8 @@ mod task_app_waiting_render {
             "problem": {
                 "reason": "Odpowiedź agenta nie zawiera etykiety.",
                 "answers": [],
-                "requirements": [{ "label": "implemented", "data": [], "variables": ["summary"] }],
-                "analysis": { "label": "implemented", "data": {}, "variables": { "summary": "all units done" }, "rationale": "Testy przechodzą." }
+                "requirements": [{ "label": "implemented", "variables": ["summary"] }],
+                "analysis": { "label": "implemented", "variables": { "summary": "all units done" }, "rationale": "Testy przechodzą." }
             },
             "episode": "ep-p",
             "requested_at": "2026-10-09T11:54:00Z"

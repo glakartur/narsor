@@ -11,7 +11,7 @@ states:
       type: script
       command: ./print_json.sh
       args:
-        - '{"choice": "ok", "variables": {"checked": true}}'
+        - '{"choice": "ok", "reason": "every check passed", "variables": {"checked": true}}'
     variables:
       - { name: checked, description: What the step reports as checked. }
     choices:

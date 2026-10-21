@@ -643,8 +643,8 @@ pub struct InputAnswer {
     pub fields: Vec<String>,
     /// `--label`.
     pub label: Option<String>,
-    /// `--data name=value` pairs.
-    pub data: Vec<String>,
+    /// `--artifact name=path` pairs.
+    pub artifacts: Vec<String>,
     /// `--variable name=value` pairs.
     pub variables: Vec<String>,
     /// `--comment`.
@@ -743,7 +743,7 @@ pub async fn input(
 
     let mut delivery = HumanInputDeliveryDto {
         values,
-        data: step_values("data", &answer.data)?,
+        artifacts: artifact_paths(&answer.artifacts)?,
         variables: step_values("variable", &answer.variables)?,
         chosen_label: answer.label,
         comment: answer.comment,
@@ -827,24 +827,42 @@ pub async fn input(
     Ok(())
 }
 
-/// Parses `name=value` pairs of `--data`/`--variable` into a map. A value
-/// that reads as JSON is taken as that, so `units_completed=3` is a number;
-/// anything else is the text as written.
+/// Parses `name=value` pairs of `--variable` into a map. A value that reads
+/// as JSON is taken as that, so `units_completed=3` is a number; anything
+/// else is the text as written.
 fn step_values(flag: &str, pairs: &[String]) -> Result<Map<String, Value>> {
     let mut values = Map::new();
-    for pair in pairs {
-        let (name, raw) = pair
-            .split_once('=')
-            .filter(|(name, _)| !name.trim().is_empty())
-            .ok_or_else(|| {
-                CliError::usage(format!(
-                    "Invalid --{flag} '{pair}' — expected the form name=value."
-                ))
-            })?;
+    for (name, raw) in step_pairs(flag, pairs)? {
         let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
-        values.insert(name.trim().to_string(), value);
+        values.insert(name, value);
     }
     Ok(values)
+}
+
+/// Parses `name=path` pairs of `--artifact` into the step's artifacts.
+fn artifact_paths(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    Ok(step_pairs("artifact", pairs)?
+        .into_iter()
+        .map(|(name, path)| (name, path.to_string()))
+        .collect())
+}
+
+/// Splits `name=value` pairs of `--{flag}`; a usage error for one without a
+/// name.
+fn step_pairs<'a>(flag: &str, pairs: &'a [String]) -> Result<Vec<(String, &'a str)>> {
+    pairs
+        .iter()
+        .map(|pair| {
+            pair.split_once('=')
+                .filter(|(name, _)| !name.trim().is_empty())
+                .map(|(name, raw)| (name.trim().to_string(), raw))
+                .ok_or_else(|| {
+                    CliError::usage(format!(
+                        "Invalid --{flag} '{pair}' — expected the form name=value."
+                    ))
+                })
+        })
+        .collect()
 }
 
 /// `narsor resume <id>` — continue a paused execution.
@@ -1785,9 +1803,9 @@ pub(super) fn pending_input_lines(pending: &impl serde::Serialize) -> Vec<String
             .flatten()
             .find(|requirement| requirement["label"].as_str() == Some(label))
         {
-            for key in requirement["data"].as_array().into_iter().flatten() {
+            for key in requirement["artifacts"].as_array().into_iter().flatten() {
                 if let Some(key) = key.as_str() {
-                    lines.push(format!("        requires --data {key}=…"));
+                    lines.push(format!("        requires --artifact {key}=…"));
                 }
             }
             for key in requirement["variables"].as_array().into_iter().flatten() {

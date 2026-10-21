@@ -5,7 +5,7 @@
 //! Like the rest of the TUI's state, this holds no terminal. [`InputPanel`]
 //! turns a [`PendingHumanInputView`] into the entries of a
 //! [`crate::tui::chooser::Chooser`] and their fields (the label picker, the
-//! declared fields, a problem's `data` and `variables`, the comment), and the
+//! declared fields, a problem's `artifacts` and `variables`, the comment), and the
 //! chosen entry turns back into the [`HumanInputDelivery`] the server
 //! receives.
 //!
@@ -123,7 +123,7 @@ impl InputClosure {
             close_reason,
             episode,
             output_label,
-            data,
+            artifacts,
             variables,
             comment,
         } = data
@@ -134,7 +134,7 @@ impl InputClosure {
         if let Some(label) = output_label {
             parts.push(format!("'{label}'"));
         }
-        for values in [Some(input), data.as_ref(), variables.as_ref()]
+        for values in [Some(input), artifacts.as_ref(), variables.as_ref()]
             .into_iter()
             .flatten()
         {
@@ -433,7 +433,7 @@ impl ContextLine {
 
 /// The name of the optional field that takes more `data` keys than the label
 /// needs, one `key=value` per line.
-pub const EXTRA_DATA_FIELD: &str = "data (klucz=wartość)";
+pub const EXTRA_ARTIFACTS_FIELD: &str = "artifacts (nazwa=ścieżka)";
 
 /// The same for `variables`.
 pub const EXTRA_VARIABLES_FIELD: &str = "variables (klucz=wartość)";
@@ -508,10 +508,10 @@ impl InputPanel {
         panel
             .context
             .push(ContextLine::plain(pending.instruction()));
-        if let Some(question) = &pending.question {
+        if let Some(reason) = &pending.reason {
             panel
                 .context
-                .push(ContextLine::plain(format!("„{question}”")));
+                .push(ContextLine::plain(format!("„{reason}”")));
         }
         if let Some(tail) = &pending.answer_tail {
             panel
@@ -905,11 +905,17 @@ impl InputPanel {
                 output.description.clone().unwrap_or_default(),
             );
             let requirement = problem.requirement_for(&output.label);
-            let required_data: &[String] = requirement.map_or(&[], |need| need.data.as_slice());
+            let required_artifacts: &[String] =
+                requirement.map_or(&[], |need| need.artifacts.as_slice());
             let required_variables: &[String] =
                 requirement.map_or(&[], |need| need.variables.as_slice());
+            let proposed_artifacts: Map<String, Value> = analysis
+                .artifacts
+                .iter()
+                .map(|(name, path)| (name.clone(), Value::String(path.clone())))
+                .collect();
             for (map, prefix, required) in [
-                (&analysis.data, "data", required_data),
+                (&proposed_artifacts, "artifacts", required_artifacts),
                 (&analysis.variables, "variables", required_variables),
             ] {
                 let mut keys: Vec<&String> = required.iter().collect();
@@ -919,7 +925,7 @@ impl InputPanel {
                 for key in keys {
                     let name = format!("{prefix}.{key}");
                     let mut field = ChooserField::multiline(name.clone());
-                    if prefix == "data" && required.contains(key) {
+                    if prefix == "artifacts" && required.contains(key) {
                         field = field
                             .required()
                             .described("wymagane przez stan, do którego prowadzi etykieta");
@@ -934,7 +940,7 @@ impl InputPanel {
                 }
             }
             item = item
-                .with_field(ChooserField::multiline(EXTRA_DATA_FIELD))
+                .with_field(ChooserField::multiline(EXTRA_ARTIFACTS_FIELD))
                 .with_field(ChooserField::multiline(EXTRA_VARIABLES_FIELD))
                 .with_field(ChooserField::multiline(COMMENT_FIELD));
             if proposed {
@@ -1000,7 +1006,7 @@ impl InputPanel {
     ) -> Result<HumanInputDeliveryDto, String> {
         let mut maps = [Map::new(), Map::new()];
         for (name, text) in &submission.values {
-            for (slot, prefix) in ["data.", "variables."].into_iter().enumerate() {
+            for (slot, prefix) in ["artifacts.", "variables."].into_iter().enumerate() {
                 if let Some(key) = name.strip_prefix(prefix) {
                     let value = self.delivered_value(submission.index, name, text);
                     insert_once(&mut maps[slot], &prefix[..prefix.len() - 1], key, value)?;
@@ -1008,7 +1014,7 @@ impl InputPanel {
             }
         }
         for (slot, (field, map)) in [
-            (EXTRA_DATA_FIELD, "data"),
+            (EXTRA_ARTIFACTS_FIELD, "artifacts"),
             (EXTRA_VARIABLES_FIELD, "variables"),
         ]
         .into_iter()
@@ -1037,10 +1043,13 @@ impl InputPanel {
                 )?;
             }
         }
-        let [data, variables] = maps;
+        let [artifacts, variables] = maps;
         Ok(HumanInputDeliveryDto {
             chosen_label: Some(label.to_string()),
-            data,
+            artifacts: artifacts
+                .into_iter()
+                .map(|(name, path)| (name, value_as_text(&path)))
+                .collect(),
             variables,
             comment: Self::value_of(submission, COMMENT_FIELD)
                 .map(str::trim)

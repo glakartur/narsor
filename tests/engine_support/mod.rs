@@ -292,29 +292,48 @@ impl ActionExecutor for StubAgentExecutor {
     }
 }
 
-/// An `agent` executor that answers from a fixed list of replies: each one a
-/// label together with the `data` and the answer text a real agent returns.
+/// An `agent` executor that answers from a fixed list of results, and records
+/// the prompt and the resumed session of every call.
 pub struct AnsweringAgentExecutor {
-    replies: Mutex<VecDeque<(String, Value, String)>>,
+    results: Mutex<VecDeque<ActionResult>>,
     prompts: Mutex<Vec<String>>,
+    resumed_sessions: Mutex<Vec<Option<String>>>,
 }
 
 impl AnsweringAgentExecutor {
     /// An executor that returns these `(label, data, answer)` replies, in order.
     pub fn new(replies: Vec<(&str, Value, &str)>) -> Self {
+        Self::from_results(
+            replies
+                .into_iter()
+                .map(|(label, data, answer)| ActionResult {
+                    output_label: label.to_string(),
+                    data,
+                    exit_code: Some(0),
+                    stdout: answer.to_string(),
+                    reply: Some(answer.to_string()),
+                    ..ActionResult::default()
+                })
+                .collect(),
+        )
+    }
+
+    /// An executor that returns these results, in order.
+    pub fn from_results(results: Vec<ActionResult>) -> Self {
         Self {
-            replies: Mutex::new(
-                replies
-                    .into_iter()
-                    .map(|(label, data, answer)| (label.to_string(), data, answer.to_string()))
-                    .collect(),
-            ),
+            results: Mutex::new(results.into()),
             prompts: Mutex::new(Vec::new()),
+            resumed_sessions: Mutex::new(Vec::new()),
         }
     }
 
     pub fn prompts(&self) -> Vec<String> {
         self.prompts.lock().expect("prompts").clone()
+    }
+
+    /// The `resume_session` each call was handed, in order.
+    pub fn resumed_sessions(&self) -> Vec<Option<String>> {
+        self.resumed_sessions.lock().expect("sessions").clone()
     }
 }
 
@@ -329,22 +348,21 @@ impl ActionExecutor for AnsweringAgentExecutor {
                     .lock()
                     .expect("prompts")
                     .push(config.prompt.clone());
+                self.resumed_sessions.lock().expect("sessions").push(
+                    config
+                        .parameters
+                        .get("resume_session")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                );
             }
-            let (output_label, data, stdout) = self
-                .replies
+            let result = self
+                .results
                 .lock()
-                .expect("replies")
+                .expect("results")
                 .pop_front()
-                .unwrap_or_else(|| ("unexpected".to_string(), json!({}), String::new()));
-
-            Ok(ActionOutcome::Completed(ActionResult {
-                output_label,
-                data,
-                exit_code: Some(0),
-                stdout: stdout.clone(),
-                reply: Some(stdout),
-                ..ActionResult::default()
-            }))
+                .unwrap_or_else(|| ActionResult::new("unexpected"));
+            Ok(ActionOutcome::Completed(result))
         })
     }
 }
@@ -394,7 +412,8 @@ impl ActionExecutor for ResumeRejectingAgentExecutor {
                             description: None,
                             options: Vec::new(),
                         }],
-                        question: None,
+                        reason: None,
+                        required_values: Vec::new(),
                         answer_tail: None,
                         agent_harness: Some("fake".to_string()),
                         agent_session_id: Some("gone-session".to_string()),
@@ -467,7 +486,8 @@ impl ActionExecutor for QuestioningAgentExecutor {
                             description: None,
                             options: Vec::new(),
                         }],
-                        question: None,
+                        reason: None,
+                        required_values: Vec::new(),
                         answer_tail: None,
                         agent_harness: None,
                         agent_session_id: None,
@@ -783,7 +803,8 @@ impl ActionExecutor for ScriptedAgentExecutor {
                     options: Vec::new(),
                 }]
             },
-            question: None,
+            reason: None,
+            required_values: Vec::new(),
             answer_tail: None,
             agent_harness: Some("claude-code".to_string()),
             agent_session_id: Some("agent-session".to_string()),

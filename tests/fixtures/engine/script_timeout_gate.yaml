@@ -1,0 +1,20 @@
+name: script-timeout-gate
+version: 1
+description: >
+  A script that runs out of its time limit and declares a `timeout` choice
+  leading to a gate: the gate shows a reason the engine wrote from the limit.
+states:
+  wait_for_merge:
+    timeout: 1s
+    action:
+      type: script
+      command: ./sleep_then_emit.sh
+      args: ['30', '{"choice": "merged"}']
+    choices: [merged, timeout]
+    transitions: { merged: completed, timeout: merge_timed_out }
+  merge_timed_out:
+    action: { type: human, message: The merge did not finish in time. }
+    choices: [accept]
+    transitions: { accept: completed }
+  completed: { description: done }
+terminal_states: [completed]

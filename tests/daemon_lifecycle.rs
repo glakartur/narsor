@@ -1401,7 +1401,7 @@ async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() 
                 episode: Some("attempt-rejected".to_string()),
                 state_id: Some("work".to_string()),
                 output_label: Some("implemented".to_string()),
-                data: serde_json::json!({}),
+                artifacts: Default::default(),
                 variables: serde_json::json!({}),
                 confidence: narsor_engine::domain::Confidence::High,
                 rationale: Some("the agent said all tests pass".to_string()),

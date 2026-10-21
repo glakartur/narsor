@@ -22,8 +22,9 @@ pub struct HumanInputDeliveryDto {
     pub values: Map<String, Value>,
     #[serde(default)]
     pub chosen_label: Option<String>,
+    /// The step's named artifacts, name → path, for a problem.
     #[serde(default)]
-    pub data: Map<String, Value>,
+    pub artifacts: BTreeMap<String, String>,
     #[serde(default)]
     pub variables: Map<String, Value>,
     #[serde(default)]
@@ -88,8 +89,12 @@ pub struct PendingHumanInputView {
     pub instruction: String,
     #[serde(default)]
     pub fields: Vec<HumanInputFieldView>,
+    /// Why the agent or script step before this gate made its choice.
     #[serde(default)]
-    pub question: Option<String>,
+    pub reason: Option<String>,
+    /// The values that choice required.
+    #[serde(default)]
+    pub required_values: Vec<RequiredValue>,
     #[serde(default)]
     pub answer_tail: Option<String>,
     #[serde(default)]
@@ -140,6 +145,23 @@ impl PendingHumanInputView {
             .map(|output| output.label.clone())
             .collect()
     }
+}
+
+/// Whether a required value is a step variable or a step artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredValueKind {
+    Variable,
+    Artifact,
+}
+
+/// A value the choice before a gate required, as the gate shows it: agent
+/// text, already cleaned and bounded by the engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequiredValue {
+    pub name: String,
+    pub kind: RequiredValueKind,
+    pub value: String,
 }
 
 /// A field in a pending operator form.
@@ -291,14 +313,14 @@ pub struct RejectedAnswerView {
     pub answer_tail: Option<String>,
 }
 
-/// Input keys a label requires before its transition can complete.
+/// Values a label requires before its transition can complete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputRequirementView {
     pub label: String,
     #[serde(default)]
-    pub data: Vec<String>,
-    #[serde(default)]
     pub variables: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
 }
 
 /// The conductor's proposed answer values, advisory until accepted.
@@ -307,7 +329,7 @@ pub struct ConductorAnalysisView {
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
-    pub data: Map<String, Value>,
+    pub artifacts: BTreeMap<String, String>,
     #[serde(default)]
     pub variables: Map<String, Value>,
     #[serde(default)]

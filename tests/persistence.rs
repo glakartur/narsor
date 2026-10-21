@@ -240,9 +240,10 @@ fn an_old_format_agent_session_event_deserializes_with_the_new_fields_absent() {
 }
 
 /// Same guarantee for `HumanInputRequested`, which carries the preceding
-/// agent's question and answer tail since the conductor plan's U3.
+/// step's reason and required values instead of the agent's question since
+/// the agent contract plan's U4 (KTD16).
 #[test]
-fn an_old_format_human_input_requested_event_deserializes_with_no_question() {
+fn an_old_format_human_input_requested_event_deserializes_with_no_reason() {
     let old_format = serde_json::json!({
         "id": "event-3",
         "workflow_execution_id": "exec-old-format",
@@ -250,7 +251,8 @@ fn an_old_format_human_input_requested_event_deserializes_with_no_question() {
         "sequence": 3,
         "data": {
             "type": "human_input_requested",
-            "instruction": "Approve?"
+            "instruction": "Approve?",
+            "question": "Account or user limit?"
         }
     });
 
@@ -258,12 +260,14 @@ fn an_old_format_human_input_requested_event_deserializes_with_no_question() {
     match event.data {
         EventData::HumanInputRequested {
             instruction,
-            question,
+            reason,
+            required_values,
             answer_tail,
             episode,
         } => {
             assert_eq!(instruction, "Approve?");
-            assert_eq!(question, None);
+            assert_eq!(reason, None);
+            assert!(required_values.is_empty());
             assert_eq!(answer_tail, None);
             assert_eq!(episode, None);
         }
@@ -294,13 +298,13 @@ fn an_old_format_human_input_received_event_deserializes_as_a_plain_answer() {
             close_reason,
             episode,
             output_label,
-            data,
+            artifacts,
             variables,
             comment,
         } => {
             assert_eq!(input, &serde_json::json!({"approval_status": "approved"}));
             assert!(answered_by.is_none() && close_reason.is_none() && episode.is_none());
-            assert!(output_label.is_none() && data.is_none() && variables.is_none());
+            assert!(output_label.is_none() && artifacts.is_none() && variables.is_none());
             assert!(comment.is_none());
         }
         other => panic!("unexpected event data: {other:?}"),

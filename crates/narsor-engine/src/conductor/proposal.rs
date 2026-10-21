@@ -24,6 +24,7 @@
 //! result and does nothing. A proposal about a moment the execution has
 //! moved on from is refused ([`ProposalError::Stale`]) and changes nothing.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
@@ -437,6 +438,15 @@ impl ConductorRegistry {
     }
 }
 
+/// The artifact paths of a proposal's `artifacts`, name → path. A value that
+/// is no path is no artifact.
+fn artifact_paths(artifacts: &Map<String, Value>) -> BTreeMap<String, String> {
+    artifacts
+        .iter()
+        .filter_map(|(name, path)| Some((name.clone(), path.as_str()?.to_string())))
+        .collect()
+}
+
 /// The delivery that answers `pending` as `proposal` says, made by the
 /// conductor at `episode`.
 fn answer_delivery(
@@ -449,18 +459,20 @@ fn answer_delivery(
     let mut delivery = match pending.continuation {
         InputContinuation::ResolveOutput => {
             // A problem's answer is the step's output: `values` holds its
-            // `data` and `variables`, or is the `data` itself.
+            // `variables` and `artifacts`, or is the `variables` itself.
             let object = |key: &str| match values.get(key) {
                 Some(Value::Object(map)) => Some(map.clone()),
                 _ => None,
             };
-            let (data, variables) = match (object("data"), object("variables")) {
+            let (variables, artifacts) = match (object("variables"), object("artifacts")) {
                 (None, None) => (values.clone(), Map::new()),
-                (data, variables) => (data.unwrap_or_default(), variables.unwrap_or_default()),
+                (variables, artifacts) => {
+                    (variables.unwrap_or_default(), artifacts.unwrap_or_default())
+                }
             };
             HumanInputDelivery::default()
-                .with_data(data)
                 .with_variables(variables)
+                .with_artifacts(artifact_paths(&artifacts))
         }
         InputContinuation::ResumeAgent if values.is_empty() => {
             let text = proposal.text.clone().unwrap_or_default();

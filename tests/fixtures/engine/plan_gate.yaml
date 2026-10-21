@@ -1,0 +1,24 @@
+name: plan-gate
+version: 1
+description: >
+  A plan step whose choices lead to a review gate: `needs_requirements_revision`
+  requires the variable that describes the blocker, `needs_human_decision`
+  requires nothing. The gate shows the step's reason and the required values.
+states:
+  plan:
+    action: { type: agent, prompt: Plan the work. }
+    variables:
+      - { name: requirements_blocker, description: What blocks the requirements. }
+    choices:
+      - label: needs_requirements_revision
+        requires_variables: [requirements_blocker]
+      - needs_human_decision
+    transitions:
+      needs_requirements_revision: review
+      needs_human_decision: review
+  review:
+    action: { type: human, message: Review the plan. }
+    choices: [accept]
+    transitions: { accept: completed }
+  completed: { description: done }
+terminal_states: [completed]

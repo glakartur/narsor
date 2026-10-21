@@ -291,11 +291,11 @@ fn two_answers_without_label() -> Vec<Reply> {
     ]
 }
 
-fn choose(label: &str, confidence: &str, data: Value, variables: Value) -> Script {
+fn choose(label: &str, confidence: &str, artifacts: Value, variables: Value) -> Script {
     Script::Answer(json!({
         "decision": "choose_output",
         "label": label,
-        "data": data,
+        "artifacts": artifacts,
         "variables": variables,
         "confidence": confidence,
         "rationale": "the agent reported three units done and working",
@@ -335,7 +335,7 @@ async fn a_sure_choice_completes_the_step_on_the_conductors_word() {
         vec![choose(
             "implemented",
             "high",
-            json!({ "units_completed": 3 }),
+            json!({ "report": "docs/report.md" }),
             json!({ "summary": "three units implemented" }),
         )],
     );
@@ -410,6 +410,14 @@ async fn a_sure_choice_completes_the_step_on_the_conductors_word() {
     assert_eq!(
         execution.context.variables.get("summary"),
         Some(&json!("three units implemented"))
+    );
+    assert_eq!(
+        execution
+            .context
+            .artifacts
+            .get("report")
+            .map(|artifact| artifact.location.as_str()),
+        Some("docs/report.md")
     );
 
     // The decision is on record for an undo, and no longer waits to apply.
@@ -498,25 +506,24 @@ async fn a_choice_of_an_undeclared_label_is_an_escalation() {
     );
 }
 
-/// AE6: the conductor chooses `needs_human_decision` without the question
-/// the gate it leads to shows (KTD15): an escalation, saying what is
-/// missing.
+/// The conductor chooses `implemented` without the `summary` it requires
+/// (KTD15): an escalation, saying what is missing.
 #[tokio::test]
-async fn a_choice_without_a_value_the_next_step_needs_is_an_escalation() {
+async fn a_choice_without_a_value_it_requires_is_an_escalation() {
     let fixture = Fixture::new(
         two_answers_without_label(),
-        vec![choose("needs_human_decision", "high", json!({}), json!({}))],
+        vec![choose("implemented", "high", json!({}), json!({}))],
     );
     let execution = fixture.run().await;
 
     let (_, problem) = fixture.problem(&execution);
     let analysis = problem.analysis.expect("an analysis");
-    assert_eq!(analysis.label.as_deref(), Some("needs_human_decision"));
+    assert_eq!(analysis.label.as_deref(), Some("implemented"));
     assert!(
         analysis
             .rationale
             .as_deref()
-            .is_some_and(|rationale| rationale.contains("data.question")),
+            .is_some_and(|rationale| rationale.contains("variables.summary")),
         "{analysis:?}"
     );
     let events = fixture.events(&execution.id);

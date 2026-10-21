@@ -98,7 +98,7 @@ use crate::engine::actions::harness;
 use crate::engine::actions::human::{
     self, AgentSessionProvenance, ApprovalCandidate, ConductorAnalysis, EntryLimitDetails,
     HumanActionError, HumanInputDelivery, HumanInputRequest, InputContinuation, OutputProblem,
-    OutputRequirement, PendingHumanInput, RejectedAnswer, APPROVE_OUTPUT_LABEL,
+    OutputRequirement, PendingHumanInput, RejectedAnswer, RequiredValue, APPROVE_OUTPUT_LABEL,
     ENTRY_LIMIT_CONTINUE_LABEL, ENTRY_LIMIT_RESET_LABEL, RESUME_AGENT_LABEL,
 };
 use crate::engine::actions::{
@@ -114,9 +114,12 @@ use crate::workflow::{
 };
 
 mod failure;
+mod gate_context;
 mod operations;
 mod rescue;
 mod step_memory;
+
+use gate_context::{has_step_contract, GateContext};
 
 pub use failure::{
     step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
@@ -141,7 +144,8 @@ pub const METADATA_ENGINE_KEY: &str = "engine";
 /// Key of the persisted mid-step state inside the engine's scratch area.
 pub const METADATA_PENDING_STEP_KEY: &str = "pending_step";
 
-/// Key of the record of the agent step behind the latest transition (KTD8).
+/// Key of the record of the agent or script step behind the latest
+/// transition (KTD8, KTD11).
 pub const METADATA_LAST_AGENT_STEP_KEY: &str = "last_agent_step";
 
 /// Key of an agent output that was rejected and still awaits its reprompt
@@ -253,16 +257,17 @@ pub struct PendingStep {
     pub artifacts: Vec<Artifact>,
 }
 
-/// What the agent step behind the latest transition said (KTD8).
+/// What the agent or script step behind the latest transition said (KTD8,
+/// KTD11).
 ///
 /// Persisted in `metadata.engine.last_agent_step` when a transition leaves an
-/// agent state, and dropped when one leaves any other state, so that a human
-/// gate entered right after an agent can show the agent's question. The
-/// action's own result is gone by then: `pending_step` is cleared the moment
-/// the transition is taken.
+/// agent or script state, and dropped when one leaves any other state, so
+/// that a human gate entered right after the step can show its reason and
+/// the values its choice required. The action's own result is gone by then:
+/// `pending_step` is cleared the moment the transition is taken.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastAgentStep {
-    /// The agent state the transition left.
+    /// The state the transition left.
     pub state_id: StateId,
 
     /// The state the transition entered — the only one the record speaks to.
@@ -271,32 +276,43 @@ pub struct LastAgentStep {
     /// The attempt that produced the answer.
     pub action_execution_id: String,
 
-    /// The agent's `data.question`, when it stated one.
+    /// Why the step made its choice, cleaned; the placeholder when it gave
+    /// no reason. A record written before reasons were kept has none.
     #[serde(default)]
-    pub question: Option<String>,
+    pub reason: Option<String>,
 
-    /// The end of the agent's answer.
+    /// The values the choice required, cleaned and bounded.
+    #[serde(default)]
+    pub required_values: Vec<RequiredValue>,
+
+    /// The end of the step's answer.
     #[serde(default)]
     pub answer_tail: Option<String>,
 }
 
 impl LastAgentStep {
-    /// The record of `result`, produced in `state_id` by `action_execution_id`
-    /// and followed by a transition into `to_state`.
+    /// The record of `result`, produced in `state` by `action_execution_id`
+    /// and followed by a transition into `to_state`; `None` when `state` is
+    /// no agent or script step.
     fn from_result(
-        state_id: StateId,
+        state: &State,
         to_state: StateId,
         action_execution_id: String,
         result: &ActionResult,
-    ) -> Self {
-        let (question, answer_tail) = agent_answer(result);
-        Self {
-            state_id,
+        kept_locals: &Map<String, Value>,
+    ) -> Option<Self> {
+        if !has_step_contract(state) {
+            return None;
+        }
+        let context = GateContext::of(state, result, kept_locals);
+        Some(Self {
+            state_id: state.id.clone(),
             to_state,
             action_execution_id,
-            question,
-            answer_tail,
-        }
+            reason: context.reason,
+            required_values: context.required_values,
+            answer_tail: context.answer_tail,
+        })
     }
 }
 
@@ -393,8 +409,7 @@ impl OutputRejection {
             state_id: state.id.clone(),
             action_execution_id: action_execution_id.to_string(),
             reason,
-            answer_tail: Some(harness::tail(&result.stdout, ANSWER_TAIL_BYTES))
-                .filter(|tail| !tail.is_empty()),
+            answer_tail: gate_context::answer_tail(&result.stdout),
             reply: result.reply.clone(),
             harness: session_field("/harness"),
             harness_session_id: session_field("/config/harness_session_id"),
@@ -1750,7 +1765,7 @@ impl Engine {
             let mut result = resumed.result;
             // What the agent last said, for a gate the label may lead to: it
             // is the answer the operator settled, and the gate shows it
-            // beside the question the operator supplied (KTD8).
+            // (KTD8).
             result.stdout = resumed
                 .pending
                 .problem
@@ -1845,7 +1860,8 @@ impl Engine {
                                 description: None,
                                 options: Vec::new(),
                             }],
-                            question: None,
+                            reason: None,
+                            required_values: Vec::new(),
                             answer_tail: None,
                             agent_harness: None,
                             agent_session_id: None,
@@ -2159,7 +2175,8 @@ impl Engine {
             let failure = match attempted {
                 Ok(AttemptOutcome::AwaitingHumanInput(mut request)) => {
                     if let Some(record) = preceding_agent_step(execution, state) {
-                        request.question = record.question;
+                        request.reason = record.reason;
+                        request.required_values = record.required_values;
                         request.answer_tail = record.answer_tail;
                     }
                     self.suspend_for_input(
@@ -2410,7 +2427,8 @@ impl Engine {
                         description: None,
                         options: Vec::new(),
                     }],
-                    question: None,
+                    reason: None,
+                    required_values: Vec::new(),
                     answer_tail: None,
                     agent_harness: None,
                     agent_session_id: None,
@@ -2870,7 +2888,8 @@ impl Engine {
                 state.id
             ),
             fields: Vec::new(),
-            question: None,
+            reason: None,
+            required_values: Vec::new(),
             answer_tail,
             agent_harness: session.as_ref().and_then(|(harness, _)| harness.clone()),
             agent_session_id: session.and_then(|(_, session)| session),
@@ -2993,7 +3012,8 @@ impl Engine {
                     "Review the agent output: accept it, or return it to the agent with a comment."
                         .to_string(),
                 fields: Vec::new(),
-                question: None,
+                reason: None,
+                required_values: Vec::new(),
                 answer_tail: Some(pending.result.stdout.clone()),
                 agent_harness: agent_harness.clone(),
                 agent_session_id: agent_session_id.clone(),
@@ -3031,19 +3051,17 @@ impl Engine {
         let outcome = match request {
             DecisionRequest::Resolved(outcome) => outcome,
             DecisionRequest::AwaitHuman { message } => {
-                // The question comes straight from the agent that just
+                // The context comes straight from the step that just
                 // answered: its result is still at hand.
-                let (question, answer_tail) = if is_agent(state) {
-                    agent_answer(&pending.result)
-                } else {
-                    (None, None)
-                };
+                let kept_locals = step_memory::step_locals(execution, &state.id)?;
+                let context = GateContext::of(state, &pending.result, &kept_locals);
                 let request = HumanInputRequest {
                     action_execution_id: pending.action_execution_id.clone(),
                     instruction: message,
                     fields: Vec::new(),
-                    question,
-                    answer_tail,
+                    reason: context.reason,
+                    required_values: context.required_values,
+                    answer_tail: context.answer_tail,
                     agent_harness: None,
                     agent_session_id: None,
                     prefilled_answer: None,
@@ -3159,14 +3177,14 @@ impl Engine {
         // Before `pending_step` goes: it holds the answer the record is made
         // of. Written from the same `save_execution` as the context, so the
         // record and the transition cannot disagree after a crash.
-        let record = is_agent(state).then(|| {
-            LastAgentStep::from_result(
-                state.id.clone(),
-                target.clone(),
-                pending.action_execution_id.clone(),
-                &pending.result,
-            )
-        });
+        let kept_locals = step_memory::step_locals(execution, &state.id)?;
+        let record = LastAgentStep::from_result(
+            state,
+            target.clone(),
+            pending.action_execution_id.clone(),
+            &pending.result,
+            &kept_locals,
+        );
         set_last_agent_step(execution, record.as_ref())?;
         self.clear_pending_step(execution);
         // A rescued step is over once its transition is taken (F1), and so
@@ -3242,7 +3260,8 @@ impl Engine {
                 required: false,
                 description: Some("Kontynuuj albo rozpocznij licznik od nowa".to_string()),
             }],
-            question: None,
+            reason: None,
+            required_values: Vec::new(),
             answer_tail: None,
             agent_harness: None,
             agent_session_id: None,
@@ -3537,9 +3556,9 @@ impl Engine {
     // Artifacts
     // -----------------------------------------------------------------------
 
-    /// Turns the artifacts a result reports into artifact records: an
-    /// action's named `artifacts` and its `additional_artifacts`, and the
-    /// `data.artifacts` list a person or the conductor delivered.
+    /// Turns the artifacts a result reports into artifact records: its named
+    /// `artifacts` — an action's, or those a person or the conductor
+    /// delivered — and an action's `additional_artifacts`.
     ///
     /// Each one becomes an `ArtifactCreated` event here and an entry in
     /// `context.artifacts` when the context is written. An entry that names
@@ -3560,16 +3579,9 @@ impl Engine {
         let reported = named
             .chain(additional)
             .filter_map(|(name, path)| artifact_at(name, path, action_execution_id));
-        let delivered = result
-            .data
-            .get("artifacts")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| artifact_from(entry, action_execution_id));
 
         let mut artifacts = Vec::new();
-        for artifact in reported.chain(delivered) {
+        for artifact in reported {
             self.emit(
                 &execution.id,
                 EventData::ArtifactCreated {
@@ -3940,44 +3952,6 @@ fn artifact_at(name: Option<&str>, path: &str, action_execution_id: &str) -> Opt
     Some(artifact)
 }
 
-/// Builds an artifact record from one entry of a delivered `data.artifacts`
-/// list.
-///
-/// Accepts either a bare path or an object with `path`/`location`, and
-/// optionally `name` and `type`.
-fn artifact_from(entry: &Value, action_execution_id: &str) -> Option<Artifact> {
-    let (location, name, artifact_type, metadata) = match entry {
-        Value::String(path) => (path.clone(), None, "file".to_string(), json!({})),
-        Value::Object(object) => {
-            let location = object
-                .get("path")
-                .or_else(|| object.get("location"))
-                .and_then(Value::as_str)?
-                .to_string();
-            let name = object
-                .get("name")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            let artifact_type = object
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("file")
-                .to_string();
-            (location, name, artifact_type, entry.clone())
-        }
-        _ => return None,
-    };
-
-    if location.is_empty() {
-        return None;
-    }
-
-    let mut artifact = Artifact::new(artifact_type, location, action_execution_id.to_string());
-    artifact.name = name;
-    artifact.metadata = metadata;
-    Some(artifact)
-}
-
 /// The mid-step state of `execution`, when it belongs to `state_id`.
 fn stored_pending_step(
     execution: &WorkflowExecution,
@@ -4153,51 +4127,57 @@ fn restore_state_entries(
 }
 
 /// What choosing each label of `state` requires of an answer to a problem
-/// (KTD15, R18), worked out from the state each label leads to.
+/// (KTD15, R18).
 ///
-/// A `human` gate shows the question the agent left open, so it needs
-/// `data.question`. Every `context.NAME` the target's templates use needs a
-/// value — unless the context already holds one, since the target then
-/// renders as it is.
+/// A label requires the variables and artifacts its choice names, and every
+/// `context.NAME` the templates of the state it leads to use that no step or
+/// gate declares — a declared one renders as empty text (KTD6). A variable
+/// the context, or for a `local.*` the step's kept memory (KTD10), already
+/// holds is required of no one.
 fn output_requirements(
     definition: &WorkflowDefinition,
     execution: &WorkflowExecution,
     state: &State,
 ) -> Vec<OutputRequirement> {
+    let declared = DeclaredNames::of(definition);
+    // Unreadable memory only costs the leniency of KTD10: the operator is
+    // asked for a value the step may already keep.
+    let kept_locals = step_memory::step_locals(execution, &state.id).unwrap_or_default();
+    let held = |name: &String| {
+        execution
+            .context
+            .variables
+            .get(name)
+            .or_else(|| kept_locals.get(name))
+            .is_some_and(|value| !human::is_blank(value))
+    };
     state
         .choices
         .iter()
-        .map(|output| {
-            let target = state
+        .map(|choice| {
+            let target_action = state
                 .transitions
-                .get(&output.label)
-                .and_then(|target| definition.states.get(target));
-            let action = target.and_then(|target| target.action.as_ref());
-            let data = match action {
-                Some(ActionConfig::Human(_)) => vec!["question".to_string()],
-                _ => Vec::new(),
-            };
-            let mut variables = output.requires_variables.clone();
-            variables.extend(
-                action
-                    .map(action_context_references)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|name| {
-                        !execution
-                            .context
-                            .variables
-                            .get(name)
-                            .is_some_and(|value| !human::is_blank(value))
-                    })
-                    .collect::<Vec<_>>(),
-            );
+                .get(&choice.label)
+                .and_then(|target| definition.states.get(target))
+                .and_then(|target| target.action.as_ref());
+            let undeclared_references = target_action
+                .map(action_context_references)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|name| !declared.declares_variable(name));
+            let mut variables: Vec<String> = choice
+                .requires_variables
+                .iter()
+                .cloned()
+                .chain(undeclared_references)
+                .filter(|name| !held(name))
+                .collect();
             variables.sort();
             variables.dedup();
             OutputRequirement {
-                label: output.label.clone(),
-                data,
+                label: choice.label.clone(),
                 variables,
+                artifacts: choice.requires_artifacts.clone(),
             }
         })
         .collect()
@@ -4206,23 +4186,6 @@ fn output_requirements(
 /// Whether `state` runs an agent.
 fn is_agent(state: &State) -> bool {
     matches!(state.action, Some(ActionConfig::Agent(_)))
-}
-
-/// The `data.question` an agent stated and the end of its answer.
-///
-/// The answer is `stdout`, which keeps the head of an answer longer than the
-/// capture limit; its tail is then the end of what was kept.
-fn agent_answer(result: &ActionResult) -> (Option<String>, Option<String>) {
-    let question = result
-        .data
-        .get("question")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|question| !question.is_empty())
-        .map(ToString::to_string);
-    let answer_tail =
-        Some(harness::tail(&result.stdout, ANSWER_TAIL_BYTES)).filter(|tail| !tail.is_empty());
-    (question, answer_tail)
 }
 
 fn agent_session_provenance(pending: &PendingStep) -> Option<AgentSessionProvenance> {
@@ -4268,11 +4231,12 @@ fn set_last_agent_step(
     Ok(())
 }
 
-/// The agent step whose transition led straight into `state`, if there is one.
+/// The agent or script step whose transition led straight into `state`, if
+/// there is one.
 ///
 /// Every transition rewrites or drops the record, so one naming `state` as
 /// its destination describes the transition that entered it — never a
-/// question from an earlier pass through a loop. An unreadable record is
+/// reason from an earlier pass through a loop. An unreadable record is
 /// only lost context, not a reason to refuse the suspension.
 fn preceding_agent_step(execution: &WorkflowExecution, state: &State) -> Option<LastAgentStep> {
     let value = execution
@@ -4294,56 +4258,35 @@ fn preceding_agent_step(execution: &WorkflowExecution, state: &State) -> Option<
 }
 
 /// Records the step behind a manual transition from `from` into `to`, as
-/// [`Engine`] does for every transition it takes itself (KTD8).
+/// [`Engine`] does for every transition it takes itself (KTD8, KTD11).
 ///
-/// A manual transition takes no decision, so the agent's answer is wherever
-/// the state left it: in `pending_step` when the agent finished and waited
-/// for a decision, or in `pending_input` when it asked a question of its own
-/// (then there is a question but no answer to quote) or when its step is a
-/// problem (then there is an answer but no question). Leaving any other
-/// state drops the record.
+/// A manual transition takes no decision, so the step's answer is wherever
+/// the state left it: in `pending_step` when the step finished and waited
+/// for a decision, or, for an agent, in `pending_input` when it asked a
+/// question of its own (then the question is the reason, and there is no
+/// answer to quote) or when its step is a problem (then there is an answer
+/// but no choice, so no reason). Leaving any other state drops the record.
 pub fn record_manual_transition(
     execution: &mut WorkflowExecution,
     from: &State,
     to: &str,
     pending_input: Option<&PendingHumanInput>,
 ) -> Result<(), EngineError> {
-    let record = if is_agent(from) {
-        if let Some(pending) = stored_pending_step(execution, &from.id)? {
-            Some(LastAgentStep::from_result(
-                from.id.clone(),
+    let record = match stored_pending_step(execution, &from.id)? {
+        Some(pending) => {
+            let kept_locals = step_memory::step_locals(execution, &from.id)?;
+            LastAgentStep::from_result(
+                from,
                 to.to_string(),
                 pending.action_execution_id,
                 &pending.result,
-            ))
-        } else {
-            pending_input
-                .filter(|input| input.state_id == from.id)
-                .and_then(|input| match input.continuation {
-                    InputContinuation::ResumeAgent => Some(LastAgentStep {
-                        state_id: from.id.clone(),
-                        to_state: to.to_string(),
-                        action_execution_id: input.action_execution_id().to_string(),
-                        question: Some(input.instruction().to_string()),
-                        answer_tail: None,
-                    }),
-                    // A problem left by hand: no question, but the answer
-                    // the agent did give.
-                    InputContinuation::ResolveOutput => Some(LastAgentStep {
-                        state_id: from.id.clone(),
-                        to_state: to.to_string(),
-                        action_execution_id: input.action_execution_id().to_string(),
-                        question: None,
-                        answer_tail: input.request.answer_tail.clone(),
-                    }),
-                    InputContinuation::CompleteStep => None,
-                    InputContinuation::ApproveOutput => None,
-                    InputContinuation::ResolvePermission => None,
-                    InputContinuation::EntryLimit => None,
-                })
+                &kept_locals,
+            )
         }
-    } else {
-        None
+        None if is_agent(from) => pending_input
+            .filter(|input| input.state_id == from.id)
+            .and_then(|input| agent_input_record(from, to, input)),
+        None => None,
     };
     // A manual transition abandons a rejected output still owed a reprompt,
     // a rescue the conductor had not finished, and a failure it diagnoses.
@@ -4352,6 +4295,29 @@ pub fn record_manual_transition(
     clear_engine_metadata(execution, METADATA_STEP_FAILURE_KEY);
     clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);
     set_last_agent_step(execution, record.as_ref())
+}
+
+/// The record of an agent step left by hand while it waited on `input`.
+fn agent_input_record(from: &State, to: &str, input: &PendingHumanInput) -> Option<LastAgentStep> {
+    let (reason, answer_tail) = match input.continuation {
+        InputContinuation::ResumeAgent => (
+            Some(gate_context::gate_reason(input.instruction())),
+            None,
+        ),
+        InputContinuation::ResolveOutput => (None, input.request.answer_tail.clone()),
+        InputContinuation::CompleteStep
+        | InputContinuation::ApproveOutput
+        | InputContinuation::ResolvePermission
+        | InputContinuation::EntryLimit => return None,
+    };
+    Some(LastAgentStep {
+        state_id: from.id.clone(),
+        to_state: to.to_string(),
+        action_execution_id: input.action_execution_id().to_string(),
+        reason,
+        required_values: Vec::new(),
+        answer_tail,
+    })
 }
 
 /// Returns the engine-owned metadata object, normalizing records written
@@ -4495,25 +4461,5 @@ mod tests {
             terminal_status(&terminal("rejected_by_reviewer", None)),
             ExecutionStatus::Completed
         );
-    }
-
-    #[test]
-    fn an_artifact_can_be_a_bare_path_or_an_object() {
-        let bare = artifact_from(&json!("reports/coverage.html"), "action-1").expect("artifact");
-        assert_eq!(bare.location, "reports/coverage.html");
-        assert_eq!(bare.artifact_type, "file");
-        assert_eq!(bare.producer, "action-1");
-
-        let described = artifact_from(
-            &json!({ "name": "report", "type": "text/markdown", "path": "plan.md" }),
-            "action-1",
-        )
-        .expect("artifact");
-        assert_eq!(described.name.as_deref(), Some("report"));
-        assert_eq!(described.artifact_type, "text/markdown");
-        assert_eq!(described.location, "plan.md");
-
-        assert!(artifact_from(&json!({ "name": "no location" }), "action-1").is_none());
-        assert!(artifact_from(&json!(42), "action-1").is_none());
     }
 }

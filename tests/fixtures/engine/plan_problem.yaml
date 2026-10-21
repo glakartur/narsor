@@ -1,0 +1,29 @@
+name: plan-problem
+version: 1
+description: >
+  A plan step whose answer may carry no choice, so its step becomes a problem.
+  `plan_ready` requires the plan document as an artifact. `blocked` leads to a
+  step that renders the declared `plan_blocker`, which has no value yet.
+states:
+  plan:
+    action: { type: agent, prompt: Plan the work. }
+    variables:
+      - { name: plan_blocker, description: What blocks the plan. }
+    artifacts:
+      - { name: plan_doc, description: The plan document. }
+    choices:
+      - label: plan_ready
+        requires_artifacts: [plan_doc]
+      - blocked
+    transitions: { plan_ready: completed, blocked: report_blocker }
+  report_blocker:
+    action:
+      type: script
+      command: ./print_json.sh
+      args: ['{"choice": "ok"}']
+      env:
+        PLAN_BLOCKER: "{{ context.plan_blocker }}"
+    choices: [ok]
+    transitions: { ok: completed }
+  completed: { description: done }
+terminal_states: [completed]

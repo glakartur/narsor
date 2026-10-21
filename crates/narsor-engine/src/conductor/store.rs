@@ -218,9 +218,9 @@ pub struct SavedDecision {
     /// The output label chosen, if one was.
     #[serde(default)]
     pub output_label: Option<String>,
-    /// The step's `data` the conductor supplied.
+    /// The step's artifacts the conductor supplied, name → path.
     #[serde(default)]
-    pub data: Value,
+    pub artifacts: BTreeMap<String, String>,
     /// The step's `variables` the conductor supplied.
     #[serde(default)]
     pub variables: Value,

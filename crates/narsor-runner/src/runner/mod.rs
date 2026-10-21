@@ -1294,7 +1294,7 @@ impl Session {
         let delivery = HumanInputDelivery {
             values: input.delivery.values,
             chosen_label: input.delivery.chosen_label,
-            data: input.delivery.data,
+            artifacts: input.delivery.artifacts,
             variables: input.delivery.variables,
             comment: input.delivery.comment,
             agent_message: input.delivery.agent_message,

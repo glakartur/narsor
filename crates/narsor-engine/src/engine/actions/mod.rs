@@ -278,7 +278,8 @@ pub struct TimedOutAction {
 
 impl TimedOutAction {
     /// Turns the timeout into a `timeout` result when the state declares that
-    /// label, and into an action error when it does not.
+    /// label — with a reason naming the limit, for the gate it may lead to
+    /// (KTD11) — and into an action error when it does not.
     ///
     /// A state that maps exit code 124 to some label is unaffected: that is an
     /// ordinary exit-code mapping of a process that finished on its own, and
@@ -288,6 +289,7 @@ impl TimedOutAction {
 
         if declared_outputs.iter().any(|label| label == TIMEOUT_LABEL) {
             return Ok(ActionResult {
+                reason: format!("krok przekroczył limit czasu {seconds}s"),
                 data: serde_json::json!({ "timeout_secs": seconds }),
                 ..ActionResult::new(TIMEOUT_LABEL)
             });

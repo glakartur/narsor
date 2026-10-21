@@ -815,7 +815,7 @@ fn saved_choice() -> SavedDecision {
         episode: Some("attempt-rejected".to_string()),
         state_id: Some("work".to_string()),
         output_label: Some("implemented".to_string()),
-        data: json!({ "units_completed": 3 }),
+        artifacts: [("report".to_string(), "docs/report.md".to_string())].into(),
         variables: json!({ "summary": "three units" }),
         confidence: Confidence::High,
         rationale: Some("the agent said it was done".to_string()),
@@ -933,7 +933,7 @@ async fn a_restart_after_the_choices_result_takes_only_the_decision() {
         action_execution_id: "attempt-rejected".to_string(),
         result: narsor_engine::domain::ActionResult {
             output_label: "implemented".to_string(),
-            data: decision.data.clone(),
+            artifacts: decision.artifacts.clone(),
             variables: decision.variables.as_object().cloned().unwrap_or_default(),
             ..Default::default()
         },

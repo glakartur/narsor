@@ -110,7 +110,8 @@ impl ConductorRegistry {
             "instruction": pending.instruction(),
             "fields": pending.fields(),
             "outputs": pending.outputs,
-            "question": pending.request.question,
+            "reason": pending.request.reason,
+            "required_values": pending.request.required_values,
             "answer_tail": pending.request.answer_tail,
         }));
         if let Err(error) = self

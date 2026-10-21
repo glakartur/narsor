@@ -761,7 +761,7 @@ mod tests {
         let delivery = HumanInputDeliveryDto {
             values: Map::from_iter([("name".into(), serde_json::json!("Ada"))]),
             chosen_label: Some("approved".into()),
-            data: Map::new(),
+            artifacts: Default::default(),
             variables: Map::new(),
             comment: None,
             agent_message: Some("Use the revised draft".into()),

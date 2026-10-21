@@ -167,7 +167,8 @@ fn every_event_data_variant() -> Vec<EventData> {
         },
         EventData::HumanInputRequested {
             instruction: "approve?".to_string(),
-            question: None,
+            reason: None,
+            required_values: Vec::new(),
             answer_tail: None,
             episode: None,
         },
@@ -4907,12 +4908,12 @@ mod task_app_waiting {
                 "reason": "Odpowiedź agenta nie zawiera etykiety.",
                 "answers": [{ "action_execution_id": "act-9", "reason": "brak etykiety", "answer_tail": "Done, all tests pass." }],
                 "requirements": [
-                    { "label": "implemented", "data": [], "variables": ["summary"] },
-                    { "label": "needs_human_decision", "data": ["question"], "variables": [] }
+                    { "label": "implemented", "variables": ["summary"], "artifacts": [] },
+                    { "label": "needs_human_decision", "variables": [], "artifacts": ["decision_doc"] }
                 ],
                 "analysis": if proposed { json!({
                     "label": "implemented",
-                    "data": {},
+                    "artifacts": {},
                     "variables": { "summary": "all units done", "files": 3 },
                     "rationale": "Odpowiedź mówi, że testy przechodzą."
                 }) } else { Value::Null }
@@ -4942,8 +4943,8 @@ mod task_app_waiting {
             "problem": {
                 "reason": "entry limit reached (5/5)",
                 "requirements": [
-                    { "label": "clean", "data": [], "variables": [] },
-                    { "label": "findings", "data": [], "variables": ["manual_note"] }
+                    { "label": "clean", "variables": [] },
+                    { "label": "findings", "variables": ["manual_note"] }
                 ]
             },
             "entry_limit": { "entries": 5, "max_entries": 5 },
@@ -5569,15 +5570,15 @@ mod task_app_waiting {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
         ch(&mut app, '2');
         assert_eq!(selected_label(&app), "needs_human_decision");
-        assert!(enter_until_error(&mut app), "data.question is required");
+        assert!(enter_until_error(&mut app), "artifacts.decision_doc is required");
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
         let field = &chooser_of(&app).fields_of(1)[0];
-        assert_eq!(field.name, "data.question");
+        assert_eq!(field.name, "artifacts.decision_doc");
         assert!(field
             .error()
-            .is_some_and(|error| error.contains("data.question")));
+            .is_some_and(|error| error.contains("artifacts.decision_doc")));
 
-        typed(&mut app, "Konto czy użytkownik?");
+        typed(&mut app, "docs/decision.md");
         // A key of the operator's own, beside the ones the label needs.
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
@@ -5587,7 +5588,7 @@ mod task_app_waiting {
             delivery.chosen_label.as_deref(),
             Some("needs_human_decision")
         );
-        assert_eq!(delivery.data["question"], "Konto czy użytkownik?");
+        assert_eq!(delivery.artifacts["decision_doc"], "docs/decision.md");
         assert_eq!(delivery.variables["scope"], "account");
     }
 

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::{ConductorPurposeDto, ConductorTriggerDto, ProblemKindDto};
+use crate::api::{ConductorPurposeDto, ConductorTriggerDto, ProblemKindDto, RequiredValue};
 
 /// Unique identifier for an event
 pub type EventId = String;
@@ -219,12 +219,15 @@ pub enum EventData {
     // Human interaction events
     HumanInputRequested {
         instruction: String,
-        /// The `data.question` of the agent step the request follows, if any.
-        /// `#[serde(default)]` so an event log written before this field
-        /// still reads.
+        /// Why the agent or script step the request follows made its
+        /// choice. `#[serde(default)]` so an event log written before this
+        /// field still reads.
         #[serde(default)]
-        question: Option<String>,
-        /// The end of that agent step's answer.
+        reason: Option<String>,
+        /// The values that choice required.
+        #[serde(default)]
+        required_values: Vec<RequiredValue>,
+        /// The end of that step's answer.
         #[serde(default)]
         answer_tail: Option<String>,
         /// The key of the pending input this request opened (KTD9): a
@@ -254,9 +257,9 @@ pub enum EventData {
         /// The output label the answer chose explicitly, if it chose one.
         #[serde(default)]
         output_label: Option<String>,
-        /// The step's `data`, when the answer resolved a problem.
+        /// The step's artifacts, when the answer resolved a problem.
         #[serde(default)]
-        data: Option<serde_json::Value>,
+        artifacts: Option<serde_json::Value>,
         /// The step's `variables`, when the answer resolved a problem.
         #[serde(default)]
         variables: Option<serde_json::Value>,
@@ -652,7 +655,7 @@ impl EventData {
             close_reason: None,
             episode: None,
             output_label: None,
-            data: None,
+            artifacts: None,
             variables: None,
             comment: None,
         }
