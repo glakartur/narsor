@@ -742,6 +742,31 @@ mod tests {
     }
 
     #[test]
+    fn a_gate_after_an_agent_prints_its_reason_and_required_values() {
+        let pending = serde_json::json!({
+            "state_id": "review",
+            "instruction": "Review the plan.",
+            "reason": "Plan blocked\u{1b}[31m by the migration.",
+            "required_values": [
+                {"name": "plan_blocker", "kind": "variable", "value": "No decision yet.\nAsk the owner."},
+                {"name": "plan_doc", "kind": "artifact", "value": "docs/plan.md"},
+            ],
+            "outputs": [{"label": "approve"}],
+        });
+        let text = commands::pending_input_lines(&pending).join("\n");
+        assert!(
+            text.contains("\n  Reason: Plan blocked[31m by the migration.\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n  Required values:\n    plan_blocker (variable): No decision yet.\n      Ask the owner.\n    plan_doc (artifact): docs/plan.md\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn a_pattern_goes_only_with_allow_pattern_and_the_comment_reaches_the_agent() {
         use narsor_protocol::api::PermissionGrantScopeDto;
         let decision =

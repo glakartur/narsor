@@ -36,7 +36,9 @@ use std::str::Chars;
 use serde_json::{Map, Value};
 
 use crate::conductor::Annotation;
-use crate::domain::display::is_invisible_format;
+use crate::domain::display::{
+    is_invisible_format, without_unsafe_chars, without_unsafe_chars_multiline,
+};
 use crate::tui::chooser::{ChooserField, ChooserItem, FieldKind, Submission};
 use narsor_protocol::api::{
     bash_grant_rules, bash_pattern_rule, is_approvable_permission_reason, BashGrantScope,
@@ -431,11 +433,8 @@ impl ContextLine {
     }
 }
 
-/// The name of the optional field that takes more `data` keys than the label
+/// The name of the optional field that takes more `variables` than the label
 /// needs, one `key=value` per line.
-pub const EXTRA_ARTIFACTS_FIELD: &str = "artifacts (nazwa=ścieżka)";
-
-/// The same for `variables`.
 pub const EXTRA_VARIABLES_FIELD: &str = "variables (klucz=wartość)";
 
 /// A problem's free-text comment, kept in the log with the answer.
@@ -509,9 +508,10 @@ impl InputPanel {
             .context
             .push(ContextLine::plain(pending.instruction()));
         if let Some(reason) = &pending.reason {
-            panel
-                .context
-                .push(ContextLine::plain(format!("„{reason}”")));
+            panel.push_reason(reason);
+        }
+        for required in &pending.required_values {
+            panel.push_named_value(&required.name, &required.value);
         }
         if let Some(tail) = &pending.answer_tail {
             panel
@@ -752,6 +752,23 @@ impl InputPanel {
             .map(|(_, value)| value.as_str())
     }
 
+    /// Why the agent made its choice, `uzasadnienie: …`.
+    fn push_reason(&mut self, reason: &str) {
+        self.context.push(ContextLine::plain(format!(
+            "uzasadnienie: {}",
+            without_unsafe_chars(reason)
+        )));
+    }
+
+    /// A value the agent gave, `name: value`.
+    fn push_named_value(&mut self, name: &str, value: &str) {
+        self.context.push(ContextLine::plain(format!(
+            "{}: {}",
+            without_unsafe_chars(name),
+            without_unsafe_chars_multiline(value)
+        )));
+    }
+
     fn push(&mut self, item: ChooserItem, plan: Plan) {
         self.items.push(item);
         self.plans.push(plan);
@@ -940,7 +957,6 @@ impl InputPanel {
                 }
             }
             item = item
-                .with_field(ChooserField::multiline(EXTRA_ARTIFACTS_FIELD))
                 .with_field(ChooserField::multiline(EXTRA_VARIABLES_FIELD))
                 .with_field(ChooserField::multiline(COMMENT_FIELD));
             if proposed {
@@ -1013,37 +1029,29 @@ impl InputPanel {
                 }
             }
         }
-        for (slot, (field, map)) in [
-            (EXTRA_ARTIFACTS_FIELD, "artifacts"),
-            (EXTRA_VARIABLES_FIELD, "variables"),
-        ]
-        .into_iter()
-        .enumerate()
+        let [artifacts, mut variables] = maps;
+        for line in Self::value_of(submission, EXTRA_VARIABLES_FIELD)
+            .unwrap_or_default()
+            .lines()
         {
-            for line in Self::value_of(submission, field)
-                .unwrap_or_default()
-                .lines()
-            {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Some((key, value)) = line.split_once('=') else {
-                    return Err(format!(
-                        "Linia '{line}' w {map} nie ma postaci klucz=wartość."
-                    ));
-                };
-                if key.trim().is_empty() {
-                    return Err(format!("Linia '{line}' w {map} nie ma klucza."));
-                }
-                insert_once(
-                    &mut maps[slot],
-                    map,
-                    key.trim(),
-                    Value::String(value.trim().to_string()),
-                )?;
+            if line.trim().is_empty() {
+                continue;
             }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(format!(
+                    "Linia '{line}' w variables nie ma postaci klucz=wartość."
+                ));
+            };
+            if key.trim().is_empty() {
+                return Err(format!("Linia '{line}' w variables nie ma klucza."));
+            }
+            insert_once(
+                &mut variables,
+                "variables",
+                key.trim(),
+                Value::String(value.trim().to_string()),
+            )?;
         }
-        let [artifacts, variables] = maps;
         Ok(HumanInputDeliveryDto {
             chosen_label: Some(label.to_string()),
             artifacts: artifacts
@@ -1261,9 +1269,12 @@ impl InputPanel {
     fn build_approval(&mut self, pending: &PendingHumanInputView) {
         let mut resumable = false;
         if let Some(approval) = &pending.approval {
-            let label = approval.result.output_label.clone();
-            self.context
-                .push(ContextLine::plain(format!("wynik agenta: {label}")));
+            let result = &approval.result;
+            let label = result.output_label.clone();
+            self.context.push(ContextLine::plain(format!(
+                "wybór agenta: {}",
+                without_unsafe_chars(&label)
+            )));
             if let Some(description) = pending
                 .outputs
                 .iter()
@@ -1272,10 +1283,13 @@ impl InputPanel {
             {
                 self.context.push(ContextLine::dim(description));
             }
-            if !approval.result.data.is_null() {
-                let data = serde_json::to_string_pretty(&approval.result.data).unwrap_or_default();
-                self.context
-                    .push(ContextLine::plain(format!("data: {data}")));
+            let reason = result.reason.trim();
+            self.push_reason(if reason.is_empty() { NO_REASON } else { reason });
+            for (name, value) in &result.variables {
+                self.push_named_value(name, &value_as_text(value));
+            }
+            for (name, path) in &result.artifacts {
+                self.push_named_value(name, path);
             }
             resumable = approval.agent_session_id.is_some();
             self.approval_label = Some(label);
@@ -1305,6 +1319,10 @@ impl InputPanel {
         self.selected = 1;
     }
 }
+
+/// What an approval says when the agent gave no reason (R3), as the engine
+/// says it at a gate.
+const NO_REASON: &str = "brak uzasadnienia";
 
 /// The field a message to the agent is typed into.
 pub const MESSAGE_FIELD: &str = "Wiadomość dla agenta";
@@ -1364,7 +1382,8 @@ fn insert_once(
 
 /// `item` with a field for each of `fields`. A field is required when the
 /// workflow says so — except a resume comment, which only the output that
-/// resumes an agent needs (3f3dab2).
+/// resumes an agent needs (3f3dab2), and that output always needs, even when
+/// the field itself is optional (KTD12).
 fn declared_fields(
     mut item: ChooserItem,
     fields: &[&HumanInputFieldView],
@@ -1378,7 +1397,13 @@ fn declared_fields(
                     && output.resume_comment_field.as_deref() == Some(field.name.as_str())
             })
         });
-        let required = field.required && !claimed_by_other;
+        let claimed_by_own = label.is_some_and(|label| {
+            outputs.iter().any(|output| {
+                output.label == label
+                    && output.resume_comment_field.as_deref() == Some(field.name.as_str())
+            })
+        });
+        let required = (field.required && !claimed_by_other) || claimed_by_own;
         let mut built = match field.field_type {
             HumanInputTypeView::Text => ChooserField::multiline(field.name.clone()),
             HumanInputTypeView::Select => {

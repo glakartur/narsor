@@ -353,10 +353,16 @@ pub struct ApprovalCandidateView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionResultView {
     pub output_label: String,
+    /// Why the action made its choice; empty when it gave none.
+    #[serde(default)]
+    pub reason: String,
     #[serde(default)]
     pub data: Value,
     #[serde(default)]
     pub variables: Map<String, Value>,
+    /// The step's named artifacts the action produced: name → path.
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, String>,
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub stdout: String,

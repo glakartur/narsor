@@ -3517,6 +3517,128 @@ mod task_app_waiting_render {
         assert_eq!(buffer[(layout::LIST_WIDTH + 4, divider_y)].fg, Color::Black);
     }
 
+    /// A gate after an agent step, with the agent's reason and the values its
+    /// choice required, as the engine writes them (KTD11).
+    fn gate_after_agent(reason: &str) -> serde_json::Value {
+        let mut form = gate();
+        form["reason"] = json!(reason);
+        form["required_values"] = json!([
+            { "name": "plan_blocker", "kind": "variable", "value": "Brak decyzji o migracji." },
+            { "name": "plan_doc", "kind": "artifact", "value": "docs/plan.md" }
+        ]);
+        form
+    }
+
+    fn approval(result: serde_json::Value) -> serde_json::Value {
+        json!({
+            "execution_id": "exec-1",
+            "state_id": "doc_review",
+            "action_execution_id": "act-7",
+            "instruction": "Zatwierdź przegląd dokumentu",
+            "outputs": [{ "label": "approved", "description": "Dokument przeszedł przegląd." }],
+            "continuation": "approve_output",
+            "approval": {
+                "action_execution_id": "act-7",
+                "result": result,
+                "agent_session_id": "sess-1"
+            },
+            "episode": "ep-a",
+            "requested_at": "2026-10-09T11:54:00Z"
+        })
+    }
+
+    #[test]
+    fn a_gate_after_an_agent_shows_its_reason_and_the_required_values() {
+        let mut app = opened(with_pending(
+            running(),
+            gate_after_agent("Plan czeka na decyzję o migracji."),
+        ));
+        let screen = draw_app(&mut app, 120, 40, false);
+        for expected in [
+            "uzasadnienie: Plan czeka na decyzję o migracji.",
+            "plan_blocker: Brak decyzji o migracji.",
+            "plan_doc: docs/plan.md",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} is missing:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn a_gate_whose_agent_gave_no_reason_says_so() {
+        // The engine writes the placeholder when the agent gave none (R3).
+        let mut app = opened(with_pending(running(), gate_after_agent("brak uzasadnienia")));
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(screen.contains("uzasadnienie: brak uzasadnienia"), "{screen}");
+    }
+
+    #[test]
+    fn an_escape_in_the_reason_never_reaches_the_terminal() {
+        let pending = gate_after_agent("ok\u{1b}[31m czerwony\u{7}");
+        let view: narsor_protocol::api::PendingHumanInputView =
+            serde_json::from_value(pending.clone()).unwrap();
+        let panel = narsor::tui::input_form::InputPanel::new(&view, &|_| None);
+        assert!(
+            panel
+                .context()
+                .iter()
+                .all(|line| !line.text.chars().any(char::is_control)),
+            "{:?}",
+            panel.context()
+        );
+
+        let mut app = opened(with_pending(running(), pending));
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(!screen.contains('\u{1b}'), "{screen:?}");
+        assert!(screen.contains("czerwony"), "{screen}");
+    }
+
+    #[test]
+    fn an_approval_shows_the_choice_reason_variables_and_artifacts_not_raw_data() {
+        let pending = approval(json!({
+            "output_label": "approved",
+            "reason": "Dokument jest kompletny.",
+            "data": { "agent_session": "sess-1" },
+            "variables": { "review_summary": "Wszystkie sekcje opisane." },
+            "artifacts": { "review_doc": "docs/review.md" },
+            "exit_code": null, "stdout": "", "stderr": ""
+        }));
+        let view: narsor_protocol::api::PendingHumanInputView =
+            serde_json::from_value(pending.clone()).unwrap();
+        let panel = narsor::tui::input_form::InputPanel::new(&view, &|_| None);
+        let context: Vec<&str> = panel.context().iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            context,
+            [
+                "Zatwierdź przegląd dokumentu",
+                "wybór agenta: approved",
+                "Dokument przeszedł przegląd.",
+                "uzasadnienie: Dokument jest kompletny.",
+                "review_summary: Wszystkie sekcje opisane.",
+                "review_doc: docs/review.md",
+            ]
+        );
+
+        // The panel scrolls its context; the head of it is on screen.
+        let mut app = opened(with_pending(running(), pending));
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(screen.contains("wybór agenta: approved"), "{screen}");
+        assert!(!screen.contains("agent_session"), "no raw data:\n{screen}");
+    }
+
+    #[test]
+    fn an_approval_without_a_reason_says_so() {
+        let mut app = opened(with_pending(
+            running(),
+            approval(json!({
+                "output_label": "approved",
+                "variables": {},
+                "exit_code": null, "stdout": "", "stderr": ""
+            })),
+        ));
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(screen.contains("uzasadnienie: brak uzasadnienia"), "{screen}");
+    }
+
     #[test]
     fn the_agent_reply_composer_sits_below_the_action_list_as_a_separate_field() {
         let mut app = opened(with_pending(running(), problem()));

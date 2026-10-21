@@ -1668,6 +1668,32 @@ fn print_pending_input(pending: &impl serde::Serialize) {
 }
 
 /// The lines [`print_pending_input`] prints.
+/// The reason of the agent or script step before a gate and the values its
+/// choice required (KTD11), from an already cleaned `pending`. A value may
+/// span lines; each further line is indented under its name.
+fn gate_context_lines(pending: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(reason) = pending["reason"].as_str() {
+        lines.push(format!("  Reason: {}", without_unsafe_chars(reason)));
+    }
+    let required = pending["required_values"].as_array().cloned().unwrap_or_default();
+    if required.is_empty() {
+        return lines;
+    }
+    lines.push("  Required values:".to_string());
+    for value in &required {
+        let mut text = value["value"].as_str().unwrap_or_default().lines();
+        lines.push(format!(
+            "    {} ({}): {}",
+            value["name"].as_str().unwrap_or("?"),
+            value["kind"].as_str().unwrap_or("?"),
+            text.next().unwrap_or_default()
+        ));
+        lines.extend(text.map(|line| format!("      {line}")));
+    }
+    lines
+}
+
 pub(super) fn pending_input_lines(pending: &impl serde::Serialize) -> Vec<String> {
     let mut lines = Vec::new();
     let Ok(mut pending) = serde_json::to_value(pending) else {
@@ -1681,6 +1707,7 @@ pub(super) fn pending_input_lines(pending: &impl serde::Serialize) -> Vec<String
         "Human input expected: {}",
         pending["instruction"].as_str().unwrap_or("(unavailable)")
     ));
+    lines.extend(gate_context_lines(&pending));
     for field in pending["fields"].as_array().into_iter().flatten() {
         let requirement = if field["required"].as_bool().unwrap_or(false) {
             "required"

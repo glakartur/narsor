@@ -1453,7 +1453,12 @@ mod remote_support;
 /// without a label and cannot be asked again — before any daemon runs, and
 /// returns its id.
 fn stop_on_a_problem(root: &TempRoot) -> String {
-    let definition_path = engine_support::fixtures().join("engine/agent_problem.yaml");
+    stop_on_the_problem_of(root, "agent_problem")
+}
+
+/// The same for the engine fixture `workflow`.
+fn stop_on_the_problem_of(root: &TempRoot, workflow: &str) -> String {
+    let definition_path = engine_support::fixtures().join(format!("engine/{workflow}.yaml"));
     let definition = load_from_file(&definition_path).expect("load the fixture");
     let workspace_path = root.path().join("workspace");
     fs::create_dir_all(&workspace_path).expect("create workspace dir");
@@ -1538,6 +1543,35 @@ fn input_resolves_a_problem_with_a_label_artifacts_and_variables() {
             .stdout
             .contains("Decision 'implemented' made by 'human'"),
         "{events:?}"
+    );
+}
+
+#[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+fn input_supplies_the_artifact_a_problem_is_missing() {
+    let root = TempRoot::new();
+    let id = stop_on_the_problem_of(&root, "plan_problem");
+
+    let refused = cli(&root, &["input", &id, "--label", "plan_ready"]);
+    assert_eq!(refused.code, EXIT_FAILURE, "{refused:?}");
+    assert!(refused.output().contains("artifacts.plan_doc"), "{refused:?}");
+
+    let resolved = cli(
+        &root,
+        &[
+            "input",
+            &id,
+            "--label",
+            "plan_ready",
+            "--artifact",
+            "plan_doc=docs/p.md",
+        ],
+    );
+    assert_eq!(resolved.code, EXIT_SUCCESS, "{resolved:?}");
+    let shown = cli(&root, &["show", &id]);
+    assert!(
+        shown.stdout.contains("Status:        completed"),
+        "{shown:?}"
     );
 }
 
