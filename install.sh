@@ -58,6 +58,15 @@ else
 fi
 
 echo "Zainstalowano binaria Narsor w $bin_dir."
+
+# Działający serwer to nadal stara binarka: tworzyłby snapshoty workflow w
+# starym schemacie, a nowy runner by je odrzucał. Zatrzymujemy go; klient
+# uruchomi nowy serwer przy następnym wywołaniu. Runnerów działających zadań
+# to nie zatrzymuje (mają własną grupę procesów).
+if "$bin_dir/narsor-server" stop >/dev/null 2>&1; then
+    echo "Zatrzymano działający serwer Narsor; klient uruchomi nowy przy następnym wywołaniu."
+    echo "Zamknij i uruchom ponownie otwarte okna 'narsor', bo działają na starej binarce."
+fi
 case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *) echo "Dodaj $bin_dir do PATH, np.: export PATH=\"$bin_dir:\$PATH\"" ;;

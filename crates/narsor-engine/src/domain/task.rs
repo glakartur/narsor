@@ -96,6 +96,20 @@ pub enum LaunchDefinitionError {
         /// Its version.
         found_version: u32,
     },
+    /// The snapshot reads, but this build's validation rejects it: it was
+    /// sealed by a Narsor build with another workflow schema.
+    #[error(
+        "the workflow definition snapshot of '{workflow}' is not valid for this build — it was \
+         sealed by a Narsor build with another workflow schema; restart the server on this \
+         build, archive the task and create it again:\n  {}",
+        violations.join("\n  ")
+    )]
+    Invalid {
+        /// Workflow id of the spec.
+        workflow: String,
+        /// Every violation, as validation reports them.
+        violations: Vec<String>,
+    },
 }
 
 /// The fields of a current-version spec, for the version-checked read.
@@ -187,7 +201,9 @@ impl TaskLaunchSpec {
     ///
     /// Refuses a spec without one and a snapshot of another workflow than
     /// the spec names: a runner must never fall back to looking the
-    /// workflow up by name.
+    /// workflow up by name. Refuses a snapshot this build does not validate
+    /// too, so a server and a runner of different builds meet as a reported
+    /// problem rather than as a runner that dies before it is ready.
     pub fn definition(&self) -> Result<WorkflowDefinition, LaunchDefinitionError> {
         let value = self
             .definition
@@ -206,6 +222,12 @@ impl TaskLaunchSpec {
                 found_version: definition.version,
             });
         }
+        definition
+            .validate()
+            .map_err(|violations| LaunchDefinitionError::Invalid {
+                workflow: self.workflow_id.clone(),
+                violations: violations.iter().map(ToString::to_string).collect(),
+            })?;
         Ok(definition)
     }
 

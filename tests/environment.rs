@@ -16,8 +16,8 @@ use environment_support::{
     workflow_yaml,
 };
 use narsor_engine::domain::{
-    ImageDigest, ImageSource, ImageSpec, RefOrigin, ResolvedEnvironment, ResourceProfile,
-    SecretDelivery, TaskLaunchSpec, TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
+    ImageDigest, ImageSource, ImageSpec, LaunchDefinitionError, RefOrigin, ResolvedEnvironment,
+    ResourceProfile, SecretDelivery, TaskLaunchSpec, TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
 };
 use narsor_engine::environment::{
     BackendKind, BackendLimits, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent,
@@ -980,6 +980,23 @@ fn a_launch_spec_carries_the_definition_it_was_resolved_with() {
         ..spec
     };
     assert!(without.definition().is_err(), "a runner never looks it up");
+}
+
+#[test]
+fn a_snapshot_this_build_does_not_validate_is_refused_on_read() {
+    let root = TempRoot::new();
+    let spec = root.resolve(&intent("wf")).unwrap().spec;
+    let mut foreign = spec.definition().unwrap();
+    foreign.initial_state = "missing".to_string();
+    let sealed_elsewhere = spec.with_definition(&foreign).unwrap();
+
+    let error = sealed_elsewhere.definition().unwrap_err();
+
+    assert!(
+        matches!(error, LaunchDefinitionError::Invalid { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("Initial state 'missing' not found"));
 }
 
 #[test]
