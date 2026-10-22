@@ -1957,7 +1957,8 @@ mod task_app_list {
             status: ExecutionStatus,
             pending_input_id: Option<String>,
             attention: Vec<narsor_protocol::controller::AttentionItem>,
-        ) -> Option<Result<narsor_protocol::controller::ControlEventEnvelope, ClientError>> {
+        ) -> Option<Result<narsor_protocol::controller::ControlEventEnvelope, ClientError>>
+        {
             event(
                 id,
                 "a",
@@ -2005,7 +2006,14 @@ mod task_app_list {
         #[test]
         fn a_report_that_changes_state_question_or_attention_asks_for_a_read() {
             let mut app = running_app(true);
-            app.on_stream(report("s", 2, 50, ExecutionStatus::Completed, None, Vec::new()));
+            app.on_stream(report(
+                "s",
+                2,
+                50,
+                ExecutionStatus::Completed,
+                None,
+                Vec::new(),
+            ));
             assert!(app.refresh_wanted(), "status changed");
 
             let mut app = running_app(true);
@@ -2040,7 +2048,14 @@ mod task_app_list {
         #[test]
         fn a_report_for_a_row_without_a_runner_asks_for_a_read() {
             let mut app = running_app(false);
-            app.on_stream(report("n", 2, 50, ExecutionStatus::Running, None, Vec::new()));
+            app.on_stream(report(
+                "n",
+                2,
+                50,
+                ExecutionStatus::Running,
+                None,
+                Vec::new(),
+            ));
             assert!(app.refresh_wanted());
         }
 
@@ -7065,8 +7080,8 @@ mod task_app_actions {
 
     use super::remote_support::{snapshot, RemoteHarness};
     use super::task_app_support::{
-        displayed, event, listing, queued, task, titled, waiting_on, with_controller, with_runner,
-        with_transitions,
+        displayed, event, listing, offered, queued, task, titled, waiting_on, with_controller,
+        with_runner, with_transitions,
     };
 
     fn offline_client() -> ApiClient {
@@ -7125,6 +7140,13 @@ mod task_app_actions {
         with_controller(task("a", "local", word, 1))
     }
 
+    /// A title for the row, and nothing else: the actions the test put on the
+    /// task stay as they are.
+    fn titled_as_served(mut task: TaskSummary) -> TaskSummary {
+        task.display.title = "NAR-12".to_string();
+        task
+    }
+
     fn loaded(task: TaskSummary) -> TaskApp {
         let mut app = app();
         app.load(listing(vec![titled(task, "NAR-12")], "c"));
@@ -7178,6 +7200,83 @@ mod task_app_actions {
     }
 
     // -- the table of origin §3 --------------------------------------------
+
+    mod comment {
+        use super::*;
+        use narsor::tui::task_app::actions::CommentForm;
+
+        fn type_text(app: &mut TaskApp, text: &str) {
+            for c in text.chars() {
+                ch(app, c);
+            }
+        }
+
+        #[test]
+        fn a_paused_task_offers_a_comment_and_resume_apart() {
+            let paused = runner_state("paused");
+            assert!(available(&paused, TaskAction::Comment));
+            assert!(available(&paused, TaskAction::PauseResume));
+            assert_eq!(verb(&paused, TaskAction::Comment), "komentarz");
+        }
+
+        #[test]
+        fn a_running_task_says_why_it_takes_no_comment() {
+            let reason = unavailable(&running("a", 1), TaskAction::Comment);
+            assert!(reason.contains("zadanie działa"), "{reason}");
+        }
+
+        #[test]
+        fn c_opens_the_field_and_enter_sends_one_comment_in_one_step() {
+            let mut app = loaded(runner_state("paused"));
+            assert_eq!(ch(&mut app, 'c'), Request::None);
+            assert!(matches!(app.overlay(), Some(Overlay::Comment(_))));
+            // Enter goes on to the field; the text is typed there.
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            type_text(&mut app, "zacznij od testów");
+            let request = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(
+                request.send,
+                ActionSend::Comment("zacznij od testów".to_string())
+            );
+            assert_eq!(request.verb, "komentarz");
+            assert!(request.summary.contains("wznowione"), "{}", request.summary);
+            assert!(app.overlay().is_none(), "no window of confirmation");
+        }
+
+        #[test]
+        fn a_blank_comment_is_not_sent() {
+            let mut app = loaded(runner_state("paused"));
+            ch(&mut app, 'c');
+            let request = press(&mut app, KeyCode::Enter);
+            assert_eq!(request, Request::None);
+        }
+
+        #[test]
+        fn without_an_offer_there_is_no_comment_field() {
+            let mut task = runner_state("paused");
+            task.actions = None;
+            let mut app = app();
+            app.load(listing(vec![titled_as_served(task)], "c"));
+            assert_eq!(ch(&mut app, 'c'), Request::None);
+            assert!(app.overlay().is_none());
+            assert!(note(&app).contains("brak danych"), "{}", note(&app));
+        }
+
+        #[test]
+        fn the_menu_has_the_comment_entry_with_its_effect() {
+            let mut app = loaded(runner_state("paused"));
+            ch(&mut app, '.');
+            let chooser = app.overlay().and_then(Overlay::chooser).expect("menu");
+            let entry = chooser
+                .items()
+                .iter()
+                .find(|item| item.label.contains("dodaj komentarz"))
+                .expect("a comment entry");
+            assert_eq!(entry.unavailable, None);
+            assert!(entry.description.contains("wznawia zadanie"));
+            let _ = std::any::type_name::<CommentForm>();
+        }
+    }
 
     mod availability_table {
         use super::*;
@@ -7237,6 +7336,7 @@ mod task_app_actions {
             let mut silent = running("a", 1);
             silent.runner.as_mut().unwrap().freshness =
                 narsor_engine::controller_protocol::Freshness::Stale;
+            let silent = offered(silent);
             assert!(unavailable(&silent, TaskAction::Interrupt).contains("nie odpowiada"));
         }
 
@@ -7284,7 +7384,7 @@ mod task_app_actions {
         }
 
         #[test]
-        fn archive_is_for_finished_and_interrupted_tasks() {
+        fn archive_is_offered_wherever_the_control_plane_takes_it() {
             assert!(available(&finished("a", 1), TaskAction::Archive));
             assert!(available(&runner_state("interrupted"), TaskAction::Archive));
             let failed = waiting_on(
@@ -7294,13 +7394,57 @@ mod task_app_actions {
                 None,
             );
             assert!(available(&failed, TaskAction::Archive));
-            for blocked in [running("a", 1), queued("a", 1), runner_state("paused")] {
+            // The control plane archives a running, queued or paused task too
+            // (it frees the slot), so the server offers it and the menu shows it.
+            for taken in [running("a", 1), queued("a", 1), runner_state("paused")] {
                 assert!(
-                    unavailable(&blocked, TaskAction::Archive).contains("zakończone lub przerwane"),
+                    available(&taken, TaskAction::Archive),
                     "{:?}",
-                    blocked.runner_state
+                    taken.runner_state
                 );
             }
+        }
+
+        #[test]
+        fn the_client_draws_the_offer_it_is_given_not_a_rule_of_its_own() {
+            // The server says archive is not possible now; no local rule
+            // overrides it.
+            let mut task = running("a", 1);
+            for offer in task.actions.as_mut().unwrap() {
+                if offer.id == narsor_engine::controller_protocol::TaskActionId::Archive {
+                    offer.available = false;
+                    offer.reason = Some("zadanie działa — poczekaj".to_string());
+                }
+            }
+            assert_eq!(
+                unavailable(&task, TaskAction::Archive),
+                "zadanie działa — poczekaj"
+            );
+        }
+
+        #[test]
+        fn a_task_without_an_offer_has_no_action_from_the_server() {
+            let mut task = running("a", 1);
+            task.actions = None;
+            for action in [
+                TaskAction::PauseResume,
+                TaskAction::Interrupt,
+                TaskAction::Transition,
+                TaskAction::Restart,
+                TaskAction::Archive,
+                TaskAction::Comment,
+            ] {
+                assert_eq!(
+                    unavailable(&task, action),
+                    "niedostępne: brak danych z serwera",
+                    "{action:?}"
+                );
+            }
+            // Moving and opening a link are the client's own.
+            assert_eq!(
+                unavailable(&task, TaskAction::Move),
+                "zadanie nie jest w kolejce"
+            );
         }
 
         #[test]
@@ -7381,7 +7525,7 @@ mod task_app_actions {
                 by_label("przesuń").unavailable.as_deref(),
                 Some("zadanie nie jest w kolejce")
             );
-            assert!(by_label("archiwizuj").unavailable.is_some());
+            assert_eq!(by_label("archiwizuj").unavailable, None);
             assert!(by_label("otwórz link").unavailable.is_some());
             assert_eq!(app.key_context().base, Context::Menu);
         }
@@ -7452,7 +7596,15 @@ mod task_app_actions {
 
         #[test]
         fn a_shortcut_to_an_unavailable_action_in_the_menu_gives_the_same_reason() {
-            let mut app = loaded(running("a", 1));
+            let mut task = running("a", 1);
+            for offer in task.actions.as_mut().unwrap() {
+                if offer.id == narsor_engine::controller_protocol::TaskActionId::Archive {
+                    offer.available = false;
+                    offer.reason = Some("zadanie działa — poczekaj".to_string());
+                }
+            }
+            let mut app = app();
+            app.load(listing(vec![titled_as_served(task)], "c"));
             ch(&mut app, '.');
             assert_eq!(ch(&mut app, 'a'), Request::None);
             assert!(

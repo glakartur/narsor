@@ -6633,7 +6633,10 @@ async fn a_comment_on_a_permission_denies_with_the_text_and_never_allows() {
         .permission_decision
         .as_ref()
         .expect("a permission decision");
-    assert_eq!(decision.decision, narsor_protocol::api::PermissionDecisionKindDto::Deny);
+    assert_eq!(
+        decision.decision,
+        narsor_protocol::api::PermissionDecisionKindDto::Deny
+    );
     assert_eq!(decision.denial_index, None);
     assert_eq!(decision.message.as_deref(), Some("use the read-only tool"));
 
@@ -6664,7 +6667,10 @@ async fn a_comment_on_an_approval_returns_the_output_with_the_note_and_does_not_
 
     let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
     let delivery = &polled.inputs[0].delivery;
-    assert_eq!(delivery.action, Some(narsor_protocol::api::HumanInputActionDto::Resume));
+    assert_eq!(
+        delivery.action,
+        Some(narsor_protocol::api::HumanInputActionDto::Resume)
+    );
     assert_eq!(delivery.comment.as_deref(), Some("tests are missing"));
 }
 

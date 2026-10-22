@@ -14,7 +14,6 @@
 
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
-use narsor_protocol::controller::ResumeMessage;
 use super::model::{
     InputOutcome, InputRequest, InputStatus, InputUpdate, QueuedInput, RunnerObservation,
     RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
@@ -24,6 +23,7 @@ use crate::domain::{without_unsafe_chars, TaskId};
 use crate::engine::{ConversationState, EventLink, Timeline};
 use crate::environment::backend::DEFAULT_SLOT_RELEASE_GRACE_SECS;
 use chrono::{DateTime, Duration, Utc};
+use narsor_protocol::controller::ResumeMessage;
 
 impl ControlPlane {
     /// Accepts a runner snapshot from `incarnation`, launched at
@@ -237,12 +237,7 @@ impl ControlPlane {
     /// Keeps the owner's comment on a paused task for the runner of its next
     /// launch. The same key stored again changes nothing and says so
     /// (`true`); a task that is not paused cannot take it.
-    pub fn store_resume_message(
-        &self,
-        task_id: &TaskId,
-        key: &str,
-        text: &str,
-    ) -> Result<bool> {
+    pub fn store_resume_message(&self, task_id: &TaskId, key: &str, text: &str) -> Result<bool> {
         let (_, replayed) = self.mutate(task_id, |record, _| {
             if record
                 .resume_message

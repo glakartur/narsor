@@ -475,10 +475,7 @@ impl ProtocolService {
 ///
 /// The owner's text never allows anything: at an approval and at a
 /// permission it turns the request down with the text as the note.
-fn comment_delivery(
-    task: &TaskSummary,
-    text: &str,
-) -> Option<(String, HumanInputDeliveryDto)> {
+fn comment_delivery(task: &TaskSummary, text: &str) -> Option<(String, HumanInputDeliveryDto)> {
     let form = waiting(task)?;
     let pending_id = task.runner.as_ref()?.pending_input.as_ref()?.id.clone();
     let text = text.to_string();
@@ -575,9 +572,11 @@ impl ProtocolService {
             // the record for the runner of the next launch, and the task is
             // resumed (a retry repairs a resume that did not happen).
             if record.runner_state == RunnerState::Stopped {
-                let replayed = self
-                    .control
-                    .store_resume_message(&record.task_id, &request.idempotency_key, text)?;
+                let replayed = self.control.store_resume_message(
+                    &record.task_id,
+                    &request.idempotency_key,
+                    text,
+                )?;
                 if !replayed {
                     self.notify(&record.task_id);
                 }

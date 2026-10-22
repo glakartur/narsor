@@ -14,9 +14,8 @@ pub use narsor_protocol::controller::{
     ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
     InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary, OperatorCommand,
     OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion,
-    ResumeMessage,
-    ResumeState, RunnerProblem, RunnerState, SlotReleaseReason, TaskEvent, TaskEventKind,
-    TaskState, WorkloadLoss,
+    ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason, TaskEvent,
+    TaskEventKind, TaskState, WorkloadLoss,
 };
 
 /// Current schema version of [`TaskRecord`].

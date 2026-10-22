@@ -284,6 +284,8 @@ pub enum Action {
     Archive,
     /// Open a link.
     OpenLink,
+    /// Comment to the agent.
+    Comment,
     /// Pick the n-th entry of a list; the digit comes from the key event
     /// ([`digit_of`]).
     Pick,
@@ -668,6 +670,13 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::List,
+        Key::char('c'),
+        Action::Comment,
+        "",
+        "dodaj komentarz do agenta (serwer wybiera skutek według stanu zatrzymania)",
+    ),
+    bind(
+        Context::List,
         Key::char('r'),
         Action::RetrySend,
         "",
@@ -1042,6 +1051,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::OpenLink,
         "",
         "otwórz link zadania w przeglądarce",
+    ),
+    bind(
+        Context::Menu,
+        Key::char('c'),
+        Action::Comment,
+        "",
+        "dodaj komentarz do agenta (serwer wybiera skutek według stanu zatrzymania)",
     ),
     // The confirmation window of an action `!`: the same for all of them.
     bind(

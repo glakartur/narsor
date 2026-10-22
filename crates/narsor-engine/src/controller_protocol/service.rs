@@ -960,7 +960,11 @@ impl ProtocolService {
     /// (running, or already resumed or queued) needs nothing. Called for a
     /// retry too: a first call that stored the work and failed before the
     /// resume is repaired by it.
-    pub(super) fn resume_for_work(&self, record: &TaskRecord, work_key: &str) -> ProtocolResult<()> {
+    pub(super) fn resume_for_work(
+        &self,
+        record: &TaskRecord,
+        work_key: &str,
+    ) -> ProtocolResult<()> {
         let current = self.control.task(&record.task_id)?;
         if current.runner_state != RunnerState::Stopped {
             return Ok(());
@@ -2266,8 +2270,12 @@ async fn harness_changed(
 /// in the task's event stream, which is not the place for a document.
 const MAX_CHAT_CHARS: usize = 4_000;
 
-/// What can be said about a conductor command without the runner: that it
-/// names what it needs.
+/// The offer of actions the server puts on a task summary, for whoever builds
+/// a summary by hand (a test of a client) and wants the server's words.
+pub fn task_actions(task: &TaskSummary) -> Vec<TaskActionOffer> {
+    actions::offer(task)
+}
+
 /// The action of the offer an operator command is, if it is one of them: the
 /// conductor's commands are not.
 fn operator_action(command: &OperatorCommand) -> Option<TaskActionId> {
@@ -2278,6 +2286,8 @@ fn operator_action(command: &OperatorCommand) -> Option<TaskActionId> {
     }
 }
 
+/// What can be said about a conductor command without the runner: that it
+/// names what it needs.
 fn check_conductor_command(command: &OperatorCommand) -> ProtocolResult<()> {
     let blank = |text: &str| text.trim().is_empty();
     match command {

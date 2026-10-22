@@ -56,11 +56,13 @@ use ratatui::Frame;
 
 use crate::api::ClientError;
 use crate::controller_protocol::{
-    OwnerCommandRequest, SubmitOperatorCommandRequest, TaskSummary, TransitionExit,
+    OwnerCommandRequest, SubmitCommentRequest, SubmitOperatorCommandRequest, TaskSummary,
+    TransitionExit,
 };
 use crate::domain::display::safe_link_url;
+use narsor_protocol::api::{InputContinuationView, PendingHumanInputView};
 use narsor_protocol::controller::{
-    AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, TaskState,
+    OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, TaskActionId, TaskState,
 };
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
@@ -73,7 +75,6 @@ use super::list::{title_of, CommandResolved};
 use super::notify::Severity;
 use super::waiting::AnswerRequest;
 use super::{failure_reason, idempotency_key, is_transport, Request, TaskApp};
-use narsor_protocol::display::{loss_state, LossState};
 
 // ---------------------------------------------------------------------
 // What can be done, and when
@@ -96,11 +97,14 @@ pub enum TaskAction {
     Archive,
     /// `o`: open a link of the task.
     OpenLink,
+    /// `c`: a comment to the agent; the server picks what it does by the
+    /// way the task is stopped.
+    Comment,
 }
 
 impl TaskAction {
     /// Every action, in the order of the menu.
-    pub const ALL: [TaskAction; 7] = [
+    pub const ALL: [TaskAction; 8] = [
         TaskAction::Move,
         TaskAction::PauseResume,
         TaskAction::Interrupt,
@@ -108,6 +112,7 @@ impl TaskAction {
         TaskAction::Restart,
         TaskAction::Archive,
         TaskAction::OpenLink,
+        TaskAction::Comment,
     ];
 
     /// The action a key of the map asks for.
@@ -120,6 +125,7 @@ impl TaskAction {
             Action::Restart => Some(Self::Restart),
             Action::Archive => Some(Self::Archive),
             Action::OpenLink => Some(Self::OpenLink),
+            Action::Comment => Some(Self::Comment),
             _ => None,
         }
     }
@@ -134,6 +140,7 @@ impl TaskAction {
             Self::Restart => 's',
             Self::Archive => 'a',
             Self::OpenLink => 'o',
+            Self::Comment => 'c',
         }
     }
 
@@ -177,90 +184,46 @@ impl Availability {
     }
 }
 
-/// What the task is, as a clause that begins a reason.
-fn state_phrase(task: &TaskSummary) -> &'static str {
-    if task.runner_state == RunnerState::Interrupted {
-        return "zadanie jest przerwane";
-    }
-    match task.state {
-        TaskState::Queued => "zadanie jest w kolejce",
-        TaskState::Running => "zadanie działa",
-        TaskState::HumanNeeded => "zadanie czeka na odpowiedź",
-        TaskState::Paused if task.holds_slot => "zadanie jest wstrzymywane",
-        TaskState::Paused => "zadanie jest wstrzymane",
-        TaskState::Finished => "zadanie jest zakończone",
-        TaskState::Error => "zadanie jest przerwane",
-        TaskState::Archived => "zadanie jest archiwizowane",
-        TaskState::Unrecognized => "zadanie jest w nieznanym stanie",
-    }
-}
-
-/// Whether the execution ended, one way or the other.
-fn is_finished(task: &TaskSummary) -> bool {
-    matches!(task.state, TaskState::Finished | TaskState::Error)
-}
-
-/// Whether the runner of the task is alive and asked about its step: the task
-/// runs, or waits for an answer with the slot still held.
-fn runner_alive(task: &TaskSummary) -> bool {
-    if task.runner_state == RunnerState::Interrupted {
-        // Its workload is gone, whatever the owner sees while the resume
-        // policy still tries.
-        return false;
-    }
-    match task.state {
-        TaskState::Running => true,
-        TaskState::HumanNeeded => task.holds_slot,
-        _ => false,
-    }
-}
-
-/// Whether the control plane could not prepare the workspace.
-fn provisioning_failed(task: &TaskSummary) -> bool {
-    task.attention
-        .iter()
-        .any(|item| item.kind == AttentionKind::ProvisioningFailed)
-}
-
-/// Why a task is not one whose step can be acted on — `None` when its
-/// runner is alive and in a step.
-fn not_running(task: &TaskSummary) -> Option<String> {
-    let phrase = state_phrase(task);
-    if let Some(LossState::AutoResume { attempt, limit }) =
-        loss_state(task.runner_state, &task.resume)
-    {
-        return Some(format!(
-            "{phrase} — wznowi się samo (próba {attempt}/{limit}) albo uruchom je od nowa (s)"
-        ));
-    }
-    if runner_alive(task) {
-        return None;
-    }
-    if task.state == TaskState::HumanNeeded {
-        return Some(format!("{phrase} — odpowiedz, a zadanie wznowi się"));
-    }
-    if task.runner_state == RunnerState::Stopped {
-        return Some(format!("{phrase} — wznów je (p)"));
-    }
-    if task.state == TaskState::Error || task.runner_state == RunnerState::Interrupted {
-        return Some(format!("{phrase} — uruchom je od nowa (s)"));
-    }
-    Some(phrase.to_string())
-}
-
-/// Why the runner of a running task cannot be asked for anything.
-fn runner_unreachable(task: &TaskSummary) -> Option<&'static str> {
-    match task.runner.as_ref() {
-        None => Some("runner jeszcze się nie zgłosił"),
-        Some(runner) if runner.freshness != crate::controller_protocol::Freshness::Live => {
-            Some("runner nie odpowiada od dłuższego czasu")
+/// The action of the server's offer that `action` is for `task`; `None` for
+/// what the server does not offer: moving in the queue and opening a link
+/// stay with the client (they work on the list and on the browser).
+fn offered_id(task: &TaskSummary, action: TaskAction) -> Option<TaskActionId> {
+    match action {
+        TaskAction::Move | TaskAction::OpenLink => None,
+        TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => {
+            Some(TaskActionId::Resume)
         }
-        Some(_) => None,
+        TaskAction::PauseResume => Some(TaskActionId::Pause),
+        TaskAction::Interrupt => Some(TaskActionId::Interrupt),
+        TaskAction::Transition => Some(TaskActionId::Transition),
+        TaskAction::Restart => Some(TaskActionId::Restart),
+        TaskAction::Archive => Some(TaskActionId::Archive),
+        TaskAction::Comment => Some(TaskActionId::Comment),
+    }
+}
+
+/// What the server says of `id` for `task`: its offer, or that it said
+/// nothing (a server from before the offer, or one that does not know the
+/// action).
+fn offered(task: &TaskSummary, id: TaskActionId) -> Availability {
+    let Some(offer) = task
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.iter().find(|offer| offer.id == id))
+    else {
+        return Availability::because("niedostępne: brak danych z serwera");
+    };
+    if offer.available {
+        Availability::Available
+    } else {
+        Availability::because(offer.reason.as_deref().unwrap_or("niedostępne"))
     }
 }
 
 /// Whether `action` can be done to `task` now, and if not, why.
 ///
+/// The server decides, on the same rule it checks at the send (R3, R4): this
+/// only reads what it offered. Moving and opening a link are the client's own.
 /// A pure function of the summary: the menu, the shortcuts and the
 /// notifications all ask it, so they cannot disagree. It knows nothing of the
 /// connection — that gate is [`TaskApp::mutation_allowed`].
@@ -272,54 +235,6 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
             RunnerState::Queued => Availability::Available,
             _ => Availability::because("zadanie nie jest w kolejce"),
         },
-        // Resume is a command of the stopped runner, whatever the owner sees
-        // the task as: a finished task without a slot resumes too.
-        TaskAction::PauseResume => match task.runner_state {
-            RunnerState::Stopped => Availability::Available,
-            RunnerState::PauseRequested => Availability::because("zadanie jest już wstrzymywane"),
-            _ => not_running(task).map_or(Availability::Available, Availability::because),
-        },
-        TaskAction::Interrupt => {
-            match not_running(task).or(runner_unreachable(task).map(str::to_string)) {
-                Some(reason) => Availability::because(reason),
-                None => Availability::Available,
-            }
-        }
-        TaskAction::Transition => {
-            if let Some(reason) = not_running(task).or(runner_unreachable(task).map(str::to_string))
-            {
-                return Availability::because(reason);
-            }
-            match &task.manual_transitions {
-                None => Availability::because("serwer nie podał wyjść bieżącego stanu"),
-                Some(offer) if offer.exits.is_empty() && !has_override(task) => {
-                    Availability::because(format!(
-                        "stan „{}” nie ma wyjść i nie dopuszcza override",
-                        one_line(&offer.from_state)
-                    ))
-                }
-                Some(_) => Availability::Available,
-            }
-        }
-        TaskAction::Restart => match task.runner_state {
-            RunnerState::Interrupted | RunnerState::Unknown => Availability::Available,
-            _ if provisioning_failed(task) => Availability::Available,
-            _ if runner_alive(task) => Availability::because(
-                "zadanie działa — jest co przerwać (x), nie ma co uruchamiać od nowa",
-            ),
-            RunnerState::Stopped | RunnerState::PauseRequested => {
-                Availability::because(format!("{} — wznów je (p)", state_phrase(task)))
-            }
-            _ => Availability::because(state_phrase(task)),
-        },
-        TaskAction::Archive => match task.runner_state {
-            RunnerState::Interrupted | RunnerState::Unknown => Availability::Available,
-            _ if is_finished(task) || provisioning_failed(task) => Availability::Available,
-            _ => Availability::because(format!(
-                "{} — archiwizować można zakończone lub przerwane",
-                state_phrase(task)
-            )),
-        },
         TaskAction::OpenLink => {
             if openable_links(task).next().is_some() {
                 Availability::Available
@@ -329,6 +244,10 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
                 Availability::because("linki zadania nie mają jeszcze wartości")
             }
         }
+        _ => match offered_id(task, action) {
+            Some(id) => offered(task, id),
+            None => Availability::because("niedostępne: brak danych z serwera"),
+        },
     }
 }
 
@@ -359,6 +278,7 @@ pub fn verb(task: &TaskSummary, action: TaskAction) -> &'static str {
         TaskAction::Restart => "uruchomienie od nowa",
         TaskAction::Archive => "archiwizacja",
         TaskAction::OpenLink => "link",
+        TaskAction::Comment => "komentarz",
     }
 }
 
@@ -373,6 +293,8 @@ pub enum ActionSend {
     Owner(OwnerCommand),
     /// A command for the runner: interrupt, a transition.
     Operator(OperatorCommand),
+    /// A comment to the agent: what it does, the server decides.
+    Comment(String),
 }
 
 /// An action chosen and confirmed, ready to be sent: [`TaskApp::perform`]
@@ -486,6 +408,13 @@ pub struct LinkList {
     chooser: Chooser,
 }
 
+/// The field a comment is typed into.
+#[derive(Debug, Clone)]
+pub struct CommentForm {
+    task_id: String,
+    chooser: Chooser,
+}
+
 /// What sits over the screen, taking the keys.
 #[derive(Debug, Clone)]
 pub enum Overlay {
@@ -499,6 +428,8 @@ pub enum Overlay {
     Harness(HarnessList),
     /// The limit of concurrent tasks of a backend (`L`); about no task.
     Limit(LimitList),
+    /// The text of a comment (`c`).
+    Comment(CommentForm),
     /// The `y` / `n` window.
     Confirm(Confirmation),
 }
@@ -522,6 +453,7 @@ impl Overlay {
             Self::Menu(menu) => Some(&menu.task_id),
             Self::Transitions(list) => Some(&list.task_id),
             Self::Links(list) => Some(&list.task_id),
+            Self::Comment(form) => Some(&form.task_id),
             Self::Harness(_) | Self::Limit(_) => None,
             Self::Confirm(confirmation) => Some(&confirmation.task_id),
         }
@@ -533,6 +465,7 @@ impl Overlay {
             Self::Menu(menu) => Some(&menu.chooser),
             Self::Transitions(list) => Some(&list.chooser),
             Self::Links(list) => Some(&list.chooser),
+            Self::Comment(form) => Some(&form.chooser),
             Self::Harness(list) => Some(list.chooser()),
             Self::Limit(list) => Some(list.chooser()),
             Self::Confirm(_) => None,
@@ -554,6 +487,7 @@ impl Overlay {
             Self::Confirm(_) => Context::Confirm,
             Self::Transitions(list) => chooser_context(&list.chooser),
             Self::Links(list) => chooser_context(&list.chooser),
+            Self::Comment(form) => chooser_context(&form.chooser),
             Self::Harness(list) => chooser_context(list.chooser()),
             Self::Limit(list) => chooser_context(list.chooser()),
         }
@@ -627,9 +561,55 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
             "otwórz link".to_string(),
             "Otwiera w przeglądarce link z `display.links` zadania.".to_string(),
         ),
+        TaskAction::Comment => (
+            "dodaj komentarz".to_string(),
+            comment_effect(task).to_string(),
+        ),
     };
     (format!("{}  {name}", action.key()), effect)
 }
+
+/// What a comment does to `task`, in words: the server decides by the way the
+/// task is stopped, and the operator should not have to guess.
+fn comment_effect(task: &TaskSummary) -> &'static str {
+    match continuation_of(task) {
+        Some(InputContinuationView::ResolvePermission) => {
+            "Odmawia zgody z uwagą: agent wznowi sesję z Twoim tekstem. Komentarz nigdy nie \
+             udziela zgody."
+        }
+        Some(InputContinuationView::ApproveOutput) => {
+            "Nie zatwierdza wyniku: agent wznowi sesję z Twoją uwagą."
+        }
+        Some(_) => "Wysyła wiadomość do agenta w tej samej sesji.",
+        None if task.runner_state == RunnerState::Stopped => {
+            "Wysyła tekst do agenta i wznawia zadanie jednym krokiem."
+        }
+        None => "Wysyła tekst do agenta; serwer wybiera skutek według stanu zatrzymania.",
+    }
+}
+
+/// How the request the task waits on continues, when it waits on one.
+fn continuation_of(task: &TaskSummary) -> Option<InputContinuationView> {
+    let pending = task.runner.as_ref()?.pending_input.as_ref()?;
+    serde_json::from_value::<PendingHumanInputView>(pending.form.clone())
+        .ok()
+        .map(|form| form.continuation)
+}
+
+/// The field of a comment.
+fn comment_form(task: &TaskSummary) -> CommentForm {
+    CommentForm {
+        task_id: task.task_id.to_string(),
+        chooser: Chooser::new(vec![ChooserItem::new(
+            "wyślij komentarz",
+            comment_effect(task),
+        )
+        .with_field(ChooserField::multiline(COMMENT_FIELD).required())]),
+    }
+}
+
+/// The name of the field a comment is typed into.
+const COMMENT_FIELD: &str = "komentarz";
 
 /// The entries of the menu for `task`. `blocked` is why nothing that changes
 /// state can be done right now (no connection), if that is so.
@@ -823,7 +803,9 @@ impl TaskApp {
         match overlay {
             Overlay::Menu(_) => self.on_menu_key(&key),
             Overlay::Confirm(_) => self.on_confirm_key(&key),
-            Overlay::Transitions(_) | Overlay::Links(_) => self.on_list_key(key),
+            Overlay::Transitions(_) | Overlay::Links(_) | Overlay::Comment(_) => {
+                self.on_list_key(key)
+            }
             Overlay::Harness(_) => self.on_harness_key(key),
             Overlay::Limit(_) => self.on_limit_key(key),
         }
@@ -908,6 +890,9 @@ impl TaskApp {
             Some(Overlay::Links(list)) => {
                 list.chooser.paste(pasted);
             }
+            Some(Overlay::Comment(form)) => {
+                form.chooser.paste(pasted);
+            }
             _ => {}
         }
     }
@@ -917,6 +902,7 @@ impl TaskApp {
         let chooser = match &mut self.overlay {
             Some(Overlay::Transitions(list)) => &mut list.chooser,
             Some(Overlay::Links(list)) => &mut list.chooser,
+            Some(Overlay::Comment(form)) => &mut form.chooser,
             _ => return Request::None,
         };
         match chooser.on_key(key) {
@@ -935,9 +921,50 @@ impl TaskApp {
                     Some(link) => Request::OpenLink(link.clone()),
                     None => Request::None,
                 },
+                Some(Overlay::Comment(form)) => self.chosen_comment(form, &submission),
+
                 _ => Request::None,
             },
         }
+    }
+
+    /// The operator wrote a comment: one step, sent at once. What it does is
+    /// the server's rule, told on the bar in the words of the stop.
+    fn chosen_comment(&mut self, form: CommentForm, submission: &Submission) -> Request {
+        if !self.mutation_allowed() {
+            return Request::None;
+        }
+        let Some(task) = self
+            .list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == form.task_id)
+            .cloned()
+        else {
+            return Request::None;
+        };
+        let text = submission
+            .values
+            .iter()
+            .find(|(field, _)| field == COMMENT_FIELD)
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_default();
+        if text.is_empty() {
+            self.notify(Severity::Warning, "komentarz: napisz, co agent ma zobaczyć");
+            return Request::None;
+        }
+        let summary = match continuation_of(&task) {
+            Some(InputContinuationView::ResolvePermission) => "odmowa z uwagą wysłana",
+            Some(InputContinuationView::ApproveOutput) => "wynik niezatwierdzony, uwaga wysłana",
+            Some(_) => "wiadomość wysłana do agenta",
+            None => "komentarz wysłany, zadanie wznowione",
+        };
+        Request::Act(Box::new(self.action_request(
+            &task,
+            "komentarz",
+            summary.to_string(),
+            ActionSend::Comment(text),
+        )))
     }
 
     /// The operator chose an exit (sent at once) or the override (asks first).
@@ -1084,6 +1111,10 @@ impl TaskApp {
                 self.overlay = Some(Overlay::Links(link_list(&task)));
                 Request::None
             }
+            TaskAction::Comment => {
+                self.overlay = Some(Overlay::Comment(comment_form(&task)));
+                Request::None
+            }
         }
     }
 
@@ -1205,6 +1236,18 @@ impl TaskApp {
                 )
                 .await
                 .map(|response| (Some(response.command), false)),
+            ActionSend::Comment(text) => self
+                .client
+                .control_comment(
+                    &task_id,
+                    &SubmitCommentRequest {
+                        text,
+                        idempotency_key: key,
+                        expected_generation: Some(generation),
+                    },
+                )
+                .await
+                .map(|_| (None, false)),
         };
         match result {
             Ok((None, queued)) => {
@@ -1325,7 +1368,7 @@ fn conductor_kind(command: &OperatorCommand) -> Option<ConductorSent> {
 fn conductor_command(send: &ActionSend) -> Option<ConductorSent> {
     match send {
         ActionSend::Operator(command) => conductor_kind(command),
-        ActionSend::Owner(_) => None,
+        ActionSend::Owner(_) | ActionSend::Comment(_) => None,
     }
 }
 
@@ -1519,6 +1562,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
                     area,
                     &format!("Linki · {title}"),
                     &mut list.chooser,
+                    styles,
+                );
+            }
+            Overlay::Comment(form) => {
+                render_list(
+                    frame,
+                    area,
+                    &format!("Komentarz · {title}"),
+                    &mut form.chooser,
                     styles,
                 );
             }
