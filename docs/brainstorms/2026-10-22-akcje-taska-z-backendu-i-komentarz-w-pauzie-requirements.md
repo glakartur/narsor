@@ -58,10 +58,11 @@ Drugi problem: komentarz do sesji agenta jest dziś zależny od rodzaju oczekiwa
 **Komentarz w stanie zatrzymania**
 
 - R5. Task w stanie zatrzymania przetwarzania przez agenta zawsze ma dostępną akcję „Dodaj komentarz". Stany zatrzymania: pytanie agenta, zatwierdzenie akcji, zgoda na uprawnienie, pauza wywołana przez operatora.
-- R6. Komentarz nie jest akcją workflow. Operator nie wybiera przejścia ani opcji. Komentarz wraca do agenta jako kontynuacja bieżącej sesji i przetwarzanie rusza dalej.
+- R6. Komentarz nie jest akcją workflow. Operator nie wybiera przejścia ani opcji. Wysłanie komentarza jest jednym krokiem: backend zapisuje komentarz w rozmowie, przekazuje go agentowi jako kontynuację bieżącej sesji i przetwarzanie rusza dalej. Nie ma wariantu „zapisz i czekaj". Skutek komentarza zależy od stanu zatrzymania: pytanie i pauza — komentarz jest wiadomością do agenta (R9); zatwierdzenie i zgoda na uprawnienie — komentarz jest odmową z uwagą (R10).
 - R7. Komentarz jest widoczny w rozmowie taska jako wypowiedź operatora, tak samo jak odpowiedź na pytanie agenta.
 - R8. Komentarz jest dostępny obok opcji decyzji, nie zamiast nich. Gdy agent pyta o zatwierdzenie, operator nadal może zatwierdzić lub odrzucić bez komentarza.
-- R9. Gdy task jest zatrzymany przez operatora (pauza), wysłanie komentarza wznawia sesję agenta z tym komentarzem. Operator nie musi najpierw użyć osobnej akcji „wznów".
+- R9. Gdy task jest zatrzymany przez operatora (pauza), wysłanie komentarza wznawia sesję agenta z tym komentarzem w jednym kroku. Operator nie musi najpierw użyć osobnej akcji „wznów". Operator, który chce tylko wznowić bez tekstu, nadal używa akcji „wznów".
+- R10. Gdy agent czeka na zatwierdzenie akcji lub zgodę na uprawnienie, komentarz znaczy „odmów z uwagą". Agent dostaje odmowę razem z tekstem operatora i przetwarzanie rusza dalej. Komentarz nigdy nie udziela zgody. Zgodę daje tylko jawna akcja „Zezwól" lub „Zatwierdź".
 
 ---
 
@@ -70,7 +71,7 @@ Drugi problem: komentarz do sesji agenta jest dziś zależny od rodzaju oczekiwa
 - AE1. **Covers R1, R2, R3.** Dane: backend oznacza „archiwizuj" jako niedostępne z powodem „zadanie działa". Gdy klient rysuje menu, pozycja jest wyszarzona z tym powodem. Klient nie ma własnej reguły, która by to zmieniła.
 - AE2. **Covers R4.** Dane: operator wybrał akcję, a w międzyczasie task zmienił stan. Gdy wysyła wybór, backend odrzuca go z powodem. Klient pokazuje powód i odświeża listę akcji.
 - AE3. **Covers R5, R6, R7.** Dane: agent zadał pytanie. Gdy operator wybiera „Dodaj komentarz" i wysyła tekst, agent dostaje go jako odpowiedź w tej samej sesji, a rozmowa pokazuje wypowiedź operatora.
-- AE4. **Covers R5, R8.** Dane: agent czeka na zgodę na uprawnienie. Lista akcji zawiera „Zezwól", „Odmów" i „Dodaj komentarz". Gdy operator wybiera „Zezwól", nic więcej nie jest wymagane.
+- AE4. **Covers R5, R8, R10.** Dane: agent czeka na zgodę na uprawnienie. Lista akcji zawiera „Zezwól", „Odmów" i „Dodaj komentarz". Gdy operator wybiera „Zezwól", nic więcej nie jest wymagane. Gdy operator wybiera „Dodaj komentarz" i wysyła tekst, agent dostaje odmowę z tym tekstem, zgoda nie zostaje udzielona, a task nie czeka już na tę zgodę. Rozmowa pokazuje wypowiedź operatora.
 - AE5. **Covers R5, R9.** Dane: operator wstrzymał task. Gdy dodaje komentarz, sesja agenta rusza dalej z tym komentarzem, a stan taska przestaje być „wstrzymany".
 - AE6. **Covers R3.** Dane: opis taska nie zawiera listy akcji (stary lub niedostępny backend). Klient pokazuje akcje jako niedostępne z powodem „brak danych" i nie wylicza ich ze stanu.
 
@@ -98,7 +99,8 @@ Drugi problem: komentarz do sesji agenta jest dziś zależny od rodzaju oczekiwa
 
 - Backend jest jedynym źródłem prawdy o dostępności akcji. Dlaczego: jedna reguła dla wszystkich klientów i brak rozjazdu z walidacją po stronie serwera (R4 i tak ją egzekwuje).
 - Komentarz nie jest przejściem workflow. Dlaczego: operator w zatrzymaniu chce rozmawiać z agentem, nie sterować grafem stanów. Workflow dalej prowadzi agent.
-- Komentarz w pauzie wznawia agenta. Dlaczego: inaczej operator musiałby użyć dwóch akcji (wznów, potem napisz). Ta decyzja jest założeniem do potwierdzenia (patrz niżej).
+- Komentarz w pauzie wznawia agenta jednym krokiem. Dlaczego: inaczej operator musiałby użyć dwóch akcji (wznów, potem napisz), a wymaganie mówi, że przetwarzanie wraca do agenta z komentarzem. Założenie Z2.
+- Komentarz przy zgodzie na uprawnienie lub zatwierdzeniu to „odmów z uwagą". Dlaczego: to najbezpieczniejsza opcja — komentarz nie może przypadkiem udzielić zgody, a agent nie zostaje zablokowany bez możliwości odebrania tekstu. Wariant „sama uwaga, zgoda nadal czeka" odrzucono, bo agent czekający na decyzję nie ma jak odebrać uwagi w tej samej sesji. Założenie Z6.
 
 ---
 
@@ -112,23 +114,24 @@ Drugi problem: komentarz do sesji agenta jest dziś zależny od rodzaju oczekiwa
 ## Założenia do potwierdzenia
 
 - Z1. „Stan zatrzymania" obejmuje cztery przypadki z opisu: pytanie agenta, zatwierdzenie akcji, zgoda na uprawnienie, pauza operatora. Nie obejmuje nieudanego kroku, problemu runnera ani nieudanego provisioning. W tych stanach komentarz nie jest wymagany.
-- Z2. Komentarz do wstrzymanego taska wznawia agenta jednym krokiem (R9). Alternatywa: komentarz zostaje zapisany i czeka na osobne „wznów".
+- Z2. Komentarz do wstrzymanego taska wznawia agenta jednym krokiem (R9). Alternatywy: komentarz zostaje zapisany i czeka na osobne „wznów"; albo operator wybiera „zapisz" lub „wyślij i wznów". Wybrano jeden krok, bo jest najprostszy i zgodny z opisem zadania.
+- Z6. Komentarz do zatwierdzenia akcji lub zgody na uprawnienie znaczy „odmów z uwagą" (R10). Alternatywa: „sama uwaga", zgoda nadal czeka, task nadal stoi. Wybrano odmowę z uwagą, bo komentarz nie może udzielić zgody i zawsze wraca do agenta.
 - Z3. Komentarz jest zwykłym tekstem. Załączniki i materiały są poza zakresem.
 - Z4. Lista akcji z backendu jest częścią opisu taska, który klient i tak pobiera. Nie wymaga osobnego zapytania na każdy task. (Szczegół do decyzji w planowaniu, ale zakłada, że koszt odczytu listy nie rośnie wyraźnie.)
 - Z5. Klient zachowuje własne, czysto prezentacyjne wyszarzanie i skróty. Źródłem prawdy o tym, co wolno, jest backend.
 
 ## Pytania otwarte dla użytkownika
 
-- P1. Czy komentarz w pauzie ma wznawiać agenta od razu (Z2), czy operator ma mieć wybór, np. „zapisz komentarz" i „wyślij i wznów"?
-- P2. Czy pytanie agenta z predefiniowanymi opcjami ma pokazywać komentarz jako osobną opcję, czy jako zawsze obecne pole obok opcji?
-- P3. Czy komentarz dla „zgody na uprawnienie" ma znaczyć „odmów z uwagą" (agent dostaje odmowę i tekst), czy „bez decyzji, tylko uwaga" (zgoda nadal czeka)? To zmienia, czy task po komentarzu nadal stoi.
+- P1. (Zamknięte przyjętym założeniem Z2; do potwierdzenia na MR.) Czy komentarz w pauzie ma wznawiać agenta od razu, czy operator ma mieć wybór „zapisz" i „wyślij i wznów"?
+- P2. Czy pytanie agenta z predefiniowanymi opcjami ma pokazywać komentarz jako osobną opcję, czy jako zawsze obecne pole obok opcji? (Do planowania: R8 wymaga tylko, by komentarz był obok opcji.)
+- P3. (Zamknięte przyjętym założeniem Z6; do potwierdzenia na MR.) Czy komentarz dla „zgody na uprawnienie" ma znaczyć „odmów z uwagą", czy „tylko uwaga" (zgoda nadal czeka)?
 - P4. Czy lista akcji z backendu ma obejmować także akcje, które dziś klient zna lokalnie (przenoszenie w kolejce, otwarcie linku), czy tylko akcje związane z rozmową i decyzjami (zakres R1)?
 
 ## Outstanding Questions
 
 ### Resolve Before Planning
 
-- [Affects R6, R9][User decision] Patrz P1 i P3: zachowanie komentarza w pauzie i przy zgodzie na uprawnienie.
+Brak. Decyzje z P1 i P3 zapisano w R6, R9, R10 i AE4 jako założenia Z2 i Z6. Planowanie może ruszyć; zmiana tych założeń na MR zmieni tylko wskazane wymagania.
 
 ### Deferred to Planning
 
