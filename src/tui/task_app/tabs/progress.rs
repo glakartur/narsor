@@ -330,6 +330,7 @@ pub fn render(
     attempts: &mut Attempts,
     stale: bool,
     keys: Option<StepFocus>,
+    glyph: &str,
 ) {
     let axis_focused = keys == Some(StepFocus::Axis);
     let conversation_focused = keys == Some(StepFocus::Conversation);
@@ -351,8 +352,9 @@ pub fn render(
         area.height.saturating_sub(top_rows),
     );
     if progress.positions().is_empty() {
+        let loading = format!("{glyph} wczytuję przebieg…");
         let text = if progress.timeline().is_none() && progress.failure().is_none() {
-            "wczytuję przebieg…"
+            loading.as_str()
         } else if progress.timeline().is_none() {
             ""
         } else {
@@ -401,6 +403,7 @@ pub fn render(
         attempts,
         stale,
         conversation_focused,
+        glyph,
     );
 }
 
@@ -413,6 +416,7 @@ fn render_step(
     attempts: &mut Attempts,
     stale: bool,
     focused: bool,
+    glyph: &str,
 ) {
     let Some(position) = progress.selected_position() else {
         return;
@@ -448,7 +452,7 @@ fn render_step(
     ) {
         (ConversationState::Recorded, Some(attempt_id)) => match attempts.get_mut(attempt_id) {
             Some(attempt) => render_attempt(frame, body, styles, attempt, stale, focused),
-            None => message(frame, "wczytuję rozmowę kroku…".to_string()),
+            None => message(frame, format!("{glyph} wczytuję rozmowę kroku…")),
         },
         (ConversationState::Recorded, None) | (ConversationState::NoRecord, _) => {
             message(frame, "brak zapisu rozmowy tego kroku".to_string());

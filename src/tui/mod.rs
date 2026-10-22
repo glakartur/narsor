@@ -28,7 +28,10 @@
 //!
 //! The first read happens after the first draw, so the screen opens with
 //! "łączę z …" and the application retries on its own schedule
-//! ([`task_app::TaskApp::refresh_if_due`]). The event stream is opened by
+//! ([`task_app::TaskApp::start_refresh_if_due`]). No read blocks the loop: it
+//! runs as a job ([`task_app::background`]), the screen shows the loading
+//! marker in the place of its data, and keys — quit among them — work
+//! meanwhile. The event stream is opened by
 //! [`task_app::EventFeed::ensure_open`] only once a read gave the application
 //! a cursor, and resumes from it after every drop.
 
@@ -43,6 +46,7 @@ pub mod keymap;
 pub mod refresh;
 pub mod scroll;
 pub mod selection;
+pub mod spinner;
 pub mod style;
 pub mod task_app;
 pub mod transcript;
@@ -232,6 +236,7 @@ pub async fn run(
 
     let styles = Styles::from_env();
     let mut app = TaskApp::new(client.clone(), connection_name, refresh_interval);
+    app.set_spinner(spinner::Spinner::from_env());
     app.detail_mut()
         .set_hyperlinks(detail::hyperlinks_supported(|name| {
             std::env::var(name).ok()
@@ -255,7 +260,7 @@ pub async fn run(
 
         if first_read_pending {
             first_read_pending = false;
-            app.refresh().await;
+            app.start_refresh();
             feed.ensure_open(&app);
             continue;
         }
@@ -265,7 +270,7 @@ pub async fn run(
             incoming = keys_rx.recv() => match incoming {
                 Some(TerminalEvent::Key(key)) if key.kind == KeyEventKind::Press => {
                     let request = app.on_key(key);
-                    app.perform(request).await;
+                    app.dispatch(request).await;
                 }
                 // A paste is text for the field being typed in, never keys.
                 Some(TerminalEvent::Paste(text)) => app.on_paste(&text),
@@ -275,13 +280,14 @@ pub async fn run(
                 None => break,
             },
             received = feed.next() => app.on_stream(received),
-            _ = tokio::time::sleep(wait) => {}
+            Some(outcome) = app.next_outcome(), if app.has_running() => app.on_outcome(outcome),
+            _ = tokio::time::sleep(wait) => app.advance_animation(),
         }
 
         feed.ensure_open(&app);
-        app.refresh_if_due(Instant::now()).await;
+        app.start_refresh_if_due(Instant::now());
         app.retry_outgoing_if_due(Instant::now()).await;
-        app.sync_detail().await;
+        app.start_detail_reads();
         feed.ensure_open(&app);
     }
 

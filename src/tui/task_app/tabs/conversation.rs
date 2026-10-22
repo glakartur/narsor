@@ -871,6 +871,7 @@ pub fn render(
     conversation: &mut Conversation,
     stale: bool,
     focused: bool,
+    glyph: &str,
 ) {
     let failure = conversation
         .failure
@@ -886,11 +887,11 @@ pub fn render(
     let body = render_notes(frame, area, notes);
     if conversation.transcript().entries().is_empty() {
         let text = if conversation.is_loading() {
-            "wczytuję rozmowę…"
+            format!("{glyph} wczytuję rozmowę…")
         } else if conversation.record().is_some() {
-            "brak zapisanej rozmowy"
+            "brak zapisanej rozmowy".to_string()
         } else {
-            "brak rozmowy — żaden krok nie zapisał jej jeszcze"
+            "brak rozmowy — żaden krok nie zapisał jej jeszcze".to_string()
         };
         frame.render_widget(
             Paragraph::new(Line::styled(text, styles.of(Role::Done))),

@@ -33,6 +33,7 @@ use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::actions::{chooser_context, Confirmation, Confirmed, Overlay};
+use super::background::{JobKey, OpeningKind, Outcome};
 use super::notify::Severity;
 use super::{failure_reason, Focus, Request, TaskApp, View};
 
@@ -238,12 +239,12 @@ impl TaskApp {
         }
     }
 
-    /// `R`: reads the registry, then opens the repositories.
-    pub(super) async fn read_and_open_repositories(&mut self) {
-        if self.capabilities.is_none() {
-            self.read_capabilities().await;
-        }
-        match self.client.control_repositories().await {
+    /// The read `R` started is back: opens the repositories over it.
+    pub(super) fn on_repositories_read(
+        &mut self,
+        listing: Result<RepositoryListResponse, ClientError>,
+    ) {
+        match listing {
             Ok(listing) => self.open_repositories(listing),
             Err(error) => {
                 self.note_transport(&error);
@@ -417,7 +418,7 @@ impl TaskApp {
                 if let View::Repositories(repositories) = &mut self.view {
                     repositories.adding = None;
                 }
-                self.reload_repositories(Some(&added.id)).await;
+                self.reload_repositories(Some(added.id.clone()));
                 self.sync_repository_draft();
                 self.notify(
                     Severity::Success,
@@ -454,14 +455,14 @@ impl TaskApp {
     pub(super) async fn remove_repository(&mut self, id: &str) {
         match self.client.control_remove_repository(id).await {
             Ok(removed) => {
-                self.reload_repositories(None).await;
+                self.reload_repositories(None);
                 self.notify(
                     Severity::Success,
                     format!("usunięto repozytorium {}", one_line(&removed.id)),
                 );
             }
             Err(ClientError::NotFound) => {
-                self.reload_repositories(None).await;
+                self.reload_repositories(None);
                 self.notify(
                     Severity::Warning,
                     format!("repozytorium {} już nie istnieje", one_line(id)),
@@ -481,13 +482,22 @@ impl TaskApp {
         }
     }
 
-    async fn reload_repositories(&mut self, select: Option<&str>) {
-        let Ok(listing) = self.client.control_repositories().await else {
-            return;
-        };
-        if let View::Repositories(repositories) = &mut self.view {
-            repositories.set_listing(listing, select);
-        }
+    /// Starts the read that brings the open list up to date after a write;
+    /// the row `select` is the one to stand on when it is back.
+    pub(super) fn reload_repositories(&mut self, select: Option<String>) {
+        let client = self.client.clone();
+        self.background
+            .start(JobKey::Reload(OpeningKind::Repositories), async move {
+                let listing = client.control_repositories().await;
+                Outcome::new(move |app: &mut TaskApp| {
+                    let Ok(listing) = listing else {
+                        return;
+                    };
+                    if let View::Repositories(repositories) = &mut app.view {
+                        repositories.set_listing(listing, select.as_deref());
+                    }
+                })
+            });
     }
 }
 

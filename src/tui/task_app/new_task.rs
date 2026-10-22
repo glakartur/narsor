@@ -535,14 +535,14 @@ impl TaskApp {
         self.enter_view(View::NewTask(Box::new(form)), Focus::Details);
     }
 
-    /// `n`: reads the catalogue, then opens the form. Without an answer the
-    /// form of the last time opens as it was, or the bar says why not.
-    pub(super) async fn read_and_open_new_task(&mut self) {
-        if self.capabilities.is_none() {
-            self.read_capabilities().await;
-        }
-        let workflows = self.client.control_workflows().await;
-        let repositories = self.client.control_repositories().await;
+    /// The read `n` started is back: opens the form over it. Without an
+    /// answer the form of the last time opens as it was, or the bar says why
+    /// not.
+    pub(super) fn on_new_task_read(
+        &mut self,
+        workflows: Result<WorkflowListResponse, ClientError>,
+        repositories: Result<RepositoryListResponse, ClientError>,
+    ) {
         match workflows {
             Ok(workflows) => {
                 let repositories = repositories.unwrap_or_else(|error| {
