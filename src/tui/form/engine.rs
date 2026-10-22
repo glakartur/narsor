@@ -25,6 +25,7 @@ pub struct FormEngine {
     stage: Stage,
     focused: bool,
     rows: Option<u16>,
+    events: Vec<FormEvent>,
 }
 
 impl FormEngine {
@@ -34,6 +35,17 @@ impl FormEngine {
             focused: true,
             ..Self::default()
         }
+    }
+
+    /// Adds events to the ones the owner has not taken yet.
+    pub fn queue(&mut self, events: Vec<FormEvent>) {
+        self.events.extend(events);
+    }
+
+    /// Hands the owner what happened since it last asked. The owner asks
+    /// after a key; the engine never calls it back.
+    pub fn take_events(&mut self) -> Vec<FormEvent> {
+        std::mem::take(&mut self.events)
     }
 
     /// Forgets an edge press: any other key than the arrow cancels it.

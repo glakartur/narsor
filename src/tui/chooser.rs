@@ -44,6 +44,8 @@
 //! Text that comes from outside — workflow labels and descriptions, values
 //! the runner proposed — goes through [`sanitize`] before it is drawn.
 
+use std::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -55,6 +57,7 @@ mod inputs;
 
 use super::form::buffer::TextBuffer;
 use super::form::engine::FormEngine;
+use super::form::events::{FormEvent, Growth};
 use super::form::field;
 use super::form::layout::WrapWidth;
 use super::input_form::{cycle_option, pasted_text};
@@ -456,6 +459,10 @@ pub struct Chooser {
     form: FormEngine,
     /// Whether sending asks the operator first (R12).
     confirms_submit: bool,
+    /// How the fields may grow, as the owner last said.
+    growth: Cell<Option<Growth>>,
+    /// The width the fields were last drawn in.
+    area_width: Cell<usize>,
 }
 
 impl Chooser {
@@ -472,7 +479,47 @@ impl Chooser {
             top: 0,
             form: FormEngine::new(),
             confirms_submit: false,
+            growth: Cell::new(None),
+            area_width: Cell::new(0),
         }
+    }
+
+    /// Tells how the fields may grow: the way and the most rows. Past the
+    /// limit the field scrolls instead. The owner says it again whenever its
+    /// area changes.
+    pub fn set_growth(&self, growth: Growth) {
+        self.growth.set(Some(growth));
+    }
+
+    /// The rows the fields want in an area `width` columns wide, within the
+    /// limit of [`Chooser::set_growth`], and at least one.
+    pub fn preferred_rows(&self, width: usize) -> u16 {
+        let wanted = usize::from(self.field_rows_in(width));
+        let limit = self
+            .growth
+            .get()
+            .map_or(usize::MAX, |growth| growth.limit_rows);
+        wanted.min(limit.max(1)).max(1).min(usize::from(u16::MAX)) as u16
+    }
+
+    /// What happened to the form since the owner last asked: a value edited,
+    /// the rows it wants changed, a send asked for, made or given up, the
+    /// focus gained or lost. The owner reacts in its own loop; nothing is
+    /// called back.
+    pub fn take_events(&mut self) -> Vec<FormEvent> {
+        self.form.take_events()
+    }
+
+    /// Gives the keys to the form or takes them away. Without them the form
+    /// takes no key and keeps what was typed and where its cursor stands.
+    pub fn set_focus(&mut self, focused: bool) {
+        let events = self.form.set_focus(focused);
+        self.form.queue(events);
+    }
+
+    /// Whether the form takes keys.
+    pub fn has_focus(&self) -> bool {
+        self.form.has_focus()
     }
 
     /// The same chooser, asking "Zatwierdzić formularz?" before it sends.
@@ -698,6 +745,52 @@ impl Chooser {
 
     /// Folds one key into the chooser.
     pub fn on_key(&mut self, event: KeyEvent) -> ChooserAction {
+        if !self.form.has_focus() {
+            return ChooserAction::None;
+        }
+        let before = self.edit_signature();
+        let was_confirming = self.form.is_confirming();
+        let action = self.route_key(event);
+        self.note_changes(&before, was_confirming, &action);
+        action
+    }
+
+    /// What the active field holds and where its cursor is, to tell whether
+    /// a key edited it.
+    fn edit_signature(&self) -> (String, usize) {
+        self.selected_item()
+            .and_then(|item| item.fields.get(self.field))
+            .map(|field| (field.value().to_string(), field.cursor()))
+            .unwrap_or_default()
+    }
+
+    /// Turns what a key did into the events of the form.
+    fn note_changes(
+        &mut self,
+        before: &(String, usize),
+        was_confirming: bool,
+        action: &ChooserAction,
+    ) {
+        let mut events = Vec::new();
+        if self.edit_signature().0 != before.0 {
+            events.push(FormEvent::Edited);
+        }
+        if let Some(growth) = self.growth.get() {
+            let wanted = usize::from(self.field_rows_in(self.area_width.get().max(1)));
+            events.extend(self.form.resize(wanted, growth.limit_rows));
+        }
+        if !was_confirming && self.form.is_confirming() {
+            events.push(FormEvent::ConfirmRequested);
+        }
+        match action {
+            ChooserAction::Submit(_) => events.push(FormEvent::Submitted),
+            ChooserAction::Cancel => events.push(FormEvent::Cancelled),
+            _ => {}
+        }
+        self.form.queue(events);
+    }
+
+    fn route_key(&mut self, event: KeyEvent) -> ChooserAction {
         if self.form.is_confirming() {
             return self.on_confirm_key(&event);
         }
@@ -711,10 +804,18 @@ impl Chooser {
     /// and never moves the focus; with the keys on the list, or on a
     /// `select`, it is ignored. Returns whether a field took it.
     pub fn paste(&mut self, pasted: &str) -> bool {
-        if self.focus != ChooserFocus::Fields || self.form.is_confirming() {
+        if self.focus != ChooserFocus::Fields || self.form.is_confirming() || !self.form.has_focus()
+        {
             return false;
         }
         self.form.clear_edge();
+        let before = self.edit_signature();
+        let used = self.paste_into_field(pasted);
+        self.note_changes(&before, false, &ChooserAction::None);
+        used
+    }
+
+    fn paste_into_field(&mut self, pasted: &str) -> bool {
         let index = self.field;
         self.items
             .get_mut(self.selected)
@@ -857,6 +958,11 @@ impl Chooser {
     /// The keys of the confirmation popup, and no others: `Enter` sends,
     /// `Esc` returns to the form as it was. Anything else does nothing.
     fn on_confirm_key(&mut self, event: &KeyEvent) -> ChooserAction {
+        // Only the plain keys: Shift+Enter, Ctrl+Enter and Alt+Enter are not
+        // the `Enter` of the window.
+        if !event.modifiers.is_empty() {
+            return ChooserAction::None;
+        }
         match lookup(Context::FormConfirm, event) {
             Some(Action::Accept) if self.form.accept() => self.submission(),
             Some(Action::Cancel) => {
@@ -1107,6 +1213,7 @@ fn field_lines(
     let Some(item) = chooser.selected_item() else {
         return (Vec::new(), 0);
     };
+    chooser.area_width.set(width);
     let focused = (owner_focused && chooser.focus == ChooserFocus::Fields).then_some(chooser.field);
     let mut lines = Vec::new();
     let mut focus_line = 0;

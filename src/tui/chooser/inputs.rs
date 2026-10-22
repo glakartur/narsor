@@ -11,7 +11,7 @@ use ratatui::Frame;
 
 use super::{Chooser, ChooserField, ChooserFocus, ChooserItem, FieldKind};
 use crate::tui::form::field::{cursor_spans, value_lines};
-use crate::tui::form::layout::{window_start, PROMPT_WIDTH};
+use crate::tui::form::layout::{window_start, wrap, PROMPT_WIDTH};
 use crate::tui::scroll::{one_line, sanitize};
 use crate::tui::style::{Role, Styles};
 
@@ -22,9 +22,9 @@ const FOLDED_ROWS: usize = 3;
 /// to their headers.
 const MIN_MAIN_ROWS: usize = 4;
 
-/// The rows above the multi-line fields: the strip (with its borders), the bar
-/// and the status line.
-const TOP_ROWS: u16 = 5;
+/// The rows above the multi-line fields besides the strip: the bar and the
+/// status line.
+const BAR_ROWS: u16 = 2;
 
 /// What the area says when there is no multi-line field.
 const NO_TEXT_FIELD: &str = "brak pola tekstowego w tym workflow";
@@ -40,46 +40,66 @@ pub(super) fn render(
     let Some(item) = chooser.selected_item() else {
         return;
     };
-    let top = TOP_ROWS.min(area.height);
+    // The description wraps in its frame, whole, up to a third of the area.
+    let summary = strip_summary(item);
+    let text_width = usize::from(area.width).saturating_sub(if footer { 2 } else { 2 });
+    let mut summary_rows = wrap(&summary, None, text_width).rows;
+    let cap = (usize::from(area.height) / 3).max(1);
+    if summary_rows.len() > cap {
+        summary_rows.truncate(cap);
+        if let Some(last) = summary_rows.last_mut() {
+            *last = clip(&format!("{last}…"), text_width.max(1));
+        }
+    }
+    let frame_rows: u16 = if footer { 1 } else { 2 };
+    let strip_rows = frame_rows + summary_rows.len() as u16;
+    let top = (strip_rows + BAR_ROWS).min(area.height);
     let [head, rest] = Layout::vertical([Constraint::Length(top), Constraint::Min(0)]).areas(area);
     let [strip, bar, status] = Layout::vertical([
-        Constraint::Length(3.min(head.height)),
-        Constraint::Length(1.min(head.height.saturating_sub(3))),
-        Constraint::Length(1.min(head.height.saturating_sub(4))),
+        Constraint::Length(strip_rows.min(head.height)),
+        Constraint::Length(1.min(head.height.saturating_sub(strip_rows))),
+        Constraint::Length(1.min(head.height.saturating_sub(strip_rows + 1))),
     ])
     .areas(head);
-    render_strip(frame, strip, item, styles, footer);
+    render_strip(frame, strip, item, &summary_rows, styles, footer);
     let focused = (owner_focused && chooser.focus == ChooserFocus::Fields).then_some(chooser.field);
     render_bar(frame, bar, item, focused, styles);
     render_status(frame, status, item, focused, styles);
     render_long_fields(frame, rest, chooser, item, focused, styles);
 }
 
-fn render_strip(frame: &mut Frame, area: Rect, item: &ChooserItem, styles: &Styles, footer: bool) {
-    let summary = item
-        .description
+/// The first paragraph of the entry's description, on one line.
+fn strip_summary(item: &ChooserItem) -> String {
+    item.description
         .lines()
         .find(|line| !line.trim().is_empty())
         .map(|line| one_line(&sanitize(line)))
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn render_strip(
+    frame: &mut Frame,
+    area: Rect,
+    item: &ChooserItem,
+    summary: &[String],
+    styles: &Styles,
+    footer: bool,
+) {
     if footer {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    format!("  {}", one_line(&item.label)),
-                    styles.strong(Role::Calm),
-                ),
-                Line::raw(format!("  {summary}")),
-            ]),
-            area,
-        );
+        let mut lines = vec![Line::styled(
+            format!("  {}", one_line(&item.label)),
+            styles.strong(Role::Calm),
+        )];
+        lines.extend(summary.iter().map(|row| Line::raw(format!("  {row}"))));
+        frame.render_widget(Paragraph::new(lines), area);
     } else {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(Styles::FRAME)
             .border_style(styles.of(Role::Done))
             .title(format!(" {} ", one_line(&item.label)));
-        frame.render_widget(Paragraph::new(summary).block(block), area);
+        let lines: Vec<Line> = summary.iter().map(|row| Line::raw(row.clone())).collect();
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
 

@@ -57,6 +57,7 @@ use crate::controller_protocol::{
 use crate::domain::ConductorPurpose;
 use crate::tui::chat::{tab_entry, tab_items, undo_lines, ChatItem, TAB_KEYS};
 use crate::tui::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
+use crate::tui::form::events::{Direction, Growth};
 use crate::tui::keymap::{key_of, Action, Context};
 use crate::tui::style::{Role, Styles};
 use crate::tui::transcript::{DisplayMode, TranscriptId, TranscriptState};
@@ -458,7 +459,16 @@ pub fn render(
     let mut box_rows = 0;
     if ready {
         if conductor.is_typing() {
-            box_rows = conductor.composer.field_rows().min(area.height / 2).max(2);
+            // The box grows upward over the history, to half the tab; past
+            // that the text scrolls inside it.
+            conductor.composer.set_growth(Growth {
+                direction: Direction::Up,
+                limit_rows: usize::from(area.height / 2),
+            });
+            box_rows = conductor
+                .composer
+                .preferred_rows(usize::from(area.width))
+                .max(2);
         } else if !conductor.draft().is_empty() {
             bottom.push(Line::styled(
                 format!(

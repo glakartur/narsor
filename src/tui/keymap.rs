@@ -147,7 +147,7 @@ impl Context {
     /// Whether the global keys also work here. False where typed text must
     /// not be intercepted.
     pub fn inherits_global(self) -> bool {
-        !matches!(self, Self::Global | Self::Form)
+        !matches!(self, Self::Global | Self::Form | Self::FormConfirm)
     }
 }
 
