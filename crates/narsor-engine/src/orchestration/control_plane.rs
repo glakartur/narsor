@@ -197,6 +197,8 @@ impl ControlPlane {
             slot_release_due_at: None,
             limit_stop_accepted: false,
             reader_lease: None,
+            resume_message: None,
+            resume_message_taken: Vec::new(),
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),

@@ -574,7 +574,9 @@ several waitings of one task. The header counts them (`? 1 · ! 1`).
 
 **The action menu** (`.`) lists everything that can be done with the selected
 task, each with its shortcut, and greys out what cannot be done with the
-reason. An action marked `!` asks `y` / `n` first.
+reason. What can be done comes from the server (it checks the same rule when
+the command arrives); a server that does not say shows "niedostępne: brak
+danych". An action marked `!` asks `y` / `n` first.
 
 | Key | Action | The CLI it stands for |
 |---|---|---|
@@ -585,6 +587,7 @@ reason. An action marked `!` asks `y` / `n` first.
 | `s` | start again an interrupted task or a failed provisioning | `narsor-cli task start` |
 | `a` | archive (`!`) | `narsor-cli task archive` |
 | `o` | open a link of the task (`display.links`) in the browser | — |
+| `c` | comment to the agent, in one step: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a pause: the note goes to the agent and the task resumes | — |
 | `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
 | `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor-cli task conductor undo` |
 | the panel | confirm / reject a proposal, restart a failed step with a note | `narsor-cli task conductor confirm` / `reject`, `narsor-cli task restart-step` |
@@ -634,7 +637,7 @@ the current step or a draft.
 | Where | Keys |
 |---|---|
 | Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
-| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `r`, `h` default harness |
+| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `c` `r`, `h` default harness |
 | Details | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
 | — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all |

@@ -85,5 +85,7 @@ pub use credentials::{
     RunnerIdentity, RunnerRole,
 };
 pub use error::{ProtocolError, ProtocolResult};
-pub use service::{AutoResumePass, ProtocolConfig, ProtocolService, SlotReleasePass, LOCAL_OWNER};
+pub use service::{
+    task_actions, AutoResumePass, ProtocolConfig, ProtocolService, SlotReleasePass, LOCAL_OWNER,
+};
 pub use wire::*;

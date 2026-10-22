@@ -25,8 +25,9 @@ use narsor_engine::controller_protocol::{
     CreateTaskRequest, DesiredAction, ExecutionEventsPage, ExecutionEventsQuery,
     ExecutionEventsResponse, ExecutionEventsSource, Freshness, LaunchRequest, OwnerCommandRequest,
     ProtocolConfig, ProtocolService, RelayFailure, ReportRequest, RunnerClient,
-    RunnerCredentialRequest, RunnerDirective, SubmitInputRequest, SubmitOperatorCommandRequest,
-    TaskDefaultHarness, TaskState, TaskSummary, LOCAL_OWNER,
+    RunnerCredentialRequest, RunnerDirective, SubmitCommentRequest, SubmitInputRequest,
+    SubmitOperatorCommandRequest, TaskActionId, TaskActionOffer, TaskDefaultHarness, TaskState,
+    TaskSummary, LOCAL_OWNER,
 };
 use narsor_engine::domain::{
     BackendId, DisplayLink, Event, EventData, ExecutionStatus, TaskDisplay, TaskId,
@@ -5973,4 +5974,1126 @@ async fn a_task_the_limit_stopped_gets_the_next_free_slot_by_its_rank() {
 
     assert!(control_task(&harness, "task-1").holds_capacity());
     assert!(!control_task(&harness, "task-3").holds_capacity());
+}
+
+// ---------------------------------------------------------------------------
+// The actions of a task (U1-U3)
+// ---------------------------------------------------------------------------
+
+/// The summary of a task as a client of an older or newer server sends it.
+fn summary_json(extra: serde_json::Value) -> serde_json::Value {
+    let at = Utc.with_ymd_and_hms(2026, 10, 22, 12, 0, 0).unwrap();
+    let mut summary = serde_json::json!({
+        "task_id": "task-1",
+        "backend_id": "k8s",
+        "runner_state": "running",
+        "generation": 1,
+        "revision": 1,
+        "rank": 1,
+        "created_at": at,
+        "queue_sequence": 1,
+        "workflow_id": "implement-feature",
+        "workflow_version": 3,
+        "launch_digest": "digest",
+        "environment_identity": "env",
+        "archive": null,
+        "observation": null,
+        "runner": null,
+        "controller": null,
+        "inputs": [],
+        "as_of": at,
+    });
+    summary
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    summary
+}
+
+#[test]
+fn the_actions_of_a_summary_round_trip() {
+    let summary: TaskSummary = serde_json::from_value(summary_json(serde_json::json!({
+        "actions": [
+            { "id": "comment", "available": true },
+            {
+                "id": "archive",
+                "available": false,
+                "reason": "zadanie działa — archiwizować można zakończone lub przerwane",
+            },
+            {
+                "id": "answer",
+                "available": true,
+                "options": [{ "label": "go", "description": "carry on" }, { "label": "stop" }],
+            },
+        ],
+    })))
+    .expect("a summary with actions");
+    let actions = summary.actions.clone().expect("the actions");
+    assert_eq!(actions.len(), 3);
+    assert_eq!(actions[1].id, TaskActionId::Archive);
+    assert!(!actions[1].available);
+    assert_eq!(
+        actions[2].options[0].description.as_deref(),
+        Some("carry on")
+    );
+
+    let again: TaskSummary =
+        serde_json::from_value(serde_json::to_value(&summary).unwrap()).expect("round trip");
+    assert_eq!(again, summary);
+}
+
+#[test]
+fn a_summary_without_actions_reads_as_none_and_writes_none() {
+    let summary: TaskSummary =
+        serde_json::from_value(summary_json(serde_json::json!({}))).expect("an old summary");
+    assert_eq!(summary.actions, None);
+    assert!(serde_json::to_value(&summary)
+        .unwrap()
+        .get("actions")
+        .is_none());
+}
+
+#[test]
+fn an_action_of_a_newer_server_decodes_as_unrecognized_and_the_rest_reads() {
+    let summary: TaskSummary = serde_json::from_value(summary_json(serde_json::json!({
+        "actions": [
+            { "id": "teleport", "available": true },
+            { "id": "pause", "available": true },
+        ],
+    })))
+    .expect("a summary with a newer action");
+    let ids: Vec<_> = summary.actions.unwrap().into_iter().map(|a| a.id).collect();
+    assert_eq!(ids, vec![TaskActionId::Unrecognized, TaskActionId::Pause]);
+}
+
+#[test]
+fn a_comment_without_an_idempotency_key_is_refused_when_read() {
+    let without_key = serde_json::json!({ "text": "keep going" });
+    assert!(serde_json::from_value::<SubmitCommentRequest>(without_key).is_err());
+    let request: SubmitCommentRequest = serde_json::from_value(serde_json::json!({
+        "text": "keep going",
+        "idempotency_key": "comment-1",
+    }))
+    .expect("a comment with a key");
+    assert_eq!(request.expected_generation, None);
+}
+
+/// The offer of `id`.
+fn action(task: &TaskSummary, id: TaskActionId) -> &TaskActionOffer {
+    task.actions
+        .as_ref()
+        .expect("the server offers actions")
+        .iter()
+        .find(|offer| offer.id == id)
+        .unwrap_or_else(|| panic!("{id:?} is not offered"))
+}
+
+/// Asserts `id` is available.
+fn assert_available(task: &TaskSummary, id: TaskActionId) {
+    let offer = action(task, id);
+    assert!(offer.available, "{id:?}: {:?}", offer.reason);
+    assert_eq!(offer.reason, None, "an available action has no reason");
+}
+
+/// Asserts `id` is unavailable, with a reason that contains `reason`.
+fn assert_unavailable(task: &TaskSummary, id: TaskActionId, reason: &str) {
+    let offer = action(task, id);
+    assert!(!offer.available, "{id:?} should not be available");
+    let said = offer.reason.as_deref().unwrap_or_default();
+    assert!(said.contains(reason), "{id:?}: {said}");
+}
+
+/// A snapshot of a task that waits on `id`, which continues as `continuation`.
+fn snapshot_waiting(
+    sequence: u64,
+    event_cursor: u64,
+    id: &str,
+    continuation: &str,
+    kind: AttentionKind,
+) -> RunnerSnapshot {
+    let mut waiting = snapshot(sequence, ExecutionStatus::InputNeeded, event_cursor, None);
+    let form: PendingHumanInput = serde_json::from_value(serde_json::json!({
+        "execution_id": "exec-1",
+        "state_id": "review",
+        "action_execution_id": "act-7",
+        "instruction": "What now?",
+        "fields": [],
+        "outputs": [
+            { "label": "go", "description": "carry on" },
+            { "label": "stop" },
+        ],
+        "continuation": continuation,
+        "episode": id,
+        "requested_at": "2026-10-03T12:00:00Z",
+    }))
+    .expect("pending input form");
+    waiting.pending_input = Some(PendingInputRef {
+        id: id.to_string(),
+        attempt_id: Some("act-7".to_string()),
+        form,
+    });
+    waiting.attention = vec![attention(kind, id, Some("review"))];
+    waiting
+}
+
+/// A task of `harness` that waits on a request of `continuation`.
+async fn waiting_on_request(harness: &Harness, continuation: &str, kind: AttentionKind) -> Running {
+    let running = harness.running("task-1", "k8s").await;
+    running
+        .runner
+        .snapshot(&snapshot_waiting(2, 4, "ep-1", continuation, kind))
+        .await
+        .expect("input needed");
+    running
+}
+
+#[tokio::test]
+async fn a_finished_task_offers_to_archive_and_not_to_interrupt() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    running
+        .runner
+        .snapshot(&snapshot(2, ExecutionStatus::Completed, 4, None))
+        .await
+        .expect("completed");
+    let mut at_safe_point = snapshot(3, ExecutionStatus::Completed, 5, None);
+    at_safe_point.safe_point = true;
+    running.runner.snapshot(&at_safe_point).await.expect("safe");
+    running
+        .controller
+        .report(&report(
+            "task-1",
+            running.epoch,
+            2,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+
+    let task = harness.task("task-1").await;
+    assert_eq!(task.state, TaskState::Finished);
+    assert_available(&task, TaskActionId::Archive);
+    assert_unavailable(&task, TaskActionId::Interrupt, "zadanie jest zakończone");
+    assert_available(&task, TaskActionId::Resume);
+    assert_unavailable(&task, TaskActionId::Comment, "zadanie jest zakończone");
+}
+
+#[tokio::test]
+async fn an_archived_task_has_nothing_left_to_archive() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    harness
+        .command("task-1", OwnerCommand::Archive, "archive-1")
+        .await;
+
+    let task = harness.task("task-1").await;
+    assert_unavailable(&task, TaskActionId::Archive, "zadanie jest archiwizowane");
+}
+
+#[tokio::test]
+async fn a_running_task_offers_the_archive_the_control_plane_takes() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+
+    let task = harness.task("task-1").await;
+    assert_available(&task, TaskActionId::Archive);
+    assert_available(&task, TaskActionId::Interrupt);
+    assert_available(&task, TaskActionId::Pause);
+    assert_unavailable(&task, TaskActionId::Resume, "zadanie działa");
+    assert_unavailable(&task, TaskActionId::Restart, "jest co przerwać");
+    assert_unavailable(&task, TaskActionId::Answer, "nie czeka na odpowiedź");
+}
+
+#[tokio::test]
+async fn a_question_of_the_agent_offers_an_answer_with_its_options_and_a_comment() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resolve_output", AttentionKind::Problem).await;
+
+    let task = harness.task("task-1").await;
+    assert_available(&task, TaskActionId::Answer);
+    let labels: Vec<_> = action(&task, TaskActionId::Answer)
+        .options
+        .iter()
+        .map(|option| option.label.as_str())
+        .collect();
+    assert_eq!(labels, ["go", "stop"]);
+    assert_available(&task, TaskActionId::Comment);
+    assert_unavailable(&task, TaskActionId::Approve, "nie czeka na zatwierdzenie");
+    assert_unavailable(&task, TaskActionId::AllowPermission, "nie czeka na zgodę");
+}
+
+#[tokio::test]
+async fn a_permission_request_offers_allow_deny_and_a_comment() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resolve_permission", AttentionKind::Problem).await;
+
+    let task = harness.task("task-1").await;
+    assert_available(&task, TaskActionId::AllowPermission);
+    assert_available(&task, TaskActionId::DenyPermission);
+    assert_available(&task, TaskActionId::Comment);
+    assert_unavailable(&task, TaskActionId::Answer, "nie czeka na odpowiedź");
+}
+
+#[tokio::test]
+async fn an_approval_offers_approve_reject_and_a_comment() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "approve_output", AttentionKind::Approval).await;
+
+    let task = harness.task("task-1").await;
+    assert_available(&task, TaskActionId::Approve);
+    assert_available(&task, TaskActionId::Reject);
+    assert_available(&task, TaskActionId::Comment);
+}
+
+#[tokio::test]
+async fn a_request_that_takes_no_message_has_no_comment_and_says_so() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "complete_step", AttentionKind::Question).await;
+
+    let task = harness.task("task-1").await;
+    assert_available(&task, TaskActionId::Answer);
+    assert_unavailable(&task, TaskActionId::Comment, "nie przyjmuje komentarza");
+}
+
+#[tokio::test]
+async fn a_task_paused_by_the_operator_offers_a_comment_and_resume() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    let task = harness.task("task-1").await;
+    assert_eq!(task.runner_state, RunnerState::Stopped);
+    assert_eq!(task.state, TaskState::Paused);
+    assert_available(&task, TaskActionId::Comment);
+    assert_available(&task, TaskActionId::Resume);
+    assert_unavailable(&task, TaskActionId::Pause, "zadanie jest wstrzymane");
+}
+
+#[tokio::test]
+async fn a_queued_task_has_no_comment_for_it_has_no_session() {
+    let harness = Harness::start().await;
+    let created = harness.create("task-1", "k8s").await;
+
+    assert_unavailable(&created, TaskActionId::Comment, "jest w kolejce");
+    assert_unavailable(&created, TaskActionId::Pause, "zadanie jest w kolejce");
+}
+
+#[tokio::test]
+async fn a_task_that_failed_to_provision_has_no_comment() {
+    let harness = Harness::start().await;
+    harness.create("task-1", "k8s").await;
+    let (controller, epoch) = harness.controller("k8s").await;
+    for observation in [
+        Observation::StartAccepted,
+        Observation::WorkloadLost { state_known: true },
+    ] {
+        controller
+            .report(&report("task-1", epoch, 1, observation, None))
+            .await
+            .expect("report");
+    }
+
+    let task = harness.task("task-1").await;
+    assert_unavailable(&task, TaskActionId::Comment, "komentarz można dodać przy");
+    assert_available(&task, TaskActionId::Restart);
+    assert_available(&task, TaskActionId::Archive);
+}
+
+#[tokio::test]
+async fn a_task_with_a_failed_step_has_no_comment() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    let mut failed = snapshot(2, ExecutionStatus::Running, 4, None);
+    failed.attention = vec![attention(
+        AttentionKind::FailedStep,
+        "fail-1",
+        Some("review"),
+    )];
+    runner.snapshot(&failed).await.expect("snapshot");
+
+    let task = harness.task("task-1").await;
+    assert_unavailable(&task, TaskActionId::Comment, "komentarz można dodać przy");
+}
+
+#[tokio::test]
+async fn a_silent_runner_cannot_be_interrupted_or_given_a_transition() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    harness.clock.advance(Duration::minutes(10));
+
+    let task = harness.task("task-1").await;
+    assert_unavailable(
+        &task,
+        TaskActionId::Interrupt,
+        "runner nie odpowiada od dłuższego czasu",
+    );
+    assert_unavailable(
+        &task,
+        TaskActionId::Transition,
+        "runner nie odpowiada od dłuższego czasu",
+    );
+}
+
+#[tokio::test]
+async fn a_transition_needs_the_exits_of_the_state_the_runner_reported() {
+    let harness = Harness::start().await;
+    write_override_workflow(&harness);
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    // The state of the seeded snapshot is not one of this workflow's.
+    let task = harness.task("task-1").await;
+    assert!(task.manual_transitions.is_none());
+    assert_unavailable(
+        &task,
+        TaskActionId::Transition,
+        "serwer nie podał wyjść bieżącego stanu",
+    );
+
+    runner
+        .snapshot(&snapshot_in(2, "work", 4))
+        .await
+        .expect("in work");
+    let task = harness.task("task-1").await;
+    assert_available(&task, TaskActionId::Transition);
+    let exits: Vec<_> = action(&task, TaskActionId::Transition)
+        .options
+        .iter()
+        .map(|option| option.label.as_str())
+        .collect();
+    assert_eq!(exits, ["success → locked"]);
+}
+
+#[tokio::test]
+async fn the_list_carries_the_same_actions_as_the_task() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    harness.create("task-2", "k8s").await;
+
+    let listed = harness.owner.control_tasks().await.expect("list").tasks;
+    for task in listed {
+        let single = harness.task(task.task_id.as_str()).await;
+        assert_eq!(task.actions, single.actions, "{}", task.task_id);
+        assert!(task.actions.is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_transition_the_offer_does_not_allow_is_refused_with_its_reason() {
+    let harness = Harness::start().await;
+    write_override_workflow(&harness);
+    harness.running("task-1", "k8s").await;
+    let before = harness.task("task-1").await;
+    let reason = action(&before, TaskActionId::Transition)
+        .reason
+        .clone()
+        .expect("the offer says why");
+
+    match harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(transition("locked", false, None), "transition-1"),
+        )
+        .await
+    {
+        Err(ClientError::Refused { code, message }) => {
+            assert_eq!(code, "action_unavailable");
+            assert_eq!(message, reason, "the reason the offer showed a moment ago");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let after = harness.task("task-1").await;
+    assert_eq!(after.revision, before.revision, "nothing was written");
+    assert!(after.operator_commands.is_empty());
+}
+
+#[tokio::test]
+async fn a_pause_of_a_task_whose_step_ended_is_refused_with_the_reason() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    runner
+        .snapshot(&snapshot(2, ExecutionStatus::Failed, 4, None))
+        .await
+        .expect("failed");
+    let task = harness.task("task-1").await;
+    assert_eq!(task.runner_state, RunnerState::Running);
+    assert_eq!(task.state, TaskState::Error);
+
+    let refusal = harness
+        .owner
+        .control_command(
+            "task-1",
+            &OwnerCommandRequest {
+                command: OwnerCommand::Pause,
+                idempotency_key: "pause-1".to_string(),
+                expected_generation: None,
+            },
+        )
+        .await;
+    assert_eq!(refused_code(refusal), "action_unavailable");
+    assert_eq!(harness.task("task-1").await.revision, task.revision);
+}
+
+#[tokio::test]
+async fn an_interrupt_of_a_task_that_stands_is_refused_with_the_reason() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let before = harness.task("task-1").await;
+
+    match harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(OperatorCommand::Interrupt, "interrupt-1"),
+        )
+        .await
+    {
+        Err(ClientError::Refused { code, message }) => {
+            assert_eq!(code, "operator_command_refused", "the code clients know");
+            assert!(!message.is_empty());
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(action(&before, TaskActionId::Interrupt).reason.is_some());
+}
+
+#[tokio::test]
+async fn resuming_a_running_task_is_refused_with_a_reason() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+
+    let refusal = harness
+        .owner
+        .control_command(
+            "task-1",
+            &OwnerCommandRequest {
+                command: OwnerCommand::Resume,
+                idempotency_key: "resume-1".to_string(),
+                expected_generation: None,
+            },
+        )
+        .await;
+    assert_eq!(refused_code(refusal), "illegal_command");
+}
+
+#[tokio::test]
+async fn a_stale_generation_is_still_refused_with_its_own_code() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    let generation = harness.task("task-1").await.generation;
+
+    // Interrupting a task that runs is allowed; the stale generation says no.
+    let mut request = operator_request(OperatorCommand::Interrupt, "interrupt-1");
+    request.expected_generation = Some(generation + 1);
+    assert_eq!(
+        refused_code(
+            harness
+                .owner
+                .control_operator_command("task-1", &request)
+                .await
+        ),
+        "stale_generation"
+    );
+
+    // A move of a task that is not queued: the generation comes first too.
+    let stale_move = narsor_engine::controller_protocol::MoveTaskRequest {
+        target: narsor_engine::orchestration::MoveTarget::Top.into(),
+        expected_generation: Some(generation + 1),
+    };
+    assert_eq!(
+        refused_code(harness.owner.control_move_task("task-1", &stale_move).await),
+        "stale_generation"
+    );
+}
+
+#[tokio::test]
+async fn a_move_of_a_task_that_is_not_queued_is_refused_with_the_reason() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+
+    let request = narsor_engine::controller_protocol::MoveTaskRequest {
+        target: narsor_engine::orchestration::MoveTarget::Top.into(),
+        expected_generation: None,
+    };
+    match harness.owner.control_move_task("task-1", &request).await {
+        Err(ClientError::Refused { code, message }) => {
+            assert_eq!(code, "task_not_queued");
+            assert_eq!(message, "zadanie nie jest w kolejce");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn repeating_a_key_after_success_returns_the_first_answer_not_an_availability_error() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    let request = OwnerCommandRequest {
+        command: OwnerCommand::Pause,
+        idempotency_key: "pause-1".to_string(),
+        expected_generation: None,
+    };
+    let first = harness
+        .owner
+        .control_command("task-1", &request)
+        .await
+        .expect("pause");
+    assert!(!first.replayed);
+
+    // The task is pausing now, which the offer would refuse as a new pause.
+    assert_unavailable(
+        &harness.task("task-1").await,
+        TaskActionId::Pause,
+        "zadanie jest już wstrzymywane",
+    );
+    let second = harness
+        .owner
+        .control_command("task-1", &request)
+        .await
+        .expect("the same key");
+    assert!(second.replayed);
+}
+
+#[tokio::test]
+async fn an_answer_to_the_pending_question_is_still_taken_and_an_obsolete_one_keeps_its_code() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resolve_output", AttentionKind::Problem).await;
+
+    assert_eq!(
+        refused_code(
+            harness
+                .owner
+                .control_input("task-1", &input_request("ep-0", "answer-0"))
+                .await
+        ),
+        "obsolete_input"
+    );
+    harness
+        .owner
+        .control_input("task-1", &input_request("ep-1", "answer-1"))
+        .await
+        .expect("the answer to the pending request");
+}
+
+#[tokio::test]
+async fn a_permission_decision_is_judged_as_the_decision_it_is() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resolve_permission", AttentionKind::Problem).await;
+    let before = harness.task("task-1").await;
+    assert_available(&before, TaskActionId::AllowPermission);
+
+    let mut deny = input_request("ep-1", "deny-1");
+    deny.delivery = narsor_protocol::api::HumanInputDeliveryDto {
+        episode: Some("ep-1".to_string()),
+        permission_decision: Some(narsor_protocol::api::PermissionDecisionDto {
+            denial_index: None,
+            decision: narsor_protocol::api::PermissionDecisionKindDto::Deny,
+            scope: None,
+            pattern: None,
+            message: Some("not that".to_string()),
+        }),
+        ..narsor_protocol::api::HumanInputDeliveryDto::default()
+    };
+    harness
+        .owner
+        .control_input("task-1", &deny)
+        .await
+        .expect("a denial of a pending permission");
+}
+
+// ---------------------------------------------------------------------------
+// The comment (U4)
+// ---------------------------------------------------------------------------
+
+fn comment_request(text: &str, key: &str) -> SubmitCommentRequest {
+    SubmitCommentRequest {
+        text: text.to_string(),
+        idempotency_key: key.to_string(),
+        expected_generation: None,
+    }
+}
+
+#[tokio::test]
+async fn a_comment_on_a_permission_denies_with_the_text_and_never_allows() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "resolve_permission", AttentionKind::Problem).await;
+
+    let response = harness
+        .owner
+        .control_comment("task-1", &comment_request("use the read-only tool", "c-1"))
+        .await
+        .expect("comment");
+    assert!(!response.replayed);
+
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    let decision = polled.inputs[0]
+        .delivery
+        .permission_decision
+        .as_ref()
+        .expect("a permission decision");
+    assert_eq!(
+        decision.decision,
+        narsor_protocol::api::PermissionDecisionKindDto::Deny
+    );
+    assert_eq!(decision.denial_index, None);
+    assert_eq!(decision.message.as_deref(), Some("use the read-only tool"));
+
+    // The request is answered: the task offers no decision on it any more.
+    assert_unavailable(
+        &response.task,
+        TaskActionId::AllowPermission,
+        "nie czeka na zgodę",
+    );
+    assert_unavailable(
+        &response.task,
+        TaskActionId::DenyPermission,
+        "nie czeka na zgodę",
+    );
+}
+
+#[tokio::test]
+async fn a_comment_on_an_approval_returns_the_output_with_the_note_and_does_not_approve() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "approve_output", AttentionKind::Approval).await;
+
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("tests are missing", "c-1"))
+        .await
+        .expect("comment");
+
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    let delivery = &polled.inputs[0].delivery;
+    assert_eq!(
+        delivery.action,
+        Some(narsor_protocol::api::HumanInputActionDto::Resume)
+    );
+    assert_eq!(delivery.comment.as_deref(), Some("tests are missing"));
+}
+
+#[tokio::test]
+async fn a_comment_on_a_question_reaches_the_agent_as_the_reply() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("take the second option", "c-1"))
+        .await
+        .expect("comment");
+
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    let delivery = &polled.inputs[0].delivery;
+    assert_eq!(
+        delivery.values.get("answer").and_then(|v| v.as_str()),
+        Some("take the second option")
+    );
+    assert_eq!(delivery.episode.as_deref(), Some("ep-1"));
+}
+
+#[tokio::test]
+async fn a_comment_on_a_problem_is_a_message_to_the_agent() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "resolve_output", AttentionKind::Problem).await;
+
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("try again", "c-1"))
+        .await
+        .expect("comment");
+
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    assert_eq!(
+        polled.inputs[0].delivery.agent_message.as_deref(),
+        Some("try again")
+    );
+}
+
+#[tokio::test]
+async fn a_comment_key_is_taken_once() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+
+    let first = harness
+        .owner
+        .control_comment("task-1", &comment_request("one", "c-1"))
+        .await
+        .expect("comment");
+    let again = harness
+        .owner
+        .control_comment("task-1", &comment_request("one", "c-1"))
+        .await
+        .expect("retry");
+    assert!(!first.replayed);
+    assert!(again.replayed);
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    assert_eq!(polled.inputs.len(), 1);
+}
+
+#[tokio::test]
+async fn a_blank_comment_and_a_comment_on_a_running_task_are_refused() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+
+    let task = harness.task("task-1").await;
+    assert_unavailable(&task, TaskActionId::Comment, "zadanie działa");
+    assert_eq!(
+        refused_code(
+            harness
+                .owner
+                .control_comment("task-1", &comment_request("hello", "c-1"))
+                .await
+        ),
+        "action_unavailable"
+    );
+    let blank = harness
+        .owner
+        .control_comment("task-1", &comment_request("   ", "c-2"))
+        .await;
+    assert!(blank.is_err(), "a blank comment is refused: {blank:?}");
+}
+
+#[tokio::test]
+async fn a_comment_on_an_older_generation_is_refused() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+    let task = harness.task("task-1").await;
+
+    let mut request = comment_request("late", "c-1");
+    request.expected_generation = Some(task.generation + 1);
+    assert_eq!(
+        refused_code(harness.owner.control_comment("task-1", &request).await),
+        "stale_generation"
+    );
+}
+
+#[tokio::test]
+async fn a_comment_on_a_pause_waits_for_the_next_runner_and_resumes_the_task() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    let response = harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests first", "c-1"))
+        .await
+        .expect("comment");
+    assert!(!response.replayed);
+    assert_ne!(response.task.runner_state, RunnerState::Stopped);
+
+    let again = harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests first", "c-1"))
+        .await
+        .expect("retry");
+    assert!(again.replayed);
+
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    let resumes = record
+        .commands
+        .iter()
+        .filter(|receipt| receipt.command == OwnerCommand::Resume)
+        .count();
+    assert_eq!(resumes, 1, "one resume for the comment, however often sent");
+    assert_eq!(
+        record.resume_message.as_ref().map(|m| m.text.as_str()),
+        Some("look at the tests first")
+    );
+
+    let credential = running
+        .controller
+        .issue_runner_credential(
+            "task-1",
+            &RunnerCredentialRequest {
+                lease_epoch: running.epoch,
+                generation: record.generation,
+                incarnation: "pod-2".to_string(),
+            },
+        )
+        .await
+        .expect("runner credential");
+    let runner = RunnerClient::new(harness.base_url(), credential.credential);
+    let polled = runner.poll(None, 0).await.expect("poll");
+    let message = polled.launch.resume_message.expect("the launch carries it");
+    assert_eq!(message.key, "c-1");
+    assert_eq!(message.text, "look at the tests first");
+
+    // A report alone does not take the comment off the record: only the
+    // runner's word that it gave it to its agent does. Then a runner with
+    // fresh storage is not handed it again, and the retry of its key still
+    // reads as a replay.
+    runner
+        .snapshot(&snapshot(1, ExecutionStatus::Running, 9, None))
+        .await
+        .expect("snapshot");
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(
+        record.resume_message.as_ref().map(|m| m.key.as_str()),
+        Some("c-1")
+    );
+    runner
+        .poll_with(&narsor_protocol::controller::RunnerPollQuery {
+            wait_secs: Some(0),
+            resume_message_taken: Some("c-1".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("poll that says the comment was taken");
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(record.resume_message, None);
+    assert_eq!(record.resume_message_taken, vec!["c-1".to_string()]);
+    let commands_before = record.commands.len();
+    assert!(runner
+        .poll(None, 0)
+        .await
+        .expect("poll")
+        .launch
+        .resume_message
+        .is_none());
+    let retry = harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests first", "c-1"))
+        .await
+        .expect("retry after the launch took it");
+    assert!(retry.replayed);
+    // The comment did its resume once: a late retry does not resume a task
+    // the owner stopped since.
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(record.commands.len(), commands_before);
+}
+
+#[tokio::test]
+async fn a_report_alone_leaves_the_comment_on_the_record() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests first", "c-1"))
+        .await
+        .expect("comment");
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    let credential = running
+        .controller
+        .issue_runner_credential(
+            "task-1",
+            &RunnerCredentialRequest {
+                lease_epoch: running.epoch,
+                generation: record.generation,
+                incarnation: "pod-2".to_string(),
+            },
+        )
+        .await
+        .expect("runner credential");
+    let runner = RunnerClient::new(harness.base_url(), credential.credential);
+    let mut problem = snapshot(1, ExecutionStatus::Running, 9, None);
+    problem.problem = Some(narsor_engine::orchestration::RunnerProblem {
+        code: "no_harness".to_string(),
+        message: "the runner cannot work".to_string(),
+    });
+    runner.snapshot(&problem).await.expect("problem snapshot");
+
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(
+        record.resume_message.as_ref().map(|m| m.key.as_str()),
+        Some("c-1")
+    );
+}
+
+#[tokio::test]
+async fn a_second_comment_does_not_replace_one_no_runner_has_taken() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let control = harness.service.control_plane();
+    let id = TaskId::parse("task-1").unwrap();
+
+    assert!(!control.store_resume_message(&id, "c-1", "first").unwrap());
+    // Another key while the first waits (two owners racing on the pause):
+    // the first is not overwritten.
+    assert!(matches!(
+        control.store_resume_message(&id, "c-2", "second"),
+        Err(narsor_engine::orchestration::OrchestrationError::ResumeMessagePending { .. })
+    ));
+    // The same key with another text is a mistake of the client.
+    assert!(matches!(
+        control.store_resume_message(&id, "c-1", "other"),
+        Err(narsor_engine::orchestration::OrchestrationError::InputKeyReused { .. })
+    ));
+    // The same key and text is a replay.
+    assert!(control.store_resume_message(&id, "c-1", "first").unwrap());
+    assert_eq!(
+        control
+            .task(&id)
+            .unwrap()
+            .resume_message
+            .as_ref()
+            .map(|m| m.text.as_str()),
+        Some("first")
+    );
+}
+
+#[tokio::test]
+async fn taking_a_comment_checks_the_key_and_remembers_only_the_latest_keys() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let control = harness.service.control_plane();
+    let id = TaskId::parse("task-1").unwrap();
+
+    control.store_resume_message(&id, "c-0", "first").unwrap();
+    // A key that is not the waiting one changes nothing.
+    assert!(!control.take_resume_message(&id, "other").unwrap());
+    assert!(control.task(&id).unwrap().resume_message.is_some());
+
+    assert!(control.take_resume_message(&id, "c-0").unwrap());
+    // A second take of the same key finds nothing to drop.
+    assert!(!control.take_resume_message(&id, "c-0").unwrap());
+    // The replay of a taken key stays a replay.
+    assert!(control.store_resume_message(&id, "c-0", "first").unwrap());
+
+    // Only the latest 32 keys are kept.
+    for n in 1..=32 {
+        let key = format!("c-{n}");
+        control.store_resume_message(&id, &key, "text").unwrap();
+        assert!(control.take_resume_message(&id, &key).unwrap());
+    }
+    let taken = control.task(&id).unwrap().resume_message_taken;
+    assert_eq!(taken.len(), 32);
+    assert!(!taken.iter().any(|key| key == "c-0"), "{taken:?}");
+    // The dropped key reads as a new comment: the known limit of the cap.
+    assert!(!control.store_resume_message(&id, "c-0", "late").unwrap());
+}
+
+#[tokio::test]
+async fn a_comment_of_unreasonable_size_is_refused() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    let long = "x".repeat(4_001);
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_comment("task-1", &comment_request(&long, "c-1"))
+                .await
+        ),
+        "comment_too_long"
+    );
+    let key = "k".repeat(129);
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_comment("task-1", &comment_request("fine", &key))
+                .await
+        ),
+        "idempotency_key_too_long"
+    );
+    assert_eq!(
+        harness.task("task-1").await.runner_state,
+        RunnerState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn a_comment_is_refused_at_the_send_where_the_request_takes_no_message() {
+    for continuation in ["complete_step", "entry_limit"] {
+        let harness = Harness::start().await;
+        waiting_on_request(&harness, continuation, AttentionKind::Question).await;
+        assert_eq!(
+            refused_code(
+                harness
+                    .owner
+                    .control_comment("task-1", &comment_request("hello", "c-1"))
+                    .await
+            ),
+            "action_unavailable",
+            "{continuation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_comment_without_a_key_is_refused_by_the_service() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_comment("task-1", &comment_request("hello", " "))
+                .await
+        ),
+        "missing_idempotency_key"
+    );
+}
+
+#[tokio::test]
+async fn a_comment_on_a_pause_shows_in_the_event_stream_of_the_task() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests", "c-1"))
+        .await
+        .expect("comment");
+
+    let events = operator_events(&harness, "task-1").await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TaskEventKind::ResumeMessageStored { idempotency_key } if idempotency_key == "c-1"
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_blank_comment_on_a_pause_is_refused_and_the_task_stays_paused() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    assert!(harness
+        .owner
+        .control_comment("task-1", &comment_request(" ", "c-1"))
+        .await
+        .is_err());
+    assert_eq!(
+        harness.task("task-1").await.runner_state,
+        RunnerState::Stopped
+    );
 }

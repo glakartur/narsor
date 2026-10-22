@@ -223,6 +223,14 @@ pub enum OrchestrationError {
         key: String,
     },
 
+    /// A comment on the pause still waits for the runner of the next launch;
+    /// the record keeps one.
+    #[error("task '{task_id}' already holds a comment on its pause that no runner has taken")]
+    ResumeMessagePending {
+        /// The task.
+        task_id: TaskId,
+    },
+
     /// No queued input with this id exists.
     #[error("task '{task_id}' has no input '{input_id}'")]
     InputNotFound {

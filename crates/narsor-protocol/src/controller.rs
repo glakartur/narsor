@@ -83,6 +83,10 @@ pub struct RunnerPollQuery {
     pub defer_materials: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    /// The key of the comment on the pause the runner has given to its
+    /// agent: the control plane drops that comment from the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_message_taken: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -743,6 +747,19 @@ pub struct RunnerLaunchView {
     pub authorized_by: Option<OwnerCommand>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorized_by_actor: Option<CommandActor>,
+    /// The owner's comment on the pause this launch ends: the runner gives
+    /// it to the agent before the work goes on, once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_message: Option<ResumeMessage>,
+}
+
+/// What the owner told the agent while the task was paused, kept until the
+/// runner of the next launch has taken it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeMessage {
+    /// The key of the comment; the runner takes a key once.
+    pub key: String,
+    pub text: String,
 }
 
 /// Response to `POST /runner/v1/snapshots`.
@@ -874,6 +891,10 @@ pub struct TaskSummary {
     pub display: crate::display::TaskDisplay,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_transitions: Option<TransitionOffer>,
+    /// What the owner can do to the task now, and why not where it cannot.
+    /// `None` when the server did not say (a server from before the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<TaskActionOffer>>,
     #[serde(default)]
     pub resume: ResumeState,
     pub as_of: DateTime<Utc>,
@@ -945,6 +966,15 @@ pub enum TaskEventKind {
     InputQueued {
         input_id: String,
         pending_input_id: String,
+    },
+    /// The owner commented on a paused task; the comment waits for the
+    /// runner of the next launch.
+    ResumeMessageStored {
+        idempotency_key: String,
+    },
+    /// The runner of a launch gave the comment on the pause to its agent.
+    ResumeMessageTaken {
+        idempotency_key: String,
     },
     OperatorCommandQueued {
         command_id: String,
@@ -1811,6 +1841,80 @@ pub struct TransitionOffer {
     pub override_allowed: bool,
     #[serde(default)]
     pub override_targets: Vec<String>,
+}
+
+impl TransitionOffer {
+    /// Whether the state allows an override with somewhere to go.
+    pub fn has_override(&self) -> bool {
+        self.override_allowed && !self.override_targets.is_empty()
+    }
+}
+
+/// An action of the owner on a task that the server can tell apart.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskActionId {
+    Comment,
+    Answer,
+    Approve,
+    Reject,
+    AllowPermission,
+    DenyPermission,
+    Pause,
+    Resume,
+    Interrupt,
+    Transition,
+    Restart,
+    Archive,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// One action of a task as the server offers it: whether it can be done now
+/// and, when it cannot, why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskActionOffer {
+    pub id: TaskActionId,
+    pub available: bool,
+    /// Why the action cannot be done, in words for the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// What the action does here, in words for the owner, when it depends on
+    /// the stop the task is in (a comment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
+    /// The choices the action has (the exits of a transition, the outputs of
+    /// a question).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<TaskActionOption>,
+}
+
+/// One choice of a task action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskActionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// `POST /control/v1/tasks/:task_id/comment`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubmitCommentRequest {
+    /// What the owner tells the agent.
+    pub text: String,
+    /// Client-chosen key; a retry reuses it.
+    pub idempotency_key: String,
+    /// Refuse unless the task is still at this generation.
+    #[serde(default)]
+    pub expected_generation: Option<u64>,
+}
+
+/// Answer to a comment the server took.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubmitCommentResponse {
+    pub task: TaskSummary,
+    /// The key was used before; nothing was done again.
+    pub replayed: bool,
 }
 
 /// One declared transition out of a workflow state.

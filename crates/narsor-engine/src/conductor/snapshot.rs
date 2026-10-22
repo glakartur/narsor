@@ -34,7 +34,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::conductor::store::{Annotation, ChatEntry, ConductorStore, QueuedRequest};
-use crate::domain::{Event, EventData, ChoiceDefinition, WorkflowExecution};
+use crate::domain::{ChoiceDefinition, Event, EventData, WorkflowExecution};
 use crate::engine::actions::human::PendingHumanInput;
 use crate::persistence::{ConversationSource, ConversationStore, ExecutionStore};
 

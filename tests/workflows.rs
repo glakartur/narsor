@@ -201,7 +201,11 @@ fn built_prompt(state: &State) -> String {
     let Some(ActionConfig::Agent(config)) = &state.action else {
         panic!("built_prompt is only defined for agent states");
     };
-    format!("{}{}", config.prompt, output_contract(&StepContract::of(state)))
+    format!(
+        "{}{}",
+        config.prompt,
+        output_contract(&StepContract::of(state))
+    )
 }
 
 /// The declared output labels of a state.
@@ -721,8 +725,11 @@ impl CompoundRun {
 
     /// Makes the n-th agent call sleep after it answers, past a time limit.
     fn with_call_hanging(self, call: usize, seconds: u32) -> Self {
-        fs::write(self.harness_dir.join(format!("sleep.{call}")), seconds.to_string())
-            .expect("write the sleep file");
+        fs::write(
+            self.harness_dir.join(format!("sleep.{call}")),
+            seconds.to_string(),
+        )
+        .expect("write the sleep file");
         self
     }
 
@@ -771,7 +778,10 @@ impl CompoundRun {
     }
 
     /// The gate the run waits at, with the request it shows.
-    fn pending(&self, execution_id: &str) -> narsor_engine::engine::actions::human::PendingHumanInput {
+    fn pending(
+        &self,
+        execution_id: &str,
+    ) -> narsor_engine::engine::actions::human::PendingHumanInput {
         self.engine
             .pending_input(execution_id)
             .expect("read the pending request")
@@ -805,7 +815,12 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates_and_mer
 
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(execution.current_state.as_deref(), Some("finished"));
-    assert!(run.took(&execution.id, "check_learning_feedback", "no_feedback", "finalize"));
+    assert!(run.took(
+        &execution.id,
+        "check_learning_feedback",
+        "no_feedback",
+        "finalize"
+    ));
     assert!(run.took(&execution.id, "finalize", "merged", "finished"));
     assert_eq!(
         execution.context.variables.get("pr_url"),
@@ -813,10 +828,22 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates_and_mer
         "the display reads the pull request from the context"
     );
     // The documents the agents returned are named in the later prompts.
-    assert!(run.prompt(17).contains(PR_URL), "finalize names the pull request");
-    assert!(run.prompt(2).contains(REQUIREMENTS_DOC), "doc_review names the requirements");
-    assert!(run.prompt(5).contains(REQUIREMENTS_DOC), "plan names the requirements");
-    assert!(run.prompt(6).contains(PLAN_DOC), "plan_review names the plan");
+    assert!(
+        run.prompt(17).contains(PR_URL),
+        "finalize names the pull request"
+    );
+    assert!(
+        run.prompt(2).contains(REQUIREMENTS_DOC),
+        "doc_review names the requirements"
+    );
+    assert!(
+        run.prompt(5).contains(REQUIREMENTS_DOC),
+        "plan names the requirements"
+    );
+    assert!(
+        run.prompt(6).contains(PLAN_DOC),
+        "plan_review names the plan"
+    );
     assert!(run.prompt(9).contains(PLAN_DOC), "work names the plan");
 }
 
@@ -883,8 +910,16 @@ async fn blockers_reach_the_author_of_the_stage_and_do_not_come_back() {
         .await;
 
     assert!(run.took(&execution.id, "work", "needs_plan_revision", "plan"));
-    assert!(run.took(&execution.id, "plan", "needs_requirements_revision", "brainstorm"));
-    assert!(run.prompt(10).contains(plan_blocker), "plan reads the blocker of work");
+    assert!(run.took(
+        &execution.id,
+        "plan",
+        "needs_requirements_revision",
+        "brainstorm"
+    ));
+    assert!(
+        run.prompt(10).contains(plan_blocker),
+        "plan reads the blocker of work"
+    );
     assert!(
         run.prompt(11).contains(requirements_blocker),
         "brainstorm reads the blocker of plan"
@@ -922,13 +957,21 @@ async fn revise_requirements_at_the_plan_gate_resumes_the_brainstorm_session() {
         )
         .await;
 
-    assert!(run.took(&execution.id, "approve_plan", "revise_requirements", "brainstorm"));
+    assert!(run.took(
+        &execution.id,
+        "approve_plan",
+        "revise_requirements",
+        "brainstorm"
+    ));
     let resumed = run.prompt(8);
     assert!(
         resumed.contains("--resume\n--%ARG%--\nfake-session-1\n"),
         "brainstorm continues its own session: {resumed}"
     );
-    assert!(resumed.contains(comment), "the comment is the message: {resumed}");
+    assert!(
+        resumed.contains(comment),
+        "the comment is the message: {resumed}"
+    );
 }
 
 /// The agent may skip the requirements review: the document goes straight to
@@ -948,10 +991,21 @@ async fn a_skipped_requirements_review_goes_straight_to_publication() {
 
     let execution = run.run(&requirements_gates()).await;
 
-    assert!(run.took(&execution.id, "brainstorm", "requirements_ready", "publish_requirements"));
-    assert!(run.took(&execution.id, "publish_requirements", "published", "approve_requirements"));
+    assert!(run.took(
+        &execution.id,
+        "brainstorm",
+        "requirements_ready",
+        "publish_requirements"
+    ));
+    assert!(run.took(
+        &execution.id,
+        "publish_requirements",
+        "published",
+        "approve_requirements"
+    ));
     assert!(
-        run.prompt(2).contains("Przegląd pominięto: zmiana jednej etykiety"),
+        run.prompt(2)
+            .contains("Przegląd pominięto: zmiana jednej etykiety"),
         "the publish step reads the reason for the skipped review"
     );
 }
@@ -966,7 +1020,10 @@ async fn dropping_the_learning_removes_it_and_goes_on_to_finalize() {
     let run = CompoundRun::new(&replies);
     let gates = [
         gates_up_to_compound(),
-        vec![Answer::new("approve_learning", &[("learning_decision", "drop")])],
+        vec![Answer::new(
+            "approve_learning",
+            &[("learning_decision", "drop")],
+        )],
     ]
     .concat();
 
@@ -1002,7 +1059,8 @@ async fn covers_ae4_a_failed_pipeline_goes_to_repair_with_the_reason() {
 
     assert!(run.took(&execution.id, "finalize", "pipeline_failed", "repair_merge"));
     assert!(
-        run.prompt(16).contains("the pipeline of the pull request ended failed"),
+        run.prompt(16)
+            .contains("the pipeline of the pull request ended failed"),
         "repair_merge reads why finalize stopped: {}",
         run.prompt(16)
     );
@@ -1023,7 +1081,10 @@ async fn a_conflict_goes_to_repair() {
 /// reason `finalize` gave.
 #[tokio::test]
 async fn covers_ae3_a_blocked_finalize_stops_at_the_gate_with_its_reason() {
-    let blocked = reply_with("blocked", json!({ "reason": "gh is not installed where the step runs" }));
+    let blocked = reply_with(
+        "blocked",
+        json!({ "reason": "gh is not installed where the step runs" }),
+    );
     let replies = [replies_up_to_finalize(), vec![blocked]].concat();
     let run = CompoundRun::new(&replies);
 
@@ -1079,7 +1140,12 @@ async fn covers_ae5_a_finalize_stopped_by_its_time_limit_is_disarmed_by_its_own_
     let execution = run.run(&gates_up_to_compound()).await;
 
     assert!(run.took(&execution.id, "finalize", "timeout", "disarm_merge"));
-    assert!(run.took(&execution.id, "disarm_merge", "disarmed", "finalize_blocked"));
+    assert!(run.took(
+        &execution.id,
+        "disarm_merge",
+        "disarmed",
+        "finalize_blocked"
+    ));
     assert_eq!(run.pending(&execution.id).state_id, "finalize_blocked");
 }
 
@@ -1125,7 +1191,10 @@ fn the_finalize_prompt_carries_every_guarantee_and_names_both_tools() {
         "gh pr merge <url> --auto",
         "glab mr merge <n> --auto-merge",
     ] {
-        assert!(prompt.contains(needle), "the finalize prompt lacks `{needle}`");
+        assert!(
+            prompt.contains(needle),
+            "the finalize prompt lacks `{needle}`"
+        );
     }
 }
 
@@ -1142,7 +1211,10 @@ fn the_disarm_prompt_cancels_auto_merge_restores_the_draft_and_reads_again() {
         "gh pr merge <url> --disable-auto",
         "cancel_merge_when_pipeline_succeeds",
     ] {
-        assert!(prompt.contains(needle), "the disarm prompt lacks `{needle}`");
+        assert!(
+            prompt.contains(needle),
+            "the disarm prompt lacks `{needle}`"
+        );
     }
 }
 
@@ -1193,7 +1265,10 @@ fn covers_r10_the_other_prompts_do_not_assume_gitlab() {
     let Some(ActionConfig::Agent(repair)) = &definition.states["repair_merge"].action else {
         panic!("repair_merge is an agent step");
     };
-    assert!(repair.prompt.contains("gh pr checks"), "repair_merge names the GitHub tool too");
+    assert!(
+        repair.prompt.contains("gh pr checks"),
+        "repair_merge names the GitHub tool too"
+    );
 }
 
 /// The engine does not apply input defaults, so the wait limit lives in the
@@ -1201,7 +1276,10 @@ fn covers_r10_the_other_prompts_do_not_assume_gitlab() {
 #[test]
 fn finalize_needs_no_input_of_its_own() {
     let definition = shipped("compound-engineering.yaml");
-    assert!(definition.inputs.iter().all(|input| input.name != "finalize_wait_minutes"));
+    assert!(definition
+        .inputs
+        .iter()
+        .all(|input| input.name != "finalize_wait_minutes"));
     for id in ["finalize", "disarm_merge"] {
         let prompt = built_prompt(&definition.states[id]);
         assert!(!prompt.contains("inputs."), "'{id}' reads an input");
@@ -1250,13 +1328,25 @@ const COMPOUND_EDGES: [(&str, &str, &str); 63] = [
     ("brainstorm", "requirements_ready", "publish_requirements"),
     ("doc_review", "reviewed", "publish_requirements"),
     ("publish_requirements", "published", "approve_requirements"),
-    ("approve_requirements", "approve", "check_requirements_feedback"),
+    (
+        "approve_requirements",
+        "approve",
+        "check_requirements_feedback",
+    ),
     ("approve_requirements", "revise", "brainstorm"),
     ("approve_requirements", "abandon", "cancelled"),
     ("check_requirements_feedback", "no_feedback", "plan"),
-    ("check_requirements_feedback", "fixed_minor", "publish_requirements"),
+    (
+        "check_requirements_feedback",
+        "fixed_minor",
+        "publish_requirements",
+    ),
     ("check_requirements_feedback", "fixed_major", "doc_review"),
-    ("check_requirements_feedback", "needs_human", "approve_requirements"),
+    (
+        "check_requirements_feedback",
+        "needs_human",
+        "approve_requirements",
+    ),
     ("plan", "plan_ready", "plan_review"),
     ("plan", "needs_requirements_revision", "brainstorm"),
     ("plan_review", "reviewed", "publish_plan"),
@@ -1348,7 +1438,10 @@ async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates(
         &[
             reply("routed", json!({ "brief": null })), // discover
             reply("ready", json!({ "ready_status": "READY", "gaps": [] })), // intake
-            reply("actionable", json!({ "evidence": "empty list renders blank" })), // triage
+            reply(
+                "actionable",
+                json!({ "evidence": "empty list renders blank" }),
+            ), // triage
             reply("claimed", json!({ "claimed_by": "narsor" })), // claim
             json!({
                 "choice": "user_facing",
@@ -1365,7 +1458,10 @@ async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates(
             reply("updated", json!({ "threads_addressed": 1 })), // address_feedback
             reply("approved", json!({ "findings": 0, "blockers": 0 })), // code_review again
             reply("needs_qa", json!({ "qa_label": "needs-qa" })), // qa_routing
-            reply("evidence_ready", json!({ "scenarios": 7, "qa_head": "deadbeef" })), // qa_run
+            reply(
+                "evidence_ready",
+                json!({ "scenarios": 7, "qa_head": "deadbeef" }),
+            ), // qa_run
             reply("mergeable", json!({ "blockers": [] })), // premerge_check
             reply("merged", json!({ "merge_commit": "c0ffee" })), // merge_pr
             reply("reconciled", json!({ "closed": 1, "follow_ups": 0 })), // housekeeping

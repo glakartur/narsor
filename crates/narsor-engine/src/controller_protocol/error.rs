@@ -108,6 +108,7 @@ impl From<OrchestrationError> for ProtocolError {
             | E::OperatorCommandKeyReused { .. } => {
                 Self::conflict("idempotency_key_reused", message)
             }
+            E::ResumeMessagePending { .. } => Self::conflict("comment_pending", message),
             E::StaleGeneration { .. } => Self::conflict("stale_generation", message),
             E::IllegalCommand { .. } => Self::conflict("illegal_command", message),
             E::IllegalObservation { .. } => Self::conflict("illegal_observation", message),

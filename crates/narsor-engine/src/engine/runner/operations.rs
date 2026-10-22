@@ -236,6 +236,71 @@ impl Engine {
         Ok(execution)
     }
 
+    /// Gives the agent what the owner said while the task was paused, for
+    /// the work that goes on from here: into the session the current state
+    /// last completed when there is one — the agent answers there — and as
+    /// the operator's note for the state's next attempt when there is not.
+    ///
+    /// Taken while no pass drives the execution, and not while it waits on
+    /// input: that one needs an answer. The key goes into the same save as
+    /// the comment, so a key left once is left once: a second call with it
+    /// changes nothing, whatever happened to the caller in between.
+    pub fn leave_resume_message(
+        &self,
+        execution_id: &str,
+        key: &str,
+        text: &str,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let _guard = self.begin_run(execution_id)?;
+        let mut execution = self.store.load_execution(execution_id)?;
+        if !matches!(
+            execution.status,
+            ExecutionStatus::Running | ExecutionStatus::Paused
+        ) {
+            return Err(self.not_runnable(&execution, "commented on"));
+        }
+        if engine_metadata_mut(&mut execution)
+            .get(METADATA_RESUME_MESSAGE_KEY)
+            .and_then(Value::as_str)
+            == Some(key)
+        {
+            return Ok(execution);
+        }
+        engine_metadata_mut(&mut execution).insert(
+            METADATA_RESUME_MESSAGE_KEY.to_string(),
+            Value::String(key.to_string()),
+        );
+        let session = match execution.current_state.clone() {
+            Some(state_id) => {
+                let sessions: BTreeMap<String, AgentSessionProvenance> =
+                    read_engine_record(&execution, METADATA_AGENT_SESSIONS_KEY)?
+                        .unwrap_or_default();
+                sessions
+                    .get(&state_id)
+                    .map(|session| (state_id, session.clone()))
+            }
+            None => None,
+        };
+        match session {
+            Some((state_id, session)) => self.store_agent_input(
+                &mut execution,
+                &state_id,
+                text,
+                Some(session.harness.as_str()),
+                Some(session.session_id.as_str()),
+                Vec::new(),
+            )?,
+            None => {
+                engine_metadata_mut(&mut execution).insert(
+                    METADATA_OPERATOR_RECOVERY_NOTE_KEY.to_string(),
+                    Value::String(text.to_string()),
+                );
+                self.store.save_execution(&execution)?;
+            }
+        }
+        Ok(execution)
+    }
+
     /// Settles an execution whose pass an operator cut short (U3): what the
     /// pass left in flight becomes the unknown outcome ordinary recovery
     /// knows ([`crate::persistence::reconcile`] — `Unknown`, recoverable by

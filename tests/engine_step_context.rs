@@ -714,7 +714,10 @@ async fn an_undeclared_variable_goes_to_additional_data_not_the_context() {
     let harness = Harness::new();
     let (_engine, agent, execution) = run_required(
         &harness,
-        vec![AgentTurn::with_variables("clean", json!({ "extra": "kept aside" }))],
+        vec![AgentTurn::with_variables(
+            "clean",
+            json!({ "extra": "kept aside" }),
+        )],
     )
     .await;
 
@@ -1281,7 +1284,10 @@ async fn the_fourth_entry_lists_the_three_earlier_choices() {
     let fourth = &prompts[3];
     assert!(fourth.starts_with(PLAN_PROMPT), "{fourth}");
     assert!(fourth.contains(HISTORY_HEADING), "{fourth}");
-    assert!(fourth.contains("This is entry 4 into this step."), "{fourth}");
+    assert!(
+        fourth.contains("This is entry 4 into this step."),
+        "{fourth}"
+    );
     for reason in ["no API named", "no users named", "no limits named"] {
         let line = format!("- needs_requirements_revision — {reason}\n");
         assert!(fourth.contains(&line), "{line:?} in {fourth}");
@@ -1308,9 +1314,21 @@ async fn a_local_note_survives_until_it_is_replaced() {
 
     assert_eq!(execution.status, ExecutionStatus::Completed);
     let prompts = plan_prompts(&agent);
-    assert!(prompts[1].starts_with("Plan. Memory: [A]."), "{}", prompts[1]);
-    assert!(prompts[2].starts_with("Plan. Memory: [A]."), "{}", prompts[2]);
-    assert!(prompts[3].starts_with("Plan. Memory: [B]."), "{}", prompts[3]);
+    assert!(
+        prompts[1].starts_with("Plan. Memory: [A]."),
+        "{}",
+        prompts[1]
+    );
+    assert!(
+        prompts[2].starts_with("Plan. Memory: [A]."),
+        "{}",
+        prompts[2]
+    );
+    assert!(
+        prompts[3].starts_with("Plan. Memory: [B]."),
+        "{}",
+        prompts[3]
+    );
     assert_eq!(
         execution.metadata["engine"]["step_locals"]["plan"],
         json!({ "local.memory": "B" })
@@ -1398,13 +1416,19 @@ async fn a_failed_attempt_is_shown_with_its_error_type() {
 
     assert_eq!(execution.status, ExecutionStatus::Completed);
     let prompts = plan_prompts(&agent);
-    assert_eq!(prompts[1], PLAN_PROMPT, "the recovery is the first entry still");
+    assert_eq!(
+        prompts[1], PLAN_PROMPT,
+        "the recovery is the first entry still"
+    );
     let second_entry = &prompts[2];
     assert!(
         second_entry.contains("This is entry 2 into this step."),
         "{second_entry}"
     );
-    assert!(second_entry.contains("- error: timeout\n"), "{second_entry}");
+    assert!(
+        second_entry.contains("- error: timeout\n"),
+        "{second_entry}"
+    );
     assert!(
         second_entry.contains("- needs_requirements_revision — no API named"),
         "{second_entry}"
@@ -1441,7 +1465,11 @@ async fn an_answered_question_is_not_an_entry_and_gets_no_history() {
     assert_eq!(execution.status, ExecutionStatus::Completed);
     let calls = agent.calls();
     assert_eq!(calls[3].resume_session.as_deref(), Some("agent-session"));
-    assert!(!calls[3].prompt.contains(HISTORY_HEADING), "{}", calls[3].prompt);
+    assert!(
+        !calls[3].prompt.contains(HISTORY_HEADING),
+        "{}",
+        calls[3].prompt
+    );
     let last = plan_prompts(&agent).pop().expect("a last plan prompt");
     assert!(last.contains("This is entry 3 into this step."), "{last}");
 }
@@ -1534,14 +1562,21 @@ async fn the_history_is_cleaned_and_bounded() {
     let last = plan_prompts(&agent).pop().expect("a last plan prompt");
     let block = &last[last.find(HISTORY_HEADING).expect("a history block")..];
     assert!(block.len() <= 4 * 1024, "{} bytes", block.len());
-    assert!(block.contains("This is entry 16 into this step."), "{block}");
+    assert!(
+        block.contains("This is entry 16 into this step."),
+        "{block}"
+    );
     let reasons: Vec<&str> = block
         .lines()
         .filter_map(|line| line.strip_prefix("- needs_requirements_revision — "))
         .collect();
     assert!(!reasons.is_empty(), "{block}");
     for shown in reasons {
-        assert!(shown.chars().count() <= 300, "{} chars", shown.chars().count());
+        assert!(
+            shown.chars().count() <= 300,
+            "{} chars",
+            shown.chars().count()
+        );
         assert!(shown.starts_with("[31mredline"), "{shown}");
         assert!(!shown.chars().any(char::is_control), "{shown:?}");
     }

@@ -48,9 +48,17 @@ pub fn task(id: &str, backend: &str, runner_state: &str, rank: u32) -> TaskSumma
     .map(|mut task: TaskSummary| {
         task.holds_slot = held_by(&task);
         task.state = served_state(&task);
-        task
+        offered(task)
     })
     .expect("a task summary")
+}
+
+/// `task` with the actions the server would offer for what it shows now:
+/// the client reads them, it does not work them out. Built again by every
+/// builder below that changes what the offer depends on.
+pub fn offered(mut task: TaskSummary) -> TaskSummary {
+    task.actions = Some(narsor_engine::controller_protocol::task_actions(&task));
+    task
 }
 
 /// What the control plane says of a slot: compute is held in every state
@@ -81,7 +89,7 @@ pub fn served_state(task: &TaskSummary) -> TaskState {
 /// after the work ended: the state stays, the slot goes.
 pub fn without_slot(mut task: TaskSummary) -> TaskSummary {
     task.holds_slot = false;
-    task
+    offered(task)
 }
 
 pub fn queued(id: &str, rank: u32) -> TaskSummary {
@@ -90,14 +98,14 @@ pub fn queued(id: &str, rank: u32) -> TaskSummary {
 
 pub fn titled(mut task: TaskSummary, title: &str) -> TaskSummary {
     task.display.title = title.to_string();
-    task
+    offered(task)
 }
 
 /// The runner reports `status`, in the workflow state `step`.
 pub fn with_runner(mut task: TaskSummary, status: ExecutionStatus, step: &str) -> TaskSummary {
     task.runner = Some(runner(status, step));
     task.state = served_state(&task);
-    task
+    offered(task)
 }
 
 pub fn runner(status: ExecutionStatus, step: &str) -> RunnerView {
@@ -132,7 +140,7 @@ pub fn with_controller(mut task: TaskSummary) -> TaskSummary {
         }))
         .expect("a controller"),
     );
-    task
+    offered(task)
 }
 
 pub fn waiting(mut task: TaskSummary, kind: AttentionKind) -> TaskSummary {
@@ -142,7 +150,7 @@ pub fn waiting(mut task: TaskSummary, kind: AttentionKind) -> TaskSummary {
         since: at(),
         waiting_id: format!("{kind:?}-{}", task.task_id),
     });
-    task
+    offered(task)
 }
 
 pub fn queue_view(reason: QueueReason) -> QueueView {
@@ -164,7 +172,7 @@ pub fn waiting_for_capacity(
         running,
         limit,
     }));
-    task
+    offered(task)
 }
 
 pub fn listing(tasks: Vec<TaskSummary>, cursor: &str) -> TaskListResponse {
@@ -214,7 +222,7 @@ pub fn displayed(
             url: url.map(str::to_string),
         })
         .collect();
-    task
+    offered(task)
 }
 
 /// An attempt `"<state> #1"` of an agent action with `status`, and no
@@ -298,7 +306,7 @@ pub fn with_pending(mut task: TaskSummary, form: serde_json::Value) -> TaskSumma
         waiting_id: id,
     });
     task.state = served_state(&task);
-    task
+    offered(task)
 }
 
 /// The task waits on `kind` with the identity `waiting_id`.
@@ -314,7 +322,7 @@ pub fn waiting_on(
         since: at(),
         waiting_id: waiting_id.to_string(),
     });
-    task
+    offered(task)
 }
 
 /// The state `task`'s runner is in offers `exits` — `(label, target,
@@ -345,7 +353,7 @@ pub fn with_transitions(
             .map(|target| (*target).to_string())
             .collect(),
     });
-    task
+    offered(task)
 }
 
 /// The runner of `task` reports a conductor that works.
@@ -354,7 +362,7 @@ pub fn with_conductor(mut task: TaskSummary) -> TaskSummary {
         runner.conductor_available = true;
         runner.conductor_unavailable_reason = None;
     }
-    task
+    offered(task)
 }
 
 /// The runner of `task` reports that it has no conductor, and why.
@@ -363,7 +371,7 @@ pub fn without_conductor(mut task: TaskSummary, reason: &str) -> TaskSummary {
         runner.conductor_available = false;
         runner.conductor_unavailable_reason = Some(reason.to_string());
     }
-    task
+    offered(task)
 }
 
 /// The runner of `task` reports that it cannot switch to the default
@@ -382,7 +390,7 @@ pub fn with_harness_unavailable(
                 reason: reason.to_string(),
             });
     }
-    task
+    offered(task)
 }
 
 /// One chat entry of a conductor, as the runner would serve it.
@@ -527,7 +535,7 @@ pub fn archived(id: &str, title: &str, hours: i64) -> TaskSummary {
         completed_at: Some(requested_at),
         resources_never_created: false,
     });
-    task
+    offered(task)
 }
 
 /// An execution from before the task scheduler, started `hours` hours after
@@ -594,7 +602,7 @@ pub fn interrupted(id: &str, from: RunnerState, losses: u32, planned: bool) -> T
         ..ResumeState::default()
     };
     task.state = served_state(&task);
-    task
+    offered(task)
 }
 
 /// The resume policy gave up on `task` with `reason` (the server's words).
@@ -606,7 +614,7 @@ pub fn exhausted(mut task: TaskSummary, reason: &str) -> TaskSummary {
         announced: true,
     });
     task.state = served_state(&task);
-    task
+    offered(task)
 }
 
 /// The stream's `AutoResumed` of `task` at `sequence`: attempt `attempt` of

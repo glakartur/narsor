@@ -975,7 +975,13 @@ mod tests {
             EventData::ActionCompleted { reason: None, ref additional_data, ref warnings, .. }
                 if additional_data.is_empty() && warnings.is_empty()
         ));
-        assert!(matches!(failed, EventData::ActionFailed { error_type: None, .. }));
+        assert!(matches!(
+            failed,
+            EventData::ActionFailed {
+                error_type: None,
+                ..
+            }
+        ));
     }
 
     #[test]

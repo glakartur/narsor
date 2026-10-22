@@ -16,6 +16,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, watch};
 
+mod actions;
 mod auto_resume;
 mod backend_limit;
 mod conductor;
@@ -647,6 +648,14 @@ impl ProtocolService {
             ));
         }
         let command = request.command;
+        // A repeated key is answered with the receipt it got, not judged anew.
+        let is_retry = record
+            .commands
+            .iter()
+            .any(|receipt| receipt.idempotency_key == request.idempotency_key);
+        if !is_retry {
+            self.require_owner_command_available(&record, command, request.expected_generation)?;
+        }
         let outcome = self.control.command_with_capacity_from(
             &record.task_id,
             CommandRequest {
@@ -727,6 +736,7 @@ impl ProtocolService {
             MoveTaskTarget::Top => MoveTarget::Top,
             MoveTaskTarget::Bottom => MoveTarget::Bottom,
         };
+        self.require_movable(&record, request.expected_generation)?;
         let (_, changed) =
             self.control
                 .move_task(&record.task_id, &target, request.expected_generation)?;
@@ -912,6 +922,13 @@ impl ProtocolService {
                 "an input needs an idempotency key",
             ));
         }
+        let is_retry = record
+            .inputs
+            .iter()
+            .any(|queued| queued.idempotency_key == request.idempotency_key);
+        if !is_retry {
+            self.require_input_available(&record, &request)?;
+        }
         let outcome = self.control.queue_input(
             &record.task_id,
             InputRequest {
@@ -943,7 +960,11 @@ impl ProtocolService {
     /// (running, or already resumed or queued) needs nothing. Called for a
     /// retry too: a first call that stored the work and failed before the
     /// resume is repaired by it.
-    fn resume_for_work(&self, record: &TaskRecord, work_key: &str) -> ProtocolResult<()> {
+    pub(super) fn resume_for_work(
+        &self,
+        record: &TaskRecord,
+        work_key: &str,
+    ) -> ProtocolResult<()> {
         let current = self.control.task(&record.task_id)?;
         if current.runner_state != RunnerState::Stopped {
             return Ok(());
@@ -1006,6 +1027,9 @@ impl ProtocolService {
             .any(|queued| queued.idempotency_key == request.idempotency_key);
         if !is_retry {
             self.check_operator_command(&record, &request.command)?;
+            if let Some(action) = operator_action(&request.command) {
+                self.require_available(&record, action, request.expected_generation)?;
+            }
         }
         let outcome = self.control.queue_operator_command(
             &record.task_id,
@@ -1740,6 +1764,13 @@ impl ProtocolService {
         let pending = query.pending_input_id.as_deref();
         let defer_materials = query.defer_materials;
         let reader = identity.role == RunnerRole::Reader;
+        // The runner that gave the comment on the pause to its agent says
+        // so; only then is the record rid of it.
+        if let (false, Some(key)) = (reader, query.resume_message_taken.as_deref()) {
+            if self.control.take_resume_message(&identity.task_id, key)? {
+                self.notify(&identity.task_id);
+            }
+        }
         let poll = || -> ProtocolResult<RunnerPollResponse> {
             // A reader is handed nothing it would have to act on:
             // delivering an answer or a command to it would spend them.
@@ -2016,7 +2047,7 @@ impl ProtocolService {
             }
             None => None,
         };
-        Ok(TaskSummary {
+        let mut summary = TaskSummary {
             task_id: record.task_id.clone(),
             backend_id: record.assignment.backend_id.clone(),
             runner_state: record.runner_state,
@@ -2052,9 +2083,28 @@ impl ProtocolService {
             queue: record.queue.as_ref().map(QueueView::from),
             display: task_display(record),
             manual_transitions: manual_transitions(record),
+            actions: None,
             resume: record.resume.clone(),
             as_of: now,
-        })
+        };
+        // Last: the offer reads the rest of the summary.
+        let mut actions = actions::offer(&summary);
+        // One comment waits on a pause at a time: another is refused until a
+        // runner takes it (`comment_pending`), so the offer does not promise it.
+        if record.resume_message.is_some() {
+            if let Some(comment) = actions
+                .iter_mut()
+                .find(|offer| offer.id == TaskActionId::Comment)
+            {
+                comment.available = false;
+                comment.options = Vec::new();
+                comment.effect = None;
+                comment.reason =
+                    Some("poprzedni komentarz czeka na wznowienie zadania".to_string());
+            }
+        }
+        summary.actions = Some(actions);
+        Ok(summary)
     }
 
     /// Live only while the task expects a runner, the runner's launch is
@@ -2241,6 +2291,23 @@ async fn harness_changed(
 /// Most characters of one chat message to the conductor: the text is kept
 /// in the task's event stream, which is not the place for a document.
 const MAX_CHAT_CHARS: usize = 4_000;
+
+/// The offer of actions the server puts on a task summary, for whoever builds
+/// a summary by hand (a test of a client) and wants the server's words.
+#[doc(hidden)]
+pub fn task_actions(task: &TaskSummary) -> Vec<TaskActionOffer> {
+    actions::offer(task)
+}
+
+/// The action of the offer an operator command is, if it is one of them: the
+/// conductor's commands are not.
+fn operator_action(command: &OperatorCommand) -> Option<TaskActionId> {
+    match command {
+        OperatorCommand::Interrupt => Some(TaskActionId::Interrupt),
+        OperatorCommand::Transition { .. } => Some(TaskActionId::Transition),
+        _ => None,
+    }
+}
 
 /// What can be said about a conductor command without the runner: that it
 /// names what it needs.
@@ -2480,6 +2547,10 @@ fn launch_view(identity: &RunnerIdentity, record: &TaskRecord) -> RunnerLaunchVi
         launch_generation: identity.launch_generation,
         authorized_by: receipt.map(|receipt| receipt.command),
         authorized_by_actor: receipt.map(|receipt| receipt.actor),
+        resume_message: match identity.role {
+            RunnerRole::Worker => record.resume_message.clone(),
+            RunnerRole::Reader => None,
+        },
     }
 }
 

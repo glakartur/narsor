@@ -68,8 +68,8 @@ use narsor_protocol::api::{
 };
 use narsor_protocol::controller::{
     ControlEventEnvelope, ConversationResponse as RemoteConversationResponse, MoveTaskRequest,
-    OwnerCommandResponse, SubmitInputResponse, SubmitOperatorCommandResponse, TaskEvent,
-    TaskListResponse, TaskSummary, TimelineResponse,
+    OwnerCommandResponse, SubmitCommentRequest, SubmitCommentResponse, SubmitInputResponse,
+    SubmitOperatorCommandResponse, TaskEvent, TaskListResponse, TaskSummary, TimelineResponse,
 };
 use narsor_protocol::event::{Event, EventData};
 
@@ -822,6 +822,17 @@ impl ApiClient {
             "{}/control/v1/tasks/{task_id}/operator-commands",
             self.base_url
         );
+        self.post_json(&url, request).await
+    }
+
+    /// Sends the owner's comment to a remote task; the server picks what it
+    /// does by the way the task is stopped.
+    pub async fn control_comment(
+        &self,
+        task_id: &str,
+        request: &SubmitCommentRequest,
+    ) -> Result<SubmitCommentResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}/comment", self.base_url);
         self.post_json(&url, request).await
     }
 

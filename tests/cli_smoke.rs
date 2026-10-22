@@ -1511,7 +1511,10 @@ fn input_resolves_a_problem_with_a_label_artifacts_and_variables() {
     // The label requires the summary.
     let refused = cli(&root, &["input", &id, "--label", "implemented"]);
     assert_eq!(refused.code, EXIT_FAILURE, "{refused:?}");
-    assert!(refused.output().contains("variables.summary"), "{refused:?}");
+    assert!(
+        refused.output().contains("variables.summary"),
+        "{refused:?}"
+    );
 
     let resolved = cli(
         &root,
@@ -1554,7 +1557,10 @@ fn input_supplies_the_artifact_a_problem_is_missing() {
 
     let refused = cli(&root, &["input", &id, "--label", "plan_ready"]);
     assert_eq!(refused.code, EXIT_FAILURE, "{refused:?}");
-    assert!(refused.output().contains("artifacts.plan_doc"), "{refused:?}");
+    assert!(
+        refused.output().contains("artifacts.plan_doc"),
+        "{refused:?}"
+    );
 
     let resolved = cli(
         &root,
@@ -2902,7 +2908,12 @@ mod remote_cli {
             "{}",
             refused.stderr
         );
-        let malformed = remote(&harness, token, &["task", "input", "t-ask", "--artifact", "n"]).await;
+        let malformed = remote(
+            &harness,
+            token,
+            &["task", "input", "t-ask", "--artifact", "n"],
+        )
+        .await;
         assert_eq!(malformed.code, EXIT_USAGE, "{}", malformed.output());
 
         let answered = remote(
