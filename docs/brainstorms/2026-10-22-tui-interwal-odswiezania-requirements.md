@@ -7,53 +7,60 @@ topic: tui-interwal-odswiezania
 
 ## Summary
 
-Prośba: TUI ma odczytywać stan wszystkich zadań rzadziej, co 10 s, a odstęp ma być ustawiany w pliku konfiguracyjnym narsora. Kod już to robi: ustawienie `tui_refresh_interval` ma wartość domyślną 10 s i działa przez plik konfiguracyjny, zmienną środowiskową i `none`. Ten dokument nie dodaje nowego zachowania. Zapisuje wynik sprawdzenia i wskazuje, co zostaje do potwierdzenia.
+Prośba: TUI ma odczytywać listę zadań rzadziej, co 10 s, a odstęp ma być ustawiany w pliku konfiguracyjnym narsora. Ustawienie `tui_refresh_interval` istnieje i ma w kodzie wartość domyślną 10 s. Użytkownik potwierdził jednak, że znacznik odczytu w panelu zadań pojawia się mniej więcej co sekundę. Te odczyty listy mają przejść pod okres `tui_refresh_interval`. Przyczyna odczytów co ok. 1 s nie jest jeszcze ustalona.
 
 ---
 
 ## Problem Frame
 
-Operator chce mniej odczytów z serwera w tle. Sprawdzenie kodu pokazuje, że wymaganie jest już spełnione:
+Operator chce mniej odczytów z serwera w tle. Sprawdzenie kodu pokazało, że ustawienie już istnieje:
 
 - `crates/narsor-shared/src/config/settings.rs`: `DEFAULT_TUI_REFRESH_SECS = 10` i klucz `TuiRefreshInterval` (`tui_refresh_interval`).
 - `crates/narsor-shared/src/config/resolve.rs`: `tui_refresh_interval()` zwraca wartość po kaskadzie konfiguracji.
 - `src/cli/commands.rs` przekazuje wartość do `crate::tui::run`. `src/tui/refresh.rs` (`RefreshSchedule`) używa jej jako okresu odczytu.
 - `README.md` opisuje ustawienie: `tui_refresh_interval: 10s`, zmienna `NARSOR_TUI_REFRESH_INTERVAL`, `none` wyłącza odczyt okresowy.
 
-Możliwe, że prośba powstała ze starszego stanu kodu, albo że chodzi o inny odczyt niż okresowy odczyt listy zadań. Tego nie da się rozstrzygnąć z kodu.
+Mimo to użytkownik widzi w panelu zadań znacznik odczytu co ok. 1 s. Znaczy to, że jakiś odczyt listy nie idzie przez `RefreshSchedule` albo wyzwala się częściej niż okres. Kandydaci do sprawdzenia przy planowaniu:
+
+- odpytywanie zakładki Conductor co 2 s, gdy czeka na odpowiedź (`src/tui/task_app/tabs/conductor.rs:80`);
+- ponowienia po błędzie: `FIRST_RETRY` 1 s i `READER_RETRY` 2 s;
+- odczyty wywołane zdarzeniami na żywo (`DEBOUNCE` 400 ms);
+- sprawdzanie strumienia co 1 s (`STREAM_RECHECK_INTERVAL`).
+
+Lista nie jest zweryfikowana. To wskazówki, nie ustalona przyczyna.
 
 ---
 
 ## Requirements
 
-- R1. TUI odczytuje stan wszystkich zadań z serwera co 10 s, gdy nic innego nie wymusza odczytu.
-- R2. Odstęp ustawia się w pliku konfiguracyjnym narsora. Kolejność źródeł i podgląd źródła są takie same jak dla innych ustawień.
+- R1. TUI odczytuje listę zadań z serwera co `tui_refresh_interval`, gdy nic innego nie wymusza odczytu. Wartość domyślna to 10 s.
+- R2. Odstęp ustawia się w pliku konfiguracyjnym narsora. Kolejność źródeł i podgląd źródła są takie same jak dla innych ustawień. Zmienna środowiskowa `NARSOR_TUI_REFRESH_INTERVAL` też działa.
 - R3. Wartość `none` wyłącza odczyt okresowy.
-- R4. Odczyty wywołane zdarzeniem na żywo (po krótkim opóźnieniu) i ponowienia po błędzie zostają bez zmian. Dotyczy tylko odczytu okresowego.
+- R4. Odczyty wywołane zdarzeniem na żywo (po krótkim opóźnieniu) i ponowienia po błędzie zostają bez zmian, o ile nie są przyczyną odczytów co ok. 1 s. Odczyt ręczny (`r`) działa jak dotąd.
+- R5. W trakcie normalnej pracy, bez błędów, TUI nie odczytuje listy zadań częściej niż co `tui_refresh_interval`. Znacznik odczytu w panelu zadań pojawia się wtedy co ten okres. Wyjątek: odczyty z R4.
 
-R1–R4 są dziś spełnione. Praca nad kodem jest potrzebna tylko wtedy, gdy któraś odpowiedź w sekcji „Pytania otwarte dla użytkownika" wskaże lukę.
+R1–R4 są spełnione w kodzie, ale R5 nie jest, według obserwacji użytkownika. Praca nad kodem polega na znalezieniu odczytu listy co ok. 1 s i podporządkowaniu go okresowi z R1.
 
 ---
 
 ## Scope Boundaries
 
-- Bez zmiany wartości domyślnej, nazwy klucza i formatu wartości.
-- Bez zmiany odstępów innych niż odczyt okresowy (opóźnienie zdarzeń, ponowienia po błędzie, ticki animacji).
+- Bez zmiany nazwy klucza i formatu wartości. Wartość domyślna zostaje 10 s.
+- Bez zmiany odstępów innych niż odczyt listy: opóźnienie zdarzeń, ponowienia po błędzie i ticki animacji zostają, chyba że okażą się przyczyną odczytów co ok. 1 s.
+- Zakres obejmuje tylko listę zadań. Odczyty szczegółów zaznaczonego zadania i rozmowy zostają bez zmian.
 - Bez nowego ustawienia dla odczytów szczegółów lub rozmowy.
 
 ---
 
 ## Założenia do potwierdzenia
 
-- Z1. „Stan wszystkich zadań" oznacza okresowy odczyt listy zadań w TUI (`RefreshSchedule`), a nie odczyty szczegółów, historii lub rozmowy.
+- Z1. „Stan wszystkich zadań" oznacza odczyt listy zadań w TUI. Szczegóły, historia i rozmowa nie wchodzą w zakres. Potwierdzone przez użytkownika.
 - Z2. Obecne ustawienie `tui_refresh_interval` jest tym ustawieniem, o które chodzi. Nowy klucz nie jest potrzebny.
-- Z3. Domyślne 10 s jest wartością docelową. Użytkownik nie oczekuje innej wartości domyślnej.
-- Z4. Odczyty wywołane zdarzeniami na żywo nie są „odczytem rzadziej" i zostają bez zmian.
+- Z3. Wartość domyślna to 10 s. Użytkownik prosi o 10 s, a kod już ją ma. Skutek zmiany to usunięcie odczytów co ok. 1 s, nie zmiana liczby w ustawieniach.
+- Z4. Odczyty wywołane zdarzeniami na żywo zostają bez zmian, o ile nie powodują odczytów co ok. 1 s.
 
 ---
 
-## Pytania otwarte dla użytkownika
+## Pytania otwarte
 
-- P1. Czy zaobserwowano w TUI odczyty częstsze niż co 10 s? Jeśli tak: w jakiej wersji i w jakim widoku? Wtedy należy sprawdzić, który odczyt je powoduje (np. zdarzenia na żywo, ponowienia po błędzie, odczyt szczegółów zaznaczonego zadania).
-- P2. Czy prośba dotyczy też odczytów szczegółów zaznaczonego zadania, a nie tylko listy?
-- P3. Czy wystarczy, że ustawienie już istnieje i jest opisane w README, czy trzeba coś dodać (np. zmienić domyślny odstęp albo opis)?
+- P1. Który odczyt powoduje znacznik co ok. 1 s w panelu zadań? Do ustalenia przy planowaniu przez sprawdzenie kandydatów z sekcji „Problem Frame".
