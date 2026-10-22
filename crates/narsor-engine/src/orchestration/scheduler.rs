@@ -24,9 +24,16 @@
 //! order (`queue_sequence`) among equal ranks, which only a crash in the
 //! middle of a renumbering can leave. The owner reorders them with
 //! [`ControlPlane::move_task`]. A reservation, once granted, is never taken
-//! back — not by a task moved ahead of it, a lowered limit or a controller
-//! going away — and nothing here ever stops a task that holds compute
-//! (R11).
+//! back — not by a task moved ahead of it or a controller going away —
+//! and nothing here ever stops a task that holds compute (R11).
+//!
+//! Two exceptions come with a limit that goes below the slots in use. A
+//! reservation over the limit is taken back at once: nothing started on it,
+//! so it costs nothing. A task that runs is asked to stop, and only at a safe
+//! point: [`ControlPlane::decide_limit_stop`] accepts exactly as many safe
+//! points as the limit is exceeded by, the first ones that arrive, and
+//! answers "continue" to the others. A stopped task goes back to the queue
+//! on its own rank.
 //!
 //! # What holds a slot
 //!
@@ -48,10 +55,11 @@
 use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, CommandEffect};
 use super::model::{
-    BackendCapacity, CapacityReservation, CommandOutcome, CommandRequest, DefaultBackendSelection,
-    MoveTarget, OwnerCommand, QueueReason, QueueStatus, RunnerState, TaskEventKind, TaskRecord,
-    DEFAULT_BACKEND_SELECTION_VERSION,
+    BackendCapacity, CapacityReservation, CommandActor, CommandOutcome, CommandRequest,
+    DefaultBackendSelection, MoveTarget, OwnerCommand, QueueReason, QueueStatus, RunnerState,
+    SlotReleaseReason, TaskEventKind, TaskRecord, DEFAULT_BACKEND_SELECTION_VERSION,
 };
+use super::resume::limit_stop_key;
 use super::{control_plane::Mutation, ControlPlane};
 use crate::domain::{BackendId, TaskId};
 
@@ -59,6 +67,9 @@ use crate::domain::{BackendId, TaskId};
 enum Verdict {
     /// Grant a reservation (or keep the one it holds).
     Admit,
+    /// Take the reservation back (the limit went below the slots in use) and
+    /// keep waiting, for this reason.
+    Revoke(QueueReason),
     /// Keep waiting, for this reason.
     Wait(QueueReason),
 }
@@ -76,20 +87,59 @@ impl ControlPlane {
         backend_id: &BackendId,
         capacity: &BackendCapacity,
     ) -> Result<Vec<TaskId>> {
+        self.schedule_with(backend_id, || capacity.clone())
+    }
+
+    /// [`Self::schedule`] reading the limit *after* the schedule lock is
+    /// taken, so a decision never uses a limit that a change made while it
+    /// waited for the lock has already replaced (R15).
+    pub fn schedule_with(
+        &self,
+        backend_id: &BackendId,
+        capacity: impl FnOnce() -> BackendCapacity,
+    ) -> Result<Vec<TaskId>> {
         let _lock = self.store().lock_schedule(backend_id)?;
+        let capacity = &capacity();
         let tasks = self.dense_backend_tasks(backend_id)?;
         let online = self.controller_online(backend_id)?;
         let mut in_use = slots_in_use(&tasks);
 
+        // Reservations over a lowered limit are taken back, those of the
+        // lowest priority first. A task that holds compute is never one.
+        let mut revoked: Vec<&TaskId> = Vec::new();
+        if let BackendCapacity::Limit(limit) = capacity {
+            let mut reserved: Vec<&TaskRecord> = tasks
+                .iter()
+                .filter(|task| {
+                    task.runner_state == RunnerState::Queued && task.reservation.is_some()
+                })
+                .collect();
+            reserved.sort_by_key(|task| std::cmp::Reverse((task.rank, task.queue_sequence)));
+            for task in reserved {
+                if in_use <= *limit {
+                    break;
+                }
+                in_use -= 1;
+                revoked.push(&task.task_id);
+            }
+        }
+
         let mut waiting: Vec<&TaskRecord> = tasks
             .iter()
-            .filter(|task| task.runner_state == RunnerState::Queued && task.reservation.is_none())
+            .filter(|task| {
+                task.runner_state == RunnerState::Queued
+                    && (task.reservation.is_none() || revoked.contains(&&task.task_id))
+            })
             .collect();
         waiting.sort_by_key(|task| (task.rank, task.queue_sequence));
 
         let mut verdicts: Vec<(TaskId, Verdict)> = tasks
             .iter()
-            .filter(|task| task.runner_state == RunnerState::Queued && task.reservation.is_some())
+            .filter(|task| {
+                task.runner_state == RunnerState::Queued
+                    && task.reservation.is_some()
+                    && !revoked.contains(&&task.task_id)
+            })
             .map(|task| (task.task_id.clone(), Verdict::Admit))
             .collect();
         let mut still_waiting = Vec::new();
@@ -117,7 +167,12 @@ impl ControlPlane {
                     limit: *limit,
                 },
             };
-            verdicts.push((task.task_id.clone(), Verdict::Wait(reason)));
+            let verdict = if revoked.contains(&&task.task_id) {
+                Verdict::Revoke(reason)
+            } else {
+                Verdict::Wait(reason)
+            };
+            verdicts.push((task.task_id.clone(), verdict));
         }
 
         let mut changed = Vec::new();
@@ -127,6 +182,78 @@ impl ControlPlane {
             }
         }
         Ok(changed)
+    }
+
+    /// What the backend's tasks hold right now, for the limit's overshoot.
+    pub fn backend_load(&self, backend_id: &BackendId) -> Result<BackendLoad> {
+        Ok(BackendLoad::of(&self.backend_tasks(backend_id)?))
+    }
+
+    /// Asks the task running at `generation` to stop at a safe point,
+    /// because the backend's limit is exceeded: a `Pause` of
+    /// [`CommandActor::Policy`], keyed [`limit_stop_key`]`(generation)`.
+    ///
+    /// Allowed only while [`TaskRecord::limit_stop_candidate`]. An owner
+    /// command that came first moves the generation or the state, so the
+    /// policy's is refused with `StaleGeneration` or `IllegalCommand`.
+    pub fn request_limit_stop(&self, task_id: &TaskId, generation: u64) -> Result<CommandOutcome> {
+        self.command(
+            task_id,
+            CommandRequest::new(OwnerCommand::Pause, limit_stop_key(generation))
+                .expecting_generation(generation)
+                .issued_by(CommandActor::Policy),
+        )
+    }
+
+    /// Decides what happens to the task whose runner reports a safe point
+    /// while it waits for a pause a lowered limit asked for.
+    ///
+    /// Under the backend's schedule lock, with the limit read after it is
+    /// taken: the stops accepted so far and not yet carried out count
+    /// against the overshoot, so two reports at once never stop two tasks
+    /// for an overshoot of one. With an overshoot left the safe point is
+    /// accepted ([`TaskRecord::limit_stop_accepted`]) and the runner is told
+    /// to stop. Otherwise — the overshoot went, the limit is unknown, or the
+    /// owner has work for the runner — the pause is taken back: the task is
+    /// `Running` again and the runner is told to continue. Any other task,
+    /// and a repeated report, is left as it is.
+    pub fn decide_limit_stop(
+        &self,
+        task_id: &TaskId,
+        capacity: impl FnOnce() -> BackendCapacity,
+    ) -> Result<LimitStopDecision> {
+        let backend_id = self.task(task_id)?.assignment.backend_id;
+        let _lock = self.store().lock_schedule(&backend_id)?;
+        let capacity = capacity();
+        let load = BackendLoad::of(&self.backend_tasks(&backend_id)?);
+        let (_, decision) = self.mutate(task_id, |record, _now| {
+            if !record.pause_requested_by_limit() {
+                return Ok(Mutation::Unchanged(LimitStopDecision::NotApplicable));
+            }
+            if record.limit_stop_accepted {
+                return Ok(Mutation::Unchanged(LimitStopDecision::Accepted));
+            }
+            let overshoot = match &capacity {
+                BackendCapacity::Limit(limit) => load.overshoot(*limit),
+                BackendCapacity::Unavailable(_) => 0,
+            };
+            if overshoot > 0 && !record.owner_work_pending() {
+                record.limit_stop_accepted = true;
+                return Ok(Mutation::Changed(
+                    TaskEventKind::SlotReleased {
+                        reason: SlotReleaseReason::LimitLowered,
+                    },
+                    LimitStopDecision::Accepted,
+                ));
+            }
+            record.generation += 1;
+            record.runner_state = RunnerState::Running;
+            Ok(Mutation::Changed(
+                TaskEventKind::LimitStopWithdrawn,
+                LimitStopDecision::Withdrawn,
+            ))
+        })?;
+        Ok(decision)
     }
 
     /// Slots of `backend_id` in use right now (see
@@ -167,6 +294,17 @@ impl ControlPlane {
         request: CommandRequest,
         capacity: &BackendCapacity,
     ) -> Result<CommandOutcome> {
+        self.command_with_capacity_from(task_id, request, || capacity.clone())
+    }
+
+    /// [`Self::command_with_capacity`] reading the limit after the schedule
+    /// lock is taken, like [`Self::schedule_with`].
+    pub fn command_with_capacity_from(
+        &self,
+        task_id: &TaskId,
+        request: CommandRequest,
+        capacity: impl FnOnce() -> BackendCapacity,
+    ) -> Result<CommandOutcome> {
         let backend_id = self.task(task_id)?.assignment.backend_id;
         let _lock = self.store().lock_schedule(&backend_id)?;
         let record = self.task(task_id)?;
@@ -184,7 +322,7 @@ impl ControlPlane {
             );
         let mut queue_resume = false;
         if takes_slot {
-            match capacity {
+            match &capacity() {
                 BackendCapacity::Unavailable(detail) => {
                     return Err(OrchestrationError::BackendUnavailable {
                         backend_id,
@@ -421,7 +559,16 @@ impl ControlPlane {
                 return Ok(Mutation::Unchanged(false));
             }
             let mut granted = false;
+            let mut revoked = false;
             let reason = match verdict {
+                // A controller may already hold the `Start` this reservation
+                // offered. Its `StartAccepted` is then refused (`NotAdmitted`),
+                // and nothing is lost: the protocol has it create no resource
+                // before that report is accepted.
+                Verdict::Revoke(reason) => {
+                    revoked = record.reservation.take().is_some();
+                    reason
+                }
                 Verdict::Admit => {
                     if record.reservation.is_none() {
                         record.reservation = Some(CapacityReservation { granted_at: now });
@@ -435,7 +582,10 @@ impl ControlPlane {
                 Verdict::Wait(_) if record.reservation.is_some() => QueueReason::Admitted,
                 Verdict::Wait(reason) => reason,
             };
-            if !granted && record.queue.as_ref().map(|status| &status.reason) == Some(&reason) {
+            if !granted
+                && !revoked
+                && record.queue.as_ref().map(|status| &status.reason) == Some(&reason)
+            {
                 return Ok(Mutation::Unchanged(false));
             }
             record.queue = Some(QueueStatus {
@@ -493,6 +643,56 @@ fn reordered<'a>(
     };
     rest.insert(index, task_id);
     Ok(rest)
+}
+
+/// The outcome of [`ControlPlane::decide_limit_stop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitStopDecision {
+    /// The task's pause is not one a lowered limit asked for.
+    NotApplicable,
+    /// The safe point is accepted: the runner stops, the task goes back to
+    /// the queue.
+    Accepted,
+    /// The pause was taken back: the runner continues.
+    Withdrawn,
+}
+
+/// What the tasks of a backend hold, as the limit's overshoot reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackendLoad {
+    /// Slots held by compute that exists or may exist. A reservation that
+    /// nothing started on is not counted: the schedule takes it back.
+    pub compute: u32,
+    /// Safe points already accepted whose compute is not removed yet.
+    pub stopping: u32,
+    /// Tasks that wait for a pause a lowered limit asked for, safe point not
+    /// yet decided.
+    pub stop_requested: u32,
+}
+
+impl BackendLoad {
+    fn of(tasks: &[TaskRecord]) -> Self {
+        let count = |keep: &dyn Fn(&TaskRecord) -> bool| {
+            u32::try_from(tasks.iter().filter(|task| keep(task)).count()).unwrap_or(u32::MAX)
+        };
+        Self {
+            compute: count(&|task| task.holds_compute_slot()),
+            stopping: count(&|task| {
+                task.limit_stop_accepted && task.runner_state == RunnerState::PauseRequested
+            }),
+            stop_requested: count(&|task| {
+                task.pause_requested_by_limit() && !task.limit_stop_accepted
+            }),
+        }
+    }
+
+    /// Tasks that still have to stop for `limit`: the slots held, less the
+    /// limit and the stops already accepted.
+    pub fn overshoot(&self, limit: u32) -> u32 {
+        self.compute
+            .saturating_sub(limit)
+            .saturating_sub(self.stopping)
+    }
 }
 
 fn slots_in_use(tasks: &[TaskRecord]) -> u32 {

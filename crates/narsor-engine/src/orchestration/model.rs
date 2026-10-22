@@ -324,6 +324,12 @@ pub struct TaskRecord {
     /// record so a restart of the daemon neither loses nor shortens it.
     #[serde(default)]
     pub slot_release_due_at: Option<DateTime<Utc>>,
+    /// The control plane accepted the safe point of this task's pause for a
+    /// lowered limit: the task goes back to the queue once its compute is
+    /// gone. Set under the backend's schedule lock, so the accepted stops
+    /// never exceed the overshoot.
+    #[serde(default)]
+    pub limit_stop_accepted: bool,
     /// The control plane's want of a read-only runner for the stopped task
     /// (D63): set by a read of its details, moved later by the next one,
     /// removed when it ran out and by any command that resumes or archives
@@ -458,6 +464,33 @@ impl TaskRecord {
                     && receipt.generation_after == self.generation
                     && receipt.actor == CommandActor::Policy
             })
+    }
+
+    /// Whether the pause the task now waits to complete is the one a lowered
+    /// limit of concurrent tasks asked for.
+    pub fn pause_requested_by_limit(&self) -> bool {
+        self.runner_state == RunnerState::PauseRequested
+            && self.commands.iter().rev().any(|receipt| {
+                receipt.command == OwnerCommand::Pause
+                    && receipt.generation_after == self.generation
+                    && receipt.actor == CommandActor::Policy
+                    && receipt
+                        .idempotency_key
+                        .starts_with(super::resume::LIMIT_STOP_KEY_PREFIX)
+            })
+    }
+
+    /// Whether a lowered limit may ask the task to stop now: it runs and
+    /// nothing of the owner's waits for the runner. `Interrupted` and
+    /// `Unknown` are not asked, until the control plane knows their state.
+    pub fn limit_stop_candidate(&self) -> bool {
+        self.runner_state == RunnerState::Running && !self.owner_work_pending()
+    }
+
+    /// Whether the task holds a slot with compute that exists or may exist,
+    /// as opposed to a reservation that nothing started on yet.
+    pub fn holds_compute_slot(&self) -> bool {
+        self.holds_capacity() && self.runner_state != RunnerState::Queued
     }
 
     /// The receipt of the start or resume that produced `launch_generation`

@@ -126,6 +126,12 @@ where
             "/control/v1/default-backend",
             get(get_default_backend).put(put_default_backend),
         )
+        .route(
+            "/control/v1/backends/{backend_id}/limit",
+            get(get_backend_limit)
+                .put(put_backend_limit)
+                .delete(delete_backend_limit),
+        )
         .route("/control/v1/tasks/{task_id}/timeline", get(get_timeline))
         .route(
             "/control/v1/tasks/{task_id}/execution-events",
@@ -405,6 +411,31 @@ async fn put_default_backend(
     Json(request): Json<SetDefaultBackendRequest>,
 ) -> ProtocolResult<Json<DefaultBackendView>> {
     Ok(Json(service.set_default_backend(request)?))
+}
+
+async fn get_backend_limit(
+    State(service): State<Service>,
+    Extension(_owner): Extension<OwnerRef>,
+    Path(backend_id): Path<String>,
+) -> ProtocolResult<Json<BackendLimitView>> {
+    Ok(Json(service.backend_limit_view(&backend_id)?))
+}
+
+async fn put_backend_limit(
+    State(service): State<Service>,
+    Extension(_owner): Extension<OwnerRef>,
+    Path(backend_id): Path<String>,
+    Json(request): Json<SetBackendLimitRequest>,
+) -> ProtocolResult<Json<BackendLimitView>> {
+    Ok(Json(service.set_backend_limit(&backend_id, request.limit)?))
+}
+
+async fn delete_backend_limit(
+    State(service): State<Service>,
+    Extension(_owner): Extension<OwnerRef>,
+    Path(backend_id): Path<String>,
+) -> ProtocolResult<Json<BackendLimitView>> {
+    Ok(Json(service.clear_backend_limit(&backend_id)?))
 }
 
 async fn get_timeline(

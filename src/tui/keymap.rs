@@ -316,6 +316,8 @@ pub enum Action {
     /// Choose the installation's default agent harness (the header says
     /// which one is in force).
     ChooseHarness,
+    /// Change the limit of concurrent tasks of the selected task's backend.
+    ChooseLimit,
     /// Send a task again that did not get through (the new-task form).
     RetrySend,
     /// Recover an old execution of the history.
@@ -460,6 +462,10 @@ pub const fn bind(
 const CHOOSE_HARNESS: &str =
     "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji";
 
+/// What `L` does, in every context that has it.
+const CHOOSE_LIMIT: &str =
+    "limit zadań równoległych backendu zaznaczonego zadania: o 1 więcej, o 1 mniej albo wartość z pliku";
+
 /// The key map.
 pub static BINDINGS: &[Binding] = &[
     // Everywhere a context inherits them.
@@ -589,6 +595,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::ChooseHarness,
         "harness",
         CHOOSE_HARNESS,
+    ),
+    bind(
+        Context::List,
+        Key::char('L'),
+        Action::ChooseLimit,
+        "limit",
+        CHOOSE_LIMIT,
     ),
     bind(
         Context::List,
@@ -795,6 +808,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::ChooseHarness,
         "",
         CHOOSE_HARNESS,
+    ),
+    bind(
+        Context::Details,
+        Key::char('L'),
+        Action::ChooseLimit,
+        "",
+        CHOOSE_LIMIT,
     ),
     // The "waiting for you" panel, focus on its actions. Focus in a field
     // types text; the chooser handles those keys.

@@ -17,6 +17,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, watch};
 
 mod auto_resume;
+mod backend_limit;
 mod conductor;
 mod conversation;
 mod events;
@@ -288,6 +289,7 @@ pub struct ProtocolService {
     event_reads: Mutex<EventsRelay>,
     conductor_reads: Mutex<ConductorRelay>,
     materials: MaterialStore,
+    limit_overrides: backend_limit::LimitOverrides,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -335,6 +337,7 @@ impl ProtocolService {
             pages: Mutex::new(PageRelay::default()),
             event_reads: Mutex::new(EventsRelay::default()),
             conductor_reads: Mutex::new(ConductorRelay::default()),
+            limit_overrides: Mutex::default(),
         }
     }
 
@@ -643,9 +646,8 @@ impl ProtocolService {
                 format!("idempotency keys starting with `{prefix}` are reserved for {purpose}"),
             ));
         }
-        let capacity = self.capacity(&record.assignment.backend_id);
         let command = request.command;
-        let outcome = self.control.command_with_capacity(
+        let outcome = self.control.command_with_capacity_from(
             &record.task_id,
             CommandRequest {
                 command,
@@ -653,7 +655,7 @@ impl ProtocolService {
                 expected_generation: request.expected_generation,
                 actor: CommandActor::Owner,
             },
-            &capacity,
+            || self.capacity(&record.assignment.backend_id),
         )?;
         if command == crate::orchestration::OwnerCommand::Archive {
             // Archive removes the task's materials too (U9) — also on a
@@ -806,8 +808,11 @@ impl ProtocolService {
     /// here must not fail that request: it is logged, and the next trigger
     /// (or the daemon's periodic pass) decides again.
     pub fn reschedule(&self, backend_id: &BackendId) {
-        let capacity = self.capacity(backend_id);
-        match self.control.schedule(backend_id, &capacity) {
+        // Read under the schedule lock: a limit changed meanwhile applies.
+        match self
+            .control
+            .schedule_with(backend_id, || self.capacity(backend_id))
+        {
             Ok(changed) => {
                 for task_id in changed {
                     self.notify(&task_id);
@@ -819,12 +824,10 @@ impl ProtocolService {
         }
     }
 
-    /// The backend's capacity per configuration, read fresh.
+    /// The backend's capacity: the ad hoc limit or the configured one, read
+    /// fresh (see [`Self::effective_capacity`]).
     fn capacity(&self, backend_id: &BackendId) -> BackendCapacity {
-        match self.launch.backend_limit(backend_id) {
-            Ok(limit) => BackendCapacity::Limit(limit),
-            Err(error) => BackendCapacity::Unavailable(error.to_string()),
-        }
+        self.effective_capacity(backend_id)
     }
 
     /// The owner's task, re-read and summarized.
@@ -945,8 +948,7 @@ impl ProtocolService {
         if current.runner_state != RunnerState::Stopped {
             return Ok(());
         }
-        let capacity = self.capacity(&current.assignment.backend_id);
-        let outcome = self.control.command_with_capacity(
+        let outcome = self.control.command_with_capacity_from(
             &current.task_id,
             CommandRequest {
                 command: crate::orchestration::OwnerCommand::Resume,
@@ -954,7 +956,7 @@ impl ProtocolService {
                 expected_generation: None,
                 actor: CommandActor::Owner,
             },
-            &capacity,
+            || self.capacity(&current.assignment.backend_id),
         );
         match outcome {
             Ok(outcome) => {
@@ -1677,9 +1679,24 @@ impl ProtocolService {
         let snapshot = super::wire::runner_snapshot_from_request(snapshot).map_err(|error| {
             ProtocolError::bad_request("invalid_runner_snapshot", error.to_string())
         })?;
+        let current = self.control.task(&identity.task_id)?;
         let grace = self
-            .slot_release_timings(&self.control.task(&identity.task_id)?.assignment.backend_id)
+            .slot_release_timings(&current.assignment.backend_id)
             .grace;
+        // A runner at a safe point that a lowered limit asked for: the
+        // control plane decides first whether the stop is still wanted, so
+        // the acknowledgement below never lets compute go for nothing.
+        if snapshot.safe_point
+            && current.pause_requested_by_limit()
+            && !current.supersedes_launch(identity.launch_generation)
+        {
+            let decision = self.control.decide_limit_stop(&identity.task_id, || {
+                self.capacity(&current.assignment.backend_id)
+            })?;
+            if decision != crate::orchestration::scheduler::LimitStopDecision::NotApplicable {
+                self.notify(&identity.task_id);
+            }
+        }
         let outcome = self.control.record_runner_snapshot_with(
             &identity.task_id,
             &identity.incarnation,

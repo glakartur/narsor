@@ -14,9 +14,10 @@ use serde::Serialize;
 
 use crate::api::{ClientError, HarnessSelectionSnapshot};
 use crate::controller_protocol::{
-    ConversationResponse, ConversationUnavailableReason, DefaultBackendView, ExecutionEventsSource,
-    Freshness, OwnerCommandResponse, QueueView, TaskSummary, TimelineResponse,
-    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
+    BackendLimitSource, BackendLimitView, ConversationResponse, ConversationUnavailableReason,
+    DefaultBackendView, ExecutionEventsSource, Freshness, OwnerCommandResponse, QueueView,
+    TaskSummary, TimelineResponse, CONVERSATION_RECORD_UNREADABLE,
+    CONVERSATION_RECORD_UNREADABLE_PREFIX,
 };
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
 use crate::tui::task_app::list::{attention_of, Attention};
@@ -895,7 +896,14 @@ pub fn event_line(event: &TaskEvent) -> String {
             "the slot is freed at {} unless the task gets work before",
             due_at.format("%H:%M:%S")
         ),
+        TaskEventKind::LimitStopWithdrawn => {
+            "the stop for a lowered limit is withdrawn: the task goes on".to_string()
+        }
         TaskEventKind::SlotReleased { reason } => match reason {
+            SlotReleaseReason::LimitLowered => {
+                "slot freed: the limit of concurrent tasks was lowered; the runner is asked to stop, and the task goes back to the queue"
+                    .to_string()
+            }
             SlotReleaseReason::Terminal => {
                 "slot freed: the task's work ended; the runner is asked to stop".to_string()
             }
@@ -1029,6 +1037,29 @@ pub fn command_name(command: OwnerCommand) -> &'static str {
         OwnerCommand::Resume => "resume",
         OwnerCommand::Archive => "archive",
     }
+}
+
+/// The lines `narsor backend limit` prints: the control plane's numbers as
+/// they are, in a fixed order.
+pub fn backend_limit_lines(view: &BackendLimitView) -> Vec<String> {
+    let source = match view.source {
+        BackendLimitSource::File => "file",
+        BackendLimitSource::AdHoc => "ad hoc, until the control plane restarts",
+        BackendLimitSource::Unrecognized => "unknown",
+    };
+    vec![
+        format!("Backend: {}", view.backend_id),
+        format!("Limit: {} ({source})", view.effective),
+        format!("File: {}", view.file_value),
+        format!(
+            "Ad hoc: {}",
+            view.override_value
+                .map_or("-".to_string(), |value| value.to_string())
+        ),
+        format!("Slots held: {}", view.slots_held),
+        format!("Over the limit: {}", view.overshoot),
+        format!("Waiting to stop: {}", view.waiting_to_stop),
+    ]
 }
 
 /// The default-backend line of the header.

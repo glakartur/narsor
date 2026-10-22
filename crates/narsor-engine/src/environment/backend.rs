@@ -35,9 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{BackendId, ResourceProfile, SecretDelivery, SecretReference};
 
-/// Most concurrent tasks a backend record may declare. A sanity bound, not a
-/// scheduling policy: Narsor targets a handful of parallel tasks (R6).
-pub const MAX_CONCURRENT_TASKS_LIMIT: u32 = 1024;
+pub use narsor_protocol::controller::MAX_CONCURRENT_TASKS_LIMIT;
 
 /// Default wait before the control plane frees the slot of a task that waits
 /// in a transient state (`slot_release_grace_secs`).
@@ -50,6 +48,17 @@ pub const DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS: u64 = 180;
 pub const DEFAULT_SLOT_READER_IDLE_SECS: u64 = 120;
 /// Longest period a slot-release setting may have: one day.
 pub const MAX_SLOT_PERIOD_SECS: u64 = 86_400;
+
+/// Checks a limit of concurrent tasks, whether the backend file or the
+/// operator states it. The error names what is wrong, to follow a field name.
+pub fn validate_concurrent_tasks(value: u32) -> Result<(), String> {
+    if value == 0 || value > MAX_CONCURRENT_TASKS_LIMIT {
+        return Err(format!(
+            "must be between 1 and {MAX_CONCURRENT_TASKS_LIMIT}, not {value}"
+        ));
+    }
+    Ok(())
+}
 
 pub use narsor_controller_runtime::backend::{BackendCapabilities, BackendKind};
 
@@ -259,14 +268,8 @@ impl BackendRecord {
         }
 
         let limits = &self.limits;
-        if limits.max_concurrent_tasks == 0
-            || limits.max_concurrent_tasks > MAX_CONCURRENT_TASKS_LIMIT
-        {
-            problems.push(format!(
-                "limits.max_concurrent_tasks must be between 1 and {MAX_CONCURRENT_TASKS_LIMIT}, \
-                 not {}",
-                limits.max_concurrent_tasks
-            ));
+        if let Err(problem) = validate_concurrent_tasks(limits.max_concurrent_tasks) {
+            problems.push(format!("limits.max_concurrent_tasks {problem}"));
         }
         for (name, secs) in [
             ("slot_release_grace_secs", limits.slot_release_grace_secs),

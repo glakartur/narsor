@@ -195,6 +195,7 @@ impl ControlPlane {
             workload_epoch: None,
             resume: ResumeState::default(),
             slot_release_due_at: None,
+            limit_stop_accepted: false,
             reader_lease: None,
             last_event: TaskEvent {
                 sequence: 1,
@@ -282,7 +283,13 @@ impl ControlPlane {
             }
             let policy_may_act = match request.command {
                 OwnerCommand::Resume => record.auto_resume_due(now),
-                OwnerCommand::Pause => record.slot_release_due(now),
+                OwnerCommand::Pause => {
+                    record.slot_release_due(now)
+                        || (request
+                            .idempotency_key
+                            .starts_with(super::resume::LIMIT_STOP_KEY_PREFIX)
+                            && record.limit_stop_candidate())
+                }
                 _ => false,
             };
             if request.actor == CommandActor::Policy && !policy_may_act {
@@ -297,6 +304,16 @@ impl ControlPlane {
                     command: request.command,
                     idempotency_key: request.idempotency_key.clone(),
                 },
+                // A lowered limit asks the task to stop: planned now, decided
+                // at the safe point (see `decide_limit_stop`).
+                CommandActor::Policy
+                    if request.command == OwnerCommand::Pause
+                        && request
+                            .idempotency_key
+                            .starts_with(super::resume::LIMIT_STOP_KEY_PREFIX) =>
+                {
+                    TaskEventKind::SlotReleaseScheduled { due_at: now }
+                }
                 CommandActor::Policy if request.command == OwnerCommand::Pause => {
                     TaskEventKind::SlotReleased {
                         reason: record
@@ -349,6 +366,11 @@ impl ControlPlane {
                     };
                     record.generation += 1;
                     record.runner_state = next;
+                    // The accepted safe point belongs to the pause it was
+                    // accepted for; any other way out of it ends it.
+                    if next != RunnerState::PauseRequested {
+                        record.limit_stop_accepted = false;
+                    }
                     // A new desired state ends whatever the last snapshot
                     // made the policy wait for.
                     record.slot_release_due_at = None;
@@ -734,7 +756,35 @@ impl ControlPlane {
                         return Err(OrchestrationError::NotAdmitted(record.task_id.clone()));
                     }
                     let previous = record.runner_state;
+                    // The safe point a lowered limit asked for: the compute
+                    // is gone, and the task goes back to the queue on its
+                    // own rank, with no reservation, as the resume that
+                    // starts it again.
+                    let next = if next == RunnerState::Stopped && record.limit_stop_accepted {
+                        record.limit_stop_accepted = false;
+                        record.slot_release_due_at = None;
+                        record.reservation = None;
+                        record.queue = None;
+                        record.generation += 1;
+                        record.commands.push(CommandReceipt {
+                            idempotency_key: super::resume::limit_requeue_key(record.generation),
+                            command: OwnerCommand::Resume,
+                            expected_generation: None,
+                            accepted_at: now,
+                            generation_after: record.generation,
+                            runner_state_after: RunnerState::Queued,
+                            revision: record.revision + 1,
+                            actor: CommandActor::Policy,
+                        });
+                        self.order_launch(record)?;
+                        RunnerState::Queued
+                    } else {
+                        next
+                    };
                     record.runner_state = next;
+                    if next != RunnerState::PauseRequested {
+                        record.limit_stop_accepted = false;
+                    }
                     match report.observation {
                         Observation::StartAccepted => record.resources_may_exist = true,
                         Observation::RunnerReady => record.running_since = Some(now),

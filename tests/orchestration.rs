@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
+use narsor_engine::orchestration::scheduler::{BackendLoad, LimitStopDecision};
 use narsor_engine::orchestration::{
     exhaustion_loss, loss_state, BackendCapacity, BackendLease, Clock, CommandActor,
     CommandRequest, ControlPlane, ControllerReport, LossState, MoveTarget, NewTask, Observation,
@@ -1318,10 +1319,24 @@ fn at_capacity_rank_orders_the_waiting_and_a_move_reorders_them_without_preempti
         })
     );
 
-    // Lowering the limit again takes no reservation back.
+    // Lowering the limit again takes the reservation back: nothing started
+    // on it, and the task keeps its place in the queue.
     fx.control.schedule(&k8s(), &limit(1)).unwrap();
-    assert_eq!(reason(&fx, "third"), Some(QueueReason::Admitted));
-    assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 2);
+    assert_eq!(
+        reason(&fx, "third"),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1,
+        })
+    );
+    assert!(fx
+        .control
+        .task(&task("third"))
+        .unwrap()
+        .reservation
+        .is_none());
+    assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 1);
     assert!(matches!(
         report_now(&fx, "first", &lease, Observation::StartAccepted),
         Err(OrchestrationError::NotAdmitted(_))
@@ -1477,6 +1492,42 @@ fn concurrent_creation_and_admission_never_exceed_the_limit() {
         .collect();
     assert_eq!(admitted.len(), 3, "{admitted:?}");
     assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 3);
+}
+
+#[test]
+fn a_schedule_racing_a_lowered_limit_leaves_the_slots_within_the_new_limit() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let fx = Fixture::new();
+    fx.lease("k8s", "controller-a");
+    for index in 0..10 {
+        fx.create(&format!("task-{index}"));
+    }
+    let current = AtomicU32::new(5);
+    std::thread::scope(|scope| {
+        for _ in 0..6 {
+            let control = fx.reopen();
+            let current = &current;
+            scope.spawn(move || {
+                control
+                    .schedule_with(&k8s(), || limit(current.load(Ordering::SeqCst)))
+                    .expect("schedule");
+            });
+        }
+        let control = fx.reopen();
+        let current = &current;
+        scope.spawn(move || {
+            current.store(2, Ordering::SeqCst);
+            control
+                .schedule_with(&k8s(), || limit(current.load(Ordering::SeqCst)))
+                .expect("schedule");
+        });
+    });
+    assert_eq!(
+        fx.control.capacity_in_use(&k8s()).unwrap(),
+        2,
+        "no task is admitted above the lowered limit"
+    );
 }
 
 #[test]
@@ -4787,4 +4838,138 @@ fn the_reader_events_decode_in_an_older_reader_as_unrecognized() {
     let ended: TaskEventKind =
         serde_json::from_value(serde_json::json!({ "type": "reader_lease_ended" })).expect("ended");
     assert_eq!(ended, TaskEventKind::ReaderLeaseEnded);
+}
+
+// ---------------------------------------------------------------------------
+// Safe points a lowered limit asked for
+// ---------------------------------------------------------------------------
+
+/// Two tasks that run under a limit of two slots, both asked to stop at a
+/// safe point because the limit was lowered.
+fn two_running_asked_to_stop(fx: &Fixture, lease: &BackendLease) {
+    for id in ["a", "b"] {
+        fx.create(id);
+    }
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    for id in ["a", "b"] {
+        report_now(fx, id, lease, Observation::StartAccepted).unwrap();
+        report_now(fx, id, lease, Observation::RunnerReady).unwrap();
+    }
+    for id in ["a", "b"] {
+        let generation = fx.control.task(&task(id)).unwrap().generation;
+        fx.control
+            .request_limit_stop(&task(id), generation)
+            .unwrap();
+    }
+}
+
+fn decide(fx: &Fixture, id: &str, capacity: BackendCapacity) -> LimitStopDecision {
+    fx.control
+        .decide_limit_stop(&task(id), || capacity)
+        .unwrap()
+}
+
+#[test]
+fn the_overshoot_is_the_slots_held_less_the_limit_and_the_stops_accepted() {
+    let load = |compute, stopping| BackendLoad {
+        compute,
+        stopping,
+        stop_requested: 0,
+    };
+    assert_eq!(load(3, 0).overshoot(1), 2);
+    assert_eq!(load(3, 1).overshoot(1), 1);
+    assert_eq!(load(3, 2).overshoot(1), 0);
+    assert_eq!(load(3, 0).overshoot(5), 0);
+    assert_eq!(load(0, 0).overshoot(0), 0);
+}
+
+#[test]
+fn a_lowered_limit_accepts_only_as_many_safe_points_as_it_is_exceeded_by() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    two_running_asked_to_stop(&fx, &lease);
+
+    assert_eq!(decide(&fx, "a", limit(1)), LimitStopDecision::Accepted);
+    assert_eq!(
+        decide(&fx, "b", limit(1)),
+        LimitStopDecision::Withdrawn,
+        "the accepted stop already covers the overshoot of one"
+    );
+    // A repeated report is left as it is.
+    assert_eq!(decide(&fx, "a", limit(1)), LimitStopDecision::Accepted);
+    let withdrawn = fx.control.task(&task("b")).unwrap();
+    assert_eq!(withdrawn.runner_state, RunnerState::Running);
+    assert!(!withdrawn.limit_stop_accepted);
+    assert!(fx.control.task(&task("a")).unwrap().limit_stop_accepted);
+}
+
+#[test]
+fn an_unknown_limit_withdraws_the_safe_point_instead_of_stopping_the_task() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    two_running_asked_to_stop(&fx, &lease);
+
+    let unavailable = BackendCapacity::Unavailable("backend file is unreadable".to_string());
+    assert_eq!(decide(&fx, "a", unavailable), LimitStopDecision::Withdrawn);
+    assert_eq!(
+        fx.control.task(&task("a")).unwrap().runner_state,
+        RunnerState::Running
+    );
+}
+
+#[test]
+fn a_task_that_is_not_waiting_for_a_limit_stop_is_not_decided() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    run_in_single_slot(&fx, "a", &lease);
+    assert_eq!(decide(&fx, "a", limit(0)), LimitStopDecision::NotApplicable);
+}
+
+#[test]
+fn two_safe_points_decided_at_once_stop_one_task_for_an_overshoot_of_one() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    two_running_asked_to_stop(&fx, &lease);
+
+    let decisions: Vec<LimitStopDecision> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                let control = fx.reopen();
+                scope.spawn(move || {
+                    control
+                        .decide_limit_stop(&task(id), || limit(1))
+                        .expect("decide")
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let accepted = decisions
+        .iter()
+        .filter(|decision| **decision == LimitStopDecision::Accepted)
+        .count();
+    assert_eq!(accepted, 1, "{decisions:?}");
+}
+
+#[test]
+fn an_accepted_safe_point_ends_when_the_task_leaves_the_pause_another_way() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    two_running_asked_to_stop(&fx, &lease);
+    assert_eq!(decide(&fx, "a", limit(1)), LimitStopDecision::Accepted);
+
+    // The workload is lost before the safe point is carried out.
+    let record = report_now(
+        &fx,
+        "a",
+        &lease,
+        Observation::WorkloadLost { state_known: true },
+    )
+    .unwrap();
+    assert_ne!(record.runner_state, RunnerState::PauseRequested);
+    assert!(
+        !record.limit_stop_accepted,
+        "the accepted stop must not outlive its pause"
+    );
 }
