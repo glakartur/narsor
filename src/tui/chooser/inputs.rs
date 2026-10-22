@@ -42,7 +42,7 @@ pub(super) fn render(
     };
     // The description wraps in its frame, whole, up to a third of the area.
     let summary = strip_summary(item);
-    let text_width = usize::from(area.width).saturating_sub(if footer { 2 } else { 2 });
+    let text_width = usize::from(area.width).saturating_sub(2);
     let mut summary_rows = wrap(&summary, None, text_width).rows;
     let cap = (usize::from(area.height) / 3).max(1);
     if summary_rows.len() > cap {

@@ -11,7 +11,7 @@
 //!   1 approved                ↩ wraca do agenta: plan
 //! | 2 | revise                Zakres wymaga poprawy…
 //! Komentarz dla agenta (wymagane):
-//! > Uwzględnij migrację tabeli orders▏
+//! > Uwzględnij migrację tabeli orders
 //! ```
 //!
 //! # What the panel is made of

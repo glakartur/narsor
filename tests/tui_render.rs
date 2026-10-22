@@ -4728,6 +4728,141 @@ mod task_app_create_render {
         }
     }
 
+    /// The form over one workflow with a long description and a prompt, the
+    /// keys on its first field.
+    fn open_described_form(app: &mut TaskApp, description: &str) {
+        keys(app, "n");
+        app.open_new_task(
+            catalogue(vec![catalogue_workflow(
+                "ship",
+                description,
+                vec![
+                    workflow_input("ticket_id", ParamType::String, false, None),
+                    workflow_input("prompt", ParamType::Text, true, None),
+                ],
+            )]),
+            registry(vec![repository("narsor", "git@github.com:acme/narsor.git")]),
+        );
+        press(app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn a_long_description_wraps_whole_inside_its_frame_at_any_width() {
+        let description = "Pełny cykl wysyłki: plan, implementacja, przegląd, testy, \
+                           wydanie i opis zmian w dzienniku, aż do zamknięcia zgłoszenia.";
+        for width in [60u16, 64, 100, 130] {
+            let mut app = app();
+            open_described_form(&mut app, description);
+            let screen = draw_app(&mut app, width, 34, false);
+            // The text is cut at the frame, not at words, so compare the
+            // frame's rows joined, without the spaces the cut may fall on.
+            let lines: Vec<Vec<char>> = screen.lines().map(|row| row.chars().collect()).collect();
+            let top = lines
+                .iter()
+                .position(|row| row.iter().collect::<String>().contains("╭ ship"))
+                .expect("the strip");
+            let left = lines[top].iter().position(|&c| c == '╭').unwrap();
+            let left = lines[top]
+                .iter()
+                .enumerate()
+                .skip(left)
+                .find(|(i, _)| lines[top][*i..].iter().take(6).collect::<String>() == "╭ ship")
+                .map(|(i, _)| i)
+                .unwrap();
+            let right = lines[top].iter().rposition(|&c| c == '╮').unwrap();
+            let inside: String = lines[top + 1..]
+                .iter()
+                .take_while(|row| row.get(left) != Some(&'╰'))
+                .map(|row| row[left + 1..right].iter().collect::<String>())
+                .collect();
+            let squashed = |text: &str| {
+                text.chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            };
+            assert_eq!(
+                squashed(&inside),
+                squashed(description),
+                "{width}:\n{screen}"
+            );
+            for row in screen.lines() {
+                assert!(row.chars().count() <= usize::from(width), "{width}: {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_confirmation_window_is_drawn_even_in_a_terminal_too_small_for_the_form() {
+        let mut app = app();
+        open_described_form(&mut app, "Wysyła zmianę.");
+        keys(&mut app, "NAR-1");
+        for _ in 0..2 {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        keys(&mut app, "tekst");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.form_confirming());
+        assert_eq!(app.key_context().base, Context::FormConfirm);
+        for (width, height) in [(120, 34), (60, 20), (40, 10)] {
+            let screen = draw_app(&mut app, width, height, false);
+            assert!(
+                screen.contains("Zatwierdzić formularz?"),
+                "{width}x{height}\n{screen}"
+            );
+        }
+        // The bar offers the window's keys and no others.
+        let screen = draw_app(&mut app, 120, 34, false);
+        let bar = screen.lines().last().unwrap();
+        assert!(
+            bar.contains("Enter wyślij") && bar.contains("Esc wróć"),
+            "{bar}"
+        );
+        assert!(!bar.contains("wyjście"), "no global keys in the bar: {bar}");
+        // `q` and `?` are not commands while the window is open, and not text.
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(app.form_confirming());
+        assert!(!app.is_help_open());
+        assert!(!app.should_quit());
+        let screen = draw_app(&mut app, 120, 34, false);
+        assert!(!screen.contains("Wyjść z TUI?"), "{screen}");
+        // A paste does not reach the field behind it.
+        app.on_paste("wklejone");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.form_confirming());
+        let screen = draw_app(&mut app, 120, 34, false);
+        assert!(
+            screen.contains("tekst") && !screen.contains("wklejone"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_field_in_edit_has_the_navy_fill_and_the_others_do_not() {
+        let mut app = app();
+        open_described_form(&mut app, "Wysyła zmianę.");
+        let buffer = draw_buffer(&mut app, 120, 34, false);
+        let fill = Styles::new(false).field_editing().bg;
+        let filled: Vec<usize> = rows(&buffer)
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| {
+                let width = usize::from(buffer.area.width);
+                buffer.content()[row * width..(row + 1) * width]
+                    .iter()
+                    .any(|cell| Some(cell.bg) == fill)
+            })
+            .map(|(row, _)| row)
+            .collect();
+        assert!(!filled.is_empty(), "the field in edit is filled");
+        // The bar shows the first field in edit; the prompt below is not.
+        let prompt_row = row_of(&buffer, "prompt (wymagane)");
+        assert!(!filled.contains(&prompt_row), "{filled:?} vs {prompt_row}");
+        // Without colour there is no fill at all.
+        let plain = draw_buffer(&mut app, 120, 34, true);
+        assert!(plain.content().iter().all(|cell| cell.bg == Color::Reset));
+    }
+
     #[test]
     fn a_long_line_of_the_prompt_wraps_and_the_cursor_stays_in_view() {
         let mut app = app();

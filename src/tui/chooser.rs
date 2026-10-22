@@ -14,7 +14,7 @@
 //! │────────────────────────│ │                                       │
 //! ╰────────────────────────╯ ╰───────────────────────────────────────╯
 //! Komentarz dla agenta (wymagany):
-//! > Uwzględnij migrację tabeli orders▏
+//! > Uwzględnij migrację tabeli orders
 //! ```
 //!
 //! Beside a wide area the description sits to the right of the list; below
@@ -36,10 +36,12 @@
 //! # Fields keep what was typed
 //!
 //! Each entry owns its fields, so moving to another action and back finds the
-//! text exactly where it was left. Editing goes through the primitives that
-//! [`super::input_form`] shares with its own fields ([`text_insert`],
-//! [`cycle_option`], …): one set of rules for the cursor, for the new line and
-//! for stepping an option, whichever surface hosts the field.
+//! text exactly where it was left. The rules of the fields — editing with
+//! `Delete`, `Home` and `End`, wrapping, the cursor as a style of its cell,
+//! moving between fields, the confirmation before a send and the events a form
+//! reports to its owner — are in [`super::form`], not here: this module puts
+//! the list, the description and a form together. A form is a list of fields
+//! and an area to draw them in.
 //!
 //! Text that comes from outside — workflow labels and descriptions, values
 //! the runner proposed — goes through [`sanitize`] before it is drawn.

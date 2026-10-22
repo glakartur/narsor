@@ -9,7 +9,7 @@
 //! │                    ││   ścieżka…             │ │                        ││
 //! │                    │╰────────────────────────╯ ╰────────────────────────╯│
 //! │                    │ ticket_id (wymagane) · numer zgłoszenia             │
-//! │                    │ > NAR-18▏                                           │
+//! │                    │ > NAR-18                                           │
 //! ```
 //!
 //! The form is a [`Chooser`]: the workflows of the catalogue are its entries
