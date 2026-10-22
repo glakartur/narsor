@@ -61,9 +61,9 @@ use thiserror::Error;
 
 use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction};
 use crate::domain::{
-    ActionConfig, ActionError, ActionExecutionId, ActionResult, AnsweredBy, Artifact,
-    ChoiceDefinition, EventData, ExecutionId, ExecutionStatus, HumanActionConfig, HumanInputField,
-    HumanInputType, InputCloseReason, OutputLabel, StateId, WorkflowExecution,
+    ActionConfig, ActionError, ActionExecutionId, ActionResult, AnsweredBy, Artifact, EventData,
+    ExecutionId, ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType,
+    InputCloseReason, ChoiceDefinition, OutputLabel, StateId, WorkflowExecution,
 };
 use crate::persistence::{ExecutionStore, PersistenceError};
 
@@ -1353,7 +1353,11 @@ fn resume_inner(
         ),
         InputContinuation::ResolveOutput => {
             let label = resolve_output(&pending, delivery, &execution)?;
-            (label, Value::Object(Map::new()), delivery.variables.clone())
+            (
+                label,
+                Value::Object(Map::new()),
+                delivery.variables.clone(),
+            )
         }
         InputContinuation::EntryLimit => {
             let decision = values
@@ -1376,7 +1380,11 @@ fn resume_inner(
                 (label.to_string(), Value::Object(Map::new()), Map::new())
             } else {
                 let label = resolve_output(&pending, delivery, &execution)?;
-                (label, Value::Object(Map::new()), delivery.variables.clone())
+                (
+                    label,
+                    Value::Object(Map::new()),
+                    delivery.variables.clone(),
+                )
             }
         }
         InputContinuation::ApproveOutput => {

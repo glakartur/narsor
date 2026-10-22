@@ -349,18 +349,12 @@ fn compound_engineering_choices_require_their_variables_and_artifacts() {
         requires("plan", "needs_requirements_revision"),
         variables(&["requirements_blocker"])
     );
-    assert_eq!(
-        requires("work", "implemented"),
-        variables(&["test_baseline"])
-    );
+    assert_eq!(requires("work", "implemented"), variables(&["test_baseline"]));
     assert_eq!(
         requires("work", "needs_plan_revision"),
         variables(&["plan_blocker"])
     );
-    assert_eq!(
-        requires("compound", "documented"),
-        artifacts(&["learning_doc"])
-    );
+    assert_eq!(requires("compound", "documented"), artifacts(&["learning_doc"]));
 }
 
 /// `brainstorm` has two ways out and never asks the person; the review result
@@ -381,9 +375,11 @@ fn brainstorm_does_not_ask_and_can_skip_the_review() {
             .any(|variable| variable.name == "review_summary"),
         "'brainstorm' defines the reason for skipping the review"
     );
-    assert!(choice(&definition, "brainstorm", "requirements_drafted")
-        .requires_variables
-        .is_empty());
+    assert!(
+        choice(&definition, "brainstorm", "requirements_drafted")
+            .requires_variables
+            .is_empty()
+    );
 
     let Some(ActionConfig::Agent(action)) = &brainstorm.action else {
         panic!("'brainstorm' is an agent step");
@@ -391,7 +387,9 @@ fn brainstorm_does_not_ask_and_can_skip_the_review() {
     assert!(!action.prompt.contains("ask the person;"));
     assert!(action.prompt.contains("Do not ask the person anything"));
     assert!(action.prompt.contains("Założenia do potwierdzenia"));
-    assert!(action.prompt.contains("Pytania otwarte dla użytkownika"));
+    assert!(action
+        .prompt
+        .contains("Pytania otwarte dla użytkownika"));
 
     for publish in ["publish_requirements", "publish_plan"] {
         let Some(ActionConfig::Agent(action)) = &definition.states[publish].action else {
@@ -430,9 +428,7 @@ fn compound_engineering_steps_that_read_a_blocker_can_clear_it() {
         let Some(ActionConfig::Agent(action)) = &definition.states[state].action else {
             panic!("'{state}' is an agent step");
         };
-        assert!(action
-            .prompt
-            .contains(&format!("{{{{ context.{blocker} }}}}")));
+        assert!(action.prompt.contains(&format!("{{{{ context.{blocker} }}}}")));
         assert!(
             definition.states[state]
                 .variables

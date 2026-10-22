@@ -683,9 +683,7 @@ fn check_syntax_and_reference_collectors_know_the_artifacts_root() {
 
     assert!(check_syntax("{{ artifacts.plan_doc }}", "f").is_ok());
     assert_eq!(
-        artifact_references(
-            "{{ artifacts.plan_doc }} {{ artifacts.review }} {{ artifacts.plan_doc }}"
-        ),
+        artifact_references("{{ artifacts.plan_doc }} {{ artifacts.review }} {{ artifacts.plan_doc }}"),
         vec!["plan_doc".to_string(), "review".to_string()]
     );
 }

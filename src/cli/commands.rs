@@ -1676,10 +1676,7 @@ fn gate_context_lines(pending: &Value) -> Vec<String> {
     if let Some(reason) = pending["reason"].as_str() {
         lines.push(format!("  Reason: {}", without_unsafe_chars(reason)));
     }
-    let required = pending["required_values"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let required = pending["required_values"].as_array().cloned().unwrap_or_default();
     if required.is_empty() {
         return lines;
     }

@@ -543,11 +543,7 @@ fn check_choice(
             "the conductor chose the output '{label}' without variables.{key}, which it requires"
         ));
     }
-    if let Some(name) = requirement
-        .artifacts
-        .iter()
-        .find(|name| !artifact_given(name))
-    {
+    if let Some(name) = requirement.artifacts.iter().find(|name| !artifact_given(name)) {
         return Err(format!(
             "the conductor chose the output '{label}' without artifacts.{name}, which it requires"
         ));

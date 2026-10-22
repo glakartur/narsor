@@ -565,13 +565,11 @@ impl<'a> TemplateScope<'a> {
     }
 
     fn declares_variable(&self, name: &str) -> bool {
-        self.declared
-            .is_some_and(|declared| declared.declares_variable(name))
+        self.declared.is_some_and(|declared| declared.declares_variable(name))
     }
 
     fn declares_artifact(&self, name: &str) -> bool {
-        self.declared
-            .is_some_and(|declared| declared.declares_artifact(name))
+        self.declared.is_some_and(|declared| declared.declares_artifact(name))
     }
 }
 

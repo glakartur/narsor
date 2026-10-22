@@ -23,11 +23,7 @@ pub(super) struct GateContext {
 impl GateContext {
     /// The context of `result`, produced in `state`. A required `local.*`
     /// the result does not give is read from `kept_locals` (KTD10).
-    pub(super) fn of(
-        state: &State,
-        result: &ActionResult,
-        kept_locals: &Map<String, Value>,
-    ) -> Self {
+    pub(super) fn of(state: &State, result: &ActionResult, kept_locals: &Map<String, Value>) -> Self {
         if !has_step_contract(state) {
             return Self::none();
         }
@@ -90,10 +86,7 @@ fn required_values(
         return Vec::new();
     };
     let variables = choice.requires_variables.iter().filter_map(|name| {
-        let value = result
-            .variables
-            .get(name)
-            .or_else(|| kept_locals.get(name))?;
+        let value = result.variables.get(name).or_else(|| kept_locals.get(name))?;
         Some(shown(name, RequiredValueKind::Variable, &text_of(value)))
     });
     let artifacts = choice.requires_artifacts.iter().filter_map(|name| {

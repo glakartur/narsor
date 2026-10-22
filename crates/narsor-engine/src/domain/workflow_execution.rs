@@ -4,8 +4,8 @@
 
 use crate::domain::{Artifact, Context, StateId, WorkflowDefinition, Workspace};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use narsor_protocol::api::ExecutionStatusDto as ExecutionStatus;

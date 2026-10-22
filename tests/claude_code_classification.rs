@@ -759,10 +759,7 @@ fn the_harness_run_is_still_accumulated() {
     }
     let run = parser.finish(0, "");
     assert_eq!(run.failure, None);
-    assert_eq!(
-        run.text,
-        r#"{"choice":"done","additional_data":{"lines":3}}"#
-    );
+    assert_eq!(run.text, r#"{"choice":"done","additional_data":{"lines":3}}"#);
     assert_eq!(run.reply.as_deref(), Some("Plik `notes.txt` ma 3 linie (`wc -l` zwróciło 3). Treść: `alpha`, `beta`, `gamma needle`."));
     assert!(run.session_id.is_some());
 

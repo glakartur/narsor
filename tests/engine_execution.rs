@@ -1614,10 +1614,7 @@ fn agent_choice(choice: &str, reason: &str, variables: Value, answer: &str) -> A
 
 /// The `reason` and `required_values` of every `HumanInputRequested`, in
 /// order.
-fn requested_gates(
-    harness: &Harness,
-    execution_id: &str,
-) -> Vec<(Option<String>, Vec<RequiredValue>)> {
+fn requested_gates(harness: &Harness, execution_id: &str) -> Vec<(Option<String>, Vec<RequiredValue>)> {
     harness
         .events(execution_id)
         .into_iter()
@@ -1679,10 +1676,7 @@ async fn a_gate_after_an_agent_shows_its_reason_and_the_required_variable() {
             "which API version is in scope?",
         )],
     );
-    assert_eq!(
-        requested_gates(&harness, &execution.id),
-        vec![expected.clone()]
-    );
+    assert_eq!(requested_gates(&harness, &execution.id), vec![expected.clone()]);
     let view = pending_view(&engine, &execution.id);
     assert_eq!((view.reason, view.required_values), expected);
     assert_eq!(view.answer_tail.as_deref(), Some("I could not plan it."));
@@ -1709,11 +1703,7 @@ async fn a_choice_without_required_values_shows_only_its_reason() {
 
     let view = pending_view(&engine, &execution.id);
     assert_eq!(view.reason.as_deref(), Some("two designs fit equally well"));
-    assert!(
-        view.required_values.is_empty(),
-        "{:?}",
-        view.required_values
-    );
+    assert!(view.required_values.is_empty(), "{:?}", view.required_values);
 }
 
 #[tokio::test]
@@ -1796,18 +1786,8 @@ async fn a_gate_reached_again_shows_the_newest_reason() {
     let engine = engine_answering(
         &harness,
         vec![
-            agent_choice(
-                "needs_human_decision",
-                "first reason",
-                json!({}),
-                "first answer",
-            ),
-            agent_choice(
-                "needs_human_decision",
-                "second reason",
-                json!({}),
-                "second answer",
-            ),
+            agent_choice("needs_human_decision", "first reason", json!({}), "first answer"),
+            agent_choice("needs_human_decision", "second reason", json!({}), "second answer"),
         ],
     );
     let definition = workflow("agent_gate");
@@ -1847,12 +1827,7 @@ async fn a_gate_after_a_script_shows_the_scripts_reason_not_the_agents() {
     let harness = Harness::new();
     let engine = engine_answering(
         &harness,
-        vec![agent_choice(
-            "done",
-            "stale reason",
-            json!({}),
-            "stale answer",
-        )],
+        vec![agent_choice("done", "stale reason", json!({}), "stale answer")],
     );
 
     let execution = engine
@@ -1874,12 +1849,7 @@ async fn a_human_decision_on_an_agent_shows_its_reason() {
     let harness = Harness::new();
     let engine = engine_answering(
         &harness,
-        vec![agent_choice(
-            "done",
-            "every test passes",
-            json!({}),
-            "the answer",
-        )],
+        vec![agent_choice("done", "every test passes", json!({}), "the answer")],
     );
 
     let execution = engine
@@ -1907,7 +1877,10 @@ async fn a_script_choosing_blocked_leads_to_a_gate_with_its_reason() {
         .await
         .expect("run up to the gate");
 
-    assert_eq!(execution.current_state.as_deref(), Some("finalize_blocked"));
+    assert_eq!(
+        execution.current_state.as_deref(),
+        Some("finalize_blocked")
+    );
     assert_eq!(
         requested_gates(&harness, &execution.id),
         vec![(
@@ -2009,15 +1982,8 @@ mod revise_comment {
         assert_eq!(execution.current_state.as_deref(), Some("review"));
         let prompts = agent.prompts();
         assert_eq!(prompts.len(), 2);
-        assert!(
-            prompts[1].contains("cover the error path"),
-            "{}",
-            prompts[1]
-        );
-        assert_eq!(
-            agent.resumed_sessions(),
-            vec![None, Some(SESSION.to_string())]
-        );
+        assert!(prompts[1].contains("cover the error path"), "{}", prompts[1]);
+        assert_eq!(agent.resumed_sessions(), vec![None, Some(SESSION.to_string())]);
     }
 
     #[tokio::test]
@@ -2222,9 +2188,7 @@ mod problems {
     }
 
     /// Runs `plan_problem` until its plan step becomes a problem.
-    async fn raise_plan_problem(
-        harness: &Harness,
-    ) -> (Engine, WorkflowDefinition, PendingHumanInput) {
+    async fn raise_plan_problem(harness: &Harness) -> (Engine, WorkflowDefinition, PendingHumanInput) {
         let engine = Engine::new(harness.store()).with_executor(
             ActionKind::Agent,
             Arc::new(LabellessAgentExecutor::answering(ANSWER)),
@@ -2274,8 +2238,9 @@ mod problems {
             .deliver_human_input(
                 &definition,
                 &execution_id,
-                &HumanInputDelivery::label("plan_ready")
-                    .with_artifacts([("plan_doc".to_string(), "docs/plan.md".to_string())].into()),
+                &HumanInputDelivery::label("plan_ready").with_artifacts(
+                    [("plan_doc".to_string(), "docs/plan.md".to_string())].into(),
+                ),
             )
             .await
             .expect("resolve with the artifact");

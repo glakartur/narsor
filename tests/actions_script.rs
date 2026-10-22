@@ -188,10 +188,7 @@ async fn a_script_names_its_artifacts_and_lists_additional_ones() {
         result.artifacts.get("pull_request").map(String::as_str),
         Some("https://example.invalid/pr/1")
     );
-    assert_eq!(
-        result.additional_artifacts,
-        vec!["logs/build.txt".to_string()]
-    );
+    assert_eq!(result.additional_artifacts, vec!["logs/build.txt".to_string()]);
 }
 
 /// A choice whose other fields have the wrong shape is an error, not a

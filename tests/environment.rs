@@ -996,9 +996,7 @@ fn a_snapshot_this_build_does_not_validate_is_refused_on_read() {
         matches!(error, LaunchDefinitionError::Invalid { .. }),
         "{error}"
     );
-    assert!(error
-        .to_string()
-        .contains("Initial state 'missing' not found"));
+    assert!(error.to_string().contains("Initial state 'missing' not found"));
 }
 
 #[test]

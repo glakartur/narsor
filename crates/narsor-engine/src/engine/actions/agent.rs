@@ -62,12 +62,12 @@ use tokio::process::Command;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use super::answer::{self, ChoiceAnswer};
 use super::harness::{
     HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
 use super::script::{truncate, MAX_BUFFERED_OUTPUT_BYTES};
+use super::answer::{self, ChoiceAnswer};
 use super::{
     ActionExecutor, ActionOutcome, ActionRequest, StepContract, SuspendedAction, TimedOutAction,
     ACTION_ID_ENV_VAR,
@@ -143,10 +143,7 @@ fn choice_list(choices: &[ChoiceDefinition]) -> String {
     }
     let mut text = "`choice` is required and must be exactly one of these labels:\n".to_string();
     for choice in choices {
-        text.push_str(&described_item(
-            &choice.label,
-            choice.description.as_deref(),
-        ));
+        text.push_str(&described_item(&choice.label, choice.description.as_deref()));
         text.push_str(&required_names("variables", &choice.requires_variables));
         text.push_str(&required_names("artifacts", &choice.requires_artifacts));
     }

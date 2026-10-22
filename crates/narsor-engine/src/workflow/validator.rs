@@ -145,11 +145,7 @@ fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
 
     for choice in &state.choices {
         for name in &choice.requires_variables {
-            if !state
-                .variables
-                .iter()
-                .any(|variable| &variable.name == name)
-            {
+            if !state.variables.iter().any(|variable| &variable.name == name) {
                 errors.push(ValidationError::UndefinedRequiredVariable {
                     state: state.id.clone(),
                     label: choice.label.clone(),
@@ -158,11 +154,7 @@ fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
             }
         }
         for name in &choice.requires_artifacts {
-            if !state
-                .artifacts
-                .iter()
-                .any(|artifact| &artifact.name == name)
-            {
+            if !state.artifacts.iter().any(|artifact| &artifact.name == name) {
                 errors.push(ValidationError::UndefinedRequiredArtifact {
                     state: state.id.clone(),
                     label: choice.label.clone(),

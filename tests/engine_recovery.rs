@@ -1368,10 +1368,7 @@ async fn a_recovered_step_keeps_its_history_and_notes() {
     assert_eq!(finished.status, ExecutionStatus::Completed);
     let prompt = &after_the_restart.prompts()[0];
     assert!(prompt.starts_with("Plan. Memory: [A]."), "{prompt}");
-    assert!(
-        prompt.contains("This is entry 2 into this step."),
-        "{prompt}"
-    );
+    assert!(prompt.contains("This is entry 2 into this step."), "{prompt}");
     assert!(
         prompt.contains("- needs_requirements_revision — no API named"),
         "{prompt}"

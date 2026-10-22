@@ -24,7 +24,7 @@
 //! where D20 (an agent that has to be told to pick again) will hook in.
 
 use crate::domain::{
-    ActionResult, ChoiceDefinition, DecisionConfig, DecisionProviderType, OutputLabel, State,
+    ActionResult, DecisionConfig, DecisionProviderType, ChoiceDefinition, OutputLabel, State,
     StateId,
 };
 
@@ -184,7 +184,7 @@ pub fn check_label<'a>(state: &'a State, label: &str) -> Result<&'a StateId, Dec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AgentDecisionConfig, ChoiceDefinition, HumanDecisionConfig};
+    use crate::domain::{AgentDecisionConfig, HumanDecisionConfig, ChoiceDefinition};
     use std::collections::HashMap;
 
     fn state_with(decision: Option<DecisionConfig>) -> State {

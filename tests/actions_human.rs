@@ -11,8 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use narsor_engine::domain::{
-    ActionConfig, ChoiceDefinition, Event, EventData, ExecutionStatus, HumanActionConfig,
-    HumanInputField, HumanInputType, WorkflowExecution, Workspace,
+    ActionConfig, Event, EventData, ExecutionStatus, HumanActionConfig, HumanInputField,
+    HumanInputType, ChoiceDefinition, WorkflowExecution, Workspace,
 };
 use narsor_engine::engine::actions::human::{
     self, HumanActionError, HumanInputRequest, PendingHumanInput, PermissionDecision,
@@ -1262,8 +1262,12 @@ fn a_problem_answer_without_a_required_key_names_the_key_and_changes_nothing() {
     let mut execution = start_execution(&store, root.path());
     raise_problem(&store, &mut execution);
 
-    let error = human::resume(&store, &execution.id, &HumanInputDelivery::label("planned"))
-        .expect_err("the plan needs its document");
+    let error = human::resume(
+        &store,
+        &execution.id,
+        &HumanInputDelivery::label("planned"),
+    )
+    .expect_err("the plan needs its document");
     assert!(
         matches!(&error, HumanActionError::MissingRequiredKey { key, .. } if key == "artifacts.plan_doc"),
         "{error:?}"
