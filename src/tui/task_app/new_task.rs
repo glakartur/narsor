@@ -179,6 +179,7 @@ impl NewTaskForm {
         let first = form.first_available();
         form.chooser = Chooser::new(form.items())
             .with_inputs_layout()
+            .confirming_submit()
             .selecting(first);
         form
     }
@@ -611,7 +612,8 @@ impl TaskApp {
 
     /// A key while the form is open: the chooser's own, then what it chose.
     pub(super) fn on_new_task_key(&mut self, key: KeyEvent) -> Request {
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        let confirming = matches!(&self.view, View::NewTask(form) if form.chooser.is_confirming());
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && !confirming {
             self.focus = Focus::List;
             return Request::None;
         }

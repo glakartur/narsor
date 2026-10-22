@@ -344,6 +344,11 @@ impl Conductor {
         self.composer.is_typing()
     }
 
+    /// Whether the text box waits for the confirmation of its send.
+    pub fn is_confirming(&self) -> bool {
+        self.composer.is_confirming()
+    }
+
     /// Puts the keys in the text box.
     pub fn begin_compose(&mut self) {
         self.composer.enter_fields();
@@ -384,14 +389,13 @@ impl Conductor {
 
 /// The text box: one entry with one required, multi-line field.
 fn new_composer(text: &str) -> Chooser {
-    Chooser::new(vec![ChooserItem::new(
+    let composer = Chooser::new(vec![ChooserItem::new(
         "Wiadomość do dyrygenta",
         "Dyrygent odpowie wpisem w czacie; jego propozycje pojawią się w panelu \
          „Czeka na Ciebie”.",
     )
-    .with_field(
-        ChooserField::multiline(MESSAGE).required().with_value(text),
-    )])
+    .with_field(ChooserField::multiline(MESSAGE).required().with_value(text))]);
+    composer.confirming_submit()
 }
 
 fn unavailable_text(reason: Option<&str>) -> String {
@@ -675,6 +679,16 @@ impl TaskApp {
                 .selected_id()
                 .and_then(|id| self.detail.view(id))
                 .is_some_and(|view| view.conductor().is_typing())
+    }
+
+    /// Whether the text box asks to confirm the send.
+    pub(in crate::tui::task_app) fn conductor_confirming(&self) -> bool {
+        self.conductor_typing()
+            && self
+                .list
+                .selected_id()
+                .and_then(|id| self.detail.view(id))
+                .is_some_and(|view| view.conductor().is_confirming())
     }
 
     /// A key typed into the text box.

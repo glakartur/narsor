@@ -1,6 +1,6 @@
 //! The state a form keeps between keys, apart from its fields: the edge
-//! press that has to come twice, the confirmation before a send, and the
-//! events the owner is told about.
+//! press that has to come twice, the confirmation before a send, the
+//! focus and the growth, and the events the owner is told about.
 //!
 //! The engine does no I/O and calls nobody back. Every call that changes
 //! something returns [`FormEvent`]s as plain data, and the owner reacts to
@@ -16,9 +16,6 @@ enum Stage {
     Editing,
     /// The popup asks whether to send; the field to return to on `Esc`.
     Confirming { return_field: usize },
-    /// The send went out; a second `Enter` is ignored until the form is
-    /// rebuilt or reset.
-    Submitted,
 }
 
 /// The state of one form.
@@ -81,25 +78,15 @@ impl FormEngine {
         }
     }
 
-    /// `Enter` in the popup: the form is sent, once.
+    /// `Enter` in the popup: the form is sent, once. The popup is closed, so
+    /// another `Enter` on a form the owner kept only asks again.
     pub fn accept(&mut self) -> bool {
         if self.is_confirming() {
-            self.stage = Stage::Submitted;
+            self.stage = Stage::Editing;
             true
         } else {
             false
         }
-    }
-
-    /// Whether the form was sent and not yet reset.
-    pub fn is_submitted(&self) -> bool {
-        self.stage == Stage::Submitted
-    }
-
-    /// Back to editing, as when the owner shows the form again.
-    pub fn reset(&mut self) {
-        self.stage = Stage::Editing;
-        self.pending_edge = None;
     }
 
     /// Gives the focus to the form or takes it away. Without it the form
@@ -161,10 +148,7 @@ mod tests {
             vec![FormEvent::ConfirmRequested]
         );
         assert!(engine.accept());
-        assert!(!engine.accept());
-        assert!(engine.is_submitted());
-        engine.reset();
-        assert!(!engine.is_submitted());
+        assert!(!engine.accept(), "the popup is closed after the send");
     }
 
     #[test]

@@ -4933,7 +4933,7 @@ mod task_app_create_render {
         open_form(&mut app);
         press(&mut app, KeyCode::Enter);
         keys(&mut app, "NAR-18");
-        let request = (0..4)
+        let request = (0..5)
             .map(|_| press(&mut app, KeyCode::Enter))
             .find(|request| *request != Request::None)
             .unwrap_or(Request::None);

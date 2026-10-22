@@ -4705,8 +4705,15 @@ mod task_app_waiting {
         )
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {
@@ -6976,8 +6983,15 @@ mod task_app_actions {
         TaskApp::new(offline_client(), "local", None)
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {
@@ -8582,8 +8596,15 @@ mod task_app_conductor {
         )
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {
@@ -9792,8 +9813,15 @@ mod task_app_create {
         app
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {
@@ -12218,8 +12246,15 @@ mod task_app_harness {
         )
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {

@@ -487,11 +487,6 @@ impl Chooser {
         self.form.is_confirming()
     }
 
-    /// Forgets that the form was sent, as when it is shown again.
-    pub fn reset_submission(&mut self) {
-        self.form.reset();
-    }
-
     /// The same chooser in the layout of a form of inputs: `Enter` on an entry
     /// with fields goes into them; there the short fields make a bar, the
     /// multi-line ones fill the screen, and `Esc` returns to the list.
@@ -536,7 +531,7 @@ impl Chooser {
     /// and help are the same whichever half has the focus.
     pub fn context(&self) -> Context {
         if self.form.is_confirming() {
-            Context::Confirm
+            Context::FormConfirm
         } else {
             Context::Panel
         }
@@ -545,11 +540,12 @@ impl Chooser {
     /// Whether keys are being typed into a field, so the owner must not
     /// treat `q` or `?` as commands.
     pub fn is_typing(&self) -> bool {
-        self.focus == ChooserFocus::Fields
-            && self
-                .selected_item()
-                .and_then(|item| item.fields.get(self.field))
-                .is_some_and(|field| !matches!(field.kind, FieldKind::Select(_)))
+        self.form.is_confirming()
+            || self.focus == ChooserFocus::Fields
+                && self
+                    .selected_item()
+                    .and_then(|item| item.fields.get(self.field))
+                    .is_some_and(|field| !matches!(field.kind, FieldKind::Select(_)))
     }
 
     /// The fields of entry `index`, with what was typed.
@@ -814,14 +810,6 @@ impl Chooser {
     }
 
     fn on_fields_key(&mut self, event: KeyEvent) -> ChooserAction {
-        if self.form.is_submitted() {
-            // A second Enter while the send is out does nothing; any other
-            // key means the owner kept the form, and it is edited again.
-            if lookup(Context::Panel, &event) == Some(Action::Submit) {
-                return ChooserAction::None;
-            }
-            self.form.reset();
-        }
         if self.inputs_layout && matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
             if event.code == KeyCode::BackTab && self.focus_order().first() == Some(&self.field) {
                 self.leave_fields();
@@ -869,7 +857,7 @@ impl Chooser {
     /// The keys of the confirmation popup, and no others: `Enter` sends,
     /// `Esc` returns to the form as it was. Anything else does nothing.
     fn on_confirm_key(&mut self, event: &KeyEvent) -> ChooserAction {
-        match lookup(Context::Confirm, event) {
+        match lookup(Context::FormConfirm, event) {
             Some(Action::Accept) if self.form.accept() => self.submission(),
             Some(Action::Cancel) => {
                 self.form.decline();
@@ -974,9 +962,6 @@ impl Chooser {
         if let Some(reason) = &item.unavailable {
             return ChooserAction::Blocked(reason.clone());
         }
-        if self.form.is_submitted() {
-            return ChooserAction::None;
-        }
         for field in &mut item.fields {
             field.error = None;
         }
@@ -990,7 +975,8 @@ impl Chooser {
             self.focus = ChooserFocus::Fields;
             return ChooserAction::None;
         }
-        if self.confirms_submit {
+        // An irreversible entry has its own window, which the owner opens.
+        if self.confirms_submit && !item.irreversible {
             self.form.ask_confirmation(self.field);
             return ChooserAction::None;
         }

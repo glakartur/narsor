@@ -63,6 +63,8 @@ pub enum Context {
     Confirm,
     /// A form is taking input: new task, repositories, a panel's fields.
     Form,
+    /// The `Enter` / `Esc` window a form shows before it sends.
+    FormConfirm,
     /// A queued task is being moved.
     Move,
     /// The history's list has the focus.
@@ -87,7 +89,7 @@ pub enum Context {
 
 impl Context {
     /// Every context, in the order help and tests walk them.
-    pub const ALL: [Context; 16] = [
+    pub const ALL: [Context; 17] = [
         Context::Global,
         Context::List,
         Context::Details,
@@ -95,6 +97,7 @@ impl Context {
         Context::Menu,
         Context::Confirm,
         Context::Form,
+        Context::FormConfirm,
         Context::Move,
         Context::History,
         Context::HistoryDetails,
@@ -116,6 +119,7 @@ impl Context {
             Self::Menu => "menu",
             Self::Confirm => "potwierdzenie",
             Self::Form => "formularz",
+            Self::FormConfirm => "potwierdzenie formularza",
             Self::Move => "przesuwanie",
             Self::History => "historia",
             Self::HistoryDetails => "historia: szczegóły",
@@ -1040,6 +1044,21 @@ pub static BINDINGS: &[Binding] = &[
         Action::Cancel,
         "",
         "nie rób nic i wróć",
+    ),
+    // The window a form shows before it sends: only these keys act.
+    bind(
+        Context::FormConfirm,
+        Key::code(KeyCode::Enter),
+        Action::Accept,
+        "wyślij",
+        "zatwierdź formularz i wyślij go",
+    ),
+    bind(
+        Context::FormConfirm,
+        Key::code(KeyCode::Esc),
+        Action::Cancel,
+        "wróć",
+        "wróć do formularza bez wysyłania; wpisane wartości zostają",
     ),
     // A form: new task, repositories.
     bind(
