@@ -7,7 +7,7 @@ topic: tui-edycja-formularzy
 
 ## Summary
 
-Wszystkie formularze TUI dostają jedną, przewidywalną zasadę edycji i nawigacji: poprawny kursor, zawijanie linii do szerokości pola, pełne klawisze edycji (`Delete`, `Home`, `End`), wyraźne tło pola w edycji, przejście między polami strzałkami na brzegu pola, `Enter` jako „dalej" oraz popup potwierdzenia przed zatwierdzeniem.
+Wszystkie formularze TUI dostają jedną, przewidywalną zasadę edycji i nawigacji: poprawny kursor, zawijanie linii do szerokości pola, pełne klawisze edycji (`Delete`, `Home`, `End`), wyraźne tło pola w edycji, przejście między polami strzałkami na brzegu pola, `Enter` jako „dalej" oraz popup potwierdzenia przed zatwierdzeniem. Reguły realizuje jeden, generyczny silnik formularza, który dostaje od aplikacji obszar na ekranie i definicję formatki, a potem przejmuje działanie w tym obszarze (R16–R21).
 
 ---
 
@@ -65,14 +65,22 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 
 **Nawigacja między polami**
 - R9. Focus początkowy w każdym formularzu jest na pierwszym polu od góry. Dotyczy to też formularzy, które dziś otwierają się na innej pozycji (np. formularz z listą wyboru).
-- R10. Strzałka w górę na pierwszej linii pola przenosi na pole wyżej. Strzałka w dół na ostatniej linii pola przenosi na pole następne. Przejście następuje dopiero przy powtórzeniu strzałki: pierwsze naciśnięcie na brzegu pola tylko ustawia kursor na początku (w górę) lub końcu (w dół) tekstu, kolejne to samo naciśnięcie przechodzi do sąsiedniego pola. Dotyczy to każdego formularza i pól wielolinijkowych, jednolinijkowych oraz wyborów.
+- R10. Strzałka w górę na pierwszej linii pola przenosi na pole wyżej. Strzałka w dół na ostatniej linii pola przenosi na pole następne. W polach tekstowych (jedno- i wielolinijkowych) przejście następuje dopiero przy powtórzeniu strzałki: pierwsze naciśnięcie na brzegu pola tylko ustawia kursor na początku (w górę) lub końcu (w dół) tekstu, drugie to samo naciśnięcie przechodzi do sąsiedniego pola. Dotyczy to każdego formularza. W polach bez kursora tekstowego (wybory, liczby) wystarcza pojedyncza strzałka. Decyzja w Z5 i Z8.
 - R11. `Enter` przechodzi do następnego pola. `Enter` na ostatnim polu zatwierdza formularz (zasada bez zmian), ale z potwierdzeniem z R12. Nowa linia w polach wielolinijkowych nadal działa przez `Ctrl+J` (i `Shift+Enter`/`Alt+Enter` tam, gdzie terminal je rozróżnia).
 
 **Potwierdzenie formularza**
-- R12. `Enter` na ostatnim polu każdego formularza otwiera popup z pytaniem o potwierdzenie zatwierdzenia. Dotyczy to formularzy, które dziś wysyłają dane: nowe zadanie, panel odpowiedzi (każdy rodzaj), formularz błędu, zakładka Dyrygent. Nie dotyczy zwykłych list wyboru bez pól tekstowych (Z4).
+- R12. `Enter` zatwierdzający formularz (na ostatnim polu) otwiera popup z pytaniem o potwierdzenie. Dotyczy to formularzy, które dziś wysyłają dane: nowe zadanie, panel odpowiedzi (każdy rodzaj, także sam wybór bez pól tekstowych), formularz błędu, zakładka Dyrygent. Potwierdzenie jest na poziomie zatwierdzenia formularza, nie przy przejściu między polami. Nie dotyczy zwykłych list wyboru, które nie wysyłają formularza (Z4).
 - R13. W popupie `Enter` zatwierdza formularz. Inne klawisze (poza `Esc`) niczego nie zatwierdzają.
 - R14. W popupie `Esc` zamyka popup i wraca do edycji na polu, które miało focus przed `Enter`. Wartości i kursor zostają.
 - R15. Popup i pasek skrótów trzymają się kontraktu klawiatury modalnych potwierdzeń (`docs/solutions/design-patterns/tui-modal-confirmation-keyboard-contract.md`): podczas popupu działają tylko jego klawisze, pasek skrótów pokazuje tylko je, popup jest widoczny także w małym terminalu.
+
+**Silnik formularza**
+- R16. Wszystkie formularze TUI używają jednego, wspólnego i generycznego silnika formularza. Formularze nie mają własnej logiki edycji, nawigacji, rysowania pól ani potwierdzenia. Zachowują się spójnie w całej aplikacji.
+- R17. Silnik dostaje na wejściu: położenie i rozmiar obszaru formularza na ekranie (współrzędne i wymiary), definicję formatki (pola, ich nazwy i typy) oraz parametry wyglądu (np. kolory) i inne potrzebne ustawienia. Silnik przejmuje obsługę klawiszy i rysowanie w tym obszarze.
+- R18. Formularz może oddać focus innemu elementowi okna aplikacji i go odzyskać. Przykład: formularz w panelu rozmowy traci focus na rzecz innego elementu widoku. Przy utraconym focusie formularz nie przechwytuje klawiszy i zachowuje wpisane wartości oraz kursor.
+- R19. Formularz może rosnąć wraz z ilością wpisanej treści, w ustalonym kierunku i do ustalonego limitu. Kierunek i limit podaje wywołujący. Przykład: formularz dodawania komentarza w oknie rozmowy rośnie do góry, do 50% wysokości widoku rozmowy. Po osiągnięciu limitu pole przewija się zamiast rosnąć.
+- R20. Silnik informuje obiekt, który go wywołał, o zmianach swojego stanu: zmiana rozmiaru, zatwierdzenie, anulowanie, zmiana focusu i podobne zdarzenia. Wywołujący nie odpytuje silnika. Dzięki temu np. widok rozmowy przelicza własny układ, gdy formularz urósł.
+- R21. R1–R15 są realizowane w silniku, a nie osobno w każdym formularzu. Nowy formularz wymaga tylko definicji formatki i obszaru.
 
 ---
 
@@ -85,6 +93,10 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 - AE5. **Covers R7.** Given formularz o szerokości 40 komórek, when pole edycji jest narysowane, then `>` stoi w kolumnie wcięcia, a tekst pola kończy się najpóźniej w komórce 39 bez znaku za polem.
 - AE6. **Covers R10.** Given kursor na pierwszej linii pola, nie na początku tekstu, when operator naciska `↑`, then kursor idzie na początek tekstu. Gdy naciśnie `↑` ponownie, focus przechodzi na pole wyżej. Symetrycznie `↓` na ostatniej linii.
 - AE7. **Covers R9.** Given dowolny formularz, when się otwiera, then focus jest na pierwszym polu od góry.
+- AE9. **Covers R10.** Given pole wyboru z focusem, when operator naciska `↓` jeden raz, then focus przechodzi na następne pole.
+- AE10. **Covers R17, R21.** Given dwa różne formularze podane silnikowi z różnymi obszarami i definicjami, when operator edytuje w obu, then oba mają te same reguły edycji, nawigacji i potwierdzenia bez osobnego kodu w formularzu.
+- AE11. **Covers R18.** Given formularz komentarza w panelu rozmowy, when focus przechodzi na inny element okna, then formularz przestaje przechwytywać klawisze i zachowuje wpisany tekst. Po powrocie focusu edycja trwa od tego samego miejsca.
+- AE12. **Covers R19, R20.** Given formularz komentarza rosnący do góry z limitem 50% wysokości widoku rozmowy, when operator wpisuje kolejne linie, then formularz rośnie do góry i zgłasza zmianę rozmiaru wywołującemu. Po osiągnięciu limitu rośnie już tylko przewijanie pola.
 - AE8. **Covers R12, R13, R14.** Given focus na ostatnim polu, when operator naciska `Enter`, then pojawia się popup. `Esc` wraca na to samo pole z zachowanym tekstem. Ponowne `Enter` na polu i `Enter` w popupie wysyła formularz raz.
 
 ---
@@ -102,15 +114,16 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 - Nie zmieniamy treści formularzy, pól ani walidacji.
 - Nie dodajemy zaznaczania tekstu, kopiowania, cofania (`undo`) ani skoku po słowach (`Ctrl+←/→`).
 - Nie zmieniamy obsługi wklejania wieloliniowego ani klawiszy nowej linii.
-- Nie zmieniamy ramek, kolorów poza tłem pola w edycji i układu ekranów poza polami formularzy.
-- Nie obejmuje edycji tekstu poza formularzami (np. pole rozmowy z agentem w widoku zadania), chyba że używa tego samego wspólnego pola — wtedy dostaje R1–R5 automatycznie, a R10–R14 go nie dotyczą (Z4).
+- Nie zmieniamy ramek, kolorów poza tłem pola w edycji i układu ekranów poza obszarami formularzy. Obszar formularza, jego limit wzrostu i kierunek wzrostu wyznacza wywołujący, nie silnik.
+- Nie obejmuje edycji tekstu poza formularzami (np. pole rozmowy z agentem w widoku zadania), chyba że używa tego samego wspólnego pola — wtedy dostaje R1–R5 automatycznie, a R10–R14 go nie dotyczą (Z4). Formularz dodawania komentarza w oknie rozmowy jest formularzem i używa silnika (R16–R20).
 
 ---
 
 ## Key Decisions
 
-- Jedna zasada dla wszystkich formularzy: zmiana we wspólnym kodzie pola i formularza, nie osobne poprawki per formularz.
-- Przejście strzałką dopiero przy powtórzeniu: zapobiega przypadkowej ucieczce z pola przy pisaniu wielu linii.
+- Jedna zasada dla wszystkich formularzy: jeden generyczny silnik formularza, nie osobne poprawki per formularz. Silnik dostaje obszar i definicję formatki oraz przejmuje obsługę w tym obszarze.
+- Silnik jest sterowany zdarzeniami: oddaje focus, rośnie w limicie i zgłasza zmiany stanu wywołującemu (R18–R20).
+- Przejście strzałką dopiero przy powtórzeniu w polach tekstowych: zapobiega przypadkowej ucieczce z pola przy pisaniu wielu linii. Operator potwierdził to wprost. W polach bez kursora tekstowego wystarcza jedna strzałka.
 - Potwierdzenie ma jeden klawisz zatwierdzający (`Enter`) i jeden wycofujący (`Esc`), jak w istniejących modalach.
 
 ---
@@ -127,18 +140,19 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 - Z1. Przyczyna błędu kursora to wstawianie znaku kursora do tekstu (`▏`, szerokość w terminalu może być niejednoznaczna). Wymaganie opisuje skutek (R1), nie sposób naprawy. Przyczynę potwierdza planowanie.
 - Z2. `Home`/`End` działają na linii widocznej po zawinięciu, nie na całej linii logicznej (do znaku `\n`). Taki wybór zgadza się z oczekiwaniem „początek i koniec bieżącej linii".
 - Z3. „Granat" oznacza ciemne, stonowane tło pola w edycji. Dokładny odcień wybiera planowanie ze stylów TUI. Bez zmiany koloru tekstu.
-- Z4. Popup potwierdzenia dotyczy formularzy z polami, które wysyłają dane (R12). Wybór z samej listy (bez pól) nadal działa jednym `Enter`. Panel odpowiedzi z wyborem „zatwierdź/odrzuć" bez pól tekstowych też zostaje bez popupu.
-- Z5. Powtórzenie strzałki (R10) liczy się jako dwa kolejne naciśnięcia tej samej strzałki bez innego klawisza pomiędzy. Pierwsze naciśnięcie na brzegu pola, gdy kursor już jest na początku/końcu tekstu, liczy się jako pierwsze z dwóch (więc przejście wymaga jeszcze jednego). Decyzja, czy kursor „już na brzegu" przechodzi od razu, jest w pytaniach otwartych.
+- Z4. Popup potwierdzenia dotyczy formularzy, które wysyłają dane (R12), także panelu odpowiedzi z samym wyborem „zatwierdź/odrzuć" (odpowiedź operatora). Czysta lista wyboru, która niczego nie wysyła, nadal działa jednym `Enter`.
+- Z5. Powtórzenie strzałki (R10) liczy się jako dwa kolejne naciśnięcia tej samej strzałki bez innego klawisza pomiędzy. Pierwsze naciśnięcie na brzegu pola, gdy kursor już jest na początku/końcu tekstu, liczy się jako pierwsze z dwóch (więc przejście wymaga jeszcze jednego). Operator potwierdził wersję ostrożną: dopiero drugie naciśnięcie zmienia pole, także gdy kursor już stoi na brzegu.
 - Z6. Pola typu wybór (`‹ … ›`) i liczba mają ten sam układ i tło w edycji co pola tekstowe. Strzałki `←`/`→` zmieniają wartość wyboru, jak dziś.
-- Z7. Popup potwierdzenia ma stały tekst ogólny (np. „Zatwierdzić formularz?") z podpowiedzią klawiszy. Wartości pól nie są w nim powtarzane.
+- Z7. Popup potwierdzenia ma stały tekst ogólny (np. „Zatwierdzić formularz?") z podpowiedzią klawiszy. Wartości pól nie są w nim powtarzane. Popup jest częścią silnika, więc jest taki sam w każdym formularzu (odpowiedź operatora: „ogólne, jeden silnik, generyczny").
+- Z8. Odpowiedź operatora o „pojedynczej strzałce do kolejnego pola" czytamy jako dotyczącą pól bez kursora tekstowego (wybory, liczby, lista w panelu odpowiedzi). Dla pól tekstowych obowiązuje potwierdzone powtórzenie strzałki (Z5). Do potwierdzenia przy kolejnym przeglądzie.
 
 ---
 
-## Pytania otwarte dla użytkownika
+## Odpowiedzi operatora na pytania otwarte
 
-- Czy przy powtórzeniu strzałki (R10) pierwsze naciśnięcie na brzegu pola ma zawsze tylko ustawić kursor na początku/końcu tekstu, czy gdy kursor już jest na początku (w górę) lub na końcu (w dół), przejście ma nastąpić od razu? Założono wersję ostrożną: dwa naciśnięcia, zawsze.
-- Czy popup potwierdzenia ma pokazywać krótkie podsumowanie danych (np. tytuł zadania), czy wystarcza ogólne pytanie (Z7)?
-- Czy wybór z listy w panelu odpowiedzi (bez pól tekstowych) też ma wymagać potwierdzenia? Założono, że nie (Z4).
+- Strzałka na brzegu pola tekstowego: dwa naciśnięcia, zawsze (Z5).
+- Popup potwierdzenia: tekst ogólny, jeden generyczny silnik (Z7).
+- Potwierdzenie: jest na poziomie zatwierdzenia formularza po `Enter`, także w panelu odpowiedzi z samym wyborem (R12). Przejście do kolejnego pola wymaga jednej strzałki w polach bez kursora tekstowego (Z8).
 
 ---
 
@@ -154,3 +168,6 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 - [Affects R5, R6][Technical] Jak połączyć zawijanie z wyliczaniem pozycji kursora, przewijaniem i `Up`/`Down` po liniach widocznych.
 - [Affects R8][Needs research] Który odcień granatu jest czytelny w obu motywach i spójny z istniejącymi rolami stylu.
 - [Affects R12][Technical] Czy popup współdzielić z istniejącym kontraktem modalnym, a które formularze dziś omijają wspólny kod.
+- [Affects R16, R17][Technical] Kształt interfejsu silnika: definicja formatki, typy pól, parametry wyglądu i model zdarzeń do wywołującego.
+- [Affects R18][Technical] Jak silnik oddaje i odzyskuje focus wobec istniejącego routingu klawiszy w TUI.
+- [Affects R19][Technical] Jak wzrost formularza współgra z układem widoku rozmowy (przeliczenie układu po zdarzeniu zmiany rozmiaru).
