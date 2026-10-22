@@ -995,6 +995,9 @@ pub enum TaskEventKind {
     SlotReleased {
         reason: SlotReleaseReason,
     },
+    /// A lowered limit asked this task to stop, and the control plane
+    /// took the request back at the safe point: the overshoot was gone.
+    LimitStopWithdrawn,
     /// An owner is reading a stopped task: the control plane asked for a
     /// read-only runner until `until` (D63).
     ReaderLeased {
@@ -1016,6 +1019,9 @@ pub enum SlotReleaseReason {
     /// The task waited for its owner (input needed, failed) and the wait
     /// ran out.
     GraceElapsed,
+    /// The backend's limit of concurrent tasks went below the number of
+    /// tasks that run, and this task was the first to reach a safe point.
+    LimitLowered,
     #[serde(other)]
     Unrecognized,
 }
@@ -1569,6 +1575,50 @@ pub struct DefaultBackendView {
 pub struct SetDefaultBackendRequest {
     #[serde(default)]
     pub backend_id: Option<String>,
+}
+
+/// Where a backend's effective limit of concurrent tasks comes from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendLimitSource {
+    /// `max_concurrent_tasks` of the backend file.
+    File,
+    /// A value the operator set in the running control plane.
+    AdHoc,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// Most concurrent tasks a backend record may declare. A sanity bound, not a
+/// scheduling policy: Narsor targets a handful of parallel tasks (R6).
+pub const MAX_CONCURRENT_TASKS_LIMIT: u32 = 1024;
+
+/// A backend's limit of concurrent tasks as presented to an owner client.
+/// The control plane computes every field; a client shows them as they are.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendLimitView {
+    pub backend_id: String,
+    /// The limit the scheduler applies now.
+    pub effective: u32,
+    pub source: BackendLimitSource,
+    /// `max_concurrent_tasks` of the backend file, read now.
+    pub file_value: u32,
+    /// The ad hoc value; it lasts until the control plane restarts.
+    #[serde(rename = "override")]
+    pub override_value: Option<u32>,
+    /// Slots held by tasks that have, or may have, compute.
+    pub slots_held: u32,
+    /// How many tasks still have to stop for the effective limit.
+    pub overshoot: u32,
+    /// Tasks that wait for a pause a lowered limit asked for, and tasks
+    /// whose safe point was accepted and whose compute is not removed yet.
+    pub waiting_to_stop: u32,
+}
+
+/// Request to set (`limit: Some`) the ad hoc limit of a backend.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetBackendLimitRequest {
+    pub limit: u32,
 }
 
 /// A workflow input's declared value type in the owner API.

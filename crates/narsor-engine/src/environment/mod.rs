@@ -36,8 +36,8 @@ pub mod profile;
 pub mod resolver;
 
 pub use backend::{
-    BackendCapabilities, BackendKind, BackendLimits, BackendRecord, BackendSecret,
-    SecretDeliveryMode, SlotReleaseTimings, TrustScope, MAX_CONCURRENT_TASKS_LIMIT,
+    validate_concurrent_tasks, BackendCapabilities, BackendKind, BackendLimits, BackendRecord,
+    BackendSecret, SecretDeliveryMode, SlotReleaseTimings, TrustScope, MAX_CONCURRENT_TASKS_LIMIT,
 };
 pub use catalog::{CatalogError, EnvironmentCatalog};
 pub use image::{ImageResolver, NoTagResolution, StaticImageResolver};

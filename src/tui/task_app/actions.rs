@@ -68,6 +68,7 @@ use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::harness::HarnessList;
+use super::limit::LimitList;
 use super::list::{title_of, CommandResolved};
 use super::notify::Severity;
 use super::waiting::AnswerRequest;
@@ -496,6 +497,8 @@ pub enum Overlay {
     Links(LinkList),
     /// The installation's default harness (`h`); about no task.
     Harness(HarnessList),
+    /// The limit of concurrent tasks of a backend (`L`); about no task.
+    Limit(LimitList),
     /// The `y` / `n` window.
     Confirm(Confirmation),
 }
@@ -505,7 +508,7 @@ impl Overlay {
     /// away. The window that removes a repository is about none.
     pub fn is_task_bound(&self) -> bool {
         match self {
-            Self::Harness(_) => false,
+            Self::Harness(_) | Self::Limit(_) => false,
             Self::Confirm(confirmation) => {
                 !matches!(confirmation.confirmed, Confirmed::RemoveRepository(_))
             }
@@ -519,7 +522,7 @@ impl Overlay {
             Self::Menu(menu) => Some(&menu.task_id),
             Self::Transitions(list) => Some(&list.task_id),
             Self::Links(list) => Some(&list.task_id),
-            Self::Harness(_) => None,
+            Self::Harness(_) | Self::Limit(_) => None,
             Self::Confirm(confirmation) => Some(&confirmation.task_id),
         }
     }
@@ -531,6 +534,7 @@ impl Overlay {
             Self::Transitions(list) => Some(&list.chooser),
             Self::Links(list) => Some(&list.chooser),
             Self::Harness(list) => Some(list.chooser()),
+            Self::Limit(list) => Some(list.chooser()),
             Self::Confirm(_) => None,
         }
     }
@@ -551,6 +555,7 @@ impl Overlay {
             Self::Transitions(list) => chooser_context(&list.chooser),
             Self::Links(list) => chooser_context(&list.chooser),
             Self::Harness(list) => chooser_context(list.chooser()),
+            Self::Limit(list) => chooser_context(list.chooser()),
         }
     }
 }
@@ -820,6 +825,7 @@ impl TaskApp {
             Overlay::Confirm(_) => self.on_confirm_key(&key),
             Overlay::Transitions(_) | Overlay::Links(_) => self.on_list_key(key),
             Overlay::Harness(_) => self.on_harness_key(key),
+            Overlay::Limit(_) => self.on_limit_key(key),
         }
     }
 
@@ -1518,6 +1524,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
             }
             Overlay::Harness(list) => {
                 render_list(frame, area, "Domyślny harness", list.chooser_mut(), styles);
+            }
+            Overlay::Limit(list) => {
+                let title = format!("Limit zadań · {}", list.backend());
+                render_list(frame, area, &title, list.chooser_mut(), styles);
             }
         }
     }

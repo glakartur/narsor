@@ -83,12 +83,13 @@ use crate::controller_protocol::{
     ConductorReadResponse, LegacyExecutionListResponse, LegacyExecutionView,
 };
 use narsor_protocol::controller::{
-    CapabilitiesView, ConductorReadQuery, ControllerListResponse, ControllerView,
+    BackendLimitView, CapabilitiesView, ConductorReadQuery, ControllerListResponse, ControllerView,
     ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest, CreateTaskRequest,
     DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery, ExecutionEventsResponse,
-    OwnerCommandRequest, RepositoryListResponse, RepositoryView, SetDefaultBackendRequest,
-    SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
-    ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
+    OwnerCommandRequest, RepositoryListResponse, RepositoryView, SetBackendLimitRequest,
+    SetDefaultBackendRequest, SubmitInputRequest, SubmitOperatorCommandRequest,
+    ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest,
+    WorkflowSourceResponse,
 };
 
 use super::token::{TokenCell, TokenSource};
@@ -691,6 +692,36 @@ impl ApiClient {
     ) -> Result<DefaultBackendView, ClientError> {
         let url = format!("{}/control/v1/default-backend", self.base_url);
         self.put_json(&url, request).await
+    }
+
+    /// The limit of concurrent tasks of a backend: its source, the file's
+    /// value and what the tasks hold.
+    pub async fn control_backend_limit(
+        &self,
+        backend_id: &str,
+    ) -> Result<BackendLimitView, ClientError> {
+        let url = format!("{}/control/v1/backends/{backend_id}/limit", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Sets the ad hoc limit of a backend; it lasts until the control plane
+    /// restarts.
+    pub async fn control_set_backend_limit(
+        &self,
+        backend_id: &str,
+        limit: u32,
+    ) -> Result<BackendLimitView, ClientError> {
+        let url = format!("{}/control/v1/backends/{backend_id}/limit", self.base_url);
+        self.put_json(&url, &SetBackendLimitRequest { limit }).await
+    }
+
+    /// Removes the ad hoc limit of a backend: the file's value applies.
+    pub async fn control_clear_backend_limit(
+        &self,
+        backend_id: &str,
+    ) -> Result<BackendLimitView, ClientError> {
+        let url = format!("{}/control/v1/backends/{backend_id}/limit", self.base_url);
+        self.delete_json(&url).await
     }
 
     /// The last timeline the remote task's runner reported.

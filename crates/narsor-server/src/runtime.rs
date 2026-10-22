@@ -415,6 +415,9 @@ fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinH
 /// time to live ran out (U9), and the reader leases that ran idle (D63). Returns what the resume policy did.
 pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     control.reschedule_all();
+    // Asks running tasks to stop while a backend holds more slots than its
+    // limit allows, e.g. after the operator edited the backend file.
+    control.limit_stop_pass();
     let resumed = control.auto_resume_pass();
     // Stops tasks whose deadline came; the slot itself goes on once the
     // runner reached its safe point, and that report re-runs admission.

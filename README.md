@@ -669,6 +669,7 @@ or a runner directly.
 
 ```bash
 narsor-cli backend default                        # which backend new tasks get (set/reset to change)
+narsor-cli backend limit <backend> [get|set <n>|reset]   # concurrent tasks of a backend, changed without a restart (ad hoc, lasts until the daemon restarts)
 narsor-cli harness default [--json]               # the default agent harness, for new and running tasks (set/reset to change)
 narsor-cli task create implement-feature --input ticket=NAR-1 [--backend k8s]
 narsor-cli task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first

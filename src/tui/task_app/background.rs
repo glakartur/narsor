@@ -158,6 +158,8 @@ pub(super) enum JobKey {
     Open(OpeningKind),
     /// The read that brings an open view up to date after a write.
     Reload(OpeningKind),
+    /// The read of the limit of one backend (`L`).
+    Limit(String),
 }
 
 impl JobKey {

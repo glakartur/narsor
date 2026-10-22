@@ -96,6 +96,7 @@ pub mod detail;
 pub mod harness;
 pub mod history;
 pub mod layout;
+pub mod limit;
 pub mod list;
 pub mod new_task;
 pub mod notify;
@@ -392,6 +393,16 @@ pub enum Request {
     /// Make this harness the installation's default; `None` goes back to
     /// the configured one.
     SetHarness(Option<String>),
+    /// `L`: read the limit of the selected task's backend and open the list
+    /// to change it.
+    OpenLimit,
+    /// Set the ad hoc limit of a backend; `None` removes it.
+    SetLimit {
+        /// The backend's id.
+        backend: String,
+        /// The new limit, or `None` for the file's value.
+        limit: Option<u32>,
+    },
 }
 
 /// A fresh key for a command that must not run twice (an owner command, an
@@ -821,7 +832,11 @@ impl TaskApp {
         match action {
             Action::Help => self.help_open = true,
             Action::Quit => self.on_quit(),
-            Action::NewTask | Action::History | Action::Repositories | Action::ChooseHarness
+            Action::NewTask
+            | Action::History
+            | Action::Repositories
+            | Action::ChooseHarness
+            | Action::ChooseLimit
                 if !matches!(&self.view, View::Tasks) =>
             {
                 self.notify(
@@ -878,6 +893,7 @@ impl TaskApp {
             Action::History => return Request::OpenHistory,
             Action::Repositories => return Request::OpenRepositories,
             Action::ChooseHarness => return Request::OpenHarness,
+            Action::ChooseLimit => return Request::OpenLimit,
             Action::RetrySend => return self.retry_selected(),
             other => {
                 if let Some(action) = TaskAction::of_key(other) {
@@ -1078,6 +1094,8 @@ impl TaskApp {
             Request::OpenLink(link) => self.open_link(link),
             Request::OpenHarness => self.start_opening(OpeningKind::Harness),
             Request::SetHarness(harness) => self.change_harness(harness).await,
+            Request::OpenLimit => self.start_limit_read(),
+            Request::SetLimit { backend, limit } => self.change_limit(backend, limit).await,
         }
     }
 

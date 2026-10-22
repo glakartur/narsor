@@ -44,6 +44,23 @@ pub fn slot_release_key(generation: u64) -> String {
     format!("{SLOT_RELEASE_KEY_PREFIX}{generation}")
 }
 
+/// The prefix of the idempotency keys of the commands a lowered limit of
+/// concurrent tasks causes (`limit-stop:<generation>`), reserved like
+/// [`AUTO_RESUME_KEY_PREFIX`].
+pub const LIMIT_STOP_KEY_PREFIX: &str = "limit-stop:";
+
+/// The idempotency key of the policy's pause of the task running at
+/// `generation`: one per run, however often a pass finds the overshoot.
+pub fn limit_stop_key(generation: u64) -> String {
+    format!("{LIMIT_STOP_KEY_PREFIX}{generation}")
+}
+
+/// The key of the receipt that returns a stopped task to the queue, as the
+/// resume that starts it again later (see [`limit_stop_key`]).
+pub fn limit_requeue_key(generation: u64) -> String {
+    format!("{LIMIT_STOP_KEY_PREFIX}requeue:{generation}")
+}
+
 /// The prefix of the idempotency keys of the resume that work sent to a
 /// paused task causes (`work-resume:<key of the work>`), reserved like
 /// [`AUTO_RESUME_KEY_PREFIX`]: a retry of the work resumes the task once.
@@ -51,9 +68,10 @@ pub const WORK_RESUME_KEY_PREFIX: &str = "work-resume:";
 
 /// The idempotency key prefixes only a policy may use, each with what it is
 /// reserved for: an owner's command may not carry one.
-pub const RESERVED_KEY_PREFIXES: [(&str, &str); 3] = [
+pub const RESERVED_KEY_PREFIXES: [(&str, &str); 4] = [
     (AUTO_RESUME_KEY_PREFIX, "the resume policy"),
     (SLOT_RELEASE_KEY_PREFIX, "the slot-release policy"),
+    (LIMIT_STOP_KEY_PREFIX, "the limit of concurrent tasks"),
     (
         WORK_RESUME_KEY_PREFIX,
         "the resume that work sent to a paused task causes",
