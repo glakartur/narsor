@@ -14,6 +14,7 @@
 
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
+use narsor_protocol::controller::ResumeMessage;
 use super::model::{
     InputOutcome, InputRequest, InputStatus, InputUpdate, QueuedInput, RunnerObservation,
     RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
@@ -231,6 +232,43 @@ impl ControlPlane {
             ))
         })?;
         Ok(InputOutcome { input, replayed })
+    }
+
+    /// Keeps the owner's comment on a paused task for the runner of its next
+    /// launch. The same key stored again changes nothing and says so
+    /// (`true`); a task that is not paused cannot take it.
+    pub fn store_resume_message(
+        &self,
+        task_id: &TaskId,
+        key: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let (_, replayed) = self.mutate(task_id, |record, _| {
+            if record
+                .resume_message
+                .as_ref()
+                .is_some_and(|message| message.key == key)
+            {
+                return Ok(Mutation::Unchanged(true));
+            }
+            if record.runner_state != RunnerState::Stopped {
+                return Err(OrchestrationError::TaskNotAcceptingInput {
+                    task_id: record.task_id.clone(),
+                    runner_state: record.runner_state,
+                });
+            }
+            record.resume_message = Some(ResumeMessage {
+                key: key.to_string(),
+                text: text.to_string(),
+            });
+            Ok(Mutation::Changed(
+                TaskEventKind::ResumeMessageStored {
+                    idempotency_key: key.to_string(),
+                },
+                false,
+            ))
+        })?;
+        Ok(replayed)
     }
 
     /// The answers to hand a polling runner that waits on `pending_input_id`.

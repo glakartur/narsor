@@ -1374,3 +1374,56 @@ async fn a_recovered_step_keeps_its_history_and_notes() {
         "{prompt}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A comment left on a pause
+// ---------------------------------------------------------------------------
+
+/// What the owner said while the task was paused reaches the agent of the
+/// state the work goes on in, once: no session to answer in, so as the
+/// operator's note of its next attempt.
+#[tokio::test]
+async fn a_comment_left_on_a_pause_reaches_the_next_attempt_once() {
+    let harness = Harness::new();
+    let definition = workflow("step_history");
+    let before = Arc::new(ScriptedAgentExecutor::new(vec![
+        AgentTurn::label("needs_requirements_revision", "no API named"),
+        AgentTurn::label("drafted", "drafted"),
+    ]));
+    let engine = harness.engine().with_executor(ActionKind::Agent, before);
+    let started = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let paused = engine
+        .run_steps(&definition, &started.id, 2)
+        .await
+        .expect("run up to plan");
+    assert_eq!(paused.current_state.as_deref(), Some("plan"));
+
+    engine
+        .leave_resume_message(&paused.id, "name the API first")
+        .expect("leave the comment");
+
+    let after = Arc::new(ScriptedAgentExecutor::new(vec![AgentTurn::label(
+        "plan_ready",
+        "planned",
+    )]));
+    let reopened = Arc::new(
+        harness
+            .engine()
+            .with_executor(ActionKind::Agent, after.clone()),
+    );
+    let finished = reopened
+        .try_begin_resume(&paused.id)
+        .expect("resume")
+        .run_to_completion(&definition)
+        .await
+        .expect("run on");
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    let prompts = after.prompts();
+    assert!(
+        prompts[0].contains("name the API first"),
+        "the first attempt carries the comment: {}",
+        prompts[0]
+    );
+}

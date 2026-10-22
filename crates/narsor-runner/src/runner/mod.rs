@@ -769,6 +769,7 @@ impl Session {
         // A queued or paused task may have missed a change of the default:
         // its first action starts on the current one, not on the fallback.
         self.ask_default_harness().await?;
+        self.take_resume_message();
 
         match continuation {
             Continuation::Fresh => {
@@ -787,6 +788,44 @@ impl Session {
         // After the runner's own recovery, like the daemon's startup hook.
         self.conductor.restore_at_startup();
         self.drive().await
+    }
+
+    /// Gives the agent the comment the owner left on the pause this launch
+    /// ends, before any work goes on. The launch carries it until the record
+    /// is rid of it, so a key is taken once, here, by storage.
+    fn take_resume_message(&mut self) {
+        let Some(message) = self
+            .link
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.resume_message.clone())
+        else {
+            return;
+        };
+        let Some(execution_id) = self.execution_id.clone() else {
+            return;
+        };
+        let mark = format!("resume-message:{}", message.key);
+        match self.storage.input_consumed(&mark) {
+            Ok(false) => {}
+            Ok(true) => return,
+            Err(error) => {
+                tracing::warn!(%error, "could not tell whether the comment on the pause was taken");
+                return;
+            }
+        }
+        let taken = self
+            .engine
+            .leave_resume_message(&execution_id, &message.text)
+            .map_err(|error| error.to_string())
+            .and_then(|_| {
+                self.storage
+                    .record_consumed_input(&mark)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = taken {
+            tracing::warn!(%error, "the comment on the pause did not reach the agent");
+        }
     }
 
     /// Asks the control plane once, without waiting, which default harness

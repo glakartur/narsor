@@ -14,6 +14,7 @@ pub use narsor_protocol::controller::{
     ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
     InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary, OperatorCommand,
     OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion,
+    ResumeMessage,
     ResumeState, RunnerProblem, RunnerState, SlotReleaseReason, TaskEvent, TaskEventKind,
     TaskState, WorkloadLoss,
 };
@@ -337,6 +338,10 @@ pub struct TaskRecord {
     /// and removes the reader by it; the reader is no slot.
     #[serde(default)]
     pub reader_lease: Option<ReaderLease>,
+    /// The owner's comment on the pause, for the runner of the next launch.
+    /// The runner takes a key once, so the record needs no mark of its own.
+    #[serde(default)]
+    pub resume_message: Option<ResumeMessage>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).

@@ -743,6 +743,19 @@ pub struct RunnerLaunchView {
     pub authorized_by: Option<OwnerCommand>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorized_by_actor: Option<CommandActor>,
+    /// The owner's comment on the pause this launch ends: the runner gives
+    /// it to the agent before the work goes on, once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_message: Option<ResumeMessage>,
+}
+
+/// What the owner told the agent while the task was paused, kept until the
+/// runner of the next launch has taken it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeMessage {
+    /// The key of the comment; the runner takes a key once.
+    pub key: String,
+    pub text: String,
 }
 
 /// Response to `POST /runner/v1/snapshots`.
@@ -949,6 +962,11 @@ pub enum TaskEventKind {
     InputQueued {
         input_id: String,
         pending_input_id: String,
+    },
+    /// The owner commented on a paused task; the comment waits for the
+    /// runner of the next launch.
+    ResumeMessageStored {
+        idempotency_key: String,
     },
     OperatorCommandQueued {
         command_id: String,

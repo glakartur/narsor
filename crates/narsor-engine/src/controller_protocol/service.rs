@@ -960,7 +960,7 @@ impl ProtocolService {
     /// (running, or already resumed or queued) needs nothing. Called for a
     /// retry too: a first call that stored the work and failed before the
     /// resume is repaired by it.
-    fn resume_for_work(&self, record: &TaskRecord, work_key: &str) -> ProtocolResult<()> {
+    pub(super) fn resume_for_work(&self, record: &TaskRecord, work_key: &str) -> ProtocolResult<()> {
         let current = self.control.task(&record.task_id)?;
         if current.runner_state != RunnerState::Stopped {
             return Ok(());
@@ -2514,6 +2514,10 @@ fn launch_view(identity: &RunnerIdentity, record: &TaskRecord) -> RunnerLaunchVi
         launch_generation: identity.launch_generation,
         authorized_by: receipt.map(|receipt| receipt.command),
         authorized_by_actor: receipt.map(|receipt| receipt.actor),
+        resume_message: match identity.role {
+            RunnerRole::Worker => record.resume_message.clone(),
+            RunnerRole::Reader => None,
+        },
     }
 }
 

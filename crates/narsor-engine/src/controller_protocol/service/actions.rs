@@ -268,11 +268,6 @@ fn state_phrase(task: &TaskSummary) -> &'static str {
     }
 }
 
-/// Whether the execution ended, one way or the other.
-fn is_finished(task: &TaskSummary) -> bool {
-    matches!(task.state, TaskState::Finished | TaskState::Error)
-}
-
 /// Whether the runner of the task is alive and asked about its step: the task
 /// runs, or waits for an answer with the slot still held.
 fn runner_alive(task: &TaskSummary) -> bool {
@@ -552,11 +547,17 @@ impl ProtocolService {
                 "a comment needs a text",
             ));
         }
-        let is_retry = record
-            .inputs
-            .iter()
-            .any(|queued| queued.idempotency_key == request.idempotency_key);
-        if !is_retry {
+        let key_taken = |record: &TaskRecord| {
+            record
+                .inputs
+                .iter()
+                .any(|queued| queued.idempotency_key == request.idempotency_key)
+                || record
+                    .resume_message
+                    .as_ref()
+                    .is_some_and(|message| message.key == request.idempotency_key)
+        };
+        if !key_taken(&record) {
             if request
                 .expected_generation
                 .is_some_and(|expected| expected != record.generation)
@@ -570,22 +571,35 @@ impl ProtocolService {
         }
         let summary = self.summarize(&record)?;
         let Some((pending_input_id, delivery)) = comment_delivery(&summary, text) else {
+            // A pause: nothing waits on an answer, so the comment waits on
+            // the record for the runner of the next launch, and the task is
+            // resumed (a retry repairs a resume that did not happen).
+            if record.runner_state == RunnerState::Stopped {
+                let replayed = self
+                    .control
+                    .store_resume_message(&record.task_id, &request.idempotency_key, text)?;
+                if !replayed {
+                    self.notify(&record.task_id);
+                }
+                self.resume_for_work(&record, &request.idempotency_key)?;
+                return Ok(SubmitCommentResponse {
+                    task: self.summarize(&self.owned_task(owner, task_id)?)?,
+                    replayed,
+                });
+            }
             // A retry of a comment already taken: the request it answered
             // is no longer pending.
-            return match record
-                .inputs
-                .iter()
-                .find(|queued| queued.idempotency_key == request.idempotency_key)
-            {
-                Some(_) => Ok(SubmitCommentResponse {
+            return if key_taken(&record) {
+                Ok(SubmitCommentResponse {
                     task: summary,
                     replayed: true,
-                }),
-                None => Err(ProtocolError::conflict(
+                })
+            } else {
+                Err(ProtocolError::conflict(
                     "action_unavailable",
                     comment_reason(&summary)
                         .unwrap_or_else(|| "komentarz nie ma dokąd trafić".to_string()),
-                )),
+                ))
             };
         };
         let response = self.submit_input(

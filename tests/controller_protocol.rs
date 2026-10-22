@@ -6766,3 +6766,79 @@ async fn a_comment_on_an_older_generation_is_refused() {
         "stale_generation"
     );
 }
+
+#[tokio::test]
+async fn a_comment_on_a_pause_waits_for_the_next_runner_and_resumes_the_task() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    let response = harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests first", "c-1"))
+        .await
+        .expect("comment");
+    assert!(!response.replayed);
+    assert_ne!(response.task.runner_state, RunnerState::Stopped);
+
+    let again = harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests first", "c-1"))
+        .await
+        .expect("retry");
+    assert!(again.replayed);
+
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    let resumes = record
+        .commands
+        .iter()
+        .filter(|receipt| receipt.command == OwnerCommand::Resume)
+        .count();
+    assert_eq!(resumes, 1, "one resume for the comment, however often sent");
+    assert_eq!(
+        record.resume_message.as_ref().map(|m| m.text.as_str()),
+        Some("look at the tests first")
+    );
+
+    let credential = running
+        .controller
+        .issue_runner_credential(
+            "task-1",
+            &RunnerCredentialRequest {
+                lease_epoch: running.epoch,
+                generation: record.generation,
+                incarnation: "pod-2".to_string(),
+            },
+        )
+        .await
+        .expect("runner credential");
+    let runner = RunnerClient::new(harness.base_url(), credential.credential);
+    let answer = runner
+        .snapshot(&snapshot(1, ExecutionStatus::Running, 9, None))
+        .await
+        .expect("snapshot");
+    let message = answer.launch.resume_message.expect("the launch carries it");
+    assert_eq!(message.key, "c-1");
+    assert_eq!(message.text, "look at the tests first");
+}
+
+#[tokio::test]
+async fn a_blank_comment_on_a_pause_is_refused_and_the_task_stays_paused() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    assert!(harness
+        .owner
+        .control_comment("task-1", &comment_request(" ", "c-1"))
+        .await
+        .is_err());
+    assert_eq!(
+        harness.task("task-1").await.runner_state,
+        RunnerState::Stopped
+    );
+}
