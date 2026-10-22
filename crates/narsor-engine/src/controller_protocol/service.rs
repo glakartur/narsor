@@ -1764,6 +1764,13 @@ impl ProtocolService {
         let pending = query.pending_input_id.as_deref();
         let defer_materials = query.defer_materials;
         let reader = identity.role == RunnerRole::Reader;
+        // The runner that gave the comment on the pause to its agent says
+        // so; only then is the record rid of it.
+        if let (false, Some(key)) = (reader, query.resume_message_taken.as_deref()) {
+            if self.control.take_resume_message(&identity.task_id, key)? {
+                self.notify(&identity.task_id);
+            }
+        }
         let poll = || -> ProtocolResult<RunnerPollResponse> {
             // A reader is handed nothing it would have to act on:
             // delivering an answer or a command to it would spend them.
@@ -2081,7 +2088,22 @@ impl ProtocolService {
             as_of: now,
         };
         // Last: the offer reads the rest of the summary.
-        summary.actions = Some(actions::offer(&summary));
+        let mut actions = actions::offer(&summary);
+        // One comment waits on a pause at a time: another is refused until a
+        // runner takes it (`comment_pending`), so the offer does not promise it.
+        if record.resume_message.is_some() {
+            if let Some(comment) = actions
+                .iter_mut()
+                .find(|offer| offer.id == TaskActionId::Comment)
+            {
+                comment.available = false;
+                comment.options = Vec::new();
+                comment.effect = None;
+                comment.reason =
+                    Some("poprzedni komentarz czeka na wznowienie zadania".to_string());
+            }
+        }
+        summary.actions = Some(actions);
         Ok(summary)
     }
 
@@ -2272,6 +2294,7 @@ const MAX_CHAT_CHARS: usize = 4_000;
 
 /// The offer of actions the server puts on a task summary, for whoever builds
 /// a summary by hand (a test of a client) and wants the server's words.
+#[doc(hidden)]
 pub fn task_actions(task: &TaskSummary) -> Vec<TaskActionOffer> {
     actions::offer(task)
 }

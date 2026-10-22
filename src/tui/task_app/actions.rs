@@ -60,9 +60,9 @@ use crate::controller_protocol::{
     TransitionExit,
 };
 use crate::domain::display::safe_link_url;
-use narsor_protocol::api::{InputContinuationView, PendingHumanInputView};
 use narsor_protocol::controller::{
-    OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, TaskActionId, TaskState,
+    OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, TaskActionId,
+    TaskActionOffer, TaskState,
 };
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
@@ -184,34 +184,20 @@ impl Availability {
     }
 }
 
-/// The action of the server's offer that `action` is for `task`; `None` for
-/// what the server does not offer: moving in the queue and opening a link
-/// stay with the client (they work on the list and on the browser).
-fn offered_id(task: &TaskSummary, action: TaskAction) -> Option<TaskActionId> {
-    match action {
-        TaskAction::Move | TaskAction::OpenLink => None,
-        TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => {
-            Some(TaskActionId::Resume)
-        }
-        TaskAction::PauseResume => Some(TaskActionId::Pause),
-        TaskAction::Interrupt => Some(TaskActionId::Interrupt),
-        TaskAction::Transition => Some(TaskActionId::Transition),
-        TaskAction::Restart => Some(TaskActionId::Restart),
-        TaskAction::Archive => Some(TaskActionId::Archive),
-        TaskAction::Comment => Some(TaskActionId::Comment),
-    }
+/// Said of an action the server's offer does not cover.
+const NO_OFFER: &str = "niedostępne: brak danych z serwera";
+
+/// The offer of the server for `id`, if it made one.
+fn offer_of(task: &TaskSummary, id: TaskActionId) -> Option<&TaskActionOffer> {
+    task.actions.as_ref()?.iter().find(|offer| offer.id == id)
 }
 
 /// What the server says of `id` for `task`: its offer, or that it said
 /// nothing (a server from before the offer, or one that does not know the
 /// action).
 fn offered(task: &TaskSummary, id: TaskActionId) -> Availability {
-    let Some(offer) = task
-        .actions
-        .as_ref()
-        .and_then(|actions| actions.iter().find(|offer| offer.id == id))
-    else {
-        return Availability::because("niedostępne: brak danych z serwera");
+    let Some(offer) = offer_of(task, id) else {
+        return Availability::because(NO_OFFER);
     };
     if offer.available {
         Availability::Available
@@ -244,18 +230,16 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
                 Availability::because("linki zadania nie mają jeszcze wartości")
             }
         }
-        _ => match offered_id(task, action) {
-            Some(id) => offered(task, id),
-            None => Availability::because("niedostępne: brak danych z serwera"),
-        },
+        TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => {
+            offered(task, TaskActionId::Resume)
+        }
+        TaskAction::PauseResume => offered(task, TaskActionId::Pause),
+        TaskAction::Interrupt => offered(task, TaskActionId::Interrupt),
+        TaskAction::Transition => offered(task, TaskActionId::Transition),
+        TaskAction::Restart => offered(task, TaskActionId::Restart),
+        TaskAction::Archive => offered(task, TaskActionId::Archive),
+        TaskAction::Comment => offered(task, TaskActionId::Comment),
     }
-}
-
-/// Whether the current state of `task` allows an override with somewhere to go.
-fn has_override(task: &TaskSummary) -> bool {
-    task.manual_transitions
-        .as_ref()
-        .is_some_and(|offer| offer.override_allowed && !offer.override_targets.is_empty())
 }
 
 /// The links a browser can be pointed at: those with a safe address.
@@ -561,39 +545,17 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
             "otwórz link".to_string(),
             "Otwiera w przeglądarce link z `display.links` zadania.".to_string(),
         ),
-        TaskAction::Comment => (
-            "dodaj komentarz".to_string(),
-            comment_effect(task).to_string(),
-        ),
+        TaskAction::Comment => ("dodaj komentarz".to_string(), comment_effect(task)),
     };
     (format!("{}  {name}", action.key()), effect)
 }
 
-/// What a comment does to `task`, in words: the server decides by the way the
-/// task is stopped, and the operator should not have to guess.
-fn comment_effect(task: &TaskSummary) -> &'static str {
-    match continuation_of(task) {
-        Some(InputContinuationView::ResolvePermission) => {
-            "Odmawia zgody z uwagą: agent wznowi sesję z Twoim tekstem. Komentarz nigdy nie \
-             udziela zgody."
-        }
-        Some(InputContinuationView::ApproveOutput) => {
-            "Nie zatwierdza wyniku: agent wznowi sesję z Twoją uwagą."
-        }
-        Some(_) => "Wysyła wiadomość do agenta w tej samej sesji.",
-        None if task.runner_state == RunnerState::Stopped => {
-            "Wysyła tekst do agenta i wznawia zadanie jednym krokiem."
-        }
-        None => "Wysyła tekst do agenta; serwer wybiera skutek według stanu zatrzymania.",
-    }
-}
-
-/// How the request the task waits on continues, when it waits on one.
-fn continuation_of(task: &TaskSummary) -> Option<InputContinuationView> {
-    let pending = task.runner.as_ref()?.pending_input.as_ref()?;
-    serde_json::from_value::<PendingHumanInputView>(pending.form.clone())
-        .ok()
-        .map(|form| form.continuation)
+/// What a comment does to `task`, in words: the server says, by the way the
+/// task is stopped.
+fn comment_effect(task: &TaskSummary) -> String {
+    offer_of(task, TaskActionId::Comment)
+        .and_then(|offer| offer.effect.clone())
+        .unwrap_or_else(|| "Wysyła tekst do agenta.".to_string())
 }
 
 /// The field of a comment.
@@ -646,7 +608,7 @@ fn transition_list(task: &TaskSummary) -> Option<TransitionList> {
             )
         })
         .collect();
-    if has_override(task) {
+    if offer.has_override() {
         items.push(
             ChooserItem::new(
                 "! override — dowolny stan",
@@ -953,16 +915,10 @@ impl TaskApp {
             self.notify(Severity::Warning, "komentarz: napisz, co agent ma zobaczyć");
             return Request::None;
         }
-        let summary = match continuation_of(&task) {
-            Some(InputContinuationView::ResolvePermission) => "odmowa z uwagą wysłana",
-            Some(InputContinuationView::ApproveOutput) => "wynik niezatwierdzony, uwaga wysłana",
-            Some(_) => "wiadomość wysłana do agenta",
-            None => "komentarz wysłany, zadanie wznowione",
-        };
         Request::Act(Box::new(self.action_request(
             &task,
             "komentarz",
-            summary.to_string(),
+            "komentarz wysłany".to_string(),
             ActionSend::Comment(text),
         )))
     }
@@ -1247,7 +1203,11 @@ impl TaskApp {
                     },
                 )
                 .await
-                .map(|_| (None, false)),
+                .map(|response| {
+                    // Work for a task without a slot resumes it, and the
+                    // resume waits when the backend is full.
+                    (None, response.task.state == TaskState::Queued)
+                }),
         };
         match result {
             Ok((None, queued)) => {

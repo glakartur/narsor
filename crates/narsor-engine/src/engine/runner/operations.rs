@@ -242,10 +242,13 @@ impl Engine {
     /// the operator's note for the state's next attempt when there is not.
     ///
     /// Taken while no pass drives the execution, and not while it waits on
-    /// input: that one needs an answer.
+    /// input: that one needs an answer. The key goes into the same save as
+    /// the comment, so a key left once is left once: a second call with it
+    /// changes nothing, whatever happened to the caller in between.
     pub fn leave_resume_message(
         &self,
         execution_id: &str,
+        key: &str,
         text: &str,
     ) -> Result<WorkflowExecution, EngineError> {
         let _guard = self.begin_run(execution_id)?;
@@ -256,6 +259,17 @@ impl Engine {
         ) {
             return Err(self.not_runnable(&execution, "commented on"));
         }
+        if engine_metadata_mut(&mut execution)
+            .get(METADATA_RESUME_MESSAGE_KEY)
+            .and_then(Value::as_str)
+            == Some(key)
+        {
+            return Ok(execution);
+        }
+        engine_metadata_mut(&mut execution).insert(
+            METADATA_RESUME_MESSAGE_KEY.to_string(),
+            Value::String(key.to_string()),
+        );
         let session = match execution.current_state.clone() {
             Some(state_id) => {
                 let sessions: BTreeMap<String, AgentSessionProvenance> =

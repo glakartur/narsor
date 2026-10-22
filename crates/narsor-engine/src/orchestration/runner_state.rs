@@ -25,6 +25,9 @@ use crate::environment::backend::DEFAULT_SLOT_RELEASE_GRACE_SECS;
 use chrono::{DateTime, Duration, Utc};
 use narsor_protocol::controller::ResumeMessage;
 
+/// How many keys of comments already taken a record remembers.
+const RESUME_MESSAGES_REMEMBERED: usize = 32;
+
 impl ControlPlane {
     /// Accepts a runner snapshot from `incarnation`, launched at
     /// `launch_generation`.
@@ -234,16 +237,58 @@ impl ControlPlane {
         Ok(InputOutcome { input, replayed })
     }
 
-    /// Keeps the owner's comment on a paused task for the runner of its next
-    /// launch. The same key stored again changes nothing and says so
-    /// (`true`); a task that is not paused cannot take it.
-    pub fn store_resume_message(&self, task_id: &TaskId, key: &str, text: &str) -> Result<bool> {
-        let (_, replayed) = self.mutate(task_id, |record, _| {
-            if record
+    /// Drops the comment on the pause from the record once the runner says it
+    /// gave it to its agent (`key`), and remembers the key so a retry of the
+    /// comment still reads as a replay. `true` when the record changed.
+    pub fn take_resume_message(&self, task_id: &TaskId, key: &str) -> Result<bool> {
+        let (_, changed) = self.mutate(task_id, |record, _| {
+            if !record
                 .resume_message
                 .as_ref()
                 .is_some_and(|message| message.key == key)
             {
+                return Ok(Mutation::Unchanged(false));
+            }
+            record.resume_message = None;
+            record.resume_message_taken.push(key.to_string());
+            // A retry of a comment is a matter of minutes: only the latest
+            // keys are kept, so the record does not grow with every comment.
+            let excess = record
+                .resume_message_taken
+                .len()
+                .saturating_sub(RESUME_MESSAGES_REMEMBERED);
+            record.resume_message_taken.drain(..excess);
+            Ok(Mutation::Changed(
+                TaskEventKind::ResumeMessageTaken {
+                    idempotency_key: key.to_string(),
+                },
+                true,
+            ))
+        })?;
+        Ok(changed)
+    }
+
+    /// Keeps the owner's comment on a paused task for the runner of its next
+    /// launch. The same key and text stored again change nothing and say so
+    /// (`true`); a task that is not paused cannot take it, and one comment
+    /// waits at a time, until a runner says it took it.
+    pub fn store_resume_message(&self, task_id: &TaskId, key: &str, text: &str) -> Result<bool> {
+        let (_, replayed) = self.mutate(task_id, |record, _| {
+            if record.resume_message_taken.iter().any(|taken| taken == key) {
+                return Ok(Mutation::Unchanged(true));
+            }
+            if let Some(message) = &record.resume_message {
+                if message.key != key {
+                    return Err(OrchestrationError::ResumeMessagePending {
+                        task_id: record.task_id.clone(),
+                    });
+                }
+                if message.text != text {
+                    return Err(OrchestrationError::InputKeyReused {
+                        task_id: record.task_id.clone(),
+                        key: key.to_string(),
+                    });
+                }
                 return Ok(Mutation::Unchanged(true));
             }
             if record.runner_state != RunnerState::Stopped {

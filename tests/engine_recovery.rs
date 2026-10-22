@@ -1404,8 +1404,15 @@ async fn a_comment_left_on_a_pause_reaches_the_next_attempt_once() {
     assert_eq!(paused.current_state.as_deref(), Some("plan"));
 
     engine
-        .leave_resume_message(&paused.id, "name the API first")
+        .leave_resume_message(&paused.id, "c-1", "name the API first")
         .expect("leave the comment");
+    // The same key again, as after a crash between the comment and its mark,
+    // leaves it once.
+    let again = engine
+        .leave_resume_message(&paused.id, "c-1", "name the API first")
+        .expect("the same key again");
+    let stored = engine.store().load_execution(&paused.id).unwrap();
+    assert_eq!(again.metadata, stored.metadata);
 
     let after = Arc::new(ScriptedAgentExecutor::new(vec![AgentTurn::label(
         "plan_ready",
@@ -1428,5 +1435,111 @@ async fn a_comment_left_on_a_pause_reaches_the_next_attempt_once() {
         prompts[0].contains("name the API first"),
         "the first attempt carries the comment: {}",
         prompts[0]
+    );
+    assert_eq!(prompts.len(), 1);
+    let left = harness.store().load_execution(&paused.id).expect("load");
+    assert!(
+        !left.metadata.to_string().contains("name the API first"),
+        "the attempt took the note off the execution"
+    );
+}
+
+/// With a session to answer in, the comment goes to that session as the
+/// answer the agent gets before the work goes on, and only once.
+#[tokio::test]
+async fn a_comment_left_on_a_pause_goes_to_the_session_of_the_state() {
+    let harness = Harness::new();
+    let definition = workflow("step_history");
+    let before = Arc::new(ScriptedAgentExecutor::new(vec![
+        AgentTurn::Label {
+            label: "needs_requirements_revision",
+            reason: "no API named",
+            variables: json!({}),
+            artifacts: json!({}),
+            reply: None,
+            session: true,
+        },
+        AgentTurn::label("drafted", "drafted"),
+    ]));
+    let engine = harness.engine().with_executor(ActionKind::Agent, before);
+    let started = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let paused = engine
+        .run_steps(&definition, &started.id, 2)
+        .await
+        .expect("run up to plan");
+
+    let left = engine
+        .leave_resume_message(&paused.id, "c-1", "name the API first")
+        .expect("leave the comment");
+    assert!(
+        left.metadata.to_string().contains("name the API first"),
+        "stored for the agent of the state"
+    );
+    assert!(
+        left.metadata["engine"]["agent_input"]["session"].is_string(),
+        "addressed to the session the state completed: {}",
+        left.metadata
+    );
+
+    let after = Arc::new(ScriptedAgentExecutor::new(vec![AgentTurn::label(
+        "plan_ready",
+        "planned",
+    )]));
+    let reopened = Arc::new(
+        harness
+            .engine()
+            .with_executor(ActionKind::Agent, after.clone()),
+    );
+    let finished = reopened
+        .try_begin_resume(&paused.id)
+        .expect("resume")
+        .run_to_completion(&definition)
+        .await
+        .expect("run on");
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    let calls = after.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].resume_session.is_some(), "{:?}", calls[0]);
+    assert!(calls[0].prompt.contains("name the API first"));
+    let stored = harness.store().load_execution(&paused.id).expect("load");
+    assert!(
+        !stored.metadata.to_string().contains("name the API first"),
+        "the attempt took the comment off the execution"
+    );
+}
+
+/// An execution that ended takes no comment: nothing goes on to receive it.
+#[tokio::test]
+async fn a_comment_is_refused_by_an_execution_that_is_not_to_run_on() {
+    let harness = Harness::new();
+    let definition = workflow("step_history");
+    let engine = harness.engine().with_executor(
+        ActionKind::Agent,
+        Arc::new(ScriptedAgentExecutor::new(vec![
+            AgentTurn::label("needs_requirements_revision", "no API named"),
+            AgentTurn::label("drafted", "drafted"),
+            AgentTurn::label("plan_ready", "planned"),
+        ])),
+    );
+    let started = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let finished = Arc::new(engine)
+        .try_begin_resume(&started.id)
+        .expect("resume")
+        .run_to_completion(&definition)
+        .await
+        .expect("run to the end");
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+
+    let error = harness
+        .engine()
+        .leave_resume_message(&finished.id, "c-1", "too late")
+        .expect_err("a finished execution takes no comment");
+    assert!(
+        matches!(error, EngineError::NotRunnable { .. }),
+        "{error:?}"
     );
 }

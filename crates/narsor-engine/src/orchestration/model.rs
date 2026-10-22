@@ -341,6 +341,10 @@ pub struct TaskRecord {
     /// The runner takes a key once, so the record needs no mark of its own.
     #[serde(default)]
     pub resume_message: Option<ResumeMessage>,
+    /// The keys of the comments a launch took off the record, so a late
+    /// retry of any of them still reads as a replay.
+    #[serde(default)]
+    pub resume_message_taken: Vec<String>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).

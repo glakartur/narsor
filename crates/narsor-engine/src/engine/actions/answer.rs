@@ -73,8 +73,7 @@ fn answer_with(choice: String, object: &Map<String, Value>) -> Result<ChoiceAnsw
     Ok(ChoiceAnswer {
         choice,
         reason: reason(object)?,
-        variables: object_field(object, "variables")
-            .ok_or("'variables' must be an object")?,
+        variables: object_field(object, "variables").ok_or("'variables' must be an object")?,
         artifacts: named_artifacts(object)?,
         additional_data: object_field(object, "additional_data")
             .ok_or("'additional_data' must be an object")?,

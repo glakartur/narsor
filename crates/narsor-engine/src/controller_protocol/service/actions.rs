@@ -16,6 +16,7 @@ use narsor_protocol::api::{
 use narsor_protocol::controller::{
     AttentionKind, Freshness, RunnerState, SubmitCommentRequest, SubmitCommentResponse,
     SubmitInputRequest, TaskActionId, TaskActionOffer, TaskActionOption, TaskState, TaskSummary,
+    TransitionOffer,
 };
 use narsor_protocol::display::{loss_state, LossState};
 
@@ -52,6 +53,11 @@ pub(super) fn offer(task: &TaskSummary) -> Vec<TaskActionOffer> {
                     options(task, id)
                 } else {
                     Vec::new()
+                },
+                effect: if reason.is_none() && id == TaskActionId::Comment {
+                    Some(comment_effect(task).to_string())
+                } else {
+                    None
                 },
                 reason,
             }
@@ -246,6 +252,22 @@ fn comment_reason(task: &TaskSummary) -> Option<String> {
     ))
 }
 
+/// What a comment does to `task`, in words: the server picks the effect by
+/// the way the task is stopped (KTD4), and the owner should not have to guess.
+fn comment_effect(task: &TaskSummary) -> &'static str {
+    match waiting(task).map(|form| form.continuation) {
+        Some(InputContinuationView::ResolvePermission) => {
+            "Odmawia zgody z uwagą: agent wznowi sesję z Twoim tekstem. Komentarz nigdy nie \
+             udziela zgody."
+        }
+        Some(InputContinuationView::ApproveOutput) => {
+            "Nie zatwierdza wyniku: agent wznowi sesję z Twoją uwagą."
+        }
+        Some(_) => "Wysyła wiadomość do agenta w tej samej sesji.",
+        None => "Wysyła tekst do agenta i wznawia zadanie jednym krokiem.",
+    }
+}
+
 // ---------------------------------------------------------------------
 // What the task is
 // ---------------------------------------------------------------------
@@ -331,7 +353,7 @@ fn runner_unreachable(task: &TaskSummary) -> Option<String> {
 fn has_override(task: &TaskSummary) -> bool {
     task.manual_transitions
         .as_ref()
-        .is_some_and(|offer| offer.override_allowed && !offer.override_targets.is_empty())
+        .is_some_and(TransitionOffer::has_override)
 }
 
 /// `text` on one line, without control characters.
@@ -521,6 +543,11 @@ fn comment_delivery(task: &TaskSummary, text: &str) -> Option<(String, HumanInpu
     ))
 }
 
+/// The most characters a comment holds, as the chat of the conductor does.
+const MAX_COMMENT_CHARS: usize = 4_000;
+/// The most characters the key of a comment holds.
+const MAX_COMMENT_KEY_CHARS: usize = 128;
+
 impl ProtocolService {
     /// The owner's comment on a stopped task: the one entry point, whatever
     /// the stop is (KTD3). The server picks what it does by the stop (KTD4).
@@ -537,6 +564,12 @@ impl ProtocolService {
                 "a comment needs an idempotency key",
             ));
         }
+        if request.idempotency_key.chars().count() > MAX_COMMENT_KEY_CHARS {
+            return Err(ProtocolError::bad_request(
+                "idempotency_key_too_long",
+                format!("an idempotency key holds at most {MAX_COMMENT_KEY_CHARS} characters"),
+            ));
+        }
         let text = request.text.trim();
         if text.is_empty() {
             return Err(ProtocolError::bad_request(
@@ -544,11 +577,24 @@ impl ProtocolService {
                 "a comment needs a text",
             ));
         }
+        if text.chars().count() > MAX_COMMENT_CHARS {
+            return Err(ProtocolError::bad_request(
+                "comment_too_long",
+                format!("a comment holds at most {MAX_COMMENT_CHARS} characters"),
+            ));
+        }
+        let comment_taken = |record: &TaskRecord| {
+            record
+                .resume_message_taken
+                .iter()
+                .any(|taken| *taken == request.idempotency_key)
+        };
         let key_taken = |record: &TaskRecord| {
             record
                 .inputs
                 .iter()
                 .any(|queued| queued.idempotency_key == request.idempotency_key)
+                || comment_taken(record)
                 || record
                     .resume_message
                     .as_ref()
@@ -572,11 +618,26 @@ impl ProtocolService {
             // the record for the runner of the next launch, and the task is
             // resumed (a retry repairs a resume that did not happen).
             if record.runner_state == RunnerState::Stopped {
-                let replayed = self.control.store_resume_message(
-                    &record.task_id,
-                    &request.idempotency_key,
-                    text,
-                )?;
+                // A comment a launch already took did its resume: a retry
+                // of it must not undo a pause the owner asked for since.
+                if comment_taken(&record) {
+                    return Ok(SubmitCommentResponse {
+                        task: summary,
+                        replayed: true,
+                    });
+                }
+                // A key already queued as the answer to a question is not
+                // stored again: the retry only repairs the resume.
+                let queued = record
+                    .inputs
+                    .iter()
+                    .any(|queued| queued.idempotency_key == request.idempotency_key);
+                let replayed = queued
+                    || self.control.store_resume_message(
+                        &record.task_id,
+                        &request.idempotency_key,
+                        text,
+                    )?;
                 if !replayed {
                     self.notify(&record.task_id);
                 }

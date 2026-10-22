@@ -1348,6 +1348,159 @@ async fn an_automatic_resume_recovers_the_interrupted_action_and_says_so() {
     assert!(!note.contains("owner resume"), "{note}");
 }
 
+const PAUSABLE_WORKFLOW: &str = r#"
+name: two-step-task
+version: 1
+states:
+  first:
+    action:
+      type: script
+      command: sh
+      args:
+        - -c
+        - |
+          sleep 3
+          printf '{"choice": "done"}'
+    choices: [done]
+    transitions:
+      done: second
+  second:
+    action:
+      type: script
+      command: sh
+      args:
+        - -c
+        - |
+          printf '{"choice": "done"}'
+    choices: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+/// The owner's comment on a task paused between two steps reaches the runner
+/// of the next launch on its launch view; the storage marks its key as
+/// taken, the engine keeps it for the step to come, and the control plane
+/// drops it from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_comment_on_a_pause_is_given_to_the_next_launch_once_and_marked_taken() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let spec = spec(
+        PAUSABLE_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-2", spec.clone());
+    fixture.report("task-2", Observation::StartAccepted);
+    let launch = Launch::new(&fixture, "task-2", &spec);
+    let credential = fixture.credential("task-2", "pod-1");
+    let first = fixture.spawn(&launch, "pod-1", &credential);
+    fixture.report("task-2", Observation::RunnerReady);
+    fixture.command("task-2", OwnerCommand::Pause, "pause-1");
+    let status = fixture.wait_exit(first, Duration::from_secs(30));
+    assert!(
+        status.success(),
+        "a paused runner exits cleanly: {status:?}"
+    );
+    fixture.report("task-2", Observation::PausedAtSafePoint);
+    let id = TaskId::parse("task-2").unwrap();
+    fixture
+        .service
+        .control_plane()
+        .store_resume_message(&id, "c-1", "mind the flaky test")
+        .expect("the comment waits on the record");
+    fixture.command("task-2", OwnerCommand::Resume, "resume-1");
+
+    let credential = fixture.credential("task-2", "pod-2");
+    fixture.spawn(&launch, "pod-2", &credential);
+    wait_until_async(Duration::from_secs(60), "the recovered run", || {
+        runner_status(&fixture, "task-2") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+
+    let execution = launch
+        .store()
+        .load_execution(&launch.execution_id().unwrap())
+        .unwrap();
+    let note = execution.metadata.to_string();
+    assert_eq!(
+        note.matches("mind the flaky test").count(),
+        1,
+        "the comment is given once: {note}"
+    );
+    let marks = fs::read_to_string(launch.storage.join("narsor/inputs.json")).unwrap();
+    assert!(
+        marks.contains("resume-message:c-1"),
+        "the storage marks the comment as taken: {marks}"
+    );
+    let record = fixture.record("task-2");
+    assert_eq!(record.resume_message, None);
+    assert_eq!(record.resume_message_taken, vec!["c-1".to_string()]);
+}
+
+/// The first poll of a launch fails while a comment on the pause waits: the
+/// runner waits a short time for the launch view, then goes on without the
+/// comment instead of waiting for the control plane for as long as it is away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_comment_on_a_pause_does_not_block_the_resume_when_the_control_plane_is_away() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let spec = spec(
+        PAUSABLE_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-2", spec.clone());
+    fixture.report("task-2", Observation::StartAccepted);
+    let launch = Launch::new(&fixture, "task-2", &spec);
+    let credential = fixture.credential("task-2", "pod-1");
+    let first = fixture.spawn(&launch, "pod-1", &credential);
+    fixture.report("task-2", Observation::RunnerReady);
+    fixture.command("task-2", OwnerCommand::Pause, "pause-1");
+    let status = fixture.wait_exit(first, Duration::from_secs(30));
+    assert!(
+        status.success(),
+        "a paused runner exits cleanly: {status:?}"
+    );
+    fixture.report("task-2", Observation::PausedAtSafePoint);
+    let id = TaskId::parse("task-2").unwrap();
+    fixture
+        .service
+        .control_plane()
+        .store_resume_message(&id, "c-1", "mind the flaky test")
+        .expect("the comment waits on the record");
+    fixture.command("task-2", OwnerCommand::Resume, "resume-1");
+    let credential = fixture.credential("task-2", "pod-2");
+
+    // The control plane is away while the next runner starts.
+    fixture.server.take().expect("served").abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    fixture.spawn(&launch, "pod-2", &credential);
+    // Past the short wait for the launch view the runner goes on without
+    // the comment, so the one given later by the answer is not given at all.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    fixture.serve().await;
+    wait_until_async(Duration::from_secs(60), "the resumed run", || {
+        runner_status(&fixture, "task-2") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    let execution = launch
+        .store()
+        .load_execution(&launch.execution_id().unwrap())
+        .unwrap();
+    assert!(
+        !execution.metadata.to_string().contains("mind the flaky test"),
+        "the comment was not known, so it was not given: {}", execution.metadata
+    );
+}
+
 /// A task waiting for an approval when its workload was lost waits for the
 /// same approval after the automatic resume: the owner's draft keeps its
 /// place (R8).
@@ -1512,9 +1665,10 @@ async fn a_runner_whose_credential_ran_out_offline_renews_it_and_reports_again()
 
     fixture.serve().await;
     wait_until_async(Duration::from_secs(30), "the report after renewal", || {
-        fixture.record("task-3").runner.is_some_and(|runner| {
-            runner.snapshot.execution_status == ExecutionStatus::Completed
-        })
+        fixture
+            .record("task-3")
+            .runner
+            .is_some_and(|runner| runner.snapshot.execution_status == ExecutionStatus::Completed)
     })
     .await;
 }

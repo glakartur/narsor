@@ -119,7 +119,7 @@ use crate::domain::{
 };
 use crate::engine::{Engine, EngineError, HumanInputDelivery, Recovery};
 use crate::orchestration::{
-    CommandActor, HarnessUnavailable, OwnerCommand, RunnerProblem, RunnerSnapshot,
+    CommandActor, HarnessUnavailable, OwnerCommand, ResumeMessage, RunnerProblem, RunnerSnapshot,
 };
 use crate::persistence::{reconcile, PersistenceError, ReconciliationOutcome};
 use crate::workspace::WorkspaceError;
@@ -226,6 +226,9 @@ pub enum RunnerExit {
     /// was reachable.
     Problem(RunnerProblem),
 }
+
+/// Longest wait for the launch view before a clean restart resumes.
+const CLEAN_LAUNCH_WAIT: Duration = Duration::from_secs(5);
 
 /// Timing of the control channel; tests shorten it.
 #[derive(Debug, Clone)]
@@ -722,6 +725,21 @@ struct Decision {
     actor: CommandActor,
 }
 
+/// The mark in storage that says the comment of `message` was taken.
+fn resume_message_mark(message: &ResumeMessage) -> String {
+    format!("resume-message:{}", message.key)
+}
+
+/// The key of `message` when the storage says it gave it. A mark that cannot
+/// be read counts as not given: the comment is then sent again, never lost.
+fn taken_key(message: &ResumeMessage, consumed: Result<bool, RunnerError>) -> Option<String> {
+    let taken = consumed.unwrap_or_else(|error| {
+        tracing::warn!(%error, "the mark of the comment on the pause cannot be read");
+        false
+    });
+    taken.then(|| message.key.clone())
+}
+
 impl Decision {
     /// What the recovered action's history says about who decided.
     fn comment(self) -> String {
@@ -769,7 +787,6 @@ impl Session {
         // A queued or paused task may have missed a change of the default:
         // its first action starts on the current one, not on the fallback.
         self.ask_default_harness().await?;
-        self.take_resume_message();
 
         match continuation {
             Continuation::Fresh => {
@@ -780,9 +797,21 @@ impl Session {
                 )?;
                 tracing::info!(execution_id = %execution.id, "started the task's execution");
                 self.execution_id = Some(execution.id.clone());
+                // No wait for the launch view here: a task that starts its
+                // execution has no pause behind it, so no comment waits, and
+                // a start must work offline.
+                self.take_resume_message()?;
                 self.resume_pass()?;
             }
-            Continuation::Clean => self.resume_pass()?,
+            Continuation::Clean => {
+                // The first poll may have failed: the comment of a pause is
+                // known only once the launch view is. The wait is short: a
+                // runner restarted while the control plane is away goes on
+                // without the comment, which stays in the record.
+                let _ = tokio::time::timeout(CLEAN_LAUNCH_WAIT, self.await_launch()).await;
+                self.take_resume_message()?;
+                self.resume_pass()?;
+            }
             Continuation::Recover(decision) => self.recover(decision)?,
         }
         // After the runner's own recovery, like the daemon's startup hook.
@@ -790,42 +819,39 @@ impl Session {
         self.drive().await
     }
 
-    /// Gives the agent the comment the owner left on the pause this launch
-    /// ends, before any work goes on. The launch carries it until the record
-    /// is rid of it, so a key is taken once, here, by storage.
-    fn take_resume_message(&mut self) {
+    /// The comment on the pause this launch ends, unless this storage took it
+    /// before. The control plane drops it from the record once a poll says
+    /// it was taken; the mark in storage covers the launches before that.
+    fn untaken_resume_message(&self) -> Result<Option<ResumeMessage>, RunnerError> {
         let Some(message) = self
             .link
             .launch
             .as_ref()
             .and_then(|launch| launch.resume_message.clone())
         else {
-            return;
+            return Ok(None);
+        };
+        let taken = self
+            .storage
+            .input_consumed(&resume_message_mark(&message))?;
+        Ok((!taken).then_some(message))
+    }
+
+    /// Gives the agent the comment the owner left on the pause this launch
+    /// ends, before any work goes on. A comment that cannot be given stops
+    /// the launch: the record keeps it for the next one.
+    fn take_resume_message(&mut self) -> Result<(), RunnerError> {
+        let Some(message) = self.untaken_resume_message()? else {
+            return Ok(());
         };
         let Some(execution_id) = self.execution_id.clone() else {
-            return;
+            tracing::warn!("a comment on the pause waits, but the task has no execution yet");
+            return Ok(());
         };
-        let mark = format!("resume-message:{}", message.key);
-        match self.storage.input_consumed(&mark) {
-            Ok(false) => {}
-            Ok(true) => return,
-            Err(error) => {
-                tracing::warn!(%error, "could not tell whether the comment on the pause was taken");
-                return;
-            }
-        }
-        let taken = self
-            .engine
-            .leave_resume_message(&execution_id, &message.text)
-            .map_err(|error| error.to_string())
-            .and_then(|_| {
-                self.storage
-                    .record_consumed_input(&mark)
-                    .map_err(|error| error.to_string())
-            });
-        if let Err(error) = taken {
-            tracing::warn!(%error, "the comment on the pause did not reach the agent");
-        }
+        self.engine
+            .leave_resume_message(&execution_id, &message.key, &message.text)?;
+        self.storage
+            .record_consumed_input(&resume_message_mark(&message))
     }
 
     /// Asks the control plane once, without waiting, which default harness
@@ -865,7 +891,20 @@ impl Session {
             wait_secs: Some(wait_secs),
             defer_materials: false,
             harness: Some(harness),
+            resume_message_taken: self.taken_resume_message_key(),
         }
+    }
+
+    /// The key of the comment on the pause the launch view still carries and
+    /// this storage already gave to the agent: saying so lets the control
+    /// plane drop it. Said on every poll until it is dropped, so a lost
+    /// answer costs nothing.
+    fn taken_resume_message_key(&self) -> Option<String> {
+        let message = self.link.launch.as_ref()?.resume_message.as_ref()?;
+        taken_key(
+            message,
+            self.storage.input_consumed(&resume_message_mark(message)),
+        )
     }
 
     /// Applies what every answer of the control plane carries, in one
@@ -934,20 +973,12 @@ impl Session {
         self.conductor.refresh(None);
     }
 
-    /// Waits for the control plane to say which command launched this
-    /// incarnation, and returns it when it authorizes recovering the
-    /// storage `previous` left behind.
-    async fn owner_decision(
-        &mut self,
-        previous: &SessionRecord,
-    ) -> Result<Option<Decision>, RunnerError> {
-        tracing::warn!(
-            previous = %previous.incarnation,
-            "the previous runner stopped unexpectedly; waiting for the owner's decision"
-        );
-        let launch = loop {
+    /// Waits until the control plane has said how this incarnation was
+    /// launched, and returns what it said.
+    async fn await_launch(&mut self) -> RunnerLaunchView {
+        loop {
             if let Some(launch) = &self.link.launch {
-                break launch.clone();
+                return launch.clone();
             }
             if let Some(client) = self.link.client() {
                 match client.poll_with(&self.poll_query(None, 0)).await {
@@ -962,7 +993,21 @@ impl Session {
                 self.link.failed(&ClientError::Unauthorized, &self.timing);
             }
             tokio::time::sleep_until(self.link.next_attempt).await;
-        };
+        }
+    }
+
+    /// Waits for the control plane to say which command launched this
+    /// incarnation, and returns it when it authorizes recovering the
+    /// storage `previous` left behind.
+    async fn owner_decision(
+        &mut self,
+        previous: &SessionRecord,
+    ) -> Result<Option<Decision>, RunnerError> {
+        tracing::warn!(
+            previous = %previous.incarnation,
+            "the previous runner stopped unexpectedly; waiting for the owner's decision"
+        );
+        let launch = self.await_launch().await;
 
         if previous.incarnation == self.incarnation {
             // The same incarnation started again: nobody decided anything.
@@ -1007,13 +1052,30 @@ impl Session {
         let reconciliation = reconcile(self.engine.store(), &execution_id)?;
         tracing::info!(?decision, outcome = ?reconciliation.outcome, "recovering after an unexpected stop");
         if let ReconciliationOutcome::InterruptedAction { .. } = reconciliation.outcome {
-            let handle = self.engine.try_begin_recover_with(
-                &execution_id,
-                Recovery::with_comment(Some(decision.comment())),
-            )?;
+            // The recovery's own note would replace the owner's comment, so
+            // the comment rides on it.
+            let message = self.untaken_resume_message()?;
+            let comment = match &message {
+                Some(message) => format!("{}\n\n{}", decision.comment(), message.text),
+                None => decision.comment(),
+            };
+            let handle = self
+                .engine
+                .try_begin_recover_with(&execution_id, Recovery::with_comment(Some(comment)))?;
+            // The comment is in the note already: a mark that cannot be
+            // written risks a second delivery, a failed launch would lose it.
+            if let Some(message) = message {
+                if let Err(error) = self
+                    .storage
+                    .record_consumed_input(&resume_message_mark(&message))
+                {
+                    tracing::warn!(%error, "the comment on the pause cannot be marked as given");
+                }
+            }
             self.spawn_pass(handle);
             return Ok(());
         }
+        self.take_resume_message()?;
         self.resume_pass()
     }
 
@@ -1546,5 +1608,35 @@ async fn wait_for_poll(
     match poll {
         Some(poll) => (&mut poll.handle).await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message() -> ResumeMessage {
+        ResumeMessage {
+            key: "c-1".to_string(),
+            text: "mind the flaky test".to_string(),
+        }
+    }
+
+    fn unreadable() -> RunnerError {
+        RunnerError::Io {
+            path: PathBuf::from("inputs.json"),
+            source: std::io::Error::other("unreadable"),
+        }
+    }
+
+    #[test]
+    fn a_given_comment_is_said_taken() {
+        assert_eq!(taken_key(&message(), Ok(true)), Some("c-1".to_string()));
+        assert_eq!(taken_key(&message(), Ok(false)), None);
+    }
+
+    #[test]
+    fn an_unreadable_mark_counts_as_not_given() {
+        assert_eq!(taken_key(&message(), Err(unreadable())), None);
     }
 }

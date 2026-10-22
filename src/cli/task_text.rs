@@ -848,6 +848,7 @@ pub fn event_line(event: &TaskEvent) -> String {
         },
         TaskEventKind::InputQueued { input_id, .. } => format!("input {input_id} queued"),
         TaskEventKind::ResumeMessageStored { .. } => "comment on the pause stored".to_string(),
+        TaskEventKind::ResumeMessageTaken { .. } => "comment on the pause taken".to_string(),
         TaskEventKind::OperatorCommandQueued {
             command_id,
             command,

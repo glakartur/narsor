@@ -7203,7 +7203,8 @@ mod task_app_actions {
 
     mod comment {
         use super::*;
-        use narsor::tui::task_app::actions::CommentForm;
+        use crate::task_app_support::with_pending;
+        use serde_json::{json, Value};
 
         fn type_text(app: &mut TaskApp, text: &str) {
             for c in text.chars() {
@@ -7239,8 +7240,64 @@ mod task_app_actions {
                 ActionSend::Comment("zacznij od testów".to_string())
             );
             assert_eq!(request.verb, "komentarz");
-            assert!(request.summary.contains("wznowione"), "{}", request.summary);
+            assert_eq!(request.summary, "komentarz wysłany");
             assert!(app.overlay().is_none(), "no window of confirmation");
+        }
+
+        fn stop_form(continuation: &str) -> Value {
+            json!({
+                "execution_id": "exec-1",
+                "state_id": "review_scope",
+                "action_execution_id": "act-7",
+                "instruction": "Zatwierdź wynik",
+                "outputs": [{ "label": "reviewed", "description": "Wynik przeglądu." }],
+                "fields": [{ "name": "answer", "type": "text", "required": true }],
+                "continuation": continuation,
+                "approval": {
+                    "action_execution_id": "act-7",
+                    "result": { "output_label": "reviewed", "data": {}, "variables": {}, "exit_code": null, "stdout": "", "stderr": "" },
+                    "agent_session_id": "sess-1"
+                },
+                "episode": "ep-1",
+                "requested_at": "2026-10-09T11:54:00Z"
+            })
+        }
+
+        /// What the menu says a comment does at a stop the agent waits at.
+        fn effect_at(continuation: &str) -> String {
+            let mut app = loaded(with_pending(running("a", 1), stop_form(continuation)));
+            ch(&mut app, '.');
+            let chooser = app.overlay().and_then(Overlay::chooser).expect("menu");
+            let entry = chooser
+                .items()
+                .iter()
+                .find(|item| item.label.contains("dodaj komentarz"))
+                .expect("a comment entry");
+            assert_eq!(entry.unavailable, None);
+            entry.description.clone()
+        }
+
+        #[test]
+        fn the_menu_words_of_a_comment_are_the_servers_for_each_stop() {
+            assert!(effect_at("resume_agent").contains("w tej samej sesji"));
+            assert!(effect_at("approve_output").contains("Nie zatwierdza"));
+        }
+
+        #[test]
+        fn a_comment_on_a_question_and_on_an_approval_is_sent_as_a_comment() {
+            for continuation in ["resume_agent", "approve_output"] {
+                let mut app = loaded(with_pending(running("a", 1), stop_form(continuation)));
+                assert_eq!(ch(&mut app, 'c'), Request::None, "{continuation}");
+                assert!(matches!(app.overlay(), Some(Overlay::Comment(_))));
+                press(&mut app, KeyCode::Enter);
+                type_text(&mut app, "uwaga");
+                let request = act(press(&mut app, KeyCode::Enter));
+                assert_eq!(
+                    request.send,
+                    ActionSend::Comment("uwaga".to_string()),
+                    "{continuation}"
+                );
+            }
         }
 
         #[test]
@@ -7274,7 +7331,6 @@ mod task_app_actions {
                 .expect("a comment entry");
             assert_eq!(entry.unavailable, None);
             assert!(entry.description.contains("wznawia zadanie"));
-            let _ = std::any::type_name::<CommentForm>();
         }
     }
 

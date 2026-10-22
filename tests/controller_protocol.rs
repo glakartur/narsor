@@ -6823,13 +6823,262 @@ async fn a_comment_on_a_pause_waits_for_the_next_runner_and_resumes_the_task() {
         .await
         .expect("runner credential");
     let runner = RunnerClient::new(harness.base_url(), credential.credential);
-    let answer = runner
+    let polled = runner.poll(None, 0).await.expect("poll");
+    let message = polled.launch.resume_message.expect("the launch carries it");
+    assert_eq!(message.key, "c-1");
+    assert_eq!(message.text, "look at the tests first");
+
+    // A report alone does not take the comment off the record: only the
+    // runner's word that it gave it to its agent does. Then a runner with
+    // fresh storage is not handed it again, and the retry of its key still
+    // reads as a replay.
+    runner
         .snapshot(&snapshot(1, ExecutionStatus::Running, 9, None))
         .await
         .expect("snapshot");
-    let message = answer.launch.resume_message.expect("the launch carries it");
-    assert_eq!(message.key, "c-1");
-    assert_eq!(message.text, "look at the tests first");
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(
+        record.resume_message.as_ref().map(|m| m.key.as_str()),
+        Some("c-1")
+    );
+    runner
+        .poll_with(&narsor_protocol::controller::RunnerPollQuery {
+            wait_secs: Some(0),
+            resume_message_taken: Some("c-1".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("poll that says the comment was taken");
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(record.resume_message, None);
+    assert_eq!(record.resume_message_taken, vec!["c-1".to_string()]);
+    let commands_before = record.commands.len();
+    assert!(runner
+        .poll(None, 0)
+        .await
+        .expect("poll")
+        .launch
+        .resume_message
+        .is_none());
+    let retry = harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests first", "c-1"))
+        .await
+        .expect("retry after the launch took it");
+    assert!(retry.replayed);
+    // The comment did its resume once: a late retry does not resume a task
+    // the owner stopped since.
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(record.commands.len(), commands_before);
+}
+
+#[tokio::test]
+async fn a_report_alone_leaves_the_comment_on_the_record() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests first", "c-1"))
+        .await
+        .expect("comment");
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    let credential = running
+        .controller
+        .issue_runner_credential(
+            "task-1",
+            &RunnerCredentialRequest {
+                lease_epoch: running.epoch,
+                generation: record.generation,
+                incarnation: "pod-2".to_string(),
+            },
+        )
+        .await
+        .expect("runner credential");
+    let runner = RunnerClient::new(harness.base_url(), credential.credential);
+    let mut problem = snapshot(1, ExecutionStatus::Running, 9, None);
+    problem.problem = Some(narsor_engine::orchestration::RunnerProblem {
+        code: "no_harness".to_string(),
+        message: "the runner cannot work".to_string(),
+    });
+    runner.snapshot(&problem).await.expect("problem snapshot");
+
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(
+        record.resume_message.as_ref().map(|m| m.key.as_str()),
+        Some("c-1")
+    );
+}
+
+#[tokio::test]
+async fn a_second_comment_does_not_replace_one_no_runner_has_taken() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let control = harness.service.control_plane();
+    let id = TaskId::parse("task-1").unwrap();
+
+    assert!(!control.store_resume_message(&id, "c-1", "first").unwrap());
+    // Another key while the first waits (two owners racing on the pause):
+    // the first is not overwritten.
+    assert!(matches!(
+        control.store_resume_message(&id, "c-2", "second"),
+        Err(narsor_engine::orchestration::OrchestrationError::ResumeMessagePending { .. })
+    ));
+    // The same key with another text is a mistake of the client.
+    assert!(matches!(
+        control.store_resume_message(&id, "c-1", "other"),
+        Err(narsor_engine::orchestration::OrchestrationError::InputKeyReused { .. })
+    ));
+    // The same key and text is a replay.
+    assert!(control.store_resume_message(&id, "c-1", "first").unwrap());
+    assert_eq!(
+        control
+            .task(&id)
+            .unwrap()
+            .resume_message
+            .as_ref()
+            .map(|m| m.text.as_str()),
+        Some("first")
+    );
+}
+
+#[tokio::test]
+async fn taking_a_comment_checks_the_key_and_remembers_only_the_latest_keys() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let control = harness.service.control_plane();
+    let id = TaskId::parse("task-1").unwrap();
+
+    control.store_resume_message(&id, "c-0", "first").unwrap();
+    // A key that is not the waiting one changes nothing.
+    assert!(!control.take_resume_message(&id, "other").unwrap());
+    assert!(control.task(&id).unwrap().resume_message.is_some());
+
+    assert!(control.take_resume_message(&id, "c-0").unwrap());
+    // A second take of the same key finds nothing to drop.
+    assert!(!control.take_resume_message(&id, "c-0").unwrap());
+    // The replay of a taken key stays a replay.
+    assert!(control.store_resume_message(&id, "c-0", "first").unwrap());
+
+    // Only the latest 32 keys are kept.
+    for n in 1..=32 {
+        let key = format!("c-{n}");
+        control.store_resume_message(&id, &key, "text").unwrap();
+        assert!(control.take_resume_message(&id, &key).unwrap());
+    }
+    let taken = control.task(&id).unwrap().resume_message_taken;
+    assert_eq!(taken.len(), 32);
+    assert!(!taken.iter().any(|key| key == "c-0"), "{taken:?}");
+    // The dropped key reads as a new comment: the known limit of the cap.
+    assert!(!control.store_resume_message(&id, "c-0", "late").unwrap());
+}
+
+#[tokio::test]
+async fn a_comment_of_unreasonable_size_is_refused() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    let long = "x".repeat(4_001);
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_comment("task-1", &comment_request(&long, "c-1"))
+                .await
+        ),
+        "comment_too_long"
+    );
+    let key = "k".repeat(129);
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_comment("task-1", &comment_request("fine", &key))
+                .await
+        ),
+        "idempotency_key_too_long"
+    );
+    assert_eq!(
+        harness.task("task-1").await.runner_state,
+        RunnerState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn a_comment_is_refused_at_the_send_where_the_request_takes_no_message() {
+    for continuation in ["complete_step", "entry_limit"] {
+        let harness = Harness::start().await;
+        waiting_on_request(&harness, continuation, AttentionKind::Question).await;
+        assert_eq!(
+            refused_code(
+                harness
+                    .owner
+                    .control_comment("task-1", &comment_request("hello", "c-1"))
+                    .await
+            ),
+            "action_unavailable",
+            "{continuation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_comment_without_a_key_is_refused_by_the_service() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_comment("task-1", &comment_request("hello", " "))
+                .await
+        ),
+        "missing_idempotency_key"
+    );
+}
+
+#[tokio::test]
+async fn a_comment_on_a_pause_shows_in_the_event_stream_of_the_task() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("look at the tests", "c-1"))
+        .await
+        .expect("comment");
+
+    let events = operator_events(&harness, "task-1").await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TaskEventKind::ResumeMessageStored { idempotency_key } if idempotency_key == "c-1"
+        )),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]

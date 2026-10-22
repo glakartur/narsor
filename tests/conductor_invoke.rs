@@ -23,8 +23,8 @@ use narsor_engine::conductor::{
     Invocation, InvocationOutcome, LiveHarness, QueuedRequest, ResponseError,
 };
 use narsor_engine::domain::{
-    ArtifactReference, ConductorOutcome, ConductorPurpose, ConductorTrigger, Confidence, Event,
-    EventData, ChoiceDefinition,
+    ArtifactReference, ChoiceDefinition, ConductorOutcome, ConductorPurpose, ConductorTrigger,
+    Confidence, Event, EventData,
 };
 use narsor_engine::engine::actions::harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessRegistry, OpenCodeAdapter,
