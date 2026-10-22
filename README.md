@@ -622,7 +622,9 @@ data is greyed and marked with its age (`stan sprzed 40s`), actions that change
 state are blocked with the reason, and drafts and forms stay. The stream always
 resumes from the last event applied. Events of a task patch its row at once, the
 rest is read again after a short delay, and every `tui_refresh_interval` (10 s
-by default, `none` turns it off; see [Configuration](#configuration)). A read
+by default, `none` turns it off; see [Configuration](#configuration)). A runner
+report that changes no state, question or attention does not start a read, so the
+current step of a task refreshes every `tui_refresh_interval`. A read
 never changes the selection, the focus, the tab, the cursors, the following of
 the current step or a draft.
 

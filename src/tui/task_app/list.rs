@@ -889,14 +889,15 @@ impl TaskList {
     ///   carries and renumbers its rows;
     /// * [`TaskEventKind::InputQueued`] and [`TaskEventKind::RunnerReported`]
     ///   patch the attention of the row (and the runner's status), so a
-    ///   question or an answer shows without a read;
+    ///   question or an answer shows without a read; a report that changes
+    ///   none of status, pending input or attention asks for no read, and the
+    ///   runner's current step shows with the periodic read;
     /// * [`TaskEventKind::AutoResumed`] and
     ///   [`TaskEventKind::AutoResumeExhausted`] say so in
     ///   [`EventEffect::resume`] for a notification — the row keeps its
     ///   place, only its marker changes — and ask for a read;
-    /// * everything else — and anything the event cannot say, such as the
-    ///   runner's current step or a task this list does not know — asks for a
-    ///   read, which the caller debounces.
+    /// * everything else — and anything the event cannot say, such as a task
+    ///   this list does not know — asks for a read, which the caller debounces.
     ///
     /// An event that is not newer than the row's revision is dropped — except
     /// a `Moved` at exactly that revision: a read that came in between the
@@ -1330,14 +1331,19 @@ fn patch_row(task: &mut TaskSummary, kind: &TaskEventKind, event: &TaskEvent) ->
             let Some(runner) = task.runner.as_mut() else {
                 return true;
             };
+            let status_changed = runner.execution_status != *execution_status;
+            let pending_changed = runner.pending_input.as_ref().map(|pending| &pending.id)
+                != pending_input_id.as_ref();
             runner.execution_status = *execution_status;
             runner.event_cursor = *event_cursor;
             if pending_input_id.is_none() {
                 runner.pending_input = None;
             }
+            let before = task.attention.clone();
             replace_reported_attention(&mut task.attention, attention, &task.inputs);
-            // The step the runner is in is not in the event.
-            true
+            // The step the runner is in is not in the event; the periodic read
+            // shows it. A report that moves only the event cursor asks for nothing.
+            status_changed || pending_changed || task.attention != before
         }
         _ => true,
     }
