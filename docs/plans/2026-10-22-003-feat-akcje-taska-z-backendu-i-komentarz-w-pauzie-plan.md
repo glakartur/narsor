@@ -47,7 +47,7 @@ Wymagania R1–R10, przepływy F1–F2 i AE1–AE6 pochodzą z dokumentu źród�
 
 Bez zmian względem dokumentu źródłowego (see origin: Scope Boundaries):
 
-- Bez zmiany znaczenia akcji workflow (przejścia, `allow_manual_override`).
+- Bez zmiany znaczenia akcji workflow (przejścia, `allow_manual_override`). Jedyny wyjątek: dostępność archiwizacji podąża za control plane (KTD8), więc menu TUI pokazuje ją także dla taska działającego, w kolejce i wstrzymanego.
 - Bez komentarza do taska bez sesji agenta (zakończony, zarchiwizowany, w kolejce).
 - Bez nowych ról i uprawnień, bez wątków i edycji komentarza, bez załączników (Z3).
 - Bez komentarza w stanach: nieudany krok, problem runnera, nieudany provisioning (Z1).
@@ -362,7 +362,7 @@ sequenceDiagram
 
 **Requirements:** R3, F1, AE1, AE6
 
-**Dependencies:** U2
+**Dependencies:** U2, U3
 
 **Files:**
 - Modify: `src/tui/task_app/actions.rs` (`availability`, `menu_items`, `invoke`, `verb`)
@@ -456,7 +456,7 @@ sequenceDiagram
 | Zmiana Z2 lub Z6 na MR | Zmiana semantyki w U4 i U5 | Reguła w jednej tabeli (KTD4) i jednym dyspozytorze (KTD3); zmiana lokalna |
 | Wiadomość przy `Resume` dostarczona dwa razy lub utracona przy restarcie runnera | Agent dostaje komentarz podwójnie albo wcale | Atomowy zapis z poleceniem, znacznik „zużyta", klucz idempotencji; testy restartu w U5 |
 
-Zależności: brak zewnętrznych. U1 jest pierwsza; U2 po U1; U6 po U2 (wymaga danych z U2); U7 na końcu.
+Zależności: brak zewnętrznych. U1 jest pierwsza; U2 po U1; U6 po U2 i U3 (wymaga danych z U2 i odrzuceń z U3); U7 na końcu.
 
 ---
 
