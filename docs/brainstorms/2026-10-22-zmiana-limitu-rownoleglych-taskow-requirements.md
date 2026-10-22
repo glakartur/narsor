@@ -69,14 +69,15 @@ Dotyczy to operatora, który prowadzi kilka tasków na jednym backendzie (lokaln
 **Obniżenie limitu**
 - R7. Obniżenie limitu nie zatrzymuje tasków natychmiast. Centrala natychmiast przestaje uruchamiać nowe taski ponad nowy limit.
 - R8. Gdy liczba tasków trzymających slot jest większa od limitu, centrala zatrzymuje nadwyżkę po jednym tasku. Zatrzymanie następuje dopiero, gdy task jest w bezpiecznym punkcie (ta sama ścieżka bezpiecznego zatrzymania, której używa dziś zwolnienie slotu z polityki). Centrala wybiera pierwszy task, który ten punkt osiągnie. Centrala nie wybiera tasków z góry.
-- R9. Zatrzymany w ten sposób task zachowuje cały stan pracy. Task nie jest oznaczony jako zatrzymany przez właściciela. Task wraca do kolejki przed wszystkimi oczekującymi taskami (tak jak wznowienie zatrzymanego taska przy pełnym backendzie w D62) i rusza ponownie, gdy slot się zwolni.
+- R9. Zatrzymany w ten sposób task zachowuje cały stan pracy. Task nie jest oznaczony jako zatrzymany przez właściciela. Task wraca do kolejki na swoją dotychczasową pozycję, a nie na początek i nie na koniec. Jeśli task z niższej pozycji znajdzie wolny slot wcześniej, ten task go zajmie. Zatrzymany task rusza ponownie, gdy slot się zwolni i przyjdzie jego kolej.
 - R10. Task, który czeka na odpowiedź właściciela albo ma nierozpatrzone polecenie operatora, jest pomijany przy wyborze nadwyżki, dopóki ta praca czeka. Centrala nie zatrzymuje taska w środku kroku.
+- R10a. Taski `Interrupted` i `Unknown`, które trzymają slot, wchodzą do nadwyżki. Centrala najpierw ustala, co dzieje się z takim taskiem, i dopiero potem może nim zarządzać. Do czasu ustalenia stanu centrala pomija taki task przy wyborze nadwyżki.
 - R11. Task, który z innego powodu zwalnia slot (zakończenie, anulowanie, zwolnienie z polityki w D62), liczy się do spadku nadwyżki. Centrala nie zatrzymuje wtedy dodatkowych tasków ponad potrzebę.
 - R12. Gdy nadwyżka istnieje, operator widzi to w liście tasków i w widoku limitu: ile slotów jest trzymanych, jaki jest limit, ile tasków czeka na zatrzymanie. Zdarzenia zatrzymania z powodu obniżenia limitu zostają w historii taska z powodem.
 - R13. Operator może zmienić limit ad hoc z TUI i z CLI. Obie powierzchnie pokazują ten sam stan, który podaje centrala. Klienci niczego sami nie wyprowadzają (zasada D62).
 
-**Trwałość i bezpieczeństwo**
-- R14. Zmiana ad hoc przeżywa restart centrali. Operator widzi, że nadpisanie jest aktywne.
+**Czas życia nadpisania i bezpieczeństwo**
+- R14. Zmiana ad hoc nie przeżywa restartu centrali. Po restarcie obowiązuje limit z pliku konfiguracyjnego. Operator widzi, że nadpisanie jest aktywne, dopóki centrala działa.
 - R15. Dwie jednoczesne zmiany limitu nie dają niespójnego stanu: obowiązuje ostatnia zatwierdzona, a limit i liczenie nadwyżki nigdy nie dopuszczają uruchomienia taska ponad limit.
 
 ---
@@ -84,10 +85,13 @@ Dotyczy to operatora, który prowadzi kilka tasków na jednym backendzie (lokaln
 ## Acceptance Examples
 
 - AE1. **Covers R5, R6.** Given backend z limitem 2, dwoma działającymi taskami i trzema czekającymi w kolejce, gdy operator ustawia limit 4, dwa pierwsze czekające taski ruszają w kolejności kolejki. Dwa działające taski działają dalej bez zmian. Trzeci czekający zostaje w kolejce.
-- AE2. **Covers R7, R8, R9.** Given limit 3 i trzy działające taski, w tym task A w środku kroku, gdy operator obniża limit do 2, a task B pierwszy dochodzi do bezpiecznego punktu, centrala zatrzymuje B i zwalnia jego slot. Task A działa dalej do końca kroku. B wraca do kolejki przed oczekującymi, ze stanem pracy bez zmian.
+- AE2. **Covers R7, R8, R9.** Given limit 3 i trzy działające taski, w tym task A w środku kroku, gdy operator obniża limit do 2, a task B pierwszy dochodzi do bezpiecznego punktu, centrala zatrzymuje B i zwalnia jego slot. Task A działa dalej do końca kroku. B wraca do kolejki na swoją dotychczasową pozycję, ze stanem pracy bez zmian.
 - AE3. **Covers R7.** Given limit 3 i trzy działające taski, gdy operator obniża limit do 2 i task kończy się sam, centrala nie zatrzymuje żadnego innego taska.
 - AE4. **Covers R10.** Given nadwyżka 1 i jedyny kandydat czeka na odpowiedź właściciela, gdy odpowiedź jest nierozpatrzona, centrala nie zatrzymuje tego taska. Operator widzi, że nadwyżka czeka.
 - AE5. **Covers R2, R3.** Given limit w pliku 3 i nadpisanie ad hoc 5, gdy operator usuwa nadpisanie, obowiązuje limit 3 i działa F2, jeśli trzymanych slotów jest więcej niż 3.
+- AE7. **Covers R9.** Given zatrzymany task A na pozycji 1 kolejki i task B na pozycji 3, gdy B znajdzie wolny slot wcześniej niż A, B go zajmuje. A czeka na swoją kolej na pozycji 1.
+- AE8. **Covers R14.** Given nadpisanie ad hoc 5 i limit w pliku 3, gdy centrala się restartuje, obowiązuje limit 3. Operator nie widzi aktywnego nadpisania.
+- AE9. **Covers R10a.** Given nadwyżka 1 i jedyny kandydat ma stan `Unknown`, gdy centrala jeszcze nie ustaliła jego stanu, nie zatrzymuje go. Po ustaleniu stanu centrala zarządza nim jak innymi taskami.
 - AE6. **Covers R4.** Given limit 3, gdy operator wpisuje 0 albo 2000, centrala odrzuca wartość z komunikatem. Limit zostaje 3.
 
 ---
@@ -106,6 +110,8 @@ Dotyczy to operatora, który prowadzi kilka tasków na jednym backendzie (lokaln
 - Brak natychmiastowego, wymuszonego zatrzymania tasków przy obniżeniu limitu.
 - Brak wyboru przez operatora, który task zatrzymać. Zatrzymuje się pierwszy gotowy.
 - Brak zmian w kolejności kolejki, priorytetu i w zasadach zwalniania slotów z D62 poza opisanymi powyżej.
+- Brak wskazania operatorowi, który task zostanie zatrzymany jako następny. Operator widzi tylko licznik nadwyżki.
+- Brak osobnej opcji limitu w ogólnych ustawieniach. Limit zostaje w pliku backendu.
 - Brak limitu globalnego ponad backendami. Limit pozostaje ustawieniem backendu.
 - Brak zmiany zakresu 1–1024.
 
@@ -116,6 +122,10 @@ Dotyczy to operatora, który prowadzi kilka tasków na jednym backendzie (lokaln
 - **Bezpieczny punkt to istniejąca ścieżka zatrzymania z polityki (D62), nie nowy mechanizm.** Dzięki temu zatrzymanie nadwyżki zachowuje te same gwarancje co zwolnienie slotu.
 - **Zatrzymuje się pierwszy task, który jest gotowy, a nie task wybrany z góry.** Odpowiada to intencji z opisu: centrala czeka na pierwszą sesję w bezpiecznym stanie.
 - **Zmiana ad hoc nie zapisuje pliku.** Plik pozostaje deklaracją operatora. Nadpisanie jest osobnym, widocznym stanem.
+- **Nadpisanie ad hoc wygasa przy restarcie.** Po restarcie centrala wraca do stanu z pliku konfiguracyjnego.
+- **Zatrzymany task wraca na swoją pozycję w kolejce.** Task z niższej pozycji może zająć wolny slot przed nim.
+- **Limit ustawia się tylko w pliku backendu.** Nie ma osobnej opcji w ogólnych ustawieniach.
+- **Operator widzi licznik nadwyżki.** Wskazanie następnego taska do zatrzymania nie jest potrzebne, bo kolejność zależy od czasu przetwarzania i nie jest deterministyczna.
 
 ---
 
@@ -132,19 +142,19 @@ Dotyczy to operatora, który prowadzi kilka tasków na jednym backendzie (lokaln
 - Z1. „Koordynator tasków" w opisie to centrala (control plane) wraz z daemonem. „Aktywna sesja koordynatora" to działająca centrala. Zmiana ad hoc dotyczy działającego procesu.
 - Z2. Limit pozostaje ustawieniem każdego backendu osobno. Konfiguracja „w pliku" to plik backendu, a nie nowy, globalny plik.
 - Z3. „Bezpieczny punkt" to ten sam punkt, w którym dziś zatrzymuje się runner przy `Pause` z polityki (po zakończeniu bieżącego kroku lub w innym punkcie, który ta ścieżka uznaje za bezpieczny). Zakładamy, że to odpowiada opisowi „po zakończeniu jakiegoś kroku". Potwierdza to użytkownik i weryfikuje specjalista, bo punkt zależy od tego, jak runner obsługuje pauzę.
-- Z4. Zatrzymany z powodu limitu task wraca do kolejki na początek (jak w D62), a nie na koniec.
-- Z5. Zmiana ad hoc przeżywa restart centrali (R14). Bezpieczniejsze dla operatora niż ciche wycofanie.
+- Z4. Zatrzymany z powodu limitu task wraca do kolejki na swoją dotychczasową pozycję (R9). Potwierdził użytkownik.
+- Z5. Zmiana ad hoc nie przeżywa restartu centrali (R14). Potwierdził użytkownik.
 - Z6. Zmiana ad hoc jest dostępna dla właściciela centrali, tak jak inne polecenia sterujące. Osobny model uprawnień nie jest potrzebny.
 
 ---
 
-## Pytania otwarte dla użytkownika
+## Rozstrzygnięte pytania
 
-- P1. Czy zmiana ad hoc ma przeżywać restart centrali (Z5), czy wygasać przy restarcie i wracać do pliku?
-- P2. Czy zatrzymany task ma wracać na początek kolejki (Z4), czy na koniec? Początek chroni task przed głodzeniem. Koniec daje szansę taskom, które czekały dłużej.
-- P3. Czy limit ma być także ustawiany w pliku ogólnych ustawień (np. jedna wartość dla backendu `local`), czy wystarczy plik backendu?
-- P4. Czy zatrzymanie nadwyżki ma dotyczyć też tasków `Interrupted` i `Unknown`, które trzymają slot, a nie mają działającego runnera? Zakładamy, że nie, bo nie ma czego zatrzymać w bezpiecznym punkcie.
-- P5. Czy operator chce widzieć, który task jest następny w kolejce do zatrzymania, czy wystarczy licznik nadwyżki?
+- P1. Zmiana ad hoc nie przeżywa restartu. Po restarcie centrala wraca do stanu z pliku konfiguracyjnego (R14).
+- P2. Zatrzymany task wraca na swoją dotychczasową pozycję w kolejce. Task z niższej pozycji, który znajdzie wolny slot, może go zająć przed nim (R9).
+- P3. Limit pozostaje jedną opcją w pliku konfiguracyjnym backendu (Z2). Nie dodajemy osobnej opcji w ogólnych ustawieniach. To odczytanie odpowiedzi „jedna opcja w pliku konfiguracji narsor'a" wymaga potwierdzenia przez użytkownika.
+- P4. Zatrzymanie nadwyżki dotyczy też tasków `Interrupted` i `Unknown`. Centrala najpierw ustala stan takich tasków i dopiero potem nimi zarządza (R10a).
+- P5. Wystarczy licznik nadwyżki. Kolejność zatrzymania zależy od czasu przetwarzania tasków i nie jest deterministyczna (R12).
 
 ---
 
@@ -153,6 +163,7 @@ Dotyczy to operatora, który prowadzi kilka tasków na jednym backendzie (lokaln
 ### Deferred to Planning
 
 - [Affects R8, R10][Technical] Jak centrala rozpoznaje „task dotarł do bezpiecznego punktu" i jak zapobiega wyścigowi z poleceniem właściciela.
-- [Affects R14][Technical] Gdzie zapisać nadpisanie ad hoc, żeby przeżyło restart i nie kolidowało z odczytem pliku.
+- [Affects R14][Technical] Gdzie trzymać nadpisanie ad hoc w pamięci centrali, żeby nie kolidowało z odczytem pliku i znikało przy restarcie.
+- [Affects R10a][Technical] Jak centrala ustala stan tasków `Interrupted` i `Unknown` oraz co zatrzymanie oznacza dla taska bez działającego runnera.
 - [Affects R13][Technical] Jakie polecenie CLI i jaki widok TUI wystawiają zmianę.
 - [Affects R5][Technical] Co wyzwala ponowne planowanie po zmianie limitu (pętla co 5 s czy zdarzenie).
