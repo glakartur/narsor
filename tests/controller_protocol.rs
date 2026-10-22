@@ -6180,16 +6180,24 @@ async fn a_finished_task_offers_to_archive_and_not_to_interrupt() {
 }
 
 #[tokio::test]
-async fn a_running_task_cannot_be_archived_and_says_why() {
+async fn an_archived_task_has_nothing_left_to_archive() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    harness
+        .command("task-1", OwnerCommand::Archive, "archive-1")
+        .await;
+
+    let task = harness.task("task-1").await;
+    assert_unavailable(&task, TaskActionId::Archive, "zadanie jest archiwizowane");
+}
+
+#[tokio::test]
+async fn a_running_task_offers_the_archive_the_control_plane_takes() {
     let harness = Harness::start().await;
     harness.running("task-1", "k8s").await;
 
     let task = harness.task("task-1").await;
-    assert_unavailable(
-        &task,
-        TaskActionId::Archive,
-        "zadanie działa — archiwizować można zakończone lub przerwane",
-    );
+    assert_available(&task, TaskActionId::Archive);
     assert_available(&task, TaskActionId::Interrupt);
     assert_available(&task, TaskActionId::Pause);
     assert_unavailable(&task, TaskActionId::Resume, "zadanie działa");

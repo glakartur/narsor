@@ -108,14 +108,13 @@ pub(super) fn unavailable_reason(task: &TaskSummary, id: TaskActionId) -> Option
             }
             _ => Some(state_phrase(task).to_string()),
         },
-        TaskActionId::Archive => match task.runner_state {
-            RunnerState::Interrupted | RunnerState::Unknown => None,
-            _ if is_finished(task) || provisioning_failed(task) => None,
-            _ => Some(format!(
-                "{} — archiwizować można zakończone lub przerwane",
-                state_phrase(task)
-            )),
-        },
+        // The control plane takes an archive in any state ("archive wins":
+        // it frees the slot of a running, queued or paused task), so the
+        // offer follows it. Only a task already archiving or archived has nothing to do.
+        TaskActionId::Archive if task.runner_state.is_archival() => {
+            Some("zadanie jest archiwizowane".to_string())
+        }
+        TaskActionId::Archive => None,
         TaskActionId::Unrecognized => Some("serwer nie zna tej akcji".to_string()),
     }
 }
@@ -401,10 +400,8 @@ impl ProtocolService {
         command: OwnerCommand,
         expected_generation: Option<u64>,
     ) -> ProtocolResult<()> {
-        // An archive is not judged by the offer: the control plane lets the
-        // owner archive a task in any state (archive wins), and the
-        // archive of a queued or running task is how a slot is freed. The
-        // offer only says when a client should show it.
+        // An archive of an archived task converges in the control plane, so
+        // it is not refused here.
         if command == OwnerCommand::Archive
             || !matches!(
                 lifecycle::command_effect(record.runner_state, command),
