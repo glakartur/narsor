@@ -43,13 +43,15 @@ pub use narsor_protocol::controller::{
     RotateKeyResponse, RunnerCredentialRequest, RunnerCredentialResponse, RunnerDirective,
     RunnerLaunchView, RunnerPollQuery, RunnerPollResponse, RunnerProblem, RunnerProgress,
     RunnerRenewResponse, RunnerSnapshotRequest, RunnerSnapshotResponse, RunnerState, RunnerView,
-    SetBackendLimitRequest, SetDefaultBackendRequest, SubmitInputRequest, SubmitInputResponse,
-    SubmitOperatorCommandRequest, SubmitOperatorCommandResponse, TaskEvent, TaskEventKind,
-    TaskListResponse, TaskState, TaskSummary, TimelineResponse, TransitionExit, TransitionOffer,
-    ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType, WorkflowInputView,
-    WorkflowListResponse, WorkflowSource, WorkflowSourceRequest, WorkflowSourceResponse,
-    WorkflowView, WorkspaceRequest, CONVERSATION_READER_STARTING, CONVERSATION_RECORD_UNREADABLE,
-    CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
+    SetBackendLimitRequest, SetDefaultBackendRequest, SubmitCommentRequest, SubmitCommentResponse,
+    SubmitInputRequest, SubmitInputResponse, SubmitOperatorCommandRequest,
+    SubmitOperatorCommandResponse, TaskActionId, TaskActionOffer, TaskActionOption, TaskEvent,
+    TaskEventKind, TaskListResponse, TaskState, TaskSummary, TimelineResponse, TransitionExit,
+    TransitionOffer, ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType,
+    WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowSourceRequest,
+    WorkflowSourceResponse, WorkflowView, WorkspaceRequest, CONVERSATION_READER_STARTING,
+    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
+    CONVERSATION_UNAVAILABLE,
 };
 
 use crate::domain::TaskId;

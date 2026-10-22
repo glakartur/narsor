@@ -16,6 +16,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, watch};
 
+mod actions;
 mod auto_resume;
 mod backend_limit;
 mod conductor;
@@ -647,6 +648,14 @@ impl ProtocolService {
             ));
         }
         let command = request.command;
+        // A repeated key is answered with the receipt it got, not judged anew.
+        let is_retry = record
+            .commands
+            .iter()
+            .any(|receipt| receipt.idempotency_key == request.idempotency_key);
+        if !is_retry {
+            self.require_owner_command_available(&record, command, request.expected_generation)?;
+        }
         let outcome = self.control.command_with_capacity_from(
             &record.task_id,
             CommandRequest {
@@ -727,6 +736,7 @@ impl ProtocolService {
             MoveTaskTarget::Top => MoveTarget::Top,
             MoveTaskTarget::Bottom => MoveTarget::Bottom,
         };
+        self.require_movable(&record, request.expected_generation)?;
         let (_, changed) =
             self.control
                 .move_task(&record.task_id, &target, request.expected_generation)?;
@@ -912,6 +922,13 @@ impl ProtocolService {
                 "an input needs an idempotency key",
             ));
         }
+        let is_retry = record
+            .inputs
+            .iter()
+            .any(|queued| queued.idempotency_key == request.idempotency_key);
+        if !is_retry {
+            self.require_input_available(&record, &request)?;
+        }
         let outcome = self.control.queue_input(
             &record.task_id,
             InputRequest {
@@ -1006,6 +1023,9 @@ impl ProtocolService {
             .any(|queued| queued.idempotency_key == request.idempotency_key);
         if !is_retry {
             self.check_operator_command(&record, &request.command)?;
+            if let Some(action) = operator_action(&request.command) {
+                self.require_available(&record, action, request.expected_generation)?;
+            }
         }
         let outcome = self.control.queue_operator_command(
             &record.task_id,
@@ -2016,7 +2036,7 @@ impl ProtocolService {
             }
             None => None,
         };
-        Ok(TaskSummary {
+        let mut summary = TaskSummary {
             task_id: record.task_id.clone(),
             backend_id: record.assignment.backend_id.clone(),
             runner_state: record.runner_state,
@@ -2052,9 +2072,13 @@ impl ProtocolService {
             queue: record.queue.as_ref().map(QueueView::from),
             display: task_display(record),
             manual_transitions: manual_transitions(record),
+            actions: None,
             resume: record.resume.clone(),
             as_of: now,
-        })
+        };
+        // Last: the offer reads the rest of the summary.
+        summary.actions = Some(actions::offer(&summary));
+        Ok(summary)
     }
 
     /// Live only while the task expects a runner, the runner's launch is
@@ -2244,6 +2268,16 @@ const MAX_CHAT_CHARS: usize = 4_000;
 
 /// What can be said about a conductor command without the runner: that it
 /// names what it needs.
+/// The action of the offer an operator command is, if it is one of them: the
+/// conductor's commands are not.
+fn operator_action(command: &OperatorCommand) -> Option<TaskActionId> {
+    match command {
+        OperatorCommand::Interrupt => Some(TaskActionId::Interrupt),
+        OperatorCommand::Transition { .. } => Some(TaskActionId::Transition),
+        _ => None,
+    }
+}
+
 fn check_conductor_command(command: &OperatorCommand) -> ProtocolResult<()> {
     let blank = |text: &str| text.trim().is_empty();
     match command {
