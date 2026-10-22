@@ -31,7 +31,7 @@ Możliwe, że prośba powstała ze starszego stanu kodu, albo że chodzi o inny 
 - R3. Wartość `none` wyłącza odczyt okresowy.
 - R4. Odczyty wywołane zdarzeniem na żywo (po krótkim opóźnieniu) i ponowienia po błędzie zostają bez zmian. Dotyczy tylko odczytu okresowego.
 
-R1–R4 są dziś spełnione. Praca nad kodem jest potrzebna tylko wtedy, gdy któraś odpowiedź w sekcji „Pytania otwarte" wskaże lukę.
+R1–R4 są dziś spełnione. Praca nad kodem jest potrzebna tylko wtedy, gdy któraś odpowiedź w sekcji „Pytania otwarte dla użytkownika" wskaże lukę.
 
 ---
 
