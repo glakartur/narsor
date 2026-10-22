@@ -3,7 +3,13 @@
 //! The cursor is an index in characters, not bytes, and `Home`/`End` work on
 //! the logical line (between `\n`), not on the wrapped row.
 
-use crate::tui::input_form::char_byte_index;
+/// The byte index of character `character` of `text`, or its length past the end.
+pub(crate) fn char_byte_index(text: &str, character: usize) -> usize {
+    text.char_indices()
+        .nth(character)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
 
 /// The value of a text field and where the cursor stands in it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -43,12 +49,6 @@ impl TextBuffer {
     /// Replaces the text; the cursor goes to its end.
     pub fn set(&mut self, value: impl Into<String>) {
         *self = Self::new(value);
-    }
-
-    /// Replaces the text and puts the cursor at `cursor`, kept inside it.
-    pub fn restore(&mut self, value: String, cursor: usize) {
-        self.value = value;
-        self.cursor = cursor.min(self.len());
     }
 
     /// Puts the cursor at `cursor`, kept inside the text.

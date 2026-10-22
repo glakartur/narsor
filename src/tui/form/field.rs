@@ -4,7 +4,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::layout::{text_width, wrap, Wrapped, PROMPT_WIDTH};
+use super::layout::{text_width, wrap, Wrapped};
 use crate::tui::chooser::{ChooserField, FieldKind};
 use crate::tui::scroll::sanitize;
 use crate::tui::style::{Role, Styles};
@@ -115,9 +115,4 @@ pub fn value_rows(field: &ChooserField, width: usize, focused: bool) -> usize {
         .rows
         .len()
         .max(1)
-}
-
-/// The columns before the text of a field.
-pub const fn prompt_width() -> usize {
-    PROMPT_WIDTH
 }

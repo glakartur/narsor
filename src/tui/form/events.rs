@@ -47,9 +47,6 @@ pub enum FormEvent {
         /// Whether it has the focus now.
         gained: bool,
     },
-    /// An arrow press found no field beyond the first or the last one: the
-    /// owner decides where the focus goes.
-    EdgeReached(Edge),
     /// A value changed.
     Edited,
 }

@@ -5,7 +5,7 @@
 //! place, for scrolling and for moving the cursor up and down the rows that
 //! are drawn. Text that is not edited (descriptions) wraps through it too.
 
-use crate::tui::input_form::char_byte_index;
+use super::buffer::char_byte_index;
 use crate::tui::scroll::sanitize;
 
 /// The columns before a field's text: the `> ` prompt, or its blank twin.
@@ -15,13 +15,10 @@ pub const PROMPT_WIDTH: usize = 2;
 /// full row still has a cell inside the field.
 pub const FIELD_RIGHT_MARGIN: usize = 1;
 
-/// The columns the form is indented by.
-pub const FIELD_INDENT: usize = 0;
-
 /// The columns a field's text may take in an area `area_width` wide.
 pub fn text_width(area_width: usize) -> usize {
     area_width
-        .saturating_sub(FIELD_INDENT + PROMPT_WIDTH + FIELD_RIGHT_MARGIN)
+        .saturating_sub(PROMPT_WIDTH + FIELD_RIGHT_MARGIN)
         .max(1)
 }
 
@@ -59,6 +56,32 @@ impl PartialEq for WrapWidth {
 }
 
 impl Eq for WrapWidth {}
+
+/// The first row of a field's window as last drawn, so that a field taller
+/// than its window moves only when the cursor leaves it. Every value compares
+/// equal, like [`WrapWidth`].
+#[derive(Debug, Clone, Default)]
+pub struct WindowRow(std::cell::Cell<usize>);
+
+impl WindowRow {
+    /// The first row drawn last time.
+    pub fn get(&self) -> usize {
+        self.0.get()
+    }
+
+    /// Remembers the first row of the last drawing.
+    pub fn set(&self, row: usize) {
+        self.0.set(row);
+    }
+}
+
+impl PartialEq for WindowRow {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for WindowRow {}
 
 /// A text laid out in rows of at most `width` cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,13 +179,43 @@ fn chunk_by_cells(chars: &[char], width: usize) -> Vec<&[char]> {
 /// before it. The drawing turns a tab into spaces, so the cursor counts what
 /// the text before it draws as, not its characters.
 fn drawn_offsets(value: &str) -> Vec<usize> {
-    let count = value.chars().count();
-    (0..=count)
-        .map(|character| {
-            let byte = char_byte_index(value, character);
-            sanitize(&value[..byte]).chars().count()
-        })
-        .collect()
+    // An escape sequence swallows the characters after it, so a prefix has to
+    // be drawn whole. Rare, and the only case that is not one pass.
+    if value.contains('\u{1b}') {
+        let count = value.chars().count();
+        return (0..=count)
+            .map(|character| {
+                let byte = char_byte_index(value, character);
+                sanitize(&value[..byte]).chars().count()
+            })
+            .collect();
+    }
+    const TAB_WIDTH: usize = 4;
+    let mut offsets = Vec::with_capacity(value.len() + 1);
+    let mut drawn = 0;
+    let mut column = 0;
+    offsets.push(0);
+    for character in value.chars() {
+        let width = match character {
+            '\n' => {
+                column = 0;
+                1
+            }
+            '\t' => {
+                let width = TAB_WIDTH - (column % TAB_WIDTH);
+                column += width;
+                width
+            }
+            other => {
+                let width = sanitize(other.encode_utf8(&mut [0; 4])).chars().count();
+                column += width;
+                width
+            }
+        };
+        drawn += width;
+        offsets.push(drawn);
+    }
+    offsets
 }
 
 impl Wrapped {
@@ -215,6 +268,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn offsets_count_what_is_drawn() {
+        let offsets = drawn_offsets("a\tb\nc");
+        assert_eq!(offsets, vec![0, 1, 4, 5, 6, 7]);
+        let escaped = "x\u{1b}[31my";
+        let last = *drawn_offsets(escaped).last().unwrap();
+        assert_eq!(last, sanitize(escaped).chars().count());
+    }
+
+    #[test]
+    fn a_large_value_wraps_at_once() {
+        let value = "ab\t".repeat(100_000);
+        let wrapped = wrap(&value, Some(value.chars().count()), 40);
+        assert!(wrapped.rows.len() > 1000);
+    }
+
+    #[test]
+    fn the_window_stays_while_the_cursor_is_in_it() {
+        assert_eq!(window_start(5, 4, 3), 3);
+        assert_eq!(window_start(2, 4, 3), 2);
+        assert_eq!(window_start(9, 4, 3), 6);
+    }
+
+    #[test]
     fn long_text_wraps_after_width_cells() {
         let wrapped = wrap("abcdefgh", None, 3);
         assert_eq!(wrapped.rows, ["abc", "def", "gh"]);
@@ -223,7 +299,7 @@ mod tests {
     #[test]
     fn text_in_a_form_of_forty_columns_ends_before_the_last_cell() {
         let width = text_width(40);
-        assert_eq!(FIELD_INDENT + PROMPT_WIDTH + width, 39);
+        assert_eq!(PROMPT_WIDTH + width, 39);
         let wrapped = wrap(&"x".repeat(100), None, width);
         assert!(wrapped.rows.iter().all(|row| row.chars().count() <= width));
     }

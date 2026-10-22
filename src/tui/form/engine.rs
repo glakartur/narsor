@@ -18,6 +18,14 @@ enum Stage {
     Confirming { return_field: usize },
 }
 
+/// The most events kept for an owner that does not ask; the oldest go first.
+const MAX_QUEUED_EVENTS: usize = 64;
+
+/// `wanted` rows within `limit`, never fewer than one.
+pub fn clamp_rows(wanted: usize, limit: usize) -> u16 {
+    wanted.min(limit.max(1)).max(1).min(usize::from(u16::MAX)) as u16
+}
+
 /// The state of one form.
 #[derive(Debug, Clone, Default)]
 pub struct FormEngine {
@@ -37,9 +45,12 @@ impl FormEngine {
         }
     }
 
-    /// Adds events to the ones the owner has not taken yet.
+    /// Adds events to the ones the owner has not taken yet. An owner that
+    /// never asks does not make the queue grow: past the limit the oldest go.
     pub fn queue(&mut self, events: Vec<FormEvent>) {
         self.events.extend(events);
+        let excess = self.events.len().saturating_sub(MAX_QUEUED_EVENTS);
+        self.events.drain(..excess);
     }
 
     /// Hands the owner what happened since it last asked. The owner asks
@@ -121,7 +132,7 @@ impl FormEngine {
     /// take at most (never fewer than one). Returns a `Resized` event when
     /// the answer differs from the last one.
     pub fn resize(&mut self, wanted: usize, limit: usize) -> Vec<FormEvent> {
-        let rows = wanted.min(limit.max(1)).max(1).min(u16::MAX as usize) as u16;
+        let rows = clamp_rows(wanted, limit);
         if self.rows == Some(rows) {
             return Vec::new();
         }
@@ -184,6 +195,18 @@ mod tests {
             engine.set_focus(true),
             vec![FormEvent::FocusChanged { gained: true }]
         );
+    }
+
+    #[test]
+    fn unread_events_do_not_pile_up() {
+        let mut engine = FormEngine::new();
+        for _ in 0..(MAX_QUEUED_EVENTS * 3) {
+            engine.queue(vec![FormEvent::Edited]);
+        }
+        engine.queue(vec![FormEvent::Submitted]);
+        let events = engine.take_events();
+        assert_eq!(events.len(), MAX_QUEUED_EVENTS);
+        assert_eq!(events.last(), Some(&FormEvent::Submitted));
     }
 
     #[test]

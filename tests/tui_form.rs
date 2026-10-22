@@ -161,6 +161,53 @@ fn a_multiline_field_lets_go_on_the_second_arrow_in_a_row() {
 }
 
 #[test]
+fn tab_cancels_a_pending_edge_press() {
+    let mut chooser = Chooser::new(vec![ChooserItem::new("go", "Start.")
+        .with_field(ChooserField::text("name"))
+        .with_field(ChooserField::multiline("note"))
+        .with_field(ChooserField::text("tail"))])
+    .with_inputs_layout();
+    into_fields(&mut chooser);
+    // Walk to the multi-line field, wherever the layout starts the focus.
+    for _ in 0..3 {
+        type_text(&mut chooser, "|");
+        if !value(&chooser, 1).is_empty() {
+            break;
+        }
+        press(&mut chooser, KeyCode::Down);
+    }
+    // One Down at its last row arms the edge; a round of Tab through the
+    // three fields comes back to it disarmed.
+    press(&mut chooser, KeyCode::Down);
+    for _ in 0..3 {
+        press(&mut chooser, KeyCode::Tab);
+    }
+    press(&mut chooser, KeyCode::Down);
+    type_text(&mut chooser, "n");
+    assert_eq!(
+        value(&chooser, 1),
+        "|n",
+        "one Down after Tab only arms again"
+    );
+}
+
+#[test]
+fn a_rebuilt_form_closes_the_confirmation() {
+    let item = || ChooserItem::new("go", "Start.").with_field(ChooserField::text("a"));
+    let mut chooser = Chooser::new(vec![item()]).confirming_submit();
+    into_fields(&mut chooser);
+    type_text(&mut chooser, "a");
+    press(&mut chooser, KeyCode::Enter);
+    let mut chooser = chooser.rebuilt(vec![item()]);
+    let action = press(&mut chooser, KeyCode::Enter);
+    assert_eq!(
+        action,
+        ChooserAction::None,
+        "Enter after a rebuild asks again; it does not send"
+    );
+}
+
+#[test]
 fn a_select_and_a_one_line_field_move_on_one_arrow() {
     let mut chooser = Chooser::new(vec![ChooserItem::new("go", "Start.")
         .with_field(ChooserField::select("mode", vec!["a".into(), "b".into()]))

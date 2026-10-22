@@ -167,7 +167,7 @@ fn bar_text(field: &ChooserField) -> (String, usize) {
         return (text, 0);
     }
     let value = one_line(&sanitize(field.value()));
-    let byte = crate::tui::input_form::char_byte_index(field.value(), field.cursor());
+    let byte = crate::tui::form::buffer::char_byte_index(field.value(), field.cursor());
     let before = one_line(&sanitize(&field.value()[..byte])).chars().count();
     (format!("{name}{value}"), name.chars().count() + before)
 }
@@ -395,9 +395,10 @@ fn main_body(
 ) -> Vec<Line<'static>> {
     let (rows, cursor_row) = value_lines(field, width, focused, styles);
     let first = if focused {
-        window_start(cursor_row, height, 0)
+        window_start(cursor_row, height, field.window_row().get())
     } else {
         0
     };
+    field.window_row().set(first);
     rows.into_iter().skip(first).take(height).collect()
 }

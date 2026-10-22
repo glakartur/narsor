@@ -289,13 +289,6 @@ pub fn cycle_option(options: &[String], current: &str, delta: isize) -> Option<S
     Some(options[next].clone())
 }
 
-pub(crate) fn char_byte_index(text: &str, character: usize) -> usize {
-    text.char_indices()
-        .nth(character)
-        .map(|(index, _)| index)
-        .unwrap_or(text.len())
-}
-
 /// Whether a single `select` field lets the engine infer the output label.
 fn infers_label(fields: &[HumanInputFieldView]) -> bool {
     fields

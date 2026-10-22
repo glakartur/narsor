@@ -58,10 +58,11 @@ use ratatui::Frame;
 mod inputs;
 
 use super::form::buffer::TextBuffer;
+use super::form::engine::clamp_rows;
 use super::form::engine::FormEngine;
 use super::form::events::{FormEvent, Growth};
 use super::form::field;
-use super::form::layout::WrapWidth;
+use super::form::layout::{WindowRow, WrapWidth};
 use super::input_form::{cycle_option, pasted_text};
 use super::keymap::{digit_of, lookup, Action, Context};
 use super::scroll::{one_line, sanitize, wrap_visible, ScrollState};
@@ -102,6 +103,8 @@ pub struct ChooserField {
     /// The width the text was last wrapped to, so that `↑`/`↓` walk the rows
     /// that are drawn.
     wrap_width: WrapWidth,
+    /// The first row drawn of a field taller than its window.
+    window_row: WindowRow,
 }
 
 impl ChooserField {
@@ -115,6 +118,7 @@ impl ChooserField {
             proposed: false,
             error: None,
             wrap_width: WrapWidth::default(),
+            window_row: WindowRow::default(),
         }
     }
 
@@ -227,6 +231,11 @@ impl ChooserField {
     /// The width the text was last wrapped to.
     pub(crate) fn wrap_width(&self) -> &WrapWidth {
         &self.wrap_width
+    }
+
+    /// The first row of the window the field was last drawn in.
+    pub(crate) fn window_row(&self) -> &WindowRow {
+        &self.window_row
     }
 
     /// Whether the field takes several lines.
@@ -501,7 +510,7 @@ impl Chooser {
             .growth
             .get()
             .map_or(usize::MAX, |growth| growth.limit_rows);
-        wanted.min(limit.max(1)).max(1).min(usize::from(u16::MAX)) as u16
+        clamp_rows(wanted, limit)
     }
 
     /// What happened to the form since the owner last asked: a value edited,
@@ -632,8 +641,11 @@ impl Chooser {
     /// known after it was first built. What the operator typed carries over to
     /// the fields that are still there (by entry label and field name), the
     /// highlighted entry is the same one when it still exists, the focus
-    /// stays where it was and so does the scrolled list.
+    /// stays where it was and so does the scrolled list. An open
+    /// confirmation closes: the operator confirms again what is now there.
     pub fn rebuilt(mut self, mut items: Vec<ChooserItem>) -> Self {
+        // The popup asked about entries that may be gone or changed.
+        self.form.decline();
         let label = self.selected_item().map(|item| item.label.clone());
         for item in &mut items {
             let Some(old) = self.items.iter().find(|old| old.label == item.label) else {
@@ -913,6 +925,10 @@ impl Chooser {
     }
 
     fn on_fields_key(&mut self, event: KeyEvent) -> ChooserAction {
+        // Only two arrows in a row arm the edge; any other key starts over.
+        if !matches!(event.code, KeyCode::Up | KeyCode::Down) {
+            self.form.clear_edge();
+        }
         if self.inputs_layout && matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
             if event.code == KeyCode::BackTab && self.focus_order().first() == Some(&self.field) {
                 self.leave_fields();
@@ -966,7 +982,14 @@ impl Chooser {
             return ChooserAction::None;
         }
         match lookup(Context::FormConfirm, event) {
-            Some(Action::Accept) if self.form.accept() => self.submission(),
+            Some(Action::Accept) if self.form.accept() => {
+                // Sent only if the entry still passes what `submit` checks.
+                if self.is_sendable() {
+                    self.submission()
+                } else {
+                    self.submit()
+                }
+            }
             Some(Action::Cancel) => {
                 self.form.decline();
                 ChooserAction::None
@@ -1089,6 +1112,14 @@ impl Chooser {
             return ChooserAction::None;
         }
         self.submission()
+    }
+
+    /// Whether the highlighted entry is available and has no field with a
+    /// problem.
+    fn is_sendable(&self) -> bool {
+        self.selected_item().is_some_and(|item| {
+            item.unavailable.is_none() && item.fields.iter().all(|field| field.problem().is_none())
+        })
     }
 
     /// What the highlighted entry sends.
