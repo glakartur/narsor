@@ -86,8 +86,8 @@ use crate::conductor::ConductorRegistry;
 use crate::config::AgentDefaults;
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy, Artifact,
-    ArtifactReference, DecisionProviderType, Event, EventData, ExecutionId, ExecutionStatus,
-    HumanInputField, HumanInputType, InputCloseReason, ChoiceDefinition, ProblemKind, RepromptedBy,
+    ArtifactReference, ChoiceDefinition, DecisionProviderType, Event, EventData, ExecutionId,
+    ExecutionStatus, HumanInputField, HumanInputType, InputCloseReason, ProblemKind, RepromptedBy,
     State, StateId, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
     LOCAL_VARIABLE_PREFIX,
 };
@@ -102,8 +102,8 @@ use crate::engine::actions::human::{
     ENTRY_LIMIT_CONTINUE_LABEL, ENTRY_LIMIT_RESET_LABEL, RESUME_AGENT_LABEL,
 };
 use crate::engine::actions::{
-    ActionExecutor, ActionOutcome, ActionRequest, StepContract, AgentExecutor, HumanExecutor, LoggingEventSink,
-    ScriptExecutor, SuspendedAction,
+    ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
+    ScriptExecutor, StepContract, SuspendedAction,
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
@@ -484,7 +484,11 @@ fn unmet_requirements(
     if missing.is_empty() {
         return None;
     }
-    Some(format!("output '{}' {}", choice.label, missing.join(" and ")))
+    Some(format!(
+        "output '{}' {}",
+        choice.label,
+        missing.join(" and ")
+    ))
 }
 
 /// Moves the variables of an agent or script `result` that its step does not
@@ -500,7 +504,10 @@ fn set_aside_undeclared_variables(state: &State, result: &mut ActionResult) -> V
     }
     let is_kept = |name: &String| {
         name == agent::SESSION_ID_VARIABLE
-            || state.variables.iter().any(|variable| &variable.name == name)
+            || state
+                .variables
+                .iter()
+                .any(|variable| &variable.name == name)
     };
     let (kept, undeclared): (Map<String, Value>, Map<String, Value>) =
         std::mem::take(&mut result.variables)
@@ -4298,10 +4305,9 @@ pub fn record_manual_transition(
 /// The record of an agent step left by hand while it waited on `input`.
 fn agent_input_record(from: &State, to: &str, input: &PendingHumanInput) -> Option<LastAgentStep> {
     let (reason, answer_tail) = match input.continuation {
-        InputContinuation::ResumeAgent => (
-            Some(gate_context::gate_reason(input.instruction())),
-            None,
-        ),
+        InputContinuation::ResumeAgent => {
+            (Some(gate_context::gate_reason(input.instruction())), None)
+        }
         InputContinuation::ResolveOutput => (None, input.request.answer_tail.clone()),
         InputContinuation::CompleteStep
         | InputContinuation::ApproveOutput

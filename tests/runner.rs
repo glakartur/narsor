@@ -1512,9 +1512,10 @@ async fn a_runner_whose_credential_ran_out_offline_renews_it_and_reports_again()
 
     fixture.serve().await;
     wait_until_async(Duration::from_secs(30), "the report after renewal", || {
-        fixture.record("task-3").runner.is_some_and(|runner| {
-            runner.snapshot.execution_status == ExecutionStatus::Completed
-        })
+        fixture
+            .record("task-3")
+            .runner
+            .is_some_and(|runner| runner.snapshot.execution_status == ExecutionStatus::Completed)
     })
     .await;
 }

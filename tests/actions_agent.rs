@@ -18,9 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use narsor_engine::domain::{
-    ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus,
-    ArtifactDefinition, ChoiceDefinition, RepromptedBy, VariableDefinition, Workspace,
-    WorkspaceAccess,
+    ActionConfig, ActionError, AgentActionConfig, ArtifactDefinition, ChoiceDefinition, Context,
+    EventData, ExecutionStatus, RepromptedBy, VariableDefinition, Workspace, WorkspaceAccess,
 };
 use narsor_engine::engine::actions::agent::{
     output_contract, output_schema, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
@@ -737,7 +736,10 @@ async fn additional_data_and_artifacts_reach_the_result_untouched() {
         result.additional_data.get("findings"),
         Some(&json!([{ "title": "x" }]))
     );
-    assert_eq!(result.additional_artifacts, vec!["notes/a.md", "notes/b.md"]);
+    assert_eq!(
+        result.additional_artifacts,
+        vec!["notes/a.md", "notes/b.md"]
+    );
     assert!(result.artifacts.is_empty());
 }
 
@@ -1035,7 +1037,12 @@ async fn claude_is_denied_the_tools_that_defer_work_past_the_answer() {
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
-    complete(&executor(&fake), agent_action("continue"), &root.workspace()).await;
+    complete(
+        &executor(&fake),
+        agent_action("continue"),
+        &root.workspace(),
+    )
+    .await;
 
     let args = fake.args(1);
     let deny = args
@@ -1449,7 +1456,9 @@ async fn prompt_sent_with_contract(contract: StepContract<'_>) -> String {
     let action = ActionConfig::Agent(agent_action("do the thing"));
     let workspace = root.workspace();
     executor(&fake)
-        .execute(ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_contract(contract))
+        .execute(
+            ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_contract(contract),
+        )
         .await
         .expect("the action runs");
 
@@ -1539,14 +1548,27 @@ async fn the_contract_describes_step_values_once_and_lists_requirements_per_choi
         "- `local.notes` — What to remember for the next attempt.\n",
         "- `plan_doc` — The plan document.\n",
     ] {
-        assert_eq!(prompt.matches(description).count(), 1, "{description}: {prompt}");
+        assert_eq!(
+            prompt.matches(description).count(),
+            1,
+            "{description}: {prompt}"
+        );
     }
     let done = prompt.split("- `done`").nth(1).expect("done is listed");
     let done = done.split("- `blocked`").next().expect("done's section");
     assert!(done.contains("Required variables: `summary`\n"), "{prompt}");
-    assert!(done.contains("Required artifacts: `plan_doc`\n"), "{prompt}");
-    let blocked = prompt.split("- `blocked`").nth(1).expect("blocked is listed");
-    assert!(blocked.contains("Required variables: `local.notes`\n"), "{prompt}");
+    assert!(
+        done.contains("Required artifacts: `plan_doc`\n"),
+        "{prompt}"
+    );
+    let blocked = prompt
+        .split("- `blocked`")
+        .nth(1)
+        .expect("blocked is listed");
+    assert!(
+        blocked.contains("Required variables: `local.notes`\n"),
+        "{prompt}"
+    );
     assert!(!blocked.contains("Required artifacts"), "{prompt}");
 }
 
@@ -2102,7 +2124,10 @@ async fn a_missing_label_is_asked_for_again_in_the_same_read_only_session() {
     let fixture = EngineFixture::new();
     fixture
         .fake
-        .answers_on_call(1, &envelope(r#"Done. {"additional_data": {"units_completed": 3}}"#))
+        .answers_on_call(
+            1,
+            &envelope(r#"Done. {"additional_data": {"units_completed": 3}}"#),
+        )
         .answers_on_call(2, &envelope(r#"{"choice":"implemented"}"#));
 
     let definition = fixture.workflow(REPROMPT_WORKFLOW);
@@ -3020,7 +3045,10 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
     assert_eq!(entries[0].source, ConversationSource::Narsor);
     assert!(entry_text(&entries[0]).contains("look around"));
     let (prompt, resumed, purpose) = prompt_element(&entries[0]);
-    assert_eq!(prompt, format!("look around{}", output_contract(&StepContract::default())));
+    assert_eq!(
+        prompt,
+        format!("look around{}", output_contract(&StepContract::default()))
+    );
     assert_eq!(resumed, None);
     assert_eq!(purpose, PromptPurpose::Step);
 

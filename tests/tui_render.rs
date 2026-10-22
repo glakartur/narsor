@@ -46,6 +46,31 @@ fn screen(buffer: &Buffer) -> String {
     rows(buffer).join("\n")
 }
 
+/// The cells drawn reversed: the cursor, which is a style of the cell it
+/// stands on and no character of the text.
+fn cursor_cells(buffer: &Buffer) -> Vec<(u16, u16)> {
+    let width = buffer.area.width;
+    buffer
+        .content()
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| cell.modifier.contains(Modifier::REVERSED))
+        .map(|(index, _)| (index as u16 % width, index as u16 / width))
+        .collect()
+}
+
+/// Whether the cursor stands in the cell right after `text` on its row.
+fn cursor_follows(buffer: &Buffer, text: &str) -> bool {
+    let rows = rows(buffer);
+    let Some((y, row)) = rows.iter().enumerate().find(|(_, row)| row.contains(text)) else {
+        return false;
+    };
+    let end = row
+        .find(text)
+        .map(|byte| row[..byte].chars().count() + text.chars().count());
+    end.is_some_and(|x| cursor_cells(buffer).contains(&(x as u16, y as u16)))
+}
+
 fn row_of(buffer: &Buffer, needle: &str) -> usize {
     rows(buffer)
         .iter()
@@ -346,7 +371,12 @@ mod chooser_render {
         let mut chooser = review_chooser();
         chooser.on_key(keymap::Key::code(crossterm::event::KeyCode::Tab).to_event());
         let buffer = draw_chooser(100, 16, &mut chooser, &Styles::new(false));
-        assert!(screen(&buffer).contains("> Uwzględnij migrację▏"));
+        assert!(screen(&buffer).contains("> Uwzględnij migrację"));
+        assert!(
+            !screen(&buffer).contains('▏'),
+            "no cursor character in the text"
+        );
+        assert!(cursor_follows(&buffer, "> Uwzględnij migrację"));
     }
 
     /// One entry with `field`, the keys in it, in the list layout or in the
@@ -368,9 +398,10 @@ mod chooser_render {
         for inputs_layout in [false, true] {
             let mut chooser = typing_into(ChooserField::multiline("prompt"), inputs_layout);
             assert!(chooser.paste(&text.join("\n")));
-            let screen = screen(&draw_chooser(100, 20, &mut chooser, &Styles::new(false)));
+            let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
+            let screen = screen(&buffer);
             assert!(
-                screen.contains("linia 200▏"),
+                screen.contains("linia 200") && cursor_follows(&buffer, "linia 200"),
                 "inputs layout {inputs_layout}:\n{screen}"
             );
         }
@@ -385,9 +416,10 @@ mod chooser_render {
             ] {
                 let mut chooser = typing_into(field, inputs_layout);
                 assert!(chooser.paste("a\tb"));
-                let screen = screen(&draw_chooser(100, 20, &mut chooser, &Styles::new(false)));
+                let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
+                let screen = screen(&buffer);
                 assert!(
-                    screen.contains("a   b▏"),
+                    screen.contains("a   b") && cursor_follows(&buffer, "a   b"),
                     "inputs layout {inputs_layout}:\n{screen}"
                 );
             }
@@ -402,7 +434,7 @@ mod chooser_render {
             let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
             let screen = screen(&buffer);
             assert!(
-                screen.contains("x y z▏"),
+                screen.contains("x y z") && cursor_follows(&buffer, "x y z"),
                 "inputs layout {inputs_layout}:\n{screen}"
             );
             assert!(
@@ -3688,11 +3720,11 @@ mod task_app_waiting_render {
         press(&mut app, KeyCode::Down);
         type_text(&mut app, "szkic");
         let focused = draw_buffer(&mut app, 120, 40, false);
-        assert!(focused.content.iter().any(|cell| cell.symbol() == "▏"));
+        assert!(!cursor_cells(&focused).is_empty());
 
         press(&mut app, KeyCode::Tab);
         let blurred = draw_buffer(&mut app, 120, 40, false);
-        assert!(!blurred.content.iter().any(|cell| cell.symbol() == "▏"));
+        assert!(cursor_cells(&blurred).is_empty());
         assert!(screen(&blurred).contains("szkic"));
     }
 
@@ -4431,9 +4463,10 @@ mod task_app_conductor_render {
         for character in "Dlaczego?".chars() {
             press(&mut app, KeyCode::Char(character));
         }
-        let text = screen(&draw_app(&mut app, 120, 30, false));
+        let buffer = draw_app(&mut app, 120, 30, false);
+        let text = screen(&buffer);
         assert!(text.contains("wiadomość (wymagane)"), "{text}");
-        assert!(text.contains("> Dlaczego?▏"), "{text}");
+        assert!(cursor_follows(&buffer, "> Dlaczego?"), "{text}");
         assert!(
             text.contains("Enter wyślij") && text.contains("Ctrl+J nowa linia"),
             "{text}"
@@ -4601,7 +4634,7 @@ mod task_app_create_render {
             "→ trafi na koniec kolejki (#3)",
             "implement-feature",
             "Pełny cykl",
-            "ticket_id: NAR-18▏",
+            "ticket_id: NAR-18",
             "attempts: ",
             "dry_run: ‹ false ›",
             "target_repo: ‹ narsor ›",
@@ -4627,7 +4660,7 @@ mod task_app_create_render {
             "Nowe zadanie",
             "→ trafi na koniec kolejki (#3)",
             "implement-feature",
-            "ticket_id: NAR-18▏",
+            "ticket_id: NAR-18",
         ] {
             assert!(screen.contains(expected), "{expected}:\n{screen}");
         }
@@ -4665,6 +4698,10 @@ mod task_app_create_render {
             assert_eq!(listed.contains("Opis"), width >= 64, "{listed}");
 
             press(&mut app, KeyCode::Enter);
+            // The focus starts on the first field; the prompt is the last.
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Down);
+            }
             keys(&mut app, "pierwsza");
             app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
             keys(&mut app, "druga");
@@ -4677,7 +4714,7 @@ mod task_app_create_render {
                 "target_repo: ‹ narsor ›",
                 "prompt (wymagane)",
                 "> pierwsza",
-                "  druga▏",
+                "  druga",
             ] {
                 assert!(
                     screen.contains(expected),
@@ -4696,9 +4733,12 @@ mod task_app_create_render {
         let mut app = app();
         open_prompt_form(&mut app, &["prompt"]);
         press(&mut app, KeyCode::Enter);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
         keys(&mut app, &"ab ".repeat(60));
         let screen = draw_app(&mut app, 60, 20, false);
-        assert!(screen.contains('▏'), "{screen}");
+        assert!(!screen.contains('▏'), "{screen}");
         assert!(
             screen.lines().all(|row| row.chars().count() <= 60),
             "{screen}"

@@ -823,7 +823,10 @@ fn input_delivery(
         values: field_values(fields)?,
         artifacts: artifacts
             .iter()
-            .map(|pair| split_pair("artifact", pair).map(|(name, path)| (name.to_string(), path.to_string())))
+            .map(|pair| {
+                split_pair("artifact", pair)
+                    .map(|(name, path)| (name.to_string(), path.to_string()))
+            })
             .collect::<Result<_>>()?,
         variables: parse_pairs("variable", variables)?,
         chosen_label: label.clone(),

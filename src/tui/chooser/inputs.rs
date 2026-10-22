@@ -9,10 +9,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use super::{
-    drawn_cursor, field_value_rows, Chooser, ChooserField, ChooserFocus, ChooserItem, CURSOR,
-    PROMPT,
-};
+use super::{Chooser, ChooserField, ChooserFocus, ChooserItem, FieldKind};
+use crate::tui::form::field::{cursor_spans, value_lines};
+use crate::tui::form::layout::{window_start, PROMPT_WIDTH};
 use crate::tui::scroll::{one_line, sanitize};
 use crate::tui::style::{Role, Styles};
 
@@ -103,12 +102,12 @@ fn render_bar(
         usize::from(area.width).saturating_sub(separator.chars().count() * (short.len() - 1));
     let texts: Vec<String> = short
         .iter()
-        .map(|&index| bar_text(&item.fields[index], focused == Some(index)))
+        .map(|&index| bar_text(&item.fields[index]).0)
         .collect();
     // The field being typed in keeps what it needs, up to two fifths of the bar.
     let focused_position = short.iter().position(|&index| focused == Some(index));
     let reserved = focused_position.map_or(0, |position| {
-        texts[position].chars().count().min((room * 2 / 5).max(12))
+        (texts[position].chars().count() + 1).min((room * 2 / 5).max(12))
     });
     let others: Vec<String> = texts
         .iter()
@@ -123,31 +122,34 @@ fn render_bar(
             spans.push(Span::styled(separator, styles.of(Role::Done)));
         }
         let field = &item.fields[index];
-        let is_focused = focused == Some(index);
-        let shown = if is_focused {
-            window_around_cursor(text, reserved)
+        if focused == Some(index) {
+            let base = styles.of(Role::Focus).patch(styles.field_editing());
+            let (text, cursor) = bar_text(field);
+            let (shown, cursor) = window_around_cursor(&text, cursor, reserved);
+            spans.extend(cursor_spans(&shown, cursor, base, styles.cursor()));
         } else {
-            clip(text, cap)
-        };
-        spans.push(Span::styled(
-            shown,
-            if is_focused {
-                styles.of(Role::Focus)
-            } else if field.error.is_some() {
+            let style = if field.error.is_some() {
                 styles.of(Role::Problem)
             } else {
                 Style::default()
-            },
-        ));
+            };
+            spans.push(Span::styled(clip(text, cap), style));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// `name: value`, the cursor in the value when the field has the focus.
-fn bar_text(field: &ChooserField, focused: bool) -> String {
-    let value = one_line(&sanitize(&field.value));
-    let rows = field_value_rows(field, &value, focused);
-    format!("{}: {}", one_line(&field.name), rows.concat())
+/// `name: value`, and where the cursor falls in it.
+fn bar_text(field: &ChooserField) -> (String, usize) {
+    let name = format!("{}: ", one_line(&field.name));
+    if matches!(field.kind, FieldKind::Select(_)) {
+        let text = format!("{name}‹ {} ›", one_line(&sanitize(field.value())));
+        return (text, 0);
+    }
+    let value = one_line(&sanitize(field.value()));
+    let byte = crate::tui::input_form::char_byte_index(field.value(), field.cursor());
+    let before = one_line(&sanitize(&field.value()[..byte])).chars().count();
+    (format!("{name}{value}"), name.chars().count() + before)
 }
 
 /// The widest a segment may be so that all of them fit in `room`: short ones
@@ -171,19 +173,21 @@ fn clip(text: &str, width: usize) -> String {
     format!("{kept}…")
 }
 
-/// `text` cut to `width` columns around the cursor mark, so that it shows.
-fn window_around_cursor(text: &str, width: usize) -> String {
+/// `text` cut to `width` columns so that the cell at `cursor` shows, and the
+/// cursor's place in the cut.
+fn window_around_cursor(text: &str, cursor: usize, width: usize) -> (String, usize) {
     let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= width {
-        return text.to_string();
+    if chars.len() < width.max(1) {
+        return (text.to_string(), cursor);
     }
-    let cursor = chars.iter().position(|&c| c == CURSOR).unwrap_or(0);
+    let width = width.max(1);
     let start = (cursor + 1).saturating_sub(width);
-    let mut shown: Vec<char> = chars[start..(start + width).min(chars.len())].to_vec();
-    if start > 0 {
+    let mut shown: Vec<char> =
+        chars[start.min(chars.len())..(start + width).min(chars.len())].to_vec();
+    if start > 0 && !shown.is_empty() {
         shown[0] = '…';
     }
-    shown.into_iter().collect()
+    (shown.into_iter().collect(), cursor - start)
 }
 
 /// What the focused short field is, or the complaint about one.
@@ -245,8 +249,8 @@ fn render_long_fields(
     }
     let main = focused
         .filter(|index| item.fields[*index].is_long())
-        .unwrap_or_else(|| chooser.start_field());
-    let width = usize::from(area.width).saturating_sub(PROMPT.chars().count());
+        .unwrap_or_else(|| chooser.main_field());
+    let width = usize::from(area.width).saturating_sub(PROMPT_WIDTH);
     let header_rows = |index: usize| 1 + usize::from(item.fields[index].error.is_some());
     let folded = |index: usize, with_text: bool| {
         let text = if with_text {
@@ -286,10 +290,16 @@ fn render_long_fields(
             ));
         }
         if index == main {
-            let mut rows = main_body(field, width, is_focused, main_height);
+            let mut rows = main_body(
+                field,
+                usize::from(area.width),
+                is_focused,
+                main_height,
+                styles,
+            );
             // The main field keeps its room, so the folded ones stay below it.
-            rows.resize(main_height, String::new());
-            lines.extend(prefixed(rows, styles));
+            rows.resize(main_height, Line::raw(""));
+            lines.extend(rows);
         } else if with_text {
             lines.extend(prefixed(folded_rows(field, width), styles));
         }
@@ -325,7 +335,7 @@ fn prefixed(rows: Vec<String>, styles: &Styles) -> Vec<Line<'static>> {
     rows.into_iter()
         .enumerate()
         .map(|(row, text)| {
-            let prefix = if row == 0 { PROMPT } else { "  " };
+            let prefix = if row == 0 { "> " } else { "  " };
             Line::from(vec![
                 Span::styled(prefix, styles.of(Role::Done)),
                 Span::raw(text),
@@ -336,7 +346,7 @@ fn prefixed(rows: Vec<String>, styles: &Styles) -> Vec<Line<'static>> {
 
 /// A folded field: its first lines, `…` when there is more or nothing.
 fn folded_rows(field: &ChooserField, width: usize) -> Vec<String> {
-    let value = sanitize(&field.value);
+    let value = sanitize(field.value());
     if value.trim().is_empty() {
         return vec!["…".to_string()];
     }
@@ -356,39 +366,18 @@ fn folded_rows(field: &ChooserField, width: usize) -> Vec<String> {
 
 /// The rows of the main field, wrapped to `width` and scrolled so that the
 /// cursor is in view within `height` rows.
-fn main_body(field: &ChooserField, width: usize, focused: bool, height: usize) -> Vec<String> {
-    let value = sanitize(&field.value);
-    let (rows, cursor_row) = wrapped(field, &value, width.max(1), focused);
+fn main_body(
+    field: &ChooserField,
+    width: usize,
+    focused: bool,
+    height: usize,
+    styles: &Styles,
+) -> Vec<Line<'static>> {
+    let (rows, cursor_row) = value_lines(field, width, focused, styles);
     let first = if focused {
-        (cursor_row + 1).saturating_sub(height)
+        window_start(cursor_row, height, 0)
     } else {
         0
     };
     rows.into_iter().skip(first).take(height).collect()
-}
-
-/// The value hard-wrapped to `width` columns, and the row the cursor is on.
-fn wrapped(field: &ChooserField, value: &str, width: usize, focused: bool) -> (Vec<String>, usize) {
-    let logical = field_value_rows(field, value, focused);
-    let cursor = focused.then(|| drawn_cursor(field));
-    let mut rows = Vec::new();
-    let mut cursor_row = 0;
-    let mut consumed = 0;
-    for line in logical {
-        let chars: Vec<char> = line.chars().collect();
-        let chunks: Vec<&[char]> = if chars.is_empty() {
-            vec![&chars[..]]
-        } else {
-            chars.chunks(width).collect()
-        };
-        for chunk in chunks {
-            if cursor.is_some_and(|at| at >= consumed && at < consumed + chunk.len().max(1)) {
-                cursor_row = rows.len();
-            }
-            consumed += chunk.len();
-            rows.push(chunk.iter().collect());
-        }
-        consumed += 1;
-    }
-    (rows, cursor_row)
 }

@@ -53,10 +53,11 @@ use ratatui::Frame;
 
 mod inputs;
 
-use super::input_form::{
-    char_byte_index, cycle_option, pasted_text, text_backspace, text_insert, text_insert_str,
-    text_step,
-};
+use super::form::buffer::TextBuffer;
+use super::form::engine::FormEngine;
+use super::form::field;
+use super::form::layout::WrapWidth;
+use super::input_form::{cycle_option, pasted_text};
 use super::keymap::{digit_of, lookup, Action, Context};
 use super::scroll::{one_line, sanitize, wrap_visible, ScrollState};
 use super::selection::{bracketed_list_rows, render_bracketed_list, PREFIX_WIDTH};
@@ -64,10 +65,6 @@ use super::style::{Role, Styles};
 
 /// The narrowest area in which the description still sits beside the list.
 pub const SIDE_BY_SIDE_MIN_WIDTH: u16 = 64;
-
-/// The mark that opens a field's text, and the cursor inside it.
-const PROMPT: &str = "> ";
-const CURSOR: char = '▏';
 
 /// What a field accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,10 +91,12 @@ pub struct ChooserField {
     pub required: bool,
     /// What the field is for, shown dim beside its name.
     pub description: Option<String>,
-    value: String,
-    cursor: usize,
+    buffer: TextBuffer,
     proposed: bool,
     error: Option<String>,
+    /// The width the text was last wrapped to, so that `↑`/`↓` walk the rows
+    /// that are drawn.
+    wrap_width: WrapWidth,
 }
 
 impl ChooserField {
@@ -107,10 +106,10 @@ impl ChooserField {
             kind,
             required: false,
             description: None,
-            value: String::new(),
-            cursor: 0,
+            buffer: TextBuffer::default(),
             proposed: false,
             error: None,
+            wrap_width: WrapWidth::default(),
         }
     }
 
@@ -128,7 +127,7 @@ impl ChooserField {
     pub fn select(name: impl Into<String>, options: Vec<String>) -> Self {
         let mut field = Self::new(name, FieldKind::Select(Vec::new()));
         if let Some(first) = options.first() {
-            field.value = first.clone();
+            field.buffer.set(first.clone());
         }
         field.kind = FieldKind::Select(options);
         field
@@ -166,8 +165,7 @@ impl ChooserField {
     }
 
     fn set_value(&mut self, value: impl Into<String>) {
-        self.value = value.into();
-        self.cursor = self.value.chars().count();
+        self.buffer.set(value);
     }
 
     /// Takes over what the operator did to `from`, the same field of an
@@ -178,8 +176,7 @@ impl ChooserField {
         if from.proposed {
             return;
         }
-        self.value = from.value.clone();
-        self.cursor = from.cursor;
+        self.buffer = from.buffer.clone();
         self.proposed = false;
         self.error = from.error.clone();
     }
@@ -192,7 +189,7 @@ impl ChooserField {
 
     /// What is in the field.
     pub fn value(&self) -> &str {
-        &self.value
+        self.buffer.value()
     }
 
     /// Whether the value is still the one the conductor proposed.
@@ -207,7 +204,7 @@ impl ChooserField {
 
     /// Where the cursor is, in characters of the value.
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.buffer.cursor()
     }
 
     /// Puts pasted text at the cursor, as one edit, and the cursor after it.
@@ -216,10 +213,15 @@ impl ChooserField {
         let Some(text) = pasted_text(&self.kind, pasted).filter(|text| !text.is_empty()) else {
             return false;
         };
-        text_insert_str(&mut self.value, &mut self.cursor, &text);
+        self.buffer.insert_str(&text);
         self.proposed = false;
         self.error = None;
         true
+    }
+
+    /// The width the text was last wrapped to.
+    pub(crate) fn wrap_width(&self) -> &WrapWidth {
+        &self.wrap_width
     }
 
     /// Whether the field takes several lines.
@@ -228,7 +230,7 @@ impl ChooserField {
     }
 
     fn is_blank(&self) -> bool {
-        self.value.trim().is_empty()
+        self.buffer.value().trim().is_empty()
     }
 
     /// Folds one key into the field. Returns whether it was used.
@@ -236,36 +238,48 @@ impl ChooserField {
         let used = match (&self.kind, event.code) {
             // The new line key is never text: in a one-line field it is ignored.
             (FieldKind::Text { multiline: true }, _) if newline => {
-                text_insert(&mut self.value, &mut self.cursor, '\n');
+                self.buffer.insert('\n');
                 true
             }
             _ if newline => return false,
             (FieldKind::Text { .. }, KeyCode::Char(character)) => {
-                text_insert(&mut self.value, &mut self.cursor, character);
+                self.buffer.insert(character);
                 true
             }
             (FieldKind::Integer, KeyCode::Char(character))
                 if character.is_ascii_digit() || character == '-' =>
             {
-                text_insert(&mut self.value, &mut self.cursor, character);
+                self.buffer.insert(character);
                 true
             }
             (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Backspace) => {
-                text_backspace(&mut self.value, &mut self.cursor);
+                self.buffer.backspace();
+                true
+            }
+            (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Delete) => {
+                self.buffer.delete();
                 true
             }
             (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Left) => {
-                text_step(&self.value, &mut self.cursor, -1);
+                self.buffer.left();
                 return true;
             }
             (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Right) => {
-                text_step(&self.value, &mut self.cursor, 1);
+                self.buffer.right();
+                return true;
+            }
+            (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Home) => {
+                self.buffer.home();
+                return true;
+            }
+            (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::End) => {
+                self.buffer.end();
                 return true;
             }
             (FieldKind::Select(options), KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) => {
                 let delta = if event.code == KeyCode::Left { -1 } else { 1 };
-                if let Some(next) = cycle_option(options, &self.value, delta) {
-                    self.value = next;
+                if let Some(next) = cycle_option(options, self.buffer.value(), delta) {
+                    self.buffer.set(next);
                 }
                 true
             }
@@ -286,13 +300,16 @@ impl ChooserField {
                 .then(|| format!("Pole '{}' jest wymagane.", self.name));
         }
         match &self.kind {
-            FieldKind::Integer if self.value.trim().parse::<i64>().is_err() => {
+            FieldKind::Integer if self.value().trim().parse::<i64>().is_err() => {
                 Some(format!("Pole '{}' wymaga liczby całkowitej.", self.name))
             }
-            FieldKind::Select(options) if !options.contains(&self.value) => Some(format!(
-                "'{}' nie jest dozwoloną wartością pola '{}'.",
-                self.value, self.name
-            )),
+            FieldKind::Select(options) if !options.iter().any(|o| o == self.value()) => {
+                Some(format!(
+                    "'{}' nie jest dozwoloną wartością pola '{}'.",
+                    self.value(),
+                    self.name
+                ))
+            }
             _ => None,
         }
     }
@@ -435,6 +452,10 @@ pub struct Chooser {
     /// The first entry in view: the list scrolls inside its pane, and a
     /// rebuild keeps it where it was.
     top: usize,
+    /// What the form keeps between keys: the edge press, the confirmation.
+    form: FormEngine,
+    /// Whether sending asks the operator first (R12).
+    confirms_submit: bool,
 }
 
 impl Chooser {
@@ -449,7 +470,26 @@ impl Chooser {
             inputs_layout: false,
             enter_fields_on_activate: false,
             top: 0,
+            form: FormEngine::new(),
+            confirms_submit: false,
         }
+    }
+
+    /// The same chooser, asking "Zatwierdzić formularz?" before it sends.
+    /// For a form that sends; a list that only picks does not use it.
+    pub fn confirming_submit(mut self) -> Self {
+        self.confirms_submit = true;
+        self
+    }
+
+    /// Whether the confirmation popup is open. While it is, it has the keys.
+    pub fn is_confirming(&self) -> bool {
+        self.form.is_confirming()
+    }
+
+    /// Forgets that the form was sent, as when it is shown again.
+    pub fn reset_submission(&mut self) {
+        self.form.reset();
     }
 
     /// The same chooser in the layout of a form of inputs: `Enter` on an entry
@@ -495,7 +535,11 @@ impl Chooser {
     /// The key-map context of the chooser. Always the panel's: its hints
     /// and help are the same whichever half has the focus.
     pub fn context(&self) -> Context {
-        Context::Panel
+        if self.form.is_confirming() {
+            Context::Confirm
+        } else {
+            Context::Panel
+        }
     }
 
     /// Whether keys are being typed into a field, so the owner must not
@@ -586,7 +630,12 @@ impl Chooser {
         let mut lines = Vec::new();
         for item in &self.items {
             for field in item.fields.iter().filter(|field| field.is_drafted()) {
-                lines.push(format!("{} / {}: {}", item.label, field.name, field.value));
+                lines.push(format!(
+                    "{} / {}: {}",
+                    item.label,
+                    field.name,
+                    field.value()
+                ));
             }
         }
         lines.join("\n")
@@ -618,18 +667,23 @@ impl Chooser {
 
     /// The rows the fields of the highlighted entry take.
     pub fn field_rows(&self) -> u16 {
+        self.field_rows_in(usize::MAX)
+    }
+
+    /// The rows the fields of the highlighted entry take in an area `width`
+    /// columns wide, their text wrapped to it.
+    pub fn field_rows_in(&self, width: usize) -> u16 {
         let Some(item) = self.selected_item() else {
             return 0;
         };
+        let focused = (self.focus == ChooserFocus::Fields).then_some(self.field);
         let rows: usize = item
             .fields
             .iter()
-            .map(|field| {
-                let value_rows = match field.kind {
-                    FieldKind::Select(_) => 1,
-                    _ => field.value.split('\n').count().max(1),
-                };
-                1 + value_rows + usize::from(field.error.is_some())
+            .enumerate()
+            .map(|(index, field)| {
+                1 + field::value_rows(field, width, focused == Some(index))
+                    + usize::from(field.error.is_some())
             })
             .sum();
         rows as u16
@@ -648,6 +702,9 @@ impl Chooser {
 
     /// Folds one key into the chooser.
     pub fn on_key(&mut self, event: KeyEvent) -> ChooserAction {
+        if self.form.is_confirming() {
+            return self.on_confirm_key(&event);
+        }
         match self.focus {
             ChooserFocus::Actions => self.on_actions_key(event),
             ChooserFocus::Fields => self.on_fields_key(event),
@@ -658,9 +715,10 @@ impl Chooser {
     /// and never moves the focus; with the keys on the list, or on a
     /// `select`, it is ignored. Returns whether a field took it.
     pub fn paste(&mut self, pasted: &str) -> bool {
-        if self.focus != ChooserFocus::Fields {
+        if self.focus != ChooserFocus::Fields || self.form.is_confirming() {
             return false;
         }
+        self.form.clear_edge();
         let index = self.field;
         self.items
             .get_mut(self.selected)
@@ -716,7 +774,7 @@ impl Chooser {
         {
             self.focus = ChooserFocus::Fields;
             self.field = if self.inputs_layout {
-                self.start_field()
+                self.focus_order().first().copied().unwrap_or(0)
             } else {
                 self.field.min(self.field_count().saturating_sub(1))
             };
@@ -733,9 +791,10 @@ impl Chooser {
         focus_order_of(item, self.inputs_layout)
     }
 
-    /// Where the focus starts in a form of inputs: the first required
-    /// multi-line field, else the first multi-line one, else the first field.
-    fn start_field(&self) -> usize {
+    /// The multi-line field a form of inputs draws large when the focus is
+    /// not on one: the first required one, else the first, else the first
+    /// field. Only drawing uses it; the focus starts on the first field (R9).
+    fn main_field(&self) -> usize {
         let order = self.focus_order();
         let Some(item) = self.selected_item() else {
             return 0;
@@ -755,6 +814,14 @@ impl Chooser {
     }
 
     fn on_fields_key(&mut self, event: KeyEvent) -> ChooserAction {
+        if self.form.is_submitted() {
+            // A second Enter while the send is out does nothing; any other
+            // key means the owner kept the form, and it is edited again.
+            if lookup(Context::Panel, &event) == Some(Action::Submit) {
+                return ChooserAction::None;
+            }
+            self.form.reset();
+        }
         if self.inputs_layout && matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
             if event.code == KeyCode::BackTab && self.focus_order().first() == Some(&self.field) {
                 self.leave_fields();
@@ -782,6 +849,7 @@ impl Chooser {
             Some(Action::Submit) => return self.advance_field_or_submit(),
             Some(Action::Cancel) => return ChooserAction::Cancel,
             Some(Action::Newline) => {
+                self.form.clear_edge();
                 self.edit_field(&event, true);
                 return ChooserAction::None;
             }
@@ -790,9 +858,25 @@ impl Chooser {
         match event.code {
             KeyCode::Down => self.step_field_or_cursor(1),
             KeyCode::Up => self.step_field_or_cursor(-1),
-            _ => self.edit_field(&event, false),
+            _ => {
+                self.form.clear_edge();
+                self.edit_field(&event, false);
+            }
         }
         ChooserAction::None
+    }
+
+    /// The keys of the confirmation popup, and no others: `Enter` sends,
+    /// `Esc` returns to the form as it was. Anything else does nothing.
+    fn on_confirm_key(&mut self, event: &KeyEvent) -> ChooserAction {
+        match lookup(Context::Confirm, event) {
+            Some(Action::Accept) if self.form.accept() => self.submission(),
+            Some(Action::Cancel) => {
+                self.form.decline();
+                ChooserAction::None
+            }
+            _ => ChooserAction::None,
+        }
     }
 
     fn advance_field_or_submit(&mut self) -> ChooserAction {
@@ -808,6 +892,10 @@ impl Chooser {
         }
     }
 
+    /// `↑`/`↓` in a field. A multi-line field first walks the rows that are
+    /// drawn; on the first or last row the first press puts the cursor at the
+    /// start or the end of the text and the second leaves for the next field
+    /// (R10). A one-line field, a `select` and a number leave at once.
     fn step_field_or_cursor(&mut self, delta: isize) {
         let Some(field) = self
             .items
@@ -817,28 +905,37 @@ impl Chooser {
             return;
         };
         let multiline = field.is_long();
-        let at_start = field.cursor == 0;
-        let at_end = field.cursor == field.value.chars().count();
         if !multiline {
+            self.form.clear_edge();
             let at_first = self.focus_order().first() == Some(&self.field);
-            if delta < 0 && at_start && at_first {
+            if delta < 0 && at_first {
                 self.focus = ChooserFocus::Actions;
                 return;
             }
             self.move_field(delta);
             return;
         }
-        if delta < 0 && at_start {
-            let current = self.field;
-            self.move_field(-1);
-            if self.field == current {
-                self.focus = ChooserFocus::Actions;
+        let wrapped = field::layout_of_current(field);
+        if let Some(target) = wrapped.vertical(delta) {
+            self.form.clear_edge();
+            field.buffer.set_cursor(target);
+            return;
+        }
+        if self.form.take_edge(delta) {
+            if delta < 0 {
+                let current = self.field;
+                self.move_field(-1);
+                if self.field == current {
+                    self.focus = ChooserFocus::Actions;
+                }
+            } else {
+                self.move_field(1);
             }
-        } else if delta > 0 && at_end {
-            self.move_field(1);
+        } else if delta < 0 {
+            field.buffer.set_cursor(0);
         } else {
-            let field = &mut self.items[self.selected].fields[self.field];
-            move_cursor_vertical(field, delta);
+            let end = field.buffer.len();
+            field.buffer.set_cursor(end);
         }
     }
 
@@ -867,7 +964,8 @@ impl Chooser {
     }
 
     /// Sends the highlighted entry: validates its fields, and on the first
-    /// problem puts the complaint on the field and the focus on it.
+    /// problem puts the complaint on the field and the focus on it. A form
+    /// that confirms asks first; the send goes out on the popup's `Enter`.
     fn submit(&mut self) -> ChooserAction {
         let selected = self.selected;
         let Some(item) = self.items.get_mut(selected) else {
@@ -875,6 +973,9 @@ impl Chooser {
         };
         if let Some(reason) = &item.unavailable {
             return ChooserAction::Blocked(reason.clone());
+        }
+        if self.form.is_submitted() {
+            return ChooserAction::None;
         }
         for field in &mut item.fields {
             field.error = None;
@@ -889,14 +990,26 @@ impl Chooser {
             self.focus = ChooserFocus::Fields;
             return ChooserAction::None;
         }
+        if self.confirms_submit {
+            self.form.ask_confirmation(self.field);
+            return ChooserAction::None;
+        }
+        self.submission()
+    }
+
+    /// What the highlighted entry sends.
+    fn submission(&self) -> ChooserAction {
+        let Some(item) = self.items.get(self.selected) else {
+            return ChooserAction::None;
+        };
         ChooserAction::Submit(Submission {
-            index: selected,
+            index: self.selected,
             label: item.label.clone(),
             values: item
                 .fields
                 .iter()
                 .filter(|field| !field.is_blank())
-                .map(|field| (field.name.clone(), field.value.clone()))
+                .map(|field| (field.name.clone(), field.value().to_string()))
                 .collect(),
         })
     }
@@ -923,30 +1036,6 @@ impl Chooser {
 
     fn description_lines(&self) -> usize {
         self.description_text().len()
-    }
-}
-
-fn move_cursor_vertical(field: &mut ChooserField, delta: isize) {
-    let mut remaining = field.cursor;
-    let mut line_start = 0;
-    let mut previous: Option<(usize, usize)> = None;
-    let mut lines = field.value.split('\n');
-    for line in lines.by_ref() {
-        let line_len = line.chars().count();
-        if remaining <= line_len {
-            let (target_start, target_len) = if delta < 0 {
-                let Some(previous) = previous else { return };
-                previous
-            } else {
-                let Some(next) = lines.next() else { return };
-                (line_start + line_len + 1, next.chars().count())
-            };
-            field.cursor = target_start + remaining.min(target_len);
-            return;
-        }
-        remaining -= line_len + 1;
-        previous = Some((line_start, line_len));
-        line_start += line_len + 1;
     }
 }
 
@@ -1021,12 +1110,13 @@ fn list_line(
     Line::from(spans)
 }
 
-/// The lines of the fields of the highlighted entry, and the line the focus
-/// is on (for scrolling).
+/// The lines of the fields of the highlighted entry, wrapped to `width`
+/// columns, and the line the focus is on (for scrolling).
 fn field_lines(
     chooser: &Chooser,
     styles: &Styles,
     owner_focused: bool,
+    width: usize,
 ) -> (Vec<Line<'static>>, usize) {
     let Some(item) = chooser.selected_item() else {
         return (Vec::new(), 0);
@@ -1057,24 +1147,11 @@ fn field_lines(
             ));
         }
         lines.push(Line::from(header));
-        let value = sanitize(&field.value);
-        let rows = field_value_rows(field, &value, is_focused);
         let value_start = lines.len();
-        for (row, text) in rows.into_iter().enumerate() {
-            let prefix = if row == 0 { PROMPT } else { "  " };
-            lines.push(Line::from(vec![
-                Span::styled(prefix, styles.of(Role::Done)),
-                Span::raw(text),
-            ]));
-        }
+        let (rows, cursor_row) = field::value_lines(field, width, is_focused, styles);
+        lines.extend(rows);
         if is_focused {
-            focus_line = value_start
-                + field
-                    .value
-                    .chars()
-                    .take(field.cursor)
-                    .filter(|ch| *ch == '\n')
-                    .count();
+            focus_line = value_start + cursor_row;
         }
         if let Some(error) = &field.error {
             lines.push(Line::styled(
@@ -1087,34 +1164,6 @@ fn field_lines(
         }
     }
     (lines, focus_line)
-}
-
-/// The rows of a field's value; a focused text field has the cursor in it.
-fn field_value_rows(field: &ChooserField, value: &str, focused: bool) -> Vec<String> {
-    let mut text = value.to_string();
-    match &field.kind {
-        FieldKind::Select(_) => {
-            return vec![format!("‹ {value} ›")];
-        }
-        FieldKind::Text { .. } | FieldKind::Integer => {
-            if focused {
-                let byte = text
-                    .char_indices()
-                    .nth(drawn_cursor(field))
-                    .map_or(text.len(), |(index, _)| index);
-                text.insert(byte, CURSOR);
-            }
-        }
-    }
-    text.split('\n').map(str::to_string).collect()
-}
-
-/// Where the cursor falls in the drawn value. The drawing turns a tab into
-/// spaces, so the cursor counts what the text before it draws as, not its
-/// characters.
-fn drawn_cursor(field: &ChooserField) -> usize {
-    let byte = char_byte_index(&field.value, field.cursor);
-    sanitize(&field.value[..byte]).chars().count()
 }
 
 /// Draws `chooser` into `area`: the list and the description (side by side,
@@ -1157,7 +1206,7 @@ fn render_with_style(
         inputs::render(frame, area, chooser, styles, focused, footer);
         return;
     }
-    let (fields, focus_line) = field_lines(chooser, styles, focused);
+    let (fields, focus_line) = field_lines(chooser, styles, focused, usize::from(area.width));
     let fields_height = (fields.len() as u16).min(area.height.saturating_sub(5));
     let [top, bottom] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(fields_height)]).areas(area);
@@ -1220,7 +1269,7 @@ pub fn render_fields(
     styles: &Styles,
     focused: bool,
 ) {
-    let (fields, focus_line) = field_lines(chooser, styles, focused);
+    let (fields, focus_line) = field_lines(chooser, styles, focused, usize::from(area.width));
     let height = usize::from(area.height);
     let offset = (focus_line + 1).saturating_sub(height) as u16;
     frame.render_widget(Paragraph::new(fields).scroll((offset, 0)), area);

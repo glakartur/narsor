@@ -49,9 +49,8 @@ use crate::domain::{
 };
 use crate::persistence::ConversationStore;
 
-pub use agent::{
-    AgentEventSink, AgentExecutor, DefaultHarnessSource, LoggingEventSink,
-};
+pub use agent::{AgentEventSink, AgentExecutor, DefaultHarnessSource, LoggingEventSink};
+pub use answer::ChoiceAnswer;
 pub use harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry,
     HarnessRequest, HarnessRun, OpenCodeAdapter,
@@ -62,7 +61,6 @@ pub use human::{
     PermissionDecisionKind, PermissionDenialDetails, PermissionGrantScope,
     PermissionRequestDetails, RejectedAnswer, ResumedHumanAction,
 };
-pub use answer::ChoiceAnswer;
 pub use script::ScriptExecutor;
 
 /// Environment variable carrying the [`crate::domain::ActionExecution`] id into
