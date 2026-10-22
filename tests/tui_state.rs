@@ -1950,6 +1950,100 @@ mod task_app_list {
             assert!(!app.refresh_wanted());
         }
 
+        fn report(
+            id: &str,
+            sequence: u64,
+            event_cursor: u64,
+            status: ExecutionStatus,
+            pending_input_id: Option<String>,
+            attention: Vec<narsor_protocol::controller::AttentionItem>,
+        ) -> Option<Result<narsor_protocol::controller::ControlEventEnvelope, ClientError>> {
+            event(
+                id,
+                "a",
+                sequence,
+                RunnerState::Running,
+                TaskEventKind::RunnerReported {
+                    incarnation: "pod-1".into(),
+                    event_cursor,
+                    execution_status: status,
+                    pending_input_id,
+                    attention,
+                },
+            )
+        }
+
+        fn running_app(with_runner: bool) -> TaskApp {
+            let mut app = app();
+            let mut task = controlled("a", "local", "running", 1);
+            if with_runner {
+                task.runner = Some(narsor_runner());
+            }
+            app.load(listing(vec![task], "c"));
+            app
+        }
+
+        #[test]
+        fn a_report_that_moves_only_the_event_cursor_asks_for_no_read() {
+            let mut app = running_app(true);
+            let cursor = app.list().tasks()[0].runner.as_ref().unwrap().event_cursor;
+            for step in 1..=10 {
+                app.on_stream(report(
+                    &format!("r{step}"),
+                    step + 1,
+                    cursor + step,
+                    ExecutionStatus::Running,
+                    None,
+                    Vec::new(),
+                ));
+                assert!(!app.refresh_wanted(), "report {step} changes no row field");
+            }
+            let runner = app.list().tasks()[0].runner.as_ref().unwrap();
+            assert_eq!(runner.event_cursor, cursor + 10);
+        }
+
+        #[test]
+        fn a_report_that_changes_state_question_or_attention_asks_for_a_read() {
+            let mut app = running_app(true);
+            app.on_stream(report("s", 2, 50, ExecutionStatus::Completed, None, Vec::new()));
+            assert!(app.refresh_wanted(), "status changed");
+
+            let mut app = running_app(true);
+            app.on_stream(report(
+                "p",
+                2,
+                50,
+                ExecutionStatus::Running,
+                Some("wait-1".into()),
+                Vec::new(),
+            ));
+            assert!(app.refresh_wanted(), "a question appeared");
+
+            let item = waiting(
+                controlled("a", "local", "running", 1),
+                AttentionKind::Question,
+            )
+            .attention[0]
+                .clone();
+            let mut app = running_app(true);
+            app.on_stream(report(
+                "t",
+                2,
+                50,
+                ExecutionStatus::Running,
+                None,
+                vec![item],
+            ));
+            assert!(app.refresh_wanted(), "attention changed");
+        }
+
+        #[test]
+        fn a_report_for_a_row_without_a_runner_asks_for_a_read() {
+            let mut app = running_app(false);
+            app.on_stream(report("n", 2, 50, ExecutionStatus::Running, None, Vec::new()));
+            assert!(app.refresh_wanted());
+        }
+
         fn narsor_runner() -> narsor_engine::controller_protocol::RunnerView {
             super::super::task_app_support::runner(ExecutionStatus::Running, "review")
         }
