@@ -101,6 +101,7 @@ Pominięte. Kod ma mocne lokalne wzorce (`manual_transitions`, `agent_message`, 
 
   Komentarz nigdy nie wybiera `Allow`. Test tej własności jest obowiązkowy w U4.
 - KTD5. **Wiadomość przy wznowieniu jest trwałym polem odbioru polecenia `Resume`, zużywanym przez runner raz.** Dlaczego: zapis w tym samym odbiorze co polecenie daje atomowość („zapisz i wznów" to jedno zdarzenie) i klucz idempotencji chroni przed podwójnym dostarczeniem. Wzorzec z poprzedniego planu kontynuacji (KTD1, KTD2). Dotyczy R6, R9.
+- KTD8. **Archiwizacja jest oferowana wszędzie, gdzie control plane ją przyjmuje.** Dlaczego: „archive wins" to istniejąca, celowa semantyka (zwolnienie slotu z taska uruchomionego, w kolejce lub wstrzymanego); wymuszenie dawnej reguły TUI w backendzie psuje 15 istniejących testów i zmienia znaczenie akcji, czego Scope Boundaries zakazuje. Oferta i walidacja to jedna funkcja (KTD2), więc nie ma rozjazdu. AE1 pozostaje prawdziwy jako test klienta na danych (klient rysuje to, co poda backend), a AE2 jest pokryty innymi akcjami. Skutek widoczny dla operatora: menu TUI pokazuje archiwizację także dla taska działającego; potwierdzenie `y`/`n` zostaje jak dziś. Wymagania nie wymagają zmiany słownej.
 - KTD6. **Klient zostawia lokalnie tylko to, co prezentacyjne.** Mapa „identyfikator akcji → skrót i etykieta" zostaje w TUI (Z5). `Move` i `OpenLink` nie są w liście z backendu (decyzja P4) i zachowują lokalne reguły. Dotyczy R3.
 - KTD7. **Komentarz jest obok opcji, jako zawsze obecne pole w panelu odpowiedzi** (odpowiedź na P2). Dlaczego: R8 wymaga „obok, nie zamiast"; pole przy każdym oczekiwaniu z R5 daje jedną regułę wyświetlania, ustaloną przez dostępność z backendu. Dotyczy R8.
 
@@ -117,7 +118,7 @@ Pominięte. Kod ma mocne lokalne wzorce (`manual_transitions`, `agent_message`, 
 
 ### Deferred to Implementation
 
-- Dla każdego `InputContinuation` w stanie „pytanie" lub „zatwierdzenie" wskazać, czy komentarz da się dostarczyć istniejącą ścieżką. `CompleteStep`, `EntryLimit` i pytania bez sesji agenta mogą jej nie mieć. Jeśli tak, U2 oznacza komentarz jako niedostępny z powodem. To nie jest cicha rezygnacja: wynik wraca do autora wymagań jako luka względem R5 (patrz Risks).
+- Dla każdego `InputContinuation` w stanie „pytanie" lub „zatwierdzenie" wskazać, czy komentarz da się dostarczyć istniejącą ścieżką. **Ustalone w implementacji U2:** `CompleteStep` i `EntryLimit` nie mają takiej ścieżki, więc komentarz jest tam niedostępny z jawnym powodem. To znana luka względem R5 (patrz Risks), przekazana autorowi wymagań; nie jest cicha. Plan nie dodaje dla nich nowej ścieżki (poza zakresem).
 - Dokładna nazwa pól, wariantów i kodów błędów protokołu.
 - Jak każdy z trzech harnessów przyjmuje wiadomość przy wznowieniu zapisanej sesji (U5).
 - Czy wznowienie z komentarzem, gdy backend jest pełny, czeka w kolejce jak zwykłe `Resume` (`queued_for_slot`). Zakładany wynik: tak, wiadomość czeka razem z poleceniem.
@@ -211,6 +212,7 @@ sequenceDiagram
 **Approach:**
 - Funkcja przyjmuje `TaskRecord` i stan oczekującego wejścia, zwraca pełną listę (też niedostępne pozycje z powodem).
 - Przenosi reguły z `availability`, `not_running`, `runner_unreachable`, `provisioning_failed` i teksty powodów z `src/tui/task_app/actions.rs`, bez zmiany ich znaczenia (Scope Boundaries). Zachowuje obecne teksty, bo testy TUI na nie patrzą.
+- **Wyjątek: archiwizacja (KTD8).** Oferta archiwizacji odzwierciedla control plane, a nie dawną regułę klienta: dostępna w każdym stanie nie-archiwalnym (uruchomiony, w kolejce, wstrzymany, zakończony, przerwany), bo control plane przyjmuje ją zawsze („archive wins”, `lifecycle.rs`) i istniejące testy używają jej do zwolnienia slotu. Niedostępna tylko gdy task już jest `Archiving` lub `Archived`, z powodem. Dawny tekst „archiwizować można zakończone lub przerwane” znika razem z regułą.
 - Komentarz jest dostępny dokładnie w stanach z R5: pytanie, zatwierdzenie, uprawnienie, pauza (`RunnerState::Stopped`, runner zatrzymany przez operatora). W pozostałych niedostępny z powodem. Nie dotyczy to nieudanego kroku, problemu runnera i provisioningu (Z1).
 - Opcje decyzji (odpowiedź, zatwierdzenie, uprawnienie) pochodzą z oczekującego wejścia, które backend już zna. Opcje przejść ręcznych z `manual_transitions`; to samo źródło, nie dwa.
 - Dla `InputContinuation`, w którym komentarz nie ma ścieżki (patrz Deferred), pozycja jest niedostępna z jawnym powodem.
@@ -219,7 +221,9 @@ sequenceDiagram
 
 **Test scenarios:**
 - Happy path: task `Finished` ma `archive` dostępne, `interrupt` niedostępne z powodem.
-- Covers AE1. Task uruchomiony: `archive` niedostępne z powodem „zadanie działa …".
+- Happy path (KTD8): task uruchomiony, w kolejce i wstrzymany mają `archive` dostępne, tak jak przyjmuje je control plane.
+- Edge case: task `Archiving` lub `Archived`: `archive` niedostępne z powodem.
+- Covers AE1. Oferta jako dane: `interrupt` niedostępne z powodem „zadanie nie działa …" dla taska wstrzymanego; fixture klienta w U6 pokazuje, że klient rysuje tę treść bez własnej reguły.
 - Happy path: task z pytaniem agenta ma dostępne `comment` i opcje odpowiedzi.
 - Covers AE4. Task czekający na zgodę na uprawnienie: lista ma „Zezwól", „Odmów" i „Dodaj komentarz".
 - Covers AE5. Task wstrzymany (`Stopped`): `comment` i `resume` dostępne.
@@ -229,7 +233,7 @@ sequenceDiagram
 - Edge case: task z `manual_transitions == None` (runner nie zgłoszony): przejście niedostępne z powodem.
 - Integration: lista w odpowiedzi `GET /control/v1/tasks` jest tą samą, którą waliduje U3 (jedna funkcja).
 
-**Verification:** Odpowiedź taska niesie `actions` we wszystkich stanach; teksty powodów zgadzają się z dotychczasowymi z TUI.
+**Verification:** Odpowiedź taska niesie `actions` we wszystkich stanach; teksty powodów zgadzają się z dotychczasowymi z TUI, z jednym uzgodnionym wyjątkiem: archiwizacja (KTD8). Komentarz jest niedostępny z powodem dla `CompleteStep` i `EntryLimit` (znana luka względem R5).
 
 ---
 
@@ -247,7 +251,8 @@ sequenceDiagram
 - Test: `tests/controller_protocol.rs`
 
 **Approach:**
-- Każda z istniejących ścieżek woła funkcję z U2 po sprawdzeniu `expected_generation` i odrzuca z powodem tej funkcji.
+- Każda z istniejących ścieżek woła funkcję z U2 po sprawdzeniu `expected_generation` i odrzuca z powodem tej funkcji. Reguły z oferty i z walidacji są jedną funkcją, więc archiwizacja nie wymaga wyjątku w walidacji: oferta już ją dopuszcza (KTD8).
+- Nie zmienia semantyki akcji control plane. Żaden istniejący test nie zmienia fixtures z powodu U3.
 - Zachowuje dotychczasowe kody (`stale_generation`, `illegal_transition`, `backend_at_capacity` itd.), żeby nie psuć klientów i `refusal_reason` w TUI. Nowy kod dodaje tylko to, czego dziś nie wyłapuje nic.
 - Idempotentny powtórzony klucz nie podlega nowej walidacji (odpowiedź jak dziś).
 - Runner dalej odrzuca polecenia operatora po swojej stronie (`OperatorCommandStatus::Rejected`); ta walidacja jest wcześniejsza i tańsza, nie zamiennik.
@@ -255,7 +260,8 @@ sequenceDiagram
 **Patterns to follow:** istniejące wczesne odrzucenia `submit_operator_command` (`override_not_allowed`, `illegal_transition`).
 
 **Test scenarios:**
-- Covers AE2. Archiwizacja zlecona, gdy task w międzyczasie ruszył: odrzucona z powodem z oferty, task bez zmian.
+- Covers AE2. Przerwanie zlecone, gdy task w międzyczasie się zatrzymał (lub wznowienie zlecone, gdy już działa): odrzucone z powodem z oferty, task bez zmian. AE2 nie używa archiwizacji, bo ta jest przyjmowana w każdym stanie (KTD8).
+- Edge case: archiwizacja taska uruchomionego, w kolejce i wstrzymanego nadal przechodzi (archive wins); 15 istniejących testów `api`, `controller_protocol` i `tui_state`, które tak archiwizują, zostają bez zmian.
 - Error path: przerwanie taska, który stoi: odrzucone z powodem.
 - Error path: stara generacja: odrzucona kodem `stale_generation`, jak dziś.
 - Edge case: powtórzenie tego samego klucza po sukcesie zwraca pierwotny wynik, nie błąd dostępności.
@@ -346,7 +352,7 @@ sequenceDiagram
 - Error path: stara generacja odrzucona.
 - Integration: wiadomość dociera do agenta przez adapter każdego z obsługiwanych harnessów (test per harness lub jawne „niedostępne" w ofercie).
 
-**Verification:** Komentarz w pauzie rusza agenta z tekstem w jednym kroku; wiadomość nie ginie i nie dubluje się.
+**Verification:** Komentarz w pauzie rusza agenta z tekstem w jednym kroku; wiadomość nie ginie i nie dubluje się. Dowodem są `tests/controller_protocol.rs`, `tests/actions_agent.rs` i `tests/engine_recovery.rs`. `tests/runner.rs` pada w całości jeszcze przed zmianami planu (stan bazowy), więc nie jest bramką dla U5: implementujący dopisuje scenariusze runnera tam, gdzie to możliwe, i zapisuje w opisie MR, że ten plik nie weryfikuje U5. Naprawa `tests/runner.rs` jest poza zakresem.
 
 ---
 
@@ -373,7 +379,7 @@ sequenceDiagram
 **Patterns to follow:** obecny `menu_items` i `notify_after_refresh` w `src/tui/task_app/actions.rs`.
 
 **Test scenarios:**
-- Covers AE1. Backend oznacza archiwizację niedostępną z powodem „zadanie działa": pozycja wyszarzona z tym powodem; żadna lokalna reguła tego nie zmienia (test z oferta sprzeczną z lokalną regułą).
+- Covers AE1. Oferta (dane testowe, nie stan rzeczywistego backendu; prawdziwy backend oferuje archiwizację według KTD8) oznacza archiwizację niedostępną z powodem „zadanie działa": pozycja wyszarzona z tym powodem; żadna lokalna reguła tego nie zmienia (test z oferta sprzeczną z lokalną regułą).
 - Covers AE6. Opis taska bez `actions`: wszystkie akcje z backendu niedostępne z powodem „brak danych".
 - Edge case: skrót klawiszowy na niedostępnej akcji mówi powód na pasku.
 - Edge case: `Move` i `OpenLink` działają jak dotąd bez `actions`.
@@ -442,8 +448,10 @@ sequenceDiagram
 
 | Ryzyko | Skutek | Ograniczenie |
 |---|---|---|
-| Nie każdy `InputContinuation` lub workflow ma ścieżkę dostarczenia komentarza (np. zatwierdzenie bez wyjścia odrzucającego z polem komentarza) | R5 („zawsze dostępna") nie jest spełnione dla tego przypadku | U2 oznacza komentarz jako niedostępny z jawnym powodem. Implementujący zgłasza każdy taki przypadek jako lukę względem R5 w opisie MR, nie ukrywa go. Decyzję o zmianie wymagań podejmuje autor |
+| Nie każdy `InputContinuation` lub workflow ma ścieżkę dostarczenia komentarza (np. zatwierdzenie bez wyjścia odrzucającego z polem komentarza) | R5 („zawsze dostępna") nie jest spełnione dla tego przypadku | U2 oznacza komentarz jako niedostępny z jawnym powodem. Znane przypadki: `CompleteStep` i `EntryLimit` (komentarz niedostępny z powodem). Implementujący zgłasza je jako lukę względem R5 w opisie MR, nie ukrywa jej. Decyzję o rozszerzeniu wymagań podejmuje autor |
 | Harness nie przyjmuje wiadomości przy wznowieniu sesji | Komentarz w pauzie niedostępny dla tego harnessu | U5 sprawdza wszystkie trzy adaptery; różnica jest jawna w ofercie, nie cicha |
+| Archiwizacja oferowana dla taska działającego zmienia menu TUI (dawniej szara) | Operator widzi akcję, której klient dotąd nie pokazywał jako dostępnej | KTD8: control plane i tak ją przyjmuje; potwierdzenie `y`/`n` zostaje; zmianę wymienia opis MR |
+| `tests/runner.rs` pada przed zmianami | U5 nie da się zweryfikować w tym pliku | Weryfikacja przez inne pliki testów (U5); stan bazowy zapisany w MR |
 | Jedna funkcja oferty i walidacji zmienia zachowanie istniejących odrzuceń | Regresja kodów błędów, które klient zna | U3 zachowuje dotychczasowe kody i testuje je bez zmian |
 | Zmiana Z2 lub Z6 na MR | Zmiana semantyki w U4 i U5 | Reguła w jednej tabeli (KTD4) i jednym dyspozytorze (KTD3); zmiana lokalna |
 | Wiadomość przy `Resume` dostarczona dwa razy lub utracona przy restarcie runnera | Agent dostaje komentarz podwójnie albo wcale | Atomowy zapis z poleceniem, znacznik „zużyta", klucz idempotencji; testy restartu w U5 |
