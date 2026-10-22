@@ -10,11 +10,12 @@
 //! decision; their words are kept.
 
 use narsor_protocol::api::{
-    HumanInputActionDto, InputContinuationView, PendingHumanInputView, PermissionDecisionKindDto,
+    HumanInputActionDto, HumanInputDeliveryDto, InputContinuationView, PendingHumanInputView,
+    PermissionDecisionDto, PermissionDecisionKindDto,
 };
 use narsor_protocol::controller::{
-    AttentionKind, Freshness, RunnerState, SubmitInputRequest, TaskActionId, TaskActionOffer,
-    TaskActionOption, TaskState, TaskSummary,
+    AttentionKind, Freshness, RunnerState, SubmitCommentRequest, SubmitCommentResponse,
+    SubmitInputRequest, TaskActionId, TaskActionOffer, TaskActionOption, TaskState, TaskSummary,
 };
 use narsor_protocol::display::{loss_state, LossState};
 
@@ -467,5 +468,139 @@ impl ProtocolService {
             Some(reason) => Err(ProtocolError::conflict("task_not_queued", reason)),
             None => Ok(()),
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// The comment
+// ---------------------------------------------------------------------
+
+/// The delivery a comment is to the request the task waits on, and the
+/// request's id (KTD4).
+///
+/// The owner's text never allows anything: at an approval and at a
+/// permission it turns the request down with the text as the note.
+fn comment_delivery(
+    task: &TaskSummary,
+    text: &str,
+) -> Option<(String, HumanInputDeliveryDto)> {
+    let form = waiting(task)?;
+    let pending_id = task.runner.as_ref()?.pending_input.as_ref()?.id.clone();
+    let text = text.to_string();
+    let delivery = match form.continuation {
+        // The agent asked: the text is the reply, in the same session.
+        InputContinuationView::ResumeAgent => HumanInputDeliveryDto {
+            values: serde_json::Map::from_iter([(
+                "answer".to_string(),
+                serde_json::Value::String(text),
+            )]),
+            ..HumanInputDeliveryDto::default()
+        },
+        InputContinuationView::ResolveOutput => HumanInputDeliveryDto {
+            agent_message: Some(text),
+            ..HumanInputDeliveryDto::default()
+        },
+        // The output is not approved: the agent resumes with the note.
+        InputContinuationView::ApproveOutput => HumanInputDeliveryDto {
+            comment: Some(text),
+            action: Some(HumanInputActionDto::Resume),
+            ..HumanInputDeliveryDto::default()
+        },
+        InputContinuationView::ResolvePermission => HumanInputDeliveryDto {
+            permission_decision: Some(PermissionDecisionDto {
+                denial_index: None,
+                decision: PermissionDecisionKindDto::Deny,
+                scope: None,
+                pattern: None,
+                message: Some(text),
+            }),
+            ..HumanInputDeliveryDto::default()
+        },
+        InputContinuationView::CompleteStep
+        | InputContinuationView::EntryLimit
+        | InputContinuationView::Unrecognized => return None,
+    };
+    Some((
+        pending_id,
+        HumanInputDeliveryDto {
+            episode: Some(form.episode_key().to_string()),
+            ..delivery
+        },
+    ))
+}
+
+impl ProtocolService {
+    /// The owner's comment on a stopped task: the one entry point, whatever
+    /// the stop is (KTD3). The server picks what it does by the stop (KTD4).
+    pub fn submit_comment(
+        &self,
+        owner: &super::OwnerRef,
+        task_id: &str,
+        request: SubmitCommentRequest,
+    ) -> ProtocolResult<SubmitCommentResponse> {
+        let record = self.owned_task(owner, task_id)?;
+        if request.idempotency_key.trim().is_empty() {
+            return Err(ProtocolError::bad_request(
+                "missing_idempotency_key",
+                "a comment needs an idempotency key",
+            ));
+        }
+        let text = request.text.trim();
+        if text.is_empty() {
+            return Err(ProtocolError::bad_request(
+                "empty_comment",
+                "a comment needs a text",
+            ));
+        }
+        let is_retry = record
+            .inputs
+            .iter()
+            .any(|queued| queued.idempotency_key == request.idempotency_key);
+        if !is_retry {
+            if request
+                .expected_generation
+                .is_some_and(|expected| expected != record.generation)
+            {
+                return Err(ProtocolError::conflict(
+                    "stale_generation",
+                    "the task changed since the comment was written",
+                ));
+            }
+            self.require_available(&record, TaskActionId::Comment, None)?;
+        }
+        let summary = self.summarize(&record)?;
+        let Some((pending_input_id, delivery)) = comment_delivery(&summary, text) else {
+            // A retry of a comment already taken: the request it answered
+            // is no longer pending.
+            return match record
+                .inputs
+                .iter()
+                .find(|queued| queued.idempotency_key == request.idempotency_key)
+            {
+                Some(_) => Ok(SubmitCommentResponse {
+                    task: summary,
+                    replayed: true,
+                }),
+                None => Err(ProtocolError::conflict(
+                    "action_unavailable",
+                    comment_reason(&summary)
+                        .unwrap_or_else(|| "komentarz nie ma dokąd trafić".to_string()),
+                )),
+            };
+        };
+        let response = self.submit_input(
+            owner,
+            task_id,
+            SubmitInputRequest {
+                pending_input_id,
+                idempotency_key: request.idempotency_key,
+                delivery,
+            },
+        )?;
+        let task = self.summarize(&self.owned_task(owner, task_id)?)?;
+        Ok(SubmitCommentResponse {
+            task,
+            replayed: response.replayed,
+        })
     }
 }

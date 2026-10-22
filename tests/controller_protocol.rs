@@ -6601,3 +6601,168 @@ async fn a_permission_decision_is_judged_as_the_decision_it_is() {
         .await
         .expect("a denial of a pending permission");
 }
+
+// ---------------------------------------------------------------------------
+// The comment (U4)
+// ---------------------------------------------------------------------------
+
+fn comment_request(text: &str, key: &str) -> SubmitCommentRequest {
+    SubmitCommentRequest {
+        text: text.to_string(),
+        idempotency_key: key.to_string(),
+        expected_generation: None,
+    }
+}
+
+#[tokio::test]
+async fn a_comment_on_a_permission_denies_with_the_text_and_never_allows() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "resolve_permission", AttentionKind::Problem).await;
+
+    let response = harness
+        .owner
+        .control_comment("task-1", &comment_request("use the read-only tool", "c-1"))
+        .await
+        .expect("comment");
+    assert!(!response.replayed);
+
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    let decision = polled.inputs[0]
+        .delivery
+        .permission_decision
+        .as_ref()
+        .expect("a permission decision");
+    assert_eq!(decision.decision, narsor_protocol::api::PermissionDecisionKindDto::Deny);
+    assert_eq!(decision.denial_index, None);
+    assert_eq!(decision.message.as_deref(), Some("use the read-only tool"));
+
+    // The request is answered: the task offers no decision on it any more.
+    assert_unavailable(
+        &response.task,
+        TaskActionId::AllowPermission,
+        "nie czeka na zgodę",
+    );
+    assert_unavailable(
+        &response.task,
+        TaskActionId::DenyPermission,
+        "nie czeka na zgodę",
+    );
+}
+
+#[tokio::test]
+async fn a_comment_on_an_approval_returns_the_output_with_the_note_and_does_not_approve() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "approve_output", AttentionKind::Approval).await;
+
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("tests are missing", "c-1"))
+        .await
+        .expect("comment");
+
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    let delivery = &polled.inputs[0].delivery;
+    assert_eq!(delivery.action, Some(narsor_protocol::api::HumanInputActionDto::Resume));
+    assert_eq!(delivery.comment.as_deref(), Some("tests are missing"));
+}
+
+#[tokio::test]
+async fn a_comment_on_a_question_reaches_the_agent_as_the_reply() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("take the second option", "c-1"))
+        .await
+        .expect("comment");
+
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    let delivery = &polled.inputs[0].delivery;
+    assert_eq!(
+        delivery.values.get("answer").and_then(|v| v.as_str()),
+        Some("take the second option")
+    );
+    assert_eq!(delivery.episode.as_deref(), Some("ep-1"));
+}
+
+#[tokio::test]
+async fn a_comment_on_a_problem_is_a_message_to_the_agent() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "resolve_output", AttentionKind::Problem).await;
+
+    harness
+        .owner
+        .control_comment("task-1", &comment_request("try again", "c-1"))
+        .await
+        .expect("comment");
+
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    assert_eq!(
+        polled.inputs[0].delivery.agent_message.as_deref(),
+        Some("try again")
+    );
+}
+
+#[tokio::test]
+async fn a_comment_key_is_taken_once() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } =
+        waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+
+    let first = harness
+        .owner
+        .control_comment("task-1", &comment_request("one", "c-1"))
+        .await
+        .expect("comment");
+    let again = harness
+        .owner
+        .control_comment("task-1", &comment_request("one", "c-1"))
+        .await
+        .expect("retry");
+    assert!(!first.replayed);
+    assert!(again.replayed);
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    assert_eq!(polled.inputs.len(), 1);
+}
+
+#[tokio::test]
+async fn a_blank_comment_and_a_comment_on_a_running_task_are_refused() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+
+    let task = harness.task("task-1").await;
+    assert_unavailable(&task, TaskActionId::Comment, "zadanie działa");
+    assert_eq!(
+        refused_code(
+            harness
+                .owner
+                .control_comment("task-1", &comment_request("hello", "c-1"))
+                .await
+        ),
+        "action_unavailable"
+    );
+    let blank = harness
+        .owner
+        .control_comment("task-1", &comment_request("   ", "c-2"))
+        .await;
+    assert!(blank.is_err(), "a blank comment is refused: {blank:?}");
+}
+
+#[tokio::test]
+async fn a_comment_on_an_older_generation_is_refused() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+    let task = harness.task("task-1").await;
+
+    let mut request = comment_request("late", "c-1");
+    request.expected_generation = Some(task.generation + 1);
+    assert_eq!(
+        refused_code(harness.owner.control_comment("task-1", &request).await),
+        "stale_generation"
+    );
+}

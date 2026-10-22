@@ -147,6 +147,7 @@ where
             get(get_conversation_page),
         )
         .route("/control/v1/tasks/{task_id}/input", post(post_input))
+        .route("/control/v1/tasks/{task_id}/comment", post(post_comment))
         .route(
             "/control/v1/tasks/{task_id}/operator-commands",
             post(post_operator_command),
@@ -494,6 +495,16 @@ async fn post_input(
     Json(request): Json<SubmitInputRequest>,
 ) -> ProtocolResult<(StatusCode, Json<SubmitInputResponse>)> {
     let response = service.submit_input(&owner, &task_id, request)?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn post_comment(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+    Json(request): Json<SubmitCommentRequest>,
+) -> ProtocolResult<(StatusCode, Json<SubmitCommentResponse>)> {
+    let response = service.submit_comment(&owner, &task_id, request)?;
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
