@@ -57,6 +57,7 @@ use crate::controller_protocol::{
 use crate::domain::ConductorPurpose;
 use crate::tui::chat::{tab_entry, tab_items, undo_lines, ChatItem, TAB_KEYS};
 use crate::tui::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
+use crate::tui::form::events::{Direction, Growth};
 use crate::tui::keymap::{key_of, Action, Context};
 use crate::tui::style::{Role, Styles};
 use crate::tui::transcript::{DisplayMode, TranscriptId, TranscriptState};
@@ -344,6 +345,11 @@ impl Conductor {
         self.composer.is_typing()
     }
 
+    /// Whether the text box waits for the confirmation of its send.
+    pub fn is_confirming(&self) -> bool {
+        self.composer.is_confirming()
+    }
+
     /// Puts the keys in the text box.
     pub fn begin_compose(&mut self) {
         self.composer.enter_fields();
@@ -384,14 +390,13 @@ impl Conductor {
 
 /// The text box: one entry with one required, multi-line field.
 fn new_composer(text: &str) -> Chooser {
-    Chooser::new(vec![ChooserItem::new(
+    let composer = Chooser::new(vec![ChooserItem::new(
         "Wiadomość do dyrygenta",
         "Dyrygent odpowie wpisem w czacie; jego propozycje pojawią się w panelu \
          „Czeka na Ciebie”.",
     )
-    .with_field(
-        ChooserField::multiline(MESSAGE).required().with_value(text),
-    )])
+    .with_field(ChooserField::multiline(MESSAGE).required().with_value(text))]);
+    composer.confirming_submit()
 }
 
 fn unavailable_text(reason: Option<&str>) -> String {
@@ -454,7 +459,16 @@ pub fn render(
     let mut box_rows = 0;
     if ready {
         if conductor.is_typing() {
-            box_rows = conductor.composer.field_rows().min(area.height / 2).max(2);
+            // The box grows upward over the history, to half the tab; past
+            // that the text scrolls inside it.
+            conductor.composer.set_growth(Growth {
+                direction: Direction::Up,
+                limit_rows: usize::from(area.height / 2),
+            });
+            box_rows = conductor
+                .composer
+                .preferred_rows(usize::from(area.width))
+                .max(2);
         } else if !conductor.draft().is_empty() {
             bottom.push(Line::styled(
                 format!(
@@ -675,6 +689,16 @@ impl TaskApp {
                 .selected_id()
                 .and_then(|id| self.detail.view(id))
                 .is_some_and(|view| view.conductor().is_typing())
+    }
+
+    /// Whether the text box asks to confirm the send.
+    pub(in crate::tui::task_app) fn conductor_confirming(&self) -> bool {
+        self.conductor_typing()
+            && self
+                .list
+                .selected_id()
+                .and_then(|id| self.detail.view(id))
+                .is_some_and(|view| view.conductor().is_confirming())
     }
 
     /// A key typed into the text box.

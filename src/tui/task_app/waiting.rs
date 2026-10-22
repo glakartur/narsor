@@ -11,7 +11,7 @@
 //!   1 approved                ↩ wraca do agenta: plan
 //! | 2 | revise                Zakres wymaga poprawy…
 //! Komentarz dla agenta (wymagane):
-//! > Uwzględnij migrację tabeli orders▏
+//! > Uwzględnij migrację tabeli orders
 //! ```
 //!
 //! # What the panel is made of
@@ -301,10 +301,13 @@ impl Entry {
         let model = Self::model(item, task, positions, conductor);
         let chooser = Chooser::new(model.items())
             .enter_fields_on_activate()
+            .confirming_submit()
             .selecting(model.selected());
-        let composer = model
-            .composer_item()
-            .map(|item| Chooser::new(vec![item]).with_inputs_layout());
+        let composer = model.composer_item().map(|item| {
+            Chooser::new(vec![item])
+                .with_inputs_layout()
+                .confirming_submit()
+        });
         Self {
             item: item.clone(),
             model,
@@ -433,7 +436,8 @@ impl Entry {
             }
         } else if model.has_composer() {
             let mut composer = Chooser::new(vec![model.composer_item().expect("composer spec")])
-                .with_inputs_layout();
+                .with_inputs_layout()
+                .confirming_submit();
             composer.leave_fields();
             self.composer = Some(composer);
         }
@@ -625,6 +629,15 @@ impl WaitingPanel {
     /// The drafts of waitings that went away.
     pub fn released(&self) -> &[Released] {
         &self.released
+    }
+
+    /// Whether the form of the current entry waits for the confirmation of
+    /// its send: only the popup's keys act then.
+    pub fn is_confirming(&self) -> bool {
+        self.entries.get(self.current).is_some_and(|entry| {
+            entry.chooser.is_confirming()
+                || entry.composer.as_ref().is_some_and(Chooser::is_confirming)
+        })
     }
 
     /// Whether keys are typed into a field: `q` and `?` are text then.
@@ -848,6 +861,7 @@ impl WaitingPanel {
             }
         }
         if entry.composer.is_some()
+            && !entry.chooser.is_confirming()
             && entry.chooser.focus() == ChooserFocus::Actions
             && (entry.chooser.items().is_empty()
                 || (entry.chooser.selected() + 1 == entry.chooser.items().len()
@@ -860,7 +874,10 @@ impl WaitingPanel {
                 return PanelEffect::None;
             }
         }
-        if key.code == KeyCode::Esc && entry.chooser.focus() == ChooserFocus::Fields {
+        if key.code == KeyCode::Esc
+            && entry.chooser.focus() == ChooserFocus::Fields
+            && !entry.chooser.is_confirming()
+        {
             entry.chooser.leave_fields();
             return PanelEffect::None;
         }
@@ -1303,6 +1320,14 @@ impl TaskApp {
         self.detail.view(id).map(|view| &view.waiting)
     }
 
+    /// Whether the panel's form asks the operator to confirm the send.
+    pub(super) fn panel_confirming(&self) -> bool {
+        self.panel_focused()
+            && self
+                .selected_panel()
+                .is_some_and(WaitingPanel::is_confirming)
+    }
+
     /// Whether a key is typed into a field of the panel.
     pub(super) fn panel_typing(&self) -> bool {
         self.panel_focused() && self.selected_panel().is_some_and(WaitingPanel::is_typing)
@@ -1383,7 +1408,7 @@ impl TaskApp {
 
     /// A key while the panel has the keyboard.
     pub(super) fn on_panel_key(&mut self, key: KeyEvent) -> Request {
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && !self.panel_confirming() {
             // Tab changes the outer panel focus. Chooser fields use arrows and
             // Enter, so leaving here never submits or discards a draft.
             self.panel_focus = false;

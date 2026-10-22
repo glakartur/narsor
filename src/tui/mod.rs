@@ -41,6 +41,7 @@ pub mod connection;
 pub mod conversation;
 pub mod event_text;
 pub mod failure_form;
+pub mod form;
 pub mod input_form;
 pub mod keymap;
 pub mod refresh;

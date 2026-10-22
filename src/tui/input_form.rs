@@ -190,25 +190,11 @@ impl InputClosure {
 }
 
 // ---------------------------------------------------------------------------
-// Field editing, shared with the embedded fields of the chooser
+// What a field takes from a paste or a key, besides the text buffer
 // ---------------------------------------------------------------------------
 //
-// The form edits its fields through these, and so does `super::chooser`, whose
-// fields live inside the answer panel: one set of rules for the cursor, for a
-// newline and for stepping a `select`, whichever surface hosts the field.
-
-/// Inserts `inserted` at the character `cursor` and moves the cursor past it.
-pub fn text_insert(value: &mut String, cursor: &mut usize, inserted: char) {
-    insert_char(value, *cursor, inserted);
-    *cursor += 1;
-}
-
-/// Inserts `inserted` at the character `cursor` in one go and moves the
-/// cursor past it — a paste, which may be a long log.
-pub fn text_insert_str(value: &mut String, cursor: &mut usize, inserted: &str) {
-    value.insert_str(char_byte_index(value, *cursor), inserted);
-    *cursor += inserted.chars().count();
-}
+// Editing of the text itself is `super::form::buffer::TextBuffer`; here are
+// the rules about what a paste may carry and how a `select` steps.
 
 /// What a paste puts into a field of `kind`: nothing for a `select`, and for
 /// the others only what could have been typed — no escape sequence, no
@@ -288,19 +274,6 @@ fn is_unicode_tag(character: char) -> bool {
     ('\u{E0000}'..='\u{E007F}').contains(&character)
 }
 
-/// Deletes the character before `cursor`, if there is one.
-pub fn text_backspace(value: &mut String, cursor: &mut usize) {
-    if *cursor > 0 {
-        remove_char(value, *cursor - 1);
-        *cursor -= 1;
-    }
-}
-
-/// Moves `cursor` by `delta` characters, staying inside `value`.
-pub fn text_step(value: &str, cursor: &mut usize, delta: isize) {
-    *cursor = (*cursor as isize + delta).clamp(0, value.chars().count() as isize) as usize;
-}
-
 /// The option `delta` steps from `current`, wrapping around. A `current` that
 /// is not an option starts at the first (forward) or last (backward) one.
 /// `None` when there are no options.
@@ -314,23 +287,6 @@ pub fn cycle_option(options: &[String], current: &str, delta: isize) -> Option<S
         None => options.len() - 1,
     };
     Some(options[next].clone())
-}
-
-pub(crate) fn char_byte_index(text: &str, character: usize) -> usize {
-    text.char_indices()
-        .nth(character)
-        .map(|(index, _)| index)
-        .unwrap_or(text.len())
-}
-
-fn insert_char(text: &mut String, character: usize, inserted: char) {
-    text.insert(char_byte_index(text, character), inserted);
-}
-
-fn remove_char(text: &mut String, character: usize) {
-    let start = char_byte_index(text, character);
-    let end = char_byte_index(text, character + 1);
-    text.replace_range(start..end, "");
 }
 
 /// Whether a single `select` field lets the engine infer the output label.

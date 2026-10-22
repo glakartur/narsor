@@ -168,7 +168,7 @@ fn add_form(local_paths: bool) -> Chooser {
     } else {
         "tylko zdalny URL git: https://…, ssh://… albo user@host:ścieżka"
     };
-    Chooser::new(vec![ChooserItem::new(
+    let form = Chooser::new(vec![ChooserItem::new(
         ADD_LABEL,
         "Rejestruje repozytorium, do którego workflow mogą się odwoływać po id. Serwer sprawdza \
          je tak jak `narsor repo add`.",
@@ -186,9 +186,8 @@ fn add_form(local_paths: bool) -> Chooser {
             "gałąź, gdy workflow nie podaje `ref`; jawny `ref` workflow ma pierwszeństwo",
         ),
     )
-    .with_field(
-        ChooserField::text(DESCRIPTION).described("dowolna notatka"),
-    )])
+    .with_field(ChooserField::text(DESCRIPTION).described("dowolna notatka"))]);
+    form.confirming_submit()
 }
 
 /// The request a submitted form stands for.
@@ -288,7 +287,12 @@ impl TaskApp {
 
     /// A key while the repositories are open.
     pub(super) fn on_repositories_key(&mut self, key: KeyEvent) -> Request {
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        let confirming = matches!(
+            &self.view,
+            View::Repositories(repositories)
+                if repositories.adding.as_ref().is_some_and(Chooser::is_confirming)
+        );
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && !confirming {
             self.focus = Focus::List;
             return Request::None;
         }

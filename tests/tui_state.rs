@@ -1107,6 +1107,8 @@ mod foundations {
                 .with_field(ChooserField::multiline("follow_up"))])
             .with_inputs_layout();
             focused_comment(&mut chooser);
+            // The focus starts on the first field, `title`.
+            chooser.on_key(press(KeyCode::Down));
             type_text(&mut chooser, "abc");
             chooser.on_key(ctrl_j());
             type_text(&mut chooser, "def");
@@ -1116,6 +1118,9 @@ mod foundations {
             chooser.on_key(press(KeyCode::Down));
             type_text(&mut chooser, "Y");
             assert_eq!(chooser.fields_of(0)[1].value(), "abcX\ndefY");
+            // On the last row the first press only goes to the end; the
+            // second leaves for the next field.
+            chooser.on_key(press(KeyCode::Down));
             chooser.on_key(press(KeyCode::Down));
             type_text(&mut chooser, "Z");
             assert_eq!(chooser.fields_of(0)[2].value(), "Z");
@@ -1166,21 +1171,24 @@ mod foundations {
         }
 
         #[test]
-        fn a_form_of_inputs_starts_on_the_required_text_and_esc_goes_back_to_the_list() {
+        fn a_form_of_inputs_starts_on_the_first_field_and_esc_goes_back_to_the_list() {
             let mut chooser = Chooser::new(vec![ChooserItem::new("ship", "Wysyła.")
                 .with_field(ChooserField::text("ticket"))
                 .with_field(ChooserField::multiline("notes"))
                 .with_field(ChooserField::multiline("prompt").required())])
             .with_inputs_layout();
             assert_eq!(chooser.on_key(press(KeyCode::Enter)), ChooserAction::None);
-            type_text(&mut chooser, "p");
-            assert_eq!(chooser.fields_of(0)[2].value(), "p");
-            // Short fields come first in the walk; arrows move between fields.
-            chooser.on_key(press(KeyCode::Backspace));
-            chooser.on_key(press(KeyCode::Up));
-            chooser.on_key(press(KeyCode::Up));
+            // The focus starts on the first field from the top (R9).
             type_text(&mut chooser, "t");
             assert_eq!(chooser.fields_of(0)[0].value(), "t");
+            // Short fields come first in the walk; a multi-line field lets
+            // go on the second arrow in a row.
+            chooser.on_key(press(KeyCode::Down));
+            chooser.on_key(press(KeyCode::Down));
+            chooser.on_key(press(KeyCode::Down));
+            type_text(&mut chooser, "p");
+            assert_eq!(chooser.fields_of(0)[2].value(), "p");
+            chooser.on_key(press(KeyCode::Backspace));
             assert_eq!(chooser.on_key(press(KeyCode::Esc)), ChooserAction::None);
             assert_eq!(chooser.focus(), ChooserFocus::Actions);
             assert_eq!(chooser.on_key(press(KeyCode::Esc)), ChooserAction::Cancel);
@@ -1244,6 +1252,9 @@ mod foundations {
             for _ in 0..15 {
                 chooser.on_key(press(KeyCode::Left));
             }
+            // At the start of the text the first press only arms the edge.
+            chooser.on_key(press(KeyCode::Up));
+            assert_eq!(chooser.focus(), ChooserFocus::Fields);
             chooser.on_key(press(KeyCode::Up));
             assert_eq!(chooser.focus(), ChooserFocus::Actions);
             chooser.on_key(press(KeyCode::Char('k')));
@@ -4694,8 +4705,15 @@ mod task_app_waiting {
         )
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {
@@ -5355,6 +5373,8 @@ mod task_app_waiting {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
         ch(&mut app, '1');
         press(&mut app, KeyCode::Enter);
+        // A multi-line field lets go on the second arrow in a row.
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         typed(&mut app, "bez znaku");
         assert!(enter_until_error(&mut app), "a key without '=' is refused");
@@ -5642,7 +5662,10 @@ mod task_app_waiting {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
         ch(&mut app, '2');
         assert_eq!(selected_label(&app), "needs_human_decision");
-        assert!(enter_until_error(&mut app), "artifacts.decision_doc is required");
+        assert!(
+            enter_until_error(&mut app),
+            "artifacts.decision_doc is required"
+        );
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
         let field = &chooser_of(&app).fields_of(1)[0];
         assert_eq!(field.name, "artifacts.decision_doc");
@@ -5659,11 +5682,16 @@ mod task_app_waiting {
             .collect();
         assert_eq!(
             names,
-            ["artifacts.decision_doc", "variables (klucz=wartość)", "komentarz"]
+            [
+                "artifacts.decision_doc",
+                "variables (klucz=wartość)",
+                "komentarz"
+            ]
         );
 
         typed(&mut app, "docs/decision.md");
         // A key of the operator's own, beside the ones the label needs.
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         typed(&mut app, "scope=account");
         let delivery = delivery(enter_until_answer(&mut app));
@@ -5682,6 +5710,7 @@ mod task_app_waiting {
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "x");
         press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
         typed(&mut app, "summary=again");
         assert!(enter_until_error(&mut app), "duplicate keys are refused");
         let error = app
@@ -5698,6 +5727,8 @@ mod task_app_waiting {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
         ch(&mut app, '1');
         press(&mut app, KeyCode::Enter);
+        // A multi-line field lets go on the second arrow in a row.
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         typed(&mut app, "bez znaku");
         assert!(enter_until_error(&mut app), "a key without '=' is refused");
@@ -6952,8 +6983,15 @@ mod task_app_actions {
         TaskApp::new(offline_client(), "local", None)
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {
@@ -8558,8 +8596,15 @@ mod task_app_conductor {
         )
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {
@@ -9768,8 +9813,15 @@ mod task_app_create {
         app
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {
@@ -11772,6 +11824,8 @@ mod task_app_create {
                 narsor_registry(),
             );
             press(app, KeyCode::Enter);
+            // The focus starts on the first field; the prompt is below it.
+            press(app, KeyCode::Down);
             assert_eq!(app.key_context().base, Context::Form);
         }
 
@@ -12192,8 +12246,15 @@ mod task_app_harness {
         )
     }
 
+    /// One key. An `Enter` that asks for the confirmation of a send is
+    /// answered with the `Enter` of the window, so a test that says "Enter
+    /// sends" still reads so; the window itself is tested with `on_key`.
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+        let request = app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        if code == KeyCode::Enter && request == Request::None && app.form_confirming() {
+            return app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        request
     }
 
     fn ch(app: &mut TaskApp, character: char) -> Request {

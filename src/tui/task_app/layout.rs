@@ -144,6 +144,9 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
     let areas = areas(frame.area(), app.focus());
     if areas.screen == Screen::TooSmall {
         render_too_small(frame, areas.outer, styles);
+        if app.form_confirming() {
+            crate::tui::form::confirm::render(frame, areas.outer, styles);
+        }
         if app.quit_confirm {
             actions::render_quit_confirmation(
                 frame,
@@ -179,6 +182,9 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
     render_bar(frame, areas.bar, app, styles, now);
     let body = overlay_area(areas.outer);
     actions::render(frame, body, app, styles);
+    if app.form_confirming() {
+        crate::tui::form::confirm::render(frame, body, styles);
+    }
     if app.is_help_open() {
         if app.active_agent_transcript_mode() == Some(crate::tui::transcript::DisplayMode::Raw) {
             keymap::render_raw_conversation_help(frame, body, app.key_context(), styles);

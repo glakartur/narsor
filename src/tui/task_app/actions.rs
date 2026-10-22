@@ -558,7 +558,9 @@ impl Overlay {
 /// A list typed into is a form (`q` and `?` are text); otherwise it is the
 /// panel's keys.
 pub(super) fn chooser_context(chooser: &Chooser) -> Context {
-    if chooser.is_typing() {
+    if chooser.is_confirming() {
+        Context::FormConfirm
+    } else if chooser.is_typing() {
         Context::Form
     } else {
         chooser.context()

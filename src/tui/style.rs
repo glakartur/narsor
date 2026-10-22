@@ -227,6 +227,23 @@ impl Styles {
         }
     }
 
+    /// The fill behind the field being edited: a navy darker than the task
+    /// header, so the field stands out on it. Without colour the field is
+    /// told apart by its `>` in the focus role.
+    pub fn field_editing(&self) -> Style {
+        if self.no_color {
+            Style::default()
+        } else {
+            Style::default().bg(Color::Rgb(24, 36, 64))
+        }
+    }
+
+    /// The cursor: the cell it stands on, reversed. Nothing is inserted
+    /// into the text.
+    pub fn cursor(&self) -> Style {
+        Style::default().add_modifier(Modifier::REVERSED)
+    }
+
     /// The answer panel's edge shows focus across its full height.
     pub fn answer_panel_marker(&self, focused: bool) -> Style {
         self.of(if focused { Role::Focus } else { Role::Done })

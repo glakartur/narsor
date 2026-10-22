@@ -628,6 +628,23 @@ impl TaskApp {
         }
     }
 
+    /// Whether a form asks the operator to confirm its send. While it does,
+    /// only the window's keys act.
+    pub fn form_confirming(&self) -> bool {
+        if self.overlay.is_some() {
+            return false;
+        }
+        let in_view = self.focus == Focus::Details
+            && match &self.view {
+                View::NewTask(form) => form.chooser().is_confirming(),
+                View::Repositories(open) => open
+                    .form()
+                    .is_some_and(super::chooser::Chooser::is_confirming),
+                _ => false,
+            };
+        in_view || self.panel_confirming() || self.conductor_confirming()
+    }
+
     /// The keys that apply now: the context, and over the details the layer
     /// of the tab shown.
     pub fn key_context(&self) -> Stack {
@@ -650,7 +667,9 @@ impl TaskApp {
         }
         if self.panel_focused() {
             // Typing into a field: `q` and `?` are text, not commands.
-            return if self.panel_typing() {
+            return if self.panel_confirming() {
+                Context::FormConfirm
+            } else if self.panel_typing() {
                 Context::Form
             } else {
                 Context::Panel
@@ -658,7 +677,12 @@ impl TaskApp {
             .into();
         }
         if self.conductor_typing() {
-            return Context::Form.into();
+            return if self.conductor_confirming() {
+                Context::FormConfirm
+            } else {
+                Context::Form
+            }
+            .into();
         }
         match layout::context_of(self.focus, &self.list) {
             Context::Details => detail_keys(Context::Details, self.detail.tab, self.step_focus()),
@@ -778,7 +802,7 @@ impl TaskApp {
             return self.on_panel_key(key);
         }
         if self.conductor_typing() {
-            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && !self.conductor_confirming() {
                 self.focus_panel();
                 return Request::None;
             }
