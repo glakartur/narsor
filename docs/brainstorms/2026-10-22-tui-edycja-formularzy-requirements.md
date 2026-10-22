@@ -15,7 +15,7 @@ Wszystkie formularze TUI dostają jedną, przewidywalną zasadę edycji i nawiga
 
 Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formularz błędu, zakładka Dyrygent, wybór repozytorium). Edycja zachowuje się nienaturalnie.
 
-- Kursor jest wstawiany do tekstu jako osobny znak (`▏` w `src/tui/chooser.rs`). Po cofnięciu się o znak na ekranie widać `ab| c` zamiast `ab|c`: tekst za kursorem przesuwa się i wygląda na zmieniony.
+- Kursor jest wstawiany do tekstu jako osobny znak (`▏` w `src/tui/chooser.rs`). Po cofnięciu się o znak kursor (pokazany tu jako `|`) zajmuje własną komórkę, więc za nim pojawia się spacja: na ekranie widać `ab| c` zamiast `ab|c`. Tekst za kursorem przesuwa się i wygląda na zmieniony.
 - Długa linia nie jest łamana na szerokości pola. Dotyczy to pola edycji i zwykłego tekstu, np. opisu workflow w formularzu nowego zadania.
 - Brak obsługi `Delete`, `Home` i `End`.
 - Pole w edycji nie wyróżnia się od innych pól.
@@ -54,7 +54,7 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 **Edycja tekstu**
 - R1. Kursor nie zmienia położenia ani wyglądu tekstu. Znaki przed i za kursorem stoją w tych samych komórkach niezależnie od pozycji kursora (nie ma dodatkowej przerwy ani przesunięcia).
 - R2. `Delete` usuwa znak za kursorem. Na końcu tekstu nic nie robi.
-- R3. `Home` przenosi kursor na początek bieżącej linii. `End` przenosi kursor na koniec bieżącej linii. „Linia" oznacza linię widoczną na ekranie po zawinięciu (patrz R5). Decyzja w „Założenia do potwierdzenia" (Z2).
+- R3. `Home` przenosi kursor na początek bieżącej linii. `End` przenosi kursor na koniec bieżącej linii. „Linia" oznacza linię logiczną, czyli tekst między znakami nowej linii (`\n`), a nie linię widoczną po zawinięciu (R5). Decyzja w „Założenia do potwierdzenia" (Z2).
 - R4. Reguły R1–R3 działają w każdym polu tekstowym każdego formularza TUI, tak jak dziś działa wspólny kod edycji.
 
 **Zawijanie i układ pola**
@@ -65,7 +65,7 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 
 **Nawigacja między polami**
 - R9. Focus początkowy w każdym formularzu jest na pierwszym polu od góry. Dotyczy to też formularzy, które dziś otwierają się na innej pozycji (np. formularz z listą wyboru).
-- R10. Strzałka w górę na pierwszej linii pola przenosi na pole wyżej. Strzałka w dół na ostatniej linii pola przenosi na pole następne. W polach tekstowych (jedno- i wielolinijkowych) przejście następuje dopiero przy powtórzeniu strzałki: pierwsze naciśnięcie na brzegu pola tylko ustawia kursor na początku (w górę) lub końcu (w dół) tekstu, drugie to samo naciśnięcie przechodzi do sąsiedniego pola. Dotyczy to każdego formularza. W polach bez kursora tekstowego (wybory, liczby) wystarcza pojedyncza strzałka. Decyzja w Z5 i Z8.
+- R10. Strzałka w górę na pierwszej linii pola przenosi na pole wyżej. Strzałka w dół na ostatniej linii pola przenosi na pole następne. W polach tekstowych wielolinijkowych przejście następuje dopiero przy powtórzeniu strzałki: pierwsze naciśnięcie na brzegu pola tylko ustawia kursor na początku (w górę) lub końcu (w dół) tekstu, drugie to samo naciśnięcie przechodzi do sąsiedniego pola. W polach tekstowych jednolinijkowych i w polach wyboru (zmiana wartości `←`/`→`) wystarcza pojedyncza strzałka. W liście wybieranej `↑`/`↓` (np. lista akcji w panelu odpowiedzi) strzałki nie opuszczają listy; do następnego pola przechodzi się `Enter` (R11). Dotyczy to każdego formularza. Decyzja w Z5 i Z8.
 - R11. `Enter` przechodzi do następnego pola. `Enter` na ostatnim polu zatwierdza formularz (zasada bez zmian), ale z potwierdzeniem z R12. Nowa linia w polach wielolinijkowych nadal działa przez `Ctrl+J` (i `Shift+Enter`/`Alt+Enter` tam, gdzie terminal je rozróżnia).
 
 **Potwierdzenie formularza**
@@ -88,12 +88,12 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 
 - AE1. **Covers R1.** Given pole z tekstem `abc` i kursorem na końcu, when operator naciska `←`, then na ekranie widać `ab` i `c` obok siebie z kursorem między nimi, a `c` nie zmienia pozycji.
 - AE2. **Covers R2.** Given tekst `abc` z kursorem po `a`, when operator naciska `Delete`, then tekst to `ac` z kursorem po `a`. Given kursor na końcu, `Delete` nie zmienia tekstu.
-- AE3. **Covers R3, R5.** Given długi tekst zawinięty na trzy linie widoczne i kursor w środku drugiej, when operator naciska `Home`, then kursor jest na początku drugiej widocznej linii. `End` ustawia go na końcu tej linii.
+- AE3. **Covers R3, R5.** Given tekst z dwiema liniami logicznymi, z których druga jest długa i zawinięta na trzy linie widoczne, i kursor w środku drugiej widocznej linii tej drugiej linii logicznej, when operator naciska `Home`, then kursor jest na początku drugiej linii logicznej, a nie drugiej linii widocznej. `End` ustawia go na końcu tej linii logicznej.
 - AE4. **Covers R6.** Given workflow z opisem dłuższym niż szerokość panelu w formularzu nowego zadania, when formularz się rysuje, then opis zawija się do szerokości panelu w całości.
 - AE5. **Covers R7.** Given formularz o szerokości 40 komórek, when pole edycji jest narysowane, then `>` stoi w kolumnie wcięcia, a tekst pola kończy się najpóźniej w komórce 39 bez znaku za polem.
-- AE6. **Covers R10.** Given kursor na pierwszej linii pola, nie na początku tekstu, when operator naciska `↑`, then kursor idzie na początek tekstu. Gdy naciśnie `↑` ponownie, focus przechodzi na pole wyżej. Symetrycznie `↓` na ostatniej linii.
+- AE6. **Covers R10.** Given kursor na pierwszej linii pola, nie na początku tekstu, when operator naciska `↑`, then kursor idzie na początek tekstu. Gdy naciśnie `↑` ponownie, focus przechodzi na pole wyżej. Symetrycznie `↓` na ostatniej linii. Dotyczy pól wielolinijkowych; w polu jednolinijkowym wystarcza jedno naciśnięcie.
 - AE7. **Covers R9.** Given dowolny formularz, when się otwiera, then focus jest na pierwszym polu od góry.
-- AE9. **Covers R10.** Given pole wyboru z focusem, when operator naciska `↓` jeden raz, then focus przechodzi na następne pole.
+- AE9. **Covers R10.** Given pole wyboru (wartość zmieniają `←`/`→`) z focusem, when operator naciska `↓` jeden raz, then focus przechodzi na następne pole. Given lista akcji wybierana `↑`/`↓`, when operator naciska `↓` na ostatniej pozycji, then focus zostaje w liście, a `Enter` przechodzi do następnego pola.
 - AE10. **Covers R17, R21.** Given dwa różne formularze podane silnikowi z różnymi obszarami i definicjami, when operator edytuje w obu, then oba mają te same reguły edycji, nawigacji i potwierdzenia bez osobnego kodu w formularzu.
 - AE11. **Covers R18.** Given formularz komentarza w panelu rozmowy, when focus przechodzi na inny element okna, then formularz przestaje przechwytywać klawisze i zachowuje wpisany tekst. Po powrocie focusu edycja trwa od tego samego miejsca.
 - AE12. **Covers R19, R20.** Given formularz komentarza rosnący do góry z limitem 50% wysokości widoku rozmowy, when operator wpisuje kolejne linie, then formularz rośnie do góry i zgłasza zmianę rozmiaru wywołującemu. Po osiągnięciu limitu rośnie już tylko przewijanie pola.
@@ -123,7 +123,7 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 
 - Jedna zasada dla wszystkich formularzy: jeden generyczny silnik formularza, nie osobne poprawki per formularz. Silnik dostaje obszar i definicję formatki oraz przejmuje obsługę w tym obszarze.
 - Silnik jest sterowany zdarzeniami: oddaje focus, rośnie w limicie i zgłasza zmiany stanu wywołującemu (R18–R20).
-- Przejście strzałką dopiero przy powtórzeniu w polach tekstowych: zapobiega przypadkowej ucieczce z pola przy pisaniu wielu linii. Operator potwierdził to wprost. W polach bez kursora tekstowego wystarcza jedna strzałka.
+- Przejście strzałką dopiero przy powtórzeniu w polach tekstowych: zapobiega przypadkowej ucieczce z pola przy pisaniu wielu linii. Operator potwierdził to wprost. W polach wyboru i jednolinijkowych wystarcza jedna strzałka, a w liście `↑`/`↓` do przejścia dalej służy `Enter`.
 - Potwierdzenie ma jeden klawisz zatwierdzający (`Enter`) i jeden wycofujący (`Esc`), jak w istniejących modalach.
 
 ---
@@ -137,14 +137,14 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 
 ## Założenia do potwierdzenia
 
-- Z1. Przyczyna błędu kursora to wstawianie znaku kursora do tekstu (`▏`, szerokość w terminalu może być niejednoznaczna). Wymaganie opisuje skutek (R1), nie sposób naprawy. Przyczynę potwierdza planowanie.
-- Z2. `Home`/`End` działają na linii widocznej po zawinięciu, nie na całej linii logicznej (do znaku `\n`). Taki wybór zgadza się z oczekiwaniem „początek i koniec bieżącej linii".
+- Z1. Przyczyna błędu kursora to wstawianie znaku kursora do tekstu (`▏`, szerokość w terminalu może być niejednoznaczna). W przykładach `|` tylko pokazuje pozycję kursora: nie jest wstawiany do tekstu. Skutkiem jest spacja za kursorem. Wymaganie opisuje skutek (R1), nie sposób naprawy. Przyczynę potwierdza planowanie.
+- Z2. `Home`/`End` działają na linii logicznej (do znaku `\n`), nie na linii widocznej po zawinięciu. Operator wskazał, że jest to bardziej intuicyjne.
 - Z3. „Granat" oznacza ciemne, stonowane tło pola w edycji. Dokładny odcień wybiera planowanie ze stylów TUI. Bez zmiany koloru tekstu.
-- Z4. Popup potwierdzenia dotyczy formularzy, które wysyłają dane (R12), także panelu odpowiedzi z samym wyborem „zatwierdź/odrzuć" (odpowiedź operatora). Czysta lista wyboru, która niczego nie wysyła, nadal działa jednym `Enter`.
+- Z4. Popup potwierdzenia dotyczy formularzy, które wysyłają dane (R12), także panelu odpowiedzi z samym wyborem „zatwierdź/odrzuć" (odpowiedź operatora). Lista wyboru, która niczego nie wysyła (np. wybór repozytorium lub harnessu), nie jest formularzem w rozumieniu R12 i nadal działa jednym `Enter`.
 - Z5. Powtórzenie strzałki (R10) liczy się jako dwa kolejne naciśnięcia tej samej strzałki bez innego klawisza pomiędzy. Pierwsze naciśnięcie na brzegu pola, gdy kursor już jest na początku/końcu tekstu, liczy się jako pierwsze z dwóch (więc przejście wymaga jeszcze jednego). Operator potwierdził wersję ostrożną: dopiero drugie naciśnięcie zmienia pole, także gdy kursor już stoi na brzegu.
 - Z6. Pola typu wybór (`‹ … ›`) i liczba mają ten sam układ i tło w edycji co pola tekstowe. Strzałki `←`/`→` zmieniają wartość wyboru, jak dziś.
 - Z7. Popup potwierdzenia ma stały tekst ogólny (np. „Zatwierdzić formularz?") z podpowiedzią klawiszy. Wartości pól nie są w nim powtarzane. Popup jest częścią silnika, więc jest taki sam w każdym formularzu (odpowiedź operatora: „ogólne, jeden silnik, generyczny").
-- Z8. Odpowiedź operatora o „pojedynczej strzałce do kolejnego pola" czytamy jako dotyczącą pól bez kursora tekstowego (wybory, liczby, lista w panelu odpowiedzi). Dla pól tekstowych obowiązuje potwierdzone powtórzenie strzałki (Z5). Do potwierdzenia przy kolejnym przeglądzie.
+- Z8. Operator doprecyzował: pojedyncza strzałka w górę/w dół przenosi na inne pole tylko z pola wyboru, w którym wartość zmieniają `←`/`→`. W liście, po której poruszamy się `↑`/`↓` (np. lista akcji w panelu odpowiedzi na pytanie agenta), strzałki nie opuszczają listy, a do przejścia dalej potrzeba `Enter`. Pola tekstowe wielolinijkowe wymagają podwójnej strzałki (Z5), a jednolinijkowe pojedynczej.
 
 ---
 
@@ -152,7 +152,7 @@ Operator edytuje tekst w formularzach TUI (nowe zadanie, panel odpowiedzi, formu
 
 - Strzałka na brzegu pola tekstowego: dwa naciśnięcia, zawsze (Z5).
 - Popup potwierdzenia: tekst ogólny, jeden generyczny silnik (Z7).
-- Potwierdzenie: jest na poziomie zatwierdzenia formularza po `Enter`, także w panelu odpowiedzi z samym wyborem (R12). Przejście do kolejnego pola wymaga jednej strzałki w polach bez kursora tekstowego (Z8).
+- Potwierdzenie: jest na poziomie zatwierdzenia formularza po `Enter`, także w panelu odpowiedzi z samym wyborem (R12). Przejście do kolejnego pola: jedna strzałka w polach wyboru `←`/`→` i w polach jednolinijkowych, dwie w polach wielolinijkowych, `Enter` w liście `↑`/`↓` (Z8).
 
 ---
 
