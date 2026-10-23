@@ -7,7 +7,7 @@ topic: tlo-aktywnego-pola-formularza
 
 ## Summary
 
-Aktywne pole formularza TUI ma tło `field_editing` na całej szerokości pola: od znaku `>` do ostatniej komórki przed końcem formularza. Dziś tło widać tylko pod wpisanym tekstem. Gdy tekst się zawija lub operator dodaje nową linię, tło obejmuje także każdą nową linię pola.
+Aktywne pole formularza TUI ma tło `field_editing` na całej szerokości pola: od pierwszej komórki tekstu (za wcięciem `> `) do ostatniej komórki przed końcem formularza. Wcięcie `> ` nie ma tła. Dziś tło widać tylko pod wpisanym tekstem. Gdy tekst się zawija lub operator dodaje nową linię, tło obejmuje także każdą nową linię pola.
 
 ---
 
@@ -29,7 +29,7 @@ Przyczyna jest niezweryfikowana (Z1). Wymaganie opisuje skutek, nie naprawę.
 
 - F1. Wejście do pola
   - **Trigger:** Focus przechodzi na pole.
-  - **Steps:** Pole dostaje tło edycji od `>` do końca szerokości pola, także gdy jest puste.
+  - **Steps:** Pole dostaje tło edycji od pierwszej komórki tekstu (za `> `) do końca szerokości pola, także gdy jest puste.
   - **Outcome:** Operator widzi pełny prostokąt pola.
   - **Covered by:** R1, R2
 
@@ -43,7 +43,7 @@ Przyczyna jest niezweryfikowana (Z1). Wymaganie opisuje skutek, nie naprawę.
 
 ## Requirements
 
-- R1. Aktywne pole ma tło edycji na całej szerokości pola. Zakres: od kolumny znaku `>` do ostatniej komórki przed końcem formularza (spacja przed końcem pola jest w tle). Dotyczy komórek za tekstem, nie tylko pod nim.
+- R1. Aktywne pole ma tło edycji na całej szerokości pola. Zakres: od pierwszej komórki tekstu (za wcięciem `> `) do ostatniej komórki przed końcem formularza (spacja przed końcem pola jest w tle). Wcięcie `> ` (znak `>` i spacja po nim) nie ma tła edycji. Dotyczy komórek za tekstem, nie tylko pod nim.
 - R2. Puste aktywne pole też ma tło na całej szerokości swojej linii.
 - R3. Pole wielolinijkowe ma tło na całej szerokości w każdej linii: w liniach z nowej linii (`\n`), w liniach z zawinięcia i w linii z kursorem na końcu tekstu. Dodana linia dostaje tło od razu.
 - R4. Pole, które nie jest aktywne, nie ma tła edycji. Tło znika z całego pola, gdy focus je opuści.
@@ -56,7 +56,7 @@ Przyczyna jest niezweryfikowana (Z1). Wymaganie opisuje skutek, nie naprawę.
 
 ## Acceptance Examples
 
-- AE1. **Covers R1, R2.** Given formularz o szerokości 40 komórek i puste aktywne pole, when formularz się rysuje, then wszystkie komórki linii pola od `>` do przedostatniej (włącznie ze spacją przed końcem) mają tło edycji.
+- AE1. **Covers R1, R2.** Given formularz o szerokości 40 komórek i puste aktywne pole, when formularz się rysuje, then wszystkie komórki linii pola od pierwszej komórki tekstu (za `> `) do przedostatniej (włącznie ze spacją przed końcem) mają tło edycji, a `> ` nie ma tła.
 - AE2. **Covers R1.** Given pole z tekstem `abc`, when jest aktywne, then tło obejmuje także komórki za `c` do końca pola.
 - AE3. **Covers R3.** Given pole z tekstem `abc`, when operator naciska `Ctrl+J`, then pole ma dwie linie i druga linia ma tło na całej szerokości.
 - AE4. **Covers R3.** Given tekst dłuższy niż szerokość pola, when zawija się na trzy linie, then każda z trzech linii ma tło na całej szerokości.
@@ -105,5 +105,7 @@ Przyczyna jest niezweryfikowana (Z1). Wymaganie opisuje skutek, nie naprawę.
 
 ## Pytania otwarte dla użytkownika
 
-- P1. Czy tło ma obejmować także dwie komórki wcięcia (`> `), czy tylko miejsce od tekstu do końca pola? Przyjęto: od znaku `>` (zgodnie z opisem w poleceniu).
-- P2. Czy pole wyboru ma mieć tło na całej szerokości, czy tylko pod `‹ wartość ›`? Przyjęto: na całej szerokości (Z3).
+Brak. Odpowiedzi recenzenta:
+
+- P1. Czy tło ma obejmować także dwie komórki wcięcia (`> `)? Odpowiedź: nie. Tło zaczyna się od pierwszej komórki tekstu i sięga do końca pola (R1).
+- P2. Czy pole wyboru ma mieć tło na całej szerokości, czy tylko pod `‹ wartość ›`? Odpowiedź: cała szerokość (R5, Z3).
