@@ -36,8 +36,12 @@ step is an agent step: the agent finds the host from `pr_url` and the `origin`
 remote, then uses `gh` (GitHub) or `glab` (GitLab). The place where the step
 runs needs that tool authenticated, under an identity that may take the pull
 request out of Draft. Without that, `finalize` ends the run in `finalize_failed` with
-the reason. A person fixes the environment and starts a new task. Protection against a merge after the Draft is gone (for example
-branch rules) stays with the repository host.
+the reason.
+
+A person fixes the environment and starts a new task.
+
+Protection against a merge after the Draft is gone (for example branch rules)
+stays with the repository host.
 
 The agent keeps to the limits written in the prompt (validated `pr_url`, a
 closed list of host operations, no `git merge`, no push). The prompt is not a

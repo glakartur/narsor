@@ -782,6 +782,24 @@ impl CompoundRun {
             .any(|(f, l, t)| f == from && l == label && t == to)
     }
 
+    /// The reason given with every completed action that chose `label`.
+    fn reasons_for(&self, execution_id: &str, label: &str) -> Vec<String> {
+        narsor_engine::persistence::ExecutionStore::new(self.root.dir("store"))
+            .event_log(execution_id)
+            .read_all()
+            .expect("read the event log")
+            .into_iter()
+            .filter_map(|event| match event.data {
+                EventData::ActionCompleted {
+                    output_label,
+                    reason,
+                    ..
+                } if output_label == label => reason,
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether the run ever entered `state`.
     fn visited(&self, execution_id: &str, state: &str) -> bool {
         self.transitions(execution_id)
@@ -1164,6 +1182,11 @@ async fn covers_ae4_a_blocked_finalize_fails_the_run_with_its_reason() {
     assert!(run.took(&execution.id, "finalize", "blocked", "finalize_failed"));
     assert_eq!(execution.current_state.as_deref(), Some("finalize_failed"));
     assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert_eq!(
+        run.reasons_for(&execution.id, "blocked"),
+        vec!["glab is not signed in where the step runs".to_string()],
+        "the history shows why finalize failed"
+    );
 }
 
 /// The engine stops a `finalize` that outlives its step limit and hands it

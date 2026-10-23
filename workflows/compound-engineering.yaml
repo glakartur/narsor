@@ -820,9 +820,9 @@ states:
       - label: ready
         description: the pull request is out of Draft and ready for a person to review and merge, or it is already merged.
       - label: blocked
-        description: the pull request could not be taken out of Draft; a person decides.
+        description: the pull request could not be taken out of Draft; the run fails.
       - label: timeout
-        description: the step outlived its time limit; a person decides.
+        description: the step outlived its time limit; the run fails.
     transitions:
       ready: finished
       blocked: finalize_failed
