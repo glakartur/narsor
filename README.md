@@ -1276,7 +1276,7 @@ and modelled on real agentic development processes rather than invented ones:
 
 | File | Process | Modelled on |
 |---|---|---|
-| `workflows/compound-engineering.yaml` | five stages on one Draft merge request — requirements → plan → implementation → learning → finalize (auto-merge after a green pipeline), with a person at the end of each stage | the `ce-*` skills of the compound-engineering plugin, and `glab` |
+| `workflows/compound-engineering.yaml` | five stages on one Draft merge request — requirements → plan → implementation → learning → finalize (the merge request leaves Draft; a person merges it), with a person at the end of each stage | the `ce-*` skills of the compound-engineering plugin, and `gh` or `glab` |
 | `workflows/open-mercato-sdlc.yaml` | Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | Open Mercato's `SDLC.md` and the `om-*` skills |
 
 ```sh
@@ -1298,9 +1298,11 @@ agent can settle from the repository alone.
 **Compound engineering** opens a PR for the reviewed requirements, then pushes
 the plan, implementation and learning to that same PR. After every push it
 handles existing PR feedback: fixes are pushed for another review, while no
-actionable feedback advances the workflow. A person approves the scope, plan,
-implementation and final learning on the current PR; implementation can pause
-to ask for missing input. Before pushing implementation, it runs the target
+actionable feedback advances the workflow. A person reviews the scope, plan,
+implementation and final learning on the current PR, and at each gate checks
+the feedback, accepts the stage at once, or sends it back; implementation can
+pause to ask for missing input. Finalize only takes the PR out of Draft; a
+person merges it. Before pushing implementation, it runs the target
 repository's optional `scripts/verify.sh`; a failure returns to repair and
 review, while a missing script skips the check.
 
