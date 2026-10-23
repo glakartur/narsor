@@ -293,7 +293,6 @@ fn compound_engineering_limits_its_repair_loops() {
         limits,
         vec![
             ("code_review", 10),
-            ("repair_merge", 3),
             ("repair_verification", 5),
         ]
     );
@@ -363,10 +362,10 @@ fn compound_engineering_choices_require_their_variables_and_artifacts() {
     );
 }
 
-/// `brainstorm` has two ways out and never asks the person; the review result
+/// `brainstorm` has two ways out, one past the review; the review result
 /// reaches the merge request through the publish steps.
 #[test]
-fn brainstorm_does_not_ask_and_can_skip_the_review() {
+fn brainstorm_can_skip_the_review() {
     let definition = compound_engineering();
     let brainstorm = &definition.states["brainstorm"];
     assert_eq!(brainstorm.transitions["requirements_drafted"], "doc_review");
@@ -384,14 +383,6 @@ fn brainstorm_does_not_ask_and_can_skip_the_review() {
     assert!(choice(&definition, "brainstorm", "requirements_drafted")
         .requires_variables
         .is_empty());
-
-    let Some(ActionConfig::Agent(action)) = &brainstorm.action else {
-        panic!("'brainstorm' is an agent step");
-    };
-    assert!(!action.prompt.contains("ask the person;"));
-    assert!(action.prompt.contains("Do not ask the person anything"));
-    assert!(action.prompt.contains("Założenia do potwierdzenia"));
-    assert!(action.prompt.contains("Pytania otwarte dla użytkownika"));
 
     for publish in ["publish_requirements", "publish_plan"] {
         let Some(ActionConfig::Agent(action)) = &definition.states[publish].action else {
@@ -460,12 +451,12 @@ fn compound_engineering_steps_that_read_a_blocker_can_clear_it() {
 fn compound_engineering_revisions_continue_the_author_session() {
     let definition = compound_engineering();
     for (gate, label) in [
-        ("approve_requirements", "revise"),
-        ("approve_plan", "revise"),
-        ("approve_plan", "revise_requirements"),
-        ("approve_work", "revise"),
-        ("approve_work", "revise_plan"),
-        ("approve_learning", "revise"),
+        ("review_requirements", "revise"),
+        ("review_plan", "revise"),
+        ("review_plan", "revise_requirements"),
+        ("review_work", "revise"),
+        ("review_work", "revise_plan"),
+        ("review_learning", "revise"),
     ] {
         assert!(
             choice(&definition, gate, label)
@@ -476,31 +467,23 @@ fn compound_engineering_revisions_continue_the_author_session() {
     }
 }
 
-/// `finalize` has its own time limit and a `timeout` choice, because the
-/// engine kills it on the limit and its own clean-up never runs (KTD14).
+/// `finalize` is the only step that talks to the repository host at the end.
+/// It has its own time limit and a `timeout` choice: without the choice the
+/// engine ends a step that outlives its limit with an error instead of a gate.
 #[test]
-fn compound_engineering_finalize_steps_are_read_only_agents_with_a_timeout_choice() {
+fn compound_engineering_finalize_is_a_read_only_agent_with_a_timeout_choice() {
     let definition = compound_engineering();
-    for step in ["finalize", "disarm_merge"] {
-        let Some(ActionConfig::Agent(agent)) = &definition.states[step].action else {
-            panic!("'{step}' is an agent step");
-        };
-        assert_eq!(
-            agent.workspace_access,
-            Some(narsor_engine::domain::WorkspaceAccess::ReadOnly),
-            "'{step}' must not change the workspace"
-        );
-        assert!(
-            !agent
-                .prompt
-                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                .any(|word| word == "main"),
-            "'{step}' takes the target branch from the pull request, not a literal"
-        );
-    }
     let finalize = &definition.states["finalize"];
-    assert_eq!(finalize.timeout_secs, Some(70 * 60));
-    assert_eq!(finalize.transitions["timeout"], "disarm_merge");
+    let Some(ActionConfig::Agent(agent)) = &finalize.action else {
+        panic!("'finalize' is an agent step");
+    };
+    assert_eq!(
+        agent.workspace_access,
+        Some(narsor_engine::domain::WorkspaceAccess::ReadOnly),
+        "'finalize' must not change the workspace"
+    );
+    assert_eq!(finalize.timeout_secs, Some(10 * 60));
+    assert_eq!(finalize.transitions["timeout"], "finalize_blocked");
 }
 
 /// The engine appends the reply contract to every agent prompt, so no
@@ -554,18 +537,9 @@ fn the_work_prompt_uses_agent_input_for_ambiguity() {
     let entry = builtin("compound-engineering").expect("compound-engineering is built in");
     let definition = narsor_engine::workflow::load_from_str(entry.source).expect("it loads");
     let work = &definition.states["work"];
-    let Some(ActionConfig::Agent(action)) = &work.action else {
-        panic!("'work' is an agent state");
-    };
-
     assert!(
-        !action.prompt.contains("Use exactly one of these labels"),
-        "the prompt of 'work' still carries a hand-written label list"
-    );
-
-    assert!(
-        !action.prompt.contains("awaiting_input"),
-        "the prompt of 'work' repeats what the engine's output contract says"
+        matches!(work.action, Some(ActionConfig::Agent(_))),
+        "'work' is an agent state"
     );
     assert!(
         output_contract(&StepContract::of(work)).contains("awaiting_input"),
