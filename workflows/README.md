@@ -5,7 +5,7 @@ real agentic development processes rather than invented ones:
 
 | File | Process | Source material |
 |---|---|---|
-| `compound-engineering.yaml` | Five stages on one Draft pull request (merge request on GitLab): requirements → plan → implementation → learning → finalize (auto-merge after a green pipeline), with a person at the end of each stage | the `ce-*` skills of the `compound-engineering` plugin, and `gh` (GitHub) or `glab` (GitLab) |
+| `compound-engineering.yaml` | Five stages on one Draft pull request (merge request on GitLab): requirements → plan → implementation → learning → finalize (the merge request leaves Draft; a person merges it), with a person at the end of each stage | the `ce-*` skills of the `compound-engineering` plugin, and `gh` (GitHub) or `glab` (GitLab) |
 | `open-mercato-sdlc.yaml` | The Open Mercato ticket lifecycle: Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | [`SDLC.md`](https://github.com/open-mercato/skills) and the `om-*` skills |
 
 Both validate with zero violations and both are exercised end to end in
@@ -32,12 +32,12 @@ selected harness. Narsor does not install, translate, or migrate those skills;
 an operator should install compatible packages before running the workflow.
 
 The compound-engineering workflow works on GitHub and on GitLab. Its `finalize`
-and `disarm_merge` steps are agent steps: the agent finds the host from `pr_url`
-and the `origin` remote, then uses `gh` (GitHub) or `glab` (GitLab). The place
-where the steps run needs that tool authenticated, under an identity that may
-approve the pull request and set auto-merge. GitHub also needs auto-merge
-enabled in the repository, with branch protection rules. Without that,
-`finalize` stops at `finalize_blocked` with the reason.
+step is an agent step: the agent finds the host from `pr_url` and the `origin`
+remote, then uses `gh` (GitHub) or `glab` (GitLab). The place where the step
+runs needs that tool authenticated, under an identity that may take the pull
+request out of Draft. Without that, `finalize` stops at `finalize_blocked` with
+the reason. Protection against a merge after the Draft is gone (for example
+branch rules) stays with the repository host.
 
 The agent keeps to the limits written in the prompt (validated `pr_url`, a
 closed list of host operations, no `git merge`, no push). The prompt is not a
@@ -73,21 +73,22 @@ straight to a merge.
 ### `compound-engineering.yaml` — five stages
 
 Every stage has the same shape: an author step, publication to one Draft merge
-request, a gate where a person decides, and a feedback check after the gate.
+request, a review gate where a person decides, and an optional feedback check
+after the gate.
 The first publication opens the Draft merge request against the repository's
 default branch and stores its URL as `pr_url`; every later one pushes to it.
 
 ```
-1 requirements  brainstorm → doc_review* → publish_requirements → approve_requirements → check_requirements_feedback
+1 requirements  brainstorm → doc_review* → publish_requirements → review_requirements → (check_requirements_feedback)
                 brainstorm → publish_requirements (the agent skipped the review)
-2 plan          plan → plan_review* → publish_plan → approve_plan → check_plan_feedback
-3 implementation work → simplify → code_review → verify_work → publish_work → approve_work → check_work_feedback
-4 learning      compound → publish_learning → approve_learning → check_learning_feedback
+2 plan          plan → plan_review* → publish_plan → review_plan → (check_plan_feedback)
+3 implementation work → simplify → code_review → verify_work → publish_work → review_work → (check_work_feedback)
+4 learning      compound → publish_learning → review_learning → (check_learning_feedback)
 5 finalize      finalize → finished
 ```
 
 `*` — the review step fixes what it finds and reports `review_summary`. The
-result is not held for approval: the publish step pushes it and adds the
+result is not held for a gate: the publish step pushes it and adds the
 summary to the merge request as a comment, and the person reads it at the gate.
 
 `brainstorm` never asks the person. It writes its assumptions in the section
@@ -100,24 +101,28 @@ runs.
 
 | Gate | Choices | Why there |
 |---|---|---|
-| `approve_requirements` | `approve`, `revise`, `abandon` | Every later step is measured against the requirements; a wrong scope corrected here costs one conversation. |
-| `approve_plan` | `approve`, `revise`, `revise_requirements`, `abandon` | The last point before code exists. The plan can also show that the requirements are wrong. |
-| `approve_work` | `approve`, `revise`, `revise_plan`, `abandon` | The person reviews the published implementation. |
-| `approve_learning` | `approve`, `revise`, `drop` | The implementation is already approved, so this gate keeps, revises or drops the learning; it cannot stop the pipeline. |
-| `finalize_blocked` | `retry`, `finish_unmerged` | Finalize could not merge; the gate shows its reason. |
+| `review_requirements` | `check_feedback`, `accept`, `revise`, `abandon` | Every later step is measured against the requirements; a wrong scope corrected here costs one conversation. |
+| `review_plan` | `check_feedback`, `accept`, `revise`, `revise_requirements`, `abandon` | The last point before code exists. The plan can also show that the requirements are wrong. |
+| `review_work` | `check_feedback`, `accept`, `revise`, `revise_plan`, `abandon` | The person reviews the published implementation. |
+| `review_learning` | `check_feedback`, `accept`, `revise`, `drop` | The implementation is already accepted, so this gate keeps, revises or drops the learning; it cannot stop the pipeline. |
+| `finalize_blocked` | `retry`, `finish_as_draft` | Finalize could not take the merge request out of Draft; the gate shows its reason. |
 
-Every `revise` needs a comment and continues the session of the stage's author
+Every choice that sends a stage back (`revise`, `revise_requirements`,
+`revise_plan`) needs a comment and continues the session of the stage's author
 with it (`resume_comment_field`): `brainstorm` for the requirements, `plan` for
 the plan, `work_revision` for the implementation, `compound` for the learning.
-The comment field is optional for the other choices; a note given with an
-approval reaches the next stage as a context variable.
+The comment field is optional for `check_feedback` and `accept`. Only the note
+from `review_requirements` is carried on: the plan reads it.
 
-After each gate a `check_*_feedback` step runs `ce-resolve-pr-feedback` on
-`pr_url` for the feedback posted while the person was reading. For requirements
-and plan it judges the size of a fix: `fixed_minor` publishes and asks for
-approval again, `fixed_major` goes back to the review step. For implementation,
-`fixed` goes back to `code_review`; for learning, it publishes again.
-`needs_human` returns to the gate, which shows the agent's `reason`.
+`check_feedback` runs the stage's `check_*_feedback` step, which runs
+`ce-resolve-pr-feedback` on `pr_url` for the feedback posted while the person
+was reading. For requirements and plan it judges the size of a fix:
+`fixed_minor` publishes and asks for a review again, `fixed_major` goes back to
+the review step. For implementation, `fixed` goes back to `code_review`; for
+learning, it publishes again. `needs_human` returns to the gate, which shows
+the agent's `reason`. `accept` skips that step and goes at once to the first
+step of the next stage (`plan`, `work`, `compound`, `finalize`): the person who
+accepts takes responsibility for the comments on the merge request.
 
 Blockers go back to the author of the earlier stage. `plan` chooses
 `needs_requirements_revision` with `requirements_blocker`, and `brainstorm`
@@ -129,8 +134,10 @@ and `{{ artifacts.learning_doc }}`, empty on the first pass.
 
 Implementation: `simplify` runs once, after `work`. Every later change of code
 — `fix_findings`, `repair_verification`, `work_revision`, a fix from
-`check_work_feedback` or `repair_merge` — goes through `code_review →
-verify_work → publish_work → approve_work`. Review findings reach `fix_findings`
+`check_work_feedback` — goes through `code_review → verify_work → publish_work
+→ review_work`. `publish_work` rewrites the description of the merge request on
+every push, so it describes the whole change: the code, the requirements and
+the plan. The other publish steps leave the description as it is. Review findings reach `fix_findings`
 through `{{ steps.code_review.reply }}`. `verify_work` runs `scripts/verify.sh`
 from the target repository when that file exists; a missing file skips the
 check, and a failure goes to `repair_verification`, which receives
@@ -142,25 +149,24 @@ Learning: `compound` either documents (`documented` → publish) or has nothing
 to document and goes straight to `finalize`. `drop` at the gate removes the
 document through `drop_learning` and then finalizes.
 
-Finalize is an agent step (`workspace_access: read-only`): it takes the pull
-request out of Draft, approves it and sets auto-merge, which merges when the
-checks succeed. It then reads the pull request until it is merged, the checks
-fail, it conflicts with its target branch, or an hour has passed (the 60-minute
-wait limit is written in the prompt and must stay below the step timeout). The
-number, repository and target branch come from `pr_url` and the pull request,
-never from a branch name. On any result other than `merged`, the agent cancels
-auto-merge, restores the Draft and reads the pull request once more, so it never
-merges without a person; if it merged meanwhile, the result is `merged`. A
-retried finalize first checks whether the pull request is already merged.
-`pipeline_failed` and `conflict` go to `repair_merge`, `blocked` to the
-`finalize_blocked` gate. The step has `timeout: 70m`: if the engine stops it,
-its clean-up never runs, so the `timeout` choice goes to `disarm_merge`, which
-cancels auto-merge, restores the Draft and reads the state.
+Finalize is an agent step (`workspace_access: read-only`, `timeout: 10m`): it
+takes the pull request out of Draft and does nothing more. It does not approve
+it, does not set auto-merge, does not merge it and does not wait for the
+checks; a person merges it on the repository host. The number and repository
+come from `pr_url` and the pull request, never from a branch name. A pull
+request that is already out of Draft or already merged is `ready` too. `ready`
+goes to `finished`; `blocked` (no tool, not signed in, a bad URL, a closed pull
+request) and `timeout` (the engine stopped the step at its limit) go to the
+`finalize_blocked` gate, which can `retry` or `finish_as_draft`.
 
-Loop limits (`max_entries`): `code_review` 10, `repair_verification` 5,
-`repair_merge` 3. Terminals: `finished` (merged, completed), `cancelled`
-(`abandon` at a gate) and `not_merged` (`finish_unmerged`, cancelled).
-`abandon` does not close the pull request.
+Loop limits (`max_entries`): `code_review` 10, `repair_verification` 5.
+Terminals: `finished` (out of Draft and ready for review, completed),
+`cancelled` (`abandon` at a gate) and `left_as_draft` (`finish_as_draft`,
+cancelled). `abandon` does not close the pull request.
+
+Tasks that run on an earlier version of this workflow, with the earlier
+gates or the merge steps, may not resume after an update. Finish or cancel them
+before you update.
 
 The graph is drawn in `compound-engineering-flow.html`.
 
