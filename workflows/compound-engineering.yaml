@@ -804,11 +804,14 @@ states:
 
         Allowed operations on this pull request only: read it and take it out of Draft. Do not use any other host call. Do not approve it, do not set auto-merge, do not merge it and do not wait for its checks. Do not touch other pull requests or other repositories. Do not run `git merge`. Do not push. Do not change files.
 
-        Steps:
-        1. Read the pull request. If it is merged, answer `ready`. If it is closed without a merge, answer `blocked`. If it is open and already out of Draft, answer `ready`.
+        Steps (at most 3 attempts in total):
+        1. Read the pull request from the host. If it is merged, answer `ready`. If it is closed without a merge, answer `blocked`. If it is open and the Draft field says it is out of Draft, answer `ready`.
         2. Take it out of Draft.
-        3. Read the pull request again. If it is out of Draft, answer `ready`. Otherwise answer `blocked`.
-        Put the state you read from the host in `reason`. With `blocked`, also put the cause and how to fix it in `reason`.
+        3. Read the pull request again from the host. If the Draft field says it is out of Draft, answer `ready`. Otherwise wait a short time (for example 10 seconds) and go to step 2 for the next attempt.
+        4. After 3 attempts the pull request is still in Draft: answer `blocked`.
+        Answer `ready` only after a read from the host that shows the pull request out of Draft or merged. Do not decide the state from the title (`Draft:` or `WIP:`), from the output of the take-out command or from memory. Put the state you read from the host in `reason`. With `blocked`, also put the cause and how to fix it in `reason`.
+
+        The Draft field: GitHub `isDraft` (true = Draft). GitLab: the Draft field of the JSON that `glab mr view -F json` returns (`draft`; if the JSON has no such field, read `work_in_progress` or the `Draft:` title prefix, and say in `reason` which one you used).
 
         Equivalents (use another command of the same tool when it fits better):
         - read state: `glab mr view <n> -F json` | `gh pr view <url> --json state,isDraft`
@@ -822,36 +825,9 @@ states:
         description: the step outlived its time limit; a person decides.
     transitions:
       ready: finished
-      blocked: finalize_blocked
-      timeout: finalize_blocked
+      blocked: finalize_failed
+      timeout: finalize_failed
     timeout: 10m
-
-  finalize_blocked:
-    description: >
-      HUMAN GATE — finalize could not take the merge request out of Draft.
-      Its reason is shown with the request.
-    action:
-      type: human
-      message: >
-        Finalize could not take the merge request out of Draft; its reason is
-        shown above. Choose retry to run finalize again after you fix the
-        cause on the repository host, or finish_as_draft to end the pipeline
-        with the merge request still in Draft.
-      inputs:
-        - name: finalize_decision
-          type: select
-          required: true
-          options:
-            - retry
-            - finish_as_draft
-    choices:
-      - label: retry
-        description: run finalize again.
-      - label: finish_as_draft
-        description: end the pipeline; the merge request stays open as a Draft.
-    transitions:
-      retry: finalize
-      finish_as_draft: left_as_draft
 
   # -------------------------------------------------------------------------
   # Terminals
@@ -863,10 +839,10 @@ states:
   cancelled:
     description: A person stopped the pipeline.
 
-  left_as_draft:
-    description: A person ended the pipeline after finalize could not confirm that the merge request is out of Draft.
+  finalize_failed:
+    description: Finalize could not confirm that the merge request is out of Draft. Its reason is in the history of the finalize step.
 
 terminal_states:
   finished: completed
   cancelled: cancelled
-  left_as_draft: cancelled
+  finalize_failed: failed

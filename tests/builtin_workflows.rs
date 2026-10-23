@@ -291,10 +291,7 @@ fn compound_engineering_limits_its_repair_loops() {
         .collect();
     assert_eq!(
         limits,
-        vec![
-            ("code_review", 10),
-            ("repair_verification", 5),
-        ]
+        vec![("code_review", 10), ("repair_verification", 5),]
     );
 }
 
@@ -483,7 +480,31 @@ fn compound_engineering_finalize_is_a_read_only_agent_with_a_timeout_choice() {
         "'finalize' must not change the workspace"
     );
     assert_eq!(finalize.timeout_secs, Some(10 * 60));
-    assert_eq!(finalize.transitions["timeout"], "finalize_blocked");
+    assert_eq!(finalize.transitions["timeout"], "finalize_failed");
+}
+
+/// `finalize` answers `ready` only after a read from the host, with the Draft
+/// field of each host and a bounded number of attempts.
+#[test]
+fn compound_engineering_finalize_prompt_demands_a_read_from_the_host() {
+    let definition = compound_engineering();
+    let Some(ActionConfig::Agent(agent)) = &definition.states["finalize"].action else {
+        panic!("'finalize' is an agent step");
+    };
+    for needle in [
+        "isDraft",
+        "glab mr view",
+        "`draft`",
+        "at most 3 attempts",
+        "Do not decide the state from the title",
+        "do not merge it",
+        "Do not push",
+    ] {
+        assert!(
+            agent.prompt.contains(needle),
+            "the finalize prompt lacks {needle:?}"
+        );
+    }
 }
 
 /// The engine appends the reply contract to every agent prompt, so no
