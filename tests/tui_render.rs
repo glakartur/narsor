@@ -5914,3 +5914,160 @@ mod bracketed_list_render {
         assert_eq!(bar_prefix(&styles, false, true).content, "  ");
     }
 }
+
+mod active_field_fill {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    const WIDTH: u16 = 40;
+
+    fn key(chooser: &mut Chooser, code: KeyCode, modifiers: KeyModifiers) {
+        chooser.on_key(KeyEvent::new(code, modifiers));
+    }
+
+    fn type_text(chooser: &mut Chooser, text: &str) {
+        for character in text.chars() {
+            key(chooser, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+    }
+
+    fn form(field: ChooserField) -> Chooser {
+        let mut chooser = Chooser::new(vec![ChooserItem::new("go", "Start.").with_field(field)]);
+        key(&mut chooser, KeyCode::Tab, KeyModifiers::NONE);
+        chooser
+    }
+
+    /// The rows of the buffer that start with the prompt or its blank twin
+    /// and carry the editing fill somewhere: the rows of the active field.
+    fn field_rows(buffer: &Buffer, styles: &Styles) -> Vec<Vec<Cell>> {
+        let fill = styles.field_editing().bg;
+        let width = usize::from(buffer.area.width);
+        buffer
+            .content()
+            .chunks(width)
+            .filter(|row| row.iter().any(|cell| Some(cell.bg) == fill))
+            .map(<[Cell]>::to_vec)
+            .collect()
+    }
+
+    /// Cells 2..=38 filled; the prompt (0, 1) and the margin (39) are not.
+    fn assert_filled(row: &[Cell], styles: &Styles) {
+        let fill = styles.field_editing().bg;
+        for (column, cell) in row.iter().enumerate() {
+            let expected = (2..=38).contains(&column);
+            assert_eq!(Some(cell.bg) == fill, expected, "column {column}");
+        }
+    }
+
+    fn drawn(chooser: &mut Chooser, styles: &Styles) -> Vec<Vec<Cell>> {
+        let buffer = draw_chooser(WIDTH, 12, chooser, styles);
+        field_rows(&buffer, styles)
+    }
+
+    #[test]
+    fn an_empty_field_is_filled_after_the_prompt_to_the_last_text_cell() {
+        let styles = Styles::new(false);
+        let rows = drawn(&mut form(ChooserField::text("a")), &styles);
+        assert_eq!(rows.len(), 1);
+        assert_filled(&rows[0], &styles);
+    }
+
+    #[test]
+    fn a_short_text_is_filled_behind_and_after_it() {
+        let styles = Styles::new(false);
+        let mut chooser = form(ChooserField::text("a"));
+        type_text(&mut chooser, "abc");
+        let rows = drawn(&mut chooser, &styles);
+        assert_eq!(rows.len(), 1);
+        assert_filled(&rows[0], &styles);
+    }
+
+    #[test]
+    fn every_row_of_a_multiline_or_wrapped_field_is_filled() {
+        let styles = Styles::new(false);
+        let mut chooser = form(ChooserField::multiline("a"));
+        type_text(&mut chooser, "a");
+        key(&mut chooser, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        key(&mut chooser, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        type_text(&mut chooser, "b");
+        let rows = drawn(&mut chooser, &styles);
+        assert_eq!(rows.len(), 3);
+        rows.iter().for_each(|row| assert_filled(row, &styles));
+
+        let mut chooser = form(ChooserField::multiline("a"));
+        type_text(&mut chooser, &"x".repeat(100));
+        let rows = drawn(&mut chooser, &styles);
+        assert!(rows.len() >= 3);
+        rows.iter().for_each(|row| assert_filled(row, &styles));
+    }
+
+    #[test]
+    fn a_select_and_a_number_are_filled_the_same_way() {
+        let styles = Styles::new(false);
+        let select = ChooserField::select("m", vec!["a".into(), "b".into()]);
+        for field in [select, ChooserField::integer("n")] {
+            let rows = drawn(&mut form(field), &styles);
+            assert_eq!(rows.len(), 1);
+            assert_filled(&rows[0], &styles);
+        }
+    }
+
+    #[test]
+    fn the_cursor_stays_the_only_reversed_cell() {
+        let styles = Styles::new(false);
+        let mut chooser = form(ChooserField::text("a"));
+        type_text(&mut chooser, "abc");
+        let buffer = draw_chooser(WIDTH, 12, &mut chooser, &styles);
+        let reversed = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .count();
+        assert_eq!(reversed, 1);
+    }
+
+    #[test]
+    fn without_colour_no_cell_has_a_fill() {
+        let styles = Styles::new(true);
+        let mut chooser = form(ChooserField::text("a"));
+        let buffer = draw_chooser(WIDTH, 12, &mut chooser, &styles);
+        let editing = Styles::new(false).field_editing().bg;
+        assert!(buffer.content().iter().all(|cell| Some(cell.bg) != editing));
+    }
+
+    #[test]
+    fn a_very_narrow_area_does_not_panic() {
+        let styles = Styles::new(false);
+        let mut chooser = form(ChooserField::text("a"));
+        type_text(&mut chooser, "abcdef");
+        for width in 1..=4 {
+            draw_chooser(width, 8, &mut chooser, &styles);
+        }
+    }
+
+    #[test]
+    fn the_short_field_in_the_bar_is_filled_to_its_whole_place() {
+        let styles = Styles::new(false);
+        let mut chooser = Chooser::new(vec![ChooserItem::new("go", "Start.")
+            .with_field(ChooserField::text("ab"))
+            .with_field(ChooserField::text("cd"))
+            .with_field(ChooserField::multiline("long"))]);
+        key(&mut chooser, KeyCode::Tab, KeyModifiers::NONE);
+        let buffer = draw_chooser(80, 12, &mut chooser, &styles);
+        let fill = styles.field_editing().bg;
+        let filled: Vec<usize> = buffer
+            .content()
+            .chunks(80)
+            .flat_map(|row| {
+                row.iter()
+                    .enumerate()
+                    .filter(|(_, cell)| Some(cell.bg) == fill)
+                    .map(|(column, _)| column)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(!filled.is_empty());
+        // "ab: " is 4 cells plus the cursor space: the place is 5 cells wide.
+        assert!(filled.len() >= 5, "filled {filled:?}");
+    }
+}

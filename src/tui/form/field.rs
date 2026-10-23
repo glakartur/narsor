@@ -4,7 +4,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::layout::{text_width, wrap, Wrapped};
+use super::layout::{cell_width, text_width, wrap, Wrapped};
 use crate::tui::chooser::{ChooserField, FieldKind};
 use crate::tui::scroll::sanitize;
 use crate::tui::style::{Role, Styles};
@@ -35,6 +35,18 @@ pub fn cursor_spans(
         spans.push(Span::styled(after, base));
     }
     spans
+}
+
+/// The spaces that carry `fill` from the end of a text of `used` cells to the
+/// last cell of the text area. `Paragraph` paints only the cells that hold
+/// text, so the fill of an empty cell must be a space with that style.
+pub fn fill_padding(used: usize, width: usize, fill: Style) -> Span<'static> {
+    Span::styled(" ".repeat(text_width(width).saturating_sub(used)), fill)
+}
+
+/// How many cells `text` takes.
+fn cells(text: &str) -> usize {
+    text.chars().map(cell_width).sum()
 }
 
 /// How a field is laid out for `width` columns, the cursor included when
@@ -74,12 +86,15 @@ pub fn value_lines(
     let prompt_role = if focused { Role::Focus } else { Role::Done };
     if matches!(field.kind, FieldKind::Select(_)) {
         let value = sanitize(field.value());
-        let line = Line::from(vec![
+        let shown = format!("‹ {value} ›");
+        let mut spans = vec![
             Span::styled(PROMPT, styles.of(prompt_role)),
-            Span::raw(format!("‹ {value} ›")),
-        ])
-        .style(fill);
-        return (vec![line], 0);
+            Span::styled(shown.clone(), fill),
+        ];
+        if focused {
+            spans.push(fill_padding(cells(&shown), width, fill));
+        }
+        return (vec![Line::from(spans)], 0);
     }
     let wrapped = layout_of(field, width, focused);
     let lines = wrapped
@@ -93,13 +108,21 @@ pub fn value_lines(
                 spans.extend(cursor_spans(
                     text,
                     wrapped.cursor_col,
-                    Style::default(),
+                    fill,
                     styles.cursor(),
                 ));
             } else {
-                spans.push(Span::raw(text.clone()));
+                spans.push(Span::styled(text.clone(), fill));
             }
-            Line::from(spans).style(fill)
+            if focused {
+                let used = if row == wrapped.cursor_row {
+                    cells(text).max(wrapped.cursor_col + 1)
+                } else {
+                    cells(text)
+                };
+                spans.push(fill_padding(used, width, fill));
+            }
+            Line::from(spans)
         })
         .collect();
     (lines, wrapped.cursor_row)
