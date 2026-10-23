@@ -143,8 +143,9 @@ states:
       type: human
       message: >
         Read the requirements document and its review on the merge request.
-        Answer the open questions on the merge request or in
-        `requirements_feedback`. Choose check_feedback to have an agent
+        Answer the open questions in `requirements_feedback`, or on the merge
+        request and then choose check_feedback: accept does not read the
+        merge request. Choose check_feedback to have an agent
         process the comments on the merge request before planning, accept to
         start the plan at once without checking the comments, revise to send
         the requirements back to their author with a comment, or abandon to
@@ -804,7 +805,7 @@ states:
         Allowed operations on this pull request only: read it and take it out of Draft. Do not use any other host call. Do not approve it, do not set auto-merge, do not merge it and do not wait for its checks. Do not touch other pull requests or other repositories. Do not run `git merge`. Do not push. Do not change files.
 
         Steps:
-        1. Read the pull request. If it is merged or already out of Draft, answer `ready`. If it is closed, answer `blocked`.
+        1. Read the pull request. If it is merged, answer `ready`. If it is closed without a merge, answer `blocked`. If it is open and already out of Draft, answer `ready`.
         2. Take it out of Draft.
         3. Read the pull request again. If it is out of Draft, answer `ready`. Otherwise answer `blocked`.
         Put the state you read from the host in `reason`. With `blocked`, also put the cause and how to fix it in `reason`.
@@ -863,7 +864,7 @@ states:
     description: A person stopped the pipeline.
 
   left_as_draft:
-    description: A person ended the pipeline with the merge request still in Draft.
+    description: A person ended the pipeline after finalize could not confirm that the merge request is out of Draft.
 
 terminal_states:
   finished: completed
