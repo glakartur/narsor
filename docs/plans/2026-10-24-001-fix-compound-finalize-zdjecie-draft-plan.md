@@ -1,16 +1,16 @@
 ---
-title: "fix: Niezawodne zdjęcie Draft w compound finalize i usunięcie finalize_blocked"
+title: "fix: Niezawodne zdjęcie Draft w compound finalize i bramka finalize_blocked"
 type: fix
 status: active
 date: 2026-10-24
 origin: docs/brainstorms/2026-10-24-compound-finalize-zdjecie-draft-requirements.md
 ---
 
-# fix: Niezawodne zdjęcie Draft w compound finalize i usunięcie finalize_blocked
+# fix: Niezawodne zdjęcie Draft w compound finalize i bramka finalize_blocked
 
 ## Summary
 
-Krok `finalize` w `workflows/compound-engineering.yaml` dostaje twardą weryfikację końcową (odczyt stanu z hosta po zdjęciu Draft), poprawny odczyt pola Draft dla GitHub i GitLab oraz ograniczoną pętlę powtórzeń w prompcie. Bramka `finalize_blocked` i stan `left_as_draft` znikają. Powód nienaprawialny kończy proces w nowym stanie `finalize_failed` ze statusem `failed`. Plan zaczyna się od zebrania dowodów (R1–R3). Zmiany w prompcie są poprawne przy hipotezach (a)–(d) z R2. Przy hipotezie (e) zakres wraca do Artura przed implementacją.
+Krok `finalize` w `workflows/compound-engineering.yaml` zdejmuje Draft i potwierdza to odczytem z hosta. Ta część jest już w kodzie (commit `0da020f`). Brakuje bramki `finalize_blocked`: dziś `blocked` i `timeout` idą wprost do `finalize_failed`. Wymaganie z PR #25 mówi, że przejście do porażki wymaga decyzji człowieka. Plan dodaje bramkę z wyborami `retry` i `confirm_failure`. `retry` wraca do `finalize`. `confirm_failure` kończy w `finalize_failed` (status `failed`). Plan zaczyna się od dowodów przyczyny (R1–R3).
 
 ---
 
@@ -18,70 +18,75 @@ Krok `finalize` w `workflows/compound-engineering.yaml` dostaje twardą weryfika
 
 Zob. origin: Problem Frame. Przyczyna porażki zdjęcia Draft jest nieznana (origin: Założenie 3). Plan nie zakłada, że winna jest kolejność operacji.
 
+Stan kodu (sprawdzony w tym planie):
+
+- Prompt `finalize` ma już pętlę 3 prób, odczyt z hosta po zdjęciu Draft, pola Draft dla GitHub i GitLab, zakaz wnioskowania z tytułu (R4–R7, R12 część automatyczna).
+- Przejścia `blocked` i `timeout` idą do `finalize_failed`. Bramki nie ma (origin: Problem Frame).
+- Testy, `workflows/README.md` i `workflows/compound-engineering-flow.html` opisują przepływ bez bramki.
+
 ---
 
 ## Requirements
 
-Numeracja R1–R10 i AE1–AE5 jak w origin (see origin: `docs/brainstorms/2026-10-24-compound-finalize-zdjecie-draft-requirements.md`).
+R1–R13 i AE1–AE6 jak w origin (see origin: `docs/brainstorms/2026-10-24-compound-finalize-zdjecie-draft-requirements.md`).
 
 ---
 
 ## Założenia przyjęte w planie
 
-Origin zostawia dwa pytania „Resolve Before Planning". Plan przyjmuje odpowiedzi z Key Decisions i Założeń 4–5 origin. Artur potwierdza je przy przeglądzie planu.
+Origin zostawia dwa pytania dla użytkownika. Żadne nie zmienia zachowania produktu, więc plan je zamyka jawnie. Artur potwierdza je przy przeglądzie.
 
-- Z1 (pyt. 2 origin): powód nienaprawialny kończy proces porażką z powodem. Bramki nie ma.
-- Z2 (pyt. 3 origin): `left_as_draft` znika. Zastępuje go `finalize_failed` (status `failed`, Założenie 5 origin).
-- Z3 (pyt. 1 origin): brak logu nie blokuje planu. U1 zbiera dowody. U2 i U3 obejmują hipotezy (a)–(d) z R2. Hipoteza (e) wymaga decyzji Artura po U1.
+- Z1 (pyt. 1 origin, log porażki): brak logu nie blokuje planu. U1 zbiera dowody. Hipoteza (e) z R2 wymaga decyzji Artura po U1.
+- Z2 (pyt. 2 origin, limit `retry`): bez limitu ręcznych `retry` (origin: Założenie 6, R12). Człowiek kontroluje pętlę. Nie dodajemy `max_entries` do `finalize`.
 
 ---
 
 ## Scope Boundaries
 
 - Poza zakresem: zatwierdzanie, auto-merge, merge, inne bramki (`review_*`, `check_*_feedback`), uprawnienia kont `gh`/`glab` (origin: Scope Boundaries).
-- Poza zakresem: komentarz na PR w stanie zatrzymania. `finalize` ma `workspace_access: read-only` i wolno mu tylko czytać PR i zdjąć Draft (R6). Powód widzi człowiek w stanie końcowym (R9, pierwsza część).
+- Poza zakresem: zadanie #22.
 
 ### Deferred to Follow-Up Work
 
-- Komentarz z powodem w TUI w każdym stanie zatrzymania: zadanie #22 (`docs/plans/2026-10-22-003-feat-akcje-taska-z-backendu-i-komentarz-w-pauzie-plan.md`). To jest komentarz operatora w sesji, nie komentarz na PR. Nie jest to warunek tego planu.
+- Komentarz w każdym stanie zatrzymania: zadanie #22 (`docs/plans/2026-10-22-003-feat-akcje-taska-z-backendu-i-komentarz-w-pauzie-plan.md`). Ten plan go nie wymaga.
 
 ---
 
 ## Context & Research
 
-- `workflows/compound-engineering.yaml`, krok `finalize`: agent `read-only`, `timeout: 10m`, odpowiedzi `ready` / `blocked` / `timeout`. `blocked` i `timeout` prowadzą do `finalize_blocked`.
-- `WORKFLOW_SCHEMA.md` (sekcja o historii wejść i `retry_policy`): `retry_policy` ponawia akcje, które zakończyły się błędem. Nie ponawia odpowiedzi `blocked`. Błąd harnessu, sandboxa lub narzędzia kończy execution jako `failed` bez przejścia. To rozstrzyga pytanie „retry_policy czy pętla w prompcie" (origin: Deferred to Planning, R8).
-- `max_entries` ogranicza liczbę wejść w krok (użyte w `code_review`, `repair_verification`). Kroki `agent` dostają w promptcie blok historii od drugiego wejścia.
-- Prompt `finalize` podaje `isDraft` dla `gh`, a dla `glab mr view -F json` nie podaje pola. To jest luka z R5.
-- Read-only runner (`narsor-runner --read-only`, `crates/narsor-engine/src/backends/local.rs`) jest hipotezą (e) z R2. Czy blokuje sieć, ustala U1.
-- Testy: `tests/workflows.rs` (ścieżki `finalize`, `COMPOUND_STATES`, `COMPOUND_EDGES`), `tests/builtin_workflows.rs`, fixture `tests/fixtures/engine/script_gate.yaml` (osobny fixture, nie zależy od zmiany).
+- `workflows/compound-engineering.yaml`, krok `finalize` (agent, `read-only`, `timeout: 10m`, wybory `ready` / `blocked` / `timeout`).
+- Wzorzec bramki: `review_learning` w tym samym pliku (`type: human`, `message`, `inputs` typu `select`, `choices`, `transitions`). Poprzednia wersja bramki `finalize_blocked` jest w `git show 0da020f^:workflows/compound-engineering.yaml` (wybory `retry` i `finish_as_draft`). Nowa wersja zmienia tylko drugi wybór na `confirm_failure` i jego cel na `finalize_failed`.
+- Powód w bramce (R10, rozstrzygnięte): silnik pokazuje `reason` wyboru agenta w widoku oczekującej bramki. Dowód: `tests/engine_execution.rs`, test `a_script_choosing_blocked_leads_to_a_gate_with_its_reason` (`pending_view`, `view.reason`). Plan nie potrzebuje szablonu ani zadania #22. Przy `timeout` silnik nie ma powodu od agenta. Opis bramki mówi o tym w jednym zdaniu.
+- `WORKFLOW_SCHEMA.md`: `retry_policy` nie ponawia odpowiedzi `blocked`. Dlatego pętla jest w prompcie, a ręczne ponowienie w bramce. Historia kroku (`{{ step.history }}`) pokazuje agentowi powód poprzedniej próby po `retry`, bez zmiany promptu.
+- Hipoteza (e) z R2: read-only runner (`crates/narsor-engine/src/backends/local.rs`, `--read-only`). Czy blokuje hosta, ustala U1.
+- Testy do zmiany: `tests/workflows.rs` (`COMPOUND_STATES`, `COMPOUND_EDGES`, testy `finalize`, linie około 1170–1210 i 1280–1380), `tests/builtin_workflows.rs` (około linii 483). `tests/fixtures/engine/script_gate.yaml` ma własny `finalize_blocked` i nie zależy od zmiany.
 
 ---
 
 ## Key Technical Decisions
 
-- **Pętla w prompcie, nie `retry_policy`.** `retry_policy` nie widzi odpowiedzi `blocked`. Pętla w prompcie ma stały limit (3 próby zdjęcia + odczytu) i jawne odczekanie między próbami. Limit czasu kroku `timeout: 10m` zostaje jako górna granica (R8).
-- **Potwierdzenie tylko z odczytu hosta.** `ready` wolno odpowiedzieć tylko po odczycie stanu z hosta, który pokazuje PR poza Draft lub zmergowany (R4, AE2).
-- **Pole Draft per host.** GitHub: `isDraft`. GitLab: pole zwracane przez `glab mr view -F json` (nazwa do potwierdzenia w U1, bo origin jej nie podaje). Prompt zakazuje wnioskowania ze stanu z tytułu (AE3).
-- **`blocked` i `timeout` → `finalize_failed`.** Terminal `failed`. Powód z `reason` kroku jest w historii taska. Bez bramki (R7, R9).
-- **`left_as_draft` usunięty, nie przeniesiony.** `finalize_failed` pełni jego rolę, ale z prawdziwym statusem porażki.
+- **Bramka zostaje (decyzja Artura, PR #25).** `blocked` i `timeout` idą do `finalize_blocked`. Porażka wymaga decyzji człowieka (R8, R9).
+- **Dwa wybory: `retry` i `confirm_failure`.** `retry` → `finalize`. `confirm_failure` → `finalize_failed` (R9, R11).
+- **Brak `left_as_draft`.** Jeden stan porażki. Kto woli zostawić Draft, wybiera `confirm_failure` (R11).
+- **Pętla automatyczna w prompcie, ręczna w bramce.** Limit 3 prób zostaje. `timeout: 10m` zostaje jako górna granica (R12).
+- **Prompt `finalize` bez zmian, poza opisami wyborów.** Opisy `blocked` i `timeout` w `choices` mówią dziś „the run fails". Mają mówić „a person decides at the gate".
 
 ---
 
 ## High-Level Technical Design
 
-> Ilustruje zamierzony kształt. To wskazówka do przeglądu, nie specyfikacja implementacji.
+> To wskazówka do przeglądu, nie specyfikacja implementacji.
 
 ```mermaid
 flowchart LR
   compound --> finalize
   review_learning --> finalize
   finalize -- ready --> finished
-  finalize -- blocked --> finalize_failed
-  finalize -- timeout --> finalize_failed
+  finalize -- blocked --> finalize_blocked
+  finalize -- timeout --> finalize_blocked
+  finalize_blocked -- retry --> finalize
+  finalize_blocked -- confirm_failure --> finalize_failed
 ```
-
-Pętla wewnątrz kroku `finalize` (opis w prompcie): odczyt → (Draft?) zdjęcie → odczyt → jeśli nadal Draft, odczekaj i powtórz do 3 prób → po wyczerpaniu `blocked` z przyczyną.
 
 ---
 
@@ -89,126 +94,122 @@ Pętla wewnątrz kroku `finalize` (opis w prompcie): odczyt → (Draft?) zdjęci
 
 ### U1. Ustalenie przyczyny porażki zdjęcia Draft
 
-**Goal:** Zebrać dowody dla R1–R3 przed zmianą promptu.
+**Goal:** Zebrać dowody dla R1–R3 przed dalszą zmianą promptu.
 
 **Requirements:** R1, R2, R3
 
 **Dependencies:** brak
 
 **Files:**
-- `docs/solutions/` (opcjonalnie: wpis z wynikiem, jeśli przyczyna jest nieoczywista)
 - Opis zmiany (PR): sekcja „Przyczyna / dowód / poprawka"
+- `docs/solutions/` (opcjonalnie, gdy przyczyna jest nieoczywista)
 
 **Approach:**
-- Zdobyć log kroku `finalize` z nieudanego taska i `reason` z historii kroku. Jeśli Artur go nie poda, przejść do kroków poniżej bez niego.
-- Dla każdej hipotezy z R2 zapisać werdykt z dowodem: (a) czas odczytu względem ostatniego pushu; (b) czy krok po `publish_*` przywraca Draft (przejrzeć prompty `ce-commit-push-pr` i `publish_*`); (c) rzeczywisty JSON z `glab mr view -F json` i `gh pr view --json` na PR testowym (nazwa pola Draft); (d) logowanie `gh`/`glab` w miejscu pracy kroku; (e) czy read-only runner lub sieć blokuje wywołania hosta (`crates/narsor-engine/src/backends/local.rs`, `--read-only`).
-- Dane testowe tylko z PR testowego. Nie wklejać danych klientów ani tokenów do opisu zmiany.
-- Jeśli (e) jest prawdziwa, zakres zmiany rośnie (zmiana `workspace_access` lub runnera). To zmienia U2 i wraca do Artura przed implementacją.
+- Zdobyć log kroku `finalize` i `reason` z historii nieudanego taska. Bez logu od Artura: kontynuować bez niego.
+- Dla każdej hipotezy z R2 zapisać werdykt z dowodem: (a) czas odczytu względem ostatniego pushu; (b) czy krok po `publish_*` przywraca Draft (prompty `ce-commit-push-pr` w `workflows/compound-engineering.yaml`); (c) rzeczywisty JSON z `glab mr view -F json` i `gh pr view --json state,isDraft` na PR testowym (nazwa pola Draft); (d) logowanie `gh`/`glab` w miejscu pracy kroku; (e) czy read-only runner lub sieć blokuje wywołania hosta.
+- Dane tylko z PR testowego. Nie wklejać danych klientów ani tokenów do opisu zmiany. Jeśli log zawiera takie dane, zamaskować je przed wklejeniem.
+- Jeśli (e) jest prawdziwa, zakres rośnie (zmiana `workspace_access` lub runnera). To wraca do Artura przed dalszą implementacją.
+- Jeśli wynik wskazuje błąd w prompcie `finalize` (kolejność, pole Draft), poprawić prompt w U2.
 
 **Test expectation: none -- badanie, bez zmiany zachowania.**
 
-**Verification:** Opis zmiany zawiera dla R2 (a)–(e) werdykt i dowód, a dla przyczyny rzeczywistej: przyczynę, dowód, poprawkę.
+**Verification:** Opis zmiany zawiera dla R2 (a)–(e) werdykt i dowód oraz przyczynę, dowód i poprawkę.
 
 ---
 
-### U2. Prompt `finalize`: weryfikacja, pole Draft per host, ograniczona pętla
+### U2. Opisy wyborów `finalize` i korekta promptu z wyniku U1
 
-**Goal:** Zmienić prompt i przejścia `finalize` tak, aby `ready` wymagało odczytu z hosta.
+**Goal:** Dopasować opisy wyborów `finalize` do bramki. Wprowadzić korektę promptu tylko wtedy, gdy U1 ją wskaże.
 
-**Requirements:** R4, R5, R6, R7, R8, AE1, AE2, AE3, AE4, AE5
+**Requirements:** R4, R5, R6, R7, R8, AE1, AE2, AE3, AE6
 
 **Dependencies:** U1
 
 **Files:**
-- `workflows/compound-engineering.yaml` (krok `finalize`)
+- `workflows/compound-engineering.yaml` (krok `finalize`: `choices`, ewentualnie prompt)
 - `tests/builtin_workflows.rs`
-- `tests/workflows.rs`
 
 **Approach:**
-- Zachować: walidację `pr_url`, listę dozwolonych operacji (czytaj, zdejmij Draft), zakazy (approve, auto-merge, merge, wait na checki, push, zmiana plików).
-- Kroki w prompcie: odczyt; zmergowany lub już poza Draft → `ready`; zamknięty bez merge → `blocked`; otwarty w Draft → zdjęcie, odczyt, i jeśli nadal Draft, odczekanie i ponowienie. Maksymalnie 3 próby. Po 3 próbach `blocked` z przyczyną.
-- Odczyt stanu: `gh pr view <url> --json state,isDraft`; dla GitLab pole z U1 (oczekiwane `draft`; do potwierdzenia, nie przyjmować z pamięci). Zakaz wnioskowania z tytułu `Draft:`.
-- `ready` zawiera w `reason` stan odczytany z hosta.
-- Przejścia: `blocked: finalize_failed`, `timeout: finalize_failed`.
-- Jeśli U1 wskaże inną przyczynę (np. kolejność względem pushu), dodać tę korektę w tym samym kroku.
+- Prompt (pętla 3 prób, odczyt z hosta, pola Draft, zakazy) już spełnia R4–R7. Nie przepisywać go bez dowodu z U1.
+- Zmienić opisy `blocked` i `timeout`: człowiek decyduje na bramce `finalize_blocked`.
+- Jeśli U1 wskaże inną przyczynę, dodać korektę w tym kroku.
 
-**Patterns to follow:** istniejący prompt `finalize` (struktura, walidacja URL); `max_entries`/`retry_policy` w `code_review` jako wzór zapisu limitów.
+**Patterns to follow:** istniejący prompt `finalize`; opisy wyborów w `review_learning`.
 
 **Test scenarios:**
-- Happy path. Covers AE1. `finalize` odpowiada `ready` → `finished`, status `Completed`.
-- Happy path. Covers AE5. Zmergowany PR → `ready`, brak operacji zdejmowania Draft w prompcie dla tej gałęzi (test na treść promptu).
-- Edge. Covers AE2. Odpowiedź `blocked` po wyczerpaniu prób → `finalize_failed`, status `Failed`.
-- Error. Covers AE4. Brak logowania `glab`: `blocked` z `reason` → `finalize_failed`, w zdarzeniu widoczny `reason`, brak oczekującej bramki.
-- Error. `timeout` kroku → `finalize_failed` (nie bramka).
-- Contract (treść promptu). Prompt zawiera pole Draft dla GitHub i GitLab (AE3, R5), limit prób i zakaz wnioskowania z tytułu.
-- Contract. Prompt zachowuje zakazy: approve, auto-merge, merge, push, wait na checki (R6).
+- Contract. Covers AE6. Prompt zawiera `draft` dla GitLab, `isDraft` dla GitHub i wymóg wskazania w `reason` pola użytego jako rezerwa.
+- Contract. Covers AE3. Prompt daje `ready` dla PR zmergowanego po pierwszym odczycie.
+- Contract. Prompt zachowuje zakazy: approve, auto-merge, merge, push, wait na checki, walidacja `pr_url` (R7).
+- Contract. Covers AE2. Prompt ma limit 3 prób i `blocked` po ich wyczerpaniu.
 
-**Verification:** Testy `finalize` przechodzą. Prompt nie zawiera dopisku, który pozwala na `ready` bez odczytu z hosta.
+**Verification:** Testy treści promptu w `tests/builtin_workflows.rs` przechodzą.
 
 ---
 
-### U3. Usunięcie `finalize_blocked` i `left_as_draft`, nowy terminal `finalize_failed`
+### U3. Przywrócenie bramki `finalize_blocked`
 
-**Goal:** Usunąć bramkę i stan, dodać terminal porażki.
+**Goal:** `blocked` i `timeout` kroku `finalize` prowadzą do bramki. `confirm_failure` prowadzi do `finalize_failed`.
 
-**Requirements:** R7, R9, R10
+**Requirements:** R8, R9, R10, R11, R12, R13, AE2, AE4, AE5
 
 **Dependencies:** U2
 
 **Files:**
-- `workflows/compound-engineering.yaml` (stany, `terminal_states`, nagłówek pliku jeśli wspomina bramkę)
-- `tests/workflows.rs` (`COMPOUND_STATES`, `COMPOUND_EDGES` — liczba krawędzi spada z 62; testy ścieżek bramki: `covers_ae5_a_blocked_finalize...`, `covers_ae5_a_retried_finalize...`, `finishing_as_draft_...`, `a_finalize_stopped_by_its_time_limit...`)
-- `tests/builtin_workflows.rs` (`compound_engineering_finalize_is_a_read_only_agent_with_a_timeout_choice`: asercja `transitions["timeout"]`)
-- `workflows/README.md` (tabela bramek, opis `finalize`, terminale, akapit o `gh`/`glab` bez logowania)
-- `workflows/compound-engineering-flow.html` (węzły „Finalizacja zablokowana" i `left_as_draft`; dodać `finalize_failed`)
+- `workflows/compound-engineering.yaml` (nowy stan `finalize_blocked`, przejścia `finalize`, opis `finalize_failed`)
+- `tests/workflows.rs` (`COMPOUND_STATES`, `COMPOUND_EDGES`, testy `finalize`)
+- `tests/builtin_workflows.rs` (asercje przejść `finalize`, nowy test bramki)
+- `workflows/README.md` (akapit o `finalize`, tabela bramek, terminale, uwaga o taskach w toku)
+- `workflows/compound-engineering-flow.html` (węzeł bramki i cztery połączenia; opis `finalize_failed`)
 
 **Approach:**
-- Usunąć stany `finalize_blocked` i `left_as_draft`. Dodać `finalize_failed` z opisem „finalize nie potwierdził, że PR jest poza Draft; powód w historii kroku". `terminal_states: finalize_failed: failed`.
-- Przepisać testy ścieżek: zamiast bramki, `blocked` i `timeout` kończą w `finalize_failed` ze statusem `Failed`. Usunąć testy `retry` i `finish_as_draft`.
-- Zaktualizować `COMPOUND_STATES`/`COMPOUND_EDGES` (usunięte 2 stany i 4 krawędzie, dodany 1 stan, 2 krawędzie; stałą długości tablicy poprawić).
-- README: napisać, że brak narzędzia lub logowania kończy proces w `finalize_failed`; człowiek poprawia środowisko i uruchamia nowe zadanie.
-- Dodać do README uwagę zgodną z istniejącą: taski w toku na starej wersji mogą nie wznowić się po aktualizacji (stan `finalize_blocked` zniknął).
-- Diagram HTML: usunąć dwa węzły i połączenia, dodać węzeł `finalize_failed`; zachować styl istniejących węzłów terminalnych.
+- Dodać stan `finalize_blocked` typu `human`: `message` mówi, że `finalize` nie zdjął Draft, że powód jest w widoku bramki (przy `timeout` powodu od agenta nie ma), że `retry` uruchamia `finalize` po naprawie przyczyny, a `confirm_failure` kończy proces porażką. `inputs`: pole `select` (`retry`, `confirm_failure`), `required: true`. Wzór: `review_learning` i wersja bramki z `0da020f^`.
+- Przejścia `finalize`: `blocked` i `timeout` → `finalize_blocked`. Przejścia bramki: `retry: finalize`, `confirm_failure: finalize_failed`.
+- Opis `finalize_failed`: człowiek potwierdził porażkę na bramce; powód jest w historii kroku `finalize`. `terminal_states` bez zmian (`finalize_failed: failed`).
+- Nie dodawać `max_entries` do `finalize` (Z2).
+- Nie wracać do nazwy `finish_as_draft` ani stanu `left_as_draft` (R11).
+- README: wpisać bramkę w opis `finalize` i tabelę bramek; zmienić uwagę o taskach w toku tak, aby nie mówiła o „usuniętej" bramce. Zachować akapit o `gh`/`glab` bez logowania: dziś mówi o porażce, ma mówić o bramce.
+- Diagram HTML: dodać węzeł bramki w stylu istniejących bramek i krawędzie `blocked`, `timeout`, `retry`, `confirm_failure`. Poprawić tekst notatki „Wiedza i zakończenie".
 
-**Patterns to follow:** inne terminale w pliku (`cancelled`); format `terminal_states` mapujący (`WORKFLOW_SCHEMA.md`, sekcja o terminalach); testy `COMPOUND_*` w `tests/workflows.rs`.
+**Patterns to follow:** bramka `review_learning`; style węzłów bramek w `compound-engineering-flow.html`; stałe `COMPOUND_*` w `tests/workflows.rs`.
 
 **Test scenarios:**
-- Integration. Graf: `the_compound_graph_is_the_one_the_plan_draws` przechodzi z nową listą stanów i krawędzi.
-- Integration. `blocked` → `finalize_failed`, `ExecutionStatus::Failed`, bez oczekującej bramki.
-- Integration. `timeout` (z `with_finalize_timeout`) → `finalize_failed`.
-- Edge. Wszystkie stany osiągalne; brak stanu bez wejścia (istniejący test osiągalności, jeśli jest).
-- Contract. Ładowanie definicji: `terminal_states` zawiera `finalize_failed: failed` i nie zawiera `left_as_draft`.
-- Regression. `tests/engine_execution.rs` i fixture `script_gate.yaml` nie zależą od zmiany i przechodzą bez edycji.
+- Integration. Graf: test zgodności z `COMPOUND_STATES` i `COMPOUND_EDGES` przechodzi po dodaniu 1 stanu (`COMPOUND_STATES` 29 → 30) i 2 nowych krawędzi bramki (`COMPOUND_EDGES` 60 → 62). Dwie istniejące krawędzie `finalize` (`blocked`, `timeout`) zmieniają tylko cel z `finalize_failed` na `finalize_blocked`.
+- Error. Covers AE2. `finalize` odpowiada `blocked` → bieżący stan `finalize_blocked`, status wykonania nie jest `Failed`, bramka oczekuje.
+- Error. Covers AE4. `blocked` z `reason` „glab is not signed in..." → widok bramki pokazuje ten `reason`. Wybór `retry` → `finalize` uruchamia się ponownie; druga odpowiedź `ready` → `finished`.
+- Error. `timeout` kroku (`with_finalize_timeout`) → `finalize_blocked`, nie `finalize_failed`.
+- Happy path. Covers AE5. `confirm_failure` → `finalize_failed`, `ExecutionStatus::Failed`.
+- Edge. `retry` dwa razy z rzędu po `blocked` nie kończy wykonania ani nie zgłasza błędu limitu (R12, Z2).
+- Contract. Definicja zawiera bramkę z dokładnie wyborami `retry` i `confirm_failure`. Nie zawiera `left_as_draft` ani `finish_as_draft`.
+- Regression. `tests/engine_execution.rs` i fixture `script_gate.yaml` przechodzą bez edycji.
 
-**Verification:** Żadne wystąpienie `finalize_blocked` ani `left_as_draft` nie zostaje w `workflows/`, `tests/workflows.rs`, `tests/builtin_workflows.rs` (poza fixture `script_gate.yaml`, który jest osobnym przykładem). Pełny przebieg testów workspace jest zielony.
+**Verification:** Testy `finalize` i graf przechodzą. Pełny przebieg testów workspace jest zielony. Nie ma `left_as_draft` ani `finish_as_draft` w `workflows/` i w testach. Nazwa `finalize_blocked` w `workflows/` odnosi się tylko do nowej bramki.
 
 ---
 
 ## System-Wide Impact
 
-- Taski w toku, które stoją w `finalize_blocked`, nie wznowią się. Opisane w README (U3).
-- TUI i backend nie znają nazw tych stanów na stałe: sprawdzić w U3 `grep` po `crates/` i `src/` (stan na dziś: brak trafień poza testami i workflow).
-- Status `failed` zamiast `cancelled` zmienia, jak TUI pokazuje taski, które nie dokończyły `finalize`. Wymaga weryfikacji przez Artura, czy ten widok wystarcza (origin: Założenie 5).
+- Taski w toku na wersji z `finalize_failed` bez bramki są zgodne: stan końcowy zostaje. Taski, które w poprzednich wersjach czekały na bramce z `finish_as_draft`, mogą nie wznowić się (wybór zmienił nazwę). README to mówi.
+- Status `failed` po `confirm_failure` zmienia widok w TUI względem `left_as_draft` (`cancelled`?). Artur potwierdza (origin: Założenie 5). TUI i backend nie znają nazw stanów na stałe: sprawdzić `grep` po `crates/` i `src/` w U3.
 
 ---
 
 ## Risks
 
-- **Przyczyna to (e): read-only runner blokuje hosta.** Wtedy sam prompt nie pomoże. Mitygacja: U1 sprawdza to pierwsze; zmiana zakresu wraca do Artura.
-- **Nazwa pola Draft w `glab` błędna.** Mitygacja: U1 potwierdza na rzeczywistym JSON. Prompt nie opiera się na pamięci.
-- **Agent przedwcześnie odpowiada `ready`.** Mitygacja: prompt wymaga stanu z odczytu w `reason`. Pełnej gwarancji nie daje test (prompt nie jest barierą techniczną, zob. `workflows/README.md`).
-- **Pętla w prompcie nie jest egzekwowana przez silnik.** Granicą twardą jest `timeout: 10m`.
+- **Przyczyna to (e): read-only runner blokuje hosta.** Sam prompt nie pomoże. U1 sprawdza to pierwsze. Zmiana zakresu wraca do Artura.
+- **Nazwa pola Draft w `glab` błędna.** U1 potwierdza na rzeczywistym JSON.
+- **`retry` w pętli bez końca.** Zamierzone (Z2): pętla jest ręczna. Człowiek może wybrać `confirm_failure`.
+- **Agent odpowiada `ready` bez odczytu.** Prompt nie jest barierą techniczną (`workflows/README.md`). Twarda granica to `timeout: 10m`.
 
 ---
 
 ## Deferred to Implementation
 
-- Dokładne słowa promptu i czas odczekania między próbami.
-- Dokładna liczba krawędzi po zmianie (liczy implementator z `COMPOUND_EDGES`).
-- Czy diagram HTML wymaga przesunięcia współrzędnych po usunięciu węzłów.
+- Dokładne słowa `message` bramki i opisów wyborów.
+- Dokładna liczba krawędzi w `COMPOUND_EDGES`.
+- Współrzędne węzła bramki w diagramie HTML.
 
 ---
 
 ## Origin coverage
 
-R1–R3 → U1. R4–R6, R7 (część w prompcie), R8, AE1–AE5 → U2. R7, R9, R10 → U3 (R8 przez limit prób i `timeout` w U2; R9 przez `finalize_failed` i `reason`; część R9 o komentarzu odroczona, zob. Scope Boundaries). Założenia i pytania otwarte origin → sekcja „Założenia przyjęte w planie".
+R1–R3 → U1. R4–R7, AE1, AE3, AE6 → U2 (prompt już w kodzie). R8–R13, AE2, AE4, AE5 → U3. Założenia i pytania otwarte origin → „Założenia przyjęte w planie". Poza zakresem origin → Scope Boundaries.
