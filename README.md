@@ -770,7 +770,7 @@ analyze:
     model: opus                   # optional, passed through verbatim
     workspace_access: read-only   # optional; default: read-write
     prompt: |
-      Analyse the repository for: {{ inputs.feature_description }}.
+      Analyse the repository for: {{ inputs.description }}.
       Write the plan to plan.md.
     parameters:                   # optional, harness-specific but not access control
       max_turns: 20
@@ -1195,7 +1195,7 @@ anywhere:
 
 ```bash
 narsor-cli run compound-engineering \
-  --input feature_description="rate-limit the public API" \
+  --input description="rate-limit the public API" \
   --input target_repo=acme-api
 ```
 
@@ -1287,7 +1287,7 @@ narsor-cli validate open-mercato-sdlc        # by name, from anywhere
 
 narsor-cli repo add acme-web --remote git@github.com:acme/web.git   # once
 narsor-cli run compound-engineering \
-  --input feature_description="let a reviewer subscribe to a run" \
+  --input description="let a reviewer subscribe to a run" \
   --input target_repo=acme-web
 
 narsor-cli show <execution-id>          # where it is waiting

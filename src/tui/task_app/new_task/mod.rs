@@ -55,6 +55,8 @@
 //! path ([`absolute_path`]); a catalogue workflow goes through
 //! `POST /control/v1/tasks` ([`CreateHow::Catalogue`]).
 
+mod layout;
+
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -1140,7 +1142,24 @@ pub fn render(
         styles.of(Role::Done),
     );
     frame.render_widget(Paragraph::new(line), header);
-    chooser::render(frame, body, &mut form.chooser, styles, focused);
+    render_chooser(frame, body, &mut form.chooser, styles, focused);
+}
+
+/// The chooser of the form: with the keys in the fields the form lays them
+/// out itself; on the list the chooser draws the list and the description of
+/// the entry.
+pub fn render_chooser(
+    frame: &mut Frame,
+    area: Rect,
+    chooser: &mut Chooser,
+    styles: &Styles,
+    focused: bool,
+) {
+    if chooser.fields_focused() {
+        layout::render(frame, area, chooser, styles, focused);
+    } else {
+        chooser::render(frame, area, chooser, styles, focused);
+    }
 }
 
 /// The details of a task that is being sent or was not: where it stands, what

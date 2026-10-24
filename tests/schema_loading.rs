@@ -218,7 +218,7 @@ fn inputs_keep_their_declared_types() {
     let definition = load_reference();
 
     let feature = &definition.inputs[0];
-    assert_eq!(feature.name, "feature_description");
+    assert_eq!(feature.name, "description");
     assert_eq!(feature.param_type, ParamType::String);
     assert!(feature.required);
 
@@ -527,7 +527,7 @@ fn script_args_stay_separate_arguments() {
         script.args,
         vec![
             "--title".to_string(),
-            "Feature: {{ inputs.feature_description }}".to_string(),
+            "Feature: {{ inputs.description }}".to_string(),
         ]
     );
 }

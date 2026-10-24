@@ -55,8 +55,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-mod inputs;
-
 use super::form::buffer::TextBuffer;
 use super::form::engine::clamp_rows;
 use super::form::engine::FormEngine;
@@ -93,6 +91,8 @@ pub struct ChooserField {
     pub name: String,
     /// What it accepts.
     pub kind: FieldKind,
+    /// The text drawn above the value, when it is not the name.
+    label: Option<String>,
     /// Whether an answer cannot be sent without it.
     pub required: bool,
     /// What the field is for, shown dim beside its name.
@@ -114,6 +114,7 @@ impl ChooserField {
         Self {
             name: name.into(),
             kind,
+            label: None,
             required: false,
             description: None,
             max_chars: None,
@@ -154,6 +155,17 @@ impl ChooserField {
     pub fn required(mut self) -> Self {
         self.required = true;
         self
+    }
+
+    /// The same field drawn under `label`; the name stays the key of its value.
+    pub fn labelled(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// The text drawn above the value: the label, or the name.
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
     }
 
     /// The same field with a description.
@@ -260,7 +272,7 @@ impl ChooserField {
     }
 
     /// Whether the field takes several lines.
-    fn is_long(&self) -> bool {
+    pub(crate) fn is_long(&self) -> bool {
         matches!(self.kind, FieldKind::Text { multiline: true })
     }
 
@@ -599,6 +611,16 @@ impl Chooser {
         self.selected
     }
 
+    /// Whether the keys are in the fields of the highlighted entry.
+    pub(crate) fn fields_focused(&self) -> bool {
+        self.focus == ChooserFocus::Fields
+    }
+
+    /// The index of the field with the keys, in the highlighted entry.
+    pub(crate) fn field_index(&self) -> usize {
+        self.field
+    }
+
     /// The highlighted entry.
     pub fn selected_item(&self) -> Option<&ChooserItem> {
         self.items.get(self.selected)
@@ -928,7 +950,7 @@ impl Chooser {
     /// The multi-line field a form of inputs draws large when the focus is
     /// not on one: the first required one, else the first, else the first
     /// field. Only drawing uses it; the focus starts on the first field (R9).
-    fn main_field(&self) -> usize {
+    pub(crate) fn main_field(&self) -> usize {
         let Some(item) = self.selected_item() else {
             return 0;
         };
@@ -1258,27 +1280,7 @@ fn field_lines(
     let mut focus_line = 0;
     for (index, field) in item.fields.iter().enumerate() {
         let is_focused = focused == Some(index);
-        let mut header = vec![Span::styled(
-            one_line(&field.name),
-            if is_focused {
-                styles.of(Role::Focus)
-            } else {
-                Style::default()
-            },
-        )];
-        if field.required {
-            header.push(Span::styled(" (wymagane)", styles.of(Role::Done)));
-        }
-        if field.proposed {
-            header.push(Span::styled(" ◆", styles.of(Role::Conductor)));
-        }
-        if let Some(description) = &field.description {
-            header.push(Span::styled(
-                format!(" · {}", one_line(description)),
-                styles.of(Role::Done),
-            ));
-        }
-        lines.push(Line::from(header));
+        lines.push(field::header_line(field, width, is_focused, styles));
         let value_start = lines.len();
         let (rows, cursor_row) = field::value_lines(field, width, is_focused, styles);
         lines.extend(rows);
@@ -1334,11 +1336,12 @@ fn render_with_style(
     focused: bool,
     footer: bool,
 ) {
-    if chooser.inputs_layout && chooser.focus == ChooserFocus::Fields {
-        inputs::render(frame, area, chooser, styles, focused, footer);
-        return;
-    }
-    let (fields, focus_line) = field_lines(chooser, styles, focused, usize::from(area.width));
+    // The form of inputs shows its fields only when they have the keys.
+    let (fields, focus_line) = if chooser.inputs_layout {
+        (Vec::new(), 0)
+    } else {
+        field_lines(chooser, styles, focused, usize::from(area.width))
+    };
     let fields_height = (fields.len() as u16).min(area.height.saturating_sub(5));
     let [top, bottom] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(fields_height)]).areas(area);

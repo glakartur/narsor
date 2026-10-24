@@ -1414,7 +1414,7 @@ async fn the_harness_receives_the_expanded_prompt_and_the_output_contract() {
 
     // What the engine does before it calls an executor (U4): expand once.
     let action = ActionConfig::Agent(agent_action(
-        "Implement {{ inputs.feature_description }} in {{ context.variables.module }}.",
+        "Implement {{ inputs.description }} in {{ context.variables.module }}.",
     ));
     let mut context = Context::new();
     context.update_variables(
@@ -1423,7 +1423,7 @@ async fn the_harness_receives_the_expanded_prompt_and_the_output_contract() {
             .expect("an object")
             .clone(),
     );
-    let inputs = json!({ "feature_description": "login" });
+    let inputs = json!({ "description": "login" });
     let scope = TemplateScope::from_execution(&inputs, &context).expect("build the scope");
     let rendered = scope
         .render_action(&action, "state 'analyze'")
@@ -1943,7 +1943,7 @@ async fn the_reference_workflow_runs_end_to_end_on_the_fake_harness() {
         .engine()
         .start_and_run(
             &definition,
-            json!({ "feature_description": "add login", "target_repo": "acme/web" }),
+            json!({ "description": "add login", "target_repo": "acme/web" }),
             fixture.workspace(),
         )
         .await

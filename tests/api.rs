@@ -4355,7 +4355,7 @@ mod control_catalog {
         let input = workflow
             .inputs
             .iter()
-            .find(|input| input.name == "feature_description")
+            .find(|input| input.name == "description")
             .expect("input declared");
         assert!(input.required);
         assert!(input.description.is_some());

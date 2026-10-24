@@ -751,7 +751,7 @@ impl CompoundRun {
             &self.engine,
             &self.definition,
             json!({
-                "feature_description": "let a reviewer subscribe to a workflow run",
+                "description": "let a reviewer subscribe to a workflow run",
                 "target_repo": "acme/web",
             }),
             self.root.workspace(),
@@ -1522,7 +1522,7 @@ async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates(
         &definition,
         json!({
             "ticket_id": "OM-417",
-            "task_brief": "the empty state of the orders list says nothing",
+            "description": "the empty state of the orders list says nothing",
             "target_repo": "open-mercato/app",
             "validation_command": gate.to_string_lossy(),
         }),
@@ -1707,7 +1707,7 @@ async fn a_failed_qa_goes_back_to_implementation_and_a_held_merge_can_be_abandon
         &definition,
         json!({
             "ticket_id": "OM-418",
-            "task_brief": "orders export times out",
+            "description": "orders export times out",
             "target_repo": "open-mercato/app",
             "validation_command": gate.to_string_lossy(),
         }),

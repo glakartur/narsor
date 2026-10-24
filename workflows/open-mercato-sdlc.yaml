@@ -14,7 +14,7 @@ inputs:
     type: string
     required: true
     description: The tracker id of the ticket, or the brief this run files one for.
-  - name: task_brief
+  - name: description
     type: text
     required: true
     description: What the work is, in one or two sentences.
@@ -32,7 +32,7 @@ inputs:
       point the pipeline shells out to.
 
 display:
-  title: "{{ inputs.ticket_id }}: {{ inputs.task_brief }}"
+  title: "{{ inputs.ticket_id }}: {{ inputs.description }}"
   links:
     - label: PR
       text: "!{{ context.variables.pr_number }}"
@@ -59,7 +59,7 @@ states:
         Run the `om-discover` and `om-brainstorm` skills for ticket
         {{ inputs.ticket_id }}:
 
-        {{ inputs.task_brief }}
+        {{ inputs.description }}
 
         Read `.ai/specs/product-brief.md` if it exists — its Non-goals,
         Business rules and Decisions tables are a protected contract; quote

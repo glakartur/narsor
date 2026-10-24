@@ -44,10 +44,10 @@ fn render_error(template: &str, inputs: &Map<String, Value>, context: &Context) 
 
 #[test]
 fn substitutes_a_workflow_input() {
-    let inputs = inputs(&[("feature_description", json!("login"))]);
+    let inputs = inputs(&[("description", json!("login"))]);
 
     let rendered = render(
-        "Zadanie: {{ inputs.feature_description }}",
+        "Zadanie: {{ inputs.description }}",
         &inputs,
         &Context::new(),
     );
@@ -227,7 +227,7 @@ fn an_unsupported_root_is_rejected() {
 
 #[test]
 fn renders_every_templated_field_of_a_script_action() {
-    let inputs = inputs(&[("feature_description", json!("login"))]);
+    let inputs = inputs(&[("description", json!("login"))]);
     let context = context(&[("branch", json!("feat/login"))]);
     let scope = TemplateScope::new(&inputs, &context);
 
@@ -290,7 +290,7 @@ fn implement_prompt_from_the_reference_fixture_expands_fully() {
         .expect("state 'implement' must carry an action");
 
     let inputs = inputs(&[
-        ("feature_description", json!("logowanie przez OAuth")),
+        ("description", json!("logowanie przez OAuth")),
         ("target_repo", json!("acme/app")),
     ]);
     // Deliberately empty: `implement` is reachable from `analyze` (label `ready`)

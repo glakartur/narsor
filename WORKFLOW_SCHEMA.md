@@ -673,7 +673,7 @@ version: 1
 description: Implementuje funkcję, testuje ją i tworzy Pull Request.
 
 inputs:
-  - name: feature_description
+  - name: description
     type: string
     required: true
   - name: target_repo
@@ -697,7 +697,7 @@ states:
       type: agent
       harness: claude-code
       prompt: |
-        Przeanalizuj repozytorium pod kątem implementacji: {{ inputs.feature_description }}.
+        Przeanalizuj repozytorium pod kątem implementacji: {{ inputs.description }}.
         Zidentyfikuj pliki, które trzeba zmodyfikować.
         Zapisz plan w pliku plan.md.
     artifacts:
@@ -739,7 +739,7 @@ states:
       harness: claude-code
       prompt: |
         Zaimplementuj funkcję zgodnie z planem w {{ artifacts.plan_doc }}
-        oraz wymaganiem: {{ inputs.feature_description }}.
+        oraz wymaganiem: {{ inputs.description }}.
         Wyjaśnienia człowieka (puste, jeśli ich nie było): {{ context.clarification_text }}
         Upewnij się, że kod kompiluje się.
     choices:
@@ -798,7 +798,7 @@ states:
       command: ./create_pr.sh
       args:
         - "--title"
-        - "Feature: {{ inputs.feature_description }}"
+        - "Feature: {{ inputs.description }}"
     choices:
       - created
     transitions:

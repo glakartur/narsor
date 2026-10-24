@@ -14,7 +14,7 @@ description: >
   person merges it.
 
 inputs:
-  - name: feature_description
+  - name: description
     type: text
     required: true
     description: The idea, problem or feature to explore, plan and ship.
@@ -24,7 +24,7 @@ inputs:
     description: The repository the work happens in.
 
 display:
-  title: "{{ inputs.feature_description }}"
+  title: "{{ inputs.description }}"
   links:
     - label: PR
       text: "{{ context.variables.pr_url }}"
@@ -52,7 +52,7 @@ states:
       prompt: |
         Run the `ce-brainstorm` skill with these arguments:
 
-        {{ inputs.feature_description }}
+        {{ inputs.description }}
 
         Talk to the person in the chat window. The skill asks the person questions and shows menus. Do not use a tool that asks questions (for example `AskUserQuestion`). Ask each question with an `awaiting_input` answer instead of a final choice. Ask one question at a time. Put the recommended option first in `options`. Then stop and wait: the engine runs this step again with the answer, in the same session. Do not answer a question for the person.
         Do not ask for the handoff menu at the end of the skill. The workflow owns what happens after the document. Choose one of the labels below and stop. Do not commit, push or open a merge request in this step.
