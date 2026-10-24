@@ -533,6 +533,7 @@ Szablony są podstawiane tuż przed wykonaniem akcji. Obsługiwane są następuj
 
 - `{{ inputs.NAZWA }}` — wejście workflow zadeklarowane w sekcji `inputs`,
 - `{{ context.variables.NAZWA }}` — zmienna kontekstu, wraz ze skrótem `{{ context.NAZWA }}`, który znaczy dokładnie to samo.
+- `{{ task.ticket }}` i `{{ task.title }}` — ticket i tytuł zadania. Operator wpisuje je w formularzu nowego zadania. Działają w każdym kroku, w `display` i w `globals.workspace`, niezależnie od `inputs`. Nie trzeba ich deklarować. Gdy zadanie ich nie ma, renderują się pustym tekstem. Inna nazwa po `task.` jest błędem. `task.title` to tytuł operatora, a gdy go brak — tytuł nadany przez dyrygenta. Dyrygent nadaje go w tle, więc krok wyrenderowany przed zapisem tytułu widzi pusty tekst. Tytuł od dyrygenta ma tylko litery, cyfry, spacje i znaki `- _ . , : ( )`.
 - `{{ artifacts.NAZWA }}` — ścieżka ostatniego zapisu artefaktu o tej nazwie w wykonaniu. Nazwa musi być zdefiniowana w `artifacts` jakiegoś kroku.
 - `{{ steps.ID.reply }}` — końcowa odpowiedź tekstowa udanej próby kroku agenta `ID`.
 - `{{ steps.ID.stdout }}` i `{{ steps.ID.stderr }}` — przechwycone wyjście ostatniego zakończonego uruchomienia kroku skryptowego `ID`.
@@ -546,6 +547,8 @@ ograniczone do przechwyconych przez silnik 64 KiB na strumień; ucięcie jest
 oznaczone. `max_entries` jest opcjonalnym limitem wejść w krok agentowy
 (wartość co najmniej 1); po osiągnięciu limitu workflow czeka na decyzję
 operatora.
+
+Pola `ticket` i `title` nie maskują danych. Nie wpisuj w nie danych osobowych klientów ani tajemnic.
 
 Białe znaki wewnątrz `{{ }}` są ignorowane. Nie ma filtrów (`| default(...)`), wyrażeń, warunków ani pętli — to świadomie prosty mechanizm podstawiania, a nie silnik szablonów. Odwołanie do nieistniejącego wejścia lub niezadeklarowanej zmiennej bez wartości jest **błędem**, który przerywa akcję. Podstawianie jest jednoprzebiegowe: jeśli wartość zmiennej sama zawiera `{{ ... }}`, nie jest rozwijana ponownie.
 
