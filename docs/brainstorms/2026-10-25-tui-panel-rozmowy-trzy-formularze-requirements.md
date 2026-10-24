@@ -53,7 +53,7 @@ Dziś jeden panel odpowiedzi miesza różne formularze (akcje kroku, pytanie age
 
 **Kontrakt z backendem**
 - R1. Backend zwraca razem z taskiem listę dostępnych formularzy panelu. Dla każdego: rodzaj (`akcja workflow`, `odpowiedź na pytanie agenta`, `swobodna rozmowa`, `potwierdzenie wejścia w krok po limicie`, `nadanie uprawnień agentowi`), pola z typami, opcjami, wymagalnością i opisami, wartości wstępne oraz znacznik domyślnego formularza.
-- R2. Backend sam rozstrzyga dostępność i domyślny formularz według reguł R5–R11 i R21–R22. TUI nie wylicza dostępności z rodzaju oczekiwania ani ze stanu agenta.
+- R2. Backend sam rozstrzyga dostępność i domyślny formularz według reguł R5–R9 i R21–R22. TUI nie wylicza dostępności z rodzaju oczekiwania ani ze stanu agenta.
 - R3. Pusta lista formularzy oznacza, że panel nie przyjmuje danych (R8).
 - R4. Wysłanie formularza używa istniejących ścieżek API (odpowiedź na oczekujące wejście, komentarz do agenta). Zmiana kontraktu dotyczy tylko opisu formularzy, nie ich wysyłania. Szczegóły w planie.
 
@@ -100,7 +100,7 @@ Dziś jeden panel odpowiedzi miesza różne formularze (akcje kroku, pytanie age
 
 - Nie zmieniamy formatu rozmowy w zakładkach ani osi czasu.
 - Nie zmieniamy ścieżek wysyłania odpowiedzi, komentarza i akcji (R4), ani reguł walidacji po stronie serwera.
-- Panele operatora (propozycje dyrygenta, błąd kroku, komendy właściciela) zostają poza zakresem, o ile plan nie wykaże, że muszą być tym samym modelem. Założenie Z4.
+- Panele operatora (propozycje dyrygenta, błąd kroku, komendy właściciela) zostają poza zakresem, o ile plan nie wykaże, że muszą być tym samym modelem.
 
 ---
 
