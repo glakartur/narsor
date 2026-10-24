@@ -147,6 +147,11 @@ fn render_bar(
             let (text, cursor) = bar_text(field);
             let (shown, cursor) = window_around_cursor(&text, cursor, reserved);
             spans.extend(cursor_spans(&shown, cursor, base, styles.cursor()));
+            let used = shown.chars().count().max(cursor + 1);
+            spans.push(Span::styled(
+                " ".repeat(reserved.saturating_sub(used)),
+                styles.field_editing(),
+            ));
         } else {
             let style = if field.error.is_some() {
                 styles.of(Role::Problem)
