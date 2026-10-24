@@ -366,7 +366,7 @@ Kolejność: U1 → (U2, U3, U5 równolegle) → (U4, U6, U7) → U8.
 ### Do potwierdzenia przez autora wymagań (nieblokujące)
 
 - Reguła „opis zadania" z KTD8 (pełny wyrenderowany `display.title`, a następnie wejścia tekstowe).
-- Dopuszczalne przycięcie tytułu z `…` w skrajnie małym terminalu, wobec brzmienia R13.
+- Potwierdzone przez autora wymagań: dopuszczalne przycięcie tytułu z `…` w skrajnie małym terminalu, wobec brzmienia R13.
 
 ---
 
