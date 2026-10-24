@@ -7259,6 +7259,20 @@ async fn the_generated_title_shows_only_when_the_operator_gave_none() {
             .map(|t| t.chars().count()),
         Some(50)
     );
+
+    reported.snapshot_sequence = 4;
+    reported.generated_title = None;
+    running.runner.snapshot(&reported).await.expect("snapshot");
+    assert_eq!(
+        harness
+            .task("task-1")
+            .await
+            .title
+            .as_deref()
+            .map(|t| t.chars().count()),
+        Some(50),
+        "a report without a title keeps the one shown"
+    );
 }
 
 #[tokio::test]

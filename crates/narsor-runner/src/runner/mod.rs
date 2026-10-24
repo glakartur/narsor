@@ -843,14 +843,16 @@ impl Session {
             // Asked again if the conductor becomes available.
             return;
         };
-        self.title_wanted = false;
         let Ok(execution) = self.engine.store().load_execution(&execution_id) else {
             return;
         };
         let description = snapshot::task_description(&self.engine, &self.definition, &execution);
         match registry.request_title(&execution_id, &description) {
-            Ok(true) => tracing::info!("asked the conductor to name the task"),
-            Ok(false) => {}
+            Ok(true) => {
+                self.title_wanted = false;
+                tracing::info!("asked the conductor to name the task")
+            }
+            Ok(false) => self.title_wanted = false,
             Err(error) => {
                 tracing::warn!(%error, "the conductor could not be asked to name the task")
             }

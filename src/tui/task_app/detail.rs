@@ -1464,7 +1464,7 @@ fn wrap_cells(text: &str, width: usize, max_rows: usize) -> Vec<String> {
             continue;
         }
         for ch in word.chars() {
-            if cells(&row) + cells(&ch.to_string()) > width {
+            if !row.is_empty() && cells(&row) + cells(&ch.to_string()) > width {
                 rows.push(std::mem::take(&mut row));
             }
             row.push(ch);

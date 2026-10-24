@@ -19,7 +19,7 @@ use super::model::{
     RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
 };
 use crate::domain::display::bounded_detail;
-use crate::domain::{without_unsafe_chars, TaskId};
+use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
 use crate::engine::{ConversationState, EventLink, Timeline};
 use crate::environment::backend::DEFAULT_SLOT_RELEASE_GRACE_SECS;
 use chrono::{DateTime, Duration, Utc};
@@ -90,8 +90,20 @@ impl ControlPlane {
             unavailable.kept = without_unsafe_chars(&unavailable.kept);
             unavailable.reason = without_unsafe_chars(&unavailable.reason);
         }
+        // The runner's title is bounded like its other free text.
+        snapshot.generated_title = snapshot
+            .generated_title
+            .as_deref()
+            .and_then(|title| one_line_label(title, GENERATED_TITLE_MAX_CHARS));
         let (task, applied) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
+            // A report without a title does not take back one already shown.
+            if snapshot.generated_title.is_none() {
+                snapshot.generated_title = record
+                    .runner
+                    .as_ref()
+                    .and_then(|previous| previous.snapshot.generated_title.clone());
+            }
             if let Some(previous) = &record.runner {
                 if previous.incarnation == incarnation
                     && previous.snapshot.snapshot_sequence == snapshot.snapshot_sequence
