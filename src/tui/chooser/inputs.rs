@@ -214,8 +214,8 @@ fn render_column(
     focused: Option<usize>,
     styles: &Styles,
 ) {
-    let order: Vec<usize> = (0..item.fields.len()).collect();
-    let has_long = order.iter().any(|&index| item.fields[index].is_long());
+    let order = 0..item.fields.len();
+    let has_long = item.fields.iter().any(ChooserField::is_long);
     let main = focused
         .filter(|index| item.fields[*index].is_long())
         .unwrap_or_else(|| chooser.main_field());
@@ -234,9 +234,9 @@ fn render_column(
     };
     let others = |with_text: bool| -> usize {
         order
-            .iter()
-            .filter(|&&index| Some(index) != main)
-            .map(|&index| rows_of(index, with_text))
+            .clone()
+            .filter(|&index| Some(index) != main)
+            .map(|index| rows_of(index, with_text))
             .sum()
     };
     let height = usize::from(area.height);
@@ -252,7 +252,7 @@ fn render_column(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut focus_line = 0;
-    for &index in &order {
+    for index in order {
         let field = &item.fields[index];
         let is_focused = focused == Some(index);
         if is_focused {

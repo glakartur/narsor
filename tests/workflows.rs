@@ -41,8 +41,14 @@ use serde_json::{json, Map, Value};
 /// The names of the workflows this crate ships, and their files.
 const SHIPPED: [(&str, &str); 4] = [
     ("compound-engineering", "compound-engineering.yaml"),
-    ("compound-engineering-chat", "compound-engineering-chat.yaml"),
-    ("compound-engineering-debug", "compound-engineering-debug.yaml"),
+    (
+        "compound-engineering-chat",
+        "compound-engineering-chat.yaml",
+    ),
+    (
+        "compound-engineering-debug",
+        "compound-engineering-debug.yaml",
+    ),
     ("open-mercato-sdlc", "open-mercato-sdlc.yaml"),
 ];
 

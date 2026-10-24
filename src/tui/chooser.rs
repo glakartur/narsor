@@ -922,7 +922,7 @@ impl Chooser {
         let Some(item) = self.selected_item() else {
             return Vec::new();
         };
-        focus_order_of(item)
+        (0..item.fields.len()).collect()
     }
 
     /// The multi-line field a form of inputs draws large when the focus is
@@ -1107,9 +1107,7 @@ impl Chooser {
         for field in &mut item.fields {
             field.error = None;
         }
-        let order = focus_order_of(item);
-        if let Some((index, message)) = order
-            .into_iter()
+        if let Some((index, message)) = (0..item.fields.len())
             .find_map(|index| item.fields[index].problem().map(|message| (index, message)))
         {
             item.fields[index].error = Some(message);
@@ -1173,11 +1171,6 @@ impl Chooser {
     fn description_lines(&self) -> usize {
         self.description_text().len()
     }
-}
-
-/// The order the focus walks the fields of `item`; see [`Chooser::focus_order`].
-fn focus_order_of(item: &ChooserItem) -> Vec<usize> {
-    (0..item.fields.len()).collect()
 }
 
 /// The multi-line field that takes the room of a form: the first required
