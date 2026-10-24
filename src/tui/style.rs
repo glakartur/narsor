@@ -44,7 +44,7 @@ use std::ffi::OsString;
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType};
 use ratatui::Frame;
 
@@ -104,6 +104,21 @@ pub struct SelectionMarks {
 /// no-color.org has it.
 pub fn no_color_requested(value: Option<OsString>) -> bool {
     value.is_some_and(|value| !value.is_empty())
+}
+
+/// What stands on the top edge of a panel, already cut to fit: pills on the
+/// left, one on the right, as [`Styles::render_panel_edge`] draws them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PanelEdge {
+    /// Texts of the pills on the left, in order.
+    pub left: Vec<String>,
+    /// A plain text, not a pill, before the pills: the panel's title when
+    /// there is nothing to put in a pill. Carries its own spaces.
+    pub plain: Option<String>,
+    /// Text of the pill on the right.
+    pub right: Option<String>,
+    /// The loading marker, after the left side and outside the pills.
+    pub tail: Option<String>,
 }
 
 /// The looks of every role, in one of two modes.
@@ -268,6 +283,85 @@ impl Styles {
         focused: bool,
     ) -> Rect {
         let block = self.panel(title, focused);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
+    }
+
+    /// Cells a pill adds to its text: a cap on each side and a space inside
+    /// each cap. Without colour the caps are `┤` and `├`, so the width is the
+    /// same in both modes.
+    pub const PILL_OVERHEAD: usize = 4;
+
+    /// A pill on a panel's edge: `text` on a ground in `role`'s colour between
+    /// two rounded caps (U+E0B6, U+E0B4). Without colour it is `┤ text ├` in
+    /// the role's own style.
+    pub fn edge_pill(&self, text: &str, role: Role, bold: bool) -> Vec<Span<'static>> {
+        let weight = |style: Style| {
+            if bold {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                style
+            }
+        };
+        if self.no_color {
+            return vec![Span::styled(format!("┤ {text} ├"), weight(self.of(role)))];
+        }
+        let ground = self.of(role).fg.unwrap_or(Color::Reset);
+        let cap = Style::default().fg(ground);
+        vec![
+            Span::styled("\u{e0b6}", cap),
+            Span::styled(
+                format!(" {text} "),
+                weight(Style::default().fg(Color::Black).bg(ground)),
+            ),
+            Span::styled("\u{e0b4}", cap),
+        ]
+    }
+
+    /// Draws the frame of a panel with `edge` on its top line (see
+    /// [`PanelEdge`]) over `area` and returns the area inside it. The frame
+    /// looks as [`Styles::panel`] has it; a `stale` edge is in the background
+    /// role whoever has the keys.
+    pub fn render_panel_edge(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        edge: &PanelEdge,
+        focused: bool,
+        stale: bool,
+    ) -> Rect {
+        let frame_role = if focused { Role::Focus } else { Role::Done };
+        let pill_role = if stale { Role::Done } else { frame_role };
+        let mut left: Vec<Span<'static>> = Vec::new();
+        if focused {
+            left.push(Span::styled("▸", self.strong(frame_role)));
+        }
+        if let Some(plain) = &edge.plain {
+            let style = if focused {
+                self.strong(frame_role)
+            } else {
+                self.of(frame_role)
+            };
+            left.push(Span::styled(plain.clone(), style));
+        }
+        for (index, text) in edge.left.iter().enumerate() {
+            if index > 0 {
+                left.push(Span::styled("─", self.of(frame_role)));
+            }
+            left.extend(self.edge_pill(text, pill_role, focused));
+        }
+        if let Some(tail) = &edge.tail {
+            left.push(Span::styled(format!(" {tail}"), self.strong(frame_role)));
+        }
+        let mut block = Block::bordered()
+            .border_type(Self::FRAME)
+            .border_style(self.of(frame_role))
+            .title(Line::from(left).left_aligned());
+        if let Some(right) = &edge.right {
+            block =
+                block.title(Line::from(self.edge_pill(right, pill_role, false)).right_aligned());
+        }
         let inner = block.inner(area);
         frame.render_widget(block, area);
         inner
