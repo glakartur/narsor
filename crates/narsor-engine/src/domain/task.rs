@@ -87,6 +87,19 @@ pub fn one_line_label(raw: &str, max: usize) -> Option<String> {
     (!cut.is_empty()).then_some(cut)
 }
 
+/// A title a model made, safe to render into any template — a script's
+/// command line included: letters, digits, spaces and `- _ . , : ( )` stay,
+/// everything else (quotes, `$`, backticks, `;`, `|`, `/`, `\`, control
+/// characters) is dropped. One line of at most `max` characters; `None` when
+/// nothing is left.
+pub fn plain_generated_title(raw: &str, max: usize) -> Option<String> {
+    let kept: String = raw
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || "-_.,:()".contains(*c))
+        .collect();
+    one_line_label(&kept, max)
+}
+
 /// The title a task shows: the operator's, else the one the conductor made.
 pub fn effective_title(operator: Option<&str>, generated: Option<&str>) -> Option<String> {
     operator

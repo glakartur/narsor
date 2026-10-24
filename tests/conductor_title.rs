@@ -152,7 +152,10 @@ async fn the_conductor_names_the_task_and_the_title_is_kept_once() {
         "a stored title is not asked for again"
     );
     assert_eq!(fixture.conductor.calls().len(), 1);
-    assert!(fixture.store().read_chat().unwrap().is_empty(), "no chat entry");
+    assert!(
+        fixture.store().read_chat().unwrap().is_empty(),
+        "no chat entry"
+    );
 }
 
 #[tokio::test]
@@ -168,7 +171,10 @@ async fn a_long_multiline_answer_is_stored_as_one_line_of_at_most_50_characters(
 
     let title = fixture.title().unwrap();
     assert!(title.chars().count() <= 50, "{title}");
-    assert!(!title.contains('\n') && !title.contains('\u{1b}'), "{title:?}");
+    assert!(
+        !title.contains('\n') && !title.contains('\u{1b}'),
+        "{title:?}"
+    );
 }
 
 #[tokio::test]
@@ -190,8 +196,29 @@ async fn a_conductor_that_fails_leaves_no_title_no_chat_and_no_retry() {
         .store()
         .load_execution(&fixture.execution_id)
         .unwrap();
-    assert_eq!(execution.status, ExecutionStatus::Running, "the execution is untouched");
+    assert_eq!(
+        execution.status,
+        ExecutionStatus::Running,
+        "the execution is untouched"
+    );
     let _ = &fixture.engine;
+}
+
+#[tokio::test]
+async fn shell_metacharacters_never_reach_the_stored_title() {
+    let fixture = Fixture::new(vec![title_answer(
+        "Napraw `rm -rf /`; $(whoami) \"x\" | cat",
+    )]);
+    fixture
+        .registry
+        .request_title(&fixture.execution_id, "opis")
+        .unwrap();
+    wait_until("the title is stored", || fixture.title().is_some()).await;
+    let title = fixture.title().unwrap();
+    for forbidden in ['`', '$', ';', '|', '"', '/', '\\', '\''] {
+        assert!(!title.contains(forbidden), "{forbidden} in {title}");
+    }
+    assert!(title.contains("Napraw"), "{title}");
 }
 
 #[tokio::test]

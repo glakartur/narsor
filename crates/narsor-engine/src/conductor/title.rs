@@ -6,6 +6,10 @@
 //! line kept in the conductor's store ([`ConductorStore::save_generated_title`]);
 //! the runner reads it from there and reports it. A conductor that fails or
 //! is interrupted leaves nothing: no chat entry, no problem, no retry.
+//!
+//! The title is model output that `{{ task.title }}` renders into steps, a
+//! script's command among them, so only a conservative set of characters is
+//! kept ([`plain_generated_title`]).
 
 use serde_json::json;
 
@@ -14,7 +18,7 @@ use crate::conductor::response::{ConductorResponse, Decision};
 use crate::conductor::store::{ConductorStore, QueuedRequest};
 use crate::conductor::ConductorRegistry;
 use crate::domain::{
-    one_line_label, ConductorPurpose, ConductorTrigger, GENERATED_TITLE_MAX_CHARS,
+    plain_generated_title, ConductorPurpose, ConductorTrigger, GENERATED_TITLE_MAX_CHARS,
 };
 use crate::persistence::Result;
 
@@ -64,7 +68,7 @@ pub(super) fn conclude_title(store: &ConductorStore, outcome: &InvocationOutcome
     else {
         return Ok(());
     };
-    match one_line_label(&title, GENERATED_TITLE_MAX_CHARS) {
+    match plain_generated_title(&title, GENERATED_TITLE_MAX_CHARS) {
         Some(title) => store.save_generated_title(&title),
         None => Ok(()),
     }
