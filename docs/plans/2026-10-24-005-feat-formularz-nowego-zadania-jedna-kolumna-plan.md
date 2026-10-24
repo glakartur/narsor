@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-10-24-formularz-nowego-zadania-pola-pod-soba-requi
 
 ## Summary
 
-Trzy zmiany w TUI. (1) `src/tui/chooser/inputs.rs` rysuje wszystkie pola jedno pod drugim zamiast paska krótkich pól. Kolejność nawigacji jest kolejnością deklaracji pól. (2) Pole wieloliniowe ma tło w całym prostokącie, także w pustych wierszach. (3) Pola Ticket i Tytuł mają limit 15 i 50 znaków, tylko w formularzu TUI, z licznikiem. Backend nie zmienia się (see origin: `docs/brainstorms/2026-10-24-formularz-nowego-zadania-pola-pod-soba-requirements.md`).
+Trzy zmiany w TUI. (1) `src/tui/chooser/inputs.rs` rysuje wszystkie pola jedno pod drugim zamiast paska krótkich pól. Kolejność nawigacji jest kolejnością deklaracji pól. (2) Pole wieloliniowe ma tło w całym prostokącie, także w pustych wierszach. (3) Pola Ticket i Tytuł mają limit 15 i 50 znaków, tylko w formularzu TUI, bez licznika znaków. Backend nie zmienia się (see origin: `docs/brainstorms/2026-10-24-formularz-nowego-zadania-pola-pod-soba-requirements.md`).
 
 ---
 
@@ -33,13 +33,14 @@ Limit tytułu 50 znaków to dziś `GENERATED_TITLE_MAX_CHARS` w `crates/narsor-e
 | R1, R2, R3, R6 | U1, U2 |
 | R4, R5 | U1, U2 |
 | R7, R8, R9, R10, R11 | U1 |
-| R12–R16 | U3, U4 |
-| R17 | U3 (brak zmiany backendu), U5 (test) |
+| R12–R15 | U3 |
+| R16 (licznik) | Poza zakresem: operator nie chce licznika znaków |
+| R17 | U3 (brak zmiany backendu), U4 (test) |
 | R18 | U3 |
 | AE1, AE9, AE10 | U1, U2 |
 | AE2, AE3, AE4 | U1 |
-| AE5, AE6, AE7 | U3, U4 |
-| AE8 | U5 |
+| AE5, AE6, AE7 | U3 |
+| AE8 | U4 |
 
 ---
 
@@ -51,6 +52,7 @@ Limit tytułu 50 znaków to dziś `GENERATED_TITLE_MAX_CHARS` w `crates/narsor-e
 - Bez limitu w polu własnym workflow o nazwie `ticket_id` albo podobnej. Limit dotyczy tylko pól `Ticket` i `Tytuł` formularza.
 - Bez zmian w innych widokach (nagłówek szczegółów, zakładka Info) i w późniejszej edycji ticketu i tytułu.
 - Bez nowych pól w formularzu.
+- Bez licznika znaków (`7/15`) w wierszu pola. Operator widzi limit tylko przez to, że dodatkowy znak nie jest przyjęty.
 
 ### Deferred to Follow-Up Work
 
@@ -67,7 +69,6 @@ Limit tytułu 50 znaków to dziś `GENERATED_TITLE_MAX_CHARS` w `crates/narsor-e
 - **Tło całego prostokąta:** `main_body` dopełnia wiersze do `main_height` wierszami z tłem (`fill_padding` z `used = 0`, z prefiksem `CONTINUATION`), nie pustymi `Line::raw("")`. Dla pola nieaktywnego dopełnienie zostaje puste, bez tła (R10). Pole zwinięte nie ma tła, bo nie ma focusu.
 - **Niski terminal (pytanie z origin).** Kolumna nie przycina Opisu do zera. Gdy wysokość nie wystarcza na wszystkie wiersze i `MIN_MAIN_ROWS` wierszy Opisu, kolumna przewija się tak, by wiersz aktywnego pola był widoczny (jak `render_fields` z `focus_line`). Wiersze krótkich pól nie giną po cichu.
 - **Limit długości w polu, nie w formularzu.** `ChooserField` dostaje opcjonalny limit znaków i budowniczy `limited(n)`. `edit` i `paste` pilnują limitu. Dzięki temu silnik jednego pola daje R14 i R15 dla każdego formularza, a tylko `label_fields()` ustawia 15 i 50.
-- **Licznik `7/15`** w wierszu pola, wyrównany do prawej, tylko gdy wiersz ma miejsce na nazwę, wartość i licznik. W wąskim terminalu licznik znika (Z7). Aktywne pole przy limicie pokazuje licznik w tym samym kolorze co wiersz.
 - **R18: jedna stała.** Przenieść `GENERATED_TITLE_MAX_CHARS` do `crates/narsor-protocol` (np. obok `display`), a `crates/narsor-engine/src/domain/task.rs` ma ją reeksportować. Formularz importuje ją z `narsor-protocol`. Limit ticketu (15) to nowa stała w `new_task.rs`: nie jest współdzielony z dyrygentem. Przed przeniesieniem sprawdzić, czy `narsor-engine` zależy od `narsor-protocol` (powinien).
 - **Wklejanie.** `pasted_text` zostaje bez zmian (nowa linia to spacja, Z8). `ChooserField::paste` obcina wynik do wolnego miejsca (`limit - znaki w polu`), po wstawieniu w miejscu kursora.
 
@@ -194,38 +195,7 @@ Limit tytułu 50 znaków to dziś `GENERATED_TITLE_MAX_CHARS` w `crates/narsor-e
 
 ---
 
-### U4. Licznik znaków w wierszu pola
-
-**Goal:** Operator widzi `7/15` przy Ticket i `12/50` przy Tytule.
-
-**Requirements:** R16; AE5.
-
-**Dependencies:** U1, U3.
-
-**Files:**
-- Modify: `src/tui/chooser/inputs.rs`
-- Test: `tests/tui_render.rs`
-
-**Approach:**
-- Wiersz pola krótkiego z limitem kończy się licznikiem `n/limit`, wyrównanym do prawej. Wartość i okno kursora dostają szerokość pomniejszoną o licznik.
-- Licznik w stylu `Done` (przygaszony). Przy `n == limit` w stylu `Problem` jest zbędny: wystarczy `Done`. Bez koloru (`Styles::new(true)`) licznik jest zwykłym tekstem.
-- Gdy wiersz ma mniej niż nazwa + 4 komórki wartości + licznik, licznik nie jest rysowany (Z7).
-
-**Patterns to follow:** `render_status`, `header_line` w `inputs.rs`.
-
-**Test scenarios:**
-- Covers AE5. Ticket z 15 znakami: wiersz kończy się `15/15`.
-- Pusty Ticket: wiersz kończy się `0/15`. Tytuł z 7 znakami: `7/50`.
-- Licznik liczy znaki, nie bajty: Tytuł `Zażółć` pokazuje `6/50`.
-- Wąski obszar (szerokość 20): brak licznika, brak paniki, wartość nadal widoczna.
-- Pole bez limitu (Repo, `dry_run`): brak licznika.
-- Licznik nie ma tła edycji (tło sięga do `text_width` pola, licznik leży za nim) i nie przesuwa kursora.
-
-**Verification:** w buforze licznik stoi w ostatnich komórkach wiersza pola z limitem i zgadza się z liczbą znaków.
-
----
-
-### U5. Brak zmiany backendu i testy regresji
+### U4. Brak zmiany backendu i testy regresji
 
 **Goal:** Udowodnić, że limity 15 i 50 nie wyciekły poza formularz.
 
@@ -270,10 +240,10 @@ Limit tytułu 50 znaków to dziś `GENERATED_TITLE_MAX_CHARS` w `crates/narsor-e
 
 ## Origin Coverage
 
-- Problem Frame, Summary, Scope Boundaries i Key Decisions z origin są przeniesione. Decyzja użytkownika (limity tylko w TUI) to U3 i U5.
+- Problem Frame, Summary, Scope Boundaries i Key Decisions z origin są przeniesione. Decyzja użytkownika (limity tylko w TUI) to U3 i U4.
 - Z1 (Temat = Tytuł), Z3 (Repo = `repository`), Z4 (Opis = główne pole tekstowe), Z5 (pozostałe wejścia po Repo): przyjęte bez zmian.
 - Z6 (przycinanie białych znaków): bez zmian. Serwer przycina, formularz liczy znaki wpisane.
-- Z7 (licznik opcjonalny): U4 rysuje licznik i chowa go w wąskim terminalu.
+- Z7 (licznik opcjonalny): licznika nie ma. Decyzja operatora z przeglądu PR #29.
 - Z8 (nowa linia to spacja): U3.
 - Pytania odroczone do planowania: pasek znika całkowicie (Key Technical Decisions); wysokość w niskim terminalu (przewijanie kolumny); przyczyna tła tylko pod tekstem (Problem Frame: `resize` z pustymi wierszami); limit i wklejanie (U3).
 - Brak pytań blokujących.
