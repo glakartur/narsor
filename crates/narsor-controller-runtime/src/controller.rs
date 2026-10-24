@@ -1605,7 +1605,7 @@ mod tests {
 
     fn launch_spec() -> serde_json::Value {
         serde_json::json!({
-            "version": 3, "workflow_id": "wf", "workflow_version": 1, "inputs": {},
+            "version": narsor_protocol::launch::TASK_LAUNCH_SPEC_VERSION, "workflow_id": "wf", "workflow_version": 1, "inputs": {},
             "workspace": {}, "environment": {}, "resources": {}, "digest": "d",
         })
     }
