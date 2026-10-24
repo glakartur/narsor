@@ -75,7 +75,7 @@ narsor validate workflows/compound-engineering.yaml
 
 narsor repo add acme-web --remote git@github.com:acme/web.git   # once
 narsor run workflows/compound-engineering.yaml \
-  --input feature_description="let a reviewer subscribe to a run" \
+  --input description="let a reviewer subscribe to a run" \
   --input target_repo=acme-web
 
 narsor show <execution-id>          # where it is waiting

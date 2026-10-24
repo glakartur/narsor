@@ -13,7 +13,7 @@ description: >
   GitLab; a person merges it.
 
 inputs:
-  - name: bug_description
+  - name: description
     type: text
     required: true
     description: >
@@ -25,7 +25,7 @@ inputs:
     description: The repository the work happens in.
 
 display:
-  title: "{{ inputs.bug_description }}"
+  title: "{{ inputs.description }}"
   links:
     - label: PR
       text: "{{ context.variables.pr_url }}"
@@ -53,7 +53,7 @@ states:
       prompt: |
         Run the `ce-debug` skill with these arguments:
 
-        {{ inputs.bug_description }}
+        {{ inputs.description }}
 
         Do phases 0, 1 and 2 only: triage, investigate, root cause. Stop when the causal chain gate is passed. Do not fix the bug. Do not edit production code. You may write a failing test that reproduces the bug. Leave it in the workspace and do not commit it.
 
@@ -149,7 +149,7 @@ states:
       prompt: |
         Run the `ce-debug` skill with these arguments:
 
-        {{ inputs.bug_description }}
+        {{ inputs.description }}
 
         The person has chosen "Fix it now". The investigation is done. Do not repeat it and do not ask the "Fix it now / Diagnosis only" question. Start at phase 3. Read the diagnosis and check it against the code. If the code does not match it, choose `needs_diagnosis_revision`.
         Diagnosis:
@@ -312,7 +312,7 @@ states:
         Push the reviewed fix, with its test, to the open merge request of this branch ({{ context.pr_url }}). If the branch has none, open one as a Draft against the repository's default branch.
         Write the description of the merge request on every push so that it describes the whole change: the bug, the root cause, the fix, the tests, the confidence. Take it from this diagnosis and from the diff. Keep the Draft state.
         {{ context.diagnosis }}
-        When the bug description refers to an issue, add the closing keyword that the issue tracker parses in the place it requires. Bug description: {{ inputs.bug_description }}
+        When the bug description refers to an issue, add the closing keyword that the issue tracker parses in the place it requires. Bug description: {{ inputs.description }}
         Report the merge request URL in `pr_url`.
     variables:
       - name: pr_url

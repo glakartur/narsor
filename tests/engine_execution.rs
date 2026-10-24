@@ -1098,7 +1098,7 @@ async fn explicit_recovery_retries_an_interrupted_agent_step_and_passes_the_oper
     let failed = engine
         .start_and_run(
             &definition,
-            json!({ "feature_description": "add login", "target_repo": "acme/web" }),
+            json!({ "description": "add login", "target_repo": "acme/web" }),
             harness.workspace(),
         )
         .await
@@ -1149,7 +1149,7 @@ async fn the_reference_workflow_runs_end_to_end_on_stubs() {
     let execution = engine
         .start_and_run(
             &definition,
-            json!({ "feature_description": "add login", "target_repo": "acme/web" }),
+            json!({ "description": "add login", "target_repo": "acme/web" }),
             harness.workspace(),
         )
         .await
@@ -1231,7 +1231,7 @@ async fn the_reference_workflow_pauses_for_a_person_and_carries_on() {
     let execution = engine
         .start_and_run(
             &definition,
-            json!({ "feature_description": "add login", "target_repo": "acme/web" }),
+            json!({ "description": "add login", "target_repo": "acme/web" }),
             harness.workspace(),
         )
         .await

@@ -731,14 +731,14 @@ fn context_references_and_filter_expressions_are_left_to_the_runtime() {
 name: runtime-references
 version: 1
 inputs:
-  - name: feature_description
+  - name: description
     type: string
 states:
   start:
     action:
       type: agent
       harness: claude-code
-      prompt: "{{ context.clarification_text | default(inputs.feature_description) }} {{ context.anything }}"
+      prompt: "{{ context.clarification_text | default(inputs.description) }} {{ context.anything }}"
     choices: [done]
     transitions:
       done: finished

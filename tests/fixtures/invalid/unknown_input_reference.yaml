@@ -3,7 +3,7 @@ name: unknown-input-reference
 version: 1
 
 inputs:
-  - name: feature_description
+  - name: description
     type: string
     required: true
 

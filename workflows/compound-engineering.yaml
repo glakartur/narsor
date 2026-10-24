@@ -12,7 +12,7 @@ description: >
   person merges it.
 
 inputs:
-  - name: feature_description
+  - name: description
     type: text
     required: true
     description: The idea, problem or feature to explore, plan and ship.
@@ -22,7 +22,7 @@ inputs:
     description: The repository the work happens in.
 
 display:
-  title: "{{ inputs.feature_description }}"
+  title: "{{ inputs.description }}"
   links:
     - label: PR
       text: "{{ context.variables.pr_url }}"
@@ -50,7 +50,7 @@ states:
       prompt: |
         Run the `ce-brainstorm` skill with these arguments:
 
-        {{ inputs.feature_description }}
+        {{ inputs.description }}
 
         Do not ask the person anything. Do not use a tool that asks questions. Do not return `awaiting_input`. When the direction is unclear, take the safest assumption and continue. Write each assumption in a section named "Założenia do potwierdzenia". Write each question that needs the person in a separate section named "Pytania otwarte dla użytkownika". The person answers on the merge request.
 

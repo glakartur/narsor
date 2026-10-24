@@ -835,7 +835,7 @@ mod tests {
     fn passes_through_context_and_filter_expressions() {
         assert!(extract_input_references("{{ context.clarification_text }}").is_empty());
         assert!(extract_input_references(
-            "{{ context.clarification_text | default(inputs.feature_description) }}"
+            "{{ context.clarification_text | default(inputs.description) }}"
         )
         .is_empty());
     }

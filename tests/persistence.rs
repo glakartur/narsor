@@ -61,7 +61,7 @@ fn sample_execution(id: &str) -> WorkflowExecution {
         current_state: Some("implement".to_string()),
         started_at: Utc::now(),
         completed_at: None,
-        inputs: serde_json::json!({ "feature_description": "login" }),
+        inputs: serde_json::json!({ "description": "login" }),
         context,
         workspace: Workspace::git_checkout(
             "/tmp/workspace-42".to_string(),
