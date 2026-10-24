@@ -266,10 +266,7 @@ pub(super) async fn serve_events(
     let Some(client) = link.client() else {
         return;
     };
-    let (events, has_more) = match store
-        .event_log(execution_id)
-        .read_after(request.after, request.limit as usize)
-    {
+    let page = match events_page(store, execution_id, &request) {
         Ok(page) => page,
         Err(error) => {
             tracing::warn!(%error, "cannot read the execution events");
@@ -277,13 +274,25 @@ pub(super) async fn serve_events(
             return;
         }
     };
-    let page = ExecutionEventsPage { events, has_more };
     if let Err(error) = client
         .upload_execution_events(&request.request_id, &page)
         .await
     {
         link.failed(&error, timing);
     }
+}
+
+/// The events an events read asks for: those after the requested sequence,
+/// at most the requested number.
+pub(super) fn events_page(
+    store: &ExecutionStore,
+    execution_id: &str,
+    request: &ExecutionEventsRequest,
+) -> Result<ExecutionEventsPage, crate::persistence::PersistenceError> {
+    let (events, has_more) = store
+        .event_log(execution_id)
+        .read_after(request.after, request.limit as usize)?;
+    Ok(ExecutionEventsPage { events, has_more })
 }
 
 /// Uploads the conductor's state an owner waits for; `describe` says whether
@@ -299,13 +308,8 @@ pub(super) async fn serve_conductor_read(
     let Some(client) = link.client() else {
         return;
     };
-    let view = match crate::conductor::ConductorView::read(
-        store,
-        execution_id,
-        request.after,
-        request.limit as usize,
-    ) {
-        Ok(view) => describe(view),
+    let view = match conductor_view(store, execution_id, &request, describe) {
+        Ok(view) => view,
         Err(error) => {
             tracing::warn!(%error, "cannot read the conductor's state");
             fail_read(link, timing, &request.request_id, &error.to_string()).await;
@@ -318,6 +322,23 @@ pub(super) async fn serve_conductor_read(
     {
         link.failed(&error, timing);
     }
+}
+
+/// The conductor's state a conductor read asks for, with what `describe`
+/// says beside it.
+pub(super) fn conductor_view(
+    store: &ExecutionStore,
+    execution_id: &str,
+    request: &ConductorReadRequest,
+    describe: impl FnOnce(crate::conductor::ConductorView) -> crate::conductor::ConductorView,
+) -> Result<crate::conductor::ConductorView, crate::persistence::PersistenceError> {
+    let view = crate::conductor::ConductorView::read(
+        store,
+        execution_id,
+        request.after,
+        request.limit as usize,
+    )?;
+    Ok(describe(view))
 }
 
 /// Tells the control plane that the read `request_id` cannot be answered, so
@@ -336,5 +357,226 @@ pub(super) async fn fail_read(
     };
     if let Err(error) = client.upload_relay_failure(request_id, &failure).await {
         link.failed(&error, timing);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::domain::{
+        EventData, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec, TaskWorkspace,
+    };
+    use crate::runner::{initialize, HarnessHome, MountedSecrets};
+
+    /// A directory that deletes itself.
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("narsor-reader-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const WORKFLOW: &str = r#"
+name: one-step
+version: 1
+states:
+  work:
+    action:
+      type: agent
+      prompt: Do the work.
+    choices: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+    fn task() -> TaskId {
+        TaskId::parse("task-1").unwrap()
+    }
+
+    /// A storage a working runner initialized, and the lock it holds.
+    fn worked_on(root: &TempRoot) -> (TaskStorage, StorageLock) {
+        let storage = TaskStorage::new(root.0.join("storage"));
+        let lock = storage.lock().unwrap();
+        let definition = crate::workflow::load_from_str(WORKFLOW).unwrap();
+        let spec = TaskLaunchSpec::new(
+            definition.id.clone(),
+            definition.version,
+            serde_json::json!({}),
+            TaskWorkspace::None,
+            ResolvedEnvironment::harness_only("claude-code"),
+            ResourceProfile::new(1000, 2048),
+        )
+        .with_definition(&definition)
+        .unwrap();
+        initialize(
+            &storage,
+            &storage.store(),
+            &task(),
+            &spec,
+            &MountedSecrets::new(None),
+        )
+        .unwrap();
+        (storage, lock)
+    }
+
+    /// A reader's configuration; its credential file does not exist, so it
+    /// never reaches a control plane.
+    fn reader_config(root: &TempRoot, storage: &TaskStorage) -> RunnerConfig {
+        RunnerConfig {
+            task_id: task(),
+            storage: storage.root().to_path_buf(),
+            launch_spec: None,
+            control_plane: "http://control-plane.invalid".to_string(),
+            credential_file: root.0.join("no-credential"),
+            secrets_dir: None,
+            harness_home: HarnessHome::default(),
+            incarnation: "reader-1".to_string(),
+            timing: RunnerTiming::default(),
+            contract: crate::runner::BaseImageContract::default(),
+            read_only: true,
+        }
+    }
+
+    type TreeEntry = (bool, u64, std::time::SystemTime);
+
+    /// Kind, size and modification time of every entry under `root`, `root`
+    /// itself and the directories included: a file created and removed again
+    /// still moves its directory's time.
+    fn tree(root: &Path) -> BTreeMap<String, TreeEntry> {
+        fn walk(root: &Path, dir: &Path, tree: &mut BTreeMap<String, TreeEntry>) {
+            let meta = fs::symlink_metadata(dir).unwrap();
+            let key = dir.strip_prefix(root).unwrap().display().to_string();
+            let size = if meta.is_dir() { 0 } else { meta.len() };
+            tree.insert(key, (meta.is_dir(), size, meta.modified().unwrap()));
+            if meta.is_dir() {
+                for entry in fs::read_dir(dir).unwrap() {
+                    walk(root, &entry.unwrap().path(), tree);
+                }
+            }
+        }
+        let mut tree = BTreeMap::new();
+        walk(root, root, &mut tree);
+        tree
+    }
+
+    /// Runs a reader on the storage as it is; checks that it ends with the
+    /// reason at once and leaves the storage alone, and returns the reason.
+    async fn unavailable_reader(root: &TempRoot, storage: &TaskStorage) -> String {
+        let before = tree(storage.root());
+        let exit = run(reader_config(root, storage)).await.unwrap();
+        assert_eq!(tree(storage.root()), before, "nothing changed");
+        let RunnerExit::Problem(problem) = exit else {
+            panic!("a problem: {exit:?}");
+        };
+        assert_eq!(problem.code, PROBLEM_READER_UNAVAILABLE);
+        problem.message
+    }
+
+    /// A storage another runner holds is not waited for: the reader says it
+    /// cannot read and changes nothing; the working runner keeps its lock.
+    #[tokio::test]
+    async fn a_read_only_runner_on_a_busy_storage_says_so_and_exits() {
+        let root = TempRoot::new();
+        let (storage, _working) = worked_on(&root);
+
+        let reason = unavailable_reader(&root, &storage).await;
+
+        assert!(reason.contains("in use by another runner"), "{reason}");
+        assert!(
+            matches!(storage.lock(), Err(RunnerError::StorageBusy(_))),
+            "the working runner still holds the lock"
+        );
+    }
+
+    /// A storage no runner ever finished initializing is not made into one
+    /// by a read, whether its marker or its lock file is what is missing.
+    #[tokio::test]
+    async fn a_read_only_runner_on_an_uninitialized_storage_says_so_and_creates_nothing() {
+        let root = TempRoot::new();
+        let (storage, working) = worked_on(&root);
+        drop(working);
+
+        fs::remove_file(storage.bookkeeping_dir().join("initialized.json")).unwrap();
+        let reason = unavailable_reader(&root, &storage).await;
+        assert!(reason.contains("never initialized"), "{reason}");
+
+        fs::remove_dir_all(storage.bookkeeping_dir()).unwrap();
+        let reason = unavailable_reader(&root, &storage).await;
+        assert!(reason.contains("never initialized"), "{reason}");
+        assert!(
+            !storage.bookkeeping_dir().exists(),
+            "not even the bookkeeping directory was created"
+        );
+    }
+
+    /// An events read is answered with the events after the asked sequence,
+    /// at most the asked number, and says whether more follow.
+    #[test]
+    fn an_events_read_gets_the_page_it_asked_for() {
+        let root = TempRoot::new();
+        let store = ExecutionStore::new(&root.0);
+        let log = store.event_log("exec-1");
+        let execution_id = "exec-1".to_string();
+        for state in ["a", "b", "c", "d", "e"] {
+            log.append_next(
+                &execution_id,
+                EventData::StateEntered {
+                    state_id: state.to_string(),
+                },
+            )
+            .unwrap();
+        }
+        let request = |after, limit| ExecutionEventsRequest {
+            request_id: "read-1".to_string(),
+            after,
+            limit,
+        };
+
+        let page = events_page(&store, "exec-1", &request(2, 2)).unwrap();
+        let sequences: Vec<u64> = page.events.iter().map(|event| event.sequence).collect();
+        assert_eq!(sequences, vec![3, 4]);
+        assert!(page.has_more);
+
+        let page = events_page(&store, "exec-1", &request(4, 10)).unwrap();
+        let sequences: Vec<u64> = page.events.iter().map(|event| event.sequence).collect();
+        assert_eq!(sequences, vec![5]);
+        assert!(!page.has_more);
+    }
+
+    /// A reader's conductor view is the stored chat, without a conductor.
+    #[test]
+    fn a_readers_conductor_view_says_no_conductor_runs() {
+        let root = TempRoot::new();
+        let store = ExecutionStore::new(&root.0);
+        let request = ConductorReadRequest {
+            request_id: "read-1".to_string(),
+            after: 0,
+            limit: 10,
+        };
+
+        let view = conductor_view(&store, "exec-1", &request, |view| {
+            view.without_conductor(NO_CONDUCTOR)
+        })
+        .unwrap();
+
+        assert!(!view.available);
+        assert_eq!(view.unavailable_reason.as_deref(), Some(NO_CONDUCTOR));
+        assert!(view.chat.is_empty());
     }
 }

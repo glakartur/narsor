@@ -1924,6 +1924,7 @@ dependencies = [
  "narsor-controller-runtime",
  "narsor-engine",
  "narsor-protocol",
+ "narsor-runner",
  "narsor-server",
  "narsor-shared",
  "p256 0.14.0",
@@ -2040,6 +2041,7 @@ dependencies = [
 name = "narsor-runner"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "clap",
  "libc",

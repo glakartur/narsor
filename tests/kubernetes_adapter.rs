@@ -290,6 +290,55 @@ fn the_runner_is_told_the_backends_home_mode() {
     assert_eq!(tail, ["--home", "host", "--codex-home", "/mnt/codex"]);
 }
 
+/// R17: a Pod's runner keeps its private HOME on the task's claim. The
+/// arguments the Pod passes, read by the runner itself, put HOME below the
+/// mount of the task's PersistentVolumeClaim, and the Pod sets no HOME.
+#[test]
+fn the_private_home_of_a_pod_is_on_the_tasks_claim() {
+    use clap::Parser;
+    use narsor_runner::runner::cli::{runner_config, RunnerArgs};
+
+    #[derive(Parser)]
+    struct Runner {
+        #[command(flatten)]
+        args: RunnerArgs,
+    }
+
+    let (pod, task, _) = generated_pod(spec());
+    let argv = std::iter::once("narsor-runner".to_string()).chain(runner_args(&pod));
+    let parsed = Runner::try_parse_from(argv).expect("the runner reads the Pod's arguments");
+    let config = runner_config(parsed.args).expect("a configuration");
+    assert_eq!(config.harness_home.mode, HomeMode::Private);
+    let home = narsor_runner::runner::TaskStorage::new(&config.storage).home_dir();
+
+    let container = &pod["spec"]["containers"][0];
+    let named = |list: &Value, name: &str| -> Value {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let mount = named(&container["volumeMounts"], "task-storage");
+    assert!(
+        home.starts_with(mount["mountPath"].as_str().unwrap()),
+        "{} is not on {mount}",
+        home.display()
+    );
+    assert_ne!(mount["readOnly"], Value::Bool(true));
+    let volume = named(&pod["spec"]["volumes"], "task-storage");
+    assert_eq!(
+        volume["persistentVolumeClaim"]["claimName"].as_str(),
+        Some(task.storage.as_str())
+    );
+    assert!(container["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|variable| variable["name"] != "HOME"));
+}
+
 /// One main runner container, one init container, separate task and PATH
 /// volumes, a non-root-compatible security context (U5 scenario 1).
 #[test]
