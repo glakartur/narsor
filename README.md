@@ -569,6 +569,9 @@ step (with the conductor's diagnosis and proposals, or the raw error), a
 proposal of the conductor's, a failed provisioning. Every choice is a list with
 a description of its effect next to it; `Tab` moves between the choices and
 their fields, `Enter` sends, `Esc` folds the panel and keeps what was typed.
+Action 0, `Napisz do agenta`, is the first choice of every panel: type a
+message and send it. The panel keeps the text when the send fails and empties
+the field when it succeeds.
 `Space` on the list jumps to the next task that waits, `[` / `]` move between
 several waitings of one task. The header counts them (`? 1 · ! 1`).
 
@@ -587,7 +590,7 @@ danych". An action marked `!` asks `y` / `n` first.
 | `s` | start again an interrupted task or a failed provisioning | `narsor-cli task start` |
 | `a` | archive (`!`) | `narsor-cli task archive` |
 | `o` | open a link of the task (`display.links`) in the browser | — |
-| `c` | comment to the agent, in one step: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a pause: the note goes to the agent and the task resumes | — |
+| `c` | action 0, `Napisz do agenta` (first in the menu), in one step: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a pause: the note goes to the agent and the task resumes. A text that was not sent stays as a draft of the task | — |
 | `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
 | `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor-cli task conductor undo` |
 | the panel | confirm / reject a proposal, restart a failed step with a note | `narsor-cli task conductor confirm` / `reject`, `narsor-cli task restart-step` |
