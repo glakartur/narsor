@@ -53,8 +53,9 @@ use narsor_engine::controller_protocol::{
 };
 use narsor_engine::domain::{BackendId, TaskId, TaskLaunchSpec};
 use narsor_engine::orchestration::{
-    CommandActor, NewTask, Observation, OperatorCommand, OperatorCommandStatus, OwnerCommand,
-    OwnerRef, ResumePolicy, RunnerState, TaskEventKind, TaskRecord,
+    CommandActor, CommandRequest, NewTask, Observation, OperatorCommand, OperatorCommandRequest,
+    OperatorCommandStatus, OwnerCommand, OwnerRef, ResumePolicy, RunnerState, TaskEventKind,
+    TaskRecord,
 };
 use narsor_engine::persistence::paths::StatePaths;
 use narsor_server::controller_protocol::http::{controller_routes, runner_routes};
@@ -361,6 +362,61 @@ impl<T: ContractTarget> Harness<T> {
         }
     }
 
+    /// The owner pauses the task: a pause the runner_state lifecycle must
+    /// take, sent to the control plane past the owner's action offer.
+    ///
+    /// The contract's workflow finishes at once and its runner then idles,
+    /// so the task is `Finished` while its runner still runs. The offer
+    /// (`service/actions.rs`) refuses to pause a finished task, as the TUI
+    /// did before the server took over the decision; that rule is tested
+    /// with the protocol (`tests/controller_protocol.rs`). The lifecycle
+    /// under test here still pauses a `Running` runner, whatever its
+    /// workflow does.
+    pub fn pause(&self, task: &str, key: &str) {
+        let task_id = TaskId::parse(task).unwrap();
+        if let Err(error) = self.service.control_plane().command(
+            &task_id,
+            CommandRequest {
+                command: OwnerCommand::Pause,
+                idempotency_key: key.to_string(),
+                expected_generation: None,
+                actor: CommandActor::Owner,
+            },
+        ) {
+            panic!("Pause of {task}: {error}");
+        }
+        self.service.notify(&task_id);
+        // A pause releases the task's slot to a waiting one.
+        self.service.reschedule(&BackendId::parse(BACKEND).unwrap());
+    }
+
+    /// An operator command for the task's runner, queued in the control
+    /// plane past the owner's action offer, for the reason [`Self::pause`]
+    /// gives. Returns the command's id.
+    pub fn queue_operator_command(
+        &self,
+        task: &str,
+        command: OperatorCommand,
+        key: &str,
+    ) -> String {
+        let task_id = TaskId::parse(task).unwrap();
+        let outcome = self
+            .service
+            .control_plane()
+            .queue_operator_command(
+                &task_id,
+                OperatorCommandRequest {
+                    command,
+                    idempotency_key: key.to_string(),
+                    expected_generation: None,
+                    requested_by: OwnerRef::new(LOCAL_OWNER),
+                },
+            )
+            .unwrap_or_else(|error| panic!("an operator command for {task}: {error}"));
+        self.service.notify(&task_id);
+        outcome.command.command_id
+    }
+
     /// An owner starts reading the task: leases a reader for `idle_secs`
     /// and wakes the controller, as a read of a stopped task does (D63).
     pub fn lease_reader(&self, task: &str, idle_secs: i64) {
@@ -429,7 +485,7 @@ impl<T: ContractTarget> Harness<T> {
     /// Runs the task and pauses it: it is `Stopped`, with its storage kept.
     pub async fn stopped(&self, task: &str) {
         self.running(task).await;
-        self.must(task, OwnerCommand::Pause, "pause-for-reading");
+        self.pause(task, "pause-for-reading");
         self.wait_runner_state(task, RunnerState::Stopped).await;
     }
 
@@ -684,7 +740,7 @@ pub async fn lifecycle_round_trip<T: ContractTarget>() {
     let first_incarnation = incarnation(&first).expect("the runner reported");
     let cursor_before = first.runner.as_ref().unwrap().snapshot.event_cursor;
 
-    h.must("task-1", OwnerCommand::Pause, "pause-1");
+    h.pause("task-1", "pause-1");
     h.wait_runner_state("task-1", RunnerState::Stopped).await;
     let paused = h.record("task-1");
     assert_eq!(
@@ -776,7 +832,7 @@ pub async fn reconnect_reconciles_instead_of_duplicating<T: ContractTarget>() {
     );
 
     // The restarted controller still drives the task.
-    h.must("task-1", OwnerCommand::Pause, "pause-1");
+    h.pause("task-1", "pause-1");
     h.wait_runner_state("task-1", RunnerState::Stopped).await;
 }
 
@@ -1086,7 +1142,7 @@ pub async fn delayed_deletion_and_resume_during_pause<T: ContractTarget>() {
     h.running("task-1").await;
 
     h.probe.delay_deletions(30);
-    h.must("task-1", OwnerCommand::Pause, "pause-1");
+    h.pause("task-1", "pause-1");
     h.wait_platform("task-1", "the deletion to start", |observed| {
         observed
             .workload
@@ -1151,7 +1207,7 @@ pub async fn lease_handoff_between_controllers<T: ContractTarget>() {
             .is_some_and(|(holder, epoch)| holder != first_id && epoch > first_epoch)
     })
     .await;
-    h.must("task-1", OwnerCommand::Pause, "pause-1");
+    h.pause("task-1", "pause-1");
     h.wait_runner_state("task-1", RunnerState::Stopped).await;
     let counters = h.counters();
     assert_eq!(
@@ -1227,7 +1283,7 @@ pub async fn parallel_tasks_are_isolated<T: ContractTarget>() {
     assert_ne!(a.storage, b.storage, "separate storage");
     assert_ne!(a.workload, b.workload, "separate workloads");
 
-    h.must("task-a", OwnerCommand::Pause, "pause-a");
+    h.pause("task-a", "pause-a");
     h.wait_runner_state("task-a", RunnerState::Stopped).await;
     let paused = h.observe("task-a").await;
     assert!(paused.workload.is_none() && paused.storage.exists());
@@ -1274,7 +1330,7 @@ pub async fn the_controller_never_starts_more_than_the_limit<T: ContractTarget>(
     assert_eq!(h.counters().workloads_created, 1, "{:?}", h.counters());
 
     // Pausing releases the compute and its slot: the waiting task starts.
-    h.must("task-1", OwnerCommand::Pause, "pause-1");
+    h.pause("task-1", "pause-1");
     h.wait_runner_state("task-1", RunnerState::Stopped).await;
     h.wait_runner_state("task-2", RunnerState::Running).await;
 
@@ -1320,18 +1376,15 @@ pub async fn operator_commands_reach_the_runner_and_come_back_with_a_verdict<T: 
         expected_generation: None,
     };
     let owner = OwnerRef::new(LOCAL_OWNER);
-    let queued = h
-        .service
-        .submit_operator_command(&owner, "task-1", request.clone())
-        .expect("queued for the running task");
+    // Past the offer: it refuses an interrupt once the workflow finished.
+    let command_id = h.queue_operator_command("task-1", OperatorCommand::Interrupt, "interrupt-1");
     let retried = h
         .service
         .submit_operator_command(&owner, "task-1", request)
         .expect("a retry of the key");
     assert!(retried.replayed);
-    assert_eq!(retried.command.command_id, queued.command.command_id);
+    assert_eq!(retried.command.command_id, command_id);
 
-    let command_id = queued.command.command_id;
     h.wait_for("the runner's verdict", |h| {
         h.record("task-1")
             .operator_command(&command_id)
@@ -1358,7 +1411,7 @@ pub async fn operator_commands_reach_the_runner_and_come_back_with_a_verdict<T: 
         TaskEventKind::OperatorCommandResolved { command_id: id, .. } if *id == command_id
     )));
 
-    h.must("task-1", OwnerCommand::Pause, "pause-1");
+    h.pause("task-1", "pause-1");
     h.wait_runner_state("task-1", RunnerState::Stopped).await;
     match h.service.submit_operator_command(
         &owner,
@@ -1455,7 +1508,7 @@ pub async fn a_resume_removes_the_reader_before_the_work_starts<T: ContractTarge
 
     // And it is paused and read again the same way.
     h.probe.clear_faults();
-    h.must("task-1", OwnerCommand::Pause, "pause-2");
+    h.pause("task-1", "pause-2");
     h.wait_runner_state("task-1", RunnerState::Stopped).await;
     h.lease_reader("task-1", 60);
     h.running_reader("task-1").await;

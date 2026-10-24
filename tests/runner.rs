@@ -865,32 +865,6 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         other => panic!("expected events, got {other:?}"),
     }
 
-    // A runner that cannot read its own log answers "unavailable" at once;
-    // it does not leave the request pending until the relay gives up.
-    let log = launch.store().event_log(&execution_id);
-    let gap = log.event_path(cursor_at_gate + 2);
-    fs::copy(log.event_path(cursor_at_gate), &gap).unwrap();
-    let started = std::time::Instant::now();
-    let refused = fixture
-        .service
-        .execution_events(
-            &fixture.owner(),
-            "task-1",
-            narsor_engine::controller_protocol::ExecutionEventsQuery::default(),
-        )
-        .await
-        .expect_err("the runner cannot read its log");
-    assert!(
-        refused.to_string().contains("runner_read_failed"),
-        "{refused}"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "answered at once, not at the relay's timeout: {:?}",
-        started.elapsed()
-    );
-    fs::remove_file(&gap).unwrap();
-
     // Work in the workspace, and a remote that moves on: neither may be
     // touched by a resume.
     fs::write(launch.workspace().join("agent-work.txt"), "keep me").unwrap();
@@ -3909,8 +3883,21 @@ async fn refused_read(fixture: &Fixture) -> String {
 
 /// Runs a reader on the storage as it is and checks that it says why it
 /// cannot read, exits with the problem code and leaves the storage alone.
-async fn unavailable_reader(fixture: &mut Fixture, launch: &mut Launch, incarnation: &str) {
-    let before = storage_tree(&launch.storage);
+///
+/// `live_writes` are the paths a live runner on the storage keeps writing
+/// meanwhile (its report sequence), left out of the comparison.
+async fn unavailable_reader(
+    fixture: &mut Fixture,
+    launch: &mut Launch,
+    incarnation: &str,
+    live_writes: &[&str],
+) {
+    let tree = |storage: &Path| {
+        let mut tree = storage_tree(storage);
+        tree.retain(|path, _| !live_writes.contains(&path.as_str()));
+        tree
+    };
+    let before = tree(&launch.storage);
     let reader = spawn_reader(fixture, launch, incarnation);
     let refused = refused_read(fixture).await;
     assert!(refused.contains("runner_read_failed"), "{refused}");
@@ -3918,7 +3905,44 @@ async fn unavailable_reader(fixture: &mut Fixture, launch: &mut Launch, incarnat
     let status = fixture.wait_exit(reader, Duration::from_secs(30));
     assert_eq!(status.code(), Some(3), "a runner problem: {status:?}");
     assert!(started.elapsed() < Duration::from_secs(5), "no waiting");
-    assert_eq!(storage_tree(&launch.storage), before, "nothing changed");
+    assert_eq!(tree(&launch.storage), before, "nothing changed");
+}
+
+/// What a live runner rewrites on its storage while it reports: the last
+/// snapshot sequence, replaced in its bookkeeping directory.
+const LIVE_RUNNER_WRITES: [&str; 2] = ["narsor", "narsor/report.json"];
+
+/// A runner that cannot read its own log answers the owner's events read
+/// "unavailable" at once; it does not leave the request pending until the
+/// relay gives up.
+///
+/// A read-only runner shows it on a log with a gap: it answers the read with
+/// the live runner's own code (`reader::serve_events`). A live runner is not
+/// used: it reads its whole log for every report, so a gap planted under it
+/// ends it at its next report, which races with the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_that_cannot_read_its_log_answers_the_events_read_at_once() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let (mut launch, live, _) = runner_in_an_action(&mut fixture).await;
+    fixture.kill(live);
+    let execution_id = launch.execution_id().expect("an execution");
+    let log = launch.store().event_log(&execution_id);
+    let last = log.last_sequence().unwrap().expect("an event");
+    fs::copy(log.event_path(last), log.event_path(last + 2)).unwrap();
+
+    let reader = spawn_reader(&mut fixture, &mut launch, "reader-1");
+    let started = Instant::now();
+    let refused = refused_read(&fixture).await;
+    assert!(refused.contains("runner_read_failed"), "{refused}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "answered at once, not at the relay's timeout: {:?}",
+        started.elapsed()
+    );
+    fixture.kill(reader);
 }
 
 /// A storage another runner holds is not waited for: the reader says it
@@ -3932,7 +3956,7 @@ async fn a_read_only_runner_on_a_busy_storage_says_so_and_exits() {
     let (mut launch, live, _) = runner_in_an_action(&mut fixture).await;
     // The live runner still holds the storage: another one cannot have it.
     assert!(storage_locked(&launch.storage));
-    unavailable_reader(&mut fixture, &mut launch, "reader-1").await;
+    unavailable_reader(&mut fixture, &mut launch, "reader-1", &LIVE_RUNNER_WRITES).await;
     assert!(
         fixture.runners[live].try_wait().unwrap().is_none(),
         "the live runner was not disturbed"
@@ -3952,10 +3976,10 @@ async fn a_read_only_runner_on_an_uninitialized_storage_says_so_and_creates_noth
     fixture.kill(live);
 
     fs::remove_file(launch.storage.join("narsor/initialized.json")).unwrap();
-    unavailable_reader(&mut fixture, &mut launch, "reader-1").await;
+    unavailable_reader(&mut fixture, &mut launch, "reader-1", &[]).await;
 
     fs::remove_dir_all(launch.storage.join("narsor")).unwrap();
-    unavailable_reader(&mut fixture, &mut launch, "reader-2").await;
+    unavailable_reader(&mut fixture, &mut launch, "reader-2", &[]).await;
     assert!(
         !launch.storage.join("narsor").exists(),
         "not even the bookkeeping directory was created"

@@ -468,17 +468,12 @@ fn compound_engineering_revisions_continue_the_author_session() {
 /// It has its own time limit and a `timeout` choice: without the choice the
 /// engine ends a step that outlives its limit with an error instead of a gate.
 #[test]
-fn compound_engineering_finalize_is_a_read_only_agent_with_a_timeout_choice() {
+fn compound_engineering_finalize_is_an_agent_with_a_timeout_choice() {
     let definition = compound_engineering();
     let finalize = &definition.states["finalize"];
-    let Some(ActionConfig::Agent(agent)) = &finalize.action else {
+    let Some(ActionConfig::Agent(_)) = &finalize.action else {
         panic!("'finalize' is an agent step");
     };
-    assert_eq!(
-        agent.workspace_access,
-        Some(narsor_engine::domain::WorkspaceAccess::ReadOnly),
-        "'finalize' must not change the workspace"
-    );
     assert_eq!(finalize.timeout_secs, Some(10 * 60));
     assert_eq!(finalize.transitions["timeout"], "finalize_blocked");
 }

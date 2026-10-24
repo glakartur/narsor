@@ -1691,7 +1691,7 @@ async fn two_tasks_share_pinned_images_but_nothing_writable() {
         cluster.volume_dir(&b.storage)
     );
 
-    h.must("task-a", OwnerCommand::Pause, "pause-a");
+    h.pause("task-a", "pause-a");
     h.wait_runner_state("task-a", RunnerState::Stopped).await;
     assert!(cluster.pod(&a.workload).is_none());
     assert!(
