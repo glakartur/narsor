@@ -67,13 +67,13 @@ Dziś jeden panel odpowiedzi miesza różne formularze (akcje kroku, pytanie age
 **Wyświetlanie i przełączanie**
 - R10. Panel w danej chwili pokazuje jeden formularz, w tym samym miejscu co dziś.
 - R11. `Esc` przełącza cyklicznie na następny dostępny formularz, zawsze (też gdy focus jest w polach). Przy jednym formularzu `Esc` nic nie zmienia. `Esc` nie zwija panelu i nie wraca do listy akcji.
-- R12. Panel zawsze pokazuje, który formularz jest aktywny i ile ich jest (np. nazwa i `1/3`), oraz że `Esc` przełącza.
+- R12. Panel zawsze pokazuje, ile jest formularzy i który jest aktywny (np. `1/3`), oraz że `Esc` przełącza. Osobna nazwa formularza w nagłówku nie jest wymagana. Każdy formularz ma polskie etykiety, z których operator wie, jaką akcję wykona (np. tytuł pola lub przycisku).
 - R13. Zmiana listy formularzy (nowy odczyt) nie zmienia formularza, który operator ogląda, jeśli nadal jest dostępny i backend nie wskazał nowego domyślnego formularza (R14). Gdy zniknął, panel przechodzi na domyślny. Wpisany tekst nie ginie przy przełączaniu: każdy formularz pamięta swój szkic, jak dziś wpisy (`Entry`). Po ponownym przełączeniu na formularz wpisana treść wraca.
 - R14. Gdy backend wskaże nowy domyślny formularz (np. agent zadał pytanie), panel przełącza się na niego, nawet jeśli operator oglądał inny. Szkic poprzedniego zostaje. Założenie Z3.
 - R15. Klawisz `Tab` zachowuje obecną rolę: przenosi focus między panelem a resztą szczegółów. Panel nie zwija się, dopóki jest w nim dostępny jakikolwiek formularz, a w szczególności swobodna rozmowa. Założenie Z1.
 
 **Formularz swobodnej rozmowy**
-- R16. Pole tekstowe wielolinijkowe. Zaczyna od jednej linii i rośnie automatycznie z wpisanym tekstem (do rozsądnego limitu wysokości z przewijaniem; limit ustala plan).
+- R16. Pole tekstowe wielolinijkowe. Zaczyna od jednej linii i rośnie automatycznie z wpisanym tekstem do 50% wysokości szczegółów taska. Powyżej limitu pole przewija się (mechanizm przewijania jest częścią tego formularza).
 - R17. Obowiązują reguły edycji z `2026-10-22-tui-edycja-formularzy-requirements.md` (kursor, zawijanie, `Ctrl+J` dla nowej linii, potwierdzenie przed wysłaniem).
 
 **Dodatkowe formularze**
@@ -111,8 +111,3 @@ Dziś jeden panel odpowiedzi miesza różne formularze (akcje kroku, pytanie age
 - Z3. Nowy domyślny formularz od backendu przejmuje widok (R14), nawet gdy operator pisze w innym. Treść wpisana przez operatora nie ginie i wraca po ponownym przełączeniu (R13).
 - Z4. Uprawnienia i limit wejść to osobne rodzaje formularzy (R21, R22), nie część „akcji workflow". Problem wyniku (dziś osobny rodzaj `InputKind`) mieści się w „akcji workflow" albo „odpowiedzi na pytanie". Plan ustali dokładne mapowanie.
 - Z5. Formularze z R21 i R22 są domyślne, gdy mają zastosowanie, przed odpowiedzią na pytanie i akcją workflow. Kolejność między nimi ustala plan.
-
-## Pytania otwarte dla użytkownika
-
-- Jak nazwać formularze w nagłówku panelu (po polsku)?
-- Czy limit wzrostu pola rozmowy ma być stały (np. 8 linii), czy zależny od wysokości terminala?
