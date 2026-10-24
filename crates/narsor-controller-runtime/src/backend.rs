@@ -176,6 +176,10 @@ struct LaunchInputEnvelope {
     resources: Value,
     #[serde(default)]
     definition: Option<Value>,
+    #[serde(default)]
+    ticket: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     digest: String,
 }
 
@@ -199,6 +203,8 @@ pub fn validate_launch_input(value: &Value) -> Result<(), String> {
         input.environment,
         input.resources,
         input.definition,
+        input.ticket,
+        input.title,
     );
     Ok(())
 }
@@ -438,5 +444,29 @@ impl Default for BackendCapabilities {
             persistent_storage: true,
             archive: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_launch_input;
+    use serde_json::json;
+
+    #[test]
+    fn launch_input_with_ticket_and_title_is_accepted() {
+        let spec = json!({
+            "version": 3,
+            "workflow_id": "compound-engineering",
+            "workflow_version": 1,
+            "inputs": {},
+            "workspace": {},
+            "environment": {},
+            "resources": {},
+            "definition": null,
+            "ticket": "NAR-001",
+            "title": "Poprawa formularza",
+            "digest": "sha256:abc",
+        });
+        assert_eq!(validate_launch_input(&spec), Ok(()));
     }
 }
