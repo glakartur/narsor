@@ -33,7 +33,7 @@ Zadanie ma dziś tylko identyfikator wewnętrzny i wejścia workflow. Numer tick
 
 **Tytuł generowany przez dyrygenta**
 - R15. Gdy zadanie powstaje bez tytułu, dyrygent przygotowuje tytuł na podstawie opisu zadania i zapisuje go jako tytuł zadania. Dyrygent nigdy nie zmienia tytułu podanego przez operatora.
-- R16. Dyrygent powstaje razem z uruchomieniem runnera, czyli po utworzeniu zadania. Dlatego wygenerowany tytuł pojawia się z opóźnieniem. Do tego czasu zadanie ma pusty tytuł i działa według R7 i R10.
+- R16. Wygenerowany tytuł jest jednoliniowy, ma najwyżej 50 znaków i jest w języku użytym przez użytkownika (języku opisu zadania). Dyrygent powstaje razem z uruchomieniem runnera, czyli po utworzeniu zadania. Dlatego wygenerowany tytuł pojawia się z opóźnieniem. Do tego czasu zadanie ma pusty tytuł i działa według R7 i R10.
 - R17. Gdy dyrygent zapisze tytuł, nagłówek i zakładka Info pokazują go bez ponownego tworzenia zadania. Zapis wygenerowanego tytułu jest widoczny po wznowieniu i dla innego runnera (jak R5).
 
 **Wejścia zadania**
@@ -41,10 +41,10 @@ Zadanie ma dziś tylko identyfikator wewnętrzny i wejścia workflow. Numer tick
 
 **Nagłówek szczegółów zadania**
 - R9. Widok szczegółów zadania ma nowy nagłówek nad zakładkami.
-- R10. Po lewej stronie nagłówka są: ticket i tytuł. Gdy brak jednego z nich, widać drugie. Gdy brak obu, lewa strona pokazuje to, co nagłówek pokazuje dziś.
+- R10. Po lewej stronie nagłówka są: ticket i tytuł. Gdy brak jednego z nich, widać drugie. Gdy brak obu, lewa strona pokazuje to, co nagłówek pokazuje dziś. Gdy tytuł jest ustawiony, zastępuje on tytuł z `display` workflow w nagłówku (linki z `display` zostają).
 - R11. Po prawej stronie nagłówka jest numer wewnętrzny zadania, obcięty do pierwszych 8 znaków identyfikatora (GUID).
 - R12. Ticket, tytuł i numer wewnętrzny są wyróżnione graficznie. Każda z tych grup ma własną ramkę lub inne wyraźne obramowanie w stylu istniejących paneli TUI.
-- R13. Zbyt długi tytuł jest skracany wielokropkiem. Numer wewnętrzny po prawej jest zawsze widoczny w całości.
+- R13. Zbyt długi tytuł jest zawijany do kolejnych wierszy i widać go w całości. Nie jest skracany. Numer wewnętrzny po prawej jest zawsze widoczny w całości.
 
 **Zakładka Info**
 - R14. Zakładka Info pokazuje ticket i tytuł, gdy są ustawione.
@@ -57,7 +57,7 @@ Zadanie ma dziś tylko identyfikator wewnętrzny i wejścia workflow. Numer tick
 - AE2. **Covers R6.** Given zadanie z ticketem `NAR-12`, when prompt kroku zawiera szablon ticketu, then agent dostaje w prompcie `NAR-12`.
 - AE3. **Covers R7.** Given zadanie bez ticketu, when prompt zawiera szablon ticketu, then szablon daje pusty tekst, a krok startuje.
 - AE4. **Covers R10, R11.** Given zadanie z ticketem `NAR-12`, tytułem „Zmiana API zamówień" i identyfikatorem zaczynającym się od `6a7ceacf`, when operator otwiera szczegóły, then po lewej widzi `NAR-12` i tytuł, a po prawej `6a7ceacf`.
-- AE5. **Covers R13.** Given bardzo długi tytuł i wąski terminal, when nagłówek się rysuje, then tytuł jest skrócony wielokropkiem, a numer wewnętrzny jest cały.
+- AE5. **Covers R13.** Given bardzo długi tytuł i wąski terminal, when nagłówek się rysuje, then tytuł jest zawinięty do kolejnych wierszy i widoczny w całości, a numer wewnętrzny jest cały.
 - AE7. **Covers R15, R16, R17.** Given zadanie utworzone bez tytułu i z opisem, when runner startuje i dyrygent powstaje, then dyrygent zapisuje tytuł z opisu, a nagłówek pokazuje go po zapisie. Przed zapisem zadanie działa z pustym tytułem.
 - AE8. **Covers R15.** Given zadanie z tytułem podanym przez operatora, when dyrygent powstaje, then tytuł się nie zmienia.
 - AE6. **Covers R8.** Given workflow z własnym wejściem `ticket_id`, when operator podaje ticket w nowym polu i w tym wejściu, then oba mają osobne wartości.
@@ -95,7 +95,7 @@ Zadanie ma dziś tylko identyfikator wewnętrzny i wejścia workflow. Numer tick
 
 ## Dependencies / Assumptions
 
-- Dotychczasowy nagłówek szczegółów (`src/tui/task_app/detail.rs`) pokazuje `display` workflow i stan. Nowy nagłówek go uzupełnia (decyzja użytkownika).
+- Dotychczasowy nagłówek szczegółów (`src/tui/task_app/detail.rs`) pokazuje `display` workflow i stan. Gdy zadanie ma tytuł, tytuł zastępuje w nagłówku tytuł z `display` (decyzja użytkownika). Lista zadań nadal pokazuje tytuł z `display`.
 - Zadania zapisane przed zmianą nie mają tych pól. Traktujemy je jako puste. Weryfikacja zgodności zapisu (`TaskLaunchSpec` jest wersjonowany i odrzuca stare wersje) należy do planowania.
 
 ---
@@ -106,16 +106,9 @@ Zadanie ma dziś tylko identyfikator wewnętrzny i wejścia workflow. Numer tick
 - „Po lewej task, tytuł" znaczy: po lewej ticket (numer Jiry) i tytuł zadania.
 - Parametry nazywają się `ticket` i `title` w przestrzeni zadania, np. `{{ task.ticket }}` i `{{ task.title }}`, a nie w `inputs.*`. Powód: brak kolizji z wejściami workflow.
 - Limit długości: ticket i tytuł mają rozsądny limit (propozycja: ticket 64, tytuł 200 znaków). Wartości nie mają znaków nowej linii.
-- Nowy nagłówek uzupełnia dotychczasowy wiersz `display` workflow (potwierdzone przez użytkownika). Gdy `display` i nowy nagłówek pokazują to samo, planowanie wybiera układ bez dublowania.
+- Tytuł z `display` workflow to początek treści zadania widoczny w nagłówku szczegółów. Pełny tytuł zadania zastępuje go (potwierdzone przez użytkownika). Gdy tytułu brak, nagłówek pokazuje `display` jak dziś.
 - „Otaczamy graficznie" znaczy ramki w istniejącym stylu paneli (zaokrąglone, zob. `docs/brainstorms/2026-10-20-tui-zaokraglone-ramki-requirements.md`).
 - Ticket i tytuł to zwykły tekst od operatora. Nie wolno w nich wpisywać danych osobowych klientów ani tajemnic. Pola nie maskują wartości.
-
----
-
-## Pytania otwarte dla użytkownika
-
-- Jak dyrygent ma przygotować tytuł (długość, język, limit z założeń)? Planowanie to ustala i trzyma się limitu 200 znaków.
-- Czy `display` ma być krótszy, gdy tytuł generowany pokazuje to samo? Planowanie wybiera układ bez dublowania.
 
 ---
 
