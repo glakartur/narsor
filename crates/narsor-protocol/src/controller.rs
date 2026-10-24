@@ -893,6 +893,13 @@ pub struct TaskSummary {
     pub queue: Option<QueueView>,
     #[serde(default)]
     pub display: crate::display::TaskDisplay,
+    /// Ticket the operator gave the task, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    /// Title of the task: the operator's, else the one the conductor
+    /// generated, if either exists yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_transitions: Option<TransitionOffer>,
     /// What the owner can do to the task now, and why not where it cannot.

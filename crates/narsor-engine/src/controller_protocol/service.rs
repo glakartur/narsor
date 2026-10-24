@@ -34,7 +34,7 @@ use super::credentials::{
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{
-    normalize_label, AnsweredBy, BackendId, LabelError, LaunchDefinitionError, ResourceProfile,
+    effective_title, normalize_label, one_line_label, AnsweredBy, GENERATED_TITLE_MAX_CHARS, BackendId, LabelError, LaunchDefinitionError, ResourceProfile,
     TaskDisplay, TaskId, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use crate::engine::{
@@ -2094,6 +2094,8 @@ impl ProtocolService {
             attention: task_attention(record),
             queue: record.queue.as_ref().map(QueueView::from),
             display: task_display(record),
+            ticket: record.launch_spec.ticket.clone(),
+            title: task_title(record),
             manual_transitions: manual_transitions(record),
             actions: None,
             resume: record.resume.clone(),
@@ -2474,6 +2476,17 @@ fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
         override_allowed: state.allow_manual_override,
         override_targets,
     })
+}
+
+/// The task's title: the operator's, else the conductor's, which a runner
+/// reports and the server therefore reduces to one short plain line.
+fn task_title(record: &TaskRecord) -> Option<String> {
+    let generated = record
+        .runner
+        .as_ref()
+        .and_then(|runner| runner.snapshot.generated_title.as_deref())
+        .and_then(|title| one_line_label(title, GENERATED_TITLE_MAX_CHARS));
+    effective_title(record.launch_spec.title.as_deref(), generated.as_deref())
 }
 
 fn task_display(record: &TaskRecord) -> TaskDisplay {
