@@ -908,14 +908,13 @@ pub fn edge_layout(
     };
     let cut_ticket = |ticket: Option<String>, cells_left: usize| {
         ticket.and_then(|text| {
-            let kept = if cells(&text) <= cells_left {
-                text
+            if cells(&text) <= cells_left {
+                Some(text)
             } else if cells_left >= MIN_TICKET_CELLS {
-                fit_cells(&text, cells_left)
+                Some(fit_cells(&text, cells_left))
             } else {
-                return None;
-            };
-            Some(kept)
+                None
+            }
         })
     };
     let (mut ticket, mut title) = (ticket, title);
@@ -1051,12 +1050,11 @@ pub(super) fn render_view(
     let inner_width = area.width.saturating_sub(3);
     let notice = notice(view.task, styles, stale, inner_width);
     let base_lines = HEADER_LINES + u16::from(notice.is_some());
-    let header_lines = base_lines;
     let panel_height = view
         .detail
         .waiting
-        .preferred_height(inner_width, area.height, header_lines);
-    let parts = areas(area, header_lines, panel_height);
+        .preferred_height(inner_width, area.height, base_lines);
+    let parts = areas(area, base_lines, panel_height);
     let content = Rect::new(
         parts.content.x.saturating_add(2),
         parts.content.y.saturating_add(1),
