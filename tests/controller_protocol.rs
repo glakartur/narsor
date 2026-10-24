@@ -250,6 +250,21 @@ impl Harness {
     /// credential, let the runner report, report it ready.
     async fn running(&self, task: &str, backend: &str) -> Running {
         self.create(task, backend).await;
+        self.start_runner(task, backend).await
+    }
+
+    /// Like [`Self::running`] for a task created from `request`.
+    async fn running_from(&self, request: &CreateTaskRequest) -> Running {
+        self.owner
+            .create_control_task(request)
+            .await
+            .expect("create task");
+        let backend = request.backend_id.as_deref().expect("a backend");
+        let task = request.task_id.as_deref().expect("a task id");
+        self.start_runner(task, backend).await
+    }
+
+    async fn start_runner(&self, task: &str, backend: &str) -> Running {
         let (controller, epoch) = self.controller(backend).await;
         controller
             .report(&report(task, epoch, 1, Observation::StartAccepted, None))
@@ -295,6 +310,8 @@ fn create_request(task: &str, backend: &str) -> CreateTaskRequest {
             profile: None,
             harness: None,
             resources: None,
+            ticket: None,
+            title: None,
         },
     }
 }
@@ -377,6 +394,7 @@ fn snapshot(
         conductor_unavailable_reason: None,
         default_harness_unavailable: None,
         display: None,
+        generated_title: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 5).unwrap(),
     }
 }
@@ -7157,5 +7175,117 @@ async fn a_blank_comment_on_a_pause_is_refused_and_the_task_stays_paused() {
     assert_eq!(
         harness.task("task-1").await.runner_state,
         RunnerState::Stopped
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ticket and title of a task
+// ---------------------------------------------------------------------------
+
+fn labelled_request(task: &str, ticket: Option<&str>, title: Option<&str>) -> CreateTaskRequest {
+    let mut request = create_request(task, "k8s");
+    request.launch.ticket = ticket.map(str::to_string);
+    request.launch.title = title.map(str::to_string);
+    request
+}
+
+#[tokio::test]
+async fn a_task_keeps_the_trimmed_ticket_and_title_it_was_created_with() {
+    let harness = Harness::start().await;
+
+    let task = harness
+        .owner
+        .create_control_task(&labelled_request(
+            "task-1",
+            Some("  NAR-12 "),
+            Some("Zmiana API zamówień"),
+        ))
+        .await
+        .expect("create");
+
+    assert_eq!(task.ticket.as_deref(), Some("NAR-12"));
+    assert_eq!(task.title.as_deref(), Some("Zmiana API zamówień"));
+    assert_eq!(
+        harness.task("task-1").await.ticket.as_deref(),
+        Some("NAR-12")
+    );
+}
+
+#[tokio::test]
+async fn a_task_without_labels_has_neither() {
+    let harness = Harness::start().await;
+    let task = harness.create("task-1", "k8s").await;
+    assert_eq!((task.ticket, task.title), (None, None));
+}
+
+#[tokio::test]
+async fn a_ticket_with_a_line_break_or_too_long_is_refused_and_creates_no_task() {
+    let harness = Harness::start().await;
+    for ticket in ["NAR\n12".to_string(), "x".repeat(65)] {
+        let error = harness
+            .owner
+            .create_control_task(&labelled_request("task-1", Some(&ticket), None))
+            .await
+            .expect_err("refused");
+        assert_eq!(bad_request_code(Err::<(), _>(error)), "invalid_task_label");
+    }
+    assert!(harness.owner.control_task("task-1").await.is_err());
+}
+
+#[tokio::test]
+async fn the_generated_title_shows_only_when_the_operator_gave_none() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    assert_eq!(harness.task("task-1").await.title, None);
+
+    let mut reported = snapshot(2, ExecutionStatus::Running, 4, None);
+    reported.generated_title = Some("Zmiana\n\u{1b}[31m API".to_string());
+    running.runner.snapshot(&reported).await.expect("snapshot");
+    assert_eq!(
+        harness.task("task-1").await.title.as_deref(),
+        Some("Zmiana [31m API"),
+        "one plain line"
+    );
+
+    reported.snapshot_sequence = 3;
+    reported.generated_title = Some("x".repeat(80));
+    running.runner.snapshot(&reported).await.expect("snapshot");
+    assert_eq!(
+        harness
+            .task("task-1")
+            .await
+            .title
+            .as_deref()
+            .map(|t| t.chars().count()),
+        Some(50)
+    );
+
+    reported.snapshot_sequence = 4;
+    reported.generated_title = None;
+    running.runner.snapshot(&reported).await.expect("snapshot");
+    assert_eq!(
+        harness
+            .task("task-1")
+            .await
+            .title
+            .as_deref()
+            .map(|t| t.chars().count()),
+        Some(50),
+        "a report without a title keeps the one shown"
+    );
+}
+
+#[tokio::test]
+async fn the_operator_title_wins_over_a_generated_one() {
+    let harness = Harness::start().await;
+    let running = harness
+        .running_from(&labelled_request("task-1", None, Some("Mój tytuł")))
+        .await;
+    let mut reported = snapshot(2, ExecutionStatus::Running, 4, None);
+    reported.generated_title = Some("Inny tytuł".to_string());
+    running.runner.snapshot(&reported).await.expect("snapshot");
+    assert_eq!(
+        harness.task("task-1").await.title.as_deref(),
+        Some("Mój tytuł")
     );
 }

@@ -5,6 +5,7 @@
 //!     state.json                    -- ConductorState, versioned, atomic
 //!     chat.jsonl                    -- one ChatEntry per line, append-only
 //!     annotations/{key}.json        -- Annotation of one human gate (R30)
+//!     title.json                    -- the title the conductor gave the task
 //! ```
 //!
 //! # Why beside the execution, not inside its `state.json`
@@ -59,6 +60,9 @@ pub const CONDUCTOR_STATE_FILE: &str = "state.json";
 
 /// The conductor's chat history, inside its directory.
 pub const CHAT_FILE: &str = "chat.jsonl";
+
+/// The file holding the title the conductor generated.
+pub const TITLE_FILE: &str = "title.json";
 
 /// The version of `state.json` this binary writes and reads.
 pub const CONDUCTOR_STATE_VERSION: u32 = 1;
@@ -396,6 +400,12 @@ pub struct Annotation {
     pub created_at: DateTime<Utc>,
 }
 
+/// What `title.json` holds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct GeneratedTitle {
+    title: String,
+}
+
 /// The conductor's files of one execution.
 #[derive(Debug, Clone)]
 pub struct ConductorStore {
@@ -435,6 +445,10 @@ impl ConductorStore {
 
     fn chat_file(&self) -> PathBuf {
         self.dir.join(CHAT_FILE)
+    }
+
+    fn title_file(&self) -> PathBuf {
+        self.dir.join(TITLE_FILE)
     }
 
     fn annotation_file(&self, key: &str) -> PathBuf {
@@ -556,6 +570,31 @@ impl ConductorStore {
     /// Writes the annotation of one gate, replacing an older one.
     pub fn save_annotation(&self, annotation: &Annotation) -> Result<()> {
         write_json_atomic(&self.annotation_file(&annotation.key), annotation)
+    }
+
+    /// Keeps the title the conductor generated, replacing none: a title
+    /// once written stays, so a resumed runner never asks twice.
+    pub fn save_generated_title(&self, title: &str) -> Result<()> {
+        if self.load_generated_title()?.is_some() {
+            return Ok(());
+        }
+        write_json_atomic(
+            &self.title_file(),
+            &GeneratedTitle {
+                title: title.into(),
+            },
+        )
+    }
+
+    /// The title the conductor generated, if it did.
+    pub fn load_generated_title(&self) -> Result<Option<String>> {
+        match read_json::<GeneratedTitle>(&self.title_file()) {
+            Ok(saved) => Ok(Some(saved.title).filter(|title| !title.is_empty())),
+            Err(PersistenceError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The annotation of the gate `key`, if there is one.

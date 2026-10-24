@@ -23,6 +23,91 @@ use super::{DisplaySpec, WorkflowDefinition};
 /// (or that it cannot even see) since the task was created.
 pub const TASK_LAUNCH_SPEC_VERSION: u32 = 3;
 
+/// Longest ticket, in characters.
+pub const TICKET_MAX_CHARS: usize = 64;
+/// Longest title the operator can type, in characters.
+pub const TITLE_MAX_CHARS: usize = 200;
+/// Longest title the conductor generates, in characters.
+pub const GENERATED_TITLE_MAX_CHARS: usize = 50;
+
+/// Why a ticket or title is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LabelError {
+    /// The text has a line break or another control character.
+    #[error("{field} must be one line without control characters")]
+    NotOneLine {
+        /// Name of the field.
+        field: &'static str,
+    },
+    /// The text is longer than the limit.
+    #[error("{field} has more than {max} characters")]
+    TooLong {
+        /// Name of the field.
+        field: &'static str,
+        /// The limit.
+        max: usize,
+    },
+}
+
+/// Trims a ticket or title the operator typed.
+///
+/// Empty text means "none". Text with a control character, a line break
+/// included, or over `max` characters is refused, never cut: the operator
+/// sees what was wrong.
+pub fn normalize_label(
+    field: &'static str,
+    raw: Option<&str>,
+    max: usize,
+) -> Result<Option<String>, LabelError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let text = raw.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if text.chars().any(char::is_control) {
+        return Err(LabelError::NotOneLine { field });
+    }
+    if text.chars().count() > max {
+        return Err(LabelError::TooLong { field, max });
+    }
+    Ok(Some(text.to_owned()))
+}
+
+/// Reduces text that came from a conductor or a remote runner to one line of
+/// at most `max` characters; `None` when nothing usable is left.
+pub fn one_line_label(raw: &str, max: usize) -> Option<String> {
+    let line = raw
+        .split_whitespace()
+        .map(|word| word.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cut: String = line.chars().take(max).collect();
+    let cut = cut.trim_end().to_owned();
+    (!cut.is_empty()).then_some(cut)
+}
+
+/// A title a model made, safe to render into any template — a script's
+/// command line included: letters, digits, spaces and `- _ . , : ( )` stay,
+/// everything else (quotes, `$`, backticks, `;`, `|`, `/`, `\`, control
+/// characters) is dropped. One line of at most `max` characters; `None` when
+/// nothing is left.
+pub fn plain_generated_title(raw: &str, max: usize) -> Option<String> {
+    let kept: String = raw
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || "-_.,:()".contains(*c))
+        .collect();
+    one_line_label(&kept, max)
+}
+
+/// The title a task shows: the operator's, else the one the conductor made.
+pub fn effective_title(operator: Option<&str>, generated: Option<&str>) -> Option<String> {
+    operator
+        .filter(|title| !title.is_empty())
+        .or(generated.filter(|title| !title.is_empty()))
+        .map(str::to_owned)
+}
+
 /// Immutable, versioned input a task is launched from.
 ///
 /// Built once when the task is created and copied to task storage once
@@ -61,6 +146,13 @@ pub struct TaskLaunchSpec {
     /// only for specs built for orchestration bookkeeping alone; a runner
     /// refuses one ([`TaskLaunchSpec::definition`]).
     pub definition: Option<serde_json::Value>,
+    /// Ticket the operator typed, already normalized. Absent in specs sealed
+    /// before the field existed, which therefore keep their digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    /// Title the operator typed, already normalized; see `ticket`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// `sha256:` digest of every other field, see
     /// [`TaskLaunchSpec::compute_digest`].
     pub digest: String,
@@ -124,6 +216,10 @@ struct TaskLaunchSpecFields {
     environment: ResolvedEnvironment,
     resources: ResourceProfile,
     definition: Option<serde_json::Value>,
+    #[serde(default)]
+    ticket: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     digest: String,
 }
 
@@ -153,6 +249,8 @@ impl<'de> Deserialize<'de> for TaskLaunchSpec {
             environment: fields.environment,
             resources: fields.resources,
             definition: fields.definition,
+            ticket: fields.ticket,
+            title: fields.title,
             digest: fields.digest,
         })
     }
@@ -178,6 +276,8 @@ impl TaskLaunchSpec {
             environment: environment.sealed(),
             resources,
             definition: None,
+            ticket: None,
+            title: None,
             digest: String::new(),
         };
         spec.digest = spec.compute_digest();
@@ -195,6 +295,14 @@ impl TaskLaunchSpec {
         self.definition = Some(serde_json::to_value(definition)?);
         self.digest = self.compute_digest();
         Ok(self)
+    }
+
+    /// Returns the spec with the operator's ticket and title set, resealed.
+    pub fn with_labels(mut self, ticket: Option<String>, title: Option<String>) -> Self {
+        self.ticket = ticket;
+        self.title = title;
+        self.digest = self.compute_digest();
+        self
     }
 
     /// The workflow definition this task runs, from its snapshot.
@@ -247,7 +355,7 @@ impl TaskLaunchSpec {
     /// forgeable by a party that can write the record but wants it to keep
     /// matching the digest a controller already accepted.
     pub fn compute_digest(&self) -> String {
-        let content = serde_json::json!({
+        let mut content = serde_json::json!({
             "version": self.version,
             "workflow_id": self.workflow_id,
             "workflow_version": self.workflow_version,
@@ -257,6 +365,16 @@ impl TaskLaunchSpec {
             "resources": self.resources,
             "definition": self.definition,
         });
+        // Only set labels enter the digest, so a spec sealed without them keeps
+        // the digest it already has.
+        if let Some(object) = content.as_object_mut() {
+            if let Some(ticket) = &self.ticket {
+                object.insert("ticket".into(), ticket.clone().into());
+            }
+            if let Some(title) = &self.title {
+                object.insert("title".into(), title.clone().into());
+            }
+        }
         canonical_sha256(&content)
     }
 

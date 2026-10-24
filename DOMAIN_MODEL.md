@@ -433,3 +433,10 @@ Model został zaprojektowany z myślą o przyszłych rozszerzeniach:
 - **Sub-workflows**: Możliwość zagnieżdżania `WorkflowExecution` wewnątrz `ActionExecution` (typ `WorkflowAction`).
 - **Policy Engine**: Oddzielenie logiki decyzyjnej do zewnętrznych modułów poprzez uogólnienie `DecisionProvider`.
 - **Multi-tenancy**: Dodanie `tenant_id` do wszystkich encji głównych pozwoli na obsługę wielu użytkowników.
+
+
+## Ticket i tytuł zadania
+
+`TaskLaunchSpec` ma dwa opcjonalne pola: `ticket` (do 64 znaków) i `title` (do 200 znaków). Operator wpisuje je w formularzu nowego zadania. Serwer je przycina i sprawdza: jedna linia, bez znaków sterujących. Pusta wartość znaczy „brak". Po utworzeniu zadania pól nie można zmienić.
+
+Gdy operator nie poda tytułu, dyrygent nadaje go raz z opisu zadania (do 50 znaków). Runner zapisuje go w magazynie dyrygenta i raportuje w migawce (`generated_title`). Serwer pokazuje w `TaskSummary.title` tytuł operatora, a gdy go brak — tytuł od dyrygenta. Tytuł operatora ma zawsze pierwszeństwo. Szablony czytają oba pola jako `{{ task.ticket }}` i `{{ task.title }}`.

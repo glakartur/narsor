@@ -389,6 +389,8 @@ fn create_request(task: &str, backend: &str) -> CreateTaskRequest {
             profile: None,
             harness: None,
             resources: None,
+            ticket: None,
+            title: None,
         },
     }
 }
@@ -1171,6 +1173,7 @@ fn snapshot() -> RunnerSnapshot {
         conductor_unavailable_reason: None,
         default_harness_unavailable: None,
         display: None,
+        generated_title: None,
         observed_at: Utc::now(),
     }
 }

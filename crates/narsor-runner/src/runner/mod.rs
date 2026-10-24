@@ -428,7 +428,11 @@ pub async fn run(
     let harness = Arc::new(LiveHarness::new(
         starting.unwrap_or_else(|| spec.environment.harness.clone()),
     ));
-    let engine = Arc::new(Engine::new(store).with_default_harness_source(harness.clone()));
+    let engine = Arc::new(
+        Engine::new(store)
+            .with_default_harness_source(harness.clone())
+            .with_task_labels(spec.ticket.clone(), spec.title.clone()),
+    );
 
     let conductor =
         conductor::ConductorHost::assemble(&engine, &storage, Arc::clone(&harness), &definition);
@@ -450,6 +454,7 @@ pub async fn run(
         outbox_due: true,
         material_failures: 0,
         material_retry_at: None,
+        title_wanted: spec.title.is_none(),
     };
     session.begin(&spec).await
 }
@@ -541,6 +546,7 @@ async fn report_problem(
         conductor_unavailable_reason: Some("the runner cannot work".to_string()),
         default_harness_unavailable: None,
         display: None,
+        generated_title: None,
         observed_at,
     };
     send_until(link, timing, &snapshot).await;
@@ -703,6 +709,9 @@ struct Session {
     /// until then the poll defers materials (U9).
     material_failures: u32,
     material_retry_at: Option<Instant>,
+    /// The operator typed no title and the conductor has not been asked for
+    /// one yet in this incarnation.
+    title_wanted: bool,
 }
 
 /// How the work on this storage continues.
@@ -816,7 +825,38 @@ impl Session {
         }
         // After the runner's own recovery, like the daemon's startup hook.
         self.conductor.restore_at_startup();
+        self.request_title();
         self.drive().await
+    }
+
+    /// Asks the conductor, once, to name a task whose operator typed no
+    /// title, from the task's own text. The execution does not wait for it:
+    /// a conductor that cannot run, or fails, leaves the title empty.
+    fn request_title(&mut self) {
+        if !self.title_wanted {
+            return;
+        }
+        let Some(execution_id) = self.execution_id.clone() else {
+            return;
+        };
+        let Ok(registry) = self.conductor.registry() else {
+            // Asked again if the conductor becomes available.
+            return;
+        };
+        let Ok(execution) = self.engine.store().load_execution(&execution_id) else {
+            return;
+        };
+        let description = snapshot::task_description(&self.engine, &self.definition, &execution);
+        match registry.request_title(&execution_id, &description) {
+            Ok(true) => {
+                self.title_wanted = false;
+                tracing::info!("asked the conductor to name the task")
+            }
+            Ok(false) => self.title_wanted = false,
+            Err(error) => {
+                tracing::warn!(%error, "the conductor could not be asked to name the task")
+            }
+        }
     }
 
     /// The comment on the pause this launch ends, unless this storage took it
@@ -971,6 +1011,7 @@ impl Session {
         }
         self.harness.set(harness);
         self.conductor.refresh(None);
+        self.request_title();
     }
 
     /// Waits until the control plane has said how this incarnation was

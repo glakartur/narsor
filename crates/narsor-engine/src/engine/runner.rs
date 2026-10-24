@@ -71,7 +71,7 @@
 //! [`terminal_status`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -85,11 +85,11 @@ use uuid::Uuid;
 use crate::conductor::ConductorRegistry;
 use crate::config::AgentDefaults;
 use crate::domain::{
-    ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy, Artifact,
-    ArtifactReference, ChoiceDefinition, DecisionProviderType, Event, EventData, ExecutionId,
-    ExecutionStatus, HumanInputField, HumanInputType, InputCloseReason, ProblemKind, RepromptedBy,
-    State, StateId, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
-    LOCAL_VARIABLE_PREFIX,
+    effective_title, ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy,
+    Artifact, ArtifactReference, ChoiceDefinition, DecisionProviderType, Event, EventData,
+    ExecutionId, ExecutionStatus, HumanInputField, HumanInputType, InputCloseReason, ProblemKind,
+    RepromptedBy, State, StateId, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
+    WorkspaceSpec, LOCAL_VARIABLE_PREFIX,
 };
 use crate::engine::actions::agent::{
     self, DefaultHarnessSource, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL, SESSION_DATA_KEY,
@@ -948,6 +948,30 @@ pub struct Engine {
     active_runs: Mutex<HashSet<ExecutionId>>,
     checkpoints: bool,
     conductor: OnceLock<Weak<ConductorRegistry>>,
+    task_labels: TaskLabels,
+}
+
+/// The ticket and title `{{ task.ticket }}` and `{{ task.title }}` render.
+///
+/// The operator's values come from the sealed launch spec. The title the
+/// conductor generates arrives later, so it sits behind a lock; the
+/// operator's title always wins.
+#[derive(Default)]
+struct TaskLabels {
+    ticket: Option<String>,
+    title: Option<String>,
+    generated_title: Mutex<Option<String>>,
+}
+
+impl TaskLabels {
+    fn effective_title(&self) -> Option<String> {
+        let generated = self
+            .generated_title
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        effective_title(self.title.as_deref(), generated.as_deref())
+    }
 }
 
 /// Holds the "already running" claim on one execution for as long as a pass is
@@ -1095,7 +1119,46 @@ impl Engine {
             active_runs: Mutex::new(HashSet::new()),
             checkpoints: false,
             conductor: OnceLock::new(),
+            task_labels: TaskLabels::default(),
         }
+    }
+
+    /// Returns the engine rendering `task.ticket` and `task.title` from the
+    /// operator's values in the task's launch spec.
+    pub fn with_task_labels(mut self, ticket: Option<String>, title: Option<String>) -> Self {
+        self.task_labels.ticket = ticket;
+        self.task_labels.title = title;
+        self
+    }
+
+    /// The ticket the operator typed, if any.
+    pub fn task_ticket(&self) -> Option<&str> {
+        self.task_labels.ticket.as_deref()
+    }
+
+    /// The title steps render as `task.title`: the operator's, else the
+    /// generated one.
+    pub fn task_title(&self) -> Option<String> {
+        self.task_labels.effective_title()
+    }
+
+    /// The title the conductor generated, if it has.
+    pub fn generated_title(&self) -> Option<String> {
+        self.task_labels
+            .generated_title
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Tells the engine the title the conductor generated, so the steps
+    /// rendered from now on see it in `task.title`.
+    pub fn set_generated_title(&self, title: Option<String>) {
+        *self
+            .task_labels
+            .generated_title
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = title;
     }
 
     /// Returns the engine with the configured defaults for `agent` actions:
@@ -2330,7 +2393,9 @@ impl Engine {
         };
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+        let task_title = self.task_labels.effective_title();
         let scope = scope
+            .with_task_fields(self.task_labels.ticket.as_deref(), task_title.as_deref())
             .with_declared(declared)
             .with_step_replies(&step_replies)
             .with_step_streams(&step_streams)

@@ -62,6 +62,7 @@ pub mod rescue;
 pub mod response;
 pub mod snapshot;
 pub mod store;
+pub mod title;
 pub mod undo;
 pub mod view;
 

@@ -941,6 +941,8 @@ pub async fn task(
                     profile: profile.clone(),
                     harness: harness.clone(),
                     resources: None,
+                    ticket: None,
+                    title: None,
                 },
             },
             *workflow_version,

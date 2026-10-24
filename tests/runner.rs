@@ -2663,6 +2663,7 @@ fn conductor_claude(root: &TempRoot, answers: &[(&str, String)]) -> PathBuf {
            *'Diagnose why'*) key=diagnose ;;\n\
            *\"Answer the operator's message\"*) key=reply ;;\n\
            *'Summarize what the operator'*) key=annotate ;;\n\
+           *'The task has no title'*) key=title ;;\n\
            *) key=choose ;;\n\
            esac ;;\n\
          *) key=agent ;;\n\
@@ -3958,5 +3959,142 @@ async fn a_read_only_runner_on_an_uninitialized_storage_says_so_and_creates_noth
     assert!(
         !launch.storage.join("narsor").exists(),
         "not even the bookkeeping directory was created"
+    );
+}
+
+/// A long step with a `display` title, so the conductor has text to name the
+/// task from.
+const TITLED_WORKFLOW: &str = r#"
+name: titled-task
+version: 1
+display:
+  title: "Przebudowa obslugi zamowien hurtowych"
+states:
+  wait:
+    action:
+      type: script
+      command: sh
+      args: [-c, "sleep 60; printf '{\"choice\": \"done\"}'"]
+    choices: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+fn title_calls(launch: &Launch) -> usize {
+    launch
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.data,
+                narsor_engine::domain::EventData::ConductorStarted {
+                    purpose: narsor_engine::domain::ConductorPurpose::GenerateTitle,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// A task without a title is named by the conductor from its description;
+/// the runner reports the title and the control plane serves it, while the
+/// step keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_without_a_title_is_named_by_the_conductor() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = conductor_claude(
+        &fixture.root,
+        &[(
+            "title",
+            conductor_says(serde_json::json!({
+                "decision": "title",
+                "title": "Zmiana API zamowien",
+                "confidence": "high",
+            })),
+        )],
+    );
+    let spec = spec(
+        TITLED_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-t", spec.clone());
+    assert_eq!(
+        fixture
+            .service
+            .task(&fixture.owner(), "task-t")
+            .unwrap()
+            .title,
+        None,
+        "no title before the conductor made one"
+    );
+    let launch = Launch::new(&fixture, "task-t", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-t", &launch).await;
+
+    wait_until_async(Duration::from_secs(30), "the generated title", || {
+        fixture
+            .service
+            .task(&fixture.owner(), "task-t")
+            .unwrap()
+            .title
+            .is_some()
+    })
+    .await;
+
+    let task = fixture.service.task(&fixture.owner(), "task-t").unwrap();
+    assert_eq!(task.title.as_deref(), Some("Zmiana API zamowien"));
+    assert_eq!(
+        runner_status(&fixture, "task-t"),
+        Some(ExecutionStatus::Running)
+    );
+    assert_eq!(title_calls(&launch), 1);
+}
+
+/// A title the operator typed is never asked for, and never replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_with_an_operator_title_does_not_ask_the_conductor() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = conductor_claude(
+        &fixture.root,
+        &[(
+            "title",
+            conductor_says(serde_json::json!({
+                "decision": "title",
+                "title": "Inny tytul",
+                "confidence": "high",
+            })),
+        )],
+    );
+    let spec = spec(
+        TITLED_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    )
+    .with_labels(Some("NAR-12".to_string()), Some("Moj tytul".to_string()));
+    fixture.create("task-o", spec.clone());
+    let launch = Launch::new(&fixture, "task-o", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-o", &launch).await;
+    // Let the runner report a few snapshots.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let task = fixture.service.task(&fixture.owner(), "task-o").unwrap();
+    assert_eq!(task.ticket.as_deref(), Some("NAR-12"));
+    assert_eq!(task.title.as_deref(), Some("Moj tytul"));
+    assert_eq!(title_calls(&launch), 0);
+    assert_eq!(
+        fixture
+            .record("task-o")
+            .runner
+            .and_then(|runner| runner.snapshot.generated_title),
+        None
     );
 }

@@ -3335,6 +3335,124 @@ mod task_app_detail_render {
             "{text}"
         );
     }
+
+    // -- Ticket and title in the header and in Info -----------------------
+
+    /// A running task with `ticket` and `title`, its id starting `6a7ceacf`.
+    fn labelled_app(ticket: Option<&str>, title: Option<&str>) -> TaskApp {
+        let mut app = app();
+        let mut running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        running.task_id = narsor_engine::domain::TaskId::parse("6a7ceacfdc604d52").unwrap();
+        running.ticket = ticket.map(str::to_string);
+        running.title = title.map(str::to_string);
+        app.load(listing(vec![displayed(running, "NAR-12 opis", &[])], "c"));
+        app.list_mut().select("6a7ceacfdc604d52");
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    #[test]
+    fn the_header_shows_ticket_and_title_on_the_left_and_the_short_id_on_the_right() {
+        let mut app = labelled_app(Some("NAR-12"), Some("Zmiana API zamówień"));
+        let rows = rows(&render(&mut app, &Styles::new(false)));
+        let row = rows
+            .iter()
+            .find(|row| row.contains("NAR-12") && row.contains("Zmiana API zamówień"))
+            .unwrap_or_else(|| panic!("no label row in {rows:#?}"));
+        assert!(row.contains("6a7ceacf"), "{row}");
+        assert!(!row.contains("6a7ceacfd"), "only 8 characters: {row}");
+        assert!(row.find("NAR-12").unwrap() < row.find("6a7ceacf").unwrap());
+        assert!(rows.iter().any(|row| row.contains('╭')), "framed");
+    }
+
+    #[test]
+    fn a_task_with_only_a_ticket_or_only_a_title_shows_just_that() {
+        let mut ticket_only = labelled_app(Some("NAR-12"), None);
+        let screen_text = screen(&render(&mut ticket_only, &Styles::new(false)));
+        assert!(screen_text.contains("NAR-12") && screen_text.contains("6a7ceacf"));
+
+        let mut title_only = labelled_app(None, Some("Zmiana API"));
+        let screen_text = screen(&render(&mut title_only, &Styles::new(false)));
+        assert!(screen_text.contains("Zmiana API") && screen_text.contains("6a7ceacf"));
+    }
+
+    #[test]
+    fn a_task_without_ticket_and_title_has_no_label_block() {
+        let mut app = labelled_app(None, None);
+        let rows = rows(&render(&mut app, &Styles::new(false)));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("╭─") && row.contains("6a7ceacf")),
+            "no empty frames"
+        );
+        assert!(
+            rows[IDENTITY_ROW].contains("NAR-12 opis"),
+            "{}",
+            rows[IDENTITY_ROW]
+        );
+    }
+
+    #[test]
+    fn a_long_title_wraps_and_the_internal_number_stays_whole_at_60_columns() {
+        let title = "Przebudowa obsługi zamówień hurtowych wraz z migracją danych klientów";
+        let mut app = labelled_app(Some("NAR-12"), Some(title));
+        let buffer = render_at(&mut app, &Styles::new(false), 60, 24);
+        let rows = rows(&buffer);
+        let screen_text = screen(&buffer);
+        assert!(screen_text.contains("6a7ceacf"), "{screen_text}");
+        assert!(screen_text.contains("Przebudowa"), "{screen_text}");
+        assert!(
+            screen_text.contains("klientów"),
+            "the whole title fits: {screen_text}"
+        );
+        assert!(rows.iter().filter(|row| row.contains('│')).count() >= 3);
+    }
+
+    #[test]
+    fn the_label_block_leaves_the_tabs_and_content_at_60_by_20() {
+        let title = "x ".repeat(80);
+        let mut app = labelled_app(Some("NAR-12"), Some(title.trim()));
+        let buffer = render_at(&mut app, &Styles::new(false), 60, 20);
+        let screen_text = screen(&buffer);
+        assert!(screen_text.contains("6a7ceacf"), "{screen_text}");
+        assert!(
+            screen_text.contains("Przebieg") && screen_text.contains("Info"),
+            "{screen_text}"
+        );
+    }
+
+    #[test]
+    fn wide_characters_in_the_title_keep_the_frames_aligned() {
+        let mut app = labelled_app(
+            Some("NAR-12"),
+            Some("変更 注文 API 🚀 の修正を行う長いタイトル"),
+        );
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 24));
+        assert!(rows.iter().any(|row| row.contains("6a7ceacf")));
+    }
+
+    #[test]
+    fn info_lists_the_ticket_and_title_only_when_there_are_any() {
+        let mut with = labelled_app(Some("NAR-12"), Some("Zmiana API"));
+        for _ in 0..3 {
+            press(&mut with, KeyCode::Char(']'));
+        }
+        let info = screen(&render(&mut with, &Styles::new(false)));
+        assert!(info.contains("ticket") && info.contains("NAR-12"), "{info}");
+        assert!(info.contains("Zmiana API"), "{info}");
+
+        let mut without = labelled_app(None, None);
+        for _ in 0..3 {
+            press(&mut without, KeyCode::Char(']'));
+        }
+        let info = screen(&render(&mut without, &Styles::new(false)));
+        assert!(!info.contains("ticket"), "{info}");
+    }
 }
 
 /// U10: the panel "Czeka na Ciebie" drawn at the bottom of the details.
@@ -4705,24 +4823,33 @@ mod task_app_create_render {
             assert_eq!(listed.contains("Opis"), width >= 64, "{listed}");
 
             press(&mut app, KeyCode::Enter);
-            // The focus starts on the first field; the prompt is the last.
-            for _ in 0..3 {
+            // The focus starts on the first field; the prompt is the last,
+            // after the form's own ticket and title fields.
+            for _ in 0..5 {
                 press(&mut app, KeyCode::Down);
             }
             keys(&mut app, "pierwsza");
             app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
             keys(&mut app, "druga");
             let screen = draw_app(&mut app, width, height, false);
-            for expected in [
+            // Five short fields (the form's ticket and title among them) do
+            // not fit whole in the bar at 60 columns; it shortens them.
+            let bar: [&str; 3] = if width >= 100 {
+                [
+                    "ticket_id:",
+                    "dry_run: ‹ false ›",
+                    "target_repo: ‹ narsor ›",
+                ]
+            } else {
+                ["ticket_id", "dry_run", "target_re"]
+            };
+            for expected in bar.into_iter().chain([
                 "ship",
                 "Wysyła zmianę.",
-                "ticket_id:",
-                "dry_run: ‹ false ›",
-                "target_repo: ‹ narsor ›",
                 "prompt (wymagane)",
                 "> pierwsza",
                 "  druga",
-            ] {
+            ]) {
                 assert!(
                     screen.contains(expected),
                     "{width}x{height} {expected}:\n{screen}"
@@ -4803,7 +4930,7 @@ mod task_app_create_render {
         let mut app = app();
         open_described_form(&mut app, "Wysyła zmianę.");
         keys(&mut app, "NAR-1");
-        for _ in 0..2 {
+        for _ in 0..4 {
             app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         keys(&mut app, "tekst");
@@ -4957,7 +5084,7 @@ mod task_app_create_render {
         keys(&mut app, "NAR-18");
         press(&mut app, KeyCode::Down);
         keys(&mut app, "1-2");
-        for _ in 0..4 {
+        for _ in 0..6 {
             let request = press(&mut app, KeyCode::Enter);
             if request != Request::None {
                 assert!(matches!(request, Request::SendTask(_)));
@@ -5075,7 +5202,7 @@ mod task_app_create_render {
         open_form(&mut app);
         press(&mut app, KeyCode::Enter);
         keys(&mut app, "NAR-18");
-        let request = (0..5)
+        let request = (0..7)
             .map(|_| press(&mut app, KeyCode::Enter))
             .find(|request| *request != Request::None)
             .unwrap_or(Request::None);

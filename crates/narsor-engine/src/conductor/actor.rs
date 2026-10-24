@@ -59,6 +59,7 @@ use crate::conductor::store::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
 };
+use crate::conductor::title::conclude_title;
 use crate::domain::{ConductorOutcome, ConductorTrigger, EventData, ExecutionId};
 use crate::engine::Engine;
 use crate::persistence::Result;
@@ -737,6 +738,10 @@ impl ConductorActor {
                 &invocation.request,
                 outcome,
             )?;
+        }
+
+        if invocation.request.trigger == ConductorTrigger::Title {
+            conclude_title(&self.store, outcome)?;
         }
 
         let mut next = inner.state.clone();

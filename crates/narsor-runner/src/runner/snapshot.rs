@@ -14,8 +14,10 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::conductor::pending_chat_proposals;
-use crate::domain::{ExecutionStatus, TaskDisplay, WorkflowDefinition, WorkflowExecution};
+use crate::conductor::{pending_chat_proposals, ConductorStore};
+use crate::domain::{
+    ExecutionStatus, ParamType, TaskDisplay, WorkflowDefinition, WorkflowExecution,
+};
 use crate::engine::conversation_summary::summaries;
 pub(crate) use crate::engine::conversation_summary::ConversationCache;
 use crate::engine::{build_timeline, step_failure, Engine, InputContinuation, PendingHumanInput};
@@ -78,6 +80,7 @@ pub(crate) fn build(
             // Nothing to render against yet; the control plane's own
             // rendering from the sealed inputs stays in force.
             display: None,
+            generated_title: engine.generated_title(),
             observed_at,
         });
     };
@@ -90,6 +93,7 @@ pub(crate) fn build(
     let recorded = conversations.recorded_attempt_ids()?;
     let timeline = build_timeline(&events, execution.status, &recorded);
 
+    adopt_stored_title(engine, execution_id);
     let observed_at = Utc::now();
     let pending = engine.pending_input(execution_id)?;
     let mut attention = attention_items(pending.as_ref(), context.problem.as_ref(), observed_at);
@@ -138,7 +142,8 @@ pub(crate) fn build(
         conductor_available: context.conductor_unavailable.is_none(),
         conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
         default_harness_unavailable: context.default_harness_unavailable.cloned(),
-        display: render_display(context.definition, &execution),
+        display: render_display(engine, context.definition, &execution),
+        generated_title: engine.generated_title(),
         observed_at,
     })
 }
@@ -221,12 +226,57 @@ fn conductor_attention(
 /// The workflow's `display` against what the execution knows now: its inputs
 /// and the variables its steps have set so far.
 fn render_display(
+    engine: &Engine,
     definition: &WorkflowDefinition,
     execution: &WorkflowExecution,
 ) -> Option<TaskDisplay> {
     let spec = definition.display.as_ref()?;
-    let scope = TemplateScope::from_execution(&execution.inputs, &execution.context).ok()?;
+    let title = engine.task_title();
+    let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
+        .ok()?
+        .with_task_fields(engine.task_ticket(), title.as_deref());
     Some(scope.render_display(spec))
+}
+
+/// Takes the title the conductor stored into the engine, once it exists, so
+/// the steps rendered from then on and this snapshot carry it.
+fn adopt_stored_title(engine: &Engine, execution_id: &str) {
+    if engine.generated_title().is_some() {
+        return;
+    }
+    let store = ConductorStore::new(engine.store().paths(), execution_id);
+    match store.load_generated_title() {
+        Ok(Some(title)) => engine.set_generated_title(Some(title)),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "the generated title cannot be read"),
+    }
+}
+
+/// The longest description the conductor is given, in characters.
+const DESCRIPTION_MAX_CHARS: usize = 2000;
+
+/// The text the conductor names the task from: the rendered `display.title`
+/// of the workflow, or else its text inputs (`string` and `text`) in the order
+/// they are declared. Empty when the task has no text at all.
+pub(crate) fn task_description(
+    engine: &Engine,
+    definition: &WorkflowDefinition,
+    execution: &WorkflowExecution,
+) -> String {
+    let from_display = render_display(engine, definition, execution)
+        .map(|display| display.title)
+        .filter(|title| !title.trim().is_empty());
+    let text = from_display.unwrap_or_else(|| {
+        definition
+            .inputs
+            .iter()
+            .filter(|input| matches!(input.param_type, ParamType::String | ParamType::Text))
+            .filter_map(|input| execution.inputs.get(&input.name)?.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    text.trim().chars().take(DESCRIPTION_MAX_CHARS).collect()
 }
 
 #[cfg(test)]
