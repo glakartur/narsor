@@ -428,7 +428,11 @@ pub async fn run(
     let harness = Arc::new(LiveHarness::new(
         starting.unwrap_or_else(|| spec.environment.harness.clone()),
     ));
-    let engine = Arc::new(Engine::new(store).with_default_harness_source(harness.clone()));
+    let engine = Arc::new(
+        Engine::new(store)
+            .with_default_harness_source(harness.clone())
+            .with_task_labels(spec.ticket.clone(), spec.title.clone()),
+    );
 
     let conductor =
         conductor::ConductorHost::assemble(&engine, &storage, Arc::clone(&harness), &definition);
@@ -541,6 +545,7 @@ async fn report_problem(
         conductor_unavailable_reason: Some("the runner cannot work".to_string()),
         default_harness_unavailable: None,
         display: None,
+        generated_title: None,
         observed_at,
     };
     send_until(link, timing, &snapshot).await;

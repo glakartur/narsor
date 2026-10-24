@@ -526,6 +526,7 @@ impl SimulatedRunner {
             conductor_unavailable_reason: None,
             default_harness_unavailable: None,
             display: None,
+            generated_title: None,
             observed_at: Utc::now(),
         };
         self.client

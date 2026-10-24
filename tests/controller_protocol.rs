@@ -379,6 +379,7 @@ fn snapshot(
         conductor_unavailable_reason: None,
         default_harness_unavailable: None,
         display: None,
+        generated_title: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 5).unwrap(),
     }
 }

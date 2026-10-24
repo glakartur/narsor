@@ -643,7 +643,8 @@ impl CatalogLaunchResolver {
         };
         let context = Context::new();
         let scope = TemplateScope::from_execution(&inputs, &context)
-            .map_err(|error| LaunchError::InvalidInputs(error.to_string()))?;
+            .map_err(|error| LaunchError::InvalidInputs(error.to_string()))?
+            .with_task_fields(intent.ticket.as_deref(), intent.title.as_deref());
         let render = |template: &str, field: &str| {
             scope
                 .render(template, field)

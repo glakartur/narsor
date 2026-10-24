@@ -78,6 +78,7 @@ pub(crate) fn build(
             // Nothing to render against yet; the control plane's own
             // rendering from the sealed inputs stays in force.
             display: None,
+            generated_title: engine.generated_title(),
             observed_at,
         });
     };
@@ -138,7 +139,8 @@ pub(crate) fn build(
         conductor_available: context.conductor_unavailable.is_none(),
         conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
         default_harness_unavailable: context.default_harness_unavailable.cloned(),
-        display: render_display(context.definition, &execution),
+        display: render_display(engine, context.definition, &execution),
+        generated_title: engine.generated_title(),
         observed_at,
     })
 }
@@ -221,11 +223,15 @@ fn conductor_attention(
 /// The workflow's `display` against what the execution knows now: its inputs
 /// and the variables its steps have set so far.
 fn render_display(
+    engine: &Engine,
     definition: &WorkflowDefinition,
     execution: &WorkflowExecution,
 ) -> Option<TaskDisplay> {
     let spec = definition.display.as_ref()?;
-    let scope = TemplateScope::from_execution(&execution.inputs, &execution.context).ok()?;
+    let title = engine.task_title();
+    let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
+        .ok()?
+        .with_task_fields(engine.task_ticket(), title.as_deref());
     Some(scope.render_display(spec))
 }
 

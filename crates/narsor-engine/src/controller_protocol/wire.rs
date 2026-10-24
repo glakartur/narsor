@@ -88,6 +88,7 @@ pub(super) fn runner_snapshot_request(
         conductor_unavailable_reason: snapshot.conductor_unavailable_reason.clone(),
         default_harness_unavailable: snapshot.default_harness_unavailable.clone(),
         display: snapshot.display.clone(),
+        generated_title: snapshot.generated_title.clone(),
         observed_at: snapshot.observed_at,
     })
 }
@@ -119,6 +120,7 @@ pub(super) fn runner_snapshot_from_request(
         conductor_unavailable_reason: request.conductor_unavailable_reason,
         default_harness_unavailable: request.default_harness_unavailable,
         display: request.display,
+        generated_title: request.generated_title,
         observed_at: request.observed_at,
     })
 }

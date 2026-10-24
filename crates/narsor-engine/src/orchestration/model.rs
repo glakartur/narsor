@@ -830,6 +830,10 @@ pub struct RunnerSnapshot {
     /// creation in place; the last report that has one wins.
     #[serde(default)]
     pub display: Option<TaskDisplay>,
+    /// Title the conductor generated for a task whose operator gave none;
+    /// the last report that has one wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_title: Option<String>,
     /// When the runner took this snapshot.
     pub observed_at: DateTime<Utc>,
 }

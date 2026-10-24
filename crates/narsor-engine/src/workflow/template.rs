@@ -125,6 +125,8 @@ pub struct TemplateScope<'a> {
     step_replies: Option<&'a HashMap<String, Value>>,
     step_streams: Option<&'a HashMap<String, Value>>,
     step_memory: Option<StepMemory<'a>>,
+    task_ticket: &'a str,
+    task_title: &'a str,
 }
 
 /// What the step being rendered keeps for itself: its `local.*` values, the
@@ -211,6 +213,8 @@ impl<'a> TemplateScope<'a> {
             step_replies: None,
             step_streams: None,
             step_memory: None,
+            task_ticket: "",
+            task_title: "",
         }
     }
 
@@ -228,6 +232,8 @@ impl<'a> TemplateScope<'a> {
             step_replies: None,
             step_streams: None,
             step_memory: None,
+            task_ticket: "",
+            task_title: "",
         }
     }
 
@@ -254,6 +260,15 @@ impl<'a> TemplateScope<'a> {
     /// `{{ step.history }}`.
     pub fn with_step_memory(mut self, memory: StepMemory<'a>) -> Self {
         self.step_memory = Some(memory);
+        self
+    }
+
+    /// Adds the task's own ticket and title: `{{ task.ticket }}` and
+    /// `{{ task.title }}`. A task without one renders as empty text, and a
+    /// scope that never got them reads both as empty.
+    pub fn with_task_fields(mut self, ticket: Option<&'a str>, title: Option<&'a str>) -> Self {
+        self.task_ticket = ticket.unwrap_or_default();
+        self.task_title = title.unwrap_or_default();
         self
     }
 
@@ -544,6 +559,12 @@ impl<'a> TemplateScope<'a> {
                     None => Err(unknown()),
                 }
             }
+
+            "task" => match path {
+                "ticket" => Ok(self.task_ticket.to_string()),
+                "title" => Ok(self.task_title.to_string()),
+                _ => Err(unknown()),
+            },
 
             "step" if path == "history" => Ok(self
                 .step_memory

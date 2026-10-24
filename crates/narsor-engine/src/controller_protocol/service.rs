@@ -2495,7 +2495,12 @@ fn task_display(record: &TaskRecord) -> TaskDisplay {
         .as_object()
         .cloned()
         .unwrap_or_default();
-    TemplateScope::from_parts(&inputs, &no_variables).render_display(&spec)
+    TemplateScope::from_parts(&inputs, &no_variables)
+        .with_task_fields(
+            record.launch_spec.ticket.as_deref(),
+            record.launch_spec.title.as_deref(),
+        )
+        .render_display(&spec)
 }
 
 /// The desired state of one task as of `now`. `reader_needed` is the reader

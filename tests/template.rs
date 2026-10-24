@@ -689,3 +689,77 @@ fn check_syntax_and_reference_collectors_know_the_artifacts_root() {
         vec!["plan_doc".to_string(), "review".to_string()]
     );
 }
+
+// ---------------------------------------------------------------------------
+// `{{ task.ticket }}` and `{{ task.title }}`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task_fields_render_the_ticket_and_title() {
+    let (inputs, context) = (inputs(&[]), context(&[]));
+    let scope = TemplateScope::new(&inputs, &context)
+        .with_task_fields(Some("NAR-12"), Some("Zmiana API zamówień"));
+    assert_eq!(
+        scope.render("Ticket {{ task.ticket }}: {{ task.title }}", WHERE).unwrap(),
+        "Ticket NAR-12: Zmiana API zamówień"
+    );
+}
+
+#[test]
+fn task_fields_without_a_value_render_empty_text() {
+    let (inputs, context) = (inputs(&[]), context(&[]));
+    let none = TemplateScope::new(&inputs, &context).with_task_fields(None, None);
+    assert_eq!(none.render("[{{ task.ticket }}]", WHERE).unwrap(), "[]");
+    // A scope that never got them reads both as empty, not as an error.
+    assert_eq!(render("[{{ task.title }}]", &inputs, &context), "[]");
+}
+
+#[test]
+fn a_task_ticket_does_not_collide_with_an_input_of_the_same_name() {
+    let (inputs, context) = (inputs(&[("ticket", json!("B"))]), context(&[]));
+    let scope = TemplateScope::new(&inputs, &context).with_task_fields(Some("A"), None);
+    assert_eq!(
+        scope.render("{{ task.ticket }}/{{ inputs.ticket }}", WHERE).unwrap(),
+        "A/B"
+    );
+}
+
+#[test]
+fn an_unknown_task_field_is_an_error_and_filters_stay_unsupported() {
+    let (inputs, context) = (inputs(&[]), context(&[]));
+    assert!(matches!(
+        render_error("{{ task.foo }}", &inputs, &context),
+        TemplateError::UnknownVariable { .. }
+    ));
+    assert!(matches!(
+        render_error("{{ task.ticket | upper }}", &inputs, &context),
+        TemplateError::FilterUnsupported { .. }
+    ));
+}
+
+#[test]
+fn a_workflow_may_use_task_fields_in_prompts_display_and_workspace() {
+    let yaml = r#"
+name: labelled
+version: 1
+display:
+  title: "{{ task.title }}"
+  links:
+    - label: Jira
+      text: "{{ task.ticket }}"
+      url: "https://jira.example/browse/{{ task.ticket }}"
+globals:
+  workspace:
+    type: git
+    repository: "{{ task.ticket }}"
+states:
+  plan:
+    action:
+      type: agent
+      prompt: "Ticket {{ task.ticket }}: {{ task.title }}"
+    choices: [done]
+    transitions:
+      done: completed
+"#;
+    narsor_engine::workflow::load_from_str(yaml).expect("task.* passes validation");
+}
