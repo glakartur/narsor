@@ -1496,8 +1496,12 @@ async fn a_comment_on_a_pause_does_not_block_the_resume_when_the_control_plane_i
         .load_execution(&launch.execution_id().unwrap())
         .unwrap();
     assert!(
-        !execution.metadata.to_string().contains("mind the flaky test"),
-        "the comment was not known, so it was not given: {}", execution.metadata
+        !execution
+            .metadata
+            .to_string()
+            .contains("mind the flaky test"),
+        "the comment was not known, so it was not given: {}",
+        execution.metadata
     );
 }
 

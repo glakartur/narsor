@@ -147,8 +147,8 @@
         <path class="edge" d="M900 2218V2434H675"/>
         <path class="edge" d="M675 2208H745V2398H640V2414"/>
         <path class="edge" d="M550 2474V2514"/>
-        <path class="edge" d="M425 2534H385V2444H425"/>
         <path class="edge" d="M550 2574V2614"/>
+        <path class="edge" d="M425 2544H380V2454H425"/>
         <path class="edge" d="M675 2460H960V2614"/>
         <path class="edge" d="M425 398H60V2644H110"/>
         <path class="edge" d="M425 954H60V2644H110"/>
@@ -204,9 +204,9 @@
         <text class="edge-label" x="560" y="2370" text-anchor="start">no_feedback</text>
         <text class="edge-label" x="232" y="2218" text-anchor="start">nothing_to_document</text>
         <text class="edge-label" x="908" y="2300" text-anchor="start">dropped</text>
-        <text class="edge-label" x="560" y="2498" text-anchor="start">blocked / timeout</text>
-        <text class="edge-label" x="345" y="2493" text-anchor="start">retry</text>
-        <text class="edge-label" x="560" y="2598" text-anchor="start">finish_as_draft</text>
+        <text class="edge-label" x="560" y="2500" text-anchor="start">blocked / timeout</text>
+        <text class="edge-label" x="560" y="2600" text-anchor="start">confirm_failure</text>
+        <text class="edge-label" x="376" y="2500" text-anchor="end">retry</text>
         <text class="edge-label" x="968" y="2540" text-anchor="start">ready</text>
         <text class="edge-label" x="66" y="2584">abandon</text>
 
@@ -237,16 +237,16 @@
         <g class="node agent"><rect x="775" y="2158" width="250" height="60"/><text class="title" x="900" y="2185">Usunięcie dokumentu</text><text class="sub" x="900" y="2204">drop_learning</text></g>
         <g class="node agent"><rect x="425" y="2258" width="250" height="60"/><text class="title" x="550" y="2285">Uwagi z MR</text><text class="sub" x="550" y="2304">check_learning_feedback</text></g>
         <g class="node agent"><rect x="425" y="2414" width="250" height="60"/><text class="title" x="550" y="2441">Zdjęcie Draftu</text><text class="sub" x="550" y="2460">finalize · gh / glab · ≤ 10 min</text></g>
-        <g class="node human"><rect x="425" y="2514" width="250" height="60"/><text class="title" x="550" y="2541">Finalizacja zablokowana</text><text class="sub" x="550" y="2560">finalize_blocked</text></g>
+        <g class="node human"><rect x="425" y="2514" width="250" height="60"/><text class="title" x="550" y="2541">Decyzja o porażce</text><text class="sub" x="550" y="2560">finalize_blocked</text></g>
         <g class="node terminal"><rect x="810" y="2614" width="180" height="60"/><text class="title" x="900" y="2641">finished</text><text class="sub" x="900" y="2660">gotowy do review</text></g>
-        <g class="node terminal"><rect x="460" y="2614" width="180" height="60"/><text class="title" x="550" y="2641">left_as_draft</text><text class="sub" x="550" y="2660">MR w stanie Draft</text></g>
+        <g class="node terminal"><rect x="460" y="2614" width="180" height="60"/><text class="title" x="550" y="2641">finalize_failed</text><text class="sub" x="550" y="2660">potwierdzona przez człowieka</text></g>
         <g class="node terminal"><rect x="110" y="2614" width="180" height="60"/><text class="title" x="200" y="2641">cancelled</text><text class="sub" x="200" y="2660">abandon</text></g>
       </svg>
     </div>
     <section class="notes" aria-label="Opis głównych pętli">
       <article class="note"><h2>Wymagania i plan</h2><p>Review poprawia dokument i podsumowuje uwagi. Wynik nie czeka na bramkę: publikacja dodaje podsumowanie do MR jako komentarz, a człowiek czyta je przy bramce. Brainstorm nie zadaje pytań. Założenia i pytania otwarte są w dokumencie, a człowiek odpowiada w MR. Dla małej i oczywistej zmiany agent może pominąć review wymagań (<code>requirements_ready</code>) i podać powód w MR. Pierwsza publikacja tworzy Draft MR. Po <code>check_feedback</code> agent ocenia skalę poprawek z uwag: mała wraca do bramki, duża do review. <code>accept</code> pomija sprawdzenie uwag. Blokada planu wraca do autora wymagań.</p></article>
       <article class="note"><h2>Implementacja</h2><p>Uproszczenie działa raz. Każda późniejsza zmiana kodu przechodzi przez code review, sprawdzenie i publikację, zanim wróci do człowieka. Publikacja kodu przepisuje opis MR, aby opisywał całą zmianę. Blokada implementacji wraca do autora planu. Pętle napraw mają limity wejść.</p></article>
-      <article class="note"><h2>Wiedza i zakończenie</h2><p>Bez nowej wiedzy proces idzie od razu do zakończenia. Agent tylko zdejmuje Draft z MR: nie zatwierdza MR, nie włącza scalenia automatycznego i nie czeka na pipeline. MR scala człowiek. Gdy agent nie może zdjąć Draftu, bramka pozwala spróbować ponownie albo zakończyć z MR w stanie Draft.</p></article>
+      <article class="note"><h2>Wiedza i zakończenie</h2><p>Bez nowej wiedzy proces idzie od razu do zakończenia. Agent tylko zdejmuje Draft z MR: nie zatwierdza MR, nie włącza scalenia automatycznego i nie czeka na pipeline. MR scala człowiek. Gdy agent nie potwierdzi zdjęcia Draftu (<code>blocked</code> lub <code>timeout</code>), proces staje na bramce <code>finalize_blocked</code>. <code>retry</code> uruchamia <code>finalize</code> ponownie. <code>confirm_failure</code> kończy proces w <code>finalize_failed</code> z powodem w historii.</p></article>
     </section>
     <footer>Diagram oparty na <code>workflows/compound-engineering.yaml</code>. Na wąskim ekranie przewiń diagram poziomo.</footer>
   </main>
