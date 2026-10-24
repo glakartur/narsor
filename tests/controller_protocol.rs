@@ -7205,7 +7205,10 @@ async fn a_task_keeps_the_trimmed_ticket_and_title_it_was_created_with() {
 
     assert_eq!(task.ticket.as_deref(), Some("NAR-12"));
     assert_eq!(task.title.as_deref(), Some("Zmiana API zamówień"));
-    assert_eq!(harness.task("task-1").await.ticket.as_deref(), Some("NAR-12"));
+    assert_eq!(
+        harness.task("task-1").await.ticket.as_deref(),
+        Some("NAR-12")
+    );
 }
 
 #[tokio::test]
@@ -7248,7 +7251,12 @@ async fn the_generated_title_shows_only_when_the_operator_gave_none() {
     reported.generated_title = Some("x".repeat(80));
     running.runner.snapshot(&reported).await.expect("snapshot");
     assert_eq!(
-        harness.task("task-1").await.title.as_deref().map(|t| t.chars().count()),
+        harness
+            .task("task-1")
+            .await
+            .title
+            .as_deref()
+            .map(|t| t.chars().count()),
         Some(50)
     );
 }
@@ -7262,5 +7270,8 @@ async fn the_operator_title_wins_over_a_generated_one() {
     let mut reported = snapshot(2, ExecutionStatus::Running, 4, None);
     reported.generated_title = Some("Inny tytuł".to_string());
     running.runner.snapshot(&reported).await.expect("snapshot");
-    assert_eq!(harness.task("task-1").await.title.as_deref(), Some("Mój tytuł"));
+    assert_eq!(
+        harness.task("task-1").await.title.as_deref(),
+        Some("Mój tytuł")
+    );
 }

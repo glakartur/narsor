@@ -3385,10 +3385,16 @@ mod task_app_detail_render {
         let mut app = labelled_app(None, None);
         let rows = rows(&render(&mut app, &Styles::new(false)));
         assert!(
-            !rows.iter().any(|row| row.contains("╭─") && row.contains("6a7ceacf")),
+            !rows
+                .iter()
+                .any(|row| row.contains("╭─") && row.contains("6a7ceacf")),
             "no empty frames"
         );
-        assert!(rows[IDENTITY_ROW].contains("NAR-12 opis"), "{}", rows[IDENTITY_ROW]);
+        assert!(
+            rows[IDENTITY_ROW].contains("NAR-12 opis"),
+            "{}",
+            rows[IDENTITY_ROW]
+        );
     }
 
     #[test]
@@ -3400,7 +3406,10 @@ mod task_app_detail_render {
         let screen_text = screen(&buffer);
         assert!(screen_text.contains("6a7ceacf"), "{screen_text}");
         assert!(screen_text.contains("Przebudowa"), "{screen_text}");
-        assert!(screen_text.contains("klientów"), "the whole title fits: {screen_text}");
+        assert!(
+            screen_text.contains("klientów"),
+            "the whole title fits: {screen_text}"
+        );
         assert!(rows.iter().filter(|row| row.contains('│')).count() >= 3);
     }
 
@@ -3411,12 +3420,18 @@ mod task_app_detail_render {
         let buffer = render_at(&mut app, &Styles::new(false), 60, 20);
         let screen_text = screen(&buffer);
         assert!(screen_text.contains("6a7ceacf"), "{screen_text}");
-        assert!(screen_text.contains("Przebieg") && screen_text.contains("Info"), "{screen_text}");
+        assert!(
+            screen_text.contains("Przebieg") && screen_text.contains("Info"),
+            "{screen_text}"
+        );
     }
 
     #[test]
     fn wide_characters_in_the_title_keep_the_frames_aligned() {
-        let mut app = labelled_app(Some("NAR-12"), Some("変更 注文 API 🚀 の修正を行う長いタイトル"));
+        let mut app = labelled_app(
+            Some("NAR-12"),
+            Some("変更 注文 API 🚀 の修正を行う長いタイトル"),
+        );
         let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 24));
         assert!(rows.iter().any(|row| row.contains("6a7ceacf")));
     }
@@ -4808,24 +4823,33 @@ mod task_app_create_render {
             assert_eq!(listed.contains("Opis"), width >= 64, "{listed}");
 
             press(&mut app, KeyCode::Enter);
-            // The focus starts on the first field; the prompt is the last.
-            for _ in 0..3 {
+            // The focus starts on the first field; the prompt is the last,
+            // after the form's own ticket and title fields.
+            for _ in 0..5 {
                 press(&mut app, KeyCode::Down);
             }
             keys(&mut app, "pierwsza");
             app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
             keys(&mut app, "druga");
             let screen = draw_app(&mut app, width, height, false);
-            for expected in [
+            // Five short fields (the form's ticket and title among them) do
+            // not fit whole in the bar at 60 columns; it shortens them.
+            let bar: [&str; 3] = if width >= 100 {
+                [
+                    "ticket_id:",
+                    "dry_run: ‹ false ›",
+                    "target_repo: ‹ narsor ›",
+                ]
+            } else {
+                ["ticket_id", "dry_run", "target_re"]
+            };
+            for expected in bar.into_iter().chain([
                 "ship",
                 "Wysyła zmianę.",
-                "ticket_id:",
-                "dry_run: ‹ false ›",
-                "target_repo: ‹ narsor ›",
                 "prompt (wymagane)",
                 "> pierwsza",
                 "  druga",
-            ] {
+            ]) {
                 assert!(
                     screen.contains(expected),
                     "{width}x{height} {expected}:\n{screen}"
@@ -4906,7 +4930,7 @@ mod task_app_create_render {
         let mut app = app();
         open_described_form(&mut app, "Wysyła zmianę.");
         keys(&mut app, "NAR-1");
-        for _ in 0..2 {
+        for _ in 0..4 {
             app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         keys(&mut app, "tekst");
@@ -5060,7 +5084,7 @@ mod task_app_create_render {
         keys(&mut app, "NAR-18");
         press(&mut app, KeyCode::Down);
         keys(&mut app, "1-2");
-        for _ in 0..4 {
+        for _ in 0..6 {
             let request = press(&mut app, KeyCode::Enter);
             if request != Request::None {
                 assert!(matches!(request, Request::SendTask(_)));
@@ -5178,7 +5202,7 @@ mod task_app_create_render {
         open_form(&mut app);
         press(&mut app, KeyCode::Enter);
         keys(&mut app, "NAR-18");
-        let request = (0..5)
+        let request = (0..7)
             .map(|_| press(&mut app, KeyCode::Enter))
             .find(|request| *request != Request::None)
             .unwrap_or(Request::None);

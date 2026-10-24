@@ -96,6 +96,33 @@ pub const PATH_LABEL: &str = "ścieżka…";
 /// The field of that entry the path is typed into.
 pub const PATH_FIELD: &str = "ścieżka";
 
+/// The form's own ticket field of every entry. Its name is what the operator
+/// reads and the key its value comes back under; it stays apart from the
+/// workflow's inputs, which are lower-case names.
+pub const TICKET_FIELD: &str = "Ticket";
+
+/// The form's own title field of every entry; see [`TICKET_FIELD`].
+pub const TITLE_FIELD: &str = "Tytuł";
+
+/// The ticket and title fields: optional, one line, for every workflow. The
+/// form only passes what was typed on; the server trims and checks it.
+fn label_fields() -> [ChooserField; 2] {
+    [
+        ChooserField::text(TICKET_FIELD).described("numer zadania w Jirze, opcjonalnie"),
+        ChooserField::text(TITLE_FIELD)
+            .described("krótki tytuł; bez niego nada go dyrygent, opcjonalnie"),
+    ]
+}
+
+/// What was typed into the field `name`, as typed, unless it is empty.
+fn typed_label(values: &[(String, String)], name: &str) -> Option<String> {
+    values
+        .iter()
+        .find(|(field, _)| field == name)
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.trim().is_empty())
+}
+
 /// What the entry says when the server does not read workflow files and gave
 /// no reason of its own.
 const PATHS_REFUSED: &str = "ten serwer nie czyta plików workflow ze swojego dysku";
@@ -304,8 +331,10 @@ fn workflow_item(workflow: &WorkflowView, repositories: &[String]) -> ChooserIte
     if workflow.version.is_none() {
         return item.unavailable("definicja się nie wczytuje");
     }
+    // After the inputs: the form still opens on the workflow's first input.
     workflow_input_fields(&workflow.inputs, repositories)
         .into_iter()
+        .chain(label_fields())
         .fold(item, ChooserItem::with_field)
 }
 
@@ -360,7 +389,12 @@ fn path_item(
         ..
     }) = check
     {
-        for field in workflow_input_fields(inputs, repositories) {
+        // Only once the file is accepted: until then `Enter` on the path asks
+        // the server to check it, as the path is the last field.
+        for field in workflow_input_fields(inputs, repositories)
+            .into_iter()
+            .chain(label_fields())
+        {
             item = item.with_field(field);
         }
     }
@@ -422,6 +456,10 @@ pub enum CreateHow {
         workflow: String,
         /// The inputs.
         inputs: Map<String, Value>,
+        /// The ticket as typed, if any.
+        ticket: Option<String>,
+        /// The title as typed, if any.
+        title: Option<String>,
     },
 }
 
@@ -716,6 +754,8 @@ impl TaskApp {
             return Request::None;
         }
         let title = title_for(&workflow, &declared, &inputs);
+        let ticket_typed = typed_label(&submission.values, TICKET_FIELD);
+        let title_typed = typed_label(&submission.values, TITLE_FIELD);
         let task_id = new_task_id();
         let send = match how_for {
             Sending::Catalogue { name, version } => {
@@ -730,14 +770,16 @@ impl TaskApp {
                         profile: None,
                         harness: None,
                         resources: None,
-                        ticket: None,
-                        title: None,
+                        ticket: ticket_typed,
+                        title: title_typed,
                     },
                 }))
             }
             Sending::Path { path } => CreateHow::Path {
                 workflow: path,
                 inputs: inputs.clone(),
+                ticket: ticket_typed,
+                title: title_typed,
             },
         };
         self.begin_sending(Outgoing {
@@ -786,9 +828,20 @@ impl TaskApp {
         };
         let result = match &outgoing.send {
             CreateHow::Catalogue(request) => self.client.create_control_task(request).await,
-            CreateHow::Path { workflow, inputs } => self
+            CreateHow::Path {
+                workflow,
+                inputs,
+                ticket,
+                title,
+            } => self
                 .client
-                .start_task(&outgoing.task_id, workflow, inputs.clone())
+                .start_task_with_labels(
+                    &outgoing.task_id,
+                    workflow,
+                    inputs.clone(),
+                    ticket.clone(),
+                    title.clone(),
+                )
                 .await
                 .map(|started| started.task),
         };

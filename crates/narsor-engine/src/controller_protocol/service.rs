@@ -34,8 +34,9 @@ use super::credentials::{
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{
-    effective_title, normalize_label, one_line_label, AnsweredBy, GENERATED_TITLE_MAX_CHARS, BackendId, LabelError, LaunchDefinitionError, ResourceProfile,
-    TaskDisplay, TaskId, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
+    effective_title, normalize_label, one_line_label, AnsweredBy, BackendId, LabelError,
+    LaunchDefinitionError, ResourceProfile, TaskDisplay, TaskId, GENERATED_TITLE_MAX_CHARS,
+    TICKET_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use crate::engine::{
     plan_operator_transition, EngineError, HumanInputDelivery, PositionStatus, Timeline,

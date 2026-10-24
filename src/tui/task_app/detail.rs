@@ -965,8 +965,8 @@ pub(super) fn render_view(
     let base_lines = HEADER_LINES + u16::from(notice.is_some());
     // The label block takes what the tabs, a row of content and the frame
     // leave; without room for even one row of title it is not drawn.
-    let title_rows = usize::from(area.height.saturating_sub(base_lines + 2 + 3 + 2))
-        .min(MAX_TITLE_ROWS);
+    let title_rows =
+        usize::from(area.height.saturating_sub(base_lines + 2 + 3 + 2)).min(MAX_TITLE_ROWS);
     let labels = label_block(
         view.task,
         styles,
@@ -1362,7 +1362,12 @@ fn label_block(
             .filter(|text| !text.trim().is_empty())
     };
     let (ticket, title) = (plain(&task.ticket), plain(&task.title));
-    let id: String = task.task_id.to_string().chars().take(SHORT_ID_CHARS).collect();
+    let id: String = task
+        .task_id
+        .to_string()
+        .chars()
+        .take(SHORT_ID_CHARS)
+        .collect();
     let id_width = cells(&id) + 4;
     if (ticket.is_none() && title.is_none()) || title_rows == 0 || width < id_width + 10 {
         return Vec::new();
@@ -1378,7 +1383,11 @@ fn label_block(
     }
     if let Some(title) = &title {
         let box_width = (cells(title) + 4).min(room).max(5);
-        left.push((wrap_cells(title, box_width - 4, title_rows), box_width, true));
+        left.push((
+            wrap_cells(title, box_width - 4, title_rows),
+            box_width,
+            true,
+        ));
     }
     let height = left.iter().map(|(rows, ..)| rows.len()).max().unwrap_or(1);
 
@@ -1386,7 +1395,10 @@ fn label_block(
     let text_role = if stale { Role::Done } else { Role::Calm };
     let mut boxes = left;
     boxes.push((vec![id], id_width, false));
-    let used: usize = boxes.iter().map(|(_, box_width, _)| box_width).sum::<usize>()
+    let used: usize = boxes
+        .iter()
+        .map(|(_, box_width, _)| box_width)
+        .sum::<usize>()
         + boxes.len().saturating_sub(2);
     let filler = width.saturating_sub(used);
     let last = boxes.len() - 1;

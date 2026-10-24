@@ -700,7 +700,9 @@ fn task_fields_render_the_ticket_and_title() {
     let scope = TemplateScope::new(&inputs, &context)
         .with_task_fields(Some("NAR-12"), Some("Zmiana API zamówień"));
     assert_eq!(
-        scope.render("Ticket {{ task.ticket }}: {{ task.title }}", WHERE).unwrap(),
+        scope
+            .render("Ticket {{ task.ticket }}: {{ task.title }}", WHERE)
+            .unwrap(),
         "Ticket NAR-12: Zmiana API zamówień"
     );
 }
@@ -719,7 +721,9 @@ fn a_task_ticket_does_not_collide_with_an_input_of_the_same_name() {
     let (inputs, context) = (inputs(&[("ticket", json!("B"))]), context(&[]));
     let scope = TemplateScope::new(&inputs, &context).with_task_fields(Some("A"), None);
     assert_eq!(
-        scope.render("{{ task.ticket }}/{{ inputs.ticket }}", WHERE).unwrap(),
+        scope
+            .render("{{ task.ticket }}/{{ inputs.ticket }}", WHERE)
+            .unwrap(),
         "A/B"
     );
 }

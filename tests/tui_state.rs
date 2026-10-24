@@ -10187,6 +10187,7 @@ mod task_app_create {
     use narsor::tui::task_app::list::PendingState;
     use narsor::tui::task_app::new_task::{
         absolute_path, CreateHow, PathVerdict, DRAFT_KEY, PATH_FIELD, PATH_LABEL, RETRY_AFTER,
+        TICKET_FIELD, TITLE_FIELD,
     };
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{DetailTab, Request, TaskApp, ViewKind};
@@ -10475,7 +10476,17 @@ mod task_app_create {
                 .iter()
                 .map(|field| field.name.as_str())
                 .collect();
-            assert_eq!(names, ["ticket_id", "attempts", "dry_run", "target_repo"]);
+            assert_eq!(
+                names,
+                [
+                    "ticket_id",
+                    "attempts",
+                    "dry_run",
+                    "target_repo",
+                    TICKET_FIELD,
+                    TITLE_FIELD
+                ]
+            );
             assert!(item.fields[0].required);
             assert_eq!(
                 item.fields[0].description.as_deref(),
@@ -10868,7 +10879,7 @@ mod task_app_create {
                 .iter()
                 .map(|field| field.name.as_str())
                 .collect();
-            assert_eq!(names, [PATH_FIELD, "ticket"]);
+            assert_eq!(names, [PATH_FIELD, "ticket", TICKET_FIELD, TITLE_FIELD]);
             assert!(item.description.contains("my-flow v4"));
             assert_eq!(
                 field_value(&app, PATH_LABEL, PATH_FIELD),
@@ -10878,6 +10889,9 @@ mod task_app_create {
 
             press(&mut app, KeyCode::Down);
             typed(&mut app, "NAR-3");
+            // Past the form's own ticket and title fields.
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Enter);
             let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
                 panic!("the task should be sent");
             };
@@ -10889,6 +10903,8 @@ mod task_app_create {
                 CreateHow::Path {
                     workflow: "/srv/ok.yaml".to_string(),
                     inputs: json!({ "ticket": "NAR-3" }).as_object().unwrap().clone(),
+                    ticket: None,
+                    title: None,
                 }
             );
         }
@@ -10987,6 +11003,58 @@ mod task_app_create {
         }
 
         #[test]
+        fn the_form_has_optional_ticket_and_title_fields_for_every_workflow() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            for workflow in ["implement-feature", "fix-bug"] {
+                let item = chooser_item(&app, workflow);
+                for name in [TICKET_FIELD, TITLE_FIELD] {
+                    let field = item.fields.iter().find(|field| field.name == name);
+                    assert!(
+                        field.is_some_and(|field| !field.required),
+                        "{workflow} {name}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_task_made_without_ticket_and_title_sends_neither() {
+            let mut app = filled();
+            let Request::SendTask(_) = super::enter_until_send(&mut app) else {
+                panic!("a send was expected");
+            };
+            let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
+                panic!("catalogue");
+            };
+            assert_eq!(
+                (&request.launch.ticket, &request.launch.title),
+                (&None, &None)
+            );
+        }
+
+        #[test]
+        fn the_typed_ticket_and_title_go_to_the_request_as_typed() {
+            let mut app = filled();
+            // From `attempts`: past `dry_run` and `target_repo` to the ticket.
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Down);
+            }
+            typed(&mut app, "  NAR-12 ");
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "Zmiana API zamówień");
+            let Request::SendTask(_) = super::enter_until_send(&mut app) else {
+                panic!("a send was expected");
+            };
+            let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
+                panic!("catalogue");
+            };
+            assert_eq!(request.launch.ticket.as_deref(), Some("  NAR-12 "));
+            assert_eq!(request.launch.title.as_deref(), Some("Zmiana API zamówień"));
+            assert_eq!(request.launch.inputs["ticket_id"], json!("NAR-18"));
+        }
+
+        #[test]
         fn a_boolean_chosen_with_the_arrow_is_sent_as_a_boolean() {
             let mut app = app_with(vec![]);
             open_form(&mut app);
@@ -10995,7 +11063,7 @@ mod task_app_create {
             press(&mut app, KeyCode::Down);
             press(&mut app, KeyCode::Right);
             assert_eq!(field_value(&app, "implement-feature", "dry_run"), "true");
-            for _ in 0..3 {
+            for _ in 0..5 {
                 press(&mut app, KeyCode::Enter);
             }
             let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
@@ -12228,8 +12296,11 @@ mod task_app_create {
                 narsor_registry(),
             );
             press(app, KeyCode::Enter);
-            // The focus starts on the first field; the prompt is below it.
-            press(app, KeyCode::Down);
+            // The focus starts on the first field; the prompt is below it,
+            // under the form's own ticket and title fields.
+            for _ in 0..3 {
+                press(app, KeyCode::Down);
+            }
             assert_eq!(app.key_context().base, Context::Form);
         }
 
