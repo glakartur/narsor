@@ -1166,10 +1166,10 @@ fn replies_up_to_finalize() -> Vec<Value> {
     [replies_up_to_compound(), vec![reply("nothing_to_document")]].concat()
 }
 
-/// Covers AE4: a finalize that cannot take the pull request out of Draft
-/// ends the run failed, with its reason, and opens no gate.
+/// Covers AE2 and AE4: a finalize that cannot take the pull request out of
+/// Draft stops at the gate with its reason. The run does not fail yet.
 #[tokio::test]
-async fn covers_ae4_a_blocked_finalize_fails_the_run_with_its_reason() {
+async fn covers_ae4_a_blocked_finalize_stops_at_the_gate_with_its_reason() {
     let blocked = reply_with(
         "blocked",
         json!({ "reason": "glab is not signed in where the step runs" }),
@@ -1179,20 +1179,90 @@ async fn covers_ae4_a_blocked_finalize_fails_the_run_with_its_reason() {
 
     let execution = run.run(&gates_up_to_compound()).await;
 
-    assert!(run.took(&execution.id, "finalize", "blocked", "finalize_failed"));
-    assert_eq!(execution.current_state.as_deref(), Some("finalize_failed"));
-    assert_eq!(execution.status, ExecutionStatus::Failed);
-    assert_eq!(
-        run.reasons_for(&execution.id, "blocked"),
-        vec!["glab is not signed in where the step runs".to_string()],
-        "the history shows why finalize failed"
+    assert!(run.took(&execution.id, "finalize", "blocked", "finalize_blocked"));
+    assert_ne!(execution.status, ExecutionStatus::Failed);
+    let pending = run.pending(&execution.id);
+    assert_eq!(pending.state_id, "finalize_blocked");
+    let reason = pending.request.reason.unwrap_or_default();
+    assert!(
+        reason.contains("glab is not signed in"),
+        "the gate shows why finalize stopped: {reason:?}"
     );
 }
 
-/// The engine stops a `finalize` that outlives its step limit and hands it
-/// the declared `timeout` choice, so the run ends failed.
+/// Covers AE4: `retry` runs finalize again.
 #[tokio::test]
-async fn a_finalize_stopped_by_its_time_limit_fails_the_run() {
+async fn covers_ae4_a_retried_finalize_can_end_ready() {
+    let replies = [
+        replies_up_to_finalize(),
+        vec![reply("blocked"), reply("ready")],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies);
+    let gates = [
+        gates_up_to_compound(),
+        vec![Answer::new(
+            "finalize_blocked",
+            &[("finalize_decision", "retry")],
+        )],
+    ]
+    .concat();
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(&execution.id, "finalize_blocked", "retry", "finalize"));
+    assert!(run.took(&execution.id, "finalize", "ready", "finished"));
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+}
+
+/// `retry` has no limit: two in a row neither fail the run nor stop it.
+#[tokio::test]
+async fn retrying_a_blocked_finalize_twice_is_not_limited() {
+    let replies = [
+        replies_up_to_finalize(),
+        vec![reply("blocked"), reply("blocked"), reply("ready")],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies);
+    let retry = || Answer::new("finalize_blocked", &[("finalize_decision", "retry")]);
+    let gates = [gates_up_to_compound(), vec![retry(), retry()]].concat();
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(&execution.id, "finalize", "ready", "finished"));
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+}
+
+/// Covers AE5: `confirm_failure` ends the run failed.
+#[tokio::test]
+async fn covers_ae5_confirming_the_failure_ends_the_run_failed() {
+    let replies = [replies_up_to_finalize(), vec![reply("blocked")]].concat();
+    let run = CompoundRun::new(&replies);
+    let gates = [
+        gates_up_to_compound(),
+        vec![Answer::new(
+            "finalize_blocked",
+            &[("finalize_decision", "confirm_failure")],
+        )],
+    ]
+    .concat();
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(
+        &execution.id,
+        "finalize_blocked",
+        "confirm_failure",
+        "finalize_failed"
+    ));
+    assert_eq!(execution.current_state.as_deref(), Some("finalize_failed"));
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+}
+
+/// The engine stops a `finalize` that outlives its step limit and hands it
+/// the declared `timeout` choice, so the run stops at the gate.
+#[tokio::test]
+async fn a_finalize_stopped_by_its_time_limit_stops_at_the_gate() {
     let replies = [replies_up_to_finalize(), vec![reply("ready")]].concat();
     let run = CompoundRun::new(&replies)
         .with_call_hanging(15, 30)
@@ -1200,8 +1270,8 @@ async fn a_finalize_stopped_by_its_time_limit_fails_the_run() {
 
     let execution = run.run(&gates_up_to_compound()).await;
 
-    assert!(run.took(&execution.id, "finalize", "timeout", "finalize_failed"));
-    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert!(run.took(&execution.id, "finalize", "timeout", "finalize_blocked"));
+    assert_eq!(run.pending(&execution.id).state_id, "finalize_blocked");
 }
 
 /// `finalize` only reads the pull request on the host and changes its Draft
@@ -1252,7 +1322,7 @@ fn every_review_gate_requires_a_comment_only_to_send_the_stage_back() {
 
 /// The graph of `workflows/compound-engineering.yaml` as the plan draws it:
 /// every state, and every `(state, label, target)` edge.
-const COMPOUND_STATES: [&str; 29] = [
+const COMPOUND_STATES: [&str; 30] = [
     "brainstorm",
     "doc_review",
     "publish_requirements",
@@ -1279,12 +1349,13 @@ const COMPOUND_STATES: [&str; 29] = [
     "drop_learning",
     "check_learning_feedback",
     "finalize",
+    "finalize_blocked",
     "finished",
     "cancelled",
     "finalize_failed",
 ];
 
-const COMPOUND_EDGES: [(&str, &str, &str); 60] = [
+const COMPOUND_EDGES: [(&str, &str, &str); 62] = [
     ("brainstorm", "requirements_drafted", "doc_review"),
     ("brainstorm", "requirements_ready", "publish_requirements"),
     ("doc_review", "reviewed", "publish_requirements"),
@@ -1359,8 +1430,10 @@ const COMPOUND_EDGES: [(&str, &str, &str); 60] = [
     ("check_learning_feedback", "fixed", "publish_learning"),
     ("check_learning_feedback", "needs_human", "review_learning"),
     ("finalize", "ready", "finished"),
-    ("finalize", "blocked", "finalize_failed"),
-    ("finalize", "timeout", "finalize_failed"),
+    ("finalize", "blocked", "finalize_blocked"),
+    ("finalize", "timeout", "finalize_blocked"),
+    ("finalize_blocked", "retry", "finalize"),
+    ("finalize_blocked", "confirm_failure", "finalize_failed"),
 ];
 
 #[test]
@@ -1377,7 +1450,7 @@ fn the_compound_graph_is_the_one_the_plan_draws() {
     assert_eq!(
         definition.states["finalize_failed"].terminal_status,
         Some(TerminalStatus::Failed),
-        "a pull request not confirmed out of Draft failed the run"
+        "a failure confirmed at the finalize gate failed the run"
     );
 }
 

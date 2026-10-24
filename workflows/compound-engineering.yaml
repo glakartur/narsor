@@ -820,14 +820,41 @@ states:
       - label: ready
         description: the pull request is out of Draft and ready for a person to review and merge, or it is already merged.
       - label: blocked
-        description: the pull request could not be taken out of Draft; the run fails.
+        description: the pull request could not be taken out of Draft; a person decides at the finalize_blocked gate.
       - label: timeout
-        description: the step outlived its time limit; the run fails.
+        description: the step outlived its time limit; a person decides at the finalize_blocked gate.
     transitions:
       ready: finished
-      blocked: finalize_failed
-      timeout: finalize_failed
+      blocked: finalize_blocked
+      timeout: finalize_blocked
     timeout: 10m
+
+  finalize_blocked:
+    description: >
+      HUMAN GATE — finalize could not take the merge request out of Draft.
+      A person decides: run finalize again or confirm the failure.
+    action:
+      type: human
+      message: >
+        Finalize could not take the merge request out of Draft. The reason of
+        the agent is shown above; after a timeout there is no reason from the
+        agent. Choose retry to run finalize again after you fix the cause on
+        the repository host, or confirm_failure to end the pipeline as failed.
+      inputs:
+        - name: finalize_decision
+          type: select
+          required: true
+          options:
+            - retry
+            - confirm_failure
+    choices:
+      - label: retry
+        description: run finalize again.
+      - label: confirm_failure
+        description: end the pipeline as failed; the merge request is not confirmed out of Draft.
+    transitions:
+      retry: finalize
+      confirm_failure: finalize_failed
 
   # -------------------------------------------------------------------------
   # Terminals
@@ -840,7 +867,7 @@ states:
     description: A person stopped the pipeline.
 
   finalize_failed:
-    description: Finalize could not confirm that the merge request is out of Draft. Its reason is in the history of the finalize step.
+    description: A person confirmed at the finalize_blocked gate that finalize could not confirm the merge request out of Draft. Its reason is in the history of the finalize step.
 
 terminal_states:
   finished: completed

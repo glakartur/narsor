@@ -35,10 +35,9 @@ The compound-engineering workflow works on GitHub and on GitLab. Its `finalize`
 step is an agent step: the agent finds the host from `pr_url` and the `origin`
 remote, then uses `gh` (GitHub) or `glab` (GitLab). The place where the step
 runs needs that tool authenticated, under an identity that may take the pull
-request out of Draft. Without that, `finalize` ends the run in `finalize_failed` with
-the reason.
-
-A person fixes the environment and starts a new task.
+request out of Draft. Without that, `finalize` answers `blocked` and the run stops at the
+`finalize_blocked` gate with the reason. A person fixes the environment and
+chooses `retry`, or chooses `confirm_failure` to end the run in `finalize_failed`.
 
 Protection against a merge after the Draft is gone (for example branch rules)
 stays with the repository host.
@@ -159,20 +158,21 @@ checks; a person merges it on the repository host. The number and repository
 come from `pr_url` and the pull request, never from a branch name. A pull
 request that is already out of Draft or already merged is `ready` too. `ready`
 goes to `finished`; `blocked` (no tool, not signed in, a bad URL, a closed pull
-request) and `timeout` (the engine stopped the step at its limit) go to
-`finalize_failed`. The step reads the pull request from the host after it takes
+request) and `timeout` (the engine stopped the step at its limit) go to the
+`finalize_blocked` gate: `retry` runs `finalize` again (no limit), `confirm_failure`
+goes to `finalize_failed`. The step reads the pull request from the host after it takes
 it out of Draft and tries at most 3 times; `ready` needs a read that shows the
 pull request out of Draft or merged.
 
 Loop limits (`max_entries`): `code_review` 10, `repair_verification` 5.
 Terminals: `finished` (out of Draft and ready for review, completed),
-`cancelled` (`abandon` at a gate) and `finalize_failed` (finalize could not confirm
+`cancelled` (`abandon` at a gate) and `finalize_failed` (a person confirmed at the `finalize_blocked` gate that finalize could not confirm
 that the pull request is out of Draft, failed). `abandon` does not close the pull request.
 
 Tasks that run on an earlier version of this workflow, with the earlier
 gates or the merge steps, may not resume after an update. Finish or cancel them
-before you update. A task that waits at the removed `finalize_blocked` gate
-will not resume.
+before you update. A task that waited at an earlier `finalize_blocked` gate with the
+`finish_as_draft` choice may not resume.
 
 The graph is drawn in `compound-engineering-flow.html`.
 

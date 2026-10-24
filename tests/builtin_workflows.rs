@@ -480,7 +480,7 @@ fn compound_engineering_finalize_is_a_read_only_agent_with_a_timeout_choice() {
         "'finalize' must not change the workspace"
     );
     assert_eq!(finalize.timeout_secs, Some(10 * 60));
-    assert_eq!(finalize.transitions["timeout"], "finalize_failed");
+    assert_eq!(finalize.transitions["timeout"], "finalize_blocked");
 }
 
 /// `finalize` answers `ready` only after a read from the host, with the Draft
@@ -768,4 +768,19 @@ fn the_listing_reports_an_override_rather_than_two_rows() {
     assert_eq!(overridden.origin.label(), "root");
     assert!(overridden.is_override());
     assert_eq!(overridden.shadow_labels(), "built-in");
+}
+
+/// The `finalize_blocked` gate offers exactly `retry` and `confirm_failure`.
+#[test]
+fn compound_engineering_finalize_gate_offers_retry_and_confirm_failure() {
+    let definition = compound_engineering();
+    let gate = &definition.states["finalize_blocked"];
+
+    assert_eq!(gate.transitions["retry"], "finalize");
+    assert_eq!(gate.transitions["confirm_failure"], "finalize_failed");
+    assert_eq!(gate.transitions.len(), 2);
+    assert_eq!(
+        definition.states["finalize"].transitions["blocked"],
+        "finalize_blocked"
+    );
 }
