@@ -426,6 +426,7 @@ pub enum ConductorTriggerDto {
     StepFailure,
     Chat,
     Annotation,
+    Title,
 }
 
 impl ConductorTriggerDto {
@@ -435,6 +436,7 @@ impl ConductorTriggerDto {
             Self::StepFailure => "step_failure",
             Self::Chat => "chat",
             Self::Annotation => "annotation",
+            Self::Title => "title",
         }
     }
 }
@@ -448,6 +450,7 @@ pub enum ConductorPurposeDto {
     DiagnoseFailure,
     ReplyToChat,
     SummarizeGate,
+    GenerateTitle,
 }
 
 impl ConductorPurposeDto {
@@ -458,6 +461,7 @@ impl ConductorPurposeDto {
             Self::DiagnoseFailure => "diagnose_failure",
             Self::ReplyToChat => "reply_to_chat",
             Self::SummarizeGate => "summarize_gate",
+            Self::GenerateTitle => "generate_title",
         }
     }
 }

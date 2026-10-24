@@ -62,6 +62,8 @@ pub enum DecisionKind {
     Reply,
     /// Summarize a `human` gate, with a recommendation (R30).
     Annotate,
+    /// Name the task in one short line.
+    Title,
 }
 
 impl DecisionKind {
@@ -75,6 +77,7 @@ impl DecisionKind {
             Self::Diagnose => "diagnose",
             Self::Reply => "reply",
             Self::Annotate => "annotate",
+            Self::Title => "title",
         }
     }
 }
@@ -87,7 +90,8 @@ impl DecisionKind {
 ///   output, never a transition (R23); a transition can only be proposed;
 /// * a chat reply: a message, with proposals;
 /// * a gate annotation: a summary and a recommendation, never an answer
-///   (R30).
+///   (R30);
+/// * a title: one line of text, nothing else.
 pub fn allowed_decisions(purpose: ConductorPurpose) -> &'static [DecisionKind] {
     match purpose {
         ConductorPurpose::ChooseOutput => &[
@@ -101,6 +105,7 @@ pub fn allowed_decisions(purpose: ConductorPurpose) -> &'static [DecisionKind] {
         ConductorPurpose::DiagnoseFailure => &[DecisionKind::Diagnose, DecisionKind::Retry],
         ConductorPurpose::ReplyToChat => &[DecisionKind::Reply],
         ConductorPurpose::SummarizeGate => &[DecisionKind::Annotate],
+        ConductorPurpose::GenerateTitle => &[DecisionKind::Title],
     }
 }
 
@@ -171,6 +176,11 @@ pub enum Decision {
         #[serde(default)]
         recommendation: Option<String>,
     },
+    /// The task is given a title.
+    Title {
+        /// The title, one short line.
+        title: String,
+    },
 }
 
 impl Decision {
@@ -184,6 +194,7 @@ impl Decision {
             Self::Diagnose { .. } => DecisionKind::Diagnose,
             Self::Reply => DecisionKind::Reply,
             Self::Annotate { .. } => DecisionKind::Annotate,
+            Self::Title { .. } => DecisionKind::Title,
         }
     }
 }
@@ -403,6 +414,7 @@ impl ConductorResponse {
                 required_text("message", self.message.as_deref().unwrap_or_default())?;
             }
             Decision::Annotate { summary, .. } => required_text("summary", summary)?,
+            Decision::Title { title } => required_text("title", title)?,
         }
 
         if !self.proposals.is_empty() && !proposals_allowed(purpose) {

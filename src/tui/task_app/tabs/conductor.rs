@@ -418,6 +418,7 @@ fn purpose_word(purpose: ConductorPurpose) -> &'static str {
         ConductorPurpose::DiagnoseFailure => "diagnozuje nieudany krok",
         ConductorPurpose::ReplyToChat => "odpowiada na wiadomość",
         ConductorPurpose::SummarizeGate => "streszcza bramkę",
+        ConductorPurpose::GenerateTitle => "nadaje tytuł zadaniu",
     }
 }
 

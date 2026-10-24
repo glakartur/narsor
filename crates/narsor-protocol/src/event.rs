@@ -509,6 +509,8 @@ pub enum ConductorTrigger {
     Chat,
     /// R30: a `human` gate was entered and can be summarized.
     Annotation,
+    /// The task has no title and the runner asks for one.
+    Title,
 }
 
 impl ConductorTrigger {
@@ -519,6 +521,7 @@ impl ConductorTrigger {
             Self::StepFailure => "step_failure",
             Self::Chat => "chat",
             Self::Annotation => "annotation",
+            Self::Title => "title",
         }
     }
 
@@ -554,6 +557,8 @@ pub enum ConductorPurpose {
     ReplyToChat,
     /// Summarize a `human` gate for the operator (R30).
     SummarizeGate,
+    /// Give a task the operator named no title a short one.
+    GenerateTitle,
 }
 
 impl ConductorPurpose {
@@ -565,6 +570,7 @@ impl ConductorPurpose {
             Self::DiagnoseFailure => "diagnose_failure",
             Self::ReplyToChat => "reply_to_chat",
             Self::SummarizeGate => "summarize_gate",
+            Self::GenerateTitle => "generate_title",
         }
     }
 }
@@ -893,6 +899,7 @@ impl From<ConductorPurpose> for ConductorPurposeDto {
             ConductorPurpose::DiagnoseFailure => Self::DiagnoseFailure,
             ConductorPurpose::ReplyToChat => Self::ReplyToChat,
             ConductorPurpose::SummarizeGate => Self::SummarizeGate,
+            ConductorPurpose::GenerateTitle => Self::GenerateTitle,
         }
     }
 }
@@ -904,6 +911,7 @@ impl From<ConductorTrigger> for ConductorTriggerDto {
             ConductorTrigger::StepFailure => Self::StepFailure,
             ConductorTrigger::Chat => Self::Chat,
             ConductorTrigger::Annotation => Self::Annotation,
+            ConductorTrigger::Title => Self::Title,
         }
     }
 }
