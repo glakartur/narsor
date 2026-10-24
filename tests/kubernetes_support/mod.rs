@@ -1,5 +1,5 @@
 //! An in-process mock of the Kubernetes API the adapter uses, with a
-//! "kubelet" that runs a real `narsor-runner` for every Pod (U5, AE2).
+//! "kubelet" that runs a runner program for every Pod (U5, AE2).
 //!
 //! # The API
 //!
@@ -20,10 +20,11 @@
 //!   materialized as directories (the PVC as a per-claim directory, the
 //!   launch Secret and projected secrets as files, `emptyDir`s empty), the
 //!   main container's command and arguments are taken *from the Pod spec*
-//!   with every mount path rewritten to its directory, and the real
-//!   `narsor` binary runs them. So the contract suite exercises the
-//!   generated Pod, not a parallel description of it. Init containers are
-//!   not run — the binary under test stands in for the runtime bundle;
+//!   with every mount path rewritten to its directory, and the program the
+//!   mock was started with runs them (the contract suite's stub runner). So
+//!   the contract suite exercises the generated Pod, not a parallel
+//!   description of it. Init containers are not run — the program stands
+//!   in for the runtime bundle;
 //! * a runner that exits makes its Pod `Succeeded` or `Failed` with the
 //!   exit code (128 + signal when killed, like a container runtime);
 //! * a Pod with a `deletionTimestamp` has its runner killed and disappears,
@@ -101,7 +102,6 @@ pub struct MockCluster {
     state: Mutex<ClusterState>,
     scratch: PathBuf,
     program: PathBuf,
-    runner_args: Vec<String>,
     /// Base URL of the API server.
     pub url: String,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -135,21 +135,6 @@ impl MockCluster {
             state: Mutex::new(state),
             scratch: scratch.to_path_buf(),
             program: program.into(),
-            runner_args: [
-                "--poll-wait-secs",
-                "1",
-                "--retry-min-ms",
-                "50",
-                "--retry-max-ms",
-                "300",
-                "--report-interval-ms",
-                "50",
-                "--problem-report-secs",
-                "10",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
             url,
             tasks: Mutex::new(Vec::new()),
         });
@@ -665,7 +650,7 @@ impl MockCluster {
     }
 
     /// Materializes the Pod's volumes and runs its main container's command
-    /// with the real binary; `None` while a volume source is missing.
+    /// with the mock's program; `None` while a volume source is missing.
     fn start_runner(&self, state: &ClusterState, pod: &Value) -> Result<Option<Child>, String> {
         use std::os::unix::process::CommandExt;
 
@@ -757,7 +742,6 @@ impl MockCluster {
             .into_iter()
             .flatten()
             .map(|arg| rewrite(arg.as_str().unwrap_or_default()))
-            .chain(self.runner_args.iter().cloned())
             .collect();
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let log = fs::File::create(dir.join("runner.log")).map_err(|e| e.to_string())?;

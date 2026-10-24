@@ -12,6 +12,15 @@
 //! so a resumed incarnation continues it the way a real one continues the
 //! Engine's log.
 //!
+//! The simulated workflow runs no step. It stands in the initial state of
+//! the launch spec's workflow, `Running`, for as long as nobody moves it: an
+//! owner's `Transition` to another state of the workflow takes it there, and
+//! a terminal state completes it. So a task runs until a test decides
+//! otherwise, and the owner's offer treats it as any running task.
+//! [`run_simulated_runner`] and [`run_simulated_reader`] are public so a
+//! stub runner *process* (the contract tests of the process-based adapters)
+//! speaks the protocol with the same code.
+//!
 //! What the fake deliberately does not do is inject faults or count calls:
 //! `narsor-controller-runtime::testkit::Probed` does both for any adapter, so
 //! every adapter — this one, the local one, U5's Kubernetes one — runs the
@@ -31,9 +40,9 @@ use super::{
 };
 use crate::api::ClientError;
 use crate::controller_protocol::{RunnerClient, RunnerDirective, RunnerPollQuery};
-use crate::domain::{ExecutionStatus, TaskId};
+use crate::domain::{ExecutionStatus, TaskId, TaskLaunchSpec, WorkflowDefinition};
 use crate::environment::{BackendCapabilities, BackendKind};
-use crate::orchestration::RunnerSnapshot;
+use crate::orchestration::{OperatorCommand, RunnerSnapshot};
 
 /// Pause between a simulated runner's retries and polls.
 const RUNNER_RETRY: Duration = Duration::from_millis(50);
@@ -62,6 +71,8 @@ struct Platform {
 struct FakeStorage {
     /// The simulated runner's progress, kept with the work it describes.
     event_cursor: u64,
+    /// The workflow state the simulated work entered last.
+    workflow_state: Option<String>,
 }
 
 #[derive(Debug)]
@@ -354,11 +365,7 @@ impl ExecutionBackend for FakeBackend {
     }
 }
 
-/// A read-only runner that answers nothing (no simulated runner has a
-/// storage's worth of conversation) but keeps the promises of the reader
-/// contract: it polls for reads only — which is what tells the control plane
-/// it is connected — and leaves on any directive but `continue` or when its
-/// credential is refused.
+/// A read-only runner of the fake platform (see [`run_simulated_reader`]).
 async fn simulated_reader(
     platform: Weak<Mutex<Platform>>,
     name: String,
@@ -366,32 +373,15 @@ async fn simulated_reader(
     launch: WorkloadLaunch,
 ) {
     let client = RunnerClient::new(&launch.control_plane_url, launch.credential.expose());
-    let query = RunnerPollQuery {
-        wait_secs: Some(RUNNER_POLL_SECS),
-        defer_materials: true,
-        ..RunnerPollQuery::default()
-    };
-    let mut up = false;
-    let code = loop {
-        match client.poll_with(&query).await {
-            Ok(response) => {
-                if !up {
-                    up = true;
-                    update_reader(&platform, &name, &uid, |state| {
-                        if state.phase == WorkloadPhase::Starting {
-                            state.phase = WorkloadPhase::Running;
-                            state.resource_generation += 1;
-                        }
-                    });
-                }
-                if response.directive != RunnerDirective::Continue {
-                    break 0;
-                }
+    let code = run_simulated_reader(&client, || {
+        update_reader(&platform, &name, &uid, |state| {
+            if state.phase == WorkloadPhase::Starting {
+                state.phase = WorkloadPhase::Running;
+                state.resource_generation += 1;
             }
-            Err(ClientError::Unauthorized) => break 1,
-            Err(_) => tokio::time::sleep(RUNNER_RETRY).await,
-        }
-    };
+        });
+    })
+    .await;
     update_reader(&platform, &name, &uid, |state| {
         state.phase = WorkloadPhase::Exited { code: Some(code) };
         state.resource_generation += 1;
@@ -419,8 +409,7 @@ fn update_reader(
     }
 }
 
-/// A runner that does no work but keeps every promise of the runner
-/// protocol (see the module docs).
+/// A working runner of the fake platform (see [`run_simulated_runner`]).
 async fn simulated_runner(
     platform: Weak<Mutex<Platform>>,
     workload: String,
@@ -429,128 +418,37 @@ async fn simulated_runner(
     launch: WorkloadLaunch,
 ) {
     let client = RunnerClient::new(&launch.control_plane_url, launch.credential.expose());
-    let mut runner = SimulatedRunner {
+    let workload = FakeWorkloadHandle {
         platform,
         workload,
         uid,
         storage,
-        client,
-        sequence: 0,
     };
-    let code = runner.run().await;
-    runner.exit(code);
-}
-
-struct SimulatedRunner {
-    platform: Weak<Mutex<Platform>>,
-    workload: String,
-    uid: String,
-    storage: String,
-    client: RunnerClient,
-    sequence: u64,
-}
-
-impl SimulatedRunner {
-    /// Runs until told to stop; returns the exit code.
-    async fn run(&mut self) -> i32 {
-        // "Up" means: the control plane accepted a first snapshot.
-        let mut directive = loop {
-            match self.report(false).await {
-                Ok(directive) => break directive,
-                Err(ClientError::Unauthorized) => return 1,
-                Err(_) => tokio::time::sleep(RUNNER_RETRY).await,
-            }
-        };
-        self.update(|state| {
+    let code = run_simulated_runner(&client, &launch.launch_spec, &workload, || {
+        workload.update(|state| {
             if state.phase == WorkloadPhase::Starting {
                 state.phase = WorkloadPhase::Running;
                 state.resource_generation += 1;
             }
         });
-        loop {
-            match directive {
-                RunnerDirective::Continue => {}
-                RunnerDirective::Stop => return 0,
-                RunnerDirective::PauseAtSafePoint => match self.report(true).await {
-                    Ok(RunnerDirective::PauseAtSafePoint | RunnerDirective::Stop) => return 0,
-                    Ok(RunnerDirective::Continue) => {}
-                    Err(ClientError::Unauthorized) => return 1,
-                    Err(_) => {
-                        tokio::time::sleep(RUNNER_RETRY).await;
-                        continue;
-                    }
-                },
-            }
-            directive = match self.client.poll(None, RUNNER_POLL_SECS).await {
-                Ok(response) => {
-                    // The simulated workflow has long finished and runs no
-                    // engine: every operator command gets the verdict a
-                    // real runner gives one it cannot act on.
-                    for command in response.commands {
-                        let _ = self
-                            .client
-                            .ack_command(
-                                &command.command_id,
-                                false,
-                                Some("the simulated workflow has finished".to_string()),
-                            )
-                            .await;
-                    }
-                    response.directive
-                }
-                Err(ClientError::Unauthorized) => return 1,
-                Err(_) => {
-                    tokio::time::sleep(RUNNER_RETRY).await;
-                    RunnerDirective::Continue
-                }
-            };
-        }
-    }
+    })
+    .await;
+    workload.update(|state| {
+        state.phase = WorkloadPhase::Exited { code: Some(code) };
+        state.resource_generation += 1;
+    });
+}
 
-    /// Posts a snapshot of the (instantly completed) simulated workflow.
-    async fn report(&mut self, safe_point: bool) -> Result<RunnerDirective, ClientError> {
-        self.sequence += 1;
-        let event_cursor = self.advance_cursor();
-        let snapshot = RunnerSnapshot {
-            snapshot_sequence: self.sequence,
-            execution_status: ExecutionStatus::Completed,
-            execution_cursor: Default::default(),
-            event_cursor,
-            pending_input: None,
-            conversation: Default::default(),
-            timeline: None,
-            safe_point,
-            problem: None,
-            attention: Vec::new(),
-            conductor_available: false,
-            conductor_unavailable_reason: None,
-            default_harness_unavailable: None,
-            display: None,
-            generated_title: None,
-            observed_at: Utc::now(),
-        };
-        self.client
-            .snapshot(&snapshot)
-            .await
-            .map(|response| response.directive)
-    }
+/// One workload of the fake platform and the storage it works on, as its
+/// simulated runner sees them.
+struct FakeWorkloadHandle {
+    platform: Weak<Mutex<Platform>>,
+    workload: String,
+    uid: String,
+    storage: String,
+}
 
-    /// One more simulated event on the storage; the cursor never goes back,
-    /// not even across incarnations.
-    fn advance_cursor(&self) -> u64 {
-        let Some(platform) = self.platform.upgrade() else {
-            return 0;
-        };
-        let mut platform = platform.lock().unwrap_or_else(PoisonError::into_inner);
-        platform
-            .storages
-            .get_mut(&self.storage)
-            .map_or(0, |storage| {
-                storage.event_cursor += 1;
-                storage.event_cursor
-            })
-    }
-
+impl FakeWorkloadHandle {
     fn update(&self, change: impl FnOnce(&mut WorkloadState)) {
         let Some(platform) = self.platform.upgrade() else {
             return;
@@ -567,10 +465,228 @@ impl SimulatedRunner {
         }
     }
 
-    fn exit(&self, code: i32) {
-        self.update(|state| {
-            state.phase = WorkloadPhase::Exited { code: Some(code) };
-            state.resource_generation += 1;
-        });
+    fn with_storage<R>(&self, read: impl FnOnce(&mut FakeStorage) -> R) -> Option<R> {
+        let platform = self.platform.upgrade()?;
+        let mut platform = platform.lock().unwrap_or_else(PoisonError::into_inner);
+        platform.storages.get_mut(&self.storage).map(read)
+    }
+}
+
+impl SimulatedStorage for FakeWorkloadHandle {
+    fn next_event(&self) -> u64 {
+        self.with_storage(|storage| {
+            storage.event_cursor += 1;
+            storage.event_cursor
+        })
+        .unwrap_or(0)
+    }
+
+    fn workflow_state(&self) -> Option<String> {
+        self.with_storage(|storage| storage.workflow_state.clone())
+            .flatten()
+    }
+
+    fn enter_state(&self, state: &str) {
+        self.with_storage(|storage| storage.workflow_state = Some(state.to_string()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The simulated runner's side of the protocol
+// ---------------------------------------------------------------------------
+
+/// Where a simulated runner keeps its work: on the task storage, so a
+/// resumed incarnation continues where the last one stood.
+pub trait SimulatedStorage: Send + Sync {
+    /// Counts one more simulated event; the new event cursor, which never
+    /// goes back, not even across incarnations.
+    fn next_event(&self) -> u64;
+
+    /// The workflow state the work entered last, if it entered one.
+    fn workflow_state(&self) -> Option<String>;
+
+    /// Records that the work entered `state`.
+    fn enter_state(&self, state: &str);
+}
+
+/// A read-only runner that answers nothing (no simulated runner has a
+/// storage's worth of conversation) but keeps the promises of the reader
+/// contract: it polls for reads only — which is what tells the control plane
+/// it is connected — and leaves on any directive but `continue` or when its
+/// credential is refused. `up` is called once, at its first answered poll.
+/// Returns the exit code.
+pub async fn run_simulated_reader(client: &RunnerClient, up: impl FnOnce()) -> i32 {
+    let query = RunnerPollQuery {
+        wait_secs: Some(RUNNER_POLL_SECS),
+        defer_materials: true,
+        ..RunnerPollQuery::default()
+    };
+    let mut up = Some(up);
+    loop {
+        match client.poll_with(&query).await {
+            Ok(response) => {
+                if let Some(up) = up.take() {
+                    up();
+                }
+                if response.directive != RunnerDirective::Continue {
+                    return 0;
+                }
+            }
+            Err(ClientError::Unauthorized) => return 1,
+            Err(_) => tokio::time::sleep(RUNNER_RETRY).await,
+        }
+    }
+}
+
+/// A runner that does no work but keeps every promise of the runner
+/// protocol (see the module docs). `launch_spec` is the launch spec as the
+/// workload got it; `up` is called once, when the control plane accepted a
+/// first snapshot. Returns the exit code.
+pub async fn run_simulated_runner(
+    client: &RunnerClient,
+    launch_spec: &serde_json::Value,
+    storage: &dyn SimulatedStorage,
+    up: impl FnOnce(),
+) -> i32 {
+    let definition = serde_json::from_value::<TaskLaunchSpec>(launch_spec.clone())
+        .ok()
+        .and_then(|spec| spec.definition().ok());
+    let mut runner = SimulatedRunner {
+        client,
+        storage,
+        state: storage
+            .workflow_state()
+            .or_else(|| definition.as_ref().map(|d| d.initial_state.clone())),
+        definition,
+        sequence: 0,
+    };
+    runner.run(up).await
+}
+
+struct SimulatedRunner<'a> {
+    client: &'a RunnerClient,
+    storage: &'a dyn SimulatedStorage,
+    definition: Option<WorkflowDefinition>,
+    /// The workflow state the work stands in.
+    state: Option<String>,
+    sequence: u64,
+}
+
+impl SimulatedRunner<'_> {
+    /// Runs until told to stop; returns the exit code.
+    async fn run(&mut self, up: impl FnOnce()) -> i32 {
+        // "Up" means: the control plane accepted a first snapshot.
+        let mut directive = loop {
+            match self.report(false).await {
+                Ok(directive) => break directive,
+                Err(ClientError::Unauthorized) => return 1,
+                Err(_) => tokio::time::sleep(RUNNER_RETRY).await,
+            }
+        };
+        up();
+        loop {
+            match directive {
+                RunnerDirective::Continue => {}
+                RunnerDirective::Stop => return 0,
+                RunnerDirective::PauseAtSafePoint => match self.report(true).await {
+                    Ok(RunnerDirective::PauseAtSafePoint | RunnerDirective::Stop) => return 0,
+                    Ok(RunnerDirective::Continue) => {}
+                    Err(ClientError::Unauthorized) => return 1,
+                    Err(_) => {
+                        tokio::time::sleep(RUNNER_RETRY).await;
+                        continue;
+                    }
+                },
+            }
+            directive = match self.client.poll(None, RUNNER_POLL_SECS).await {
+                Ok(response) => {
+                    let mut moved = false;
+                    for command in response.commands {
+                        let verdict = self.carry_out(&command.command);
+                        moved |= verdict.is_ok();
+                        let _ = self
+                            .client
+                            .ack_command(&command.command_id, verdict.is_ok(), verdict.err())
+                            .await;
+                    }
+                    if moved {
+                        match self.report(false).await {
+                            Ok(directive) => directive,
+                            Err(ClientError::Unauthorized) => return 1,
+                            Err(_) => response.directive,
+                        }
+                    } else {
+                        response.directive
+                    }
+                }
+                Err(ClientError::Unauthorized) => return 1,
+                Err(_) => {
+                    tokio::time::sleep(RUNNER_RETRY).await;
+                    RunnerDirective::Continue
+                }
+            };
+        }
+    }
+
+    /// Carries out an operator command, or says why not. The simulated
+    /// workflow can only be moved: it has no step to interrupt or restart.
+    fn carry_out(&mut self, command: &OperatorCommand) -> Result<(), String> {
+        let OperatorCommand::Transition { target, .. } = command else {
+            return Err("the simulated runner runs no step".to_string());
+        };
+        let known = self
+            .definition
+            .as_ref()
+            .is_some_and(|definition| definition.states.contains_key(target));
+        if !known {
+            return Err(format!("the workflow has no state '{target}'"));
+        }
+        self.storage.enter_state(target);
+        self.state = Some(target.clone());
+        Ok(())
+    }
+
+    /// The simulated workflow's status: completed in a terminal state,
+    /// running anywhere else.
+    fn status(&self) -> ExecutionStatus {
+        let terminal = self
+            .definition
+            .as_ref()
+            .zip(self.state.as_ref())
+            .and_then(|(definition, state)| definition.states.get(state))
+            .is_some_and(|state| state.terminal);
+        if terminal {
+            ExecutionStatus::Completed
+        } else {
+            ExecutionStatus::Running
+        }
+    }
+
+    /// Posts a snapshot of the simulated workflow.
+    async fn report(&mut self, safe_point: bool) -> Result<RunnerDirective, ClientError> {
+        self.sequence += 1;
+        let mut snapshot = RunnerSnapshot {
+            snapshot_sequence: self.sequence,
+            execution_status: self.status(),
+            execution_cursor: Default::default(),
+            event_cursor: self.storage.next_event(),
+            pending_input: None,
+            conversation: Default::default(),
+            timeline: None,
+            safe_point,
+            problem: None,
+            attention: Vec::new(),
+            conductor_available: false,
+            conductor_unavailable_reason: None,
+            default_harness_unavailable: None,
+            display: None,
+            generated_title: None,
+            observed_at: Utc::now(),
+        };
+        snapshot.execution_cursor.current_state = self.state.clone();
+        self.client
+            .snapshot(&snapshot)
+            .await
+            .map(|response| response.directive)
     }
 }
