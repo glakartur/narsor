@@ -16,7 +16,7 @@ Backend już ma jeden punkt wejścia dla komentarza do agenta (`submit_comment`,
 2. Pokazuje akcję jako niedostępną z powodem, gdy backend jej nie oferuje (R3).
 3. Zachowuje wpisany tekst, gdy wysłanie się nie uda (R8).
 
-Dostępność zawsze pochodzi z listy akcji backendu (R10, decyzja z dokumentu `2026-10-22-akcje-taska-z-backendu...` jest już zrealizowana w kodzie: zob. `docs/plans/2026-10-22-003-feat-akcje-taska-z-backendu-i-komentarz-w-pauzie-plan.md`). Dostępność w backendzie rozszerza się tylko tam, gdzie istnieje sesja agenta, której można dostarczyć wiadomość (U1).
+Backend steruje akcjami możliwymi na sesji: klient nie ocenia dostępności, skutku ani powodu odmowy (KTD7). Zmiany obejmują więc backend (U1), nie tylko pliki `tui`. Dostępność zawsze pochodzi z listy akcji backendu (R10, decyzja z dokumentu `2026-10-22-akcje-taska-z-backendu...` jest już zrealizowana w kodzie: zob. `docs/plans/2026-10-22-003-feat-akcje-taska-z-backendu-i-komentarz-w-pauzie-plan.md`). Dostępność w backendzie rozszerza się tylko tam, gdzie istnieje sesja agenta, której można dostarczyć wiadomość (U1).
 
 ---
 
@@ -91,6 +91,7 @@ Bez zmian względem dokumentu źródłowego (see origin: Scope Boundaries): brak
 - **KTD4. Z3: dla pytania agenta i problemu wpis 0 to istniejące pole.** `Model::items` już ukrywa wpis z polem (`composer_index`) i pokazuje go jako osobny `composer`. Wpis 0 w takim panelu **ustawia fokus na tym polu** i nie tworzy drugiego. Wysyłka idzie starą ścieżką (`Plan::Answer` / `Plan::Message`), bo daje to samo co `comment_delivery` (`ResumeAgent` → odpowiedź).
 - **KTD5. Pauza nie ma panelu oczekiwania.** Task w stanie `Stopped`/`Paused` nie ma `AttentionItem`. Powierzchnią akcji 0 jest tam menu akcji (`.`) i skrót `c`. Pozycja 0 w menu = „Napisz do agenta" (`TaskAction::ALL` zaczyna się od `Comment`). Założenie do potwierdzenia: R4 mówi o „panelu oczekiwania", a F2 o „otwiera task", więc pauza korzysta z menu. Zob. Open Questions.
 - **KTD6. Rozszerzenie backendu ograniczone do realnej sesji.** `comment_reason` pozwala na komentarz tylko, gdy `comment_delivery` ma dokąd go dostarczyć. Wpis jest niedostępny z powodem w pozostałych przypadkach (R3). Dlaczego: R1 mówi „o ile istnieje agent, któremu można wysłać komunikat".
+- **KTD7. Backend jest jedynym źródłem tego, co wolno zrobić na sesji.** Dostępność, `effect` i powód odmowy akcji `Comment` pochodzą z `offer` w backendzie dla każdego rodzaju oczekiwania. Klient nie zna rodzajów oczekiwań na tyle, by decydować sam; wpis 0 tylko wyświetla ofertę. Dlaczego: po dodaniu drugiego backendu zachowanie ma być takie samo. Dlatego macierz z U1 jest testem zgodności na poziomie protokołu (`tests/controller_protocol.rs`), który każdy backend ma przejść bez zmian.
 
 ---
 
@@ -109,6 +110,7 @@ Bez zmian względem dokumentu źródłowego (see origin: Scope Boundaries): brak
 - Test: `tests/controller_protocol.rs`
 
 **Approach:**
+- Test macierzy działa na typach protokołu (`TaskSummary` → `offer`), bez zależności od silnika. Drugi backend uruchamia ten sam test (KTD7).
 - Zbuduj macierz: rodzaj oczekiwania (`ResumeAgent`, `ResolveOutput`, `ApproveOutput`, `ResolvePermission`, `CompleteStep`, `EntryLimit`, nieudany krok, problem runnera, nieudany provisioning, pauza, kolejka, zakończony) × dostępność i powód.
 - Dla każdego niedostępnego wiersza sprawdź w kodzie silnika (`crates/narsor-engine/src/engine/actions/human.rs`), czy sesja agenta żyje i czy `agent_message` da się dostarczyć. Jeśli tak, dodaj gałąź do `comment_delivery` i zdejmij odmowę. Jeśli nie, zostaw odmowę i dopracuj powód (słowa po polsku, jedna linia, ASD-STE100).
 - „Awaria providera" z R1: ustal, jakim rodzajem oczekiwania jest (prawdopodobnie `Problem` → `ResumeAgent`, już dostępne). Zapisz wynik w teście.
