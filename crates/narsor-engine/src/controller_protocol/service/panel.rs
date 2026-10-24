@@ -234,15 +234,21 @@ fn entry_limit_form(task: &TaskSummary, form: &PendingHumanInputView) -> PanelFo
 /// The manual actions of the workflow the task offers now: the exits of its
 /// state, a restart, a resume. `None` when it offers none.
 fn action_form(task: &TaskSummary) -> Option<PanelForm> {
-    let mut choices: Vec<PanelChoice> = options(task, TaskActionId::Transition)
-        .into_iter()
-        .filter(|_| unavailable_reason(task, TaskActionId::Transition).is_none())
-        .map(|option| PanelChoice {
-            label: option.label,
-            description: option.description,
+    let exits = options(task, TaskActionId::Transition);
+    let mut choices = Vec::new();
+    if unavailable_reason(task, TaskActionId::Transition).is_none() {
+        choices.push(PanelChoice {
+            label: "Przejście ręczne".to_string(),
+            description: Some(
+                exits
+                    .iter()
+                    .map(|exit| exit.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
             action: Some(TaskActionId::Transition),
-        })
-        .collect();
+        });
+    }
     for (id, label) in [
         (TaskActionId::Resume, "Wznów zadanie"),
         (TaskActionId::Restart, "Uruchom krok od nowa"),

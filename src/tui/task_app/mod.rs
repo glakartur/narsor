@@ -102,6 +102,7 @@ pub mod new_task;
 pub mod notify;
 pub mod repositories;
 pub mod tabs;
+pub mod panel;
 pub mod waiting;
 
 use std::collections::{BTreeMap, HashMap};
