@@ -5,6 +5,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::layout::{cell_width, text_width, wrap, Wrapped};
+use crate::tui::scroll::one_line;
 use crate::tui::chooser::{ChooserField, FieldKind};
 use crate::tui::scroll::sanitize;
 use crate::tui::style::{Role, Styles};
@@ -138,4 +139,45 @@ pub fn value_rows(field: &ChooserField, width: usize, focused: bool) -> usize {
         .rows
         .len()
         .max(1)
+}
+
+/// The row above a field's value: its label, `(wymagane)`, `◆` and ` · description`.
+/// The label and the marks always show; the description takes the rest of
+/// `width` and ends in `…` where it is cut.
+pub fn header_line(
+    field: &ChooserField,
+    width: usize,
+    focused: bool,
+    styles: &Styles,
+) -> Line<'static> {
+    let label_style = if focused {
+        styles.of(Role::Focus)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![Span::styled(one_line(field.label()), label_style)];
+    if field.required {
+        spans.push(Span::styled(" (wymagane)", styles.of(Role::Done)));
+    }
+    if field.is_proposed() {
+        spans.push(Span::styled(" ◆", styles.of(Role::Conductor)));
+    }
+    if let Some(description) = &field.description {
+        let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+        let text = format!(" · {}", one_line(description));
+        spans.push(Span::styled(
+            clip(&text, width.saturating_sub(used)),
+            styles.of(Role::Done),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// `text` cut to `width` columns, with `…` where it was cut.
+pub fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
 }

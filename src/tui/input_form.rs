@@ -1390,6 +1390,10 @@ fn declared_fields(
 /// The two values of a `boolean` input.
 const BOOLEAN_OPTIONS: [&str; 2] = ["true", "false"];
 
+/// The labels drawn above the inputs the bundled workflows name alike. The
+/// name stays the key of the value; an input not listed is drawn under its name.
+const INPUT_LABELS: [(&str, &str); 2] = [("target_repo", "Repozytorium"), ("description", "Opis")];
+
 /// One field per declared input, in declaration order.
 ///
 /// * `boolean` is a choice between `true` and `false`; with no default it
@@ -1435,6 +1439,9 @@ pub fn workflow_input_fields(
             }
             if input.required && input.default.is_none() {
                 field = field.required();
+            }
+            if let Some((_, label)) = INPUT_LABELS.iter().find(|(name, _)| *name == input.name) {
+                field = field.labelled(*label);
             }
             match input_description(input) {
                 Some(description) => field.described(description),

@@ -4945,11 +4945,13 @@ mod task_app_create_render {
             "→ trafi na koniec kolejki (#3)",
             "implement-feature",
             "Pełny cykl",
-            "ticket_id: NAR-18",
-            "attempts: ",
-            "dry_run: ‹ false ›",
-            "target_repo: ‹ narsor ›",
             "ticket_id (wymagane) · numer zgłoszenia",
+            "> NAR-18",
+            "attempts",
+            "dry_run",
+            "> ‹ false ›",
+            "Repozytorium",
+            "> ‹ narsor ›",
             "brak pola tekstowego w tym workflow",
             // The list of tasks is where it was.
             "Zadania",
@@ -4972,7 +4974,8 @@ mod task_app_create_render {
             "Nowe zadanie",
             "→ trafi na koniec kolejki (#3)",
             "implement-feature",
-            "ticket_id: NAR-18",
+            "ticket_id",
+            "> NAR-18",
         ] {
             assert!(screen.contains(expected), "{expected}:\n{screen}");
         }
@@ -5005,9 +5008,12 @@ mod task_app_create_render {
             open_prompt_form(&mut app, &["prompt"]);
             let listed = draw_app(&mut app, width, height, false);
             assert!(listed.contains("Akcje"), "{listed}");
-            // Stacked at 60×20 the description has no room for a line, so
-            // it gives way to the list.
-            assert_eq!(listed.contains("Opis"), width >= 64, "{listed}");
+            // On the list the fields give way: the description has the room.
+            assert!(listed.contains("Opis"), "{width}x{height}:\n{listed}");
+            assert!(
+                !listed.contains("Ticket") && !listed.contains("Tytuł"),
+                "{width}x{height}:\n{listed}"
+            );
 
             press(&mut app, KeyCode::Enter);
             // The focus starts on the first field; the prompt is the last,
@@ -5019,24 +5025,13 @@ mod task_app_create_render {
             app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
             keys(&mut app, "druga");
             let screen = draw_app(&mut app, width, height, false);
-            // Five short fields (the form's ticket and title among them) do
-            // not fit whole in the bar at 60 columns; it shortens them.
-            let bar: [&str; 3] = if width >= 100 {
-                [
-                    "ticket_id:",
-                    "dry_run: ‹ false ›",
-                    "target_repo: ‹ narsor ›",
-                ]
-            } else {
-                ["ticket_id", "dry_run", "target_re"]
-            };
-            for expected in bar.into_iter().chain([
+            for expected in [
                 "ship",
                 "Wysyła zmianę.",
                 "prompt (wymagane)",
                 "> pierwsza",
                 "  druga",
-            ]) {
+            ] {
                 assert!(
                     screen.contains(expected),
                     "{width}x{height} {expected}:\n{screen}"
@@ -5236,7 +5231,7 @@ mod task_app_create_render {
     }
 
     #[test]
-    fn three_text_fields_leave_the_main_one_at_least_four_rows_at_60x24() {
+    fn three_text_fields_leave_the_main_one_at_least_four_rows_at_60x30() {
         let mut app = app();
         open_prompt_form(&mut app, &["prompt", "notatki", "dodatki"]);
         press(&mut app, KeyCode::Enter);
@@ -5250,7 +5245,7 @@ mod task_app_create_render {
             keys(&mut app, "x");
             app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         }
-        let screen = draw_app(&mut app, 60, 24, false);
+        let screen = draw_app(&mut app, 60, 30, false);
         let rows: Vec<&str> = screen.lines().collect();
         let header = rows
             .iter()
@@ -6456,8 +6451,12 @@ mod stacked_form {
             assert_eq!(found.len(), 1, "{needle}:\n{}", screen(&buffer));
             found[0]
         };
-        let (ticket, title, repo, text) = (at("Ticket:"), at("Tytuł:"), at("Repo:"), at("Opis"));
+        let (ticket, title, repo, text) = (at("Ticket"), at("Tytuł"), at("Repo"), at("Opis"));
         assert!(ticket < title && title < repo && repo < text);
+        // The value is under its label.
+        for label in [ticket, title, repo, text] {
+            assert!(rows[label + 1].starts_with('>'), "{}", screen(&buffer));
+        }
     }
 
     #[test]
@@ -6507,12 +6506,15 @@ mod stacked_form {
         let mut chooser = entered(standard());
         press(&mut chooser, KeyCode::Down);
         let buffer = draw_chooser(WIDTH, 20, &mut chooser, &styles);
-        let row = rows(&buffer)
+        let label = rows(&buffer)
             .iter()
-            .position(|row| row.contains("Tytuł:"))
+            .position(|row| row.contains("Tytuł"))
             .unwrap();
-        let cells = filled(&buffer, row, &styles);
-        assert!(cells[0..usize::from(WIDTH) - 2].iter().all(|&on| on));
+        assert!(!filled(&buffer, label, &styles).iter().any(|&on| on));
+        let cells = filled(&buffer, label + 1, &styles);
+        assert!(!cells[0] && !cells[1], "the prompt has no fill");
+        // The fill ends one cell before the edge: the free column.
+        assert!(cells[2..usize::from(WIDTH) - 1].iter().all(|&on| on));
         assert!(!cells[usize::from(WIDTH) - 1]);
     }
 
@@ -6524,9 +6526,9 @@ mod stacked_form {
         ]);
         let buffer = draw_chooser(WIDTH, 12, &mut chooser, &Styles::new(false));
         let rows = rows(&buffer);
-        let last = rows.iter().position(|row| row.contains("Repo:")).unwrap();
+        let last = rows.iter().position(|row| row.contains("Repo")).unwrap();
         assert!(
-            rows[last + 1].contains("brak pola tekstowego"),
+            rows[last + 2].contains("brak pola tekstowego"),
             "{}",
             screen(&buffer)
         );
@@ -6545,7 +6547,103 @@ mod stacked_form {
             press(&mut chooser, KeyCode::Down);
         }
         let buffer = draw_chooser(WIDTH, 8, &mut chooser, &Styles::new(false));
-        assert!(screen(&buffer).contains("czwarte:"), "{}", screen(&buffer));
+        assert!(screen(&buffer).contains("czwarte"), "{}", screen(&buffer));
+    }
+
+    #[test]
+    fn a_header_has_the_label_the_marks_and_the_description() {
+        let mut chooser = entered(vec![ChooserField::text("ticket")
+            .labelled("Ticket")
+            .required()
+            .described("numer zadania w Jirze")]);
+        let buffer = draw_chooser(60, 12, &mut chooser, &Styles::new(false));
+        let screen = screen(&buffer);
+        assert!(
+            screen.contains("Ticket (wymagane) · numer zadania w Jirze"),
+            "{screen}"
+        );
+        assert!(!screen.contains("ticket"), "the name is not drawn:\n{screen}");
+    }
+
+    #[test]
+    fn a_description_longer_than_the_row_is_cut_and_the_label_stays_whole() {
+        let mut chooser = entered(vec![ChooserField::text("Tytuł")
+            .required()
+            .described("opis, który nie zmieści się w jednym wierszu tego okna")]);
+        let buffer = draw_chooser(30, 12, &mut chooser, &Styles::new(false));
+        let screen = screen(&buffer);
+        let header = screen
+            .lines()
+            .find(|row| row.contains("Tytuł"))
+            .unwrap_or_else(|| panic!("{screen}"));
+        assert!(header.contains("Tytuł (wymagane) · "), "{header}");
+        assert!(header.contains('…'), "{header}");
+    }
+
+    #[test]
+    fn a_label_narrower_than_the_area_does_not_panic() {
+        for width in 1..=12 {
+            let mut chooser = entered(vec![ChooserField::text("Repozytorium")
+                .required()
+                .described("opis")]);
+            draw_chooser(width, 8, &mut chooser, &Styles::new(false));
+        }
+    }
+
+    #[test]
+    fn a_complaint_is_drawn_under_the_value_of_its_field() {
+        let mut chooser = entered(vec![
+            ChooserField::text("Ticket").required(),
+            ChooserField::text("Tytuł"),
+            ChooserField::multiline("Opis"),
+        ]);
+        press(&mut chooser, KeyCode::Enter);
+        let buffer = draw_chooser(WIDTH, 20, &mut chooser, &Styles::new(false));
+        let rows = rows(&buffer);
+        let label = rows.iter().position(|row| row.contains("Ticket")).unwrap();
+        let next = rows.iter().position(|row| row.contains("Tytuł")).unwrap();
+        assert!(rows[label + 1].starts_with('>'), "{}", screen(&buffer));
+        if next > label + 2 {
+            assert!(rows[label + 2].contains('✗'), "{}", screen(&buffer));
+        }
+    }
+
+    #[test]
+    fn with_the_keys_on_the_list_the_form_draws_no_fields() {
+        let item = standard()
+            .into_iter()
+            .fold(ChooserItem::new("go", "Start."), ChooserItem::with_field);
+        let mut chooser = Chooser::new(vec![item]).with_inputs_layout();
+        let buffer = draw_chooser(WIDTH, 20, &mut chooser, &Styles::new(false));
+        let screen = screen(&buffer);
+        for label in ["Ticket", "Tytuł", "Repo"] {
+            assert!(!screen.contains(label), "{label}:\n{screen}");
+        }
+        assert!(screen.contains("go"), "{screen}");
+    }
+
+    #[test]
+    fn the_inputs_of_a_workflow_are_drawn_under_their_labels_and_keep_their_names() {
+        use crate::task_app_support::workflow_input;
+        use narsor_engine::domain::ParamType;
+        use narsor::tui::input_form::workflow_input_fields;
+        let inputs = vec![
+            workflow_input("ticket_id", ParamType::String, false, None),
+            workflow_input("description", ParamType::Text, true, None),
+            workflow_input("target_repo", ParamType::Repository, false, None),
+            workflow_input("custom_input", ParamType::String, false, None),
+        ];
+        let fields = workflow_input_fields(&inputs, &["acme/web".to_string()]);
+        let labels: Vec<&str> = fields.iter().map(ChooserField::label).collect();
+        assert_eq!(labels, ["ticket_id", "Opis", "Repozytorium", "custom_input"]);
+        let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, ["ticket_id", "description", "target_repo", "custom_input"]);
+        let mut chooser = entered(fields);
+        let screen = screen(&draw_chooser(WIDTH, 20, &mut chooser, &Styles::new(false)));
+        assert!(screen.contains("Opis (wymagane)"), "{screen}");
+        assert!(screen.contains("Repozytorium"), "{screen}");
+        assert!(screen.contains("> ‹ acme/web ›"), "{screen}");
+        assert!(!screen.contains("description") && !screen.contains("target_repo"), "{screen}");
     }
 
     #[test]

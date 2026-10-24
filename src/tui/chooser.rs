@@ -93,6 +93,8 @@ pub struct ChooserField {
     pub name: String,
     /// What it accepts.
     pub kind: FieldKind,
+    /// The text drawn above the value, when it is not the name.
+    label: Option<String>,
     /// Whether an answer cannot be sent without it.
     pub required: bool,
     /// What the field is for, shown dim beside its name.
@@ -114,6 +116,7 @@ impl ChooserField {
         Self {
             name: name.into(),
             kind,
+            label: None,
             required: false,
             description: None,
             max_chars: None,
@@ -154,6 +157,17 @@ impl ChooserField {
     pub fn required(mut self) -> Self {
         self.required = true;
         self
+    }
+
+    /// The same field drawn under `label`; the name stays the key of its value.
+    pub fn labelled(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// The text drawn above the value: the label, or the name.
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
     }
 
     /// The same field with a description.
@@ -1258,27 +1272,7 @@ fn field_lines(
     let mut focus_line = 0;
     for (index, field) in item.fields.iter().enumerate() {
         let is_focused = focused == Some(index);
-        let mut header = vec![Span::styled(
-            one_line(&field.name),
-            if is_focused {
-                styles.of(Role::Focus)
-            } else {
-                Style::default()
-            },
-        )];
-        if field.required {
-            header.push(Span::styled(" (wymagane)", styles.of(Role::Done)));
-        }
-        if field.proposed {
-            header.push(Span::styled(" ◆", styles.of(Role::Conductor)));
-        }
-        if let Some(description) = &field.description {
-            header.push(Span::styled(
-                format!(" · {}", one_line(description)),
-                styles.of(Role::Done),
-            ));
-        }
-        lines.push(Line::from(header));
+        lines.push(field::header_line(field, width, is_focused, styles));
         let value_start = lines.len();
         let (rows, cursor_row) = field::value_lines(field, width, is_focused, styles);
         lines.extend(rows);
@@ -1338,7 +1332,12 @@ fn render_with_style(
         inputs::render(frame, area, chooser, styles, focused, footer);
         return;
     }
-    let (fields, focus_line) = field_lines(chooser, styles, focused, usize::from(area.width));
+    // The form of inputs shows its fields only when they have the keys.
+    let (fields, focus_line) = if chooser.inputs_layout {
+        (Vec::new(), 0)
+    } else {
+        field_lines(chooser, styles, focused, usize::from(area.width))
+    };
     let fields_height = (fields.len() as u16).min(area.height.saturating_sub(5));
     let [top, bottom] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(fields_height)]).areas(area);
