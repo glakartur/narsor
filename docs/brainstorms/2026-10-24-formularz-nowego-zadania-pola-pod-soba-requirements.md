@@ -17,7 +17,7 @@ Po dodaniu pól Ticket i Tytuł formularz ma pasek krótkich pól (`src/tui/choo
 
 Pole Opis rozciąga się na całą wolną wysokość, ale tło edycji jest tylko pod wierszami z tekstem. Pole wygląda jak podświetlony tekst, nie jak pole. Istnieje już osobny dokument o tym samym problemie dla szerokości pola: `docs/brainstorms/2026-10-24-tlo-aktywnego-pola-formularza-requirements.md`.
 
-Serwer dziś przyjmuje ticket do 64 znaków i tytuł do 200 znaków (`crates/narsor-engine/src/domain/task.rs`). To więcej niż potrzebuje formularz.
+Serwer dziś przyjmuje ticket do 64 znaków i tytuł do 200 znaków (`crates/narsor-engine/src/domain/task.rs`). Formularz potrzebuje mniejszych limitów. Limity 15 i 50 znaków dotyczą tylko formularza TUI. Limity serwera zostają bez zmian.
 
 ---
 
@@ -44,7 +44,7 @@ Serwer dziś przyjmuje ticket do 64 znaków i tytuł do 200 znaków (`crates/nar
 - R14. Formularz nie pozwala wpisać więcej znaków, niż wynosi limit. Nowa linia (`Ctrl+J`, `Shift+Enter`, `Alt+Enter`) w tych polach nic nie robi. Wklejony tekst z nowymi liniami jest zamieniany na jedną linię, a po przekroczeniu limitu jest obcinany do limitu.
 - R15. Limity liczą znaki, nie bajty. Polskie znaki liczą się za jeden.
 - R16. Operator widzi, ile znaków mu zostało lub jaki jest limit (np. `7/15`) przy każdym z tych pól.
-- R17. Backend sprawdza te same limity (15 i 50 znaków) i odrzuca zadanie z dłuższą wartością z czytelnym błędem. TUI nie jest jedynym miejscem, które pilnuje limitu. Dotyczy to także zadań tworzonych przez inne wejścia (np. `src/cli/remote.rs`).
+- R17. Limity 15 i 50 znaków pilnuje tylko formularz TUI, i tylko dla wartości wpisanej przez użytkownika. Backend i inne wejścia (np. `src/cli/remote.rs`) nie zmieniają limitów: nadal obowiązują 64 znaki (ticket) i 200 znaków (tytuł).
 - R18. Limit 50 znaków tytułu jest ten sam co limit tytułu generowanego przez dyrygenta (`GENERATED_TITLE_MAX_CHARS`). Tytuł podany przez operatora i tytuł wygenerowany mają jedną regułę.
 
 ---
@@ -58,7 +58,7 @@ Serwer dziś przyjmuje ticket do 64 znaków i tytuł do 200 znaków (`crates/nar
 - AE5. **Covers R12, R14, R16.** Given pole Ticket z 15 znakami, when operator wpisuje kolejny znak, then znak nie pojawia się, a licznik pokazuje `15/15`.
 - AE6. **Covers R14, R15.** Given operator wkleja do pola Tytuł tekst z dwiema liniami i 80 znakami, when wklejanie się kończy, then pole zawiera jedną linię o 50 znakach.
 - AE7. **Covers R13, R14.** Given pole Tytuł w edycji, when operator naciska `Ctrl+J`, then pole się nie zmienia i formularz nie jest wysłany.
-- AE8. **Covers R17.** Given wywołanie tworzenia zadania z ticketem o 20 znakach, when backend je przyjmuje, then odrzuca je z błędem o limicie 15 znaków, a zadanie nie powstaje.
+- AE8. **Covers R17.** Given wywołanie tworzenia zadania spoza formularza TUI z ticketem o 20 znakach, when backend je przyjmuje, then zadanie powstaje, bo limit backendu to nadal 64 znaki.
 - AE9. **Covers R6.** Given workflow bez wejścia tekstowego dla opisu, when formularz się rysuje, then widać Ticket, Tytuł i Repo jedno pod drugim, a pod nimi komunikat, że workflow nie ma pola tekstowego, jak dziś.
 - AE10. **Covers R4.** Given workflow z wejściami `repository`, `dry_run` i `prompt`, when formularz się rysuje, then kolejność to Ticket, Tytuł, Repo, `dry_run`, Opis.
 
@@ -68,7 +68,7 @@ Serwer dziś przyjmuje ticket do 64 znaków i tytuł do 200 znaków (`crates/nar
 
 - Operator przechodzi po polach `↓` w tej samej kolejności, w jakiej je widzi. Nie szuka pola „obok".
 - Pole Opis wygląda jak pole: pełny prostokąt tła na całej dostępnej wysokości.
-- Ticket i Tytuł nie przyjmują tekstu dłuższego niż limit w żadnym wejściu: w formularzu ani w backendzie.
+- Ticket i Tytuł nie przyjmują w formularzu TUI tekstu dłuższego niż limit. Backend nie zmienia limitów.
 - Planowanie nie musi zgadywać kolejności pól, limitów ani zakresu tła.
 
 ---
@@ -88,7 +88,7 @@ Serwer dziś przyjmuje ticket do 64 znaków i tytuł do 200 znaków (`crates/nar
 
 - Jedna kolumna dla wszystkich pól zamiast paska z kolumnami: kolejność wizualna i kolejność nawigacji są ta sama. Kosztem jest wysokość: każde krótkie pole zajmuje wiersz.
 - Kolejność Ticket, Tytuł, Repo, Opis jest sztywna dla pól własnych formularza: daje przewidywalny układ w każdym workflow.
-- Limity są pilnowane w formularzu (wygoda) i w backendzie (zasada), bo TUI jest cienkim klientem (`docs/brainstorms/2026-10-24-task-ticket-i-tytul-requirements.md`, R18).
+- Limity 15 i 50 znaków pilnuje tylko formularz TUI (decyzja użytkownika). Backend zostaje bez zmian, więc istniejące skrypty i wejścia (CLI, API) nie ulegają zmianie.
 - Tło na całej powierzchni jest regułą wspólnego rysowania pól, nie poprawką jednego pola (zgodnie z R16 z `docs/brainstorms/2026-10-22-tui-edycja-formularzy-requirements.md`).
 
 ---
@@ -96,7 +96,7 @@ Serwer dziś przyjmuje ticket do 64 znaków i tytuł do 200 znaków (`crates/nar
 ## Dependencies / Assumptions
 
 - Zweryfikowano w kodzie: pole `Ticket` i `Tytuł` są dziś zwykłymi polami tekstowymi `ChooserField::text` w `src/tui/task_app/new_task.rs`. Pasek krótkich pól rysuje `render_bar` w `src/tui/chooser/inputs.rs`. Pola wieloliniowe rysuje `render_long_fields`.
-- Zweryfikowano w kodzie: limity serwera to dziś 64 znaki (ticket) i 200 znaków (tytuł).
+- Zweryfikowano w kodzie: limity serwera to dziś 64 znaki (ticket) i 200 znaków (tytuł). Ten dokument ich nie zmienia.
 - Dokument `2026-10-24-tlo-aktywnego-pola-formularza-requirements.md` opisuje szerokość tła. Ten dokument dodaje wysokość (R7, R8). Planowanie scala oba zakresy w jedną zmianę wspólnego rysowania pól.
 
 ---
@@ -104,7 +104,7 @@ Serwer dziś przyjmuje ticket do 64 znaków i tytuł do 200 znaków (`crates/nar
 ## Założenia do potwierdzenia
 
 - Z1. „Temat - 50" z opisu zadania znaczy pole Tytuł (50 znaków). Pola o nazwie „Temat" w formularzu nie ma.
-- Z2. Limity 15 i 50 znaków obowiązują wszędzie: w formularzu i w backendzie (R17). Obniżenie limitu backendu z 64/200 nie psuje istniejących zadań: istniejące dłuższe wartości zostają bez zmian, a limit dotyczy nowych zadań. Nie zweryfikowano, czy istnieją zadania z dłuższymi wartościami.
+- Z2. Limity 15 i 50 znaków obowiązują tylko w formularzu TUI i tylko dla wartości wpisanej przez użytkownika (R17). Backend nie zmienia limitów 64/200, więc istniejące zadania i wejścia spoza TUI działają jak dziś.
 - Z3. „Repo" to dzisiejsze pole `repository` (przełącznik `‹ wartość ›`). Zmienia się tylko jego miejsce w układzie.
 - Z4. „Opis" to główne pole tekstowe (prompt) workflow, jak w `docs/brainstorms/2026-10-09-tui-formularz-nowego-zadania-uklad-requirements.md` (R4).
 - Z5. Pozostałe krótkie wejścia workflow (R4) idą po Repo, przed Opisem. To najbezpieczniejsze miejsce: Opis zostaje ostatni.
@@ -116,8 +116,9 @@ Serwer dziś przyjmuje ticket do 64 znaków i tytuł do 200 znaków (`crates/nar
 
 ## Pytania otwarte dla użytkownika
 
-- P1. Czy limit backendu ma spaść z 64/200 do 15/50 dla wszystkich wejść (CLI, API), czy 15/50 ma pilnować tylko formularz TUI? Zakładamy pierwsze (Z2). Zmiana limitu w API może złamać istniejące skrypty, które podają dłuższy ticket.
-- P2. Czy workflow, który deklaruje własne wejście `ticket_id` (AE6 w dokumencie ticketu), ma też dostać układ pionowy z limitem 15 znaków? Zakładamy: nie, limit dotyczy tylko pola własnego formularza „Ticket".
+- Brak. Odpowiedzi użytkownika z przeglądu PR:
+  - Limit 15/50 pilnuje tylko formularz TUI, nie backend (zamknięte, patrz R17).
+  - Workflow z własnym wejściem `ticket_id` nie dostaje układu pionowego z limitem 15 znaków. Limit dotyczy tylko wartości wpisanej przez użytkownika w polu własnym formularza „Ticket".
 
 ---
 
