@@ -65,7 +65,7 @@ use narsor_protocol::controller::{QueueReason, TaskState};
 
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
-use super::super::style::{Role, Styles};
+use super::super::style::{PanelEdge, Role, Styles};
 use super::background::{DetailJob, JobKey, Outcome};
 use super::list::{describe_loss, fit, state_icon, title_of};
 use super::notify::Severity;
@@ -464,10 +464,7 @@ pub struct Areas {
 /// The three lines of task metadata and the quiet row above the tabs.
 const HEADER_LINES: u16 = 5;
 
-/// Most rows of title the label block shows; a longer one ends in `…`.
-const MAX_TITLE_ROWS: usize = 4;
-
-/// How much of the task id the label block shows: the number the operator
+/// How much of the task id the frame's edge shows: the number the operator
 /// reads out loud. It is never cut.
 const SHORT_ID_CHARS: usize = 8;
 
@@ -857,6 +854,96 @@ pub(super) fn panel_title(title: &str, width: u16) -> String {
     )
 }
 
+/// The smallest a cut title or ticket gets: one character and `…`.
+const MIN_TITLE_CELLS: usize = 2;
+const MIN_TICKET_CELLS: usize = 3;
+
+/// What stands on the top edge of the frame of `task`, cut to fit a frame
+/// `width` cells wide: the ticket and the title on the left, the short task id
+/// on the right. The id is never cut; the title is cut first, then the ticket,
+/// then the title and the ticket leave one after the other. Without a ticket
+/// and a title the left side is the task's title as `display` renders it.
+/// `loading` is the marker of a task being loaded.
+pub fn edge_layout(
+    task: &TaskSummary,
+    width: u16,
+    pill_overhead: usize,
+    focused: bool,
+    loading: Option<&str>,
+) -> PanelEdge {
+    let plain = |text: &Option<String>| {
+        text.as_deref()
+            .map(one_line)
+            .filter(|text| !text.trim().is_empty())
+    };
+    let (ticket, title) = (plain(&task.ticket), plain(&task.title));
+    let id: String = task
+        .task_id
+        .to_string()
+        .chars()
+        .take(SHORT_ID_CHARS)
+        .collect();
+    // The corners, the id's pill and one cell of line between the two sides.
+    let tail = loading.map_or(0, |glyph| 1 + cells(glyph));
+    let marker = usize::from(focused);
+    let room =
+        usize::from(width).saturating_sub(2 + cells(&id) + pill_overhead + 1 + marker + tail);
+    let mut edge = PanelEdge {
+        right: Some(id),
+        tail: loading.map(str::to_string),
+        ..PanelEdge::default()
+    };
+
+    if ticket.is_none() && title.is_none() {
+        let text = title_of(task);
+        let text = fit_cells(&one_line(&text), room.saturating_sub(2));
+        edge.plain = Some(format!(" {text} "));
+        return edge;
+    }
+
+    let pill = |text: &str| cells(text) + pill_overhead;
+    let whole = |ticket: &Option<String>, title: &Option<String>| {
+        let gap = usize::from(ticket.is_some() && title.is_some());
+        ticket.as_deref().map_or(0, pill) + title.as_deref().map_or(0, pill) + gap
+    };
+    let cut_ticket = |ticket: Option<String>, cells_left: usize| {
+        ticket.and_then(|text| {
+            let kept = if cells(&text) <= cells_left {
+                text
+            } else if cells_left >= MIN_TICKET_CELLS {
+                fit_cells(&text, cells_left)
+            } else {
+                return None;
+            };
+            Some(kept)
+        })
+    };
+    let (mut ticket, mut title) = (ticket, title);
+    if whole(&ticket, &title) > room {
+        let ticket_part = ticket.as_deref().map_or(0, |text| pill(text) + 1);
+        let title_room = room.saturating_sub(ticket_part + pill_overhead);
+        if let Some(text) = title.take() {
+            if title_room >= MIN_TITLE_CELLS {
+                title = Some(fit_cells(&text, title_room));
+            } else if ticket.is_some() {
+                // The title at its least, the ticket cut to what is left.
+                let ticket_room = room.saturating_sub(2 * pill_overhead + MIN_TITLE_CELLS + 1);
+                match cut_ticket(ticket.clone(), ticket_room) {
+                    Some(cut) => {
+                        ticket = Some(cut);
+                        title = Some(fit_cells(&text, MIN_TITLE_CELLS));
+                    }
+                    None => ticket = cut_ticket(ticket, room.saturating_sub(pill_overhead)),
+                }
+            }
+        } else {
+            ticket = cut_ticket(ticket, room.saturating_sub(pill_overhead));
+        }
+    }
+    edge.left = ticket.into_iter().chain(title).collect();
+    edge
+}
+
 /// Draws the details of the selected task into `area`: a frame named after
 /// the task, lit while the keys are in the details — in the answer panel too
 /// (R4), but not in the move mode, whose keys move the list's row — and what
@@ -900,13 +987,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         );
         return;
     };
-    let title = title_of(view.task);
-    let title = if loading {
-        format!("{title} {glyph}")
-    } else {
-        title
-    };
-    let inner = styles.render_panel(frame, area, panel_title(&title, area.width), frame_focused);
+    let edge = edge_layout(
+        view.task,
+        area.width,
+        Styles::PILL_OVERHEAD,
+        frame_focused,
+        loading.then_some(glyph),
+    );
+    let inner = styles.render_panel_edge(frame, area, &edge, frame_focused, stale);
     let options = ViewOptions {
         stale,
         keys,
@@ -963,19 +1051,7 @@ pub(super) fn render_view(
     let inner_width = area.width.saturating_sub(3);
     let notice = notice(view.task, styles, stale, inner_width);
     let base_lines = HEADER_LINES + u16::from(notice.is_some());
-    // The label block takes what the tabs, a row of content and the frame
-    // leave; without room for even one row of title it is not drawn.
-    let title_rows =
-        usize::from(area.height.saturating_sub(base_lines + 2 + 3 + 2)).min(MAX_TITLE_ROWS);
-    let labels = label_block(
-        view.task,
-        styles,
-        stale,
-        usize::from(inner_width),
-        title_rows,
-    );
-    let label_lines = u16::try_from(labels.len()).unwrap_or(0);
-    let header_lines = base_lines + label_lines;
+    let header_lines = base_lines;
     let panel_height = view
         .detail
         .waiting
@@ -995,10 +1071,8 @@ pub(super) fn render_view(
         styles,
         stale,
         inner_width,
-        label_lines > 0,
     );
     lines.insert(0, Line::default());
-    lines.splice(1..1, labels);
     lines.extend(notice);
     lines.push(Line::styled(
         "─".repeat(usize::from(inner_width)),
@@ -1022,7 +1096,7 @@ pub(super) fn render_view(
         }
     }
     if hyperlinks {
-        link_spots(frame.buffer_mut(), header_content, &spots, label_lines);
+        link_spots(frame.buffer_mut(), header_content, &spots);
     }
     let header_background = styles.task_header_background().bg;
     if let Some(color) = header_background {
@@ -1232,24 +1306,13 @@ fn header(
     styles: &Styles,
     stale: bool,
     width: u16,
-    labels_shown: bool,
 ) -> (Vec<Line<'static>>, Vec<LinkSpot>) {
     let grey = |role: Role| if stale { Role::Done } else { role };
     let width = usize::from(width);
 
     // Line 1: title and task identity.
     let workflow = format!("{} v{}", one_line(&task.workflow_id), task.workflow_version);
-    // The task's own title replaces the one `display` renders. The label
-    // block above already shows the id, so the line does not repeat it.
-    let own_title = task
-        .title
-        .as_deref()
-        .map(one_line)
-        .filter(|title| !title.trim().is_empty());
-    let title = match (&own_title, labels_shown) {
-        (Some(title), true) => title.clone(),
-        _ => title_of(task),
-    };
+    let title = title_of(task);
     let identity = task.task_id.to_string();
     let identity_is_leading = title.strip_prefix(&identity).is_some_and(|suffix| {
         suffix.is_empty()
@@ -1258,7 +1321,7 @@ fn header(
                 .next()
                 .is_some_and(|ch| !ch.is_alphanumeric() && ch != '-' && ch != '_')
     });
-    let first_text = if identity_is_leading || labels_shown {
+    let first_text = if identity_is_leading {
         fit_cells(&title, width)
     } else {
         let identity_suffix = format!("  {identity}");
@@ -1345,141 +1408,9 @@ fn header(
     (vec![first, Line::from(second), Line::from(third)], spots)
 }
 
-/// The ticket, the title and the short task id, each in a rounded frame:
-/// ticket and title on the left, the id on the right edge. Empty without a
-/// ticket and a title, or when `title_rows` is zero. A title longer than one
-/// row wraps onto the next rows; past `title_rows` it ends in `…`.
-fn label_block(
-    task: &TaskSummary,
-    styles: &Styles,
-    stale: bool,
-    width: usize,
-    title_rows: usize,
-) -> Vec<Line<'static>> {
-    let plain = |text: &Option<String>| {
-        text.as_deref()
-            .map(one_line)
-            .filter(|text| !text.trim().is_empty())
-    };
-    let (ticket, title) = (plain(&task.ticket), plain(&task.title));
-    let id: String = task
-        .task_id
-        .to_string()
-        .chars()
-        .take(SHORT_ID_CHARS)
-        .collect();
-    let id_width = cells(&id) + 4;
-    if (ticket.is_none() && title.is_none()) || title_rows == 0 || width < id_width + 10 {
-        return Vec::new();
-    }
-
-    // Left of the id, one space between frames.
-    let mut room = width - id_width - 1;
-    let mut left: Vec<(Vec<String>, usize, bool)> = Vec::new();
-    if let Some(ticket) = &ticket {
-        let box_width = (cells(ticket) + 4).min((room / 3).max(8));
-        left.push((vec![fit_cells(ticket, box_width - 4)], box_width, false));
-        room = room.saturating_sub(box_width + 1);
-    }
-    if let Some(title) = &title {
-        let box_width = (cells(title) + 4).min(room).max(5);
-        left.push((
-            wrap_cells(title, box_width - 4, title_rows),
-            box_width,
-            true,
-        ));
-    }
-    let height = left.iter().map(|(rows, ..)| rows.len()).max().unwrap_or(1);
-
-    let frame = styles.of(Role::Done);
-    let text_role = if stale { Role::Done } else { Role::Calm };
-    let mut boxes = left;
-    boxes.push((vec![id], id_width, false));
-    let used: usize = boxes
-        .iter()
-        .map(|(_, box_width, _)| box_width)
-        .sum::<usize>()
-        + boxes.len().saturating_sub(2);
-    let filler = width.saturating_sub(used);
-    let last = boxes.len() - 1;
-
-    let row = |kind: usize| -> Line<'static> {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        for (index, (rows, box_width, strong)) in boxes.iter().enumerate() {
-            if index == last && filler > 0 {
-                spans.push(Span::raw(" ".repeat(filler)));
-            } else if index > 0 {
-                spans.push(Span::raw(" "));
-            }
-            let inner = box_width - 2;
-            match kind {
-                0 => spans.push(Span::styled(format!("╭{}╮", "─".repeat(inner)), frame)),
-                1 => spans.push(Span::styled(format!("╰{}╯", "─".repeat(inner)), frame)),
-                text_row => {
-                    let text = rows.get(text_row - 2).cloned().unwrap_or_default();
-                    let pad = " ".repeat((box_width - 4).saturating_sub(cells(&text)));
-                    let style = if *strong {
-                        styles.strong(text_role)
-                    } else {
-                        styles.of(if index == last { Role::Done } else { text_role })
-                    };
-                    spans.push(Span::styled("│ ", frame));
-                    spans.push(Span::styled(format!("{text}{pad}"), style));
-                    spans.push(Span::styled(" │", frame));
-                }
-            }
-        }
-        Line::from(spans)
-    };
-    let mut lines = vec![row(0)];
-    lines.extend((0..height).map(|index| row(index + 2)));
-    lines.push(row(1));
-    lines
-}
-
 /// Display width of `text` in terminal cells.
 fn cells(text: &str) -> usize {
     Span::raw(text).width()
-}
-
-/// `text` broken into rows of at most `width` cells at spaces, a word longer
-/// than a row split where it overflows. At most `max_rows` rows: the last one
-/// ends in `…` when text was left out.
-fn wrap_cells(text: &str, width: usize, max_rows: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows: Vec<String> = Vec::new();
-    let mut row = String::new();
-    for word in text.split_whitespace() {
-        let word_cells = cells(word);
-        if !row.is_empty() && cells(&row) + 1 + word_cells <= width {
-            row.push(' ');
-            row.push_str(word);
-            continue;
-        }
-        if !row.is_empty() {
-            rows.push(std::mem::take(&mut row));
-        }
-        if word_cells <= width {
-            row = word.to_string();
-            continue;
-        }
-        for ch in word.chars() {
-            if !row.is_empty() && cells(&row) + cells(&ch.to_string()) > width {
-                rows.push(std::mem::take(&mut row));
-            }
-            row.push(ch);
-        }
-    }
-    if !row.is_empty() {
-        rows.push(row);
-    }
-    if rows.len() > max_rows {
-        rows.truncate(max_rows);
-        if let Some(last) = rows.last_mut() {
-            *last = fit_cells(&format!("{last}…"), width);
-        }
-    }
-    rows
 }
 
 fn fit_cells(text: &str, width: usize) -> String {
@@ -1666,12 +1597,12 @@ fn is_safe_link_target(url: &str) -> bool {
 /// so the terminal backend neither counts the escape bytes as columns nor
 /// draws over the cells the text spans. A link that does not fit on the line is
 /// left as plain text.
-fn link_spots(buffer: &mut Buffer, header: Rect, spots: &[LinkSpot], label_lines: u16) {
-    // Below the padding row, the label block, the identity and the state.
-    if header.height < 4 + label_lines {
+fn link_spots(buffer: &mut Buffer, header: Rect, spots: &[LinkSpot]) {
+    // Below the padding row, the identity and the state.
+    if header.height < 4 {
         return;
     }
-    let y = header.y + 3 + label_lines;
+    let y = header.y + 3;
     for spot in spots {
         let end = u32::from(spot.column) + u32::from(spot.width);
         let (Some(width), true) = (NonZeroU16::new(spot.width), end <= u32::from(header.width))

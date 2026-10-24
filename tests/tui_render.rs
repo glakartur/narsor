@@ -3355,41 +3355,99 @@ mod task_app_detail_render {
         app
     }
 
+    /// The top edge of the details frame: the first row that has the `╭`
+    /// of the frame at its left edge of the panel.
+    fn edge_row(rows: &[String]) -> &String {
+        rows.iter()
+            .find(|row| row.contains("6a7ceacf") || row.contains('╭') && row.contains("NAR-12"))
+            .unwrap_or_else(|| panic!("no edge row in {rows:#?}"))
+    }
+
     #[test]
-    fn the_header_shows_ticket_and_title_on_the_left_and_the_short_id_on_the_right() {
+    fn the_edge_shows_ticket_and_title_on_the_left_and_the_short_id_on_the_right() {
         let mut app = labelled_app(Some("NAR-12"), Some("Zmiana API zamówień"));
         let rows = rows(&render(&mut app, &Styles::new(false)));
-        let row = rows
-            .iter()
-            .find(|row| row.contains("NAR-12") && row.contains("Zmiana API zamówień"))
-            .unwrap_or_else(|| panic!("no label row in {rows:#?}"));
+        let row = edge_row(&rows);
+        assert!(
+            row.contains("NAR-12") && row.contains("Zmiana API zamówień"),
+            "{row}"
+        );
         assert!(row.contains("6a7ceacf"), "{row}");
         assert!(!row.contains("6a7ceacfd"), "only 8 characters: {row}");
-        assert!(row.find("NAR-12").unwrap() < row.find("6a7ceacf").unwrap());
-        assert!(rows.iter().any(|row| row.contains('╭')), "framed");
+        assert!(row.find("NAR-12").unwrap() < row.find("Zmiana").unwrap());
+        assert!(row.find("Zmiana").unwrap() < row.find("6a7ceacf").unwrap());
+        assert!(row.contains('╭') && row.contains('╮'), "{row}");
+        assert!(
+            !rows
+                .iter()
+                .skip(1)
+                .any(|row| row.contains("╭─") && row.contains("╮")),
+            "no label frames inside the panel: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn without_colour_the_pills_are_bracketed_and_with_colour_they_use_the_caps() {
+        let mut app = labelled_app(Some("NAR-12"), Some("Zmiana API"));
+        let plain = rows(&render(&mut app, &Styles::new(true)));
+        let row = edge_row(&plain);
+        assert!(row.contains("┤ NAR-12 ├"), "{row}");
+        assert!(
+            !row.contains('\u{e0b6}') && !row.contains('\u{e0b4}'),
+            "{row}"
+        );
+
+        let coloured = rows(&render(&mut app, &Styles::new(false)));
+        let row = edge_row(&coloured);
+        assert!(
+            row.contains('\u{e0b6}') && row.contains('\u{e0b4}'),
+            "{row}"
+        );
+        assert!(!row.contains('┤'), "{row}");
+    }
+
+    #[test]
+    fn the_pill_text_is_dark_on_the_frame_colour() {
+        let mut app = labelled_app(Some("NAR-12"), None);
+        let buffer = render(&mut app, &Styles::new(false));
+        let screen_rows = rows(&buffer);
+        let y = screen_rows
+            .iter()
+            .position(|row| row.contains("NAR-12"))
+            .unwrap();
+        let x = screen_rows[y].chars().position(|c| c == 'N').unwrap();
+        let cell = &buffer[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())];
+        assert_eq!(cell.fg, ratatui::style::Color::Black);
+        assert_eq!(cell.bg, ratatui::style::Color::Cyan);
     }
 
     #[test]
     fn a_task_with_only_a_ticket_or_only_a_title_shows_just_that() {
         let mut ticket_only = labelled_app(Some("NAR-12"), None);
-        let screen_text = screen(&render(&mut ticket_only, &Styles::new(false)));
-        assert!(screen_text.contains("NAR-12") && screen_text.contains("6a7ceacf"));
+        let rows_text = rows(&render(&mut ticket_only, &Styles::new(true)));
+        let row = edge_row(&rows_text);
+        assert!(
+            row.contains("┤ NAR-12 ├") && row.contains("6a7ceacf"),
+            "{row}"
+        );
 
         let mut title_only = labelled_app(None, Some("Zmiana API"));
-        let screen_text = screen(&render(&mut title_only, &Styles::new(false)));
-        assert!(screen_text.contains("Zmiana API") && screen_text.contains("6a7ceacf"));
+        let rows_text = rows(&render(&mut title_only, &Styles::new(true)));
+        let row = edge_row(&rows_text);
+        assert!(
+            row.contains("┤ Zmiana API ├") && row.contains("6a7ceacf"),
+            "{row}"
+        );
+        assert!(!row.contains("NAR-12"), "{row}");
     }
 
     #[test]
-    fn a_task_without_ticket_and_title_has_no_label_block() {
+    fn a_task_without_ticket_and_title_shows_its_display_title_and_the_id_on_the_edge() {
         let mut app = labelled_app(None, None);
         let rows = rows(&render(&mut app, &Styles::new(false)));
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.contains("╭─") && row.contains("6a7ceacf")),
-            "no empty frames"
-        );
+        let row = edge_row(&rows);
+        assert!(row.contains("NAR-12 opis"), "{row}");
+        assert!(!row.contains("┤"), "no empty pills: {row}");
         assert!(
             rows[IDENTITY_ROW].contains("NAR-12 opis"),
             "{}",
@@ -3398,42 +3456,161 @@ mod task_app_detail_render {
     }
 
     #[test]
-    fn a_long_title_wraps_and_the_internal_number_stays_whole_at_60_columns() {
+    fn a_long_title_is_cut_with_an_ellipsis_and_the_id_stays_whole_at_60_columns() {
         let title = "Przebudowa obsługi zamówień hurtowych wraz z migracją danych klientów";
         let mut app = labelled_app(Some("NAR-12"), Some(title));
         let buffer = render_at(&mut app, &Styles::new(false), 60, 24);
         let rows = rows(&buffer);
+        let row = edge_row(&rows);
+        assert!(row.contains("NAR-12") && row.contains("6a7ceacf"), "{row}");
+        assert!(row.contains('…'), "{row}");
+        assert!(!row.contains("klientów"), "{row}");
         let screen_text = screen(&buffer);
-        assert!(screen_text.contains("6a7ceacf"), "{screen_text}");
-        assert!(screen_text.contains("Przebudowa"), "{screen_text}");
-        assert!(
-            screen_text.contains("klientów"),
-            "the whole title fits: {screen_text}"
-        );
-        assert!(rows.iter().filter(|row| row.contains('│')).count() >= 3);
-    }
-
-    #[test]
-    fn the_label_block_leaves_the_tabs_and_content_at_60_by_20() {
-        let title = "x ".repeat(80);
-        let mut app = labelled_app(Some("NAR-12"), Some(title.trim()));
-        let buffer = render_at(&mut app, &Styles::new(false), 60, 20);
-        let screen_text = screen(&buffer);
-        assert!(screen_text.contains("6a7ceacf"), "{screen_text}");
         assert!(
             screen_text.contains("Przebieg") && screen_text.contains("Info"),
             "{screen_text}"
         );
     }
 
+    /// The edge of a task with `ticket` and `title` on a frame `width` wide,
+    /// without colour (pills 4 cells wider than their text).
+    fn edge_of(
+        ticket: Option<&str>,
+        title: Option<&str>,
+        width: u16,
+    ) -> narsor::tui::style::PanelEdge {
+        let mut summary = task("a", "local", "running", 1);
+        summary.task_id = narsor_engine::domain::TaskId::parse("6a7ceacfdc604d52").unwrap();
+        summary.ticket = ticket.map(str::to_string);
+        summary.title = title.map(str::to_string);
+        narsor::tui::task_app::detail::edge_layout(&summary, width, 4, false, None)
+    }
+
+    /// Cells the edge takes: corners, pills, the gaps and one cell of line.
+    fn edge_width(edge: &narsor::tui::style::PanelEdge) -> usize {
+        let pills: Vec<&String> = edge.left.iter().chain(edge.right.iter()).collect();
+        2 + pills
+            .iter()
+            .map(|text| text.chars().count() + 4)
+            .sum::<usize>()
+            + edge.left.len().saturating_sub(1)
+            + edge.plain.as_ref().map_or(0, |text| text.chars().count())
+    }
+
     #[test]
-    fn wide_characters_in_the_title_keep_the_frames_aligned() {
-        let mut app = labelled_app(
+    fn the_edge_cuts_the_title_first_then_the_ticket_then_drops_the_pills() {
+        let title = "Przebudowa obsługi zamówień hurtowych";
+        for width in [20u16, 30, 40, 60, 100, 200] {
+            let edge = edge_of(Some("NAR-12345-LONG"), Some(title), width);
+            assert_eq!(
+                edge.right.as_deref(),
+                Some("6a7ceacf"),
+                "id whole at {width}"
+            );
+            assert!(
+                edge_width(&edge) < usize::from(width) || width < 16,
+                "{width}: {edge:?}"
+            );
+        }
+        let wide = edge_of(Some("NAR-12345-LONG"), Some(title), 60);
+        assert_eq!(wide.left[0], "NAR-12345-LONG");
+        assert!(wide.left[1].ends_with('…'), "{wide:?}");
+
+        let narrow = edge_of(Some("NAR-12345-LONG"), Some(title), 30);
+        assert!(
+            narrow
+                .left
+                .get(1)
+                .is_none_or(|title| title.chars().count() <= 2),
+            "{narrow:?}"
+        );
+        assert!(narrow.left.is_empty() || narrow.left[0].chars().count() <= 14);
+
+        let tiny = edge_of(Some("NAR-12345-LONG"), Some(title), 20);
+        assert!(tiny.left.is_empty(), "{tiny:?}");
+
+        let roomy = edge_of(Some("NAR-12"), Some("Zmiana"), 200);
+        assert_eq!(roomy.left, vec!["NAR-12".to_string(), "Zmiana".to_string()]);
+    }
+
+    #[test]
+    fn wide_characters_are_counted_in_cells_when_the_edge_is_cut() {
+        let edge = edge_of(None, Some("変更注文変更注文変更注文変更注文"), 30);
+        assert!(edge_width(&edge) <= 30 + 8, "{edge:?}");
+        let cells: usize = edge
+            .left
+            .iter()
+            .map(|text| ratatui::text::Span::raw(text.as_str()).width() + 4)
+            .sum();
+        assert!(cells + 2 + 12 + 1 <= 30, "{edge:?}");
+    }
+
+    #[test]
+    fn a_blank_ticket_or_title_counts_as_none() {
+        let mut app = labelled_app(Some("   "), Some("\n"));
+        let rows = rows(&render(&mut app, &Styles::new(true)));
+        let row = edge_row(&rows);
+        assert!(row.contains("NAR-12 opis"), "{row}");
+    }
+
+    #[test]
+    fn the_edge_frees_the_rows_of_the_old_label_block() {
+        let mut app = labelled_app(Some("NAR-12"), Some("Zmiana API"));
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 20));
+        let none = {
+            let mut app = labelled_app(None, None);
+            self::rows(&render_at(&mut app, &Styles::new(false), 60, 20))
+        };
+        let tabs = |rows: &[String]| {
+            rows.iter()
+                .position(|row| row.contains("Przebieg"))
+                .unwrap()
+        };
+        assert_eq!(tabs(&rows), tabs(&none));
+    }
+
+    #[test]
+    fn a_loading_task_keeps_its_marker_after_a_cut_title() {
+        let mut summary = task("a", "local", "running", 1);
+        summary.task_id = narsor_engine::domain::TaskId::parse("6a7ceacfdc604d52").unwrap();
+        summary.title = Some("Przebudowa obsługi zamówień hurtowych".to_string());
+        let edge = narsor::tui::task_app::detail::edge_layout(&summary, 30, 4, true, Some("⠋"));
+        assert_eq!(edge.tail.as_deref(), Some("⠋"));
+        assert!(edge.left[0].ends_with('…'), "{edge:?}");
+    }
+
+    #[test]
+    fn switching_to_a_task_without_a_ticket_leaves_no_old_pills() {
+        let mut with = labelled_app(Some("NAR-12"), Some("Zmiana API"));
+        let _ = render(&mut with, &Styles::new(true));
+        let mut without = labelled_app(None, None);
+        let rows = rows(&render(&mut without, &Styles::new(true)));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("┤ NAR-12") || row.contains("┤ Zmiana")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn wide_characters_in_the_title_keep_the_frame_aligned() {
+        let mut ascii = labelled_app(Some("NAR-12"), Some("Zmiana"));
+        let ascii_rows = rows(&render_at(&mut ascii, &Styles::new(true), 60, 24));
+        let mut wide = labelled_app(
             Some("NAR-12"),
             Some("変更 注文 API 🚀 の修正を行う長いタイトル"),
         );
-        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 24));
-        assert!(rows.iter().any(|row| row.contains("6a7ceacf")));
+        let wide_rows = rows(&render_at(&mut wide, &Styles::new(true), 60, 24));
+        let corner = |rows: &[String]| {
+            let row = edge_row(rows);
+            (
+                row.contains("6a7ceacf"),
+                row.chars().rev().position(|c| c == '╮'),
+            )
+        };
+        assert!(corner(&wide_rows).0);
+        assert_eq!(corner(&wide_rows).1, corner(&ascii_rows).1);
     }
 
     #[test]

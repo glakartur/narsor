@@ -51,7 +51,7 @@ use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::background::{JobKey, OpeningKind, Outcome};
 use super::detail::{
-    panel_title, recorded_attempt, render_view, KeysAt, StepLevel, TaskDetail, ViewOptions,
+    edge_layout, recorded_attempt, render_view, KeysAt, StepLevel, TaskDetail, ViewOptions,
 };
 use super::list::{fit, row_text, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
@@ -1014,12 +1014,14 @@ pub fn render_details(
     };
     let key = entry.key();
     let task = entry.summary();
-    let title = if loading {
-        format!("{} {glyph}", title_of(task))
-    } else {
-        title_of(task)
-    };
-    let inner = styles.render_panel(frame, area, panel_title(&title, area.width), focused);
+    let edge = edge_layout(
+        task,
+        area.width,
+        Styles::PILL_OVERHEAD,
+        focused,
+        loading.then_some(glyph),
+    );
+    let inner = styles.render_panel_edge(frame, area, &edge, focused, stale);
     let detail = history
         .details
         .entry(key.clone())
