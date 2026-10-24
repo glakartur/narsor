@@ -6256,6 +6256,68 @@ async fn a_request_that_takes_no_message_has_no_comment_and_says_so() {
     assert_unavailable(&task, TaskActionId::Comment, "nie przyjmuje komentarza");
 }
 
+/// The matrix of the message to the agent (KTD7): for every wait, whether
+/// the offer says the action is available, and what it says it does. A
+/// backend has to give the same table.
+#[tokio::test]
+async fn the_message_to_the_agent_is_offered_by_the_same_table_for_every_wait() {
+    let rows = [
+        // (continuation, kind, available, the words of the effect or the reason)
+        (
+            "resume_agent",
+            AttentionKind::Question,
+            true,
+            "w tej samej sesji",
+        ),
+        (
+            "resolve_output",
+            AttentionKind::Problem,
+            true,
+            "w tej samej sesji",
+        ),
+        (
+            "approve_output",
+            AttentionKind::Approval,
+            true,
+            "Nie zatwierdza",
+        ),
+        (
+            "resolve_permission",
+            AttentionKind::Problem,
+            true,
+            "nigdy nie udziela zgody",
+        ),
+        (
+            "complete_step",
+            AttentionKind::Question,
+            false,
+            "nie przyjmuje komentarza",
+        ),
+        (
+            "entry_limit",
+            AttentionKind::EntryLimit,
+            false,
+            "nie przyjmuje komentarza",
+        ),
+    ];
+    for (continuation, kind, available, words) in rows {
+        let harness = Harness::start().await;
+        waiting_on_request(&harness, continuation, kind).await;
+        let task = harness.task("task-1").await;
+        let offer = action(&task, TaskActionId::Comment);
+        assert_eq!(offer.available, available, "{continuation}");
+        let said = if available {
+            offer.effect.as_deref()
+        } else {
+            offer.reason.as_deref()
+        };
+        assert!(
+            said.is_some_and(|said| said.contains(words)),
+            "{continuation}: {said:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_task_paused_by_the_operator_offers_a_comment_and_resume() {
     let harness = Harness::start().await;

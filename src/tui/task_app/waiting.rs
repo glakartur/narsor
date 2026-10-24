@@ -53,21 +53,24 @@ use ratatui::Frame;
 use crate::api::ClientError;
 use crate::conductor::ConductorView;
 use crate::controller_protocol::{
-    ConductorReadResponse, ConversationUnavailableReason, OwnerCommandRequest, SubmitInputRequest,
-    SubmitOperatorCommandRequest, TaskSummary,
+    ConductorReadResponse, ConversationUnavailableReason, OwnerCommandRequest,
+    SubmitCommentRequest, SubmitInputRequest, SubmitOperatorCommandRequest, TaskSummary,
 };
 use narsor_protocol::api::{
     HumanInputDeliveryDto, PendingHumanInputView, Position, PositionStatus,
 };
 use narsor_protocol::controller::{AttentionItem, AttentionKind, OperatorCommand, OwnerCommand};
 
-use super::super::chooser::{self, Chooser, ChooserAction, ChooserFocus, ChooserItem, Submission};
+use super::super::chooser::{
+    self, Chooser, ChooserAction, ChooserField, ChooserFocus, ChooserItem, Submission,
+};
 use super::super::failure_form::OperatorPanel;
 use super::super::input_form::{ContextLine, InputPanel, Tone};
 use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::scroll::{wrap_line, ScrollState};
 use super::super::style::{Role, Styles};
+use super::actions::{write_to_agent_item, written_text, COMMENT_FIELD};
 use super::background::{DetailJob, JobKey, Outcome};
 use super::detail::short_age;
 use super::list::title_of;
@@ -100,6 +103,8 @@ pub enum Submit {
     Operator(OperatorCommand),
     /// A runner state command of the owner: `start`, `archive`.
     Owner(OwnerCommand),
+    /// Action 0, the text to the agent: the server picks what it does.
+    Comment(String),
 }
 
 /// A chosen action, ready to be sent: [`TaskApp::perform`] carries it out.
@@ -285,6 +290,8 @@ struct Entry {
     /// The key of a send that did not get an answer; a retry of the same
     /// decision reuses it.
     key: Option<String>,
+    /// The send in flight is action 0: its text goes when it is accepted.
+    wrote: bool,
     /// The answer was sent: the typed text is not a draft any more.
     sent: bool,
 }
@@ -299,10 +306,10 @@ impl Entry {
         conductor: Option<&ConductorView>,
     ) -> Self {
         let model = Self::model(item, task, positions, conductor);
-        let chooser = Chooser::new(model.items())
+        let chooser = Chooser::new(Self::items_of(&model, task))
             .enter_fields_on_activate()
             .confirming_submit()
-            .selecting(model.selected());
+            .selecting(model.selected() + 1);
         let composer = model.composer_item().map(|item| {
             Chooser::new(vec![item])
                 .with_inputs_layout()
@@ -316,8 +323,18 @@ impl Entry {
             context_scroll: ScrollState::new(),
             error: None,
             key: None,
+            wrote: false,
             sent: false,
         }
+    }
+
+    /// The entries of the chooser: action 0, then what the waiting offers.
+    /// Action 0 is the field of the composer when the waiting has one (Z3),
+    /// and has its own field when it has none.
+    fn items_of(model: &Model, task: &TaskSummary) -> Vec<ChooserItem> {
+        let mut items = vec![write_to_agent_item(task, !model.has_composer())];
+        items.extend(model.items());
+        items
     }
 
     fn model(
@@ -419,9 +436,9 @@ impl Entry {
             .map(|item| item.label.clone());
         let untouched = chooser.focus() == ChooserFocus::Actions
             && chooser.selected_item().map(|item| &item.label) == opening.as_ref();
-        let rebuilt = chooser.rebuilt(model.items());
+        let rebuilt = chooser.rebuilt(Self::items_of(&model, task));
         self.chooser = if untouched {
-            rebuilt.selecting(model.selected())
+            rebuilt.selecting(model.selected() + 1)
         } else {
             rebuilt
         };
@@ -442,6 +459,23 @@ impl Entry {
             self.composer = Some(composer);
         }
         self.model = model;
+    }
+
+    /// The field of action 0 is empty again: its text was sent.
+    fn empty_written_field(&mut self) {
+        let mut items = self.chooser.items().to_vec();
+        let Some(field) = items
+            .first_mut()
+            .and_then(|item| item.fields.iter_mut().find(|f| f.name == COMMENT_FIELD))
+        else {
+            return;
+        };
+        *field = ChooserField::multiline(COMMENT_FIELD).required();
+        let selected = self.chooser.selected();
+        self.chooser = Chooser::new(items)
+            .enter_fields_on_activate()
+            .confirming_submit()
+            .selecting(selected);
     }
 
     /// Whether what this entry shows comes from the conductor's state.
@@ -552,6 +586,8 @@ pub enum PanelEffect {
     Submit(Submission),
     /// The chosen action cannot be undone: ask in the `y` / `n` window first.
     Confirm(Submission),
+    /// Action 0 with its text: send it to the agent.
+    Comment(String),
 }
 
 /// What a read of the panel's entries changed.
@@ -891,12 +927,23 @@ impl WaitingPanel {
             }
             ChooserAction::Cancel => PanelEffect::Collapse,
             ChooserAction::Blocked(reason) => PanelEffect::Notice(reason),
-            ChooserAction::Submit(submission) => {
+            ChooserAction::Submit(mut submission) => {
+                if submission.index == 0 {
+                    // Action 0: the field of the composer takes the focus, or
+                    // the text of its own field goes to the agent.
+                    if let Some(composer) = entry.composer.as_mut() {
+                        composer.enter_fields();
+                        return PanelEffect::None;
+                    }
+                    return PanelEffect::Comment(written_text(&submission));
+                }
                 let irreversible = entry
                     .chooser
                     .items()
                     .get(submission.index)
                     .is_some_and(|item| item.irreversible);
+                // The entries of the model start after action 0.
+                submission.index -= 1;
                 if irreversible {
                     PanelEffect::Confirm(submission)
                 } else {
@@ -980,6 +1027,32 @@ impl WaitingPanel {
         })
     }
 
+    /// The request for the text of action 0 of the waiting shown.
+    pub fn prepare_comment(
+        &mut self,
+        task: &TaskSummary,
+        text: String,
+    ) -> Result<AnswerRequest, String> {
+        let entry = self
+            .entries
+            .get_mut(self.current)
+            .ok_or_else(|| "Nie ma czego wysłać.".to_string())?;
+        if text.is_empty() {
+            return Err("Napisz, co agent ma zobaczyć.".to_string());
+        }
+        entry.wrote = true;
+        let key = entry.key.get_or_insert_with(idempotency_key).clone();
+        Ok(AnswerRequest {
+            task_id: task.task_id.to_string(),
+            waiting_id: entry.item.waiting_id.clone(),
+            title: title_of(task),
+            generation: task.generation,
+            key,
+            summary: "wiadomość wysłana do agenta".to_string(),
+            submit: Submit::Comment(text),
+        })
+    }
+
     /// Says what a send of `waiting_id` came to. Success forgets the draft; a
     /// refusal keeps the panel as it is and shows why; a lost connection keeps
     /// the key for the retry.
@@ -996,8 +1069,12 @@ impl WaitingPanel {
                 entry.sent = true;
                 entry.key = None;
                 entry.error = None;
+                if std::mem::take(&mut entry.wrote) {
+                    entry.empty_written_field();
+                }
             }
             Err((reason, retryable)) => {
+                entry.wrote = false;
                 if !retryable {
                     entry.key = None;
                 }
@@ -1450,6 +1527,7 @@ impl TaskApp {
             }
             PanelEffect::Submit(submission) => self.submit_answer(&id, &submission),
             PanelEffect::Confirm(submission) => self.ask_to_confirm(&id, &submission),
+            PanelEffect::Comment(text) => self.submit_comment_text(&id, text),
         };
         if let Some(view) = self.detail.views.get(&id) {
             let text = view.draft_text();
@@ -1483,7 +1561,8 @@ impl TaskApp {
         let (label, mut lines) = self
             .selected_panel()
             .and_then(WaitingPanel::chooser)
-            .and_then(|chooser| chooser.items().get(submission.index))
+            // The submission counts from after action 0.
+            .and_then(|chooser| chooser.items().get(submission.index + 1))
             .map_or_else(
                 || (submission.label.clone(), Vec::new()),
                 |item| (item.label.clone(), one_line_per_row(&item.description)),
@@ -1511,6 +1590,33 @@ impl TaskApp {
             return Request::None;
         };
         match view.waiting.prepare(task, submission) {
+            Ok(request) => Request::Answer(Box::new(request)),
+            Err(message) => {
+                if let Some(entry) = view.waiting.entries.get_mut(view.waiting.current) {
+                    entry.error = Some(message);
+                }
+                Request::None
+            }
+        }
+    }
+
+    /// Turns the text of action 0 into a request, unless the connection says no.
+    fn submit_comment_text(&mut self, id: &str, text: String) -> Request {
+        if !self.mutation_allowed() {
+            return Request::None;
+        }
+        let Some(task) = self
+            .list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == id)
+        else {
+            return Request::None;
+        };
+        let Some(view) = self.detail.views.get_mut(id) else {
+            return Request::None;
+        };
+        match view.waiting.prepare_comment(task, text) {
             Ok(request) => Request::Answer(Box::new(request)),
             Err(message) => {
                 if let Some(entry) = view.waiting.entries.get_mut(view.waiting.current) {
@@ -1569,6 +1675,18 @@ impl TaskApp {
                     &task_id,
                     &OwnerCommandRequest {
                         command,
+                        idempotency_key: key,
+                        expected_generation: Some(generation),
+                    },
+                )
+                .await
+                .map(drop),
+            Submit::Comment(text) => self
+                .client
+                .control_comment(
+                    &task_id,
+                    &SubmitCommentRequest {
+                        text,
                         idempotency_key: key,
                         expected_generation: Some(generation),
                     },

@@ -3509,7 +3509,7 @@ mod task_app_waiting_render {
             "Czy zakres zmian obejmuje też migrację danych?",
             "Akcje",
             "Opis",
-            "| 2 | revise",
+            "| 3 | revise",
             "↩ wraca do agenta: plan",
             "Zakres wymaga poprawy.",
             "comment (wymagane)",
@@ -3521,7 +3521,7 @@ mod task_app_waiting_render {
         }
         let list_row = screen
             .lines()
-            .position(|row| row.contains("| 2 | revise"))
+            .position(|row| row.contains("| 3 | revise"))
             .unwrap();
         let context_title = screen
             .lines()
@@ -3702,7 +3702,8 @@ mod task_app_waiting_render {
         let screen = draw_app(&mut app, 120, 40, false);
         assert!(screen.contains("implemented"), "{screen}");
         assert!(screen.contains("Wiadomość dla agenta"), "{screen}");
-        assert!(!screen.contains("Napisz do agenta"), "{screen}");
+        // Action 0 is the entry that moves the focus to that one field.
+        assert!(screen.contains("Napisz do agenta"), "{screen}");
         let action_row = screen
             .lines()
             .position(|line| line.contains("implemented"))
@@ -3774,12 +3775,12 @@ mod task_app_waiting_render {
     fn the_bracket_on_the_actions_follows_the_focus_of_the_panel() {
         let mut app = opened(with_pending(running(), gate()));
         let buffer = draw_buffer(&mut app, 120, 40, false);
-        assert_action_number(&buffer, "revise", 2);
-        assert_not_bracketed(&buffer, "1   approved");
+        assert_action_number(&buffer, "revise", 3);
+        assert_not_bracketed(&buffer, "2   approved");
 
         press(&mut app, KeyCode::Tab);
         let buffer = draw_buffer(&mut app, 120, 40, false);
-        assert_action_number(&buffer, "revise", 2);
+        assert_action_number(&buffer, "revise", 3);
         let y = row_of(&buffer, "revise") as u16;
         let x = column_in(&buffer, usize::from(y), "revise");
         assert_eq!(buffer[(x - 4, y)].fg, Color::DarkGray);
@@ -3797,7 +3798,7 @@ mod task_app_waiting_render {
         ));
         let buffer = draw_buffer(&mut app, 120, 40, false);
         assert!(!app.panel_focused(), "{}", screen(&buffer));
-        assert_action_number(&buffer, "revise", 2);
+        assert_action_number(&buffer, "revise", 3);
     }
 
     /// Without colour the selected number stays visible and risk markers lead
@@ -3806,11 +3807,11 @@ mod task_app_waiting_render {
     fn without_colour_the_bracket_is_bold_and_keeps_the_markers() {
         let mut app = opened(with_pending(running(), gate()));
         let buffer = draw_buffer(&mut app, 120, 40, true);
-        assert_action_number(&buffer, "revise", 2);
+        assert_action_number(&buffer, "revise", 3);
 
         let mut app = opened(with_pending(running(), problem()));
         let buffer = draw_buffer(&mut app, 120, 40, false);
-        assert_action_number(&buffer, "implemented", 1);
+        assert_action_number(&buffer, "implemented", 2);
         assert!(screen(&buffer).contains("! Problem"));
     }
 
@@ -3819,7 +3820,8 @@ mod task_app_waiting_render {
     #[test]
     fn ae7_the_actions_scroll_inside_the_panel_and_the_rest_stays() {
         let mut app = opened(with_pending(running(), six_actions()));
-        press(&mut app, KeyCode::Char('1'));
+        // Action 0 is the first entry: `out1` is the second.
+        press(&mut app, KeyCode::Char('2'));
         let before = draw_buffer(&mut app, 120, 24, false);
         let question = row_of(&before, "Czy zakres zmian");
         let field = row_of(&before, "comment (wymagane)");
@@ -3827,7 +3829,7 @@ mod task_app_waiting_render {
             .filter(|index| screen(&before).contains(&format!("out{index}")))
             .count();
         assert!(
-            shown >= 5,
+            shown >= 4,
             "the action list remains visible:\n{}",
             screen(&before)
         );
@@ -3836,7 +3838,7 @@ mod task_app_waiting_render {
             press(&mut app, KeyCode::Char('j'));
         }
         let after = draw_buffer(&mut app, 120, 24, false);
-        assert_action_number(&after, "out6", 6);
+        assert_action_number(&after, "out6", 7);
         assert_eq!(row_of(&after, "Czy zakres zmian"), question);
         assert_eq!(row_of(&after, "comment (wymagane)"), field);
     }
@@ -3846,12 +3848,12 @@ mod task_app_waiting_render {
     fn at_the_smallest_terminal_one_action_shows_and_j_scrolls() {
         let mut app = opened(with_pending(running(), gate()));
         let buffer = draw_buffer(&mut app, 60, 20, false);
-        assert_action_number(&buffer, "revise", 2);
+        assert_action_number(&buffer, "revise", 3);
         assert!(screen(&buffer).contains("comment"), "{}", screen(&buffer));
 
         press(&mut app, KeyCode::Char('j'));
         let buffer = draw_buffer(&mut app, 60, 20, false);
-        assert_action_number(&buffer, "reject", 3);
+        assert_action_number(&buffer, "reject", 4);
     }
 
     /// R17: a refresh that builds the actions again keeps the highlighted
@@ -3859,11 +3861,11 @@ mod task_app_waiting_render {
     #[test]
     fn a_refresh_keeps_the_highlighted_action_and_the_scroll() {
         let mut app = opened(with_pending(running(), six_actions()));
-        press(&mut app, KeyCode::Char('6'));
+        press(&mut app, KeyCode::Char('7'));
         draw_buffer(&mut app, 120, 24, false);
         press(&mut app, KeyCode::Char('k'));
         let before = draw_buffer(&mut app, 120, 24, false);
-        assert!(screen(&before).contains("6   out6"), "{}", screen(&before));
+        assert!(screen(&before).contains("7   out6"), "{}", screen(&before));
 
         app.on_detail_read(
             "a",
@@ -3879,7 +3881,7 @@ mod task_app_waiting_render {
         );
         let after = draw_buffer(&mut app, 120, 24, false);
         assert_eq!(screen(&before), screen(&after));
-        assert_action_number(&after, "out5", 5);
+        assert_action_number(&after, "out5", 6);
     }
 
     #[test]
@@ -4015,9 +4017,12 @@ mod task_app_actions_render {
     #[test]
     fn the_menu_shows_the_actions_their_keys_and_why_the_move_is_grey() {
         let mut app = opened(running(), ".");
+        // Action 0 opens the menu; the move is the next entry.
+        press(&mut app, KeyCode::Char('j'));
         let screen = draw_app(&mut app, 120, 40, false);
         for expected in [
             "Akcje · NAR-12",
+            "c  napisz do agenta",
             "p  wstrzymaj",
             "x  przerwij krok !",
             "t  przejście ręczne",
@@ -4069,20 +4074,21 @@ mod task_app_actions_render {
         let buffer = draw(120, 40, |frame| {
             layout::render(frame, &mut app, &Styles::new(false), Instant::now())
         });
-        assert_bracketed(&buffer, "1 m  przesuń w kolejce", true, false);
+        assert_bracketed(&buffer, "1 c  napisz do agenta", true, false);
         assert_eq!(
-            label_colour(&buffer, "1 m  przesuń", "przesuń"),
+            label_colour(&buffer, "1 c  napisz do agenta", "napisz"),
             Color::DarkGray
         );
 
         press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
         let buffer = draw(120, 40, |frame| {
             layout::render(frame, &mut app, &Styles::new(false), Instant::now())
         });
-        assert_bracketed(&buffer, "2 p  wstrzymaj", true, false);
-        assert_not_bracketed(&buffer, "1 m  przesuń w kolejce");
+        assert_bracketed(&buffer, "3 p  wstrzymaj", true, false);
+        assert_not_bracketed(&buffer, "1 c  napisz do agenta");
         assert_eq!(
-            label_colour(&buffer, "2 p  wstrzymaj", "wstrzymaj"),
+            label_colour(&buffer, "3 p  wstrzymaj", "wstrzymaj"),
             Color::Reset
         );
     }
@@ -4095,7 +4101,7 @@ mod task_app_actions_render {
         let buffer = draw(120, 40, |frame| {
             layout::render(frame, &mut app, &Styles::new(true), Instant::now())
         });
-        assert_bracketed(&buffer, "1 m  przesuń w kolejce", true, true);
+        assert_bracketed(&buffer, "1 c  napisz do agenta", true, true);
         assert!(screen(&buffer).contains("archiwizuj !"));
     }
 
@@ -4181,6 +4187,7 @@ mod task_app_actions_render {
     #[test]
     fn without_colour_the_bangs_and_the_reasons_survive() {
         let mut app = opened(running(), ".");
+        press(&mut app, KeyCode::Char('j'));
         let menu = draw_app(&mut app, 120, 40, true);
         assert!(
             menu.contains("przerwij krok !") && menu.contains("archiwizuj !"),
@@ -4208,7 +4215,7 @@ mod task_app_actions_render {
         );
         app.load(listing(vec![queued("a", 1)], "c"));
         press(&mut app, KeyCode::Char('.'));
-        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('3'));
         let screen = draw_app(&mut app, 120, 40, false);
         assert!(
             screen.contains("niedostępne: zadanie jest w kolejce"),
