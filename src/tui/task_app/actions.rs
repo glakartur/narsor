@@ -105,6 +105,7 @@ pub enum TaskAction {
 impl TaskAction {
     /// Every action, in the order of the menu.
     pub const ALL: [TaskAction; 8] = [
+        TaskAction::Comment,
         TaskAction::Move,
         TaskAction::PauseResume,
         TaskAction::Interrupt,
@@ -112,7 +113,6 @@ impl TaskAction {
         TaskAction::Restart,
         TaskAction::Archive,
         TaskAction::OpenLink,
-        TaskAction::Comment,
     ];
 
     /// The action a key of the map asks for.
@@ -545,7 +545,7 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
             "otwórz link".to_string(),
             "Otwiera w przeglądarce link z `display.links` zadania.".to_string(),
         ),
-        TaskAction::Comment => ("dodaj komentarz".to_string(), comment_effect(task)),
+        TaskAction::Comment => (WRITE_TO_AGENT.to_lowercase(), comment_effect(task)),
     };
     (format!("{}  {name}", action.key()), effect)
 }
@@ -558,20 +558,51 @@ fn comment_effect(task: &TaskSummary) -> String {
         .unwrap_or_else(|| "Wysyła tekst do agenta.".to_string())
 }
 
+/// The label of action 0: the way to write to the agent from any wait.
+pub(super) const WRITE_TO_AGENT: &str = "Napisz do agenta";
+
+/// Action 0, as an entry of a list that stands alone of any panel (KTD3).
+///
+/// The server says whether it is available, why not, and what it does. With
+/// `field`, the entry holds the field the text is typed into; without it, the
+/// caller has a field of its own for the text.
+pub(super) fn write_to_agent_item(task: &TaskSummary, field: bool) -> ChooserItem {
+    let item = ChooserItem::new(WRITE_TO_AGENT, comment_effect(task));
+    let item = match availability(task, TaskAction::Comment) {
+        Availability::Unavailable(reason) => item.unavailable(reason),
+        Availability::Available => item,
+    };
+    if field {
+        item.with_field(ChooserField::multiline(COMMENT_FIELD).required())
+    } else {
+        item
+    }
+}
+
+/// The text a submission of [`write_to_agent_item`] carries.
+pub(super) fn written_text(submission: &Submission) -> String {
+    submission
+        .values
+        .iter()
+        .find(|(field, _)| field == COMMENT_FIELD)
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// The field of a comment.
-fn comment_form(task: &TaskSummary) -> CommentForm {
+fn comment_form(task: &TaskSummary, unsent: Option<&str>) -> CommentForm {
+    let mut item = write_to_agent_item(task, true);
+    if let (Some(text), Some(field)) = (unsent, item.fields.first_mut()) {
+        *field = std::mem::replace(field, ChooserField::text("")).with_value(text);
+    }
     CommentForm {
         task_id: task.task_id.to_string(),
-        chooser: Chooser::new(vec![ChooserItem::new(
-            "wyślij komentarz",
-            comment_effect(task),
-        )
-        .with_field(ChooserField::multiline(COMMENT_FIELD).required())]),
+        chooser: Chooser::new(vec![item]),
     }
 }
 
 /// The name of the field a comment is typed into.
-const COMMENT_FIELD: &str = "komentarz";
+pub(super) const COMMENT_FIELD: &str = "komentarz";
 
 /// The entries of the menu for `task`. `blocked` is why nothing that changes
 /// state can be done right now (no connection), if that is so.
@@ -905,16 +936,16 @@ impl TaskApp {
         else {
             return Request::None;
         };
-        let text = submission
-            .values
-            .iter()
-            .find(|(field, _)| field == COMMENT_FIELD)
-            .map(|(_, value)| value.trim().to_string())
-            .unwrap_or_default();
+        let text = written_text(submission);
         if text.is_empty() {
-            self.notify(Severity::Warning, "komentarz: napisz, co agent ma zobaczyć");
+            self.notify(
+                Severity::Warning,
+                "napisz do agenta: wpisz, co agent ma zobaczyć",
+            );
             return Request::None;
         }
+        self.unsent_messages
+            .insert(form.task_id.clone(), text.clone());
         Request::Act(Box::new(self.action_request(
             &task,
             "komentarz",
@@ -1068,7 +1099,11 @@ impl TaskApp {
                 Request::None
             }
             TaskAction::Comment => {
-                self.overlay = Some(Overlay::Comment(comment_form(&task)));
+                let unsent = self.unsent_messages.get(task.task_id.as_str());
+                self.overlay = Some(Overlay::Comment(comment_form(
+                    &task,
+                    unsent.map(String::as_str),
+                )));
                 Request::None
             }
         }
@@ -1161,6 +1196,7 @@ impl TaskApp {
         } = request;
         let signature = key_signature(&task_id, &send);
         let conductor = conductor_command(&send);
+        let is_message = matches!(send, ActionSend::Comment(_));
         let had_slot = self.holds_slot(&task_id);
         let result = match send {
             ActionSend::Owner(command) => self
@@ -1212,6 +1248,9 @@ impl TaskApp {
         match result {
             Ok((None, queued)) => {
                 self.action_keys.remove(&signature);
+                if is_message {
+                    self.unsent_messages.remove(&task_id);
+                }
                 let note = if queued { QUEUED_FOR_SLOT } else { "" };
                 self.notify(Severity::Success, format!("{title}: {summary}{note}"));
             }

@@ -673,7 +673,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('c'),
         Action::Comment,
         "",
-        "dodaj komentarz do agenta (serwer wybiera skutek według stanu zatrzymania)",
+        "napisz do agenta (serwer wybiera skutek według stanu zadania)",
     ),
     bind(
         Context::List,
@@ -1057,7 +1057,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('c'),
         Action::Comment,
         "",
-        "dodaj komentarz do agenta (serwer wybiera skutek według stanu zatrzymania)",
+        "napisz do agenta (serwer wybiera skutek według stanu zadania)",
     ),
     // The confirmation window of an action `!`: the same for all of them.
     bind(

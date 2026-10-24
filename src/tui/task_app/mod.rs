@@ -433,6 +433,9 @@ pub struct TaskApp {
     /// The keys of actions that got no answer, by decision: a retry of the
     /// same decision reuses its key.
     action_keys: BTreeMap<String, String>,
+    /// The text of a message to the agent sent from the menu and not yet
+    /// accepted, by task: the window opens with it again when the send failed.
+    unsent_messages: BTreeMap<String, String>,
     /// The keyboard is on the answer panel at the bottom of the details.
     panel_focus: bool,
     /// The level of the focus on *Przebieg*, kept while the panel, a menu or
@@ -505,6 +508,7 @@ impl TaskApp {
             help_open: false,
             overlay: None,
             action_keys: BTreeMap::new(),
+            unsent_messages: BTreeMap::new(),
             panel_focus: false,
             step_focus: StepLevel::default(),
             quit: false,

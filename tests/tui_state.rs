@@ -5128,20 +5128,20 @@ mod task_app_waiting {
         );
         let items = chooser_of(&app).items();
         assert!(
-            !items[0].fields[0].required,
+            !items[1].fields[0].required,
             "approved: the comment is optional"
         );
         assert!(
-            items[1].fields[0].required,
+            items[2].fields[0].required,
             "revise: the comment is required"
         );
-        assert!(!items[2].fields[0].required);
+        assert!(!items[3].fields[0].required);
         assert_eq!(
-            items[1].resumes_agent.as_deref(),
+            items[2].resumes_agent.as_deref(),
             Some("plan"),
             "↩ wraca do agenta: plan"
         );
-        assert!(items[0].resumes_agent.is_none());
+        assert!(items[1].resumes_agent.is_none());
 
         // The panel opens on the output that returns the work to the agent.
         assert_eq!(selected_label(&app), "revise");
@@ -5153,7 +5153,7 @@ mod task_app_waiting {
             Request::None,
             "still refused: the comment is empty"
         );
-        assert!(chooser_of(&app).fields_of(1)[0].error().is_some());
+        assert!(chooser_of(&app).fields_of(2)[0].error().is_some());
 
         typed(&mut app, "Uwzględnij migrację");
         let delivery = delivery(press(&mut app, KeyCode::Enter));
@@ -5187,12 +5187,12 @@ mod task_app_waiting {
     #[test]
     fn revise_with_an_empty_optional_comment_is_refused_at_the_field() {
         let mut app = opened(with_pending(running("a", 1), optional_comment_gate()));
-        ch(&mut app, '2');
+        ch(&mut app, '3');
         assert_eq!(selected_label(&app), "revise");
-        assert!(chooser_of(&app).items()[1].fields[0].required);
+        assert!(chooser_of(&app).items()[2].fields[0].required);
 
         assert!(enter_until_error(&mut app), "the empty comment is refused");
-        let field = &chooser_of(&app).fields_of(1)[0];
+        let field = &chooser_of(&app).fields_of(2)[0];
         assert_eq!(field.name, "comment");
         assert!(
             field.error().is_some_and(|error| error.contains("comment")),
@@ -5204,9 +5204,9 @@ mod task_app_waiting {
     #[test]
     fn approve_with_an_empty_optional_comment_is_sent() {
         let mut app = opened(with_pending(running("a", 1), optional_comment_gate()));
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         assert_eq!(selected_label(&app), "approve");
-        assert!(!chooser_of(&app).items()[0].fields[0].required);
+        assert!(!chooser_of(&app).items()[1].fields[0].required);
         let delivery = delivery(enter_until_answer(&mut app));
         assert_eq!(delivery.chosen_label.as_deref(), Some("approve"));
         assert!(delivery.values.is_empty());
@@ -5215,7 +5215,7 @@ mod task_app_waiting {
     #[test]
     fn an_output_without_a_need_for_the_comment_is_sent_at_once() {
         let mut app = gate_app();
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         assert_eq!(selected_label(&app), "approved");
         assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         let request = sent(press(&mut app, KeyCode::Enter));
@@ -5253,11 +5253,16 @@ mod task_app_waiting {
         });
         let mut app = opened(with_pending(running("a", 1), form));
         let items = chooser_of(&app).items();
-        assert_eq!(items.len(), 2, "one entry per output, no label row");
+        assert_eq!(
+            items.len(),
+            3,
+            "action 0 and one entry per output, no label row"
+        );
         assert!(items
             .iter()
+            .skip(1)
             .all(|item| item.fields.len() == 1 && item.fields[0].name == "ambiguity_answer"));
-        ch(&mut app, '2');
+        ch(&mut app, '3');
         assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(delivery.chosen_label.as_deref(), Some("replan"));
@@ -5436,6 +5441,97 @@ mod task_app_waiting {
         );
     }
 
+    /// AE1: a gate without a message field of its own leads with action 0,
+    /// which holds the field the text is typed into.
+    #[test]
+    fn an_approval_leads_with_write_to_the_agent_and_sends_the_text_as_a_comment() {
+        let mut app = opened(with_pending(running("a", 1), approval(true)));
+        let first = &chooser_of(&app).items()[0];
+        assert_eq!(first.label, "Napisz do agenta");
+        assert_eq!(first.unavailable, None);
+        assert_eq!(first.fields.len(), 1);
+
+        ch(&mut app, '1');
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        typed(&mut app, "uwaga do wyniku");
+        let request = sent(enter_until_answer(&mut app));
+        assert_eq!(
+            request.submit,
+            Submit::Comment("uwaga do wyniku".to_string())
+        );
+        assert_eq!(request.summary, "wiadomość wysłana do agenta");
+    }
+
+    /// AE2, Z3: a question has the field of its answer; action 0 only moves
+    /// the focus to it, and no second field appears.
+    #[test]
+    fn write_to_the_agent_on_a_question_leads_to_the_one_field_of_the_answer() {
+        let mut app = opened(with_pending(running("a", 1), question(None)));
+        assert_eq!(chooser_of(&app).items()[0].label, "Napisz do agenta");
+        assert!(chooser_of(&app).items()[0].fields.is_empty());
+        ch(&mut app, '1');
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert_eq!(composer_of(&app).focus(), ChooserFocus::Fields);
+        typed(&mut app, "użyj innej biblioteki");
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.values["answer"], "użyj innej biblioteki");
+    }
+
+    /// AE4: an empty text is not sent, and the field says why.
+    #[test]
+    fn an_empty_message_to_the_agent_is_not_sent() {
+        let mut app = opened(with_pending(running("a", 1), approval(true)));
+        ch(&mut app, '1');
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        let field = &chooser_of(&app).fields_of(0)[0];
+        assert!(field.error().is_some(), "{:?}", field.error());
+    }
+
+    /// AE3: a wait without a session of the agent shows action 0 greyed with
+    /// the reason of the server, and choosing it opens nothing.
+    #[test]
+    fn write_to_the_agent_is_greyed_with_the_reason_where_no_session_waits() {
+        let failed = waiting_on(
+            running("a", 1),
+            AttentionKind::FailedStep,
+            "fk1",
+            Some("test"),
+        );
+        let mut app = opened(failed);
+        let first = chooser_of(&app).items()[0].clone();
+        assert_eq!(first.label, "Napisz do agenta");
+        let reason = first.unavailable.expect("a reason");
+        assert!(!reason.is_empty());
+        ch(&mut app, '1');
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert_eq!(chooser_of(&app).focus(), ChooserFocus::Actions);
+        assert!(note(&app).contains(&reason), "{}", note(&app));
+    }
+
+    /// R8: a send that fails keeps the text in the field, and the panel says
+    /// why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_message_to_the_agent_keeps_its_text() {
+        let mut app = opened(with_pending(running("a", 1), approval(true)));
+        ch(&mut app, '1');
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "pierwsza\nlinia");
+        let request = enter_until_answer(&mut app);
+        app.perform(request).await;
+
+        let waiting = app.detail().view("a").unwrap().waiting();
+        assert!(waiting.error().is_some(), "the panel says why");
+        assert_eq!(
+            chooser_of(&app).fields_of(0)[0].value(),
+            "pierwsza\nlinia",
+            "the text stays in the field"
+        );
+        // The connection is down: the retry waits for it, the text stays.
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert_eq!(chooser_of(&app).fields_of(0)[0].value(), "pierwsza\nlinia");
+    }
+
     #[test]
     fn lines_pasted_into_an_answer_stay_in_the_field_until_enter_sends_them() {
         let mut app = opened(with_pending(running("a", 1), question(None)));
@@ -5465,7 +5561,7 @@ mod task_app_waiting {
         );
         let mut app = opened(failed);
         read_conductor(&mut app, conductor(true));
-        ch(&mut app, '3');
+        ch(&mut app, '4');
         press(&mut app, KeyCode::Enter);
         app.on_paste("użyj\tnowszego toolchaina");
         assert_eq!(
@@ -5480,7 +5576,7 @@ mod task_app_waiting {
     #[test]
     fn a_paste_into_a_refused_answer_clears_the_refusal_as_typing_does() {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         press(&mut app, KeyCode::Enter);
         // A multi-line field lets go on the second arrow in a row.
         press(&mut app, KeyCode::Down);
@@ -5572,7 +5668,7 @@ mod task_app_waiting {
             None,
         );
         let mut app = opened(failed);
-        ch(&mut app, '2');
+        ch(&mut app, '3');
         assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         assert!(app
             .overlay()
@@ -5624,7 +5720,7 @@ mod task_app_waiting {
             .iter()
             .map(|item| item.label.clone())
             .collect();
-        assert_eq!(labels, ["Akceptuj", "Zwróć agentowi"]);
+        assert_eq!(labels, ["Napisz do agenta", "Akceptuj", "Zwróć agentowi"]);
         assert_eq!(
             selected_label(&app),
             "Zwróć agentowi",
@@ -5647,7 +5743,7 @@ mod task_app_waiting {
         assert_eq!(delivery.comment.as_deref(), Some("popraw testy"));
 
         let mut app = opened(with_pending(running("a", 1), approval(true)));
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         let request = sent(press(&mut app, KeyCode::Enter));
         assert_eq!(request.summary, "zaakceptowano reviewed");
         let Submit::Input { delivery, .. } = request.submit else {
@@ -5660,7 +5756,7 @@ mod task_app_waiting {
     #[test]
     fn an_approval_whose_session_cannot_be_resumed_offers_a_new_one() {
         let app = opened(with_pending(running("a", 1), approval(false)));
-        let item = &chooser_of(&app).items()[1];
+        let item = &chooser_of(&app).items()[2];
         assert_eq!(item.label, "Nowa sesja");
         assert!(item.description.contains("nie da się wznowić"));
     }
@@ -5668,10 +5764,10 @@ mod task_app_waiting {
     #[test]
     fn a_problem_keeps_the_reply_composer_separate_from_the_actions() {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
-        assert!(chooser_of(&app)
-            .items()
-            .iter()
-            .all(|item| item.label != "Napisz do agenta"));
+        // Action 0 has no field of its own here: it leads to the composer (Z3).
+        let first = &chooser_of(&app).items()[0];
+        assert_eq!(first.label, "Napisz do agenta");
+        assert!(first.fields.is_empty());
         press(&mut app, KeyCode::Down);
         typed(&mut app, "spróbuj jeszcze raz");
         press(&mut app, KeyCode::Tab);
@@ -5769,14 +5865,14 @@ mod task_app_waiting {
     #[test]
     fn a_problem_label_needing_a_key_is_refused_until_it_is_given() {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
-        ch(&mut app, '2');
+        ch(&mut app, '3');
         assert_eq!(selected_label(&app), "needs_human_decision");
         assert!(
             enter_until_error(&mut app),
             "artifacts.decision_doc is required"
         );
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
-        let field = &chooser_of(&app).fields_of(1)[0];
+        let field = &chooser_of(&app).fields_of(2)[0];
         assert_eq!(field.name, "artifacts.decision_doc");
         assert!(field
             .error()
@@ -5785,7 +5881,7 @@ mod task_app_waiting {
         // The required artifact, a field for more variables and the comment:
         // no field for artifacts the step does not require.
         let names: Vec<&str> = chooser_of(&app)
-            .fields_of(1)
+            .fields_of(2)
             .iter()
             .map(|field| field.name.as_str())
             .collect();
@@ -5815,7 +5911,7 @@ mod task_app_waiting {
     #[test]
     fn a_key_given_twice_or_without_a_value_is_refused_at_the_panel() {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "x");
         press(&mut app, KeyCode::Down);
@@ -5834,7 +5930,7 @@ mod task_app_waiting {
 
         // A line without `=` is refused too.
         let mut app = opened(with_pending(running("a", 1), problem(false)));
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         press(&mut app, KeyCode::Enter);
         // A multi-line field lets go on the second arrow in a row.
         press(&mut app, KeyCode::Down);
@@ -6071,15 +6167,15 @@ mod task_app_waiting {
             .map(|item| item.label.clone())
             .collect();
         assert!(
-            labels[0].starts_with("Potwierdź: Uruchom krok"),
+            labels[1].starts_with("Potwierdź: Uruchom krok"),
             "{labels:?}"
         );
-        assert!(labels[1].starts_with("Odrzuć: Uruchom krok"));
-        assert_eq!(labels[2], "Restart kroku z notatką");
-        assert!(chooser_of(&app).items()[0].recommended, "◆ the conductor's");
+        assert!(labels[2].starts_with("Odrzuć: Uruchom krok"));
+        assert_eq!(labels[3], "Restart kroku z notatką");
+        assert!(chooser_of(&app).items()[1].recommended, "◆ the conductor's");
         assert_eq!(
             chooser_of(&app).selected(),
-            0,
+            1,
             "the recommendation is selected"
         );
 
@@ -6104,13 +6200,13 @@ mod task_app_waiting {
         );
         let mut app = opened(failed);
         read_conductor(&mut app, conductor(true));
-        ch(&mut app, '3');
+        ch(&mut app, '4');
 
-        assert_eq!(chooser_of(&app).selected(), 2);
+        assert_eq!(chooser_of(&app).selected(), 3);
         assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
         typed(&mut app, "powód restartu");
-        assert_eq!(chooser_of(&app).fields_of(2)[0].value(), "powód restartu");
+        assert_eq!(chooser_of(&app).fields_of(3)[0].value(), "powód restartu");
         assert_eq!(
             sent(press(&mut app, KeyCode::Enter)).submit,
             Submit::Operator(OperatorCommand::RestartStep {
@@ -6130,7 +6226,7 @@ mod task_app_waiting {
         );
         let mut app = opened(failed);
         read_conductor(&mut app, conductor(true));
-        ch(&mut app, '2');
+        ch(&mut app, '3');
         assert_eq!(
             sent(press(&mut app, KeyCode::Enter)).submit,
             Submit::Operator(OperatorCommand::RejectProposal {
@@ -6138,7 +6234,7 @@ mod task_app_waiting {
             })
         );
 
-        ch(&mut app, '3');
+        ch(&mut app, '4');
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "użyj nowszego toolchaina");
         assert_eq!(
@@ -6180,7 +6276,11 @@ mod task_app_waiting {
             "{text}"
         );
         // The raw error comes from the timeline once the entry is built again.
-        assert_eq!(chooser_of(&app).items().len(), 1, "only the restart");
+        assert_eq!(
+            chooser_of(&app).items().len(),
+            2,
+            "action 0 and the restart"
+        );
         let request = sent(enter_until_answer(&mut app));
         assert_eq!(
             request.submit,
@@ -6212,7 +6312,7 @@ mod task_app_waiting {
                 proposal_id: "p1".to_string()
             })
         );
-        ch(&mut app, '2');
+        ch(&mut app, '3');
         assert_eq!(
             sent(press(&mut app, KeyCode::Enter)).submit,
             Submit::Operator(OperatorCommand::RejectProposal {
@@ -6236,8 +6336,8 @@ mod task_app_waiting {
             Submit::Owner(OwnerCommand::Start)
         );
 
-        ch(&mut app, '2');
-        assert!(chooser_of(&app).items()[1].irreversible);
+        ch(&mut app, '3');
+        assert!(chooser_of(&app).items()[2].irreversible);
         assert_eq!(
             press(&mut app, KeyCode::Enter),
             Request::None,
@@ -6305,14 +6405,14 @@ mod task_app_waiting {
         app.load(listing(vec![titled(waiting, "NAR-12")], "e"));
         assert!(app.panel_focused());
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
-        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "Uwzględnij");
+        assert_eq!(chooser_of(&app).fields_of(2)[0].value(), "Uwzględnij");
         assert!(app
             .detail()
             .draft("a")
             .is_some_and(|draft| draft.contains("Uwzględnij")));
         typed(&mut app, " migrację");
         assert_eq!(
-            chooser_of(&app).fields_of(1)[0].value(),
+            chooser_of(&app).fields_of(2)[0].value(),
             "Uwzględnij migrację"
         );
     }
@@ -6332,14 +6432,14 @@ mod task_app_waiting {
 
         press(&mut app, KeyCode::Tab);
         assert!(app.panel_focused() && !app.detail().view("a").unwrap().waiting().is_collapsed());
-        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "szkic");
+        assert_eq!(chooser_of(&app).fields_of(2)[0].value(), "szkic");
         // From the list, Enter does the same.
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.focus(), Focus::List);
         press(&mut app, KeyCode::Enter);
         assert!(app.panel_focused());
-        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "szkic");
+        assert_eq!(chooser_of(&app).fields_of(2)[0].value(), "szkic");
     }
 
     #[test]
@@ -6396,7 +6496,7 @@ mod task_app_waiting {
         assert!(panel.released().is_empty(), "{:?}", panel.released());
         assert_eq!(panel.len(), 1);
         assert_eq!(panel.current_waiting_id(), Some("ep-1"));
-        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "moja odpowiedź");
+        assert_eq!(chooser_of(&app).fields_of(2)[0].value(), "moja odpowiedź");
         let draft = app.detail().draft("a").expect("the draft");
         assert_eq!(draft.matches("moja odpowiedź").count(), 1, "{draft}");
         assert!(!app.panel_focused(), "the focus stays where it was");
@@ -6467,7 +6567,7 @@ mod task_app_waiting {
         let note = app.notifier().latest().expect("a reason").clone();
         assert!(note.text.contains("zablokowana"), "{}", note.text);
         assert_eq!(note.severity, Severity::Warning);
-        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "tekst");
+        assert_eq!(chooser_of(&app).fields_of(2)[0].value(), "tekst");
     }
 
     #[test]
@@ -6476,7 +6576,7 @@ mod task_app_waiting {
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "q?");
         assert_eq!(
-            chooser_of(&app).fields_of(1)[0].value(),
+            chooser_of(&app).fields_of(2)[0].value(),
             "q?",
             "q and ? are text while typing"
         );
@@ -6717,7 +6817,7 @@ mod task_app_waiting {
         let request = press(&mut app, KeyCode::Enter);
         assert_eq!(request, Request::None);
         assert!(app.panel_focused());
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         let chooser = app
             .detail()
             .view("NAR-12")
@@ -6780,7 +6880,7 @@ mod task_app_waiting {
         ch(&mut app, ' ');
         press(&mut app, KeyCode::Enter);
         assert!(app.panel_focused());
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         let request = enter_until_answer(&mut app);
         app.perform(request).await;
 
@@ -6814,7 +6914,7 @@ mod task_app_waiting {
 
         press(&mut app, KeyCode::Tab);
         assert!(app.panel_focused());
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         let request = press(&mut app, KeyCode::Enter);
         app.perform(request).await;
         assert_eq!(app.focus(), Focus::Details, "{:?}", app.notifier().latest());
@@ -6839,7 +6939,7 @@ mod task_app_waiting {
             None,
         );
         let mut offline = opened(failed);
-        ch(&mut offline, '2');
+        ch(&mut offline, '3');
         assert_eq!(press(&mut offline, KeyCode::Enter), Request::None);
         let mut confirmed = sent(ch(&mut offline, 'y'));
         assert_eq!(confirmed.submit, Submit::Owner(OwnerCommand::Archive));
@@ -7043,7 +7143,7 @@ mod task_app_waiting {
         app.refresh().await;
         ch(&mut app, ' ');
         press(&mut app, KeyCode::Enter);
-        ch(&mut app, '1');
+        ch(&mut app, '2');
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "safe");
         let request = enter_until_answer(&mut app);
@@ -7271,7 +7371,7 @@ mod task_app_actions {
             let entry = chooser
                 .items()
                 .iter()
-                .find(|item| item.label.contains("dodaj komentarz"))
+                .find(|item| item.label.contains("napisz do agenta"))
                 .expect("a comment entry");
             assert_eq!(entry.unavailable, None);
             entry.description.clone()
@@ -7327,7 +7427,7 @@ mod task_app_actions {
             let entry = chooser
                 .items()
                 .iter()
-                .find(|item| item.label.contains("dodaj komentarz"))
+                .find(|item| item.label.contains("napisz do agenta"))
                 .expect("a comment entry");
             assert_eq!(entry.unavailable, None);
             assert!(entry.description.contains("wznawia zadanie"));
@@ -7626,7 +7726,9 @@ mod task_app_actions {
         fn enter_on_a_greyed_entry_says_why_and_keeps_the_menu_open() {
             let mut app = loaded(running("a", 1));
             ch(&mut app, '.');
-            // The first entry is the move, which a running task cannot do.
+            // Action 0 leads the menu; the move follows it, and a running
+            // task cannot do it.
+            ch(&mut app, 'j');
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             assert_eq!(note(&app), "przesuń: zadanie nie jest w kolejce");
             assert!(app.overlay().is_some(), "the menu stays");
@@ -7645,7 +7747,7 @@ mod task_app_actions {
         fn enter_on_an_available_entry_runs_it() {
             let mut app = loaded(running("a", 1));
             ch(&mut app, '.');
-            ch(&mut app, '2');
+            ch(&mut app, '3');
             let request = act(press(&mut app, KeyCode::Enter));
             assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Pause));
         }
@@ -9537,7 +9639,7 @@ mod task_app_conductor {
                     proposal_id: "p1".to_string()
                 })
             );
-            ch(&mut app, '2');
+            ch(&mut app, '3');
             let reject = match press(&mut app, KeyCode::Enter) {
                 Request::Answer(answer) => *answer,
                 other => panic!("an answer was expected, got {other:?}"),
