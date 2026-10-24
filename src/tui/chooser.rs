@@ -611,7 +611,6 @@ impl Chooser {
         self.selected
     }
 
-    /// The highlighted entry.
     /// Whether the keys are in the fields of the highlighted entry.
     pub(crate) fn fields_focused(&self) -> bool {
         self.focus == ChooserFocus::Fields
@@ -622,6 +621,7 @@ impl Chooser {
         self.field
     }
 
+    /// The highlighted entry.
     pub fn selected_item(&self) -> Option<&ChooserItem> {
         self.items.get(self.selected)
     }
