@@ -1,4 +1,4 @@
-//! The layout of a form of inputs: a strip with the entry's name and the
+//! The layout of the new task form: a strip with the entry's name and the
 //! fields in one column in the order they are declared. Every field is drawn
 //! as in the other forms: its header, its value under it, its complaint under
 //! the value. The main multi-line field fills the rest of the screen; the
@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use super::{Chooser, ChooserField, ChooserFocus, ChooserItem};
+use crate::tui::chooser::{Chooser, ChooserField, ChooserItem};
 use crate::tui::form::field::{clip, fill_padding, header_line, value_lines, value_rows};
 use crate::tui::form::layout::{text_width, window_start, wrap};
 use crate::tui::scroll::{one_line, sanitize};
@@ -34,7 +34,6 @@ pub(super) fn render(
     chooser: &Chooser,
     styles: &Styles,
     owner_focused: bool,
-    footer: bool,
 ) {
     let Some(item) = chooser.selected_item() else {
         return;
@@ -50,15 +49,14 @@ pub(super) fn render(
             *last = clip(&format!("{last}…"), text_width.max(1));
         }
     }
-    let frame_rows: u16 = if footer { 1 } else { 2 };
-    let strip_rows = frame_rows + summary_rows.len() as u16;
+    let strip_rows = 2 + summary_rows.len() as u16;
     let [strip, rest] = Layout::vertical([
         Constraint::Length(strip_rows.min(area.height)),
         Constraint::Min(0),
     ])
     .areas(area);
-    render_strip(frame, strip, item, &summary_rows, styles, footer);
-    let focused = (owner_focused && chooser.focus == ChooserFocus::Fields).then_some(chooser.field);
+    render_strip(frame, strip, item, &summary_rows, styles);
+    let focused = (owner_focused && chooser.fields_focused()).then_some(chooser.field_index());
     render_column(frame, rest, chooser, item, focused, styles);
 }
 
@@ -77,24 +75,14 @@ fn render_strip(
     item: &ChooserItem,
     summary: &[String],
     styles: &Styles,
-    footer: bool,
 ) {
-    if footer {
-        let mut lines = vec![Line::styled(
-            format!("  {}", one_line(&item.label)),
-            styles.strong(Role::Calm),
-        )];
-        lines.extend(summary.iter().map(|row| Line::raw(format!("  {row}"))));
-        frame.render_widget(Paragraph::new(lines), area);
-    } else {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(Styles::FRAME)
-            .border_style(styles.of(Role::Done))
-            .title(format!(" {} ", one_line(&item.label)));
-        let lines: Vec<Line> = summary.iter().map(|row| Line::raw(row.clone())).collect();
-        frame.render_widget(Paragraph::new(lines).block(block), area);
-    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(Styles::FRAME)
+        .border_style(styles.of(Role::Done))
+        .title(format!(" {} ", one_line(&item.label)));
+    let lines: Vec<Line> = summary.iter().map(|row| Line::raw(row.clone())).collect();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// The fields in one column, in the order of focus. The main field takes the
@@ -116,7 +104,7 @@ fn render_column(
     let main = has_long.then_some(main);
     let width = usize::from(area.width);
     let folded_width = text_width(width);
-    let complaint_rows = |index: usize| usize::from(item.fields[index].error.is_some());
+    let complaint_rows = |index: usize| usize::from(item.fields[index].error().is_some());
     let header_rows = |index: usize| 1 + complaint_rows(index);
     let rows_of = |index: usize, with_text: bool| {
         let field = &item.fields[index];
@@ -172,7 +160,7 @@ fn render_column(
         if is_focused {
             focus_line = value_start + cursor_row;
         }
-        if let Some(error) = &field.error {
+        if let Some(error) = field.error() {
             lines.push(Line::styled(
                 format!("✗ {}", one_line(error)),
                 styles.of(Role::Problem),

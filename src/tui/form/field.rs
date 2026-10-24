@@ -5,8 +5,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::layout::{cell_width, text_width, wrap, Wrapped};
-use crate::tui::scroll::one_line;
 use crate::tui::chooser::{ChooserField, FieldKind};
+use crate::tui::scroll::one_line;
 use crate::tui::scroll::sanitize;
 use crate::tui::style::{Role, Styles};
 

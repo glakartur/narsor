@@ -309,6 +309,19 @@ fn draw_chooser_focused(
     })
 }
 
+/// The chooser as the new task form draws it.
+fn draw_form(width: u16, height: u16, chooser: &mut Chooser, styles: &Styles) -> Buffer {
+    draw(width, height, |frame| {
+        narsor::tui::task_app::new_task::render_chooser(
+            frame,
+            Rect::new(0, 0, width, height),
+            chooser,
+            styles,
+            true,
+        )
+    })
+}
+
 /// Six plain entries, `out1` … `out6`, on the first.
 fn six_outputs() -> Chooser {
     Chooser::new(
@@ -392,13 +405,23 @@ mod chooser_render {
         chooser
     }
 
+    /// The chooser at 100×20, drawn by the layout it was built for.
+    fn draw_typing(inputs_layout: bool, chooser: &mut Chooser) -> Buffer {
+        let styles = Styles::new(false);
+        if inputs_layout {
+            draw_form(100, 20, chooser, &styles)
+        } else {
+            draw_chooser(100, 20, chooser, &styles)
+        }
+    }
+
     #[test]
     fn after_a_long_paste_the_field_shows_its_last_line_and_the_cursor() {
         let text: Vec<String> = (1..=200).map(|line| format!("linia {line}")).collect();
         for inputs_layout in [false, true] {
             let mut chooser = typing_into(ChooserField::multiline("prompt"), inputs_layout);
             assert!(chooser.paste(&text.join("\n")));
-            let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
+            let buffer = draw_typing(inputs_layout, &mut chooser);
             let screen = screen(&buffer);
             assert!(
                 screen.contains("linia 200") && cursor_follows(&buffer, "linia 200"),
@@ -416,7 +439,7 @@ mod chooser_render {
             ] {
                 let mut chooser = typing_into(field, inputs_layout);
                 assert!(chooser.paste("a\tb"));
-                let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
+                let buffer = draw_typing(inputs_layout, &mut chooser);
                 let screen = screen(&buffer);
                 assert!(
                     screen.contains("a   b") && cursor_follows(&buffer, "a   b"),
@@ -431,7 +454,7 @@ mod chooser_render {
         for inputs_layout in [false, true] {
             let mut chooser = typing_into(ChooserField::text("ticket"), inputs_layout);
             assert!(chooser.paste("x\ny\r\nz"));
-            let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
+            let buffer = draw_typing(inputs_layout, &mut chooser);
             let screen = screen(&buffer);
             assert!(
                 screen.contains("x y z") && cursor_follows(&buffer, "x y z"),
@@ -6408,6 +6431,29 @@ mod stacked_form {
 
     const WIDTH: u16 = 40;
 
+    /// The form is drawn by its own layout, as the new task form does.
+    fn draw_chooser(width: u16, height: u16, chooser: &mut Chooser, styles: &Styles) -> Buffer {
+        draw_form(width, height, chooser, styles)
+    }
+
+    fn draw_chooser_focused(
+        width: u16,
+        height: u16,
+        chooser: &mut Chooser,
+        styles: &Styles,
+        focused: bool,
+    ) -> Buffer {
+        draw(width, height, |frame| {
+            narsor::tui::task_app::new_task::render_chooser(
+                frame,
+                Rect::new(0, 0, width, height),
+                chooser,
+                styles,
+                focused,
+            )
+        })
+    }
+
     fn press(chooser: &mut Chooser, code: KeyCode) {
         chooser.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
@@ -6562,7 +6608,10 @@ mod stacked_form {
             screen.contains("Ticket (wymagane) · numer zadania w Jirze"),
             "{screen}"
         );
-        assert!(!screen.contains("ticket"), "the name is not drawn:\n{screen}");
+        assert!(
+            !screen.contains("ticket"),
+            "the name is not drawn:\n{screen}"
+        );
     }
 
     #[test]
@@ -6625,8 +6674,8 @@ mod stacked_form {
     #[test]
     fn the_inputs_of_a_workflow_are_drawn_under_their_labels_and_keep_their_names() {
         use crate::task_app_support::workflow_input;
-        use narsor_engine::domain::ParamType;
         use narsor::tui::input_form::workflow_input_fields;
+        use narsor_engine::domain::ParamType;
         let inputs = vec![
             workflow_input("ticket_id", ParamType::String, false, None),
             workflow_input("description", ParamType::Text, true, None),
@@ -6635,15 +6684,24 @@ mod stacked_form {
         ];
         let fields = workflow_input_fields(&inputs, &["acme/web".to_string()]);
         let labels: Vec<&str> = fields.iter().map(ChooserField::label).collect();
-        assert_eq!(labels, ["ticket_id", "Opis", "Repozytorium", "custom_input"]);
+        assert_eq!(
+            labels,
+            ["ticket_id", "Opis", "Repozytorium", "custom_input"]
+        );
         let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
-        assert_eq!(names, ["ticket_id", "description", "target_repo", "custom_input"]);
+        assert_eq!(
+            names,
+            ["ticket_id", "description", "target_repo", "custom_input"]
+        );
         let mut chooser = entered(fields);
         let screen = screen(&draw_chooser(WIDTH, 20, &mut chooser, &Styles::new(false)));
         assert!(screen.contains("Opis (wymagane)"), "{screen}");
         assert!(screen.contains("Repozytorium"), "{screen}");
         assert!(screen.contains("> ‹ acme/web ›"), "{screen}");
-        assert!(!screen.contains("description") && !screen.contains("target_repo"), "{screen}");
+        assert!(
+            !screen.contains("description") && !screen.contains("target_repo"),
+            "{screen}"
+        );
     }
 
     #[test]

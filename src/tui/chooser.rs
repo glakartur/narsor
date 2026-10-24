@@ -55,8 +55,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-mod inputs;
-
 use super::form::buffer::TextBuffer;
 use super::form::engine::clamp_rows;
 use super::form::engine::FormEngine;
@@ -274,7 +272,7 @@ impl ChooserField {
     }
 
     /// Whether the field takes several lines.
-    fn is_long(&self) -> bool {
+    pub(crate) fn is_long(&self) -> bool {
         matches!(self.kind, FieldKind::Text { multiline: true })
     }
 
@@ -614,6 +612,16 @@ impl Chooser {
     }
 
     /// The highlighted entry.
+    /// Whether the keys are in the fields of the highlighted entry.
+    pub(crate) fn fields_focused(&self) -> bool {
+        self.focus == ChooserFocus::Fields
+    }
+
+    /// The index of the field with the keys, in the highlighted entry.
+    pub(crate) fn field_index(&self) -> usize {
+        self.field
+    }
+
     pub fn selected_item(&self) -> Option<&ChooserItem> {
         self.items.get(self.selected)
     }
@@ -942,7 +950,7 @@ impl Chooser {
     /// The multi-line field a form of inputs draws large when the focus is
     /// not on one: the first required one, else the first, else the first
     /// field. Only drawing uses it; the focus starts on the first field (R9).
-    fn main_field(&self) -> usize {
+    pub(crate) fn main_field(&self) -> usize {
         let Some(item) = self.selected_item() else {
             return 0;
         };
@@ -1328,10 +1336,6 @@ fn render_with_style(
     focused: bool,
     footer: bool,
 ) {
-    if chooser.inputs_layout && chooser.focus == ChooserFocus::Fields {
-        inputs::render(frame, area, chooser, styles, focused, footer);
-        return;
-    }
     // The form of inputs shows its fields only when they have the keys.
     let (fields, focus_line) = if chooser.inputs_layout {
         (Vec::new(), 0)
