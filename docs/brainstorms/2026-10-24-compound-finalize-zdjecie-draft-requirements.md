@@ -7,7 +7,7 @@ topic: compound-finalize-zdjecie-draft
 
 ## Summary
 
-Krok `finalize` w procesie `compound-engineering` zdejmuje Draft z pull requestu i potwierdza to odczytem z hosta. Gdy `finalize` nie potrafi tego zrobić, proces nie przechodzi automatycznie do porażki. Zatrzymuje się na bramce `finalize_blocked`, gdzie człowiek wybiera: ponów próbę albo potwierdź porażkę. Bramka zostaje. Stan `left_as_draft` jest zastąpiony stanem porażki `finalize_failed`.
+Krok `finalize` w procesie `compound-engineering` zdejmuje Draft z pull requestu i potwierdza to odczytem z hosta. Gdy `finalize` nie potrafi tego zrobić, proces nie przechodzi automatycznie do porażki. Zatrzymuje się na bramce `finalize_blocked`, gdzie człowiek wybiera: ponów próbę albo potwierdź porażkę. Bramki `finalize_blocked` nie ma dziś w pliku workflow, więc ta zmiana dodaje ją z powrotem. Stan `left_as_draft` jest zastąpiony stanem porażki `finalize_failed`.
 
 ---
 
@@ -111,8 +111,7 @@ Stan obecny (sprawdzony w `workflows/compound-engineering.yaml`):
 ## Pytania otwarte dla użytkownika
 
 1. Jak dokładnie `finalize` zawodzi? Prosimy o log lub komunikat (GitHub czy GitLab; błąd narzędzia, czy PR zostaje w Draft mimo sukcesu).
-2. Czy `left_as_draft` ma zostać jako osobny stan końcowy (status `cancelled`), czy ma go zastąpić `finalize_failed` (R11)?
-3. Czy bramka ma mieć limit ręcznych `retry`, czy bez limitu?
+2. Czy bramka ma mieć limit ręcznych `retry`, czy bez limitu?
 
 ---
 
