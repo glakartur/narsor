@@ -730,6 +730,8 @@ impl TaskApp {
                         profile: None,
                         harness: None,
                         resources: None,
+                        ticket: None,
+                        title: None,
                     },
                 }))
             }

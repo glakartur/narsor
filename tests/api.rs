@@ -3557,6 +3557,8 @@ fn remote_task(
             profile: None,
             harness: None,
             resources: None,
+            ticket: None,
+            title: None,
         },
     }
 }

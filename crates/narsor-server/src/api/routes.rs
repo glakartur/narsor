@@ -1165,12 +1165,30 @@ async fn post_start_task(
             message: error.to_string(),
         })?;
     let inputs = Value::Object(body.inputs.clone());
+    let label_refusal = |error: narsor_engine::domain::LabelError| ProtocolError::BadRequest {
+        code: "invalid_task_label",
+        message: error.to_string(),
+    };
+    let ticket = narsor_engine::domain::normalize_label(
+        "ticket",
+        body.ticket.as_deref(),
+        narsor_engine::domain::TICKET_MAX_CHARS,
+    )
+    .map_err(label_refusal)?;
+    let title = narsor_engine::domain::normalize_label(
+        "title",
+        body.title.as_deref(),
+        narsor_engine::domain::TITLE_MAX_CHARS,
+    )
+    .map_err(label_refusal)?;
     let sealed = launch
         .resolve_definition(
             &LaunchIntent {
                 workflow_id: definition.id.clone(),
                 workflow_version: definition.version,
                 inputs,
+                ticket,
+                title,
                 ..LaunchIntent::default()
             },
             definition,

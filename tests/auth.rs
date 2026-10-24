@@ -389,6 +389,8 @@ fn create_request(task: &str, backend: &str) -> CreateTaskRequest {
             profile: None,
             harness: None,
             resources: None,
+            ticket: None,
+            title: None,
         },
     }
 }

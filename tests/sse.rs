@@ -494,6 +494,8 @@ async fn create_remote(client: &api::ApiClient, task_id: &str) {
                 profile: None,
                 harness: None,
                 resources: None,
+                ticket: None,
+                title: None,
             },
         })
         .await

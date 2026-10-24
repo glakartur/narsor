@@ -228,6 +228,8 @@ pub fn create_request(task: &str, backend: Option<&str>) -> CreateTaskRequest {
             profile: None,
             harness: None,
             resources: None,
+            ticket: None,
+            title: None,
         },
     }
 }

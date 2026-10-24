@@ -1492,6 +1492,12 @@ pub struct LaunchRequest {
     /// CPU and memory; backend default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceProfileRequest>,
+    /// Ticket the operator typed; the server trims and validates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    /// Title the operator typed; the server trims and validates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// `POST /control/v1/tasks`.
@@ -2453,9 +2459,13 @@ mod tests {
                     cpu_millicores: 1500,
                     memory_mib: 2048,
                 }),
+                ticket: None,
+                title: None,
             },
         };
         let value = serde_json::to_value(request).unwrap();
+        assert!(value["launch"].get("ticket").is_none());
+        assert!(value["launch"].get("title").is_none());
         assert_eq!(value["launch"]["workflow_id"], "hello");
         assert_eq!(value["launch"]["workspace"]["commit"], "abc123");
         assert_eq!(value["launch"]["resources"]["cpu_millicores"], 1500);

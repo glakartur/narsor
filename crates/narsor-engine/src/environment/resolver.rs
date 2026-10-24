@@ -76,6 +76,10 @@ pub struct LaunchIntent {
     pub harness: Option<String>,
     /// Explicit resources.
     pub resources: Option<ResourceProfile>,
+    /// Ticket, already normalized.
+    pub ticket: Option<String>,
+    /// Title, already normalized.
+    pub title: Option<String>,
 }
 
 /// A request that resolved: where the task goes and what it runs.
@@ -954,7 +958,8 @@ impl CatalogLaunchResolver {
         .map_err(|error| LaunchError::InvalidWorkflow {
             workflow: definition.id.clone(),
             problems: vec![format!("the definition cannot be snapshotted: {error}")],
-        })?;
+        })?
+        .with_labels(intent.ticket.clone(), intent.title.clone());
         Ok(ResolvedLaunch { backend_id, spec })
     }
 }

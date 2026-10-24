@@ -34,7 +34,8 @@ use super::credentials::{
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{
-    AnsweredBy, BackendId, LaunchDefinitionError, ResourceProfile, TaskDisplay, TaskId,
+    normalize_label, AnsweredBy, BackendId, LabelError, LaunchDefinitionError, ResourceProfile,
+    TaskDisplay, TaskId, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use crate::engine::{
     plan_operator_transition, EngineError, HumanInputDelivery, PositionStatus, Timeline,
@@ -162,6 +163,11 @@ fn launch_refusal(error: LaunchError) -> ProtocolError {
     } else {
         ProtocolError::bad_request(error.code(), error.to_string())
     }
+}
+
+/// A ticket or title that failed validation, as the owner sees it.
+fn label_refusal(error: LabelError) -> ProtocolError {
+    ProtocolError::bad_request("invalid_task_label", error.to_string())
 }
 
 /// When the owner archived the task, or created it when no tombstone
@@ -467,6 +473,10 @@ impl ProtocolService {
         // limit, an unregistered secret, an unsupported harness or a missing
         // image leaves no task and no assignment behind (U6).
         let launch = request.launch;
+        let ticket = normalize_label("ticket", launch.ticket.as_deref(), TICKET_MAX_CHARS)
+            .map_err(label_refusal)?;
+        let title = normalize_label("title", launch.title.as_deref(), TITLE_MAX_CHARS)
+            .map_err(label_refusal)?;
         let workspace = launch.workspace.unwrap_or_default();
         let resolved = self
             .launch
@@ -482,6 +492,8 @@ impl ProtocolService {
                 resources: launch.resources.map(|resources| {
                     ResourceProfile::new(resources.cpu_millicores, resources.memory_mib)
                 }),
+                ticket,
+                title,
             })
             .map_err(launch_refusal)?;
         self.create_sealed_task(owner, task_id, request_digest, resolved)

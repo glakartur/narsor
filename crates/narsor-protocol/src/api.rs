@@ -281,6 +281,12 @@ pub struct StartTaskRequest {
     pub workflow: String,
     #[serde(default)]
     pub inputs: Map<String, Value>,
+    /// Ticket the operator typed; the server trims and validates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    /// Title the operator typed; the server trims and validates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Where one raw conversation line came from.
