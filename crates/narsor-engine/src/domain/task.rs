@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use narsor_protocol::display::GENERATED_TITLE_MAX_CHARS;
 pub use narsor_protocol::identifier::{BackendId, InvalidIdentifier, TaskId, MAX_IDENTIFIER_LEN};
 pub use narsor_protocol::launch::TASK_LAUNCH_SPEC_VERSION;
 
@@ -20,8 +21,6 @@ use super::{DisplaySpec, WorkflowDefinition};
 pub const TICKET_MAX_CHARS: usize = 64;
 /// Longest title the operator can type, in characters.
 pub const TITLE_MAX_CHARS: usize = 200;
-/// Longest title the conductor generates, in characters.
-pub const GENERATED_TITLE_MAX_CHARS: usize = 50;
 
 /// Why a ticket or title is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

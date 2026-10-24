@@ -97,6 +97,8 @@ pub struct ChooserField {
     pub required: bool,
     /// What the field is for, shown dim beside its name.
     pub description: Option<String>,
+    /// The most characters the operator can type or paste, if any.
+    max_chars: Option<usize>,
     buffer: TextBuffer,
     proposed: bool,
     error: Option<String>,
@@ -114,6 +116,7 @@ impl ChooserField {
             kind,
             required: false,
             description: None,
+            max_chars: None,
             buffer: TextBuffer::default(),
             proposed: false,
             error: None,
@@ -157,6 +160,20 @@ impl ChooserField {
     pub fn described(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
+    }
+
+    /// The same field, taking at most `max` characters from the keyboard and
+    /// the clipboard. A value set in code is not cut.
+    pub fn limited(mut self, max: usize) -> Self {
+        self.max_chars = Some(max);
+        self
+    }
+
+    /// How many characters can still be added.
+    fn room(&self) -> usize {
+        self.max_chars.map_or(usize::MAX, |max| {
+            max.saturating_sub(self.value().chars().count())
+        })
     }
 
     /// The same field holding a value the conductor proposed: marked `◆`
@@ -219,9 +236,13 @@ impl ChooserField {
     /// Puts pasted text at the cursor, as one edit, and the cursor after it.
     /// A `select` takes no paste. Returns whether anything was inserted.
     pub fn paste(&mut self, pasted: &str) -> bool {
-        let Some(text) = pasted_text(&self.kind, pasted).filter(|text| !text.is_empty()) else {
+        let Some(text) = pasted_text(&self.kind, pasted) else {
             return false;
         };
+        let text: String = text.chars().take(self.room()).collect();
+        if text.is_empty() {
+            return false;
+        }
         self.buffer.insert_str(&text);
         self.proposed = false;
         self.error = None;
@@ -257,7 +278,9 @@ impl ChooserField {
             }
             _ if newline => return false,
             (FieldKind::Text { .. }, KeyCode::Char(character)) => {
-                self.buffer.insert(character);
+                if self.room() > 0 {
+                    self.buffer.insert(character);
+                }
                 true
             }
             (FieldKind::Integer, KeyCode::Char(character))
@@ -546,8 +569,9 @@ impl Chooser {
     }
 
     /// The same chooser in the layout of a form of inputs: `Enter` on an entry
-    /// with fields goes into them; there the short fields make a bar, the
-    /// multi-line ones fill the screen, and `Esc` returns to the list.
+    /// with fields goes into them; there the fields stand in one column, the
+    /// main multi-line one fills the rest of the screen, and `Esc` returns to
+    /// the list.
     pub fn with_inputs_layout(mut self) -> Self {
         self.inputs_layout = true;
         self
@@ -893,35 +917,22 @@ impl Chooser {
     }
 
     /// The indices of the highlighted entry's fields in the order the focus
-    /// walks them: in a form of inputs the short fields first, then the
-    /// multi-line ones; otherwise as declared.
+    /// walks them: as declared, which is also the order they are drawn in.
     fn focus_order(&self) -> Vec<usize> {
         let Some(item) = self.selected_item() else {
             return Vec::new();
         };
-        focus_order_of(item, self.inputs_layout)
+        (0..item.fields.len()).collect()
     }
 
     /// The multi-line field a form of inputs draws large when the focus is
     /// not on one: the first required one, else the first, else the first
     /// field. Only drawing uses it; the focus starts on the first field (R9).
     fn main_field(&self) -> usize {
-        let order = self.focus_order();
         let Some(item) = self.selected_item() else {
             return 0;
         };
-        order
-            .iter()
-            .copied()
-            .find(|&index| item.fields[index].is_long() && item.fields[index].required)
-            .or_else(|| {
-                order
-                    .iter()
-                    .copied()
-                    .find(|&index| item.fields[index].is_long())
-            })
-            .or_else(|| order.first().copied())
-            .unwrap_or(0)
+        main_field_of(&item.fields).unwrap_or(0)
     }
 
     fn on_fields_key(&mut self, event: KeyEvent) -> ChooserAction {
@@ -1096,9 +1107,7 @@ impl Chooser {
         for field in &mut item.fields {
             field.error = None;
         }
-        let order = focus_order_of(item, self.inputs_layout);
-        if let Some((index, message)) = order
-            .into_iter()
+        if let Some((index, message)) = (0..item.fields.len())
             .find_map(|index| item.fields[index].problem().map(|message| (index, message)))
         {
             item.fields[index].error = Some(message);
@@ -1164,16 +1173,13 @@ impl Chooser {
     }
 }
 
-/// The order the focus walks the fields of `item`; see [`Chooser::focus_order`].
-fn focus_order_of(item: &ChooserItem, inputs_layout: bool) -> Vec<usize> {
-    let all = 0..item.fields.len();
-    if !inputs_layout {
-        return all.collect();
-    }
-    let long = |index: &usize| item.fields[*index].is_long();
-    let mut order: Vec<usize> = all.clone().filter(|index| !long(index)).collect();
-    order.extend(all.filter(long));
-    order
+/// The multi-line field that takes the room of a form: the first required
+/// one, else the first one. The caller falls back to the first field.
+pub(crate) fn main_field_of(fields: &[ChooserField]) -> Option<usize> {
+    fields
+        .iter()
+        .position(|field| field.is_long() && field.required)
+        .or_else(|| fields.iter().position(ChooserField::is_long))
 }
 
 /// The rows of the list pane's frame.

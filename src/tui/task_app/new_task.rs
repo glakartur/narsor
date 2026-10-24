@@ -71,6 +71,7 @@ use crate::controller_protocol::{
     WorkflowView,
 };
 use narsor_protocol::controller::WorkflowInputType;
+use narsor_protocol::display::GENERATED_TITLE_MAX_CHARS;
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem};
 use super::super::input_form::{workflow_input_fields, workflow_input_values};
@@ -104,12 +105,18 @@ pub const TICKET_FIELD: &str = "Ticket";
 /// The form's own title field of every entry; see [`TICKET_FIELD`].
 pub const TITLE_FIELD: &str = "Tytuł";
 
+/// Longest ticket the form takes, in characters. The server takes more.
+const TICKET_MAX_CHARS: usize = 15;
+
 /// The ticket and title fields: optional, one line, for every workflow. The
 /// form only passes what was typed on; the server trims and checks it.
 fn label_fields() -> [ChooserField; 2] {
     [
-        ChooserField::text(TICKET_FIELD).described("numer zadania w Jirze, opcjonalnie"),
+        ChooserField::text(TICKET_FIELD)
+            .limited(TICKET_MAX_CHARS)
+            .described("numer zadania w Jirze, opcjonalnie"),
         ChooserField::text(TITLE_FIELD)
+            .limited(GENERATED_TITLE_MAX_CHARS)
             .described("krótki tytuł; bez niego nada go dyrygent, opcjonalnie"),
     ]
 }
@@ -331,11 +338,34 @@ fn workflow_item(workflow: &WorkflowView, repositories: &[String]) -> ChooserIte
     if workflow.version.is_none() {
         return item.unavailable("definicja się nie wczytuje");
     }
-    // After the inputs: the form still opens on the workflow's first input.
-    workflow_input_fields(&workflow.inputs, repositories)
+    form_fields(&workflow.inputs, repositories)
         .into_iter()
-        .chain(label_fields())
         .fold(item, ChooserItem::with_field)
+}
+
+/// The fields of a workflow's form, in the order they stand on the screen:
+/// ticket, title, the repository, the other inputs and last the main text
+/// field, which takes the rest of the room.
+fn form_fields(inputs: &[WorkflowInputView], repositories: &[String]) -> Vec<ChooserField> {
+    let mut fields = workflow_input_fields(inputs, repositories);
+    let mut is_repository: Vec<bool> = inputs
+        .iter()
+        .map(|input| matches!(input.input_type, WorkflowInputType::Repository))
+        .collect();
+    let main = chooser::main_field_of(&fields).map(|index| {
+        is_repository.remove(index);
+        fields.remove(index)
+    });
+    let (repository, others): (Vec<_>, Vec<_>) = is_repository
+        .into_iter()
+        .zip(fields)
+        .partition(|(is_repository, _)| *is_repository);
+    label_fields()
+        .into_iter()
+        .chain(repository.into_iter().map(|(_, field)| field))
+        .chain(others.into_iter().map(|(_, field)| field))
+        .chain(main)
+        .collect()
 }
 
 /// `ticket_id*, repository, dry_run`: the inputs, required ones starred.
@@ -391,10 +421,7 @@ fn path_item(
     {
         // Only once the file is accepted: until then `Enter` on the path asks
         // the server to check it, as the path is the last field.
-        for field in workflow_input_fields(inputs, repositories)
-            .into_iter()
-            .chain(label_fields())
-        {
+        for field in form_fields(inputs, repositories) {
             item = item.with_field(field);
         }
     }

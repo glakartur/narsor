@@ -4741,6 +4741,14 @@ mod task_app_create_render {
         );
     }
 
+    /// The form opens on the ticket; the workflow's `ticket_id` is the fourth
+    /// field, after the title and the repository.
+    fn to_ticket_id(app: &mut TaskApp) {
+        for _ in 0..3 {
+            press(app, KeyCode::Down);
+        }
+    }
+
     fn draw_app(app: &mut TaskApp, width: u16, height: u16, no_color: bool) -> String {
         screen(&draw(width, height, |frame| {
             layout::render(frame, app, &Styles::new(no_color), Instant::now())
@@ -4752,6 +4760,7 @@ mod task_app_create_render {
         let mut app = app();
         open_form(&mut app);
         press(&mut app, KeyCode::Enter);
+        to_ticket_id(&mut app);
         keys(&mut app, "NAR-18");
         let screen = draw_app(&mut app, 130, 34, false);
         for expected in [
@@ -4779,6 +4788,7 @@ mod task_app_create_render {
         let mut app = app();
         open_form(&mut app);
         press(&mut app, KeyCode::Enter);
+        to_ticket_id(&mut app);
         keys(&mut app, "NAR-18");
         let screen = draw_app(&mut app, 72, 30, false);
         for expected in [
@@ -5049,22 +5059,32 @@ mod task_app_create_render {
     }
 
     #[test]
-    fn three_text_fields_leave_the_focused_one_at_least_four_rows_at_60x20() {
+    fn three_text_fields_leave_the_main_one_at_least_four_rows_at_60x24() {
         let mut app = app();
         open_prompt_form(&mut app, &["prompt", "notatki", "dodatki"]);
         press(&mut app, KeyCode::Enter);
+        // The prompt is the main field, so it stands last: after the ticket,
+        // the title, the repository, `ticket_id`, `dry_run` and the two others.
+        // The arrow leaves a multi-line field only on the second press.
+        for _ in 0..9 {
+            press(&mut app, KeyCode::Down);
+        }
         for _ in 0..3 {
             keys(&mut app, "x");
             app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         }
-        let screen = draw_app(&mut app, 60, 20, false);
+        let screen = draw_app(&mut app, 60, 24, false);
         let rows: Vec<&str> = screen.lines().collect();
         let header = rows
             .iter()
             .position(|row| row.contains("prompt (wymagane)"))
-            .unwrap();
-        let next = rows.iter().position(|row| row.contains("notatki")).unwrap();
-        assert!(next - header > 4, "{screen}");
+            .unwrap_or_else(|| panic!("{screen}"));
+        let folded = rows.iter().position(|row| row.contains("notatki")).unwrap();
+        assert!(folded < header, "{screen}");
+        assert!(rows.len() > header + 4, "{screen}");
+        for row in &rows[header + 1..header + 4] {
+            assert!(row.contains('x'), "{screen}");
+        }
     }
 
     #[test]
@@ -5081,6 +5101,7 @@ mod task_app_create_render {
         let mut app = app();
         open_form(&mut app);
         press(&mut app, KeyCode::Enter);
+        to_ticket_id(&mut app);
         keys(&mut app, "NAR-18");
         press(&mut app, KeyCode::Down);
         keys(&mut app, "1-2");
@@ -5201,6 +5222,7 @@ mod task_app_create_render {
         let mut app = app();
         open_form(&mut app);
         press(&mut app, KeyCode::Enter);
+        to_ticket_id(&mut app);
         keys(&mut app, "NAR-18");
         let request = (0..7)
             .map(|_| press(&mut app, KeyCode::Enter))
@@ -6203,5 +6225,159 @@ mod active_field_fill {
         assert!(!filled.is_empty());
         // "ab: " is 4 cells plus the cursor space: the place is 5 cells wide.
         assert!(filled.len() >= 5, "filled {filled:?}");
+    }
+}
+
+/// A form of inputs draws its fields one under the other, and the field being
+/// edited has the editing fill over the whole of its rectangle.
+mod stacked_form {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    const WIDTH: u16 = 40;
+
+    fn press(chooser: &mut Chooser, code: KeyCode) {
+        chooser.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn entered(fields: Vec<ChooserField>) -> Chooser {
+        let item = fields
+            .into_iter()
+            .fold(ChooserItem::new("go", "Start."), ChooserItem::with_field);
+        let mut chooser = Chooser::new(vec![item]).with_inputs_layout();
+        chooser.enter_fields();
+        chooser
+    }
+
+    fn standard() -> Vec<ChooserField> {
+        vec![
+            ChooserField::text("Ticket"),
+            ChooserField::text("Tytuł"),
+            ChooserField::text("Repo"),
+            ChooserField::multiline("Opis").required(),
+        ]
+    }
+
+    fn filled(buffer: &Buffer, row: usize, styles: &Styles) -> Vec<bool> {
+        let width = usize::from(buffer.area.width);
+        let fill = styles.field_editing().bg;
+        buffer.content()[row * width..(row + 1) * width]
+            .iter()
+            .map(|cell| Some(cell.bg) == fill)
+            .collect()
+    }
+
+    #[test]
+    fn every_field_is_in_its_own_row_in_the_order_of_declaration() {
+        let mut chooser = entered(standard());
+        let buffer = draw_chooser(WIDTH, 20, &mut chooser, &Styles::new(false));
+        let rows = rows(&buffer);
+        let at = |needle: &str| {
+            let found: Vec<usize> = (0..rows.len())
+                .filter(|&row| rows[row].contains(needle))
+                .collect();
+            assert_eq!(found.len(), 1, "{needle}:\n{}", screen(&buffer));
+            found[0]
+        };
+        let (ticket, title, repo, text) = (at("Ticket:"), at("Tytuł:"), at("Repo:"), at("Opis"));
+        assert!(ticket < title && title < repo && repo < text);
+    }
+
+    #[test]
+    fn the_empty_main_field_is_filled_over_its_whole_rectangle() {
+        let styles = Styles::new(false);
+        let mut chooser = entered(standard());
+        for _ in 0..3 {
+            press(&mut chooser, KeyCode::Down);
+        }
+        let buffer = draw_chooser(WIDTH, 30, &mut chooser, &styles);
+        let header = rows(&buffer)
+            .iter()
+            .position(|row| row.contains("Opis"))
+            .unwrap();
+        // From the row under the header to the last row of the area.
+        let area_end = rows(&buffer).len() - 1;
+        let filled_rows: Vec<usize> = (header + 1..area_end)
+            .filter(|&row| filled(&buffer, row, &styles).iter().any(|&on| on))
+            .collect();
+        assert!(filled_rows.len() >= 10, "{}", screen(&buffer));
+        let first = filled_rows[0];
+        assert_eq!(first, header + 1);
+        assert!(filled_rows.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        for row in filled_rows {
+            let cells = filled(&buffer, row, &styles);
+            assert!(
+                cells[2..usize::from(WIDTH) - 2].iter().all(|&on| on),
+                "row {row}"
+            );
+            assert!(!cells[0] && !cells[1], "the prompt has no fill");
+        }
+    }
+
+    #[test]
+    fn a_field_without_the_focus_has_no_fill_and_no_colour_has_none_at_all() {
+        let mut chooser = entered(standard());
+        let fill = Styles::new(false).field_editing().bg;
+        let buffer = draw_chooser_focused(WIDTH, 20, &mut chooser, &Styles::new(false), false);
+        assert!(buffer.content().iter().all(|cell| Some(cell.bg) != fill));
+        let buffer = draw_chooser(WIDTH, 20, &mut chooser, &Styles::new(true));
+        assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
+    }
+
+    #[test]
+    fn a_short_field_in_edit_is_filled_to_the_last_text_cell_of_its_row() {
+        let styles = Styles::new(false);
+        let mut chooser = entered(standard());
+        press(&mut chooser, KeyCode::Down);
+        let buffer = draw_chooser(WIDTH, 20, &mut chooser, &styles);
+        let row = rows(&buffer)
+            .iter()
+            .position(|row| row.contains("Tytuł:"))
+            .unwrap();
+        let cells = filled(&buffer, row, &styles);
+        assert!(cells[0..usize::from(WIDTH) - 2].iter().all(|&on| on));
+        assert!(!cells[usize::from(WIDTH) - 1]);
+    }
+
+    #[test]
+    fn a_form_without_a_text_field_says_so_under_the_short_ones() {
+        let mut chooser = entered(vec![
+            ChooserField::text("Ticket"),
+            ChooserField::text("Repo"),
+        ]);
+        let buffer = draw_chooser(WIDTH, 12, &mut chooser, &Styles::new(false));
+        let rows = rows(&buffer);
+        let last = rows.iter().position(|row| row.contains("Repo:")).unwrap();
+        assert!(
+            rows[last + 1].contains("brak pola tekstowego"),
+            "{}",
+            screen(&buffer)
+        );
+    }
+
+    #[test]
+    fn a_low_area_scrolls_to_keep_the_focused_short_field_in_view() {
+        let mut chooser = entered(vec![
+            ChooserField::text("pierwsze"),
+            ChooserField::text("drugie"),
+            ChooserField::text("trzecie"),
+            ChooserField::text("czwarte"),
+            ChooserField::multiline("Opis"),
+        ]);
+        for _ in 0..3 {
+            press(&mut chooser, KeyCode::Down);
+        }
+        let buffer = draw_chooser(WIDTH, 8, &mut chooser, &Styles::new(false));
+        assert!(screen(&buffer).contains("czwarte:"), "{}", screen(&buffer));
+    }
+
+    #[test]
+    fn a_very_narrow_area_does_not_panic() {
+        for width in 1..=4 {
+            let mut chooser = entered(standard());
+            draw_chooser(width, 12, &mut chooser, &Styles::new(false));
+            press(&mut chooser, KeyCode::Down);
+            draw_chooser(width, 12, &mut chooser, &Styles::new(false));
+        }
     }
 }
