@@ -163,7 +163,6 @@ Limit tytułu 50 znaków to dziś `GENERATED_TITLE_MAX_CHARS` w `crates/narsor-e
 
 **Files:**
 - Modify: `src/tui/chooser.rs` (`ChooserField`, `edit`, `paste`)
-- Modify: `src/tui/input_form.rs` (jeśli obcinanie ma być w `pasted_text`)
 - Modify: `src/tui/task_app/new_task.rs` (`label_fields`, stałe)
 - Modify: `crates/narsor-protocol/src/` (nowa stała), `crates/narsor-engine/src/domain/task.rs` (reeksport)
 - Test: `tests/tui_state.rs`, `tests/tui_form.rs`, `tests/conductor_title.rs`
