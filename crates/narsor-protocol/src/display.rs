@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 /// Appended to captured output when the server truncates it at the byte cap.
 pub const TRUNCATION_MARKER: &str = "\n… [truncated by narsor]";
 
+/// Longest title the conductor generates, in characters. The new-task form
+/// stops the operator's title at the same length.
+pub const GENERATED_TITLE_MAX_CHARS: usize = 50;
+
 /// What a link shows when it has no text to show.
 pub const EMPTY_LINK_TEXT: &str = "—";
 

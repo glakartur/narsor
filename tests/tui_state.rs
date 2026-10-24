@@ -10312,8 +10312,13 @@ mod task_app_create {
         panic!("{label} was not reached");
     }
 
+    /// Types the workflow's `ticket_id`. The form opens on its own ticket;
+    /// `ticket_id` is the fourth field, after the title and the repository.
     fn fill_ticket(app: &mut TaskApp, ticket: &str) {
         press(app, KeyCode::Enter);
+        for _ in 0..3 {
+            press(app, KeyCode::Down);
+        }
         typed(app, ticket);
     }
 
@@ -10479,23 +10484,122 @@ mod task_app_create {
             assert_eq!(
                 names,
                 [
+                    TICKET_FIELD,
+                    TITLE_FIELD,
+                    "target_repo",
                     "ticket_id",
                     "attempts",
                     "dry_run",
-                    "target_repo",
-                    TICKET_FIELD,
-                    TITLE_FIELD
                 ]
             );
-            assert!(item.fields[0].required);
+            assert!(item.fields[3].required);
             assert_eq!(
-                item.fields[0].description.as_deref(),
+                item.fields[3].description.as_deref(),
                 Some("numer zgłoszenia")
             );
-            assert!(!item.fields[1].required);
+            assert!(!item.fields[4].required);
             assert_eq!(
-                item.fields[1].description.as_deref(),
+                item.fields[4].description.as_deref(),
                 Some("liczba całkowita · ile razy ponawiać")
+            );
+        }
+
+        /// The names of the fields of a workflow with `inputs`, as the form
+        /// of a new task lists them.
+        fn field_names(
+            inputs: Vec<narsor_engine::controller_protocol::WorkflowInputView>,
+        ) -> Vec<String> {
+            let mut app = app_with(vec![]);
+            ch(&mut app, 'n');
+            app.open_new_task(
+                catalogue(vec![catalogue_workflow("flow", "Opis.", inputs)]),
+                narsor_registry(),
+            );
+            chooser_item(&app, "flow")
+                .fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect()
+        }
+
+        #[test]
+        fn the_main_text_field_is_last_and_the_repository_follows_the_title() {
+            let names = field_names(vec![
+                workflow_input("prompt", ParamType::Text, true, None),
+                workflow_input("dry_run", ParamType::Boolean, false, None),
+                workflow_input("repository", ParamType::Repository, false, None),
+            ]);
+            assert_eq!(
+                names,
+                ["Ticket", "Tytuł", "repository", "dry_run", "prompt"]
+            );
+        }
+
+        #[test]
+        fn a_workflow_without_a_repository_or_a_text_field_leaves_no_gap() {
+            assert_eq!(
+                field_names(vec![
+                    workflow_input("dry_run", ParamType::Boolean, false, None),
+                    workflow_input("prompt", ParamType::Text, false, None),
+                ]),
+                ["Ticket", "Tytuł", "dry_run", "prompt"]
+            );
+            assert_eq!(
+                field_names(vec![
+                    workflow_input("repository", ParamType::Repository, false, None),
+                    workflow_input("count", ParamType::Integer, false, None),
+                ]),
+                ["Ticket", "Tytuł", "repository", "count"]
+            );
+        }
+
+        #[test]
+        fn the_required_text_field_is_the_main_one_and_ticket_id_is_an_ordinary_input() {
+            assert_eq!(
+                field_names(vec![
+                    workflow_input("notes", ParamType::Text, false, None),
+                    workflow_input("prompt", ParamType::Text, true, None),
+                    workflow_input("ticket_id", ParamType::String, false, None),
+                ]),
+                ["Ticket", "Tytuł", "notes", "ticket_id", "prompt"]
+            );
+        }
+
+        #[test]
+        fn the_ticket_takes_fifteen_characters_and_the_title_fifty() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            press(&mut app, KeyCode::Enter);
+            typed(&mut app, &"ą".repeat(20));
+            assert_eq!(
+                field_value(&app, "implement-feature", TICKET_FIELD),
+                "ą".repeat(15)
+            );
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, &"b".repeat(80));
+            assert_eq!(
+                field_value(&app, "implement-feature", TITLE_FIELD),
+                "b".repeat(50)
+            );
+            assert_eq!(narsor_protocol::display::GENERATED_TITLE_MAX_CHARS, 50);
+            assert_eq!(
+                narsor_engine::domain::GENERATED_TITLE_MAX_CHARS,
+                narsor_protocol::display::GENERATED_TITLE_MAX_CHARS
+            );
+        }
+
+        #[test]
+        fn a_workflow_input_named_like_the_ticket_has_no_limit() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            press(&mut app, KeyCode::Enter);
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Down);
+            }
+            typed(&mut app, &"x".repeat(40));
+            assert_eq!(
+                field_value(&app, "implement-feature", "ticket_id").len(),
+                40
             );
         }
 
@@ -10506,12 +10610,12 @@ mod task_app_create {
             open_form(&mut app);
             let item = chooser_item(&app, "implement-feature");
             assert_eq!(
-                item.fields[2].kind,
+                item.fields[5].kind,
                 narsor::tui::chooser::FieldKind::Select(vec!["true".into(), "false".into()])
             );
-            assert_eq!(item.fields[2].value(), "false");
+            assert_eq!(item.fields[5].value(), "false");
             assert_eq!(
-                item.fields[3].kind,
+                item.fields[2].kind,
                 narsor::tui::chooser::FieldKind::Select(vec!["docs".into(), "narsor".into()])
             );
             assert_eq!(
@@ -10542,11 +10646,11 @@ mod task_app_create {
             }
             let item = chooser_item(&app, "implement-feature");
             assert!(
-                item.fields[0]
+                item.fields[3]
                     .error()
                     .is_some_and(|error| error.contains("ticket_id")),
                 "{:?}",
-                item.fields[0].error()
+                item.fields[3].error()
             );
             assert_eq!(app.view_kind(), ViewKind::NewTask);
             assert!(app.outgoing().is_empty());
@@ -10562,13 +10666,13 @@ mod task_app_create {
             assert_eq!(enter_until_send(&mut app), Request::None);
             let item = chooser_item(&app, "implement-feature");
             assert!(
-                item.fields[1]
+                item.fields[4]
                     .error()
                     .is_some_and(|error| error.contains("attempts") && error.contains("liczby")),
                 "{:?}",
-                item.fields[1].error()
+                item.fields[4].error()
             );
-            assert!(item.fields[0].error().is_none());
+            assert!(item.fields[3].error().is_none());
             assert_eq!(app.view_kind(), ViewKind::NewTask);
             assert!(app.outgoing().is_empty());
             assert!(app.list().pending().is_empty());
@@ -10713,7 +10817,7 @@ mod task_app_create {
             assert_eq!(app.key_context().base, Context::Form);
             ch(&mut app, 'q');
             assert!(!app.should_quit());
-            assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "q");
+            assert_eq!(field_value(&app, "implement-feature", TICKET_FIELD), "q");
         }
 
         #[test]
@@ -10879,7 +10983,7 @@ mod task_app_create {
                 .iter()
                 .map(|field| field.name.as_str())
                 .collect();
-            assert_eq!(names, [PATH_FIELD, "ticket", TICKET_FIELD, TITLE_FIELD]);
+            assert_eq!(names, [PATH_FIELD, TICKET_FIELD, TITLE_FIELD, "ticket"]);
             assert!(item.description.contains("my-flow v4"));
             assert_eq!(
                 field_value(&app, PATH_LABEL, PATH_FIELD),
@@ -10887,11 +10991,11 @@ mod task_app_create {
                 "what was typed stays"
             );
 
-            press(&mut app, KeyCode::Down);
-            typed(&mut app, "NAR-3");
             // Past the form's own ticket and title fields.
-            press(&mut app, KeyCode::Enter);
-            press(&mut app, KeyCode::Enter);
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Down);
+            }
+            typed(&mut app, "NAR-3");
             let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
                 panic!("the task should be sent");
             };
@@ -11036,9 +11140,10 @@ mod task_app_create {
         #[test]
         fn the_typed_ticket_and_title_go_to_the_request_as_typed() {
             let mut app = filled();
-            // From `attempts`: past `dry_run` and `target_repo` to the ticket.
-            for _ in 0..3 {
-                press(&mut app, KeyCode::Down);
+            // From `attempts`: up past `ticket_id` and `target_repo` and the
+            // title to the ticket.
+            for _ in 0..4 {
+                press(&mut app, KeyCode::Up);
             }
             typed(&mut app, "  NAR-12 ");
             press(&mut app, KeyCode::Down);
@@ -12259,7 +12364,11 @@ mod task_app_create {
                 app.new_task_form().unwrap().path_check().unwrap().verdict,
                 PathVerdict::Valid { version: 1, .. }
             ));
-            press(&mut app, KeyCode::Down);
+            // The ticket and the title come first, then the repository and
+            // `ticket_id`.
+            for _ in 0..4 {
+                press(&mut app, KeyCode::Down);
+            }
             typed(&mut app, "NAR-77");
             let request = super::enter_until_send(&mut app);
             let Request::SendTask(id) = &request else {
@@ -12574,7 +12683,7 @@ mod task_app_create {
             choose(&mut app, "implement-feature");
             let item = chooser_item(&app, "implement-feature");
             assert_eq!(
-                item.fields[0].kind,
+                item.fields[2].kind,
                 narsor::tui::chooser::FieldKind::Select(vec!["narsor".to_string()])
             );
         }

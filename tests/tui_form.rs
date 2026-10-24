@@ -498,3 +498,78 @@ fn without_colour_a_field_in_edit_has_no_fill() {
     assert_eq!(styles.field_editing().bg, None);
     assert_eq!(styles.field_editing().fg, None);
 }
+
+// -- limits ----------------------------------------------------------------
+
+fn limited_form(limit: usize) -> Chooser {
+    let mut chooser = Chooser::new(vec![ChooserItem::new("go", "Start.")
+        .with_field(ChooserField::text("ticket").limited(limit))
+        .with_field(ChooserField::multiline("opis"))])
+    .with_inputs_layout();
+    into_fields(&mut chooser);
+    chooser
+}
+
+#[test]
+fn a_limited_field_refuses_the_character_after_the_limit_and_counts_characters() {
+    let mut chooser = limited_form(15);
+    type_text(&mut chooser, "ąęłóśżźćńąęłóśżź");
+    assert_eq!(value(&chooser, 0).chars().count(), 15);
+    assert!(
+        value(&chooser, 0).len() > 15,
+        "polish letters are many bytes"
+    );
+    press(&mut chooser, KeyCode::Backspace);
+    type_text(&mut chooser, "ab");
+    assert_eq!(value(&chooser, 0).chars().count(), 15);
+    assert!(value(&chooser, 0).ends_with('a'));
+}
+
+#[test]
+fn a_paste_is_one_line_and_is_cut_to_the_room_left() {
+    let mut chooser = limited_form(15);
+    type_text(&mut chooser, "0123456789");
+    assert!(chooser.paste("abc\r\ndefghijklmnop"));
+    assert_eq!(value(&chooser, 0), "0123456789abc d");
+    assert!(!chooser.paste("more"), "a full field takes nothing");
+}
+
+#[test]
+fn a_paste_in_the_middle_stays_in_the_limit_and_the_cursor_follows_it() {
+    let mut chooser = limited_form(6);
+    type_text(&mut chooser, "abcd");
+    press(&mut chooser, KeyCode::Left);
+    press(&mut chooser, KeyCode::Left);
+    assert!(chooser.paste("XYZ"));
+    assert_eq!(value(&chooser, 0), "abXYcd");
+    assert_eq!(chooser.fields_of(0)[0].cursor(), 4);
+}
+
+#[test]
+fn a_new_line_key_in_a_limited_field_does_nothing_and_sends_nothing() {
+    let mut chooser = limited_form(15);
+    type_text(&mut chooser, "ab");
+    assert_eq!(chooser.on_key(ctrl_j()), ChooserAction::None);
+    assert_eq!(value(&chooser, 0), "ab");
+}
+
+#[test]
+fn a_field_without_a_limit_takes_a_long_paste() {
+    let mut chooser = limited_form(15);
+    press(&mut chooser, KeyCode::Down);
+    assert!(chooser.paste(&"x".repeat(1000)));
+    assert_eq!(value(&chooser, 1).len(), 1000);
+}
+
+#[test]
+fn a_value_set_in_code_is_not_cut_and_backspace_still_works() {
+    let mut chooser = Chooser::new(vec![ChooserItem::new("go", "Start.")
+        .with_field(ChooserField::text("ticket").limited(3).with_value("abcdef"))])
+    .with_inputs_layout();
+    into_fields(&mut chooser);
+    press(&mut chooser, KeyCode::End);
+    type_text(&mut chooser, "z");
+    assert_eq!(value(&chooser, 0), "abcdef");
+    press(&mut chooser, KeyCode::Backspace);
+    assert_eq!(value(&chooser, 0), "abcde");
+}

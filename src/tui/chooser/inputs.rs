@@ -1,7 +1,7 @@
-//! The layout of a form of inputs: a strip with the entry's name, a bar of the
-//! short fields, and the multi-line fields under them. The one with the focus
-//! (the main one when the focus is in the bar) fills the screen; the others
-//! fold to what they hold.
+//! The layout of a form of inputs: a strip with the entry's name, a status
+//! line, and the fields in one column in the order they are declared. The
+//! main multi-line field fills the rest of the screen; the other multi-line
+//! fields fold to what they hold.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use super::{Chooser, ChooserField, ChooserFocus, ChooserItem, FieldKind};
-use crate::tui::form::field::{cursor_spans, value_lines};
+use crate::tui::form::field::{cursor_spans, fill_padding, value_lines};
 use crate::tui::form::layout::{window_start, wrap, PROMPT_WIDTH};
 use crate::tui::scroll::{one_line, sanitize};
 use crate::tui::style::{Role, Styles};
@@ -22,9 +22,11 @@ const FOLDED_ROWS: usize = 3;
 /// to their headers.
 const MIN_MAIN_ROWS: usize = 4;
 
-/// The rows above the multi-line fields besides the strip: the bar and the
-/// status line.
-const BAR_ROWS: u16 = 2;
+/// The rows above the fields besides the strip: the status line.
+const STATUS_ROWS: u16 = 1;
+
+/// The blank twin of the prompt, on the rows of a field after the first.
+const CONTINUATION: &str = "  ";
 
 /// What the area says when there is no multi-line field.
 const NO_TEXT_FIELD: &str = "brak pola tekstowego w tym workflow";
@@ -53,19 +55,17 @@ pub(super) fn render(
     }
     let frame_rows: u16 = if footer { 1 } else { 2 };
     let strip_rows = frame_rows + summary_rows.len() as u16;
-    let top = (strip_rows + BAR_ROWS).min(area.height);
+    let top = (strip_rows + STATUS_ROWS).min(area.height);
     let [head, rest] = Layout::vertical([Constraint::Length(top), Constraint::Min(0)]).areas(area);
-    let [strip, bar, status] = Layout::vertical([
+    let [strip, status] = Layout::vertical([
         Constraint::Length(strip_rows.min(head.height)),
         Constraint::Length(1.min(head.height.saturating_sub(strip_rows))),
-        Constraint::Length(1.min(head.height.saturating_sub(strip_rows + 1))),
     ])
     .areas(head);
     render_strip(frame, strip, item, &summary_rows, styles, footer);
     let focused = (owner_focused && chooser.focus == ChooserFocus::Fields).then_some(chooser.field);
-    render_bar(frame, bar, item, focused, styles);
     render_status(frame, status, item, focused, styles);
-    render_long_fields(frame, rest, chooser, item, focused, styles);
+    render_column(frame, rest, chooser, item, focused, styles);
 }
 
 /// The first paragraph of the entry's description, on one line.
@@ -103,90 +103,39 @@ fn render_strip(
     }
 }
 
-/// The short fields, one line: `name: value │ name: value`.
-fn render_bar(
-    frame: &mut Frame,
-    area: Rect,
-    item: &ChooserItem,
-    focused: Option<usize>,
-    styles: &Styles,
-) {
-    let short: Vec<usize> = (0..item.fields.len())
-        .filter(|&index| !item.fields[index].is_long())
-        .collect();
-    if short.is_empty() || area.height == 0 {
-        return;
-    }
-    let separator = " │ ";
-    let room =
-        usize::from(area.width).saturating_sub(separator.chars().count() * (short.len() - 1));
-    let texts: Vec<String> = short
-        .iter()
-        .map(|&index| bar_text(&item.fields[index]).0)
-        .collect();
-    // The field being typed in keeps what it needs, up to two fifths of the bar.
-    let focused_position = short.iter().position(|&index| focused == Some(index));
-    let reserved = focused_position.map_or(0, |position| {
-        (texts[position].chars().count() + 1).min((room * 2 / 5).max(12))
-    });
-    let others: Vec<String> = texts
-        .iter()
-        .enumerate()
-        .filter(|(position, _)| Some(*position) != focused_position)
-        .map(|(_, text)| text.clone())
-        .collect();
-    let cap = water_level(&others, room.saturating_sub(reserved));
-    let mut spans = Vec::new();
-    for (position, (&index, text)) in short.iter().zip(&texts).enumerate() {
-        if position > 0 {
-            spans.push(Span::styled(separator, styles.of(Role::Done)));
-        }
-        let field = &item.fields[index];
-        if focused == Some(index) {
-            let base = styles.of(Role::Focus).patch(styles.field_editing());
-            let (text, cursor) = bar_text(field);
-            let (shown, cursor) = window_around_cursor(&text, cursor, reserved);
-            spans.extend(cursor_spans(&shown, cursor, base, styles.cursor()));
-            let used = shown.chars().count().max(cursor + 1);
-            spans.push(Span::styled(
-                " ".repeat(reserved.saturating_sub(used)),
-                styles.field_editing(),
-            ));
-        } else {
-            let style = if field.error.is_some() {
-                styles.of(Role::Problem)
-            } else {
-                Style::default()
-            };
-            spans.push(Span::styled(clip(text, cap), style));
-        }
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// `name: value`, and where the cursor falls in it.
-fn bar_text(field: &ChooserField) -> (String, usize) {
+/// A short field, one line: `name: value`. The one being edited has the
+/// editing fill to the last cell of the row.
+fn short_line(field: &ChooserField, width: usize, focused: bool, styles: &Styles) -> Line<'static> {
     let name = format!("{}: ", one_line(&field.name));
-    if matches!(field.kind, FieldKind::Select(_)) {
-        let text = format!("{name}‹ {} ›", one_line(&sanitize(field.value())));
-        return (text, 0);
+    let (value, cursor) = if matches!(field.kind, FieldKind::Select(_)) {
+        (format!("‹ {} ›", one_line(&sanitize(field.value()))), 0)
+    } else {
+        let byte = crate::tui::form::buffer::char_byte_index(field.value(), field.cursor());
+        let before = one_line(&sanitize(&field.value()[..byte])).chars().count();
+        (one_line(&sanitize(field.value())), before)
+    };
+    if !focused {
+        let style = if field.error.is_some() {
+            styles.of(Role::Problem)
+        } else {
+            Style::default()
+        };
+        return Line::from(vec![Span::styled(
+            clip(&format!("{name}{value}"), width),
+            style,
+        )]);
     }
-    let value = one_line(&sanitize(field.value()));
-    let byte = crate::tui::form::buffer::char_byte_index(field.value(), field.cursor());
-    let before = one_line(&sanitize(&field.value()[..byte])).chars().count();
-    (format!("{name}{value}"), name.chars().count() + before)
-}
-
-/// The widest a segment may be so that all of them fit in `room`: short ones
-/// keep what they need, the long ones share the rest.
-fn water_level(texts: &[String], room: usize) -> usize {
-    let needs: Vec<usize> = texts.iter().map(|text| text.chars().count()).collect();
-    let widest = needs.iter().copied().max().unwrap_or(0);
-    (0..=widest)
-        .rev()
-        .find(|&cap| needs.iter().map(|need| (*need).min(cap)).sum::<usize>() <= room)
-        .unwrap_or(0)
-        .max(8.min(widest))
+    let fill = styles.field_editing();
+    let base = styles.of(Role::Focus).patch(fill);
+    let name_width = name.chars().count();
+    // The value keeps the room the name leaves, with the cursor in view.
+    let room = width.saturating_sub(name_width).max(1);
+    let (shown, cursor) = window_around_cursor(&value, cursor, room);
+    let mut spans = vec![Span::styled(name, base)];
+    spans.extend(cursor_spans(&shown, cursor, base, styles.cursor()));
+    let used = name_width + shown.chars().count().max(cursor + 1);
+    spans.push(fill_padding(used, width + PROMPT_WIDTH, fill));
+    Line::from(spans)
 }
 
 /// `text` cut to `width` columns, with `…` where it was cut.
@@ -254,7 +203,10 @@ fn render_status(
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_long_fields(
+/// The fields in one column, in the order of focus. The main field takes the
+/// room the others leave; when the column is taller than the area it scrolls
+/// to keep the focus in view.
+fn render_column(
     frame: &mut Frame,
     area: Rect,
     chooser: &Chooser,
@@ -262,51 +214,59 @@ fn render_long_fields(
     focused: Option<usize>,
     styles: &Styles,
 ) {
-    let long: Vec<usize> = (0..item.fields.len())
-        .filter(|&index| item.fields[index].is_long())
-        .collect();
-    if long.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(NO_TEXT_FIELD, styles.of(Role::Done))),
-            area,
-        );
-        return;
-    }
+    let order: Vec<usize> = (0..item.fields.len()).collect();
+    let has_long = order.iter().any(|&index| item.fields[index].is_long());
     let main = focused
         .filter(|index| item.fields[*index].is_long())
         .unwrap_or_else(|| chooser.main_field());
+    let main = has_long.then_some(main);
     let width = usize::from(area.width).saturating_sub(PROMPT_WIDTH);
     let header_rows = |index: usize| 1 + usize::from(item.fields[index].error.is_some());
-    let folded = |index: usize, with_text: bool| {
-        let text = if with_text {
-            folded_rows(&item.fields[index], width).len()
+    let rows_of = |index: usize, with_text: bool| {
+        let field = &item.fields[index];
+        if !field.is_long() {
+            1
+        } else if with_text {
+            header_rows(index) + folded_rows(field, width).len()
         } else {
-            0
-        };
-        header_rows(index) + text
+            header_rows(index)
+        }
     };
     let others = |with_text: bool| -> usize {
-        long.iter()
-            .filter(|&&index| index != main)
-            .map(|&index| folded(index, with_text))
+        order
+            .iter()
+            .filter(|&&index| Some(index) != main)
+            .map(|&index| rows_of(index, with_text))
             .sum()
     };
     let height = usize::from(area.height);
-    let mut with_text = true;
     let main_rows = |with_text: bool| {
-        height
-            .saturating_sub(others(with_text))
-            .saturating_sub(header_rows(main))
+        main.map_or(0, |main| {
+            height
+                .saturating_sub(others(with_text))
+                .saturating_sub(header_rows(main))
+        })
     };
-    if main_rows(true) < MIN_MAIN_ROWS {
-        with_text = false;
-    }
-    let main_height = main_rows(with_text);
+    let with_text = main_rows(true) >= MIN_MAIN_ROWS;
+    let main_height = main_rows(with_text).max(1);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for &index in &long {
+    let mut focus_line = 0;
+    for &index in &order {
         let field = &item.fields[index];
         let is_focused = focused == Some(index);
+        if is_focused {
+            focus_line = lines.len();
+        }
+        if !field.is_long() {
+            lines.push(short_line(
+                field,
+                usize::from(area.width),
+                is_focused,
+                styles,
+            ));
+            continue;
+        }
         lines.push(header_line(field, is_focused, styles));
         if let Some(error) = &field.error {
             lines.push(Line::styled(
@@ -314,22 +274,44 @@ fn render_long_fields(
                 styles.of(Role::Problem),
             ));
         }
-        if index == main {
-            let mut rows = main_body(
+        if Some(index) == main {
+            let (mut rows, cursor_row) = main_body(
                 field,
                 usize::from(area.width),
                 is_focused,
                 main_height,
                 styles,
             );
-            // The main field keeps its room, so the folded ones stay below it.
-            rows.resize(main_height, Line::raw(""));
+            // The main field keeps its room, and the room is all of its fill.
+            let blank = blank_row(usize::from(area.width), is_focused, styles);
+            rows.resize(main_height, blank);
+            if is_focused {
+                focus_line = lines.len() + cursor_row;
+            }
             lines.extend(rows);
         } else if with_text {
             lines.extend(prefixed(folded_rows(field, width), styles));
         }
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    if !has_long {
+        lines.push(Line::styled(NO_TEXT_FIELD, styles.of(Role::Done)));
+    }
+    let offset = (focus_line + 1).saturating_sub(height);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((offset.min(usize::from(u16::MAX)) as u16, 0)),
+        area,
+    );
+}
+
+/// A row of the main field with no text: the fill, when the field is edited.
+fn blank_row(width: usize, focused: bool, styles: &Styles) -> Line<'static> {
+    if !focused {
+        return Line::raw("");
+    }
+    Line::from(vec![
+        Span::raw(CONTINUATION),
+        fill_padding(0, width, styles.field_editing()),
+    ])
 }
 
 fn header_line(field: &ChooserField, focused: bool, styles: &Styles) -> Line<'static> {
@@ -390,14 +372,14 @@ fn folded_rows(field: &ChooserField, width: usize) -> Vec<String> {
 }
 
 /// The rows of the main field, wrapped to `width` and scrolled so that the
-/// cursor is in view within `height` rows.
+/// cursor is in view within `height` rows, and the row the cursor is on in them.
 fn main_body(
     field: &ChooserField,
     width: usize,
     focused: bool,
     height: usize,
     styles: &Styles,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     let (rows, cursor_row) = value_lines(field, width, focused, styles);
     let first = if focused {
         window_start(cursor_row, height, field.window_row().get())
@@ -405,5 +387,6 @@ fn main_body(
         0
     };
     field.window_row().set(first);
-    rows.into_iter().skip(first).take(height).collect()
+    let shown = rows.into_iter().skip(first).take(height).collect();
+    (shown, cursor_row.saturating_sub(first))
 }
