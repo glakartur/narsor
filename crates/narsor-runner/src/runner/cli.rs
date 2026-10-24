@@ -59,8 +59,8 @@ use clap::Args;
 use crate::domain::TaskId;
 
 use super::{
-    run, BaseImageContract, HarnessHome, HomeMode, ProcessEnvironment, RunnerConfig, RunnerExit,
-    RunnerTiming, PROBLEM_OWNER_DECISION,
+    run, BaseImageContract, HarnessHome, HomeMode, ProcessEnvironment, RunnerConfig, RunnerError,
+    RunnerExit, RunnerTiming, PROBLEM_OWNER_DECISION,
 };
 
 /// The runner could not work and said why (a [`crate::orchestration::RunnerProblem`]).
@@ -164,15 +164,43 @@ pub struct RunnerArgs {
 
 /// Runs the runner and maps its end onto the exit-code contract.
 pub async fn run_command(args: RunnerArgs) -> i32 {
-    let task_id = match TaskId::parse(&args.task_id) {
-        Ok(task_id) => task_id,
+    let config = match runner_config(args) {
+        Ok(config) => config,
         Err(error) => {
             eprintln!("{error}");
             return EXIT_USAGE;
         }
     };
+
+    exit_code(run(config, apply_environment).await)
+}
+
+/// The exit code of a runner that ended so (the table above); a problem or
+/// an error is printed for whoever reads the workload's log.
+fn exit_code(ended: Result<RunnerExit, RunnerError>) -> i32 {
+    match ended {
+        Ok(RunnerExit::PausedAtSafePoint) | Ok(RunnerExit::Stopped { .. }) => EXIT_SUCCESS,
+        Ok(RunnerExit::Problem(problem)) => {
+            eprintln!("runner problem ({}): {}", problem.code, problem.message);
+            if problem.code == PROBLEM_OWNER_DECISION {
+                EXIT_OWNER_DECISION
+            } else {
+                EXIT_PROBLEM
+            }
+        }
+        Err(error) => {
+            eprintln!("runner failed: {error}");
+            EXIT_FAILURE
+        }
+    }
+}
+
+/// The runner's configuration from its arguments; an error names an
+/// argument that is not valid.
+pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
+    let task_id = TaskId::parse(&args.task_id).map_err(|error| error.to_string())?;
     let defaults = RunnerTiming::default();
-    let config = RunnerConfig {
+    Ok(RunnerConfig {
         task_id,
         storage: args.task_storage,
         launch_spec: args.launch_spec,
@@ -196,23 +224,7 @@ pub async fn run_command(args: RunnerArgs) -> i32 {
         },
         contract: BaseImageContract::default(),
         read_only: args.read_only,
-    };
-
-    match run(config, apply_environment).await {
-        Ok(RunnerExit::PausedAtSafePoint) | Ok(RunnerExit::Stopped { .. }) => EXIT_SUCCESS,
-        Ok(RunnerExit::Problem(problem)) => {
-            eprintln!("runner problem ({}): {}", problem.code, problem.message);
-            if problem.code == PROBLEM_OWNER_DECISION {
-                EXIT_OWNER_DECISION
-            } else {
-                EXIT_PROBLEM
-            }
-        }
-        Err(error) => {
-            eprintln!("runner failed: {error}");
-            EXIT_FAILURE
-        }
-    }
+    })
 }
 
 /// Sets the variables every action's child process inherits.
@@ -227,5 +239,119 @@ fn apply_environment(environment: &ProcessEnvironment) {
     }
     for (name, value) in environment.variables() {
         std::env::set_var(name, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Debug, Parser)]
+    struct Cli {
+        #[command(flatten)]
+        runner: RunnerArgs,
+    }
+
+    fn config(extra: &[&str]) -> RunnerConfig {
+        let mut args = vec![
+            "narsor-runner",
+            "--task-id",
+            "task-1",
+            "--task-storage",
+            "/task",
+            "--control-plane",
+            "http://control-plane",
+            "--credential-file",
+            "/credential",
+            "--incarnation",
+            "pod-1",
+        ];
+        args.extend_from_slice(extra);
+        runner_config(Cli::try_parse_from(args).expect("valid arguments").runner)
+            .expect("a configuration")
+    }
+
+    #[test]
+    fn the_private_home_is_the_default() {
+        let config = config(&[]);
+        assert_eq!(config.harness_home, HarnessHome::default());
+        assert_eq!(config.harness_home.mode, HomeMode::Private);
+        assert_eq!(config.storage, std::path::PathBuf::from("/task"));
+        assert!(!config.read_only);
+    }
+
+    #[test]
+    fn the_home_mode_and_the_harness_directories_come_from_the_arguments() {
+        let config = config(&[
+            "--home",
+            "host",
+            "--codex-home",
+            "/srv/codex",
+            "--claude-config-dir",
+            "/srv/claude",
+            "--claude-profile-source",
+            "/srv/profile",
+        ]);
+        assert_eq!(
+            config.harness_home,
+            HarnessHome {
+                mode: HomeMode::Host,
+                codex_home: Some("/srv/codex".into()),
+                claude_config_dir: Some("/srv/claude".into()),
+                claude_profile_source: Some("/srv/profile".into()),
+            }
+        );
+    }
+
+    /// The exit-code contract a controller reads off a terminated workload.
+    #[test]
+    fn every_end_has_its_exit_code() {
+        let problem = |code: &str| {
+            Ok(RunnerExit::Problem(crate::orchestration::RunnerProblem {
+                code: code.to_string(),
+                message: "why".to_string(),
+            }))
+        };
+        assert_eq!(exit_code(Ok(RunnerExit::PausedAtSafePoint)), EXIT_SUCCESS);
+        assert_eq!(
+            exit_code(Ok(RunnerExit::Stopped { clean: false })),
+            EXIT_SUCCESS
+        );
+        for code in [
+            super::super::PROBLEM_BASE_IMAGE,
+            super::super::PROBLEM_INITIALIZATION,
+            super::super::PROBLEM_READER_UNAVAILABLE,
+        ] {
+            assert_eq!(exit_code(problem(code)), EXIT_PROBLEM, "{code}");
+        }
+        assert_eq!(
+            exit_code(problem(PROBLEM_OWNER_DECISION)),
+            EXIT_OWNER_DECISION
+        );
+        assert_eq!(
+            exit_code(Err(RunnerError::StorageBusy("/task".into()))),
+            EXIT_FAILURE
+        );
+    }
+
+    #[test]
+    fn an_invalid_task_id_is_a_usage_error() {
+        let args = Cli::try_parse_from([
+            "narsor-runner",
+            "--task-id",
+            "not a task id",
+            "--task-storage",
+            "/task",
+            "--control-plane",
+            "http://control-plane",
+            "--credential-file",
+            "/credential",
+            "--incarnation",
+            "pod-1",
+        ])
+        .unwrap();
+        assert!(runner_config(args.runner).is_err());
     }
 }

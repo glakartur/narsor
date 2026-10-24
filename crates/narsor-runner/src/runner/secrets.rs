@@ -278,4 +278,56 @@ mod tests {
             .variables()
             .any(|(name, value)| name == "CODEX_API_KEY" && value == "sk-1"));
     }
+
+    /// R19: an `env` secret becomes the tool's variable and a `file` secret
+    /// a link below the private HOME to the mount; neither value is written
+    /// anywhere on the task storage.
+    #[test]
+    fn secrets_reach_their_tools_without_being_copied_onto_task_storage() {
+        let (_dir, secrets) = mounted(&[
+            ("github-token", "tok-123-secret\n"),
+            ("gh-hosts", "hosts-secret-xyz"),
+        ]);
+        let storage =
+            Mounted(std::env::temp_dir().join(format!("narsor-storage-{}", uuid::Uuid::new_v4())));
+        let home = storage.0.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let mut environment = ResolvedEnvironment::harness_only("claude-code");
+        environment.secrets = vec![
+            reference("github-token", SecretDelivery::Env("GH_TOKEN".into())),
+            reference(
+                "gh-hosts",
+                SecretDelivery::File(".config/gh/hosts.yml".into()),
+            ),
+        ];
+
+        let process = secrets.materialize(&environment, Some(&home)).unwrap();
+
+        assert!(process
+            .variables()
+            .any(|(name, value)| name == "GH_TOKEN" && value == "tok-123-secret"));
+        let link = home.join(".config/gh/hosts.yml");
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&link).unwrap(), "hosts-secret-xyz");
+        let mut stack = vec![storage.0.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    stack.push(entry.path());
+                } else if kind.is_file() {
+                    let text = fs::read_to_string(entry.path()).unwrap_or_default();
+                    assert!(
+                        !text.contains("tok-123-secret") && !text.contains("hosts-secret-xyz"),
+                        "a secret leaked into {}",
+                        entry.path().display()
+                    );
+                }
+            }
+        }
+    }
 }

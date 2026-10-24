@@ -1,16 +1,38 @@
 # Shipped workflows
 
-Two runnable pipelines, written against `WORKFLOW_SCHEMA.md` and modelled on
+Four runnable pipelines, written against `WORKFLOW_SCHEMA.md` and modelled on
 real agentic development processes rather than invented ones:
 
 | File | Process | Source material |
 |---|---|---|
 | `compound-engineering.yaml` | Five stages on one Draft pull request (merge request on GitLab): requirements → plan → implementation → learning → finalize (the merge request leaves Draft; a person merges it), with a person at the end of each stage | the `ce-*` skills of the `compound-engineering` plugin, and `gh` (GitHub) or `glab` (GitLab) |
+| `compound-engineering-chat.yaml` | The same five stages. Copy of `compound-engineering.yaml` in which `brainstorm` and `plan` talk to the person: they ask one question at a time in the chat window (`awaiting_input`) and do not push the questions into the document | `ce-brainstorm` and `ce-plan`, with the chat contract in the prompt |
+| `compound-engineering-debug.yaml` | The `ce-debug` flow: diagnosis → gate (fix, revise, diagnosis only) → test-first fix → review and checks → Draft merge request → review gate → learning → finalize. The agent asks in the chat window | `ce-debug`, `ce-code-review`, `ce-compound` |
 | `open-mercato-sdlc.yaml` | The Open Mercato ticket lifecycle: Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | [`SDLC.md`](https://github.com/open-mercato/skills) and the `om-*` skills |
 
-Both validate with zero violations and both are exercised end to end in
+All validate with zero violations. The two original pipelines are exercised end to end in
 `tests/workflows.rs` against a fake harness and no real
 `claude`, `git`, `gh` or `glab` is ever run by the tests.
+
+## Chat variants
+
+`compound-engineering-chat.yaml` and `compound-engineering-debug.yaml` ask
+the person questions in the chat window. The agent answers with
+`{"status":"awaiting_input","question":"...","options":[...]}`. The execution
+waits in `input_needed`; the person answers with `i` in the TUI or with
+`narsor input`, and the engine runs the same step again in the same agent
+session. The prompts forbid a question tool such as `AskUserQuestion`, which
+cannot work without a terminal. Timeouts are longer than in the original
+(`globals.timeout: 12h`, 3h for the dialogue steps).
+
+`compound-engineering-debug.yaml` has these gates: `review_diagnosis` (`fix`,
+`revise`, `diagnosis_only`, `abandon`), `review_fix` (`check_feedback`,
+`accept`, `revise`, `revise_diagnosis`, `abandon`), `review_learning` and
+`finalize_blocked`. `diagnosis_only` ends the run in `diagnosed_only`
+(completed) and publishes nothing; the diagnosis stays in the history of the
+`diagnose` step. The fix step goes back to `diagnose` with `diagnosis_blocker`
+after three failed attempts. There is no `simplify` step: `ce-debug` keeps the
+fix minimal.
 
 ## Harness and skills prerequisites
 

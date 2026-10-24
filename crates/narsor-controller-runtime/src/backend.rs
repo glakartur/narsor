@@ -5,6 +5,7 @@ use std::future::Future;
 use std::fmt;
 
 use narsor_protocol::identifier::TaskId;
+use narsor_protocol::launch::{LaunchSpecEnvelope, TASK_LAUNCH_SPEC_VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -161,45 +162,21 @@ pub struct WorkloadLaunch {
     pub credential: RunnerCredential,
 }
 
-/// Engine-independent envelope checked before the controller asks the
-/// control plane to issue a runner credential. Platform adapters still
-/// validate the full nested spec before creating resources.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchInputEnvelope {
-    version: u32,
-    workflow_id: String,
-    workflow_version: u32,
-    inputs: Value,
-    workspace: Value,
-    environment: Value,
-    resources: Value,
-    #[serde(default)]
-    definition: Option<Value>,
-    digest: String,
-}
-
 /// Validates the versioned top-level launch contract without importing the
-/// engine's persisted domain model.
+/// engine's persisted domain model. Platform adapters still validate the
+/// full nested spec before creating resources.
 pub fn validate_launch_input(value: &Value) -> Result<(), String> {
-    let input: LaunchInputEnvelope = serde_json::from_value(value.clone())
+    let input: LaunchSpecEnvelope = serde_json::from_value(value.clone())
         .map_err(|error| format!("control plane returned an invalid launch spec: {error}"))?;
-    if input.version != 3 {
+    if input.version != TASK_LAUNCH_SPEC_VERSION {
         return Err(format!(
-            "task launch spec version {} is not supported by this build (expected 3)",
-            input.version
+            "task launch spec version {} is not supported by this build (expected {})",
+            input.version, TASK_LAUNCH_SPEC_VERSION
         ));
     }
     if input.workflow_id.is_empty() || input.workflow_version == 0 || input.digest.is_empty() {
         return Err("task launch spec has an invalid workflow identity or digest".into());
     }
-    let _ = (
-        input.inputs,
-        input.workspace,
-        input.environment,
-        input.resources,
-        input.definition,
-    );
     Ok(())
 }
 
@@ -438,5 +415,66 @@ impl Default for BackendCapabilities {
             persistent_storage: true,
             archive: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_launch_input;
+    use narsor_protocol::launch::TASK_LAUNCH_SPEC_VERSION;
+    use serde_json::{json, Value};
+
+    fn spec() -> Value {
+        json!({
+            "version": TASK_LAUNCH_SPEC_VERSION,
+            "workflow_id": "compound-engineering",
+            "workflow_version": 1,
+            "inputs": {},
+            "workspace": {},
+            "environment": {},
+            "resources": {},
+            "definition": null,
+            "ticket": "NAR-001",
+            "title": "Poprawa formularza",
+            "digest": "sha256:abc",
+        })
+    }
+
+    #[test]
+    fn launch_input_with_ticket_and_title_is_accepted() {
+        assert_eq!(validate_launch_input(&spec()), Ok(()));
+    }
+
+    #[test]
+    fn launch_input_without_ticket_title_and_definition_is_accepted() {
+        let mut value = spec();
+        let fields = value.as_object_mut().unwrap();
+        for key in ["ticket", "title", "definition"] {
+            fields.remove(key);
+        }
+        assert_eq!(validate_launch_input(&value), Ok(()));
+    }
+
+    #[test]
+    fn other_version_is_refused() {
+        let mut value = spec();
+        value["version"] = json!(TASK_LAUNCH_SPEC_VERSION + 1);
+        let error = validate_launch_input(&value).unwrap_err();
+        assert!(error.contains("not supported"), "{error}");
+    }
+
+    #[test]
+    fn empty_digest_is_refused() {
+        let mut value = spec();
+        value["digest"] = json!("");
+        assert!(validate_launch_input(&value).is_err());
+    }
+
+    #[test]
+    fn unknown_field_is_refused_by_name() {
+        let mut value = spec();
+        value["surprise"] = json!(1);
+        let error = validate_launch_input(&value).unwrap_err();
+        assert!(error.contains("surprise"), "{error}");
     }
 }

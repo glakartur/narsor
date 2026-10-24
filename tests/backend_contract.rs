@@ -1,21 +1,20 @@
 //! The backend contract suite (U4) run against the in-memory fake adapter
 //! and the local adapter — the same scenarios, unchanged, for both (AE2).
+//! The local adapter's runners are the suite's stub runner processes, not
+//! the real `narsor-runner`.
 //!
 //! The suite itself lives in `backend_contract_support` so other adapters'
 //! test crates (U5's Kubernetes adapter against a mock API) expand it too.
 
-#[path = "engine_support/mod.rs"]
-mod engine_support;
 mod environment_support;
 #[macro_use]
 mod backend_contract_support;
 
-use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use backend_contract_support::ContractTarget;
+use backend_contract_support::{stub_runner, ContractTarget};
 use narsor_engine::backends::{
     ExecutionBackend, FakeBackend, LocalBackend, LocalBackendConfig, TaskResources,
 };
@@ -47,14 +46,7 @@ impl ContractTarget for FakeTarget {
     }
 
     fn launch_spec(&self) -> TaskLaunchSpec {
-        TaskLaunchSpec::new(
-            "wf",
-            1,
-            serde_json::json!({}),
-            TaskWorkspace::None,
-            ResolvedEnvironment::harness_only("claude-code"),
-            ResourceProfile::new(1000, 2048),
-        )
+        contract_launch_spec()
     }
 
     fn kill_workload(&self, backend: &FakeBackend, task: &TaskResources) {
@@ -76,60 +68,34 @@ contract_suite!(fake, crate::FakeTarget);
 // The local adapter
 // ---------------------------------------------------------------------------
 
-/// `narsor-runner` processes over local directories.
+/// A launch spec of the contract's workflow, for either adapter.
+fn contract_launch_spec() -> TaskLaunchSpec {
+    let definition = backend_contract_support::workflow();
+    TaskLaunchSpec::new(
+        definition.id.clone(),
+        definition.version,
+        serde_json::json!({}),
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+        ResourceProfile::new(1000, 2048),
+    )
+    .with_definition(&definition)
+    .expect("snapshot the definition")
+}
+
+/// Stub runner processes over local directories.
 struct LocalTarget {
     config: LocalBackendConfig,
 }
-
-/// A workflow of one script step: it finishes at once, and the runner then
-/// idles until the control plane tells it otherwise.
-const WORKFLOW: &str = r#"
-name: contract-task
-version: 1
-states:
-  work:
-    action:
-      type: script
-      command: sh
-      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"choice\": \"done\"}'"]
-    choices: [done]
-    transitions:
-      done: completed
-  completed:
-    description: Done.
-terminal_states: [completed]
-"#;
 
 impl ContractTarget for LocalTarget {
     type Backend = LocalBackend;
 
     fn setup(scratch: &Path) -> Option<Self> {
-        // SAFETY: `geteuid` has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipped: the runner refuses to run as root");
-            return None;
-        }
-        let mut config = LocalBackendConfig::with_program(
-            scratch.join("local"),
-            engine_support::workspace_binary("narsor-runner"),
-        );
-        config.runner_args = [
-            "--poll-wait-secs",
-            "1",
-            "--retry-min-ms",
-            "50",
-            "--retry-max-ms",
-            "300",
-            "--report-interval-ms",
-            "50",
-            "--problem-report-secs",
-            "10",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
-        config.env = vec![("RUST_LOG".into(), "narsor=info".into())];
-        Some(Self { config })
+        let program = stub_runner::install(&scratch.join("bin"));
+        Some(Self {
+            config: LocalBackendConfig::with_program(scratch.join("local"), program),
+        })
     }
 
     fn backend(&self) -> LocalBackend {
@@ -138,18 +104,7 @@ impl ContractTarget for LocalTarget {
     }
 
     fn launch_spec(&self) -> TaskLaunchSpec {
-        let definition =
-            narsor_engine::workflow::load_from_str(WORKFLOW).expect("a valid workflow");
-        TaskLaunchSpec::new(
-            definition.id.clone(),
-            definition.version,
-            serde_json::json!({}),
-            TaskWorkspace::None,
-            ResolvedEnvironment::harness_only("claude-code"),
-            ResourceProfile::new(1000, 2048),
-        )
-        .with_definition(&definition)
-        .expect("snapshot the definition")
+        contract_launch_spec()
     }
 
     fn kill_workload(&self, backend: &LocalBackend, task: &TaskResources) {
@@ -217,138 +172,6 @@ contract_suite!(local, crate::LocalTarget);
 // Local adapter specifics
 // ---------------------------------------------------------------------------
 
-/// The local adapter runs the very same Engine through the runner: its
-/// events live on the task storage, survive the loss of the process and an
-/// owner resume, and a finished step is never executed again (R13).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_engine_work_survives_loss_and_owner_resume() {
-    use narsor_engine::orchestration::{OwnerCommand, RunnerState};
-
-    let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::without_auto_resume().await
-    else {
-        return;
-    };
-    h.start_controller();
-    let before = finished_work(&h).await;
-
-    h.kill_workload("task-1");
-    h.wait_runner_state("task-1", RunnerState::Interrupted)
-        .await;
-    h.must("task-1", OwnerCommand::Resume, "resume-1");
-    h.wait_runner_state("task-1", RunnerState::Running).await;
-
-    assert_work_continued(&h, &before);
-}
-
-/// The same, with nobody deciding: the resume policy launches a new runner
-/// on the storage, which continues the work without repeating it, and the
-/// task's history shows the loss and the automatic resume (R1, R2, AE2).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_engine_work_survives_loss_and_automatic_resume() {
-    use narsor_engine::orchestration::{Observation, RunnerState};
-
-    let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::new().await else {
-        return;
-    };
-    h.start_controller();
-    let before = finished_work(&h).await;
-    let first = h.record("task-1").runner.unwrap().incarnation;
-
-    h.kill_workload("task-1");
-    h.wait_for("a new runner", |h| {
-        let record = h.record("task-1");
-        record.runner_state == RunnerState::Running
-            && record
-                .runner
-                .is_some_and(|runner| runner.incarnation != first)
-    })
-    .await;
-
-    assert!(h
-        .reported("task-1")
-        .contains(&Observation::WorkloadLost { state_known: true }));
-    assert_eq!(
-        backend_contract_support::auto_resumes(&h.events("task-1")),
-        vec![(1, 5)]
-    );
-    assert_eq!(h.counters().workloads_created, 2);
-    assert_work_continued(&h, &before);
-}
-
-/// What the finished workflow left on the task's storage before a loss.
-struct FinishedWork {
-    storage: std::path::PathBuf,
-    execution_id: String,
-    events: Vec<narsor_engine::domain::Event>,
-    cursor: u64,
-}
-
-/// Runs task-1 until its workflow finished and records what it left.
-async fn finished_work(h: &backend_contract_support::Harness<LocalTarget>) -> FinishedWork {
-    use narsor_engine::domain::ExecutionStatus;
-    use narsor_engine::persistence::ExecutionStore;
-
-    h.running("task-1").await;
-    h.wait_for("the workflow to finish", |h| {
-        h.record("task-1")
-            .runner
-            .is_some_and(|runner| runner.snapshot.execution_status == ExecutionStatus::Completed)
-    })
-    .await;
-    let storage = h.probe.inner().storage_dir(&h.resources("task-1"));
-    let store = ExecutionStore::new(storage.join("state"));
-    let execution_id = store.list_execution_ids().unwrap().remove(0);
-    FinishedWork {
-        events: store.event_log(&execution_id).read_all().unwrap(),
-        cursor: h.record("task-1").runner.unwrap().snapshot.event_cursor,
-        storage,
-        execution_id,
-    }
-}
-
-/// The resumed runner continued `before` on the same storage: the same
-/// execution, its log only appended to, the finished step not run again.
-fn assert_work_continued(
-    h: &backend_contract_support::Harness<LocalTarget>,
-    before: &FinishedWork,
-) {
-    use narsor_engine::domain::ExecutionStatus;
-    use narsor_engine::persistence::ExecutionStore;
-
-    let record = h.record("task-1");
-    let runner = record.runner.unwrap();
-    assert_eq!(runner.launch_generation, record.generation);
-    assert!(runner.snapshot.event_cursor >= before.cursor);
-    let store = ExecutionStore::new(before.storage.join("state"));
-    assert_eq!(
-        store.list_execution_ids().unwrap(),
-        std::slice::from_ref(&before.execution_id),
-        "the same execution, on the same storage"
-    );
-    let events_after = store.event_log(&before.execution_id).read_all().unwrap();
-    let sequences = |events: &[narsor_engine::domain::Event]| -> Vec<(u64, String)> {
-        events
-            .iter()
-            .map(|event| (event.sequence, format!("{:?}", event.data)))
-            .collect()
-    };
-    assert!(events_after.len() >= before.events.len());
-    assert_eq!(
-        sequences(&events_after[..before.events.len()]),
-        sequences(&before.events),
-        "the event log is continued, never rewritten"
-    );
-    assert_eq!(
-        store.load_execution(&before.execution_id).unwrap().status,
-        ExecutionStatus::Completed
-    );
-    assert_eq!(
-        fs::read_to_string(before.storage.join("home/steps")).unwrap(),
-        "worked\n",
-        "the finished step ran once"
-    );
-}
-
 /// Whether `pid` names a live (not zombie) process.
 fn process_running(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -391,13 +214,7 @@ async fn removing_a_dead_runners_workload_kills_what_it_left_running() {
         generation: 1,
         incarnation: "task-1-g1".into(),
         lease_epoch: 1,
-        launch_spec: serde_json::to_value(
-            FakeTarget {
-                platform: FakeBackend::new(),
-            }
-            .launch_spec(),
-        )
-        .unwrap(),
+        launch_spec: serde_json::to_value(contract_launch_spec()).unwrap(),
         control_plane_url: "http://127.0.0.1:9".into(),
         credential: RunnerCredential::new("nsr.test"),
     };

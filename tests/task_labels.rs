@@ -81,3 +81,47 @@ fn text_from_outside_becomes_one_short_line() {
     assert!(!line.contains('\n') && !line.contains('\u{1b}'));
     assert_eq!(one_line_label(" \n ", 50), None);
 }
+
+fn full_spec() -> TaskLaunchSpec {
+    let mut spec = spec().with_labels(Some("NAR-12".into()), Some("Zmiana API".into()));
+    spec.definition = Some(serde_json::json!({"id": "wf"}));
+    spec.digest = spec.compute_digest();
+    spec
+}
+
+#[test]
+fn a_spec_with_labels_and_definition_round_trips() {
+    let full = full_spec();
+    let back: TaskLaunchSpec =
+        serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
+    assert_eq!(back, full);
+    assert!(back.digest_is_valid());
+}
+
+#[test]
+fn another_version_is_refused_with_both_versions() {
+    let mut json = serde_json::to_value(spec()).unwrap();
+    json["version"] = serde_json::json!(2);
+    let error = serde_json::from_value::<TaskLaunchSpec>(json).unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains("version 2") && text.contains("expected 3"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_unknown_top_level_field_is_refused() {
+    let mut json = serde_json::to_value(spec()).unwrap();
+    json["surprise"] = serde_json::json!(1);
+    let error = serde_json::from_value::<TaskLaunchSpec>(json).unwrap_err();
+    assert!(error.to_string().contains("surprise"), "{error}");
+}
+
+#[test]
+fn a_bad_workspace_error_names_the_field() {
+    let mut json = serde_json::to_value(spec()).unwrap();
+    json["workspace"] = serde_json::json!(42);
+    let error = serde_json::from_value::<TaskLaunchSpec>(json).unwrap_err();
+    assert!(error.to_string().contains("workspace"), "{error}");
+}

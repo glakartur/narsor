@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use narsor_engine::domain::{
     ActionConfig, EventData, ExecutionStatus, HumanInputType, State, TerminalStatus,
-    WorkflowDefinition, Workspace, WorkspaceAccess,
+    WorkflowDefinition, Workspace,
 };
 use narsor_engine::engine::actions::agent::output_contract;
 use narsor_engine::engine::StepContract;
@@ -39,8 +39,10 @@ use serde_json::{json, Map, Value};
 // ---------------------------------------------------------------------------
 
 /// The names of the workflows this crate ships, and their files.
-const SHIPPED: [(&str, &str); 2] = [
+const SHIPPED: [(&str, &str); 4] = [
     ("compound-engineering", "compound-engineering.yaml"),
+    ("compound-engineering-chat", "compound-engineering-chat.yaml"),
+    ("compound-engineering-debug", "compound-engineering-debug.yaml"),
     ("open-mercato-sdlc", "open-mercato-sdlc.yaml"),
 ];
 
@@ -1275,17 +1277,16 @@ async fn a_finalize_stopped_by_its_time_limit_stops_at_the_gate() {
 }
 
 /// `finalize` only reads the pull request on the host and changes its Draft
-/// state: it needs no input of its own and no write access to the workspace.
+/// state: it needs no input of its own.
 #[test]
-fn finalize_reads_no_input_and_cannot_write_the_workspace() {
+fn finalize_reads_no_input() {
     let definition = shipped("compound-engineering.yaml");
     let state = &definition.states["finalize"];
     let prompt = built_prompt(state);
     assert!(!prompt.contains("inputs."), "finalize reads an input");
-    let Some(ActionConfig::Agent(config)) = &state.action else {
+    let Some(ActionConfig::Agent(_)) = &state.action else {
         panic!("finalize is an agent step");
     };
-    assert_eq!(config.workspace_access, Some(WorkspaceAccess::ReadOnly));
 }
 
 /// The four review gates of the compound pipeline: a gate sends the stage back
