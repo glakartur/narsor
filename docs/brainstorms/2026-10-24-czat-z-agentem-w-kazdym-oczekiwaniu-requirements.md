@@ -52,13 +52,13 @@ Ten dokument jest uzupełnieniem `docs/brainstorms/2026-10-22-akcje-taska-z-back
 
 **Dostępność**
 
-- R1. Gdy task ma aktywną sesję agenta i stoi w stanie oczekiwania na odpowiedź operatora albo w pauzie, akcja „Napisz do agenta" jest dostępna. Dotyczy to każdego rodzaju oczekiwania, także takiego, dla którego workflow nie zdefiniował żadnej etykiety ani pola wiadomości.
+- R1. Gdy task ma aktywną sesję agenta i stoi w stanie oczekiwania na odpowiedź operatora albo w pauzie, akcja „Napisz do agenta" jest dostępna. Dotyczy to każdego rodzaju oczekiwania, także innego niż agentowe (np. awaria providera), o ile istnieje agent, któremu można wysłać komunikat, i także takiego, dla którego workflow nie zdefiniował żadnej etykiety ani pola wiadomości.
 - R2. Dostępność akcji nie zależy od definicji workflow. Workflow nie musi jej deklarować i nie może jej ukryć ani wyłączyć. Schemat workflow (`WORKFLOW_SCHEMA.md`) nie zyskuje nowego pola dla tej akcji.
 - R3. Gdy task nie ma aktywnej sesji agenta (np. zakończony, w kolejce, krok nie jest agentowy), akcja jest niedostępna. TUI pokazuje jej powód niedostępności, a nie ukrywa jej.
 
 **Akcja w TUI**
 
-- R4. Akcja „Napisz do agenta" ma stałą pozycję 0 na liście akcji panelu oczekiwania. Pozostałe akcje zachowują swoją kolejność za nią. Skróty numeryczne pozostałych akcji nie zmieniają numeracji w sposób, który psuje istniejące skróty — zob. Pytanie P3.
+- R4. Akcja „Napisz do agenta" ma stałą pozycję 0 na liście akcji panelu oczekiwania. Pozostałe akcje zachowują swoją kolejność za nią. Numery skrótów nie są nigdzie zapisane ani używane poza listą, więc numeracja pozostałych akcji może się przesunąć (Z6).
 - R5. Wybranie akcji pokazuje jedno pole na treść. Zatwierdzenie wysyła treść do aktywnej sesji agenta. Pusta treść nie jest wysyłana i TUI mówi, dlaczego.
 - R6. Wiadomość nie wybiera opcji workflow i nie zmienia przejścia. Skutek dla stanu taska zależy od stanu zatrzymania i jest zgodny z R6, R9 i R10 z dokumentu `2026-10-22-akcje-taska-z-backendu-i-komentarz-w-pauzie`: w pauzie wiadomość wznawia agenta, przy zatwierdzeniu i zgodzie na uprawnienie jest odmową z uwagą, przy pytaniu jest odpowiedzią. Wiadomość nigdy nie udziela zgody.
 - R7. Wysłana wiadomość jest widoczna w rozmowie taska jako wypowiedź operatora. Po wysłaniu pole wraca do stanu pustego, a panel pokazuje, że wysłano (jak dziś robi to istniejące pole wiadomości).
@@ -96,13 +96,14 @@ Ten dokument jest uzupełnieniem `docs/brainstorms/2026-10-22-akcje-taska-z-back
 - Brak załączników, edycji wysłanej wiadomości i wątków.
 - Brak wysyłania wiadomości do tasku, który nie ma aktywnej sesji agenta.
 - Brak nowych uprawnień i ról. Kto może napisać do agenta, określa dotychczasowa autoryzacja.
-- Opcja przełączania Esc między formularzem odpowiedzi a formularzem czatu nie wchodzi do tego zakresu (zob. Key Decisions i P1).
+- Opcja przełączania Esc między formularzem odpowiedzi a formularzem czatu nie wchodzi do tego zakresu (zob. Key Decisions i Z1). Decyzja użytkownika: wybrano tylko akcję 0.
+- Zwykła rozmowa z agentem, która nie wynika z pytania agenta, nie jest częścią tego zakresu. Użytkownik planuje ją w przyszłości, więc formularz czatu ma być samodzielnym elementem, który da się użyć poza oczekiwaniem (Z7).
 
 ---
 
 ## Key Decisions
 
-- Wybrano wariant „stała akcja nr 0" zamiast przełączania Esc. Dlaczego: Esc ma dziś ustalone znaczenie. Wewnątrz pól formularza wychodzi z pól (`leave_fields`), a na liście akcji zwija panel (`ChooserAction::Cancel`). Przełączanie formularzy tym samym klawiszem zmienia to znaczenie i wymaga zmiany `src/tui/keymap.rs`. Stała akcja używa tego samego wzorca co pozostałe akcje i nie koliduje z niczym. Założenie Z1.
+- Wybrano wariant „stała akcja nr 0" zamiast przełączania Esc. Dlaczego: Esc ma dziś ustalone znaczenie. Wewnątrz pól formularza wychodzi z pól (`leave_fields`), a na liście akcji zwija panel (`ChooserAction::Cancel`). Przełączanie formularzy tym samym klawiszem zmienia to znaczenie i wymaga zmiany `src/tui/keymap.rs`. Stała akcja używa tego samego wzorca co pozostałe akcje i nie koliduje z niczym. Dodatkowo jest bardziej przyjazna dla użytkownika i tańsza w realizacji. Decyzja użytkownika. Założenie Z1.
 - Możliwość jest cechą platformy, nie workflow. Dlaczego: operator potrzebuje jej właśnie wtedy, gdy workflow czegoś nie przewidział.
 
 ---
@@ -118,26 +119,27 @@ Ten dokument jest uzupełnieniem `docs/brainstorms/2026-10-22-akcje-taska-z-back
 
 ## Założenia do potwierdzenia
 
-- Z1. Z dwóch wariantów z opisu zadania wybrano stałą akcję nr 0. Alternatywa (przełączanie Esc między formularzem odpowiedzi a formularzem czatu w obie strony) została odłożona, bo Esc ma już znaczenie „wyjdź".
+- Z1. Z dwóch wariantów z opisu zadania użytkownik wybrał stałą akcję nr 0. Alternatywa (przełączanie Esc między formularzem odpowiedzi a formularzem czatu) nie jest realizowana, bo Esc ma już znaczenie „wyjdź".
 - Z2. „Aktywna sesja agenta" to sesja harnessu uruchomiona dla bieżącego kroku taska. Task bez takiej sesji (zakończony, w kolejce, krok nie jest agentowy) nie ma akcji.
 - Z3. Dla pytania agenta i problemu, które mają już pole wiadomości, akcja 0 otwiera to samo pole, a nie drugie. Operator widzi jedną drogę do napisania do agenta.
 - Z4. Wiadomość jest zwykłym tekstem. Wielolinijkowy zapis działa jak w istniejących polach (Enter wysyła, Ctrl+J nowa linia).
 - Z5. Skutek wysłania w każdym stanie jest taki, jak w dokumencie `2026-10-22-akcje-taska-z-backendu...` (R6, R9, R10). Ten dokument nie wprowadza innych znaczeń.
 
+- Z6. Numery skrótów akcji (1, 2, 3…) nie są nigdzie zapisane ani używane poza listą akcji. Wstawienie akcji 0 może więc przesunąć numerację pozostałych akcji. Decyzja użytkownika.
+- Z7. Akcja 0 jest dostępna zawsze, gdy istnieje agent, któremu można wysłać komunikat. Dotyczy to także oczekiwań innych niż agentowe (np. awaria providera). Formularz czatu ma być samodzielnym elementem, bo w przyszłości będzie potrzebna zwykła rozmowa z agentem, niezależna od pytania agenta. Decyzja użytkownika.
+
 ## Pytania otwarte dla użytkownika
 
-- P1. Czy wariant z przełączaniem Esc ma być zrealizowany zamiast stałej akcji nr 0, czy dodatkowo? Przyjęte założenie: tylko akcja 0 (Z1).
-- P2. Czy akcja 0 ma być też dostępna w innych oczekiwaniach niż agentowe (np. awaria providera), jeśli sesja agenta nadal istnieje? Przyjęte założenie: tak, gdy sesja jest aktywna (R1, Z2).
-- P3. Czy wstawienie akcji na pozycję 0 może przesunąć numery obecnych skrótów (1, 2, 3…)? Przyjęte założenie: nie wolno zmieniać ich znaczenia. Dokładne rozwiązanie wybierze planowanie.
+Brak. Pytania P1–P3 użytkownik rozstrzygnął w przeglądzie (Z1, Z6, Z7).
 
 ## Outstanding Questions
 
 ### Resolve Before Planning
 
-Brak. Decyzje z P1–P3 zapisano jako założenia Z1–Z3.
+Brak. Decyzje użytkownika zapisano jako Z1, Z6 i Z7.
 
 ### Deferred to Planning
 
 - [Affects R1, R10][Technical] Czy lista akcji z backendu już istnieje, czy akcja 0 wymaga tymczasowej oceny po stronie klienta.
 - [Affects R6][Needs research] Jak backend dostarcza wiadomość do sesji agenta w stanach bez pola wiadomości i czy każdy harness (Claude Code, Codex, opencode) to obsługuje.
-- [Affects R4][Technical] Jak wstawić akcję 0 bez zmiany numeracji istniejących skrótów w `src/tui/task_app/waiting.rs` i `src/tui/keymap.rs`.
+- [Affects R4][Technical] Jak wstawić akcję 0 w `src/tui/task_app/waiting.rs` i `src/tui/keymap.rs`. Zmiana numeracji skrótów jest dozwolona (Z6).
