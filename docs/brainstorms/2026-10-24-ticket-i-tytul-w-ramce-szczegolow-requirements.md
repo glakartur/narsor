@@ -7,7 +7,7 @@ topic: ticket-i-tytul-w-ramce-szczegolow
 
 ## Summary
 
-Ticket, tytuł i numer wewnętrzny zadania (pierwsze 8 znaków GUID) przenosimy z bloku nagłówkowego wewnątrz panelu szczegółów do górnej krawędzi ramki panelu szczegółów zadania. Każda wartość jest otoczona znakami oddzielającymi ją od linii ramki. Blok nagłówkowy z własnymi ramkami znika. To zmiana wyglądu. Dane i logika pól ticketu i tytułu zostają bez zmian.
+Ticket, tytuł i numer wewnętrzny zadania (pierwsze 8 znaków GUID) przenosimy z bloku nagłówkowego wewnątrz panelu szczegółów do górnej krawędzi ramki panelu szczegółów zadania. Każda wartość ma kształt „pigułki”: półkola po bokach, napis w środku na tle w kolorze ramki. Blok nagłówkowy z własnymi ramkami znika. To zmiana wyglądu. Dane i logika pól ticketu i tytułu zostają bez zmian.
 
 ---
 
@@ -26,19 +26,19 @@ Wymagania z `docs/brainstorms/2026-10-24-task-ticket-i-tytul-requirements.md` (R
 
 **Układ na krawędzi**
 - R4. Po lewej stronie krawędzi stoją ticket i tytuł (w tej kolejności). Po prawej stoi numer wewnętrzny: pierwsze 8 znaków GUID.
-- R5. Każda wartość jest otoczona znakami oddzielającymi ją od linii ramki, np. `┤ NAR-12 ├`. Dokładny zestaw znaków jest w „Założenia do potwierdzenia".
+- R5. Każda wartość jest osobną „pigułką” na linii krawędzi: lewe półkole, napis na tle w kolorze ramki, prawe półkole (np. glify Powerline U+E0B6 i U+E0B4). Ticket i tytuł to dwie osobne pigułki. Numer wewnętrzny też. Bez koloru (`no_color`) pigułka wraca do znaków `┤ NAR-12 ├`.
 - R6. Numer wewnętrzny jest zawsze widoczny w całości. Jeśli miejsca jest mało, najpierw skracamy tytuł, potem ticket.
-- R7. Zbyt długi tytuł jest skracany znakiem `…`. Pełny tytuł widać w zakładce Info (R14 z dokumentu bazowego).
+- R7. Zbyt długi tytuł jest skracany znakiem `…` (decyzja użytkownika: skracamy). Pełny tytuł widać w zakładce Info (R14 z dokumentu bazowego).
 
 **Brak wartości**
-- R8. Gdy brak ticketu, nie rysujemy jego znaków otaczających. To samo dla tytułu. Brak pustych par znaków.
-- R9. Gdy brak ticketu i tytułu, lewa strona krawędzi pokazuje to, co pokazuje dziś (tytuł z `display` workflow). Numer po prawej pokazujemy zawsze.
+- R8. Gdy brak ticketu, cała jego pigułka znika. To samo dla tytułu. Brak pustych pigułek.
+- R9. Gdy brak ticketu i tytułu, lewa strona krawędzi pokazuje to, co pokazuje dziś (tytuł z `display` workflow). Numer po prawej, na górnej krawędzi, pokazujemy zawsze.
 - R10. Gdy tytuł jest ustawiony, zastępuje tytuł z `display` na krawędzi (decyzja z dokumentu bazowego). Linki z `display` zostają w nagłówku (R3).
 
 **Bez zmian**
 - R11. Pola formularza, zapis, parametry szablonów `{{ ... }}` i tytuł generowany przez dyrygenta nie zmieniają się.
 - R12. Wskaźnik ładowania zostaje widoczny na krawędzi, jak dziś.
-- R13. Tryb bez koloru (`no_color`) i tryb bez połączenia (`stale`) działają jak dziś. Znaki otaczające czytelne bez koloru.
+- R13. Tryb bez koloru (`no_color`) i tryb bez połączenia (`stale`) działają jak dziś. Pigułki czytelne bez koloru (patrz R5).
 
 ---
 
@@ -46,8 +46,8 @@ Wymagania z `docs/brainstorms/2026-10-24-task-ticket-i-tytul-requirements.md` (R
 
 - AE1. **Covers R1, R4.** Given zadanie z ticketem `NAR-12`, tytułem „Zmiana API zamówień" i GUID `6a7ceacf-…`, when operator otwiera szczegóły, then górna krawędź ramki pokazuje po lewej `NAR-12` i tytuł, a po prawej `6a7ceacf`. Wewnątrz panelu nie ma osobnych ramek.
 - AE2. **Covers R6, R7.** Given bardzo długi tytuł i wąski terminal, when ramka się rysuje, then tytuł kończy się `…`, a `6a7ceacf` jest cały.
-- AE3. **Covers R8, R9.** Given zadanie bez ticketu i bez tytułu, when operator otwiera szczegóły, then krawędź pokazuje tytuł z `display` i numer po prawej, bez pustych znaków.
-- AE4. **Covers R8.** Given zadanie z samym ticketem, when ramka się rysuje, then widać ticket i numer, bez znaków dla tytułu.
+- AE3. **Covers R8, R9.** Given zadanie bez ticketu i bez tytułu, when operator otwiera szczegóły, then krawędź pokazuje tytuł z `display` i numer po prawej, bez pustych pigułek.
+- AE4. **Covers R8.** Given zadanie z samym ticketem, when ramka się rysuje, then widać ticket i numer, bez pigułki tytułu.
 
 ---
 
@@ -70,19 +70,19 @@ Wymagania z `docs/brainstorms/2026-10-24-task-ticket-i-tytul-requirements.md` (R
 ## Założenia do potwierdzenia
 
 - „Ramka panelu szczegółów" to zewnętrzna ramka panelu rysowana przez `render_panel` w `src/tui/style.rs`, nie ramka nagłówka w środku.
-- Zdanie z polecenia („otoczył te wartości znakami …") jest urwane. Zakładamy znaki w stylu ramek TUI: `┤ wartość ├` na linii krawędzi. Wartość i znaki pasują do zaokrąglonych ramek (`docs/brainstorms/2026-10-20-tui-zaokraglone-ramki-requirements.md`).
+- Kształt znaków potwierdził użytkownik: półkola, napis w środku na tle w kolorze ramki. Glify półkoli zależą od czcionki terminala (Powerline). Planowanie sprawdza, czy czcionka operatora je ma. Bez nich działa wariant `┤ … ├`.
 - Zawijanie tytułu (R13 z dokumentu bazowego) ustępuje: na krawędzi tytuł jest skracany, bo krawędź ma jeden wiersz.
 - Zwolnione wiersze nagłówka wracają do zakładek, a nie zostają puste.
 - Ten dokument zastępuje R9, R12 i R13 z dokumentu bazowego w części o nagłówku. Reszta tamtego dokumentu obowiązuje.
 
 ---
 
-## Pytania otwarte dla użytkownika
+## Decyzje użytkownika (z przeglądu PR)
 
-1. Jakimi znakami otoczyć wartości? Polecenie jest urwane. Propozycja: `┤ … ├`. Inne opcje: `[ … ]` lub `│ … │`.
-2. Czy skracanie długiego tytułu na krawędzi jest akceptowalne, czy tytuł ma być widoczny w całości (wtedy potrzebny jest dodatkowy wiersz wewnątrz panelu)?
-3. Czy numer wewnętrzny też ma stać na górnej krawędzi po prawej, czy w dolnej krawędzi?
-4. Czy ticket i tytuł mają mieć oddzielne znaki (`┤ NAR-12 ├─┤ tytuł ├`), czy jedną wspólną parę?
+1. Znaki: półkola, napis w środku na tle w kolorze ramki.
+2. Długi tytuł na krawędzi jest skracany.
+3. Numer wewnętrzny stoi na górnej krawędzi, po prawej.
+4. Ticket i tytuł są osobnymi pigułkami. Gdy brak elementu, cały człon znika.
 
 ---
 
