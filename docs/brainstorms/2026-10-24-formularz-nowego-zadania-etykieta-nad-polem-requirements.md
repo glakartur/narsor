@@ -62,7 +62,11 @@ Etykiety pochodzą z nazw wejść workflow (`target_repo`, `feature_description`
 - R17. Nazwa techniczna `target_repo` zostaje bez zmian (plik workflow, API, CLI `--input target_repo=...`, szablony).
 - R17a. Nazwa techniczna `feature_description` zmienia się na `description` wszędzie, gdzie jest nazwą wejścia: w dołączonych workflow (`workflows/compound-engineering.yaml`, `workflows/compound-engineering-chat.yaml`), w szablonach (`{{ inputs.description }}`), w dokumentacji i przykładach CLI (`README.md`, `WORKFLOW_SCHEMA.md`, `workflows/README.md`), w fixtures i testach. Opis wejścia w workflow nie mówi, że to „funkcja".
 - R17b. Workflow użytkownika, który nadal ma wejście `feature_description`, działa dalej: formularz pokazuje je z etykietą z nazwy (bez zmiany). Zmiana nie dodaje aliasu ani migracji.
+- R17c. Pozostałe dołączone workflow dostają nazwy wejść z `compound-engineering`: `workflows/compound-engineering-debug.yaml` (`bug_description` → `description`) i `workflows/open-mercato-sdlc.yaml` (`task_brief` → `description`). Nazwa `target_repo` już się zgadza. Zmiana obejmuje szablony, dokumentację i testy tych workflow. Wejście `ticket_id` w `open-mercato-sdlc.yaml` zostaje bez zmian.
 - R18. Etykiety Ticket i Tytuł zostają. Etykiety w innych formularzach (odpowiedź, komentarz, repozytoria) zostają.
+
+**Pliki formularza**
+- R19. Pliki odpowiedzialne za formularz nowego zadania stoją w jednym folderze (np. `src/tui/task_app/new_task/`): `new_task.rs` i kod układu z `src/tui/chooser/inputs.rs` (pasek workflow, linia statusu, podział wysokości, pole Opis). Wspólne rysowanie pól (`field_lines`, `value_lines`) zostaje poza tym folderem, bo używają go inne formularze (R0). Planowanie wybiera nazwę folderu i podział na moduły. Przeniesienie nie zmienia zachowania.
 
 ---
 
@@ -85,6 +89,7 @@ Etykiety pochodzą z nazw wejść workflow (`target_repo`, `feature_description`
 - Operator wybiera workflow bez pól Ticket i Tytuł na ekranie.
 - Jeden kod rysuje pola we wszystkich formularzach; w `inputs.rs` nie ma już własnego rysowania pól.
 - Operator widzi etykiety „Repozytorium" i „Opis" zamiast nazw technicznych.
+- Pliki formularza nowego zadania są w jednym folderze (R19).
 - Planowanie nie musi zgadywać układu wiersza wartości ani zakresu zmiany etykiet.
 
 ---
@@ -94,7 +99,7 @@ Etykiety pochodzą z nazw wejść workflow (`target_repo`, `feature_description`
 - Nie zmieniamy kolejności pól ani nawigacji klawiszami.
 - Nie zmieniamy kolorów, motywów ani trybu bez koloru.
 - Nie zmieniamy limitów Ticket (15) i Tytuł (50) ani zasad wklejania.
-- Nie zmieniamy nazwy `target_repo` (R17). Nazwa `feature_description` zmienia się na `description` tylko jako nazwa wejścia (R17a); API, CLI i silnik nie dostają innych zmian.
+- Nie zmieniamy nazwy `target_repo` (R17). Inne dołączone workflow zmieniają tylko nazwę wejścia opisu na `description` (R17c). Nazwa `feature_description` zmienia się na `description` tylko jako nazwa wejścia (R17a); API, CLI i silnik nie dostają innych zmian.
 - Nie dodajemy aliasu `feature_description` → `description` ani migracji zapisanych zadań (R17b).
 - Nie zmieniamy listy workflow ani treści jej opisów.
 
@@ -122,7 +127,7 @@ Etykiety pochodzą z nazw wejść workflow (`target_repo`, `feature_description`
 ## Założenia do potwierdzenia
 
 - Z1. Potwierdzone przez użytkownika: gdy focus jest na liście workflow, pól Ticket i Tytuł nie widać; mogą być wycięte z układu (R13).
-- Z2. Etykiety „Repozytorium" i „Opis" wynikają z nazw wejść `target_repo` i `description`. Inne workflow z innymi nazwami wejść zachowują dzisiejsze etykiety. Planowanie może zastąpić mapę nazw regułą po typie (wejście typu `repository` → „Repozytorium"), jeśli to prostsze; wtedy użytkownik potwierdza.
+- Z2. Potwierdzone przez użytkownika: etykiety „Repozytorium" i „Opis" wynikają z nazw wejść `target_repo` i `description`. Inne dołączone workflow dostosowujemy do nazw z `compound-engineering` (R17c), a nie dodajemy dla nich osobnych etykiet. Workflow użytkownika z innymi nazwami wejść zachowuje dzisiejsze etykiety (R17b).
 - Z3. Potwierdzone przez użytkownika: wszystkie formularze mają wspólne rysowanie pól (R0). Dziś odstępuje od niego tylko formularz nowego zadania (patrz Problem Frame), więc zmiana wyglądu dotyka głównie jego.
 - Z6. Zmiana nazwy `feature_description` → `description` łamie istniejące skrypty CLI (`--input feature_description=...`) i workflow użytkowników, którzy kopiują dołączone pliki. Przyjmuję to bez aliasu (R17b); zadania już zapisane trzymają swoje wejścia pod starą nazwą. Do weryfikacji przez zespół, jeśli ktoś wywołuje dołączone workflow ze skryptów.
 - Z4. Pole Opis (wieloliniowe) ma `> ` tylko w pierwszym wierszu wartości, a w kolejnych wierszach wcięcie o tej samej szerokości (jak `prefixed` i `CONTINUATION`).
