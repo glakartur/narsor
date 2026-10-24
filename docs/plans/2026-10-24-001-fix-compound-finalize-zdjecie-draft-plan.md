@@ -34,10 +34,10 @@ R1–R13 i AE1–AE6 jak w origin (see origin: `docs/brainstorms/2026-10-24-comp
 
 ## Założenia przyjęte w planie
 
-Origin zostawia dwa pytania dla użytkownika. Żadne nie zmienia zachowania produktu, więc plan je zamyka jawnie. Artur potwierdza je przy przeglądzie.
+Origin ma sekcję „Pytania otwarte dla użytkownika" z dwoma pytaniami. Żadne nie zmienia zachowania produktu, więc plan je zamyka jawnie. Artur potwierdza odpowiedzi przy przeglądzie.
 
-- Z1 (pyt. 1 origin, log porażki): brak logu nie blokuje planu. U1 zbiera dowody. Hipoteza (e) z R2 wymaga decyzji Artura po U1.
-- Z2 (pyt. 2 origin, limit `retry`): bez limitu ręcznych `retry` (origin: Założenie 6, R12). Człowiek kontroluje pętlę. Nie dodajemy `max_entries` do `finalize`.
+- Z1. Pytanie origin 1: „Jak dokładnie `finalize` zawodzi? Jaki jest log lub komunikat (GitHub czy GitLab; błąd narzędzia, czy PR zostaje w Draft mimo sukcesu)?" Odpowiedź planu: brak logu nie blokuje planu. U1 zbiera dowody. Hipoteza (e) z R2 wymaga decyzji Artura po U1.
+- Z2. Pytanie origin 2: „Czy bramka ma mieć limit ręcznych `retry`, czy bez limitu?" Odpowiedź planu: bez limitu (origin: Założenie 6, R12). Człowiek kontroluje pętlę. Nie dodajemy `max_entries` do `finalize`.
 
 ---
 
