@@ -9,19 +9,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use narsor_protocol::identifier::{BackendId, InvalidIdentifier, TaskId, MAX_IDENTIFIER_LEN};
+pub use narsor_protocol::launch::TASK_LAUNCH_SPEC_VERSION;
+
+use narsor_protocol::launch::LaunchSpecEnvelope;
 
 use super::environment::{canonical_sha256, ResolvedEnvironment, ResourceProfile, TaskWorkspace};
 use super::{DisplaySpec, WorkflowDefinition};
-
-/// Current schema version of [`TaskLaunchSpec`].
-///
-/// Version 2 replaced version 1's opaque `workspace` with a typed
-/// [`TaskWorkspace`], added the pinned [`ResolvedEnvironment`] and the
-/// [`ResourceProfile`], and moved the digest from FNV-1a to SHA-256.
-/// Version 3 added the [`TaskLaunchSpec::definition`] snapshot, so a runner
-/// never has to find the workflow again in a catalogue that may have changed
-/// (or that it cannot even see) since the task was created.
-pub const TASK_LAUNCH_SPEC_VERSION: u32 = 3;
 
 /// Longest ticket, in characters.
 pub const TICKET_MAX_CHARS: usize = 64;
@@ -204,25 +197,6 @@ pub enum LaunchDefinitionError {
     },
 }
 
-/// The fields of a current-version spec, for the version-checked read.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TaskLaunchSpecFields {
-    version: u32,
-    workflow_id: String,
-    workflow_version: u32,
-    inputs: serde_json::Value,
-    workspace: TaskWorkspace,
-    environment: ResolvedEnvironment,
-    resources: ResourceProfile,
-    definition: Option<serde_json::Value>,
-    #[serde(default)]
-    ticket: Option<String>,
-    #[serde(default)]
-    title: Option<String>,
-    digest: String,
-}
-
 impl<'de> Deserialize<'de> for TaskLaunchSpec {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
@@ -238,22 +212,46 @@ impl<'de> Deserialize<'de> for TaskLaunchSpec {
                  the task and create it again"
             )));
         }
-        let fields: TaskLaunchSpecFields =
+        let envelope: LaunchSpecEnvelope =
             serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        // Exhaustive on purpose (no `..`): a field added to the shared
+        // envelope stops this reader compiling until it is handled.
+        let LaunchSpecEnvelope {
+            version,
+            workflow_id,
+            workflow_version,
+            inputs,
+            workspace,
+            environment,
+            resources,
+            definition,
+            ticket,
+            title,
+            digest,
+        } = envelope;
         Ok(Self {
-            version: fields.version,
-            workflow_id: fields.workflow_id,
-            workflow_version: fields.workflow_version,
-            inputs: fields.inputs,
-            workspace: fields.workspace,
-            environment: fields.environment,
-            resources: fields.resources,
-            definition: fields.definition,
-            ticket: fields.ticket,
-            title: fields.title,
-            digest: fields.digest,
+            version,
+            workflow_id,
+            workflow_version,
+            inputs,
+            workspace: typed_part("workspace", workspace)?,
+            environment: typed_part("environment", environment)?,
+            resources: typed_part("resources", resources)?,
+            definition,
+            ticket,
+            title,
+            digest,
         })
     }
+}
+
+/// Gives a nested part of the envelope its domain type; the error names it.
+fn typed_part<T, E>(field: &'static str, value: serde_json::Value) -> Result<T, E>
+where
+    T: serde::de::DeserializeOwned,
+    E: serde::de::Error,
+{
+    serde_json::from_value(value).map_err(|error| E::custom(format!("{field}: {error}")))
 }
 
 impl TaskLaunchSpec {

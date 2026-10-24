@@ -231,6 +231,7 @@ fn copy_tree(root: &Path, source: &Path, target: &Path) -> Result<(), RunnerErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{GitIdentity, RefOrigin, ResolvedEnvironment, ResourceProfile};
 
     fn temp(name: &str) -> std::path::PathBuf {
         let path =
@@ -330,6 +331,203 @@ mod tests {
             error.to_string().contains("neither a regular file"),
             "{error}"
         );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    // The admitted clone (R39) and one storage, one task. Cloning is what is
+    // under test, and it is done by the `git` program (a runtime
+    // prerequisite of the runner): the "remote" is a local bare repository.
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=Runner Test",
+                "-c",
+                "user.email=runner@example.com",
+            ])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A bare "remote" with one commit, and that commit's id.
+    fn origin(base: &Path) -> (std::path::PathBuf, String) {
+        let work = base.join("origin-work");
+        fs::create_dir_all(&work).unwrap();
+        git(&work, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        fs::write(work.join("README.md"), "pinned\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "pinned"]);
+        let bare = base.join("origin.git");
+        git(
+            base,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &work.display().to_string(),
+                &bare.display().to_string(),
+            ],
+        );
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        (bare, head)
+    }
+
+    const WORKFLOW: &str = r#"
+name: one-step
+version: 1
+states:
+  work:
+    action:
+      type: agent
+      prompt: Do the work.
+    choices: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+    fn spec(workspace: TaskWorkspace) -> TaskLaunchSpec {
+        let definition = crate::workflow::load_from_str(WORKFLOW).unwrap();
+        TaskLaunchSpec::new(
+            definition.id.clone(),
+            definition.version,
+            serde_json::json!({}),
+            workspace,
+            ResolvedEnvironment::harness_only("claude-code"),
+            ResourceProfile::new(1000, 2048),
+        )
+        .with_definition(&definition)
+        .unwrap()
+    }
+
+    fn unpinned(
+        bare: &Path,
+        git_ref: Option<&str>,
+        ref_origin: Option<RefOrigin>,
+    ) -> TaskWorkspace {
+        TaskWorkspace::Git(GitIdentity {
+            repository: Some("demo".to_string()),
+            remote_url: bare.display().to_string(),
+            commit: String::new(),
+            git_ref: git_ref.map(str::to_string),
+            ref_origin,
+            credential: None,
+        })
+    }
+
+    fn task() -> TaskId {
+        TaskId::parse("task-1").unwrap()
+    }
+
+    /// A workspace left unpinned at creation is pinned by the admitted
+    /// clone: the remote's HEAD is resolved once, and that commit is the
+    /// workspace, the marker and the Engine's base commit.
+    #[test]
+    fn an_unpinned_workspace_is_pinned_by_the_admitted_clone() {
+        let base = temp("unpinned");
+        let (bare, head) = origin(&base);
+        let storage = TaskStorage::new(base.join("storage"));
+        fs::create_dir_all(storage.root()).unwrap();
+        let spec = spec(unpinned(&bare, None, None));
+
+        let initialized = initialize(
+            &storage,
+            &storage.store(),
+            &task(),
+            &spec,
+            &MountedSecrets::new(None),
+        )
+        .unwrap();
+
+        assert_eq!(initialized, Initialization::Fresh);
+        assert_eq!(git(&storage.workspace_dir(), &["rev-parse", "HEAD"]), head);
+        let marker = storage.marker().unwrap().expect("the marker");
+        assert_eq!(marker.workspace_commit.as_deref(), Some(head.as_str()));
+        let workspace = super::super::workspace(&storage, &spec);
+        assert_eq!(workspace.base_commit.as_deref(), Some(head.as_str()));
+        assert!(!storage.partial_clone_dir().exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A branch that does not exist fails the admitted clone, and the error
+    /// says which setting named it; nothing is left behind.
+    #[test]
+    fn a_missing_branch_names_the_setting_it_came_from() {
+        let base = temp("missing-branch");
+        let (bare, _) = origin(&base);
+        for (index, (ref_origin, words)) in [
+            (Some(RefOrigin::Repository), "z konfiguracji repozytorium"),
+            (None, "not found in repository"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let storage = TaskStorage::new(base.join(format!("storage-{index}")));
+            fs::create_dir_all(storage.root()).unwrap();
+            let spec = spec(unpinned(&bare, Some("missing"), ref_origin));
+
+            let error = initialize(
+                &storage,
+                &storage.store(),
+                &task(),
+                &spec,
+                &MountedSecrets::new(None),
+            )
+            .unwrap_err();
+
+            let message = error.to_string();
+            assert!(matches!(error, RunnerError::Workspace(_)), "{message}");
+            assert!(message.contains("missing"), "{message}");
+            assert!(message.contains(words), "{message}");
+            if ref_origin.is_none() {
+                assert!(!message.contains("(z "), "{message}");
+            }
+            assert!(storage.marker().unwrap().is_none());
+            assert!(!storage.workspace_dir().exists());
+        }
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A storage that holds anything of somebody else's is never
+    /// initialized, and the refusal names what it found.
+    #[test]
+    fn a_storage_that_is_not_empty_is_never_initialized() {
+        let base = temp("not-empty");
+        let storage = TaskStorage::new(base.join("storage"));
+        fs::create_dir_all(storage.root()).unwrap();
+        fs::write(storage.root().join("someone-elses-file"), "data").unwrap();
+        let spec = spec(TaskWorkspace::None);
+
+        let error = initialize(
+            &storage,
+            &storage.store(),
+            &task(),
+            &spec,
+            &MountedSecrets::new(None),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, RunnerError::ForeignStorage(_)), "{error}");
+        assert!(error.to_string().contains("someone-elses-file"), "{error}");
+        assert!(storage.marker().unwrap().is_none());
+        assert!(storage
+            .store()
+            .load_task_launch_spec(&task())
+            .unwrap()
+            .is_none());
+        assert!(storage.store().list_execution_ids().unwrap().is_empty());
         let _ = fs::remove_dir_all(base);
     }
 }

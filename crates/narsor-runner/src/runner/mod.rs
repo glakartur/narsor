@@ -95,6 +95,8 @@ pub mod preflight;
 pub mod profile;
 mod reader;
 pub mod secrets;
+#[cfg(test)]
+mod session_tests;
 mod snapshot;
 pub mod storage;
 
@@ -247,6 +249,8 @@ pub struct RunnerTiming {
     pub renew_margin: Duration,
     /// How long a runner that cannot work keeps trying to report why.
     pub problem_report_deadline: Duration,
+    /// Longest wait for the launch view before a clean restart resumes.
+    pub clean_launch_wait: Duration,
 }
 
 impl Default for RunnerTiming {
@@ -259,6 +263,7 @@ impl Default for RunnerTiming {
             heartbeat: Duration::from_secs(30),
             renew_margin: Duration::from_secs(5 * 60),
             problem_report_deadline: Duration::from_secs(120),
+            clean_launch_wait: CLEAN_LAUNCH_WAIT,
         }
     }
 }
@@ -391,20 +396,8 @@ pub async fn run(
         .await);
     }
 
-    environment.task.extend(config.harness_home.variables());
-    match profile::prepare_claude_profile(
-        &config.harness_home,
-        &private_home,
-        &storage.claude_profile_base_dir(),
-    ) {
-        // A configured directory is already among the variables.
-        Ok(Some(work)) if config.harness_home.claude_config_dir.is_none() => {
-            environment.task.push((
-                CLAUDE_CONFIG_DIR_ENV.to_string(),
-                work.display().to_string(),
-            ))
-        }
-        Ok(_) => {}
+    match harness_variables(&config.harness_home, &storage) {
+        Ok(variables) => environment.task.extend(variables),
         Err(error) => {
             return Ok(report_problem(
                 &storage,
@@ -418,16 +411,7 @@ pub async fn run(
     }
     apply_environment(&environment);
 
-    // One live harness for the Engine and the conductor (U7): the default
-    // this storage last switched to, else the one the task was created with,
-    // until the control plane names another.
-    let starting = storage.applied_harness().unwrap_or_else(|error| {
-        tracing::warn!(%error, "the harness last switched to cannot be read; using the task's");
-        None
-    });
-    let harness = Arc::new(LiveHarness::new(
-        starting.unwrap_or_else(|| spec.environment.harness.clone()),
-    ));
+    let harness = Arc::new(LiveHarness::new(starting_harness(&storage, &spec)));
     let engine = Arc::new(
         Engine::new(store)
             .with_default_harness_source(harness.clone())
@@ -457,6 +441,40 @@ pub async fn run(
         title_wanted: spec.title.is_none(),
     };
     session.begin(&spec).await
+}
+
+/// The variables that point the harnesses at their configuration: the
+/// directories the backend configured and, with a Claude profile source,
+/// the work directory the profile was merged into for this start.
+fn harness_variables(
+    home: &HarnessHome,
+    storage: &TaskStorage,
+) -> Result<Vec<(String, String)>, RunnerError> {
+    let mut variables = home.variables();
+    let work = profile::prepare_claude_profile(
+        home,
+        &storage.home_dir(),
+        &storage.claude_profile_base_dir(),
+    )?;
+    // A configured directory is already among the variables.
+    if let Some(work) = work.filter(|_| home.claude_config_dir.is_none()) {
+        variables.push((
+            CLAUDE_CONFIG_DIR_ENV.to_string(),
+            work.display().to_string(),
+        ));
+    }
+    Ok(variables)
+}
+
+/// The harness a runner starts on (U7): the default this storage last
+/// switched to, else the one the task was created with, until the control
+/// plane names another.
+fn starting_harness(storage: &TaskStorage, spec: &TaskLaunchSpec) -> String {
+    let applied = storage.applied_harness().unwrap_or_else(|error| {
+        tracing::warn!(%error, "the harness last switched to cannot be read; using the task's");
+        None
+    });
+    applied.unwrap_or_else(|| spec.environment.harness.clone())
 }
 
 /// Reads the mounted launch spec, or the storage's copy when none is
@@ -726,6 +744,22 @@ enum Continuation {
     Recover(Decision),
 }
 
+/// What became of one delivered owner answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputVerdict {
+    /// Not now: a pass runs, or there is no execution yet. The control
+    /// plane delivers it again.
+    Later,
+    /// The Engine has it: just now (`first`), or from an earlier delivery
+    /// whose acknowledgement was lost.
+    Taken {
+        /// Whether this delivery is the one that handed it over.
+        first: bool,
+    },
+    /// The Engine refused it, for this reason.
+    Refused(String),
+}
+
 /// The command that authorized recovering a storage after an unclean stop,
 /// and who issued it.
 #[derive(Debug, Clone, Copy)]
@@ -767,6 +801,18 @@ impl Decision {
 impl Session {
     /// Decides how to continue, starts the work and drives it.
     async fn begin(&mut self, spec: &TaskLaunchSpec) -> Result<RunnerExit, RunnerError> {
+        if let Some(exit) = self.start_work(spec).await? {
+            return Ok(exit);
+        }
+        self.drive().await
+    }
+
+    /// Decides how to continue and starts the work, without the control
+    /// loop. `Some` when the runner must stop instead (R13).
+    async fn start_work(
+        &mut self,
+        spec: &TaskLaunchSpec,
+    ) -> Result<Option<RunnerExit>, RunnerError> {
         let store = self.engine.store().clone();
         let mut executions = store.list_execution_ids()?;
         self.execution_id = match executions.len() {
@@ -782,7 +828,7 @@ impl Session {
             (Some(_), Some(previous)) if previous.closed.is_some() => Continuation::Clean,
             (Some(_), Some(previous)) => match self.owner_decision(previous).await? {
                 Some(decision) => Continuation::Recover(decision),
-                None => return self.refuse_without_decision().await,
+                None => return self.refuse_without_decision().await.map(Some),
             },
         };
 
@@ -817,7 +863,8 @@ impl Session {
                 // known only once the launch view is. The wait is short: a
                 // runner restarted while the control plane is away goes on
                 // without the comment, which stays in the record.
-                let _ = tokio::time::timeout(CLEAN_LAUNCH_WAIT, self.await_launch()).await;
+                let _ =
+                    tokio::time::timeout(self.timing.clean_launch_wait, self.await_launch()).await;
                 self.take_resume_message()?;
                 self.resume_pass()?;
             }
@@ -826,7 +873,7 @@ impl Session {
         // After the runner's own recovery, like the daemon's startup hook.
         self.conductor.restore_at_startup();
         self.request_title();
-        self.drive().await
+        Ok(None)
     }
 
     /// Asks the conductor, once, to name a task whose operator typed no
@@ -972,7 +1019,7 @@ impl Session {
         let unavailable = match default {
             TaskDefaultHarness::Available { harness } if harness == current => None,
             TaskDefaultHarness::Available { harness } => {
-                match conductor::harness_unavailable(&harness) {
+                match self.conductor.probe().unavailable(&harness) {
                     None => {
                         self.switch_harness(&current, harness);
                         None
@@ -1394,17 +1441,40 @@ impl Session {
         let Some(client) = self.link.client() else {
             return Ok(());
         };
+        let input_id = input.input_id.clone();
+        match self.take_input(input)? {
+            InputVerdict::Later => {}
+            InputVerdict::Taken { first: false } => {
+                // Our acknowledgement was lost; the Engine has it already.
+                let _ = client.ack_input(&input_id, true, None).await;
+            }
+            InputVerdict::Taken { first: true } => {
+                if let Err(error) = client.ack_input(&input_id, true, None).await {
+                    // Redelivered later and answered from the consumed record.
+                    self.link.failed(&error, &self.timing);
+                }
+            }
+            InputVerdict::Refused(reason) => {
+                if let Err(error) = client.ack_input(&input_id, false, Some(reason)).await {
+                    self.link.failed(&error, &self.timing);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Hands one owner answer to the Engine, unless this storage took it
+    /// before, and starts the pass it resumes.
+    fn take_input(&mut self, input: DeliveredInput) -> Result<InputVerdict, RunnerError> {
         if self.storage.input_consumed(&input.input_id)? {
-            // Our acknowledgement was lost; the Engine has it already.
-            let _ = client.ack_input(&input.input_id, true, None).await;
-            return Ok(());
+            return Ok(InputVerdict::Taken { first: false });
         }
         if self.pass_active() {
             // Redelivered on a later poll, once nothing runs.
-            return Ok(());
+            return Ok(InputVerdict::Later);
         }
         let Some(execution_id) = self.execution_id.clone() else {
-            return Ok(());
+            return Ok(InputVerdict::Later);
         };
         let permission_decision = input.delivery.permission_decision.map(|decision| {
             narsor_engine::engine::PermissionDecision {
@@ -1466,23 +1536,15 @@ impl Session {
                 .try_begin_deliver_human_input(&self.definition, &execution_id, &delivery)
                 .map_err(RunnerError::from)
         };
-        let verdict = match started {
+        Ok(match started {
             Ok(handle) => {
                 self.storage.record_consumed_input(&input.input_id)?;
                 self.spawn_pass(handle);
-                (true, None)
+                InputVerdict::Taken { first: true }
             }
-            Err(RunnerError::Engine(EngineError::AlreadyRunning { .. })) => return Ok(()),
-            Err(error) => (false, Some(error.to_string())),
-        };
-        if let Err(error) = client
-            .ack_input(&input.input_id, verdict.0, verdict.1)
-            .await
-        {
-            // Redelivered later and answered from the consumed record.
-            self.link.failed(&error, &self.timing);
-        }
-        Ok(())
+            Err(RunnerError::Engine(EngineError::AlreadyRunning { .. })) => InputVerdict::Later,
+            Err(error) => InputVerdict::Refused(error.to_string()),
+        })
     }
 
     /// Uploads one bounded conversation page an owner waits for.
@@ -1679,5 +1741,142 @@ mod tests {
     #[test]
     fn an_unreadable_mark_counts_as_not_given() {
         assert_eq!(taken_key(&message(), Err(unreadable())), None);
+    }
+
+    // The HOME and harness configuration a task's tools see.
+
+    /// A task storage that deletes itself.
+    struct Storage(TaskStorage);
+
+    impl Storage {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("narsor-home-{}", uuid::Uuid::new_v4()));
+            let storage = TaskStorage::new(root);
+            storage.prepare().unwrap();
+            Self(storage)
+        }
+    }
+
+    impl Drop for Storage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.root());
+        }
+    }
+
+    fn home(mode: HomeMode) -> HarnessHome {
+        HarnessHome {
+            mode,
+            ..HarnessHome::default()
+        }
+    }
+
+    fn variable<'a>(variables: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        variables
+            .iter()
+            .find(|(variable, _)| variable == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The default: HOME is the storage's own, no harness directory is
+    /// set, and inherited API keys are dropped.
+    #[test]
+    fn the_private_home_is_the_storage_home_and_drops_inherited_api_keys() {
+        let storage = Storage::new();
+        let environment = MountedSecrets::new(None)
+            .materialize(
+                &crate::domain::ResolvedEnvironment::harness_only("codex"),
+                Some(&storage.0.home_dir()),
+            )
+            .unwrap();
+        let variables = harness_variables(&home(HomeMode::Private), &storage.0).unwrap();
+
+        let home_dir = storage.0.home_dir().display().to_string();
+        assert!(environment
+            .variables()
+            .any(|(name, value)| name == "HOME" && value == home_dir));
+        assert!(variables.is_empty(), "{variables:?}");
+        let removed: Vec<&str> = environment.removed().collect();
+        assert!(removed.contains(&"ANTHROPIC_API_KEY") && removed.contains(&"OPENAI_API_KEY"));
+    }
+
+    /// A host HOME keeps the HOME the runner was started with and points the
+    /// harnesses at the directories the backend configured.
+    #[test]
+    fn a_host_home_keeps_the_hosts_home_and_its_harness_directories() {
+        let storage = Storage::new();
+        let host = HarnessHome {
+            mode: HomeMode::Host,
+            codex_home: Some(PathBuf::from("/srv/codex")),
+            claude_config_dir: Some(PathBuf::from("/srv/claude")),
+            claude_profile_source: None,
+        };
+        let environment = MountedSecrets::new(None)
+            .materialize(
+                &crate::domain::ResolvedEnvironment::harness_only("codex"),
+                None,
+            )
+            .unwrap();
+        let variables = harness_variables(&host, &storage.0).unwrap();
+
+        assert!(environment.variables().all(|(name, _)| name != "HOME"));
+        assert_eq!(variable(&variables, "CODEX_HOME"), Some("/srv/codex"));
+        assert_eq!(
+            variable(&variables, "CLAUDE_CONFIG_DIR"),
+            Some("/srv/claude")
+        );
+        assert!(environment
+            .removed()
+            .any(|name| name == "ANTHROPIC_API_KEY"));
+    }
+
+    /// A Claude profile source is merged into the work directory of the
+    /// private HOME, and Claude is pointed at it.
+    #[test]
+    fn a_claude_profile_source_is_merged_into_the_private_work_directory() {
+        let storage = Storage::new();
+        let source = storage.0.root().join("profile-source");
+        std::fs::create_dir_all(source.join("..data")).unwrap();
+        std::fs::write(source.join("settings.json"), r#"{"model":"opus"}"#).unwrap();
+        let profiled = HarnessHome {
+            claude_profile_source: Some(source),
+            ..home(HomeMode::Private)
+        };
+
+        let variables = harness_variables(&profiled, &storage.0).unwrap();
+
+        let work = storage.0.home_dir().join(".claude");
+        assert_eq!(
+            variable(&variables, "CLAUDE_CONFIG_DIR"),
+            Some(work.display().to_string().as_str())
+        );
+        assert!(work.join("settings.json").is_file());
+    }
+
+    /// A profile source that is the work directory itself (a local
+    /// installation) is not copied, and Claude is pointed at it once.
+    #[test]
+    fn a_claude_profile_source_equal_to_the_work_directory_is_not_copied() {
+        let storage = Storage::new();
+        let claude = storage.0.root().join("claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), "{}").unwrap();
+        let local = HarnessHome {
+            mode: HomeMode::Host,
+            codex_home: None,
+            claude_config_dir: Some(claude.clone()),
+            claude_profile_source: Some(claude.clone()),
+        };
+
+        let variables = harness_variables(&local, &storage.0).unwrap();
+
+        assert_eq!(
+            variables,
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                claude.display().to_string()
+            )]
+        );
+        assert!(!storage.0.home_dir().join(".claude").exists());
+        assert!(!storage.0.claude_profile_base_dir().exists());
     }
 }

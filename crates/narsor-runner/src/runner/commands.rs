@@ -32,7 +32,25 @@ impl Session {
             return Ok(());
         };
         let id = delivered.command_id.clone();
-        let verdict = match self.storage.command_progress(&id)? {
+        let verdict = self.settle_command(delivered).await?;
+        if let Err(error) = client
+            .ack_command(&id, verdict.applied, verdict.detail)
+            .await
+        {
+            // Redelivered later and answered from the recorded verdict.
+            self.link.failed(&error, &self.timing);
+        }
+        Ok(())
+    }
+
+    /// The verdict on one delivered command: carried out now when this
+    /// storage never saw it, else the one recorded the first time.
+    pub(super) async fn settle_command(
+        &mut self,
+        delivered: DeliveredOperatorCommand,
+    ) -> Result<CommandVerdict, RunnerError> {
+        let id = delivered.command_id.clone();
+        Ok(match self.storage.command_progress(&id)? {
             CommandProgress::Done(verdict) => verdict,
             CommandProgress::Begun => {
                 let verdict = CommandVerdict::rejected(
@@ -48,15 +66,7 @@ impl Session {
                 self.storage.finish_command(&id, &verdict)?;
                 verdict
             }
-        };
-        if let Err(error) = client
-            .ack_command(&id, verdict.applied, verdict.detail)
-            .await
-        {
-            // Redelivered later and answered from the recorded verdict.
-            self.link.failed(&error, &self.timing);
-        }
-        Ok(())
+        })
     }
 
     async fn decide(&mut self, delivered: DeliveredOperatorCommand) -> CommandVerdict {

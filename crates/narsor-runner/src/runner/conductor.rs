@@ -28,6 +28,7 @@
 //! waiting for its step boundary, defers owner input, and is what an
 //! interrupt drops.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -38,7 +39,9 @@ use super::preflight::{find_on_path, is_executable};
 use super::storage::TaskStorage;
 use super::Session;
 use crate::conductor::assembly::{build, restore_at_startup};
-use crate::conductor::{ConductorRegistry, HarnessInvoker, LiveHarness, PassLauncher};
+use crate::conductor::{
+    ConductorInvoker, ConductorRegistry, HarnessInvoker, LiveHarness, PassLauncher,
+};
 use crate::controller_protocol::ConductorReadRequest;
 use crate::domain::{WorkflowDefinition, WorkflowExecution};
 use crate::engine::{Engine, HarnessRegistry};
@@ -56,6 +59,8 @@ pub(super) struct ConductorHost {
     unavailable: Option<String>,
     harness: Arc<LiveHarness>,
     passes: Arc<RunnerPasses>,
+    /// Where a harness binary is looked for.
+    probe: HarnessProbe,
 }
 
 impl ConductorHost {
@@ -70,7 +75,6 @@ impl ConductorHost {
         harness: Arc<LiveHarness>,
         definition: &Arc<WorkflowDefinition>,
     ) -> Self {
-        let passes = Arc::new(RunnerPasses::new(Arc::clone(definition)));
         let invoker = HarnessInvoker::new(
             engine.store().clone(),
             storage.root(),
@@ -78,9 +82,28 @@ impl ConductorHost {
         )
         .with_default_harness_source(harness.clone())
         .with_pinned_definition(Arc::clone(definition));
+        Self::assemble_with(
+            engine,
+            harness,
+            definition,
+            Arc::new(invoker),
+            HarnessProbe::process(),
+        )
+    }
+
+    /// [`Self::assemble`] with the conductor run by `invoker`, and harness
+    /// binaries looked for by `probe`.
+    pub(super) fn assemble_with(
+        engine: &Arc<Engine>,
+        harness: Arc<LiveHarness>,
+        definition: &Arc<WorkflowDefinition>,
+        invoker: Arc<dyn ConductorInvoker>,
+        probe: HarnessProbe,
+    ) -> Self {
+        let passes = Arc::new(RunnerPasses::new(Arc::clone(definition)));
         let registry = build(
             engine,
-            Arc::new(invoker),
+            invoker,
             Some(Arc::clone(&passes) as Arc<dyn PassLauncher>),
         );
         let mut host = Self {
@@ -91,10 +114,16 @@ impl ConductorHost {
             unavailable: None,
             harness,
             passes,
+            probe,
         };
-        let unavailable = harness_unavailable(&host.harness.get());
+        let unavailable = host.probe.unavailable(&host.harness.get());
         host.refresh(unavailable);
         host
+    }
+
+    /// Where this conductor looks for a harness binary.
+    pub(super) fn probe(&self) -> &HarnessProbe {
+        &self.probe
     }
 
     /// Takes in whether the live harness can run here, after it changed —
@@ -150,21 +179,47 @@ impl ConductorHost {
     }
 }
 
-/// Why `harness` cannot run in this process's environment, when it cannot:
-/// an unknown name, or a binary that is not there.
-pub(super) fn harness_unavailable(harness: &str) -> Option<String> {
-    let registry = HarnessRegistry::defaults();
-    let adapter = match registry.get(harness) {
-        Ok(adapter) => adapter,
-        Err(error) => return Some(error.message),
-    };
-    let program = adapter.program();
-    let found = if program.contains('/') {
-        is_executable(Path::new(program))
-    } else {
-        std::env::var_os("PATH").is_some_and(|path| find_on_path(program, &path).is_some())
-    };
-    (!found).then(|| format!("the harness '{harness}' needs '{program}', which is not on PATH"))
+/// Where a harness binary is looked for: this process's `PATH`, or (in a
+/// test) a given one.
+#[derive(Debug, Clone, Default)]
+pub(super) struct HarnessProbe {
+    /// `None` reads this process's `PATH` on every look.
+    path: Option<OsString>,
+}
+
+impl HarnessProbe {
+    /// Looks on this process's `PATH`.
+    pub(super) fn process() -> Self {
+        Self { path: None }
+    }
+
+    /// Looks on `path` only.
+    #[cfg(test)]
+    pub(super) fn on_path(path: impl Into<OsString>) -> Self {
+        Self {
+            path: Some(path.into()),
+        }
+    }
+
+    /// Why `harness` cannot run in this environment, when it cannot: an
+    /// unknown name, or a binary that is not there.
+    pub(super) fn unavailable(&self, harness: &str) -> Option<String> {
+        let registry = HarnessRegistry::defaults();
+        let adapter = match registry.get(harness) {
+            Ok(adapter) => adapter,
+            Err(error) => return Some(error.message),
+        };
+        let program = adapter.program();
+        let found = if program.contains('/') {
+            is_executable(Path::new(program))
+        } else {
+            self.path
+                .clone()
+                .or_else(|| std::env::var_os("PATH"))
+                .is_some_and(|path| find_on_path(program, &path).is_some())
+        };
+        (!found).then(|| format!("the harness '{harness}' needs '{program}', which is not on PATH"))
+    }
 }
 
 /// The pass the conductor started (its one retry of a failed step), the
@@ -312,20 +367,29 @@ impl Session {
         let Some(execution_id) = self.execution_id.clone() else {
             return;
         };
-        let unavailable = self.conductor.unavailable_reason().map(str::to_string);
-        let harness = self.conductor.harness();
+        let describe = self.describe_conductor();
         super::reader::serve_conductor_read(
             &mut self.link,
             &self.timing,
             self.engine.store(),
             &execution_id,
             request,
-            |view| match unavailable {
-                None => view.available_on(harness),
-                Some(reason) => view.without_conductor(reason),
-            },
+            describe,
         )
         .await;
+    }
+
+    /// What an owner's read of the conductor says beside the stored state:
+    /// the harness it runs on, or why there is none.
+    pub(super) fn describe_conductor(
+        &self,
+    ) -> impl FnOnce(crate::conductor::ConductorView) -> crate::conductor::ConductorView {
+        let unavailable = self.conductor.unavailable_reason().map(str::to_string);
+        let harness = self.conductor.harness();
+        move |view| match unavailable {
+            None => view.available_on(harness),
+            Some(reason) => view.without_conductor(reason),
+        }
     }
 }
 

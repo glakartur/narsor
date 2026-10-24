@@ -408,7 +408,7 @@ fn a_step_reply_in_the_display_title_is_rejected() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::InvalidDisplay { field, reason }
-                if field == "display.title" && reason.contains("step replies")
+                if field == "display.title" && reason.contains("step values")
         )),
         "got: {}",
         describe(&errors)
@@ -422,7 +422,7 @@ fn a_step_reply_in_the_workspace_is_rejected() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::InvalidDisplay { field, reason }
-                if field == "globals.workspace.path" && reason.contains("step replies")
+                if field == "globals.workspace.path" && reason.contains("step values")
         )),
         "got: {}",
         describe(&errors)

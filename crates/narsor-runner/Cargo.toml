@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 narsor-engine = { path = "../narsor-engine", features = ["engine"] }
 narsor-protocol = { path = "../narsor-protocol" }
+bytes = "1"
 clap = { version = "4.6.7", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"

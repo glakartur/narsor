@@ -36,6 +36,8 @@ pub struct BaseImageContract {
     pub ca_bundles: Vec<PathBuf>,
     /// Whether the runner must not run as root.
     pub require_non_root: bool,
+    /// The `PATH` the tools are looked for on; `None` is this process's.
+    pub path: Option<std::ffi::OsString>,
 }
 
 impl Default for BaseImageContract {
@@ -58,6 +60,7 @@ impl Default for BaseImageContract {
             .map(PathBuf::from)
             .collect(),
             require_non_root: true,
+            path: None,
         }
     }
 }
@@ -111,7 +114,11 @@ impl BaseImageContract {
             );
         }
 
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = self
+            .path
+            .clone()
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_default();
         let missing: Vec<&str> = self
             .tools
             .iter()

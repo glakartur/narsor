@@ -67,7 +67,7 @@ Logging in is part of the machine a task runs on, not part of the task. With `ho
 ## Prevention
 - When a process boundary changes `HOME`, `XDG_*` or `*_CONFIG_DIR`, list which tools keep credentials there before changing it. Harness CLIs do, and so do `gh`, `glab` and `git`'s credential helpers.
 - Any change that routes local work through a different launcher (here `b9ef026`) needs an end-to-end smoke run of a real harness on a subscription login. Unit tests with fake harnesses cannot catch a missing login.
-- Keep the tests that pin this down: `a_host_home_leaves_home_alone` in `src/runner/secrets.rs`, the `HarnessHome::runner_args` tests in `src/runner/home.rs`, and the HOME cases in `tests/runner.rs` and `tests/config_resolve.rs`.
+- Keep the tests that pin this down: `a_host_home_leaves_home_alone` in `src/runner/secrets.rs`, the `HarnessHome::runner_args` tests in `src/runner/home.rs`, the HOME cases in `crates/narsor-runner/src/runner/mod.rs` and `runner/cli.rs` (unit tests), and `tests/config_resolve.rs`.
 - Never pass API-key variables through from the parent environment. A key in the daemon's shell must not decide how a task is billed.
 
 ## Related Issues

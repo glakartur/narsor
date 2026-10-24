@@ -4,19 +4,18 @@
 //! on a loopback port it bound itself, serving the owner routes behind the
 //! trusted token and the runner routes behind runner credentials. The
 //! controller side (enrollment, lease, reports, runner credentials) is
-//! driven in-process. End-to-end scenarios run the real `narsor-runner`
-//! binary on a task storage whose workspace is cloned from a local bare
-//! repository, so "no product-repository commit" is checked on a real Git
-//! clone, and "no live host mount" on a real copy.
+//! driven in-process. A material's way through the control plane is also
+//! driven in-process, with the runner's side played by its credential
+//! (`a_materials_way_through_the_control_plane_carries_no_content`); what the
+//! runner does with a material on its task storage is tested in the
+//! `narsor-runner` crate (`runner::materials`).
 
-#[path = "engine_support/mod.rs"]
-mod engine_support;
 mod environment_support;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +24,8 @@ use chrono::Utc;
 use narsor_api_client::api::{ApiClient, ClientError};
 use narsor_engine::controller_protocol::{
     AcquireLeaseRequest, ControllerIdentity, CreateEnrollmentRequest, OwnerCommandRequest,
-    ProtocolService, ReportRequest, RunnerClient, RunnerCredentialRequest, LOCAL_OWNER,
+    ProtocolError, ProtocolService, ReportRequest, RunnerClient, RunnerCredentialRequest,
+    RunnerPollQuery, LOCAL_OWNER,
 };
 use narsor_engine::domain::{
     BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
@@ -33,8 +33,8 @@ use narsor_engine::domain::{
 };
 use narsor_engine::engine::Engine;
 use narsor_engine::materials::{
-    sha256_hex, snapshot_paths, write_files, Bundle, MaterialFile, MaterialLimits, MaterialOrigin,
-    UploadManifest, WriteMode,
+    sha256_hex, snapshot_paths, write_files, Bundle, MaterialAckRequest, MaterialFile,
+    MaterialLimits, MaterialOrigin, UploadManifest, WriteMode,
 };
 use narsor_engine::orchestration::{
     ControlPlane, MaterialChange, NewTask, Observation, ObservedSummary, OwnerCommand, OwnerRef,
@@ -99,14 +99,37 @@ struct Fixture {
     root: TempRoot,
     state: PathBuf,
     service: Arc<ProtocolService>,
-    handle: ApiHandle,
+    /// The daemon API serving the service; `None` for a fixture whose
+    /// scenario calls the service in-process only.
+    handle: Option<ApiHandle>,
     controller: ControllerIdentity,
     epoch: u64,
-    runners: Vec<Child>,
 }
 
 impl Fixture {
+    /// A fixture served by the daemon API on a loopback port.
     async fn new() -> Self {
+        let mut fixture = Self::in_process();
+        // The server binds 127.0.0.1:0 itself and keeps the listener.
+        let handle = api::start_with_services(
+            Arc::new(Engine::new(ExecutionStore::new(
+                fixture.root.dir("local-engine"),
+            ))),
+            fixture.state.clone(),
+            fixture.state.clone(),
+            ApiServices {
+                control: Some(Arc::clone(&fixture.service)),
+                ..ApiServices::default()
+            },
+        )
+        .await
+        .expect("the API starts");
+        fixture.handle = Some(handle);
+        fixture
+    }
+
+    /// A fixture whose service is called in-process only.
+    fn in_process() -> Self {
         let root = TempRoot::new();
         let state = root.dir("control");
         let control = ControlPlane::new(StatePaths::new(&state));
@@ -136,35 +159,26 @@ impl Fixture {
             )
             .expect("lease")
             .epoch;
-        // The server binds 127.0.0.1:0 itself and keeps the listener.
-        let handle = api::start_with_services(
-            Arc::new(Engine::new(ExecutionStore::new(root.dir("local-engine")))),
-            state.clone(),
-            state.clone(),
-            ApiServices {
-                control: Some(Arc::clone(&service)),
-                ..ApiServices::default()
-            },
-        )
-        .await
-        .expect("the API starts");
         Self {
             root,
             state,
             service,
-            handle,
+            handle: None,
             controller,
             epoch,
-            runners: Vec::new(),
         }
     }
 
+    fn handle(&self) -> &ApiHandle {
+        self.handle.as_ref().expect("a fixture served by the API")
+    }
+
     fn client(&self) -> ApiClient {
-        self.handle.client()
+        self.handle().client()
     }
 
     fn url(&self) -> String {
-        format!("http://{}", self.handle.addr())
+        format!("http://{}", self.handle().addr())
     }
 
     fn owner(&self) -> OwnerRef {
@@ -265,105 +279,6 @@ impl Fixture {
             .events(&self.owner(), task, 0)
             .expect("task events")
     }
-
-    /// Starts `narsor-runner` for `task` on `storage`.
-    fn spawn(&mut self, launch: &Launch, incarnation: &str) -> usize {
-        use std::os::unix::process::CommandExt;
-        let credential = self
-            .root
-            .dir("credentials")
-            .join(format!("{}-{incarnation}", launch.task));
-        fs::write(&credential, self.credential(&launch.task, incarnation)).unwrap();
-        let mut command = Command::new(engine_support::workspace_binary("narsor-runner"));
-        command
-            .args(["--task-id", &launch.task])
-            .arg("--task-storage")
-            .arg(&launch.storage)
-            .arg("--launch-spec")
-            .arg(&launch.spec_file)
-            .args(["--control-plane", &self.url()])
-            .arg("--credential-file")
-            .arg(&credential)
-            .args(["--incarnation", incarnation])
-            .args(["--poll-wait-secs", "2"])
-            .args(["--retry-min-ms", "50", "--retry-max-ms", "300"])
-            .args(["--report-interval-ms", "50", "--problem-report-secs", "10"])
-            .env("RUST_LOG", "narsor=info")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .process_group(0);
-        self.runners
-            .push(command.spawn().expect("start the runner process"));
-        self.runners.len() - 1
-    }
-
-    fn wait_exit(&mut self, index: usize, within: Duration) {
-        let deadline = Instant::now() + within;
-        loop {
-            if self.runners[index].try_wait().expect("poll").is_some() {
-                return;
-            }
-            assert!(Instant::now() < deadline, "the runner did not exit in time");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        for child in &mut self.runners {
-            // SAFETY: signalling a process group we created.
-            unsafe {
-                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-            }
-            let _ = child.wait();
-        }
-    }
-}
-
-/// One task's launch: its spec on disk and its storage.
-struct Launch {
-    task: String,
-    spec_file: PathBuf,
-    storage: PathBuf,
-}
-
-impl Launch {
-    fn new(fixture: &Fixture, task: &str, spec: &TaskLaunchSpec) -> Self {
-        let spec_file = fixture.root.dir("specs").join(format!("{task}.json"));
-        fs::write(&spec_file, serde_json::to_string(spec).unwrap()).unwrap();
-        Self {
-            task: task.to_string(),
-            spec_file,
-            storage: fixture.root.dir(&format!("storage-{task}")),
-        }
-    }
-
-    fn workspace(&self) -> PathBuf {
-        self.storage.join("workspace")
-    }
-
-    fn materials(&self) -> PathBuf {
-        self.storage.join("materials")
-    }
-}
-
-fn running_as_root() -> bool {
-    // SAFETY: `geteuid` has no preconditions.
-    let root = unsafe { libc::geteuid() } == 0;
-    if root {
-        eprintln!("skipped: the runner refuses to run as root");
-    }
-    root
-}
-
-async fn wait_until(within: Duration, what: &str, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + within;
-    while !check() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 fn files_below(dir: &Path) -> Vec<PathBuf> {
@@ -382,17 +297,6 @@ fn files_below(dir: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
-}
-
-/// Relative path → content of every file below `dir`.
-fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
-    files_below(dir)
-        .into_iter()
-        .map(|path| {
-            let relative = path.strip_prefix(dir).unwrap().display().to_string();
-            (relative, fs::read(&path).unwrap())
-        })
-        .collect()
 }
 
 /// Whether any file below `dir` contains `needle`.
@@ -443,8 +347,7 @@ fn origin(root: &TempRoot) -> (PathBuf, String) {
     (bare, git(&work, &["rev-parse", "HEAD"]))
 }
 
-/// Writes a document into the outbox, then waits at a human gate, so the
-/// runner stays alive and idle.
+/// The workflow of the tasks here; no runner runs it.
 const OUTBOX_WORKFLOW: &str = r#"
 name: materials-task
 version: 1
@@ -560,32 +463,19 @@ fn in_process(body: Bytes) -> futures::stream::Iter<std::vec::IntoIter<Result<By
 }
 
 // ---------------------------------------------------------------------------
-// End to end: upload, delivery, publication, download, archive (AE7)
+// Upload, delivery, publication, archive (AE7), in-process
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materials_reach_the_runner_and_documents_come_back_without_a_commit() {
-    if running_as_root() {
-        return;
-    }
-    let mut fixture = Fixture::new().await;
-    let (spec, pinned) = git_spec(&fixture.root);
-    fixture.create_started("task-1", spec.clone());
-    let launch = Launch::new(&fixture, "task-1", &spec);
-    let runner = fixture.spawn(&launch, "pod-1");
-
-    // The runner runs the outbox step and stops at the gate.
-    wait_until(Duration::from_secs(30), "the gate", || {
-        fixture
-            .service
-            .control_plane()
-            .task(&TaskId::parse("task-1").unwrap())
-            .unwrap()
-            .pending_input_id()
-            .is_some()
-    })
-    .await;
-    let log_before = git(&launch.workspace(), &["log", "--all", "--format=%H"]);
+/// A material's way through the control plane, with the runner's side
+/// played by its credential: the owner's snapshot of a local folder is
+/// announced to the task's runner and fetched as it was uploaded, a
+/// document the runner publishes comes back to the owner, the events carry
+/// ids and counts only, and an archive drops it all.
+#[tokio::test]
+async fn a_materials_way_through_the_control_plane_carries_no_content() {
+    let fixture = Fixture::in_process();
+    let owner = fixture.owner();
+    fixture.create_started("task-1", spec(TaskWorkspace::None));
 
     // The owner snapshots a local folder: two files, a link that must not
     // be followed and a nested `.git` that must not travel.
@@ -598,8 +488,8 @@ async fn materials_reach_the_runner_and_documents_come_back_without_a_commit() {
     let outside = fixture.root.dir("outside");
     fs::write(outside.join("private.key"), "do not send").unwrap();
     std::os::unix::fs::symlink(outside.join("private.key"), source.join("key-link")).unwrap();
-    let limits = MaterialLimits::default();
-    let snapshot = snapshot_paths(std::slice::from_ref(&source), &limits).expect("snapshot");
+    let snapshot = snapshot_paths(std::slice::from_ref(&source), &MaterialLimits::default())
+        .expect("snapshot");
     let skipped: BTreeSet<String> = snapshot
         .skipped
         .iter()
@@ -619,26 +509,49 @@ async fn materials_reach_the_runner_and_documents_come_back_without_a_commit() {
     );
     let mut upload = snapshot.bundle;
     upload.manifest.material_id = Some("brief-1".to_string());
-    let response = fixture
-        .client()
-        .upload_material("task-1", upload.encode().unwrap().into())
+    let uploaded = fixture
+        .service
+        .upload_material(
+            &owner,
+            "task-1",
+            in_process(upload.encode().unwrap().into()),
+        )
         .await
         .expect("upload");
-    assert!(!response.replayed);
-    assert_eq!(response.material.file_count, 2);
+    assert!(!uploaded.replayed);
+    assert_eq!(uploaded.material.file_count, 2);
 
-    // The runner receives exactly the validated manifest.
-    wait_until(Duration::from_secs(20), "the delivery", || {
-        fixture
+    // The runner is told of it and fetches exactly the validated manifest.
+    let credential = fixture.credential("task-1", "pod-1");
+    let runner = fixture
+        .service
+        .authenticate_runner(&credential)
+        .expect("the runner's identity");
+    let poll = fixture
+        .service
+        .runner_poll(
+            &runner,
+            RunnerPollQuery {
+                wait_secs: Some(0),
+                ..RunnerPollQuery::default()
+            },
+        )
+        .await
+        .expect("poll");
+    assert_eq!(poll.materials.len(), 1);
+    assert_eq!(poll.materials[0].material_id, "brief-1");
+    let view = fixture
+        .service
+        .runner_material(&runner, "brief-1")
+        .expect("the manifest");
+    let mut fetched = BTreeMap::new();
+    for file in &view.files {
+        let blob = fixture
             .service
-            .list_materials(&fixture.owner(), "task-1")
-            .unwrap()
-            .materials
-            .iter()
-            .any(|material| material.material_id == "brief-1" && material.delivered_at.is_some())
-    })
-    .await;
-    let delivered = tree(&launch.materials().join("brief-1"));
+            .runner_material_blob(&runner, "brief-1", &file.sha256)
+            .expect("a blob");
+        fetched.insert(file.path.clone(), fs::read(blob).unwrap());
+    }
     let expected: BTreeMap<String, Vec<u8>> = [
         (
             format!("brief/docs/{SECRET_NAME}"),
@@ -648,56 +561,35 @@ async fn materials_reach_the_runner_and_documents_come_back_without_a_commit() {
     ]
     .into_iter()
     .collect();
-    assert_eq!(delivered, expected, "exactly the manifest, nothing more");
+    assert_eq!(fetched, expected, "exactly the manifest, nothing more");
 
-    // A copy, not a mount: changing the source changes nothing remote.
-    fs::write(source.join("plan.txt"), "edited locally\n").unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        fs::read(launch.materials().join("brief-1/brief/plan.txt")).unwrap(),
-        b"step one\n"
-    );
-
-    // The document the task left in its outbox comes back as a material.
-    let published = {
-        let mut found = None;
-        wait_until(Duration::from_secs(20), "the published document", || {
-            found = fixture
-                .service
-                .list_materials(&fixture.owner(), "task-1")
-                .unwrap()
-                .materials
-                .into_iter()
-                .find(|material| material.origin == MaterialOrigin::Runner);
-            found.is_some()
-        })
-        .await;
-        found.unwrap()
+    // Acknowledged twice (a lost answer): delivered once.
+    let ack = || MaterialAckRequest {
+        manifest_digest: poll.materials[0].manifest_digest.clone(),
     };
-    assert_eq!(published.label.as_deref(), Some("report"));
-    assert!(
-        !launch.storage.join("outbox/report").exists(),
-        "a published outbox folder is cleared"
-    );
-    let (view, blobs) = fixture
-        .client()
-        .fetch_material("task-1", &published.material_id)
-        .await
-        .expect("download");
-    let dest = fixture.root.dir("downloads");
-    write_files(&dest, &view.files, &blobs, WriteMode::Refuse).expect("write");
-    assert_eq!(
-        fs::read_to_string(dest.join("notes.md")).unwrap(),
-        "temporary documentation"
-    );
+    let first = fixture
+        .service
+        .runner_ack_material(&runner, "brief-1", ack())
+        .expect("ack");
+    let second = fixture
+        .service
+        .runner_ack_material(&runner, "brief-1", ack())
+        .expect("ack again");
+    assert_eq!(first.delivered_at, second.delivered_at);
 
-    // AE7: no commit, not even a dirty file, in the product repository.
-    assert_eq!(
-        git(&launch.workspace(), &["log", "--all", "--format=%H"]),
-        log_before
+    // The document the runner publishes from the task's outbox comes back.
+    let mut document = bundle(
+        Some("out-report"),
+        &[("notes.md", b"temporary documentation")],
     );
-    assert_eq!(git(&launch.workspace(), &["rev-parse", "HEAD"]), pinned);
-    assert_eq!(git(&launch.workspace(), &["status", "--porcelain"]), "");
+    document.manifest.label = Some("report".to_string());
+    let published = fixture
+        .service
+        .runner_publish_material(&runner, in_process(document.encode().unwrap().into()))
+        .await
+        .expect("publish");
+    assert_eq!(published.material.origin, MaterialOrigin::Runner);
+    assert_eq!(published.material.label.as_deref(), Some("report"));
 
     // Events carry ids and counts only.
     let changes: Vec<MaterialChange> = fixture
@@ -715,27 +607,28 @@ async fn materials_reach_the_runner_and_documents_come_back_without_a_commit() {
     ] {
         assert!(changes.contains(&change), "{change:?} in {changes:?}");
     }
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|change| **change == MaterialChange::Delivered)
+            .count(),
+        1
+    );
     let events = serde_json::to_string(&fixture.events("task-1")).unwrap();
-    let summary =
-        serde_json::to_string(&fixture.service.task(&fixture.owner(), "task-1").unwrap()).unwrap();
+    let summary = serde_json::to_string(&fixture.service.task(&owner, "task-1").unwrap()).unwrap();
     for text in [&events, &summary] {
         assert!(!text.contains(SECRET_CONTENT));
         assert!(!text.contains(SECRET_NAME));
     }
-    // Nothing of the content anywhere but the material store: not in task
-    // records, event logs, the runner's Engine state or its conversations.
     assert!(contains_anywhere(&fixture.state.join("orchestration"), SECRET_CONTENT).is_empty());
     assert!(contains_anywhere(&fixture.state.join("orchestration"), SECRET_NAME).is_empty());
-    assert!(contains_anywhere(&launch.storage.join("state"), SECRET_CONTENT).is_empty());
-    assert!(contains_anywhere(&launch.workspace(), SECRET_CONTENT).is_empty());
 
-    // Archive: the runner stops, the task's materials are gone, and a late
-    // submission for the stale task is refused without leaving anything.
+    // Archive: the task's materials are gone, and a late submission for the
+    // stale task is refused without leaving anything.
     fixture.command("task-1", OwnerCommand::Archive);
-    fixture.wait_exit(runner, Duration::from_secs(20));
     assert!(fixture
         .service
-        .list_materials(&fixture.owner(), "task-1")
+        .list_materials(&owner, "task-1")
         .unwrap()
         .materials
         .is_empty());
@@ -745,112 +638,29 @@ async fn materials_reach_the_runner_and_documents_come_back_without_a_commit() {
         fixture.stored_files()
     );
     let late = fixture
-        .client()
+        .service
         .upload_material(
+            &owner,
             "task-1",
-            bundle(None, &[("late.txt", b"late")])
-                .encode()
-                .unwrap()
-                .into(),
+            in_process(
+                bundle(None, &[("late.txt", b"late")])
+                    .encode()
+                    .unwrap()
+                    .into(),
+            ),
         )
         .await;
-    assert_eq!(refused_code(late), "task_archived");
+    assert!(
+        matches!(
+            late,
+            Err(ProtocolError::Conflict {
+                code: "task_archived",
+                ..
+            })
+        ),
+        "{late:?}"
+    );
     assert!(fixture.stored_files().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_redelivered_material_is_acknowledged_without_rewriting_and_a_tampered_one_is_refused() {
-    if running_as_root() {
-        return;
-    }
-    let mut fixture = Fixture::new().await;
-    let (spec, _) = git_spec(&fixture.root);
-    fixture.create_started("task-1", spec.clone());
-    let launch = Launch::new(&fixture, "task-1", &spec);
-    let client = fixture.client();
-
-    // Uploaded while no runner exists yet: they wait.
-    client
-        .upload_material(
-            "task-1",
-            bundle(Some("kept"), &[("a.txt", b"alpha")])
-                .encode()
-                .unwrap()
-                .into(),
-        )
-        .await
-        .expect("upload");
-    client
-        .upload_material(
-            "task-1",
-            bundle(Some("tampered"), &[("b.txt", b"bravo")])
-                .encode()
-                .unwrap()
-                .into(),
-        )
-        .await
-        .expect("upload");
-
-    // An earlier incarnation wrote `kept` but its acknowledgement was lost:
-    // the complete copy is on storage already.
-    let earlier = launch.materials().join("kept");
-    fs::create_dir_all(&earlier).unwrap();
-    fs::write(earlier.join("a.txt"), "alpha").unwrap();
-    fs::write(earlier.join("written-by-the-earlier-incarnation"), "").unwrap();
-    // The control plane's blob of `tampered` no longer matches its manifest.
-    let blob = files_below(&fixture.state.join("materials/task-1/tampered/blobs"))
-        .pop()
-        .expect("a blob");
-    fs::write(&blob, "BRAVO").unwrap();
-
-    fixture.spawn(&launch, "pod-1");
-    wait_until(Duration::from_secs(30), "the acknowledgement", || {
-        fixture
-            .service
-            .material(&fixture.owner(), "task-1", "kept")
-            .unwrap()
-            .summary
-            .delivered_at
-            .is_some()
-    })
-    .await;
-    assert!(
-        earlier.join("written-by-the-earlier-incarnation").exists(),
-        "the copy on storage is acknowledged, not rewritten"
-    );
-    let delivered = fixture
-        .events("task-1")
-        .into_iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                TaskEventKind::MaterialChanged {
-                    change: MaterialChange::Delivered,
-                    ..
-                }
-            )
-        })
-        .count();
-    assert_eq!(delivered, 1);
-
-    // The runner keeps refusing the tampered material: never written, never
-    // acknowledged.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(!launch.materials().join("tampered").exists());
-    assert!(fixture
-        .service
-        .material(&fixture.owner(), "task-1", "tampered")
-        .unwrap()
-        .summary
-        .delivered_at
-        .is_none());
-    assert!(
-        !launch
-            .storage
-            .join("narsor/materials.partial/tampered")
-            .exists(),
-        "content is verified before anything is written"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,7 +893,7 @@ async fn invalid_submissions_are_refused_without_leaving_blobs_or_manifests() {
             "{}/control/v1/tasks/task-1/materials",
             fixture.url()
         ))
-        .bearer_auth(fixture.handle.token())
+        .bearer_auth(fixture.handle().token())
         .header("content-type", "application/json")
         .body("{}")
         .send()
@@ -1256,7 +1066,7 @@ async fn materials_expire_and_the_stream_carries_counts_only() {
             "{}/control/v1/events/stream?task_id=task-1",
             fixture.url()
         ))
-        .bearer_auth(fixture.handle.token())
+        .bearer_auth(fixture.handle().token())
         .send()
         .await
         .expect("open the stream");

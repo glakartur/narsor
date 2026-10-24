@@ -1,7 +1,7 @@
 //! The Kubernetes adapter (U5) without a live cluster.
 //!
 //! * The backend contract suite of U4, **unchanged**, against an in-process
-//!   mock of the Kubernetes API whose kubelet runs the real `narsor-runner`
+//!   mock of the Kubernetes API whose kubelet runs the suite's stub runner
 //!   from each generated Pod spec (AE2).
 //! * Manifest-shape tests: what the generated Pod, PVC and Secret look like
 //!   and what is refused before any API call.
@@ -14,8 +14,6 @@
 //! An optional smoke test against a real cluster is `#[ignore]`d and
 //! gated by environment variables.
 
-#[path = "engine_support/mod.rs"]
-mod engine_support;
 mod environment_support;
 #[macro_use]
 mod backend_contract_support;
@@ -26,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use backend_contract_support::{ContractTarget, Harness};
+use backend_contract_support::{stub_runner, ContractTarget, Harness};
 use kubernetes_support::{MockCluster, DELETE_CLASS, NAMESPACE, PROFILE_SECRET, RETAIN_CLASS};
 use narsor_controller::controller::{edit_profile, ClusterArgs, EditProfileArgs};
 use narsor_controller::kubernetes::manifest::{self, check_pod_shape, KubernetesBackendConfig};
@@ -45,25 +43,6 @@ use serde_json::Value;
 
 /// Registry prefix every test image comes from.
 const REGISTRY: &str = "registry.test/";
-
-/// A workflow of one script step that finishes at once; the runner then
-/// idles until the control plane tells it otherwise.
-const WORKFLOW: &str = r#"
-name: contract-task
-version: 1
-states:
-  work:
-    action:
-      type: script
-      command: sh
-      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"choice\": \"done\"}'"]
-    choices: [done]
-    transitions:
-      done: completed
-  completed:
-    description: Done.
-terminal_states: [completed]
-"#;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -100,7 +79,7 @@ fn environment() -> ResolvedEnvironment {
 }
 
 fn spec_with(environment: ResolvedEnvironment, resources: ResourceProfile) -> TaskLaunchSpec {
-    let definition = narsor_engine::workflow::load_from_str(WORKFLOW).expect("a valid workflow");
+    let definition = backend_contract_support::workflow();
     TaskLaunchSpec::new(
         definition.id.clone(),
         definition.version,
@@ -159,7 +138,8 @@ fn scratch() -> PathBuf {
     std::env::temp_dir().join(format!("narsor-k8s-{}", uuid::Uuid::new_v4()))
 }
 
-/// A mock cluster whose Pods stay Pending, and an adapter on it.
+/// A mock cluster whose Pods stay Pending, and an adapter on it. Its
+/// kubelet is off, so the program it is given never runs.
 struct Quiet {
     cluster: Arc<MockCluster>,
     backend: KubernetesBackend,
@@ -173,11 +153,7 @@ impl Quiet {
 
     fn with(config: KubernetesBackendConfig) -> Self {
         let dir = scratch();
-        let cluster = MockCluster::start(
-            &dir,
-            engine_support::workspace_binary("narsor-runner"),
-            false,
-        );
+        let cluster = MockCluster::start(&dir, dir.join("never-run"), false);
         let backend = KubernetesBackend::new(&cluster.access(), config).expect("adapter");
         Self {
             cluster,
@@ -209,7 +185,7 @@ async fn wait_until(what: &str, mut check: impl AsyncFnMut() -> bool) {
 // The contract suite (AE2)
 // ---------------------------------------------------------------------------
 
-/// The mock cluster with a kubelet running real runners.
+/// The mock cluster with a kubelet running stub runners.
 struct KubernetesTarget {
     cluster: Arc<MockCluster>,
 }
@@ -218,17 +194,9 @@ impl ContractTarget for KubernetesTarget {
     type Backend = KubernetesBackend;
 
     fn setup(scratch: &Path) -> Option<Self> {
-        // SAFETY: `geteuid` has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipped: the runner refuses to run as root");
-            return None;
-        }
+        let program = stub_runner::install(&scratch.join("bin"));
         Some(Self {
-            cluster: MockCluster::start(
-                scratch,
-                engine_support::workspace_binary("narsor-runner"),
-                true,
-            ),
+            cluster: MockCluster::start(scratch, program, true),
         })
     }
 
@@ -320,6 +288,55 @@ fn the_runner_is_told_the_backends_home_mode() {
     let args = runner_args(&generated_pod_with(&config, spec()).0);
     let tail: Vec<&str> = args[args.len() - 4..].iter().map(String::as_str).collect();
     assert_eq!(tail, ["--home", "host", "--codex-home", "/mnt/codex"]);
+}
+
+/// R17: a Pod's runner keeps its private HOME on the task's claim. The
+/// arguments the Pod passes, read by the runner itself, put HOME below the
+/// mount of the task's PersistentVolumeClaim, and the Pod sets no HOME.
+#[test]
+fn the_private_home_of_a_pod_is_on_the_tasks_claim() {
+    use clap::Parser;
+    use narsor_runner::runner::cli::{runner_config, RunnerArgs};
+
+    #[derive(Parser)]
+    struct Runner {
+        #[command(flatten)]
+        args: RunnerArgs,
+    }
+
+    let (pod, task, _) = generated_pod(spec());
+    let argv = std::iter::once("narsor-runner".to_string()).chain(runner_args(&pod));
+    let parsed = Runner::try_parse_from(argv).expect("the runner reads the Pod's arguments");
+    let config = runner_config(parsed.args).expect("a configuration");
+    assert_eq!(config.harness_home.mode, HomeMode::Private);
+    let home = narsor_runner::runner::TaskStorage::new(&config.storage).home_dir();
+
+    let container = &pod["spec"]["containers"][0];
+    let named = |list: &Value, name: &str| -> Value {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let mount = named(&container["volumeMounts"], "task-storage");
+    assert!(
+        home.starts_with(mount["mountPath"].as_str().unwrap()),
+        "{} is not on {mount}",
+        home.display()
+    );
+    assert_ne!(mount["readOnly"], Value::Bool(true));
+    let volume = named(&pod["spec"]["volumes"], "task-storage");
+    assert_eq!(
+        volume["persistentVolumeClaim"]["claimName"].as_str(),
+        Some(task.storage.as_str())
+    );
+    assert!(container["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|variable| variable["name"] != "HOME"));
 }
 
 /// One main runner container, one init container, separate task and PATH
@@ -1616,7 +1633,7 @@ async fn observation_is_normalized_and_foreign_objects_are_refused() {
 
 /// AE1 + AE5: two tasks of one repository run side by side on the same
 /// pinned base image and runtime bundle, without building any image, each
-/// with its own PVC, limits and private HOME; pausing one leaves the other.
+/// with its own PVC and limits; pausing one leaves the other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_tasks_share_pinned_images_but_nothing_writable() {
     let Some(mut h) = Harness::<KubernetesTarget>::new().await else {
@@ -1677,12 +1694,12 @@ async fn two_tasks_share_pinned_images_but_nothing_writable() {
         BTreeSet::from([a.storage.as_str(), b.storage.as_str()])
     );
 
-    // Each runner made its private HOME on its own storage (R17).
-    h.wait_for("both HOMEs", |_| {
+    // Each runner works on its own claim, as the Pod mounts it.
+    h.wait_for("work on both claims", |_| {
         [&a, &b].iter().all(|task| {
             cluster
                 .volume_dir(&task.storage)
-                .is_some_and(|dir| dir.join("home").is_dir())
+                .is_some_and(|dir| dir.join("stub-runner").is_dir())
         })
     })
     .await;
@@ -1701,11 +1718,11 @@ async fn two_tasks_share_pinned_images_but_nothing_writable() {
     assert!(cluster.pod(&b.workload).is_some());
     assert_eq!(h.runner_state("task-b"), RunnerState::Running);
 
-    // Resume: one new Pod on the same claim, the same HOME.
-    let home = cluster.volume_dir(&a.storage).unwrap().join("home");
+    // Resume: one new Pod on the same claim.
+    let work = cluster.volume_dir(&a.storage).unwrap();
     h.must("task-a", OwnerCommand::Resume, "resume-a");
     h.wait_runner_state("task-a", RunnerState::Running).await;
-    assert_eq!(cluster.volume_dir(&a.storage).unwrap().join("home"), home);
+    assert_eq!(cluster.volume_dir(&a.storage).unwrap(), work);
     assert_eq!(cluster.created_of("PersistentVolumeClaim").len(), 2);
     assert_eq!(cluster.created_of("Pod").len(), 3);
 }
@@ -1764,74 +1781,17 @@ async fn an_evicted_pod_waits_for_the_owner_without_the_policy() {
     assert_eq!(cluster.created_of("PersistentVolumeClaim").len(), 1);
 }
 
-/// A workflow whose one step waits for the owner's approval of its output:
-/// a runner of it stands at that waiting point until answered.
-const GATED_WORKFLOW: &str = r#"
-name: gated-task
-version: 1
-states:
-  work:
-    action:
-      type: script
-      command: sh
-      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"choice\": \"ok\"}'"]
-    choices: [ok, rejected]
-    transitions:
-      ok: completed
-      rejected: failed
-    decision:
-      type: human
-      message: Ship it?
-  completed:
-    description: Done.
-  failed:
-    description: Rejected.
-terminal_states:
-  completed: completed
-  failed: failed
-"#;
-
-fn gated_spec() -> TaskLaunchSpec {
-    let definition =
-        narsor_engine::workflow::load_from_str(GATED_WORKFLOW).expect("a valid workflow");
-    TaskLaunchSpec::new(
-        definition.id.clone(),
-        definition.version,
-        serde_json::json!({}),
-        TaskWorkspace::None,
-        environment(),
-        ResourceProfile::new(1500, 3072),
-    )
-    .with_definition(&definition)
-    .expect("snapshot the definition")
-}
-
-/// The id of the input request the task's runner waits on, if it waits.
-fn waiting_on(h: &Harness<KubernetesTarget>, task: &str) -> Option<String> {
-    h.record(task)
-        .runner
-        .and_then(|runner| runner.snapshot.pending_input)
-        .map(|input| input.id)
-}
-
 /// A Pod whose node stops reporting (phase `Unknown`) makes the task
 /// Unknown and keeps it there — it may still run behind the partition.
-/// Once the node reports the runner failed, the loss is confirmed, the
-/// resume policy starts one new Pod on the same claim, and its runner
-/// returns to the very waiting point the lost one stood at without running
-/// the finished step again (R1, R3).
+/// Once the node reports the runner failed, the loss is confirmed and the
+/// resume policy starts one new Pod on the same claim (R1, R3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_partitioned_pod_waits_until_its_failure_is_reported() {
     let Some(mut h) = Harness::<KubernetesTarget>::new().await else {
         return;
     };
     h.start_controller();
-    h.create_with("task-1", gated_spec());
-    h.wait_for("the runner at its approval", |h| {
-        h.runner_state("task-1") == RunnerState::Running && waiting_on(h, "task-1").is_some()
-    })
-    .await;
-    let waiting = waiting_on(&h, "task-1").unwrap();
+    h.running("task-1").await;
     let first = h.record("task-1").runner.unwrap().incarnation;
     let cluster = Arc::clone(&h.target.cluster);
     let task = h.resources("task-1");
@@ -1848,21 +1808,15 @@ async fn a_partitioned_pod_waits_until_its_failure_is_reported() {
     assert!(!h.reported("task-1").contains(&Observation::LossConfirmed));
 
     assert!(cluster.kill_runner(&task.workload));
-    h.wait_for("the resumed runner at the same approval", |h| {
+    h.wait_for("the resumed runner", |h| {
         let record = h.record("task-1");
         record.runner_state == RunnerState::Running
             && record
                 .runner
                 .as_ref()
                 .is_some_and(|runner| runner.incarnation != first)
-            && waiting_on(h, "task-1").is_some()
     })
     .await;
-    assert_eq!(
-        waiting_on(&h, "task-1"),
-        Some(waiting),
-        "the same waiting point"
-    );
     assert!(h.reported("task-1").contains(&Observation::LossConfirmed));
     assert_eq!(
         backend_contract_support::auto_resumes(&h.events("task-1")),
@@ -1870,15 +1824,6 @@ async fn a_partitioned_pod_waits_until_its_failure_is_reported() {
     );
     assert_eq!(cluster.created_of("Pod").len(), 2);
     assert_eq!(cluster.created_of("PersistentVolumeClaim").len(), 1);
-    let steps = cluster
-        .volume_dir(&task.storage)
-        .unwrap()
-        .join("home/steps");
-    assert_eq!(
-        std::fs::read_to_string(steps).unwrap(),
-        "worked\n",
-        "the finished step ran once"
-    );
 }
 
 /// An Unknown task whose Pod is then deleted is a confirmed loss: without
@@ -1924,12 +1869,7 @@ async fn archive_leaves_nothing_of_the_task_behind() {
         "the Pod runs on (AE8)"
     );
     h.restore(index);
-    h.wait_for("the workflow to finish", |h| {
-        h.record("task-1").runner.is_some_and(|runner| {
-            runner.snapshot.execution_status == narsor_engine::domain::ExecutionStatus::Completed
-        })
-    })
-    .await;
+    h.finish("task-1").await;
     h.settle().await;
     assert!(
         cluster.pvc(&task.storage).is_some(),
