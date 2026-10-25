@@ -572,6 +572,15 @@ their fields, `Enter` sends, `Esc` folds the panel and keeps what was typed.
 Action 0, `Napisz do agenta`, is the first choice of every panel: type a
 message and send it. The panel keeps the text when the send fails and empties
 the field when it succeeds.
+
+When the server offers forms for the task (`TaskSummary.panel`), the panel
+shows one form at a time — an answer, the free conversation with the agent, an
+action of the workflow, a permission, the entry limit — and `Esc` steps through
+them, also from a field; the first line says which one (`1/2 · Esc przełącza`).
+The server says which form opens first and when there is none (the agent is at
+work). Each form keeps its own draft. The conversation is a text box that grows
+to half the height of the details; `Ctrl+J` makes a new line, `Enter` asks
+before it sends. Such a panel is not folded by `Esc`; `Tab` leaves it.
 `Space` on the list jumps to the next task that waits, `[` / `]` move between
 several waitings of one task. The header counts them (`? 1 · ! 1`).
 
@@ -645,7 +654,7 @@ the current step or a draft.
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
 | — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all |
 | — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |
-| Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold, `1`–`9` choose, `[` / `]` previous / next waiting |
+| Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold (with the server's forms: next form), `1`–`9` choose, `[` / `]` previous / next waiting (not with the server's forms) |
 | Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |
 | Confirmation | `y` confirm, `n` / `Esc` take it back |
 | Forms | `Tab` / `Shift+Tab`, `←` / `→`, `Enter` send, `Ctrl+J` new line, `Esc` back (from a new-task field to the list, then close; what was typed stays) |
