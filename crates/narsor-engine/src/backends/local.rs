@@ -113,7 +113,10 @@ impl Role {
 /// `Err` refuses the task with that problem. What a controller serving a
 /// control plane it does not trust sets (R17).
 #[derive(Clone)]
-pub struct LaunchCheck(Arc<dyn Fn(&TaskLaunchSpec) -> Result<(), String> + Send + Sync>);
+pub struct LaunchCheck(Arc<LaunchCheckFn>);
+
+/// The function of a [`LaunchCheck`].
+type LaunchCheckFn = dyn Fn(&TaskLaunchSpec) -> Result<(), String> + Send + Sync;
 
 impl LaunchCheck {
     /// A check running `check`.

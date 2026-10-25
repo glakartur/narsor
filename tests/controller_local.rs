@@ -698,7 +698,7 @@ async fn a_controller_of_a_remote_control_plane_names_its_backend() {
         .expect("a code")
         .enrollment_code;
     let port = setup.harness.handle.addr().port();
-    let mut command = setup.command(Some(&code), &[]);
+    let command = setup.command(Some(&code), &[]);
     let args: Vec<_> = command
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())

@@ -1,7 +1,7 @@
 ---
 title: "refactor: Lokalny controller jako osobny proces narsor-controller"
 type: refactor
-status: active
+status: completed
 date: 2026-10-25
 origin: docs/brainstorms/2026-10-25-lokalny-controller-osobny-proces-requirements.md
 ---
