@@ -911,6 +911,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_launch_the_check_refuses_creates_nothing() {
+        let mut scratch = Scratch::new();
+        let mut config = (*scratch.backend.config).clone();
+        config.launch_check = Some(LaunchCheck::new(|spec| {
+            Err(format!(
+                "workflow '{}' is not allowed here",
+                spec.workflow_id
+            ))
+        }));
+        scratch.backend = LocalBackend::new(config);
+        let task = scratch.task();
+
+        let refused = scratch
+            .backend
+            .provision(&task, &scratch.launch("task-1-g1"))
+            .await
+            .expect_err("refused by the check");
+
+        assert!(
+            refused.to_string().contains("'wf' is not allowed here"),
+            "{refused}"
+        );
+        assert!(!scratch.backend.storage_dir(&task).exists(), "no storage");
+        assert!(
+            !scratch.backend.workload_dir(&task, Role::Work).exists(),
+            "no workload"
+        );
+        assert!(!scratch.root.join("args").exists(), "no runner");
+    }
+
+    #[tokio::test]
     async fn a_reader_needs_storage_and_never_creates_it() {
         let scratch = Scratch::new();
         let task = scratch.task();
