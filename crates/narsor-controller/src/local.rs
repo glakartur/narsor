@@ -126,7 +126,16 @@ pub async fn local_command(args: LocalArgs) -> i32 {
 }
 
 async fn run(args: LocalArgs) -> Result<(), ControllerError> {
-    let connection = args.connection.resolve()?;
+    let connection = args
+        .connection
+        .resolve_with_default_credential(default_credential_file())?;
+    let plain_http = PLAIN_HTTP_BEYOND_LOOPBACK;
+    let place = check_transport("--control-plane", &connection.control_plane, plain_http)?;
+    check_transport(
+        "--runner-control-plane",
+        &connection.runner_control_plane,
+        plain_http,
+    )?;
     let lock_path = lock_path(&connection.credential_file);
     let timeout = Duration::from_secs(args.lock_timeout_secs);
     let _lock = tokio::task::spawn_blocking(move || ControllerLock::acquire(&lock_path, timeout))
@@ -141,7 +150,7 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
 
     let options = ClientOptions {
         release_lease_timeout: Some(RELEASE_LEASE_TIMEOUT),
-        ..ClientOptions::default()
+        refuse_redirects: true,
     };
     tracing::info!(
         control_plane = %connection.control_plane,
@@ -153,6 +162,7 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     config.lease_ttl = connection.lease_ttl;
     tracing::info!(
         storage = %args.storage.display(),
+        remote = place == ControlPlanePlace::Remote,
         "controller: driving the local backend"
     );
     let parent = args.parent_pid;
@@ -187,6 +197,69 @@ async fn load_or_enroll(
             ControllerError::failure(error.message())
         }
     })
+}
+
+/// Whether plain HTTP is accepted for a control plane beyond loopback: in a
+/// debug build only, for tests (R16).
+pub const PLAIN_HTTP_BEYOND_LOOPBACK: bool = cfg!(debug_assertions);
+
+/// Where a control plane is, as far as trusting it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlanePlace {
+    /// On this machine: the daemon of a trusted installation.
+    Loopback,
+    /// Anywhere else: its commands are not trusted (R17).
+    Remote,
+}
+
+/// Checks the transport to the control plane at `url`, given as `flag`
+/// (R16): beyond loopback only `https://` — with the certificate checked,
+/// there is no way to turn that off — unless `plain_http_beyond_loopback`.
+/// Loopback is a loopback IP address or exactly `localhost`, never a name
+/// looked up in DNS.
+pub fn check_transport(
+    flag: &str,
+    url: &str,
+    plain_http_beyond_loopback: bool,
+) -> Result<ControlPlanePlace, ControllerError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| ControllerError::usage(format!("{flag} '{url}' is not a URL: {error}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ControllerError::usage(format!(
+            "{flag} '{url}' must not carry user information"
+        )));
+    }
+    let place = if narsor_engine::config::is_loopback_host(&parsed) {
+        ControlPlanePlace::Loopback
+    } else {
+        ControlPlanePlace::Remote
+    };
+    match parsed.scheme() {
+        "https" => Ok(place),
+        "http" if place == ControlPlanePlace::Loopback || plain_http_beyond_loopback => Ok(place),
+        "http" => Err(ControllerError::usage(format!(
+            "{flag} '{url}' uses plain HTTP: a control plane beyond this machine must be reached \
+             over https://, so that nobody on the way can read or change what it sends"
+        ))),
+        other => Err(ControllerError::usage(format!(
+            "{flag} '{url}' uses the unsupported scheme '{other}'; use https://"
+        ))),
+    }
+}
+
+/// The credential file of a controller started by hand:
+/// `$XDG_STATE_HOME/narsor/workstation-controller/credential`, else under
+/// `~/.local/state`.
+pub fn default_credential_file() -> Option<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|dir| !dir.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })?;
+    Some(state.join("narsor/workstation-controller/credential"))
 }
 
 /// The lock file of the controller keeping `credential_file`.

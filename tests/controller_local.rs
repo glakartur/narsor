@@ -343,3 +343,148 @@ fn is_zombie(pid: u32) -> bool {
         })
         .unwrap_or(true)
 }
+
+// ---------------------------------------------------------------------------
+// Transport to a remote control plane (U6: R16, AE13)
+// ---------------------------------------------------------------------------
+
+mod transport {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use narsor_controller::local::{check_transport, ControlPlanePlace};
+    use narsor_engine::controller_protocol::{ClientOptions, ControllerClient};
+
+    /// What a release build accepts: no plain HTTP beyond loopback.
+    const RELEASE: bool = false;
+
+    /// Covers AE13 (`https://`).
+    #[test]
+    fn plain_http_beyond_loopback_is_refused_in_a_release_build() {
+        for flag in ["--control-plane", "--runner-control-plane"] {
+            let error =
+                check_transport(flag, "http://10.0.0.5:8443", RELEASE).expect_err("refused");
+            assert_eq!(error.code, 2);
+            assert!(error.message.contains("https://"), "{}", error.message);
+            assert!(error.message.contains(flag), "{}", error.message);
+        }
+        assert_eq!(
+            check_transport("--control-plane", "https://narsor.example", RELEASE).unwrap(),
+            ControlPlanePlace::Remote
+        );
+    }
+
+    #[test]
+    fn loopback_is_an_address_or_exactly_localhost() {
+        for url in [
+            "http://127.0.0.1:7400",
+            "http://127.1.2.3:7400",
+            "http://[::1]:7400",
+            "http://localhost:7400",
+            "https://localhost",
+        ] {
+            assert_eq!(
+                check_transport("--control-plane", url, RELEASE).expect(url),
+                ControlPlanePlace::Loopback,
+                "{url}"
+            );
+        }
+        for url in [
+            "http://localhost.example.com",
+            "http://127.0.0.1.nip.io",
+            "http://0.0.0.0:7400",
+        ] {
+            assert!(
+                check_transport("--control-plane", url, RELEASE).is_err(),
+                "{url} is not loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn other_schemes_and_user_information_are_refused() {
+        for url in [
+            "ftp://narsor.example",
+            "https://me:pw@narsor.example",
+            "narsor",
+        ] {
+            assert!(
+                check_transport("--control-plane", url, true).is_err(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_flag_turns_the_certificate_check_off() {
+        let output = std::process::Command::new(super::engine_support::workspace_binary(
+            "narsor-controller",
+        ))
+        .args(["local", "--help"])
+        .output()
+        .unwrap();
+        let help = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        for word in [
+            "insecure",
+            "invalid",
+            "no-verify",
+            "skip-tls",
+            "certificate",
+        ] {
+            assert!(!help.contains(word), "{word} in:\n{help}");
+        }
+    }
+
+    /// A control plane that redirects elsewhere is not followed: a signed
+    /// request — or an enrollment code — never reaches another host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_redirect_to_another_host_is_not_followed() {
+        let elsewhere_hits = Arc::new(AtomicUsize::new(0));
+        let elsewhere = {
+            let hits = Arc::clone(&elsewhere_hits);
+            let app = axum::Router::new().fallback(move || {
+                hits.fetch_add(1, Ordering::SeqCst);
+                async { "{}" }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            addr
+        };
+        let redirecting = {
+            let location = format!("http://{elsewhere}/controller/v1/enroll");
+            let app = axum::Router::new().fallback(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            addr
+        };
+
+        let refused = ControllerClient::enroll_with_options(
+            format!("http://{redirecting}"),
+            "the-code",
+            &ClientOptions {
+                refuse_redirects: true,
+                ..ClientOptions::default()
+            },
+        )
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(elsewhere_hits.load(Ordering::SeqCst), 0, "not followed");
+
+        // Without the option, the same request would have gone there.
+        let _ = ControllerClient::enroll(format!("http://{redirecting}"), "the-code").await;
+        assert!(
+            elsewhere_hits.load(Ordering::SeqCst) > 0,
+            "the redirect is real"
+        );
+    }
+}

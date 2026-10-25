@@ -99,7 +99,9 @@ pub struct ConnectionArgs {
     #[arg(long, env = "NARSOR_RUNNER_CONTROL_PLANE", value_name = "URL")]
     pub runner_control_plane: Option<String>,
 
-    /// Where the controller credential is kept (written on enrollment).
+    /// Where the controller credential is kept (written on enrollment);
+    /// for `local`, $XDG_STATE_HOME/narsor/workstation-controller/credential
+    /// by default.
     #[arg(long, env = "NARSOR_CONTROLLER_CREDENTIAL_FILE", value_name = "FILE")]
     pub credential_file: Option<PathBuf>,
 
@@ -153,6 +155,15 @@ impl ConnectionArgs {
     /// The connection, the enrollment code read from `--enrollment-code-file`
     /// or [`ENROLLMENT_CODE_ENV`], or a usage error naming what is missing.
     pub fn resolve(&self) -> Result<Connection, ControllerError> {
+        self.resolve_with_default_credential(None)
+    }
+
+    /// [`Self::resolve`], with `default_credential` standing in for a
+    /// credential file given neither as a flag nor in the environment.
+    pub fn resolve_with_default_credential(
+        &self,
+        default_credential: Option<PathBuf>,
+    ) -> Result<Connection, ControllerError> {
         if self.enrollment_code.is_some() {
             // The value is not repeated: it is the secret being protected.
             return Err(ControllerError::usage(format!(
@@ -165,12 +176,16 @@ impl ConnectionArgs {
             .control_plane
             .clone()
             .ok_or_else(|| missing_argument("--control-plane <URL>", "NARSOR_CONTROL_PLANE"))?;
-        let credential_file = self.credential_file.clone().ok_or_else(|| {
-            missing_argument(
-                "--credential-file <FILE>",
-                "NARSOR_CONTROLLER_CREDENTIAL_FILE",
-            )
-        })?;
+        let credential_file = self
+            .credential_file
+            .clone()
+            .or(default_credential)
+            .ok_or_else(|| {
+                missing_argument(
+                    "--credential-file <FILE>",
+                    "NARSOR_CONTROLLER_CREDENTIAL_FILE",
+                )
+            })?;
         let enrollment_code = match &self.enrollment_code_file {
             Some(path) => Some(read_enrollment_code(path)?),
             None => std::env::var(ENROLLMENT_CODE_ENV)
