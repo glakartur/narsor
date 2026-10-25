@@ -42,7 +42,7 @@ use crate::domain::{
 use crate::engine::{
     plan_operator_transition, EngineError, HumanInputDelivery, PositionStatus, Timeline,
 };
-use crate::environment::{BackendKind, LaunchError, LaunchIntent, LaunchResolver, TrustScope};
+use crate::environment::{BackendKind, LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
     AttentionItem, AttentionKind, BackendCapacity, BackendLease, CommandActor, CommandRequest,
@@ -1255,11 +1255,10 @@ impl ProtocolService {
             .map_err(|error| ProtocolError::bad_request(error.code(), error.to_string()))?
             .ok_or(ProtocolError::NotFound)?;
         // Judged by what the backend is, not by its id: the daemon's own
-        // `local` asked for over HTTP is one more such backend (R15).
-        if record.kind == BackendKind::Local
-            && record.trust_scope == TrustScope::Workstation
-            && !request.accept_workstation_risk
-        {
+        // `local` asked for over HTTP is one more such backend (R15). Its
+        // trust scope does not count either: a `local` backend declared with
+        // another one after the server started runs tasks the same way.
+        if record.kind == BackendKind::Local && !request.accept_workstation_risk {
             return Err(ProtocolError::bad_request(
                 WORKSTATION_RISK_NOT_ACCEPTED,
                 WORKSTATION_RISK,

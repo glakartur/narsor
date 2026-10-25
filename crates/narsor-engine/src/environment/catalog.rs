@@ -82,6 +82,12 @@ impl EnvironmentCatalog {
         self
     }
 
+    /// Whether the built-in `local` backend stands in for a missing
+    /// declaration.
+    pub fn has_builtin_local(&self) -> bool {
+        self.builtin_local
+    }
+
     /// The backend files the catalogue declares, by id.
     pub fn declares_backend(&self, id: &str) -> Result<bool, CatalogError> {
         Ok(read_entry::<BackendRecord>(&self.paths.backends_dir(), id)?.is_some())

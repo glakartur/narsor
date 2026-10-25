@@ -7769,6 +7769,37 @@ async fn the_built_in_local_backend_over_http_needs_the_same_consent() {
         .expect("the daemon's in-process code");
 }
 
+/// A `local` backend declared after the server started with a trust scope
+/// other than `workstation` — which the start-up check would have refused —
+/// still runs tasks on somebody's computer, so it needs the same consent.
+#[tokio::test]
+async fn a_local_backend_of_any_trust_scope_needs_the_same_consent() {
+    let harness = Harness::start().await;
+    // Written by hand: saving it through the catalogue would be refused.
+    let backends =
+        narsor_engine::persistence::paths::CatalogPaths::new(harness.root.path()).backends_dir();
+    std::fs::create_dir_all(&backends).unwrap();
+    std::fs::write(
+        backends.join("rack.yaml"),
+        "kind: local\ntrust_scope: dedicated\nlimits:\n  max_concurrent_tasks: 1\n  \
+         default_resources:\n    cpu_millicores: 1000\n    memory_mib: 2048\n",
+    )
+    .unwrap();
+    let refused = harness
+        .owner
+        .create_enrollment("rack", &CreateEnrollmentRequest::default())
+        .await;
+    assert!(
+        matches!(&refused, Err(ClientError::Request { code, .. }) if code == "workstation_risk_not_accepted"),
+        "{refused:?}"
+    );
+    harness
+        .owner
+        .create_enrollment("rack", &consenting())
+        .await
+        .expect("a code with consent");
+}
+
 #[tokio::test]
 async fn a_kubernetes_backend_on_a_workstation_needs_no_consent() {
     use narsor_engine::environment::{BackendKind, TrustScope};

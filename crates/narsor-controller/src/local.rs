@@ -16,7 +16,9 @@
 //!
 //! Two controllers on one credential would fight over the lease and over
 //! the runners. At start the controller takes an exclusive `flock` on
-//! `controller.lock` beside the credential file and writes its PID into it;
+//! `<credential file>.lock` beside the credential file and writes its PID
+//! into it — one lock per credential, so controllers whose credentials share
+//! a directory do not wait for each other;
 //! while another process holds it, it waits up to `--lock-timeout-secs`,
 //! naming the holder. The kernel releases the lock with the process, even
 //! after `SIGKILL` (R8).
@@ -33,11 +35,12 @@
 //! Started by hand, the same controller serves a remote control plane
 //! (R16-R18). It reaches it only over `https://` with the certificate
 //! checked and follows no redirect ([`check_transport`]); it treats what the
-//! server sends as untrusted ([`untrusted`]); tasks get a private HOME unless
-//! the user accepts their own with `--accept-host-home`; and it warns about
-//! all of this at start. Its HOME settings come from the flags, then the
-//! `NARSOR_LOCAL_*` variables, then the Narsor configuration file — which
-//! the daemon's child, started with `--no-config`, never reads.
+//! server sends as untrusted ([`untrusted`]); tasks get a private HOME, no
+//! harness login of the user's and a Git clone with none of the user's git
+//! credentials unless the user accepts their own with `--accept-host-home`;
+//! and it warns about all of this at start. Its HOME settings come from the
+//! flags, then the `NARSOR_LOCAL_*` variables, then the Narsor configuration
+//! file — which the daemon's child, started with `--no-config`, never reads.
 //!
 //! # Stopping
 //!
@@ -55,23 +58,25 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 
-use crate::controller::{exit_code, shutdown_signal, ConnectionArgs, ControllerError};
+use crate::controller::{
+    enrollment_error, exit_code, shutdown_signal, ConnectionArgs, ControllerError,
+};
 use untrusted::UntrustedServer;
 
-pub mod untrusted;
+mod untrusted;
 use narsor_controller_runtime::{Controller, ControllerConfig};
 use narsor_engine::backends::{LaunchCheck, LocalBackend, LocalBackendConfig};
 use narsor_engine::config::{Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source};
 use narsor_engine::controller_protocol::{ClientOptions, ControllerClient};
 use narsor_engine::controller_runtime::load_or_enroll_with_options;
 
-/// Name of the lock file beside the credential file.
-pub const LOCK_FILE: &str = "controller.lock";
+/// What the lock file's name adds to the credential file's.
+const LOCK_SUFFIX: &str = ".lock";
 
 /// Bound of the lease release on the way out: well inside the daemon's
 /// stop timeout (10 s), so a release against a dead control plane cannot
 /// get the controller killed (KTD8).
-pub const RELEASE_LEASE_TIMEOUT: Duration = Duration::from_secs(5);
+const RELEASE_LEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often a held lock is tried again.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -137,24 +142,13 @@ pub struct LocalArgs {
     pub allow_env: Vec<String>,
 }
 
-impl LocalArgs {
-    /// The HOME mode and harness directories runners are started with,
-    /// from the flags alone.
-    pub fn harness_home(&self) -> HarnessHome {
-        HarnessHome {
-            mode: self.home.unwrap_or_default(),
-            codex_home: self.codex_home.clone(),
-            claude_config_dir: self.claude_config_dir.clone(),
-            claude_profile_source: self.claude_profile_source.clone(),
-        }
-    }
-}
-
 /// The HOME settings runners are started with (R17, R18; KTD15): each from
 /// its flag, else from `config` — its `NARSOR_LOCAL_*` variable, else the
 /// configuration file. With a control plane beyond this machine the mode is
-/// `private` unless something set it, and `host` needs `--accept-host-home`.
-pub fn resolve_home(
+/// `private` unless something set it, and `host` needs `--accept-host-home`;
+/// so do the harness directories — the user's own logins — which the
+/// configuration file then does not give either.
+fn resolve_home(
     args: &LocalArgs,
     place: ControlPlanePlace,
     config: Option<&Resolved>,
@@ -181,6 +175,23 @@ pub fn resolve_home(
             }
         )));
     }
+    let untrusted = place == ControlPlanePlace::Remote && !args.accept_host_home;
+    if untrusted {
+        if let Some(flag) = harness_directory_flag(args) {
+            return Err(ControllerError::usage(format!(
+                "{flag} with a control plane beyond this machine would give every task it sends \
+                 your own harness login. Leave it out, or accept this with --accept-host-home"
+            )));
+        }
+    }
+    let configured = if untrusted {
+        HarnessHome {
+            mode: configured.mode,
+            ..HarnessHome::default()
+        }
+    } else {
+        configured
+    };
     Ok(HarnessHome {
         mode,
         codex_home: args.codex_home.clone().or(configured.codex_home),
@@ -193,6 +204,17 @@ pub fn resolve_home(
             .clone()
             .or(configured.claude_profile_source),
     })
+}
+
+/// The first harness directory flag given, by name.
+fn harness_directory_flag(args: &LocalArgs) -> Option<&'static str> {
+    [
+        ("--codex-home", &args.codex_home),
+        ("--claude-config-dir", &args.claude_config_dir),
+        ("--claude-profile-source", &args.claude_profile_source),
+    ]
+    .into_iter()
+    .find_map(|(flag, dir)| dir.is_some().then_some(flag))
 }
 
 /// The Narsor configuration as a hand-started controller reads it:
@@ -231,6 +253,9 @@ fn warn_untrusted(control_plane: &str, home: &HarnessHome) {
              and harness logins."
         );
     }
+    for (name, dir) in home.variables() {
+        eprintln!("WARNING: --accept-host-home: tasks use {name}={dir}, with its harness login.");
+    }
 }
 
 /// Runs `narsor-controller local` until `SIGTERM`, Ctrl-C or the loss of
@@ -243,12 +268,15 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     let connection = args
         .connection
         .resolve_with_default_credential(default_credential_file())?;
-    let plain_http = PLAIN_HTTP_BEYOND_LOOPBACK;
-    let place = check_transport("--control-plane", &connection.control_plane, plain_http)?;
+    let place = check_transport(
+        "--control-plane",
+        &connection.control_plane,
+        PLAIN_HTTP_BEYOND_LOOPBACK,
+    )?;
     check_transport(
         "--runner-control-plane",
         &connection.runner_control_plane,
-        plain_http,
+        PLAIN_HTTP_BEYOND_LOOPBACK,
     )?;
     let config = if args.no_config {
         None
@@ -271,6 +299,12 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     backend_config.runner_args = home.runner_args();
     if place == ControlPlanePlace::Remote {
         backend_config.launch_check = Some(untrusted_check(&args)?);
+        if home.mode == HomeMode::Private {
+            backend_config
+                .runner_args
+                .push("--pinned-git-credential-only".into());
+            backend_config.withhold_user_credentials = true;
+        }
     }
     let backend = LocalBackend::new(backend_config);
 
@@ -317,17 +351,21 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
 /// The checks of every launch spec from a control plane beyond this
 /// machine, over the controller's storage (R17).
 fn untrusted_check(args: &LocalArgs) -> Result<LaunchCheck, ControllerError> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&args.storage)
-        .map_err(|error| {
-            ControllerError::failure(format!("cannot create {}: {error}", args.storage.display()))
-        })?;
+    create_private_dir(&args.storage)?;
     let checks = UntrustedServer::new(&args.storage, &args.allow_env).map_err(|error| {
         ControllerError::failure(format!("cannot use {}: {error}", args.storage.display()))
     })?;
     Ok(LaunchCheck::new(move |spec| checks.check(spec)))
+}
+
+fn create_private_dir(path: &Path) -> Result<(), ControllerError> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .map_err(|error| {
+            ControllerError::failure(format!("cannot create {}: {error}", path.display()))
+        })
 }
 
 async fn load_or_enroll(
@@ -341,18 +379,12 @@ async fn load_or_enroll(
         options,
     )
     .await
-    .map_err(|error| {
-        if error.is_usage_error() {
-            ControllerError::usage(error.message())
-        } else {
-            ControllerError::failure(error.message())
-        }
-    })
+    .map_err(enrollment_error)
 }
 
 /// Whether plain HTTP is accepted for a control plane beyond loopback: in a
 /// debug build only, for tests (R16).
-pub const PLAIN_HTTP_BEYOND_LOOPBACK: bool = cfg!(debug_assertions);
+const PLAIN_HTTP_BEYOND_LOOPBACK: bool = cfg!(debug_assertions);
 
 /// Where a control plane is, as far as trusting it goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,7 +433,7 @@ pub fn check_transport(
 /// The credential file of a controller started by hand:
 /// `$XDG_STATE_HOME/narsor/workstation-controller/credential`, else under
 /// `~/.local/state`.
-pub fn default_credential_file() -> Option<PathBuf> {
+fn default_credential_file() -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
@@ -413,12 +445,12 @@ pub fn default_credential_file() -> Option<PathBuf> {
     Some(state.join("narsor/workstation-controller/credential"))
 }
 
-/// The lock file of the controller keeping `credential_file`.
-pub fn lock_path(credential_file: &Path) -> PathBuf {
-    credential_file
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(LOCK_FILE)
+/// The lock file of the controller keeping `credential_file`:
+/// `<credential_file>.lock`.
+fn lock_path(credential_file: &Path) -> PathBuf {
+    let mut path = credential_file.as_os_str().to_owned();
+    path.push(LOCK_SUFFIX);
+    PathBuf::from(path)
 }
 
 /// Resolves when `parent` is set and this process is no longer its child;
@@ -439,22 +471,16 @@ async fn parent_gone(parent: Option<u32>) {
 
 /// The exclusive lock on a controller credential, held while it lives.
 #[derive(Debug)]
-pub struct ControllerLock {
+struct ControllerLock {
     _file: fs::File,
 }
 
 impl ControllerLock {
     /// Takes the lock at `path`, waiting up to `timeout` for its holder, and
     /// records this process's PID in it.
-    pub fn acquire(path: &Path, timeout: Duration) -> Result<Self, ControllerError> {
+    fn acquire(path: &Path, timeout: Duration) -> Result<Self, ControllerError> {
         if let Some(parent) = path.parent() {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)
-                .map_err(|error| {
-                    ControllerError::failure(format!("cannot create {}: {error}", parent.display()))
-                })?;
+            create_private_dir(parent)?;
         }
         let mut file = fs::OpenOptions::new()
             .read(true)

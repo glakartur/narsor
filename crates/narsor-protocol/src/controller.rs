@@ -1819,8 +1819,8 @@ pub struct CreateRepositoryRequest {
     pub description: Option<String>,
 }
 
-/// The refusal code of an enrollment for a `local` backend on a
-/// `workstation` asked for without [`CreateEnrollmentRequest::accept_workstation_risk`].
+/// The refusal code of an enrollment for a `local` backend, whatever its
+/// trust scope, asked for without [`CreateEnrollmentRequest::accept_workstation_risk`].
 pub const WORKSTATION_RISK_NOT_ACCEPTED: &str = "workstation_risk_not_accepted";
 
 /// What the owner accepts when enrolling a controller of a `local` backend

@@ -448,10 +448,19 @@ pub struct RunnerClient {
 
 impl RunnerClient {
     /// A client presenting the runner `credential` (read from its mounted
-    /// file) to the control plane at `base_url`.
+    /// file) to the control plane at `base_url`. It follows no redirect: a
+    /// runner may serve a control plane that is not trusted (R16, R17).
     pub fn new(base_url: impl Into<String>, credential: impl Into<String>) -> Self {
+        let options = ClientOptions {
+            refuse_redirects: true,
+            ..ClientOptions::default()
+        };
         Self {
-            transport: Transport::new(base_url, Credential::Bearer(credential.into())),
+            transport: Transport::with_http(
+                base_url,
+                Credential::Bearer(credential.into()),
+                options.http(),
+            ),
         }
     }
 

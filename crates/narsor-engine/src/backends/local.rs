@@ -62,6 +62,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use narsor_shared::config::{CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV, ENV_PREFIX};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -71,6 +72,7 @@ use super::{
 };
 use crate::domain::{TaskId, TaskLaunchSpec};
 use crate::environment::{BackendCapabilities, BackendKind};
+use crate::workspace::provisioner::USER_GIT_ACCESS_ENVS;
 
 /// How long removing compute waits for a killed runner to disappear before
 /// it answers "in progress" and lets the controller come back.
@@ -79,10 +81,6 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 /// The environment variable every runner gets, set to its workload's uid:
 /// what proves a process group still ours after the runner is gone.
 const WORKLOAD_MARK_ENV: &str = "NARSOR_LOCAL_WORKLOAD_UID";
-
-/// The prefix of the variables a controller is configured with, none of
-/// which a runner inherits.
-const CONTROLLER_ENV_PREFIX: &str = "NARSOR_";
 
 /// Which of a task's two kinds of workload a call is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +147,10 @@ pub struct LocalBackendConfig {
     /// Run on every launch spec before its task's storage or workload is
     /// created; none by default.
     pub launch_check: Option<LaunchCheck>,
+    /// Whether runners inherit none of the user's credential variables
+    /// ([`is_user_credential`]): harness logins, Git and forge credentials.
+    /// Set for a control plane beyond this machine with a private HOME (R17).
+    pub withhold_user_credentials: bool,
 }
 
 impl LocalBackendConfig {
@@ -175,6 +177,7 @@ impl LocalBackendConfig {
             runner_args: Vec::new(),
             env: Vec::new(),
             launch_check: None,
+            withhold_user_credentials: false,
         }
     }
 }
@@ -505,8 +508,11 @@ impl LocalBackend {
         // least of all — reaches the runner or the tools it starts (R12);
         // what the adapter sets itself is set below. `spawn` isolates it:
         // the controller's environment stays as it is.
+        // Nor, for a server that is not trusted, the user's own logins: a
+        // harness directory or a Git credential inherited from the shell.
+        let withhold = self.config.withhold_user_credentials;
         for (name, _) in std::env::vars_os() {
-            if is_controller_setting(&name) {
+            if is_controller_setting(&name) || (withhold && is_user_credential(&name)) {
                 command.env_remove(name);
             }
         }
@@ -692,8 +698,40 @@ impl ExecutionBackend for LocalBackend {
 /// Whether `name` is one of the controller's own `NARSOR_*` variables,
 /// which a runner never inherits.
 fn is_controller_setting(name: &std::ffi::OsStr) -> bool {
-    name.as_encoded_bytes()
-        .starts_with(CONTROLLER_ENV_PREFIX.as_bytes())
+    name.as_encoded_bytes().starts_with(ENV_PREFIX.as_bytes())
+}
+
+/// Variables through which a runner or a harness would reach the user's
+/// own logins, beyond those git reads ([`USER_GIT_ACCESS_ENVS`]).
+const USER_CREDENTIAL_ENVS: [&str; 13] = [
+    CODEX_HOME_ENV,
+    CLAUDE_CONFIG_DIR_ENV,
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_AUTH_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_CONFIG_DIR",
+    "GITLAB_TOKEN",
+    "GL_TOKEN",
+    "GLAB_TOKEN",
+    "GLAB_CONFIG_DIR",
+];
+
+/// The prefix of git's configuration variables (`GIT_CONFIG_GLOBAL`,
+/// `GIT_CONFIG_KEY_<n>`, ...), any of which can hand git a credential.
+const GIT_CONFIG_ENV_PREFIX: &str = "GIT_CONFIG";
+
+/// Whether `name` is one of the user's credential variables, which a runner
+/// serving a server that is not trusted never inherits.
+fn is_user_credential(name: &std::ffi::OsStr) -> bool {
+    let name = name.as_encoded_bytes();
+    name.starts_with(GIT_CONFIG_ENV_PREFIX.as_bytes())
+        || USER_GIT_ACCESS_ENVS
+            .iter()
+            .chain(&USER_CREDENTIAL_ENVS)
+            .any(|known| name == known.as_bytes())
 }
 
 fn io_error(what: &str, error: io::Error) -> BackendError {
@@ -810,6 +848,33 @@ mod tests {
         }
         for name in ["PATH", "HOME", "RUST_LOG", "narsor_lower", "XNARSOR_"] {
             assert!(!is_controller_setting(name.as_ref()), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_users_logins_are_credential_variables() {
+        for name in [
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_CONFIG_DIR",
+            "GITLAB_TOKEN",
+            "GL_TOKEN",
+            "GLAB_TOKEN",
+            "GLAB_CONFIG_DIR",
+            "SSH_AUTH_SOCK",
+            "GIT_ASKPASS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_KEY_0",
+            "XDG_CONFIG_HOME",
+        ] {
+            assert!(is_user_credential(name.as_ref()), "{name}");
+        }
+        for name in ["PATH", "HOME", "GIT_TERMINAL_PROMPT", "codex_home"] {
+            assert!(!is_user_credential(name.as_ref()), "{name}");
         }
     }
 

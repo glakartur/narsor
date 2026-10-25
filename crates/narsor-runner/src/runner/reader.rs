@@ -430,6 +430,7 @@ terminal_states: [completed]
             &task(),
             &spec,
             &MountedSecrets::new(None),
+            &crate::workspace::GitAccess::User,
         )
         .unwrap();
         (storage, lock)
@@ -450,6 +451,7 @@ terminal_states: [completed]
             timing: RunnerTiming::default(),
             contract: crate::runner::BaseImageContract::default(),
             read_only: true,
+            pinned_git_credential_only: false,
         }
     }
 

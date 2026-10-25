@@ -8,6 +8,13 @@
 //! * a host directory to copy as the workspace must lie inside the
 //!   controller's storage once symlinks and `..` are resolved — the server
 //!   picks no directory of the user's;
+//! * a Git workspace is cloned over `https://` only — never a path or a
+//!   `file://`, `ssh://` or `git@host:` remote, which would clone a
+//!   repository of the user's disk or one their SSH keys open; the runner
+//!   is also started so that the clone uses none of the user's own git
+//!   configuration and credentials, only the pinned one; nor may it name
+//!   this machine or an address of a private network, which the server
+//!   could probe through git's errors;
 //! * a secret goes only into an environment variable a harness or tool the
 //!   runner supports reads ([`ALLOWED_SECRET_ENVS`]), or one the user allowed
 //!   with `--allow-env` — never `PATH`, `LD_PRELOAD` or the like;
@@ -23,7 +30,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use narsor_engine::domain::{SecretDelivery, TaskLaunchSpec, TaskWorkspace};
+use narsor_engine::domain::{GitIdentity, SecretDelivery, TaskLaunchSpec, TaskWorkspace};
 
 /// The variables a secret may be delivered as without `--allow-env`: the
 /// credentials of the harnesses and tools the runner supports.
@@ -59,8 +66,10 @@ impl UntrustedServer {
 
     /// Why `spec` is refused, if it is.
     pub fn check(&self, spec: &TaskLaunchSpec) -> Result<(), String> {
-        if let TaskWorkspace::Local { path } = &spec.workspace {
-            self.check_directory(path)?;
+        match &spec.workspace {
+            TaskWorkspace::None => {}
+            TaskWorkspace::Local { path } => self.check_directory(path)?,
+            TaskWorkspace::Git(identity) => check_remote(identity)?,
         }
         for secret in &spec.environment.secrets {
             match &secret.delivery {
@@ -97,6 +106,89 @@ impl UntrustedServer {
             return refuse("lies outside the controller's storage");
         }
         Ok(())
+    }
+}
+
+/// Refuses a Git remote other than an `https://` URL naming a host beyond
+/// this machine and its private network.
+fn check_remote(identity: &GitIdentity) -> Result<(), String> {
+    let remote = &identity.remote_url;
+    let not_https = || {
+        format!(
+            "the Git workspace '{}' is not an https:// URL; a control plane beyond this machine \
+             may only have repositories cloned over https://",
+            without_credentials(remote)
+        )
+    };
+    // Git reads the text, not a parser's view of it: to git `https:host/x`
+    // is an SSH remote, where a URL parser sees `https://host/x`.
+    let plain = !remote
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\');
+    if !plain || !remote.starts_with("https://") {
+        return Err(not_https());
+    }
+    let url = reqwest::Url::parse(remote).map_err(|_| not_https())?;
+    match url.host_str() {
+        Some(host) if is_internal(host) => Err(format!(
+            "the Git workspace '{}' names {host}, this machine or its private network; a \
+             control plane beyond this machine may only have repositories cloned from beyond \
+             it",
+            without_credentials(remote)
+        )),
+        Some(_) => Ok(()),
+        None => Err(not_https()),
+    }
+}
+
+/// Whether `host` is this machine or an address of a private network: a
+/// clone of it would let the server probe them through git's errors. A name
+/// is not resolved; only `localhost` is known to be this machine.
+fn is_internal(host: &str) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let internal_v4 = |ip: &Ipv4Addr| {
+        let [a, b, ..] = ip.octets();
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            // Shared address space (RFC 6598), carrier-grade NAT.
+            || (a == 100 && (64..128).contains(&b))
+    };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => internal_v4(&ip),
+        Ok(IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                // Unique local (fc00::/7) and link-local (fe80::/10).
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || ip.to_ipv4_mapped().is_some_and(|ip| internal_v4(&ip))
+        }
+        Err(_) => {
+            let name = bare.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+    }
+}
+
+/// `remote` as a refusal may show it: without a user name or password.
+fn without_credentials(remote: &str) -> String {
+    if let Ok(mut url) = reqwest::Url::parse(remote) {
+        if !url.username().is_empty() || url.password().is_some() {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            return url.to_string();
+        }
+    }
+    // What a parser does not see as credentials may still be some.
+    match remote.rsplit_once('@') {
+        Some((_, host)) => format!("...@{host}"),
+        None => remote.to_string(),
     }
 }
 
@@ -188,6 +280,86 @@ mod tests {
             );
         }
         assert!(server.check(&spec(TaskWorkspace::None, vec![])).is_ok());
+    }
+
+    fn git(remote_url: &str) -> TaskWorkspace {
+        TaskWorkspace::Git(GitIdentity {
+            repository: None,
+            remote_url: remote_url.to_string(),
+            commit: String::new(),
+            git_ref: None,
+            ref_origin: None,
+            credential: None,
+        })
+    }
+
+    #[test]
+    fn a_git_workspace_is_cloned_over_https_only() {
+        let dir = Dir::new();
+        let server = server(&dir, &[]);
+        assert!(server
+            .check(&spec(git("https://github.com/acme/app.git"), vec![]))
+            .is_ok());
+        for remote in [
+            "/home/me/secret-repo",
+            "../secret-repo",
+            "file:///home/me/secret-repo",
+            "ssh://git@github.com/acme/private.git",
+            "git@github.com:acme/private.git",
+            "http://github.com/acme/app.git",
+            "ext::sh -c touch% /tmp/pwned",
+            "https:github.com/acme/app.git",
+            "https:/github.com/acme/app.git",
+            "HTTPS://github.com/acme/app.git",
+            " https://github.com/acme/app.git",
+            "https://github.com\\@evil.example/app.git",
+        ] {
+            let error = server.check(&spec(git(remote), vec![])).expect_err(remote);
+            assert!(error.contains("https://"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_git_workspace_on_this_machine_or_its_network_is_refused() {
+        let dir = Dir::new();
+        let server = server(&dir, &[]);
+        for remote in [
+            "https://localhost/acme/app.git",
+            "https://git.localhost./acme/app.git",
+            "https://127.0.0.1:8443/acme/app.git",
+            "https://2130706433/acme/app.git",
+            "https://10.1.2.3/acme/app.git",
+            "https://172.16.0.1/acme/app.git",
+            "https://192.168.1.10/acme/app.git",
+            "https://169.254.169.254/latest/meta-data",
+            "https://100.64.0.1/acme/app.git",
+            "https://0.0.0.0/acme/app.git",
+            "https://[::1]/acme/app.git",
+            "https://[fd00::1]/acme/app.git",
+            "https://[fe80::1]/acme/app.git",
+            "https://[::ffff:10.0.0.1]/acme/app.git",
+        ] {
+            let error = server.check(&spec(git(remote), vec![])).expect_err(remote);
+            assert!(error.contains("private network"), "{error}");
+        }
+        assert!(server
+            .check(&spec(git("https://140.82.112.3/acme/app.git"), vec![]))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_refusal_does_not_show_the_remotes_credentials() {
+        let dir = Dir::new();
+        let server = server(&dir, &[]);
+        for remote in [
+            "http://user:s3cret@github.com/acme/app.git",
+            "https://user:s3cret@10.0.0.1/acme/app.git",
+            "https:user:s3cret@github.com/acme/app.git",
+            "user:s3cret@github.com:acme/app.git",
+        ] {
+            let error = server.check(&spec(git(remote), vec![])).expect_err(remote);
+            assert!(!error.contains("s3cret"), "{error}");
+        }
     }
 
     #[test]

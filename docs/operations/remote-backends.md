@@ -86,7 +86,7 @@ child, enrolls it on the first start and supervises it:
 * on stop the daemon sends the controller `SIGTERM`, waits up to 10 s for the
   lease release, then sends `SIGKILL`, and only then closes the API; a
   controller whose daemon was killed stops on its own;
-* one controller per credential: it holds `controller.lock` beside the
+* one controller per credential: it holds `<credential>.lock` beside the
   credential and waits up to 7 s for a predecessor.
 
 `narsor-server`, `narsor-controller` and `narsor-runner` must be installed in
@@ -997,7 +997,8 @@ see.
 `localhost`; no DNS) the controller accepts only `https://`, checks the
 server's certificate against the system's certificate store and follows no
 redirect. There is no option to turn the check off: to use a private CA, add
-it to the system store. `--runner-control-plane` follows the same rule.
+it to the system store. `--runner-control-plane` follows the same rule, and
+a runner follows no redirect either.
 (Debug builds accept plain `http://` beyond loopback, for tests only.)
 
 **What the server may ask for.** A control plane beyond loopback is not
@@ -1007,8 +1008,29 @@ task is created:
 * tasks get a private HOME on task storage. `--home host` (or `local_home:
   host` in the configuration, or `NARSOR_LOCAL_HOME=host`) needs
   `--accept-host-home`: tasks would then see your SSH keys, tokens and
-  harness logins;
+  harness logins. `--codex-home`, `--claude-config-dir` and
+  `--claude-profile-source` point at your own harness logins, so they need
+  `--accept-host-home` too; without it the configuration file's
+  `local_codex_home`, `local_claude_config_dir` and
+  `local_claude_profile_source` are not used;
+* with a private HOME the runner and everything it starts inherit none of
+  your logins from the controller's environment: no `CODEX_HOME`,
+  `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`,
+  `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR`, `GITLAB_TOKEN`, `GL_TOKEN`,
+  `GLAB_TOKEN`, `GLAB_CONFIG_DIR`, `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`,
+  `GIT_SSH`, `GIT_SSH_COMMAND`, `XDG_CONFIG_HOME` and no `GIT_CONFIG*`
+  variable;
 * a local workspace directory must lie inside `--storage`;
+* a Git workspace is cloned over `https://` only — never a path, a
+  `file://`, `ssh://` or `git@host:` remote, nor a host on this computer or
+  a private network (`localhost`, a loopback, private, link-local or
+  carrier-grade NAT address; a name is not resolved). With a private HOME
+  the clone also uses none of your own git setup: no `~/.gitconfig` or
+  system configuration, no credential helper, SSH key or agent, no askpass
+  helper. Only the credential the repository is pinned to is used, and git
+  follows no HTTP redirect, so a public host cannot send the clone on to a
+  private network;
 * a secret goes only into a variable a supported harness or tool reads
   (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`,
   `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`); allow another one

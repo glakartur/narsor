@@ -438,7 +438,6 @@ impl OwnerDefaults {
 pub struct CatalogLaunchResolver {
     catalog_root: PathBuf,
     catalog: EnvironmentCatalog,
-    builtin_local: bool,
     registry: RepositoryRegistry,
     workflows: WorkflowResolver,
     owner: OwnerDefaults,
@@ -469,7 +468,6 @@ impl CatalogLaunchResolver {
         let catalog_root = catalog_root.into();
         Self {
             catalog: EnvironmentCatalog::new(catalog_root.clone()),
-            builtin_local: true,
             registry: RepositoryRegistry::new(&catalog_root),
             catalog_root,
             workflows,
@@ -483,7 +481,6 @@ impl CatalogLaunchResolver {
     /// task on `local` is refused at creation (R13).
     pub fn without_builtin_local(mut self) -> Self {
         self.catalog = self.catalog.without_builtin_local();
-        self.builtin_local = false;
         self
     }
 
@@ -503,7 +500,7 @@ impl CatalogLaunchResolver {
             .usable_backend(&backend_id)
             .map_err(|error| match error {
                 LaunchError::UnknownBackend(id)
-                    if !self.builtin_local && id == BackendRecord::LOCAL_ID =>
+                    if !self.catalog.has_builtin_local() && id == BackendRecord::LOCAL_ID =>
                 {
                     LaunchError::NoBuiltinLocal {
                         from_default: intent.backend.is_none(),

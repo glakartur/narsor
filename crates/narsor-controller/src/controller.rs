@@ -57,7 +57,9 @@ use clap::Args;
 use crate::kubernetes::client::{ClusterAccess, TokenSource};
 use crate::kubernetes::{KubernetesBackend, KubernetesBackendConfig};
 use crate::profile_edit::{printable, EditSession, ProfileChanges};
-use narsor_controller_runtime::{Controller, ControllerConfig};
+use narsor_controller_runtime::{
+    Controller, ControllerConfig, EnrollmentError, ENROLLMENT_CODE_ENV,
+};
 use narsor_engine::config::CLAUDE_CONFIG_DIR_ENV;
 use narsor_engine::controller_protocol::ControllerClient;
 use narsor_engine::controller_runtime::load_or_enroll as load_controller_identity;
@@ -77,11 +79,6 @@ const HARNESS_ENVS: [&str; 7] = [
     "LC_CTYPE",
     "TZ",
 ];
-
-/// The variable the one-time enrollment code is read from. Never a flag
-/// with a value: the command line of a process is visible to every user of
-/// the machine (R12).
-pub const ENROLLMENT_CODE_ENV: &str = "NARSOR_ENROLLMENT_CODE";
 
 /// How a controller reaches the control plane, whichever backend it drives.
 ///
@@ -581,14 +578,16 @@ pub async fn load_or_enroll(
 ) -> Result<ControllerClient, ControllerError> {
     load_controller_identity(control_plane, credential_file, code)
         .await
-        .map_err(|error| {
-            let message = error.message();
-            if error.is_usage_error() {
-                ControllerError::usage(message)
-            } else {
-                ControllerError::failure(message)
-            }
-        })
+        .map_err(enrollment_error)
+}
+
+pub(crate) fn enrollment_error(error: EnrollmentError) -> ControllerError {
+    let message = error.message();
+    if error.is_usage_error() {
+        ControllerError::usage(message)
+    } else {
+        ControllerError::failure(message)
+    }
 }
 
 pub(crate) async fn shutdown_signal() {

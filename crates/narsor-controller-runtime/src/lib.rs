@@ -13,6 +13,12 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
+/// The variable a controller process reads its one-time enrollment code
+/// from, and the daemon sets for the controller it starts. Never a flag
+/// with a value: the command line of a process is visible to every user of
+/// the machine (R12).
+pub const ENROLLMENT_CODE_ENV: &str = "NARSOR_ENROLLMENT_CODE";
+
 /// Future returned while enrolling a controller identity.
 pub type EnrollmentFuture<'a, Client> =
     Pin<Box<dyn Future<Output = Result<(Client, String), String>> + 'a>>;

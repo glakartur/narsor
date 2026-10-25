@@ -26,7 +26,7 @@ use std::path::Path;
 
 use crate::domain::{TaskId, TaskLaunchSpec, TaskWorkspace};
 use crate::persistence::ExecutionStore;
-use crate::workspace::{checked_out_commit, clone_pinned_commit, clone_resolving_ref};
+use crate::workspace::{checked_out_commit, clone_pinned_commit, clone_resolving_ref, GitAccess};
 
 use super::secrets::MountedSecrets;
 use super::storage::{InitializationMarker, TaskStorage};
@@ -41,13 +41,15 @@ pub enum Initialization {
     Resumed,
 }
 
-/// Initializes `storage` for `task_id` from `spec`, once.
+/// Initializes `storage` for `task_id` from `spec`, once; a Git workspace
+/// is cloned with `git`'s access to the user's own git setup.
 pub fn initialize(
     storage: &TaskStorage,
     store: &ExecutionStore,
     task_id: &TaskId,
     spec: &TaskLaunchSpec,
     secrets: &MountedSecrets,
+    git: &GitAccess,
 ) -> Result<Initialization, RunnerError> {
     if let Some(marker) = storage.marker()? {
         if marker.task_id != task_id.as_str() || marker.launch_digest != spec.digest {
@@ -125,6 +127,7 @@ pub fn initialize(
                         &identity.commit,
                         &partial,
                         credential.as_deref(),
+                        git,
                     )?;
                     identity.commit.clone()
                 } else {
@@ -135,6 +138,7 @@ pub fn initialize(
                         identity.ref_origin,
                         &partial,
                         credential.as_deref(),
+                        git,
                     )?
                 };
                 fs::rename(&partial, &workspace)
@@ -448,6 +452,7 @@ terminal_states: [completed]
             &task(),
             &spec,
             &MountedSecrets::new(None),
+            &GitAccess::User,
         )
         .unwrap();
 
@@ -484,6 +489,7 @@ terminal_states: [completed]
                 &task(),
                 &spec,
                 &MountedSecrets::new(None),
+                &GitAccess::User,
             )
             .unwrap_err();
 
@@ -516,6 +522,7 @@ terminal_states: [completed]
             &task(),
             &spec,
             &MountedSecrets::new(None),
+            &GitAccess::User,
         )
         .unwrap_err();
 

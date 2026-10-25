@@ -54,27 +54,28 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use narsor_controller_runtime::{ControllerConfig, Supervision};
+use narsor_controller_runtime::{ControllerConfig, Supervision, ENROLLMENT_CODE_ENV};
 use narsor_engine::controller_protocol::ProtocolService;
 use narsor_engine::domain::BackendId;
 use narsor_engine::environment::BackendRecord;
+use narsor_shared::config::ENV_PREFIX;
 
 /// The controller binary, installed next to `narsor-server`.
-pub const CONTROLLER_PROGRAM: &str = "narsor-controller";
+const CONTROLLER_PROGRAM: &str = "narsor-controller";
 
 /// Longest wait for the child's lease, counted from its start: less than
 /// the clients' discovery timeout (15 s), with room for the child's own
 /// wait on a predecessor's lock ([`LOCK_TIMEOUT`]).
-pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the child waits for a predecessor holding its credential lock.
-pub const LOCK_TIMEOUT: Duration = Duration::from_secs(7);
+const LOCK_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Longest pause before a restart.
-pub const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
+const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
 
 /// A child that ran this long starts the restart pauses over.
-pub const RESTART_RESET_AFTER: Duration = Duration::from_secs(60);
+const RESTART_RESET_AFTER: Duration = Duration::from_secs(60);
 
 /// How many of the child's last stderr lines a start failure quotes.
 const STDERR_TAIL: usize = 20;
@@ -82,12 +83,6 @@ const STDERR_TAIL: usize = 20;
 /// How often a starting daemon looks for the child's lease, and the
 /// supervising thread for the child's end.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// The prefix of the daemon's own settings, none of which the child gets.
-const NARSOR_ENV_PREFIX: &str = "NARSOR_";
-
-/// The variable the child reads its enrollment code from.
-const ENROLLMENT_CODE_ENV: &str = "NARSOR_ENROLLMENT_CODE";
 
 /// Prefix of the child's lines in the daemon's log.
 const LOG_PREFIX: &str = "narsor-controller:";
@@ -289,7 +284,7 @@ fn supervise(
     stopped: &mpsc::Receiver<()>,
 ) {
     let policy = Supervision::default();
-    let mut delay = policy.restart_after;
+    let mut delays = RestartDelay::new(policy.restart_after);
     loop {
         let started = Instant::now();
         let outcome = match spawn(settings, code.take(), shared) {
@@ -316,9 +311,7 @@ fn supervise(
                 return;
             }
         }
-        if started.elapsed() >= RESTART_RESET_AFTER {
-            delay = policy.restart_after;
-        }
+        let delay = delays.after(started.elapsed());
         tracing::warn!(
             reason = %reason,
             restart_in_secs = delay.as_secs(),
@@ -328,7 +321,31 @@ fn supervise(
             Err(RecvTimeoutError::Timeout) => {}
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
         }
-        delay = (delay * 2).min(MAX_RESTART_DELAY);
+    }
+}
+
+/// The pauses before restarts: the first one, doubled after every restart
+/// up to [`MAX_RESTART_DELAY`], and the first one again after a child that
+/// ran [`RESTART_RESET_AFTER`].
+#[derive(Debug)]
+struct RestartDelay {
+    first: Duration,
+    next: Duration,
+}
+
+impl RestartDelay {
+    fn new(first: Duration) -> Self {
+        Self { first, next: first }
+    }
+
+    /// The pause before starting again a child that ran for `ran_for`.
+    fn after(&mut self, ran_for: Duration) -> Duration {
+        if ran_for >= RESTART_RESET_AFTER {
+            self.next = self.first;
+        }
+        let delay = self.next;
+        self.next = (delay * 2).min(MAX_RESTART_DELAY);
+        delay
     }
 }
 
@@ -413,10 +430,7 @@ fn spawn(
         .arg(parent.to_string())
         .arg("--no-config");
     for (name, _) in std::env::vars_os() {
-        if name
-            .as_encoded_bytes()
-            .starts_with(NARSOR_ENV_PREFIX.as_bytes())
-        {
+        if name.as_encoded_bytes().starts_with(ENV_PREFIX.as_bytes()) {
             command.env_remove(name);
         }
     }
@@ -466,5 +480,52 @@ fn spawn(
             let _ = child.wait();
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_restart_delay_doubles_up_to_thirty_seconds() {
+        let mut delays = RestartDelay::new(Duration::from_secs(1));
+        let crashed_at_once = Duration::from_millis(10);
+        let seconds: Vec<u64> = (0..8)
+            .map(|_| delays.after(crashed_at_once).as_secs())
+            .collect();
+        assert_eq!(seconds, [1, 2, 4, 8, 16, 30, 30, 30]);
+    }
+
+    #[test]
+    fn a_child_that_ran_a_minute_starts_the_delays_over() {
+        let mut delays = RestartDelay::new(Duration::from_secs(1));
+        for _ in 0..4 {
+            delays.after(Duration::ZERO);
+        }
+        assert_eq!(
+            delays.after(RESTART_RESET_AFTER - Duration::from_secs(1)),
+            Duration::from_secs(16)
+        );
+        assert_eq!(delays.after(RESTART_RESET_AFTER), Duration::from_secs(1));
+        assert_eq!(delays.after(Duration::ZERO), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_start_failure_quotes_the_last_twenty_lines() {
+        let shared = Shared {
+            phase: Mutex::new(Phase::Starting),
+            stderr: Mutex::new(VecDeque::new()),
+        };
+        assert_eq!(shared.stderr_tail(), "");
+        for index in 0..25 {
+            shared.remember(format!("line {index}"));
+        }
+        let tail = shared.stderr_tail();
+        // An empty line, the heading, then the lines.
+        let quoted: Vec<&str> = tail.lines().skip(2).map(str::trim).collect();
+        let expected: Vec<String> = (5..25).map(|index| format!("line {index}")).collect();
+        assert_eq!(quoted, expected);
+        assert!(tail.starts_with("\nnarsor-controller wrote:"), "{tail}");
     }
 }

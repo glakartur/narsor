@@ -13,6 +13,11 @@
 mod engine_support;
 mod environment_support;
 mod remote_support;
+/// The stub `narsor-runner` of the contract tests, at the module path its
+/// program selects.
+mod backend_contract_support {
+    pub mod stub_runner;
+}
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -63,6 +68,14 @@ impl Drop for ControllerProcess {
     }
 }
 
+/// Where one controller of a test runs from and what it keeps.
+struct Place {
+    program: PathBuf,
+    control_plane: String,
+    credential: PathBuf,
+    storage: PathBuf,
+}
+
 struct Setup {
     harness: RemoteHarness,
     credential: PathBuf,
@@ -96,16 +109,39 @@ impl Setup {
             .enrollment_code
     }
 
+    /// The test's own controller: the built binary, over loopback.
+    fn place(&self) -> Place {
+        Place {
+            program: engine_support::workspace_binary("narsor-controller"),
+            control_plane: self.harness.base_url(),
+            credential: self.credential.clone(),
+            storage: self.storage.clone(),
+        }
+    }
+
+    /// The control plane's address as one beyond this machine: an
+    /// IPv4-mapped address is not loopback to a controller.
+    fn remote_url(&self) -> String {
+        format!(
+            "http://[::ffff:127.0.0.1]:{}",
+            self.harness.handle.addr().port()
+        )
+    }
+
     fn command(&self, code: Option<&str>, extra: &[&str]) -> Command {
-        let mut command = Command::new(engine_support::workspace_binary("narsor-controller"));
+        self.command_at(&self.place(), code, extra)
+    }
+
+    fn command_at(&self, place: &Place, code: Option<&str>, extra: &[&str]) -> Command {
+        let mut command = Command::new(&place.program);
         command
             .arg("local")
             .arg("--control-plane")
-            .arg(self.harness.base_url())
+            .arg(&place.control_plane)
             .arg("--credential-file")
-            .arg(&self.credential)
+            .arg(&place.credential)
             .arg("--storage")
-            .arg(&self.storage)
+            .arg(&place.storage)
             .args(extra)
             .env_remove("NARSOR_ENROLLMENT_CODE")
             .env("RUST_LOG", "info")
@@ -246,6 +282,68 @@ async fn a_second_controller_on_the_same_credential_waits_and_gives_up_naming_th
     assert!(text.contains(&first.id().to_string()), "{text}");
 }
 
+/// The lock is the credential's, not its directory's: a controller of
+/// another backend whose credential lies beside it does not wait.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "starts narsor-controller processes; run with --ignored"]
+async fn controllers_whose_credentials_share_a_directory_do_not_wait_for_each_other() {
+    use narsor_engine::environment::{BackendKind, BackendRecord, EnvironmentCatalog, TrustScope};
+
+    let setup = Setup::new().await;
+    let code = setup.code().await;
+    let _first = setup.start(Some(&code), &[]);
+    setup.wait_for_lease("became active", |_| true).await;
+
+    EnvironmentCatalog::new(setup.harness.root.path())
+        .save_backend(&BackendRecord::new(
+            "laptop",
+            BackendKind::Local,
+            TrustScope::Workstation,
+            BackendRecord::builtin_local().limits,
+        ))
+        .expect("register the laptop");
+    let code = setup
+        .harness
+        .owner
+        .create_enrollment(
+            "laptop",
+            &CreateEnrollmentRequest {
+                accept_workstation_risk: true,
+                ..CreateEnrollmentRequest::default()
+            },
+        )
+        .await
+        .expect("a code")
+        .enrollment_code;
+    let beside = Place {
+        credential: setup.credential.with_file_name("laptop-credential"),
+        storage: setup.harness.root.path().join("laptop-work"),
+        ..setup.place()
+    };
+    let mut second = ControllerProcess(
+        setup
+            .command_at(&beside, Some(&code), &["--lock-timeout-secs", "1"])
+            .spawn()
+            .expect("start the second controller"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let lease = ControlPlane::new(StatePaths::new(setup.harness.root.path()))
+            .lease(&BackendId::parse("laptop").unwrap())
+            .expect("read the lease");
+        if lease.is_some() {
+            break;
+        }
+        assert!(
+            second.wait_within(Duration::ZERO).is_none(),
+            "the second controller gave up: {}",
+            second.stderr()
+        );
+        assert!(Instant::now() < deadline, "the laptop's lease never came");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts narsor-controller processes; run with --ignored"]
 async fn a_waiting_controller_takes_over_once_the_holder_is_killed() {
@@ -264,7 +362,7 @@ async fn a_waiting_controller_takes_over_once_the_holder_is_killed() {
         })
         .await;
     assert_eq!(again.controller_id, held.controller_id);
-    let pid = std::fs::read_to_string(setup.credential.with_file_name("controller.lock")).unwrap();
+    let pid = std::fs::read_to_string(setup.credential.with_file_name("credential.lock")).unwrap();
     assert_eq!(pid.trim(), second.id().to_string());
 }
 
@@ -353,7 +451,7 @@ mod transport {
     use std::sync::Arc;
 
     use narsor_controller::local::{check_transport, ControlPlanePlace};
-    use narsor_engine::controller_protocol::{ClientOptions, ControllerClient};
+    use narsor_engine::controller_protocol::{ClientOptions, ControllerClient, RunnerClient};
 
     /// What a release build accepts: no plain HTTP beyond loopback.
     const RELEASE: bool = false;
@@ -436,7 +534,8 @@ mod transport {
     }
 
     /// A control plane that redirects elsewhere is not followed: a signed
-    /// request — or an enrollment code — never reaches another host.
+    /// request, an enrollment code or a runner credential never reaches
+    /// another host.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_redirect_to_another_host_is_not_followed() {
         let elsewhere_hits = Arc::new(AtomicUsize::new(0));
@@ -477,6 +576,12 @@ mod transport {
             },
         )
         .await;
+        assert!(refused.is_err());
+        assert_eq!(elsewhere_hits.load(Ordering::SeqCst), 0, "not followed");
+        // Nor does a runner carry its credential there.
+        let refused = RunnerClient::new(format!("http://{redirecting}"), "runner-secret")
+            .renew()
+            .await;
         assert!(refused.is_err());
         assert_eq!(elsewhere_hits.load(Ordering::SeqCst), 0, "not followed");
 
@@ -658,6 +763,62 @@ mod untrusted_server {
         started_with(&local(&dir, &["--no-config"], &[]), "private");
     }
 
+    /// A harness directory is the user's own login: like `--home host`, it
+    /// needs `--accept-host-home`.
+    #[test]
+    fn a_harness_directory_flag_needs_the_users_explicit_acceptance() {
+        let dir = Dir::new();
+        for flag in [
+            "--codex-home",
+            "--claude-config-dir",
+            "--claude-profile-source",
+        ] {
+            let output = local(&dir, &[flag, "/home/me/.logins"], &[]);
+            let text = stderr(&output);
+            assert_eq!(output.status.code(), Some(2), "{text}");
+            assert!(text.contains(flag), "{text}");
+            assert!(text.contains("--accept-host-home"), "{text}");
+            assert!(!text.contains("enrollment failed"), "{text}");
+        }
+        let accepted = local(
+            &dir,
+            &["--codex-home", "/home/me/.codex", "--accept-host-home"],
+            &[],
+        );
+        started_with(&accepted, "private");
+        assert!(
+            stderr(&accepted).contains("CODEX_HOME=/home/me/.codex"),
+            "{}",
+            stderr(&accepted)
+        );
+    }
+
+    /// The configuration file's harness directories are the daemon's: a
+    /// control plane beyond this machine does not get them unasked.
+    #[test]
+    fn harness_directories_from_the_configuration_are_left_out() {
+        let dir = Dir::new();
+        dir.user_config(
+            "local_codex_home: /home/me/.codex\nlocal_claude_config_dir: /home/me/.claude\n",
+        );
+        let output = local(&dir, &[], &[]);
+        started_with(&output, "private");
+        assert!(
+            !stderr(&output).contains("/home/me/."),
+            "{}",
+            stderr(&output)
+        );
+
+        let accepted = local(&dir, &["--accept-host-home"], &[]);
+        started_with(&accepted, "private");
+        let text = stderr(&accepted);
+        assert!(text.contains("CODEX_HOME=/home/me/.codex"), "{text}");
+        assert!(
+            text.contains("CLAUDE_CONFIG_DIR=/home/me/.claude"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn a_file_without_local_home_leaves_a_private_home() {
         let dir = Dir::new();
@@ -745,4 +906,376 @@ async fn a_controller_of_a_remote_control_plane_names_its_backend() {
     let text = controller.stderr();
     assert!(text.contains("serving backend 'laptop'"), "{text}");
     assert!(text.contains("HOME mode 'private'"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Runners of a controller process (U2: R5, R12; U7: R17)
+// ---------------------------------------------------------------------------
+
+/// What a controller's runners do: each runner here is a script beside the
+/// controller that writes down its environment and arguments and then runs
+/// the stub runner, which speaks the runner protocol without running a
+/// workflow step.
+mod runners {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use narsor_engine::controller_protocol::{
+        CreateEnrollmentRequest, SubmitOperatorCommandRequest, WorkspaceRequest,
+    };
+    use narsor_engine::domain::{ExecutionStatus, ResourceProfile, TaskId};
+    use narsor_engine::environment::{
+        BackendKind, BackendLimits, BackendRecord, EnvironmentCatalog, TrustScope,
+    };
+    use narsor_engine::orchestration::{ControlPlane, OperatorCommand, RunnerState, TaskRecord};
+    use narsor_engine::persistence::paths::StatePaths;
+
+    use super::backend_contract_support::stub_runner;
+    use super::{remote_support, ControllerProcess, Place, Setup};
+
+    /// A directory holding a copy of the controller and, when `runner` is
+    /// set, a `narsor-runner` beside it that records how it was started in
+    /// `runner-env` and `runner-args` before it runs the stub. The
+    /// controller starts the runner beside its own executable.
+    fn controller_dir(dir: &Path, runner: bool) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let program = dir.join("narsor-controller");
+        let built = super::engine_support::workspace_binary("narsor-controller");
+        if std::fs::hard_link(&built, &program).is_err() {
+            std::fs::copy(&built, &program).unwrap();
+        }
+        if runner {
+            let stub = stub_runner::install(&dir.join("stub"));
+            let script = dir.join("narsor-runner");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nenv > '{dir}/runner-env'\nprintf '%s\\n' \"$@\" > \
+                     '{dir}/runner-args'\nexec '{stub}' \"$@\"\n",
+                    dir = dir.display(),
+                    stub = stub.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        program
+    }
+
+    fn lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn record(setup: &Setup, task: &str) -> TaskRecord {
+        ControlPlane::new(StatePaths::new(setup.harness.root.path()))
+            .task(&TaskId::parse(task).unwrap())
+            .expect("the task")
+    }
+
+    fn detail(record: &TaskRecord) -> String {
+        record
+            .observed
+            .as_ref()
+            .and_then(|observed| observed.summary.detail.clone())
+            .unwrap_or_default()
+    }
+
+    async fn wait_for(
+        setup: &Setup,
+        task: &str,
+        what: &str,
+        accept: impl Fn(&TaskRecord) -> bool,
+    ) -> TaskRecord {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let record = record(setup, task);
+            if accept(&record) {
+                return record;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{task}: never {what}; last observed: {:?}",
+                record.observed
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn create(setup: &Setup, task: &str, backend: &str, repository: Option<&Path>) {
+        let mut request = remote_support::create_request(task, Some(backend));
+        request.launch.workspace = repository.map(|repository| WorkspaceRequest {
+            repository: Some(repository.display().to_string()),
+            commit: None,
+        });
+        setup
+            .harness
+            .owner
+            .create_control_task(&request)
+            .await
+            .unwrap_or_else(|error| panic!("create {task}: {error}"));
+    }
+
+    /// A Git repository with one commit, inside the directories the control
+    /// plane may take a local workspace from.
+    fn repository(setup: &Setup) -> PathBuf {
+        let repo = setup.harness.root.path().join("users-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "first",
+            ][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        repo
+    }
+
+    /// A workstation backend `laptop` for two tasks at once, and a code
+    /// for it.
+    async fn laptop(setup: &Setup) -> String {
+        EnvironmentCatalog::new(setup.harness.root.path())
+            .save_backend(&BackendRecord::new(
+                "laptop",
+                BackendKind::Local,
+                TrustScope::Workstation,
+                BackendLimits::new(2, ResourceProfile::new(1000, 2048), None),
+            ))
+            .expect("register the laptop");
+        setup
+            .harness
+            .owner
+            .create_enrollment(
+                "laptop",
+                &CreateEnrollmentRequest {
+                    accept_workstation_risk: true,
+                    ..CreateEnrollmentRequest::default()
+                },
+            )
+            .await
+            .expect("a code")
+            .enrollment_code
+    }
+
+    /// Covers AE7 for a whole task: started, run to its end, on a runner
+    /// that inherits none of the controller's own `NARSOR_*` settings and
+    /// gets the HOME mode the controller was given.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts narsor-controller processes; run with --ignored"]
+    async fn a_task_runs_to_its_end_on_a_runner_without_the_controllers_settings() {
+        let setup = Setup::new().await;
+        let dir = setup.harness.root.path().join("trusted");
+        let place = Place {
+            program: controller_dir(&dir, true),
+            ..setup.place()
+        };
+        let code = setup.code().await;
+        let mut command = setup.command_at(&place, Some(&code), &["--home", "host"]);
+        command.env("NARSOR_PLANTED_SETTING", "controller-only");
+        let _controller = ControllerProcess(command.spawn().expect("start narsor-controller"));
+
+        create(&setup, "task-1", "local", None).await;
+        wait_for(&setup, "task-1", "started", |record| {
+            record.runner_state == RunnerState::Running
+        })
+        .await;
+        setup
+            .harness
+            .owner
+            .control_operator_command(
+                "task-1",
+                &SubmitOperatorCommandRequest {
+                    command: OperatorCommand::Transition {
+                        target: "done".to_string(),
+                        forced: false,
+                        reason: None,
+                    },
+                    idempotency_key: "finish".to_string(),
+                    expected_generation: None,
+                },
+            )
+            .await
+            .expect("move the task to its end");
+        wait_for(&setup, "task-1", "completed", |record| {
+            record.runner.as_ref().is_some_and(|runner| {
+                runner.snapshot.execution_status == ExecutionStatus::Completed
+            })
+        })
+        .await;
+
+        let env = lines(&dir.join("runner-env"));
+        let narsor: Vec<&String> = env
+            .iter()
+            .filter(|line| line.starts_with("NARSOR_"))
+            .filter(|line| !line.starts_with("NARSOR_LOCAL_WORKLOAD_UID="))
+            .collect();
+        assert!(narsor.is_empty(), "{narsor:?}");
+        let args = lines(&dir.join("runner-args"));
+        assert!(
+            args.windows(2).any(|pair| pair == ["--home", "host"]),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--pinned-git-credential-only"),
+            "a trusted daemon's runner clones as the user: {args:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts narsor-controller processes; run with --ignored"]
+    async fn without_a_runner_beside_it_a_launch_is_refused_and_says_why() {
+        let setup = Setup::new().await;
+        let dir = setup.harness.root.path().join("alone");
+        let place = Place {
+            program: controller_dir(&dir, false),
+            ..setup.place()
+        };
+        let code = setup.code().await;
+        let _controller = ControllerProcess(
+            setup
+                .command_at(&place, Some(&code), &[])
+                .spawn()
+                .expect("start narsor-controller"),
+        );
+        create(&setup, "task-1", "local", None).await;
+        let record = wait_for(&setup, "task-1", "was refused", |record| {
+            detail(record).contains("refused the workload")
+        })
+        .await;
+        let why = detail(&record);
+        assert!(why.contains("cannot start"), "{why}");
+        assert!(
+            why.contains(&dir.join("narsor-runner").display().to_string()),
+            "{why}"
+        );
+    }
+
+    /// Variables of the user's own logins a runner of a server that is not
+    /// trusted never inherits.
+    const USER_LOGINS: [&str; 9] = [
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
+        "GH_TOKEN",
+        "GITLAB_TOKEN",
+        "SSH_AUTH_SOCK",
+        "GIT_CONFIG_COUNT",
+        "XDG_CONFIG_HOME",
+    ];
+
+    /// Covers AE13 and AE14 end to end: a controller of a control plane
+    /// beyond this machine refuses a workspace of the user's disk before
+    /// anything of the task exists, and starts the runner of a task it
+    /// accepts so that it — its clone and its harness — inherits none of the
+    /// user's logins. The same workspace from a trusted daemon still starts.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts narsor-controller processes; run with --ignored"]
+    async fn a_remote_control_plane_cannot_have_the_users_repository_cloned() {
+        let setup = Setup::new().await;
+        let repo = repository(&setup);
+        let home = setup.harness.root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let remote_dir = setup.harness.root.path().join("remote");
+        let remote = Place {
+            program: controller_dir(&remote_dir, true),
+            control_plane: setup.remote_url(),
+            credential: remote_dir.join("credential"),
+            storage: remote_dir.join("storage"),
+        };
+        let code = laptop(&setup).await;
+        let mut command = setup.command_at(&remote, Some(&code), &["--no-config"]);
+        command.env("HOME", &home);
+        for name in USER_LOGINS {
+            command.env(name, "planted-by-the-user");
+        }
+        let _remote = ControllerProcess(command.spawn().expect("start the remote controller"));
+
+        create(&setup, "users-repo", "laptop", Some(&repo)).await;
+        let refused = wait_for(&setup, "users-repo", "was refused", |record| {
+            detail(record).contains("refused the workload")
+        })
+        .await;
+        let why = detail(&refused);
+        assert!(why.contains("https://"), "{why}");
+        assert!(
+            !remote_dir.join("runner-args").exists(),
+            "no runner was started"
+        );
+        let storages = remote.storage.join("storage");
+        assert!(
+            std::fs::read_dir(&storages).map_or(true, |mut entries| entries.next().is_none()),
+            "no task storage was made"
+        );
+
+        create(&setup, "no-workspace", "laptop", None).await;
+        wait_for(&setup, "no-workspace", "got a runner", |record| {
+            record.runner.is_some()
+        })
+        .await;
+        let args = lines(&remote_dir.join("runner-args"));
+        assert!(
+            args.windows(2).any(|pair| pair == ["--home", "private"]),
+            "{args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--pinned-git-credential-only"),
+            "{args:?}"
+        );
+        let env = lines(&remote_dir.join("runner-env"));
+        let inherited: Vec<&String> = env
+            .iter()
+            .filter(|line| {
+                USER_LOGINS
+                    .iter()
+                    .any(|name| line.starts_with(&format!("{name}=")))
+            })
+            .collect();
+        assert!(inherited.is_empty(), "{inherited:?}");
+
+        // The trusted daemon's controller takes the same workspace.
+        let trusted_dir = setup.harness.root.path().join("trusted");
+        let trusted = Place {
+            program: controller_dir(&trusted_dir, true),
+            ..setup.place()
+        };
+        let code = setup.code().await;
+        let mut command = setup.command_at(&trusted, Some(&code), &[]);
+        for name in ["CODEX_HOME", "GH_TOKEN"] {
+            command.env(name, "planted-by-the-user");
+        }
+        let _trusted = ControllerProcess(command.spawn().expect("start the trusted controller"));
+        create(&setup, "trusted-repo", "local", Some(&repo)).await;
+        let started = wait_for(&setup, "trusted-repo", "got a runner", |record| {
+            record.runner.is_some() || detail(record).contains("refused")
+        })
+        .await;
+        assert!(started.runner.is_some(), "{:?}", started.observed);
+        // Its runner keeps the user's logins.
+        let env = lines(&trusted_dir.join("runner-env"));
+        for name in ["CODEX_HOME", "GH_TOKEN"] {
+            let line = format!("{name}=planted-by-the-user");
+            assert!(env.contains(&line), "{name}: {env:?}");
+        }
+    }
 }
