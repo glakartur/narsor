@@ -48,7 +48,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{self, BufRead as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -115,7 +115,7 @@ pub fn controller_program() -> Result<PathBuf, String> {
         return Ok(adjacent);
     }
     #[cfg(debug_assertions)]
-    if let Some(profile) = exe.parent().and_then(Path::parent) {
+    if let Some(profile) = exe.parent().and_then(std::path::Path::parent) {
         let built = profile.join(CONTROLLER_PROGRAM);
         if built.is_file() {
             return Ok(built);
