@@ -820,6 +820,42 @@ fn an_insecure_security_value_stops_the_daemon_with_the_key_named() {
 
 #[test]
 #[ignore = "starts narsor-server; run with --ignored"]
+fn a_network_daemon_starts_without_the_built_in_local_controller() {
+    needs_no_system_config!();
+    // The built-in local controller reaches the API directly, which the
+    // network mode's trusted-proxy gate refuses; it used to stop the daemon
+    // with "enrollment failed" right after the claim code was printed.
+    let root = TempRoot::new();
+    let discovery = root.path().join(".narsor/daemon.json");
+    let watcher = {
+        let discovery = discovery.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(20) {
+                if discovery.exists() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        })
+    };
+    let invocation = daemon(&root, &NETWORK_MODE, Duration::from_secs(4));
+    assert!(
+        watcher.join().unwrap(),
+        "the daemon became discoverable: {}",
+        invocation.stderr
+    );
+    assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
+    assert!(
+        !invocation.stderr.contains("enrollment failed"),
+        "{}",
+        invocation.stderr
+    );
+}
+
+#[test]
+#[ignore = "starts narsor-server; run with --ignored"]
 fn an_unclaimed_network_daemon_prints_and_stores_a_one_time_claim_code() {
     use std::os::unix::fs::PermissionsExt;
 

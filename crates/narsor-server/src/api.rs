@@ -342,6 +342,18 @@ pub enum ServerSecurity {
 }
 
 impl ServerSecurity {
+    /// Whether the daemon runs its built-in `local` backend controller.
+    ///
+    /// Only in trusted mode. That controller and its runners reach the API
+    /// directly on the bind address, but in network mode every request must
+    /// come through a trusted proxy that reports HTTPS, so their enrollment
+    /// would be refused and the daemon would not start. A network control
+    /// plane serves remote backends only; a task sent to `local` waits as
+    /// `controller_offline`.
+    pub fn runs_local_controller(&self) -> bool {
+        matches!(self, Self::Trusted { .. })
+    }
+
     /// Trusted mode on a system-chosen loopback port.
     pub fn trusted_loopback() -> Self {
         Self::Trusted {

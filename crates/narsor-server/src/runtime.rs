@@ -139,6 +139,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     // Before anything is touched: a security configuration that does not
     // hold up must stop the daemon, not leave it half started (U7).
     let security = server_security(config, &paths)?;
+    let runs_local_controller = security.runs_local_controller();
     let store = ExecutionStore::new(config.state_dir());
 
     let recovery = recover_at_startup(&store);
@@ -245,8 +246,14 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     // plane URL.  Do not make the daemon discoverable until this loop is
     // running: otherwise a freshly connected local client can create work in
     // the gap before any controller can acquire its lease.
-    let (controller_stop, controller_task) =
-        start_local_controller(config, &api_handle, Arc::clone(&control)).await?;
+    let local_controller = if runs_local_controller {
+        Some(start_local_controller(config, &api_handle, Arc::clone(&control)).await?)
+    } else {
+        tracing::info!(
+            "daemon: network mode serves remote backends only; the built-in local controller does not start"
+        );
+        None
+    };
     info.write(&paths.daemon_file()).map_err(|error| {
         CliError::failure(format!(
             "could not write the daemon discovery file: {error}"
@@ -267,9 +274,11 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     // Release the controller lease while the API is still accepting its
     // signed request.  A successor can then acquire it immediately rather
     // than waiting for expiry.
-    let _ = controller_stop.send(());
-    if let Err(error) = controller_task.await {
-        tracing::warn!(%error, "daemon: local controller task stopped unexpectedly");
+    if let Some((controller_stop, controller_task)) = local_controller {
+        let _ = controller_stop.send(());
+        if let Err(error) = controller_task.await {
+            tracing::warn!(%error, "daemon: local controller task stopped unexpectedly");
+        }
     }
 
     // Stop accepting new connections *before* draining active runs, not
