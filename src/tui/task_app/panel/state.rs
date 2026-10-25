@@ -1,22 +1,8 @@
-//! The "Czeka na Ciebie" footer (U10, origin §2): one area at the bottom of
-//! the details that answers every kind of waiting.
+//! The state of the panel of one task: the entries that hold what the
+//! operator typed, the forms the server offered and the one shown, the chat
+//! and the drafts that outlived their waiting.
 //!
-//! ```text
-//! ───────────────────────────────────────────────────────────────────────
-//! ? Pytanie · review_scope · 6m · 1/1
-//!
-//! „Czy zakres zmian obejmuje też migrację danych?”
-//! ◆ dyrygent: raczej revise — brak planu migracji
-//! Akcje                       Opis
-//!   1 approved                ↩ wraca do agenta: plan
-//! | 2 | revise                Zakres wymaga poprawy…
-//! Komentarz dla agenta (wymagane):
-//! > Uwzględnij migrację tabeli orders
-//! ```
-//!
-//! # What the panel is made of
-//!
-//! The row of the list says *that* a task waits ([`AttentionItem`]); this
+//! The row of the list says *that* a task waits ([`AttentionItem`]); the
 //! panel is built from it and from what the details know:
 //!
 //! * a question, an approval, a problem the step must be settled with — the
@@ -24,25 +10,17 @@
 //! * a failed step and a proposal of the conductor's — the conductor's own
 //!   state, read on demand like the other tabs ([`OperatorPanel`]);
 //! * a failed provisioning and a problem of the runner's — the owner commands
-//!   `start` and `archive`.
+//!   `start` and `archive` ([`OwnerPanel`]).
 //!
 //! Each waiting is an [`Entry`]: its context, a [`Chooser`] holding what the
-//! operator typed, and how a chosen action is sent. Entries live as long as the
-//! waiting does, so a refresh, a new read of the conductor or a move to another
-//! tab never costs the operator a draft; an entry whose waiting went away takes
-//! its draft with it into a box the operator can still copy from.
+//! operator typed, and how a chosen action is sent. Entries live as long as
+//! the waiting does, so a refresh, a new read of the conductor or a move to
+//! another tab never costs the operator a draft; an entry whose waiting went
+//! away takes its draft with it into a box the operator can still copy from.
 //!
-//! # Sending
-//!
-//! A chosen action becomes an [`AnswerRequest`]: an answer to the pending input
-//! (`POST …/input`, naming the request), an operator command (`POST
-//! …/operator-commands`) or an owner command (`POST …/commands`) — each with an
-//! idempotency key a retry of the same decision reuses. A refusal (a `409`: the
-//! task moved on) leaves the panel open with what was typed and reads the
-//! tasks again; success keeps the focus in the details on the timeline with a notification.
-//!
-//! Text from the agent, the conductor and the runner is passed through
-//! [`sanitize`] before it is drawn; what the operator typed is sent as typed.
+//! When the server offers forms (`TaskSummary::panel`), only the waits a form
+//! answers have an entry, and [`super::switcher::Switcher`] says which form is
+//! shown.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -50,39 +28,34 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::api::ClientError;
 use crate::conductor::ConductorView;
 use crate::controller_protocol::{
-    ConductorReadResponse, ConversationUnavailableReason, OwnerCommandRequest,
-    SubmitCommentRequest, SubmitInputRequest, SubmitOperatorCommandRequest, TaskSummary,
+    ConductorReadResponse, ConversationUnavailableReason, TaskSummary,
 };
-use narsor_protocol::api::{
-    HumanInputDeliveryDto, PendingHumanInputView, Position, PositionStatus,
-};
+use narsor_protocol::api::{PendingHumanInputView, Position, PositionStatus};
 use narsor_protocol::controller::{
-    AttentionItem, AttentionKind, OperatorCommand, OwnerCommand, PanelForm, PanelFormKind,
-    PanelOffer, TaskActionId,
+    AttentionItem, AttentionKind, PanelForm, PanelFormKind, PanelOffer, TaskActionId,
 };
 
-use super::super::chooser::{
+use super::chat::{Chat, ChatEffect};
+use super::header::position_hint;
+use super::switcher::{FormKey, Switcher};
+use crate::tui::chooser::{
     self, Chooser, ChooserAction, ChooserField, ChooserFocus, ChooserItem, Submission,
 };
-use super::super::failure_form::OperatorPanel;
-use super::super::input_form::{ContextLine, InputPanel, Tone};
-use super::super::keymap::{self, Action, Context};
-use super::super::scroll::one_line;
-use super::super::scroll::{wrap_line, ScrollState};
-use super::super::style::{Role, Styles};
-use super::actions::{write_to_agent_item, written_text, TaskAction, COMMENT_FIELD};
-use super::background::{DetailJob, JobKey, Outcome};
-use super::detail::short_age;
-use super::list::title_of;
-use super::notify::Severity;
-use super::panel::chat::{Chat, ChatEffect};
-use super::panel::header::position_hint;
-use super::panel::switcher::{FormKey, Switcher};
-use super::tabs::conductor;
-use super::{failure_reason, idempotency_key, Request, TaskApp};
+use crate::tui::failure_form::OperatorPanel;
+use crate::tui::input_form::{ContextLine, InputPanel, Tone};
+use crate::tui::keymap::{self, Action, Context};
+use crate::tui::scroll::one_line;
+use crate::tui::scroll::{wrap_line, ScrollState};
+use crate::tui::style::{Role, Styles};
+use crate::tui::task_app::actions::{write_to_agent_item, written_text, TaskAction, COMMENT_FIELD};
+use crate::tui::task_app::detail::short_age;
+use crate::tui::task_app::idempotency_key;
+use crate::tui::task_app::list::title_of;
+
+use super::legacy::OwnerPanel;
+use super::request::{AnswerRequest, PanelEffect, Submit, SyncEffect};
 
 /// The most rows of the context the panel gives itself before it scrolls.
 const MAX_CONTEXT_ROWS: usize = 4;
@@ -90,119 +63,6 @@ const MAX_CONTEXT_ROWS: usize = 4;
 /// The fewest rows of detail content the panel leaves below the header and
 /// two-row tab bar.
 const KEEP_FOR_CONTENT: u16 = 2;
-
-// ---------------------------------------------------------------------
-// What is sent
-// ---------------------------------------------------------------------
-
-/// What a chosen action asks the API to do.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Submit {
-    /// An answer to the pending input request `pending_input_id`.
-    Input {
-        /// The request it answers.
-        pending_input_id: String,
-        /// The answer, boxed: it is far larger than the other variants.
-        delivery: Box<HumanInputDeliveryDto>,
-    },
-    /// A command for the runner: a restart, a confirmation of a proposal.
-    Operator(OperatorCommand),
-    /// A runner state command of the owner: `start`, `archive`.
-    Owner(OwnerCommand),
-    /// Action 0, the text to the agent: the server picks what it does.
-    Comment(String),
-}
-
-/// A chosen action, ready to be sent: [`TaskApp::perform`] carries it out.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AnswerRequest {
-    /// The task.
-    pub task_id: String,
-    /// The waiting it answers.
-    pub waiting_id: String,
-    /// The task's title for the notification.
-    pub title: String,
-    /// The generation the screen shows; a command is refused if the task has
-    /// moved on.
-    pub generation: u64,
-    /// The key a retry of this decision reuses.
-    pub key: String,
-    /// What the notification says when it worked.
-    pub summary: String,
-    /// What to send.
-    pub submit: Submit,
-}
-
-// ---------------------------------------------------------------------
-// The entries
-// ---------------------------------------------------------------------
-
-/// The owner commands behind a failed provisioning or a problem of the
-/// runner's.
-#[derive(Debug, Clone)]
-struct OwnerPanel {
-    context: Vec<ContextLine>,
-    items: Vec<ChooserItem>,
-    commands: Vec<OwnerCommand>,
-}
-
-impl OwnerPanel {
-    fn start_item(description: &str) -> ChooserItem {
-        ChooserItem::new("Uruchom od nowa", description)
-    }
-
-    fn provisioning(task: &TaskSummary) -> Self {
-        let mut context = vec![ContextLine::plain(
-            "Backend nie przygotował workspace'u; zadanie nie wystartowało.",
-        )];
-        if let Some(detail) = task
-            .observation
-            .as_ref()
-            .and_then(|observed| observed.summary.detail.as_deref())
-        {
-            context.push(ContextLine::problem(detail));
-        }
-        Self {
-            context,
-            items: vec![
-                Self::start_item("Ponawia przygotowanie i start zadania na tym samym storage."),
-                ChooserItem::new(
-                    "Archiwizuj",
-                    "Usuwa workload i storage zadania; zadanie trafia do Historii.",
-                )
-                .irreversible(),
-            ],
-            commands: vec![OwnerCommand::Start, OwnerCommand::Archive],
-        }
-    }
-
-    fn runner_problem(task: &TaskSummary, code: &str) -> Self {
-        let message = task
-            .runner
-            .as_ref()
-            .and_then(|runner| runner.problem.as_ref())
-            .filter(|problem| problem.code == code)
-            .map_or(String::new(), |problem| format!(": {}", problem.message));
-        Self {
-            context: vec![
-                ContextLine::plain("Runner nie może wykonywać pracy."),
-                ContextLine::problem(format!("{code}{message}")),
-            ],
-            items: vec![Self::start_item(
-                "Start zadania jest Twoją decyzją o kontynuacji: runner zaczyna od zapisanego stanu.",
-            )],
-            commands: vec![OwnerCommand::Start],
-        }
-    }
-
-    fn summary(&self, submission: &Submission) -> String {
-        match self.commands.get(submission.index) {
-            Some(OwnerCommand::Archive) => "zarchiwizowano",
-            _ => "uruchomiono od nowa",
-        }
-        .to_string()
-    }
-}
 
 /// How a waiting is answered.
 #[derive(Debug, Clone)]
@@ -597,7 +457,7 @@ fn form_offer(task: &TaskSummary) -> Option<&PanelOffer> {
 }
 
 /// The action of the menu a choice of the task's own actions does.
-fn panel_action(id: TaskActionId) -> Option<TaskAction> {
+pub(super) fn panel_action(id: TaskActionId) -> Option<TaskAction> {
     match id {
         TaskActionId::Transition => Some(TaskAction::Transition),
         TaskActionId::Resume | TaskActionId::Pause => Some(TaskAction::PauseResume),
@@ -635,40 +495,12 @@ pub struct Released {
     entry: Box<Entry>,
 }
 
-/// What a key in the panel asks of the application.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PanelEffect {
-    /// The key was folded into the panel.
-    None,
-    /// Collapse the panel.
-    Collapse,
-    /// Say something on the bar.
-    Notice(String),
-    /// Send the chosen action.
-    Submit(Submission),
-    /// The chosen action cannot be undone: ask in the `y` / `n` window first.
-    Confirm(Submission),
-    /// Action 0 with its text: send it to the agent.
-    Comment(String),
-    /// The chosen action of the workflow form: the application does it.
-    Action(TaskActionId),
-}
-
-/// What a read of the panel's entries changed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SyncEffect {
-    /// The entry the operator was in went away.
-    pub lost_current: bool,
-    /// A draft was left behind.
-    pub released: bool,
-}
-
 /// The panel of one task: every waiting, the one shown, and the drafts.
 #[derive(Debug, Clone, Default)]
 pub struct WaitingPanel {
     entries: Vec<Entry>,
     current: usize,
-    collapsed: bool,
+    pub(super) collapsed: bool,
     released: Vec<Released>,
     conductor: Option<ConductorView>,
     conductor_revision: Option<u64>,
@@ -926,7 +758,7 @@ impl WaitingPanel {
                 ..
             }) => {
                 self.conductor_retry_at =
-                    Some(std::time::Instant::now() + super::tabs::READER_RETRY);
+                    Some(std::time::Instant::now() + crate::tui::task_app::tabs::READER_RETRY);
                 return;
             }
             Ok(ConductorReadResponse::Unavailable { message, .. }) => {
@@ -1401,7 +1233,7 @@ impl WaitingPanel {
     /// Says what a send of `waiting_id` came to. Success forgets the draft; a
     /// refusal keeps the panel as it is and shows why; a lost connection keeps
     /// the key for the retry.
-    fn settle(&mut self, waiting_id: &str, outcome: Result<(), (String, bool)>) {
+    pub(super) fn settle(&mut self, waiting_id: &str, outcome: Result<(), (String, bool)>) {
         if waiting_id.is_empty() && self.forms.is_some() {
             self.chat.settle(outcome);
             return;
@@ -1775,7 +1607,7 @@ fn paint_waiting_panel(frame: &mut Frame, area: Rect, styles: &Styles, focused: 
 /// The context wrapped to `width` columns, one row per line, each in its
 /// tone. Everything in it is somebody else's text, so it is made safe here.
 /// A description as lines, each safe for a terminal.
-fn one_line_per_row(text: &str) -> Vec<String> {
+pub(super) fn one_line_per_row(text: &str) -> Vec<String> {
     text.lines().map(one_line).collect()
 }
 
@@ -1829,476 +1661,4 @@ fn render_context(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Left), area);
-}
-
-// ---------------------------------------------------------------------
-// The application's part
-// ---------------------------------------------------------------------
-
-impl TaskApp {
-    /// Whether the panel has the keyboard: the focus is in the details, on
-    /// the panel, and there is a panel.
-    pub fn panel_focused(&self) -> bool {
-        matches!(self.view, super::View::Tasks)
-            && self.focus == super::Focus::Details
-            && self.panel_focus
-            && self.selected_panel().is_some_and(WaitingPanel::is_present)
-    }
-
-    fn selected_panel(&self) -> Option<&WaitingPanel> {
-        let id = self.list.selected_id()?;
-        self.detail.view(id).map(|view| &view.waiting)
-    }
-
-    /// Whether the panel's form asks the operator to confirm the send.
-    pub(super) fn panel_confirming(&self) -> bool {
-        self.panel_focused()
-            && self
-                .selected_panel()
-                .is_some_and(WaitingPanel::is_confirming)
-    }
-
-    /// Whether a key is typed into a field of the panel.
-    pub(super) fn panel_typing(&self) -> bool {
-        self.panel_focused() && self.selected_panel().is_some_and(WaitingPanel::is_typing)
-    }
-
-    /// `Enter` on the list: the details of the selected task, and — when it
-    /// waits — its panel unfolded with the focus on the actions.
-    pub(super) fn open_selected(&mut self) {
-        let Some(id) = self.list.selected_id().map(str::to_string) else {
-            return;
-        };
-        self.focus = super::Focus::Details;
-        self.panel_focus = false;
-        self.back_to_axis();
-        self.sync_waiting();
-        if let Some(view) = self.detail.views.get_mut(&id) {
-            if view.waiting.is_present() {
-                view.waiting.expand();
-                self.panel_focus = true;
-            }
-        }
-    }
-
-    /// `Tab` in the details: to the panel, unfolding it.
-    pub(super) fn focus_panel(&mut self) {
-        let Some(id) = self.list.selected_id().map(str::to_string) else {
-            return;
-        };
-        match self.detail.views.get_mut(&id) {
-            Some(view) if view.waiting.is_present() => {
-                view.waiting.expand();
-                self.panel_focus = true;
-            }
-            _ => self.notify(Severity::Warning, "to zadanie na nic nie czeka"),
-        }
-    }
-
-    /// Brings every task's panel in line with what its row says it waits on,
-    /// and the drafts with what the panels hold. Call it after a list was
-    /// read, an event was applied, a key edited a draft.
-    pub fn sync_waiting(&mut self) {
-        let selected = self.list.selected_id().map(str::to_string);
-        let mut lost = false;
-        let mut released = false;
-        let mut drafts = Vec::new();
-        for task in self.list.tasks() {
-            let id = task.task_id.as_str();
-            let present = self
-                .detail
-                .views
-                .get(id)
-                .is_some_and(|view| view.waiting.is_present());
-            let offers_forms = task
-                .panel
-                .as_ref()
-                .is_some_and(|panel| !panel.forms.is_empty());
-            if task.attention.is_empty() && !offers_forms && !present {
-                continue;
-            }
-            let view = self.detail.view_mut(id);
-            let positions = view.progress().positions().to_vec();
-            let effect = view.waiting.sync(task, &positions);
-            if selected.as_deref() == Some(id) {
-                lost = effect.lost_current;
-                released = effect.released;
-            }
-            drafts.push((id.to_string(), view.draft_text()));
-        }
-        for (id, text) in drafts {
-            self.detail.set_draft(&id, text);
-        }
-        if lost && self.panel_focus {
-            self.panel_focus = false;
-            let text = if released {
-                "oczekiwanie zniknęło — szkic został w panelu do skopiowania"
-            } else {
-                "oczekiwanie zniknęło (odpowiedź z innego klienta?)"
-            };
-            self.notify(Severity::Warning, text);
-        }
-    }
-
-    /// A key while the panel has the keyboard.
-    pub(super) fn on_panel_key(&mut self, key: KeyEvent) -> Request {
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && !self.panel_confirming() {
-            // Tab changes the outer panel focus. Chooser fields use arrows and
-            // Enter, so leaving here never submits or discards a draft.
-            self.panel_focus = false;
-            return Request::None;
-        }
-        let Some(id) = self.list.selected_id().map(str::to_string) else {
-            return Request::None;
-        };
-        if !self.panel_typing() {
-            match keymap::lookup(Context::Panel, &key) {
-                Some(Action::Help) => {
-                    self.help_open = true;
-                    return Request::None;
-                }
-                Some(Action::Quit) => {
-                    self.on_quit();
-                    return Request::None;
-                }
-                _ => {}
-            }
-        }
-        let effect = self
-            .detail
-            .views
-            .get_mut(&id)
-            .map_or(PanelEffect::None, |view| view.waiting.on_key(key));
-        let request = match effect {
-            PanelEffect::None => Request::None,
-            PanelEffect::Collapse => {
-                if let Some(view) = self.detail.views.get_mut(&id) {
-                    view.waiting.collapsed = !view.waiting.is_empty();
-                }
-                self.panel_focus = false;
-                Request::None
-            }
-            PanelEffect::Notice(text) => {
-                self.notify(Severity::Warning, text);
-                Request::None
-            }
-            PanelEffect::Submit(submission) => self.submit_answer(&id, &submission),
-            PanelEffect::Confirm(submission) => self.ask_to_confirm(&id, &submission),
-            PanelEffect::Comment(text) => self.submit_comment_text(&id, text),
-            PanelEffect::Action(action) => match panel_action(action) {
-                Some(action) => self.invoke(action),
-                None => Request::None,
-            },
-        };
-        if let Some(view) = self.detail.views.get(&id) {
-            let text = view.draft_text();
-            self.detail.set_draft(&id, text);
-        }
-        request
-    }
-
-    /// A paste while the panel has the keyboard: into the field being typed
-    /// in, and nowhere else.
-    pub(super) fn on_panel_paste(&mut self, pasted: &str) {
-        let Some(id) = self.list.selected_id().map(str::to_string) else {
-            return;
-        };
-        let used = self
-            .detail
-            .views
-            .get_mut(&id)
-            .is_some_and(|view| view.waiting.paste(pasted));
-        if used {
-            self.sync_draft(&id);
-        }
-    }
-
-    /// An action that cannot be undone: the request is prepared as for any
-    /// other, but waits in the confirmation window for `y`.
-    fn ask_to_confirm(&mut self, id: &str, submission: &Submission) -> Request {
-        let Request::Answer(request) = self.submit_answer(id, submission) else {
-            return Request::None;
-        };
-        let (label, mut lines) = self
-            .selected_panel()
-            .and_then(|panel| {
-                // The submission counts from after action 0, when there is one.
-                panel.chooser().and_then(|chooser| {
-                    chooser
-                        .items()
-                        .get(submission.index + panel.chooser_offset())
-                })
-            })
-            .map_or_else(
-                || (submission.label.clone(), Vec::new()),
-                |item| (item.label.clone(), one_line_per_row(&item.description)),
-            );
-        lines.push("! Tego nie da się cofnąć.".to_string());
-        self.confirm_answer(request, format!("{} !", one_line(&label)), lines);
-        Request::None
-    }
-
-    /// Turns a chosen action into a request, unless the connection or the
-    /// action's own rules say no.
-    fn submit_answer(&mut self, id: &str, submission: &Submission) -> Request {
-        if !self.mutation_allowed() {
-            return Request::None;
-        }
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == id)
-        else {
-            return Request::None;
-        };
-        let Some(view) = self.detail.views.get_mut(id) else {
-            return Request::None;
-        };
-        match view.waiting.prepare(task, submission) {
-            Ok(request) => Request::Answer(Box::new(request)),
-            Err(message) => {
-                view.waiting.fail(message);
-                Request::None
-            }
-        }
-    }
-
-    /// Turns the text of action 0 into a request, unless the connection says no.
-    fn submit_comment_text(&mut self, id: &str, text: String) -> Request {
-        if !self.mutation_allowed() {
-            return Request::None;
-        }
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == id)
-        else {
-            return Request::None;
-        };
-        let Some(view) = self.detail.views.get_mut(id) else {
-            return Request::None;
-        };
-        match view.waiting.prepare_comment(task, text) {
-            Ok(request) => Request::Answer(Box::new(request)),
-            Err(message) => {
-                view.waiting.fail(message);
-                Request::None
-            }
-        }
-    }
-
-    /// Sends a chosen action. Success keeps the focus in the details on the timeline and says
-    /// what happened; a refusal keeps the panel with the typed text, shows why
-    /// and reads the tasks again.
-    pub(super) async fn answer(&mut self, request: AnswerRequest) {
-        let AnswerRequest {
-            task_id,
-            waiting_id,
-            title,
-            generation,
-            key,
-            summary,
-            submit,
-        } = request;
-        let had_slot = self.holds_slot(&task_id);
-        let result = match submit {
-            Submit::Input {
-                pending_input_id,
-                delivery,
-            } => self
-                .client
-                .control_input(
-                    &task_id,
-                    &SubmitInputRequest {
-                        pending_input_id,
-                        idempotency_key: key,
-                        delivery: *delivery,
-                    },
-                )
-                .await
-                .map(drop),
-            Submit::Operator(command) => self
-                .client
-                .control_operator_command(
-                    &task_id,
-                    &SubmitOperatorCommandRequest {
-                        command,
-                        idempotency_key: key,
-                        expected_generation: Some(generation),
-                    },
-                )
-                .await
-                .map(drop),
-            Submit::Owner(command) => self
-                .client
-                .control_command(
-                    &task_id,
-                    &OwnerCommandRequest {
-                        command,
-                        idempotency_key: key,
-                        expected_generation: Some(generation),
-                    },
-                )
-                .await
-                .map(drop),
-            Submit::Comment(text) => self
-                .client
-                .control_comment(
-                    &task_id,
-                    &SubmitCommentRequest {
-                        text,
-                        idempotency_key: key,
-                        expected_generation: Some(generation),
-                    },
-                )
-                .await
-                .map(drop),
-        };
-        match result {
-            Ok(()) => {
-                self.settle_answer(&task_id, &waiting_id, Ok(()));
-                self.focus = super::Focus::Details;
-                self.panel_focus = false;
-                self.back_to_axis();
-                // An answer to a task without a slot resumes it; the resume
-                // waits when the backend is full.
-                self.after_work_check(
-                    &task_id,
-                    had_slot,
-                    Severity::Success,
-                    format!("{title}: {summary}"),
-                );
-            }
-            Err(error) => {
-                let retryable = super::is_transport(&error);
-                let reason = failure_reason(&error);
-                self.note_transport(&error);
-                self.settle_answer(&task_id, &waiting_id, Err((reason.clone(), retryable)));
-                let text = format!("{title}: nie wysłano — {reason}");
-                if retryable {
-                    self.notify(Severity::Error, text);
-                } else {
-                    // The read changes the list; the reason is the last word
-                    // on the bar once it is in.
-                    self.notify_after_refresh(Severity::Error, text);
-                }
-            }
-        }
-    }
-
-    fn settle_answer(
-        &mut self,
-        task_id: &str,
-        waiting_id: &str,
-        outcome: Result<(), (String, bool)>,
-    ) {
-        if let Some(view) = self.detail.views.get_mut(task_id) {
-            view.waiting.settle(waiting_id, outcome);
-            let text = view.draft_text();
-            self.detail.set_draft(task_id, text);
-        }
-    }
-
-    /// Starts the read of the conductor's state when the answer panel is made
-    /// of it, or the *Dyrygent* tab is shown, and the task has not got it for
-    /// this revision. One read serves both. The tab's chat is read from the
-    /// last entry held, a page at a time, up to [`conductor::MAX_PAGES`] pages.
-    pub(super) fn start_conductor_read(&mut self, id: &str, revision: u64) {
-        let shown = self.detail.tab() == super::DetailTab::Conductor;
-        let Some(view) = self.detail.views.get(id) else {
-            return;
-        };
-        let panel = view.waiting.needs_conductor(revision);
-        let tab = shown
-            && view
-                .conductor
-                .needs_read(revision, std::time::Instant::now());
-        if !panel && !tab {
-            return;
-        }
-        let first = view.conductor.last_sequence();
-        let client = self.client.clone();
-        let task_id = id.to_string();
-        self.background.start(
-            JobKey::Detail(task_id.clone(), DetailJob::Conductor),
-            async move {
-                let mut reads = Vec::new();
-                let mut after = first;
-                for _ in 0..conductor::MAX_PAGES {
-                    let query =
-                        crate::controller_protocol::ConductorReadQuery { after, limit: None };
-                    let result = super::detail::bounded_read(
-                        super::detail::RELAYED_READ_LIMIT,
-                        client.control_conductor(&task_id, &query),
-                    )
-                    .await;
-                    // The next page, when this one was read, the tab shows
-                    // the chat and there is more of it.
-                    let next = match &result {
-                        Ok(ConductorReadResponse::Available { conductor, .. })
-                            if shown && conductor.chat_has_more =>
-                        {
-                            conductor
-                                .chat
-                                .last()
-                                .map(|entry| entry.sequence)
-                                .filter(|last| *last > after)
-                        }
-                        _ => None,
-                    };
-                    reads.push(super::detail::DetailRead::Conductor(result));
-                    match next {
-                        Some(next) => after = next,
-                        None => break,
-                    }
-                }
-                Outcome::new(move |app: &mut TaskApp| {
-                    for read in reads {
-                        app.on_detail_read(&task_id, revision, read);
-                    }
-                })
-            },
-        );
-    }
-
-    /// Takes a read of the conductor's state in: the panel and the tab both.
-    pub(super) fn apply_conductor_read(
-        &mut self,
-        task_id: &str,
-        revision: u64,
-        result: Result<ConductorReadResponse, ClientError>,
-    ) {
-        let result = self.settle(result);
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == task_id)
-        else {
-            return;
-        };
-        let view = self.detail.view_mut(task_id);
-        view.conductor
-            .apply(revision, std::time::Instant::now(), result.clone());
-        let positions = view.progress().positions().to_vec();
-        view.waiting
-            .apply_conductor(task, &positions, revision, result);
-    }
-
-    /// The steps were read: what a waiting says about them is built again.
-    pub(super) fn reread_waiting(&mut self, task_id: &str) {
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == task_id)
-        else {
-            return;
-        };
-        let view = self.detail.view_mut(task_id);
-        let positions = view.progress().positions().to_vec();
-        view.waiting.reread(task, &positions);
-    }
 }

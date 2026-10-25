@@ -4789,7 +4789,7 @@ mod task_app_waiting {
     use narsor::tui::chooser::ChooserFocus;
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::notify::Severity;
-    use narsor::tui::task_app::waiting::{AnswerRequest, Submit};
+    use narsor::tui::task_app::panel::{AnswerRequest, Submit};
     use narsor::tui::task_app::{Focus, Request, TaskApp};
     use narsor_engine::engine::actions::human::HumanInputAction;
     use narsor_engine::engine::PositionStatus;
@@ -8975,7 +8975,7 @@ mod task_app_conductor {
     use narsor::tui::task_app::actions::{ActionRequest, ActionSend, Overlay};
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::notify::Severity;
-    use narsor::tui::task_app::waiting::Submit;
+    use narsor::tui::task_app::panel::Submit;
     use narsor::tui::task_app::{DetailTab, Focus, Request, TaskApp};
     use narsor::tui::transcript::TranscriptPresentation;
     use narsor_engine::controller_protocol::{

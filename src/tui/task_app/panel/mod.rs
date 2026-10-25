@@ -7,7 +7,7 @@
 //! is announced in the header ([`header`]). Each kind of form has a
 //! directory of its own: [`chat`] is the free message to the agent; the
 //! forms that answer a wait (an answer, a permission, an entry limit, the
-//! output of a step) are made of the entries of [`super::waiting`], which
+//! output of a step) are made of the entries of [`state`], which
 //! keep their drafts.
 
 pub mod action;
@@ -16,5 +16,13 @@ pub mod chat;
 pub mod entry_limit;
 pub mod header;
 pub mod input;
+mod legacy;
 pub mod permission;
+pub mod request;
+mod state;
 pub mod switcher;
+
+mod app;
+
+pub use request::{AnswerRequest, PanelEffect, Submit, SyncEffect};
+pub use state::{Released, WaitingPanel};

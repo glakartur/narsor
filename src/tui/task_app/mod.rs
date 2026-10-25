@@ -103,7 +103,6 @@ pub mod notify;
 pub mod panel;
 pub mod repositories;
 pub mod tabs;
-pub mod waiting;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -130,8 +129,8 @@ use history::History;
 use list::{title_of, MoveRequest, Removal, ResumeNotice, ResumeNoticeKind, TaskList};
 use new_task::{NewTaskForm, Outgoing};
 use notify::{Notifier, Severity};
+use panel::AnswerRequest;
 use repositories::Repositories;
-use waiting::AnswerRequest;
 
 /// Where the keyboard is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

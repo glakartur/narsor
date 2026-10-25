@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use narsor::api::ApiClient;
 use narsor::tui::style::Styles;
-use narsor::tui::task_app::waiting::Submit;
+use narsor::tui::task_app::panel::Submit;
 use narsor::tui::task_app::{layout, Request, TaskApp};
 use narsor_engine::controller_protocol::{PanelFormKind, TaskSummary};
 use narsor_engine::domain::ExecutionStatus;

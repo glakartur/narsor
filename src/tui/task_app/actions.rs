@@ -73,7 +73,7 @@ use super::harness::HarnessList;
 use super::limit::LimitList;
 use super::list::{title_of, CommandResolved};
 use super::notify::Severity;
-use super::waiting::AnswerRequest;
+use super::panel::AnswerRequest;
 use super::{failure_reason, idempotency_key, is_transport, Request, TaskApp};
 
 // ---------------------------------------------------------------------
