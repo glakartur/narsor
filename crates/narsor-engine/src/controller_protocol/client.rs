@@ -89,7 +89,11 @@ impl Transport {
         Self::with_http(base_url, credential, reqwest::Client::new())
     }
 
-    fn with_http(base_url: impl Into<String>, credential: Credential, http: reqwest::Client) -> Self {
+    fn with_http(
+        base_url: impl Into<String>,
+        credential: Credential,
+        http: reqwest::Client,
+    ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             credential,

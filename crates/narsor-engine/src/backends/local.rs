@@ -470,7 +470,7 @@ impl LocalBackend {
         // what the adapter sets itself is set below. `spawn` isolates it:
         // the controller's environment stays as it is.
         for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with(CONTROLLER_ENV_PREFIX) {
+            if is_controller_setting(&name) {
                 command.env_remove(name);
             }
         }
@@ -653,6 +653,13 @@ impl ExecutionBackend for LocalBackend {
     }
 }
 
+/// Whether `name` is one of the controller's own `NARSOR_*` variables,
+/// which a runner never inherits.
+fn is_controller_setting(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes()
+        .starts_with(CONTROLLER_ENV_PREFIX.as_bytes())
+}
+
 fn io_error(what: &str, error: io::Error) -> BackendError {
     BackendError::transient(format!("cannot {what}: {error}"))
 }
@@ -754,6 +761,20 @@ mod tests {
             command.env(WORKLOAD_MARK_ENV, uid);
         }
         command.spawn().expect("spawn sleep")
+    }
+
+    #[test]
+    fn the_controllers_settings_are_not_inherited_by_a_runner() {
+        for name in [
+            "NARSOR_ENROLLMENT_CODE",
+            "NARSOR_CONTROL_PLANE",
+            "NARSOR_RUNNER_CONTROL_PLANE",
+        ] {
+            assert!(is_controller_setting(name.as_ref()), "{name}");
+        }
+        for name in ["PATH", "HOME", "RUST_LOG", "narsor_lower", "XNARSOR_"] {
+            assert!(!is_controller_setting(name.as_ref()), "{name}");
+        }
     }
 
     #[test]

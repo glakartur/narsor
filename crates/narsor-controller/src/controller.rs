@@ -140,7 +140,10 @@ impl std::fmt::Debug for Connection {
             .field("control_plane", &self.control_plane)
             .field("runner_control_plane", &self.runner_control_plane)
             .field("credential_file", &self.credential_file)
-            .field("enrollment_code", &self.enrollment_code.as_ref().map(|_| "<redacted>"))
+            .field(
+                "enrollment_code",
+                &self.enrollment_code.as_ref().map(|_| "<redacted>"),
+            )
             .field("lease_ttl", &self.lease_ttl)
             .finish()
     }
@@ -163,7 +166,10 @@ impl ConnectionArgs {
             .clone()
             .ok_or_else(|| missing_argument("--control-plane <URL>", "NARSOR_CONTROL_PLANE"))?;
         let credential_file = self.credential_file.clone().ok_or_else(|| {
-            missing_argument("--credential-file <FILE>", "NARSOR_CONTROLLER_CREDENTIAL_FILE")
+            missing_argument(
+                "--credential-file <FILE>",
+                "NARSOR_CONTROLLER_CREDENTIAL_FILE",
+            )
         })?;
         let enrollment_code = match &self.enrollment_code_file {
             Some(path) => Some(read_enrollment_code(path)?),

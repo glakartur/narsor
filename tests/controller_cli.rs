@@ -130,7 +130,12 @@ fn the_local_help_names_its_arguments() {
     let output = controller(&["local", "--help"], &[]);
     assert!(output.status.success());
     let help = stdout(&output);
-    for flag in ["--storage", "--home", "--control-plane", "--lock-timeout-secs"] {
+    for flag in [
+        "--storage",
+        "--home",
+        "--control-plane",
+        "--lock-timeout-secs",
+    ] {
         assert!(help.contains(flag), "{flag} missing from:\n{help}");
     }
     assert!(!help.contains("--kubernetes-config"), "{help}");
@@ -146,7 +151,10 @@ fn the_connection_comes_from_the_environment_alone() {
         &["kubernetes"],
         &[
             ("NARSOR_CONTROL_PLANE", "http://127.0.0.1:1"),
-            ("NARSOR_CONTROLLER_CREDENTIAL_FILE", credential.to_str().unwrap()),
+            (
+                "NARSOR_CONTROLLER_CREDENTIAL_FILE",
+                credential.to_str().unwrap(),
+            ),
             ("NARSOR_ENROLLMENT_CODE", "code"),
             ("NARSOR_KUBERNETES_CONFIG", config.to_str().unwrap()),
         ],
@@ -164,7 +172,10 @@ fn kubernetes_without_its_configuration_names_the_argument() {
         &["kubernetes"],
         &[
             ("NARSOR_CONTROL_PLANE", "http://127.0.0.1:1"),
-            ("NARSOR_CONTROLLER_CREDENTIAL_FILE", "/nonexistent/credential"),
+            (
+                "NARSOR_CONTROLLER_CREDENTIAL_FILE",
+                "/nonexistent/credential",
+            ),
         ],
     );
     assert_eq!(output.status.code(), Some(2));
