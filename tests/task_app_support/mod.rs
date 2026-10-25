@@ -64,7 +64,7 @@ pub fn offered(mut task: TaskSummary) -> TaskSummary {
 /// `task` with the panel forms the server would offer for what it shows now.
 pub fn with_panel(mut task: TaskSummary) -> TaskSummary {
     task = offered(task);
-    task.panel = Some(narsor_engine::controller_protocol::task_panel(&task));
+    task.panel = narsor_engine::controller_protocol::task_panel(&task);
     task
 }
 

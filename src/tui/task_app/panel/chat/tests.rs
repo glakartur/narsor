@@ -128,9 +128,20 @@ fn a_refused_send_keeps_the_text_and_a_sent_one_empties_the_box() {
     chat.settle(Err(("serwer odmówił".to_string(), false)));
     assert_eq!(chat.error(), Some("serwer odmówił"));
     assert_eq!(chat.draft_text(), "text");
+    chat.send_key(|| "k1".to_string());
     chat.settle(Ok(()));
     assert_eq!(chat.draft_text(), "");
     assert_eq!(chat.error(), None);
+}
+
+#[test]
+fn text_typed_while_a_send_is_in_flight_survives_its_success() {
+    let mut chat = Chat::new();
+    type_text(&mut chat, "text");
+    chat.send_key(|| "k1".to_string());
+    type_text(&mut chat, " more");
+    chat.settle(Ok(()));
+    assert_eq!(chat.draft_text(), "text more");
 }
 
 #[test]
@@ -142,4 +153,20 @@ fn a_lost_connection_keeps_the_key_for_the_retry() {
     assert_eq!(chat.send_key(|| "k2".to_string()), key);
     type_text(&mut chat, "!");
     assert_eq!(chat.send_key(|| "k2".to_string()), "k2");
+}
+
+#[test]
+fn keys_that_do_not_change_the_text_keep_the_key() {
+    let mut chat = Chat::new();
+    type_text(&mut chat, "text");
+    assert_eq!(chat.on_key(press(KeyCode::Enter)), ChatEffect::None);
+    assert!(chat.is_confirming());
+    let sent = chat.on_key(press(KeyCode::Enter));
+    assert_eq!(sent, ChatEffect::Send("text".to_string()));
+    let key = chat.send_key(|| "k1".to_string());
+    chat.settle(Err(("brak połączenia".to_string(), true)));
+    assert_eq!(chat.on_key(press(KeyCode::Enter)), ChatEffect::None);
+    let sent = chat.on_key(press(KeyCode::Enter));
+    assert_eq!(sent, ChatEffect::Send("text".to_string()));
+    assert_eq!(chat.send_key(|| "k2".to_string()), key);
 }

@@ -16,6 +16,14 @@ pub struct FormKey {
     pub waiting_id: Option<String>,
 }
 
+impl FormKey {
+    /// Whether this is the form of the task's own actions (see
+    /// [`narsor_protocol::controller::PanelForm::is_manual_action`]).
+    pub fn is_manual_action(&self) -> bool {
+        self.kind == PanelFormKind::Action && self.waiting_id.is_none()
+    }
+}
+
 /// The forms on offer and the one shown.
 #[derive(Debug, Clone, Default)]
 pub struct Switcher {
@@ -66,11 +74,6 @@ impl Switcher {
         self.keys.get(self.active)
     }
 
-    /// The forms on offer.
-    pub fn keys(&self) -> &[FormKey] {
-        &self.keys
-    }
-
     /// How many forms there are.
     pub fn len(&self) -> usize {
         self.keys.len()
@@ -96,7 +99,6 @@ mod tests {
         PanelForm {
             kind,
             waiting_id: waiting.map(str::to_string),
-            fields: Vec::new(),
             choices: Vec::new(),
         }
     }

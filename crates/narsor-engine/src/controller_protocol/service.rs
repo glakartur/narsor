@@ -2122,7 +2122,7 @@ impl ProtocolService {
         }
         summary.actions = Some(actions);
         // After the actions: the panel reads the same summary and the offer.
-        summary.panel = Some(panel::offer_forms(&summary));
+        summary.panel = panel::offer_forms(&summary);
         Ok(summary)
     }
 
@@ -2314,7 +2314,7 @@ const MAX_CHAT_CHARS: usize = 4_000;
 /// The panel forms the server puts on a task summary, for whoever builds a
 /// summary by hand (a test of a client) and wants the server's offer.
 #[doc(hidden)]
-pub fn task_panel(task: &TaskSummary) -> narsor_protocol::controller::PanelOffer {
+pub fn task_panel(task: &TaskSummary) -> Option<narsor_protocol::controller::PanelOffer> {
     panel::offer_forms(task)
 }
 

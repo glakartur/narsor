@@ -24,8 +24,8 @@ use crate::tui::chooser::{ChooserField, ChooserItem, FieldKind, Submission};
 use narsor_protocol::api::{
     HumanInputActionDto, HumanInputDeliveryDto, HumanInputFieldView, HumanInputTypeView,
     InputContinuationView, OutputDefinitionView, PendingHumanInputView, PermissionDecisionDto,
-    PermissionDecisionKindDto, PermissionGrantScopeDto, ENTRY_LIMIT_CONTINUE,
-    ENTRY_LIMIT_DECISION_FIELD, ENTRY_LIMIT_RESET_COUNTER,
+    PermissionDecisionKindDto, PermissionGrantScopeDto, ENTRY_LIMIT_DECISION_FIELD,
+    ENTRY_LIMIT_RESET_COUNTER,
 };
 
 /// What kind of wait the form answers, as the operator reads it.
@@ -151,8 +151,8 @@ pub(in crate::tui::task_app::panel) enum Plan {
     /// Returns the result to the agent with a comment.
     Return,
     Permission(PermissionDecisionDto),
-    EntryLimitContinue,
-    EntryLimitReset,
+    /// Settles the entry limit with this decision (`ENTRY_LIMIT_*`).
+    EntryLimit(&'static str),
 }
 
 /// A pending human input as the panel offers it: what it is about, the
@@ -351,17 +351,10 @@ impl InputPanel {
                 }),
                 ..HumanInputDeliveryDto::default()
             },
-            Plan::EntryLimitContinue => HumanInputDeliveryDto {
+            Plan::EntryLimit(decision) => HumanInputDeliveryDto {
                 values: Map::from_iter([(
                     ENTRY_LIMIT_DECISION_FIELD.to_string(),
-                    Value::String(ENTRY_LIMIT_CONTINUE.to_string()),
-                )]),
-                ..HumanInputDeliveryDto::default()
-            },
-            Plan::EntryLimitReset => HumanInputDeliveryDto {
-                values: Map::from_iter([(
-                    ENTRY_LIMIT_DECISION_FIELD.to_string(),
-                    Value::String(ENTRY_LIMIT_RESET_COUNTER.to_string()),
+                    Value::String((*decision).to_string()),
                 )]),
                 ..HumanInputDeliveryDto::default()
             },
@@ -408,8 +401,10 @@ impl InputPanel {
                     None => "zezwolono agentowi".to_string(),
                 },
             },
-            Some(Plan::EntryLimitContinue) => "kontynuowano po limicie".to_string(),
-            Some(Plan::EntryLimitReset) => "wyzerowano licznik i kontynuowano".to_string(),
+            Some(Plan::EntryLimit(decision)) if *decision == ENTRY_LIMIT_RESET_COUNTER => {
+                "wyzerowano licznik i kontynuowano".to_string()
+            }
+            Some(Plan::EntryLimit(_)) => "kontynuowano po limicie".to_string(),
         }
     }
 
@@ -464,18 +459,19 @@ pub(in crate::tui::task_app::panel) fn declared_fields(
     label: Option<&str>,
 ) -> ChooserItem {
     for field in fields {
-        let claimed_by_other = label.is_some_and(|label| {
-            outputs.iter().any(|output| {
-                output.label != label
-                    && output.resume_comment_field.as_deref() == Some(field.name.as_str())
-            })
-        });
-        let claimed_by_own = label.is_some_and(|label| {
-            outputs.iter().any(|output| {
-                output.label == label
-                    && output.resume_comment_field.as_deref() == Some(field.name.as_str())
-            })
-        });
+        // Whether this output, or another one, takes the field as the comment
+        // of its resume.
+        let (mut claimed_by_own, mut claimed_by_other) = (false, false);
+        for output in outputs
+            .iter()
+            .filter(|output| output.resume_comment_field.as_deref() == Some(field.name.as_str()))
+        {
+            if label == Some(output.label.as_str()) {
+                claimed_by_own = true;
+            } else if label.is_some() {
+                claimed_by_other = true;
+            }
+        }
         let required = (field.required && !claimed_by_other) || claimed_by_own;
         let mut built = match field.field_type {
             HumanInputTypeView::Text => ChooserField::multiline(field.name.clone()),

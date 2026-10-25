@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crate::api::ClientError;
 use crate::controller_protocol::{
     ConductorReadResponse, OwnerCommandRequest, SubmitCommentRequest, SubmitInputRequest,
-    SubmitOperatorCommandRequest,
+    SubmitOperatorCommandRequest, TaskSummary,
 };
 
 use crate::tui::chooser::Submission;
@@ -179,10 +179,7 @@ impl TaskApp {
                 None => Request::None,
             },
         };
-        if let Some(view) = self.detail.views.get(&id) {
-            let text = view.draft_text();
-            self.detail.set_draft(&id, text);
-        }
+        self.sync_draft(&id);
         request
     }
 
@@ -230,31 +227,19 @@ impl TaskApp {
     /// Turns a chosen action into a request, unless the connection or the
     /// action's own rules say no.
     fn submit_answer(&mut self, id: &str, submission: &Submission) -> Request {
-        if !self.mutation_allowed() {
-            return Request::None;
-        }
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == id)
-        else {
-            return Request::None;
-        };
-        let Some(view) = self.detail.views.get_mut(id) else {
-            return Request::None;
-        };
-        match view.waiting.prepare(task, submission) {
-            Ok(request) => Request::Answer(Box::new(request)),
-            Err(message) => {
-                view.waiting.fail(message);
-                Request::None
-            }
-        }
+        self.submit_with(id, |waiting, task| waiting.prepare(task, submission))
     }
 
     /// Turns the text of action 0 into a request, unless the connection says no.
     fn submit_comment_text(&mut self, id: &str, text: String) -> Request {
+        self.submit_with(id, |waiting, task| waiting.prepare_comment(task, text))
+    }
+
+    fn submit_with(
+        &mut self,
+        id: &str,
+        prepare: impl FnOnce(&mut WaitingPanel, &TaskSummary) -> Result<AnswerRequest, String>,
+    ) -> Request {
         if !self.mutation_allowed() {
             return Request::None;
         }
@@ -269,7 +254,7 @@ impl TaskApp {
         let Some(view) = self.detail.views.get_mut(id) else {
             return Request::None;
         };
-        match view.waiting.prepare_comment(task, text) {
+        match prepare(&mut view.waiting, task) {
             Ok(request) => Request::Answer(Box::new(request)),
             Err(message) => {
                 view.waiting.fail(message);
@@ -385,9 +370,8 @@ impl TaskApp {
     ) {
         if let Some(view) = self.detail.views.get_mut(task_id) {
             view.waiting.settle(waiting_id, outcome);
-            let text = view.draft_text();
-            self.detail.set_draft(task_id, text);
         }
+        self.sync_draft(task_id);
     }
 
     /// Starts the read of the conductor's state when the answer panel is made

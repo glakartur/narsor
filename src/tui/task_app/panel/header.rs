@@ -24,7 +24,6 @@ mod tests {
         let form = |kind| PanelForm {
             kind,
             waiting_id: None,
-            fields: Vec::new(),
             choices: Vec::new(),
         };
         let mut switcher = Switcher::default();

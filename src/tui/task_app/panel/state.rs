@@ -437,25 +437,6 @@ impl Entry {
     }
 }
 
-/// The offer of the server's forms that serves as the panel of `task`: not
-/// when the server did not say, and not when the task waits on one of the
-/// owner's own panels (a proposal of the conductor, a failed step, a failed
-/// provisioning, a problem of the runner), which keep theirs.
-fn form_offer(task: &TaskSummary) -> Option<&PanelOffer> {
-    let own_panel = task.attention.iter().any(|item| {
-        matches!(
-            item.kind,
-            AttentionKind::ConductorProposal
-                | AttentionKind::FailedStep
-                | AttentionKind::ProvisioningFailed
-        )
-    }) || task
-        .runner
-        .as_ref()
-        .is_some_and(|runner| runner.problem.is_some());
-    task.panel.as_ref().filter(|_| !own_panel)
-}
-
 /// The action of the menu a choice of the task's own actions does.
 pub(super) fn panel_action(id: TaskActionId) -> Option<TaskAction> {
     match id {
@@ -567,14 +548,20 @@ impl WaitingPanel {
             None => Slot::Nothing,
             Some(key) if key.kind == PanelFormKind::Chat => Slot::Chat,
             Some(FormKey {
+                kind:
+                    PanelFormKind::Action
+                    | PanelFormKind::Answer
+                    | PanelFormKind::EntryLimit
+                    | PanelFormKind::Permission,
                 waiting_id: Some(id),
-                ..
             }) => self
                 .entries
                 .iter()
                 .position(|entry| entry.item.waiting_id == *id)
                 .map_or(Slot::Nothing, Slot::Entry),
-            Some(_) => Slot::Manual,
+            Some(key) if key.is_manual_action() => Slot::Manual,
+            // A form of a kind this client does not know has no state.
+            Some(_) => Slot::Nothing,
         }
     }
 
@@ -598,12 +585,6 @@ impl WaitingPanel {
             Slot::Chat => self.chat.settle(Err((message, true))),
             Slot::Manual | Slot::Nothing => {}
         }
-    }
-
-    /// Whether the server's forms are the panel (not the entries of a
-    /// server that did not say, nor the owner's own panels).
-    pub fn is_form_panel(&self) -> bool {
-        self.forms.is_some()
     }
 
     /// The kind of the form shown, in the server's panel.
@@ -794,17 +775,17 @@ impl WaitingPanel {
         let mut effect = SyncEffect::default();
         let shown = self.current_waiting_id().map(str::to_string);
         let before = self.active_key();
-        let offer = form_offer(task);
+        let offer = task.panel.as_ref();
         let forms_mode = offer.is_some();
         let mut old = std::mem::take(&mut self.entries);
         let mut entries = Vec::with_capacity(task.attention.len());
         // With the server's forms, only the waits a form answers have an entry.
         let wanted = task.attention.iter().filter(|item| {
             offer.is_none_or(|offer| {
-                offer
-                    .forms
-                    .iter()
-                    .any(|form| form.waiting_id.as_deref() == Some(item.waiting_id.as_str()))
+                offer.forms.iter().any(|form| {
+                    form.kind != PanelFormKind::Unrecognized
+                        && form.waiting_id.as_deref() == Some(item.waiting_id.as_str())
+                })
             })
         });
         for item in wanted {
@@ -906,7 +887,7 @@ impl WaitingPanel {
         forms.manual = offer
             .forms
             .iter()
-            .find(|form| form.kind == PanelFormKind::Action && form.waiting_id.is_none())
+            .find(|form| form.is_manual_action())
             .map(|form| {
                 let items = manual_items(form);
                 match forms.manual.take() {
@@ -1108,7 +1089,12 @@ impl WaitingPanel {
                 ChatEffect::Send(text) => PanelEffect::Comment(text),
             }),
             Slot::Manual => {
-                let chooser = self.forms.as_mut()?.manual.as_mut()?;
+                // A form of a kind this client does not know has no chooser:
+                // the key is spent, not left to an entry that is not shown.
+                let Some(chooser) = self.forms.as_mut().and_then(|forms| forms.manual.as_mut())
+                else {
+                    return Some(PanelEffect::None);
+                };
                 let action = chooser.on_key(key);
                 Some(match action {
                     ChooserAction::Submit(submission) => self
@@ -1130,7 +1116,7 @@ impl WaitingPanel {
             .offer
             .forms
             .iter()
-            .find(|form| form.kind == PanelFormKind::Action && form.waiting_id.is_none())?
+            .find(|form| form.is_manual_action())?
             .choices
             .get(index)?
             .action
@@ -1148,9 +1134,14 @@ impl WaitingPanel {
         task: &TaskSummary,
         submission: &Submission,
     ) -> Result<AnswerRequest, String> {
+        // Only the form shown may send: the entry kept in `current` can be
+        // one the owner has stepped away from.
+        let Slot::Entry(index) = self.slot() else {
+            return Err("Nie ma czego wysłać.".to_string());
+        };
         let entry = self
             .entries
-            .get_mut(self.current)
+            .get_mut(index)
             .ok_or_else(|| "Nie ma czego wysłać.".to_string())?;
         let (submit, summary) = match &entry.model {
             Model::Input(panel) => (
@@ -1297,15 +1288,17 @@ impl WaitingPanel {
                     + entry.chooser.preferred_height(width)
                     + if entry.composer.is_some() { 3 } else { 0 }
             }
-        } else if self.leftovers().is_empty() {
-            0
         } else {
-            let lines: usize = self
-                .leftovers()
-                .iter()
-                .map(|(_, text)| 1 + text.lines().count().max(1))
-                .sum();
-            5 + lines.min(5) as u16
+            let leftovers = self.leftovers();
+            if leftovers.is_empty() {
+                0
+            } else {
+                let lines: usize = leftovers
+                    .iter()
+                    .map(|(_, text)| 1 + text.lines().count().max(1))
+                    .sum();
+                5 + lines.min(5) as u16
+            }
         };
         wanted.min(cap)
     }

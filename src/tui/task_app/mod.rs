@@ -306,7 +306,7 @@ impl DetailState {
         let text = text.into();
         if text.is_empty() {
             self.drafts.remove(task_id);
-        } else {
+        } else if self.drafts.get(task_id) != Some(&text) {
             self.drafts.insert(task_id.to_string(), text);
         }
     }

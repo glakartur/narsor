@@ -1948,35 +1948,6 @@ pub enum PanelFormKind {
     Unrecognized,
 }
 
-/// The type of a panel field.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PanelFieldKind {
-    #[default]
-    Text,
-    Multiline,
-    Select,
-    Integer,
-}
-
-/// One field of a panel form.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PanelField {
-    pub name: String,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub kind: PanelFieldKind,
-    #[serde(default)]
-    pub required: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub options: Vec<String>,
-    /// What the field holds before the owner types.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial: Option<String>,
-}
-
 /// One choice of a panel form (an exit of a step, an output of the agent).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PanelChoice {
@@ -1995,10 +1966,19 @@ pub struct PanelForm {
     /// The wait the form answers; absent for a form that answers none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fields: Vec<PanelField>,
+    /// The choices of the form of the task's own actions; empty for a form
+    /// of a wait or the chat, whose content the client builds from the wait.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<PanelChoice>,
+}
+
+impl PanelForm {
+    /// Whether this is the form of the task's own actions (a manual
+    /// transition), not the output choice of a wait: both are an
+    /// [`PanelFormKind::Action`], told apart by answering no wait.
+    pub fn is_manual_action(&self) -> bool {
+        self.kind == PanelFormKind::Action && self.waiting_id.is_none()
+    }
 }
 
 /// `POST /control/v1/tasks/:task_id/comment`.

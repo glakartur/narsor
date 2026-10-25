@@ -28,11 +28,7 @@ impl InputPanel {
         let mut exact: Vec<Option<Vec<String>>> = Vec::new();
         let mut group: Vec<Option<Vec<String>>> = Vec::new();
         for denial in denials {
-            let command = denial
-                .input
-                .get("command")
-                .and_then(Value::as_str)
-                .map(str::trim);
+            let command = denial_command(denial);
             self.context.push(ContextLine::problem(match command {
                 Some(command) => format!("{}: {command}", denial.tool_name),
                 None => format!("{}: {}", denial.tool_name, denial.input),
@@ -123,15 +119,12 @@ impl InputPanel {
         } else if many {
             // Not every denial can be granted: offer the ones that can.
             for (index, rules) in exact.iter().enumerate() {
-                let (Some(rules), Some(command)) = (
-                    rules,
-                    denials[index].input.get("command").and_then(Value::as_str),
-                ) else {
+                let (Some(rules), Some(command)) = (rules, denial_command(&denials[index])) else {
                     continue;
                 };
                 self.push(
                     ChooserItem::new(
-                        format!("Zezwól dokładnie: {}", command.trim()),
+                        format!("Zezwól dokładnie: {command}"),
                         format!("Reguły tylko dla bieżącego tasku: {}", rules.join(", ")),
                     ),
                     Plan::Permission(PermissionDecisionDto {
@@ -167,12 +160,7 @@ impl InputPanel {
                     && is_approvable_permission_reason(denial.reason_type.as_deref())
             });
         if resumable && patternable {
-            let first = denials[0]
-                .input
-                .get("command")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
+            let first = denial_command(&denials[0]).unwrap_or_default();
             self.push(
                 ChooserItem::new(
                     "Zezwól według wzorca…",
@@ -229,7 +217,16 @@ fn grant_rules(denial: &PermissionDenialView, scope: BashGrantScope) -> Option<V
     {
         return None;
     }
-    bash_grant_rules(denial.input.get("command")?.as_str()?, scope)
+    bash_grant_rules(denial_command(denial)?, scope)
+}
+
+/// The trimmed command of a Bash denial; `None` when the input has none.
+fn denial_command(denial: &PermissionDenialView) -> Option<&str> {
+    denial
+        .input
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
 }
 
 /// Why `denial` cannot be granted, in a few words; `None` when it can.

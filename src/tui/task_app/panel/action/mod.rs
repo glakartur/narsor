@@ -108,9 +108,28 @@ impl InputPanel {
         &mut self,
         pending: &PendingHumanInputView,
     ) {
-        let Some(problem) = &pending.problem else {
+        if pending.problem.is_none() {
             return;
-        };
+        }
+        let recommended = self.build_problem_outputs(pending);
+        let message = ChooserItem::new(
+            MESSAGE_ENTRY,
+            "Wiadomość wznawia ten sam krok agenta; wynik ustawi on sam.",
+        )
+        .resuming(pending.state_id.to_string())
+        .with_field(ChooserField::multiline(MESSAGE_FIELD).required());
+        self.push(message, Plan::Message);
+        // The conductor's label, or — without one — talking to the agent.
+        self.selected = recommended.unwrap_or(self.items.len() - 1);
+    }
+
+    /// The problem's context and one item per output label, without the
+    /// message entry; returns the index of the recommended item.
+    pub(in crate::tui::task_app::panel) fn build_problem_outputs(
+        &mut self,
+        pending: &PendingHumanInputView,
+    ) -> Option<usize> {
+        let problem = pending.problem.as_ref()?;
         self.context
             .push(ContextLine::problem(problem.reason.clone()));
         for answer in &problem.answers {
@@ -177,15 +196,7 @@ impl InputPanel {
             }
             self.push(item, Plan::Output(output.label.clone()));
         }
-        let message = ChooserItem::new(
-            MESSAGE_ENTRY,
-            "Wiadomość wznawia ten sam krok agenta; wynik ustawi on sam.",
-        )
-        .resuming(pending.state_id.to_string())
-        .with_field(ChooserField::multiline(MESSAGE_FIELD).required());
-        self.push(message, Plan::Message);
-        // The conductor's label, or — without one — talking to the agent.
-        self.selected = recommended.unwrap_or(self.items.len() - 1);
+        recommended
     }
 
     pub(in crate::tui::task_app::panel) fn output(

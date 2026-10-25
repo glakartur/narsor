@@ -19,6 +19,7 @@ pub enum ChatEffect {
 impl Chat {
     /// Folds a key into the box.
     pub fn on_key(&mut self, key: KeyEvent) -> ChatEffect {
+        let before = self.text().to_string();
         match self.chooser.on_key(key) {
             ChooserAction::Submit(_) => {
                 let text = self.draft_text();
@@ -32,7 +33,9 @@ impl Chat {
             // `Esc` is the switch of the panel and never reaches here.
             ChooserAction::Cancel => ChatEffect::None,
             ChooserAction::None => {
-                self.edited();
+                if self.text() != before {
+                    self.edited();
+                }
                 ChatEffect::None
             }
         }
@@ -40,8 +43,9 @@ impl Chat {
 
     /// Folds pasted text into the box; never sends. Returns whether it took it.
     pub fn paste(&mut self, pasted: &str) -> bool {
+        let before = self.text().to_string();
         let used = self.chooser.paste(pasted);
-        if used {
+        if used && self.text() != before {
             self.edited();
         }
         used

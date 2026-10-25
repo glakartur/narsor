@@ -88,4 +88,14 @@ fn a_problem_offers_its_outputs_and_a_message_to_the_agent() {
     );
     let delivery = choose(&panel, 0, &[]);
     assert_eq!(delivery.chosen_label.as_deref(), Some("implemented"));
+    let position = labels
+        .iter()
+        .position(|label| label == "needs_human_decision")
+        .expect("the second output is offered");
+    let delivery = choose(&panel, position, &[]);
+    assert_eq!(
+        delivery.chosen_label.as_deref(),
+        Some("needs_human_decision")
+    );
+    assert_eq!(delivery.episode.as_deref(), Some("ep-p"));
 }

@@ -18,18 +18,14 @@ impl InputPanel {
                 limit.entries, limit.max_entries
             )));
         }
-        self.build_problem(pending);
-        if self.plans.last() == Some(&Plan::Message) {
-            self.plans.pop();
-            self.items.pop();
-        }
+        self.build_problem_outputs(pending);
         let continue_index = self.items.len();
         self.push(
             ChooserItem::new(
                 "Kontynuuj",
                 "Uruchom krok jeszcze raz, zwiększając licznik.",
             ),
-            Plan::EntryLimitContinue,
+            Plan::EntryLimit(ENTRY_LIMIT_CONTINUE),
         );
         // The reset takes the loop guard away for a whole new round of
         // entries; the option says so.
@@ -45,7 +41,7 @@ impl InputPanel {
         };
         self.push(
             ChooserItem::new("Wyzeruj licznik", reset),
-            Plan::EntryLimitReset,
+            Plan::EntryLimit(ENTRY_LIMIT_RESET_COUNTER),
         );
         self.selected = continue_index;
     }

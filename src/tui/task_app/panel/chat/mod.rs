@@ -14,10 +14,8 @@ mod tests;
 
 pub use keys::ChatEffect;
 
+use super::input::MESSAGE_FIELD;
 use crate::tui::chooser::{Chooser, ChooserField, ChooserItem};
-
-/// The name of the field the message is typed into.
-const MESSAGE_FIELD: &str = "Wiadomość do agenta";
 
 /// The label of the box.
 const LABEL: &str = "Wiadomość do agenta";
@@ -79,11 +77,14 @@ impl Chat {
         self.key.get_or_insert_with(make).clone()
     }
 
-    /// Says what a send came to. Success empties the box; a refusal keeps the
-    /// text and shows why; a lost connection keeps the key for the retry.
+    /// Says what a send came to. Success empties the box, unless the text was
+    /// edited while the send was in flight (an edit drops the key): then what
+    /// was typed since stays. A refusal keeps the text and shows why; a lost
+    /// connection keeps the key for the retry.
     pub fn settle(&mut self, outcome: Result<(), (String, bool)>) {
         match outcome {
-            Ok(()) => *self = Self::new(),
+            Ok(()) if self.key.is_some() => *self = Self::new(),
+            Ok(()) => self.error = None,
             Err((reason, retryable)) => {
                 if !retryable {
                     self.key = None;

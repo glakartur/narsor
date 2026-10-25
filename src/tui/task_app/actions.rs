@@ -601,8 +601,9 @@ fn comment_form(task: &TaskSummary, unsent: Option<&str>) -> CommentForm {
     }
 }
 
-/// The name of the field a comment is typed into.
-pub(super) const COMMENT_FIELD: &str = "komentarz";
+/// The name of the field a comment is typed into: the one of the panel's
+/// action form, so the two chooser forms agree.
+pub(super) use super::panel::action::COMMENT_FIELD;
 
 /// The entries of the menu for `task`. `blocked` is why nothing that changes
 /// state can be done right now (no connection), if that is so.

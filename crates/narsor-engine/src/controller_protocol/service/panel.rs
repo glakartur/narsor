@@ -12,26 +12,25 @@
 //! action. The default is the first that applies of: the entry limit, the
 //! permission, the answer, the action of a step that finished, the chat.
 
-use narsor_protocol::api::{
-    HumanInputTypeView, InputContinuationView, PendingHumanInputView, ENTRY_LIMIT_CONTINUE,
-    ENTRY_LIMIT_DECISION_FIELD, ENTRY_LIMIT_RESET_COUNTER,
-};
+use narsor_protocol::api::InputContinuationView;
 use narsor_protocol::controller::{
-    AttentionKind, PanelChoice, PanelField, PanelFieldKind, PanelForm, PanelFormKind, PanelOffer,
-    TaskActionId, TaskState, TaskSummary,
+    AttentionKind, PanelChoice, PanelForm, PanelFormKind, PanelOffer, TaskActionId, TaskState,
+    TaskSummary,
 };
 
 use super::actions::{comment_reason, options, runner_alive, unavailable_reason, waiting};
 
-/// The name of the field that carries the owner's note to the agent.
-pub(crate) const CHAT_FIELD: &str = "message";
-/// The name of the optional comment of an answer.
-pub(crate) const COMMENT_FIELD: &str = "comment";
-
 /// The forms of `task`'s panel; empty while nothing can be sent to it.
-pub(super) fn offer_forms(task: &TaskSummary) -> PanelOffer {
+///
+/// `None` when the task keeps its own panel (see [`keeps_own_panel`]): the
+/// client then shows that one and no form of this module. This is the only
+/// place of the rule.
+pub(super) fn offer_forms(task: &TaskSummary) -> Option<PanelOffer> {
+    if keeps_own_panel(task) {
+        return None;
+    }
     if !asks_the_owner(task) {
-        return PanelOffer::default();
+        return Some(PanelOffer::default());
     }
     let wait = waiting(task);
     let mut forms = Vec::new();
@@ -39,20 +38,17 @@ pub(super) fn offer_forms(task: &TaskSummary) -> PanelOffer {
     // decision order of the module comment picks.
     let mut default = None;
 
-    match wait.as_ref().map(|form| (form, form.continuation)) {
-        Some((form, InputContinuationView::EntryLimit)) => {
-            default = Some(forms.len());
-            forms.push(entry_limit_form(task, form));
+    let wait_kind = match wait.as_ref().map(|form| form.continuation) {
+        Some(InputContinuationView::EntryLimit) => Some(PanelFormKind::EntryLimit),
+        Some(InputContinuationView::ResolvePermission) => Some(PanelFormKind::Permission),
+        Some(InputContinuationView::ResumeAgent | InputContinuationView::ApproveOutput) => {
+            Some(PanelFormKind::Answer)
         }
-        Some((form, InputContinuationView::ResolvePermission)) => {
-            default = Some(forms.len());
-            forms.push(permission_form(task, form));
-        }
-        Some((form, InputContinuationView::ResumeAgent | InputContinuationView::ApproveOutput)) => {
-            default = Some(forms.len());
-            forms.push(answer_form(task, form));
-        }
-        _ => {}
+        _ => None,
+    };
+    if let Some(kind) = wait_kind {
+        default = Some(forms.len());
+        forms.push(wait_form(task, kind));
     }
 
     let chat = comment_reason(task).is_none();
@@ -65,15 +61,12 @@ pub(super) fn offer_forms(task: &TaskSummary) -> PanelOffer {
 
     // A wait whose answer is a choice of the step's output is an action of
     // the workflow (Z4); it is the default when nothing before it was.
-    match wait.as_ref().map(|form| (form, form.continuation)) {
-        Some((
-            form,
-            InputContinuationView::CompleteStep | InputContinuationView::ResolveOutput,
-        )) => {
+    match wait.as_ref().map(|form| form.continuation) {
+        Some(InputContinuationView::CompleteStep | InputContinuationView::ResolveOutput) => {
             if default.is_none() {
                 default = Some(forms.len());
             }
-            forms.push(output_form(task, form));
+            forms.push(wait_form(task, PanelFormKind::Action));
         }
         _ => {
             if let Some(form) = action_form(task) {
@@ -93,13 +86,25 @@ pub(super) fn offer_forms(task: &TaskSummary) -> PanelOffer {
             .iter()
             .position(|form| form.kind == PanelFormKind::Chat);
     }
-    PanelOffer { forms, default }
+    Some(PanelOffer { forms, default })
 }
 
-/// Whether the summary is of a task the panel of this module serves at all:
-/// not queued, not archived, not working, and without a wait of the owner's
-/// own panels (a proposal of the conductor, a failed step, a failed
-/// provisioning), which keep their panels.
+/// Whether the task waits on one of the owner's own panels (a proposal of the
+/// conductor, a failed step, a failed provisioning, a problem of the runner),
+/// which keep their panels.
+fn keeps_own_panel(task: &TaskSummary) -> bool {
+    task.attention.iter().any(|item| {
+        matches!(
+            item.kind,
+            AttentionKind::ConductorProposal
+                | AttentionKind::FailedStep
+                | AttentionKind::ProvisioningFailed
+        )
+    }) || task.runner.as_ref().is_some_and(|r| r.problem.is_some())
+}
+
+/// Whether the task is one a form can be sent to: not queued, not archived,
+/// not working.
 fn asks_the_owner(task: &TaskSummary) -> bool {
     if task.runner_state.is_archival() {
         return false;
@@ -110,124 +115,26 @@ fn asks_the_owner(task: &TaskSummary) -> bool {
     ) {
         return false;
     }
-    let operator_wait = task.attention.iter().any(|item| {
-        matches!(
-            item.kind,
-            AttentionKind::ConductorProposal
-                | AttentionKind::FailedStep
-                | AttentionKind::ProvisioningFailed
-        )
-    });
-    if operator_wait || task.runner.as_ref().is_some_and(|r| r.problem.is_some()) {
-        return false;
-    }
     // The agent (or the script) is at work: nothing to send (R8).
     !(task.state == TaskState::Running && waiting(task).is_none() && runner_alive(task))
-}
-
-fn comment_field() -> PanelField {
-    PanelField {
-        name: COMMENT_FIELD.to_string(),
-        label: "Komentarz".to_string(),
-        description: None,
-        kind: PanelFieldKind::Multiline,
-        required: false,
-        options: Vec::new(),
-        initial: None,
-    }
 }
 
 fn chat_form(task: &TaskSummary) -> PanelForm {
     PanelForm {
         kind: PanelFormKind::Chat,
         waiting_id: waiting_id(task),
-        fields: vec![PanelField {
-            name: CHAT_FIELD.to_string(),
-            label: "Wiadomość do agenta".to_string(),
-            description: None,
-            kind: PanelFieldKind::Multiline,
-            required: true,
-            options: Vec::new(),
-            initial: None,
-        }],
         choices: Vec::new(),
     }
 }
 
-fn answer_form(task: &TaskSummary, form: &PendingHumanInputView) -> PanelForm {
-    let mut fields = declared_fields(form);
-    fields.push(comment_field());
+/// The form of a wait: which wait it answers is all the server says. What the
+/// form asks (fields, options, labels) the client builds from the wait's own
+/// content, which it reads anyway; it is not said twice.
+fn wait_form(task: &TaskSummary, kind: PanelFormKind) -> PanelForm {
     PanelForm {
-        kind: PanelFormKind::Answer,
+        kind,
         waiting_id: waiting_id(task),
-        fields,
-        choices: output_choices(form),
-    }
-}
-
-fn output_form(task: &TaskSummary, form: &PendingHumanInputView) -> PanelForm {
-    PanelForm {
-        kind: PanelFormKind::Action,
-        waiting_id: waiting_id(task),
-        fields: declared_fields(form),
-        choices: output_choices(form),
-    }
-}
-
-fn permission_form(task: &TaskSummary, _form: &PendingHumanInputView) -> PanelForm {
-    PanelForm {
-        kind: PanelFormKind::Permission,
-        waiting_id: waiting_id(task),
-        fields: vec![comment_field()],
-        choices: vec![
-            PanelChoice {
-                label: "Zezwól".to_string(),
-                description: None,
-                action: Some(TaskActionId::AllowPermission),
-            },
-            PanelChoice {
-                label: "Odmów".to_string(),
-                description: None,
-                action: Some(TaskActionId::DenyPermission),
-            },
-        ],
-    }
-}
-
-fn entry_limit_form(task: &TaskSummary, form: &PendingHumanInputView) -> PanelForm {
-    let choices = [ENTRY_LIMIT_CONTINUE, ENTRY_LIMIT_RESET_COUNTER]
-        .into_iter()
-        .map(|value| PanelChoice {
-            label: value.to_string(),
-            description: None,
-            action: None,
-        })
-        .collect();
-    PanelForm {
-        kind: PanelFormKind::EntryLimit,
-        waiting_id: waiting_id(task),
-        fields: vec![PanelField {
-            name: ENTRY_LIMIT_DECISION_FIELD.to_string(),
-            label: form
-                .entry_limit
-                .as_ref()
-                .map(|limit| {
-                    format!(
-                        "Limit wejść w krok: {}/{}",
-                        limit.entries, limit.max_entries
-                    )
-                })
-                .unwrap_or_else(|| "Limit wejść w krok".to_string()),
-            description: None,
-            kind: PanelFieldKind::Select,
-            required: true,
-            options: vec![
-                ENTRY_LIMIT_CONTINUE.to_string(),
-                ENTRY_LIMIT_RESET_COUNTER.to_string(),
-            ],
-            initial: None,
-        }],
-        choices,
+        choices: Vec::new(),
     }
 }
 
@@ -235,29 +142,22 @@ fn entry_limit_form(task: &TaskSummary, form: &PendingHumanInputView) -> PanelFo
 /// its state. A restart or a resume is a command of the task's life with a key
 /// of its own, not an action of the workflow. `None` when it offers none.
 fn action_form(task: &TaskSummary) -> Option<PanelForm> {
-    let exits = options(task, TaskActionId::Transition);
-    let mut choices = Vec::new();
-    if unavailable_reason(task, TaskActionId::Transition).is_none() {
-        choices.push(PanelChoice {
-            label: "Przejście ręczne".to_string(),
-            description: Some(
-                exits
-                    .iter()
-                    .map(|exit| exit.label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
-            action: Some(TaskActionId::Transition),
-        });
-    }
-    if choices.is_empty() {
+    if unavailable_reason(task, TaskActionId::Transition).is_some() {
         return None;
     }
+    let exits = options(task, TaskActionId::Transition)
+        .iter()
+        .map(|exit| exit.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     Some(PanelForm {
         kind: PanelFormKind::Action,
         waiting_id: None,
-        fields: Vec::new(),
-        choices,
+        choices: vec![PanelChoice {
+            label: "Przejście ręczne".to_string(),
+            description: Some(exits),
+            action: Some(TaskActionId::Transition),
+        }],
     })
 }
 
@@ -267,34 +167,4 @@ fn waiting_id(task: &TaskSummary) -> Option<String> {
         .and_then(|runner| runner.pending_input.as_ref())
         .filter(|_| waiting(task).is_some())
         .map(|pending| pending.id.clone())
-}
-
-fn output_choices(form: &PendingHumanInputView) -> Vec<PanelChoice> {
-    form.outputs
-        .iter()
-        .map(|output| PanelChoice {
-            label: output.label.clone(),
-            description: output.description.clone(),
-            action: None,
-        })
-        .collect()
-}
-
-/// The fields the workflow declared for the request, as the panel has them.
-fn declared_fields(form: &PendingHumanInputView) -> Vec<PanelField> {
-    form.fields
-        .iter()
-        .map(|field| PanelField {
-            name: field.name.clone(),
-            label: field.name.clone(),
-            description: field.description.clone(),
-            kind: match field.field_type {
-                HumanInputTypeView::Text => PanelFieldKind::Text,
-                HumanInputTypeView::Select => PanelFieldKind::Select,
-            },
-            required: field.required,
-            options: field.options.clone(),
-            initial: None,
-        })
-        .collect()
 }
