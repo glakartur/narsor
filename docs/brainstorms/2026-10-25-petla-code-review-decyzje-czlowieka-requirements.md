@@ -146,7 +146,6 @@ Druga luka dotyczy wszystkich kroków agenta. Kontrakt wyjścia opisuje `awaitin
 ## Pytania otwarte dla użytkownika
 
 - Brak pytań blokujących. Plan zapisuje `Open blockers: brak`.
-- Czy zadania w toku ze stanem `fix_findings` mają dostać migrację, czy wystarczy ostrzeżenie w README? Domyślnie: tylko ostrzeżenie.
 
 ---
 
