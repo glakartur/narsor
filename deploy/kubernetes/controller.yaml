@@ -6,7 +6,9 @@
 #     Pods reach the control plane under another URL);
 #   * keep backend.yaml in step with the admission parameters
 #     (admission-policy.yaml, ConfigMap narsor-admission);
-#   * create the one-time enrollment code Secret (first start only):
+#   * create the one-time enrollment code Secret (first start only). The code
+#     reaches the controller only through NARSOR_ENROLLMENT_CODE (or
+#     --enrollment-code-file), never as a command-line argument:
 #       kubectl -n narsor-user create secret generic \
 #         narsor-controller-enrollment --from-literal=code=<code>
 #     On its first start the controller enrolls, writes its `nsk.` credential
@@ -15,7 +17,7 @@
 #   * to edit the Claude profile Secret (claude_profile_secret below), use an
 #     image that also has Claude Code (`claude`) on its PATH, then run
 #       kubectl -n narsor-user exec -it deploy/narsor-controller -- \
-#         /opt/narsor/bin/narsor-controller edit-claude-profile
+#         /opt/narsor/bin/narsor-controller kubernetes edit-claude-profile
 #     The session runs in the controller's container, in /tmp (an emptyDir),
 #     and is removed when it ends.
 apiVersion: v1
@@ -95,7 +97,7 @@ spec:
       containers:
         - name: controller
           image: ghcr.io/narsor/narsor@sha256:0000000000000000000000000000000000000000000000000000000000000000
-          command: ["/opt/narsor/bin/narsor-controller"]
+          command: ["/opt/narsor/bin/narsor-controller", "kubernetes"]
           env:
             - name: NARSOR_CONTROL_PLANE
               value: https://narsor.example

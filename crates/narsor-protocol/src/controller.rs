@@ -1819,6 +1819,17 @@ pub struct CreateRepositoryRequest {
     pub description: Option<String>,
 }
 
+/// The refusal code of an enrollment for a `local` backend, whatever its
+/// trust scope, asked for without [`CreateEnrollmentRequest::accept_workstation_risk`].
+pub const WORKSTATION_RISK_NOT_ACCEPTED: &str = "workstation_risk_not_accepted";
+
+/// What the owner accepts when enrolling a controller of a `local` backend
+/// on a `workstation` (R15).
+pub const WORKSTATION_RISK: &str = "a controller of a 'local' backend runs every task the \
+server sends as the user of its computer, without a container: a server that is taken over \
+can run any program there and read every file that user can read. Accept this explicitly \
+(accept_workstation_risk; narsor-cli controller enroll-code --accept-workstation-risk)";
+
 /// Request to create a one-time controller enrollment code.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateEnrollmentRequest {
@@ -1826,6 +1837,12 @@ pub struct CreateEnrollmentRequest {
     pub name: Option<String>,
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+    /// The owner accepts that a controller of a `local` backend on a
+    /// `workstation` runs whatever the server sends as that computer's
+    /// user, without a container (R15). Required for such a backend; not
+    /// sent when not given.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accept_workstation_risk: bool,
 }
 
 /// One-time controller enrollment code and its backend scope.

@@ -893,3 +893,55 @@ fn an_unclaimed_network_daemon_prints_and_stores_a_one_time_claim_code() {
         invocation.stderr
     );
 }
+
+/// Writes backend file `id` into the catalogue of a daemon run in `root`.
+fn write_backend(root: &TempRoot, id: &str, yaml: &str) {
+    let backends = root.path().join(".narsor/backends");
+    fs::create_dir_all(&backends).unwrap();
+    fs::write(backends.join(format!("{id}.yaml")), yaml).unwrap();
+}
+
+const LAPTOP_BACKEND: &str = "kind: local\ntrust_scope: workstation\nlimits:\n  \
+max_concurrent_tasks: 1\n  default_resources:\n    cpu_millicores: 1000\n    memory_mib: 2048\n";
+
+/// Covers AE12: the id `local` belongs to a trusted daemon's built-in
+/// backend; a network server refuses a catalogue that declares it.
+#[test]
+#[ignore = "starts narsor-server; run with --ignored"]
+fn a_network_daemon_refuses_a_backend_declared_as_local() {
+    needs_no_system_config!();
+    let root = TempRoot::new();
+    write_backend(&root, "local", LAPTOP_BACKEND);
+    let invocation = daemon(&root, &NETWORK_MODE, Duration::from_secs(20));
+    assert_eq!(invocation.code, EXIT_FAILURE, "{}", invocation.stderr);
+    assert!(
+        invocation.stderr.contains("backends/local.yaml"),
+        "{}",
+        invocation.stderr
+    );
+    assert!(
+        invocation.stderr.contains("another id"),
+        "{}",
+        invocation.stderr
+    );
+    assert!(!root.path().join(".narsor/daemon.json").exists());
+}
+
+/// A network server takes a workstation under its own id, and says when
+/// its `default_backend` is the `local` it does not have.
+#[test]
+#[ignore = "starts narsor-server; run with --ignored"]
+fn a_network_daemon_starts_with_a_workstation_backend_and_warns_about_default_local() {
+    needs_no_system_config!();
+    let root = TempRoot::new();
+    write_backend(&root, "laptop", LAPTOP_BACKEND);
+    let mut environment = NETWORK_MODE.to_vec();
+    environment.push(("NARSOR_LOG_LEVEL", "warn"));
+    let invocation = daemon(&root, &environment, Duration::from_secs(4));
+    assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
+    assert!(
+        invocation.stderr.contains("default_backend is 'local'"),
+        "{}",
+        invocation.stderr
+    );
+}

@@ -2722,6 +2722,37 @@ mod remote_cli {
         assert!(code.stdout.contains("Enrollment code: "), "{}", code.stdout);
         let controllers = remote(&harness, token, &["controller", "list"]).await;
         assert_eq!(controllers.code, EXIT_SUCCESS, "{}", controllers.output());
+
+        // A `local` backend on a workstation needs the owner's consent (R15).
+        let refused = remote(&harness, token, &["controller", "enroll-code", "local"]).await;
+        assert_ne!(refused.code, EXIT_SUCCESS, "{}", refused.output());
+        assert!(
+            refused.output().contains("workstation_risk_not_accepted"),
+            "{}",
+            refused.output()
+        );
+        let accepted = remote(
+            &harness,
+            token,
+            &[
+                "controller",
+                "enroll-code",
+                "local",
+                "--accept-workstation-risk",
+            ],
+        )
+        .await;
+        assert_eq!(accepted.code, EXIT_SUCCESS, "{}", accepted.output());
+        assert!(
+            accepted.stdout.contains("Enrollment code: "),
+            "{}",
+            accepted.stdout
+        );
+        assert!(
+            accepted.stderr.contains("WARNING") && accepted.stderr.contains("without a container"),
+            "{}",
+            accepted.stderr
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

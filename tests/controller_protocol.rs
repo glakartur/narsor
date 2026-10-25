@@ -494,6 +494,7 @@ async fn an_enrollment_code_enrolls_once_and_expires() {
             &CreateEnrollmentRequest {
                 name: Some("cluster-a".to_string()),
                 ttl_secs: Some(60),
+                ..CreateEnrollmentRequest::default()
             },
         )
         .await
@@ -7668,4 +7669,201 @@ async fn the_list_carries_the_same_panel_as_the_task() {
         let single = harness.task(task.task_id.as_str()).await;
         assert_eq!(task.panel, single.panel, "{}", task.task_id);
     }
+}
+
+// ---------------------------------------------------------------------------
+// A workstation as a backend: trust scope and consent (U5)
+// ---------------------------------------------------------------------------
+
+/// Registers backend `id` of kind `local` with `trust_scope` in the
+/// harness's catalogue.
+fn register_local_backend(
+    harness: &Harness,
+    id: &str,
+    kind: narsor_engine::environment::BackendKind,
+    trust_scope: narsor_engine::environment::TrustScope,
+) {
+    let record = narsor_engine::environment::BackendRecord::new(
+        id,
+        kind,
+        trust_scope,
+        narsor_engine::environment::BackendLimits::new(
+            1,
+            narsor_engine::domain::ResourceProfile::new(1000, 2048),
+            None,
+        ),
+    );
+    narsor_engine::environment::EnvironmentCatalog::new(harness.root.path())
+        .save_backend(&record)
+        .expect("register the backend");
+}
+
+fn consenting() -> CreateEnrollmentRequest {
+    CreateEnrollmentRequest {
+        accept_workstation_risk: true,
+        ..CreateEnrollmentRequest::default()
+    }
+}
+
+/// Covers AE10.
+#[tokio::test]
+async fn a_workstation_backend_is_enrolled_only_with_the_owners_consent() {
+    use narsor_engine::environment::{BackendKind, TrustScope};
+    let harness = Harness::start().await;
+    register_local_backend(
+        &harness,
+        "laptop",
+        BackendKind::Local,
+        TrustScope::Workstation,
+    );
+
+    let refused = harness
+        .owner
+        .create_enrollment("laptop", &CreateEnrollmentRequest::default())
+        .await;
+    match refused {
+        Err(ClientError::Request { code, message }) => {
+            assert_eq!(code, "workstation_risk_not_accepted");
+            assert!(message.contains("without a container"), "{message}");
+        }
+        other => panic!("expected a 400 naming the risk, got {other:?}"),
+    }
+
+    let code = harness
+        .owner
+        .create_enrollment("laptop", &consenting())
+        .await
+        .expect("a code with consent");
+    assert_eq!(code.backend_id, "laptop");
+    let (controller, _) = ControllerClient::enroll(harness.base_url(), &code.enrollment_code)
+        .await
+        .expect("enroll");
+    controller
+        .acquire_lease(None)
+        .await
+        .expect("the laptop's lease");
+}
+
+/// The rule reads what a backend is, not its id: the trusted daemon's own
+/// `local`, asked for over HTTP, needs the same consent.
+#[tokio::test]
+async fn the_built_in_local_backend_over_http_needs_the_same_consent() {
+    let harness = Harness::start().await;
+    let refused = harness
+        .owner
+        .create_enrollment("local", &CreateEnrollmentRequest::default())
+        .await;
+    assert!(
+        matches!(&refused, Err(ClientError::Request { code, .. }) if code == "workstation_risk_not_accepted"),
+        "{refused:?}"
+    );
+    harness
+        .owner
+        .create_enrollment("local", &consenting())
+        .await
+        .expect("a code with consent");
+    // The daemon's own path needs none.
+    harness
+        .service
+        .create_builtin_local_enrollment()
+        .expect("the daemon's in-process code");
+}
+
+/// A `local` backend declared after the server started with a trust scope
+/// other than `workstation` — which the start-up check would have refused —
+/// still runs tasks on somebody's computer, so it needs the same consent.
+#[tokio::test]
+async fn a_local_backend_of_any_trust_scope_needs_the_same_consent() {
+    let harness = Harness::start().await;
+    // Written by hand: saving it through the catalogue would be refused.
+    let backends =
+        narsor_engine::persistence::paths::CatalogPaths::new(harness.root.path()).backends_dir();
+    std::fs::create_dir_all(&backends).unwrap();
+    std::fs::write(
+        backends.join("rack.yaml"),
+        "kind: local\ntrust_scope: dedicated\nlimits:\n  max_concurrent_tasks: 1\n  \
+         default_resources:\n    cpu_millicores: 1000\n    memory_mib: 2048\n",
+    )
+    .unwrap();
+    let refused = harness
+        .owner
+        .create_enrollment("rack", &CreateEnrollmentRequest::default())
+        .await;
+    assert!(
+        matches!(&refused, Err(ClientError::Request { code, .. }) if code == "workstation_risk_not_accepted"),
+        "{refused:?}"
+    );
+    harness
+        .owner
+        .create_enrollment("rack", &consenting())
+        .await
+        .expect("a code with consent");
+}
+
+#[tokio::test]
+async fn a_kubernetes_backend_on_a_workstation_needs_no_consent() {
+    use narsor_engine::environment::{BackendKind, TrustScope};
+    let harness = Harness::start().await;
+    register_local_backend(
+        &harness,
+        "desk-k8s",
+        BackendKind::Kubernetes,
+        TrustScope::Workstation,
+    );
+    harness
+        .owner
+        .create_enrollment("desk-k8s", &CreateEnrollmentRequest::default())
+        .await
+        .expect("a code without consent");
+}
+
+#[tokio::test]
+async fn an_enrollment_for_an_unknown_backend_is_not_found() {
+    let harness = Harness::start().await;
+    let refused = harness
+        .owner
+        .create_enrollment("nowhere", &consenting())
+        .await;
+    assert!(matches!(refused, Err(ClientError::NotFound)), "{refused:?}");
+}
+
+#[tokio::test]
+async fn a_revoked_workstation_controller_is_refused_and_can_be_replaced() {
+    use narsor_engine::environment::{BackendKind, TrustScope};
+    let harness = Harness::start().await;
+    register_local_backend(
+        &harness,
+        "laptop",
+        BackendKind::Local,
+        TrustScope::Workstation,
+    );
+    let code = harness
+        .owner
+        .create_enrollment("laptop", &consenting())
+        .await
+        .expect("a code");
+    let (controller, _) = ControllerClient::enroll(harness.base_url(), &code.enrollment_code)
+        .await
+        .expect("enroll");
+    controller.acquire_lease(None).await.expect("lease");
+    let listed = harness.owner.controllers().await.expect("controllers");
+    harness
+        .owner
+        .revoke_controller(&listed.controllers[0].controller_id)
+        .await
+        .expect("revoke");
+    assert!(matches!(
+        controller.heartbeat().await,
+        Err(ClientError::Unauthorized)
+    ));
+
+    let code = harness
+        .owner
+        .create_enrollment("laptop", &consenting())
+        .await
+        .expect("a new code");
+    let (replacement, _) = ControllerClient::enroll(harness.base_url(), &code.enrollment_code)
+        .await
+        .expect("enroll again");
+    replacement.acquire_lease(None).await.expect("lease again");
 }

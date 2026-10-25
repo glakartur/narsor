@@ -12,7 +12,7 @@ use narsor_protocol::controller::{
 use narsor_shared::api_error::ClientError;
 
 use crate::auth::ControllerCredential;
-use crate::controller_protocol::ControllerClient;
+use crate::controller_protocol::{ClientOptions, ControllerClient};
 
 impl ControllerLink for ControllerClient {
     async fn acquire_lease(&self, ttl: Option<u64>) -> Result<LeaseView, ClientError> {
@@ -52,14 +52,17 @@ impl ControllerLink for ControllerClient {
     }
 }
 
-struct ProtocolEnrollment;
-impl EnrollmentClient for ProtocolEnrollment {
+struct ProtocolEnrollment<'o> {
+    options: &'o ClientOptions,
+}
+
+impl EnrollmentClient for ProtocolEnrollment<'_> {
     type Client = ControllerClient;
     fn is_valid_credential(&self, credential: &str) -> bool {
         ControllerCredential::parse(credential).is_some()
     }
     fn client(&self, url: &str, credential: &str) -> Self::Client {
-        ControllerClient::new(url, credential)
+        ControllerClient::new(url, credential).with_options(self.options)
     }
     fn enroll<'a>(
         &'a self,
@@ -67,7 +70,7 @@ impl EnrollmentClient for ProtocolEnrollment {
         code: &'a str,
     ) -> narsor_controller_runtime::EnrollmentFuture<'a, Self::Client> {
         Box::pin(async move {
-            let (client, enrolled) = ControllerClient::enroll(url, code)
+            let (client, enrolled) = ControllerClient::enroll_with_options(url, code, self.options)
                 .await
                 .map_err(|e| e.to_string())?;
             let credential = client
@@ -85,5 +88,16 @@ pub async fn load_or_enroll(
     path: &Path,
     code: Option<&str>,
 ) -> Result<ControllerClient, EnrollmentError> {
-    load_or_enroll_with(&ProtocolEnrollment, url, path, code).await
+    load_or_enroll_with_options(url, path, code, &ClientOptions::default()).await
+}
+
+/// [`load_or_enroll`], the client behaving as `options` say — enrollment
+/// included (KTD8).
+pub async fn load_or_enroll_with_options(
+    url: &str,
+    path: &Path,
+    code: Option<&str>,
+    options: &ClientOptions,
+) -> Result<ControllerClient, EnrollmentError> {
+    load_or_enroll_with(&ProtocolEnrollment { options }, url, path, code).await
 }

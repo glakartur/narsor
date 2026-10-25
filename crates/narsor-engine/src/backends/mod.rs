@@ -4,7 +4,7 @@ pub mod fake;
 pub mod local;
 
 pub use fake::FakeBackend;
-pub use local::{LocalBackend, LocalBackendConfig};
+pub use local::{LaunchCheck, LocalBackend, LocalBackendConfig};
 pub use narsor_controller_runtime::backend::{
     ArchiveProgress, BackendError, BackendErrorKind, BackendResult, ExecutionBackend, Provisioned,
     ReaderStart, Removal, RunnerCredential, StorageState, TaskObservation, TaskResources,

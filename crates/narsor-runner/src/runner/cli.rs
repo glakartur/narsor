@@ -8,7 +8,7 @@
 //!               [--launch-spec <file>] [--secrets-dir <dir>] \
 //!               [--home private|host] [--codex-home <dir>] \
 //!               [--claude-config-dir <dir>] [--claude-profile-source <dir>]
-//!               [--read-only]
+//!               [--pinned-git-credential-only] [--read-only]
 //! ```
 //!
 //! * `--task-storage` — the task's persistent volume (R9). Holds the Engine
@@ -30,6 +30,11 @@
 //! * `--claude-profile-source` — the Claude Code profile (in Kubernetes the
 //!   read-only mount of the profile Secret) merged into Claude's work
 //!   directory before every start; see [`super::profile`].
+//!
+//! * `--pinned-git-credential-only` — a Git workspace is cloned with none of
+//!   the user's own git configuration, SSH keys or agent, over `https`
+//!   only; the pinned credential is the only one (a local controller of a
+//!   control plane it does not trust sets it, R17).
 //!
 //! * `--read-only` — the runner only answers reads of the storage and
 //!   changes nothing on it; see [`super::reader`]. It takes the same lock, so
@@ -131,6 +136,12 @@ pub struct RunnerArgs {
     #[arg(long)]
     pub read_only: bool,
 
+    /// Clone a Git workspace with none of the user's own git configuration
+    /// or credentials, over https only: the pinned credential is the only
+    /// one.
+    #[arg(long)]
+    pub pinned_git_credential_only: bool,
+
     /// Long-poll wait in seconds (the control plane caps it).
     #[arg(long, value_name = "SECONDS", default_value_t = 25, hide = true)]
     pub poll_wait_secs: u64,
@@ -224,6 +235,7 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
         },
         contract: BaseImageContract::default(),
         read_only: args.read_only,
+        pinned_git_credential_only: args.pinned_git_credential_only,
     })
 }
 
@@ -280,6 +292,12 @@ mod tests {
         assert_eq!(config.harness_home.mode, HomeMode::Private);
         assert_eq!(config.storage, std::path::PathBuf::from("/task"));
         assert!(!config.read_only);
+        assert!(!config.pinned_git_credential_only);
+    }
+
+    #[test]
+    fn a_controller_can_keep_the_clone_from_the_users_git_credentials() {
+        assert!(config(&["--pinned-git-credential-only"]).pinned_git_credential_only);
     }
 
     #[test]

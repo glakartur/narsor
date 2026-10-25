@@ -1,13 +1,22 @@
 //! `narsor-controller`: the environment controller of one backend, run next
-//! to it (R3-R5, R37; KTD1, KTD6).
+//! to it (R3-R5, R37; KTD1, KTD6). One subcommand per backend kind, each
+//! with its own arguments and `--help`:
 //!
 //! ```text
-//! narsor-controller --control-plane <url> --credential-file <file> \
-//!                   [--enrollment-code <code>] --kubernetes-config <file> \
+//! narsor-controller kubernetes --control-plane <url> --credential-file <file> \
+//!                   --kubernetes-config <file> \
 //!                   [--namespace <ns>] [--api-server <url> --token-file <file> --ca-file <file>]
 //!
-//! narsor-controller edit-claude-profile [--claude-command <program>] [--yes] …
+//! narsor-controller kubernetes edit-claude-profile [--claude-command <program>] [--yes] …
+//!
+//! narsor-controller local --control-plane <url> --credential-file <file> --storage <dir> …
 //! ```
+//!
+//! The connection arguments ([`ConnectionArgs`]) are shared by every
+//! backend and read the same `NARSOR_*` variables. The one-time enrollment
+//! code never travels on the command line, where every user of the machine
+//! can read it: it comes from `NARSOR_ENROLLMENT_CODE` or
+//! `--enrollment-code-file` (R12).
 //!
 //! # Editing the Claude profile
 //!
@@ -28,7 +37,7 @@
 //! The controller's identity is the `nsk.…` credential in
 //! `--credential-file`: its id and an Ed25519 key it generated itself
 //! ([`narsor_engine::auth::pop`]). On the first start the file does not exist yet;
-//! the controller then redeems the one-time `--enrollment-code`, binding a
+//! the controller then redeems the one-time enrollment code, binding a
 //! freshly generated key, and persists the credential `0600`. Every later
 //! start loads it and ignores a code still lying around in the environment,
 //! so a restarted Pod does not try to re-enroll with a spent code.
@@ -43,12 +52,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 
 use crate::kubernetes::client::{ClusterAccess, TokenSource};
 use crate::kubernetes::{KubernetesBackend, KubernetesBackendConfig};
 use crate::profile_edit::{printable, EditSession, ProfileChanges};
-use narsor_controller_runtime::{Controller, ControllerConfig};
+use narsor_controller_runtime::{
+    Controller, ControllerConfig, EnrollmentError, ENROLLMENT_CODE_ENV,
+};
 use narsor_engine::config::CLAUDE_CONFIG_DIR_ENV;
 use narsor_engine::controller_protocol::ControllerClient;
 use narsor_engine::controller_runtime::load_or_enroll as load_controller_identity;
@@ -69,54 +80,176 @@ const HARNESS_ENVS: [&str; 7] = [
     "TZ",
 ];
 
-/// Platforms `narsor-controller` can drive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum ControllerBackend {
-    /// One Pod and one PVC per task.
-    Kubernetes,
-}
-
-/// Arguments of `narsor-controller`.
-#[derive(Debug, Clone, Args)]
-pub struct ControllerArgs {
+/// How a controller reaches the control plane, whichever backend it drives.
+///
+/// The values are optional here and checked after parsing
+/// ([`Self::resolve`]): `kubernetes edit-claude-profile` needs none of them,
+/// and clap would otherwise ask for them before seeing the subcommand.
+#[derive(Debug, Clone, Default, Args)]
+pub struct ConnectionArgs {
     /// The control plane's base URL, as the controller reaches it.
     #[arg(long, env = "NARSOR_CONTROL_PLANE", value_name = "URL")]
-    pub control_plane: String,
+    pub control_plane: Option<String>,
 
-    /// The control plane's base URL as runners reach it from their Pods;
-    /// defaults to `--control-plane`.
+    /// The control plane's base URL as runners reach it from their
+    /// workloads; defaults to `--control-plane`.
     #[arg(long, env = "NARSOR_RUNNER_CONTROL_PLANE", value_name = "URL")]
     pub runner_control_plane: Option<String>,
 
-    /// Where the controller credential is kept (written on enrollment).
+    /// Where the controller credential is kept (written on enrollment);
+    /// for `local`, $XDG_STATE_HOME/narsor/workstation-controller/credential
+    /// by default.
     #[arg(long, env = "NARSOR_CONTROLLER_CREDENTIAL_FILE", value_name = "FILE")]
-    pub credential_file: PathBuf,
+    pub credential_file: Option<PathBuf>,
 
-    /// One-time enrollment code, redeemed when the credential file does
-    /// not exist yet.
-    #[arg(
-        long,
-        env = "NARSOR_ENROLLMENT_CODE",
-        hide_env_values = true,
-        value_name = "CODE"
-    )]
+    /// File holding the one-time enrollment code, redeemed when the
+    /// credential file does not exist yet. The code can also come from
+    /// NARSOR_ENROLLMENT_CODE; it is never accepted on the command line.
+    #[arg(long, env = "NARSOR_ENROLLMENT_CODE_FILE", value_name = "FILE")]
+    pub enrollment_code_file: Option<PathBuf>,
+
+    /// Refused: only here to explain where the code goes instead.
+    #[arg(long, hide = true, value_name = "CODE")]
     pub enrollment_code: Option<String>,
 
-    /// The platform.
-    #[arg(long, value_enum, default_value = "kubernetes")]
-    pub backend: ControllerBackend,
+    /// Validity of the backend lease, in seconds.
+    #[arg(long, default_value_t = 60, value_name = "SECONDS")]
+    pub lease_ttl_secs: u64,
+}
+
+/// [`ConnectionArgs`] once every required value is there.
+#[derive(Clone)]
+pub struct Connection {
+    /// The control plane's base URL, as the controller reaches it.
+    pub control_plane: String,
+    /// The control plane's base URL as runners reach it.
+    pub runner_control_plane: String,
+    /// Where the controller credential is kept.
+    pub credential_file: PathBuf,
+    /// The one-time enrollment code, when one was given.
+    pub enrollment_code: Option<String>,
+    /// Validity of the backend lease.
+    pub lease_ttl: Duration,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The enrollment code is a secret: never in a log line.
+        f.debug_struct("Connection")
+            .field("control_plane", &self.control_plane)
+            .field("runner_control_plane", &self.runner_control_plane)
+            .field("credential_file", &self.credential_file)
+            .field(
+                "enrollment_code",
+                &self.enrollment_code.as_ref().map(|_| "<redacted>"),
+            )
+            .field("lease_ttl", &self.lease_ttl)
+            .finish()
+    }
+}
+
+impl ConnectionArgs {
+    /// The connection, the enrollment code read from `--enrollment-code-file`
+    /// or [`ENROLLMENT_CODE_ENV`], or a usage error naming what is missing.
+    pub fn resolve(&self) -> Result<Connection, ControllerError> {
+        self.resolve_with_default_credential(None)
+    }
+
+    /// [`Self::resolve`], with `default_credential` standing in for a
+    /// credential file given neither as a flag nor in the environment.
+    pub fn resolve_with_default_credential(
+        &self,
+        default_credential: Option<PathBuf>,
+    ) -> Result<Connection, ControllerError> {
+        if self.enrollment_code.is_some() {
+            // The value is not repeated: it is the secret being protected.
+            return Err(ControllerError::usage(format!(
+                "--enrollment-code is not accepted: the command line of a process is visible \
+                 to every user of the machine. Set {ENROLLMENT_CODE_ENV} or use \
+                 --enrollment-code-file"
+            )));
+        }
+        let control_plane = self
+            .control_plane
+            .clone()
+            .ok_or_else(|| missing_argument("--control-plane <URL>", "NARSOR_CONTROL_PLANE"))?;
+        let credential_file = self
+            .credential_file
+            .clone()
+            .or(default_credential)
+            .ok_or_else(|| {
+                missing_argument(
+                    "--credential-file <FILE>",
+                    "NARSOR_CONTROLLER_CREDENTIAL_FILE",
+                )
+            })?;
+        let enrollment_code = match &self.enrollment_code_file {
+            Some(path) => Some(read_enrollment_code(path)?),
+            None => std::env::var(ENROLLMENT_CODE_ENV)
+                .ok()
+                .filter(|code| !code.is_empty()),
+        };
+        Ok(Connection {
+            runner_control_plane: self
+                .runner_control_plane
+                .clone()
+                .unwrap_or_else(|| control_plane.clone()),
+            control_plane,
+            credential_file,
+            enrollment_code,
+            lease_ttl: Duration::from_secs(self.lease_ttl_secs.max(1)),
+        })
+    }
+}
+
+/// A usage error for a required argument given neither as a flag nor in
+/// the environment.
+pub(crate) fn missing_argument(flag: &str, variable: &str) -> ControllerError {
+    ControllerError::usage(format!(
+        "error: the following required argument was not provided: {flag} (or {variable})"
+    ))
+}
+
+fn read_enrollment_code(path: &Path) -> Result<String, ControllerError> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        ControllerError::usage(format!("cannot read {}: {error}", path.display()))
+    })?;
+    let code = text.trim_end_matches(['\n', '\r']);
+    if code.is_empty() {
+        return Err(ControllerError::usage(format!(
+            "{} holds no enrollment code",
+            path.display()
+        )));
+    }
+    Ok(code.to_string())
+}
+
+/// Arguments of `narsor-controller kubernetes`.
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_negates_reqs = true)]
+pub struct KubernetesArgs {
+    /// How the control plane is reached.
+    #[command(flatten)]
+    pub connection: ConnectionArgs,
 
     /// The Kubernetes backend configuration (YAML).
     #[arg(long, env = "NARSOR_KUBERNETES_CONFIG", value_name = "FILE")]
-    pub kubernetes_config: PathBuf,
+    pub kubernetes_config: Option<PathBuf>,
 
     /// How the cluster is reached.
     #[command(flatten)]
     pub cluster: ClusterArgs,
 
-    /// Validity of the backend lease, in seconds.
-    #[arg(long, default_value_t = 60, value_name = "SECONDS")]
-    pub lease_ttl_secs: u64,
+    /// An operation other than running the controller.
+    #[command(subcommand)]
+    pub command: Option<KubernetesCommand>,
+}
+
+/// What `narsor-controller kubernetes` does besides running the controller.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum KubernetesCommand {
+    /// Edit the Claude profile Secret in Claude Code, then save it.
+    EditClaudeProfile(EditProfileArgs),
 }
 
 /// How a `narsor-controller` command reaches the cluster.
@@ -181,14 +314,14 @@ pub struct ControllerError {
 }
 
 impl ControllerError {
-    fn usage(message: impl Into<String>) -> Self {
+    pub(crate) fn usage(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             code: EXIT_USAGE,
         }
     }
 
-    fn failure(message: impl Into<String>) -> Self {
+    pub(crate) fn failure(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             code: EXIT_FAILURE,
@@ -196,9 +329,18 @@ impl ControllerError {
     }
 }
 
-/// Runs the controller until `SIGTERM` or Ctrl-C.
-pub async fn run_command(args: ControllerArgs) -> i32 {
-    match run(args).await {
+/// Runs `narsor-controller kubernetes`: the controller until `SIGTERM` or
+/// Ctrl-C, or the operation its subcommand names.
+pub async fn kubernetes_command(args: KubernetesArgs) -> i32 {
+    match args.command {
+        Some(KubernetesCommand::EditClaudeProfile(edit)) => edit_profile_command(edit).await,
+        None => exit_code(run_kubernetes(args).await),
+    }
+}
+
+/// The exit code of a command's outcome, its failure printed.
+pub(crate) fn exit_code(outcome: Result<(), ControllerError>) -> i32 {
+    match outcome {
         Ok(()) => EXIT_SUCCESS,
         Err(error) => {
             eprintln!("{}", error.message);
@@ -207,9 +349,12 @@ pub async fn run_command(args: ControllerArgs) -> i32 {
     }
 }
 
-async fn run(args: ControllerArgs) -> Result<(), ControllerError> {
-    let ControllerBackend::Kubernetes = args.backend;
-    let mut config = read_backend_config(&args.kubernetes_config)?;
+async fn run_kubernetes(args: KubernetesArgs) -> Result<(), ControllerError> {
+    let connection = args.connection.resolve()?;
+    let kubernetes_config = args.kubernetes_config.clone().ok_or_else(|| {
+        missing_argument("--kubernetes-config <FILE>", "NARSOR_KUBERNETES_CONFIG")
+    })?;
+    let mut config = read_backend_config(&kubernetes_config)?;
     if args.cluster.namespace.is_some() {
         config.namespace = args.cluster.namespace.clone();
     }
@@ -220,17 +365,13 @@ async fn run(args: ControllerArgs) -> Result<(), ControllerError> {
     })?;
 
     let client = load_or_enroll(
-        &args.control_plane,
-        &args.credential_file,
-        args.enrollment_code.as_deref(),
+        &connection.control_plane,
+        &connection.credential_file,
+        connection.enrollment_code.as_deref(),
     )
     .await?;
-    let runner_url = args
-        .runner_control_plane
-        .clone()
-        .unwrap_or_else(|| args.control_plane.clone());
-    let mut controller_config = ControllerConfig::new(runner_url);
-    controller_config.lease_ttl = Duration::from_secs(args.lease_ttl_secs.max(1));
+    let mut controller_config = ControllerConfig::new(connection.runner_control_plane);
+    controller_config.lease_ttl = connection.lease_ttl;
     tracing::info!(namespace = %backend.namespace(), "controller: driving the Kubernetes backend");
     Controller::new(backend, client, controller_config)
         .run(shutdown_signal())
@@ -240,13 +381,7 @@ async fn run(args: ControllerArgs) -> Result<(), ControllerError> {
 
 /// Runs one Claude profile edit session.
 pub async fn edit_profile_command(args: EditProfileArgs) -> i32 {
-    match edit_profile(args).await {
-        Ok(()) => EXIT_SUCCESS,
-        Err(error) => {
-            eprintln!("{}", error.message);
-            error.code
-        }
-    }
+    exit_code(edit_profile(args).await)
 }
 
 /// One edit session, its failure unprinted.
@@ -443,17 +578,19 @@ pub async fn load_or_enroll(
 ) -> Result<ControllerClient, ControllerError> {
     load_controller_identity(control_plane, credential_file, code)
         .await
-        .map_err(|error| {
-            let message = error.message();
-            if error.is_usage_error() {
-                ControllerError::usage(message)
-            } else {
-                ControllerError::failure(message)
-            }
-        })
+        .map_err(enrollment_error)
 }
 
-async fn shutdown_signal() {
+pub(crate) fn enrollment_error(error: EnrollmentError) -> ControllerError {
+    let message = error.message();
+    if error.is_usage_error() {
+        ControllerError::usage(message)
+    } else {
+        ControllerError::failure(message)
+    }
+}
+
+pub(crate) async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
 
     match signal(SignalKind::terminate()) {

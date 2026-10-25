@@ -124,7 +124,7 @@ use crate::orchestration::{
     CommandActor, HarnessUnavailable, OwnerCommand, ResumeMessage, RunnerProblem, RunnerSnapshot,
 };
 use crate::persistence::{reconcile, PersistenceError, ReconciliationOutcome};
-use crate::workspace::WorkspaceError;
+use crate::workspace::{GitAccess, WorkspaceError};
 use home::CLAUDE_CONFIG_DIR_ENV;
 
 pub use home::{HarnessHome, HomeMode};
@@ -294,6 +294,9 @@ pub struct RunnerConfig {
     pub contract: BaseImageContract,
     /// Only answer reads of the storage and change nothing on it ([`reader`]).
     pub read_only: bool,
+    /// Clone a Git workspace with none of the user's own git setup, only
+    /// its pinned credential ([`GitAccess::PinnedOnly`]).
+    pub pinned_git_credential_only: bool,
 }
 
 /// Runs one runner process to its end.
@@ -385,7 +388,14 @@ pub async fn run(
         OUTBOX_ENV.to_string(),
         storage.outbox_dir().display().to_string(),
     ));
-    if let Err(error) = initialize(&storage, &store, &config.task_id, &spec, &secrets) {
+    let git = if config.pinned_git_credential_only {
+        GitAccess::PinnedOnly {
+            home: private_home.clone(),
+        }
+    } else {
+        GitAccess::User
+    };
+    if let Err(error) = initialize(&storage, &store, &config.task_id, &spec, &secrets, &git) {
         return Ok(report_problem(
             &storage,
             &mut link,

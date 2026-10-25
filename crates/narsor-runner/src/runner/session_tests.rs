@@ -305,6 +305,7 @@ fn offline_config(root: &TempRoot, storage: &Path, incarnation: &str) -> RunnerC
         },
         contract: BaseImageContract::default(),
         read_only: false,
+        pinned_git_credential_only: false,
     }
 }
 
@@ -339,6 +340,7 @@ impl Fixture {
             &config.task_id,
             spec,
             &MountedSecrets::new(None),
+            &crate::workspace::GitAccess::User,
         )
         .expect("initialize the storage");
         let definition = Arc::new(spec.definition().expect("the definition"));

@@ -26,6 +26,6 @@ pub use checkpoint::{
 };
 pub use provisioner::{
     checked_out_commit, clone_pinned_commit, clone_resolving_ref, CleanupOutcome, CleanupPolicy,
-    ProvisionedRepository, ProvisionedWorkspace, RepositorySource, RepositorySpec, WorkspaceError,
-    WorkspaceProvisioner, WorkspaceRequest, CODE_DIR, TASKS_DIR,
+    GitAccess, ProvisionedRepository, ProvisionedWorkspace, RepositorySource, RepositorySpec,
+    WorkspaceError, WorkspaceProvisioner, WorkspaceRequest, CODE_DIR, TASKS_DIR,
 };

@@ -62,6 +62,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use narsor_shared::config::{CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV, ENV_PREFIX};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -71,6 +72,7 @@ use super::{
 };
 use crate::domain::{TaskId, TaskLaunchSpec};
 use crate::environment::{BackendCapabilities, BackendKind};
+use crate::workspace::provisioner::USER_GIT_ACCESS_ENVS;
 
 /// How long removing compute waits for a killed runner to disappear before
 /// it answers "in progress" and lets the controller come back.
@@ -105,6 +107,30 @@ impl Role {
     }
 }
 
+/// A check of every launch spec before anything of its task is created:
+/// `Err` refuses the task with that problem. What a controller serving a
+/// control plane it does not trust sets (R17).
+#[derive(Clone)]
+pub struct LaunchCheck(Arc<LaunchCheckFn>);
+
+/// The function of a [`LaunchCheck`].
+type LaunchCheckFn = dyn Fn(&TaskLaunchSpec) -> Result<(), String> + Send + Sync;
+
+impl LaunchCheck {
+    /// A check running `check`.
+    pub fn new(
+        check: impl Fn(&TaskLaunchSpec) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(check))
+    }
+}
+
+impl std::fmt::Debug for LaunchCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaunchCheck")
+    }
+}
+
 /// Configuration of a [`LocalBackend`].
 #[derive(Debug, Clone)]
 pub struct LocalBackendConfig {
@@ -116,8 +142,15 @@ pub struct LocalBackendConfig {
     /// knobs, for instance).
     pub runner_args: Vec<OsString>,
     /// Environment variables set for every runner, on top of the
-    /// controller's own environment.
+    /// controller's own environment less its `NARSOR_*` settings.
     pub env: Vec<(OsString, OsString)>,
+    /// Run on every launch spec before its task's storage or workload is
+    /// created; none by default.
+    pub launch_check: Option<LaunchCheck>,
+    /// Whether runners inherit none of the user's credential variables
+    /// ([`is_user_credential`]): harness logins, Git and forge credentials.
+    /// Set for a control plane beyond this machine with a private HOME (R17).
+    pub withhold_user_credentials: bool,
 }
 
 impl LocalBackendConfig {
@@ -143,6 +176,8 @@ impl LocalBackendConfig {
             program: program.into(),
             runner_args: Vec::new(),
             env: Vec::new(),
+            launch_check: None,
+            withhold_user_credentials: false,
         }
     }
 }
@@ -339,9 +374,7 @@ impl LocalBackend {
         launch: &WorkloadLaunch,
         create_storage: bool,
     ) -> BackendResult<Provisioned> {
-        serde_json::from_value::<TaskLaunchSpec>(launch.launch_spec.clone()).map_err(|error| {
-            BackendError::rejected(format!("the launch spec is malformed: {error}"))
-        })?;
+        self.checked_spec(launch)?;
         let storage = self.storage_dir(task);
         let created_storage = !storage.is_dir();
         if created_storage {
@@ -375,9 +408,7 @@ impl LocalBackend {
         task: &TaskResources,
         launch: &WorkloadLaunch,
     ) -> BackendResult<ReaderStart> {
-        serde_json::from_value::<TaskLaunchSpec>(launch.launch_spec.clone()).map_err(|error| {
-            BackendError::rejected(format!("the launch spec is malformed: {error}"))
-        })?;
+        self.checked_spec(launch)?;
         let storage = self.storage_dir(task);
         if !storage.is_dir() {
             // A reader never creates storage: there would be nothing to read.
@@ -397,6 +428,18 @@ impl LocalBackend {
             workload,
             created: true,
         })
+    }
+
+    /// The launch spec, refused when it is malformed or fails the
+    /// configured [`LaunchCheck`].
+    fn checked_spec(&self, launch: &WorkloadLaunch) -> BackendResult<TaskLaunchSpec> {
+        let spec = serde_json::from_value::<TaskLaunchSpec>(launch.launch_spec.clone()).map_err(
+            |error| BackendError::rejected(format!("the launch spec is malformed: {error}")),
+        )?;
+        if let Some(LaunchCheck(check)) = &self.config.launch_check {
+            check(&spec).map_err(BackendError::rejected)?;
+        }
+        Ok(spec)
     }
 
     fn spawn(
@@ -460,8 +503,20 @@ impl LocalBackend {
         if role == Role::Read {
             command.arg("--read-only");
         }
+        command.args(&self.config.runner_args);
+        // Nothing of the controller's own settings — its enrollment code
+        // least of all — reaches the runner or the tools it starts (R12);
+        // what the adapter sets itself is set below. `spawn` isolates it:
+        // the controller's environment stays as it is.
+        // Nor, for a server that is not trusted, the user's own logins: a
+        // harness directory or a Git credential inherited from the shell.
+        let withhold = self.config.withhold_user_credentials;
+        for (name, _) in std::env::vars_os() {
+            if is_controller_setting(&name) || (withhold && is_user_credential(&name)) {
+                command.env_remove(name);
+            }
+        }
         command
-            .args(&self.config.runner_args)
             .envs(self.config.env.iter().map(|(k, v)| (k, v)))
             .env(WORKLOAD_MARK_ENV, &uid)
             .stdin(Stdio::null())
@@ -640,6 +695,45 @@ impl ExecutionBackend for LocalBackend {
     }
 }
 
+/// Whether `name` is one of the controller's own `NARSOR_*` variables,
+/// which a runner never inherits.
+fn is_controller_setting(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(ENV_PREFIX.as_bytes())
+}
+
+/// Variables through which a runner or a harness would reach the user's
+/// own logins, beyond those git reads ([`USER_GIT_ACCESS_ENVS`]).
+const USER_CREDENTIAL_ENVS: [&str; 13] = [
+    CODEX_HOME_ENV,
+    CLAUDE_CONFIG_DIR_ENV,
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_AUTH_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_CONFIG_DIR",
+    "GITLAB_TOKEN",
+    "GL_TOKEN",
+    "GLAB_TOKEN",
+    "GLAB_CONFIG_DIR",
+];
+
+/// The prefix of git's configuration variables (`GIT_CONFIG_GLOBAL`,
+/// `GIT_CONFIG_KEY_<n>`, ...), any of which can hand git a credential.
+const GIT_CONFIG_ENV_PREFIX: &str = "GIT_CONFIG";
+
+/// Whether `name` is one of the user's credential variables, which a runner
+/// serving a server that is not trusted never inherits.
+fn is_user_credential(name: &std::ffi::OsStr) -> bool {
+    let name = name.as_encoded_bytes();
+    name.starts_with(GIT_CONFIG_ENV_PREFIX.as_bytes())
+        || USER_GIT_ACCESS_ENVS
+            .iter()
+            .chain(&USER_CREDENTIAL_ENVS)
+            .any(|known| name == known.as_bytes())
+}
+
 fn io_error(what: &str, error: io::Error) -> BackendError {
     BackendError::transient(format!("cannot {what}: {error}"))
 }
@@ -744,6 +838,47 @@ mod tests {
     }
 
     #[test]
+    fn the_controllers_settings_are_not_inherited_by_a_runner() {
+        for name in [
+            "NARSOR_ENROLLMENT_CODE",
+            "NARSOR_CONTROL_PLANE",
+            "NARSOR_RUNNER_CONTROL_PLANE",
+        ] {
+            assert!(is_controller_setting(name.as_ref()), "{name}");
+        }
+        for name in ["PATH", "HOME", "RUST_LOG", "narsor_lower", "XNARSOR_"] {
+            assert!(!is_controller_setting(name.as_ref()), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_users_logins_are_credential_variables() {
+        for name in [
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_CONFIG_DIR",
+            "GITLAB_TOKEN",
+            "GL_TOKEN",
+            "GLAB_TOKEN",
+            "GLAB_CONFIG_DIR",
+            "SSH_AUTH_SOCK",
+            "GIT_ASKPASS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_KEY_0",
+            "XDG_CONFIG_HOME",
+        ] {
+            assert!(is_user_credential(name.as_ref()), "{name}");
+        }
+        for name in ["PATH", "HOME", "GIT_TERMINAL_PROMPT", "codex_home"] {
+            assert!(!is_user_credential(name.as_ref()), "{name}");
+        }
+    }
+
+    #[test]
     fn a_group_without_the_workloads_mark_is_never_signalled() {
         let mut stranger = group_leader(Some("local-someone-else"));
         let mut unmarked = group_leader(None);
@@ -841,6 +976,37 @@ mod tests {
             }
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[tokio::test]
+    async fn a_launch_the_check_refuses_creates_nothing() {
+        let mut scratch = Scratch::new();
+        let mut config = (*scratch.backend.config).clone();
+        config.launch_check = Some(LaunchCheck::new(|spec| {
+            Err(format!(
+                "workflow '{}' is not allowed here",
+                spec.workflow_id
+            ))
+        }));
+        scratch.backend = LocalBackend::new(config);
+        let task = scratch.task();
+
+        let refused = scratch
+            .backend
+            .provision(&task, &scratch.launch("task-1-g1"))
+            .await
+            .expect_err("refused by the check");
+
+        assert!(
+            refused.to_string().contains("'wf' is not allowed here"),
+            "{refused}"
+        );
+        assert!(!scratch.backend.storage_dir(&task).exists(), "no storage");
+        assert!(
+            !scratch.backend.workload_dir(&task, Role::Work).exists(),
+            "no workload"
+        );
+        assert!(!scratch.root.join("args").exists(), "no runner");
     }
 
     #[tokio::test]

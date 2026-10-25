@@ -7,8 +7,8 @@
 
 use narsor_engine::domain::{RefOrigin, WorkflowExecution, WorkspaceType};
 use narsor_engine::workspace::{
-    checked_out_commit, clone_pinned_commit, CleanupOutcome, CleanupPolicy, RepositorySpec,
-    WorkspaceError, WorkspaceProvisioner, WorkspaceRequest,
+    checked_out_commit, clone_pinned_commit, CleanupOutcome, CleanupPolicy, GitAccess,
+    RepositorySpec, WorkspaceError, WorkspaceProvisioner, WorkspaceRequest,
 };
 use std::fs;
 use std::io;
@@ -602,6 +602,7 @@ fn an_admission_clone_names_where_a_missing_ref_came_from() {
         Some(RefOrigin::Repository),
         &temp.join("clone"),
         None,
+        &GitAccess::User,
     )
     .expect_err("a missing branch must fail");
     let message = error.to_string();
@@ -627,6 +628,7 @@ fn without_a_ref_the_clone_takes_the_head_of_the_remote_not_main() {
         None,
         &target,
         None,
+        &GitAccess::User,
     )
     .expect("the remote HEAD resolves");
     assert_eq!(commit, git(&repo, &["rev-parse", "trunk"]));
@@ -867,6 +869,7 @@ fn a_pinned_clone_checks_out_exactly_the_pinned_commit() {
         &pinned,
         &target,
         None,
+        &GitAccess::User,
     )
     .expect("clone the pinned commit");
 
@@ -893,6 +896,7 @@ fn a_pinned_clone_never_writes_into_an_existing_directory() {
         &pinned,
         &target,
         None,
+        &GitAccess::User,
     )
     .expect_err("an existing directory is never cloned into");
     assert!(matches!(error, WorkspaceError::Io { .. }), "{error:?}");
@@ -914,6 +918,7 @@ fn a_commit_missing_from_the_remote_is_a_named_error() {
         &"0".repeat(40),
         &root.join("clone"),
         None,
+        &GitAccess::User,
     )
     .expect_err("an unknown commit fails");
     assert!(
@@ -938,6 +943,7 @@ fn a_clone_credential_is_read_from_its_file_and_never_lands_in_the_clone() {
         &pinned,
         &target,
         Some(&secret),
+        &GitAccess::User,
     )
     .expect("clone with a credential file");
 
@@ -947,4 +953,31 @@ fn a_clone_credential_is_read_from_its_file_and_never_lands_in_the_clone() {
         !config.contains("credential"),
         "no helper persists: {config}"
     );
+}
+
+/// A clone a control plane beyond this machine asked for speaks https
+/// only: a path on the user's disk — or a `file://` URL — never clones.
+#[test]
+fn a_pinned_only_clone_never_reads_a_repository_of_the_users_disk() {
+    let root = TempRoot::new();
+    let origin = init_repo(&root.join("origin"));
+    commit_file(&origin, "a.txt", "one\n", "first");
+    let pinned = git(&origin, &["rev-parse", "HEAD"]);
+    let home = root.join("private-home");
+    fs::create_dir_all(&home).unwrap();
+    let access = GitAccess::PinnedOnly { home };
+
+    for (index, remote) in [
+        origin.display().to_string(),
+        format!("file://{}", origin.display()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let target = root.join(&format!("clone-{index}"));
+        let error = clone_pinned_commit("origin", &remote, &pinned, &target, None, &access)
+            .expect_err(&remote);
+        assert!(matches!(error, WorkspaceError::Git { .. }), "{error:?}");
+        assert!(!target.join("a.txt").exists());
+    }
 }

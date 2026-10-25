@@ -168,11 +168,16 @@ impl RemoteHarness {
             .expect("create task")
     }
 
-    /// An enrolled controller holding `backend`'s lease.
+    /// An enrolled controller holding `backend`'s lease. The owner accepts
+    /// the risk of a workstation backend, which `local` is (R15).
     pub async fn controller(&self, backend: &str) -> (ControllerClient, u64) {
+        let request = CreateEnrollmentRequest {
+            accept_workstation_risk: true,
+            ..CreateEnrollmentRequest::default()
+        };
         let code = self
             .owner
-            .create_enrollment(backend, &CreateEnrollmentRequest::default())
+            .create_enrollment(backend, &request)
             .await
             .expect("enrollment code");
         let (controller, _) = ControllerClient::enroll(self.base_url(), &code.enrollment_code)

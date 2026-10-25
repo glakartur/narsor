@@ -20,6 +20,7 @@ Contents:
 11. [Using it: CLI and TUI](#11-using-it-cli-and-tui)
 12. [Smoke tests](#12-smoke-tests)
 13. [Known limitations](#13-known-limitations)
+14. [A computer as a backend](#14-a-computer-as-a-backend)
 
 ---
 
@@ -34,7 +35,9 @@ Contents:
                                     └─ one durable volume: orchestration records,
                                        event logs, controller identities, owner
  controller (next to the backend) ──outbound HTTPS──▶ control plane
-   └─ native API ─▶ Kubernetes: one Pod + one PVC per task
+   ├─ narsor-controller local (trusted mode: the daemon's child)
+   │    └─ one narsor-runner process per task on this machine
+   └─ narsor-controller kubernetes ─▶ native API ─▶ one Pod + one PVC per task
                       init container: copies the runtime bundle to /opt/narsor
                       main container: the repository's base image, runs
                                       /opt/narsor/bin/narsor-runner
@@ -64,9 +67,32 @@ Rules that follow from this split:
   per state directory.
 
 The daemon that runs the local `/executions` engine is the same process that
-serves the control plane. The `local` backend adapter runs tasks through the
-local engine on the same machine; remote tasks on any backend use the same
-owner API.
+serves the control plane. The `local` backend has a controller like every
+other backend: `narsor-controller local`, a separate process that enrolls and
+talks `/controller/v1` over HTTP. In trusted mode the daemon starts it as its
+child, enrolls it on the first start and supervises it:
+
+* the daemon becomes discoverable (`daemon.json`) only after this controller
+  holds a lease of its own — a newer `epoch` than the one before its start;
+  it gives up after 10 s, and the start fails with the last lines the
+  controller wrote;
+* the controller gets every setting as a flag (`--no-config`) and none of the
+  daemon's `NARSOR_*` variables; the enrollment code reaches it only as
+  `NARSOR_ENROLLMENT_CODE`, and never reaches a runner;
+* its log lines are in the daemon's log, prefixed with `narsor-controller:`;
+  `RUST_LOG` follows the daemon's log level;
+* a controller that dies is started again (1 s, doubled up to 30 s) with the
+  same identity; running tasks keep their runners;
+* on stop the daemon sends the controller `SIGTERM`, waits up to 10 s for the
+  lease release, then sends `SIGKILL`, and only then closes the API; a
+  controller whose daemon was killed stops on its own;
+* one controller per credential: it holds `<credential>.lock` beside the
+  credential and waits up to 7 s for a predecessor.
+
+`narsor-server`, `narsor-controller` and `narsor-runner` must be installed in
+one directory; the daemon looks for the controller only next to itself, never
+on `PATH`. In network mode the daemon starts no local controller. Remote tasks
+on any backend use the same owner API.
 
 ## 2. Server modes: trusted and network
 
@@ -375,7 +401,7 @@ plugins or skills — run an edit session in the controller's Pod:
 
 ```bash
 kubectl -n narsor-user exec -it deploy/narsor-controller -- \
-  /opt/narsor/bin/narsor-controller edit-claude-profile
+  /opt/narsor/bin/narsor-controller kubernetes edit-claude-profile
 ```
 
 The controller image must have Claude Code on its `PATH` (or name it with
@@ -426,6 +452,10 @@ given them as `env` secrets. For Claude Code on a subscription, a token from
 `claude setup-token` delivered as `!env CLAUDE_CODE_OAUTH_TOKEN` needs no
 writable login directory.
 
+The Deployment runs `narsor-controller kubernetes`; every argument comes
+from the environment (`narsor-controller kubernetes --help` lists the
+variables). `narsor-controller` without a subcommand is a usage error.
+
 Set in `controller.yaml`: the Narsor release image **by digest**,
 `NARSOR_CONTROL_PLANE` (the URL the controller uses) and, when task Pods
 reach the control plane under another URL, `NARSOR_RUNNER_CONTROL_PLANE`.
@@ -454,6 +484,10 @@ Each controller has its own identity scoped to one backend.
    code by proving possession of it, and writes its credential
    `nsk.<controller-id>.<seed>` with mode `0600` to its state volume. Later
    starts load the file and ignore any code still in the environment.
+   The code reaches the controller only as `NARSOR_ENROLLMENT_CODE` or in a
+   file named by `--enrollment-code-file`; `--enrollment-code <code>` is
+   refused, because every user of the machine can read a process's
+   arguments.
 5. Delete the enrollment Secret, then check:
 
    ```bash
@@ -912,3 +946,114 @@ The ordinary test suite needs no cluster. Against a real cluster:
   recovered, from the TUI's history (`H`) or with `narsor-cli task history …`,
   over the same control plane and only on the local daemon; the local
   `/executions` routes remain for `narsor-cli list`, `show` and the like.
+
+## 14. A computer as a backend
+
+A network control plane can run tasks on a computer — a laptop, a
+workstation — with `narsor-controller local` started there by hand. The
+controller only opens outbound connections, so the computer needs no open
+port. **Read this first:** the runner runs every task as the computer's user,
+without a container. Whoever controls the server can then run any program on
+that computer and read every file its user can read. Use it only with a
+server you control, and keep the computer's user free of what tasks must not
+see.
+
+1. Register the backend under its own id, never `local` (a network server
+   refuses `backends/local.yaml` at start; that id belongs to a trusted
+   daemon). The trust scope must be `workstation`:
+
+   ```yaml
+   # {catalog}/backends/laptop.yaml
+   kind: local
+   trust_scope: workstation
+   limits:
+     max_concurrent_tasks: 1
+     default_resources: { cpu_millicores: 1000, memory_mib: 2048 }
+   ```
+
+2. As the owner, create a code. The server refuses it without the explicit
+   consent (`400 workstation_risk_not_accepted`); the CLI prints the risk:
+
+   ```bash
+   narsor-cli controller enroll-code laptop --accept-workstation-risk
+   ```
+
+3. On the computer, with `narsor-controller` and `narsor-runner` in one
+   directory, start the controller. The code goes in the environment or in a
+   file, never on the command line:
+
+   ```bash
+   NARSOR_ENROLLMENT_CODE=<code> narsor-controller local \
+     --control-plane https://narsor.example \
+     --storage ~/narsor-laptop
+   ```
+
+   The credential is kept `0600` in
+   `$XDG_STATE_HOME/narsor/workstation-controller/credential` (or
+   `--credential-file`). At start the controller prints the server's address,
+   the backend it serves and a warning.
+
+**Transport.** Beyond loopback (a loopback IP address or exactly
+`localhost`; no DNS) the controller accepts only `https://`, checks the
+server's certificate against the system's certificate store and follows no
+redirect. There is no option to turn the check off: to use a private CA, add
+it to the system store. `--runner-control-plane` follows the same rule, and
+a runner follows no redirect either.
+(Debug builds accept plain `http://` beyond loopback, for tests only.)
+
+**What the server may ask for.** A control plane beyond loopback is not
+trusted, so the controller checks every launch spec before anything of the
+task is created:
+
+* tasks get a private HOME on task storage. `--home host` (or `local_home:
+  host` in the configuration, or `NARSOR_LOCAL_HOME=host`) needs
+  `--accept-host-home`: tasks would then see your SSH keys, tokens and
+  harness logins. `--codex-home`, `--claude-config-dir` and
+  `--claude-profile-source` point at your own harness logins, so they need
+  `--accept-host-home` too; without it the configuration file's
+  `local_codex_home`, `local_claude_config_dir` and
+  `local_claude_profile_source` are not used;
+* with a private HOME the runner and everything it starts inherit none of
+  your logins from the controller's environment: no `CODEX_HOME`,
+  `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`,
+  `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR`, `GITLAB_TOKEN`, `GL_TOKEN`,
+  `GLAB_TOKEN`, `GLAB_CONFIG_DIR`, `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`,
+  `GIT_SSH`, `GIT_SSH_COMMAND`, `XDG_CONFIG_HOME` and no `GIT_CONFIG*`
+  variable;
+* a local workspace directory must lie inside `--storage`;
+* a Git workspace is cloned over `https://` only — never a path, a
+  `file://`, `ssh://` or `git@host:` remote, nor a host on this computer or
+  a private network (`localhost`, a loopback, private, link-local or
+  carrier-grade NAT address; a name is not resolved). With a private HOME
+  the clone also uses none of your own git setup: no `~/.gitconfig` or
+  system configuration, no credential helper, SSH key or agent, no askpass
+  helper. Only the credential the repository is pinned to is used, and git
+  follows no HTTP redirect, so a public host cannot send the clone on to a
+  private network;
+* a secret goes only into a variable a supported harness or tool reads
+  (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`); allow another one
+  with `--allow-env NAME`. A secret file stays inside the private HOME;
+* the runner program is always the `narsor-runner` beside the controller.
+
+These checks keep the server from choosing what the runner touches. They do
+not keep a task's own code — what its harness runs — from reading the user's
+files.
+
+**Configuration.** Started by hand, the controller reads the Narsor
+configuration file (`--config`, else the usual search) for the HOME settings
+only: a flag wins over a `NARSOR_LOCAL_*` variable, which wins over the file.
+`--no-config` reads no file.
+
+**Losing the computer.** Revoke its identity at once:
+`narsor-cli controller list`, then `narsor-cli controller revoke <id>`. Its
+tasks show `controller offline` until another controller holds the backend.
+
+**Manual test.** Against a network server with backend `laptop`: start the
+controller as above, check `narsor-cli controller list` (it holds the lease),
+create a task with `--backend laptop` and watch it run in the TUI next to the
+tasks of the other backends.
+
+Before this mode is released, a security specialist reviews the checks above
+(R16, R17).

@@ -34,7 +34,10 @@ pub fn parse_issuer(text: &str) -> Result<Url, String> {
     }
 }
 
-fn is_loopback_host(url: &Url) -> bool {
+/// Whether `url` names this machine: a loopback IP address, or exactly
+/// `localhost`. Never a DNS lookup, so no name that merely resolves to a
+/// loopback address (`127.0.0.1.nip.io`, `localhost.example.com`) counts.
+pub fn is_loopback_host(url: &Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };

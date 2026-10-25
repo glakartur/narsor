@@ -2281,6 +2281,7 @@ fn the_controller_deployment_is_locked_down() {
     assert_eq!(pod["securityContext"]["runAsNonRoot"], true);
     let container = &pod["containers"][0];
     assert_eq!(container["command"][0], "/opt/narsor/bin/narsor-controller");
+    assert_eq!(container["command"][1], "kubernetes");
     assert!(container.get("args").is_none());
     assert_eq!(
         container["securityContext"]["allowPrivilegeEscalation"],

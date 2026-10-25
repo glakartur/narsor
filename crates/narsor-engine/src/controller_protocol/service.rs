@@ -42,7 +42,7 @@ use crate::domain::{
 use crate::engine::{
     plan_operator_transition, EngineError, HumanInputDelivery, PositionStatus, Timeline,
 };
-use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
+use crate::environment::{BackendKind, LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
     AttentionItem, AttentionKind, BackendCapacity, BackendLease, CommandActor, CommandRequest,
@@ -1244,6 +1244,40 @@ impl ProtocolService {
 
     /// Creates a one-time code enrolling one controller for `backend_id`.
     pub fn create_enrollment(
+        &self,
+        backend_id: &str,
+        request: CreateEnrollmentRequest,
+    ) -> ProtocolResult<EnrollmentResponse> {
+        let id = parse_identifier(BackendId::parse(backend_id))?;
+        let record = self
+            .launch
+            .backend_record(&id)
+            .map_err(|error| ProtocolError::bad_request(error.code(), error.to_string()))?
+            .ok_or(ProtocolError::NotFound)?;
+        // Judged by what the backend is, not by its id: the daemon's own
+        // `local` asked for over HTTP is one more such backend (R15). Its
+        // trust scope does not count either: a `local` backend declared with
+        // another one after the server started runs tasks the same way.
+        if record.kind == BackendKind::Local && !request.accept_workstation_risk {
+            return Err(ProtocolError::bad_request(
+                WORKSTATION_RISK_NOT_ACCEPTED,
+                WORKSTATION_RISK,
+            ));
+        }
+        self.issue_enrollment(backend_id, request)
+    }
+
+    /// A one-time code for the controller a trusted daemon starts for its
+    /// built-in `local` backend. Not reachable over HTTP: the daemon calls
+    /// it in process, for a controller it starts itself (KTD11).
+    pub fn create_builtin_local_enrollment(&self) -> ProtocolResult<EnrollmentResponse> {
+        self.issue_enrollment(
+            crate::environment::BackendRecord::LOCAL_ID,
+            CreateEnrollmentRequest::default(),
+        )
+    }
+
+    fn issue_enrollment(
         &self,
         backend_id: &str,
         request: CreateEnrollmentRequest,

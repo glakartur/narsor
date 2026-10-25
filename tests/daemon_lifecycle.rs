@@ -1254,6 +1254,11 @@ fn spawn_daemon_with_path(root: &Path, bin: &Path) -> DaemonGuard {
 /// bare: the caller makes sure it does not outlive the test. Its output is
 /// appended to `<root>/daemon.log`, so a failing test can be read back.
 fn daemon_with_path(root: &Path, bin: &Path) -> Child {
+    daemon_with_env(root, bin, &[])
+}
+
+/// [`daemon_with_path`] with `envs` added to the daemon's environment.
+fn daemon_with_env(root: &Path, bin: &Path, envs: &[(&str, &str)]) -> Child {
     let path = format!(
         "{}:{}",
         bin.display(),
@@ -1268,6 +1273,7 @@ fn daemon_with_path(root: &Path, bin: &Path) -> Child {
         .arg("--root")
         .arg(root)
         .env("PATH", path)
+        .envs(envs.iter().copied())
         .stdout(log.try_clone().expect("share the daemon's log"))
         .stderr(log)
         .spawn()
@@ -1671,6 +1677,11 @@ struct RestartedDaemon {
 impl RestartedDaemon {
     /// Starts the daemon and creates the task.
     fn start() -> Self {
+        Self::start_with_env(&[])
+    }
+
+    /// [`Self::start`], `envs` added to the daemon's environment.
+    fn start_with_env(envs: &[(&str, &str)]) -> Self {
         let root = TempRoot::new();
         let bin = fake_claude(
             &root.path().join("bin"),
@@ -1678,7 +1689,7 @@ impl RestartedDaemon {
         );
         fs::create_dir_all(root.path().join("workflows")).unwrap();
         fs::write(root.path().join("workflows/gate.yaml"), GATE_WORKFLOW).unwrap();
-        let daemon = daemon_with_path(root.path(), &bin);
+        let daemon = daemon_with_env(root.path(), &bin, envs);
         let started = Self {
             daemon,
             bin,
@@ -1989,4 +2000,351 @@ fn interrupt_as_before_the_policy(root: &Path, task_id: &str) {
         assert!(fields.remove(added).is_some(), "the record has {added}");
     }
     fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).expect("write the task record");
+}
+
+// ---------------------------------------------------------------------------
+// The local controller as the daemon's child process (U3)
+// ---------------------------------------------------------------------------
+
+/// The live `narsor-controller local` processes of `root`: (pid, parent pid).
+fn local_controllers(root: &Path) -> Vec<(u32, u32)> {
+    let root = root.display().to_string();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let command = fs::read(entry.path().join("cmdline")).ok()?;
+            let args: Vec<String> = command
+                .split(|byte| *byte == 0)
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect();
+            let is_controller = args
+                .first()
+                .is_some_and(|program| program.ends_with("/narsor-controller"))
+                && args.get(1).is_some_and(|arg| arg == "local")
+                && args.iter().any(|arg| arg.contains(&root));
+            if !is_controller || !pid_alive(pid) {
+                return None;
+            }
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let parent = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            Some((pid, parent))
+        })
+        .collect()
+}
+
+/// The one local controller of `root`, waiting for it when needed.
+fn the_local_controller(root: &Path) -> (u32, u32) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let controllers = local_controllers(root);
+        if controllers.len() == 1 {
+            return controllers[0];
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not exactly one local controller: {controllers:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The environment of process `pid`, `NAME=value` each.
+fn environment_of(pid: u32) -> Vec<String> {
+    fs::read(format!("/proc/{pid}/environ"))
+        .expect("read the environment")
+        .split(|byte| *byte == 0)
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn active(lease: &Option<narsor_engine::orchestration::BackendLease>) -> bool {
+    lease
+        .as_ref()
+        .is_some_and(|lease| lease.expires_at > chrono::Utc::now())
+}
+
+fn wait_until_gone(pid: u32, timeout: Duration, what: &str) {
+    let deadline = Instant::now() + timeout;
+    while pid_alive(pid) {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Covers AE3: a fresh daemon runs its local controller as a child process
+/// and is discoverable only once that child holds the lease; a task on
+/// `local` runs; a stop takes the child down and releases the lease.
+#[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+async fn the_local_controller_is_a_child_that_holds_the_lease_before_discovery() {
+    let mut daemon = RestartedDaemon::start();
+    // `start` returned at the discovery file: the lease was there already.
+    let (controller, parent) = the_local_controller(daemon.root());
+    assert_eq!(parent, daemon.daemon.id(), "the daemon's own child");
+    daemon.wait_at_approval(None).await;
+
+    daemon.stop();
+    assert!(
+        !pid_alive(controller),
+        "the controller stopped with the daemon"
+    );
+    assert!(local_controllers(daemon.root()).is_empty());
+    let released = local_lease(daemon.root());
+    assert!(!active(&released), "released on stop: {released:?}");
+}
+
+#[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+fn the_discovery_file_appears_only_after_the_lease() {
+    let root = TempRoot::new();
+    let mut daemon = spawn_daemon(root.path());
+    wait_for_daemon_info(root.path(), Duration::from_secs(15));
+    assert!(
+        active(&local_lease(root.path())),
+        "the lease was taken before the daemon became discoverable"
+    );
+    send_sigterm(daemon.id());
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(20)).success());
+}
+
+/// Covers AE4: after a `kill -9` of the daemon, while the old lease is still
+/// valid, the next daemon is discoverable only once its own controller took
+/// a lease of a larger epoch — and the old controller is gone by then.
+#[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+fn after_a_kill_the_next_daemon_waits_for_a_lease_of_its_own() {
+    let root = TempRoot::new();
+    let mut first = spawn_daemon(root.path());
+    wait_for_daemon_info(root.path(), Duration::from_secs(15));
+    let (old_controller, _) = the_local_controller(root.path());
+    let held = local_lease(root.path()).expect("a lease");
+
+    // SAFETY: the daemon this test started.
+    unsafe {
+        libc::kill(first.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = first.wait();
+    let _ = fs::remove_file(daemon_file(root.path()));
+    assert!(
+        active(&local_lease(root.path())),
+        "the old lease is still valid"
+    );
+
+    let mut second = spawn_daemon(root.path());
+    wait_for_daemon_info(root.path(), Duration::from_secs(20));
+    let lease = local_lease(root.path()).expect("a lease");
+    assert!(lease.epoch > held.epoch, "{lease:?} after {held:?}");
+    assert!(active(&Some(lease)));
+    assert!(
+        !pid_alive(old_controller),
+        "the killed daemon's controller is gone"
+    );
+    let (controller, parent) = the_local_controller(root.path());
+    assert_eq!(parent, second.id());
+    assert_ne!(controller, old_controller);
+
+    send_sigterm(second.id());
+    assert!(wait_for_exit(&mut second, Duration::from_secs(20)).success());
+}
+
+#[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+fn a_killed_daemon_takes_its_controller_with_it() {
+    let root = TempRoot::new();
+    let mut daemon = spawn_daemon(root.path());
+    wait_for_daemon_info(root.path(), Duration::from_secs(15));
+    let (controller, _) = the_local_controller(root.path());
+    // SAFETY: the daemon this test started.
+    unsafe {
+        libc::kill(daemon.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = daemon.wait();
+    wait_until_gone(
+        controller,
+        Duration::from_secs(10),
+        "the controller outlived its killed daemon",
+    );
+}
+
+/// Covers AE5.
+#[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+fn without_the_controller_binary_the_daemon_does_not_start() {
+    let root = TempRoot::new();
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let server = bin.join("narsor-server");
+    fs::copy(engine_support::workspace_binary("narsor-server"), &server).unwrap();
+    let output = Command::new(&server)
+        .arg("--root")
+        .arg(root.path().join("state"))
+        .output()
+        .expect("run the copied server");
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains(&bin.join("narsor-controller").display().to_string()),
+        "{text}"
+    );
+    assert!(!daemon_file(&root.path().join("state")).exists());
+}
+
+/// Covers AE6: a killed controller is started again without a new
+/// enrollment; the task's runner lives on and a new runner can start.
+#[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+async fn a_killed_controller_is_started_again_with_the_same_identity() {
+    let daemon = RestartedDaemon::start();
+    daemon.wait_at_approval(None).await;
+    let runner = daemon.runner_pid();
+    let credential = daemon.root().join("local-controller/credential");
+    let enrolled = fs::read_to_string(&credential).unwrap();
+    let held = local_lease(daemon.root()).expect("a lease");
+    let (controller, _) = the_local_controller(daemon.root());
+
+    // SAFETY: the controller of this test's daemon.
+    unsafe {
+        libc::kill(controller as libc::pid_t, libc::SIGKILL);
+    }
+    let again = wait_for_lease(daemon.root(), "was taken again", |lease| {
+        lease
+            .as_ref()
+            .is_some_and(|lease| lease.epoch > held.epoch && lease.expires_at > chrono::Utc::now())
+    })
+    .expect("a lease");
+    assert_eq!(again.controller_id, held.controller_id);
+    assert_eq!(fs::read_to_string(&credential).unwrap(), enrolled);
+    let (restarted, parent) = the_local_controller(daemon.root());
+    assert_ne!(restarted, controller);
+    assert_eq!(parent, daemon.daemon.id());
+    assert!(pid_alive(runner), "the task's runner lives on");
+}
+
+/// Covers AE8: the daemon's `NARSOR_*` variables reach neither the
+/// controller nor a runner; the runner reaches the daemon's own address and
+/// never sees the enrollment code.
+#[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+async fn the_daemons_variables_reach_neither_the_controller_nor_a_runner() {
+    let daemon = RestartedDaemon::start_with_env(&[(
+        "NARSOR_RUNNER_CONTROL_PLANE",
+        "http://example.invalid",
+    )]);
+    daemon.wait_at_approval(None).await;
+    let (controller, _) = the_local_controller(daemon.root());
+    let environment = environment_of(controller);
+    assert!(
+        !environment
+            .iter()
+            .any(|entry| entry.starts_with("NARSOR_RUNNER_CONTROL_PLANE=")),
+        "{environment:?}"
+    );
+
+    let runner = daemon.runner_pid();
+    let environment = environment_of(runner);
+    assert!(
+        !environment
+            .iter()
+            .any(|entry| entry.starts_with("NARSOR_ENROLLMENT_CODE=")
+                || entry.starts_with("NARSOR_RUNNER_CONTROL_PLANE=")),
+        "{environment:?}"
+    );
+    let arguments = String::from_utf8_lossy(&fs::read(format!("/proc/{runner}/cmdline")).unwrap())
+        .replace('\0', " ");
+    let info = DaemonInfo::read(&daemon_file(daemon.root())).unwrap();
+    assert!(
+        arguments.contains(&format!("--control-plane http://{}", info.addr)),
+        "{arguments}"
+    );
+}
+
+#[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+fn the_controllers_log_lines_are_in_the_daemons_log() {
+    let root = TempRoot::new();
+    let mut daemon = DaemonGuard::new(
+        root.path(),
+        Command::new(engine_support::workspace_binary("narsor-server"))
+            .arg("--root")
+            .arg(root.path())
+            .env("NARSOR_LOG_LEVEL", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the daemon"),
+    );
+    wait_for_daemon_info(root.path(), Duration::from_secs(15));
+    send_sigterm(daemon.id());
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(20)).success());
+    let mut log = String::new();
+    std::io::Read::read_to_string(&mut daemon.stderr.take().unwrap(), &mut log).unwrap();
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with("narsor-controller:") && line.contains("lease acquired")),
+        "{log}"
+    );
+}
+
+#[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+fn a_broken_credential_fails_the_start_with_the_controllers_words() {
+    let root = TempRoot::new();
+    let credential = root.path().join("local-controller/credential");
+    fs::create_dir_all(credential.parent().unwrap()).unwrap();
+    fs::write(&credential, "not a credential").unwrap();
+    let mut daemon = spawn_daemon(root.path());
+    let status = wait_for_exit(&mut daemon, Duration::from_secs(20));
+    assert_eq!(status.code(), Some(1));
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut daemon.stderr.take().unwrap(), &mut text).unwrap();
+    assert!(
+        text.contains("the local controller did not start"),
+        "{text}"
+    );
+    assert!(
+        text.contains("does not hold a controller credential"),
+        "{text}"
+    );
+    assert!(!daemon_file(root.path()).exists());
+    assert!(local_controllers(root.path()).is_empty());
+}
+
+#[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
+fn a_controller_that_never_takes_the_lease_fails_the_start_in_time() {
+    let root = TempRoot::new();
+    // Another controller holds the backend for longer than the daemon waits.
+    narsor_engine::orchestration::ControlPlane::new(narsor_engine::persistence::StatePaths::new(
+        root.path(),
+    ))
+    .acquire_lease(
+        &narsor_engine::domain::BackendId::parse("local").unwrap(),
+        "ctl-somebody-else",
+        chrono::Duration::seconds(300),
+    )
+    .expect("hold the lease");
+    let started = Instant::now();
+    let mut daemon = spawn_daemon(root.path());
+    let status = wait_for_exit(&mut daemon, Duration::from_secs(25));
+    assert_eq!(status.code(), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "within the discovery timeout"
+    );
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut daemon.stderr.take().unwrap(), &mut text).unwrap();
+    assert!(text.contains("within 10 s"), "{text}");
+    assert!(!daemon_file(root.path()).exists());
+    assert!(local_controllers(root.path()).is_empty());
 }

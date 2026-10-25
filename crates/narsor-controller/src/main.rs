@@ -1,44 +1,52 @@
-use clap::Parser;
-use narsor_controller::controller::{
-    edit_profile_command, run_command, ControllerArgs, EditProfileArgs,
-};
+use clap::{Parser, Subcommand};
+use narsor_controller::controller::{kubernetes_command, KubernetesArgs};
+use narsor_controller::local::{local_command, LocalArgs};
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-/// The subcommand of [`Edit`]; anything else runs the controller.
-const EDIT_CLAUDE_PROFILE: &str = "edit-claude-profile";
+/// The filter in force when `RUST_LOG` is not set.
+const DEFAULT_LOG_FILTER: &str = "warn";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "narsor-controller",
     about = "Reconcile one Narsor backend",
-    after_help = "Run `narsor-controller edit-claude-profile --help` to edit the Claude profile Secret."
+    subcommand_required = true
 )]
 struct Args {
-    #[command(flatten)]
-    controller: ControllerArgs,
+    #[command(subcommand)]
+    backend: Backend,
 }
 
-// A separate parser rather than a clap subcommand: the controller takes its
-// required arguments from the environment, which an optional flattened
-// group next to a subcommand would not see.
-#[derive(Debug, Parser)]
-#[command(
-    name = "narsor-controller edit-claude-profile",
-    about = "Edit the Claude profile Secret in Claude Code, then save it"
-)]
-struct Edit {
-    #[command(flatten)]
-    edit: EditProfileArgs,
+/// The backend kinds `narsor-controller` can drive.
+#[derive(Debug, Subcommand)]
+enum Backend {
+    /// One Pod and one PVC per task, in a Kubernetes namespace.
+    Kubernetes(KubernetesArgs),
+    /// One `narsor-runner` process per task, on this machine.
+    Local(LocalArgs),
 }
 
 #[tokio::main]
 async fn main() {
-    let edit = std::env::args_os()
-        .nth(1)
-        .is_some_and(|arg| arg == EDIT_CLAUDE_PROFILE);
-    let code = if edit {
-        edit_profile_command(Edit::parse_from(std::env::args_os().skip(1)).edit).await
-    } else {
-        run_command(Args::parse().controller).await
+    let args = Args::parse();
+    init_logging();
+    let code = match args.backend {
+        Backend::Kubernetes(args) => kubernetes_command(args).await,
+        Backend::Local(args) => local_command(args).await,
     };
     std::process::exit(code);
+}
+
+/// Logs to stderr, filtered by `RUST_LOG` (R4). Under the daemon, stderr
+/// goes to the daemon's own log.
+fn init_logging() {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_target(false)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }

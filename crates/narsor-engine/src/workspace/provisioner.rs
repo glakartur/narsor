@@ -664,6 +664,39 @@ impl WorkspaceProvisioner {
     }
 }
 
+/// How much of the user's own git setup a clone may use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum GitAccess {
+    /// All of it: `~/.gitconfig`, credential helpers, `url.*.insteadOf`
+    /// rewrites, SSH keys and agent — what makes the user's private
+    /// repositories simply clone.
+    #[default]
+    User,
+    /// None of it, for a clone a control plane beyond this machine asked
+    /// for (R17): HOME is `home`, git reads no global or system
+    /// configuration, has no SSH agent or askpass helper, speaks `https`
+    /// only and follows no redirect. The pinned credential is the only one
+    /// it has.
+    PinnedOnly {
+        /// The HOME git runs with: one holding nothing of the user's.
+        home: PathBuf,
+    },
+}
+
+/// The variables through which git would reach the user's own credentials
+/// or configuration, none of which a [`GitAccess::PinnedOnly`] clone sees.
+pub(crate) const USER_GIT_ACCESS_ENVS: [&str; 9] = [
+    "SSH_AUTH_SOCK",
+    "SSH_ASKPASS",
+    "GIT_ASKPASS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "XDG_CONFIG_HOME",
+];
+
 /// Clones `remote` into `target` and leaves it on `commit`, detached (R39).
 ///
 /// The remote-task counterpart of [`WorkspaceProvisioner::provision`]: a task
@@ -682,11 +715,15 @@ impl WorkspaceProvisioner {
 ///
 /// `target` must not exist yet; the caller decides where a half-finished
 /// clone may live (see `crate::runner::storage`).
+///
+/// `access` says how much of the user's own git setup the clone and its
+/// checkout may use.
 fn clone_without_checkout(
     repository: &str,
     remote: &str,
     target: &Path,
     credential_file: Option<&Path>,
+    access: &GitAccess,
 ) -> Result<String> {
     check_remote(repository, remote)?;
     if target.exists() {
@@ -735,7 +772,7 @@ fn clone_without_checkout(
         remote,
         &target_arg,
     ]);
-    run_git(repository, &clone)?;
+    run_git_with(repository, &clone, access)?;
     Ok(target_arg)
 }
 
@@ -745,10 +782,11 @@ pub fn clone_pinned_commit(
     commit: &str,
     target: &Path,
     credential_file: Option<&Path>,
+    access: &GitAccess,
 ) -> Result<()> {
     check_ref(repository, commit)?;
-    let target_arg = clone_without_checkout(repository, remote, target, credential_file)?;
-    run_git(
+    let target_arg = clone_without_checkout(repository, remote, target, credential_file, access)?;
+    run_git_with(
         repository,
         &[
             "-C",
@@ -758,6 +796,7 @@ pub fn clone_pinned_commit(
             "--detach",
             &format!("{commit}^{{commit}}"),
         ],
+        access,
     )
     .map_err(|error| match error {
         WorkspaceError::Git { stderr, .. } => WorkspaceError::RefNotFound {
@@ -798,11 +837,12 @@ pub fn clone_resolving_ref(
     ref_origin: Option<RefOrigin>,
     target: &Path,
     credential_file: Option<&Path>,
+    access: &GitAccess,
 ) -> Result<String> {
     if let Some(git_ref) = git_ref {
         check_ref(repository, git_ref)?;
     }
-    let target_arg = clone_without_checkout(repository, remote, target, credential_file)?;
+    let target_arg = clone_without_checkout(repository, remote, target, credential_file, access)?;
     let wanted = git_ref.unwrap_or("HEAD");
     // A fresh clone has only the default branch locally; any other branch is
     // reachable as `origin/<branch>`, and a tag by its own name.
@@ -813,7 +853,7 @@ pub fn clone_resolving_ref(
     };
     let mut last_error = None;
     for candidate in candidates {
-        match run_git(
+        match run_git_with(
             repository,
             &[
                 "-C",
@@ -823,6 +863,7 @@ pub fn clone_resolving_ref(
                 "--detach",
                 &format!("{candidate}^{{commit}}"),
             ],
+            access,
         ) {
             Ok(_) => {
                 return head_commit(target, repository)?.ok_or_else(|| {
@@ -972,12 +1013,16 @@ fn check_ref(repository: &str, git_ref: &str) -> Result<()> {
 /// an unattended execution on a password prompt. Everything else about the
 /// user's environment is left alone on purpose — `~/.ssh/config` aliases,
 /// credential helpers and `url.*.insteadOf` rewrites are exactly what shelling
-/// out to `git` buys us.
+/// out to `git` buys us — unless `access` takes them away.
 fn git_run(args: &[&str]) -> io::Result<GitRun> {
-    let output = Command::new("git")
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()?;
+    git_run_with(args, &GitAccess::User)
+}
+
+fn git_run_with(args: &[&str], access: &GitAccess) -> io::Result<GitRun> {
+    let mut command = Command::new("git");
+    command.args(args).env("GIT_TERMINAL_PROMPT", "0");
+    restrict_git_access(&mut command, access);
+    let output = command.output()?;
     Ok(GitRun {
         ok: output.status.success(),
         code: output.status.code(),
@@ -986,10 +1031,33 @@ fn git_run(args: &[&str]) -> io::Result<GitRun> {
     })
 }
 
+/// Takes from `command` what `access` does not allow of the user's own git
+/// setup. A [`GitAccess::PinnedOnly`] git also follows no HTTP redirect, so
+/// a public host cannot send the clone on to a private network.
+fn restrict_git_access(command: &mut Command, access: &GitAccess) {
+    if let GitAccess::PinnedOnly { home } = access {
+        for name in USER_GIT_ACCESS_ENVS {
+            command.env_remove(name);
+        }
+        command
+            .env("HOME", home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.followRedirects")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_ALLOW_PROTOCOL", "https");
+    }
+}
+
 /// Runs `git` and returns its stdout, turning any failure into
 /// [`WorkspaceError::Git`] with git's own stderr attached.
 fn run_git(repository: &str, args: &[&str]) -> Result<String> {
-    let run = git_run(args).map_err(|error| {
+    run_git_with(repository, args, &GitAccess::User)
+}
+
+fn run_git_with(repository: &str, args: &[&str], access: &GitAccess) -> Result<String> {
+    let run = git_run_with(args, access).map_err(|error| {
         WorkspaceError::git(
             repository,
             args,
@@ -1400,4 +1468,77 @@ pub(crate) fn is_usable_directory_name(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `program` started from the user's shell, with their own git setup:
+    /// a `~/.gitconfig`, a global configuration, an SSH agent and an
+    /// askpass helper.
+    fn as_the_user(root: &Path, program: &str, args: &[&str]) -> Command {
+        let home = root.join("users-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join(".gitconfig"),
+            "[credential]\n\thelper = users-home-helper\n",
+        )
+        .unwrap();
+        let global = root.join("users-global");
+        fs::write(&global, "[credential]\n\thelper = users-global-helper\n").unwrap();
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("SSH_AUTH_SOCK", root.join("agent.sock"))
+            .env("GIT_ASKPASS", "users-askpass");
+        command
+    }
+
+    fn stdout(mut command: Command) -> String {
+        let output = command.output().expect("run the command");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn restricted(mut command: Command, access: &GitAccess) -> Command {
+        restrict_git_access(&mut command, access);
+        command
+    }
+
+    #[test]
+    fn a_pinned_only_git_uses_none_of_the_users_own_setup() {
+        let root = std::env::temp_dir().join(format!("narsor-git-access-{}", uuid::Uuid::new_v4()));
+        let private = root.join("private-home");
+        fs::create_dir_all(&private).unwrap();
+        let pinned = GitAccess::PinnedOnly {
+            home: private.clone(),
+        };
+        let helpers = ["config", "--get-all", "credential.helper"];
+
+        let user = as_the_user(&root, "git", &helpers);
+        assert_eq!(
+            stdout(restricted(user, &GitAccess::User)),
+            "users-global-helper"
+        );
+
+        let pinned_git = as_the_user(&root, "git", &helpers);
+        assert_eq!(stdout(restricted(pinned_git, &pinned)), "");
+
+        let redirects = as_the_user(&root, "git", &["config", "--get", "http.followRedirects"]);
+        assert_eq!(stdout(restricted(redirects, &pinned)), "false");
+
+        let env = stdout(restricted(as_the_user(&root, "env", &[]), &pinned));
+        let lines: Vec<&str> = env.lines().collect();
+        assert!(
+            lines.contains(&format!("HOME={}", private.display()).as_str()),
+            "{env}"
+        );
+        assert!(lines.contains(&"GIT_CONFIG_GLOBAL=/dev/null"), "{env}");
+        assert!(!env.contains("SSH_AUTH_SOCK="), "{env}");
+        assert!(!env.contains("GIT_ASKPASS="), "{env}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
