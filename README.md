@@ -53,7 +53,9 @@ variables and a reachable cluster.
 The workspace build keeps `narsor`, `narsor-cli`, `narsor-server`,
 `narsor-runner`, and `narsor-controller` together in `target/debug` (or
 `target/release`), so the client can find the server and the server can find
-the local runner. To install all process binaries into the same directory, run
+the local controller and runner. In trusted mode the server starts
+`narsor-controller local` as its child process; it does not start without that
+binary next to it. To install all process binaries into the same directory, run
 `./install.sh` (add `--root DIR` to install into `DIR/bin`), or by hand:
 
 ```bash

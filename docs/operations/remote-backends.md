@@ -34,7 +34,9 @@ Contents:
                                     └─ one durable volume: orchestration records,
                                        event logs, controller identities, owner
  controller (next to the backend) ──outbound HTTPS──▶ control plane
-   └─ native API ─▶ Kubernetes: one Pod + one PVC per task
+   ├─ narsor-controller local (trusted mode: the daemon's child)
+   │    └─ one narsor-runner process per task on this machine
+   └─ narsor-controller kubernetes ─▶ native API ─▶ one Pod + one PVC per task
                       init container: copies the runtime bundle to /opt/narsor
                       main container: the repository's base image, runs
                                       /opt/narsor/bin/narsor-runner
@@ -64,9 +66,32 @@ Rules that follow from this split:
   per state directory.
 
 The daemon that runs the local `/executions` engine is the same process that
-serves the control plane. The `local` backend adapter runs tasks through the
-local engine on the same machine; remote tasks on any backend use the same
-owner API.
+serves the control plane. The `local` backend has a controller like every
+other backend: `narsor-controller local`, a separate process that enrolls and
+talks `/controller/v1` over HTTP. In trusted mode the daemon starts it as its
+child, enrolls it on the first start and supervises it:
+
+* the daemon becomes discoverable (`daemon.json`) only after this controller
+  holds a lease of its own — a newer `epoch` than the one before its start;
+  it gives up after 10 s, and the start fails with the last lines the
+  controller wrote;
+* the controller gets every setting as a flag (`--no-config`) and none of the
+  daemon's `NARSOR_*` variables; the enrollment code reaches it only as
+  `NARSOR_ENROLLMENT_CODE`, and never reaches a runner;
+* its log lines are in the daemon's log, prefixed with `narsor-controller:`;
+  `RUST_LOG` follows the daemon's log level;
+* a controller that dies is started again (1 s, doubled up to 30 s) with the
+  same identity; running tasks keep their runners;
+* on stop the daemon sends the controller `SIGTERM`, waits up to 10 s for the
+  lease release, then sends `SIGKILL`, and only then closes the API; a
+  controller whose daemon was killed stops on its own;
+* one controller per credential: it holds `controller.lock` beside the
+  credential and waits up to 7 s for a predecessor.
+
+`narsor-server`, `narsor-controller` and `narsor-runner` must be installed in
+one directory; the daemon looks for the controller only next to itself, never
+on `PATH`. In network mode the daemon starts no local controller. Remote tasks
+on any backend use the same owner API.
 
 ## 2. Server modes: trusted and network
 
