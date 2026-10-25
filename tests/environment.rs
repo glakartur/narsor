@@ -1059,3 +1059,102 @@ fn slot_release_timings_are_read_fresh_from_the_backend_file() {
     let error = resolver.slot_release_timings(&id).expect_err("refused");
     assert_eq!(error.code(), "invalid_backend");
 }
+
+// ---------------------------------------------------------------------------
+// A workstation as a backend of a network server (U5: R13, R14)
+// ---------------------------------------------------------------------------
+
+/// Covers AE11.
+#[test]
+fn a_local_backend_under_another_id_must_be_a_workstation() {
+    let root = TempRoot::new();
+    let mut record = BackendRecord::new(
+        "workstation",
+        BackendKind::Local,
+        TrustScope::Dedicated,
+        backend("x").limits,
+    );
+    record.secrets = Vec::new();
+    record.secret_delivery = Default::default();
+    let problems = record.problems();
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("trust_scope")),
+        "{problems:?}"
+    );
+    let error = root.catalog().save_backend(&record).expect_err("refused");
+    assert!(error.to_string().contains("trust_scope"), "{error}");
+
+    record.trust_scope = TrustScope::Workstation;
+    assert!(record.problems().is_empty(), "{:?}", record.problems());
+    // The daemon's own `local` keeps its scope rules as before.
+    let builtin = BackendRecord::builtin_local();
+    assert!(builtin.problems().is_empty());
+}
+
+#[test]
+fn a_network_resolver_has_no_built_in_local_backend() {
+    let root = TempRoot::new();
+    root.write_workflow("bare", &workflow_yaml("bare", None));
+    let network = resolver(root.path()).without_builtin_local();
+    let local = narsor_engine::domain::BackendId::parse("local").unwrap();
+    assert!(network.backend_record(&local).unwrap().is_none());
+    assert!(resolver(root.path())
+        .backend_record(&local)
+        .unwrap()
+        .is_some());
+
+    let error = network
+        .resolve(&LaunchIntent {
+            backend: Some("local".to_string()),
+            ..intent("bare")
+        })
+        .expect_err("refused at creation");
+    assert_eq!(error.code(), "unknown_backend");
+    let message = error.to_string();
+    assert!(message.contains("network server"), "{message}");
+    assert!(!message.contains("default_backend"), "{message}");
+}
+
+#[test]
+fn a_network_resolver_defaulting_to_local_names_the_setting() {
+    let root = TempRoot::new();
+    root.write_workflow("bare", &workflow_yaml("bare", None));
+    let network = narsor_engine::environment::CatalogLaunchResolver::new(
+        root.path(),
+        narsor_engine::workflows::WorkflowResolver::with_user_dir(root.path(), None),
+        narsor_engine::environment::OwnerDefaults {
+            default_backend: "local".to_string(),
+            default_profile: "default".to_string(),
+            local_workspace_roots: Vec::new(),
+        },
+        Arc::new(narsor_engine::environment::StaticHarnessDefaults::builtin(
+            "claude-code",
+        )),
+    )
+    .without_builtin_local();
+    let error = network.resolve(&intent("bare")).expect_err("refused");
+    assert!(error.to_string().contains("default_backend"), "{error}");
+}
+
+#[test]
+fn a_declared_workstation_backend_resolves_on_a_network_server() {
+    let root = TempRoot::new();
+    root.write_workflow("bare", &workflow_yaml("bare", None));
+    let record = BackendRecord::new(
+        "laptop",
+        BackendKind::Local,
+        TrustScope::Workstation,
+        backend("x").limits,
+    );
+    root.catalog().save_backend(&record).unwrap();
+    let launch = resolver(root.path())
+        .without_builtin_local()
+        .resolve(&LaunchIntent {
+            backend: Some("laptop".to_string()),
+            ..intent("bare")
+        })
+        .expect("the laptop takes tasks");
+    assert_eq!(launch.backend_id.as_str(), "laptop");
+}

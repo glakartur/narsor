@@ -141,7 +141,11 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     let recovery = recover_at_startup(&store);
     let control_plane = recover_orchestration_at_startup(ControlPlane::new(paths.clone()));
 
-    ensure_local_backend(config.catalog_dir())?;
+    if runs_local_controller {
+        ensure_local_backend(config.catalog_dir())?;
+    } else {
+        refuse_declared_local_backend(config.catalog_dir())?;
+    }
     let defaults = config.agent_defaults();
     let supported = HarnessRegistry::defaults()
         .supported()
@@ -158,12 +162,27 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     // Tasks resolve against the same catalogue and start on the same live
     // default harness a local harnessless step would use; their runners
     // follow it afterwards, through the control plane's answers (U7).
-    let launch = Arc::new(CatalogLaunchResolver::new(
+    let owner_defaults = OwnerDefaults::from_config(config);
+    if !runs_local_controller && owner_defaults.default_backend == LOCAL_BACKEND_ID {
+        tracing::warn!(
+            "daemon: default_backend is '{LOCAL_BACKEND_ID}', which a network server does not \
+             have; a task that names no backend is refused until default_backend names another \
+             backend"
+        );
+    }
+    let launch = CatalogLaunchResolver::new(
         config.catalog_dir(),
         WorkflowResolver::new(config.catalog_dir()),
-        OwnerDefaults::from_config(config),
+        owner_defaults,
         Arc::clone(&selector) as Arc<dyn HarnessDefaults>,
-    ));
+    );
+    // A network server has no local controller, so no built-in `local`
+    // backend either: a task sent there is refused at once (R13).
+    let launch = Arc::new(if runs_local_controller {
+        launch
+    } else {
+        launch.without_builtin_local()
+    });
     // A stopped task is read by a read-only runner its controller starts
     // (D63): the control plane reads no task storage, local backend or not.
     let control = Arc::new(ProtocolService::new(control_plane, launch.clone()));
@@ -334,6 +353,22 @@ fn ensure_local_backend(catalog_dir: &Path) -> Result<()> {
             record.kind
         )))
     }
+}
+
+/// Refuses to start a network server whose catalogue declares a backend
+/// `local`: the id is the trusted daemon's own (R13).
+fn refuse_declared_local_backend(catalog_dir: &Path) -> Result<()> {
+    let declared = EnvironmentCatalog::new(catalog_dir)
+        .declares_backend(LOCAL_BACKEND_ID)
+        .map_err(|error| CliError::failure(format!("could not read the catalogue: {error}")))?;
+    if declared {
+        return Err(CliError::failure(format!(
+            "backends/{LOCAL_BACKEND_ID}.yaml: the id '{LOCAL_BACKEND_ID}' is reserved for the \
+             built-in backend of a trusted daemon; give this backend another id (for example \
+             'laptop')"
+        )));
+    }
+    Ok(())
 }
 
 /// What the daemon hands its local controller (KTD3): the paths and

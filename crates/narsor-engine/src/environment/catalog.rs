@@ -63,6 +63,7 @@ pub enum CatalogError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentCatalog {
     paths: CatalogPaths,
+    builtin_local: bool,
 }
 
 impl EnvironmentCatalog {
@@ -70,13 +71,27 @@ impl EnvironmentCatalog {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             paths: CatalogPaths::new(root),
+            builtin_local: true,
         }
+    }
+
+    /// The same catalogue without the built-in `local` backend: what a
+    /// network server reads, which has no local controller (R13).
+    pub fn without_builtin_local(mut self) -> Self {
+        self.builtin_local = false;
+        self
+    }
+
+    /// The backend files the catalogue declares, by id.
+    pub fn declares_backend(&self, id: &str) -> Result<bool, CatalogError> {
+        Ok(read_entry::<BackendRecord>(&self.paths.backends_dir(), id)?.is_some())
     }
 
     /// The backend record `id`, or `None` when none is registered.
     ///
     /// The daemon-owned `local` backend needs no declaration: when the
-    /// catalogue defines none, a built-in record stands in. The catalogue
+    /// catalogue defines none, a built-in record stands in — unless the
+    /// catalogue was opened [`Self::without_builtin_local`]. The catalogue
     /// stays declaration-only, so it can be mounted read-only.
     pub fn backend(&self, id: &str) -> Result<Option<BackendRecord>, CatalogError> {
         let declared =
@@ -84,7 +99,9 @@ impl EnvironmentCatalog {
                 record.id = id.to_string();
                 record
             });
-        Ok(declared.or_else(|| (id == BackendRecord::LOCAL_ID).then(BackendRecord::builtin_local)))
+        Ok(declared.or_else(|| {
+            (self.builtin_local && id == BackendRecord::LOCAL_ID).then(BackendRecord::builtin_local)
+        }))
     }
 
     /// Stores a backend record after validating it.

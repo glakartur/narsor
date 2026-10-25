@@ -36,7 +36,7 @@ use crate::controller_protocol::{
     ConductorReadQuery, ConductorReadResponse, ConversationPageQuery, CreateEnrollmentRequest,
     CreateTaskRequest, ExecutionEventsQuery, ExecutionEventsResponse, LaunchRequest,
     MoveTaskRequest, OwnerCommandRequest, SetDefaultBackendRequest, SubmitInputRequest,
-    SubmitOperatorCommandRequest, TaskSummary, WorkspaceRequest,
+    SubmitOperatorCommandRequest, TaskSummary, WorkspaceRequest, WORKSTATION_RISK,
 };
 use crate::domain::without_unsafe_chars;
 use crate::materials::{snapshot_paths, write_files, MaterialLimits, WriteMode};
@@ -720,6 +720,11 @@ pub enum ControllerAdminCommand {
         /// How long the code may be redeemed, in seconds.
         #[arg(long = "ttl-secs", value_name = "SECONDS")]
         ttl_secs: Option<u64>,
+        /// Accept that a controller of a `local` backend runs every task the
+        /// server sends as the user of its computer, without a container.
+        /// Required for a `local` backend on a `workstation`.
+        #[arg(long)]
+        accept_workstation_risk: bool,
     },
     /// Lists every controller identity, revoked ones included.
     List,
@@ -1897,11 +1902,20 @@ pub async fn controller_admin(
             backend,
             name,
             ttl_secs,
+            accept_workstation_risk,
         } => {
+            let request = CreateEnrollmentRequest {
+                name,
+                ttl_secs,
+                accept_workstation_risk,
+            };
             let code = client
-                .create_enrollment(&backend, &CreateEnrollmentRequest { name, ttl_secs })
+                .create_enrollment(&backend, &request)
                 .await
                 .map_err(|error| failure("Could not create an enrollment code", error))?;
+            if accept_workstation_risk {
+                eprintln!("WARNING: {WORKSTATION_RISK}.");
+            }
             println!("Enrollment code: {}", code.enrollment_code);
             println!("Backend: {}", code.backend_id);
             println!("Expires: {}", code.expires_at.to_rfc3339());

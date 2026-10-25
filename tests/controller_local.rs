@@ -84,7 +84,13 @@ impl Setup {
     async fn code(&self) -> String {
         self.harness
             .owner
-            .create_enrollment("local", &CreateEnrollmentRequest::default())
+            .create_enrollment(
+                "local",
+                &CreateEnrollmentRequest {
+                    accept_workstation_risk: true,
+                    ..CreateEnrollmentRequest::default()
+                },
+            )
             .await
             .expect("an enrollment code")
             .enrollment_code

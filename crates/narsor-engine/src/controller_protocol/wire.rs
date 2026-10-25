@@ -59,6 +59,7 @@ use crate::orchestration::{
     MoveTarget, PendingInputRef, QueueStatus, QueuedInput, QueuedOperatorCommand, RunnerSnapshot,
 };
 pub use narsor_protocol::controller::TaskDefaultHarness;
+pub use narsor_protocol::controller::{WORKSTATION_RISK, WORKSTATION_RISK_NOT_ACCEPTED};
 
 pub(super) fn runner_snapshot_request(
     snapshot: &RunnerSnapshot,

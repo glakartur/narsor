@@ -64,7 +64,9 @@ pub use narsor_controller_runtime::backend::{BackendCapabilities, BackendKind};
 
 /// How far the operator trusts the place a backend runs (R3, KTD6).
 ///
-/// Recorded, not enforced here: U5's admission policy and U7's controller
+/// A backend of kind `local` other than the daemon's own must be a
+/// `workstation`, and its enrollment needs the owner's explicit consent
+/// (R14, R15); otherwise U5's admission policy and U7's controller
 /// identities decide what a scope permits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +77,17 @@ pub enum TrustScope {
     Dedicated,
     /// Infrastructure other workloads share.
     Shared,
+}
+
+impl TrustScope {
+    /// The word in a backend file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workstation => "workstation",
+            Self::Dedicated => "dedicated",
+            Self::Shared => "shared",
+        }
+    }
 }
 
 /// How the controller materializes the credentials it is given references to.
@@ -265,6 +278,18 @@ impl BackendRecord {
         let mut problems = Vec::new();
         if let Err(error) = BackendId::parse(self.id.clone()) {
             problems.push(error.to_string());
+        }
+
+        // A local backend other than the daemon's own runs tasks on somebody's
+        // computer, as its user and without a container (R14).
+        if self.kind == BackendKind::Local
+            && self.id != Self::LOCAL_ID
+            && self.trust_scope != TrustScope::Workstation
+        {
+            problems.push(format!(
+                "trust_scope must be 'workstation' for a backend of kind 'local', not '{}'",
+                self.trust_scope.as_str()
+            ));
         }
 
         let limits = &self.limits;

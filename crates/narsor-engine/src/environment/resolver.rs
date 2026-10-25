@@ -101,6 +101,17 @@ pub enum LaunchError {
     /// No backend with that id is registered.
     #[error("backend '{0}' is not registered")]
     UnknownBackend(String),
+    /// A network server has no built-in `local` backend (R13).
+    #[error(
+        "backend 'local' is not available: a network server has no built-in local backend{}; \
+         register a backend of kind 'local' under another id",
+        if *from_default { " (it is the configured 'default_backend'; set default_backend to \
+         another backend)" } else { "" }
+    )]
+    NoBuiltinLocal {
+        /// Whether the task named no backend and `default_backend` chose it.
+        from_default: bool,
+    },
     /// The backend record is unusable (limits, secrets, harnesses…).
     #[error("backend '{id}' is misconfigured: {}", problems.join("; "))]
     InvalidBackend {
@@ -244,7 +255,9 @@ impl LaunchError {
     pub fn code(&self) -> &'static str {
         match self {
             LaunchError::InvalidBackendId(_) => "invalid_identifier",
-            LaunchError::UnknownBackend(_) => "unknown_backend",
+            LaunchError::UnknownBackend(_) | LaunchError::NoBuiltinLocal { .. } => {
+                "unknown_backend"
+            }
             LaunchError::InvalidBackend { .. } => "invalid_backend",
             LaunchError::UnknownWorkflow { .. } => "unknown_workflow",
             LaunchError::InvalidWorkflow { .. } => "invalid_workflow",
@@ -297,6 +310,11 @@ pub trait LaunchResolver: Send + Sync {
     /// The configured `default_backend` — the fallback when the owner has
     /// not chosen one through the control plane (R10).
     fn configured_default_backend(&self) -> String;
+
+    /// The record of `backend` as the catalogue declares it — the built-in
+    /// `local` included where it exists — usable or not; `None` when there
+    /// is no such backend.
+    fn backend_record(&self, backend: &BackendId) -> Result<Option<BackendRecord>, LaunchError>;
 
     /// The installation's live default harness as it applies to a task on
     /// `backend` (U7): the name when the backend runs it, why not when it
@@ -420,6 +438,7 @@ impl OwnerDefaults {
 pub struct CatalogLaunchResolver {
     catalog_root: PathBuf,
     catalog: EnvironmentCatalog,
+    builtin_local: bool,
     registry: RepositoryRegistry,
     workflows: WorkflowResolver,
     owner: OwnerDefaults,
@@ -450,6 +469,7 @@ impl CatalogLaunchResolver {
         let catalog_root = catalog_root.into();
         Self {
             catalog: EnvironmentCatalog::new(catalog_root.clone()),
+            builtin_local: true,
             registry: RepositoryRegistry::new(&catalog_root),
             catalog_root,
             workflows,
@@ -457,6 +477,14 @@ impl CatalogLaunchResolver {
             harness,
             images: Arc::new(NoTagResolution),
         }
+    }
+
+    /// The resolver of a network server: no built-in `local` backend, so a
+    /// task on `local` is refused at creation (R13).
+    pub fn without_builtin_local(mut self) -> Self {
+        self.catalog = self.catalog.without_builtin_local();
+        self.builtin_local = false;
+        self
     }
 
     /// Resolves `resolve`-policy tags through `images`.
@@ -471,7 +499,18 @@ impl CatalogLaunchResolver {
             .clone()
             .unwrap_or_else(|| self.owner.default_backend.clone());
         let backend_id = BackendId::parse(requested)?;
-        let record = self.usable_backend(&backend_id)?;
+        let record = self
+            .usable_backend(&backend_id)
+            .map_err(|error| match error {
+                LaunchError::UnknownBackend(id)
+                    if !self.builtin_local && id == BackendRecord::LOCAL_ID =>
+                {
+                    LaunchError::NoBuiltinLocal {
+                        from_default: intent.backend.is_none(),
+                    }
+                }
+                error => error,
+            })?;
         Ok((backend_id, record))
     }
 
@@ -1000,6 +1039,10 @@ impl LaunchResolver for CatalogLaunchResolver {
 
     fn configured_default_backend(&self) -> String {
         self.owner.default_backend.clone()
+    }
+
+    fn backend_record(&self, backend: &BackendId) -> Result<Option<BackendRecord>, LaunchError> {
+        Ok(self.catalog.backend(backend.as_str())?)
     }
 
     fn default_harness(&self, backend: &BackendId) -> Option<TaskDefaultHarness> {
