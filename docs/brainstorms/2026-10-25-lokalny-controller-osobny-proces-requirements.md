@@ -74,7 +74,7 @@ Skutki:
 - R5. `narsor-controller local` steruje adapterem `LocalBackend` tak samo jak dziś wbudowany controller: ten sam układ storage, te same ustawienia `HOME` i profilu harnessu dla runnera, `narsor-runner` obok binarki controllera.
 - R6. W trybie `trusted` daemon uruchamia `narsor-controller local` jako proces potomny, rejestruje go automatycznie i przekazuje mu rozwiązane ustawienia. Proces potomny nie czyta pliku konfiguracji Narsora ani obcych zmiennych `NARSOR_*` ze środowiska usera. User nie wykonuje nowego kroku.
 - R7. Daemon staje się dostępny (plik discovery) dopiero wtedy, gdy proces potomny trzyma **nowy** lease backendu `local` (z tej inkarnacji daemona, nie z poprzedniej po awarii). Gdy proces potomny kończy się przed lease, nie ma binarki albo mija limit czasu, daemon kończy start z błędem i z ostatnimi liniami stderr procesu potomnego.
-- R8. Przy zatrzymaniu daemon najpierw zatrzymuje proces potomny (ten zwalnia lease, póki API działa), potem zamyka API. Po `kill -9` daemona proces potomny też się kończy. Nigdy nie działają dwa lokalne controllery tego samego daemona naraz. Przy starcie `narsor-controller local` bierze wyłączną blokadę pliku w katalogu poświadczenia. Gdy blokada jest zajęta, proces kończy się błędem i podaje PID właściciela blokady.
+- R8. Przy zatrzymaniu daemon najpierw zatrzymuje proces potomny (ten zwalnia lease, póki API działa), potem zamyka API. Po `kill -9` daemona proces potomny też się kończy. Nigdy nie działają dwa lokalne controllery tego samego daemona naraz. Przy starcie `narsor-controller local` bierze wyłączną blokadę pliku w katalogu poświadczenia. Gdy blokada jest zajęta, proces czeka na nią do limitu czasu gotowości z R7 i zapisuje w logu PID właściciela blokady. Gdy limit mija, proces kończy się błędem z tym PID. Dzięki temu natychmiastowy restart po `kill -9` (AE4) nie kończy się błędem, gdy stary proces potomny jeszcze się zamyka.
 - R9. Po nieoczekiwanym końcu procesu potomnego daemon uruchamia go ponownie z rosnącym opóźnieniem, bez nowej rejestracji. W tym czasie zadania `local` pokazują `controller_offline`. Runnery działających zadań żyją dalej.
 - R10. Istniejące instalacje zachowują tożsamość lokalnego controllera i storage zadań. Nie ma ponownej rejestracji ani migracji danych.
 - R11. `narsor-server` nie zawiera kodu pętli controllera. Tryb `network` nadal nie uruchamia lokalnego controllera (zachowanie z `83fbb68`).
@@ -87,7 +87,7 @@ Skutki:
 - R14. Backend `kind: local` o id innym niż `local` musi mieć `trust_scope: workstation`. Inna wartość daje błąd katalogu z nazwą pola.
 - R15. Kod rejestracji dla backendu `kind: local` z `trust_scope: workstation` wymaga jawnej zgody w żądaniu. Serwer sprawdza zgodę (nie tylko CLI) po `kind` i `trust_scope`. Poza zarezerwowanym id `local` serwer nie sprawdza id. Wyjątek: wbudowany backend o id `local` w trybie `trusted`. Daemon tworzy dla niego kod w procesie, bez pola zgody (ten backend też ma `kind: local` i `trust_scope: workstation`). CLI ma flagę zgody i wypisuje ostrzeżenie: przejęty serwer może uruchamiać dowolny kod na tym komputerze jako jego user, bez izolacji kontenera.
 - R16. `narsor-controller local` łączy się z serwerem spoza loopback tylko przez `https://`, zawsze ze sprawdzeniem certyfikatu. Nie ma flagi, która wyłącza sprawdzenie. Wyjątek `http://` jest tylko w buildach debug. Serwer jest na loopback tylko wtedy, gdy host w adresie to literalne IP loopback (`127.0.0.0/8`, `::1`) albo dokładnie `localhost`. Controller nie używa DNS do tej decyzji i nie przechodzi za przekierowaniem na inny host. Każdy inny host jest spoza loopback.
-- R17. Gdy serwer nie jest na loopback, `narsor-controller local` traktuje polecenia serwera jako niezaufane: domyślnie `--home private`; `--home host` wymaga flagi potwierdzenia i pokazuje ostrzeżenie; ścieżki z launch spec są tylko wewnątrz katalogu storage; plik poświadczenia ma prawa `0600`. Przy starcie controller wypisuje adres serwera, id backendu i ostrzeżenie z R15.
+- R17. Gdy serwer nie jest na loopback, `narsor-controller local` traktuje polecenia serwera jako niezaufane: domyślnie `--home private`; `--home host` wymaga flagi potwierdzenia i pokazuje ostrzeżenie; ścieżki z launch spec są tylko wewnątrz katalogu storage (sprawdzenie po rozwiązaniu dowiązań i `..`); controller zawsze uruchamia stały `narsor-runner` obok swojej binarki, a z launch spec przyjmuje tylko pola z listy dozwolonych i odrzuca zmienne środowiskowe spoza listy (np. `PATH`, `LD_PRELOAD`); plik poświadczenia ma prawa `0600`. Przy starcie controller wypisuje adres serwera, id backendu i ostrzeżenie z R15.
 - R18. W fazie B `narsor-controller` uruchomiony ręcznie (nie przez daemon) czyta plik konfiguracji Narsora (`--config` albo ścieżka domyślna) dla ustawień `HOME`. Kolejność: flagi, potem zmienne środowiskowe, potem plik. Reguły R17 obowiązują także dla wartości z pliku: `home: host` z pliku wymaga flagi potwierdzenia. Proces potomny daemona (R6) nadal nie czyta pliku.
 
 ---
@@ -116,7 +116,7 @@ Skutki:
 - User trybu `trusted` nie widzi różnicy: ten sam start, te same zadania, ta sama tożsamość controllera, a po `stop` nie zostają procesy `narsor-controller`.
 - Każdy backend działa tak samo: osobny proces controllera, rejestracja i protokół `/controller/v1` przez HTTP.
 - Faza B: z jednego TUI widać zadania na backendzie `k8s` i na laptopie tego samego serwera. Laptopa nie da się zarejestrować bez jawnej zgody właściciela.
-- Plan i implementacja nie muszą wymyślać zachowań przy starcie, zatrzymaniu, awarii i rejestracji: AE1–AE13 je określają.
+- Plan i implementacja nie muszą wymyślać zachowań przy starcie, zatrzymaniu, awarii i rejestracji: AE1–AE14 je określają.
 
 ---
 
@@ -155,7 +155,7 @@ Skutki:
 
 ## Założenia do potwierdzenia
 
-- Plan wymienia `deploy/kind/` (pliki i `deploy/kind/server.yaml`), ale w repo nie ma tego katalogu (sprawdzone: `deploy/` zawiera tylko `deploy/kubernetes/`). Zakładam, że zmiana składni dotyczy tylko `deploy/kubernetes/` i dokumentacji, a test ręczny fazy B (serwer w kind) używa instrukcji z `docs/operations/remote-backends.md`, sekcja 12, bez nowych plików w `deploy/kind/`.
+- Plan wymienia `deploy/kind/` (pliki i `deploy/kind/server.yaml`), ale w repo nie ma tego katalogu (sprawdzone: `deploy/` zawiera tylko `deploy/kubernetes/`). Zakładam, że zmiana składni dotyczy tylko `deploy/kubernetes/` i dokumentacji, bez nowych plików w `deploy/kind/`. Sekcja 12 w `docs/operations/remote-backends.md` ma tylko testy Kubernetes i nie opisuje fazy B. Dlatego zmiana fazy B dodaje do tego dokumentu test ręczny controllera na laptopie z serwerem w trybie `network`. Test opisuje też, jak laptop ufa certyfikatowi serwera (CA serwera w systemowym magazynie zaufanych certyfikatów), bo R16 nie ma flagi, która wyłącza sprawdzenie.
 - Zakładam, że faza B wychodzi razem z fazą A w jednym wydaniu, ale może trafić do osobnego merge requesta. Plan nie określa podziału na merge requesty. Faza A może wyjść bez fazy B: gdy przegląd bezpieczeństwa fazy B nie jest gotowy, wydanie zawiera tylko fazę A.
 - Zakładam, że przegląd specjalisty od bezpieczeństwa jest warunkiem wydania fazy B, nie warunkiem jej implementacji (plan, tabela ryzyk).
 - Zakładam, że w fazie B domyślny plik poświadczenia na laptopie jest w `$XDG_STATE_HOME/narsor/workstation-controller/` niezależnie od id backendu. Przy kilku serwerach user podaje inną ścieżkę flagą.
@@ -172,6 +172,6 @@ Skutki:
 
 ### Deferred to Planning
 
-- [Affects R7, R9][Technical] Limit czasu oczekiwania na lease i parametry ponownego startu procesu potomnego. Start od wartości z `Supervision`.
+- [Affects R7, R9][Technical] Limit czasu oczekiwania na lease i parametry ponownego startu procesu potomnego. Start od wartości z `Supervision`. Start procesu potomnego i oczekiwanie na lease muszą być wyraźnie krótsze niż `DISCOVERY_TIMEOUT` (15 s, `crates/narsor-api-client/src/api/discovery.rs`). Jeśli nie, ta sama zmiana musi zmienić ten limit. Gdy CLI/TUI uruchamia daemon, błąd z R7 (z liniami stderr procesu potomnego) trafia do `narsor.log`. Komunikat klienta o przekroczeniu limitu czasu musi wskazać userowi ten log.
 - [Affects R8][Needs research] Czy `PR_SET_PDEATHSIG` działa poprawnie przy wątkach tokio (sygnał przy końcu wątku, który utworzył proces). Alternatywa: okresowe sprawdzenie `getppid()` albo uruchomienie z wątku żyjącego przez cały proces.
 - [Affects R8][Technical] Krótki limit czasu klienta HTTP controllera, żeby po `SIGTERM` przy martwym API próba zwolnienia lease nie trzymała procesu długo.
