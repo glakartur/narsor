@@ -20,6 +20,7 @@ Contents:
 11. [Using it: CLI and TUI](#11-using-it-cli-and-tui)
 12. [Smoke tests](#12-smoke-tests)
 13. [Known limitations](#13-known-limitations)
+14. [A computer as a backend](#14-a-computer-as-a-backend)
 
 ---
 
@@ -945,3 +946,92 @@ The ordinary test suite needs no cluster. Against a real cluster:
   recovered, from the TUI's history (`H`) or with `narsor-cli task history …`,
   over the same control plane and only on the local daemon; the local
   `/executions` routes remain for `narsor-cli list`, `show` and the like.
+
+## 14. A computer as a backend
+
+A network control plane can run tasks on a computer — a laptop, a
+workstation — with `narsor-controller local` started there by hand. The
+controller only opens outbound connections, so the computer needs no open
+port. **Read this first:** the runner runs every task as the computer's user,
+without a container. Whoever controls the server can then run any program on
+that computer and read every file its user can read. Use it only with a
+server you control, and keep the computer's user free of what tasks must not
+see.
+
+1. Register the backend under its own id, never `local` (a network server
+   refuses `backends/local.yaml` at start; that id belongs to a trusted
+   daemon). The trust scope must be `workstation`:
+
+   ```yaml
+   # {catalog}/backends/laptop.yaml
+   kind: local
+   trust_scope: workstation
+   limits:
+     max_concurrent_tasks: 1
+     default_resources: { cpu_millicores: 1000, memory_mib: 2048 }
+   ```
+
+2. As the owner, create a code. The server refuses it without the explicit
+   consent (`400 workstation_risk_not_accepted`); the CLI prints the risk:
+
+   ```bash
+   narsor-cli controller enroll-code laptop --accept-workstation-risk
+   ```
+
+3. On the computer, with `narsor-controller` and `narsor-runner` in one
+   directory, start the controller. The code goes in the environment or in a
+   file, never on the command line:
+
+   ```bash
+   NARSOR_ENROLLMENT_CODE=<code> narsor-controller local \
+     --control-plane https://narsor.example \
+     --storage ~/narsor-laptop
+   ```
+
+   The credential is kept `0600` in
+   `$XDG_STATE_HOME/narsor/workstation-controller/credential` (or
+   `--credential-file`). At start the controller prints the server's address,
+   the backend it serves and a warning.
+
+**Transport.** Beyond loopback (a loopback IP address or exactly
+`localhost`; no DNS) the controller accepts only `https://`, checks the
+server's certificate against the system's certificate store and follows no
+redirect. There is no option to turn the check off: to use a private CA, add
+it to the system store. `--runner-control-plane` follows the same rule.
+(Debug builds accept plain `http://` beyond loopback, for tests only.)
+
+**What the server may ask for.** A control plane beyond loopback is not
+trusted, so the controller checks every launch spec before anything of the
+task is created:
+
+* tasks get a private HOME on task storage. `--home host` (or `local_home:
+  host` in the configuration, or `NARSOR_LOCAL_HOME=host`) needs
+  `--accept-host-home`: tasks would then see your SSH keys, tokens and
+  harness logins;
+* a local workspace directory must lie inside `--storage`;
+* a secret goes only into a variable a supported harness or tool reads
+  (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`); allow another one
+  with `--allow-env NAME`. A secret file stays inside the private HOME;
+* the runner program is always the `narsor-runner` beside the controller.
+
+These checks keep the server from choosing what the runner touches. They do
+not keep a task's own code — what its harness runs — from reading the user's
+files.
+
+**Configuration.** Started by hand, the controller reads the Narsor
+configuration file (`--config`, else the usual search) for the HOME settings
+only: a flag wins over a `NARSOR_LOCAL_*` variable, which wins over the file.
+`--no-config` reads no file.
+
+**Losing the computer.** Revoke its identity at once:
+`narsor-cli controller list`, then `narsor-cli controller revoke <id>`. Its
+tasks show `controller offline` until another controller holds the backend.
+
+**Manual test.** Against a network server with backend `laptop`: start the
+controller as above, check `narsor-cli controller list` (it holds the lease),
+create a task with `--backend laptop` and watch it run in the TUI next to the
+tasks of the other backends.
+
+Before this mode is released, a security specialist reviews the checks above
+(R16, R17).

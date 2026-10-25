@@ -28,6 +28,17 @@
 //! daemon sets up, which a daemon thread ending could otherwise fire early
 //! or never (KTD6).
 //!
+//! # A control plane beyond this machine
+//!
+//! Started by hand, the same controller serves a remote control plane
+//! (R16-R18). It reaches it only over `https://` with the certificate
+//! checked and follows no redirect ([`check_transport`]); it treats what the
+//! server sends as untrusted ([`untrusted`]); tasks get a private HOME unless
+//! the user accepts their own with `--accept-host-home`; and it warns about
+//! all of this at start. Its HOME settings come from the flags, then the
+//! `NARSOR_LOCAL_*` variables, then the Narsor configuration file — which
+//! the daemon's child, started with `--no-config`, never reads.
+//!
 //! # Stopping
 //!
 //! On `SIGTERM` or Ctrl-C the loop releases the lease, bounded by
@@ -45,9 +56,12 @@ use std::time::{Duration, Instant};
 use clap::Args;
 
 use crate::controller::{exit_code, shutdown_signal, ConnectionArgs, ControllerError};
+use untrusted::UntrustedServer;
+
+pub mod untrusted;
 use narsor_controller_runtime::{Controller, ControllerConfig};
-use narsor_engine::backends::{LocalBackend, LocalBackendConfig};
-use narsor_engine::config::{HarnessHome, HomeMode};
+use narsor_engine::backends::{LaunchCheck, LocalBackend, LocalBackendConfig};
+use narsor_engine::config::{Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source};
 use narsor_engine::controller_protocol::{ClientOptions, ControllerClient};
 use narsor_engine::controller_runtime::load_or_enroll_with_options;
 
@@ -103,12 +117,29 @@ pub struct LocalArgs {
     pub parent_pid: Option<u32>,
 
     /// Read no configuration file: every setting comes from the flags.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     pub no_config: bool,
+
+    /// The Narsor configuration file to read the HOME settings from,
+    /// instead of searching for one.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
+    /// With a control plane beyond this machine: let tasks use your own
+    /// HOME (`--home host`, or `local_home: host` in the configuration),
+    /// with your SSH keys, tokens and harness logins.
+    #[arg(long)]
+    pub accept_host_home: bool,
+
+    /// With a control plane beyond this machine: also allow a secret to be
+    /// delivered as environment variable NAME (repeatable).
+    #[arg(long = "allow-env", value_name = "NAME")]
+    pub allow_env: Vec<String>,
 }
 
 impl LocalArgs {
-    /// The HOME mode and harness directories runners are started with.
+    /// The HOME mode and harness directories runners are started with,
+    /// from the flags alone.
     pub fn harness_home(&self) -> HarnessHome {
         HarnessHome {
             mode: self.home.unwrap_or_default(),
@@ -116,6 +147,89 @@ impl LocalArgs {
             claude_config_dir: self.claude_config_dir.clone(),
             claude_profile_source: self.claude_profile_source.clone(),
         }
+    }
+}
+
+/// The HOME settings runners are started with (R17, R18; KTD15): each from
+/// its flag, else from `config` — its `NARSOR_LOCAL_*` variable, else the
+/// configuration file. With a control plane beyond this machine the mode is
+/// `private` unless something set it, and `host` needs `--accept-host-home`.
+pub fn resolve_home(
+    args: &LocalArgs,
+    place: ControlPlanePlace,
+    config: Option<&Resolved>,
+) -> Result<HarnessHome, ControllerError> {
+    let configured = config.map(Resolved::local_harness_home).unwrap_or_default();
+    // `local_home` has a built-in value (`host`); only one somebody set
+    // counts for a server that is not trusted.
+    let mode_set = config
+        .is_some_and(|config| !matches!(config.source(SettingKey::LocalHome), Source::BuiltIn));
+    let mode = match (args.home, place) {
+        (Some(mode), _) => mode,
+        (None, ControlPlanePlace::Remote) if !mode_set => HomeMode::Private,
+        (None, _) => configured.mode,
+    };
+    if place == ControlPlanePlace::Remote && mode == HomeMode::Host && !args.accept_host_home {
+        return Err(ControllerError::usage(format!(
+            "HOME mode 'host' (from {}) with a control plane beyond this machine would give \
+             every task it sends your own HOME: your SSH keys, tokens and harness logins. Use \
+             --home private, or accept this with --accept-host-home",
+            if args.home.is_some() {
+                "--home"
+            } else {
+                "the configuration"
+            }
+        )));
+    }
+    Ok(HarnessHome {
+        mode,
+        codex_home: args.codex_home.clone().or(configured.codex_home),
+        claude_config_dir: args
+            .claude_config_dir
+            .clone()
+            .or(configured.claude_config_dir),
+        claude_profile_source: args
+            .claude_profile_source
+            .clone()
+            .or(configured.claude_profile_source),
+    })
+}
+
+/// The Narsor configuration as a hand-started controller reads it:
+/// `--config` or the usual search, then the `NARSOR_*` variables.
+fn read_config(args: &LocalArgs) -> Result<Resolved, ControllerError> {
+    let flags = Flags {
+        root: None,
+        config: args.config.clone(),
+    };
+    let resolved = narsor_engine::config::resolve(
+        &flags,
+        &narsor_engine::config::resolve::environment_from_process(),
+    );
+    if !resolved.is_ok() {
+        let errors: Vec<String> = resolved.errors().iter().map(ToString::to_string).collect();
+        return Err(ControllerError::usage(errors.join("\n")));
+    }
+    Ok(resolved)
+}
+
+/// Tells the user, before anything else happens, what serving a control
+/// plane beyond this machine means.
+fn warn_untrusted(control_plane: &str, home: &HarnessHome) {
+    eprintln!(
+        "narsor-controller: this computer is a backend of the control plane at {control_plane}."
+    );
+    eprintln!(
+        "WARNING: that server can run any program on this computer as your user, without a \
+         container; whoever takes the server over can read every file you can read. Tasks run \
+         with HOME mode '{}'.",
+        home.mode.as_str()
+    );
+    if home.mode == HomeMode::Host {
+        eprintln!(
+            "WARNING: --accept-host-home: tasks use your own HOME, with your SSH keys, tokens \
+             and harness logins."
+        );
     }
 }
 
@@ -136,6 +250,15 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
         &connection.runner_control_plane,
         plain_http,
     )?;
+    let config = if args.no_config {
+        None
+    } else {
+        Some(read_config(&args)?)
+    };
+    let home = resolve_home(&args, place, config.as_ref())?;
+    if place == ControlPlanePlace::Remote {
+        warn_untrusted(&connection.control_plane, &home);
+    }
     let lock_path = lock_path(&connection.credential_file);
     let timeout = Duration::from_secs(args.lock_timeout_secs);
     let _lock = tokio::task::spawn_blocking(move || ControllerLock::acquire(&lock_path, timeout))
@@ -145,7 +268,10 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     let mut backend_config = LocalBackendConfig::new(&args.storage).map_err(|error| {
         ControllerError::failure(format!("cannot configure the local backend: {error}"))
     })?;
-    backend_config.runner_args = args.harness_home().runner_args();
+    backend_config.runner_args = home.runner_args();
+    if place == ControlPlanePlace::Remote {
+        backend_config.launch_check = Some(untrusted_check(&args)?);
+    }
     let backend = LocalBackend::new(backend_config);
 
     let options = ClientOptions {
@@ -158,6 +284,15 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
         "controller: connecting to the control plane"
     );
     let client = load_or_enroll(&connection, &options).await?;
+    if place == ControlPlanePlace::Remote {
+        match client.heartbeat().await {
+            Ok(heartbeat) => eprintln!(
+                "narsor-controller: serving backend '{}' as controller {}.",
+                heartbeat.backend_id, heartbeat.controller_id
+            ),
+            Err(error) => tracing::warn!(%error, "controller: the first heartbeat failed"),
+        }
+    }
     let mut config = ControllerConfig::new(connection.runner_control_plane);
     config.lease_ttl = connection.lease_ttl;
     tracing::info!(
@@ -177,6 +312,22 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
         })
         .await;
     Ok(())
+}
+
+/// The checks of every launch spec from a control plane beyond this
+/// machine, over the controller's storage (R17).
+fn untrusted_check(args: &LocalArgs) -> Result<LaunchCheck, ControllerError> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&args.storage)
+        .map_err(|error| {
+            ControllerError::failure(format!("cannot create {}: {error}", args.storage.display()))
+        })?;
+    let checks = UntrustedServer::new(&args.storage, &args.allow_env).map_err(|error| {
+        ControllerError::failure(format!("cannot use {}: {error}", args.storage.display()))
+    })?;
+    Ok(LaunchCheck::new(move |spec| checks.check(spec)))
 }
 
 async fn load_or_enroll(

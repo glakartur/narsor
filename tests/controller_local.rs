@@ -488,3 +488,261 @@ mod transport {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A control plane beyond this machine: HOME and the configuration (U7)
+// ---------------------------------------------------------------------------
+
+mod untrusted_server {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+
+    /// A control plane beyond loopback that never answers: its name does
+    /// not resolve, so a controller that got past its checks fails to
+    /// enroll at once.
+    const REMOTE: &str = "https://narsor.invalid";
+
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "narsor-untrusted-cli-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(dir.join("config")).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Writes the user's configuration file, found by the usual search.
+        fn user_config(&self, text: &str) {
+            std::fs::create_dir_all(self.0.join("config/narsor")).unwrap();
+            std::fs::write(self.0.join("config/narsor/config.yaml"), text).unwrap();
+        }
+
+        fn file(&self, name: &str, text: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn local(dir: &Dir, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let mut command =
+            Command::new(super::engine_support::workspace_binary("narsor-controller"));
+        for (name, _) in std::env::vars() {
+            if name.starts_with("NARSOR_") {
+                command.env_remove(name);
+            }
+        }
+        command
+            .arg("local")
+            .arg("--control-plane")
+            .arg(REMOTE)
+            .arg("--storage")
+            .arg(dir.path().join("storage"))
+            .arg("--credential-file")
+            .arg(dir.path().join("state/credential"))
+            .args(args)
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_STATE_HOME", dir.path().join("state-home"))
+            .env("NARSOR_ENROLLMENT_CODE", "code")
+            .envs(envs.iter().copied())
+            .output()
+            .expect("run narsor-controller local")
+    }
+
+    fn stderr(output: &Output) -> String {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// Past every check: it went on to enroll, with this HOME mode.
+    fn started_with(output: &Output, mode: &str) {
+        let text = stderr(output);
+        assert_eq!(output.status.code(), Some(1), "{text}");
+        assert!(text.contains("enrollment failed"), "{text}");
+        assert!(text.contains(&format!("HOME mode '{mode}'")), "{text}");
+    }
+
+    fn refused_host_home(output: &Output) {
+        let text = stderr(output);
+        assert_eq!(output.status.code(), Some(2), "{text}");
+        assert!(text.contains("--accept-host-home"), "{text}");
+        assert!(text.contains("SSH keys"), "{text}");
+        assert!(!text.contains("enrollment failed"), "{text}");
+    }
+
+    /// Covers AE13 (`--home host`).
+    #[test]
+    fn host_home_needs_the_users_explicit_acceptance() {
+        let dir = Dir::new();
+        refused_host_home(&local(&dir, &["--home", "host"], &[]));
+
+        let accepted = local(&dir, &["--home", "host", "--accept-host-home"], &[]);
+        started_with(&accepted, "host");
+        assert!(stderr(&accepted).contains("WARNING: --accept-host-home"));
+    }
+
+    #[test]
+    fn without_any_setting_tasks_get_a_private_home_and_the_user_is_warned() {
+        let dir = Dir::new();
+        let output = local(&dir, &[], &[]);
+        started_with(&output, "private");
+        let text = stderr(&output);
+        assert!(text.contains(REMOTE), "{text}");
+        assert!(text.contains("WARNING"), "{text}");
+        assert!(text.contains("without a container"), "{text}");
+    }
+
+    /// Covers AE14.
+    #[test]
+    fn host_home_from_the_configuration_needs_the_same_acceptance() {
+        let dir = Dir::new();
+        let config = dir.file("config.yaml", "local_home: host\n");
+        let config = config.to_str().unwrap();
+        refused_host_home(&local(&dir, &["--config", config], &[]));
+        started_with(
+            &local(&dir, &["--config", config, "--home", "private"], &[]),
+            "private",
+        );
+    }
+
+    #[test]
+    fn a_flag_wins_over_the_environment_which_wins_over_the_file() {
+        let dir = Dir::new();
+        let private_file = dir.file("private.yaml", "local_home: private\n");
+        let host_file = dir.file("host.yaml", "local_home: host\n");
+        let host_env = [("NARSOR_LOCAL_HOME", "host")];
+        let private_env = [("NARSOR_LOCAL_HOME", "private")];
+
+        // The flag over the environment.
+        started_with(&local(&dir, &["--home", "private"], &host_env), "private");
+        // The environment over the file.
+        refused_host_home(&local(
+            &dir,
+            &["--config", private_file.to_str().unwrap()],
+            &host_env,
+        ));
+        started_with(
+            &local(
+                &dir,
+                &["--config", host_file.to_str().unwrap()],
+                &private_env,
+            ),
+            "private",
+        );
+        // The file alone.
+        refused_host_home(&local(
+            &dir,
+            &["--config", host_file.to_str().unwrap()],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn no_config_skips_the_configuration_file() {
+        let dir = Dir::new();
+        dir.user_config("local_home: host\n");
+        refused_host_home(&local(&dir, &[], &[]));
+        started_with(&local(&dir, &["--no-config"], &[]), "private");
+    }
+
+    #[test]
+    fn a_file_without_local_home_leaves_a_private_home() {
+        let dir = Dir::new();
+        dir.user_config("log_level: warn\n");
+        started_with(&local(&dir, &[], &[]), "private");
+    }
+}
+
+/// A controller serving a control plane it does not trust — reached under
+/// an IPv4-mapped address, which is not loopback to it — says which backend
+/// it serves and holds that backend's lease.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "starts narsor-controller processes; run with --ignored"]
+async fn a_controller_of_a_remote_control_plane_names_its_backend() {
+    use narsor_engine::environment::{BackendKind, BackendRecord, EnvironmentCatalog, TrustScope};
+
+    let setup = Setup::new().await;
+    let record = BackendRecord::new(
+        "laptop",
+        BackendKind::Local,
+        TrustScope::Workstation,
+        BackendRecord::builtin_local().limits,
+    );
+    EnvironmentCatalog::new(setup.harness.root.path())
+        .save_backend(&record)
+        .expect("register the laptop");
+    let code = setup
+        .harness
+        .owner
+        .create_enrollment(
+            "laptop",
+            &CreateEnrollmentRequest {
+                accept_workstation_risk: true,
+                ..CreateEnrollmentRequest::default()
+            },
+        )
+        .await
+        .expect("a code")
+        .enrollment_code;
+    let port = setup.harness.handle.addr().port();
+    let mut command = setup.command(Some(&code), &[]);
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let mut remote = Command::new(command.get_program());
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--control-plane" {
+            let _ = args.next();
+            remote
+                .arg(arg)
+                .arg(format!("http://[::ffff:127.0.0.1]:{port}"));
+        } else {
+            remote.arg(arg);
+        }
+    }
+    let state = setup.harness.root.path().join("home");
+    std::fs::create_dir_all(state.join("config")).unwrap();
+    remote
+        .arg("--no-config")
+        .env("NARSOR_ENROLLMENT_CODE", &code)
+        .env("HOME", &state)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    drop(command);
+    let mut controller = ControllerProcess(remote.spawn().expect("start narsor-controller"));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let lease = loop {
+        let lease = ControlPlane::new(StatePaths::new(setup.harness.root.path()))
+            .lease(&BackendId::parse("laptop").unwrap())
+            .expect("read the lease");
+        if lease.is_some() {
+            break lease.unwrap();
+        }
+        assert!(Instant::now() < deadline, "the laptop's lease never came");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(lease.backend_id.as_str(), "laptop");
+    send(controller.id(), libc::SIGTERM);
+    controller
+        .wait_within(Duration::from_secs(10))
+        .expect("stopped");
+    let text = controller.stderr();
+    assert!(text.contains("serving backend 'laptop'"), "{text}");
+    assert!(text.contains("HOME mode 'private'"), "{text}");
+}

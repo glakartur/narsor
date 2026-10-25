@@ -109,6 +109,27 @@ impl Role {
     }
 }
 
+/// A check of every launch spec before anything of its task is created:
+/// `Err` refuses the task with that problem. What a controller serving a
+/// control plane it does not trust sets (R17).
+#[derive(Clone)]
+pub struct LaunchCheck(Arc<dyn Fn(&TaskLaunchSpec) -> Result<(), String> + Send + Sync>);
+
+impl LaunchCheck {
+    /// A check running `check`.
+    pub fn new(
+        check: impl Fn(&TaskLaunchSpec) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(check))
+    }
+}
+
+impl std::fmt::Debug for LaunchCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaunchCheck")
+    }
+}
+
 /// Configuration of a [`LocalBackend`].
 #[derive(Debug, Clone)]
 pub struct LocalBackendConfig {
@@ -122,6 +143,9 @@ pub struct LocalBackendConfig {
     /// Environment variables set for every runner, on top of the
     /// controller's own environment less its `NARSOR_*` settings.
     pub env: Vec<(OsString, OsString)>,
+    /// Run on every launch spec before its task's storage or workload is
+    /// created; none by default.
+    pub launch_check: Option<LaunchCheck>,
 }
 
 impl LocalBackendConfig {
@@ -147,6 +171,7 @@ impl LocalBackendConfig {
             program: program.into(),
             runner_args: Vec::new(),
             env: Vec::new(),
+            launch_check: None,
         }
     }
 }
@@ -343,9 +368,7 @@ impl LocalBackend {
         launch: &WorkloadLaunch,
         create_storage: bool,
     ) -> BackendResult<Provisioned> {
-        serde_json::from_value::<TaskLaunchSpec>(launch.launch_spec.clone()).map_err(|error| {
-            BackendError::rejected(format!("the launch spec is malformed: {error}"))
-        })?;
+        self.checked_spec(launch)?;
         let storage = self.storage_dir(task);
         let created_storage = !storage.is_dir();
         if created_storage {
@@ -379,9 +402,7 @@ impl LocalBackend {
         task: &TaskResources,
         launch: &WorkloadLaunch,
     ) -> BackendResult<ReaderStart> {
-        serde_json::from_value::<TaskLaunchSpec>(launch.launch_spec.clone()).map_err(|error| {
-            BackendError::rejected(format!("the launch spec is malformed: {error}"))
-        })?;
+        self.checked_spec(launch)?;
         let storage = self.storage_dir(task);
         if !storage.is_dir() {
             // A reader never creates storage: there would be nothing to read.
@@ -401,6 +422,18 @@ impl LocalBackend {
             workload,
             created: true,
         })
+    }
+
+    /// The launch spec, refused when it is malformed or fails the
+    /// configured [`LaunchCheck`].
+    fn checked_spec(&self, launch: &WorkloadLaunch) -> BackendResult<TaskLaunchSpec> {
+        let spec = serde_json::from_value::<TaskLaunchSpec>(launch.launch_spec.clone()).map_err(
+            |error| BackendError::rejected(format!("the launch spec is malformed: {error}")),
+        )?;
+        if let Some(LaunchCheck(check)) = &self.config.launch_check {
+            check(&spec).map_err(BackendError::rejected)?;
+        }
+        Ok(spec)
     }
 
     fn spawn(
