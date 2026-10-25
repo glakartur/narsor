@@ -80,6 +80,10 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 /// what proves a process group still ours after the runner is gone.
 const WORKLOAD_MARK_ENV: &str = "NARSOR_LOCAL_WORKLOAD_UID";
 
+/// The prefix of the variables a controller is configured with, none of
+/// which a runner inherits.
+const CONTROLLER_ENV_PREFIX: &str = "NARSOR_";
+
 /// Which of a task's two kinds of workload a call is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -116,7 +120,7 @@ pub struct LocalBackendConfig {
     /// knobs, for instance).
     pub runner_args: Vec<OsString>,
     /// Environment variables set for every runner, on top of the
-    /// controller's own environment.
+    /// controller's own environment less its `NARSOR_*` settings.
     pub env: Vec<(OsString, OsString)>,
 }
 
@@ -460,8 +464,17 @@ impl LocalBackend {
         if role == Role::Read {
             command.arg("--read-only");
         }
+        command.args(&self.config.runner_args);
+        // Nothing of the controller's own settings — its enrollment code
+        // least of all — reaches the runner or the tools it starts (R12);
+        // what the adapter sets itself is set below. `spawn` isolates it:
+        // the controller's environment stays as it is.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with(CONTROLLER_ENV_PREFIX) {
+                command.env_remove(name);
+            }
+        }
         command
-            .args(&self.config.runner_args)
             .envs(self.config.env.iter().map(|(k, v)| (k, v)))
             .env(WORKLOAD_MARK_ENV, &uid)
             .stdin(Stdio::null())

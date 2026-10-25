@@ -28,6 +28,31 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound of one material blob download or publication (U9).
 const MATERIAL_TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How a controller's client behaves beyond its URL and credential.
+#[derive(Debug, Clone, Default)]
+pub struct ClientOptions {
+    /// Bound of `release_lease`, when it must be shorter than a plain
+    /// request's: a controller stopping under a supervisor's deadline gives
+    /// up on a dead control plane in time (KTD8).
+    pub release_lease_timeout: Option<Duration>,
+    /// Never follow a redirect: a control plane answers where it was asked,
+    /// and a redirect to another host would carry signed requests there
+    /// (R16).
+    pub refuse_redirects: bool,
+}
+
+impl ClientOptions {
+    fn http(&self) -> reqwest::Client {
+        if !self.refuse_redirects {
+            return reqwest::Client::new();
+        }
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+}
+
 /// How a client proves who it is.
 #[derive(Clone)]
 enum Credential {
@@ -61,10 +86,14 @@ impl std::fmt::Debug for Transport {
 
 impl Transport {
     fn new(base_url: impl Into<String>, credential: Credential) -> Self {
+        Self::with_http(base_url, credential, reqwest::Client::new())
+    }
+
+    fn with_http(base_url: impl Into<String>, credential: Credential, http: reqwest::Client) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             credential,
-            http: reqwest::Client::new(),
+            http,
         }
     }
 
@@ -91,13 +120,23 @@ impl Transport {
         path: &str,
         body: &B,
     ) -> Result<T, ClientError> {
+        self.post_within(path, body, REQUEST_TIMEOUT).await
+    }
+
+    /// [`Self::post`] bounded by `timeout`.
+    async fn post_within<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<T, ClientError> {
         let body = serde_json::to_vec(body)
             .map_err(|error| ClientError::Server(format!("cannot encode the request: {error}")))?;
         let request = self
             .http
             .request(Method::POST, self.url(path))
             .header(CONTENT_TYPE, "application/json")
-            .timeout(REQUEST_TIMEOUT);
+            .timeout(timeout);
         self.send(request, body).await
     }
 
@@ -190,6 +229,7 @@ impl Transport {
 #[derive(Debug, Clone)]
 pub struct ControllerClient {
     transport: Transport,
+    release_lease_timeout: Option<Duration>,
 }
 
 impl ControllerClient {
@@ -205,6 +245,19 @@ impl ControllerClient {
         };
         Self {
             transport: Transport::new(base_url, credential),
+            release_lease_timeout: None,
+        }
+    }
+
+    /// The same identity, behaving as `options` say.
+    pub fn with_options(self, options: &ClientOptions) -> Self {
+        Self {
+            transport: Transport::with_http(
+                self.transport.base_url,
+                self.transport.credential,
+                options.http(),
+            ),
+            release_lease_timeout: options.release_lease_timeout,
         }
     }
 
@@ -215,13 +268,28 @@ impl ControllerClient {
         base_url: impl Into<String>,
         enrollment_code: &str,
     ) -> Result<(Self, EnrollResponse), ClientError> {
-        let anonymous = Transport::new(base_url, Credential::None);
+        Self::enroll_with_options(base_url, enrollment_code, &ClientOptions::default()).await
+    }
+
+    /// [`Self::enroll`], the enrollment request and the returned client
+    /// behaving as `options` say.
+    pub async fn enroll_with_options(
+        base_url: impl Into<String>,
+        enrollment_code: &str,
+        options: &ClientOptions,
+    ) -> Result<(Self, EnrollResponse), ClientError> {
+        let anonymous = Transport::with_http(base_url, Credential::None, options.http());
         let key = ControllerKey::generate();
         let request = crate::auth::pop::signed_enrollment_request(enrollment_code, &key);
         let enrolled: EnrollResponse = anonymous.post("/controller/v1/enroll", &request).await?;
         let credential = ControllerCredential::new(enrolled.controller_id.clone(), key);
         let client = Self {
-            transport: Transport::new(anonymous.base_url, Credential::Signed(Box::new(credential))),
+            transport: Transport::with_http(
+                anonymous.base_url,
+                Credential::Signed(Box::new(credential)),
+                anonymous.http,
+            ),
+            release_lease_timeout: options.release_lease_timeout,
         };
         Ok((client, enrolled))
     }
@@ -253,10 +321,12 @@ impl ControllerClient {
             self.transport.post("/controller/v1/key", &request).await?;
         let credential = ControllerCredential::new(current.controller_id(), key);
         let client = Self {
-            transport: Transport::new(
+            transport: Transport::with_http(
                 self.transport.base_url.clone(),
                 Credential::Signed(Box::new(credential)),
+                self.transport.http.clone(),
             ),
+            release_lease_timeout: self.release_lease_timeout,
         };
         Ok((client, response))
     }
@@ -289,15 +359,17 @@ impl ControllerClient {
             .await
     }
 
-    /// `POST /controller/v1/lease/release`.
+    /// `POST /controller/v1/lease/release`, bounded by the
+    /// [`ClientOptions::release_lease_timeout`] when one was set.
     pub async fn release_lease(&self, epoch: u64) -> Result<LeaseView, ClientError> {
         self.transport
-            .post(
+            .post_within(
                 "/controller/v1/lease/release",
                 &LeaseEpochRequest {
                     epoch,
                     ttl_secs: None,
                 },
+                self.release_lease_timeout.unwrap_or(REQUEST_TIMEOUT),
             )
             .await
     }

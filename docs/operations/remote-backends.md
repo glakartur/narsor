@@ -375,7 +375,7 @@ plugins or skills — run an edit session in the controller's Pod:
 
 ```bash
 kubectl -n narsor-user exec -it deploy/narsor-controller -- \
-  /opt/narsor/bin/narsor-controller edit-claude-profile
+  /opt/narsor/bin/narsor-controller kubernetes edit-claude-profile
 ```
 
 The controller image must have Claude Code on its `PATH` (or name it with
@@ -426,6 +426,10 @@ given them as `env` secrets. For Claude Code on a subscription, a token from
 `claude setup-token` delivered as `!env CLAUDE_CODE_OAUTH_TOKEN` needs no
 writable login directory.
 
+The Deployment runs `narsor-controller kubernetes`; every argument comes
+from the environment (`narsor-controller kubernetes --help` lists the
+variables). `narsor-controller` without a subcommand is a usage error.
+
 Set in `controller.yaml`: the Narsor release image **by digest**,
 `NARSOR_CONTROL_PLANE` (the URL the controller uses) and, when task Pods
 reach the control plane under another URL, `NARSOR_RUNNER_CONTROL_PLANE`.
@@ -454,6 +458,10 @@ Each controller has its own identity scoped to one backend.
    code by proving possession of it, and writes its credential
    `nsk.<controller-id>.<seed>` with mode `0600` to its state volume. Later
    starts load the file and ignore any code still in the environment.
+   The code reaches the controller only as `NARSOR_ENROLLMENT_CODE` or in a
+   file named by `--enrollment-code-file`; `--enrollment-code <code>` is
+   refused, because every user of the machine can read a process's
+   arguments.
 5. Delete the enrollment Secret, then check:
 
    ```bash

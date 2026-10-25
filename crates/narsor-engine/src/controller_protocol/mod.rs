@@ -79,7 +79,7 @@ pub mod error;
 pub mod service;
 pub mod wire;
 
-pub use client::{ControllerClient, RunnerClient};
+pub use client::{ClientOptions, ControllerClient, RunnerClient};
 pub use credentials::{
     ControllerAuthenticator, ControllerIdentity, CredentialStore, RunnerAuthenticator,
     RunnerIdentity, RunnerRole,

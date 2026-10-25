@@ -182,7 +182,8 @@ impl EnrollmentError {
                 format!("{} does not hold a controller credential", path.display())
             }
             Self::MissingCode(path) => format!(
-                "{} does not exist and no enrollment code was given (--enrollment-code)",
+                "{} does not exist and no enrollment code was given \
+                 (NARSOR_ENROLLMENT_CODE or --enrollment-code-file)",
                 path.display()
             ),
             Self::Read { path, source } => format!("cannot read {}: {source}", path.display()),
