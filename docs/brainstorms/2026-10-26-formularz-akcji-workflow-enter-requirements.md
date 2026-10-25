@@ -46,7 +46,7 @@ Hipotezy nie wykluczają się. Możliwe, że objaw ma więcej niż jedną przycz
 - R3. Diagnoza potwierdza, który formularz widzi operator. Odpowiedź Q3 wskazuje formularz z oknem potwierdzenia. To zawęża hipotezy do H2 i H1.
 
 **Zachowanie po poprawce**
-- R4. Gdy operator wypełnił formularz i naciska `Enter` na ostatnim polu, formularz zostaje zatwierdzony przy pierwszym `Enter`, niezależnie od tego, ile czasu minęło od otwarcia i ile zdarzeń przyszło w tym czasie.
+- R4. Obecny przebieg zostaje bez zmian: `Enter` przechodzi między polami, po ostatnim polu pojawia się okno potwierdzenia wysyłki, `Enter` w oknie zatwierdza, `Esc` odrzuca. Gdy okno potwierdzenia jest otwarte, pierwszy `Enter` zatwierdza formularz, niezależnie od tego, ile czasu minęło od otwarcia formularza i ile zdarzeń przyszło w tym czasie.
 - R5. Odświeżenie danych (odczyt listy, zdarzenie ze strumienia) nie zabiera focusa z pola, nie zamyka okna potwierdzenia i nie kasuje wpisanego tekstu, dopóki ten sam formularz nadal jest dostępny.
 - R6. Gdy formularz naprawdę znika albo backend wskazuje inny domyślny formularz, panel przełącza się zgodnie z istniejącą regułą z `docs/brainstorms/2026-10-25-tui-panel-rozmowy-trzy-formularze-requirements.md` (R13, R14). Operator widzi komunikat o zmianie, a szkic zostaje.
 - R7. Gdy `Enter` nie może zatwierdzić formularza (brak połączenia, zapis w toku, błąd walidacji), operator widzi to od razu i wyraźnie, w miejscu panelu. Ciche zignorowanie `Enter` nie jest dopuszczalne.
@@ -57,7 +57,7 @@ Hipotezy nie wykluczają się. Możliwe, że objaw ma więcej niż jedną przycz
 
 ## Acceptance Examples
 
-- AE1. **Covers R4, R5.** Dane: formularz akcji otwarty i wypełniony, focus w ostatnim polu. W tle przychodzi zdarzenie, które powoduje odświeżenie listy, ale formularz nadal jest dostępny. Gdy operator naciska `Enter`, formularz zostaje zatwierdzony za pierwszym razem.
+- AE1. **Covers R4, R5.** Dane: formularz akcji otwarty i wypełniony, okno potwierdzenia wysyłki jest otwarte. W tle przychodzi zdarzenie, które powoduje odświeżenie listy, ale formularz nadal jest dostępny. Gdy operator naciska `Enter`, formularz zostaje zatwierdzony za pierwszym razem.
 - AE2. **Covers R5.** Dane: okno potwierdzenia jest otwarte. Przychodzi odświeżenie listy. Okno zostaje otwarte, a `Enter` je zatwierdza.
 - AE3. **Covers R7.** Dane: połączenie z backendem jest zerwane. Gdy operator naciska `Enter` na ostatnim polu, panel pokazuje powód odmowy. Wpisany tekst zostaje.
 - AE4. **Covers R8.** Dane: zapis formularza trwa. Gdy operator naciska `Enter` ponownie, żądanie nie jest wysłane drugi raz.
@@ -67,7 +67,7 @@ Hipotezy nie wykluczają się. Możliwe, że objaw ma więcej niż jedną przycz
 
 ## Success Criteria
 
-- Operator zatwierdza formularz akcji pierwszym `Enter` po dowolnie długim oczekiwaniu. Artur nie odtwarza już objawu.
+- Operator zatwierdza formularz akcji pierwszym `Enter` w oknie potwierdzenia po dowolnie długim oczekiwaniu. Artur nie odtwarza już objawu.
 - Gdy `Enter` nie działa, operator wie dlaczego.
 - Planista ma udokumentowaną, potwierdzoną przyczynę (nie tylko hipotezę) i test regresji, który ją pokrywa.
 
