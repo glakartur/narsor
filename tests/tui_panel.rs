@@ -129,11 +129,17 @@ fn esc_in_a_text_field_switches_and_the_draft_stays() {
 
     key(&mut app, KeyCode::Esc);
     assert_eq!(shown(&app), Some(PanelFormKind::Answer));
-    assert_eq!(app.detail().view("a").unwrap().waiting().chat_draft(), "pisze");
+    assert_eq!(
+        app.detail().view("a").unwrap().waiting().chat_draft(),
+        "pisze"
+    );
 
     key(&mut app, KeyCode::Esc);
     assert_eq!(shown(&app), Some(PanelFormKind::Chat));
-    assert_eq!(app.detail().view("a").unwrap().waiting().chat_draft(), "pisze");
+    assert_eq!(
+        app.detail().view("a").unwrap().waiting().chat_draft(),
+        "pisze"
+    );
 }
 
 #[test]
@@ -165,7 +171,10 @@ fn a_new_default_takes_the_view_and_the_chat_draft_stays() {
     assert_eq!(shown(&app), Some(PanelFormKind::Answer));
     key(&mut app, KeyCode::Esc);
     assert_eq!(shown(&app), Some(PanelFormKind::Chat));
-    assert_eq!(app.detail().view("a").unwrap().waiting().chat_draft(), "szkic");
+    assert_eq!(
+        app.detail().view("a").unwrap().waiting().chat_draft(),
+        "szkic"
+    );
 }
 
 #[test]

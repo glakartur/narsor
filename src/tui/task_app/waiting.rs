@@ -776,11 +776,7 @@ impl WaitingPanel {
 
     /// The kind of the form shown, in the server's panel.
     pub fn active_form(&self) -> Option<PanelFormKind> {
-        self.forms
-            .as_ref()?
-            .switcher
-            .active()
-            .map(|key| key.kind)
+        self.forms.as_ref()?.switcher.active().map(|key| key.kind)
     }
 
     /// How many forms the server's panel has.
