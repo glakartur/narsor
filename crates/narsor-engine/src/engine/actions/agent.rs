@@ -94,7 +94,10 @@ use crate::persistence::{
 /// prompt no longer has to repeat the labels for the agent to know them.
 /// With no choices to list (a direct call with nothing wired up) the agent
 /// is pointed at the label the task asks for instead.
-pub fn output_contract(contract: &StepContract<'_>) -> String {
+///
+/// `harness_note` is how the harness wants the answer delivered
+/// ([`HarnessAdapter::contract_note`]); it closes the contract.
+pub fn output_contract(contract: &StepContract<'_>, harness_note: Option<&str>) -> String {
     format!(
         "\n\n\
 ---\n\
@@ -111,10 +114,16 @@ fields are optional unless your choice requires them. If, and only if, you need 
 person to answer a question before continuing this same task, return instead:\n\
 {{\"status\":\"awaiting_input\",\"question\":\"<question>\",\"options\":[\"<optional choice>\"]}}\n\
 Do not use `awaiting_input` for a harness, sandbox, permission, or tool error; \
-those are action failures. Do not omit the JSON object: without it the workflow \
-cannot continue.",
+those are action failures. A decision you cannot make yourself (a trade-off, a \
+change of behaviour, or a question a skill would put to the user) is a question \
+for the person: ask it with `awaiting_input`, and do not use a question tool. Do \
+not omit the JSON object: without it the workflow cannot continue.\
+{note}",
         definitions = step_definitions(contract),
         choices = choice_list(contract.choices),
+        note = harness_note
+            .map(|note| format!("\n{note}"))
+            .unwrap_or_default(),
     )
 }
 
@@ -614,7 +623,11 @@ impl AgentExecutor {
 
         let mut session = new_session(config, harness, request.execution_id);
 
-        let prompt = format!("{}{}", config.prompt, output_contract(&request.contract));
+        let prompt = format!(
+            "{}{}",
+            config.prompt,
+            output_contract(&request.contract, adapter.contract_note())
+        );
         let schema = output_schema(&request.contract);
         let workspace = Path::new(&request.workspace.path);
 

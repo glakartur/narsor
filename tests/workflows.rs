@@ -212,7 +212,7 @@ fn built_prompt(state: &State) -> String {
     format!(
         "{}{}",
         config.prompt,
-        output_contract(&StepContract::of(state))
+        output_contract(&StepContract::of(state), None)
     )
 }
 

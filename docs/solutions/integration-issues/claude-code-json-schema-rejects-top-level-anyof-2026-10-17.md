@@ -90,7 +90,7 @@ A flat schema cannot say "either A or B", so narsor must still check the answer.
 - `structured_output` is on the `result` line, also with `--resume` and `--permission-mode plan`. The `result` text holds the same JSON.
 - The model calls `tool_use` `StructuredOutput`, and the CLI answers `Structured output provided successfully`. When the model ends a turn without the tool, the CLI adds a `user` line with `isSynthetic: true` and `[structured-output-enforce] You MUST call the StructuredOutput tool…`.
 - On a schema mismatch, the `tool_result` has `is_error: true` and `Output does not match required schema: /output: must be equal to one of the allowed values: [...]`, and the model tries again. What the CLI does when the retries run out is not known.
-- `AskUserQuestion` is not available in `--print`. The model calls `ToolSearch` (`select:AskUserQuestion`), gets `No matching deferred tools found` and asks in plain text. The output contract's `awaiting_input` is the real route for questions.
+- `AskUserQuestion` is not available in `--print`. The model calls `ToolSearch` (`select:AskUserQuestion`), gets `No matching deferred tools found` and asks in plain text. The output contract's `awaiting_input` is the real route for questions. Since 2026-10-25 the `claude-code` adapter adds a note to the contract (`HarnessAdapter::contract_note`): the answer and every question go through `StructuredOutput`.
 - `thinking` blocks have empty text and only a signature.
 - An `error_max_turns` result has no `result` field. Its `errors[]` holds plain strings, not objects with `message`.
 - `system` subtypes seen: `init`, `hook_started`, `hook_response`, `thinking_tokens`, `permission_denied`.

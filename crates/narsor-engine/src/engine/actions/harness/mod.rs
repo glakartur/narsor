@@ -174,6 +174,13 @@ pub trait HarnessAdapter: Send + Sync + std::fmt::Debug {
     /// far, whether a `result` line has appeared) that must never leak
     /// between two attempts.
     fn stream_parser(&self) -> Box<dyn HarnessStreamParser>;
+
+    /// How this harness wants the answer and any `awaiting_input` question
+    /// delivered, appended to the output contract; `None` when the contract
+    /// alone is enough.
+    fn contract_note(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The harnesses an [`AgentExecutor`](super::agent::AgentExecutor) knows.
