@@ -3,17 +3,19 @@ date: 2026-10-26
 topic: formularz-akcji-workflow-enter
 ---
 
-# Formularz wyboru akcji workflow: `Enter` nie zatwierdza po dłuższym oczekiwaniu
+# Formularz wyboru akcji workflow: `Enter` nie zatwierdza po kilkunastu sekundach oczekiwania
 
 ## Summary
 
-Znajdź przyczynę, dla której `Enter` w formularzu wyboru akcji workflow (panel na dole szczegółów taska) czasem nie zatwierdza formularza, głównie po długim czekaniu. Potem usuń przyczynę tak, aby pierwszy `Enter` zawsze działał albo operator widział, dlaczego nie działa.
+Znajdź przyczynę, dla której `Enter` w formularzu wyboru akcji workflow (panel na dole szczegółów taska) czasem nie zatwierdza formularza, głównie po kilkunastu sekundach otwartego formularza. Potem usuń przyczynę tak, aby pierwszy `Enter` zawsze działał albo operator widział, dlaczego nie działa.
 
 ---
 
 ## Problem Frame
 
-Operator otwiera formularz akcji workflow i czeka z decyzją. Po dłuższym czasie naciska `Enter`, a formularz się nie zatwierdza. Operator musi nacisnąć `Enter` kilka razy. Zatwierdzenie udaje się dopiero wtedy, gdy ostatnie pole i cały formularz zostaną zatwierdzone bardzo szybko, jeden `Enter` po drugim.
+Operator otwiera formularz akcji workflow i czeka z decyzją kilkanaście sekund. Potem naciska `Enter`. Pojawia się okno potwierdzenia zakończenia pracy z formularzem, ale `Enter` nie zamyka formularza. Operator nadal może wybierać opcje. Czasem po chwili lista dostępnych opcji się zmienia. Operator musi nacisnąć `Enter` kilka razy. Zatwierdzenie udaje się dopiero wtedy, gdy ostatnie pole i cały formularz zostaną zatwierdzone bardzo szybko, jeden `Enter` po drugim.
+
+Ekran w tym czasie reaguje na klawisze. Artur nie widział komunikatu na pasku. Objaw wystąpił z lokalnym backendem. Artur nie zauważył go przy dodawaniu nowych tasków.
 
 Artur podejrzewa asynchroniczne dostarczenie danych formularza do backendu. Nie zostało to jeszcze potwierdzone ani odrzucone.
 
@@ -27,10 +29,10 @@ Przyczyna **nie jest jeszcze potwierdzona**. Poniższe hipotezy wynikają z czyt
 
 Ścieżka `Enter` w formularzu akcji workflow: `src/tui/task_app/panel/app.rs` (`on_panel_key`) → `src/tui/task_app/panel/state.rs` (`on_forms_key`, `sync`, `sync_forms`) → `src/tui/chooser.rs` (`on_fields_key`, `advance_field_or_submit`, `submit`) → `invoke` w `src/tui/task_app/actions.rs`.
 
-- **H1. Odświeżenie zmienia stan formularza między dwoma `Enter`.** `sync_waiting` działa po każdym odczycie listy i po każdym zdarzeniu ze strumienia. Gdy aktywny formularz serwera się zmieni, `sync` wywołuje `leave_all`, które zabiera focus z pól. Kolejny `Enter` działa wtedy na liście akcji (otwiera pola), a nie na ostatnim polu. Przy długim oczekiwaniu przychodzi więcej zdarzeń, więc zmiana jest bardziej prawdopodobna. Pasuje do objawu „szybki `Enter` po `Enter` działa".
-- **H2. Przebudowa formularza zamyka okno potwierdzenia.** `Chooser::rebuilt` wywołuje `decline()`: otwarte okno potwierdzenia znika po każdym `sync_forms`. Dotyczy formularzy z potwierdzeniem (`confirming_submit`). Formularz akcji „ręcznych" (`Slot::Manual`) w kodzie nie ma `confirming_submit`, więc H2 może go nie dotyczyć. Do sprawdzenia, który z formularzy to jest u Artura.
-- **H3. Zapis jest czekany w pętli klawiszy.** Pętla TUI wykonuje zapis (`dispatch(...).await`) w gałęzi klawisza. Jeśli żądanie do backendu wisi (np. martwe połączenie po długiej bezczynności), pętla nie rysuje ekranu i nie obsługuje innych zdarzeń do końca żądania. To jest zgodne z intuicją Artura o asynchroniczności, ale wymaga pomiaru czasu odpowiedzi backendu.
-- **H4. Blokada akcji zmieniających stan.** `mutation_allowed` odrzuca akcję, gdy połączenie nie jest `live` (strumień zerwany, ponawianie). Powód pojawia się tylko jako krótkie powiadomienie na pasku. Operator może go nie zauważyć. Po odzyskaniu połączenia pierwszy `Enter` działa od razu.
+- **H1. Odświeżenie zmienia stan formularza między dwoma `Enter`.** `sync_waiting` działa po każdym odczycie listy i po każdym zdarzeniu ze strumienia. Gdy aktywny formularz serwera się zmieni, `sync` wywołuje `leave_all`, które zabiera focus z pól. Kolejny `Enter` działa wtedy na liście akcji (otwiera pola), a nie na ostatnim polu. Im dłużej formularz jest otwarty, tym więcej zdarzeń przychodzi, więc zmiana jest bardziej prawdopodobna. Pasuje do objawu „szybki `Enter` po `Enter` działa".
+- **H2. Przebudowa formularza zamyka okno potwierdzenia.** `Chooser::rebuilt` wywołuje `decline()`: otwarte okno potwierdzenia znika po każdym `sync_forms`. Dotyczy formularzy z potwierdzeniem (`confirming_submit`). Formularz akcji „ręcznych" (`Slot::Manual`) w kodzie nie ma `confirming_submit`, więc H2 może go nie dotyczyć. Artur widzi okno potwierdzenia (odpowiedź Q3), więc najpewniej to formularz z `confirming_submit` i H2 jest główną hipotezą. Do potwierdzenia w diagnozie (R3).
+- **H3. Zapis jest czekany w pętli klawiszy.** Pętla TUI wykonuje zapis (`dispatch(...).await`) w gałęzi klawisza. Jeśli żądanie do backendu wisi, pętla nie rysuje ekranu i nie obsługuje innych zdarzeń do końca żądania. Artur zgłosił, że ekran reaguje (Q2), a backend jest lokalny (Q5). To osłabia H3. Wymaga pomiaru czasu odpowiedzi backendu, aby ją odrzucić.
+- **H4. Blokada akcji zmieniających stan.** `mutation_allowed` odrzuca akcję, gdy połączenie nie jest `live` (strumień zerwany, ponawianie). Powód pojawia się tylko jako krótkie powiadomienie na pasku. Operator może go nie zauważyć. Po odzyskaniu połączenia pierwszy `Enter` działa od razu. Artur nie zauważył komunikatu (Q1), a backend jest lokalny (Q5). To osłabia H4, ale nie wyklucza jej, bo komunikat jest krótki.
 
 Hipotezy nie wykluczają się. Możliwe, że objaw ma więcej niż jedną przyczynę.
 
@@ -41,7 +43,7 @@ Hipotezy nie wykluczają się. Możliwe, że objaw ma więcej niż jedną przycz
 **Diagnoza**
 - R1. Przed poprawką powstaje odtworzenie problemu: kroki, które w kontrolowanych warunkach dają objaw (długie oczekiwanie symulowane zdarzeniem lub odświeżeniem, opóźnienie lub zerwanie połączenia z backendem).
 - R2. Dla każdej z hipotez H1–H4 jest wynik: potwierdzona albo odrzucona, z dowodem (test, log, pomiar). Wynik trafia do planu i do opisu poprawki.
-- R3. Diagnoza ustala, który formularz widzi operator: akcje workflow „ręczne" czy formularz wpisu z potwierdzeniem. To zawęża hipotezy.
+- R3. Diagnoza potwierdza, który formularz widzi operator. Odpowiedź Q3 wskazuje formularz z oknem potwierdzenia. To zawęża hipotezy do H2 i H1.
 
 **Zachowanie po poprawce**
 - R4. Gdy operator wypełnił formularz i naciska `Enter` na ostatnim polu, formularz zostaje zatwierdzony przy pierwszym `Enter`, niezależnie od tego, ile czasu minęło od otwarcia i ile zdarzeń przyszło w tym czasie.
@@ -86,23 +88,23 @@ Hipotezy nie wykluczają się. Możliwe, że objaw ma więcej niż jedną przycz
 
 ---
 
-## Założenia do potwierdzenia
+## Założenia (potwierdzone przez Artura)
 
-- Z1. „Formularz wyboru akcji workflow" to panel akcji na dole szczegółów taska (typ „akcja workflow" z `2026-10-25-tui-panel-rozmowy-trzy-formularze-requirements.md`), a nie formularz nowego zadania.
-- Z2. „Dłuższy czas oczekiwania" to minuty, w których TUI działa i dostaje zdarzenia (nie zamknięcie i ponowne uruchomienie TUI).
-- Z3. Objaw występuje z lokalnym backendem (daemon na tej samej maszynie) tak samo jak ze zdalnym. Jeśli tylko ze zdalnym, H3 i H4 stają się główne.
-- Z4. Przy `Enter`, który „nie działa", ekran nadal się rysuje (np. kursor miga, spinner działa). Gdyby ekran stał, to wskazuje na H3.
+- Z1. Potwierdzone. „Formularz wyboru akcji workflow” to panel akcji na dole szczegółów taska (typ „akcja workflow” z `2026-10-25-tui-panel-rozmowy-trzy-formularze-requirements.md`), a nie formularz nowego zadania.
+- Z2. Skorygowane. „Dłuższy czas oczekiwania” to kilkanaście sekund otwartego formularza, a nie minuty.
+- Z3. Zawężone. Objaw występuje z lokalnym backendem (daemon na tej samej maszynie). Zdalny backend nie jest potrzebny do objawu, więc H3 i H4 nie są główne.
+- Z4. Potwierdzone. Ekran w czasie objawu reaguje. To wskazuje przeciw H3.
 - Z5. Wybrana jest wersja bezpieczna: najpierw diagnoza w planie, bez zgadywania poprawki.
 
 ---
 
-## Pytania otwarte dla użytkownika
+## Odpowiedzi na pytania
 
-- Q1. Czy podczas objawu na pasku pojawia się jakikolwiek komunikat (np. „ponawiam połączenie", „akcja zmieniająca stan jest zablokowana")? To rozstrzyga H4.
-- Q2. Czy w czasie objawu ekran nadal reaguje (przewijanie, spinner), czy wygląda na zawieszony? To rozstrzyga H3.
-- Q3. Czy po `Enter`, który „nie działa", pojawia się okno potwierdzenia, które potem znika? To wskazuje H2.
-- Q4. Czy objaw występuje także w innych formularzach panelu (odpowiedź na pytanie agenta, rozmowa), czy tylko w formularzu akcji workflow?
-- Q5. Z jakim backendem pracuje TUI w chwili objawu: lokalny daemon czy zdalny serwer?
+- Q1. Artur nie zauważył komunikatu na pasku. H4 nie jest potwierdzona. Brak komunikatu jest zgodny z R7: komunikat musi być widoczny w panelu.
+- Q2. Cały ekran reaguje. H3 jako zawieszenie pętli jest mało prawdopodobna.
+- Q3. Tak, ale dokładniej: `Enter` dotyczy okna potwierdzenia zakończenia pracy z formularzem. Po `Enter` okno nie zamyka formularza, operator nadal wybiera opcje, a lista opcji czasem zmienia się po chwili. To wskazuje H2 (przebudowa formularza zamyka okno potwierdzenia) i H1 (odświeżenie listy opcji).
+- Q4. Artur nie zauważył objawu przy dodawaniu nowych tasków. Czy objaw dotyczy odpowiedzi na pytanie agenta lub rozmowy, nie wiadomo. Plan sprawdza to w odtworzeniu (R1).
+- Q5. Lokalny backend.
 
 ---
 
@@ -110,7 +112,7 @@ Hipotezy nie wykluczają się. Możliwe, że objaw ma więcej niż jedną przycz
 
 ### Resolve Before Planning
 
-- Brak. Pytania Q1–Q5 zawężają diagnozę, ale plan może zacząć od odtworzenia (R1) bez nich.
+- Brak. Odpowiedzi Q1–Q5 są w sekcji „Odpowiedzi na pytania”. Plan zaczyna od odtworzenia (R1) na ścieżce okna potwierdzenia (H2, H1) z lokalnym backendem. Q4 zostaje do sprawdzenia w odtworzeniu.
 
 ### Deferred to Planning
 
