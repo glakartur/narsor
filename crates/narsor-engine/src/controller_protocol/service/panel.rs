@@ -2,21 +2,24 @@
 //! R21, R22).
 //!
 //! One pure function of the task's summary, [`offer_forms`], fills
-//! [`TaskSummary::panel`]. The client shows what it says and decides nothing:
-//! whether a message to the agent is possible is the answer of
-//! `actions::comment_reason`, the same one the offer of actions gives, so the
-//! two cannot disagree.
+//! [`TaskSummary::panel`]. The client shows what it says and decides nothing,
+//! not even what a form of a wait asks: its entries, fields and the way its
+//! answer is delivered are the definition the server builds with
+//! [`narsor_protocol::panel::define`]. Whether a message to the agent is
+//! possible is the answer of `actions::comment_reason`, the same one the offer
+//! of actions gives, so the two cannot disagree.
 //!
 //! The order of the list is the order the owner steps through it: the form of
 //! the wait (an answer, a permission, an entry limit), the free chat, the
 //! action. The default is the first that applies of: the entry limit, the
 //! permission, the answer, the action of a step that finished, the chat.
 
-use narsor_protocol::api::InputContinuationView;
+use narsor_protocol::api::{InputContinuationView, PendingHumanInputView};
 use narsor_protocol::controller::{
     AttentionKind, PanelChoice, PanelForm, PanelFormKind, PanelOffer, TaskActionId, TaskState,
     TaskSummary,
 };
+use narsor_protocol::panel::define;
 
 use super::actions::{comment_reason, options, runner_alive, unavailable_reason, waiting};
 
@@ -48,7 +51,7 @@ pub(super) fn offer_forms(task: &TaskSummary) -> Option<PanelOffer> {
     };
     if let Some(kind) = wait_kind {
         default = Some(forms.len());
-        forms.push(wait_form(task, kind));
+        forms.push(wait_form(task, kind, wait.as_ref()));
     }
 
     let chat = comment_reason(task).is_none();
@@ -66,7 +69,7 @@ pub(super) fn offer_forms(task: &TaskSummary) -> Option<PanelOffer> {
             if default.is_none() {
                 default = Some(forms.len());
             }
-            forms.push(wait_form(task, PanelFormKind::Action));
+            forms.push(wait_form(task, PanelFormKind::Action, wait.as_ref()));
         }
         _ => {
             if let Some(form) = action_form(task) {
@@ -124,17 +127,24 @@ fn chat_form(task: &TaskSummary) -> PanelForm {
         kind: PanelFormKind::Chat,
         waiting_id: waiting_id(task),
         choices: Vec::new(),
+        definition: None,
     }
 }
 
-/// The form of a wait: which wait it answers is all the server says. What the
-/// form asks (fields, options, labels) the client builds from the wait's own
-/// content, which it reads anyway; it is not said twice.
-fn wait_form(task: &TaskSummary, kind: PanelFormKind) -> PanelForm {
+/// The form of a wait: which wait it answers, and what it asks — the
+/// entries, their fields and how the answer is delivered. The server names the
+/// workflow state an output resumes only as an attempt: the client knows the
+/// steps and says which state it is.
+fn wait_form(
+    task: &TaskSummary,
+    kind: PanelFormKind,
+    wait: Option<&PendingHumanInputView>,
+) -> PanelForm {
     PanelForm {
         kind,
         waiting_id: waiting_id(task),
         choices: Vec::new(),
+        definition: wait.map(|wait| define(wait, &|_| None)),
     }
 }
 
@@ -158,6 +168,7 @@ fn action_form(task: &TaskSummary) -> Option<PanelForm> {
             description: Some(exits),
             action: Some(TaskActionId::Transition),
         }],
+        definition: None,
     })
 }
 

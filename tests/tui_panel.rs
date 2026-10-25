@@ -26,6 +26,7 @@ use narsor_protocol::api::{
     PermissionDecisionKindDto, ENTRY_LIMIT_CONTINUE, ENTRY_LIMIT_DECISION_FIELD,
     ENTRY_LIMIT_RESET_COUNTER,
 };
+use narsor_protocol::panel::PanelContextLine;
 
 mod task_app_support;
 
@@ -285,6 +286,7 @@ fn a_form_of_an_unknown_kind_sends_nothing_for_the_wait_behind_it() {
             kind: PanelFormKind::Unrecognized,
             waiting_id: None,
             choices: Vec::new(),
+            definition: None,
         },
     );
     offer.default = Some(0);
@@ -314,6 +316,7 @@ fn a_form_of_an_unknown_kind_that_names_a_wait_does_not_take_the_wait_entry() {
             kind: PanelFormKind::Unrecognized,
             waiting_id: Some(waiting_id),
             choices: Vec::new(),
+            definition: None,
         },
     );
     offer.default = Some(0);
@@ -330,6 +333,33 @@ fn a_form_of_an_unknown_kind_that_names_a_wait_does_not_take_the_wait_entry() {
 }
 
 #[test]
+fn the_panel_shows_the_definition_of_the_server_and_not_a_copy_of_its_own() {
+    let mut task = asking();
+    let offer = task.panel.as_mut().expect("panel");
+    let answer = offer
+        .forms
+        .iter_mut()
+        .find(|form| form.kind == PanelFormKind::Answer)
+        .expect("the answer form");
+    let definition = answer.definition.as_mut().expect("the server's definition");
+    definition.entries[0].label = "Etykieta z serwera".to_string();
+    definition.entries[0].summary = "podsumowanie z serwera".to_string();
+    definition
+        .context
+        .push(PanelContextLine::plain("kontekst z serwera"));
+
+    let mut app = opened(task);
+    let drawn = screen(&mut app, 120, 40);
+    assert!(drawn.contains("kontekst z serwera"), "{drawn}");
+
+    // The composer takes the answer once the operator enters its field.
+    key(&mut app, KeyCode::Enter);
+    typed(&mut app, "v2");
+    let request = enter_until_sent(&mut app);
+    assert_eq!(request.summary, "podsumowanie z serwera");
+}
+
+#[test]
 fn a_form_of_an_unknown_kind_next_to_the_manual_action_form_does_not_show_its_chooser() {
     let mut task = action_task(TaskActionId::Resume, "stopped");
     let offer = task.panel.as_mut().expect("panel");
@@ -339,6 +369,7 @@ fn a_form_of_an_unknown_kind_next_to_the_manual_action_form_does_not_show_its_ch
             kind: PanelFormKind::Unrecognized,
             waiting_id: None,
             choices: Vec::new(),
+            definition: None,
         },
     );
     offer.default = Some(0);
@@ -348,21 +379,26 @@ fn a_form_of_an_unknown_kind_next_to_the_manual_action_form_does_not_show_its_ch
     assert_eq!(key(&mut app, KeyCode::Enter), Request::None);
     assert_eq!(key(&mut app, KeyCode::Enter), Request::None);
 
-    // The manual form is still there, behind the unknown one.
-    key(&mut app, KeyCode::Esc);
+    // The manual form is still there, behind the unknown one and the chat.
+    for _ in 0..2 {
+        key(&mut app, KeyCode::Esc);
+    }
     assert_eq!(shown(&app), Some(PanelFormKind::Action));
 }
 
 #[test]
-fn a_server_that_sent_no_forms_keeps_the_old_panel() {
-    let old = with_pending(running(), question());
-    assert!(old.panel.is_none());
+fn a_wait_the_server_gave_no_definition_for_shows_no_content() {
+    // A server from before the panel field sends no forms, so nothing says
+    // what the wait asks: the panel does not guess.
+    let mut old = with_pending(running(), question());
+    old.panel = None;
     let mut app = opened(old);
     assert_eq!(shown(&app), None);
-    assert!(app.panel_focused());
-    // `Esc` folds the panel as it did.
-    key(&mut app, KeyCode::Esc);
-    assert!(app.detail().view("a").unwrap().waiting().is_collapsed());
+    let drawn = screen(&mut app, 120, 40);
+    assert!(
+        drawn.contains("Treść oczekiwania jeszcze nie dotarła"),
+        "{drawn}"
+    );
 }
 
 #[test]
@@ -499,6 +535,7 @@ fn action_task(action: TaskActionId, runner_state: &str) -> TaskSummary {
             description: None,
             action: Some(action),
         }],
+        definition: None,
     });
     offer.default = Some(1);
     task

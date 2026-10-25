@@ -32,7 +32,7 @@ use crate::conductor::ConductorView;
 use crate::controller_protocol::{
     ConductorReadResponse, ConversationUnavailableReason, TaskSummary,
 };
-use narsor_protocol::api::{PendingHumanInputView, Position, PositionStatus};
+use narsor_protocol::api::{Position, PositionStatus};
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, PanelForm, PanelFormKind, PanelOffer, TaskActionId,
 };
@@ -89,7 +89,7 @@ impl Model {
     fn items(&self) -> Vec<ChooserItem> {
         match self {
             Self::Input(panel) => {
-                let composer_index = panel.composer_spec().map(|(index, _)| index);
+                let composer_index = panel.composer_spec().map(|composer| composer.entry);
                 panel
                     .items()
                     .iter()
@@ -110,9 +110,8 @@ impl Model {
 
     fn selected(&self) -> usize {
         match self {
-            Self::Input(panel) => panel.selected().min(self.items().len().saturating_sub(1)),
             Self::Operator(panel) => panel.selected(),
-            Self::Owner(_) | Self::Missing => 0,
+            Self::Input(_) | Self::Owner(_) | Self::Missing => 0,
         }
     }
 
@@ -124,14 +123,9 @@ impl Model {
         let Self::Input(panel) = self else {
             return None;
         };
-        let (index, label) = panel.composer_spec()?;
-        let help = if panel.kind() == crate::tui::input_form::InputKind::AgentQuestion {
-            "Odpowiada agentowi."
-        } else {
-            "Wysyła wiadomość do agenta."
-        };
-        let field = panel.items().get(index)?.fields.first()?.clone();
-        Some(ChooserItem::new(label, help).with_field(field))
+        let composer = panel.composer_spec()?;
+        let field = panel.items().get(composer.entry)?.fields.first()?.clone();
+        Some(ChooserItem::new(composer.label.clone(), composer.help.clone()).with_field(field))
     }
 
     fn composer_submission(&self, composer: &Chooser) -> Option<Submission> {
@@ -224,46 +218,12 @@ impl Entry {
         conductor: Option<&ConductorView>,
     ) -> Model {
         match item.kind {
-            AttentionKind::Question | AttentionKind::Approval => task
-                .runner
-                .as_ref()
-                .and_then(|runner| runner.pending_input.as_ref())
-                .filter(|pending| pending.id == item.waiting_id)
-                .map_or(Model::Missing, |pending| {
-                    let state_of = |attempt: &str| {
-                        positions
-                            .iter()
-                            .find(|position| {
-                                position.action_execution_id.as_deref() == Some(attempt)
-                            })
-                            .map(|position| position.state_id.clone())
-                    };
-                    serde_json::from_value::<PendingHumanInputView>(pending.form.clone())
-                        .map_or(Model::Missing, |form| {
-                            Model::Input(InputPanel::new(&form, &state_of))
-                        })
-                }),
+            AttentionKind::Question | AttentionKind::Approval => {
+                input_panel(item, task, positions).map_or(Model::Missing, Model::Input)
+            }
             AttentionKind::Problem | AttentionKind::EntryLimit => {
-                let pending = task
-                    .runner
-                    .as_ref()
-                    .and_then(|runner| runner.pending_input.as_ref())
-                    .filter(|pending| pending.id == item.waiting_id);
-                match pending {
-                    Some(pending) => {
-                        let state_of = |attempt: &str| {
-                            positions
-                                .iter()
-                                .find(|position| {
-                                    position.action_execution_id.as_deref() == Some(attempt)
-                                })
-                                .map(|position| position.state_id.clone())
-                        };
-                        serde_json::from_value::<PendingHumanInputView>(pending.form.clone())
-                            .map_or(Model::Missing, |form| {
-                                Model::Input(InputPanel::new(&form, &state_of))
-                            })
-                    }
+                match input_panel(item, task, positions) {
+                    Some(panel) => Model::Input(panel),
                     None if task
                         .runner
                         .as_ref()
@@ -445,6 +405,29 @@ pub(super) fn panel_action(id: TaskActionId) -> Option<TaskAction> {
         TaskActionId::Restart => Some(TaskAction::Restart),
         _ => None,
     }
+}
+
+/// The panel of the wait `item` stands for: the definition the server put in
+/// its form. `None` while the server offers no form for the wait.
+fn input_panel(
+    item: &AttentionItem,
+    task: &TaskSummary,
+    positions: &[Position],
+) -> Option<InputPanel> {
+    let state_of = |attempt: &str| {
+        positions
+            .iter()
+            .find(|position| position.action_execution_id.as_deref() == Some(attempt))
+            .map(|position| position.state_id.clone())
+    };
+    let definition = task
+        .panel
+        .as_ref()?
+        .forms
+        .iter()
+        .filter(|form| form.waiting_id.as_deref() == Some(item.waiting_id.as_str()))
+        .find_map(|form| form.definition.as_ref())?;
+    Some(InputPanel::from_definition(definition, &state_of))
 }
 
 /// The entries of the form of the task's own actions.

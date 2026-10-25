@@ -100,6 +100,7 @@ mod tests {
             kind,
             waiting_id: waiting.map(str::to_string),
             choices: Vec::new(),
+            definition: None,
         }
     }
 

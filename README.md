@@ -578,7 +578,10 @@ shows one form at a time — an answer, the free conversation with the agent, an
 action of the workflow, a permission, the entry limit — and `Esc` steps through
 them, also from a field; the first line says which one (`1/2 · Esc przełącza`).
 The server says which form opens first and when there is none (the agent is at
-work). Each form keeps its own draft. The conversation is a text box that grows
+work). It also says what each form of a wait asks — its entries, their fields,
+how the chosen entry becomes the answer and what the notification says after it
+(`narsor_protocol::panel`); the panel only shows that and sends the answer
+back. Each form keeps its own draft. The conversation is a text box that grows
 to half the height of the details; `Ctrl+J` makes a new line, `Enter` asks
 before it sends. Such a panel is not folded by `Esc`; `Tab` leaves it.
 `Space` on the list jumps to the next task that waits, `[` / `]` move between

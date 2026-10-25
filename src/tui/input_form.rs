@@ -1,10 +1,10 @@
 //! The text helpers of the forms and the inputs a workflow declares (the
 //! new-task form), and the reason a request stopped waiting.
 //!
-//! What the answer panel offers for a pending human input moved to
-//! [`crate::tui::task_app::panel`], one directory for each kind of form; its
-//! names are given again here, so a path through `input_form` still leads to
-//! them.
+//! What the answer panel offers for a pending human input is defined by the
+//! server (`narsor_protocol::panel`) and shown by
+//! [`crate::tui::task_app::panel`]; its names are given again here, so a path
+//! through `input_form` still leads to them.
 
 use std::iter::Peekable;
 use std::str::Chars;
@@ -15,14 +15,12 @@ use crate::domain::display::is_invisible_format;
 use crate::tui::chooser::{ChooserField, FieldKind};
 use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView};
 use narsor_protocol::event::{AnsweredBy, EventData, InputCloseReason};
+use narsor_protocol::panel::value_as_text;
 
-pub use crate::tui::task_app::panel::action::{
-    COMMENT_FIELD, EXTRA_VARIABLES_FIELD, MESSAGE_ENTRY,
-};
 pub use crate::tui::task_app::panel::input::{
-    ContextLine, InputKind, InputPanel, Tone, COMMENT_TO_AGENT, MESSAGE_FIELD,
+    ContextLine, InputKind, InputPanel, Tone, COMMENT_FIELD, COMMENT_TO_AGENT,
+    EXTRA_VARIABLES_FIELD, MESSAGE_ENTRY, MESSAGE_FIELD, PATTERN_FIELD,
 };
-pub use crate::tui::task_app::panel::permission::PATTERN_FIELD;
 
 /// How the request an open form answers stopped waiting — someone else's
 /// answer, a transition, an interrupt, a recovery (R5, AE13).
@@ -216,15 +214,6 @@ pub fn cycle_option(options: &[String], current: &str, delta: isize) -> Option<S
         None => options.len() - 1,
     };
     Some(options[next].clone())
-}
-
-/// A proposed value as editable text: a string as itself, anything else as
-/// JSON.
-pub(crate) fn value_as_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
 }
 
 /// Steps `current` by `delta`, wrapping around `length`.

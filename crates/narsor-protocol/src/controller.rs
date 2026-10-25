@@ -1967,9 +1967,15 @@ pub struct PanelForm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_id: Option<String>,
     /// The choices of the form of the task's own actions; empty for a form
-    /// of a wait or the chat, whose content the client builds from the wait.
+    /// of a wait or the chat, whose content is its `definition`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<PanelChoice>,
+    /// What the form of a wait asks and how its answer is delivered: the
+    /// server's definition, which the client shows and does not change. Absent
+    /// for the chat and the form of the task's own actions, and from a server
+    /// from before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<crate::panel::PanelDefinition>,
 }
 
 impl PanelForm {

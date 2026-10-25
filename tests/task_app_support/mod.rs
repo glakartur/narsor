@@ -17,6 +17,7 @@ use narsor_engine::orchestration::{
     derive_task_state, AttentionItem, AttentionKind, ExecutionCursor, QueueReason,
     ResumeExhaustion, ResumeState, RunnerState, TaskEvent, TaskEventKind, TaskState, WorkloadLoss,
 };
+use narsor_protocol::controller::{PanelForm, PanelFormKind, PanelOffer};
 
 pub fn at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 9, 12, 0, 0).unwrap()
@@ -313,6 +314,24 @@ pub fn with_pending(mut task: TaskSummary, form: serde_json::Value) -> TaskSumma
         waiting_id: id,
     });
     task.state = served_state(&task);
+    let definition = stub_definition(&wire_form_of(&task));
+    let kind = match definition.continuation {
+        narsor_protocol::api::InputContinuationView::EntryLimit => PanelFormKind::EntryLimit,
+        narsor_protocol::api::InputContinuationView::ResolvePermission => PanelFormKind::Permission,
+        narsor_protocol::api::InputContinuationView::ResumeAgent
+        | narsor_protocol::api::InputContinuationView::ApproveOutput => PanelFormKind::Answer,
+        _ => PanelFormKind::Action,
+    };
+    let offer = task.panel.get_or_insert_with(|| PanelOffer {
+        forms: Vec::new(),
+        default: Some(0),
+    });
+    offer.forms.push(PanelForm {
+        kind,
+        waiting_id: Some(definition.episode.clone()),
+        choices: Vec::new(),
+        definition: Some(definition),
+    });
     offered(task)
 }
 
@@ -643,4 +662,32 @@ pub fn auto_resumed(
             loss_reason: None,
         },
     )
+}
+
+/// The pending form of the last wait `task` got.
+fn wire_form_of(task: &TaskSummary) -> serde_json::Value {
+    task.runner
+        .as_ref()
+        .and_then(|runner| runner.pending_input.as_ref())
+        .map(|pending| pending.form.clone())
+        .expect("a pending input")
+}
+
+/// The definition the server would send for the wait whose form is `form`:
+/// recorded data of the test (`tests/fixtures/panel_definitions.json`, one
+/// `{form, def}` pair per wait the tests use), so no test needs a server or
+/// the code that builds definitions. A wait without a record has to get one.
+pub fn stub_definition(form: &serde_json::Value) -> narsor_protocol::panel::PanelDefinition {
+    let records: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../fixtures/panel_definitions.json"))
+            .expect("the recorded definitions");
+    let record = records
+        .into_iter()
+        .find(|record| &record["form"] == form)
+        .unwrap_or_else(|| {
+            panic!(
+                "no recorded definition for this wait; add `{{form, def}}` to the fixture:\n{form}"
+            )
+        });
+    serde_json::from_value(record["def"].clone()).expect("a recorded definition")
 }

@@ -1,21 +1,21 @@
 //! The form of the decision on a permission the agent asked for.
 
-#[cfg(test)]
-mod tests;
-
-use super::input::*;
-use crate::tui::chooser::{ChooserField, ChooserItem, Submission};
-use narsor_protocol::api::*;
 use serde_json::Value;
+
+use super::{
+    value_of, Builder, PanelContextLine, PanelEntry, PanelField, PanelPlan, MESSAGE_FIELD,
+};
+use crate::api::{
+    bash_grant_rules, bash_pattern_rule, is_approvable_permission_reason, BashGrantScope,
+    PendingHumanInputView, PermissionDecisionDto, PermissionDecisionKindDto, PermissionDenialView,
+    PermissionGrantScopeDto,
+};
 
 /// The field the operator types a Bash pattern into.
 pub const PATTERN_FIELD: &str = "Wzorzec polecenia";
 
-impl InputPanel {
-    pub(in crate::tui::task_app::panel) fn build_permission_info(
-        &mut self,
-        pending: &PendingHumanInputView,
-    ) {
+impl Builder {
+    pub(super) fn build_permission_info(&mut self, pending: &PendingHumanInputView) {
         let denials = pending
             .permission
             .as_ref()
@@ -29,25 +29,25 @@ impl InputPanel {
         let mut group: Vec<Option<Vec<String>>> = Vec::new();
         for denial in denials {
             let command = denial_command(denial);
-            self.context.push(ContextLine::problem(match command {
+            self.context.push(PanelContextLine::problem(match command {
                 Some(command) => format!("{}: {command}", denial.tool_name),
                 None => format!("{}: {}", denial.tool_name, denial.input),
             }));
             self.context
-                .push(ContextLine::dim(format!("katalog: {}", denial.cwd)));
+                .push(PanelContextLine::dim(format!("katalog: {}", denial.cwd)));
             let rules = |scope| grant_rules(denial, scope);
             let (denial_exact, denial_group) =
                 (rules(BashGrantScope::Exact), rules(BashGrantScope::Group));
             match (&denial_exact, why_not_grantable(denial, resumable)) {
-                (Some(rules), None) => self.context.push(ContextLine::dim(format!(
+                (Some(rules), None) => self.context.push(PanelContextLine::dim(format!(
                     "reguły zgody: {}",
                     rules.join(", ")
                 ))),
                 (_, Some(why)) => {
                     self.context
-                        .push(ContextLine::plain(format!("zgoda niedostępna: {why}")));
+                        .push(PanelContextLine::plain(format!("zgoda niedostępna: {why}")));
                     if let Some(reason) = denial.reason.as_deref() {
-                        self.context.push(ContextLine::dim(reason));
+                        self.context.push(PanelContextLine::dim(reason));
                     }
                 }
                 (None, None) => {}
@@ -75,8 +75,17 @@ impl InputPanel {
                 && is_approvable_permission_reason(denial.reason_type.as_deref())
                 && grant_rules(denial, BashGrantScope::Exact).is_none()
         });
+        let decision = |denial_index, decision, scope| PanelPlan::Permission {
+            decision: PermissionDecisionDto {
+                denial_index,
+                decision,
+                scope,
+                pattern: None,
+                message: None,
+            },
+        };
         self.push(
-            ChooserItem::new(
+            PanelEntry::new(
                 if many { "Odmów wszystkim" } else { "Odmów" },
                 if unpinnable {
                     "Agent wznowi tę sesję i dostanie prośbę, aby polecenia bez reguły \
@@ -85,18 +94,12 @@ impl InputPanel {
                     "Agent wznowi tę sesję z informacją, że te operacje są zablokowane."
                 },
             )
-            .with_field(ChooserField::multiline(MESSAGE_FIELD)),
-            Plan::Permission(PermissionDecisionDto {
-                denial_index: None,
-                decision: PermissionDecisionKindDto::Deny,
-                scope: None,
-                pattern: None,
-                message: None,
-            }),
+            .with_field(PanelField::multiline(MESSAGE_FIELD)),
+            decision(None, PermissionDecisionKindDto::Deny, None),
         );
         if let Some(rules) = all(&exact) {
             self.push(
-                ChooserItem::new(
+                PanelEntry::new(
                     if many {
                         "Zezwól dokładnie na te polecenia"
                     } else {
@@ -108,13 +111,11 @@ impl InputPanel {
                         rules.join(", ")
                     ),
                 ),
-                Plan::Permission(PermissionDecisionDto {
-                    denial_index: None,
-                    decision: PermissionDecisionKindDto::Allow,
-                    scope: Some(PermissionGrantScopeDto::ExactOperation),
-                    pattern: None,
-                    message: None,
-                }),
+                decision(
+                    None,
+                    PermissionDecisionKindDto::Allow,
+                    Some(PermissionGrantScopeDto::ExactOperation),
+                ),
             );
         } else if many {
             // Not every denial can be granted: offer the ones that can.
@@ -123,33 +124,29 @@ impl InputPanel {
                     continue;
                 };
                 self.push(
-                    ChooserItem::new(
+                    PanelEntry::new(
                         format!("Zezwól dokładnie: {command}"),
                         format!("Reguły tylko dla bieżącego tasku: {}", rules.join(", ")),
                     ),
-                    Plan::Permission(PermissionDecisionDto {
-                        denial_index: Some(index),
-                        decision: PermissionDecisionKindDto::Allow,
-                        scope: Some(PermissionGrantScopeDto::ExactOperation),
-                        pattern: None,
-                        message: None,
-                    }),
+                    decision(
+                        Some(index),
+                        PermissionDecisionKindDto::Allow,
+                        Some(PermissionGrantScopeDto::ExactOperation),
+                    ),
                 );
             }
         }
         if let Some(rules) = all(&group).filter(|rules| Some(rules) != all(&exact).as_ref()) {
             self.push(
-                ChooserItem::new(
+                PanelEntry::new(
                     format!("Zezwól na grupę: {}", rules.join(", ")),
                     "Zgoda obejmie te grupy poleceń do końca bieżącego tasku.",
                 ),
-                Plan::Permission(PermissionDecisionDto {
-                    denial_index: None,
-                    decision: PermissionDecisionKindDto::Allow,
-                    scope: Some(PermissionGrantScopeDto::CommandGroup),
-                    pattern: None,
-                    message: None,
-                }),
+                decision(
+                    None,
+                    PermissionDecisionKindDto::Allow,
+                    Some(PermissionGrantScopeDto::CommandGroup),
+                ),
             );
         }
         // The operator's own rule, for what the rules above do not cover:
@@ -162,13 +159,13 @@ impl InputPanel {
         if resumable && patternable {
             let first = denial_command(&denials[0]).unwrap_or_default();
             self.push(
-                ChooserItem::new(
+                PanelEntry::new(
                     "Zezwól według wzorca…",
                     "Wpisz całe polecenie albo jego początek z * na końcu, np. npm run *. \
                      Zgoda obejmie pasujące polecenia Bash do końca bieżącego tasku.",
                 )
                 .with_field(
-                    ChooserField::text(PATTERN_FIELD)
+                    PanelField::text(PATTERN_FIELD)
                         .required()
                         .with_value(first)
                         .described(
@@ -177,41 +174,36 @@ impl InputPanel {
                              polecenie Bash.",
                         ),
                 ),
-                Plan::Permission(PermissionDecisionDto {
-                    denial_index: None,
-                    decision: PermissionDecisionKindDto::Allow,
-                    scope: Some(PermissionGrantScopeDto::Pattern),
-                    pattern: None,
-                    message: None,
-                }),
+                decision(
+                    None,
+                    PermissionDecisionKindDto::Allow,
+                    Some(PermissionGrantScopeDto::Pattern),
+                ),
             );
         }
-    }
-
-    /// The pattern typed for a `pattern` grant, refused when no rule can
-    /// carry it; `None` for every other decision.
-    pub(in crate::tui::task_app::panel) fn permission_pattern(
-        decision: &PermissionDecisionDto,
-        submission: &Submission,
-    ) -> Result<Option<String>, String> {
-        if decision.scope != Some(PermissionGrantScopeDto::Pattern) {
-            return Ok(None);
-        }
-        let pattern = Self::value_of(submission, PATTERN_FIELD)
-            .unwrap_or_default()
-            .trim();
-        if bash_pattern_rule(pattern).is_none() {
-            return Err(
-                "Wzorzec nie może być pusty ani zawierać nawiasów lub znaków sterujących."
-                    .to_string(),
-            );
-        }
-        Ok(Some(pattern.to_string()))
     }
 }
 
+/// The pattern typed for a `pattern` grant, refused when no rule can carry
+/// it; `None` for every other decision.
+pub(super) fn pattern(
+    decision: &PermissionDecisionDto,
+    values: &[(String, String)],
+) -> Result<Option<String>, String> {
+    if decision.scope != Some(PermissionGrantScopeDto::Pattern) {
+        return Ok(None);
+    }
+    let pattern = value_of(values, PATTERN_FIELD).unwrap_or_default().trim();
+    if bash_pattern_rule(pattern).is_none() {
+        return Err(
+            "Wzorzec nie może być pusty ani zawierać nawiasów lub znaków sterujących.".to_string(),
+        );
+    }
+    Ok(Some(pattern.to_string()))
+}
+
 /// The allow rules that would grant `denial` at `scope`, the same the
-/// engine grants ([`narsor_protocol::api::bash_grant_rules`]).
+/// engine grants ([`bash_grant_rules`]).
 fn grant_rules(denial: &PermissionDenialView, scope: BashGrantScope) -> Option<Vec<String>> {
     if denial.tool_name != "Bash" || !is_approvable_permission_reason(denial.reason_type.as_deref())
     {

@@ -7522,11 +7522,16 @@ async fn the_forms_of_a_permission_and_an_entry_limit_name_their_wait() {
         assert_eq!(form.kind, form_kind);
         assert!(form.waiting_id.is_some(), "{continuation}");
         assert!(form.choices.is_empty(), "{continuation}");
+        let definition = form
+            .definition
+            .as_ref()
+            .expect("the server defines the form");
+        assert!(!definition.entries.is_empty(), "{continuation}");
     }
 }
 
 #[tokio::test]
-async fn a_form_of_a_wait_names_the_wait_and_leaves_its_content_to_the_client() {
+async fn a_form_of_a_wait_carries_the_definition_the_server_builds_of_the_wait() {
     let harness = Harness::start().await;
     waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
     let task = harness.task("task-1").await;
@@ -7536,6 +7541,40 @@ async fn a_form_of_a_wait_names_the_wait_and_leaves_its_content_to_the_client() 
     assert_eq!(answer.waiting_id.as_deref(), Some("ep-1"));
     assert!(answer.choices.is_empty());
     assert!(!answer.is_manual_action());
+
+    let definition = answer
+        .definition
+        .as_ref()
+        .expect("the server defines the form");
+    let pending: narsor_protocol::api::PendingHumanInputView = serde_json::from_value(
+        task.runner
+            .as_ref()
+            .and_then(|runner| runner.pending_input.as_ref())
+            .expect("the wait")
+            .form
+            .clone(),
+    )
+    .expect("a pending input");
+    assert_eq!(
+        definition,
+        &narsor_protocol::panel::define(&pending, &|_| None),
+        "the definition is the one `define` makes of the wait"
+    );
+    assert_eq!(definition.entries[0].label, "Odpowiedz agentowi");
+}
+
+#[tokio::test]
+async fn the_chat_and_the_manual_action_carry_no_definition() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+    let task = harness.task("task-1").await;
+    let panel = task.panel.expect("panel");
+    let chat = panel
+        .forms
+        .iter()
+        .find(|form| form.kind == PanelFormKind::Chat)
+        .expect("a chat");
+    assert!(chat.definition.is_none());
 }
 
 #[tokio::test]

@@ -25,6 +25,7 @@ mod tests {
             kind,
             waiting_id: None,
             choices: Vec::new(),
+            definition: None,
         };
         let mut switcher = Switcher::default();
         switcher.sync(&PanelOffer {
