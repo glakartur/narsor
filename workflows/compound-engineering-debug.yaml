@@ -165,7 +165,14 @@ states:
         Talk to the person in the chat window only when a question blocks the work and the code does not settle it. Do not use a tool that asks questions. Ask with an `awaiting_input` answer. Ask one question at a time. The engine runs this step again with the answer, in the same session.
 
         After 3 failed fix attempts, or when the fix needs a change of design, choose `needs_diagnosis_revision` and put what you found in `diagnosis_blocker`. Say which hypothesis the evidence ruled out. The diagnosis goes back to its author.
+        Set `review_findings` and `review_decisions` to an empty text in your answer, whatever you choose: a new fix starts a new code review.
     variables:
+      - name: review_findings
+        description: >-
+          Set it to an empty text: a new fix starts a new code review.
+      - name: review_decisions
+        description: >-
+          Set it to an empty text: a new fix starts a new code review.
       - name: test_baseline
         description: concise result of checks run before the fix, including pre-existing failures or “all passed”.
       - name: diagnosis_blocker
@@ -191,47 +198,62 @@ states:
 
   code_review:
     description: >
-      ce-code-review in report mode. Every change of code passes here before
-      it is verified and published.
+      ce-code-review in headless mode. Every change of code passes here before
+      it is verified and published. The agent asks the person in the chat
+      window about the findings that need a decision.
     action:
       type: agent
       prompt: |
-        Run the `ce-code-review` skill with these arguments: mode:agent
+        Run the `ce-code-review` skill with these arguments: mode:headless
 
         This change is a bug fix. The diagnosis it must follow:
         {{ context.diagnosis }}
+
+        Before you run the skill, run `git add -N .` so that the review sees new files.
+
+        The skill applies the safe fixes itself and returns the other findings with the fields `autofix_class`, `owner` and `suggested_fix`. Sort each finding that is left in this way:
+        - A finding that is `pre_existing` or `advisory`, or has `owner: release`, is only reported. Put it in `reason`. It is not a finding and not a question.
+        - A finding with `owner: human`, with `autofix_class: gated_auto`, or one that needs a trade-off or a change of behaviour, is a question.
+        - A `manual` finding with `owner: downstream-resolver`, with or without `suggested_fix`, is a finding for the author of the fix.
+        - A finding with no `owner` field is a question.
+
+        Decisions the person already made (empty at first). Each entry has a number D<n>, a file, a symbol or region of code, the point of the problem, the decision (`popraw` or `zostaw`) and a short reason:
+        {{ context.review_decisions }}
+
+        Match a finding to a decision by the file and the point of the problem. Do not match by line number or by title. When you are not sure that a finding matches, treat it as new.
+        - A finding that matches a decision `zostaw` is not reported again. It is not a finding and not a question.
+        - A finding that matches a decision `popraw`: check whether the code now does what the decision says. If it does not, report it as a finding for the author of the fix. Never as a question.
+
+        The skill never asks the person. You ask, with an `awaiting_input` answer, after the skill has finished. Do not use a tool that asks questions. Ask one question for each finding that is a question, one at a time, and put the recommended option first in `options`. Then stop and wait: the engine runs this step again with the answer, in the same session. Do not answer a question for the person.
+
+        Order of work. When at least one finding is for the author of the fix, do not ask yet: the questions wait for the next review, after the fixes. Choose `findings`, put the findings in `review_findings`, and name in `reason` the questions that wait. When no finding is for the author and at least one question is left, ask the questions. Write every decision of the person into `review_decisions`: copy every earlier entry without a change and add the new entries at the end, with the next numbers D<n>. For each decision `popraw`, add the change that is needed to `review_findings`, with file, line and the fix, and choose `findings`. When the person declined every question, choose `clean`. When nothing is left, choose `clean`.
+        Set `review_findings` to an empty text when you choose `clean`.
+    variables:
+      - name: review_findings
+        description: >-
+          the findings the author of the fix fixes, each with file, line,
+          problem and suggested fix. An empty text when there are none.
+      - name: review_decisions
+        description: >-
+          the whole list of decisions: every earlier entry unchanged and the
+          new entries at the end. Each entry has a number D<n>, a file, a symbol
+          or region of code, the point of the problem, the decision (`popraw`
+          or `zostaw`) and a short reason.
     choices:
       - label: clean
-        description: no actionable findings survived the confidence gate.
+        description: no finding is left for the author and the person has no open question.
       - label: findings
-        description: findings need fixes before the code is verified and published.
+        description: at least one finding or decision `popraw` needs a change by the author of the fix.
+        requires_variables: [review_findings]
     transitions:
       clean: verify_work
-      findings: fix_findings
+      findings: fix_revision
     timeout: 1h
     max_entries: 10
     retry_policy:
       max_attempts: 2
       backoff: 1m
 
-  fix_findings:
-    description: Address the code-review findings; the review then runs again.
-    action:
-      type: agent
-      prompt: |
-        Fix these findings from the code review. Do not perform an independent review of the diff; only address the listed actionable work.
-
-        {{ steps.code_review.reply }}
-
-        Test baseline captured before implementation:
-        {{ context.test_baseline }}
-        Preserve this baseline: do not repair pre-existing failures or investigate them as part of this fix.
-    choices:
-      - label: fixed
-        description: the findings are addressed; review the code again.
-    transitions:
-      fixed: code_review
-    timeout: 1h
 
   verify_work:
     description: >
@@ -375,21 +397,34 @@ states:
 
   fix_revision:
     description: >
-      Make the changes the person asked for at the fix gate. They go through
-      code review, verification and publication again.
+      Make the changes the person asked for at the fix gate, and fix the
+      findings of the code review. They go through code review, verification
+      and publication again.
     action:
       type: agent
       prompt: |
         Make the changes requested in review of the bug fix. Keep the fix minimal. Write a test first for any change of behavior.
 
-        Requested changes:
+        Requested changes (empty when there are none):
         {{ context.fix_feedback }}
+
+        Fix these findings from the code review (empty when there are none). Do not perform an independent review of the diff; only address the listed work:
+        {{ context.review_findings }}
 
         Diagnosis of the bug: {{ context.diagnosis }}
         Test baseline captured before the fix:
         {{ context.test_baseline }}
         Preserve this baseline: do not repair pre-existing failures or investigate them as part of this fix.
         Do not commit, push or open a merge request in this step.
+
+        Set `fix_feedback` and `review_findings` to an empty text in your answer: this pass has taken them into account.
+    variables:
+      - name: fix_feedback
+        description: >-
+          Set it to an empty text: this pass has taken it into account.
+      - name: review_findings
+        description: >-
+          Set it to an empty text: this pass has taken it into account.
     choices:
       - label: revised
         description: the requested changes are made and the checks pass.

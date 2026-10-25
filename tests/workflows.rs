@@ -1573,7 +1573,11 @@ async fn abandon_at_the_questions_gate_cancels_the_run() {
 /// write them copy the earlier entries.
 #[test]
 fn the_review_prompts_carry_the_decision_rules() {
-    for file in ["compound-engineering.yaml"] {
+    for file in [
+        "compound-engineering.yaml",
+        "compound-engineering-chat.yaml",
+        "compound-engineering-debug.yaml",
+    ] {
         let definition = shipped(file);
         let prompt = built_prompt(&definition.states["code_review"]);
         assert!(prompt.contains("mode:headless"), "{file}: {prompt}");
@@ -1643,6 +1647,204 @@ async fn a_revision_at_the_work_gate_resumes_work_revision_and_clears_what_it_re
         execution.context.variables.get("review_findings"),
         Some(&json!(""))
     );
+}
+
+/// A `code_review` answer that stops to ask the person in the chat window.
+fn review_question() -> Value {
+    json!({
+        "status": "awaiting_input",
+        "question": "src/subscribe.rs:10 the limit is a trade-off. Keep 5?",
+        "options": ["keep 5 (recommended)", "raise to 10"],
+    })
+}
+
+fn answer_to_review_question() -> Answer {
+    Answer::new("code_review", &[("answer", "keep 5")])
+}
+
+/// Covers F3: in `-chat` the review asks in the session, the decision is
+/// written down, and a declined finding ends the review as clean.
+#[tokio::test]
+async fn covers_f3_chat_asks_in_the_session_and_a_declined_finding_is_clean() {
+    let replies = [
+        up_to_code_review(),
+        vec![
+            review_question(), // 11. code_review
+            // 12. code_review, resumed with the answer
+            reply_with(
+                "clean",
+                json!({ "variables": {
+                    "review_decisions": REVIEW_DECISIONS,
+                    "review_findings": "",
+                } }),
+            ),
+            published(), // 13. publish_work
+        ],
+    ]
+    .concat();
+    let run = CompoundRun::of("compound-engineering-chat.yaml", &replies);
+    let gates = [gates_before_work(), vec![answer_to_review_question()]].concat();
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(&execution.id, "code_review", "clean", "verify_work"));
+    assert_eq!(run.pending(&execution.id).state_id, "review_work");
+    let resumed = run.prompt(12);
+    assert!(
+        resumed.contains("--resume\n--%ARG%--\nfake-session-1\n"),
+        "the same session continues: {resumed}"
+    );
+    assert!(resumed.contains("keep 5"), "{resumed}");
+    assert_eq!(
+        execution.context.variables.get("review_decisions"),
+        Some(&json!(REVIEW_DECISIONS))
+    );
+}
+
+/// In `-chat` a decision `popraw` sends the change to the author, and the
+/// review that follows reads the decision.
+#[tokio::test]
+async fn chat_a_decision_to_fix_goes_to_the_author_and_the_next_review_reads_it() {
+    let replies = [
+        up_to_code_review(),
+        vec![
+            review_question(), // 11. code_review
+            // 12. code_review, resumed
+            reply_with(
+                "findings",
+                json!({ "variables": {
+                    "review_decisions": REVIEW_DECISIONS,
+                    "review_findings": REVIEW_FINDINGS,
+                } }),
+            ),
+            reply("revised"), // 13. work_revision
+            reply("clean"),   // 14. code_review
+            published(),      // 15. publish_work
+        ],
+    ]
+    .concat();
+    let run = CompoundRun::of("compound-engineering-chat.yaml", &replies);
+    let gates = [gates_before_work(), vec![answer_to_review_question()]].concat();
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(&execution.id, "code_review", "findings", "work_revision"));
+    assert!(run.took(&execution.id, "work_revision", "revised", "code_review"));
+    assert!(run.prompt(13).contains(REVIEW_FINDINGS));
+    assert!(run.prompt(14).contains(REVIEW_DECISIONS));
+    assert_eq!(run.pending(&execution.id).state_id, "review_work");
+}
+
+fn diagnosed() -> Value {
+    reply_with(
+        "diagnosed",
+        json!({ "variables": { "diagnosis": "the subscription is never removed" } }),
+    )
+}
+
+fn fixed() -> Value {
+    reply_with(
+        "fixed",
+        json!({ "variables": { "test_baseline": "all relevant checks passed before the fix" } }),
+    )
+}
+
+fn diagnosis_gate() -> Answer {
+    Answer::new("review_diagnosis", &[("diagnosis_decision", "fix")])
+}
+
+/// In `-debug` the findings go to `fix_revision`, and a revision at the fix
+/// gate resumes that same session and clears what it read.
+#[tokio::test]
+async fn debug_findings_go_to_fix_revision_and_a_revision_clears_what_it_read() {
+    let comment = "name the test after the bug";
+    let replies = [
+        diagnosed(),       // 1. diagnose
+        fixed(),           // 2. fix
+        review_findings(), // 3. code_review
+        reply("revised"),  // 4. fix_revision, the first time
+        reply("clean"),    // 5. code_review
+        published(),       // 6. publish_fix
+        // 7. fix_revision, resumed
+        reply_with(
+            "revised",
+            json!({ "variables": { "fix_feedback": "", "review_findings": "" } }),
+        ),
+        reply("clean"), // 8. code_review
+        published(),    // 9. publish_fix
+    ]
+    .to_vec();
+    let run = CompoundRun::of("compound-engineering-debug.yaml", &replies);
+    let gates = vec![
+        diagnosis_gate(),
+        Answer::new(
+            "review_fix",
+            &[("fix_decision", "revise"), ("fix_feedback", comment)],
+        ),
+    ];
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(&execution.id, "code_review", "findings", "fix_revision"));
+    assert!(run.took(&execution.id, "fix_revision", "revised", "code_review"));
+    assert!(run.prompt(4).contains(REVIEW_FINDINGS));
+    let resumed = run.prompt(7);
+    assert!(
+        resumed.contains("--resume\n--%ARG%--\nfake-session-1\n"),
+        "{resumed}"
+    );
+    assert!(resumed.contains(comment), "{resumed}");
+    assert_eq!(
+        execution.context.variables.get("fix_feedback"),
+        Some(&json!(""))
+    );
+    assert_eq!(
+        execution.context.variables.get("review_findings"),
+        Some(&json!(""))
+    );
+    assert_eq!(run.pending(&execution.id).state_id, "review_fix");
+}
+
+/// Covers F3 for `-debug`: the question is asked in the session.
+#[tokio::test]
+async fn debug_asks_in_the_session_and_a_declined_finding_is_clean() {
+    let replies = [
+        diagnosed(),
+        fixed(),
+        review_question(), // 3. code_review
+        reply_with(
+            "clean",
+            json!({ "variables": { "review_decisions": REVIEW_DECISIONS, "review_findings": "" } }),
+        ), // 4. code_review, resumed
+        published(),       // 5. publish_fix
+    ]
+    .to_vec();
+    let run = CompoundRun::of("compound-engineering-debug.yaml", &replies);
+    let gates = vec![diagnosis_gate(), answer_to_review_question()];
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(&execution.id, "code_review", "clean", "verify_work"));
+    assert_eq!(run.pending(&execution.id).state_id, "review_fix");
+}
+
+/// The chat and debug graphs have no `fix_findings` and no `questions` label.
+#[test]
+fn chat_and_debug_have_no_fix_findings_and_no_questions_label() {
+    for file in [
+        "compound-engineering-chat.yaml",
+        "compound-engineering-debug.yaml",
+    ] {
+        let definition = shipped(file);
+        assert!(!definition.states.contains_key("fix_findings"), "{file}");
+        assert!(
+            !definition.states["code_review"]
+                .choices
+                .iter()
+                .any(|choice| choice.label == "questions"),
+            "{file}"
+        );
+    }
 }
 
 /// The graph of `workflows/compound-engineering.yaml` as the plan draws it:
