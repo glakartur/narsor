@@ -34,11 +34,12 @@ Kontrakt wyjścia (`crates/narsor-engine/src/engine/actions/agent.rs`, `output_c
 ### Key Decisions
 
 - **`code_review` działa w `mode:headless`.** Skill sam stosuje poprawki `safe_auto` i zwraca resztę w strukturze z polami `autofix_class`, `owner` i `suggested_fix`. Skill w tym trybie nigdy nie pyta. Poprawki `safe_auto` przy wyniku `clean` idą do `verify_work` bez ponownego review. To akceptowalne, bo te poprawki są lokalne, a `verify_work` uruchamia testy. (session-settled: user-directed)
-- **`fix_findings` znika.** Każda zmiana kodu po implementacji przechodzi przez krok autora implementacji: `work_revision` (w `-debug`: `fix_revision`). Ten krok czyta uwagi z bramki (`work_feedback`) i z review (`review_findings`). Nie `work`, bo `work` mierzy `test_baseline` od nowa, a jego wybór `implemented` prowadzi do `simplify`, który ma działać tylko raz. (session-settled: user-directed)
+- **`fix_findings` znika.** Każda zmiana kodu po implementacji przechodzi przez krok autora implementacji: `work_revision` (w `-debug`: `fix_revision`). Ten krok czyta uwagi z bramki (`work_feedback`, w `-debug`: `fix_feedback` z bramki `review_fix`) i z review (`review_findings`). Nie `work`, bo `work` mierzy `test_baseline` od nowa, a jego wybór `implemented` prowadzi do `simplify`, który ma działać tylko raz. (session-settled: user-directed)
 - **Findingi do poprawy wygrywają z pytaniami.** Gdy review ma oba rodzaje, wybiera `findings`. Pytania padają dopiero wtedy, gdy zostały tylko findingi do decyzji. Agent pracuje, a człowiek zajmuje się czymś innym. Potem człowiek decyduje raz, na kodzie bez znanych drobnych problemów. (session-settled: user-directed)
 - **Pamięć decyzji jest w narsorze.** Zmienna `review_decisions` zawiera każdą decyzję: finding, decyzję i krótki powód. `code_review` czyta tylko tę zmienną. PR jest tylko interfejsem komunikacji. (session-settled: user-directed)
 - **Wariant bez `-chat` pyta w PR.** Kod i pytania trafiają do PR zaraz po review, jako komentarze inline przy liniach findingów. Bramka `answer_questions` nie ma `accept`, bo kod nie przeszedł jeszcze `verify_work`. Krok `collect_answers` czyta odpowiedzi tylko z wątków zapisanych w `review_questions`. (session-settled: user-directed)
 - **Warianty `-chat` i `-debug` pytają w sesji.** `code_review` po zakończeniu skilla zadaje pytania przez `awaiting_input`, po jednym findingu, z rekomendowaną opcją jako pierwszą. Dopytanie nie jest wyborem wyjścia. (session-settled: user-directed)
+- **Wpis decyzji ma stały identyfikator i klucz dopasowania.** Każda decyzja ma numer (`D1`, `D2`, …), plik, symbol lub region kodu, istotę problemu, decyzję (`popraw` albo `zostaw`) i krótki powód. Krok, który dopisuje decyzje, kopiuje poprzednie wpisy bez zmian i dopisuje nowe na końcu. `code_review` dopasowuje finding do decyzji po pliku i istocie problemu, nie po numerze linii ani tytule. Gdy nie ma pewności, traktuje finding jako nowy.
 - **Workflow nie wspomina `StructuredOutput`.** Workflow używa słownika kontraktu narsora (`awaiting_input`). Adapter harnessu dopisuje do kontraktu sposób dostarczenia odpowiedzi. Robi to tylko `claude-code`. `codex` i `opencode` nie dopisują nic. (session-settled: user-directed)
 
 ### Requirements
@@ -46,17 +47,17 @@ Kontrakt wyjścia (`crates/narsor-engine/src/engine/actions/agent.rs`, `output_c
 - R1. `code_review` we wszystkich trzech workflow uruchamia `ce-code-review` z `mode:headless`.
 - R2. W żadnym z trzech workflow nie ma stanu `fix_findings`.
 - R3. `code_review` wybiera `findings`, gdy jest co najmniej jeden finding, który agent może poprawić bez decyzji człowieka. Wtedy przekazuje go w `review_findings` do kroku autora implementacji.
-- R4. `code_review` nie zgłasza ponownie findingu, który jest w `review_decisions`.
+- R4. `code_review` nie zgłasza ponownie findingu, który ma w `review_decisions` decyzję `zostaw`. Dla decyzji `popraw` sprawdza, czy kod ją realizuje. Gdy nie realizuje, zgłasza finding w `review_findings`, a nie jako pytanie.
 - R5. Wariant bez `-chat`: gdy zostały tylko findingi do decyzji, `code_review` wybiera `questions`. Kod i pytania trafiają do PR, a proces czeka na bramce `answer_questions` z wyborami `answered` i `abandon`.
-- R6. Wariant bez `-chat`: `collect_answers` dopisuje odpowiedzi do `review_decisions`. Gdy któraś decyzja wymaga zmiany kodu, wybiera `changes_needed` i prowadzi do `work_revision`. Gdy człowiek odrzucił wszystkie, wybiera `all_declined` i prowadzi do `verify_work`. Gdy brakuje odpowiedzi, wybiera `unanswered` i wraca do `answer_questions`.
+- R6. Wariant bez `-chat`: `collect_answers` dopisuje odpowiedzi do `review_decisions`. Gdy któraś decyzja wymaga zmiany kodu, wybiera `changes_needed` i prowadzi do `work_revision`. Gdy człowiek odrzucił wszystkie, wybiera `all_declined` i prowadzi do `verify_work`. Gdy brakuje odpowiedzi na którekolwiek pytanie, wybiera `unanswered` i wraca do `answer_questions`, nawet gdy inne decyzje wymagają zmiany. `changes_needed` i `all_declined` są możliwe tylko przy komplecie odpowiedzi.
 - R7. Warianty `-chat` i `-debug`: `code_review` pyta w sesji przez `awaiting_input`, dopisuje decyzje do `review_decisions` i wybiera `findings` (są zmiany do zrobienia) albo `clean` (człowiek odrzucił wszystko).
 - R8. Krok autora implementacji czyta `work_feedback` i `review_findings` i czyści oba w swojej odpowiedzi. `work` czyści `review_findings` i `review_decisions`, gdy wraca do implementacji po rewizji planu.
-- R9. Kontrakt wyjścia w `claude-code` mówi, że odpowiedź i pytanie `awaiting_input` przechodzą przez `StructuredOutput`, a pytanie zadane zwykłym tekstem nie dociera do człowieka. Kontrakt w innych harnessach się nie zmienia.
+- R9. Kontrakt wyjścia w `claude-code` mówi, że odpowiedź i pytanie `awaiting_input` przechodzą przez `StructuredOutput`, a pytanie zadane zwykłym tekstem nie dociera do człowieka. Inne harnessy nie dostają tej notki. Zdanie z R10 obowiązuje we wszystkich harnessach.
 - R10. Kontrakt wyjścia mówi, że decyzja, której agent nie może podjąć sam, jest pytaniem do człowieka.
 
 ### Key Flows
 
-- F1. **Bez `-chat`, findingi i pytania.** `code_review` zgłasza 2 findingi do poprawy i 1 do decyzji → `findings` → `work_revision` → `code_review` zgłasza tylko 1 do decyzji → `questions` → `publish_questions` (push, komentarz inline) → `answer_questions` → człowiek odpowiada w wątku i wybiera `answered` → `collect_answers` → `changes_needed` → `work_revision` → `code_review` (finding jest w `review_decisions`, nie wraca) → `clean` → `verify_work` → `publish_work` → `review_work`.
+- F1. **Bez `-chat`, findingi i pytania.** `code_review` zgłasza 2 findingi do poprawy i 1 do decyzji → `findings` → `work_revision` → `code_review` zgłasza tylko 1 do decyzji → `questions` → `publish_questions` (push, komentarz inline) → `answer_questions` → człowiek odpowiada w wątku i wybiera `answered` → `collect_answers` → `changes_needed` → `work_revision` → `code_review` (finding ma decyzję `popraw` i kod ją realizuje, więc nie wraca) → `clean` → `verify_work` → `publish_work` → `review_work`.
 - F2. **Bez `-chat`, wszystko odrzucone.** … → `collect_answers` → `all_declined` → `verify_work` → `publish_work` → `review_work`.
 - F3. **`-chat`, pytanie w sesji.** `code_review` kończy skill, ma 1 finding do decyzji → `awaiting_input` → człowiek odpowiada w oknie rozmowy → ta sama sesja dopisuje decyzję → `findings` (gdy człowiek chce zmiany) albo `clean`.
 
@@ -70,22 +71,28 @@ Kontrakt wyjścia (`crates/narsor-engine/src/engine/actions/agent.rs`, `output_c
 ### Scope Boundaries
 
 - Tylko trzy workflow compound: `compound-engineering.yaml`, `compound-engineering-chat.yaml`, `compound-engineering-debug.yaml`. Inne workflow (np. `open-mercato-sdlc.yaml`) się nie zmieniają.
-- Silnik nie dostaje nowych mechanizmów grafu (np. kontynuacji sesji przy przejściu agent → agent). Zmiana silnika to tylko notka adaptera.
+- Silnik nie dostaje nowych mechanizmów grafu (np. kontynuacji sesji przy przejściu agent → agent). Zmiana silnika to notka adaptera oraz jedno wspólne zdanie o decyzjach w `output_contract` (R10).
+- Dyrygent (`crates/narsor-engine/src/conductor/prompt.rs`) ma własny `answer_contract` i nie używa `output_contract` ani `awaiting_input`. U1 go nie zmienia.
 - Nie zmieniamy skilli compound-engineering.
 
 ### Deferred to Follow-Up Work
 
 - **Sygnał diagnostyczny „pytanie poza kontraktem”.** Silnik dodaje element techniczny do rozmowy, gdy po `[structured-output-enforce]` przyszła zwykła etykieta, a ostatni tekst agenta kończył się pytajnikiem. To heurystyka. Ma pokazać, czy notka z U1 wystarcza.
 - **Obniżenie `max_entries` w `code_review`.** Po tej zmianie długie pętle powinny zniknąć. Limit 10 zostaje, dopóki nie ma danych z prawdziwych zadań.
+- **Błąd skilla w trybie headless.** Gdy skill zwraca `Review failed (headless mode)` albo `Code review degraded`, `code_review` nie ma pasującego wyboru. Na razie agent zgłasza to jako błąd akcji, a działa `retry_policy`. Osobny wybór i bramka są do decyzji później.
+- **Rozwiązywanie wątków `[narsor:decyzja]`.** Czy proces ma rozwiązywać wątki po `collect_answers` albo po scaleniu PR.
 - **Token `mode:pipeline` w `ce-resolve-pr-feedback`.** Workflow go używa, a w skillu 3.8.2 nie znalazłem tego tokenu w sekcji Mode Detection. Do sprawdzenia osobno.
 
 ### Dependencies / Assumptions
 
 - `ce-code-review` 3.8.2 w `mode:headless` zwraca findingi z polami `autofix_class` i `owner` (`SKILL.md`, sekcja Headless mode rules).
-- `ExecutionContext::update_variables` nadpisuje cały klucz (`crates/narsor-engine/src/domain/context.rs`). Krok, który dopisuje decyzje, dostaje w prompcie poprzednią wartość i zwraca całą listę.
+- `Context::update_variables` nadpisuje cały klucz (`crates/narsor-engine/src/domain/context.rs`). Krok, który dopisuje decyzje, dostaje w prompcie poprzednią wartość i zwraca całą listę. Pusty string też się zapisuje, więc czyszczenie zmiennej działa (test `blockers_reach_the_author_of_the_stage_and_do_not_come_back`). Czyszczenie zależy jednak od tego, czy model zwróci pole, bo kontrakt mówi, że zmienne są opcjonalne.
+- Zmienną, której krok nie definiuje, silnik odkłada do `additional_data` (`set_aside_undeclared_variables`). Każdy krok, który zapisuje `review_decisions`, `review_findings`, `pending_questions` albo `review_questions`, musi je zdefiniować.
+- Walidator nie zabrania definiowania tej samej zmiennej w kilku stanach (precedens: `pr_url`). `requires_variables` wskazuje zmienne zdefiniowane w tym samym stanie.
 - Zmienne trafiają do kontekstu dopiero po odpowiedzi końcowej, nie po `awaiting_input`. W trakcie sesji agent pamięta odpowiedzi sam.
 - Reprompt (`reprompt_config`, `OUTPUT_REPROMPT`) przechodzi przez `AgentExecutor::run`, który skleja prompt z `output_contract`. Notka z U1 trafi więc też do repromptu.
-- `finalize` działa z `workspace_access: read-only` i używa `gh`/`glab`. `collect_answers` może użyć tego samego wzorca.
+- `finalize` działa z domyślnym dostępem `read-write`, a zakaz zmian jest tylko w prompcie. `workspace_access: read-only` daje w `claude-code` `--permission-mode plan`, które może blokować `gh` i `glab`. `collect_answers` używa wzorca `finalize`, czyli bez `workspace_access`.
+- `ce-code-review` w `mode:headless` przegląda tylko pliki śledzone. Nieśledzone pliki są tylko w Coverage.
 
 ---
 
@@ -95,9 +102,15 @@ Kontrakt wyjścia (`crates/narsor-engine/src/engine/actions/agent.rs`, `output_c
 
 - **KTD1. Notka jako metoda traitu `HarnessAdapter` z domyślnym `None`.** `AgentExecutor::run` zna adapter przed złożeniem promptu (`crates/narsor-engine/src/engine/actions/agent.rs`, `run`). `output_contract` dostaje notkę jako dodatkowy argument i dopisuje ją na końcu. Wiedza o `StructuredOutput` zostaje w adapterze `claude-code`, obok `--json-schema`.
 - **KTD2. Zdanie o decyzjach w kontrakcie jest wspólne dla wszystkich harnessów (R10).** To reguła kontraktu narsora, a nie sposób dostarczenia. Kontrakt ma zostać krótki (komentarz nad `output_contract`), więc dodajemy jedno zdanie.
-- **KTD3. Zmienne czyści krok, który je czyta.** To ten sam wzorzec co `plan_blocker` i `requirements_blocker` (`workflows/README.md`). `work_revision` deklaruje `work_feedback` i `review_findings` i zwraca je puste.
+- **KTD3. Zmienne czyści krok, który je czyta.** To ten sam wzorzec co `plan_blocker` i `requirements_blocker` (`workflows/README.md`). `work_revision` deklaruje `work_feedback` i `review_findings` i zwraca je puste. Uwaga: `revise` na `review_work` (i `review_fix` w `-debug`) ma `resume_comment_field`. Silnik wznawia wtedy ostatnią sesję kroku autora i wysyła tylko komentarz, bez szablonu promptu. Ta sesja może pochodzić z rundy findingów. Testy sprawdzają więc wznowienie sesji i wyczyszczony kontekst, a nie treść promptu.
+- **KTD6. Jedna reguła podziału findingów, ta sama w U2, U3 i U4.** Według pól z koperty headless:
+  - `pre_existing`, `advisory` i `owner: release`: tylko raport.
+  - `owner: human`, `gated_auto` i każdy kompromis: pytanie.
+  - `manual` z `owner: downstream-resolver`, z `suggested_fix` albo bez: `review_findings`.
+  - Finding bez pola `owner`: pytanie (bezpieczniejsza droga).
+  Przy wyborze `findings` `reason` wymienia też findingi, które czekają na decyzję. Wtedy bramka limitu wejść je pokazuje. Przed skillem `code_review` oznacza nowe pliki przez `git add -N`, aby review je widział.
 - **KTD4. `publish_questions` to osobny krok, a nie wariant `publish_work`.** `publish_work` prowadzi do `review_work`, gdzie `accept` przechodzi do `compound`. Kod z pytaniami nie przeszedł `verify_work`, więc nie może trafić na tę bramkę. Komentarze inline trzeba publikować po pushu, bo muszą wskazywać commit na serwerze.
-- **KTD5. Pytania w PR mają znacznik.** Komentarz zaczyna się od `[narsor:decyzja]`. `collect_answers` czyta wątki po identyfikatorach z `review_questions`, a znacznik pomaga człowiekowi odróżnić pytanie procesu od zwykłego komentarza.
+- **KTD5. Pytania w PR mają numerowany znacznik.** Komentarz zaczyna się od `[narsor:decyzja Q<n>]`. `review_questions` zapisuje numer, identyfikator wątku, finding i `file:line`. `collect_answers` czyta odpowiedź z wątku inline. Gdy pytanie jest komentarzem ogólnym (GitHub nie ma wtedy wątku), czyta późniejszy komentarz, który cytuje `Q<n>`. Komentarz ogólny mówi człowiekowi, jak odpowiedzieć.
 
 ### High-Level Technical Design
 
@@ -123,7 +136,7 @@ W wariantach `-chat` i `-debug` nie ma gałęzi `questions`. `code_review` pyta 
 
 ### System-Wide Impact
 
-- **Wszystkie kroki agenta w `claude-code`** dostają notkę o `StructuredOutput`. To zmienia prompt każdego kroku, także w workflow spoza compound. Ma to poprawić dopytanie w `work`, `plan` i krokach `check_*_feedback`.
+- **Wszystkie kroki agenta** dostają zdanie o decyzjach (R10), a w `claude-code` także notkę o `StructuredOutput`. To zmienia prompt każdego kroku, także w workflow spoza compound (np. `open-mercato-sdlc.yaml`). Ta zmiana jest zamierzona. Ma to poprawić dopytanie w `work`, `plan` i krokach `check_*_feedback`.
 - **Zadania w toku.** Zadanie, które stoi w `fix_findings` albo ma go w historii, może się nie wznowić po aktualizacji workflow. README już ma ostrzeżenie dla takich zmian; trzeba je rozszerzyć.
 
 ### Risks and Mitigation
@@ -132,10 +145,13 @@ W wariantach `-chat` i `-debug` nie ma gałęzi `questions`. `code_review` pyta 
 - **Komentarz inline nie trafia w linię.** Linia z findingu może nie należeć do diffu PR. Mitygacja: `publish_questions` publikuje wtedy komentarz ogólny w PR ze znacznikiem, `file:line` i tym samym zapisem w `review_questions`.
 - **GitHub i GitLab mają różne API komentarzy.** Mitygacja: prompt mówi, którego narzędzia użyć dla którego hosta, tak jak `finalize`.
 - **Człowiek odpowiada tylko na część pytań.** `collect_answers` wybiera `unanswered` i podaje w `reason`, których odpowiedzi brakuje. Bramka pokazuje ten powód.
+- **Model gubi wpis przy przepisywaniu `review_decisions`.** Mitygacja: stałe numery `D<n>` i instrukcja „kopiuj poprzednie wpisy bez zmian”. Test sprawdza, że prompt kroku zawiera poprzednią wartość i tę instrukcję.
+- **Wspólny licznik wejść.** `max_entries` `code_review` liczy wszystkie wejścia w zadaniu, także rundy po pytaniach i po `revise`. README opisuje to wprost.
+- **Retry w `-chat` po `awaiting_input`.** Gdy krok przekroczy czas albo zadziała `retry_policy`, nowa sesja nie zna odpowiedzi z poprzedniej. Człowiek może dostać to samo pytanie drugi raz. Ryzyko jest akceptowane.
 
 ### Sequencing
 
-U1 jest niezależne od reszty. U2, U3 i U4 dotyczą osobnych plików i mogą iść w dowolnej kolejności. U5 jest ostatnie.
+U1 jest niezależne od reszty. U2 i U3 nie zależą od siebie, ale oba zmieniają `tests/workflows.rs`. U4 idzie po U3. Kolejność wdrażania: U1, U2, U3, U4, U5.
 
 ---
 
@@ -160,7 +176,7 @@ U1 jest niezależne od reszty. U2, U3 i U4 dotyczą osobnych plików i mogą iś
 - Trait dostaje metodę z domyślną implementacją, która zwraca brak notki. `claude-code` zwraca notkę: odpowiedź i każde pytanie `awaiting_input` przechodzą przez narzędzie `StructuredOutput`; pytanie zadane zwykłym tekstem nie dociera do człowieka.
 - `output_contract` przyjmuje opcjonalną notkę i dopisuje ją po zdaniu o `awaiting_input`.
 - Zdanie o decyzjach (R10) jest częścią wspólnego tekstu: kompromis, zmiana zachowania albo pytanie, które skill zadałby narzędziem do pytań, to pytanie do człowieka; nie używaj narzędzia do pytań.
-- Wszystkie miejsca, które wołają `output_contract`, przekazują notkę adaptera. Dyrygent (`crates/narsor-engine/src/conductor/prompt.rs`) też składa prompt dla harnessu ze schematem; sprawdzić, czy używa tego samego kontraktu.
+- Wszystkie miejsca, które wołają `output_contract`, przekazują notkę adaptera. Kompilator wskaże wywołania w `tests/workflows.rs` (`built_prompt`), `tests/builtin_workflows.rs` i `tests/actions_agent.rs`.
 
 **Patterns to follow:** `stream_parser` i `invocation` w `HarnessAdapter`; testy tekstu kontraktu w `agent.rs`.
 
@@ -170,7 +186,7 @@ U1 jest niezależne od reszty. U2, U3 i U4 dotyczą osobnych plików i mogą iś
 - Happy path: kontrakt bez notki zawiera zdanie o decyzjach (R10).
 - Integration: `AgentExecutor::run` z adapterem testowym, który zwraca notkę, przekazuje harnessowi prompt z tą notką. Reprompt tego samego kroku też ją zawiera.
 
-**Verification:** prompt kroku w nagraniu lub w teście `claude-code` ma notkę, a w `codex` nie ma.
+**Verification:** prompt kroku w teście `claude-code` ma notkę, a w `codex` nie ma. Przed U3 i U4: ręczny test na prawdziwym CLI `claude` z `--json-schema` i promptem, który wymusza pytanie. Oczekiwany wynik: krok czeka na odpowiedź z treścią pytania i nie kończy się etykietą po `[structured-output-enforce]`. Wynik trafia do `docs/solutions/`. Gdy test nie przechodzi, działa warunek stopu z Goal Capsule.
 
 ### U2. `compound-engineering.yaml`: pętla review z pytaniami w PR
 
@@ -185,10 +201,10 @@ U1 jest niezależne od reszty. U2, U3 i U4 dotyczą osobnych plików i mogą iś
 - `tests/workflows.rs`
 
 **Approach:**
-- `code_review`: `mode:headless plan:…`. Prompt mówi, jak podzielić findingi: `safe_auto` stosuje skill; `manual` z `suggested_fix` i `owner: downstream-resolver` to `review_findings`; `gated_auto`, `owner: human` i kompromisy to pytania; `advisory` tylko w raporcie. Prompt podaje `{{ context.review_decisions }}` i zakazuje zgłaszać ponownie te findingi. Kolejność wyboru: `findings` (wymaga `review_findings`) przed `questions` (wymaga `pending_questions`: finding, `file:line`, pytanie, opcje z rekomendacją jako pierwszą; `publish_questions` czyta tę zmienną) przed `clean`. `max_entries: 10` zostaje.
-- `publish_questions` (nowy, agent): push przez `ce-commit-push-pr mode:pipeline babysit:off`, jak `publish_work`; potem po jednym komentarzu inline na pytanie, ze znacznikiem `[narsor:decyzja]`, opcjami i rekomendacją; notka w opisie PR, że kod czeka na decyzje. Zwraca `pr_url` i `review_questions` (identyfikator wątku, finding, `file:line`, pytanie). Wybór `published` → `answer_questions`.
+- `code_review`: `mode:headless plan:…`. Prompt dzieli findingi według KTD6 i stosuje R4 do `{{ context.review_decisions }}` z kluczem dopasowania z Key Decisions. Opis kolejności wyborów nie może być listą punktowaną etykiet w backtickach, bo test `no_agent_prompt_carries_a_manual_label_list` tego zabrania. Kolejność wyboru: `findings` (wymaga `review_findings`) przed `questions` (wymaga `pending_questions`: finding, `file:line`, pytanie, opcje z rekomendacją jako pierwszą; `publish_questions` czyta tę zmienną) przed `clean`. `max_entries: 10` zostaje.
+- `publish_questions` (nowy, agent): push przez `ce-commit-push-pr mode:pipeline babysit:off`, jak `publish_work`; potem po jednym komentarzu inline na pytanie, ze znacznikiem `[narsor:decyzja Q<n>]` (KTD5), opcjami i rekomendacją; gdy linii findingu nie ma w diffie PR, komentarz ogólny z tym samym znacznikiem, `file:line` i instrukcją odpowiedzi; notka w opisie PR, że kod czeka na decyzje. Zwraca `pr_url` i `review_questions` (identyfikator wątku, finding, `file:line`, pytanie). Wybór `published` → `answer_questions`.
 - `answer_questions` (nowa bramka `human`): select `answered` / `abandon`. Bez `accept`.
-- `collect_answers` (nowy, agent, `workspace_access: read-only`): czyta wątki z `review_questions`, dopisuje decyzje do `review_decisions` (dostaje poprzednią wartość w prompcie, zwraca całą listę), dla decyzji „popraw” składa `review_findings`. Wybory `changes_needed` → `work_revision`, `all_declined` → `verify_work`, `unanswered` → `answer_questions`.
+- `collect_answers` (nowy, agent, bez `workspace_access`, z zakazem zmian plików i innych wywołań hosta niż odczyt w prompcie, jak `finalize`): czyta odpowiedzi według KTD5, dopisuje decyzje do `review_decisions` (dostaje poprzednią wartość w prompcie, kopiuje wpisy bez zmian, dopisuje nowe z numerem `D<n>`), stosuje pierwszeństwo `unanswered` z R6, dla decyzji „popraw” składa `review_findings`. Wybory `changes_needed` → `work_revision`, `all_declined` → `verify_work`, `unanswered` → `answer_questions`.
 - `work_revision`: czyta `work_feedback` i `review_findings`, deklaruje oba jako swoje zmienne i zwraca je puste (KTD3).
 - `work`: deklaruje `review_findings` i `review_decisions` i zwraca je puste.
 - Usunąć `fix_findings`.
@@ -203,7 +219,10 @@ U1 jest niezależne od reszty. U2, U3 i U4 dotyczą osobnych plików i mogą iś
 - Edge: `collect_answers` `unanswered` wraca do `answer_questions`.
 - Edge: `abandon` na `answer_questions` kończy w `cancelled`.
 - Covers AE1. Prompt `code_review` zbudowany po `collect_answers` zawiera wartość `review_decisions`.
-- Integration: `work_revision` po `revise` na `review_work` nie dostaje starych `review_findings` (zostały wyczyszczone przy poprzednim przejściu).
+- Integration: po `revise` na `review_work` silnik wznawia sesję `work_revision` (KTD3), a kontekst po odpowiedzi tego kroku ma puste `review_findings` i `work_feedback`.
+- Covers R4. Decyzja `popraw` w `review_decisions` nie blokuje wyboru `findings` dla tego samego findingu (prompt `code_review` zawiera regułę R4).
+- Prompt `collect_answers` zawiera poprzednią wartość `review_decisions` i instrukcję kopiowania wpisów bez zmian.
+- Edge: `collect_answers` przy jednej odpowiedzi `popraw` i jednym braku odpowiedzi wybiera `unanswered`.
 - Istniejące testy grafu (`a_terminal_is_reachable_from_every_state`, `every_human_gate_offers_a_select_over_exactly_its_outputs`, `every_agent_state_has_a_time_limit`) przechodzą bez zmian w testach.
 
 **Verification:** walidator przyjmuje workflow bez naruszeń, a przebiegi F1 i F2 kończą się w oczekiwanych krokach.
@@ -221,9 +240,10 @@ U1 jest niezależne od reszty. U2, U3 i U4 dotyczą osobnych plików i mogą iś
 - `tests/workflows.rs`
 
 **Approach:**
-- `code_review`: `mode:headless plan:…`, ten sam podział findingów co w U2. Po skillu, gdy nie ma findingów do poprawy, a są findingi do decyzji: pytania przez `awaiting_input`, jedno na finding, rekomendowana opcja jako pierwsza. Gdy są findingi do poprawy, pytania czekają na następną rundę (Key Decisions). Decyzje trafiają do `review_decisions`; decyzje „popraw” do `review_findings`. Wybory: `findings` → `work_revision`, `clean` → `verify_work`.
+- `code_review`: `mode:headless plan:…`, podział findingów według KTD6, R4 jak w U2. Prompt zawiera `{{ context.review_decisions }}` i instrukcję kopiowania wpisów bez zmian. `code_review` definiuje `review_decisions` i `review_findings`. Po skillu, gdy nie ma findingów do poprawy, a są findingi do decyzji: pytania przez `awaiting_input`, jedno na finding, rekomendowana opcja jako pierwsza. Gdy są findingi do poprawy, pytania czekają na następną rundę (Key Decisions). Decyzje trafiają do `review_decisions`; decyzje „popraw” do `review_findings`. Wybory: `findings` → `work_revision`, `clean` → `verify_work`.
 - Słownik pytań taki jak w `brainstorm` i `plan` tego pliku. Bez nazwy `StructuredOutput`.
 - `work_revision` i `work` jak w U2. Usunąć `fix_findings`.
+- Testy: `CompoundRun::new` w `tests/workflows.rs` dziś zawsze ładuje `compound-engineering.yaml`. Trzeba go sparametryzować plikiem workflow i dodać sekwencje odpowiedzi dla etapów `-chat` i `-debug` przed `code_review`. Fake harness zwraca `session_id`, a `run_to_terminal` obsługuje pauzę agenta.
 
 **Patterns to follow:** prompty `brainstorm` i `plan` w tym pliku (kontrakt rozmowy).
 
@@ -254,7 +274,7 @@ U1 jest niezależne od reszty. U2, U3 i U4 dotyczą osobnych plików i mogą iś
 
 **Test scenarios:**
 - Happy path: `code_review` `findings` → `fix_revision` → `code_review`.
-- Edge: `fix_revision` po `revise` na `review_fix` nie dostaje starych `review_findings`.
+- Integration: po `revise` na `review_fix` silnik wznawia sesję `fix_revision`, a kontekst po odpowiedzi ma puste `review_findings` i `fix_feedback`.
 
 **Verification:** walidator przyjmuje workflow, a test przebiegu przechodzi.
 
@@ -274,6 +294,7 @@ U1 jest niezależne od reszty. U2, U3 i U4 dotyczą osobnych plików i mogą iś
 - README, sekcja Implementation: nowa pętla, kolejność findingów przed pytaniami, `review_decisions`, pytania w PR (bez `-chat`) i w sesji (`-chat`, `-debug`), bramka `answer_questions` bez `accept`. Usunąć zdanie o `fix_findings` i `{{ steps.code_review.reply }}`.
 - README, sekcja Chat variants: notka adaptera i to, że workflow używa tylko `awaiting_input`.
 - README: ostrzeżenie o zadaniach w toku rozszerzone o `fix_findings`.
+- README, Loop limits: licznik `code_review` liczy wszystkie wejścia w zadaniu, także rundy po pytaniach i po `revise`.
 - Diagram: usunąć węzeł „Poprawki z review”, dodać `publish_questions`, `answer_questions`, `collect_answers` i krawędzie z U2.
 
 **Test expectation:** none — dokumentacja.
