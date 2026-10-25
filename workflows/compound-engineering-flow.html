@@ -76,7 +76,7 @@
   </header>
   <main>
     <div class="canvas" role="region" aria-label="Diagram przepływu workflow; na wąskim ekranie można przewijać poziomo" tabindex="0">
-      <svg viewBox="0 0 1160 2730" role="img" aria-labelledby="diagram-title diagram-desc">
+      <svg viewBox="0 0 1480 2730" role="img" aria-labelledby="diagram-title diagram-desc">
         <title id="diagram-title">Diagram compound-engineering</title>
         <desc id="diagram-desc">Pięć etapów: wymagania, plan, implementacja, wiedza i zakończenie. Każdy etap publikuje zmiany do tego samego Draft MR i czeka na bramkę przeglądu. Bramka sprawdza komentarze na MR, akceptuje etap od razu albo wraca do autora. Zakończenie tylko zdejmuje Draft z MR; MR scala człowiek.</desc>
         <defs>
@@ -125,8 +125,13 @@
         <path class="edge" d="M550 1762V1802"/>
         <path class="edge" d="M425 1232H240V690H425"/>
         <path class="edge" d="M425 1722H270V698H425"/>
-        <path class="edge" d="M675 1420H775"/>
-        <path class="edge" d="M775 1446H675"/>
+        <path class="edge" d="M675 1438H1140V1744H1025"/>
+        <path class="edge" d="M650 1402V1380H1230V1402"/>
+        <path class="edge" d="M1340 1462V1502"/>
+        <path class="edge" d="M1340 1562V1602"/>
+        <path class="edge" d="M1230 1640H1180V1720H1025"/>
+        <path class="edge" d="M1230 1618H1205V1540H1230"/>
+        <path class="edge" d="M1450 1632H1470V1350H710V1532H675"/>
         <path class="edge" d="M675 1532H775"/>
         <path class="edge" d="M1025 1532H1080V1408H675"/>
         <path class="edge" d="M675 1732H775"/>
@@ -224,7 +229,9 @@
         <g class="node agent"><rect x="425" y="1202" width="250" height="60"/><text class="title" x="550" y="1229">Implementacja</text><text class="sub" x="550" y="1248">work · ce-work</text></g>
         <g class="node agent"><rect x="425" y="1302" width="250" height="60"/><text class="title" x="550" y="1329">Uproszczenie</text><text class="sub" x="550" y="1348">simplify · ce-simplify-code</text></g>
         <g class="node agent"><rect x="425" y="1402" width="250" height="60"/><text class="title" x="550" y="1429">Code review</text><text class="sub" x="550" y="1448">code_review · max 10</text></g>
-        <g class="node agent"><rect x="775" y="1402" width="250" height="60"/><text class="title" x="900" y="1429">Poprawki z review</text><text class="sub" x="900" y="1448">fix_findings</text></g>
+        <g class="node agent"><rect x="1230" y="1402" width="220" height="60"/><text class="title" x="1340" y="1429">Pytania w MR</text><text class="sub" x="1340" y="1448">publish_questions</text></g>
+        <g class="node human"><rect x="1230" y="1502" width="220" height="60"/><text class="title" x="1340" y="1529">Decyzje człowieka</text><text class="sub" x="1340" y="1548">answer_questions</text></g>
+        <g class="node agent"><rect x="1230" y="1602" width="220" height="60"/><text class="title" x="1340" y="1629">Odczyt odpowiedzi</text><text class="sub" x="1340" y="1648">collect_answers</text></g>
         <g class="node script"><rect x="425" y="1502" width="250" height="60"/><text class="title" x="550" y="1529">Sprawdzenie</text><text class="sub" x="550" y="1548">verify_work · scripts/verify.sh</text></g>
         <g class="node agent"><rect x="775" y="1502" width="250" height="60"/><text class="title" x="900" y="1529">Naprawa sprawdzenia</text><text class="sub" x="900" y="1548">repair_verification · max 5</text></g>
         <g class="node agent"><rect x="425" y="1602" width="250" height="60"/><text class="title" x="550" y="1629">Publikacja</text><text class="sub" x="550" y="1648">publish_work · przepisuje opis MR</text></g>
@@ -245,7 +252,7 @@
     </div>
     <section class="notes" aria-label="Opis głównych pętli">
       <article class="note"><h2>Wymagania i plan</h2><p>Review poprawia dokument i podsumowuje uwagi. Wynik nie czeka na bramkę: publikacja dodaje podsumowanie do MR jako komentarz, a człowiek czyta je przy bramce. Brainstorm nie zadaje pytań. Założenia i pytania otwarte są w dokumencie, a człowiek odpowiada w MR. Dla małej i oczywistej zmiany agent może pominąć review wymagań (<code>requirements_ready</code>) i podać powód w MR. Pierwsza publikacja tworzy Draft MR. Po <code>check_feedback</code> agent ocenia skalę poprawek z uwag: mała wraca do bramki, duża do review. <code>accept</code> pomija sprawdzenie uwag. Blokada planu wraca do autora wymagań.</p></article>
-      <article class="note"><h2>Implementacja</h2><p>Uproszczenie działa raz. Każda późniejsza zmiana kodu przechodzi przez code review, sprawdzenie i publikację, zanim wróci do człowieka. Publikacja kodu przepisuje opis MR, aby opisywał całą zmianę. Blokada implementacji wraca do autora planu. Pętle napraw mają limity wejść.</p></article>
+      <article class="note"><h2>Implementacja</h2><p>Uproszczenie działa raz. Każda późniejsza zmiana kodu przechodzi przez code review, sprawdzenie i publikację, zanim wróci do człowieka. Code review działa w trybie <code>headless</code>. Findingi do poprawy idą zawsze pierwsze, do kroku <code>work_revision</code>. Pytania do człowieka padają dopiero wtedy, gdy zostały tylko findingi do decyzji: kod i pytania trafiają do MR (<code>publish_questions</code>), człowiek odpowiada w wątkach i wybiera <code>answered</code> (<code>answer_questions</code>), a <code>collect_answers</code> zapisuje decyzje w <code>review_decisions</code>. Review nie zgłasza ponownie findingu z decyzją „zostaw”. Gdy człowiek odrzucił wszystko, kod idzie do <code>verify_work</code>. Publikacja kodu przepisuje opis MR, aby opisywał całą zmianę. Blokada implementacji wraca do autora planu. Pętle napraw mają limity wejść.</p></article>
       <article class="note"><h2>Wiedza i zakończenie</h2><p>Bez nowej wiedzy proces idzie od razu do zakończenia. Agent tylko zdejmuje Draft z MR: nie zatwierdza MR, nie włącza scalenia automatycznego i nie czeka na pipeline. MR scala człowiek. Gdy agent nie potwierdzi zdjęcia Draftu (<code>blocked</code> lub <code>timeout</code>), proces staje na bramce <code>finalize_blocked</code>. <code>retry</code> uruchamia <code>finalize</code> ponownie. <code>confirm_failure</code> kończy proces w <code>finalize_failed</code> z powodem w historii.</p></article>
     </section>
     <footer>Diagram oparty na <code>workflows/compound-engineering.yaml</code>. Na wąskim ekranie przewiń diagram poziomo.</footer>
