@@ -7,7 +7,11 @@ use super::switcher::Switcher;
 /// Always there, with one form too: the operator learns the key and the count
 /// from the same place.
 pub fn position_hint(switcher: &Switcher) -> String {
-    format!("{}/{} · Esc przełącza", switcher.position() + 1, switcher.len())
+    format!(
+        "{}/{} · Esc przełącza",
+        switcher.position() + 1,
+        switcher.len()
+    )
 }
 
 #[cfg(test)]

@@ -173,7 +173,10 @@ mod tests {
             ],
             Some(0),
         ));
-        assert_eq!(switcher.active().map(|key| key.kind), Some(PanelFormKind::Chat));
+        assert_eq!(
+            switcher.active().map(|key| key.kind),
+            Some(PanelFormKind::Chat)
+        );
         // The agent asks a question: the answer is the new default.
         switcher.sync(&offer(
             vec![
@@ -183,10 +186,16 @@ mod tests {
             ],
             Some(0),
         ));
-        assert_eq!(switcher.active().map(|key| key.kind), Some(PanelFormKind::Answer));
+        assert_eq!(
+            switcher.active().map(|key| key.kind),
+            Some(PanelFormKind::Answer)
+        );
         // And the chat is one `Esc` away.
         switcher.next();
-        assert_eq!(switcher.active().map(|key| key.kind), Some(PanelFormKind::Chat));
+        assert_eq!(
+            switcher.active().map(|key| key.kind),
+            Some(PanelFormKind::Chat)
+        );
     }
 
     #[test]

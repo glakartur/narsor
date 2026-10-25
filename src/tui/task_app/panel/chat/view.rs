@@ -52,10 +52,7 @@ impl Chat {
         .areas(area);
         let line = match &self.error {
             Some(error) => Line::styled(format!("✗ {}", one_line(error)), styles.of(Role::Problem)),
-            None => Line::styled(
-                "Ctrl+J nowa linia · Enter wysyła",
-                styles.of(Role::Done),
-            ),
+            None => Line::styled("Ctrl+J nowa linia · Enter wysyła", styles.of(Role::Done)),
         };
         frame.render_widget(Paragraph::new(line), notice);
         chooser::render_fields(frame, text_box, &self.chooser, styles, focused);

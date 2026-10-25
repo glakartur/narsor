@@ -7421,20 +7421,20 @@ async fn the_options_of_the_agent_are_the_choices_of_the_answer() {
 }
 
 #[tokio::test]
-async fn a_pause_opens_on_the_chat_and_keeps_the_action_second() {
+async fn a_pause_opens_on_the_chat_alone() {
     let harness = Harness::start().await;
     let running = harness.running("task-1", "k8s").await;
     pause(&harness, &running).await;
 
     let task = harness.task("task-1").await;
     let (kinds, default) = panel_kinds(&task);
-    assert_eq!(kinds, [PanelFormKind::Chat, PanelFormKind::Action]);
+    assert_eq!(kinds, [PanelFormKind::Chat]);
     assert_eq!(default, Some(PanelFormKind::Chat));
     assert_chat_follows_comment(&task);
 }
 
 #[tokio::test]
-async fn a_finished_task_has_only_the_action_and_it_is_the_default() {
+async fn a_finished_task_has_no_form() {
     let harness = Harness::start().await;
     let running = harness.running("task-1", "k8s").await;
     running
@@ -7458,9 +7458,7 @@ async fn a_finished_task_has_only_the_action_and_it_is_the_default() {
         .expect("paused");
 
     let task = harness.task("task-1").await;
-    let (kinds, default) = panel_kinds(&task);
-    assert_eq!(kinds, [PanelFormKind::Action]);
-    assert_eq!(default, Some(PanelFormKind::Action));
+    assert_eq!(task.panel, Some(PanelOffer::default()));
     assert_chat_follows_comment(&task);
 }
 

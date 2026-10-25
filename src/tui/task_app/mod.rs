@@ -100,9 +100,9 @@ pub mod limit;
 pub mod list;
 pub mod new_task;
 pub mod notify;
+pub mod panel;
 pub mod repositories;
 pub mod tabs;
-pub mod panel;
 pub mod waiting;
 
 use std::collections::{BTreeMap, HashMap};

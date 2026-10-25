@@ -59,7 +59,10 @@ use crate::controller_protocol::{
 use narsor_protocol::api::{
     HumanInputDeliveryDto, PendingHumanInputView, Position, PositionStatus,
 };
-use narsor_protocol::controller::{AttentionItem, AttentionKind, OperatorCommand, OwnerCommand};
+use narsor_protocol::controller::{
+    AttentionItem, AttentionKind, OperatorCommand, OwnerCommand, PanelForm, PanelFormKind,
+    PanelOffer, TaskActionId,
+};
 
 use super::super::chooser::{
     self, Chooser, ChooserAction, ChooserField, ChooserFocus, ChooserItem, Submission,
@@ -70,11 +73,14 @@ use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::scroll::{wrap_line, ScrollState};
 use super::super::style::{Role, Styles};
-use super::actions::{write_to_agent_item, written_text, COMMENT_FIELD};
+use super::actions::{write_to_agent_item, written_text, TaskAction, COMMENT_FIELD};
 use super::background::{DetailJob, JobKey, Outcome};
 use super::detail::short_age;
 use super::list::title_of;
 use super::notify::Severity;
+use super::panel::chat::{Chat, ChatEffect};
+use super::panel::header::position_hint;
+use super::panel::switcher::{FormKey, Switcher};
 use super::tabs::conductor;
 use super::{failure_reason, idempotency_key, Request, TaskApp};
 
@@ -294,6 +300,9 @@ struct Entry {
     wrote: bool,
     /// The answer was sent: the typed text is not a draft any more.
     sent: bool,
+    /// The entry is a form of the server's panel: the message to the agent
+    /// is the chat form's, so the list has no action 0.
+    forms: bool,
 }
 
 impl Entry {
@@ -304,12 +313,13 @@ impl Entry {
         task: &TaskSummary,
         positions: &[Position],
         conductor: Option<&ConductorView>,
+        forms: bool,
     ) -> Self {
         let model = Self::model(item, task, positions, conductor);
-        let chooser = Chooser::new(Self::items_of(&model, task))
+        let chooser = Chooser::new(Self::items_of(&model, task, forms))
             .enter_fields_on_activate()
             .confirming_submit()
-            .selecting(model.selected() + 1);
+            .selecting(model.selected() + usize::from(!forms));
         let composer = model.composer_item().map(|item| {
             Chooser::new(vec![item])
                 .with_inputs_layout()
@@ -325,13 +335,23 @@ impl Entry {
             key: None,
             wrote: false,
             sent: false,
+            forms,
         }
+    }
+
+    /// Where the model's entries start in the chooser: after action 0, when
+    /// there is one.
+    fn offset(&self) -> usize {
+        usize::from(!self.forms)
     }
 
     /// The entries of the chooser: action 0, then what the waiting offers.
     /// Action 0 is the field of the composer when the waiting has one (Z3),
     /// and has its own field when it has none.
-    fn items_of(model: &Model, task: &TaskSummary) -> Vec<ChooserItem> {
+    fn items_of(model: &Model, task: &TaskSummary, forms: bool) -> Vec<ChooserItem> {
+        if forms {
+            return model.items();
+        }
         let mut items = vec![write_to_agent_item(task, !model.has_composer())];
         items.extend(model.items());
         items
@@ -436,9 +456,9 @@ impl Entry {
             .map(|item| item.label.clone());
         let untouched = chooser.focus() == ChooserFocus::Actions
             && chooser.selected_item().map(|item| &item.label) == opening.as_ref();
-        let rebuilt = chooser.rebuilt(Self::items_of(&model, task));
+        let rebuilt = chooser.rebuilt(Self::items_of(&model, task, self.forms));
         self.chooser = if untouched {
-            rebuilt.selecting(model.selected() + 1)
+            rebuilt.selecting(model.selected() + self.offset())
         } else {
             rebuilt
         };
@@ -557,6 +577,48 @@ impl Entry {
     }
 }
 
+/// The offer of the server's forms that serves as the panel of `task`: not
+/// when the server did not say, and not when the task waits on one of the
+/// owner's own panels (a proposal of the conductor, a failed step, a failed
+/// provisioning, a problem of the runner), which keep theirs.
+fn form_offer(task: &TaskSummary) -> Option<&PanelOffer> {
+    let own_panel = task.attention.iter().any(|item| {
+        matches!(
+            item.kind,
+            AttentionKind::ConductorProposal
+                | AttentionKind::FailedStep
+                | AttentionKind::ProvisioningFailed
+        )
+    }) || task
+        .runner
+        .as_ref()
+        .is_some_and(|runner| runner.problem.is_some());
+    task.panel.as_ref().filter(|_| !own_panel)
+}
+
+/// The action of the menu a choice of the task's own actions does.
+fn panel_action(id: TaskActionId) -> Option<TaskAction> {
+    match id {
+        TaskActionId::Transition => Some(TaskAction::Transition),
+        TaskActionId::Resume | TaskActionId::Pause => Some(TaskAction::PauseResume),
+        TaskActionId::Restart => Some(TaskAction::Restart),
+        _ => None,
+    }
+}
+
+/// The entries of the form of the task's own actions.
+fn manual_items(form: &PanelForm) -> Vec<ChooserItem> {
+    form.choices
+        .iter()
+        .map(|choice| {
+            ChooserItem::new(
+                choice.label.clone(),
+                choice.description.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
 /// What a waiting left behind when it went away with a draft.
 ///
 /// The entry itself is kept: should the same waiting come back — a task
@@ -588,6 +650,8 @@ pub enum PanelEffect {
     Confirm(Submission),
     /// Action 0 with its text: send it to the agent.
     Comment(String),
+    /// The chosen action of the workflow form: the application does it.
+    Action(TaskActionId),
 }
 
 /// What a read of the panel's entries changed.
@@ -610,12 +674,123 @@ pub struct WaitingPanel {
     conductor_revision: Option<u64>,
     /// When a read told "the reader is starting" is asked again (D63).
     conductor_retry_at: Option<std::time::Instant>,
+    /// The forms of the server's panel and the one shown; `None` for a task
+    /// whose server did not say (a server from before the field) or whose
+    /// wait is one of the owner's own panels.
+    forms: Option<Forms>,
+    /// The free message to the agent: one draft per task.
+    chat: Chat,
+    /// The height of the details the panel was last asked about: the chat
+    /// box grows to half of it (R16).
+    details_height: std::cell::Cell<u16>,
+}
+
+/// The forms the server offered, and which is shown.
+#[derive(Debug, Clone)]
+struct Forms {
+    offer: PanelOffer,
+    switcher: Switcher,
+    /// The choices of the form of the task's own actions.
+    manual: Option<Chooser>,
+}
+
+/// Where the form shown keeps its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// An entry of the waiting panel (an answer, a permission, an entry
+    /// limit, the output of a step), by its index.
+    Entry(usize),
+    /// The free message to the agent.
+    Chat,
+    /// The choices of the task's own actions.
+    Manual,
+    /// Nothing is shown.
+    Nothing,
 }
 
 impl WaitingPanel {
-    /// Whether there is anything to show: a waiting or a draft left behind.
+    /// Whether there is anything to show: a waiting, a form of the server's
+    /// panel, or a draft left behind.
     pub fn is_present(&self) -> bool {
-        !self.entries.is_empty() || !self.released.is_empty()
+        match &self.forms {
+            Some(forms) => {
+                !forms.switcher.is_empty()
+                    || !self.released.is_empty()
+                    || !self.chat.draft_text().is_empty()
+            }
+            None => !self.entries.is_empty() || !self.released.is_empty(),
+        }
+    }
+
+    /// Where the form shown keeps its state.
+    fn slot(&self) -> Slot {
+        let Some(forms) = &self.forms else {
+            return if self.current < self.entries.len() {
+                Slot::Entry(self.current)
+            } else {
+                Slot::Nothing
+            };
+        };
+        match forms.switcher.active() {
+            None => Slot::Nothing,
+            Some(key) if key.kind == PanelFormKind::Chat => Slot::Chat,
+            Some(FormKey {
+                waiting_id: Some(id),
+                ..
+            }) => self
+                .entries
+                .iter()
+                .position(|entry| entry.item.waiting_id == *id)
+                .map_or(Slot::Nothing, Slot::Entry),
+            Some(_) => Slot::Manual,
+        }
+    }
+
+    fn current_entry(&self) -> Option<&Entry> {
+        match self.slot() {
+            Slot::Entry(index) => self.entries.get(index),
+            _ => None,
+        }
+    }
+
+    /// Where the entries of the chooser of the shown form start in its
+    /// list: after action 0, when there is one.
+    pub fn chooser_offset(&self) -> usize {
+        self.current_entry().map_or(1, Entry::offset)
+    }
+
+    /// Says on the form shown what a try to send it found wrong.
+    pub fn fail(&mut self, message: String) {
+        match self.slot() {
+            Slot::Entry(index) => self.entries[index].error = Some(message),
+            Slot::Chat => self.chat.settle(Err((message, true))),
+            Slot::Manual | Slot::Nothing => {}
+        }
+    }
+
+    /// Whether the server's forms are the panel (not the entries of a
+    /// server that did not say, nor the owner's own panels).
+    pub fn is_form_panel(&self) -> bool {
+        self.forms.is_some()
+    }
+
+    /// The kind of the form shown, in the server's panel.
+    pub fn active_form(&self) -> Option<PanelFormKind> {
+        self.forms
+            .as_ref()?
+            .switcher
+            .active()
+            .map(|key| key.kind)
+    }
+
+    /// How many forms the server's panel has.
+    pub fn form_count(&self) -> usize {
+        self.forms.as_ref().map_or(0, |forms| forms.switcher.len())
+    }
+
+    /// What the operator wrote in the chat form and has not sent.
+    pub fn chat_draft(&self) -> String {
+        self.chat.draft_text()
     }
 
     /// How many things wait.
@@ -647,19 +822,22 @@ impl WaitingPanel {
 
     /// The chooser of the waiting shown.
     pub fn chooser(&self) -> Option<&Chooser> {
-        self.entries.get(self.current).map(|entry| &entry.chooser)
+        self.current_entry().map(|entry| &entry.chooser)
     }
 
     /// The separate text composer for an ordinary answer or conversation reply.
     pub fn composer(&self) -> Option<&Chooser> {
-        self.entries.get(self.current)?.composer.as_ref()
+        self.current_entry()?.composer.as_ref()
     }
 
     /// What the last send of the waiting shown found wrong.
     pub fn error(&self) -> Option<&str> {
-        self.entries
-            .get(self.current)
-            .and_then(|entry| entry.error.as_deref())
+        match self.slot() {
+            Slot::Chat => self.chat.error(),
+            _ => self
+                .current_entry()
+                .and_then(|entry| entry.error.as_deref()),
+        }
     }
 
     /// The drafts of waitings that went away.
@@ -670,17 +848,25 @@ impl WaitingPanel {
     /// Whether the form of the current entry waits for the confirmation of
     /// its send: only the popup's keys act then.
     pub fn is_confirming(&self) -> bool {
-        self.entries.get(self.current).is_some_and(|entry| {
-            entry.chooser.is_confirming()
-                || entry.composer.as_ref().is_some_and(Chooser::is_confirming)
-        })
+        match self.slot() {
+            Slot::Chat => self.chat.is_confirming(),
+            Slot::Manual => false,
+            _ => self.current_entry().is_some_and(|entry| {
+                entry.chooser.is_confirming()
+                    || entry.composer.as_ref().is_some_and(Chooser::is_confirming)
+            }),
+        }
     }
 
     /// Whether keys are typed into a field: `q` and `?` are text then.
     pub fn is_typing(&self) -> bool {
-        self.entries.get(self.current).is_some_and(|entry| {
-            entry.chooser.is_typing() || entry.composer.as_ref().is_some_and(Chooser::is_typing)
-        })
+        match self.slot() {
+            Slot::Chat => self.chat.is_typing(),
+            Slot::Manual => false,
+            _ => self.current_entry().is_some_and(|entry| {
+                entry.chooser.is_typing() || entry.composer.as_ref().is_some_and(Chooser::is_typing)
+            }),
+        }
     }
 
     /// Unfolds the panel.
@@ -698,6 +884,12 @@ impl WaitingPanel {
             .map(Entry::draft_text)
             .collect();
         parts.extend(self.released.iter().map(|released| released.text.clone()));
+        if self.forms.is_some() {
+            let chat = self.chat.draft_text();
+            if !chat.is_empty() {
+                parts.push(chat);
+            }
+        }
         parts.join("\n")
     }
 
@@ -773,13 +965,24 @@ impl WaitingPanel {
     pub fn sync(&mut self, task: &TaskSummary, positions: &[Position]) -> SyncEffect {
         let mut effect = SyncEffect::default();
         let shown = self.current_waiting_id().map(str::to_string);
+        let before = self.active_key();
+        let offer = form_offer(task);
+        let forms_mode = offer.is_some();
         let mut old = std::mem::take(&mut self.entries);
         let mut entries = Vec::with_capacity(task.attention.len());
-        for item in &task.attention {
-            match old
-                .iter()
-                .position(|entry| entry.item.waiting_id == item.waiting_id)
-            {
+        // With the server's forms, only the waits a form answers have an entry.
+        let wanted = task.attention.iter().filter(|item| {
+            offer.is_none_or(|offer| {
+                offer
+                    .forms
+                    .iter()
+                    .any(|form| form.waiting_id.as_deref() == Some(item.waiting_id.as_str()))
+            })
+        });
+        for item in wanted {
+            match old.iter().position(|entry| {
+                entry.item.waiting_id == item.waiting_id && entry.forms == forms_mode
+            }) {
                 Some(index) => {
                     let mut entry = old.remove(index);
                     if matches!(entry.model, Model::Missing) {
@@ -791,7 +994,10 @@ impl WaitingPanel {
                     let parked = self
                         .released
                         .iter()
-                        .position(|released| released.waiting_id == item.waiting_id)
+                        .position(|released| {
+                            released.waiting_id == item.waiting_id
+                                && released.entry.forms == forms_mode
+                        })
                         .map(|index| self.released.remove(index));
                     let entry = match parked {
                         Some(released) => {
@@ -807,7 +1013,9 @@ impl WaitingPanel {
                             }
                             entry
                         }
-                        None => Entry::build(item, task, positions, self.conductor.as_ref()),
+                        None => {
+                            Entry::build(item, task, positions, self.conductor.as_ref(), forms_mode)
+                        }
                     };
                     entries.push(entry);
                 }
@@ -842,13 +1050,79 @@ impl WaitingPanel {
                     .position(|entry| entry.item.waiting_id == id)
             })
             .unwrap_or(0);
+        match offer {
+            Some(offer) => {
+                self.sync_forms(offer);
+                if let Slot::Entry(index) = self.slot() {
+                    self.current = index;
+                }
+                if self.active_key() != before {
+                    self.leave_all();
+                    self.arrive();
+                }
+            }
+            None => self.forms = None,
+        }
         effect
+    }
+
+    /// Takes the server's offer in: which forms there are, which is shown,
+    /// and the choices of the form of the task's own actions.
+    fn sync_forms(&mut self, offer: &PanelOffer) {
+        let mut forms = self.forms.take().unwrap_or_else(|| Forms {
+            offer: PanelOffer::default(),
+            switcher: Switcher::default(),
+            manual: None,
+        });
+        forms.switcher.sync(offer);
+        forms.manual = offer
+            .forms
+            .iter()
+            .find(|form| form.kind == PanelFormKind::Action && form.waiting_id.is_none())
+            .map(|form| {
+                let items = manual_items(form);
+                match forms.manual.take() {
+                    Some(chooser) => chooser.rebuilt(items),
+                    None => Chooser::new(items),
+                }
+            });
+        forms.offer = offer.clone();
+        self.forms = Some(forms);
+    }
+
+    /// The key of the form shown, in the server's panel.
+    fn active_key(&self) -> Option<FormKey> {
+        self.forms
+            .as_ref()
+            .and_then(|forms| forms.switcher.active().cloned())
+    }
+
+    /// Takes the keys out of every form: what was typed stays.
+    fn leave_all(&mut self) {
+        self.chat.leave();
+        for entry in &mut self.entries {
+            entry.chooser.leave_fields();
+            if let Some(composer) = entry.composer.as_mut() {
+                composer.leave_fields();
+            }
+        }
+    }
+
+    /// Gives the keys to the box of the form that came into view, when it is
+    /// a text box.
+    fn arrive(&mut self) {
+        if self.slot() == Slot::Chat {
+            self.chat.enter();
+        }
     }
 
     /// Folds a key into the panel. Keys that are the application's — `q`,
     /// `?` — are not here: the caller handles them first when nothing is
     /// being typed.
     pub fn on_key(&mut self, key: KeyEvent) -> PanelEffect {
+        if let Some(effect) = self.on_forms_key(key) {
+            return effect;
+        }
         if self.entries.is_empty() {
             return match keymap::lookup(Context::Panel, &key) {
                 Some(Action::Cancel) => {
@@ -861,8 +1135,8 @@ impl WaitingPanel {
         let typing = self.is_typing();
         if !typing {
             match keymap::lookup(Context::Panel, &key) {
-                Some(Action::PrevPending) => return self.step(-1),
-                Some(Action::NextPending) => return self.step(1),
+                Some(Action::PrevPending) if self.forms.is_none() => return self.step(-1),
+                Some(Action::NextPending) if self.forms.is_none() => return self.step(1),
                 Some(Action::Top) => {
                     self.entries[self.current].context_scroll.to_top();
                     return PanelEffect::None;
@@ -928,7 +1202,7 @@ impl WaitingPanel {
             ChooserAction::Cancel => PanelEffect::Collapse,
             ChooserAction::Blocked(reason) => PanelEffect::Notice(reason),
             ChooserAction::Submit(mut submission) => {
-                if submission.index == 0 {
+                if submission.index == 0 && !entry.forms {
                     // Action 0: the field of the composer takes the focus, or
                     // the text of its own field goes to the agent.
                     if let Some(composer) = entry.composer.as_mut() {
@@ -942,8 +1216,8 @@ impl WaitingPanel {
                     .items()
                     .get(submission.index)
                     .is_some_and(|item| item.irreversible);
-                // The entries of the model start after action 0.
-                submission.index -= 1;
+                // The entries of the model start after action 0, when there is one.
+                submission.index -= entry.offset();
                 if irreversible {
                     PanelEffect::Confirm(submission)
                 } else {
@@ -957,6 +1231,11 @@ impl WaitingPanel {
     /// field of the chosen action — as a key that edits it would: the last
     /// send's verdict goes. Never sends. Returns whether a field took it.
     pub fn paste(&mut self, pasted: &str) -> bool {
+        match self.slot() {
+            Slot::Chat => return self.chat.paste(pasted),
+            Slot::Manual | Slot::Nothing => return false,
+            Slot::Entry(_) => {}
+        }
         let Some(entry) = self.entries.get_mut(self.current) else {
             return false;
         };
@@ -970,6 +1249,63 @@ impl WaitingPanel {
             entry.error = None;
         }
         used
+    }
+
+    /// A key in the server's panel: `Esc` steps through the forms, the chat
+    /// and the task's own actions take their keys; the entries take theirs
+    /// in [`Self::on_key`]. `None` leaves the key to it.
+    fn on_forms_key(&mut self, key: KeyEvent) -> Option<PanelEffect> {
+        if self
+            .forms
+            .as_ref()
+            .is_none_or(|forms| forms.switcher.is_empty())
+        {
+            return None;
+        }
+        if key.code == KeyCode::Esc && !self.is_confirming() {
+            self.leave_all();
+            if let Some(forms) = self.forms.as_mut() {
+                forms.switcher.next();
+            }
+            if let Slot::Entry(index) = self.slot() {
+                self.current = index;
+            }
+            self.arrive();
+            return Some(PanelEffect::None);
+        }
+        match self.slot() {
+            Slot::Chat => Some(match self.chat.on_key(key) {
+                ChatEffect::None => PanelEffect::None,
+                ChatEffect::Notice(text) => PanelEffect::Notice(text),
+                ChatEffect::Send(text) => PanelEffect::Comment(text),
+            }),
+            Slot::Manual => {
+                let chooser = self.forms.as_mut()?.manual.as_mut()?;
+                let action = chooser.on_key(key);
+                Some(match action {
+                    ChooserAction::Submit(submission) => self
+                        .manual_action(submission.index)
+                        .map_or(PanelEffect::None, PanelEffect::Action),
+                    ChooserAction::Blocked(reason) => PanelEffect::Notice(reason),
+                    ChooserAction::Cancel | ChooserAction::None => PanelEffect::None,
+                })
+            }
+            Slot::Nothing => Some(PanelEffect::None),
+            Slot::Entry(_) => None,
+        }
+    }
+
+    /// The action the `index`th choice of the task's own actions does.
+    fn manual_action(&self, index: usize) -> Option<TaskActionId> {
+        self.forms
+            .as_ref()?
+            .offer
+            .forms
+            .iter()
+            .find(|form| form.kind == PanelFormKind::Action && form.waiting_id.is_none())?
+            .choices
+            .get(index)?
+            .action
     }
 
     fn step(&mut self, by: isize) -> PanelEffect {
@@ -1033,13 +1369,26 @@ impl WaitingPanel {
         task: &TaskSummary,
         text: String,
     ) -> Result<AnswerRequest, String> {
+        if text.is_empty() {
+            return Err("Napisz, co agent ma zobaczyć.".to_string());
+        }
+        if self.forms.is_some() {
+            // The chat form: the message is about the task, not about a wait.
+            let key = self.chat.send_key(idempotency_key);
+            return Ok(AnswerRequest {
+                task_id: task.task_id.to_string(),
+                waiting_id: String::new(),
+                title: title_of(task),
+                generation: task.generation,
+                key,
+                summary: "wiadomość wysłana do agenta".to_string(),
+                submit: Submit::Comment(text),
+            });
+        }
         let entry = self
             .entries
             .get_mut(self.current)
             .ok_or_else(|| "Nie ma czego wysłać.".to_string())?;
-        if text.is_empty() {
-            return Err("Napisz, co agent ma zobaczyć.".to_string());
-        }
         entry.wrote = true;
         let key = entry.key.get_or_insert_with(idempotency_key).clone();
         Ok(AnswerRequest {
@@ -1057,6 +1406,10 @@ impl WaitingPanel {
     /// refusal keeps the panel as it is and shows why; a lost connection keeps
     /// the key for the retry.
     fn settle(&mut self, waiting_id: &str, outcome: Result<(), (String, bool)>) {
+        if waiting_id.is_empty() && self.forms.is_some() {
+            self.chat.settle(outcome);
+            return;
+        }
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -1092,8 +1445,22 @@ impl WaitingPanel {
     pub fn preferred_height(&self, width: u16, area_height: u16, header_height: u16) -> u16 {
         let reserved = header_height + 2 + KEEP_FOR_CONTENT;
         let cap = area_height.saturating_sub(reserved);
-        let wanted = if let Some(entry) = self.entries.get(self.current) {
-            if self.collapsed {
+        self.details_height.set(area_height);
+        let other = matches!(self.slot(), Slot::Chat | Slot::Manual);
+        let wanted = if other {
+            // The padding, the heading and the gap, and the form.
+            5 + match (
+                self.slot(),
+                self.forms.as_ref().and_then(|f| f.manual.as_ref()),
+            ) {
+                (Slot::Manual, Some(chooser)) => chooser.preferred_height(width),
+                _ => self.chat.preferred_height(width, area_height),
+            }
+        } else if let Some(entry) = self
+            .current_entry()
+            .filter(|_| self.forms.is_some() || self.slot() != Slot::Nothing)
+        {
+            if self.collapsed && self.forms.is_none() {
                 2
             } else {
                 let context = context_rows(&entry.model.context(), usize::from(width)).len();
@@ -1102,13 +1469,13 @@ impl WaitingPanel {
                     + entry.chooser.preferred_height(width)
                     + if entry.composer.is_some() { 3 } else { 0 }
             }
-        } else if self.released.is_empty() {
+        } else if self.leftovers().is_empty() {
             0
         } else {
             let lines: usize = self
-                .released
+                .leftovers()
                 .iter()
-                .map(|released| 1 + released.text.lines().count().max(1))
+                .map(|(_, text)| 1 + text.lines().count().max(1))
                 .sum();
             5 + lines.min(5) as u16
         };
@@ -1133,14 +1500,22 @@ impl WaitingPanel {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        if self.entries.is_empty() {
+        if matches!(self.slot(), Slot::Chat | Slot::Manual) {
+            self.render_other_form(frame, area, styles, stale, focused);
+            return;
+        }
+        if self.current_entry().is_none() {
             self.render_released(frame, area, styles);
             paint_waiting_panel(frame, area, styles, focused);
             return;
         }
         let count = self.entries.len();
+        let position = self
+            .forms
+            .as_ref()
+            .map(|forms| position_hint(&forms.switcher));
         let current = self.current;
-        let collapsed = self.collapsed;
+        let collapsed = self.collapsed && position.is_none();
         let entry = &mut self.entries[current];
         let vertical_padding = u16::from(area.height >= 16);
         let inner = Rect::new(
@@ -1183,10 +1558,10 @@ impl WaitingPanel {
             return;
         }
 
-        let count_suffix = if count > 1 {
-            format!("  {}/{count}", current + 1)
-        } else {
-            String::new()
+        let count_suffix = match &position {
+            Some(hint) => format!("  {hint}"),
+            None if count > 1 => format!("  {}/{count}", current + 1),
+            None => String::new(),
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1281,16 +1656,98 @@ impl WaitingPanel {
             area.height.saturating_sub(4),
         );
         let mut lines = Vec::new();
-        for released in &self.released {
-            lines.push(Line::styled(
-                one_line(&released.title),
-                styles.of(Role::Done),
-            ));
-            for line in released.text.lines() {
+        for (title, text) in self.leftovers() {
+            lines.push(Line::styled(one_line(&title), styles.of(Role::Done)));
+            for line in text.lines() {
                 lines.push(Line::raw(one_line(line)));
             }
         }
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The drafts that have no waiting to go with: the ones of waitings that
+    /// went away, and the chat's when no form is on offer.
+    fn leftovers(&self) -> Vec<(String, String)> {
+        let mut drafts: Vec<(String, String)> = self
+            .released
+            .iter()
+            .map(|released| (released.title.clone(), released.text.clone()))
+            .collect();
+        if self
+            .forms
+            .as_ref()
+            .is_some_and(|forms| forms.switcher.is_empty())
+        {
+            let chat = self.chat.draft_text();
+            if !chat.is_empty() {
+                drafts.push(("Wiadomość do agenta".to_string(), chat));
+            }
+        }
+        drafts
+    }
+
+    /// Draws the form that is not an entry: the free message to the agent or
+    /// the choices of the task's own actions, under the heading with the
+    /// place among the forms.
+    fn render_other_form(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        styles: &Styles,
+        stale: bool,
+        focused: bool,
+    ) {
+        let vertical_padding = u16::from(area.height >= 16);
+        let inner = Rect::new(
+            area.x.saturating_add(2),
+            area.y.saturating_add(vertical_padding),
+            area.width.saturating_sub(3),
+            area.height
+                .saturating_sub(vertical_padding.saturating_mul(2)),
+        );
+        let slot = self.slot();
+        let Some(hint) = self
+            .forms
+            .as_ref()
+            .map(|forms| position_hint(&forms.switcher))
+        else {
+            return;
+        };
+        if inner.width == 0 || inner.height < 2 {
+            paint_waiting_panel(frame, area, styles, focused);
+            return;
+        }
+        let role = if stale { Role::Done } else { Role::Attention };
+        let title = if slot == Slot::Chat {
+            "› Rozmowa z agentem"
+        } else {
+            "› Akcje zadania"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(title, styles.strong(role)),
+                Span::styled(format!("  {hint}"), styles.of(role)),
+            ])),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        let gap = if inner.height >= 10 { 2 } else { 1 };
+        let body = Rect::new(
+            inner.x,
+            inner.y.saturating_add(gap),
+            inner.width,
+            inner.height.saturating_sub(gap),
+        );
+        match slot {
+            Slot::Chat => self
+                .chat
+                .render(frame, body, self.details_height.get(), styles, focused),
+            _ => {
+                if let Some(chooser) = self.forms.as_mut().and_then(|f| f.manual.as_mut()) {
+                    chooser::render_footer(frame, body, chooser, styles, focused);
+                }
+            }
+        }
+        paint_waiting_panel(frame, area, styles, focused);
     }
 }
 
@@ -1457,7 +1914,11 @@ impl TaskApp {
                 .views
                 .get(id)
                 .is_some_and(|view| view.waiting.is_present());
-            if task.attention.is_empty() && !present {
+            let offers_forms = task
+                .panel
+                .as_ref()
+                .is_some_and(|panel| !panel.forms.is_empty());
+            if task.attention.is_empty() && !offers_forms && !present {
                 continue;
             }
             let view = self.detail.view_mut(id);
@@ -1528,6 +1989,10 @@ impl TaskApp {
             PanelEffect::Submit(submission) => self.submit_answer(&id, &submission),
             PanelEffect::Confirm(submission) => self.ask_to_confirm(&id, &submission),
             PanelEffect::Comment(text) => self.submit_comment_text(&id, text),
+            PanelEffect::Action(action) => match panel_action(action) {
+                Some(action) => self.invoke(action),
+                None => Request::None,
+            },
         };
         if let Some(view) = self.detail.views.get(&id) {
             let text = view.draft_text();
@@ -1560,9 +2025,14 @@ impl TaskApp {
         };
         let (label, mut lines) = self
             .selected_panel()
-            .and_then(WaitingPanel::chooser)
-            // The submission counts from after action 0.
-            .and_then(|chooser| chooser.items().get(submission.index + 1))
+            .and_then(|panel| {
+                // The submission counts from after action 0, when there is one.
+                panel.chooser().and_then(|chooser| {
+                    chooser
+                        .items()
+                        .get(submission.index + panel.chooser_offset())
+                })
+            })
             .map_or_else(
                 || (submission.label.clone(), Vec::new()),
                 |item| (item.label.clone(), one_line_per_row(&item.description)),
@@ -1592,9 +2062,7 @@ impl TaskApp {
         match view.waiting.prepare(task, submission) {
             Ok(request) => Request::Answer(Box::new(request)),
             Err(message) => {
-                if let Some(entry) = view.waiting.entries.get_mut(view.waiting.current) {
-                    entry.error = Some(message);
-                }
+                view.waiting.fail(message);
                 Request::None
             }
         }
@@ -1619,9 +2087,7 @@ impl TaskApp {
         match view.waiting.prepare_comment(task, text) {
             Ok(request) => Request::Answer(Box::new(request)),
             Err(message) => {
-                if let Some(entry) = view.waiting.entries.get_mut(view.waiting.current) {
-                    entry.error = Some(message);
-                }
+                view.waiting.fail(message);
                 Request::None
             }
         }

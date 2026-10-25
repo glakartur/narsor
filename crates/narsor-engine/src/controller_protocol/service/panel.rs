@@ -231,8 +231,9 @@ fn entry_limit_form(task: &TaskSummary, form: &PendingHumanInputView) -> PanelFo
     }
 }
 
-/// The manual actions of the workflow the task offers now: the exits of its
-/// state, a restart, a resume. `None` when it offers none.
+/// The manual action of the workflow the task offers now: a transition out of
+/// its state. A restart or a resume is a command of the task's life with a key
+/// of its own, not an action of the workflow. `None` when it offers none.
 fn action_form(task: &TaskSummary) -> Option<PanelForm> {
     let exits = options(task, TaskActionId::Transition);
     let mut choices = Vec::new();
@@ -248,18 +249,6 @@ fn action_form(task: &TaskSummary) -> Option<PanelForm> {
             ),
             action: Some(TaskActionId::Transition),
         });
-    }
-    for (id, label) in [
-        (TaskActionId::Resume, "Wznów zadanie"),
-        (TaskActionId::Restart, "Uruchom krok od nowa"),
-    ] {
-        if unavailable_reason(task, id).is_none() {
-            choices.push(PanelChoice {
-                label: label.to_string(),
-                description: None,
-                action: Some(id),
-            });
-        }
     }
     if choices.is_empty() {
         return None;

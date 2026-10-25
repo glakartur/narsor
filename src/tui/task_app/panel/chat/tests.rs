@@ -75,7 +75,10 @@ fn a_text_past_the_limit_scrolls_and_keeps_the_cursor_in_view() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(screen.contains("line8"), "the end is in view: {screen}");
-    assert!(!screen.contains("first"), "the start scrolled away: {screen}");
+    assert!(
+        !screen.contains("first"),
+        "the start scrolled away: {screen}"
+    );
 }
 
 #[test]

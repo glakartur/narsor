@@ -6817,7 +6817,8 @@ mod task_app_waiting {
         let request = press(&mut app, KeyCode::Enter);
         assert_eq!(request, Request::None);
         assert!(app.panel_focused());
-        ch(&mut app, '2');
+        // The server's forms have no action 0: the first entry is the answer.
+        ch(&mut app, '1');
         let chooser = app
             .detail()
             .view("NAR-12")
@@ -6880,7 +6881,7 @@ mod task_app_waiting {
         ch(&mut app, ' ');
         press(&mut app, KeyCode::Enter);
         assert!(app.panel_focused());
-        ch(&mut app, '2');
+        ch(&mut app, '1');
         let request = enter_until_answer(&mut app);
         app.perform(request).await;
 
@@ -6904,7 +6905,8 @@ mod task_app_waiting {
 
         ch(&mut app, ' ');
         press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Esc);
+        // `Esc` steps through the forms now; `Tab` leaves the panel.
+        press(&mut app, KeyCode::Tab);
         app.detail_mut()
             .set_tab(narsor::tui::task_app::DetailTab::Progress);
         let revision = app.list().selected().unwrap().revision;
@@ -6914,7 +6916,7 @@ mod task_app_waiting {
 
         press(&mut app, KeyCode::Tab);
         assert!(app.panel_focused());
-        ch(&mut app, '2');
+        ch(&mut app, '1');
         let request = press(&mut app, KeyCode::Enter);
         app.perform(request).await;
         assert_eq!(app.focus(), Focus::Details, "{:?}", app.notifier().latest());
@@ -7143,7 +7145,7 @@ mod task_app_waiting {
         app.refresh().await;
         ch(&mut app, ' ');
         press(&mut app, KeyCode::Enter);
-        ch(&mut app, '2');
+        ch(&mut app, '1');
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "safe");
         let request = enter_until_answer(&mut app);

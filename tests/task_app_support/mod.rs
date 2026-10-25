@@ -61,6 +61,13 @@ pub fn offered(mut task: TaskSummary) -> TaskSummary {
     task
 }
 
+/// `task` with the panel forms the server would offer for what it shows now.
+pub fn with_panel(mut task: TaskSummary) -> TaskSummary {
+    task = offered(task);
+    task.panel = Some(narsor_engine::controller_protocol::task_panel(&task));
+    task
+}
+
 /// What the control plane says of a slot: compute is held in every state
 /// that has a runner (or is admitted to get one).
 fn held_by(task: &TaskSummary) -> bool {
