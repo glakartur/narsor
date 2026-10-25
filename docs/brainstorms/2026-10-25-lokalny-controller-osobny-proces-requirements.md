@@ -58,7 +58,7 @@ Skutki:
   - **Steps:** A2 deklaruje w katalogu backend `kind: local` o własnym id i z `trust_scope: workstation`. A2 tworzy kod rejestracji z jawną zgodą i widzi ostrzeżenie. A3 uruchamia `narsor-controller local` na laptopie z adresem `https://` serwera. Controller się rejestruje i bierze lease.
   - **Outcome:** Z jednego TUI widać zadania na backendach `k8s` i na laptopie tego samego serwera.
   - **Failure path:** Bez zgody serwer nie wydaje kodu. Bez `https://` (adres spoza loopback) controller nie startuje w buildzie wydania. Po utracie laptopa A2 unieważnia controller przez `narsor-cli controller revoke <id>`.
-  - **Covered by:** R12, R13, R14, R15, R16, R17
+  - **Covered by:** R12, R13, R14, R15, R16, R17, R18
 
 ---
 
@@ -83,11 +83,12 @@ Skutki:
 - R12. Kod rejestracji nigdy nie jest widoczny w argumentach procesu (`ps`, historia powłoki). `narsor-controller local` przyjmuje go tylko ze zmiennej środowiskowej albo z pliku. Runnery nie dostają kodu rejestracji ani innych zmiennych `NARSOR_*` controllera.
 
 **Faza B: laptop jako backend zdalnego serwera**
-- R13. Katalog serwera może zadeklarować backend `kind: local` o id innym niż `local` (np. `workstation`). Serwer w trybie `network` go obsługuje. Id `local` jest zarezerwowane dla wbudowanego backendu trybu `trusted`: w trybie `network` wpis o id `local` jest odrzucany przy starcie z podpowiedzią innego id, a zadanie na `local` jest odrzucane przy tworzeniu z czytelnym błędem.
+- R13. Katalog serwera może zadeklarować backend `kind: local` o dowolnym id innym niż `local`. Id `workstation` w tym dokumencie to tylko przykład, nie zalecana nazwa. Serwer w trybie `network` go obsługuje. Id `local` jest zarezerwowane dla wbudowanego backendu trybu `trusted`: w trybie `network` wpis o id `local` jest odrzucany przy starcie z podpowiedzią innego id, a zadanie na `local` jest odrzucane przy tworzeniu z czytelnym błędem.
 - R14. Backend `kind: local` o id innym niż `local` musi mieć `trust_scope: workstation`. Inna wartość daje błąd katalogu z nazwą pola.
 - R15. Kod rejestracji dla backendu `kind: local` z `trust_scope: workstation` wymaga jawnej zgody w żądaniu. Serwer sprawdza zgodę (nie tylko CLI) po `kind` i `trust_scope`. Poza zarezerwowanym id `local` serwer nie sprawdza id. Wyjątek: wbudowany backend o id `local` w trybie `trusted`. Daemon tworzy dla niego kod w procesie, bez pola zgody (ten backend też ma `kind: local` i `trust_scope: workstation`). CLI ma flagę zgody i wypisuje ostrzeżenie: przejęty serwer może uruchamiać dowolny kod na tym komputerze jako jego user, bez izolacji kontenera.
 - R16. `narsor-controller local` łączy się z serwerem spoza loopback tylko przez `https://`, zawsze ze sprawdzeniem certyfikatu. Nie ma flagi, która wyłącza sprawdzenie. Wyjątek `http://` jest tylko w buildach debug. Serwer jest na loopback tylko wtedy, gdy host w adresie to literalne IP loopback (`127.0.0.0/8`, `::1`) albo dokładnie `localhost`. Controller nie używa DNS do tej decyzji i nie przechodzi za przekierowaniem na inny host. Każdy inny host jest spoza loopback.
 - R17. Gdy serwer nie jest na loopback, `narsor-controller local` traktuje polecenia serwera jako niezaufane: domyślnie `--home private`; `--home host` wymaga flagi potwierdzenia i pokazuje ostrzeżenie; ścieżki z launch spec są tylko wewnątrz katalogu storage; plik poświadczenia ma prawa `0600`. Przy starcie controller wypisuje adres serwera, id backendu i ostrzeżenie z R15.
+- R18. W fazie B `narsor-controller` uruchomiony ręcznie (nie przez daemon) czyta plik konfiguracji Narsora (`--config` albo ścieżka domyślna) dla ustawień `HOME`. Kolejność: flagi, potem zmienne środowiskowe, potem plik. Reguły R17 obowiązują także dla wartości z pliku: `home: host` z pliku wymaga flagi potwierdzenia. Proces potomny daemona (R6) nadal nie czyta pliku.
 
 ---
 
@@ -106,6 +107,7 @@ Skutki:
 - AE11. **Covers R14.** Given backend `kind: local` o id `workstation` z `trust_scope: dedicated`, when serwer używa katalogu, then błąd wskazuje pole `trust_scope`.
 - AE12. **Covers R13.** Given tryb `network` i plik `backends/local.yaml`, when daemon startuje, then błąd startu z podpowiedzią innego id.
 - AE13. **Covers R16, R17.** Given `--control-plane http://10.0.0.5:8443` w buildzie wydania, when user uruchamia `narsor-controller local`, then kod 2 z komunikatem o `https://`. Given serwer spoza loopback i `--home host` bez flagi potwierdzenia, then kod 2 z opisem ryzyka.
+- AE14. **Covers R17, R18.** Given serwer spoza loopback i plik konfiguracji z `home: host`, when user uruchamia `narsor-controller local` bez flagi potwierdzenia, then kod 2 z opisem ryzyka. Given ten sam plik i flaga `--home private`, then controller używa `private`.
 
 ---
 
@@ -139,6 +141,8 @@ Skutki:
 - Gotowość daemona = nowy lease, nie sama rejestracja: zadanie zaraz po starcie ma controller, także po awarii daemona.
 - Faza B używa istniejącego `trust_scope: workstation` i zaczyna go sprawdzać: wartość opisuje dokładnie ten przypadek, a dziś nie jest sprawdzana nigdzie.
 - Faza B jest w tym samym zakresie co faza A, jako druga faza (decyzja Artura, 2026-10-25).
+- Ręcznie uruchomiony `narsor-controller local` czyta plik konfiguracji Narsora dla ustawień `HOME` (R18). Proces potomny daemona go nie czyta (R6) (decyzja Artura, 2026-10-25).
+- Id backendu `kind: local` w fazie B jest dowolne. Dokumentacja podaje `workstation` tylko jako przykład (decyzja Artura, 2026-10-25).
 
 ---
 
@@ -160,8 +164,7 @@ Skutki:
 
 ## Pytania otwarte dla użytkownika
 
-- [Affects R17] Czy w fazie B `narsor-controller local` ma czytać plik konfiguracji Narsora (`--config`) dla ustawień `HOME`, czy tylko flagi i zmienne? Plan zaczyna od flag i zmiennych.
-- [Affects R13] Czy id `workstation` ma być zalecaną nazwą w dokumentacji, czy tylko przykładem? Reguły sprawdzają `kind` i `trust_scope`, więc id nie ma znaczenia technicznego.
+- Brak. Odpowiedzi są w Key Decisions.
 
 ---
 
