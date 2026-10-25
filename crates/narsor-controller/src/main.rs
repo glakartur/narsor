@@ -45,6 +45,7 @@ fn init_logging() {
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_target(false)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);

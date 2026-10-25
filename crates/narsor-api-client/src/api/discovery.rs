@@ -67,6 +67,9 @@ const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// recovery sweep, socket bind — that its own path never pays for.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The log a daemon this client spawns writes to, in its state directory.
+const DAEMON_LOG: &str = "narsor.log";
+
 /// How many times [`try_acquire_lock`] will reap a stale lock and retry
 /// before giving up and treating the lock as held by a live racer.
 ///
@@ -98,8 +101,12 @@ pub enum DiscoveryError {
     /// Waited [`DISCOVERY_TIMEOUT`] without ever seeing a discovery file
     /// that both names a live PID and answers an authenticated health
     /// check — whether this caller was the one spawning or was waiting on
-    /// another caller's spawn.
-    Timeout,
+    /// another caller's spawn. `log` is where a daemon this client spawns
+    /// writes, the reason it did not start included.
+    Timeout {
+        /// The daemon's log, `{state}/narsor.log`.
+        log: std::path::PathBuf,
+    },
 }
 
 impl std::fmt::Display for DiscoveryError {
@@ -122,9 +129,10 @@ impl std::fmt::Display for DiscoveryError {
                 "the narsor daemon on this state directory runs in network mode; connect \
                  to it with an OIDC token instead of the local discovery file"
             ),
-            DiscoveryError::Timeout => write!(
+            DiscoveryError::Timeout { log } => write!(
                 f,
-                "timed out waiting for the narsor daemon to start and answer"
+                "timed out waiting for the narsor daemon to start and answer; see its log, {}",
+                log.display()
             ),
         }
     }
@@ -137,7 +145,7 @@ impl std::error::Error for DiscoveryError {
             DiscoveryError::Spawn(error) => Some(error),
             DiscoveryError::Unprotected(_)
             | DiscoveryError::NetworkMode
-            | DiscoveryError::Timeout => None,
+            | DiscoveryError::Timeout { .. } => None,
         }
     }
 }
@@ -351,7 +359,7 @@ async fn spawn_and_wait(
     daemon_file: &std::path::Path,
 ) -> Result<DaemonDiscoveryRecord, DiscoveryError> {
     let args = daemon_launch_args(flags);
-    spawn_detached(args, &state_root.join("narsor.log")).map_err(DiscoveryError::Spawn)?;
+    spawn_detached(args, &state_root.join(DAEMON_LOG)).map_err(DiscoveryError::Spawn)?;
     poll_until_ready(daemon_file, DISCOVERY_TIMEOUT).await
 }
 
@@ -395,7 +403,9 @@ async fn poll_until_ready(
             }
         }
         if Instant::now() >= deadline {
-            return Err(DiscoveryError::Timeout);
+            return Err(DiscoveryError::Timeout {
+                log: daemon_file.with_file_name(DAEMON_LOG),
+            });
         }
         tokio::time::sleep(DISCOVERY_POLL_INTERVAL).await;
     }
@@ -453,6 +463,27 @@ mod tests {
         assert_eq!(
             daemon_launch_args(&flags),
             vec!["--root", "/tmp/some-root", "--config", "/tmp/some.toml",]
+        );
+    }
+
+    #[test]
+    fn a_timeout_points_at_the_daemons_log() {
+        let state =
+            std::env::temp_dir().join(format!("narsor-discovery-timeout-{}", std::process::id()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(poll_until_ready(
+                &state.join("daemon.json"),
+                Duration::from_millis(1),
+            ))
+            .expect_err("no daemon answers");
+        let message = error.to_string();
+        assert!(
+            message.contains(&state.join("narsor.log").display().to_string()),
+            "{message}"
         );
     }
 
