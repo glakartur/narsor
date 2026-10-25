@@ -213,7 +213,18 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     fn stream_parser(&self) -> Box<dyn HarnessStreamParser> {
         Box::new(ClaudeCodeStreamParser::default())
     }
+
+    fn contract_note(&self) -> Option<&str> {
+        Some(CONTRACT_NOTE)
+    }
 }
+
+/// Appended to the output contract: with `--json-schema` the CLI accepts only
+/// what goes through `StructuredOutput`, and answers a plain-text question
+/// with `[structured-output-enforce]` instead of passing it on.
+const CONTRACT_NOTE: &str = "Deliver your answer, and every `awaiting_input` question, \
+through the `StructuredOutput` tool. A question written as plain text does not reach the \
+person.";
 
 /// Reads the `stream-json` lines of one run, live, line by line.
 ///

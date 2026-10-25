@@ -4,6 +4,7 @@ type: feat
 date: 2026-10-25
 topic: petla-code-review-decyzje-czlowieka
 execution: code
+origin: docs/brainstorms/2026-10-25-petla-code-review-decyzje-czlowieka-requirements.md
 ---
 
 # Pętla code review z decyzjami człowieka - Plan
@@ -54,6 +55,10 @@ Kontrakt wyjścia (`crates/narsor-engine/src/engine/actions/agent.rs`, `output_c
 - R8. Krok autora implementacji czyta `work_feedback` i `review_findings` i czyści oba w swojej odpowiedzi. `work` czyści `review_findings` i `review_decisions`, gdy wraca do implementacji po rewizji planu.
 - R9. Kontrakt wyjścia w `claude-code` mówi, że odpowiedź i pytanie `awaiting_input` przechodzą przez `StructuredOutput`, a pytanie zadane zwykłym tekstem nie dociera do człowieka. Inne harnessy nie dostają tej notki. Zdanie z R10 obowiązuje we wszystkich harnessach.
 - R10. Kontrakt wyjścia mówi, że decyzja, której agent nie może podjąć sam, jest pytaniem do człowieka.
+
+### Mapowanie na dokument wymagań
+
+Źródło: `docs/brainstorms/2026-10-25-petla-code-review-decyzje-czlowieka-requirements.md` (see origin). Numeracja R w planie jest zwięzlejsza niż w dokumencie wymagań. Mapowanie (wymagania → plan): R1→R1, R2→R2, R3→R3, R4→R4, R5 (podział findingów)→KTD6, R6→R5, R7→R6, R8→R7, R9 (pamięć decyzji)→Key Decisions i R4/R6, R10→R8, R11→R9, R12→R10, R13→U5. AE wymagań: AE1→AE1, AE2→AE2, AE3 i AE4→AE3 (plan i testy U2 pokrywają też `unanswered`), AE5→AE4. Pytania odroczone do planowania są rozstrzygnięte: komentarze inline i rozpoznanie wątku w KTD5 i U2; skuteczność notki `StructuredOutput` sprawdza ręczny test w U1 (warunek stopu przed U3 i U4).
 
 ### Key Flows
 
@@ -202,11 +207,12 @@ U1 jest niezależne od reszty. U2 i U3 nie zależą od siebie, ale oba zmieniaj�
 
 **Approach:**
 - `code_review`: `mode:headless plan:…`. Prompt dzieli findingi według KTD6 i stosuje R4 do `{{ context.review_decisions }}` z kluczem dopasowania z Key Decisions. Opis kolejności wyborów nie może być listą punktowaną etykiet w backtickach, bo test `no_agent_prompt_carries_a_manual_label_list` tego zabrania. Kolejność wyboru: `findings` (wymaga `review_findings`) przed `questions` (wymaga `pending_questions`: finding, `file:line`, pytanie, opcje z rekomendacją jako pierwszą; `publish_questions` czyta tę zmienną) przed `clean`. `max_entries: 10` zostaje.
-- `publish_questions` (nowy, agent): push przez `ce-commit-push-pr mode:pipeline babysit:off`, jak `publish_work`; potem po jednym komentarzu inline na pytanie, ze znacznikiem `[narsor:decyzja Q<n>]` (KTD5), opcjami i rekomendacją; gdy linii findingu nie ma w diffie PR, komentarz ogólny z tym samym znacznikiem, `file:line` i instrukcją odpowiedzi; notka w opisie PR, że kod czeka na decyzje. Zwraca `pr_url` i `review_questions` (identyfikator wątku, finding, `file:line`, pytanie). Wybór `published` → `answer_questions`.
+- `publish_questions` (nowy, agent): push przez `ce-commit-push-pr mode:pipeline babysit:off`, jak `publish_work`; potem po jednym komentarzu inline na pytanie, ze znacznikiem `[narsor:decyzja Q<n>]` (KTD5), opcjami i rekomendacją; gdy linii findingu nie ma w diffie PR, komentarz ogólny z tym samym znacznikiem, `file:line` i instrukcją odpowiedzi; notka w opisie PR, że kod czeka na decyzje. Zwraca `pr_url` i `review_questions` (numer Q<n>, identyfikator wątku, finding, `file:line`, pytanie). Wybór `published` → `answer_questions`.
 - `answer_questions` (nowa bramka `human`): select `answered` / `abandon`. Bez `accept`.
 - `collect_answers` (nowy, agent, bez `workspace_access`, z zakazem zmian plików i innych wywołań hosta niż odczyt w prompcie, jak `finalize`): czyta odpowiedzi według KTD5, dopisuje decyzje do `review_decisions` (dostaje poprzednią wartość w prompcie, kopiuje wpisy bez zmian, dopisuje nowe z numerem `D<n>`), stosuje pierwszeństwo `unanswered` z R6, dla decyzji „popraw” składa `review_findings`. Wybory `changes_needed` → `work_revision`, `all_declined` → `verify_work`, `unanswered` → `answer_questions`.
 - `work_revision`: czyta `work_feedback` i `review_findings`, deklaruje oba jako swoje zmienne i zwraca je puste (KTD3).
 - `work`: deklaruje `review_findings` i `review_decisions` i zwraca je puste.
+- Deklaracje zmiennych (zgodnie z Dependencies): `code_review` definiuje `pending_questions` i `review_findings`; `publish_questions` czyta `pending_questions` i definiuje `pr_url` oraz `review_questions`; `collect_answers` definiuje `review_decisions` i `review_findings`.
 - Usunąć `fix_findings`.
 
 **Patterns to follow:** `publish_work` (push), `finalize` (GitHub i GitLab, read-only), `plan_blocker` (czyszczenie zmiennej), `review_work` (bramka z select).
@@ -233,7 +239,7 @@ U1 jest niezależne od reszty. U2 i U3 nie zależą od siebie, ale oba zmieniaj�
 
 **Requirements:** R1–R4, R7, R8.
 
-**Dependencies:** brak.
+**Dependencies:** U1 (wynik ręcznego testu notki `StructuredOutput` przed startem U3).
 
 **Files:**
 - `workflows/compound-engineering-chat.yaml`

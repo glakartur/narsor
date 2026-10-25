@@ -1576,10 +1576,13 @@ async fn the_contract_describes_step_values_once_and_lists_requirements_per_choi
 #[test]
 fn the_contract_requires_a_reason_and_keeps_the_question_instructions() {
     let choices = [ChoiceDefinition::new("done")];
-    let contract = output_contract(&StepContract {
-        choices: &choices,
-        ..StepContract::default()
-    });
+    let contract = output_contract(
+        &StepContract {
+            choices: &choices,
+            ..StepContract::default()
+        },
+        None,
+    );
 
     assert!(contract.contains("`reason` is required"), "{contract}");
     assert!(contract.contains("\"choice\""), "{contract}");
@@ -1590,6 +1593,56 @@ fn the_contract_requires_a_reason_and_keeps_the_question_instructions() {
         ),
         "{contract}"
     );
+}
+
+/// R10: a decision the agent cannot make is a question, in every harness.
+#[test]
+fn the_contract_says_a_decision_the_agent_cannot_make_is_a_question() {
+    let contract = output_contract(&StepContract::default(), None);
+
+    assert!(contract.contains("is a question"), "{contract}");
+    assert!(
+        contract.contains("do not use a question tool"),
+        "{contract}"
+    );
+    assert!(!contract.contains("StructuredOutput"), "{contract}");
+}
+
+/// R9: the harness note closes the contract, and only when there is one.
+#[test]
+fn the_contract_ends_with_the_harness_note() {
+    let contract = output_contract(&StepContract::default(), Some("deliver it this way"));
+
+    assert!(contract.ends_with("\ndeliver it this way"), "{contract}");
+}
+
+/// AE4: `claude-code` tells the agent about `StructuredOutput`, `codex` does not.
+#[tokio::test]
+async fn covers_ae4_only_the_claude_code_prompt_names_structured_output() {
+    let claude_prompt = prompt_sent_with_choices(&[]).await;
+    assert!(
+        claude_prompt.contains("StructuredOutput"),
+        "{claude_prompt}"
+    );
+    assert!(
+        claude_prompt.contains("does not reach the person"),
+        "{claude_prompt}"
+    );
+
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&codex_stream("thread-1", r#"{"choice":"ready"}"#));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("look around");
+    config.harness = Some("codex".to_string());
+    complete(&executor, config, &root.workspace()).await;
+
+    let codex_prompt = fake.args(1).join("\n");
+    assert!(codex_prompt.contains("awaiting_input"), "{codex_prompt}");
+    assert!(!codex_prompt.contains("StructuredOutput"), "{codex_prompt}");
 }
 
 /// A state without descriptions gets a plain list — no dangling dashes.
@@ -1607,10 +1660,13 @@ fn a_contract_without_descriptions_lists_bare_labels_only() {
             resume_comment_field: None,
         },
     ];
-    let contract = output_contract(&StepContract {
-        choices: &choices,
-        ..StepContract::default()
-    });
+    let contract = output_contract(
+        &StepContract {
+            choices: &choices,
+            ..StepContract::default()
+        },
+        None,
+    );
 
     assert!(contract.contains("- `approved`\n"), "{contract}");
     assert!(contract.contains("- `rejected`\n"), "{contract}");
@@ -3047,7 +3103,13 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
     let (prompt, resumed, purpose) = prompt_element(&entries[0]);
     assert_eq!(
         prompt,
-        format!("look around{}", output_contract(&StepContract::default()))
+        format!(
+            "look around{}",
+            output_contract(
+                &StepContract::default(),
+                ClaudeCodeAdapter::default().contract_note()
+            )
+        )
     );
     assert_eq!(resumed, None);
     assert_eq!(purpose, PromptPurpose::Step);

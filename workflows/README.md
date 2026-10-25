@@ -22,7 +22,11 @@ the person questions in the chat window. The agent answers with
 waits in `input_needed`; the person answers with `i` in the TUI or with
 `narsor input`, and the engine runs the same step again in the same agent
 session. The prompts forbid a question tool such as `AskUserQuestion`, which
-cannot work without a terminal. Timeouts are longer than in the original
+cannot work without a terminal. The workflows use only the contract word
+`awaiting_input`. How the answer reaches the engine depends on the harness: the
+`claude-code` adapter adds a note to the output contract (`contract_note`) that
+the answer and every question go through the `StructuredOutput` tool. `codex`
+and `opencode` add nothing. Timeouts are longer than in the original
 (`globals.timeout: 12h`, 3h for the dialogue steps).
 
 `compound-engineering-debug.yaml` has these gates: `review_diagnosis` (`fix`,
@@ -108,6 +112,8 @@ default branch and stores its URL as `pr_url`; every later one pushes to it.
                 brainstorm → publish_requirements (the agent skipped the review)
 2 plan          plan → plan_review* → publish_plan → review_plan → (check_plan_feedback)
 3 implementation work → simplify → code_review → verify_work → publish_work → review_work → (check_work_feedback)
+                code_review → work_revision → code_review (findings for the agent)
+                code_review → publish_questions → answer_questions → collect_answers → work_revision | verify_work
 4 learning      compound → publish_learning → review_learning → (check_learning_feedback)
 5 finalize      finalize → finished
 ```
@@ -157,12 +163,53 @@ answer, so an old blocker does not come back on a later pass. `plan` and
 and `{{ artifacts.learning_doc }}`, empty on the first pass.
 
 Implementation: `simplify` runs once, after `work`. Every later change of code
-— `fix_findings`, `repair_verification`, `work_revision`, a fix from
-`check_work_feedback` — goes through `code_review → verify_work → publish_work
-→ review_work`. `publish_work` rewrites the description of the merge request on
-every push, so it describes the whole change: the code, the requirements and
-the plan. The other publish steps leave the description as it is. Review findings reach `fix_findings`
-through `{{ steps.code_review.reply }}`. `verify_work` runs `scripts/verify.sh`
+— `work_revision`, a fix from `repair_verification` or `check_work_feedback` —
+goes through `code_review → verify_work → publish_work → review_work`.
+`publish_work` rewrites the description of the merge request on every push, so
+it describes the whole change: the code, the requirements and the plan. The
+other publish steps leave the description as it is.
+
+`code_review` runs `ce-code-review` in `mode:headless`. The skill applies the
+safe fixes itself and returns the other findings with `autofix_class`, `owner`
+and `suggested_fix`. The step sorts them: findings that an agent can fix go to
+`review_findings`; findings that need a decision by the person go to
+`pending_questions`. Findings for the agent always go first. The choice is
+`findings` whenever at least one finding is for the agent, and the questions
+wait for the next review. Only when nothing is left for the agent does the
+step choose `questions`. `work_revision` fixes
+the findings, and also the comments from the gate (`work_feedback`). It reads
+both and clears both in its answer. `work` clears `review_findings` and
+`review_decisions` when it starts a new implementation.
+
+`review_decisions` is the memory of decisions. Each entry has a number `D<n>`,
+a file, a symbol or region of code, the point of the problem, the decision
+(`popraw` or `zostaw`) and a short reason. The step that adds decisions copies
+the earlier entries without a change and adds the new ones at the end.
+`code_review` reads only this variable. It matches a finding to a decision by
+the file and the point of the problem, not by line number or title; when it is
+not sure, the finding is new. A finding with the decision `zostaw` is not
+reported again. For `popraw` the review checks that the code does what was
+decided, and reports a finding for the agent when it does not.
+
+Questions in the original workflow go to the merge request: `publish_questions`
+pushes the code and adds one inline comment for each question, marked
+`[narsor:decyzja Q<n>]`. When the line is not in the diff, it adds a general
+comment with the same mark. The gate `answer_questions` has the choices
+`answered` and `abandon`, and no `accept`: the code has not passed
+`verify_work`. `collect_answers` reads the answers only from the threads in
+`review_questions`, and only from the author of the merge request and members
+with write access. It writes the decisions to `review_decisions`. When any
+question has no answer it chooses `unanswered` and the gate asks again, even
+when other decisions need a change. With all answers: `changes_needed` goes to
+`work_revision`, `all_declined` goes to `verify_work`.
+
+In the chat variants (`-chat`, `-debug`) there is no `questions` choice.
+`code_review` asks in the session with `awaiting_input`, one question for each
+finding, the recommended option first. It writes the decisions to
+`review_decisions` and chooses `findings` or `clean`. In `-debug` the author
+step is `fix_revision` and the gate is `review_fix`.
+
+`verify_work` runs `scripts/verify.sh`
 from the target repository when that file exists; a missing file skips the
 check, and a failure goes to `repair_verification`, which receives
 `{{ steps.verify_work.stdout }}` and `{{ steps.verify_work.stderr }}`. During
@@ -186,13 +233,17 @@ goes to `finalize_failed`. The step reads the pull request from the host after i
 it out of Draft and tries at most 3 times; `ready` needs a read that shows the
 pull request out of Draft or merged.
 
-Loop limits (`max_entries`): `code_review` 10, `repair_verification` 5.
+Loop limits (`max_entries`): `code_review` 10, `repair_verification` 5. The
+counter of `code_review` counts every entry in the task, including the rounds
+after questions and after `revise`.
 Terminals: `finished` (out of Draft and ready for review, completed),
 `cancelled` (`abandon` at a gate) and `finalize_failed` (a person confirmed at the `finalize_blocked` gate that finalize could not confirm
 that the pull request is out of Draft, failed). `abandon` does not close the pull request.
 
 Tasks that run on an earlier version of this workflow, with the earlier
-gates or the merge steps, may not resume after an update. Finish or cancel them
+gates or the merge steps, may not resume after an update. A task that waits in
+`fix_findings`, or has it in its history, may not resume either: the step no
+longer exists. Finish or cancel them
 before you update. A task that waited at an earlier `finalize_blocked` gate with the
 `finish_as_draft` choice may not resume.
 

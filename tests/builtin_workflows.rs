@@ -558,7 +558,7 @@ fn the_work_prompt_uses_agent_input_for_ambiguity() {
         "'work' is an agent state"
     );
     assert!(
-        output_contract(&StepContract::of(work)).contains("awaiting_input"),
+        output_contract(&StepContract::of(work), None).contains("awaiting_input"),
         "the output contract tells the agent to ask and resume in place"
     );
     let labels: Vec<&str> = work
