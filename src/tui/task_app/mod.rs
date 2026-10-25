@@ -100,9 +100,9 @@ pub mod limit;
 pub mod list;
 pub mod new_task;
 pub mod notify;
+pub mod panel;
 pub mod repositories;
 pub mod tabs;
-pub mod waiting;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -129,8 +129,8 @@ use history::History;
 use list::{title_of, MoveRequest, Removal, ResumeNotice, ResumeNoticeKind, TaskList};
 use new_task::{NewTaskForm, Outgoing};
 use notify::{Notifier, Severity};
+use panel::AnswerRequest;
 use repositories::Repositories;
-use waiting::AnswerRequest;
 
 /// Where the keyboard is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,7 +306,7 @@ impl DetailState {
         let text = text.into();
         if text.is_empty() {
             self.drafts.remove(task_id);
-        } else {
+        } else if self.drafts.get(task_id) != Some(&text) {
             self.drafts.insert(task_id.to_string(), text);
         }
     }

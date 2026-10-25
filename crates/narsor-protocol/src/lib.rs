@@ -7,3 +7,4 @@ pub mod display;
 pub mod event;
 pub mod identifier;
 pub mod launch;
+pub mod panel;

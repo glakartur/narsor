@@ -1,22 +1,8 @@
-//! The "Czeka na Ciebie" footer (U10, origin §2): one area at the bottom of
-//! the details that answers every kind of waiting.
+//! The state of the panel of one task: the entries that hold what the
+//! operator typed, the forms the server offered and the one shown, the chat
+//! and the drafts that outlived their waiting.
 //!
-//! ```text
-//! ───────────────────────────────────────────────────────────────────────
-//! ? Pytanie · review_scope · 6m · 1/1
-//!
-//! „Czy zakres zmian obejmuje też migrację danych?”
-//! ◆ dyrygent: raczej revise — brak planu migracji
-//! Akcje                       Opis
-//!   1 approved                ↩ wraca do agenta: plan
-//! | 2 | revise                Zakres wymaga poprawy…
-//! Komentarz dla agenta (wymagane):
-//! > Uwzględnij migrację tabeli orders
-//! ```
-//!
-//! # What the panel is made of
-//!
-//! The row of the list says *that* a task waits ([`AttentionItem`]); this
+//! The row of the list says *that* a task waits ([`AttentionItem`]); the
 //! panel is built from it and from what the details know:
 //!
 //! * a question, an approval, a problem the step must be settled with — the
@@ -24,25 +10,17 @@
 //! * a failed step and a proposal of the conductor's — the conductor's own
 //!   state, read on demand like the other tabs ([`OperatorPanel`]);
 //! * a failed provisioning and a problem of the runner's — the owner commands
-//!   `start` and `archive`.
+//!   `start` and `archive` ([`OwnerPanel`]).
 //!
 //! Each waiting is an [`Entry`]: its context, a [`Chooser`] holding what the
-//! operator typed, and how a chosen action is sent. Entries live as long as the
-//! waiting does, so a refresh, a new read of the conductor or a move to another
-//! tab never costs the operator a draft; an entry whose waiting went away takes
-//! its draft with it into a box the operator can still copy from.
+//! operator typed, and how a chosen action is sent. Entries live as long as
+//! the waiting does, so a refresh, a new read of the conductor or a move to
+//! another tab never costs the operator a draft; an entry whose waiting went
+//! away takes its draft with it into a box the operator can still copy from.
 //!
-//! # Sending
-//!
-//! A chosen action becomes an [`AnswerRequest`]: an answer to the pending input
-//! (`POST …/input`, naming the request), an operator command (`POST
-//! …/operator-commands`) or an owner command (`POST …/commands`) — each with an
-//! idempotency key a retry of the same decision reuses. A refusal (a `409`: the
-//! task moved on) leaves the panel open with what was typed and reads the
-//! tasks again; success keeps the focus in the details on the timeline with a notification.
-//!
-//! Text from the agent, the conductor and the runner is passed through
-//! [`sanitize`] before it is drawn; what the operator typed is sent as typed.
+//! When the server offers forms (`TaskSummary::panel`), only the waits a form
+//! answers have an entry, and [`super::switcher::Switcher`] says which form is
+//! shown.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -50,33 +28,34 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::api::ClientError;
 use crate::conductor::ConductorView;
 use crate::controller_protocol::{
-    ConductorReadResponse, ConversationUnavailableReason, OwnerCommandRequest,
-    SubmitCommentRequest, SubmitInputRequest, SubmitOperatorCommandRequest, TaskSummary,
+    ConductorReadResponse, ConversationUnavailableReason, TaskSummary,
 };
-use narsor_protocol::api::{
-    HumanInputDeliveryDto, PendingHumanInputView, Position, PositionStatus,
+use narsor_protocol::api::{Position, PositionStatus};
+use narsor_protocol::controller::{
+    AttentionItem, AttentionKind, PanelForm, PanelFormKind, PanelOffer, TaskActionId,
 };
-use narsor_protocol::controller::{AttentionItem, AttentionKind, OperatorCommand, OwnerCommand};
 
-use super::super::chooser::{
+use super::chat::{Chat, ChatEffect};
+use super::header::position_hint;
+use super::switcher::{FormKey, Switcher};
+use crate::tui::chooser::{
     self, Chooser, ChooserAction, ChooserField, ChooserFocus, ChooserItem, Submission,
 };
-use super::super::failure_form::OperatorPanel;
-use super::super::input_form::{ContextLine, InputPanel, Tone};
-use super::super::keymap::{self, Action, Context};
-use super::super::scroll::one_line;
-use super::super::scroll::{wrap_line, ScrollState};
-use super::super::style::{Role, Styles};
-use super::actions::{write_to_agent_item, written_text, COMMENT_FIELD};
-use super::background::{DetailJob, JobKey, Outcome};
-use super::detail::short_age;
-use super::list::title_of;
-use super::notify::Severity;
-use super::tabs::conductor;
-use super::{failure_reason, idempotency_key, Request, TaskApp};
+use crate::tui::failure_form::OperatorPanel;
+use crate::tui::input_form::{ContextLine, InputPanel, Tone};
+use crate::tui::keymap::{self, Action, Context};
+use crate::tui::scroll::one_line;
+use crate::tui::scroll::{wrap_line, ScrollState};
+use crate::tui::style::{Role, Styles};
+use crate::tui::task_app::actions::{write_to_agent_item, written_text, TaskAction, COMMENT_FIELD};
+use crate::tui::task_app::detail::short_age;
+use crate::tui::task_app::idempotency_key;
+use crate::tui::task_app::list::title_of;
+
+use super::legacy::OwnerPanel;
+use super::request::{AnswerRequest, PanelEffect, Submit, SyncEffect};
 
 /// The most rows of the context the panel gives itself before it scrolls.
 const MAX_CONTEXT_ROWS: usize = 4;
@@ -84,119 +63,6 @@ const MAX_CONTEXT_ROWS: usize = 4;
 /// The fewest rows of detail content the panel leaves below the header and
 /// two-row tab bar.
 const KEEP_FOR_CONTENT: u16 = 2;
-
-// ---------------------------------------------------------------------
-// What is sent
-// ---------------------------------------------------------------------
-
-/// What a chosen action asks the API to do.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Submit {
-    /// An answer to the pending input request `pending_input_id`.
-    Input {
-        /// The request it answers.
-        pending_input_id: String,
-        /// The answer, boxed: it is far larger than the other variants.
-        delivery: Box<HumanInputDeliveryDto>,
-    },
-    /// A command for the runner: a restart, a confirmation of a proposal.
-    Operator(OperatorCommand),
-    /// A runner state command of the owner: `start`, `archive`.
-    Owner(OwnerCommand),
-    /// Action 0, the text to the agent: the server picks what it does.
-    Comment(String),
-}
-
-/// A chosen action, ready to be sent: [`TaskApp::perform`] carries it out.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AnswerRequest {
-    /// The task.
-    pub task_id: String,
-    /// The waiting it answers.
-    pub waiting_id: String,
-    /// The task's title for the notification.
-    pub title: String,
-    /// The generation the screen shows; a command is refused if the task has
-    /// moved on.
-    pub generation: u64,
-    /// The key a retry of this decision reuses.
-    pub key: String,
-    /// What the notification says when it worked.
-    pub summary: String,
-    /// What to send.
-    pub submit: Submit,
-}
-
-// ---------------------------------------------------------------------
-// The entries
-// ---------------------------------------------------------------------
-
-/// The owner commands behind a failed provisioning or a problem of the
-/// runner's.
-#[derive(Debug, Clone)]
-struct OwnerPanel {
-    context: Vec<ContextLine>,
-    items: Vec<ChooserItem>,
-    commands: Vec<OwnerCommand>,
-}
-
-impl OwnerPanel {
-    fn start_item(description: &str) -> ChooserItem {
-        ChooserItem::new("Uruchom od nowa", description)
-    }
-
-    fn provisioning(task: &TaskSummary) -> Self {
-        let mut context = vec![ContextLine::plain(
-            "Backend nie przygotował workspace'u; zadanie nie wystartowało.",
-        )];
-        if let Some(detail) = task
-            .observation
-            .as_ref()
-            .and_then(|observed| observed.summary.detail.as_deref())
-        {
-            context.push(ContextLine::problem(detail));
-        }
-        Self {
-            context,
-            items: vec![
-                Self::start_item("Ponawia przygotowanie i start zadania na tym samym storage."),
-                ChooserItem::new(
-                    "Archiwizuj",
-                    "Usuwa workload i storage zadania; zadanie trafia do Historii.",
-                )
-                .irreversible(),
-            ],
-            commands: vec![OwnerCommand::Start, OwnerCommand::Archive],
-        }
-    }
-
-    fn runner_problem(task: &TaskSummary, code: &str) -> Self {
-        let message = task
-            .runner
-            .as_ref()
-            .and_then(|runner| runner.problem.as_ref())
-            .filter(|problem| problem.code == code)
-            .map_or(String::new(), |problem| format!(": {}", problem.message));
-        Self {
-            context: vec![
-                ContextLine::plain("Runner nie może wykonywać pracy."),
-                ContextLine::problem(format!("{code}{message}")),
-            ],
-            items: vec![Self::start_item(
-                "Start zadania jest Twoją decyzją o kontynuacji: runner zaczyna od zapisanego stanu.",
-            )],
-            commands: vec![OwnerCommand::Start],
-        }
-    }
-
-    fn summary(&self, submission: &Submission) -> String {
-        match self.commands.get(submission.index) {
-            Some(OwnerCommand::Archive) => "zarchiwizowano",
-            _ => "uruchomiono od nowa",
-        }
-        .to_string()
-    }
-}
 
 /// How a waiting is answered.
 #[derive(Debug, Clone)]
@@ -223,7 +89,7 @@ impl Model {
     fn items(&self) -> Vec<ChooserItem> {
         match self {
             Self::Input(panel) => {
-                let composer_index = panel.composer_spec().map(|(index, _)| index);
+                let composer_index = panel.composer_spec().map(|composer| composer.entry);
                 panel
                     .items()
                     .iter()
@@ -244,9 +110,8 @@ impl Model {
 
     fn selected(&self) -> usize {
         match self {
-            Self::Input(panel) => panel.selected().min(self.items().len().saturating_sub(1)),
             Self::Operator(panel) => panel.selected(),
-            Self::Owner(_) | Self::Missing => 0,
+            Self::Input(_) | Self::Owner(_) | Self::Missing => 0,
         }
     }
 
@@ -258,14 +123,9 @@ impl Model {
         let Self::Input(panel) = self else {
             return None;
         };
-        let (index, label) = panel.composer_spec()?;
-        let help = if panel.kind() == crate::tui::input_form::InputKind::AgentQuestion {
-            "Odpowiada agentowi."
-        } else {
-            "Wysyła wiadomość do agenta."
-        };
-        let field = panel.items().get(index)?.fields.first()?.clone();
-        Some(ChooserItem::new(label, help).with_field(field))
+        let composer = panel.composer_spec()?;
+        let field = panel.items().get(composer.entry)?.fields.first()?.clone();
+        Some(ChooserItem::new(composer.label.clone(), composer.help.clone()).with_field(field))
     }
 
     fn composer_submission(&self, composer: &Chooser) -> Option<Submission> {
@@ -294,6 +154,9 @@ struct Entry {
     wrote: bool,
     /// The answer was sent: the typed text is not a draft any more.
     sent: bool,
+    /// The entry is a form of the server's panel: the message to the agent
+    /// is the chat form's, so the list has no action 0.
+    forms: bool,
 }
 
 impl Entry {
@@ -304,12 +167,13 @@ impl Entry {
         task: &TaskSummary,
         positions: &[Position],
         conductor: Option<&ConductorView>,
+        forms: bool,
     ) -> Self {
         let model = Self::model(item, task, positions, conductor);
-        let chooser = Chooser::new(Self::items_of(&model, task))
+        let chooser = Chooser::new(Self::items_of(&model, task, forms))
             .enter_fields_on_activate()
             .confirming_submit()
-            .selecting(model.selected() + 1);
+            .selecting(model.selected() + usize::from(!forms));
         let composer = model.composer_item().map(|item| {
             Chooser::new(vec![item])
                 .with_inputs_layout()
@@ -325,13 +189,23 @@ impl Entry {
             key: None,
             wrote: false,
             sent: false,
+            forms,
         }
+    }
+
+    /// Where the model's entries start in the chooser: after action 0, when
+    /// there is one.
+    fn offset(&self) -> usize {
+        usize::from(!self.forms)
     }
 
     /// The entries of the chooser: action 0, then what the waiting offers.
     /// Action 0 is the field of the composer when the waiting has one (Z3),
     /// and has its own field when it has none.
-    fn items_of(model: &Model, task: &TaskSummary) -> Vec<ChooserItem> {
+    fn items_of(model: &Model, task: &TaskSummary, forms: bool) -> Vec<ChooserItem> {
+        if forms {
+            return model.items();
+        }
         let mut items = vec![write_to_agent_item(task, !model.has_composer())];
         items.extend(model.items());
         items
@@ -344,46 +218,12 @@ impl Entry {
         conductor: Option<&ConductorView>,
     ) -> Model {
         match item.kind {
-            AttentionKind::Question | AttentionKind::Approval => task
-                .runner
-                .as_ref()
-                .and_then(|runner| runner.pending_input.as_ref())
-                .filter(|pending| pending.id == item.waiting_id)
-                .map_or(Model::Missing, |pending| {
-                    let state_of = |attempt: &str| {
-                        positions
-                            .iter()
-                            .find(|position| {
-                                position.action_execution_id.as_deref() == Some(attempt)
-                            })
-                            .map(|position| position.state_id.clone())
-                    };
-                    serde_json::from_value::<PendingHumanInputView>(pending.form.clone())
-                        .map_or(Model::Missing, |form| {
-                            Model::Input(InputPanel::new(&form, &state_of))
-                        })
-                }),
+            AttentionKind::Question | AttentionKind::Approval => {
+                input_panel(item, task, positions).map_or(Model::Missing, Model::Input)
+            }
             AttentionKind::Problem | AttentionKind::EntryLimit => {
-                let pending = task
-                    .runner
-                    .as_ref()
-                    .and_then(|runner| runner.pending_input.as_ref())
-                    .filter(|pending| pending.id == item.waiting_id);
-                match pending {
-                    Some(pending) => {
-                        let state_of = |attempt: &str| {
-                            positions
-                                .iter()
-                                .find(|position| {
-                                    position.action_execution_id.as_deref() == Some(attempt)
-                                })
-                                .map(|position| position.state_id.clone())
-                        };
-                        serde_json::from_value::<PendingHumanInputView>(pending.form.clone())
-                            .map_or(Model::Missing, |form| {
-                                Model::Input(InputPanel::new(&form, &state_of))
-                            })
-                    }
+                match input_panel(item, task, positions) {
+                    Some(panel) => Model::Input(panel),
                     None if task
                         .runner
                         .as_ref()
@@ -436,9 +276,9 @@ impl Entry {
             .map(|item| item.label.clone());
         let untouched = chooser.focus() == ChooserFocus::Actions
             && chooser.selected_item().map(|item| &item.label) == opening.as_ref();
-        let rebuilt = chooser.rebuilt(Self::items_of(&model, task));
+        let rebuilt = chooser.rebuilt(Self::items_of(&model, task, self.forms));
         self.chooser = if untouched {
-            rebuilt.selecting(model.selected() + 1)
+            rebuilt.selecting(model.selected() + self.offset())
         } else {
             rebuilt
         };
@@ -557,6 +397,52 @@ impl Entry {
     }
 }
 
+/// The action of the menu a choice of the task's own actions does.
+pub(super) fn panel_action(id: TaskActionId) -> Option<TaskAction> {
+    match id {
+        TaskActionId::Transition => Some(TaskAction::Transition),
+        TaskActionId::Resume | TaskActionId::Pause => Some(TaskAction::PauseResume),
+        TaskActionId::Restart => Some(TaskAction::Restart),
+        _ => None,
+    }
+}
+
+/// The panel of the wait `item` stands for: the definition the server put in
+/// its form. `None` while the server offers no form for the wait.
+fn input_panel(
+    item: &AttentionItem,
+    task: &TaskSummary,
+    positions: &[Position],
+) -> Option<InputPanel> {
+    let state_of = |attempt: &str| {
+        positions
+            .iter()
+            .find(|position| position.action_execution_id.as_deref() == Some(attempt))
+            .map(|position| position.state_id.clone())
+    };
+    let definition = task
+        .panel
+        .as_ref()?
+        .forms
+        .iter()
+        .filter(|form| form.waiting_id.as_deref() == Some(item.waiting_id.as_str()))
+        .find_map(|form| form.definition.as_ref())?;
+    Some(InputPanel::from_definition(definition, &state_of))
+}
+
+/// The entries of the form of the task's own actions.
+fn manual_items(form: &PanelForm) -> Vec<ChooserItem> {
+    form.choices
+        .iter()
+        .map(|choice| {
+            ChooserItem::new(
+                choice.label.clone(),
+                choice.description.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
 /// What a waiting left behind when it went away with a draft.
 ///
 /// The entry itself is kept: should the same waiting come back — a task
@@ -573,49 +459,130 @@ pub struct Released {
     entry: Box<Entry>,
 }
 
-/// What a key in the panel asks of the application.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PanelEffect {
-    /// The key was folded into the panel.
-    None,
-    /// Collapse the panel.
-    Collapse,
-    /// Say something on the bar.
-    Notice(String),
-    /// Send the chosen action.
-    Submit(Submission),
-    /// The chosen action cannot be undone: ask in the `y` / `n` window first.
-    Confirm(Submission),
-    /// Action 0 with its text: send it to the agent.
-    Comment(String),
-}
-
-/// What a read of the panel's entries changed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SyncEffect {
-    /// The entry the operator was in went away.
-    pub lost_current: bool,
-    /// A draft was left behind.
-    pub released: bool,
-}
-
 /// The panel of one task: every waiting, the one shown, and the drafts.
 #[derive(Debug, Clone, Default)]
 pub struct WaitingPanel {
     entries: Vec<Entry>,
     current: usize,
-    collapsed: bool,
+    pub(super) collapsed: bool,
     released: Vec<Released>,
     conductor: Option<ConductorView>,
     conductor_revision: Option<u64>,
     /// When a read told "the reader is starting" is asked again (D63).
     conductor_retry_at: Option<std::time::Instant>,
+    /// The forms of the server's panel and the one shown; `None` for a task
+    /// whose server did not say (a server from before the field) or whose
+    /// wait is one of the owner's own panels.
+    forms: Option<Forms>,
+    /// The free message to the agent: one draft per task.
+    chat: Chat,
+    /// The height of the details the panel was last asked about: the chat
+    /// box grows to half of it (R16).
+    details_height: std::cell::Cell<u16>,
+}
+
+/// The forms the server offered, and which is shown.
+#[derive(Debug, Clone)]
+struct Forms {
+    offer: PanelOffer,
+    switcher: Switcher,
+    /// The choices of the form of the task's own actions.
+    manual: Option<Chooser>,
+}
+
+/// Where the form shown keeps its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// An entry of the waiting panel (an answer, a permission, an entry
+    /// limit, the output of a step), by its index.
+    Entry(usize),
+    /// The free message to the agent.
+    Chat,
+    /// The choices of the task's own actions.
+    Manual,
+    /// Nothing is shown.
+    Nothing,
 }
 
 impl WaitingPanel {
-    /// Whether there is anything to show: a waiting or a draft left behind.
+    /// Whether there is anything to show: a waiting, a form of the server's
+    /// panel, or a draft left behind.
     pub fn is_present(&self) -> bool {
-        !self.entries.is_empty() || !self.released.is_empty()
+        match &self.forms {
+            Some(forms) => {
+                !forms.switcher.is_empty()
+                    || !self.released.is_empty()
+                    || !self.chat.draft_text().is_empty()
+            }
+            None => !self.entries.is_empty() || !self.released.is_empty(),
+        }
+    }
+
+    /// Where the form shown keeps its state.
+    fn slot(&self) -> Slot {
+        let Some(forms) = &self.forms else {
+            return if self.current < self.entries.len() {
+                Slot::Entry(self.current)
+            } else {
+                Slot::Nothing
+            };
+        };
+        match forms.switcher.active() {
+            None => Slot::Nothing,
+            Some(key) if key.kind == PanelFormKind::Chat => Slot::Chat,
+            Some(FormKey {
+                kind:
+                    PanelFormKind::Action
+                    | PanelFormKind::Answer
+                    | PanelFormKind::EntryLimit
+                    | PanelFormKind::Permission,
+                waiting_id: Some(id),
+            }) => self
+                .entries
+                .iter()
+                .position(|entry| entry.item.waiting_id == *id)
+                .map_or(Slot::Nothing, Slot::Entry),
+            Some(key) if key.is_manual_action() => Slot::Manual,
+            // A form of a kind this client does not know has no state.
+            Some(_) => Slot::Nothing,
+        }
+    }
+
+    fn current_entry(&self) -> Option<&Entry> {
+        match self.slot() {
+            Slot::Entry(index) => self.entries.get(index),
+            _ => None,
+        }
+    }
+
+    /// Where the entries of the chooser of the shown form start in its
+    /// list: after action 0, when there is one.
+    pub fn chooser_offset(&self) -> usize {
+        self.current_entry().map_or(1, Entry::offset)
+    }
+
+    /// Says on the form shown what a try to send it found wrong.
+    pub fn fail(&mut self, message: String) {
+        match self.slot() {
+            Slot::Entry(index) => self.entries[index].error = Some(message),
+            Slot::Chat => self.chat.settle(Err((message, true))),
+            Slot::Manual | Slot::Nothing => {}
+        }
+    }
+
+    /// The kind of the form shown, in the server's panel.
+    pub fn active_form(&self) -> Option<PanelFormKind> {
+        self.forms.as_ref()?.switcher.active().map(|key| key.kind)
+    }
+
+    /// How many forms the server's panel has.
+    pub fn form_count(&self) -> usize {
+        self.forms.as_ref().map_or(0, |forms| forms.switcher.len())
+    }
+
+    /// What the operator wrote in the chat form and has not sent.
+    pub fn chat_draft(&self) -> String {
+        self.chat.draft_text()
     }
 
     /// How many things wait.
@@ -647,19 +614,22 @@ impl WaitingPanel {
 
     /// The chooser of the waiting shown.
     pub fn chooser(&self) -> Option<&Chooser> {
-        self.entries.get(self.current).map(|entry| &entry.chooser)
+        self.current_entry().map(|entry| &entry.chooser)
     }
 
     /// The separate text composer for an ordinary answer or conversation reply.
     pub fn composer(&self) -> Option<&Chooser> {
-        self.entries.get(self.current)?.composer.as_ref()
+        self.current_entry()?.composer.as_ref()
     }
 
     /// What the last send of the waiting shown found wrong.
     pub fn error(&self) -> Option<&str> {
-        self.entries
-            .get(self.current)
-            .and_then(|entry| entry.error.as_deref())
+        match self.slot() {
+            Slot::Chat => self.chat.error(),
+            _ => self
+                .current_entry()
+                .and_then(|entry| entry.error.as_deref()),
+        }
     }
 
     /// The drafts of waitings that went away.
@@ -670,17 +640,25 @@ impl WaitingPanel {
     /// Whether the form of the current entry waits for the confirmation of
     /// its send: only the popup's keys act then.
     pub fn is_confirming(&self) -> bool {
-        self.entries.get(self.current).is_some_and(|entry| {
-            entry.chooser.is_confirming()
-                || entry.composer.as_ref().is_some_and(Chooser::is_confirming)
-        })
+        match self.slot() {
+            Slot::Chat => self.chat.is_confirming(),
+            Slot::Manual => false,
+            _ => self.current_entry().is_some_and(|entry| {
+                entry.chooser.is_confirming()
+                    || entry.composer.as_ref().is_some_and(Chooser::is_confirming)
+            }),
+        }
     }
 
     /// Whether keys are typed into a field: `q` and `?` are text then.
     pub fn is_typing(&self) -> bool {
-        self.entries.get(self.current).is_some_and(|entry| {
-            entry.chooser.is_typing() || entry.composer.as_ref().is_some_and(Chooser::is_typing)
-        })
+        match self.slot() {
+            Slot::Chat => self.chat.is_typing(),
+            Slot::Manual => false,
+            _ => self.current_entry().is_some_and(|entry| {
+                entry.chooser.is_typing() || entry.composer.as_ref().is_some_and(Chooser::is_typing)
+            }),
+        }
     }
 
     /// Unfolds the panel.
@@ -698,6 +676,12 @@ impl WaitingPanel {
             .map(Entry::draft_text)
             .collect();
         parts.extend(self.released.iter().map(|released| released.text.clone()));
+        if self.forms.is_some() {
+            let chat = self.chat.draft_text();
+            if !chat.is_empty() {
+                parts.push(chat);
+            }
+        }
         parts.join("\n")
     }
 
@@ -738,7 +722,7 @@ impl WaitingPanel {
                 ..
             }) => {
                 self.conductor_retry_at =
-                    Some(std::time::Instant::now() + super::tabs::READER_RETRY);
+                    Some(std::time::Instant::now() + crate::tui::task_app::tabs::READER_RETRY);
                 return;
             }
             Ok(ConductorReadResponse::Unavailable { message, .. }) => {
@@ -773,13 +757,24 @@ impl WaitingPanel {
     pub fn sync(&mut self, task: &TaskSummary, positions: &[Position]) -> SyncEffect {
         let mut effect = SyncEffect::default();
         let shown = self.current_waiting_id().map(str::to_string);
+        let before = self.active_key();
+        let offer = task.panel.as_ref();
+        let forms_mode = offer.is_some();
         let mut old = std::mem::take(&mut self.entries);
         let mut entries = Vec::with_capacity(task.attention.len());
-        for item in &task.attention {
-            match old
-                .iter()
-                .position(|entry| entry.item.waiting_id == item.waiting_id)
-            {
+        // With the server's forms, only the waits a form answers have an entry.
+        let wanted = task.attention.iter().filter(|item| {
+            offer.is_none_or(|offer| {
+                offer.forms.iter().any(|form| {
+                    form.kind != PanelFormKind::Unrecognized
+                        && form.waiting_id.as_deref() == Some(item.waiting_id.as_str())
+                })
+            })
+        });
+        for item in wanted {
+            match old.iter().position(|entry| {
+                entry.item.waiting_id == item.waiting_id && entry.forms == forms_mode
+            }) {
                 Some(index) => {
                     let mut entry = old.remove(index);
                     if matches!(entry.model, Model::Missing) {
@@ -791,7 +786,10 @@ impl WaitingPanel {
                     let parked = self
                         .released
                         .iter()
-                        .position(|released| released.waiting_id == item.waiting_id)
+                        .position(|released| {
+                            released.waiting_id == item.waiting_id
+                                && released.entry.forms == forms_mode
+                        })
                         .map(|index| self.released.remove(index));
                     let entry = match parked {
                         Some(released) => {
@@ -807,7 +805,9 @@ impl WaitingPanel {
                             }
                             entry
                         }
-                        None => Entry::build(item, task, positions, self.conductor.as_ref()),
+                        None => {
+                            Entry::build(item, task, positions, self.conductor.as_ref(), forms_mode)
+                        }
                     };
                     entries.push(entry);
                 }
@@ -842,13 +842,79 @@ impl WaitingPanel {
                     .position(|entry| entry.item.waiting_id == id)
             })
             .unwrap_or(0);
+        match offer {
+            Some(offer) => {
+                self.sync_forms(offer);
+                if let Slot::Entry(index) = self.slot() {
+                    self.current = index;
+                }
+                if self.active_key() != before {
+                    self.leave_all();
+                    self.arrive();
+                }
+            }
+            None => self.forms = None,
+        }
         effect
+    }
+
+    /// Takes the server's offer in: which forms there are, which is shown,
+    /// and the choices of the form of the task's own actions.
+    fn sync_forms(&mut self, offer: &PanelOffer) {
+        let mut forms = self.forms.take().unwrap_or_else(|| Forms {
+            offer: PanelOffer::default(),
+            switcher: Switcher::default(),
+            manual: None,
+        });
+        forms.switcher.sync(offer);
+        forms.manual = offer
+            .forms
+            .iter()
+            .find(|form| form.is_manual_action())
+            .map(|form| {
+                let items = manual_items(form);
+                match forms.manual.take() {
+                    Some(chooser) => chooser.rebuilt(items),
+                    None => Chooser::new(items),
+                }
+            });
+        forms.offer = offer.clone();
+        self.forms = Some(forms);
+    }
+
+    /// The key of the form shown, in the server's panel.
+    fn active_key(&self) -> Option<FormKey> {
+        self.forms
+            .as_ref()
+            .and_then(|forms| forms.switcher.active().cloned())
+    }
+
+    /// Takes the keys out of every form: what was typed stays.
+    fn leave_all(&mut self) {
+        self.chat.leave();
+        for entry in &mut self.entries {
+            entry.chooser.leave_fields();
+            if let Some(composer) = entry.composer.as_mut() {
+                composer.leave_fields();
+            }
+        }
+    }
+
+    /// Gives the keys to the box of the form that came into view, when it is
+    /// a text box.
+    fn arrive(&mut self) {
+        if self.slot() == Slot::Chat {
+            self.chat.enter();
+        }
     }
 
     /// Folds a key into the panel. Keys that are the application's — `q`,
     /// `?` — are not here: the caller handles them first when nothing is
     /// being typed.
     pub fn on_key(&mut self, key: KeyEvent) -> PanelEffect {
+        if let Some(effect) = self.on_forms_key(key) {
+            return effect;
+        }
         if self.entries.is_empty() {
             return match keymap::lookup(Context::Panel, &key) {
                 Some(Action::Cancel) => {
@@ -861,8 +927,8 @@ impl WaitingPanel {
         let typing = self.is_typing();
         if !typing {
             match keymap::lookup(Context::Panel, &key) {
-                Some(Action::PrevPending) => return self.step(-1),
-                Some(Action::NextPending) => return self.step(1),
+                Some(Action::PrevPending) if self.forms.is_none() => return self.step(-1),
+                Some(Action::NextPending) if self.forms.is_none() => return self.step(1),
                 Some(Action::Top) => {
                     self.entries[self.current].context_scroll.to_top();
                     return PanelEffect::None;
@@ -928,7 +994,7 @@ impl WaitingPanel {
             ChooserAction::Cancel => PanelEffect::Collapse,
             ChooserAction::Blocked(reason) => PanelEffect::Notice(reason),
             ChooserAction::Submit(mut submission) => {
-                if submission.index == 0 {
+                if submission.index == 0 && !entry.forms {
                     // Action 0: the field of the composer takes the focus, or
                     // the text of its own field goes to the agent.
                     if let Some(composer) = entry.composer.as_mut() {
@@ -942,8 +1008,8 @@ impl WaitingPanel {
                     .items()
                     .get(submission.index)
                     .is_some_and(|item| item.irreversible);
-                // The entries of the model start after action 0.
-                submission.index -= 1;
+                // The entries of the model start after action 0, when there is one.
+                submission.index -= entry.offset();
                 if irreversible {
                     PanelEffect::Confirm(submission)
                 } else {
@@ -957,6 +1023,11 @@ impl WaitingPanel {
     /// field of the chosen action — as a key that edits it would: the last
     /// send's verdict goes. Never sends. Returns whether a field took it.
     pub fn paste(&mut self, pasted: &str) -> bool {
+        match self.slot() {
+            Slot::Chat => return self.chat.paste(pasted),
+            Slot::Manual | Slot::Nothing => return false,
+            Slot::Entry(_) => {}
+        }
         let Some(entry) = self.entries.get_mut(self.current) else {
             return false;
         };
@@ -972,6 +1043,68 @@ impl WaitingPanel {
         used
     }
 
+    /// A key in the server's panel: `Esc` steps through the forms, the chat
+    /// and the task's own actions take their keys; the entries take theirs
+    /// in [`Self::on_key`]. `None` leaves the key to it.
+    fn on_forms_key(&mut self, key: KeyEvent) -> Option<PanelEffect> {
+        if self
+            .forms
+            .as_ref()
+            .is_none_or(|forms| forms.switcher.is_empty())
+        {
+            return None;
+        }
+        if key.code == KeyCode::Esc && !self.is_confirming() {
+            self.leave_all();
+            if let Some(forms) = self.forms.as_mut() {
+                forms.switcher.next();
+            }
+            if let Slot::Entry(index) = self.slot() {
+                self.current = index;
+            }
+            self.arrive();
+            return Some(PanelEffect::None);
+        }
+        match self.slot() {
+            Slot::Chat => Some(match self.chat.on_key(key) {
+                ChatEffect::None => PanelEffect::None,
+                ChatEffect::Notice(text) => PanelEffect::Notice(text),
+                ChatEffect::Send(text) => PanelEffect::Comment(text),
+            }),
+            Slot::Manual => {
+                // A form of a kind this client does not know has no chooser:
+                // the key is spent, not left to an entry that is not shown.
+                let Some(chooser) = self.forms.as_mut().and_then(|forms| forms.manual.as_mut())
+                else {
+                    return Some(PanelEffect::None);
+                };
+                let action = chooser.on_key(key);
+                Some(match action {
+                    ChooserAction::Submit(submission) => self
+                        .manual_action(submission.index)
+                        .map_or(PanelEffect::None, PanelEffect::Action),
+                    ChooserAction::Blocked(reason) => PanelEffect::Notice(reason),
+                    ChooserAction::Cancel | ChooserAction::None => PanelEffect::None,
+                })
+            }
+            Slot::Nothing => Some(PanelEffect::None),
+            Slot::Entry(_) => None,
+        }
+    }
+
+    /// The action the `index`th choice of the task's own actions does.
+    fn manual_action(&self, index: usize) -> Option<TaskActionId> {
+        self.forms
+            .as_ref()?
+            .offer
+            .forms
+            .iter()
+            .find(|form| form.is_manual_action())?
+            .choices
+            .get(index)?
+            .action
+    }
+
     fn step(&mut self, by: isize) -> PanelEffect {
         let count = self.entries.len();
         self.current = (self.current as isize + by).rem_euclid(count as isize) as usize;
@@ -984,9 +1117,14 @@ impl WaitingPanel {
         task: &TaskSummary,
         submission: &Submission,
     ) -> Result<AnswerRequest, String> {
+        // Only the form shown may send: the entry kept in `current` can be
+        // one the owner has stepped away from.
+        let Slot::Entry(index) = self.slot() else {
+            return Err("Nie ma czego wysłać.".to_string());
+        };
         let entry = self
             .entries
-            .get_mut(self.current)
+            .get_mut(index)
             .ok_or_else(|| "Nie ma czego wysłać.".to_string())?;
         let (submit, summary) = match &entry.model {
             Model::Input(panel) => (
@@ -1033,13 +1171,26 @@ impl WaitingPanel {
         task: &TaskSummary,
         text: String,
     ) -> Result<AnswerRequest, String> {
+        if text.is_empty() {
+            return Err("Napisz, co agent ma zobaczyć.".to_string());
+        }
+        if self.forms.is_some() {
+            // The chat form: the message is about the task, not about a wait.
+            let key = self.chat.send_key(idempotency_key);
+            return Ok(AnswerRequest {
+                task_id: task.task_id.to_string(),
+                waiting_id: String::new(),
+                title: title_of(task),
+                generation: task.generation,
+                key,
+                summary: "wiadomość wysłana do agenta".to_string(),
+                submit: Submit::Comment(text),
+            });
+        }
         let entry = self
             .entries
             .get_mut(self.current)
             .ok_or_else(|| "Nie ma czego wysłać.".to_string())?;
-        if text.is_empty() {
-            return Err("Napisz, co agent ma zobaczyć.".to_string());
-        }
         entry.wrote = true;
         let key = entry.key.get_or_insert_with(idempotency_key).clone();
         Ok(AnswerRequest {
@@ -1056,7 +1207,11 @@ impl WaitingPanel {
     /// Says what a send of `waiting_id` came to. Success forgets the draft; a
     /// refusal keeps the panel as it is and shows why; a lost connection keeps
     /// the key for the retry.
-    fn settle(&mut self, waiting_id: &str, outcome: Result<(), (String, bool)>) {
+    pub(super) fn settle(&mut self, waiting_id: &str, outcome: Result<(), (String, bool)>) {
+        if waiting_id.is_empty() && self.forms.is_some() {
+            self.chat.settle(outcome);
+            return;
+        }
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -1092,8 +1247,22 @@ impl WaitingPanel {
     pub fn preferred_height(&self, width: u16, area_height: u16, header_height: u16) -> u16 {
         let reserved = header_height + 2 + KEEP_FOR_CONTENT;
         let cap = area_height.saturating_sub(reserved);
-        let wanted = if let Some(entry) = self.entries.get(self.current) {
-            if self.collapsed {
+        self.details_height.set(area_height);
+        let other = matches!(self.slot(), Slot::Chat | Slot::Manual);
+        let wanted = if other {
+            // The padding, the heading and the gap, and the form.
+            5 + match (
+                self.slot(),
+                self.forms.as_ref().and_then(|f| f.manual.as_ref()),
+            ) {
+                (Slot::Manual, Some(chooser)) => chooser.preferred_height(width),
+                _ => self.chat.preferred_height(width, area_height),
+            }
+        } else if let Some(entry) = self
+            .current_entry()
+            .filter(|_| self.forms.is_some() || self.slot() != Slot::Nothing)
+        {
+            if self.collapsed && self.forms.is_none() {
                 2
             } else {
                 let context = context_rows(&entry.model.context(), usize::from(width)).len();
@@ -1102,15 +1271,17 @@ impl WaitingPanel {
                     + entry.chooser.preferred_height(width)
                     + if entry.composer.is_some() { 3 } else { 0 }
             }
-        } else if self.released.is_empty() {
-            0
         } else {
-            let lines: usize = self
-                .released
-                .iter()
-                .map(|released| 1 + released.text.lines().count().max(1))
-                .sum();
-            5 + lines.min(5) as u16
+            let leftovers = self.leftovers();
+            if leftovers.is_empty() {
+                0
+            } else {
+                let lines: usize = leftovers
+                    .iter()
+                    .map(|(_, text)| 1 + text.lines().count().max(1))
+                    .sum();
+                5 + lines.min(5) as u16
+            }
         };
         wanted.min(cap)
     }
@@ -1133,14 +1304,22 @@ impl WaitingPanel {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        if self.entries.is_empty() {
+        if matches!(self.slot(), Slot::Chat | Slot::Manual) {
+            self.render_other_form(frame, area, styles, stale, focused);
+            return;
+        }
+        if self.current_entry().is_none() {
             self.render_released(frame, area, styles);
             paint_waiting_panel(frame, area, styles, focused);
             return;
         }
         let count = self.entries.len();
+        let position = self
+            .forms
+            .as_ref()
+            .map(|forms| position_hint(&forms.switcher));
         let current = self.current;
-        let collapsed = self.collapsed;
+        let collapsed = self.collapsed && position.is_none();
         let entry = &mut self.entries[current];
         let vertical_padding = u16::from(area.height >= 16);
         let inner = Rect::new(
@@ -1183,10 +1362,10 @@ impl WaitingPanel {
             return;
         }
 
-        let count_suffix = if count > 1 {
-            format!("  {}/{count}", current + 1)
-        } else {
-            String::new()
+        let count_suffix = match &position {
+            Some(hint) => format!("  {hint}"),
+            None if count > 1 => format!("  {}/{count}", current + 1),
+            None => String::new(),
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1281,16 +1460,98 @@ impl WaitingPanel {
             area.height.saturating_sub(4),
         );
         let mut lines = Vec::new();
-        for released in &self.released {
-            lines.push(Line::styled(
-                one_line(&released.title),
-                styles.of(Role::Done),
-            ));
-            for line in released.text.lines() {
+        for (title, text) in self.leftovers() {
+            lines.push(Line::styled(one_line(&title), styles.of(Role::Done)));
+            for line in text.lines() {
                 lines.push(Line::raw(one_line(line)));
             }
         }
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The drafts that have no waiting to go with: the ones of waitings that
+    /// went away, and the chat's when no form is on offer.
+    fn leftovers(&self) -> Vec<(String, String)> {
+        let mut drafts: Vec<(String, String)> = self
+            .released
+            .iter()
+            .map(|released| (released.title.clone(), released.text.clone()))
+            .collect();
+        if self
+            .forms
+            .as_ref()
+            .is_some_and(|forms| forms.switcher.is_empty())
+        {
+            let chat = self.chat.draft_text();
+            if !chat.is_empty() {
+                drafts.push(("Wiadomość do agenta".to_string(), chat));
+            }
+        }
+        drafts
+    }
+
+    /// Draws the form that is not an entry: the free message to the agent or
+    /// the choices of the task's own actions, under the heading with the
+    /// place among the forms.
+    fn render_other_form(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        styles: &Styles,
+        stale: bool,
+        focused: bool,
+    ) {
+        let vertical_padding = u16::from(area.height >= 16);
+        let inner = Rect::new(
+            area.x.saturating_add(2),
+            area.y.saturating_add(vertical_padding),
+            area.width.saturating_sub(3),
+            area.height
+                .saturating_sub(vertical_padding.saturating_mul(2)),
+        );
+        let slot = self.slot();
+        let Some(hint) = self
+            .forms
+            .as_ref()
+            .map(|forms| position_hint(&forms.switcher))
+        else {
+            return;
+        };
+        if inner.width == 0 || inner.height < 2 {
+            paint_waiting_panel(frame, area, styles, focused);
+            return;
+        }
+        let role = if stale { Role::Done } else { Role::Attention };
+        let title = if slot == Slot::Chat {
+            "› Rozmowa z agentem"
+        } else {
+            "› Akcje zadania"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(title, styles.strong(role)),
+                Span::styled(format!("  {hint}"), styles.of(role)),
+            ])),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        let gap = if inner.height >= 10 { 2 } else { 1 };
+        let body = Rect::new(
+            inner.x,
+            inner.y.saturating_add(gap),
+            inner.width,
+            inner.height.saturating_sub(gap),
+        );
+        match slot {
+            Slot::Chat => self
+                .chat
+                .render(frame, body, self.details_height.get(), styles, focused),
+            _ => {
+                if let Some(chooser) = self.forms.as_mut().and_then(|f| f.manual.as_mut()) {
+                    chooser::render_footer(frame, body, chooser, styles, focused);
+                }
+            }
+        }
+        paint_waiting_panel(frame, area, styles, focused);
     }
 }
 
@@ -1322,7 +1583,7 @@ fn paint_waiting_panel(frame: &mut Frame, area: Rect, styles: &Styles, focused: 
 /// The context wrapped to `width` columns, one row per line, each in its
 /// tone. Everything in it is somebody else's text, so it is made safe here.
 /// A description as lines, each safe for a terminal.
-fn one_line_per_row(text: &str) -> Vec<String> {
+pub(super) fn one_line_per_row(text: &str) -> Vec<String> {
     text.lines().map(one_line).collect()
 }
 
@@ -1376,467 +1637,4 @@ fn render_context(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Left), area);
-}
-
-// ---------------------------------------------------------------------
-// The application's part
-// ---------------------------------------------------------------------
-
-impl TaskApp {
-    /// Whether the panel has the keyboard: the focus is in the details, on
-    /// the panel, and there is a panel.
-    pub fn panel_focused(&self) -> bool {
-        matches!(self.view, super::View::Tasks)
-            && self.focus == super::Focus::Details
-            && self.panel_focus
-            && self.selected_panel().is_some_and(WaitingPanel::is_present)
-    }
-
-    fn selected_panel(&self) -> Option<&WaitingPanel> {
-        let id = self.list.selected_id()?;
-        self.detail.view(id).map(|view| &view.waiting)
-    }
-
-    /// Whether the panel's form asks the operator to confirm the send.
-    pub(super) fn panel_confirming(&self) -> bool {
-        self.panel_focused()
-            && self
-                .selected_panel()
-                .is_some_and(WaitingPanel::is_confirming)
-    }
-
-    /// Whether a key is typed into a field of the panel.
-    pub(super) fn panel_typing(&self) -> bool {
-        self.panel_focused() && self.selected_panel().is_some_and(WaitingPanel::is_typing)
-    }
-
-    /// `Enter` on the list: the details of the selected task, and — when it
-    /// waits — its panel unfolded with the focus on the actions.
-    pub(super) fn open_selected(&mut self) {
-        let Some(id) = self.list.selected_id().map(str::to_string) else {
-            return;
-        };
-        self.focus = super::Focus::Details;
-        self.panel_focus = false;
-        self.back_to_axis();
-        self.sync_waiting();
-        if let Some(view) = self.detail.views.get_mut(&id) {
-            if view.waiting.is_present() {
-                view.waiting.expand();
-                self.panel_focus = true;
-            }
-        }
-    }
-
-    /// `Tab` in the details: to the panel, unfolding it.
-    pub(super) fn focus_panel(&mut self) {
-        let Some(id) = self.list.selected_id().map(str::to_string) else {
-            return;
-        };
-        match self.detail.views.get_mut(&id) {
-            Some(view) if view.waiting.is_present() => {
-                view.waiting.expand();
-                self.panel_focus = true;
-            }
-            _ => self.notify(Severity::Warning, "to zadanie na nic nie czeka"),
-        }
-    }
-
-    /// Brings every task's panel in line with what its row says it waits on,
-    /// and the drafts with what the panels hold. Call it after a list was
-    /// read, an event was applied, a key edited a draft.
-    pub fn sync_waiting(&mut self) {
-        let selected = self.list.selected_id().map(str::to_string);
-        let mut lost = false;
-        let mut released = false;
-        let mut drafts = Vec::new();
-        for task in self.list.tasks() {
-            let id = task.task_id.as_str();
-            let present = self
-                .detail
-                .views
-                .get(id)
-                .is_some_and(|view| view.waiting.is_present());
-            if task.attention.is_empty() && !present {
-                continue;
-            }
-            let view = self.detail.view_mut(id);
-            let positions = view.progress().positions().to_vec();
-            let effect = view.waiting.sync(task, &positions);
-            if selected.as_deref() == Some(id) {
-                lost = effect.lost_current;
-                released = effect.released;
-            }
-            drafts.push((id.to_string(), view.draft_text()));
-        }
-        for (id, text) in drafts {
-            self.detail.set_draft(&id, text);
-        }
-        if lost && self.panel_focus {
-            self.panel_focus = false;
-            let text = if released {
-                "oczekiwanie zniknęło — szkic został w panelu do skopiowania"
-            } else {
-                "oczekiwanie zniknęło (odpowiedź z innego klienta?)"
-            };
-            self.notify(Severity::Warning, text);
-        }
-    }
-
-    /// A key while the panel has the keyboard.
-    pub(super) fn on_panel_key(&mut self, key: KeyEvent) -> Request {
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && !self.panel_confirming() {
-            // Tab changes the outer panel focus. Chooser fields use arrows and
-            // Enter, so leaving here never submits or discards a draft.
-            self.panel_focus = false;
-            return Request::None;
-        }
-        let Some(id) = self.list.selected_id().map(str::to_string) else {
-            return Request::None;
-        };
-        if !self.panel_typing() {
-            match keymap::lookup(Context::Panel, &key) {
-                Some(Action::Help) => {
-                    self.help_open = true;
-                    return Request::None;
-                }
-                Some(Action::Quit) => {
-                    self.on_quit();
-                    return Request::None;
-                }
-                _ => {}
-            }
-        }
-        let effect = self
-            .detail
-            .views
-            .get_mut(&id)
-            .map_or(PanelEffect::None, |view| view.waiting.on_key(key));
-        let request = match effect {
-            PanelEffect::None => Request::None,
-            PanelEffect::Collapse => {
-                if let Some(view) = self.detail.views.get_mut(&id) {
-                    view.waiting.collapsed = !view.waiting.is_empty();
-                }
-                self.panel_focus = false;
-                Request::None
-            }
-            PanelEffect::Notice(text) => {
-                self.notify(Severity::Warning, text);
-                Request::None
-            }
-            PanelEffect::Submit(submission) => self.submit_answer(&id, &submission),
-            PanelEffect::Confirm(submission) => self.ask_to_confirm(&id, &submission),
-            PanelEffect::Comment(text) => self.submit_comment_text(&id, text),
-        };
-        if let Some(view) = self.detail.views.get(&id) {
-            let text = view.draft_text();
-            self.detail.set_draft(&id, text);
-        }
-        request
-    }
-
-    /// A paste while the panel has the keyboard: into the field being typed
-    /// in, and nowhere else.
-    pub(super) fn on_panel_paste(&mut self, pasted: &str) {
-        let Some(id) = self.list.selected_id().map(str::to_string) else {
-            return;
-        };
-        let used = self
-            .detail
-            .views
-            .get_mut(&id)
-            .is_some_and(|view| view.waiting.paste(pasted));
-        if used {
-            self.sync_draft(&id);
-        }
-    }
-
-    /// An action that cannot be undone: the request is prepared as for any
-    /// other, but waits in the confirmation window for `y`.
-    fn ask_to_confirm(&mut self, id: &str, submission: &Submission) -> Request {
-        let Request::Answer(request) = self.submit_answer(id, submission) else {
-            return Request::None;
-        };
-        let (label, mut lines) = self
-            .selected_panel()
-            .and_then(WaitingPanel::chooser)
-            // The submission counts from after action 0.
-            .and_then(|chooser| chooser.items().get(submission.index + 1))
-            .map_or_else(
-                || (submission.label.clone(), Vec::new()),
-                |item| (item.label.clone(), one_line_per_row(&item.description)),
-            );
-        lines.push("! Tego nie da się cofnąć.".to_string());
-        self.confirm_answer(request, format!("{} !", one_line(&label)), lines);
-        Request::None
-    }
-
-    /// Turns a chosen action into a request, unless the connection or the
-    /// action's own rules say no.
-    fn submit_answer(&mut self, id: &str, submission: &Submission) -> Request {
-        if !self.mutation_allowed() {
-            return Request::None;
-        }
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == id)
-        else {
-            return Request::None;
-        };
-        let Some(view) = self.detail.views.get_mut(id) else {
-            return Request::None;
-        };
-        match view.waiting.prepare(task, submission) {
-            Ok(request) => Request::Answer(Box::new(request)),
-            Err(message) => {
-                if let Some(entry) = view.waiting.entries.get_mut(view.waiting.current) {
-                    entry.error = Some(message);
-                }
-                Request::None
-            }
-        }
-    }
-
-    /// Turns the text of action 0 into a request, unless the connection says no.
-    fn submit_comment_text(&mut self, id: &str, text: String) -> Request {
-        if !self.mutation_allowed() {
-            return Request::None;
-        }
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == id)
-        else {
-            return Request::None;
-        };
-        let Some(view) = self.detail.views.get_mut(id) else {
-            return Request::None;
-        };
-        match view.waiting.prepare_comment(task, text) {
-            Ok(request) => Request::Answer(Box::new(request)),
-            Err(message) => {
-                if let Some(entry) = view.waiting.entries.get_mut(view.waiting.current) {
-                    entry.error = Some(message);
-                }
-                Request::None
-            }
-        }
-    }
-
-    /// Sends a chosen action. Success keeps the focus in the details on the timeline and says
-    /// what happened; a refusal keeps the panel with the typed text, shows why
-    /// and reads the tasks again.
-    pub(super) async fn answer(&mut self, request: AnswerRequest) {
-        let AnswerRequest {
-            task_id,
-            waiting_id,
-            title,
-            generation,
-            key,
-            summary,
-            submit,
-        } = request;
-        let had_slot = self.holds_slot(&task_id);
-        let result = match submit {
-            Submit::Input {
-                pending_input_id,
-                delivery,
-            } => self
-                .client
-                .control_input(
-                    &task_id,
-                    &SubmitInputRequest {
-                        pending_input_id,
-                        idempotency_key: key,
-                        delivery: *delivery,
-                    },
-                )
-                .await
-                .map(drop),
-            Submit::Operator(command) => self
-                .client
-                .control_operator_command(
-                    &task_id,
-                    &SubmitOperatorCommandRequest {
-                        command,
-                        idempotency_key: key,
-                        expected_generation: Some(generation),
-                    },
-                )
-                .await
-                .map(drop),
-            Submit::Owner(command) => self
-                .client
-                .control_command(
-                    &task_id,
-                    &OwnerCommandRequest {
-                        command,
-                        idempotency_key: key,
-                        expected_generation: Some(generation),
-                    },
-                )
-                .await
-                .map(drop),
-            Submit::Comment(text) => self
-                .client
-                .control_comment(
-                    &task_id,
-                    &SubmitCommentRequest {
-                        text,
-                        idempotency_key: key,
-                        expected_generation: Some(generation),
-                    },
-                )
-                .await
-                .map(drop),
-        };
-        match result {
-            Ok(()) => {
-                self.settle_answer(&task_id, &waiting_id, Ok(()));
-                self.focus = super::Focus::Details;
-                self.panel_focus = false;
-                self.back_to_axis();
-                // An answer to a task without a slot resumes it; the resume
-                // waits when the backend is full.
-                self.after_work_check(
-                    &task_id,
-                    had_slot,
-                    Severity::Success,
-                    format!("{title}: {summary}"),
-                );
-            }
-            Err(error) => {
-                let retryable = super::is_transport(&error);
-                let reason = failure_reason(&error);
-                self.note_transport(&error);
-                self.settle_answer(&task_id, &waiting_id, Err((reason.clone(), retryable)));
-                let text = format!("{title}: nie wysłano — {reason}");
-                if retryable {
-                    self.notify(Severity::Error, text);
-                } else {
-                    // The read changes the list; the reason is the last word
-                    // on the bar once it is in.
-                    self.notify_after_refresh(Severity::Error, text);
-                }
-            }
-        }
-    }
-
-    fn settle_answer(
-        &mut self,
-        task_id: &str,
-        waiting_id: &str,
-        outcome: Result<(), (String, bool)>,
-    ) {
-        if let Some(view) = self.detail.views.get_mut(task_id) {
-            view.waiting.settle(waiting_id, outcome);
-            let text = view.draft_text();
-            self.detail.set_draft(task_id, text);
-        }
-    }
-
-    /// Starts the read of the conductor's state when the answer panel is made
-    /// of it, or the *Dyrygent* tab is shown, and the task has not got it for
-    /// this revision. One read serves both. The tab's chat is read from the
-    /// last entry held, a page at a time, up to [`conductor::MAX_PAGES`] pages.
-    pub(super) fn start_conductor_read(&mut self, id: &str, revision: u64) {
-        let shown = self.detail.tab() == super::DetailTab::Conductor;
-        let Some(view) = self.detail.views.get(id) else {
-            return;
-        };
-        let panel = view.waiting.needs_conductor(revision);
-        let tab = shown
-            && view
-                .conductor
-                .needs_read(revision, std::time::Instant::now());
-        if !panel && !tab {
-            return;
-        }
-        let first = view.conductor.last_sequence();
-        let client = self.client.clone();
-        let task_id = id.to_string();
-        self.background.start(
-            JobKey::Detail(task_id.clone(), DetailJob::Conductor),
-            async move {
-                let mut reads = Vec::new();
-                let mut after = first;
-                for _ in 0..conductor::MAX_PAGES {
-                    let query =
-                        crate::controller_protocol::ConductorReadQuery { after, limit: None };
-                    let result = super::detail::bounded_read(
-                        super::detail::RELAYED_READ_LIMIT,
-                        client.control_conductor(&task_id, &query),
-                    )
-                    .await;
-                    // The next page, when this one was read, the tab shows
-                    // the chat and there is more of it.
-                    let next = match &result {
-                        Ok(ConductorReadResponse::Available { conductor, .. })
-                            if shown && conductor.chat_has_more =>
-                        {
-                            conductor
-                                .chat
-                                .last()
-                                .map(|entry| entry.sequence)
-                                .filter(|last| *last > after)
-                        }
-                        _ => None,
-                    };
-                    reads.push(super::detail::DetailRead::Conductor(result));
-                    match next {
-                        Some(next) => after = next,
-                        None => break,
-                    }
-                }
-                Outcome::new(move |app: &mut TaskApp| {
-                    for read in reads {
-                        app.on_detail_read(&task_id, revision, read);
-                    }
-                })
-            },
-        );
-    }
-
-    /// Takes a read of the conductor's state in: the panel and the tab both.
-    pub(super) fn apply_conductor_read(
-        &mut self,
-        task_id: &str,
-        revision: u64,
-        result: Result<ConductorReadResponse, ClientError>,
-    ) {
-        let result = self.settle(result);
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == task_id)
-        else {
-            return;
-        };
-        let view = self.detail.view_mut(task_id);
-        view.conductor
-            .apply(revision, std::time::Instant::now(), result.clone());
-        let positions = view.progress().positions().to_vec();
-        view.waiting
-            .apply_conductor(task, &positions, revision, result);
-    }
-
-    /// The steps were read: what a waiting says about them is built again.
-    pub(super) fn reread_waiting(&mut self, task_id: &str) {
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == task_id)
-        else {
-            return;
-        };
-        let view = self.detail.view_mut(task_id);
-        let positions = view.progress().positions().to_vec();
-        view.waiting.reread(task, &positions);
-    }
 }

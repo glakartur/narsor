@@ -906,6 +906,10 @@ pub struct TaskSummary {
     /// `None` when the server did not say (a server from before the field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<TaskActionOffer>>,
+    /// The forms the owner's panel offers now, and which one opens first.
+    /// `None` when the server did not say (a server from before the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<PanelOffer>,
     #[serde(default)]
     pub resume: ResumeState,
     pub as_of: DateTime<Utc>,
@@ -1912,6 +1916,75 @@ pub struct TaskActionOption {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+/// The forms of the owner's panel that the server offers for a task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PanelOffer {
+    /// In the order the owner steps through them.
+    #[serde(default)]
+    pub forms: Vec<PanelForm>,
+    /// Index in `forms` of the form that opens first; `None` when there is
+    /// no form.
+    #[serde(default)]
+    pub default: Option<usize>,
+}
+
+/// The kind of a panel form.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelFormKind {
+    /// A choice of what happens to the step: an exit, an output, a restart.
+    Action,
+    /// An answer to a question or an approval of the agent.
+    Answer,
+    /// A free message to the agent.
+    Chat,
+    /// The decision at the entry limit of a step.
+    EntryLimit,
+    /// The decision on a permission the agent asked for.
+    Permission,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// One choice of a panel form (an exit of a step, an output of the agent).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PanelChoice {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The action the choice does, when it is one of the task's actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<TaskActionId>,
+}
+
+/// One form of the panel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PanelForm {
+    pub kind: PanelFormKind,
+    /// The wait the form answers; absent for a form that answers none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_id: Option<String>,
+    /// The choices of the form of the task's own actions; empty for a form
+    /// of a wait or the chat, whose content is its `definition`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<PanelChoice>,
+    /// What the form of a wait asks and how its answer is delivered: the
+    /// server's definition, which the client shows and does not change. Absent
+    /// for the chat and the form of the task's own actions, and from a server
+    /// from before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<crate::panel::PanelDefinition>,
+}
+
+impl PanelForm {
+    /// Whether this is the form of the task's own actions (a manual
+    /// transition), not the output choice of a wait: both are an
+    /// [`PanelFormKind::Action`], told apart by answering no wait.
+    pub fn is_manual_action(&self) -> bool {
+        self.kind == PanelFormKind::Action && self.waiting_id.is_none()
+    }
 }
 
 /// `POST /control/v1/tasks/:task_id/comment`.

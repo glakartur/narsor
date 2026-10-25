@@ -138,7 +138,7 @@ fn move_reason(task: &TaskSummary) -> Option<String> {
 }
 
 /// What the offer says `id` has to choose from.
-fn options(task: &TaskSummary, id: TaskActionId) -> Vec<TaskActionOption> {
+pub(super) fn options(task: &TaskSummary, id: TaskActionId) -> Vec<TaskActionOption> {
     match id {
         TaskActionId::Answer => waiting(task)
             .map(|form| {
@@ -171,7 +171,7 @@ fn options(task: &TaskSummary, id: TaskActionId) -> Vec<TaskActionOption> {
 /// The request the task waits on the owner to answer: the runner's pending
 /// input, as long as it is still among the things the task waits for (an
 /// answer queued for it takes it off the attention list).
-fn waiting(task: &TaskSummary) -> Option<PendingHumanInputView> {
+pub(super) fn waiting(task: &TaskSummary) -> Option<PendingHumanInputView> {
     let pending = task.runner.as_ref()?.pending_input.as_ref()?;
     let waits = task.attention.iter().any(|item| {
         item.waiting_id == pending.id
@@ -221,7 +221,7 @@ fn decision_reason(task: &TaskSummary, id: TaskActionId) -> Option<String> {
 /// A comment has somewhere to go in four stops: a question of the agent, an
 /// approval, a permission, and a pause of the operator. A failed step, a
 /// problem of the runner and a failed provisioning are not among them.
-fn comment_reason(task: &TaskSummary) -> Option<String> {
+pub(super) fn comment_reason(task: &TaskSummary) -> Option<String> {
     if let Some(form) = waiting(task) {
         return match form.continuation {
             InputContinuationView::ResumeAgent
@@ -292,7 +292,7 @@ fn state_phrase(task: &TaskSummary) -> &'static str {
 
 /// Whether the runner of the task is alive and asked about its step: the task
 /// runs, or waits for an answer with the slot still held.
-fn runner_alive(task: &TaskSummary) -> bool {
+pub(super) fn runner_alive(task: &TaskSummary) -> bool {
     if task.runner_state == RunnerState::Interrupted {
         // Its workload is gone, whatever the owner sees while the resume
         // policy still tries.
@@ -350,7 +350,7 @@ fn runner_unreachable(task: &TaskSummary) -> Option<String> {
 }
 
 /// Whether the current state of `task` allows an override with somewhere to go.
-fn has_override(task: &TaskSummary) -> bool {
+pub(super) fn has_override(task: &TaskSummary) -> bool {
     task.manual_transitions
         .as_ref()
         .is_some_and(TransitionOffer::has_override)

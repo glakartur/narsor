@@ -73,7 +73,7 @@ use super::harness::HarnessList;
 use super::limit::LimitList;
 use super::list::{title_of, CommandResolved};
 use super::notify::Severity;
-use super::waiting::AnswerRequest;
+use super::panel::AnswerRequest;
 use super::{failure_reason, idempotency_key, is_transport, Request, TaskApp};
 
 // ---------------------------------------------------------------------
@@ -601,8 +601,9 @@ fn comment_form(task: &TaskSummary, unsent: Option<&str>) -> CommentForm {
     }
 }
 
-/// The name of the field a comment is typed into.
-pub(super) const COMMENT_FIELD: &str = "komentarz";
+/// The name of the field a comment is typed into: the one of the panel's
+/// action form, so the two chooser forms agree.
+pub(super) use super::panel::input::COMMENT_FIELD;
 
 /// The entries of the menu for `task`. `blocked` is why nothing that changes
 /// state can be done right now (no connection), if that is so.

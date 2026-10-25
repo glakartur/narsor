@@ -3820,6 +3820,8 @@ mod task_app_waiting_render {
     #[test]
     fn wide_the_panel_shows_context_actions_description_and_fields() {
         let mut app = opened(with_pending(running(), gate()));
+        // The panel opens on the first entry; `revise` carries the description.
+        press(&mut app, KeyCode::Down);
         let buffer = draw_buffer(&mut app, 120, 40, false);
         let screen = screen(&buffer);
         for expected in [
@@ -3827,7 +3829,7 @@ mod task_app_waiting_render {
             "Czy zakres zmian obejmuje też migrację danych?",
             "Akcje",
             "Opis",
-            "| 3 | revise",
+            "| 2 | revise",
             "↩ wraca do agenta: plan",
             "Zakres wymaga poprawy.",
             "comment (wymagane)",
@@ -3839,7 +3841,7 @@ mod task_app_waiting_render {
         }
         let list_row = screen
             .lines()
-            .position(|row| row.contains("| 3 | revise"))
+            .position(|row| row.contains("| 2 | revise"))
             .unwrap();
         let context_title = screen
             .lines()
@@ -3944,7 +3946,10 @@ mod task_app_waiting_render {
         let pending = gate_after_agent("ok\u{1b}[31m czerwony\u{7}");
         let view: narsor_protocol::api::PendingHumanInputView =
             serde_json::from_value(pending.clone()).unwrap();
-        let panel = narsor::tui::input_form::InputPanel::new(&view, &|_| None);
+        let panel = narsor::tui::input_form::InputPanel::from_definition(
+            &narsor_protocol::panel::define(&view, &|_| None),
+            &|_| None,
+        );
         assert!(
             panel
                 .context()
@@ -3972,7 +3977,10 @@ mod task_app_waiting_render {
         }));
         let view: narsor_protocol::api::PendingHumanInputView =
             serde_json::from_value(pending.clone()).unwrap();
-        let panel = narsor::tui::input_form::InputPanel::new(&view, &|_| None);
+        let panel = narsor::tui::input_form::InputPanel::from_definition(
+            &narsor_protocol::panel::define(&view, &|_| None),
+            &|_| None,
+        );
         let context: Vec<&str> = panel
             .context()
             .iter()
@@ -4020,8 +4028,7 @@ mod task_app_waiting_render {
         let screen = draw_app(&mut app, 120, 40, false);
         assert!(screen.contains("implemented"), "{screen}");
         assert!(screen.contains("Wiadomość dla agenta"), "{screen}");
-        // Action 0 is the entry that moves the focus to that one field.
-        assert!(screen.contains("Napisz do agenta"), "{screen}");
+        assert!(!screen.contains("Napisz do agenta"), "{screen}");
         let action_row = screen
             .lines()
             .position(|line| line.contains("implemented"))
@@ -4093,14 +4100,14 @@ mod task_app_waiting_render {
     fn the_bracket_on_the_actions_follows_the_focus_of_the_panel() {
         let mut app = opened(with_pending(running(), gate()));
         let buffer = draw_buffer(&mut app, 120, 40, false);
-        assert_action_number(&buffer, "revise", 3);
-        assert_not_bracketed(&buffer, "2   approved");
+        assert_action_number(&buffer, "approved", 1);
+        assert_not_bracketed(&buffer, "2   revise");
 
         press(&mut app, KeyCode::Tab);
         let buffer = draw_buffer(&mut app, 120, 40, false);
-        assert_action_number(&buffer, "revise", 3);
-        let y = row_of(&buffer, "revise") as u16;
-        let x = column_in(&buffer, usize::from(y), "revise");
+        assert_action_number(&buffer, "approved", 1);
+        let y = row_of(&buffer, "approved") as u16;
+        let x = column_in(&buffer, usize::from(y), "approved");
         assert_eq!(buffer[(x - 4, y)].fg, Color::DarkGray);
     }
 
@@ -4116,7 +4123,7 @@ mod task_app_waiting_render {
         ));
         let buffer = draw_buffer(&mut app, 120, 40, false);
         assert!(!app.panel_focused(), "{}", screen(&buffer));
-        assert_action_number(&buffer, "revise", 3);
+        assert_action_number(&buffer, "approved", 1);
     }
 
     /// Without colour the selected number stays visible and risk markers lead
@@ -4125,11 +4132,11 @@ mod task_app_waiting_render {
     fn without_colour_the_bracket_is_bold_and_keeps_the_markers() {
         let mut app = opened(with_pending(running(), gate()));
         let buffer = draw_buffer(&mut app, 120, 40, true);
-        assert_action_number(&buffer, "revise", 3);
+        assert_action_number(&buffer, "approved", 1);
 
         let mut app = opened(with_pending(running(), problem()));
         let buffer = draw_buffer(&mut app, 120, 40, false);
-        assert_action_number(&buffer, "implemented", 2);
+        assert_action_number(&buffer, "implemented", 1);
         assert!(screen(&buffer).contains("! Problem"));
     }
 
@@ -4138,8 +4145,7 @@ mod task_app_waiting_render {
     #[test]
     fn ae7_the_actions_scroll_inside_the_panel_and_the_rest_stays() {
         let mut app = opened(with_pending(running(), six_actions()));
-        // Action 0 is the first entry: `out1` is the second.
-        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('1'));
         let before = draw_buffer(&mut app, 120, 24, false);
         let question = row_of(&before, "Czy zakres zmian");
         let field = row_of(&before, "comment (wymagane)");
@@ -4156,7 +4162,7 @@ mod task_app_waiting_render {
             press(&mut app, KeyCode::Char('j'));
         }
         let after = draw_buffer(&mut app, 120, 24, false);
-        assert_action_number(&after, "out6", 7);
+        assert_action_number(&after, "out6", 6);
         assert_eq!(row_of(&after, "Czy zakres zmian"), question);
         assert_eq!(row_of(&after, "comment (wymagane)"), field);
     }
@@ -4166,12 +4172,12 @@ mod task_app_waiting_render {
     fn at_the_smallest_terminal_one_action_shows_and_j_scrolls() {
         let mut app = opened(with_pending(running(), gate()));
         let buffer = draw_buffer(&mut app, 60, 20, false);
-        assert_action_number(&buffer, "revise", 3);
+        assert_action_number(&buffer, "approved", 1);
         assert!(screen(&buffer).contains("comment"), "{}", screen(&buffer));
 
         press(&mut app, KeyCode::Char('j'));
         let buffer = draw_buffer(&mut app, 60, 20, false);
-        assert_action_number(&buffer, "reject", 4);
+        assert_action_number(&buffer, "revise", 2);
     }
 
     /// R17: a refresh that builds the actions again keeps the highlighted
@@ -4179,11 +4185,11 @@ mod task_app_waiting_render {
     #[test]
     fn a_refresh_keeps_the_highlighted_action_and_the_scroll() {
         let mut app = opened(with_pending(running(), six_actions()));
-        press(&mut app, KeyCode::Char('7'));
+        press(&mut app, KeyCode::Char('6'));
         draw_buffer(&mut app, 120, 24, false);
         press(&mut app, KeyCode::Char('k'));
         let before = draw_buffer(&mut app, 120, 24, false);
-        assert!(screen(&before).contains("7   out6"), "{}", screen(&before));
+        assert!(screen(&before).contains("6   out6"), "{}", screen(&before));
 
         app.on_detail_read(
             "a",
@@ -4199,12 +4205,13 @@ mod task_app_waiting_render {
         );
         let after = draw_buffer(&mut app, 120, 24, false);
         assert_eq!(screen(&before), screen(&after));
-        assert_action_number(&after, "out5", 6);
+        assert_action_number(&after, "out5", 5);
     }
 
     #[test]
     fn narrow_the_description_goes_under_the_actions() {
         let mut app = opened(with_pending(running(), gate()));
+        press(&mut app, KeyCode::Down);
         let screen = draw_app(&mut app, 64, 40, false);
         let rows: Vec<&str> = screen.lines().collect();
         let last_action = rows
@@ -4222,6 +4229,7 @@ mod task_app_waiting_render {
     #[test]
     fn without_colour_the_markers_survive() {
         let mut app = opened(with_pending(running(), gate()));
+        press(&mut app, KeyCode::Down);
         let question = draw_app(&mut app, 120, 40, true);
         assert!(
             question.contains('?') && question.contains('↩'),
@@ -4239,22 +4247,6 @@ mod task_app_waiting_render {
         assert!(
             problem.contains("variables.summary ◆"),
             "the proposed value is marked:\n{problem}"
-        );
-    }
-
-    #[test]
-    fn the_panel_gives_its_rows_back_to_the_tab_when_folded() {
-        let mut app = opened(with_pending(running(), gate()));
-        let open = draw_app(&mut app, 120, 40, false);
-        press(&mut app, KeyCode::Esc);
-        let folded = draw_app(&mut app, 120, 40, false);
-        assert!(
-            open.contains("Akcje") && !folded.contains("Akcje"),
-            "{folded}"
-        );
-        assert!(
-            folded.contains("? Pytanie · review_scope") && folded.contains("Tab rozwiń"),
-            "{folded}"
         );
     }
 

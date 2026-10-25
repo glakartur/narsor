@@ -23,6 +23,7 @@ mod conductor;
 mod conversation;
 mod events;
 mod materials;
+mod panel;
 mod reader;
 mod relay;
 mod slot_release;
@@ -2099,6 +2100,7 @@ impl ProtocolService {
             title: task_title(record),
             manual_transitions: manual_transitions(record),
             actions: None,
+            panel: None,
             resume: record.resume.clone(),
             as_of: now,
         };
@@ -2119,6 +2121,8 @@ impl ProtocolService {
             }
         }
         summary.actions = Some(actions);
+        // After the actions: the panel reads the same summary and the offer.
+        summary.panel = panel::offer_forms(&summary);
         Ok(summary)
     }
 
@@ -2306,6 +2310,13 @@ async fn harness_changed(
 /// Most characters of one chat message to the conductor: the text is kept
 /// in the task's event stream, which is not the place for a document.
 const MAX_CHAT_CHARS: usize = 4_000;
+
+/// The panel forms the server puts on a task summary, for whoever builds a
+/// summary by hand (a test of a client) and wants the server's offer.
+#[doc(hidden)]
+pub fn task_panel(task: &TaskSummary) -> Option<narsor_protocol::controller::PanelOffer> {
+    panel::offer_forms(task)
+}
 
 /// The offer of actions the server puts on a task summary, for whoever builds
 /// a summary by hand (a test of a client) and wants the server's words.

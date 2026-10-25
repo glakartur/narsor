@@ -1,0 +1,2790 @@
+[
+ {
+  "def": {
+   "composer": {
+    "entry": 0,
+    "help": "Odpowiada agentowi.",
+    "label": "Odpowiedź agentowi"
+   },
+   "context": [
+    {
+     "text": "Która wersja API?",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "resume_agent",
+   "entries": [
+    {
+     "description": "Odpowiedź wznawia sesję agenta.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "answer",
+       "required": true
+      }
+     ],
+     "label": "Odpowiedz agentowi",
+     "plan": "answer",
+     "recommended": false,
+     "resumes": "review_scope",
+     "summary": "odpowiedziano agentowi"
+    }
+   ],
+   "episode": "ep-q"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "continuation": "resume_agent",
+   "episode": "ep-q",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Która wersja API?",
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Która wersja API?",
+     "tone": "plain"
+    },
+    {
+     "text": "Wejścia: 5/5",
+     "tone": "problem"
+    }
+   ],
+   "continuation": "entry_limit",
+   "entries": [
+    {
+     "description": "Uruchom krok jeszcze raz, zwiększając licznik.",
+     "label": "Kontynuuj",
+     "plan": {
+      "entry_limit": {
+       "decision": "continue"
+      }
+     },
+     "recommended": false,
+     "summary": "kontynuowano po limicie"
+    },
+    {
+     "description": "Wyzeruj licznik wejść i uruchom krok. Limit przestaje chronić przed pętlą, aż licznik znów dojdzie do 5.",
+     "label": "Wyzeruj licznik",
+     "plan": {
+      "entry_limit": {
+       "decision": "reset_counter"
+      }
+     },
+     "recommended": false,
+     "summary": "wyzerowano licznik i kontynuowano"
+    }
+   ],
+   "episode": "ep-q"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "continuation": "entry_limit",
+   "entry_limit": {
+    "entries": 5,
+    "max_entries": 5
+   },
+   "episode": "ep-q",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "entry_limit_decision",
+     "options": [
+      "continue",
+      "reset_counter"
+     ],
+     "required": false,
+     "type": "select"
+    }
+   ],
+   "instruction": "Która wersja API?",
+   "outputs": [
+    {
+     "label": "clean"
+    },
+    {
+     "label": "findings"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Która wersja API?",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "resolve_output",
+   "entries": [],
+   "episode": "ep-q"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "continuation": "resolve_output",
+   "episode": "ep-q",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Która wersja API?",
+   "outputs": [
+    {
+     "label": "go"
+    },
+    {
+     "label": "stop"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Która wersja API?",
+     "tone": "plain"
+    },
+    {
+     "text": "Bash: cargo test",
+     "tone": "problem"
+    },
+    {
+     "text": "katalog: /tmp/task",
+     "tone": "dim"
+    },
+    {
+     "text": "reguły zgody: Bash(cargo test)",
+     "tone": "dim"
+    }
+   ],
+   "continuation": "resolve_permission",
+   "entries": [
+    {
+     "description": "Agent wznowi tę sesję z informacją, że te operacje są zablokowane.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Wiadomość dla agenta",
+       "required": false
+      }
+     ],
+     "label": "Odmów",
+     "plan": {
+      "permission": {
+       "decision": {
+        "decision": "deny",
+        "scope": null
+       }
+      }
+     },
+     "recommended": false,
+     "summary": "odmówiono dostępu agentowi"
+    },
+    {
+     "description": "Agent wznowi sesję i może je uruchomić. Reguły tylko dla bieżącego tasku: Bash(cargo test)",
+     "label": "Zezwól dokładnie na to polecenie",
+     "plan": {
+      "permission": {
+       "decision": {
+        "decision": "allow",
+        "scope": "exact_operation"
+       }
+      }
+     },
+     "recommended": false,
+     "summary": "zezwolono na tę operację"
+    },
+    {
+     "description": "Zgoda obejmie te grupy poleceń do końca bieżącego tasku.",
+     "label": "Zezwól na grupę: Bash(cargo test *)",
+     "plan": {
+      "permission": {
+       "decision": {
+        "decision": "allow",
+        "scope": "command_group"
+       }
+      }
+     },
+     "recommended": false,
+     "summary": "zezwolono na grupę poleceń w tym tasku"
+    },
+    {
+     "description": "Wpisz całe polecenie albo jego początek z * na końcu, np. npm run *. Zgoda obejmie pasujące polecenia Bash do końca bieżącego tasku.",
+     "fields": [
+      {
+       "description": "Polecenie złożone (&&, ;, |, pętla) Claude Code sprawdza po częściach: wtedy pomoże tylko *. Sam * zezwala na KAŻDE polecenie Bash.",
+       "kind": {
+        "text": {
+         "multiline": false
+        }
+       },
+       "name": "Wzorzec polecenia",
+       "required": true,
+       "value": "cargo test"
+      }
+     ],
+     "label": "Zezwól według wzorca…",
+     "plan": {
+      "permission": {
+       "decision": {
+        "decision": "allow",
+        "scope": "pattern"
+       }
+      }
+     },
+     "recommended": false,
+     "summary": "zezwolono na polecenia według wzorca w tym tasku"
+    }
+   ],
+   "episode": "ep-q"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "agent_harness": "claude-code",
+   "agent_session_id": "s1",
+   "continuation": "resolve_permission",
+   "episode": "ep-q",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Która wersja API?",
+   "permission": {
+    "denials": [
+     {
+      "cwd": "/tmp/task",
+      "input": {
+       "command": "cargo test"
+      },
+      "reason": "This command requires approval.",
+      "reason_type": "asyncAgent",
+      "tool_name": "Bash",
+      "tool_use_id": "t1"
+     }
+    ]
+   },
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "composer": {
+    "entry": 1,
+    "help": "Wysyła wiadomość do agenta.",
+    "label": "Odpowiedź do rozmowy"
+   },
+   "context": [
+    {
+     "text": "Krok nie dał etykiety",
+     "tone": "plain"
+    },
+    {
+     "text": "Odpowiedź agenta nie zawiera etykiety.",
+     "tone": "problem"
+    },
+    {
+     "text": "◆ dyrygent: Testy przechodzą.",
+     "tone": "conductor"
+    }
+   ],
+   "continuation": "resolve_output",
+   "entries": [
+    {
+     "description": "Funkcja gotowa.",
+     "fields": [
+      {
+       "description": "wymagane, chyba że kontekst już ma wartość",
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "variables.summary",
+       "proposed": "all units done",
+       "required": false,
+       "value": "all units done"
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "variables (klucz=wartość)",
+       "required": false
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "komentarz",
+       "required": false
+      }
+     ],
+     "label": "implemented",
+     "plan": {
+      "output": {
+       "label": "implemented"
+      }
+     },
+     "recommended": true,
+     "summary": "rozwiązano problem: implemented"
+    },
+    {
+     "description": "Wiadomość wznawia ten sam krok agenta; wynik ustawi on sam.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Wiadomość dla agenta",
+       "required": true
+      }
+     ],
+     "label": "Napisz do agenta",
+     "plan": "message",
+     "recommended": false,
+     "resumes": "implement",
+     "summary": "wysłano wiadomość do agenta"
+    }
+   ],
+   "episode": "ep-p"
+  },
+  "form": {
+   "action_execution_id": "act-9",
+   "continuation": "resolve_output",
+   "episode": "ep-p",
+   "execution_id": "exec-1",
+   "instruction": "Krok nie dał etykiety",
+   "outputs": [
+    {
+     "description": "Funkcja gotowa.",
+     "label": "implemented"
+    }
+   ],
+   "problem": {
+    "analysis": {
+     "label": "implemented",
+     "rationale": "Testy przechodzą.",
+     "variables": {
+      "summary": "all units done"
+     }
+    },
+    "answers": [],
+    "reason": "Odpowiedź agenta nie zawiera etykiety.",
+    "requirements": [
+     {
+      "label": "implemented",
+      "variables": [
+       "summary"
+      ]
+     }
+    ]
+   },
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "implement"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "pytanie\u001b[31m‮ewil\u0007",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "approved",
+     "plan": {
+      "complete": {
+       "label": "approved",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "revise",
+     "plan": {
+      "complete": {
+       "label": "revise",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "resumes": "",
+     "resumes_attempt": "act-plan",
+     "summary": "odpowiedziano revise ↩ wraca do agenta"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "reject",
+     "plan": {
+      "complete": {
+       "label": "reject",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano reject"
+    }
+   ],
+   "episode": "ep-1"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "comment",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "pytanie\u001b[31m‮ewil\u0007",
+   "outputs": [
+    {
+     "label": "approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "label": "revise",
+     "resume_comment_field": "comment"
+    },
+    {
+     "label": "reject"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "resume_targets": {
+    "revise": {
+     "action_execution_id": "act-plan",
+     "harness": "claude",
+     "session_id": "s1"
+    }
+   },
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Czy zakres zmian obejmuje też migrację danych?",
+     "tone": "plain"
+    },
+    {
+     "text": "uzasadnienie: Plan czeka na decyzję o migracji.",
+     "tone": "plain"
+    },
+    {
+     "text": "plan_blocker: Brak decyzji o migracji.",
+     "tone": "plain"
+    },
+    {
+     "text": "plan_doc: docs/plan.md",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "approved",
+     "plan": {
+      "complete": {
+       "label": "approved",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "revise",
+     "plan": {
+      "complete": {
+       "label": "revise",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "resumes": "",
+     "resumes_attempt": "act-plan",
+     "summary": "odpowiedziano revise ↩ wraca do agenta"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "reject",
+     "plan": {
+      "complete": {
+       "label": "reject",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano reject"
+    }
+   ],
+   "episode": "ep-1"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "comment",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Czy zakres zmian obejmuje też migrację danych?",
+   "outputs": [
+    {
+     "label": "approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "label": "revise",
+     "resume_comment_field": "comment"
+    },
+    {
+     "label": "reject"
+    }
+   ],
+   "reason": "Plan czeka na decyzję o migracji.",
+   "requested_at": "2026-10-09T11:54:00Z",
+   "required_values": [
+    {
+     "kind": "variable",
+     "name": "plan_blocker",
+     "value": "Brak decyzji o migracji."
+    },
+    {
+     "kind": "artifact",
+     "name": "plan_doc",
+     "value": "docs/plan.md"
+    }
+   ],
+   "resume_targets": {
+    "revise": {
+     "action_execution_id": "act-plan",
+     "harness": "claude",
+     "session_id": "s1"
+    }
+   },
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Czy zakres zmian obejmuje też migrację danych?",
+     "tone": "plain"
+    },
+    {
+     "text": "uzasadnienie: brak uzasadnienia",
+     "tone": "plain"
+    },
+    {
+     "text": "plan_blocker: Brak decyzji o migracji.",
+     "tone": "plain"
+    },
+    {
+     "text": "plan_doc: docs/plan.md",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "approved",
+     "plan": {
+      "complete": {
+       "label": "approved",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "revise",
+     "plan": {
+      "complete": {
+       "label": "revise",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "resumes": "",
+     "resumes_attempt": "act-plan",
+     "summary": "odpowiedziano revise ↩ wraca do agenta"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "reject",
+     "plan": {
+      "complete": {
+       "label": "reject",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano reject"
+    }
+   ],
+   "episode": "ep-1"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "comment",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Czy zakres zmian obejmuje też migrację danych?",
+   "outputs": [
+    {
+     "label": "approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "label": "revise",
+     "resume_comment_field": "comment"
+    },
+    {
+     "label": "reject"
+    }
+   ],
+   "reason": "brak uzasadnienia",
+   "requested_at": "2026-10-09T11:54:00Z",
+   "required_values": [
+    {
+     "kind": "variable",
+     "name": "plan_blocker",
+     "value": "Brak decyzji o migracji."
+    },
+    {
+     "kind": "artifact",
+     "name": "plan_doc",
+     "value": "docs/plan.md"
+    }
+   ],
+   "resume_targets": {
+    "revise": {
+     "action_execution_id": "act-plan",
+     "harness": "claude",
+     "session_id": "s1"
+    }
+   },
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Czy zakres zmian obejmuje też migrację danych?",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "out1",
+     "plan": {
+      "complete": {
+       "label": "out1",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano out1"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "out2",
+     "plan": {
+      "complete": {
+       "label": "out2",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano out2"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "out3",
+     "plan": {
+      "complete": {
+       "label": "out3",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano out3"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "out4",
+     "plan": {
+      "complete": {
+       "label": "out4",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano out4"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "out5",
+     "plan": {
+      "complete": {
+       "label": "out5",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano out5"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "out6",
+     "plan": {
+      "complete": {
+       "label": "out6",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano out6"
+    }
+   ],
+   "episode": "ep-1"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "comment",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Czy zakres zmian obejmuje też migrację danych?",
+   "outputs": [
+    {
+     "label": "out1"
+    },
+    {
+     "label": "out2"
+    },
+    {
+     "label": "out3"
+    },
+    {
+     "label": "out4"
+    },
+    {
+     "label": "out5"
+    },
+    {
+     "label": "out6"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "resume_targets": {},
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Zatwierdź przegląd dokumentu",
+     "tone": "plain"
+    },
+    {
+     "text": "wybór agenta: approved",
+     "tone": "plain"
+    },
+    {
+     "text": "Dokument przeszedł przegląd.",
+     "tone": "dim"
+    },
+    {
+     "text": "uzasadnienie: Dokument jest kompletny.",
+     "tone": "plain"
+    },
+    {
+     "text": "review_summary: Wszystkie sekcje opisane.",
+     "tone": "plain"
+    },
+    {
+     "text": "review_doc: docs/review.md",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "approve_output",
+   "entries": [
+    {
+     "description": "Przyjmuje wynik agenta; zadanie idzie dalej.",
+     "label": "Akceptuj",
+     "plan": "approve",
+     "recommended": false,
+     "summary": "zaakceptowano approved"
+    },
+    {
+     "description": "Agent wznowi swoją sesję z Twoim komentarzem i przygotuje nowy wynik.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Komentarz dla agenta",
+       "required": true
+      }
+     ],
+     "label": "Zwróć agentowi",
+     "plan": "return",
+     "recommended": false,
+     "resumes": "doc_review",
+     "summary": "zwrócono agentowi"
+    }
+   ],
+   "episode": "ep-a"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "approval": {
+    "action_execution_id": "act-7",
+    "agent_session_id": "sess-1",
+    "result": {
+     "artifacts": {
+      "review_doc": "docs/review.md"
+     },
+     "data": {
+      "agent_session": "sess-1"
+     },
+     "exit_code": null,
+     "output_label": "approved",
+     "reason": "Dokument jest kompletny.",
+     "stderr": "",
+     "stdout": "",
+     "variables": {
+      "review_summary": "Wszystkie sekcje opisane."
+     }
+    }
+   },
+   "continuation": "approve_output",
+   "episode": "ep-a",
+   "execution_id": "exec-1",
+   "instruction": "Zatwierdź przegląd dokumentu",
+   "outputs": [
+    {
+     "description": "Dokument przeszedł przegląd.",
+     "label": "approved"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "doc_review"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Zatwierdź przegląd dokumentu",
+     "tone": "plain"
+    },
+    {
+     "text": "wybór agenta: approved",
+     "tone": "plain"
+    },
+    {
+     "text": "Dokument przeszedł przegląd.",
+     "tone": "dim"
+    },
+    {
+     "text": "uzasadnienie: brak uzasadnienia",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "approve_output",
+   "entries": [
+    {
+     "description": "Przyjmuje wynik agenta; zadanie idzie dalej.",
+     "label": "Akceptuj",
+     "plan": "approve",
+     "recommended": false,
+     "summary": "zaakceptowano approved"
+    },
+    {
+     "description": "Agent wznowi swoją sesję z Twoim komentarzem i przygotuje nowy wynik.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Komentarz dla agenta",
+       "required": true
+      }
+     ],
+     "label": "Zwróć agentowi",
+     "plan": "return",
+     "recommended": false,
+     "resumes": "doc_review",
+     "summary": "zwrócono agentowi"
+    }
+   ],
+   "episode": "ep-a"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "approval": {
+    "action_execution_id": "act-7",
+    "agent_session_id": "sess-1",
+    "result": {
+     "exit_code": null,
+     "output_label": "approved",
+     "stderr": "",
+     "stdout": "",
+     "variables": {}
+    }
+   },
+   "continuation": "approve_output",
+   "episode": "ep-a",
+   "execution_id": "exec-1",
+   "instruction": "Zatwierdź przegląd dokumentu",
+   "outputs": [
+    {
+     "description": "Dokument przeszedł przegląd.",
+     "label": "approved"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "doc_review"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Czy zakres zmian obejmuje też migrację danych?",
+     "tone": "plain"
+    },
+    {
+     "text": "uzasadnienie: ok[31m czerwony",
+     "tone": "plain"
+    },
+    {
+     "text": "plan_blocker: Brak decyzji o migracji.",
+     "tone": "plain"
+    },
+    {
+     "text": "plan_doc: docs/plan.md",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "approved",
+     "plan": {
+      "complete": {
+       "label": "approved",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "revise",
+     "plan": {
+      "complete": {
+       "label": "revise",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "resumes": "",
+     "resumes_attempt": "act-plan",
+     "summary": "odpowiedziano revise ↩ wraca do agenta"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "reject",
+     "plan": {
+      "complete": {
+       "label": "reject",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano reject"
+    }
+   ],
+   "episode": "ep-1"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "comment",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Czy zakres zmian obejmuje też migrację danych?",
+   "outputs": [
+    {
+     "label": "approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "label": "revise",
+     "resume_comment_field": "comment"
+    },
+    {
+     "label": "reject"
+    }
+   ],
+   "reason": "ok\u001b[31m czerwony\u0007",
+   "requested_at": "2026-10-09T11:54:00Z",
+   "required_values": [
+    {
+     "kind": "variable",
+     "name": "plan_blocker",
+     "value": "Brak decyzji o migracji."
+    },
+    {
+     "kind": "artifact",
+     "name": "plan_doc",
+     "value": "docs/plan.md"
+    }
+   ],
+   "resume_targets": {
+    "revise": {
+     "action_execution_id": "act-plan",
+     "harness": "claude",
+     "session_id": "s1"
+    }
+   },
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Czy zakres zmian obejmuje też migrację danych?",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "approved",
+     "plan": {
+      "complete": {
+       "label": "approved",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "revise",
+     "plan": {
+      "complete": {
+       "label": "revise",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "resumes": "",
+     "resumes_attempt": "act-plan",
+     "summary": "odpowiedziano revise ↩ wraca do agenta"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "reject",
+     "plan": {
+      "complete": {
+       "label": "reject",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano reject"
+    }
+   ],
+   "episode": "ep-1"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "comment",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Czy zakres zmian obejmuje też migrację danych?",
+   "outputs": [
+    {
+     "label": "approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.",
+     "label": "revise",
+     "resume_comment_field": "comment"
+    },
+    {
+     "label": "reject"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "resume_targets": {
+    "revise": {
+     "action_execution_id": "act-plan",
+     "harness": "claude",
+     "session_id": "s1"
+    }
+   },
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "composer": {
+    "entry": 0,
+    "help": "Odpowiada agentowi.",
+    "label": "Odpowiedź agentowi"
+   },
+   "context": [
+    {
+     "text": "Zatwierdź wynik",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "resume_agent",
+   "entries": [
+    {
+     "description": "Odpowiedź wznawia sesję agenta.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "answer",
+       "required": true
+      }
+     ],
+     "label": "Odpowiedz agentowi",
+     "plan": "answer",
+     "recommended": false,
+     "resumes": "review_scope",
+     "summary": "odpowiedziano agentowi"
+    }
+   ],
+   "episode": "ep-1"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "approval": {
+    "action_execution_id": "act-7",
+    "agent_session_id": "sess-1",
+    "result": {
+     "data": {},
+     "exit_code": null,
+     "output_label": "reviewed",
+     "stderr": "",
+     "stdout": "",
+     "variables": {}
+    }
+   },
+   "continuation": "resume_agent",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Zatwierdź wynik",
+   "outputs": [
+    {
+     "description": "Wynik przeglądu.",
+     "label": "reviewed"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Zatwierdź wynik",
+     "tone": "plain"
+    },
+    {
+     "text": "wybór agenta: reviewed",
+     "tone": "plain"
+    },
+    {
+     "text": "Wynik przeglądu.",
+     "tone": "dim"
+    },
+    {
+     "text": "uzasadnienie: brak uzasadnienia",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "approve_output",
+   "entries": [
+    {
+     "description": "Przyjmuje wynik agenta; zadanie idzie dalej.",
+     "label": "Akceptuj",
+     "plan": "approve",
+     "recommended": false,
+     "summary": "zaakceptowano reviewed"
+    },
+    {
+     "description": "Agent wznowi swoją sesję z Twoim komentarzem i przygotuje nowy wynik.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Komentarz dla agenta",
+       "required": true
+      }
+     ],
+     "label": "Zwróć agentowi",
+     "plan": "return",
+     "recommended": false,
+     "resumes": "review_scope",
+     "summary": "zwrócono agentowi"
+    }
+   ],
+   "episode": "ep-1"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "approval": {
+    "action_execution_id": "act-7",
+    "agent_session_id": "sess-1",
+    "result": {
+     "data": {},
+     "exit_code": null,
+     "output_label": "reviewed",
+     "stderr": "",
+     "stdout": "",
+     "variables": {}
+    }
+   },
+   "continuation": "approve_output",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Zatwierdź wynik",
+   "outputs": [
+    {
+     "description": "Wynik przeglądu.",
+     "label": "reviewed"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "composer": {
+    "entry": 0,
+    "help": "Odpowiada agentowi.",
+    "label": "Odpowiedź agentowi"
+   },
+   "context": [
+    {
+     "text": "Która wersja API?",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "resume_agent",
+   "entries": [
+    {
+     "description": "Odpowiedź wznawia sesję agenta.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "answer",
+       "required": true
+      }
+     ],
+     "label": "Odpowiedz agentowi",
+     "plan": "answer",
+     "recommended": false,
+     "resumes": "review",
+     "summary": "odpowiedziano agentowi"
+    }
+   ],
+   "episode": "ep-q"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "continuation": "resume_agent",
+   "episode": "ep-q",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Która wersja API?",
+   "prefilled_answer": null,
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Czy zakres zmian obejmuje też migrację danych?",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "approved",
+     "plan": {
+      "complete": {
+       "label": "approved",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "revise",
+     "plan": {
+      "complete": {
+       "label": "revise",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "resumes": "",
+     "resumes_attempt": "act-plan",
+     "summary": "odpowiedziano revise ↩ wraca do agenta"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "reject",
+     "plan": {
+      "complete": {
+       "label": "reject",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano reject"
+    }
+   ],
+   "episode": "ep-1"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "comment",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Czy zakres zmian obejmuje też migrację danych?",
+   "outputs": [
+    {
+     "label": "approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy.",
+     "label": "revise",
+     "resume_comment_field": "comment"
+    },
+    {
+     "label": "reject"
+    }
+   ],
+   "question": "Czy migracja wchodzi w zakres?",
+   "requested_at": "2026-10-09T11:54:00Z",
+   "resume_targets": {
+    "revise": {
+     "action_execution_id": "act-plan",
+     "harness": "claude",
+     "session_id": "s1"
+    }
+   },
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Czy zakres zmian obejmuje też migrację danych?",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "approved",
+     "plan": {
+      "complete": {
+       "label": "approved",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "revise",
+     "plan": {
+      "complete": {
+       "label": "revise",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "resumes": "",
+     "resumes_attempt": "act-plan",
+     "summary": "odpowiedziano revise ↩ wraca do agenta"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "reject",
+     "plan": {
+      "complete": {
+       "label": "reject",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano reject"
+    }
+   ],
+   "episode": "ep-2"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "episode": "ep-2",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "comment",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Czy zakres zmian obejmuje też migrację danych?",
+   "outputs": [
+    {
+     "label": "approved"
+    },
+    {
+     "description": "Zakres wymaga poprawy.",
+     "label": "revise",
+     "resume_comment_field": "comment"
+    },
+    {
+     "label": "reject"
+    }
+   ],
+   "question": "Czy migracja wchodzi w zakres?",
+   "requested_at": "2026-10-09T11:54:00Z",
+   "resume_targets": {
+    "revise": {
+     "action_execution_id": "act-plan",
+     "harness": "claude",
+     "session_id": "s1"
+    }
+   },
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Zatwierdź wynik",
+     "tone": "plain"
+    },
+    {
+     "text": "wybór agenta: reviewed",
+     "tone": "plain"
+    },
+    {
+     "text": "Wynik przeglądu.",
+     "tone": "dim"
+    },
+    {
+     "text": "uzasadnienie: brak uzasadnienia",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "approve_output",
+   "entries": [
+    {
+     "description": "Przyjmuje wynik agenta; zadanie idzie dalej.",
+     "label": "Akceptuj",
+     "plan": "approve",
+     "recommended": false,
+     "summary": "zaakceptowano reviewed"
+    },
+    {
+     "description": "Agent wznowi swoją sesję z Twoim komentarzem i przygotuje nowy wynik.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Komentarz dla agenta",
+       "required": true
+      }
+     ],
+     "label": "Zwróć agentowi",
+     "plan": "return",
+     "recommended": false,
+     "resumes": "review_scope",
+     "summary": "zwrócono agentowi"
+    }
+   ],
+   "episode": "ep-a"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "approval": {
+    "action_execution_id": "act-7",
+    "agent_session_id": "sess-1",
+    "result": {
+     "data": {
+      "files": 3
+     },
+     "exit_code": null,
+     "output_label": "reviewed",
+     "stderr": "",
+     "stdout": "",
+     "variables": {}
+    }
+   },
+   "continuation": "approve_output",
+   "episode": "ep-a",
+   "execution_id": "exec-1",
+   "instruction": "Zatwierdź wynik",
+   "outputs": [
+    {
+     "description": "Wynik przeglądu.",
+     "label": "reviewed"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "composer": {
+    "entry": 2,
+    "help": "Wysyła wiadomość do agenta.",
+    "label": "Odpowiedź do rozmowy"
+   },
+   "context": [
+    {
+     "text": "Krok nie dał etykiety",
+     "tone": "plain"
+    },
+    {
+     "text": "Odpowiedź agenta nie zawiera etykiety.",
+     "tone": "problem"
+    },
+    {
+     "text": "odrzucona odpowiedź agenta: brak etykiety …Done, all tests pass.",
+     "tone": "dim"
+    }
+   ],
+   "continuation": "resolve_output",
+   "entries": [
+    {
+     "description": "Funkcja gotowa.",
+     "fields": [
+      {
+       "description": "wymagane, chyba że kontekst już ma wartość",
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "variables.summary",
+       "required": false
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "variables (klucz=wartość)",
+       "required": false
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "komentarz",
+       "required": false
+      }
+     ],
+     "label": "implemented",
+     "plan": {
+      "output": {
+       "label": "implemented"
+      }
+     },
+     "recommended": false,
+     "summary": "rozwiązano problem: implemented"
+    },
+    {
+     "description": "Najpierw decyzja człowieka.",
+     "fields": [
+      {
+       "description": "wymagane przez stan, do którego prowadzi etykieta",
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "artifacts.decision_doc",
+       "required": true
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "variables (klucz=wartość)",
+       "required": false
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "komentarz",
+       "required": false
+      }
+     ],
+     "label": "needs_human_decision",
+     "plan": {
+      "output": {
+       "label": "needs_human_decision"
+      }
+     },
+     "recommended": false,
+     "summary": "rozwiązano problem: needs_human_decision"
+    },
+    {
+     "description": "Wiadomość wznawia ten sam krok agenta; wynik ustawi on sam.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Wiadomość dla agenta",
+       "required": true
+      }
+     ],
+     "label": "Napisz do agenta",
+     "plan": "message",
+     "recommended": false,
+     "resumes": "implement",
+     "summary": "wysłano wiadomość do agenta"
+    }
+   ],
+   "episode": "ep-p"
+  },
+  "form": {
+   "action_execution_id": "act-9",
+   "continuation": "resolve_output",
+   "episode": "ep-p",
+   "execution_id": "exec-1",
+   "instruction": "Krok nie dał etykiety",
+   "outputs": [
+    {
+     "description": "Funkcja gotowa.",
+     "label": "implemented"
+    },
+    {
+     "description": "Najpierw decyzja człowieka.",
+     "label": "needs_human_decision"
+    }
+   ],
+   "problem": {
+    "analysis": null,
+    "answers": [
+     {
+      "action_execution_id": "act-9",
+      "answer_tail": "Done, all tests pass.",
+      "reason": "brak etykiety"
+     }
+    ],
+    "reason": "Odpowiedź agenta nie zawiera etykiety.",
+    "requirements": [
+     {
+      "artifacts": [],
+      "label": "implemented",
+      "variables": [
+       "summary"
+      ]
+     },
+     {
+      "artifacts": [
+       "decision_doc"
+      ],
+      "label": "needs_human_decision",
+      "variables": []
+     }
+    ]
+   },
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "implement"
+  }
+ },
+ {
+  "def": {
+   "composer": {
+    "entry": 2,
+    "help": "Wysyła wiadomość do agenta.",
+    "label": "Odpowiedź do rozmowy"
+   },
+   "context": [
+    {
+     "text": "Krok nie dał etykiety",
+     "tone": "plain"
+    },
+    {
+     "text": "Odpowiedź agenta nie zawiera etykiety.",
+     "tone": "problem"
+    },
+    {
+     "text": "odrzucona odpowiedź agenta: brak etykiety …Done, all tests pass.",
+     "tone": "dim"
+    },
+    {
+     "text": "◆ dyrygent: Odpowiedź mówi, że testy przechodzą.",
+     "tone": "conductor"
+    }
+   ],
+   "continuation": "resolve_output",
+   "entries": [
+    {
+     "description": "Funkcja gotowa.",
+     "fields": [
+      {
+       "description": "wymagane, chyba że kontekst już ma wartość",
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "variables.summary",
+       "proposed": "all units done",
+       "required": false,
+       "value": "all units done"
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "variables.files",
+       "proposed": 3,
+       "required": false,
+       "value": "3"
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "variables (klucz=wartość)",
+       "required": false
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "komentarz",
+       "required": false
+      }
+     ],
+     "label": "implemented",
+     "plan": {
+      "output": {
+       "label": "implemented"
+      }
+     },
+     "recommended": true,
+     "summary": "rozwiązano problem: implemented"
+    },
+    {
+     "description": "Najpierw decyzja człowieka.",
+     "fields": [
+      {
+       "description": "wymagane przez stan, do którego prowadzi etykieta",
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "artifacts.decision_doc",
+       "required": true
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "variables (klucz=wartość)",
+       "required": false
+      },
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "komentarz",
+       "required": false
+      }
+     ],
+     "label": "needs_human_decision",
+     "plan": {
+      "output": {
+       "label": "needs_human_decision"
+      }
+     },
+     "recommended": false,
+     "summary": "rozwiązano problem: needs_human_decision"
+    },
+    {
+     "description": "Wiadomość wznawia ten sam krok agenta; wynik ustawi on sam.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Wiadomość dla agenta",
+       "required": true
+      }
+     ],
+     "label": "Napisz do agenta",
+     "plan": "message",
+     "recommended": false,
+     "resumes": "implement",
+     "summary": "wysłano wiadomość do agenta"
+    }
+   ],
+   "episode": "ep-p"
+  },
+  "form": {
+   "action_execution_id": "act-9",
+   "continuation": "resolve_output",
+   "episode": "ep-p",
+   "execution_id": "exec-1",
+   "instruction": "Krok nie dał etykiety",
+   "outputs": [
+    {
+     "description": "Funkcja gotowa.",
+     "label": "implemented"
+    },
+    {
+     "description": "Najpierw decyzja człowieka.",
+     "label": "needs_human_decision"
+    }
+   ],
+   "problem": {
+    "analysis": {
+     "artifacts": {},
+     "label": "implemented",
+     "rationale": "Odpowiedź mówi, że testy przechodzą.",
+     "variables": {
+      "files": 3,
+      "summary": "all units done"
+     }
+    },
+    "answers": [
+     {
+      "action_execution_id": "act-9",
+      "answer_tail": "Done, all tests pass.",
+      "reason": "brak etykiety"
+     }
+    ],
+    "reason": "Odpowiedź agenta nie zawiera etykiety.",
+    "requirements": [
+     {
+      "artifacts": [],
+      "label": "implemented",
+      "variables": [
+       "summary"
+      ]
+     },
+     {
+      "artifacts": [
+       "decision_doc"
+      ],
+      "label": "needs_human_decision",
+      "variables": []
+     }
+    ]
+   },
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "implement"
+  }
+ },
+ {
+  "def": {
+   "composer": {
+    "entry": 0,
+    "help": "Odpowiada agentowi.",
+    "label": "Odpowiedź agentowi"
+   },
+   "context": [
+    {
+     "text": "Która wersja API?",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "resume_agent",
+   "entries": [
+    {
+     "description": "Odpowiedź wznawia sesję agenta.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "answer",
+       "required": true
+      }
+     ],
+     "label": "Odpowiedz agentowi",
+     "plan": "answer",
+     "recommended": false,
+     "resumes": "review_scope",
+     "summary": "odpowiedziano agentowi"
+    }
+   ],
+   "episode": "ep-q"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "continuation": "resume_agent",
+   "episode": "ep-q",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Która wersja API?",
+   "prefilled_answer": null,
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "composer": {
+    "entry": 0,
+    "help": "Odpowiada agentowi.",
+    "label": "Odpowiedź agentowi"
+   },
+   "context": [
+    {
+     "text": "Która wersja API?",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "resume_agent",
+   "entries": [
+    {
+     "description": "Odpowiedź wznawia sesję agenta.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "answer",
+       "required": true,
+       "value": "wersja 2"
+      }
+     ],
+     "label": "Odpowiedz agentowi",
+     "plan": "answer",
+     "recommended": false,
+     "resumes": "review_scope",
+     "summary": "odpowiedziano agentowi"
+    }
+   ],
+   "episode": "ep-q"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "continuation": "resume_agent",
+   "episode": "ep-q",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Która wersja API?",
+   "prefilled_answer": "wersja 2",
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Agent zatrzymał się na niejednoznaczności.",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "ambiguity_answer",
+       "required": false
+      }
+     ],
+     "label": "answered",
+     "plan": {
+      "complete": {
+       "label": "answered",
+       "label_field": "ambiguity_decision"
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano answered"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "ambiguity_answer",
+       "required": false
+      }
+     ],
+     "label": "replan",
+     "plan": {
+      "complete": {
+       "label": "replan",
+       "label_field": "ambiguity_decision"
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano replan"
+    }
+   ],
+   "episode": "ep-g"
+  },
+  "form": {
+   "action_execution_id": "act-1",
+   "episode": "ep-g",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "ambiguity_decision",
+     "options": [
+      "answered",
+      "replan"
+     ],
+     "required": true,
+     "type": "select"
+    },
+    {
+     "name": "ambiguity_answer",
+     "type": "text"
+    }
+   ],
+   "instruction": "Agent zatrzymał się na niejednoznaczności.",
+   "outputs": [
+    {
+     "label": "answered"
+    },
+    {
+     "label": "replan"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "resolve_ambiguity"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Zatwierdź wynik",
+     "tone": "plain"
+    },
+    {
+     "text": "wybór agenta: reviewed",
+     "tone": "plain"
+    },
+    {
+     "text": "Wynik przeglądu.",
+     "tone": "dim"
+    },
+    {
+     "text": "uzasadnienie: brak uzasadnienia",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "approve_output",
+   "entries": [
+    {
+     "description": "Przyjmuje wynik agenta; zadanie idzie dalej.",
+     "label": "Akceptuj",
+     "plan": "approve",
+     "recommended": false,
+     "summary": "zaakceptowano reviewed"
+    },
+    {
+     "description": "Sesji agenta nie da się wznowić: komentarz zaczyna nową sesję i nowy wynik.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Komentarz dla agenta",
+       "required": true
+      }
+     ],
+     "label": "Nowa sesja",
+     "plan": "return",
+     "recommended": false,
+     "resumes": "review_scope",
+     "summary": "zwrócono agentowi"
+    }
+   ],
+   "episode": "ep-a"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "approval": {
+    "action_execution_id": "act-7",
+    "agent_session_id": null,
+    "result": {
+     "data": {
+      "files": 3
+     },
+     "exit_code": null,
+     "output_label": "reviewed",
+     "stderr": "",
+     "stdout": "",
+     "variables": {}
+    }
+   },
+   "continuation": "approve_output",
+   "episode": "ep-a",
+   "execution_id": "exec-1",
+   "instruction": "Zatwierdź wynik",
+   "outputs": [
+    {
+     "description": "Wynik przeglądu.",
+     "label": "reviewed"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Przejrzyj pracę.",
+     "tone": "plain"
+    }
+   ],
+   "continuation": "complete_step",
+   "entries": [
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": false
+      }
+     ],
+     "label": "approve",
+     "plan": {
+      "complete": {
+       "label": "approve",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "summary": "odpowiedziano approve"
+    },
+    {
+     "description": "",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "comment",
+       "required": true
+      }
+     ],
+     "label": "revise",
+     "plan": {
+      "complete": {
+       "label": "revise",
+       "label_field": null
+      }
+     },
+     "recommended": false,
+     "resumes": "",
+     "summary": "odpowiedziano revise ↩ wraca do agenta"
+    }
+   ],
+   "episode": "ep-r"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "episode": "ep-r",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "comment",
+     "required": false,
+     "type": "text"
+    }
+   ],
+   "instruction": "Przejrzyj pracę.",
+   "outputs": [
+    {
+     "label": "approve"
+    },
+    {
+     "label": "revise",
+     "resume_comment_field": "comment"
+    }
+   ],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
+ },
+ {
+  "form": {
+   "action_execution_id": "act-1",
+   "episode": "ep-1",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "type": "text"
+    }
+   ],
+   "instruction": "Which one?",
+   "outputs": [],
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "plan"
+  },
+  "def": {
+   "continuation": "complete_step",
+   "episode": "ep-1",
+   "context": [
+    {
+     "tone": "plain",
+     "text": "Which one?"
+    }
+   ],
+   "entries": [
+    {
+     "label": "Odpowiedz",
+     "description": "Which one?",
+     "fields": [
+      {
+       "name": "answer",
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "required": false
+      }
+     ],
+     "plan": {
+      "complete": {
+       "label": null,
+       "label_field": null
+      }
+     },
+     "summary": "odpowiedziano"
+    }
+   ]
+  }
+ }
+]

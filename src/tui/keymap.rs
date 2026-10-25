@@ -860,7 +860,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::code(KeyCode::Esc),
         Action::Cancel,
         "wstecz",
-        "z pola wróć do akcji; z akcji zwiń panel, szkic zostaje",
+        "formularze z serwera: następny formularz, także w polu; bez nich z pola wróć do akcji, z akcji zwiń panel, szkic zostaje",
     ),
     bind(
         Context::Panel,
@@ -916,14 +916,14 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('['),
         Action::PrevPending,
         "",
-        "poprzednie oczekiwanie zadania",
+        "poprzednie oczekiwanie zadania (panel bez formularzy z serwera)",
     ),
     bind(
         Context::Panel,
         Key::char(']'),
         Action::NextPending,
         "",
-        "następne oczekiwanie zadania",
+        "następne oczekiwanie zadania (panel bez formularzy z serwera)",
     ),
     bind(
         Context::Panel,

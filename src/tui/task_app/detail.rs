@@ -39,7 +39,7 @@
 //!
 //! [`areas`] takes the height of the panel and returns where it goes; the tab
 //! content gives up that many rows at the bottom. [`render`] asks
-//! [`super::waiting::WaitingPanel::preferred_height`] for it and draws the
+//! [`super::panel::WaitingPanel::preferred_height`] for it and draws the
 //! panel there; the conductor's state, which a failed step and a proposal are
 //! made of, is read with the other tabs' data ([`DetailRead::Conductor`]).
 
@@ -69,6 +69,7 @@ use super::super::style::{PanelEdge, Role, Styles};
 use super::background::{DetailJob, JobKey, Outcome};
 use super::list::{describe_loss, fit, state_icon, title_of};
 use super::notify::Severity;
+use super::panel::WaitingPanel;
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{
     self, transcript_action, Attempt, AttemptRead, Attempts, Conversation, ReadFailure,
@@ -76,7 +77,6 @@ use super::tabs::conversation::{
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
 use super::tabs::progress::{self, Progress};
-use super::waiting::WaitingPanel;
 use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
 
 /// Everything the details of one task remember.

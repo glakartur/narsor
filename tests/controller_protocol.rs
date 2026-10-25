@@ -24,10 +24,10 @@ use narsor_engine::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, CreateEnrollmentRequest,
     CreateTaskRequest, DesiredAction, ExecutionEventsPage, ExecutionEventsQuery,
     ExecutionEventsResponse, ExecutionEventsSource, Freshness, LaunchRequest, OwnerCommandRequest,
-    ProtocolConfig, ProtocolService, RelayFailure, ReportRequest, RunnerClient,
-    RunnerCredentialRequest, RunnerDirective, SubmitCommentRequest, SubmitInputRequest,
-    SubmitOperatorCommandRequest, TaskActionId, TaskActionOffer, TaskDefaultHarness, TaskState,
-    TaskSummary, LOCAL_OWNER,
+    PanelFormKind, PanelOffer, ProtocolConfig, ProtocolService, RelayFailure, ReportRequest,
+    RunnerClient, RunnerCredentialRequest, RunnerDirective, SubmitCommentRequest,
+    SubmitInputRequest, SubmitOperatorCommandRequest, TaskActionId, TaskActionOffer,
+    TaskDefaultHarness, TaskState, TaskSummary, LOCAL_OWNER,
 };
 use narsor_engine::domain::{
     BackendId, DisplayLink, Event, EventData, ExecutionStatus, TaskDisplay, TaskId,
@@ -7288,4 +7288,384 @@ async fn the_operator_title_wins_over_a_generated_one() {
         harness.task("task-1").await.title.as_deref(),
         Some("Mój tytuł")
     );
+}
+
+// ---------------------------------------------------------------------------
+// The forms of the panel (R1–R3, R5–R9, R21, R22)
+// ---------------------------------------------------------------------------
+
+/// The kinds of the panel forms of `task`, in order, and the kind of the default.
+fn panel_kinds(task: &TaskSummary) -> (Vec<PanelFormKind>, Option<PanelFormKind>) {
+    let panel = task.panel.as_ref().expect("the server offers a panel");
+    let kinds: Vec<_> = panel.forms.iter().map(|form| form.kind).collect();
+    let default = panel.default.map(|index| kinds[index]);
+    (kinds, default)
+}
+
+/// The chat is offered exactly when the offer of actions offers the comment.
+fn assert_chat_follows_comment(task: &TaskSummary) {
+    let (kinds, _) = panel_kinds(task);
+    assert_eq!(
+        kinds.contains(&PanelFormKind::Chat),
+        action(task, TaskActionId::Comment).available
+    );
+}
+
+#[tokio::test]
+async fn panel_offer_survives_the_wire_and_an_old_summary_has_none() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+    let task = harness.task("task-1").await;
+    let json = serde_json::to_value(&task).expect("serialize");
+    let back: TaskSummary = serde_json::from_value(json.clone()).expect("deserialize");
+    assert_eq!(back.panel, task.panel);
+    assert!(task.panel.is_some());
+
+    let mut old = json;
+    old.as_object_mut().expect("object").remove("panel");
+    let old: TaskSummary = serde_json::from_value(old).expect("a summary without the field");
+    assert_eq!(old.panel, None);
+}
+
+#[test]
+fn an_unknown_form_kind_is_unrecognized_and_an_empty_offer_goes_both_ways() {
+    let kind: PanelFormKind = serde_json::from_str("\"from_the_future\"").expect("kind");
+    assert_eq!(kind, PanelFormKind::Unrecognized);
+    let empty = PanelOffer::default();
+    let back: PanelOffer =
+        serde_json::from_value(serde_json::to_value(&empty).expect("ser")).expect("de");
+    assert_eq!(back, empty);
+    assert_eq!(back.default, None);
+}
+
+#[tokio::test]
+async fn a_working_agent_has_no_form_and_a_queued_task_neither() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    harness.create("task-2", "k8s").await;
+
+    let working = harness.task("task-1").await;
+    assert_eq!(working.panel, Some(PanelOffer::default()));
+    let queued = harness.task("task-2").await;
+    assert_eq!(queued.panel, Some(PanelOffer::default()));
+}
+
+#[tokio::test]
+async fn the_panel_of_every_wait_has_its_forms_and_default() {
+    use PanelFormKind::{Action, Answer, Chat, EntryLimit, Permission};
+    let rows = [
+        // (continuation, kind, forms in order, default)
+        (
+            "resume_agent",
+            AttentionKind::Question,
+            vec![Answer, Chat],
+            Answer,
+        ),
+        (
+            "approve_output",
+            AttentionKind::Approval,
+            vec![Answer, Chat],
+            Answer,
+        ),
+        (
+            "resolve_permission",
+            AttentionKind::Problem,
+            vec![Permission, Chat],
+            Permission,
+        ),
+        (
+            "resolve_output",
+            AttentionKind::Problem,
+            vec![Chat, Action],
+            Action,
+        ),
+        (
+            "complete_step",
+            AttentionKind::Question,
+            vec![Action],
+            Action,
+        ),
+        (
+            "entry_limit",
+            AttentionKind::EntryLimit,
+            vec![EntryLimit],
+            EntryLimit,
+        ),
+    ];
+    for (continuation, kind, forms, default) in rows {
+        let harness = Harness::start().await;
+        waiting_on_request(&harness, continuation, kind).await;
+        let task = harness.task("task-1").await;
+        let (kinds, chosen) = panel_kinds(&task);
+        assert_eq!(kinds, forms, "{continuation}");
+        assert_eq!(chosen, Some(default), "{continuation}");
+        assert_chat_follows_comment(&task);
+        let panel = task.panel.as_ref().expect("panel");
+        for form in panel.forms.iter().filter(|form| form.kind != Chat) {
+            assert!(form.waiting_id.is_some(), "{continuation}: {:?}", form.kind);
+        }
+    }
+}
+
+#[tokio::test]
+async fn several_waits_give_one_form_for_the_one_the_runner_presents() {
+    use PanelFormKind::{Answer, Chat};
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    // An older wait of the same task stands on the attention list, but the
+    // runner presents the newer one: the form answers that one (R6).
+    let mut waiting = snapshot_waiting(2, 4, "ep-2", "resume_agent", AttentionKind::Question);
+    let mut older = attention(AttentionKind::Question, "ep-1", Some("review"));
+    older.since = Utc.with_ymd_and_hms(2026, 10, 3, 11, 0, 0).unwrap();
+    waiting.attention.insert(0, older);
+    running.runner.snapshot(&waiting).await.expect("snapshot");
+
+    let task = harness.task("task-1").await;
+    let (kinds, default) = panel_kinds(&task);
+    assert_eq!(kinds, [Answer, Chat], "one form for the wait, not one each");
+    assert_eq!(default, Some(Answer));
+    let panel = task.panel.as_ref().expect("panel");
+    assert_eq!(panel.forms[0].waiting_id.as_deref(), Some("ep-2"));
+}
+
+#[tokio::test]
+async fn a_script_step_at_work_has_no_form_even_with_a_manual_override() {
+    let harness = Harness::start().await;
+    write_override_workflow(&harness);
+    let running = harness.running("task-1", "k8s").await;
+    running
+        .runner
+        .snapshot(&snapshot_in(2, "work", 4))
+        .await
+        .expect("snapshot");
+
+    let task = harness.task("task-1").await;
+    assert_eq!(task.state, TaskState::Running);
+    assert_eq!(task.panel, Some(PanelOffer::default()));
+}
+
+#[tokio::test]
+async fn a_wait_the_panel_does_not_serve_has_no_form_even_when_it_asks_the_owner() {
+    // The same wait that opens a panel (see the rows above), with one more
+    // thing the owner's own panels keep: no form of this panel then.
+    for extra in [
+        AttentionKind::ConductorProposal,
+        AttentionKind::FailedStep,
+        AttentionKind::ProvisioningFailed,
+    ] {
+        let harness = Harness::start().await;
+        let running = harness.running("task-1", "k8s").await;
+        let mut waiting = snapshot_waiting(2, 4, "ep-1", "resume_agent", AttentionKind::Question);
+        waiting
+            .attention
+            .push(attention(extra, "other-1", Some("review")));
+        running.runner.snapshot(&waiting).await.expect("snapshot");
+        let task = harness.task("task-1").await;
+        assert_eq!(task.panel, None, "{extra:?}");
+    }
+
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    let mut waiting = snapshot_waiting(2, 4, "ep-1", "resume_agent", AttentionKind::Question);
+    waiting.problem = Some(narsor_engine::orchestration::RunnerProblem {
+        code: "no_harness".to_string(),
+        message: "the runner cannot work".to_string(),
+    });
+    running.runner.snapshot(&waiting).await.expect("snapshot");
+    let task = harness.task("task-1").await;
+    assert_eq!(task.panel, None, "a runner problem");
+}
+
+#[tokio::test]
+async fn a_step_that_ended_with_no_chat_opens_on_the_manual_transition() {
+    use PanelFormKind::Action;
+    let harness = Harness::start().await;
+    write_override_workflow(&harness);
+    let running = harness.running("task-1", "k8s").await;
+    // A wait of a kind this server does not know is no wait of the panel,
+    // takes no comment, and nothing answers it but the task's own action (R9).
+    let mut waiting = snapshot_waiting(2, 4, "ep-1", "resume_agent", AttentionKind::Unrecognized);
+    waiting.execution_cursor.current_state = Some("work".to_string());
+    running.runner.snapshot(&waiting).await.expect("snapshot");
+
+    let task = harness.task("task-1").await;
+    assert_available(&task, TaskActionId::Transition);
+    let (kinds, default) = panel_kinds(&task);
+    assert_eq!(kinds, [Action]);
+    assert_eq!(default, Some(Action));
+    let panel = task.panel.as_ref().expect("panel");
+    let choice = &panel.forms[0].choices[0];
+    assert_eq!(choice.action, Some(TaskActionId::Transition));
+    assert_eq!(panel.forms[0].waiting_id, None);
+    assert_eq!(choice.description.as_deref(), Some("success → locked"));
+}
+
+#[tokio::test]
+async fn the_forms_of_a_permission_and_an_entry_limit_name_their_wait() {
+    for (continuation, kind, form_kind) in [
+        (
+            "resolve_permission",
+            AttentionKind::Problem,
+            PanelFormKind::Permission,
+        ),
+        (
+            "entry_limit",
+            AttentionKind::EntryLimit,
+            PanelFormKind::EntryLimit,
+        ),
+    ] {
+        let harness = Harness::start().await;
+        waiting_on_request(&harness, continuation, kind).await;
+        let task = harness.task("task-1").await;
+        let panel = task.panel.expect("panel");
+        let form = &panel.forms[0];
+        assert_eq!(form.kind, form_kind);
+        assert!(form.waiting_id.is_some(), "{continuation}");
+        assert!(form.choices.is_empty(), "{continuation}");
+        let definition = form
+            .definition
+            .as_ref()
+            .expect("the server defines the form");
+        assert!(!definition.entries.is_empty(), "{continuation}");
+    }
+}
+
+#[tokio::test]
+async fn a_form_of_a_wait_carries_the_definition_the_server_builds_of_the_wait() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+    let task = harness.task("task-1").await;
+    let panel = task.panel.expect("panel");
+    let answer = &panel.forms[0];
+    assert_eq!(answer.kind, PanelFormKind::Answer);
+    assert_eq!(answer.waiting_id.as_deref(), Some("ep-1"));
+    assert!(answer.choices.is_empty());
+    assert!(!answer.is_manual_action());
+
+    let definition = answer
+        .definition
+        .as_ref()
+        .expect("the server defines the form");
+    let pending: narsor_protocol::api::PendingHumanInputView = serde_json::from_value(
+        task.runner
+            .as_ref()
+            .and_then(|runner| runner.pending_input.as_ref())
+            .expect("the wait")
+            .form
+            .clone(),
+    )
+    .expect("a pending input");
+    assert_eq!(
+        definition,
+        &narsor_protocol::panel::define(&pending, &|_| None),
+        "the definition is the one `define` makes of the wait"
+    );
+    assert_eq!(definition.entries[0].label, "Odpowiedz agentowi");
+}
+
+#[tokio::test]
+async fn the_chat_and_the_manual_action_carry_no_definition() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+    let task = harness.task("task-1").await;
+    let panel = task.panel.expect("panel");
+    let chat = panel
+        .forms
+        .iter()
+        .find(|form| form.kind == PanelFormKind::Chat)
+        .expect("a chat");
+    assert!(chat.definition.is_none());
+}
+
+#[tokio::test]
+async fn a_pause_opens_on_the_chat_alone() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    let task = harness.task("task-1").await;
+    let (kinds, default) = panel_kinds(&task);
+    assert_eq!(kinds, [PanelFormKind::Chat]);
+    assert_eq!(default, Some(PanelFormKind::Chat));
+    assert_chat_follows_comment(&task);
+}
+
+#[tokio::test]
+async fn a_question_with_a_manual_action_keeps_the_answer_as_the_default() {
+    use PanelFormKind::{Action, Answer, Chat};
+    let harness = Harness::start().await;
+    write_override_workflow(&harness);
+    let running = harness.running("task-1", "k8s").await;
+    let mut waiting = snapshot_waiting(2, 4, "ep-1", "resume_agent", AttentionKind::Question);
+    waiting.execution_cursor.current_state = Some("work".to_string());
+    running.runner.snapshot(&waiting).await.expect("snapshot");
+
+    let task = harness.task("task-1").await;
+    assert_available(&task, TaskActionId::Transition);
+    let (kinds, default) = panel_kinds(&task);
+    assert_eq!(kinds, [Answer, Chat, Action]);
+    assert_eq!(default, Some(Answer), "R9: the action is not the default");
+}
+
+#[tokio::test]
+async fn an_output_to_resolve_opens_on_the_action_and_keeps_the_chat() {
+    use PanelFormKind::{Action, Chat};
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resolve_output", AttentionKind::Question).await;
+    let task = harness.task("task-1").await;
+    let (kinds, default) = panel_kinds(&task);
+    assert_eq!(kinds, [Chat, Action]);
+    assert_eq!(default, Some(Action));
+    assert_chat_follows_comment(&task);
+}
+
+#[tokio::test]
+async fn a_finished_task_has_no_form() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    running
+        .runner
+        .snapshot(&snapshot(2, ExecutionStatus::Completed, 4, None))
+        .await
+        .expect("completed");
+    let mut at_safe_point = snapshot(3, ExecutionStatus::Completed, 5, None);
+    at_safe_point.safe_point = true;
+    running.runner.snapshot(&at_safe_point).await.expect("safe");
+    running
+        .controller
+        .report(&report(
+            "task-1",
+            running.epoch,
+            2,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+
+    let task = harness.task("task-1").await;
+    assert_eq!(task.panel, Some(PanelOffer::default()));
+    assert_chat_follows_comment(&task);
+}
+
+#[tokio::test]
+async fn an_archived_task_has_no_form() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    harness
+        .command("task-1", OwnerCommand::Archive, "archive-1")
+        .await;
+    let task = harness.task("task-1").await;
+    assert_eq!(task.panel, Some(PanelOffer::default()));
+}
+
+#[tokio::test]
+async fn the_list_carries_the_same_panel_as_the_task() {
+    let harness = Harness::start().await;
+    waiting_on_request(&harness, "resume_agent", AttentionKind::Question).await;
+    harness.create("task-2", "k8s").await;
+    for task in harness.owner.control_tasks().await.expect("list").tasks {
+        let single = harness.task(task.task_id.as_str()).await;
+        assert_eq!(task.panel, single.panel, "{}", task.task_id);
+    }
 }
