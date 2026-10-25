@@ -1,5 +1,8 @@
 //! The form of the decision at the entry limit of a step.
 
+#[cfg(test)]
+mod tests;
+
 use super::input::*;
 use crate::tui::chooser::ChooserItem;
 use narsor_protocol::api::*;

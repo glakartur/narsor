@@ -1,6 +1,9 @@
 //! The form of an action of the workflow: a gate that completes a step and a
 //! problem the owner settles by giving the output the agent did not give.
 
+#[cfg(test)]
+mod tests;
+
 use super::input::*;
 use crate::tui::chooser::{ChooserField, ChooserItem, Submission};
 use crate::tui::input_form::value_as_text;

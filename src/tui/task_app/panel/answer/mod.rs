@@ -1,6 +1,9 @@
 //! The form of an answer to the agent: its own question, and the approval of
 //! its result.
 
+#[cfg(test)]
+mod tests;
+
 use super::input::*;
 use crate::domain::display::without_unsafe_chars;
 use crate::tui::chooser::{ChooserField, ChooserItem, Submission};

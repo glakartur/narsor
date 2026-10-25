@@ -1,5 +1,8 @@
 //! The form of the decision on a permission the agent asked for.
 
+#[cfg(test)]
+mod tests;
+
 use super::input::*;
 use crate::tui::chooser::{ChooserField, ChooserItem, Submission};
 use narsor_protocol::api::*;
