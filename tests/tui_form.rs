@@ -191,20 +191,79 @@ fn tab_cancels_a_pending_edge_press() {
     );
 }
 
-#[test]
-fn a_rebuilt_form_closes_the_confirmation() {
-    let item = || ChooserItem::new("go", "Start.").with_field(ChooserField::text("a"));
-    let mut chooser = Chooser::new(vec![item()]).confirming_submit();
+/// A chooser with the confirmation open on "go", the text "a" typed.
+fn confirming(items: Vec<ChooserItem>) -> Chooser {
+    let mut chooser = Chooser::new(items).confirming_submit();
     into_fields(&mut chooser);
     type_text(&mut chooser, "a");
     press(&mut chooser, KeyCode::Enter);
-    let mut chooser = chooser.rebuilt(vec![item()]);
+    assert!(chooser.is_confirming());
+    chooser
+}
+
+fn go(description: &str) -> ChooserItem {
+    ChooserItem::new("go", description).with_field(ChooserField::text("a"))
+}
+
+#[test]
+fn a_rebuilt_form_with_the_same_entry_keeps_the_confirmation() {
+    let mut chooser = confirming(vec![go("Start.")]).rebuilt(vec![go("Start.")]);
+    assert!(chooser.is_confirming());
+    let action = press(&mut chooser, KeyCode::Enter);
+    assert!(matches!(action, ChooserAction::Submit(_)), "{action:?}");
+}
+
+#[test]
+fn a_rebuild_that_changes_another_entry_keeps_the_confirmation() {
+    let other = |text: &str| ChooserItem::new("other", text);
+    let mut chooser = confirming(vec![go("Start."), other("one")]);
+    chooser = chooser.rebuilt(vec![
+        go("Start."),
+        other("two"),
+        ChooserItem::new("new", "x"),
+    ]);
+    assert!(chooser.is_confirming());
+}
+
+#[test]
+fn a_rebuild_that_changes_the_entry_closes_the_confirmation() {
+    let mut chooser = confirming(vec![go("Start.")]).rebuilt(vec![go("Start again.")]);
+    assert!(!chooser.is_confirming());
     let action = press(&mut chooser, KeyCode::Enter);
     assert_eq!(
         action,
         ChooserAction::None,
-        "Enter after a rebuild asks again; it does not send"
+        "Enter asks again; it does not send"
     );
+}
+
+#[test]
+fn a_rebuild_that_makes_the_entry_unavailable_closes_the_confirmation() {
+    let chooser = confirming(vec![go("Start.")]);
+    let chooser = chooser.rebuilt(vec![go("Start.").unavailable("zajęte")]);
+    assert!(!chooser.is_confirming());
+}
+
+#[test]
+fn a_rebuild_that_drops_the_entry_closes_the_confirmation() {
+    let chooser = confirming(vec![go("Start."), ChooserItem::new("other", "x")]);
+    let chooser = chooser.rebuilt(vec![ChooserItem::new("other", "x")]);
+    assert!(!chooser.is_confirming());
+}
+
+#[test]
+fn a_rebuild_that_changes_the_fields_closes_the_confirmation() {
+    let chooser = confirming(vec![go("Start.")]);
+    let chooser = chooser.rebuilt(vec![
+        go("Start.").with_field(ChooserField::text("b").required())
+    ]);
+    assert!(!chooser.is_confirming());
+}
+
+#[test]
+fn a_rebuild_keeps_what_was_typed() {
+    let chooser = confirming(vec![go("Start.")]).rebuilt(vec![go("Start.")]);
+    assert_eq!(value(&chooser, 0), "a");
 }
 
 #[test]

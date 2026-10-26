@@ -219,6 +219,16 @@ impl ChooserField {
         self.error = from.error.clone();
     }
 
+    /// Whether `other` asks for the same thing: name, kind, wording and
+    /// whether it is required — the typed value is not compared.
+    fn same_definition(&self, other: &ChooserField) -> bool {
+        self.name == other.name
+            && self.kind == other.kind
+            && self.label == other.label
+            && self.required == other.required
+            && self.description == other.description
+    }
+
     /// Whether the operator wrote something here that is not sent yet: a
     /// text value that is not blank and not the conductor's untouched one.
     pub fn is_drafted(&self) -> bool {
@@ -688,11 +698,14 @@ impl Chooser {
     /// the fields that are still there (by entry label and field name), the
     /// highlighted entry is the same one when it still exists, the focus
     /// stays where it was and so does the scrolled list. An open
-    /// confirmation closes: the operator confirms again what is now there.
+    /// confirmation stays open when the highlighted entry is the same and can
+    /// still be sent, and closes otherwise: the operator confirms again what
+    /// is now there.
     pub fn rebuilt(mut self, mut items: Vec<ChooserItem>) -> Self {
-        // The popup asked about entries that may be gone or changed.
-        self.form.decline();
+        // The popup asked about an entry that may be gone or changed.
+        let asked = self.form.decline();
         let label = self.selected_item().map(|item| item.label.clone());
+        let earlier = self.selected_item().cloned();
         for item in &mut items {
             let Some(old) = self.items.iter().find(|old| old.label == item.label) else {
                 continue;
@@ -724,6 +737,27 @@ impl Chooser {
         } else {
             0
         };
+        if let Some(return_field) = asked {
+            let unchanged = match (earlier, self.selected_item()) {
+                (Some(earlier), Some(now)) => {
+                    earlier.description == now.description
+                        && earlier.resumes_agent == now.resumes_agent
+                        && earlier.recommended == now.recommended
+                        && earlier.irreversible == now.irreversible
+                        && earlier.unavailable == now.unavailable
+                        && earlier.fields.len() == now.fields.len()
+                        && earlier
+                            .fields
+                            .iter()
+                            .zip(&now.fields)
+                            .all(|(a, b)| a.same_definition(b))
+                }
+                _ => false,
+            };
+            if unchanged && self.is_sendable() {
+                self.form.ask_confirmation(return_field.min(self.field));
+            }
+        }
         self
     }
 

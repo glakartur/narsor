@@ -91,6 +91,7 @@ impl TaskApp {
         let selected = self.list.selected_id().map(str::to_string);
         let mut lost = false;
         let mut released = false;
+        let mut switched = false;
         let mut drafts = Vec::new();
         for task in self.list.tasks() {
             let id = task.task_id.as_str();
@@ -112,11 +113,18 @@ impl TaskApp {
             if selected.as_deref() == Some(id) {
                 lost = effect.lost_current;
                 released = effect.released;
+                switched = effect.switched;
             }
             drafts.push((id.to_string(), view.draft_text()));
         }
         for (id, text) in drafts {
             self.detail.set_draft(&id, text);
+        }
+        if switched {
+            self.notify(
+                Severity::Warning,
+                "agent czeka na coś nowego — formularz zmieniony, szkic zostaje",
+            );
         }
         if lost && self.panel_focus {
             self.panel_focus = false;
@@ -205,6 +213,9 @@ impl TaskApp {
         let Request::Answer(request) = self.submit_answer(id, submission) else {
             return Request::None;
         };
+        if let Some(view) = self.detail.views.get_mut(id) {
+            view.waiting.unprepare(&request.waiting_id);
+        }
         let (label, mut lines) = self
             .selected_panel()
             .and_then(|panel| {
@@ -240,9 +251,7 @@ impl TaskApp {
         id: &str,
         prepare: impl FnOnce(&mut WaitingPanel, &TaskSummary) -> Result<AnswerRequest, String>,
     ) -> Request {
-        if !self.mutation_allowed() {
-            return Request::None;
-        }
+        let refusal = self.mutation_refusal().err();
         let Some(task) = self
             .list
             .tasks()
@@ -254,6 +263,10 @@ impl TaskApp {
         let Some(view) = self.detail.views.get_mut(id) else {
             return Request::None;
         };
+        if let Some(reason) = refusal {
+            view.waiting.fail(reason);
+            return Request::None;
+        }
         match prepare(&mut view.waiting, task) {
             Ok(request) => Request::Answer(Box::new(request)),
             Err(message) => {

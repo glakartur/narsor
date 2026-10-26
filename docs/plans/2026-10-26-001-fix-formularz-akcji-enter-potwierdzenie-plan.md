@@ -245,12 +245,12 @@ Uzupełnia wykonawca w U1. Szablon:
 
 | Hipoteza | Werdykt | Dowód (test, log, pomiar) |
 |----------|---------|----------------------------|
-| H1 | do ustalenia | |
-| H2 | do ustalenia | |
-| H3 | do ustalenia | |
-| H4 | do ustalenia | |
-| R3 (który formularz) | do ustalenia | |
-| Q4 (pytanie / rozmowa / akcja) | do ustalenia | |
+| H1 | odrzucona | Test `the_same_listing_keeps_the_focus_and_the_confirmation`: ponowne `load` tej samej oferty zostawia okno otwarte. `leave_all` działa tylko przy zmianie klucza formularza. |
+| H2 | potwierdzona | Test `the_confirmation_of_an_answer_survives_a_read_of_the_timeline` zawodził przed poprawką: `reread` → `Entry::rebuild` → `Chooser::rebuilt` wołało `decline()`. Po U2 przechodzi. |
+| H3 | nie potwierdzona (z czytania kodu, bez pomiaru na żywo) | Zgodnie z Q2/Q5 z origin; limity klienta nie zostały zmierzone. R9 zostaje odroczone. |
+| H4 | potwierdzona (luka R7) | `submit_with` zwracało `Request::None`, powód szedł tylko do paska. Test `a_refused_confirmation_says_why_in_the_panel_and_keeps_the_text`. |
+| R3 (który formularz) | wpis `Slot::Entry` | Odpowiedź na pytanie agenta ma okno potwierdzenia w `composer` wpisu. `Slot::Manual` go nie ma. |
+| Q4 (pytanie / rozmowa / akcja) | objaw dla wpisów z oknem | Sprawdzono pytanie agenta. Akcja workflow nie została sprawdzona osobnym testem. |
 
 ---
 

@@ -74,4 +74,7 @@ pub struct SyncEffect {
     pub lost_current: bool,
     /// A draft was left behind.
     pub released: bool,
+    /// The form shown changed while the operator was typing in the one
+    /// before or confirming it; its draft stays there.
+    pub switched: bool,
 }

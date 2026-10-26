@@ -11,10 +11,11 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use serde_json::{json, Value};
 
-use narsor::api::ApiClient;
+use narsor::api::{ApiClient, ClientError};
 use narsor::tui::chooser::Submission;
 use narsor::tui::style::Styles;
 use narsor::tui::task_app::actions::ActionSend;
+use narsor::tui::task_app::detail::DetailRead;
 use narsor::tui::task_app::panel::{Submit, WaitingPanel};
 use narsor::tui::task_app::{layout, Request, TaskApp};
 use narsor_engine::controller_protocol::{
@@ -31,7 +32,8 @@ use narsor_protocol::panel::PanelContextLine;
 mod task_app_support;
 
 use task_app_support::{
-    listing, task, titled, waiting_on, with_controller, with_panel, with_pending, with_runner,
+    listing, task, timeline, titled, waiting_on, with_controller, with_panel, with_pending,
+    with_runner,
 };
 
 fn app() -> TaskApp {
@@ -210,6 +212,81 @@ fn a_message_in_the_chat_is_sent_as_a_comment_after_the_confirmation() {
         panic!("the confirmed message is sent");
     };
     assert_eq!(request.submit, Submit::Comment("sprawdź logi".to_string()));
+}
+
+/// The timeline read that follows every change of the row's revision.
+fn timeline_read(app: &mut TaskApp) {
+    app.on_detail_read(
+        "a",
+        1,
+        DetailRead::Timeline(Ok(timeline("a", vec![], None))),
+    );
+}
+
+#[test]
+fn the_confirmation_of_an_answer_survives_a_read_of_the_timeline() {
+    let mut app = opened(asking());
+    key(&mut app, KeyCode::Enter);
+    typed(&mut app, "v2");
+    assert_eq!(key(&mut app, KeyCode::Enter), Request::None);
+    assert!(app.form_confirming(), "Enter asks before it sends");
+
+    timeline_read(&mut app);
+
+    assert!(app.form_confirming(), "the read closed the confirmation");
+    let Request::Answer(request) = key(&mut app, KeyCode::Enter) else {
+        panic!("the first Enter in the window sends the answer");
+    };
+    assert!(
+        matches!(request.submit, Submit::Input { .. }),
+        "{:?}",
+        request.submit
+    );
+}
+
+#[test]
+fn the_same_listing_keeps_the_focus_and_the_confirmation() {
+    let mut app = opened(asking());
+    key(&mut app, KeyCode::Enter);
+    typed(&mut app, "v2");
+    key(&mut app, KeyCode::Enter);
+    assert!(app.form_confirming());
+    app.load(listing(vec![titled(asking(), "NAR-12")], "c"));
+    assert!(app.form_confirming());
+    assert!(app.detail().view("a").unwrap().waiting().is_confirming());
+}
+
+#[test]
+fn a_refused_confirmation_says_why_in_the_panel_and_keeps_the_text() {
+    let mut app = opened(asking());
+    key(&mut app, KeyCode::Enter);
+    typed(&mut app, "v2");
+    key(&mut app, KeyCode::Enter);
+    app.on_stream(Some(Err(ClientError::Unavailable("down".into()))));
+
+    assert_eq!(key(&mut app, KeyCode::Enter), Request::None);
+
+    let drawn = screen(&mut app, 120, 40);
+    assert!(
+        drawn.contains("✗") && drawn.contains("zablokowana"),
+        "{drawn}"
+    );
+    assert!(drawn.contains("v2"), "{drawn}");
+}
+
+#[test]
+fn a_second_send_waits_for_the_first_to_settle() {
+    let mut app = opened(asking());
+    key(&mut app, KeyCode::Enter);
+    typed(&mut app, "v2");
+    key(&mut app, KeyCode::Enter);
+    let Request::Answer(_) = key(&mut app, KeyCode::Enter) else {
+        panic!("the confirmed answer is sent");
+    };
+    // The answer is not settled yet: nothing is sent twice.
+    key(&mut app, KeyCode::Enter);
+    let again = key(&mut app, KeyCode::Enter);
+    assert_eq!(again, Request::None, "the second send must wait");
 }
 
 #[test]

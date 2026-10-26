@@ -154,6 +154,9 @@ struct Entry {
     wrote: bool,
     /// The answer was sent: the typed text is not a draft any more.
     sent: bool,
+    /// What is being sent: the same decision is not sent a second time
+    /// before the first is settled.
+    sending: Option<Submit>,
     /// The entry is a form of the server's panel: the message to the agent
     /// is the chat form's, so the list has no action 0.
     forms: bool,
@@ -189,6 +192,7 @@ impl Entry {
             key: None,
             wrote: false,
             sent: false,
+            sending: None,
             forms,
         }
     }
@@ -266,6 +270,7 @@ impl Entry {
         conductor: Option<&ConductorView>,
     ) {
         let model = Self::model(&self.item, task, positions, conductor);
+        let was_confirming = self.is_confirming();
         let chooser = std::mem::replace(&mut self.chooser, Chooser::new(Vec::new()));
         // An operator who has not moved from the opening entry follows the
         // recommendation to wherever the new build puts it.
@@ -298,7 +303,16 @@ impl Entry {
             composer.leave_fields();
             self.composer = Some(composer);
         }
+        if was_confirming && !self.is_confirming() {
+            self.error =
+                Some("Lista opcji się zmieniła — sprawdź i zatwierdź ponownie.".to_string());
+        }
         self.model = model;
+    }
+
+    /// Whether a send waits for the confirmation of the operator.
+    fn is_confirming(&self) -> bool {
+        self.chooser.is_confirming() || self.composer.as_ref().is_some_and(Chooser::is_confirming)
     }
 
     /// The field of action 0 is empty again: its text was sent.
@@ -849,6 +863,7 @@ impl WaitingPanel {
                     self.current = index;
                 }
                 if self.active_key() != before {
+                    effect.switched = self.is_typing() || self.is_confirming();
                     self.leave_all();
                     self.arrive();
                 }
@@ -1154,6 +1169,10 @@ impl WaitingPanel {
             Model::Missing => return Err("Treść oczekiwania jeszcze nie dotarła.".to_string()),
         };
         let key = entry.key.get_or_insert_with(idempotency_key).clone();
+        if entry.sending.as_ref() == Some(&submit) {
+            return Err("Zapis trwa.".to_string());
+        }
+        entry.sending = Some(submit.clone());
         Ok(AnswerRequest {
             task_id: task.task_id.to_string(),
             waiting_id: entry.item.waiting_id.clone(),
@@ -1204,6 +1223,18 @@ impl WaitingPanel {
         })
     }
 
+    /// A request made by [`Self::prepare`] was not sent (it waits behind the
+    /// `y` / `n` window): the same decision may be prepared again.
+    pub(super) fn unprepare(&mut self, waiting_id: &str) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.item.waiting_id == waiting_id)
+        {
+            entry.sending = None;
+        }
+    }
+
     /// Says what a send of `waiting_id` came to. Success forgets the draft; a
     /// refusal keeps the panel as it is and shows why; a lost connection keeps
     /// the key for the retry.
@@ -1219,6 +1250,7 @@ impl WaitingPanel {
         else {
             return;
         };
+        entry.sending = None;
         match outcome {
             Ok(()) => {
                 entry.sent = true;
