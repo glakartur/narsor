@@ -57,14 +57,14 @@ Drugi problem: `claude` po prawie każdej odpowiedzi tekstowej prosi agenta o od
 **Zamykanie kroku**
 
 - R1. Za odpowiedź końcową uznaje się linię `result`, której `structured_output` zawiera string `choice`, albo `status: awaiting_input` z kompletnym pytaniem. Linia `result` bez takiego obiektu nie kończy kroku. `claude` emituje kilka linii `result` w jednej sesji.
-- R2. Po odpowiedzi końcowej silnik czeka okres łaski (stała, domyślnie 5 s), aby proces zdążył wyjść sam i dopisać sesję. Potem kończy proces.
+- R2. Po odpowiedzi końcowej silnik czeka okres łaski (stała w kodzie, 15 s), aby proces zdążył wyjść sam i dopisać sesję. Potem kończy proces.
 - R3. Silnik uruchamia proces agenta we własnej grupie procesów. Zakończenie obejmuje całą grupę: najpierw SIGTERM, po krótkim czasie SIGKILL. Zabijany jest też Playwright MCP (`npm exec`, `node`) i każdy `bash` z pętlą. `kill_on_drop` zabija dziś tylko sam `claude`.
 - R4. Krok zamknięty w ten sposób nie jest błędem. Silnik zapisuje w rozmowie wpis narsora, że proces zakończono po odpowiedzi końcowej, z numerem grupy procesów. Kod wyjścia wymuszonego zakończenia nie zmienia wyniku kroku.
 
 **Odpowiedź `progress`**
 
 - R5. Schemat `--json-schema` (`output_schema`) dopuszcza `status: progress` obok `awaiting_input`, z polem `message` (string). Schemat pozostaje płaskim obiektem, bez `anyOf`/`oneOf`.
-- R6. Kontrakt w prompcie (`output_contract` i `CONTRACT_NOTE`) opisuje `progress`: służy do komentarzy, informacji o czekaniu i wyników częściowych. Odpowiedź z `choice` agent wysyła dokładnie raz, gdy wszystkie subagenty oddały wyniki. Prompt ogranicza użycie, np. do jednego komentarza na zakończony etap.
+- R6. Kontrakt w prompcie (`output_contract` i `CONTRACT_NOTE`) opisuje `progress`: służy do komentarzy, informacji o czekaniu i wyników częściowych. Odpowiedź z `choice` agent wysyła dokładnie raz, gdy wszystkie subagenty oddały wyniki. Prompt nie limituje liczby wywołań `progress`.
 - R7. Wywołanie `progress` pojawia się w rozmowie jako wpis z treścią `message` (rozszerzenie `structured_output_summary` w `tools.rs`). Nie kończy kroku i nie zmienia stanu workflow.
 - R8. Parser strumienia zapamiętuje ostatni `structured_output`, który jest odpowiedzią końcową (R1). `progress` go nie zastępuje.
 - R9. Gdy sesja kończy się bez odpowiedzi końcowej, a ostatni `structured_output` to `progress`, silnik używa istniejącego wznowienia (`reprompt_config`, `continuation_config` w `agent.rs`). Wznowienie liczy się do istniejącego limitu ponowień.
@@ -87,7 +87,7 @@ Drugi problem: `claude` po prawie każdej odpowiedzi tekstowej prosi agenta o od
 ## Scope Boundaries
 
 - Nie zmieniamy definicji workflow (`workflows/`) ani ich treści promptów poza wspólnym kontraktem z R6.
-- Nie dodajemy limitu liczby `progress` w silniku. Ogranicza go prompt (R6). Limit w silniku jest do rozważenia, gdy pojawi się nadużycie.
+- Nie limitujemy liczby `progress` — ani w silniku, ani w prompcie. R6 opisuje tylko, do czego `progress` służy (decyzja użytkownika).
 - Nie zmieniamy limitów czasu kroków (`timeout_secs`).
 - Inne harnessy niż `claude-code` nie dostają `progress` przez `--json-schema`. Dla nich zmiana dotyczy tylko tekstu kontraktu, jeśli adapter go używa (do sprawdzenia w planie).
 - Nie blokujemy `Bash` ani nie próbujemy wykrywać pętli w poleceniach agenta.
@@ -98,25 +98,17 @@ Drugi problem: `claude` po prawie każdej odpowiedzi tekstowej prosi agenta o od
 
 - Zakładamy zachowanie `claude` 2.1.x: `StructuredOutput` nie kończy sesji, a po turze tekstowej CLI prosi o `StructuredOutput`. Dowód: w obserwowanym tasku proces żył po `result` z 11:15:39. Zachowanie CLI trzeba potwierdzić fixturą (`tests/fixtures/claude-code/`).
 - Zakładamy, że schemat z `status: progress` jest przyjmowany przez API tak samo jak dziś z `awaiting_input` (płaski obiekt). Do sprawdzenia fixturą.
-- Nie sprawdzono, czy brak zabijania po `result` jest świadomą decyzją (np. zapis sesji potrzebnej do `--resume`). Okres łaski z R2 ma to pokryć. Do potwierdzenia testem wznowienia po zabiciu.
+- Nie sprawdzono, czy brak zabijania po `result` jest świadomą decyzją (np. zapis sesji potrzebnej do `--resume`). Okres łaski z R2 (15 s) ma to pokryć. Do potwierdzenia testem wznowienia po zabiciu.
 
 ---
 
 ## Założenia do potwierdzenia
 
-- Okres łaski z R2 to stała w kodzie (5 s). Nie dodajemy parametru workflow. To najmniejsza zmiana. Parametr można dodać później.
-- `progress` jest zwykłym wpisem agenta w rozmowie i w panelu TUI. Bez osobnej ikony. Zmiana TUI jest poza zakresem.
+- Okres łaski z R2 to stała w kodzie, 15 s (decyzja użytkownika). Nie dodajemy parametru workflow.
+- `progress` jest zwykłym wpisem agenta w rozmowie i w panelu TUI, z zwykłym nagłówkiem (kolor + opis) jak każdy wpis agenta. Bez osobnej ikony. Zmiana TUI jest poza zakresem (decyzja użytkownika).
 - Jeśli po zabiciu grupy procesów (R3) sesja `claude` nie da się wznowić przez `--resume`, krok z `awaiting_input` i `history: true` nie jest zabijany przed końcem okresu łaski. Do sprawdzenia testem w planie. Dopóki test nie potwierdzi wznowienia, zabijanie obejmuje tylko odpowiedź z `choice`.
 - Zachowanie `claude` 2.1.x z sekcji „Dependencies / Assumptions” jest prawdziwe. Fixtura w planie ma to potwierdzić.
 - Zabijanie grupy procesów dotyczy tylko Linux i macOS (grupy procesów POSIX). Inne platformy nie są wspierane przez runner.
-
----
-
-## Pytania otwarte dla użytkownika
-
-- Czy `progress` ma trafiać do panelu TUI osobnym elementem (inna ikona), czy wystarczy zwykły wpis agenta?
-- Czy okres łaski (R2) ma być parametrem workflow (`parameters`), czy wystarczy stała 5 s?
-- Czy limit liczby `progress` na krok ma być w silniku już teraz, czy wystarczy ograniczenie w prompcie (R6)?
 
 ---
 
