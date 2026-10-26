@@ -1225,10 +1225,7 @@ async fn spawn_and_wait(
         Ok(driven) => driven,
         Err(_elapsed) => {
             // The waiting future is gone, so the child can be reaped for
-            // good. The whole group goes, not only the harness.
-            if let Some(pgid) = group.pgid() {
-                process_group::signal(pgid, process_group::KILL);
-            }
+            // good. The still armed guard kills the rest of the group.
             let _ = child.kill().await;
             return Ok(SpawnEnding::TimedOut);
         }
@@ -1654,7 +1651,7 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         let progress = objects
             .iter()
             .rev()
-            .any(|value| value.get("status").and_then(Value::as_str) == Some(PROGRESS));
+            .any(is_progress_note);
         return Err(no_label_error(
             if progress {
                 "the agent's last answer was a progress note, not a final answer"
