@@ -252,6 +252,13 @@ fn a_rebuild_that_drops_the_entry_closes_the_confirmation() {
 }
 
 #[test]
+fn a_rebuild_that_puts_another_entry_in_its_place_closes_the_confirmation() {
+    let named = |label: &str| ChooserItem::new(label, "Start.").with_field(ChooserField::text("a"));
+    let chooser = confirming(vec![named("go")]).rebuilt(vec![named("stop")]);
+    assert!(!chooser.is_confirming());
+}
+
+#[test]
 fn a_rebuild_that_changes_the_fields_closes_the_confirmation() {
     let chooser = confirming(vec![go("Start.")]);
     let chooser = chooser.rebuilt(vec![

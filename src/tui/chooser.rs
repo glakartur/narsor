@@ -740,7 +740,8 @@ impl Chooser {
         if let Some(return_field) = asked {
             let unchanged = match (earlier, self.selected_item()) {
                 (Some(earlier), Some(now)) => {
-                    earlier.description == now.description
+                    earlier.label == now.label
+                        && earlier.description == now.description
                         && earlier.resumes_agent == now.resumes_agent
                         && earlier.recommended == now.recommended
                         && earlier.irreversible == now.irreversible
