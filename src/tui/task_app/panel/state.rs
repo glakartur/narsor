@@ -1213,8 +1213,13 @@ impl WaitingPanel {
             .entries
             .get_mut(self.current)
             .ok_or_else(|| "Nie ma czego wysłać.".to_string())?;
+        let submit = Submit::Comment(text);
+        if entry.sending.as_ref() == Some(&submit) {
+            return Err("Zapis trwa.".to_string());
+        }
         entry.wrote = true;
         let key = entry.key.get_or_insert_with(idempotency_key).clone();
+        entry.sending = Some(submit.clone());
         Ok(AnswerRequest {
             task_id: task.task_id.to_string(),
             waiting_id: entry.item.waiting_id.clone(),
@@ -1222,7 +1227,7 @@ impl WaitingPanel {
             generation: task.generation,
             key,
             summary: "wiadomość wysłana do agenta".to_string(),
-            submit: Submit::Comment(text),
+            submit,
         })
     }
 

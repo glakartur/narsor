@@ -753,6 +753,19 @@ fn a_second_prepare_of_the_same_decision_waits_for_the_first() {
     assert_eq!(panel.prepare(&task, &choice(0)).unwrap_err(), "Zapis trwa.");
 }
 
+#[test]
+fn a_second_comment_of_the_same_text_waits_for_the_first() {
+    let task = provisioning_failed();
+    let mut panel = synced(&task);
+    panel
+        .prepare_comment(&task, "uwaga".to_string())
+        .expect("the first send");
+    assert_eq!(
+        panel.prepare_comment(&task, "uwaga".to_string()).unwrap_err(),
+        "Zapis trwa."
+    );
+}
+
 /// A control plane that takes every input as queued, lists `tasks` and refuses
 /// every other request with "not found".
 async fn serving(tasks: Vec<TaskSummary>) -> ApiClient {
