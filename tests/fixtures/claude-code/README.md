@@ -50,6 +50,8 @@ albo `awaiting_input`).
 | `schema_resume.ndjson` | `--json-schema <schemat> --resume <sesja schema_done> --permission-mode acceptEdits` | schemat działa po `--resume`; hooki `SessionStart:resume` |
 | `schema_plan_resume.ndjson` | `--json-schema <schemat> --resume <sesja schema_done> --permission-mode plan` | kształt repromptu narsora (tekst `OUTPUT_REPROMPT`) |
 | `schema_plan_fresh.ndjson` | `--json-schema <schemat> --permission-mode plan` | kształt wywołania dyrygenta (nowa sesja, `plan`) |
+| `schema_progress.ndjson` | *(syntetyczne)* `--json-schema <schemat z progress>` | `StructuredOutput` z `status: progress`, potem z `choice: done`; po każdym wywołaniu linia `result` ze `structured_output` |
+| `schema_progress_only.ndjson` | *(syntetyczne)* `--json-schema <schemat z progress>` | sesja kończy się samym `progress`: `structured_output` na linii `result` to `progress`, nie odpowiedź końcowa |
 | `schema_mismatch.ndjson` | `--json-schema <schemat> --permission-mode acceptEdits` | prompt żąda labela spoza `enum`; CLI odrzuca wywołanie `StructuredOutput` i model poprawia odpowiedź |
 
 ## Odpowiedzi na pytania odłożone do implementacji
@@ -85,6 +87,16 @@ albo `awaiting_input`).
 8. **`result` i metadane.** `total_cost_usd`, `usage`, `num_turns`, `duration_ms`, `stop_reason`,
    `terminal_reason`, `subtype`, `is_error`, `session_id`. Przy `error_max_turns` brak pola `result`,
    jest `errors[]`.
+
+## Nagrania syntetyczne (`progress`)
+
+`schema_progress.ndjson` i `schema_progress_only.ndjson` zbudowano ręcznie z kształtu
+`schema_done.ndjson` (plan `docs/plans/2026-10-26-001-feat-zamykanie-kroku-agenta-i-progress-plan.md`, U1).
+Nie powstały na żywym `claude`. Schemat ma `status` z wartościami `awaiting_input` i `progress` oraz
+pole `message`. Założenia z dokumentu źródłowego, które te pliki **tylko przyjmują**, a nie
+potwierdzają: API przyjmuje taki schemat; `StructuredOutput` nie kończy sesji; każde wywołanie daje
+własną linię `result` (testy sprawdzają ich liczbę). Nagranie na żywo trzeba zrobić, zanim założenia
+uznamy za potwierdzone; do tego czasu wiedzę o `claude` 2.1.x daje tylko ta uwaga.
 
 ## Maskowanie
 

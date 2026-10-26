@@ -947,3 +947,138 @@ fn only_the_prose_after_the_last_tool_call_is_the_reply() {
 
     assert_eq!(run.reply.as_deref(), Some("All green."));
 }
+
+// ---------------------------------------------------------------------------
+// `progress` notes and the final answer (synthetic recordings)
+// ---------------------------------------------------------------------------
+
+use narsor_engine::engine::actions::harness::FinalAnswer;
+
+fn result_line(structured: Option<Value>, is_error: bool) -> String {
+    let mut line = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": is_error,
+        "session_id": "session-1",
+        "result": "text",
+    });
+    if let Some(structured) = structured {
+        line["structured_output"] = structured;
+    }
+    line.to_string()
+}
+
+fn feed(lines: &[String]) -> Box<dyn narsor_engine::engine::actions::harness::HarnessStreamParser> {
+    let mut parser = parser();
+    for line in lines {
+        parser.on_stdout_line(line.as_bytes());
+    }
+    parser
+}
+
+#[test]
+fn progress_calls_are_classified_and_summarised() {
+    let summaries: Vec<String> = tool_calls(&classify_all(&recording("schema_progress.ndjson")))
+        .into_iter()
+        .filter(|(_, tool, _)| tool == "StructuredOutput")
+        .map(|(_, _, summary)| summary)
+        .collect();
+    assert_eq!(
+        summaries,
+        ["progress: waiting for the subagent", "choice: done"]
+    );
+    assert!(classify_all(&recording("schema_progress.ndjson"))
+        .iter()
+        .all(|element| !matches!(element, ChatElement::Unclassified { .. })));
+}
+
+#[test]
+fn a_progress_without_a_message_is_summarised_by_its_status() {
+    assert_eq!(
+        call_summary("StructuredOutput", json!({"status": "progress"})),
+        "progress"
+    );
+}
+
+#[test]
+fn the_recording_with_progress_has_one_result_line_per_answer() {
+    let results = recording("schema_progress.ndjson")
+        .iter()
+        .filter(|line| line.contains(r#""type":"result""#))
+        .count();
+    assert_eq!(results, 2);
+}
+
+#[test]
+fn a_choice_result_is_a_final_answer() {
+    let parser = feed(&[result_line(Some(json!({"choice": "done"})), false)]);
+    assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
+}
+
+#[test]
+fn a_question_result_is_a_final_answer_only_when_it_asks_something() {
+    let asking = feed(&[result_line(
+        Some(json!({"status": "awaiting_input", "question": "Which one?"})),
+        false,
+    )]);
+    assert_eq!(asking.final_answer(), Some(FinalAnswer::AwaitingInput));
+
+    let empty = feed(&[result_line(
+        Some(json!({"status": "awaiting_input", "question": ""})),
+        false,
+    )]);
+    assert_eq!(empty.final_answer(), None);
+}
+
+#[test]
+fn a_prose_result_is_not_a_final_answer() {
+    assert_eq!(feed(&[result_line(None, false)]).final_answer(), None);
+}
+
+#[test]
+fn a_progress_after_the_answer_does_not_replace_it() {
+    let parser = feed(&[
+        result_line(Some(json!({"choice": "done"})), false),
+        result_line(Some(json!({"status": "progress", "message": "x"})), false),
+    ]);
+    assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
+    let run = parser.finish(0, "");
+    assert_eq!(run.structured_output, Some(json!({"choice": "done"})));
+}
+
+#[test]
+fn an_answer_after_a_progress_is_the_structured_output() {
+    let run = feed(&[
+        result_line(Some(json!({"status": "progress", "message": "x"})), false),
+        result_line(Some(json!({"choice": "done"})), false),
+    ])
+    .finish(0, "");
+    assert_eq!(run.structured_output, Some(json!({"choice": "done"})));
+}
+
+#[test]
+fn an_error_result_is_not_a_final_answer() {
+    let parser = feed(&[result_line(Some(json!({"choice": "done"})), true)]);
+    assert_eq!(parser.final_answer(), None);
+    let run = parser.finish(0, "");
+    assert!(run.failure.is_some());
+    assert_eq!(run.structured_output, None);
+}
+
+#[test]
+fn a_label_the_state_does_not_declare_is_still_a_final_answer() {
+    let parser = feed(&[result_line(Some(json!({"choice": "no-such-label"})), false)]);
+    assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
+}
+
+#[test]
+fn a_session_that_ends_in_a_progress_has_no_structured_output() {
+    let mut parser = parser();
+    for line in recording("schema_progress_only.ndjson") {
+        parser.on_stdout_line(line.as_bytes());
+    }
+    assert_eq!(parser.final_answer(), None);
+    let run = parser.finish(0, "");
+    assert_eq!(run.structured_output, None);
+    assert!(run.text.contains("progress"), "{}", run.text);
+}

@@ -57,6 +57,7 @@ use narsor_protocol::chat::{
     SUMMARY_MAX_CHARS,
 };
 use serde_json::{Map, Value};
+use std::process::ExitStatus;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast;
@@ -64,9 +65,10 @@ use uuid::Uuid;
 
 use super::answer::{self, ChoiceAnswer};
 use super::harness::{
-    HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun, HarnessStreamParser,
+    FinalAnswer, HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
+use super::process_group::{self, GroupGuard};
 use super::script::{truncate, MAX_BUFFERED_OUTPUT_BYTES};
 use super::{
     ActionExecutor, ActionOutcome, ActionRequest, StepContract, SuspendedAction, TimedOutAction,
@@ -114,7 +116,8 @@ fields are optional unless your choice requires them. If, and only if, you need 
 person to answer a question before continuing this same task, return instead:\n\
 {{\"status\":\"awaiting_input\",\"question\":\"<question>\",\"options\":[\"<optional choice>\"]}}\n\
 Do not use `awaiting_input` for a harness, sandbox, permission, or tool error; \
-those are action failures. A decision you cannot make yourself (a trade-off, a \
+those are action failures. Send the answer with `choice` exactly once, when all \
+your subagents have returned their results. A decision you cannot make yourself (a trade-off, a \
 change of behaviour, or a question a skill would put to the user) is a question \
 for the person: ask it with `awaiting_input`, and do not use a question tool. Do \
 not omit the JSON object: without it the workflow cannot continue.\
@@ -218,8 +221,9 @@ pub fn output_schema(contract: &StepContract<'_>) -> Value {
             "artifacts": { "type": "object", "additionalProperties": { "type": "string" } },
             "additional_data": { "type": "object" },
             "additional_artifacts": { "type": "array", "items": { "type": "string" } },
-            "status": { "type": "string", "enum": [AWAITING_INPUT] },
+            "status": { "type": "string", "enum": [AWAITING_INPUT, PROGRESS] },
             "question": { "type": "string" },
+            "message": { "type": "string" },
             "options": { "type": "array", "items": { "type": "string" } },
         },
         "additionalProperties": false,
@@ -228,6 +232,9 @@ pub fn output_schema(contract: &StepContract<'_>) -> Value {
 
 /// The `status` of an answer that asks a person before the task continues.
 const AWAITING_INPUT: &str = "awaiting_input";
+
+/// The `status` of a note that is not an answer: the step goes on after it.
+const PROGRESS: &str = "progress";
 
 /// The `error_type` of an answer no output label could be extracted from — a
 /// format error the engine answers with a reprompt, not with `retry_policy`
@@ -490,6 +497,8 @@ impl ConversationSink {
 pub struct AgentExecutor {
     harnesses: HarnessRegistry,
     events: Option<Arc<dyn AgentEventSink>>,
+    /// How long a harness may go on after its final answer.
+    final_answer_grace: Duration,
 }
 
 /// Where the harness of an agent action that names none comes from.
@@ -524,7 +533,15 @@ impl AgentExecutor {
         Self {
             harnesses: HarnessRegistry::defaults(),
             events: None,
+            final_answer_grace: FINAL_ANSWER_GRACE,
         }
+    }
+
+    /// The same executor, waiting `grace` after a final answer before it ends
+    /// the harness's process group.
+    pub fn with_final_answer_grace(mut self, grace: Duration) -> Self {
+        self.final_answer_grace = grace;
+        self
     }
 
     /// An executor with a registry of its own.
@@ -532,6 +549,7 @@ impl AgentExecutor {
         Self {
             harnesses,
             events: None,
+            final_answer_grace: FINAL_ANSWER_GRACE,
         }
     }
 
@@ -674,6 +692,7 @@ impl AgentExecutor {
             workspace,
             Some(request.action_execution_id),
             request.timeout,
+            self.final_answer_grace,
             adapter.stream_parser(),
             &conversation,
         )
@@ -681,6 +700,12 @@ impl AgentExecutor {
 
         let finished = match ending {
             Ok(SpawnEnding::Finished(finished)) => {
+                if let Some(group) = finished.terminated_group {
+                    conversation.append_outcome(
+                        &format!("agent process group {group} terminated after the final answer"),
+                        serde_json::json!({ "process_group": group, "reason": "final_answer" }),
+                    );
+                }
                 conversation.append_outcome(
                     &format!("harness exited with code {}", finished.exit_code),
                     serde_json::json!({ "exit_code": finished.exit_code }),
@@ -1006,6 +1031,9 @@ pub(crate) struct FinishedRun {
     /// A bounded capture of stderr, for error messages only — the full text,
     /// unbounded, is what the conversation file holds (R14).
     pub(crate) stderr: String,
+    /// The process group that was still alive after the final answer and was
+    /// ended by narsor, when there was one.
+    pub(crate) terminated_group: Option<i32>,
 }
 
 /// How the harness process ended, from [`spawn_and_wait`]'s point of view.
@@ -1036,11 +1064,43 @@ pub(crate) async fn run_harness_process(
         working_dir,
         None,
         limit,
+        FINAL_ANSWER_GRACE,
         parser,
         &ConversationSink::none(),
     )
     .await
 }
+
+/// How long the harness may go on after its final answer before its process
+/// group is ended. Long enough for it to write its session to disk, so the
+/// session can be resumed.
+const FINAL_ANSWER_GRACE: Duration = Duration::from_secs(15);
+
+/// How long the group has to leave on `SIGTERM` before it is killed.
+const TERM_TO_KILL: Duration = Duration::from_secs(3);
+
+/// How long the pipes are read for after the group was killed.
+const DRAIN_AFTER_KILL: Duration = Duration::from_secs(2);
+
+/// Whether a question, like a choice, ends the step shortly after it.
+///
+/// Off until a run against the real `claude` shows that `--resume` works on
+/// a session whose process was killed right after the question; the answer
+/// to the question is that resume.
+const KILL_AFTER_QUESTION: bool = false;
+
+/// What [`spawn_and_wait`]'s driving loop found out about the group.
+struct Driven {
+    /// What the pipes and the wait ended with; `None` when the pipes did not
+    /// close even after the group was killed.
+    joined: Option<Joined>,
+    /// The harness was still running when the grace period ran out.
+    forced: bool,
+    /// The group still had members when it was signalled.
+    terminated: bool,
+}
+
+type Joined = (io::Result<()>, io::Result<()>, io::Result<ExitStatus>);
 
 /// Runs the harness, draining both pipes while it goes and feeding every
 /// stdout line to `parser` and then, with the elements it returned, to the
@@ -1052,12 +1112,20 @@ pub(crate) async fn run_harness_process(
 /// pipe and look exactly like a hang, so both pipes are still drained
 /// concurrently with the wait, only now line by line instead of as one
 /// unbounded blob.
+///
+/// The harness leads a process group of its own. Once the parser has seen the
+/// final answer the step does not wait for the process to exit: after `grace`
+/// the group is sent `SIGTERM` and then `SIGKILL`. The group is cleaned up
+/// even when the harness exits by itself — a background task it left behind
+/// keeps the stdout pipe open, so the pipe would never reach end of file.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_and_wait(
     program: &str,
     args: &[String],
     working_dir: &Path,
     action_execution_id: Option<&str>,
     limit: Option<Duration>,
+    grace: Duration,
     parser: Box<dyn HarnessStreamParser>,
     conversation: &ConversationSink,
 ) -> Result<SpawnEnding, ActionError> {
@@ -1070,56 +1138,110 @@ async fn spawn_and_wait(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
 
     let mut child = spawn_retrying_text_busy(&mut command)
         .await
         .map_err(|error| spawn_error(program, working_dir, &error))?;
+    let mut group = GroupGuard::new(child.id());
 
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
 
-    let stdout_task = async {
-        let mut parser = parser;
-        let result = stream_lines(&mut stdout_pipe, |line| {
-            let elements = if line.len() <= PARSE_LINE_LIMIT {
-                parser.on_stdout_line(line)
-            } else {
-                vec![ChatElement::Unclassified {
-                    reason: UnclassifiedReason::TooLarge,
-                }]
-            };
-            conversation.append(ConversationSource::Stdout, line, &elements);
-        })
-        .await;
-        (result, parser)
+    let mut parser = parser;
+    let mut stderr_capture: Vec<u8> = Vec::new();
+    // Kept here, not in the stdout task: the sender must outlive the task, or
+    // the driving loop would see a closed channel where it expects an answer.
+    let (answered_tx, mut answered_rx) = tokio::sync::watch::channel(false);
+
+    let stdout_task = stream_lines(&mut stdout_pipe, |line| {
+        let elements = if line.len() <= PARSE_LINE_LIMIT {
+            parser.on_stdout_line(line)
+        } else {
+            vec![ChatElement::Unclassified {
+                reason: UnclassifiedReason::TooLarge,
+            }]
+        };
+        conversation.append(ConversationSource::Stdout, line, &elements);
+        let ends_step = match parser.final_answer() {
+            Some(FinalAnswer::Choice) => true,
+            Some(FinalAnswer::AwaitingInput) => KILL_AFTER_QUESTION,
+            None => false,
+        };
+        if ends_step {
+            answered_tx.send_replace(true);
+        }
+    });
+
+    let stderr_task = stream_lines(&mut stderr_pipe, |line| {
+        conversation.append(ConversationSource::Stderr, line, &[stderr_element(line)]);
+        accumulate_capped(&mut stderr_capture, line, MAX_BUFFERED_OUTPUT_BYTES);
+        accumulate_capped(&mut stderr_capture, b"\n", MAX_BUFFERED_OUTPUT_BYTES);
+    });
+
+    let pgid = group.pgid();
+    let drive = async {
+        let wait = async { tokio::join!(stdout_task, stderr_task, child.wait()) };
+        tokio::pin!(wait);
+
+        let mut joined: Option<Joined> = None;
+        tokio::select! {
+            finished = &mut wait => joined = Some(finished),
+            _ = answered_rx.wait_for(|answered| *answered) => {}
+        }
+        let answered = *answered_rx.borrow();
+        if joined.is_none() {
+            joined = tokio::time::timeout(grace, &mut wait).await.ok();
+        }
+        let forced = joined.is_none();
+
+        let mut terminated = false;
+        if let Some(pgid) = pgid.filter(|_| answered) {
+            if forced {
+                terminated = process_group::signal(pgid, process_group::TERMINATE);
+                if terminated {
+                    joined = tokio::time::timeout(TERM_TO_KILL, &mut wait).await.ok();
+                }
+            }
+            terminated |= process_group::signal(pgid, process_group::KILL);
+            if joined.is_none() {
+                joined = tokio::time::timeout(DRAIN_AFTER_KILL, &mut wait).await.ok();
+            }
+        }
+        Driven {
+            joined,
+            forced,
+            terminated,
+        }
     };
 
-    let stderr_task = async {
-        let mut stderr_capture: Vec<u8> = Vec::new();
-        let result = stream_lines(&mut stderr_pipe, |line| {
-            conversation.append(ConversationSource::Stderr, line, &[stderr_element(line)]);
-            accumulate_capped(&mut stderr_capture, line, MAX_BUFFERED_OUTPUT_BYTES);
-            accumulate_capped(&mut stderr_capture, b"\n", MAX_BUFFERED_OUTPUT_BYTES);
-        })
-        .await;
-        (result, stderr_capture)
+    let driven = match limit {
+        Some(limit) => tokio::time::timeout(limit, drive).await,
+        None => Ok(drive.await),
     };
 
-    let wait = async { tokio::join!(stdout_task, stderr_task, child.wait()) };
-
-    let finished = match limit {
-        Some(limit) => tokio::time::timeout(limit, wait).await,
-        None => Ok(wait.await),
-    };
-
-    let ((stdout_result, parser), (stderr_result, stderr_capture), status) = match finished {
-        Ok(finished) => finished,
+    let driven = match driven {
+        Ok(driven) => driven,
         Err(_elapsed) => {
-            // The waiting future is gone, so the child can be reaped for good.
+            // The waiting future is gone, so the child can be reaped for
+            // good. The still armed guard kills the rest of the group.
             let _ = child.kill().await;
             return Ok(SpawnEnding::TimedOut);
         }
+    };
+    group.disarm();
+
+    let Driven {
+        joined,
+        forced,
+        terminated,
+    } = driven;
+    let (stdout_result, stderr_result, status) = match joined {
+        Some(joined) => joined,
+        // The pipes stayed open after the kill: a process outside the group
+        // holds them. What was read so far is all there will be.
+        None => (Ok(()), Ok(()), child.wait().await),
     };
 
     stdout_result.map_err(|error| io_error(program, "stdout", &error))?;
@@ -1128,12 +1250,20 @@ async fn spawn_and_wait(
 
     let stderr = String::from_utf8_lossy(&stderr_capture).into_owned();
 
-    let Some(exit_code) = status.code() else {
-        return Err(ActionError {
-            message: format!("the agent harness '{program}' was killed and left no exit code"),
-            error_type: Some("killed_by_signal".to_string()),
-            details: Some(serde_json::json!({ "program": program, "stderr": truncate(&stderr) })),
-        });
+    // A harness ended after its final answer was not a failure, whatever
+    // status the signal left.
+    let exit_code = match status.code() {
+        _ if forced => 0,
+        Some(code) => code,
+        None => {
+            return Err(ActionError {
+                message: format!("the agent harness '{program}' was killed and left no exit code"),
+                error_type: Some("killed_by_signal".to_string()),
+                details: Some(
+                    serde_json::json!({ "program": program, "stderr": truncate(&stderr) }),
+                ),
+            });
+        }
     };
 
     let run = parser.finish(exit_code, &stderr);
@@ -1142,6 +1272,7 @@ async fn spawn_and_wait(
         run,
         exit_code,
         stderr,
+        terminated_group: terminated.then_some(pgid).flatten(),
     }))
 }
 
@@ -1440,6 +1571,24 @@ fn read_response(run: &HarnessRun) -> Result<AgentResponse, ActionError> {
     extract_response(&run.text)
 }
 
+/// Whether `value` is a `progress` note: a status report that is not an
+/// answer and must not stand in for one.
+pub(crate) fn is_progress_note(value: &Value) -> bool {
+    value.get("status").and_then(Value::as_str) == Some(PROGRESS)
+}
+
+/// What kind of final answer `value` is, by the same rule [`read_response`]
+/// uses: `None` for a `progress` note and for anything else that is not an
+/// answer. A label the state does not declare is still a final answer; the
+/// engine rejects it later.
+pub(crate) fn final_answer_kind(value: &Value) -> Option<FinalAnswer> {
+    match structured_response(value) {
+        Ok(AgentResponse::Completed(_)) => Some(FinalAnswer::Choice),
+        Ok(AgentResponse::AwaitingInput { .. }) => Some(FinalAnswer::AwaitingInput),
+        Err(_) => None,
+    }
+}
+
 /// Reads an answer from a harness's `structured_output` value, by the same
 /// rules as an object found in the text.
 fn structured_response(value: &Value) -> Result<AgentResponse, ActionError> {
@@ -1499,8 +1648,16 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         .rev()
         .find_map(|value| value.as_object().filter(|object| is_answer_object(object)))
     else {
+        let progress = objects
+            .iter()
+            .rev()
+            .any(is_progress_note);
         return Err(no_label_error(
-            "the agent's answer contains JSON, but no object with a string 'choice' key",
+            if progress {
+                "the agent's last answer was a progress note, not a final answer"
+            } else {
+                "the agent's answer contains JSON, but no object with a string 'choice' key"
+            },
             text,
         ));
     };
