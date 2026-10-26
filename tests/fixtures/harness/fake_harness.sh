@@ -11,6 +11,11 @@
 #   exit, exit.<n>       the exit code (per call, then the fallback; default 0)
 #   sleep, sleep.<n>     seconds to sleep after answering (per call, then the
 #                        fallback; for timeout tests)
+#   background, background.<n>
+#                        seconds a background `sleep` lives, started before
+#                        the answer is printed and holding stdout open like a
+#                        task an agent left behind (per call, then the
+#                        fallback)
 #
 # and which it writes back, one set per call:
 #
@@ -19,6 +24,7 @@
 #   cwd.<n>              its working directory
 #   action_id.<n>        the value of ORCHESTRATOR_ACTION_ID
 #   args.<n>             its arguments, each terminated by a --%ARG%-- line
+#   bg_pid.<n>           the process id of the background `sleep`
 set -u
 
 dir=$(dirname "$0")
@@ -38,6 +44,14 @@ printf '%s\n' "${ORCHESTRATOR_ACTION_ID-}" > "$dir/action_id.$count"
 for arg in "$@"; do
     printf '%s\n--%%ARG%%--\n' "$arg" >> "$dir/args.$count"
 done
+
+if [ -f "$dir/background.$count" ]; then
+    sleep "$(cat "$dir/background.$count")" &
+    printf '%s\n' "$!" > "$dir/bg_pid.$count"
+elif [ -f "$dir/background" ]; then
+    sleep "$(cat "$dir/background")" &
+    printf '%s\n' "$!" > "$dir/bg_pid.$count"
+fi
 
 # Output is printed *before* the sleep, and flushed line-by-line (`cat` does
 # not buffer), so a streaming reader on the other end of the pipe really does

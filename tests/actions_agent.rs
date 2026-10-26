@@ -135,6 +135,19 @@ impl FakeHarness {
         self
     }
 
+    /// Starts a background `sleep` of `seconds` that holds stdout open.
+    fn leaves_a_task_behind(&self, seconds: u64) -> &Self {
+        fs::write(self.dir.join("background"), seconds.to_string()).expect("write the background");
+        self
+    }
+
+    /// The process id of the background task of the `nth` call.
+    fn background_pid(&self, nth: usize) -> u32 {
+        read_line(&self.dir.join(format!("bg_pid.{nth}")))
+            .parse()
+            .expect("the pid is a number")
+    }
+
     /// Makes the `nth` call (1-based) sleep after answering.
     fn sleeps_on_call(&self, nth: usize, seconds: u64) -> &Self {
         fs::write(self.dir.join(format!("sleep.{nth}")), seconds.to_string())
@@ -647,6 +660,31 @@ async fn an_answer_without_any_json_is_an_error_and_never_a_guessed_label() {
     );
 }
 
+/// A session that ends in a `progress` note has no final answer: the format
+/// error names the note, and carries the session the engine resumes to ask
+/// again.
+#[tokio::test]
+async fn a_session_that_ends_in_a_progress_note_is_a_format_error_with_its_session() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&final_line(
+        json!({ "status": "progress", "message": "waiting for the subagent" }),
+    ));
+
+    let error = fail(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+    )
+    .await;
+
+    assert_eq!(error.error_type.as_deref(), Some("missing_output_label"));
+    assert!(error.message.contains("progress note"), "{}", error.message);
+    let details = error.details.expect("details");
+    assert_eq!(details["harness"], "claude-code");
+    assert_eq!(details["harness_session_id"], "fake-session-1");
+}
+
 #[tokio::test]
 async fn json_without_a_choice_key_is_an_error() {
     let root = TempRoot::new();
@@ -1028,7 +1066,7 @@ async fn a_task_permission_grant_reaches_claude_as_its_allowed_tool_rules() {
     );
 }
 
-/// A pending `ScheduleWakeup` or `CronCreate` keeps `claude --print` running
+/// A pending `ScheduleWakeup`, `CronCreate` or `Monitor` keeps `claude --print` running
 /// until it fires: an agent that scheduled a 20-minute fallback while its
 /// subagents ran held its step that long after it had answered.
 #[tokio::test]
@@ -1049,8 +1087,11 @@ async fn claude_is_denied_the_tools_that_defer_work_past_the_answer() {
         .iter()
         .position(|arg| arg == "--disallowedTools")
         .expect("the deferring tools are denied");
-    assert_eq!(args[deny + 1..deny + 3], ["ScheduleWakeup", "CronCreate"]);
-    assert!(args[deny + 3].starts_with("--"), "{args:?}");
+    assert_eq!(
+        args[deny + 1..deny + 4],
+        ["ScheduleWakeup", "CronCreate", "Monitor"]
+    );
+    assert!(args[deny + 4].starts_with("--"), "{args:?}");
 }
 
 /// `--allowedTools` and `--add-dir` take any number of values: right before
@@ -1628,6 +1669,14 @@ async fn covers_ae4_only_the_claude_code_prompt_names_structured_output() {
         claude_prompt.contains("does not reach the person"),
         "{claude_prompt}"
     );
+    assert!(
+        claude_prompt.contains(r#"{"status":"progress","message":"<text>"}"#),
+        "{claude_prompt}"
+    );
+    assert!(
+        claude_prompt.contains("`choice` exactly once"),
+        "{claude_prompt}"
+    );
 
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
@@ -1643,6 +1692,11 @@ async fn covers_ae4_only_the_claude_code_prompt_names_structured_output() {
     let codex_prompt = fake.args(1).join("\n");
     assert!(codex_prompt.contains("awaiting_input"), "{codex_prompt}");
     assert!(!codex_prompt.contains("StructuredOutput"), "{codex_prompt}");
+    assert!(!codex_prompt.contains("\"progress\""), "{codex_prompt}");
+    assert!(
+        codex_prompt.contains("`choice` exactly once"),
+        "{codex_prompt}"
+    );
 }
 
 /// A state without descriptions gets a plain list — no dangling dashes.
@@ -1735,6 +1789,267 @@ async fn a_timeout_kills_the_harness_and_is_reported_as_a_timeout() {
     // The process is really gone, not merely no longer awaited.
     let pid = fake.pid(1);
     assert!(!process_is_alive(pid), "process {pid} survived the timeout");
+}
+
+/// How long the tests give the harness after its final answer.
+const TEST_GRACE: Duration = Duration::from_millis(300);
+
+/// A `result` line whose `structured_output` is `structured`.
+fn final_line(structured: Value) -> String {
+    format!(
+        "{}\n",
+        structured_envelope(&structured.to_string(), structured)
+    )
+}
+
+/// Runs `config` and returns the outcome and how long the step took.
+async fn run_timed(
+    executor: &AgentExecutor,
+    conversation: &ConversationFixture,
+    config: AgentActionConfig,
+    workspace: &Workspace,
+    timeout: Option<Duration>,
+) -> (Result<ActionOutcome, ActionError>, Duration) {
+    let started = std::time::Instant::now();
+    let outcome =
+        execute_with_conversation(executor, config, workspace, conversation, timeout).await;
+    (outcome, started.elapsed())
+}
+
+/// The harness answers and then stays alive with a task in the background:
+/// the step ends after the grace period with the answer, not at its timeout,
+/// and nothing of the harness's group survives.
+#[tokio::test]
+async fn the_step_ends_after_the_final_answer_and_the_group_is_killed() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&final_line(json!({ "choice": "done", "reason": "all in" })))
+        .leaves_a_task_behind(600)
+        .sleeps(600);
+    let executor = executor(&fake).with_final_answer_grace(TEST_GRACE);
+
+    let (outcome, elapsed) = run_timed(
+        &executor,
+        &conversation,
+        agent_action("work"),
+        &root.workspace(),
+        Some(Duration::from_secs(60)),
+    )
+    .await;
+
+    let Ok(ActionOutcome::Completed(result)) = outcome else {
+        panic!("expected a completed step, got {outcome:?}");
+    };
+    assert_eq!(result.output_label, "done");
+    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+
+    let (harness, task) = (fake.pid(1), fake.background_pid(1));
+    assert!(
+        !process_is_alive_or_zombie(harness),
+        "harness {harness} lives"
+    );
+    assert!(!process_is_alive_or_zombie(task), "task {task} lives");
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    let ended = entries
+        .iter()
+        .find(|entry| entry_text(entry).contains("terminated after the final answer"))
+        .expect("an entry tells that the group was ended");
+    assert!(
+        entry_text(ended).contains("process group"),
+        "{}",
+        entry_text(ended)
+    );
+}
+
+/// The harness exits by itself, but a task it left behind holds the pipe
+/// open: the step still ends, and the task is killed.
+#[tokio::test]
+async fn a_task_left_behind_by_a_harness_that_exited_is_killed() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&final_line(json!({ "choice": "done", "reason": "all in" })))
+        .leaves_a_task_behind(600);
+    let executor = executor(&fake).with_final_answer_grace(TEST_GRACE);
+
+    let (outcome, elapsed) = run_timed(
+        &executor,
+        &conversation,
+        agent_action("work"),
+        &root.workspace(),
+        Some(Duration::from_secs(60)),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Ok(ActionOutcome::Completed(_))),
+        "{outcome:?}"
+    );
+    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    let task = fake.background_pid(1);
+    assert!(!process_is_alive_or_zombie(task), "task {task} lives");
+}
+
+/// A harness that exits by itself with nothing left behind needs no ending:
+/// no entry, and its real exit code stands.
+#[tokio::test]
+async fn a_harness_that_exits_in_the_grace_period_is_not_terminated() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&final_line(json!({ "choice": "done", "reason": "all in" })));
+    let executor = executor(&fake).with_final_answer_grace(TEST_GRACE);
+
+    let (outcome, _) = run_timed(
+        &executor,
+        &conversation,
+        agent_action("work"),
+        &root.workspace(),
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Ok(ActionOutcome::Completed(_))),
+        "{outcome:?}"
+    );
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !entry_text(entry).contains("terminated after")),
+        "{entries:?}"
+    );
+}
+
+/// A `progress` note is not an answer: the harness is left running until its
+/// time limit.
+#[tokio::test]
+async fn a_progress_note_does_not_end_the_step() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&final_line(
+        json!({ "status": "progress", "message": "waiting for the subagent" }),
+    ))
+    .sleeps(600);
+    let executor = executor(&fake).with_final_answer_grace(TEST_GRACE);
+
+    let (outcome, elapsed) = run_timed(
+        &executor,
+        &conversation,
+        agent_action("work"),
+        &root.workspace(),
+        Some(Duration::from_secs(2)),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Ok(ActionOutcome::TimedOut(_))),
+        "{outcome:?}"
+    );
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+}
+
+/// A question does not end the step while `--resume` after a kill is
+/// unproven (`KILL_AFTER_QUESTION`).
+#[tokio::test]
+async fn a_question_does_not_start_the_grace_period() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&final_line(
+        json!({ "status": "awaiting_input", "question": "Which one?" }),
+    ))
+    .sleeps(600);
+    let executor = executor(&fake).with_final_answer_grace(TEST_GRACE);
+
+    let (outcome, elapsed) = run_timed(
+        &executor,
+        &conversation,
+        agent_action("work"),
+        &root.workspace(),
+        Some(Duration::from_secs(2)),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Ok(ActionOutcome::TimedOut(_))),
+        "{outcome:?}"
+    );
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+}
+
+/// The time limit ends the whole group, not only the harness.
+#[tokio::test]
+async fn a_timeout_kills_the_tasks_the_harness_left_behind() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#))
+        .leaves_a_task_behind(600)
+        .sleeps(600);
+
+    let outcome = execute(
+        &executor(&fake),
+        agent_action("think for a long time"),
+        &root.workspace(),
+        Some(Duration::from_millis(500)),
+    )
+    .await
+    .expect("a timeout is an outcome, not a failure");
+
+    assert!(matches!(outcome, ActionOutcome::TimedOut(_)));
+    let task = fake.background_pid(1);
+    assert!(!process_is_alive_or_zombie(task), "task {task} lives");
+}
+
+/// Cancelling the step kills the group as well.
+#[tokio::test]
+async fn cancelling_the_step_kills_the_group() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#))
+        .leaves_a_task_behind(600)
+        .sleeps(600);
+    let executor = executor(&fake);
+    let workspace = root.workspace();
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(700),
+        execute(&executor, agent_action("work"), &workspace, None),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the step was meant to still be running");
+
+    let task = fake.background_pid(1);
+    assert!(!process_is_alive_or_zombie(task), "task {task} lives");
+}
+
+/// Whether a process still runs after a short wait for a signal to take
+/// effect. A killed process whose parent has not reaped it yet is a zombie
+/// and counts as gone.
+fn process_is_alive_or_zombie(pid: u32) -> bool {
+    for _ in 0..40 {
+        if !is_running(pid) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+fn is_running(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state is the field after the `(name)` that ends with the last `)`.
+    let state = stat
+        .rsplit(')')
+        .next()
+        .and_then(|rest| rest.trim().chars().next());
+    state != Some('Z')
 }
 
 /// Whether a process id still exists. `/proc` is authoritative on Linux and the
@@ -3656,6 +3971,10 @@ fn structured_envelope(text: &str, structured: Value) -> String {
     .to_string()
 }
 
+fn properties_of(schema: &Value) -> &Value {
+    &schema["properties"]
+}
+
 /// The `done`/`blocked` outputs of the schema tests.
 fn two_labels() -> [ChoiceDefinition; 2] {
     [
@@ -3735,7 +4054,11 @@ async fn a_claude_step_passes_its_labels_as_a_json_schema_before_the_permission_
     );
     assert_eq!(
         schema["properties"]["status"]["enum"],
-        json!(["awaiting_input"])
+        json!(["awaiting_input", "progress"])
+    );
+    assert_eq!(
+        properties_of(&schema)["message"],
+        json!({ "type": "string" })
     );
     assert_eq!(schema["additionalProperties"], false);
     let properties = &schema["properties"];
@@ -4047,6 +4370,39 @@ async fn the_real_claude_binary_honours_the_output_contract() {
     let result = complete(&AgentExecutor::new(), config, &root.workspace()).await;
 
     assert_eq!(result.output_label, "ready");
+}
+
+/// Drives the actual `claude` binary to find out whether `--resume` works on
+/// a session whose process group was killed right after a question — the
+/// evidence `KILL_AFTER_QUESTION` waits for. Run it deliberately; it prints
+/// what happened and does not decide the constant.
+#[tokio::test]
+#[ignore = "drives the real `claude` binary: costs money, needs credentials"]
+async fn the_real_claude_binary_resumes_a_session_killed_after_its_question() {
+    if which("claude").is_none() {
+        eprintln!("skipping: `claude` is not on PATH");
+        return;
+    }
+
+    let root = TempRoot::new();
+    let mut config = agent_action(
+        "Do not use any tools. Ask the person which colour to use, with \
+         `awaiting_input`, and wait for the answer.",
+    );
+    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    // The question ends the step only while `KILL_AFTER_QUESTION` is on, so
+    // the harness is killed here by the time limit instead: the same kill,
+    // a little later.
+    let outcome = execute(
+        &AgentExecutor::new(),
+        config,
+        &root.workspace(),
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    eprintln!("first run: {outcome:?}");
+    // Resuming the killed session with the answer is the part to look at:
+    // when it continues the same conversation, set `KILL_AFTER_QUESTION`.
 }
 
 /// Drives the actual `claude` binary with two labels: the label comes from

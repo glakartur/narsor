@@ -6,7 +6,7 @@
 //! ```text
 //! claude --print --verbose --permission-prompts none \
 //!        [--add-dir <read_only_paths…>] [--allowedTools <rule>] \
-//!        --disallowedTools ScheduleWakeup CronCreate \
+//!        --disallowedTools ScheduleWakeup CronCreate Monitor \
 //!        [--model <model>] [--max-turns <n>] \
 //!        [--append-system-prompt <text>] [--resume <session-id>] \
 //!        [--json-schema <schema>] \
@@ -46,6 +46,10 @@
 //! * `--disallowedTools` denies the tools that schedule a later turn: a
 //!   pending one keeps the `--print` process alive until it fires, so a step
 //!   would wait for it (20 minutes, in the case seen) after its answer.
+//!   `Monitor` is denied for the same reason. A background task started with
+//!   `Bash` (a polling loop) or by a subagent cannot be denied without
+//!   denying `Bash`; instead the executor ends the step shortly after the
+//!   final answer and kills the process group the harness runs in.
 //! * `--resume <id>` is always passed *with* its value: the flag's value is
 //!   optional, and a bare `--resume` would consume the prompt.
 //!
@@ -66,11 +70,12 @@ use serde_json::{Map, Value};
 
 use super::{
     integer_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
-    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
-    PermissionDenial,
+    FinalAnswer, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
+    HarnessStreamParser, PermissionDenial,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
+use crate::engine::actions::agent;
 use narsor_protocol::chat::ChatElement;
 
 /// The `harness:` value this adapter answers to.
@@ -87,8 +92,9 @@ const FAILURE_DETAIL_BYTES: usize = 2 * 1024;
 
 /// Tools that schedule a later turn. Under `--print` the CLI does not exit
 /// while one is pending, so the step waits for it long after the answer;
-/// subagent hand-backs already wake the agent without them.
-const DEFERRING_TOOLS: [&str; 2] = ["ScheduleWakeup", "CronCreate"];
+/// subagent hand-backs already wake the agent without them. `Monitor` keeps
+/// a background watcher alive the same way.
+const DEFERRING_TOOLS: [&str; 3] = ["ScheduleWakeup", "CronCreate", "Monitor"];
 
 /// Adapter for the `claude` CLI.
 #[derive(Debug, Clone)]
@@ -224,7 +230,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 /// with `[structured-output-enforce]` instead of passing it on.
 const CONTRACT_NOTE: &str = "Deliver your answer, and every `awaiting_input` question, \
 through the `StructuredOutput` tool. A question written as plain text does not reach the \
-person.";
+person. To report progress without ending the step — a comment, a wait for a subagent, a \
+partial result — send {\"status\":\"progress\",\"message\":\"<text>\"} through the same \
+tool. A progress note is not an answer and does not end the step. There is no limit on the \
+number of progress notes. Send the answer with `choice` exactly once, when all your \
+subagents have returned their results.";
 
 /// Reads the `stream-json` lines of one run, live, line by line.
 ///
@@ -255,8 +265,10 @@ struct ClaudeCodeStreamParser {
     reported_error: bool,
     /// The `result` line's `subtype`, for the failure message.
     subtype: Option<String>,
-    /// The latest `structured_output` any `result` line carried.
+    /// The latest final answer a `result` line carried. A `progress` note
+    /// or a line with an error never replaces it.
     structured_output: Option<Value>,
+    final_answer: Option<FinalAnswer>,
     permission_denials: Vec<PermissionDenial>,
     denial_reasons: std::collections::HashMap<String, (Option<String>, Option<String>)>,
 }
@@ -321,9 +333,18 @@ impl ClaudeCodeStreamParser {
         self.subtype = result.subtype.clone();
         self.reported_error = result.is_error;
         // A subagent hand-back after the answer ends in a prose-only
-        // `result`; it must not drop the answer.
-        if result.structured_output.is_some() {
-            self.structured_output = result.structured_output.clone();
+        // `result`; it must not drop the answer. A `progress` note is not
+        // an answer, and neither is anything on an error line. Any other
+        // object is kept — an answer the engine will reject, or the
+        // conductor's own shape — but only a usable answer is a final one
+        // that ends the step.
+        if let Some(value) = result
+            .structured_output
+            .as_ref()
+            .filter(|value| !result.is_error && !agent::is_progress_note(value))
+        {
+            self.structured_output = Some(value.clone());
+            self.final_answer = agent::final_answer_kind(value);
         }
         self.permission_denials = result.permission_denials.clone();
         self.result_text = result.text.clone().unwrap_or_default();
@@ -365,6 +386,10 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
         }
         self.accumulate(&object, result.as_ref());
         self.classifier.classify(object, result)
+    }
+
+    fn final_answer(&self) -> Option<FinalAnswer> {
+        self.final_answer
     }
 
     fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun {

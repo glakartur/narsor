@@ -35,6 +35,7 @@ pub mod agent;
 pub mod answer;
 pub mod harness;
 pub mod human;
+mod process_group;
 pub mod script;
 
 use std::future::Future;

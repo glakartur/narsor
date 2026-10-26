@@ -93,9 +93,10 @@ pub struct HarnessRun {
     /// harness is content — which says nothing yet about the output label.
     pub failure: Option<String>,
 
-    /// The answer as the harness validated it against
-    /// [`HarnessRequest::output_schema`], when it reported one. The caller
-    /// still checks it, and falls back to `text` when it is absent or unusable.
+    /// The final answer as the harness validated it against
+    /// [`HarnessRequest::output_schema`], when it reported one. A `progress`
+    /// note is never kept here: it is not an answer. The caller still checks
+    /// it, and falls back to `text` when it is absent or unusable.
     pub structured_output: Option<Value>,
 
     /// Structured permission denials emitted by Claude Code in the final
@@ -112,6 +113,15 @@ pub struct PermissionDenial {
     pub reason_type: Option<String>,
     pub reason: Option<String>,
     pub session_id: Option<String>,
+}
+
+/// What kind of final answer a harness's stream has delivered so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalAnswer {
+    /// An answer with an output label (`choice`).
+    Choice,
+    /// A complete `awaiting_input` question.
+    AwaitingInput,
 }
 
 /// A stateful parser fed one stdout line at a time as the harness streams,
@@ -138,6 +148,14 @@ pub trait HarnessStreamParser: Send {
     /// make sense of becomes an [`ChatElement::Unclassified`] element, never
     /// an error.
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement>;
+
+    /// The final answer the stream has delivered so far, once a `result`
+    /// line has carried one. The executor ends the step shortly after it,
+    /// whether or not the process has exited. `None` for a harness that
+    /// cannot tell (the default) or while no final answer has arrived.
+    fn final_answer(&self) -> Option<FinalAnswer> {
+        None
+    }
 
     /// Distills the run once the process has exited.
     ///
