@@ -221,9 +221,9 @@ impl ChooserField {
 
     /// Whether `other` asks for the same thing: name, kind, wording and
     /// whether it is required. A typed value is not compared; a value the
-    /// conductor proposed on both sides is, as it is part of what was asked.
+    /// conductor proposed on the earlier side is, as it is part of what was asked.
     fn same_definition(&self, other: &ChooserField) -> bool {
-        (!(self.proposed && other.proposed) || self.value() == other.value())
+        (!self.proposed || self.value() == other.value())
             && self.name == other.name
             && self.kind == other.kind
             && self.label == other.label
