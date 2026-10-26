@@ -761,7 +761,9 @@ fn a_second_comment_of_the_same_text_waits_for_the_first() {
         .prepare_comment(&task, "uwaga".to_string())
         .expect("the first send");
     assert_eq!(
-        panel.prepare_comment(&task, "uwaga".to_string()).unwrap_err(),
+        panel
+            .prepare_comment(&task, "uwaga".to_string())
+            .unwrap_err(),
         "Zapis trwa."
     );
 }

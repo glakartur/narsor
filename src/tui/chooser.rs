@@ -220,9 +220,11 @@ impl ChooserField {
     }
 
     /// Whether `other` asks for the same thing: name, kind, wording and
-    /// whether it is required — the typed value is not compared.
+    /// whether it is required. A typed value is not compared; a value the
+    /// conductor proposed on both sides is, as it is part of what was asked.
     fn same_definition(&self, other: &ChooserField) -> bool {
-        self.name == other.name
+        (!(self.proposed && other.proposed) || self.value() == other.value())
+            && self.name == other.name
             && self.kind == other.kind
             && self.label == other.label
             && self.required == other.required
@@ -835,6 +837,10 @@ impl Chooser {
     /// values; the focus returns to the list.
     pub fn select(&mut self, index: usize) {
         if index < self.items.len() {
+            if index != self.selected {
+                // A confirmation asked about the entry that was highlighted.
+                self.form.decline();
+            }
             self.selected = index;
             self.focus = ChooserFocus::Actions;
             self.field = 0;
