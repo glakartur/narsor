@@ -394,6 +394,23 @@ pub struct ChooserItem {
 }
 
 impl ChooserItem {
+    /// Whether `other` offers the same thing: wording, flags and the
+    /// definition of each field — the typed values are not compared.
+    fn same_definition(&self, other: &ChooserItem) -> bool {
+        self.label == other.label
+            && self.description == other.description
+            && self.resumes_agent == other.resumes_agent
+            && self.recommended == other.recommended
+            && self.irreversible == other.irreversible
+            && self.unavailable == other.unavailable
+            && self.fields.len() == other.fields.len()
+            && self
+                .fields
+                .iter()
+                .zip(&other.fields)
+                .all(|(a, b)| a.same_definition(b))
+    }
+
     /// An entry with a label and a description.
     pub fn new(label: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
@@ -739,20 +756,7 @@ impl Chooser {
         };
         if let Some(return_field) = asked {
             let unchanged = match (earlier, self.selected_item()) {
-                (Some(earlier), Some(now)) => {
-                    earlier.label == now.label
-                        && earlier.description == now.description
-                        && earlier.resumes_agent == now.resumes_agent
-                        && earlier.recommended == now.recommended
-                        && earlier.irreversible == now.irreversible
-                        && earlier.unavailable == now.unavailable
-                        && earlier.fields.len() == now.fields.len()
-                        && earlier
-                            .fields
-                            .iter()
-                            .zip(&now.fields)
-                            .all(|(a, b)| a.same_definition(b))
-                }
+                (Some(earlier), Some(now)) => earlier.same_definition(now),
                 _ => false,
             };
             if unchanged && self.is_sendable() {

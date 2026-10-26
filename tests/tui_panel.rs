@@ -945,6 +945,50 @@ fn a_new_default_form_warns_the_operator_who_was_confirming() {
     assert!(note(&app).contains("formularz zmieniony"), "{}", note(&app));
 }
 
+/// [`permission_wait`] under another waiting identity.
+fn other_permission_wait() -> TaskSummary {
+    let mut form = question();
+    form["episode"] = json!("ep-p2");
+    form["continuation"] = json!("resolve_permission");
+    form["permission"] = json!({ "denials": [{
+        "tool_name": "Bash",
+        "tool_use_id": "t1",
+        "input": { "command": "cargo test" },
+        "cwd": "/tmp/task",
+        "reason_type": "asyncAgent",
+        "reason": "This command requires approval."
+    }] });
+    form["agent_harness"] = json!("claude-code");
+    form["agent_session_id"] = json!("s1");
+    with_panel(with_pending(running(), form))
+}
+
+/// The panel checks who was writing in the form that is replaced, not in the
+/// one that comes: the new form has another waiting identity.
+#[test]
+fn the_switch_is_judged_by_the_form_that_was_replaced() {
+    let mut panel = synced(&asking());
+    for code in [KeyCode::Enter, KeyCode::Char('v'), KeyCode::Char('2')] {
+        panel.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    assert!(panel.is_typing());
+
+    let effect = panel.sync(&other_permission_wait(), &[]);
+
+    assert_eq!(panel.active_form(), Some(PanelFormKind::Permission));
+    assert!(effect.switched);
+}
+
+#[test]
+fn the_switch_is_not_reported_when_nobody_was_writing() {
+    let mut panel = synced(&asking());
+
+    let effect = panel.sync(&other_permission_wait(), &[]);
+
+    assert_eq!(panel.active_form(), Some(PanelFormKind::Permission));
+    assert!(!effect.switched);
+}
+
 #[test]
 fn a_new_default_form_does_not_warn_the_operator_who_was_not_writing() {
     let mut app = opened(asking());

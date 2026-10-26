@@ -772,6 +772,9 @@ impl WaitingPanel {
         let mut effect = SyncEffect::default();
         let shown = self.current_waiting_id().map(str::to_string);
         let before = self.active_key();
+        // Asked before the entries change: the form the operator wrote in or
+        // confirmed, not the one that replaces it.
+        let was_busy = self.is_typing() || self.is_confirming();
         let offer = task.panel.as_ref();
         let forms_mode = offer.is_some();
         let mut old = std::mem::take(&mut self.entries);
@@ -863,7 +866,7 @@ impl WaitingPanel {
                     self.current = index;
                 }
                 if self.active_key() != before {
-                    effect.switched = self.is_typing() || self.is_confirming();
+                    effect.switched = was_busy;
                     self.leave_all();
                     self.arrive();
                 }
