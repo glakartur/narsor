@@ -14,8 +14,9 @@ use serde_json::{json, Value};
 use narsor::api::{ApiClient, ClientError};
 use narsor::tui::chooser::Submission;
 use narsor::tui::style::Styles;
-use narsor::tui::task_app::actions::ActionSend;
+use narsor::tui::task_app::actions::{ActionSend, Overlay};
 use narsor::tui::task_app::detail::DetailRead;
+use narsor::tui::task_app::notify::Severity;
 use narsor::tui::task_app::panel::{Submit, WaitingPanel};
 use narsor::tui::task_app::{layout, Request, TaskApp};
 use narsor_engine::controller_protocol::{
@@ -729,4 +730,355 @@ fn an_empty_message_is_not_sent() {
         panel.prepare_comment(&task, String::new()).unwrap_err(),
         "Napisz, co agent ma zobaczyć."
     );
+}
+
+// -- the send lock, the notice of a changed form, the window of a rebuild ----
+
+/// A task whose runner failed to provision: the owner's panel, with `Start`
+/// first and the irreversible `Archive` after it.
+fn provisioning_failed() -> TaskSummary {
+    waiting_on(
+        task("a", "local", "interrupted", 1),
+        AttentionKind::ProvisioningFailed,
+        "provisioning-1",
+        None,
+    )
+}
+
+#[test]
+fn a_second_prepare_of_the_same_decision_waits_for_the_first() {
+    let task = provisioning_failed();
+    let mut panel = synced(&task);
+    panel.prepare(&task, &choice(0)).expect("the first send");
+    assert_eq!(panel.prepare(&task, &choice(0)).unwrap_err(), "Zapis trwa.");
+}
+
+/// A control plane that takes every input as queued, lists `tasks` and refuses
+/// every other request with "not found".
+async fn serving(tasks: Vec<TaskSummary>) -> ApiClient {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let tasks = serde_json::to_string(&listing(tasks, "after")).unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let tasks = tasks.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head_end, wanted) = loop {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        break (end + 4, length);
+                    }
+                };
+                while request.len() < head_end + wanted {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let head = String::from_utf8_lossy(&request[..head_end]).to_string();
+                let first = head.lines().next().unwrap_or_default().to_string();
+                let (status, body) = if first.contains("/input") {
+                    (
+                        "200 OK",
+                        json!({
+                            "input": {
+                                "input_id": "in-1",
+                                "pending_input_id": "ep-q",
+                                "status": "queued",
+                                "submitted_at": "2026-10-09T12:00:00Z",
+                                "updated_at": "2026-10-09T12:00:00Z",
+                                "detail": null
+                            },
+                            "replayed": false
+                        })
+                        .to_string(),
+                    )
+                } else if first.contains("/control/v1/tasks?") {
+                    ("200 OK", tasks)
+                } else {
+                    ("404 Not Found", "{}".to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    ApiClient::new(address, "token")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_settled_send_frees_the_decision() {
+    let mut app = TaskApp::new(serving(Vec::new()).await, "local", None);
+    app.load(listing(vec![titled(entry_limit_wait(), "NAR-12")], "c"));
+    key(&mut app, KeyCode::Char(' '));
+    key(&mut app, KeyCode::Enter);
+
+    let first = enter_until_sent(&mut app);
+    app.perform(Request::Answer(Box::new(first))).await;
+
+    // The answer went through: the panel no longer waits for the save.
+    for _ in 0..2 {
+        key(&mut app, KeyCode::Enter);
+    }
+    let drawn = screen(&mut app, 120, 40);
+    assert!(!drawn.contains("Zapis trwa"), "{drawn}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_connection_frees_the_decision_for_a_retry() {
+    // Nothing listens on the port of `app()`: the send is lost in transit.
+    let mut app = opened(provisioning_failed());
+    let first = enter_until_sent(&mut app);
+    app.perform(Request::Answer(Box::new(first.clone()))).await;
+
+    // The connection is back with the next read of the list.
+    app.load(listing(vec![titled(provisioning_failed(), "NAR-12")], "d"));
+    let retry = enter_until_sent(&mut app);
+    assert_eq!(first.submit, retry.submit);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_frees_the_decision_and_the_next_send_has_a_new_key() {
+    let listed = vec![titled(provisioning_failed(), "NAR-12")];
+    let mut app = TaskApp::new(serving(listed.clone()).await, "local", None);
+    app.load(listing(listed, "c"));
+    key(&mut app, KeyCode::Char(' '));
+    key(&mut app, KeyCode::Enter);
+
+    let first = enter_until_sent(&mut app);
+    app.perform(Request::Answer(Box::new(first.clone()))).await;
+
+    let next = enter_until_sent(&mut app);
+    assert_ne!(first.key, next.key);
+}
+
+#[test]
+fn the_panel_says_the_save_is_running_while_the_first_send_is_not_settled() {
+    let mut app = opened(provisioning_failed());
+    enter_until_sent(&mut app);
+
+    // The send is not settled yet: the same decision is not sent twice.
+    for _ in 0..2 {
+        assert_eq!(key(&mut app, KeyCode::Enter), Request::None);
+    }
+    let drawn = screen(&mut app, 120, 40);
+    assert!(drawn.contains("Zapis trwa"), "{drawn}");
+}
+
+#[test]
+fn an_irreversible_action_that_the_operator_declines_can_be_prepared_again() {
+    let mut app = opened(provisioning_failed());
+    key(&mut app, KeyCode::Down);
+    assert_eq!(key(&mut app, KeyCode::Enter), Request::None);
+    assert!(
+        app.overlay().and_then(Overlay::confirmation).is_some(),
+        "the irreversible action asks first"
+    );
+
+    key(&mut app, KeyCode::Char('n'));
+    assert!(app.overlay().and_then(Overlay::confirmation).is_none());
+
+    // The decision was never sent: choosing it again asks again.
+    assert_eq!(key(&mut app, KeyCode::Enter), Request::None);
+    assert!(
+        app.overlay().and_then(Overlay::confirmation).is_some(),
+        "the window opens again"
+    );
+    let drawn = screen(&mut app, 120, 40);
+    assert!(!drawn.contains("Zapis trwa"), "{drawn}");
+}
+
+/// What the bar of notices says last.
+fn note(app: &TaskApp) -> String {
+    app.notifier()
+        .latest()
+        .map(|note| note.text.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_new_default_form_warns_the_operator_who_was_typing() {
+    let mut app = opened(asking());
+    key(&mut app, KeyCode::Enter);
+    typed(&mut app, "v2");
+    assert!(app.detail().view("a").unwrap().waiting().is_typing());
+
+    app.load(listing(vec![titled(permission_wait(), "NAR-12")], "d"));
+
+    assert_eq!(shown(&app), Some(PanelFormKind::Permission));
+    assert!(note(&app).contains("formularz zmieniony"), "{}", note(&app));
+    assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
+}
+
+#[test]
+fn a_new_default_form_warns_the_operator_who_was_confirming() {
+    let mut app = opened(asking());
+    key(&mut app, KeyCode::Enter);
+    typed(&mut app, "v2");
+    key(&mut app, KeyCode::Enter);
+    assert!(app.form_confirming());
+
+    app.load(listing(vec![titled(permission_wait(), "NAR-12")], "d"));
+
+    assert!(note(&app).contains("formularz zmieniony"), "{}", note(&app));
+}
+
+#[test]
+fn a_new_default_form_does_not_warn_the_operator_who_was_not_writing() {
+    let mut app = opened(asking());
+
+    app.load(listing(vec![titled(permission_wait(), "NAR-12")], "d"));
+
+    assert_eq!(shown(&app), Some(PanelFormKind::Permission));
+    assert!(
+        !note(&app).contains("formularz zmieniony"),
+        "{}",
+        note(&app)
+    );
+}
+
+#[test]
+fn the_draft_of_a_form_stays_when_esc_switches_to_the_chat() {
+    let mut app = opened(asking());
+    key(&mut app, KeyCode::Enter);
+    typed(&mut app, "v2");
+
+    key(&mut app, KeyCode::Esc);
+    assert_eq!(shown(&app), Some(PanelFormKind::Chat));
+    assert!(
+        !note(&app).contains("formularz zmieniony"),
+        "{}",
+        note(&app)
+    );
+    assert!(
+        app.detail()
+            .draft("a")
+            .is_some_and(|draft| draft.contains("v2")),
+        "{:?}",
+        app.detail().draft("a")
+    );
+
+    key(&mut app, KeyCode::Esc);
+    assert_eq!(shown(&app), Some(PanelFormKind::Answer));
+    assert!(
+        app.detail()
+            .draft("a")
+            .is_some_and(|draft| draft.contains("v2")),
+        "{:?}",
+        app.detail().draft("a")
+    );
+}
+
+/// A task that waits on the conductor's proposal `p1`.
+fn proposal_wait() -> TaskSummary {
+    waiting_on(running(), AttentionKind::ConductorProposal, "p1", None)
+}
+
+/// A conductor that holds the proposal `p1`.
+fn conductor_with_proposal() -> narsor_protocol::controller::ConductorView {
+    task_app_support::conductor_view(
+        Vec::new(),
+        json!({
+            "proposals": [{
+                "proposal_id": "p1",
+                "text": "Uruchom krok od nowa",
+                "at": "2026-10-09T12:00:00Z",
+                "record": {
+                    "episode": "fk1",
+                    "state_id": "test",
+                    "proposal": {
+                        "kind": "retry",
+                        "summary": "Uruchom krok od nowa",
+                        "text": "z nowszym toolchainem"
+                    },
+                    "confidence": "high",
+                    "rationale": "Błąd wygląda na przejściowy."
+                },
+                "state": "pending"
+            }]
+        }),
+    )
+}
+
+#[test]
+fn a_read_that_changes_the_chosen_entry_closes_the_window_and_the_panel_says_so() {
+    let mut app = opened(proposal_wait());
+    // The first entry after action 0, while the proposal is still being read.
+    key(&mut app, KeyCode::Char('2'));
+    assert_eq!(key(&mut app, KeyCode::Enter), Request::None);
+    assert!(app.form_confirming(), "Enter asks before it sends");
+
+    // The proposal comes in and the entry says something else.
+    app.on_detail_read(
+        "a",
+        1,
+        DetailRead::Conductor(Ok(
+            narsor::controller_protocol::ConductorReadResponse::Available {
+                conductor: Box::new(conductor_with_proposal()),
+                source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
+            },
+        )),
+    );
+
+    assert!(!app.form_confirming(), "the window of another entry closed");
+    let drawn = screen(&mut app, 120, 40);
+    assert!(drawn.contains("Lista opcji"), "{drawn}");
+}
+
+#[test]
+fn once_the_connection_is_back_the_first_enter_in_the_window_sends() {
+    let mut app = opened(asking());
+    key(&mut app, KeyCode::Enter);
+    typed(&mut app, "v2");
+    key(&mut app, KeyCode::Enter);
+    app.on_stream(Some(Err(ClientError::Unavailable("down".into()))));
+    assert!(app.form_confirming(), "the drop alone keeps the window");
+
+    app.load(listing(vec![titled(asking(), "NAR-12")], "d"));
+    assert!(app.form_confirming(), "the read keeps the window");
+
+    let Request::Answer(request) = key(&mut app, KeyCode::Enter) else {
+        panic!("the first Enter after the connection came back sends");
+    };
+    assert!(
+        matches!(request.submit, Submit::Input { .. }),
+        "{:?}",
+        request.submit
+    );
+}
+
+#[test]
+fn an_empty_required_field_shows_its_error_at_the_field() {
+    let mut app = opened(asking());
+    key(&mut app, KeyCode::Enter);
+
+    // Nothing is typed: the form does not send and says why at the field.
+    for _ in 0..2 {
+        assert_eq!(key(&mut app, KeyCode::Enter), Request::None);
+    }
+    assert!(!app.form_confirming());
+    let drawn = screen(&mut app, 120, 40);
+    assert!(drawn.contains("✗"), "{drawn}");
 }
