@@ -102,11 +102,21 @@ Drugi problem: `claude` po prawie każdej odpowiedzi tekstowej prosi agenta o od
 
 ---
 
-## Open Questions
+## Założenia do potwierdzenia
 
-- Czy okres łaski (R2) ma być stałą, czy parametrem workflow (`parameters`)?
-- Czy `progress` ma trafiać do panelu TUI osobnym elementem (inna ikona), czy jako zwykły wpis agenta?
-- Czy po zabiciu grupy procesów (R3) sesja `claude` nadal da się wznowić przez `--resume`? Dotyczy kroków z `awaiting_input` i `history: true`.
+- Okres łaski z R2 to stała w kodzie (5 s). Nie dodajemy parametru workflow. To najmniejsza zmiana. Parametr można dodać później.
+- `progress` jest zwykłym wpisem agenta w rozmowie i w panelu TUI. Bez osobnej ikony. Zmiana TUI jest poza zakresem.
+- Jeśli po zabiciu grupy procesów (R3) sesja `claude` nie da się wznowić przez `--resume`, krok z `awaiting_input` i `history: true` nie jest zabijany przed końcem okresu łaski. Do sprawdzenia testem w planie. Dopóki test nie potwierdzi wznowienia, zabijanie obejmuje tylko odpowiedź z `choice`.
+- Zachowanie `claude` 2.1.x z sekcji „Dependencies / Assumptions” jest prawdziwe. Fixtura w planie ma to potwierdzić.
+- Zabijanie grupy procesów dotyczy tylko Linux i macOS (grupy procesów POSIX). Inne platformy nie są wspierane przez runner.
+
+---
+
+## Pytania otwarte dla użytkownika
+
+- Czy `progress` ma trafiać do panelu TUI osobnym elementem (inna ikona), czy wystarczy zwykły wpis agenta?
+- Czy okres łaski (R2) ma być parametrem workflow (`parameters`), czy wystarczy stała 5 s?
+- Czy limit liczby `progress` na krok ma być w silniku już teraz, czy wystarczy ograniczenie w prompcie (R6)?
 
 ---
 
