@@ -219,6 +219,18 @@ impl ChooserField {
         self.error = from.error.clone();
     }
 
+    /// Whether `other` asks for the same thing: name, kind, wording and
+    /// whether it is required. A typed value is not compared; a value the
+    /// conductor proposed on the earlier side is, as it is part of what was asked.
+    fn same_definition(&self, other: &ChooserField) -> bool {
+        (!self.proposed || self.value() == other.value())
+            && self.name == other.name
+            && self.kind == other.kind
+            && self.label == other.label
+            && self.required == other.required
+            && self.description == other.description
+    }
+
     /// Whether the operator wrote something here that is not sent yet: a
     /// text value that is not blank and not the conductor's untouched one.
     pub fn is_drafted(&self) -> bool {
@@ -384,6 +396,23 @@ pub struct ChooserItem {
 }
 
 impl ChooserItem {
+    /// Whether `other` offers the same thing: wording, flags and the
+    /// definition of each field — the typed values are not compared.
+    fn same_definition(&self, other: &ChooserItem) -> bool {
+        self.label == other.label
+            && self.description == other.description
+            && self.resumes_agent == other.resumes_agent
+            && self.recommended == other.recommended
+            && self.irreversible == other.irreversible
+            && self.unavailable == other.unavailable
+            && self.fields.len() == other.fields.len()
+            && self
+                .fields
+                .iter()
+                .zip(&other.fields)
+                .all(|(a, b)| a.same_definition(b))
+    }
+
     /// An entry with a label and a description.
     pub fn new(label: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
@@ -688,11 +717,14 @@ impl Chooser {
     /// the fields that are still there (by entry label and field name), the
     /// highlighted entry is the same one when it still exists, the focus
     /// stays where it was and so does the scrolled list. An open
-    /// confirmation closes: the operator confirms again what is now there.
+    /// confirmation stays open when the highlighted entry is the same and can
+    /// still be sent, and closes otherwise: the operator confirms again what
+    /// is now there.
     pub fn rebuilt(mut self, mut items: Vec<ChooserItem>) -> Self {
-        // The popup asked about entries that may be gone or changed.
-        self.form.decline();
+        // The popup asked about an entry that may be gone or changed.
+        let asked = self.form.decline();
         let label = self.selected_item().map(|item| item.label.clone());
+        let earlier = self.selected_item().cloned();
         for item in &mut items {
             let Some(old) = self.items.iter().find(|old| old.label == item.label) else {
                 continue;
@@ -724,6 +756,15 @@ impl Chooser {
         } else {
             0
         };
+        if let Some(return_field) = asked {
+            let unchanged = match (earlier, self.selected_item()) {
+                (Some(earlier), Some(now)) => earlier.same_definition(now),
+                _ => false,
+            };
+            if unchanged && self.is_sendable() {
+                self.form.ask_confirmation(return_field.min(self.field));
+            }
+        }
         self
     }
 
@@ -796,6 +837,10 @@ impl Chooser {
     /// values; the focus returns to the list.
     pub fn select(&mut self, index: usize) {
         if index < self.items.len() {
+            if index != self.selected {
+                // A confirmation asked about the entry that was highlighted.
+                self.form.decline();
+            }
             self.selected = index;
             self.focus = ChooserFocus::Actions;
             self.field = 0;

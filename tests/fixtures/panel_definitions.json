@@ -2786,5 +2786,143 @@
     }
    ]
   }
+ },
+ {
+  "def": {
+   "context": [
+    {
+     "text": "Kt\u00f3ra wersja API?",
+     "tone": "plain"
+    },
+    {
+     "text": "Bash: cargo test",
+     "tone": "problem"
+    },
+    {
+     "text": "katalog: /tmp/task",
+     "tone": "dim"
+    },
+    {
+     "text": "regu\u0142y zgody: Bash(cargo test)",
+     "tone": "dim"
+    }
+   ],
+   "continuation": "resolve_permission",
+   "entries": [
+    {
+     "description": "Agent wznowi t\u0119 sesj\u0119 z informacj\u0105, \u017ce te operacje s\u0105 zablokowane.",
+     "fields": [
+      {
+       "kind": {
+        "text": {
+         "multiline": true
+        }
+       },
+       "name": "Wiadomo\u015b\u0107 dla agenta",
+       "required": false
+      }
+     ],
+     "label": "Odm\u00f3w",
+     "plan": {
+      "permission": {
+       "decision": {
+        "decision": "deny",
+        "scope": null
+       }
+      }
+     },
+     "recommended": false,
+     "summary": "odm\u00f3wiono dost\u0119pu agentowi"
+    },
+    {
+     "description": "Agent wznowi sesj\u0119 i mo\u017ce je uruchomi\u0107. Regu\u0142y tylko dla bie\u017c\u0105cego tasku: Bash(cargo test)",
+     "label": "Zezw\u00f3l dok\u0142adnie na to polecenie",
+     "plan": {
+      "permission": {
+       "decision": {
+        "decision": "allow",
+        "scope": "exact_operation"
+       }
+      }
+     },
+     "recommended": false,
+     "summary": "zezwolono na t\u0119 operacj\u0119"
+    },
+    {
+     "description": "Zgoda obejmie te grupy polece\u0144 do ko\u0144ca bie\u017c\u0105cego tasku.",
+     "label": "Zezw\u00f3l na grup\u0119: Bash(cargo test *)",
+     "plan": {
+      "permission": {
+       "decision": {
+        "decision": "allow",
+        "scope": "command_group"
+       }
+      }
+     },
+     "recommended": false,
+     "summary": "zezwolono na grup\u0119 polece\u0144 w tym tasku"
+    },
+    {
+     "description": "Wpisz ca\u0142e polecenie albo jego pocz\u0105tek z * na ko\u0144cu, np. npm run *. Zgoda obejmie pasuj\u0105ce polecenia Bash do ko\u0144ca bie\u017c\u0105cego tasku.",
+     "fields": [
+      {
+       "description": "Polecenie z\u0142o\u017cone (&&, ;, |, p\u0119tla) Claude Code sprawdza po cz\u0119\u015bciach: wtedy pomo\u017ce tylko *. Sam * zezwala na KA\u017bDE polecenie Bash.",
+       "kind": {
+        "text": {
+         "multiline": false
+        }
+       },
+       "name": "Wzorzec polecenia",
+       "required": true,
+       "value": "cargo test"
+      }
+     ],
+     "label": "Zezw\u00f3l wed\u0142ug wzorca\u2026",
+     "plan": {
+      "permission": {
+       "decision": {
+        "decision": "allow",
+        "scope": "pattern"
+       }
+      }
+     },
+     "recommended": false,
+     "summary": "zezwolono na polecenia wed\u0142ug wzorca w tym tasku"
+    }
+   ],
+   "episode": "ep-p2"
+  },
+  "form": {
+   "action_execution_id": "act-7",
+   "agent_harness": "claude-code",
+   "agent_session_id": "s1",
+   "continuation": "resolve_permission",
+   "episode": "ep-p2",
+   "execution_id": "exec-1",
+   "fields": [
+    {
+     "name": "answer",
+     "required": true,
+     "type": "text"
+    }
+   ],
+   "instruction": "Kt\u00f3ra wersja API?",
+   "permission": {
+    "denials": [
+     {
+      "cwd": "/tmp/task",
+      "input": {
+       "command": "cargo test"
+      },
+      "reason": "This command requires approval.",
+      "reason_type": "asyncAgent",
+      "tool_name": "Bash",
+      "tool_use_id": "t1"
+     }
+    ]
+   },
+   "requested_at": "2026-10-09T11:54:00Z",
+   "state_id": "review_scope"
+  }
  }
 ]

@@ -735,11 +735,17 @@ impl TaskApp {
     /// Whether an action that changes state may run now; otherwise the reason
     /// goes to the bar. Every mutation asks this first (R18).
     pub fn mutation_allowed(&mut self) -> bool {
+        self.mutation_refusal().is_ok()
+    }
+
+    /// As [`Self::mutation_allowed`], but hands the reason back (it is on the
+    /// bar as well) for a form that shows it where the operator looks.
+    pub(in crate::tui::task_app) fn mutation_refusal(&mut self) -> Result<(), String> {
         match self.connection.mutation_gate(Instant::now()) {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(blocked) => {
-                self.notify(Severity::Warning, blocked.reason);
-                false
+                self.notify(Severity::Warning, blocked.reason.clone());
+                Err(blocked.reason)
             }
         }
     }
