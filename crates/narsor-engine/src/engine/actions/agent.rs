@@ -252,6 +252,22 @@ because it did not end with a valid output object. Do not continue the task and 
 change any files: the work is already done. Reply only with the JSON object described \
 below, choosing the label that describes the work you already did.";
 
+/// How many times the engine resumes a session that ended on a `progress`
+/// note before it hands the step to the conductor.
+pub const MAX_PROGRESS_CONTINUATIONS: u32 = 5;
+
+/// The key of an [`MISSING_OUTPUT_LABEL`] error's `details` that says the run
+/// ended on a `progress` note: the agent has not finished the step, and the
+/// engine resumes it instead of asking for a label of work already done.
+pub const PROGRESS_ONLY_DETAIL: &str = "progress_only";
+
+/// What the engine says to an agent whose turn the harness closed on a
+/// `progress` note (a harness may end the turn on any answer it is given).
+pub const PROGRESS_CONTINUATION: &str = "Your previous turn ended on a progress note, so \
+the harness closed it before the step was done. A progress note is not an answer. Continue \
+the step from where you stopped. Send another progress note only if you must stop again. \
+When the step is done, reply with the JSON object described below.";
+
 /// The configuration of the engine's reprompt of an agent (KTD7).
 ///
 /// Resumes `harness_session` on `harness` — the harness the rejected attempt
@@ -275,6 +291,20 @@ pub fn reprompt_config(
         Value::String(harness_session.to_string()),
     );
     config
+}
+
+/// The configuration of the engine's continuation of an agent whose turn ended
+/// on a `progress` note.
+///
+/// Unlike [`reprompt_config`] it keeps the action's workspace access: the
+/// agent has work left to do, and is not asked to repair the form of work
+/// already done.
+pub fn progress_continuation_config(
+    original: &AgentActionConfig,
+    harness: &str,
+    harness_session: &str,
+) -> AgentActionConfig {
+    continuation_config(original, harness, harness_session, PROGRESS_CONTINUATION)
 }
 
 /// What follows the conductor's own words when it asks the agent again
@@ -1648,18 +1678,19 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         .rev()
         .find_map(|value| value.as_object().filter(|object| is_answer_object(object)))
     else {
-        let progress = objects
-            .iter()
-            .rev()
-            .any(is_progress_note);
-        return Err(no_label_error(
+        let progress = objects.iter().rev().any(is_progress_note);
+        let mut error = no_label_error(
             if progress {
                 "the agent's last answer was a progress note, not a final answer"
             } else {
                 "the agent's answer contains JSON, but no object with a string 'choice' key"
             },
             text,
-        ));
+        );
+        if progress {
+            mark_progress_only(&mut error);
+        }
+        return Err(error);
     };
 
     response_from_object(object).map_err(|reason| no_label_error(reason, text))
@@ -1729,6 +1760,14 @@ fn no_label_error(reason: &str, text: &str) -> ActionError {
         details: Some(serde_json::json!({
             "answer_tail": super::harness::tail(text, FAILED_EXTRACTION_QUOTE_BYTES),
         })),
+    }
+}
+
+/// Says in the details of an extraction failure that the run ended on a
+/// `progress` note ([`PROGRESS_ONLY_DETAIL`]).
+fn mark_progress_only(error: &mut ActionError) {
+    if let Some(Value::Object(details)) = error.details.as_mut() {
+        details.insert(PROGRESS_ONLY_DETAIL.to_string(), Value::Bool(true));
     }
 }
 
@@ -2028,6 +2067,28 @@ mod json_object_tests {
             label_of("{\"choice\":\"first\"} then { and {\"choice\":\"second\"}"),
             "second"
         );
+    }
+
+    fn progress_only_of(text: &str) -> Option<bool> {
+        let error = extract_response(text).expect_err("no answer");
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get(super::PROGRESS_ONLY_DETAIL))
+            .and_then(serde_json::Value::as_bool)
+    }
+
+    #[test]
+    fn a_run_that_ends_on_a_progress_note_is_marked_progress_only() {
+        assert_eq!(
+            progress_only_of("{\"status\":\"progress\",\"message\":\"I read the code\"}"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_run_without_a_label_or_a_progress_note_is_not_marked() {
+        assert_eq!(progress_only_of("{\"reason\":\"no label\"}"), None);
     }
 }
 

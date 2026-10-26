@@ -352,6 +352,15 @@ pub struct OutputRejection {
     /// The harness's own session id, when it reported one.
     #[serde(default)]
     pub harness_session_id: Option<String>,
+
+    /// Whether the attempt ended on a `progress` note: the agent is not done,
+    /// and is resumed to carry on, not asked to repair an answer.
+    #[serde(default)]
+    pub progress_only: bool,
+
+    /// How many times the agent was resumed after such a note in this row.
+    #[serde(default)]
+    pub continuations: u32,
 }
 
 impl OutputRejection {
@@ -377,6 +386,13 @@ impl OutputRejection {
             reply: detail("reply"),
             harness: detail("harness"),
             harness_session_id: detail("harness_session_id"),
+            progress_only: error
+                .details
+                .as_ref()
+                .and_then(|details| details.get(agent::PROGRESS_ONLY_DETAIL))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            continuations: 0,
         })
     }
 
@@ -415,6 +431,8 @@ impl OutputRejection {
             reply: result.reply.clone(),
             harness: session_field("/harness"),
             harness_session_id: session_field("/config/harness_session_id"),
+            progress_only: false,
+            continuations: 0,
         })
     }
 
@@ -432,6 +450,8 @@ impl OutputRejection {
             reply: None,
             harness: None,
             harness_session_id: None,
+            progress_only: false,
+            continuations: 0,
         }
     }
 }
@@ -851,6 +871,8 @@ pub(super) struct UnlabelledAnswer {
     harness_session_id: Option<String>,
     /// The attempt's reply, when it had one.
     reply: Option<String>,
+    /// Whether the attempt ended on a `progress` note.
+    progress_only: bool,
 }
 
 /// How a reprompt ended without a label the state accepts.
@@ -2677,6 +2699,12 @@ impl Engine {
     /// attempt's harness session, read-only, on the harness it ran on, asking
     /// only for the output object.
     ///
+    /// An attempt that ended on a `progress` note is not a format error: the
+    /// agent has work left, and a harness may close its turn on any answer.
+    /// It is resumed with the step's own workspace access — up to
+    /// [`agent::MAX_PROGRESS_CONTINUATIONS`] times in a row — and not asked
+    /// to repair work it has not done.
+    ///
     /// Not a `retry_policy` retry (R15): it is announced by `OutputReprompted`,
     /// never `ActionRetrying`. Whatever it ends with but a label — another
     /// format error, a question, a failure — and a rejected attempt with no
@@ -2688,60 +2716,97 @@ impl Engine {
         execution: &mut WorkflowExecution,
         state: &State,
         action: &ActionConfig,
-        rejection: OutputRejection,
+        mut rejection: OutputRejection,
         timeout: Option<Duration>,
     ) -> Result<ActionUpshot, EngineError> {
-        let mut rescue = OutputRescue::after(&rejection);
-        let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
-            (ActionConfig::Agent(config), Some(harness), Some(session)) => Some(
-                agent::reprompt_config(config, harness, session, &rejection.reason),
-            ),
-            _ => None,
-        };
-        let Some(config) = resumable else {
-            rescue.reason = format!(
-                "{} The agent could not be asked again for its output label: its harness \
-                 reported no session to resume.",
-                rejection.reason
-            );
-            self.begin_rescue(execution, &rescue)?;
-            let flow = self
-                .rescue_output(definition, execution, state, rescue, timeout)
-                .await?;
-            return Ok(ActionUpshot::settled(flow));
-        };
-
-        match self
-            .reprompt_attempt(
-                execution,
-                state,
-                config,
-                &rejection.action_execution_id,
-                rejection.reply.as_deref(),
-                RepromptedBy::Engine,
-                timeout,
-            )
-            .await?
-        {
-            RepromptEnd::Labelled {
-                action_execution_id,
-                result,
-            } => Ok(ActionUpshot::Completed {
-                action_execution_id,
-                result,
-            }),
-            RepromptEnd::Stopped => Ok(ActionUpshot::Stopped),
-            RepromptEnd::Unlabelled(failure) => {
-                rescue.record(&failure);
-                // The record before the event that closes the attempt: a
-                // crash in between leaves the attempt open (`Unknown`), and
-                // one after it leaves the rescue to continue from (F1).
+        loop {
+            let mut rescue = OutputRescue::after(&rejection);
+            let exhausted = rejection.progress_only
+                && rejection.continuations >= agent::MAX_PROGRESS_CONTINUATIONS;
+            let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
+                (ActionConfig::Agent(config), Some(harness), Some(session)) if !exhausted => {
+                    Some(if rejection.progress_only {
+                        agent::progress_continuation_config(config, harness, session)
+                    } else {
+                        agent::reprompt_config(config, harness, session, &rejection.reason)
+                    })
+                }
+                _ => None,
+            };
+            let Some(config) = resumable else {
+                rescue.reason = if exhausted {
+                    format!(
+                        "{} The agent ended {} turns in a row on a progress note and never \
+                         gave its output label.",
+                        rejection.reason,
+                        rejection.continuations + 1
+                    )
+                } else {
+                    format!(
+                        "{} The agent could not be asked again for its output label: its \
+                         harness reported no session to resume.",
+                        rejection.reason
+                    )
+                };
                 self.begin_rescue(execution, &rescue)?;
-                self.close_unlabelled(execution, state, &failure.answer)?;
                 let flow = self
                     .rescue_output(definition, execution, state, rescue, timeout)
                     .await?;
-                Ok(ActionUpshot::settled(flow))
+                return Ok(ActionUpshot::settled(flow));
+            };
+
+            match self
+                .reprompt_attempt(
+                    execution,
+                    state,
+                    config,
+                    &rejection.action_execution_id,
+                    rejection.reply.as_deref(),
+                    RepromptedBy::Engine,
+                    timeout,
+                )
+                .await?
+            {
+                RepromptEnd::Labelled {
+                    action_execution_id,
+                    result,
+                } => {
+                    return Ok(ActionUpshot::Completed {
+                        action_execution_id,
+                        result,
+                    })
+                }
+                RepromptEnd::Stopped => return Ok(ActionUpshot::Stopped),
+                RepromptEnd::Unlabelled(failure) if failure.progress_only => {
+                    // Another progress note: the attempt is rejected like the
+                    // first one was — the record before the event that
+                    // closes it — and the agent is resumed again.
+                    let next = OutputRejection {
+                        state_id: state.id.clone(),
+                        action_execution_id: failure.answer.action_execution_id,
+                        reason: failure.answer.reason,
+                        answer_tail: failure.answer.answer_tail,
+                        reply: failure.reply,
+                        harness: failure.harness,
+                        harness_session_id: failure.harness_session_id,
+                        progress_only: true,
+                        continuations: rejection.continuations + 1,
+                    };
+                    self.reject_output(execution, &next)?;
+                    rejection = next;
+                }
+                RepromptEnd::Unlabelled(failure) => {
+                    rescue.record(&failure);
+                    // The record before the event that closes the attempt: a
+                    // crash in between leaves the attempt open (`Unknown`), and
+                    // one after it leaves the rescue to continue from (F1).
+                    self.begin_rescue(execution, &rescue)?;
+                    self.close_unlabelled(execution, state, &failure.answer)?;
+                    let flow = self
+                        .rescue_output(definition, execution, state, rescue, timeout)
+                        .await?;
+                    return Ok(ActionUpshot::settled(flow));
+                }
             }
         }
     }
@@ -2856,6 +2921,7 @@ impl Engine {
                 harness: rejection.harness,
                 harness_session_id: rejection.harness_session_id,
                 reply: rejection.reply,
+                progress_only: rejection.progress_only,
             },
             RepromptFailure::Failed(message) => {
                 let reason =
@@ -2870,6 +2936,7 @@ impl Engine {
                     harness: None,
                     harness_session_id: None,
                     reply: None,
+                    progress_only: false,
                 }
             }
         }))
