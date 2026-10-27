@@ -232,9 +232,12 @@ const CONTRACT_NOTE: &str = "Deliver your answer, and every `awaiting_input` que
 through the `StructuredOutput` tool. A question written as plain text does not reach the \
 person. To report progress without ending the step — a comment, a wait for a subagent, a \
 partial result — send {\"status\":\"progress\",\"message\":\"<text>\"} through the same \
-tool. A progress note is not an answer and does not end the step. There is no limit on the \
-number of progress notes. Send the answer with `choice` exactly once, when all your \
-subagents have returned their results.";
+tool. A progress note is not an answer and does not end the step. It does end your turn \
+when no subagent or background task is running, and each such note costs a resumed \
+session: send one only while you wait for a subagent or a background task, not to \
+comment on work you are doing yourself. There is no limit on the number of progress \
+notes. Send the answer with `choice` exactly once, when all your subagents have returned \
+their results.";
 
 /// Reads the `stream-json` lines of one run, live, line by line.
 ///

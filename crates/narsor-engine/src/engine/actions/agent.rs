@@ -53,8 +53,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use narsor_protocol::chat::{
-    summary_line, ChatElement, QuestionSource, TechnicalCategory, UnclassifiedReason,
-    SUMMARY_MAX_CHARS,
+    summary_line, ChatElement, PromptPurpose, QuestionSource, TechnicalCategory,
+    UnclassifiedReason, SUMMARY_MAX_CHARS,
 };
 use serde_json::{Map, Value};
 use std::process::ExitStatus;
@@ -252,14 +252,11 @@ because it did not end with a valid output object. Do not continue the task and 
 change any files: the work is already done. Reply only with the JSON object described \
 below, choosing the label that describes the work you already did.";
 
-/// How many times the engine resumes a session that ended on a `progress`
-/// note before it hands the step to the conductor.
-pub const MAX_PROGRESS_CONTINUATIONS: u32 = 5;
-
 /// The key of an [`MISSING_OUTPUT_LABEL`] error's `details` that says the run
-/// ended on a `progress` note: the agent has not finished the step, and the
-/// engine resumes it instead of asking for a label of work already done.
-pub const PROGRESS_ONLY_DETAIL: &str = "progress_only";
+/// ended on a `progress` note: the agent has not finished the step. The
+/// executor resumes it at once (see [`AgentExecutor::run_until_answered`]);
+/// the error never leaves it while the session can be resumed.
+const PROGRESS_ONLY_DETAIL: &str = "progress_only";
 
 /// What the engine says to an agent whose turn the harness closed on a
 /// `progress` note (a harness may end the turn on any answer it is given).
@@ -299,7 +296,7 @@ pub fn reprompt_config(
 /// Unlike [`reprompt_config`] it keeps the action's workspace access: the
 /// agent has work left to do, and is not asked to repair the form of work
 /// already done.
-pub fn progress_continuation_config(
+fn progress_continuation_config(
     original: &AgentActionConfig,
     harness: &str,
     harness_session: &str,
@@ -613,7 +610,7 @@ impl ActionExecutor for AgentExecutor {
         &'a self,
         request: ActionRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
-        Box::pin(async move { self.run(request).await })
+        Box::pin(async move { self.run_until_answered(request).await })
     }
 }
 
@@ -647,6 +644,63 @@ impl AgentExecutor {
         };
         sink.append_narsor(&entry, &[element]);
         sink
+    }
+
+    /// The agent work of one step: a run, and a resumed run for every
+    /// `progress` note that ended one.
+    ///
+    /// A harness may close its turn on a `progress` note — Claude Code does
+    /// when nothing runs in the background — but the note is not an answer
+    /// and not an error: the step is not done. The session is resumed with
+    /// the step's own workspace access, inside this one action, so the log
+    /// shows no failed session, no rejected output and no reprompt. There is
+    /// no limit on notes; the timeout of the step, counted from its first
+    /// run, ends a series that never gives a label.
+    async fn run_until_answered(
+        &self,
+        request: ActionRequest<'_>,
+    ) -> Result<ActionOutcome, ActionError> {
+        let started = std::time::Instant::now();
+        let mut action = request.action.clone();
+        let mut purpose = request.purpose;
+        loop {
+            let timeout = match request.timeout {
+                None => None,
+                Some(limit) => match limit
+                    .checked_sub(started.elapsed())
+                    .filter(|left| !left.is_zero())
+                {
+                    Some(left) => Some(left),
+                    None => return Ok(ActionOutcome::TimedOut(timed_out(&action, limit))),
+                },
+            };
+            let attempt = ActionRequest {
+                action: &action,
+                timeout,
+                purpose,
+                ..request
+            };
+            let error = match self.run(attempt).await {
+                // The limit reported is the step's, not what was left of it.
+                Ok(ActionOutcome::TimedOut(mut timed_out)) => {
+                    if let Some(limit) = request.timeout {
+                        timed_out.timeout = limit;
+                    }
+                    return Ok(ActionOutcome::TimedOut(timed_out));
+                }
+                Err(error) => error,
+                done => return done,
+            };
+            let Some((harness, session)) = progress_session(&error) else {
+                return Err(error);
+            };
+            action = ActionConfig::Agent(progress_continuation_config(
+                agent_config(&action)?,
+                &harness,
+                &session,
+            ));
+            purpose = PromptPurpose::Continuation;
+        }
     }
 
     /// One agent run, from the session record to the output label.
@@ -894,13 +948,23 @@ impl AgentExecutor {
                 // (KTD7): the harness it ran on and the session it left.
                 record_session_in_details(&mut error, harness, run.session_id.as_deref());
                 record_reply_in_details(&mut error, &run);
-                self.fail_session(
-                    request.execution_id,
-                    request.action_execution_id,
-                    &mut session,
-                    run.session_id.clone(),
-                    error.message.clone(),
-                );
+                if progress_session(&error).is_some() {
+                    // A note, not a failure: the executor resumes the session.
+                    self.complete_session(
+                        request.execution_id,
+                        request.action_execution_id,
+                        &mut session,
+                        run.session_id.clone(),
+                    );
+                } else {
+                    self.fail_session(
+                        request.execution_id,
+                        request.action_execution_id,
+                        &mut session,
+                        run.session_id.clone(),
+                        error.message.clone(),
+                    );
+                }
                 return Err(error);
             }
         };
@@ -935,6 +999,26 @@ impl AgentExecutor {
                 }),
             )),
         }
+    }
+
+    /// Marks the session completed and says so in the log.
+    fn complete_session(
+        &self,
+        execution_id: Option<&str>,
+        action_execution_id: &str,
+        session: &mut AgentSession,
+        harness_session_id: Option<String>,
+    ) {
+        session.status = AgentSessionStatus::Completed;
+        session.ended_at = Some(Utc::now());
+        self.emit(
+            execution_id,
+            EventData::AgentSessionCompleted {
+                session_id: session.id.clone(),
+                action_execution_id: Some(action_execution_id.to_string()),
+                harness_session_id,
+            },
+        );
     }
 
     /// Marks the session failed and says so in the log.
@@ -1760,6 +1844,34 @@ fn no_label_error(reason: &str, text: &str) -> ActionError {
         details: Some(serde_json::json!({
             "answer_tail": super::harness::tail(text, FAILED_EXTRACTION_QUOTE_BYTES),
         })),
+    }
+}
+
+/// The harness and the session to resume when `error` says the run ended on
+/// a `progress` note and the harness reported a session — `None` for any
+/// other failure.
+fn progress_session(error: &ActionError) -> Option<(String, String)> {
+    if error.error_type.as_deref() != Some(MISSING_OUTPUT_LABEL) {
+        return None;
+    }
+    let details = error.details.as_ref()?;
+    if details.get(PROGRESS_ONLY_DETAIL).and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let text = |key: &str| details.get(key).and_then(Value::as_str).map(str::to_string);
+    Some((text("harness")?, text("harness_session_id")?))
+}
+
+/// The timeout of a step that ran out of time between two runs, before the
+/// next one started.
+fn timed_out(action: &ActionConfig, limit: Duration) -> TimedOutAction {
+    let harness = match action {
+        ActionConfig::Agent(config) => config.harness.as_deref().unwrap_or(BUILT_IN_HARNESS),
+        _ => BUILT_IN_HARNESS,
+    };
+    TimedOutAction {
+        timeout: limit,
+        subject: format!("agent harness '{harness}'"),
     }
 }
 

@@ -102,9 +102,6 @@ enum Reply {
     Fail,
     /// Answers with text that names no output label.
     Labelless(&'static str),
-    /// Ends the session on a `progress` note: no final answer, but a session
-    /// the engine can resume.
-    ProgressOnly,
 }
 
 /// One call of the in-process agent.
@@ -112,11 +109,6 @@ enum Reply {
 struct Call {
     prompt: String,
     harness: Option<String>,
-    /// The session this call resumes, as a reprompt does.
-    resume_session: Option<String>,
-    /// The workspace access the call asks for; a reprompt takes it down to
-    /// read-only.
-    workspace_access: Option<crate::domain::WorkspaceAccess>,
 }
 
 /// The agent actions of a task, answered in-process: each call takes the
@@ -159,12 +151,6 @@ impl ActionExecutor for Agent {
         self.calls.lock().unwrap().push(Call {
             prompt: config.prompt.clone(),
             harness: config.harness.clone(),
-            resume_session: config
-                .parameters
-                .get(crate::engine::actions::agent::RESUME_SESSION_PARAMETER)
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            workspace_access: config.workspace_access,
         });
         let reply = self
             .replies
@@ -201,19 +187,6 @@ impl ActionExecutor for Agent {
                         crate::engine::actions::agent::MISSING_OUTPUT_LABEL.to_string(),
                     ),
                     details: Some(json!({ "answer_tail": answer })),
-                }),
-                Reply::ProgressOnly => Err(ActionError {
-                    message: "the agent's last answer was a progress note, not a final answer"
-                        .to_string(),
-                    error_type: Some(
-                        crate::engine::actions::agent::MISSING_OUTPUT_LABEL.to_string(),
-                    ),
-                    details: Some(json!({
-                        "answer_tail": "waiting for the subagent",
-                        "progress_only": true,
-                        "harness": "claude-code",
-                        "harness_session_id": "agent-session",
-                    })),
                 }),
             }
         })
@@ -1480,93 +1453,6 @@ async fn a_chosen_output_is_undone_and_the_step_is_a_problem_again() {
         )
         .await;
     assert!(again.contains("already undone"), "{again}");
-}
-
-/// R9: a harness that ends its turn on a `progress` note — Claude Code ends it
-/// on any `StructuredOutput` call — has not finished the step. The engine
-/// resumes the session as a continuation, with the step's own workspace
-/// access, and not as a read-only reprompt that says the work is done.
-#[tokio::test]
-async fn a_progress_only_session_is_continued_with_the_access_of_its_step() {
-    let root = TempRoot::new();
-    let path = harness_path(&root, &["claude"]);
-    let agent = Agent::new(
-        vec![Reply::ProgressOnly, Reply::Label("implemented")],
-        Reply::Hang,
-    );
-    let mut fixture = Fixture::new(
-        &root,
-        &root.dir("storage"),
-        "pod-1",
-        &spec(LABELLESS, "claude-code"),
-        agent,
-        Conductor::silent(),
-        &path,
-    );
-    fixture.begin().await;
-    fixture.settled().await;
-
-    assert_eq!(fixture.status(), ExecutionStatus::Completed);
-    let calls = fixture.agent.calls();
-    assert_eq!(calls.len(), 2, "one attempt, one continuation: {calls:?}");
-    assert_eq!(calls[1].resume_session.as_deref(), Some("agent-session"));
-    assert_ne!(
-        calls[1].workspace_access,
-        Some(crate::domain::WorkspaceAccess::ReadOnly),
-        "the continuation writes where the step writes"
-    );
-    assert!(
-        !calls[1].prompt.contains("the work is already done"),
-        "a progress note is not finished work: {}",
-        calls[1].prompt
-    );
-}
-
-/// R9: an agent that only ever sends progress notes is continued a bounded
-/// number of times; then the step goes to the conductor.
-#[tokio::test]
-async fn a_session_of_progress_notes_is_continued_up_to_the_limit_then_goes_to_the_conductor() {
-    let root = TempRoot::new();
-    let path = harness_path(&root, &["claude"]);
-    let conductor = Conductor::silent();
-    let mut fixture = Fixture::new(
-        &root,
-        &root.dir("storage"),
-        "pod-1",
-        &spec(LABELLESS, "claude-code"),
-        Agent::new(vec![], Reply::ProgressOnly),
-        conductor.clone(),
-        &path,
-    );
-    fixture.begin().await;
-    {
-        let fixture = &fixture;
-        wait_for("the step to need the operator", || {
-            fixture.status() == ExecutionStatus::InputNeeded
-        })
-        .await;
-    }
-    fixture.settled().await;
-
-    let calls = fixture.agent.calls();
-    assert_eq!(
-        calls.len(),
-        1 + crate::engine::actions::agent::MAX_PROGRESS_CONTINUATIONS as usize,
-        "one attempt, then the continuations: {calls:?}"
-    );
-    assert_eq!(calls[0].resume_session, None);
-    assert!(calls[1..]
-        .iter()
-        .all(|call| call.resume_session.as_deref() == Some("agent-session")));
-    // The silent conductor fails, and the actor repeats a failed request
-    // once (R24): both requests are the conductor's first choice.
-    let asked = conductor.calls.lock().unwrap().len();
-    assert!(asked >= 1, "the last unusable result goes to the conductor");
-    assert_eq!(
-        conductor.calls_for(ConductorPurpose::ChooseOutput).len(),
-        asked,
-        "the conductor is asked to choose, not to reprompt after a reprompt"
-    );
 }
 
 /// The conductor's harness is no longer chosen per task: a choice an older

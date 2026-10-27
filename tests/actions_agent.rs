@@ -660,29 +660,170 @@ async fn an_answer_without_any_json_is_an_error_and_never_a_guessed_label() {
     );
 }
 
-/// A session that ends in a `progress` note has no final answer: the format
-/// error names the note, and carries the session the engine resumes to ask
-/// again.
+/// A `progress` note is not an error. A harness may end its turn on it
+/// (Claude Code does when nothing runs in the background), so the executor
+/// resumes the session itself and goes on listening: the step is one action,
+/// with no failed session and no rejected output on the way.
 #[tokio::test]
-async fn a_session_that_ends_in_a_progress_note_is_a_format_error_with_its_session() {
+async fn a_progress_note_ends_the_run_but_not_the_action() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&final_line(
-        json!({ "status": "progress", "message": "waiting for the subagent" }),
-    ));
+    fake.answers_on_call(
+        1,
+        &final_line(json!({ "status": "progress", "message": "waiting for the subagent" })),
+    )
+    .answers_on_call(2, &final_line(json!({ "choice": "ready" })));
+    let sink = Arc::new(RecordingSink::default());
+    let executor = executor(&fake).with_event_sink(sink.clone());
 
-    let error = fail(
+    let result = complete(&executor, agent_action("look around"), &root.workspace()).await;
+
+    assert_eq!(result.output_label, "ready");
+    assert_eq!(fake.calls(), 2, "the run and its continuation");
+    assert!(has_flag(&fake.args(2), "--resume", "fake-session-1"));
+    let types = sink.types();
+    assert!(
+        !types.contains(&"agent_session_failed".to_string()),
+        "{types:?}"
+    );
+    assert_eq!(
+        types
+            .iter()
+            .filter(|t| *t == "agent_session_completed")
+            .count(),
+        2,
+        "each run ends as a completed session: {types:?}"
+    );
+}
+
+/// The continuation keeps the step's own workspace access: the agent has work
+/// left, and is not asked to repair an answer.
+#[tokio::test]
+async fn the_continuation_after_a_progress_note_keeps_the_workspace_access_of_the_step() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers_on_call(
+        1,
+        &final_line(json!({ "status": "progress", "message": "x" })),
+    )
+    .answers_on_call(2, &final_line(json!({ "choice": "ready" })));
+
+    complete(
         &executor(&fake),
         agent_action("look around"),
         &root.workspace(),
     )
     .await;
 
-    assert_eq!(error.error_type.as_deref(), Some("missing_output_label"));
-    assert!(error.message.contains("progress note"), "{}", error.message);
-    let details = error.details.expect("details");
-    assert_eq!(details["harness"], "claude-code");
-    assert_eq!(details["harness_session_id"], "fake-session-1");
+    let first = fake.args(1);
+    let second = fake.args(2);
+    let mode = |args: &[String]| {
+        args.windows(2)
+            .find(|pair| pair[0] == "--permission-mode")
+            .map(|pair| pair[1].clone())
+    };
+    assert_eq!(mode(&second), mode(&first), "the access of the step");
+    assert!(
+        !second
+            .last()
+            .expect("a prompt")
+            .contains("the work is already done"),
+        "a progress note is not finished work"
+    );
+}
+
+/// The runs of one step share its conversation, and a reader follows it by
+/// entry number: the numbers go on across a resumed run, none repeats.
+#[tokio::test]
+async fn a_resumed_run_continues_the_numbering_of_the_conversation() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers_on_call(
+        1,
+        &final_line(json!({ "status": "progress", "message": "x" })),
+    )
+    .answers_on_call(2, &final_line(json!({ "choice": "ready" })));
+    let conversation = ConversationFixture::new(&root);
+
+    let outcome = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Ok(ActionOutcome::Completed(_))),
+        "{outcome:?}"
+    );
+    let numbers: Vec<u64> = conversation
+        .entries(ACTION_EXECUTION_ID)
+        .iter()
+        .map(|entry| entry.entry_number)
+        .collect();
+    let expected: Vec<u64> = (1..=numbers.len() as u64).collect();
+    assert_eq!(numbers, expected, "one sequence for the whole step");
+    assert!(numbers.len() > 4, "both runs are in it: {numbers:?}");
+}
+
+/// There is no limit on progress notes: only the step's timeout ends a long
+/// series (decision of the requirements, R6).
+#[tokio::test]
+async fn a_long_series_of_progress_notes_is_not_limited() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let notes = 8;
+    for call in 1..=notes {
+        fake.answers_on_call(
+            call,
+            &final_line(json!({ "status": "progress", "message": format!("note {call}") })),
+        );
+    }
+    fake.answers_on_call(notes + 1, &final_line(json!({ "choice": "ready" })));
+
+    let result = complete(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+    )
+    .await;
+
+    assert_eq!(result.output_label, "ready");
+    assert_eq!(fake.calls(), notes + 1);
+}
+
+/// The timeout of the step covers all its runs, not each one: a series of
+/// progress notes cannot outlast it by resuming.
+#[tokio::test]
+async fn the_timeout_of_the_step_counts_from_its_first_run() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&final_line(
+        json!({ "status": "progress", "message": "still here" }),
+    ))
+    .sleeps(1);
+
+    let started = std::time::Instant::now();
+    let outcome = execute(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        Some(Duration::from_millis(1500)),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Ok(ActionOutcome::TimedOut(_))),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "one limit for the whole step: {:?}",
+        started.elapsed()
+    );
+    assert!(fake.calls() <= 2, "no run starts after the limit");
 }
 
 #[tokio::test]
@@ -2772,6 +2913,35 @@ async fn an_undeclared_label_is_asked_for_again_instead_of_failing_at_once() {
         "{types:?}"
     );
     assert!(!types.contains(&"action_retrying".to_string()), "{types:?}");
+}
+
+/// A `progress` note never reaches the workflow as a rejected output: the
+/// step completes in one action, and its log shows no failed session, no
+/// rejection and no reprompt.
+#[tokio::test]
+async fn a_progress_note_leaves_no_rejection_in_the_log() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(
+            1,
+            &final_line(json!({ "status": "progress", "message": "reading the code" })),
+        )
+        .answers_on_call(2, &final_line(json!({ "choice": "implemented" })));
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 2);
+    let types = fixture.event_types(&execution.id);
+    for absent in [
+        "agent_session_failed",
+        "action_output_rejected",
+        "output_reprompted",
+        "action_retrying",
+    ] {
+        assert!(!types.contains(&absent.to_string()), "{absent}: {types:?}");
+    }
 }
 
 /// A harness that reported no session cannot be asked again: the action fails
