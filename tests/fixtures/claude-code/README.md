@@ -4,7 +4,7 @@ Te pliki są źródłem prawdy o formacie `claude --print --output-format stream
 dla adaptera `claude-code` (plan `docs/plans/2026-10-16-2343-feat-zunifikowany-model-rozmowy-plan.md`, U1).
 Plik `docs/sources/claude-code-json.md` nie jest źródłem prawdy.
 
-- Wersja CLI: `claude` 2.1.302 (pole `claude_code_version` w `system/init`).
+- Wersja CLI: `claude` 2.1.302 (pole `claude_code_version` w `system/init`); nagrania `noschema_*`: 2.1.311.
 - Model: `sonnet` (`claude-sonnet-5-5`).
 - Data nagrania: 2026-10-16.
 - Katalog roboczy: pusty projekt testowy z plikiem `notes.txt` (`alpha`, `beta`, `gamma needle`)
@@ -50,8 +50,8 @@ albo `awaiting_input`).
 | `schema_resume.ndjson` | `--json-schema <schemat> --resume <sesja schema_done> --permission-mode acceptEdits` | schemat działa po `--resume`; hooki `SessionStart:resume` |
 | `schema_plan_resume.ndjson` | `--json-schema <schemat> --resume <sesja schema_done> --permission-mode plan` | kształt repromptu narsora (tekst `OUTPUT_REPROMPT`) |
 | `schema_plan_fresh.ndjson` | `--json-schema <schemat> --permission-mode plan` | kształt wywołania dyrygenta (nowa sesja, `plan`) |
-| `schema_progress.ndjson` | *(syntetyczne)* `--json-schema <schemat z progress>` | `StructuredOutput` z `status: progress`, potem z `choice: done`; po każdym wywołaniu linia `result` ze `structured_output` |
-| `schema_progress_only.ndjson` | *(syntetyczne)* `--json-schema <schemat z progress>` | sesja kończy się samym `progress`: `structured_output` na linii `result` to `progress`, nie odpowiedź końcowa |
+| `noschema_plain.ndjson` | *(bez `--json-schema`)* `--disallowedTools ScheduleWakeup CronCreate Monitor --permission-mode acceptEdits` | komentarz tekstowy, `Bash`, JSON odpowiedzi w ostatniej wiadomości; jedna sesja, jedna linia `result`, w której `result` to ten JSON (nie ma `structured_output`) |
+| `noschema_background.ndjson` | to samo | zadanie w tle (`Bash` z `run_in_background`), komentarz tekstowy i koniec tury: pierwsza linia `result` to sam tekst, proces żyje; po `task_notification` druga tura (`system/init`) i druga linia `result` z JSON |
 | `schema_mismatch.ndjson` | `--json-schema <schemat> --permission-mode acceptEdits` | prompt żąda labela spoza `enum`; CLI odrzuca wywołanie `StructuredOutput` i model poprawia odpowiedź |
 
 ## Odpowiedzi na pytania odłożone do implementacji
@@ -88,15 +88,21 @@ albo `awaiting_input`).
    `terminal_reason`, `subtype`, `is_error`, `session_id`. Przy `error_max_turns` brak pola `result`,
    jest `errors[]`.
 
-## Nagrania syntetyczne (`progress`)
+## Nagrania bez schematu (`noschema_*`)
 
-`schema_progress.ndjson` i `schema_progress_only.ndjson` zbudowano ręcznie z kształtu
-`schema_done.ndjson` (plan `docs/plans/2026-10-26-001-feat-zamykanie-kroku-agenta-i-progress-plan.md`, U1).
-Nie powstały na żywym `claude`. Schemat ma `status` z wartościami `awaiting_input` i `progress` oraz
-pole `message`. Założenia z dokumentu źródłowego, które te pliki **tylko przyjmują**, a nie
-potwierdzają: API przyjmuje taki schemat; `StructuredOutput` nie kończy sesji; każde wywołanie daje
-własną linię `result` (testy sprawdzają ich liczbę). Nagranie na żywo trzeba zrobić, zanim założenia
-uznamy za potwierdzone; do tego czasu wiedzę o `claude` 2.1.x daje tylko ta uwaga.
+Plan `docs/plans/2026-10-27-0858-feat-agent-bez-json-schema-plan.md`, U4. Nagrane na żywo 2026-10-27:
+`claude` 2.1.311, model `haiku`, pusty katalog, flagi narsora
+(`--print --verbose --permission-prompts none --disallowedTools ScheduleWakeup CronCreate Monitor
+--strict-mcp-config --output-format stream-json --permission-mode acceptEdits`), prompt z tekstowym
+kontraktem wyjścia (JSON `choice` w ostatniej wiadomości, nic po nim). Wnioski:
+
+- Bez schematu tura nie kończy się na komentarzu tekstowym: agent pisze komentarz, woła narzędzia
+  i dopiero potem odpowiada. `--json-schema` zamykał turę na każdym `StructuredOutput`.
+- Odpowiedź jest w polu `result` linii `result` (tekst ostatniej wiadomości). Pola
+  `structured_output` nie ma.
+- Z zadaniem w tle proces nie wychodzi po pierwszej linii `result`. Linia ma sam tekst komentarza
+  (nie jest odpowiedzią końcową). Po zakończeniu zadania CLI zaczyna nową turę (`system/init`,
+  `task_notification`) i wysyła drugą linię `result` z JSON.
 
 ## Maskowanie
 

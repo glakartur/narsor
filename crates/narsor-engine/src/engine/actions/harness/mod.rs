@@ -63,7 +63,7 @@ pub struct HarnessRequest<'a> {
     ///
     /// An addition to the text contract in `prompt`, never a replacement:
     /// `claude-code` passes it as `--json-schema`, and every other adapter
-    /// ignores it.
+    /// ignores it. The conductor sets it; the agent step does not.
     pub output_schema: Option<&'a Value>,
 }
 
@@ -94,9 +94,10 @@ pub struct HarnessRun {
     pub failure: Option<String>,
 
     /// The final answer as the harness validated it against
-    /// [`HarnessRequest::output_schema`], when it reported one. A `progress`
-    /// note is never kept here: it is not an answer. The caller still checks
-    /// it, and falls back to `text` when it is absent or unusable.
+    /// [`HarnessRequest::output_schema`], or the object that closes the text of
+    /// an agent's final message. A later line without an answer never
+    /// replaces it. The caller still checks it, and falls back to `text` when
+    /// it is absent or unusable.
     pub structured_output: Option<Value>,
 
     /// Structured permission denials emitted by Claude Code in the final

@@ -167,8 +167,7 @@ have one, \"recommendation\": \"<the answer you would give>\""
 /// The JSON Schema of the answer the prompt's answer contract describes for
 /// `purpose`, for a harness that can enforce one.
 ///
-/// One flat object, like an agent step's
-/// ([`crate::engine::actions::agent::output_schema`]): the API refuses
+/// One flat object: the API refuses
 /// `anyOf`, `oneOf` and `allOf` at the top level, so the fields of every
 /// decision the purpose allows are optional properties side by side, and
 /// only `decision` is required. Which fields a decision needs is checked by

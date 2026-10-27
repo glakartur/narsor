@@ -27,16 +27,16 @@
 //!   *whole* stream captured, byte for byte, as it happens (U3). `--verbose`
 //!   is required by the CLI for `stream-json` under `--print`; without it the
 //!   command refuses to start.
-//! * `--json-schema <schema>` carries the output contract as a JSON Schema,
-//!   one compact argument that starts with `{`, so it can never be read as a
-//!   flag. The CLI gives the model a `StructuredOutput` tool with that input
-//!   schema, rejects a call that does not match it and lets the model try
-//!   again, and reports the accepted object as `structured_output` on the
-//!   `result` line — also after `--resume` and in `plan` mode. The API
-//!   refuses `anyOf`/`oneOf`/`allOf` at the top level of the schema and
-//!   requires `"type": "object"` there, so the schema is one flat object
-//!   (see [`crate::engine::actions::agent::output_schema`]). The text contract stays in
-//!   the prompt: the schema adds to it, and narsor checks the answer itself.
+//! * `--json-schema <schema>` is passed only when the caller gives an output
+//!   schema (the conductor does; the agent step does not). The CLI then gives
+//!   the model a `StructuredOutput` tool, rejects a call that does not match
+//!   the schema, and reports the accepted object as `structured_output` on the
+//!   `result` line. That tool ends the turn, which is why the agent step
+//!   passes no schema: its answer is the closing JSON object of the last
+//!   message, read from the text of the `result` line (see
+//!   [`crate::engine::actions::agent::closing_answer`]). The API refuses
+//!   `anyOf`/`oneOf`/`allOf` at the top level of a schema and requires
+//!   `"type": "object"` there.
 //! * The flag right before the prompt always takes exactly one value —
 //!   `--permission-mode` when the workflow sets `workspace_access`, else
 //!   `--output-format` — so the prompt can never be read as a flag argument.
@@ -219,22 +219,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     fn stream_parser(&self) -> Box<dyn HarnessStreamParser> {
         Box::new(ClaudeCodeStreamParser::default())
     }
-
-    fn contract_note(&self) -> Option<&str> {
-        Some(CONTRACT_NOTE)
-    }
 }
-
-/// Appended to the output contract: with `--json-schema` the CLI accepts only
-/// what goes through `StructuredOutput`, and answers a plain-text question
-/// with `[structured-output-enforce]` instead of passing it on.
-const CONTRACT_NOTE: &str = "Deliver your answer, and every `awaiting_input` question, \
-through the `StructuredOutput` tool. A question written as plain text does not reach the \
-person. To report progress without ending the step — a comment, a wait for a subagent, a \
-partial result — send {\"status\":\"progress\",\"message\":\"<text>\"} through the same \
-tool. A progress note is not an answer and does not end the step. There is no limit on the \
-number of progress notes. Send the answer with `choice` exactly once, when all your \
-subagents have returned their results.";
 
 /// Reads the `stream-json` lines of one run, live, line by line.
 ///
@@ -265,8 +250,8 @@ struct ClaudeCodeStreamParser {
     reported_error: bool,
     /// The `result` line's `subtype`, for the failure message.
     subtype: Option<String>,
-    /// The latest final answer a `result` line carried. A `progress` note
-    /// or a line with an error never replaces it.
+    /// The latest final answer a `result` line carried. A later line without
+    /// a usable answer, or with an error, never replaces it.
     structured_output: Option<Value>,
     final_answer: Option<FinalAnswer>,
     permission_denials: Vec<PermissionDenial>,
@@ -332,21 +317,34 @@ impl ClaudeCodeStreamParser {
         }
         self.subtype = result.subtype.clone();
         self.reported_error = result.is_error;
-        // A subagent hand-back after the answer ends in a prose-only
-        // `result`; it must not drop the answer. A `progress` note is not
-        // an answer, and neither is anything on an error line. Any other
-        // object is kept — an answer the engine will reject, or the
-        // conductor's own shape — but only a usable answer is a final one
-        // that ends the step.
-        if let Some(value) = result
-            .structured_output
-            .as_ref()
-            .filter(|value| !result.is_error && !agent::is_progress_note(value))
-        {
-            self.structured_output = Some(value.clone());
-            self.final_answer = agent::final_answer_kind(value);
-        }
+        // The conductor's answer arrives as `structured_output`, an agent's
+        // as the closing object of the text. A later `result` line without
+        // an answer (a subagent hand-back, a note while a background task
+        // runs) never drops the answer already kept. An answer on an error
+        // line is none. Any object is kept as it comes — an answer the
+        // engine will reject, or the conductor's own shape — but only a
+        // usable answer is a final one that ends the step.
+        let answered = if result.is_error {
+            None
+        } else if let Some(value) = &result.structured_output {
+            Some((value.clone(), agent::final_answer_kind(value)))
+        } else {
+            result
+                .text
+                .as_deref()
+                .and_then(agent::closing_answer)
+                .map(|(value, kind)| (value, Some(kind)))
+        };
         self.permission_denials = result.permission_denials.clone();
+        let Some((value, kind)) = answered else {
+            // Neither the answer nor the text it came from is replaced.
+            if result.is_error || self.structured_output.is_none() {
+                self.result_text = result.text.clone().unwrap_or_default();
+            }
+            return;
+        };
+        self.structured_output = Some(value);
+        self.final_answer = kind;
         self.result_text = result.text.clone().unwrap_or_default();
     }
 }

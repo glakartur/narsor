@@ -13,12 +13,12 @@
 //!    the step's variables and artifacts are. D19
 //!    calls this "forcing structure on the agent"; forcing it starts with
 //!    saying it.
-//! 2. **Read robustly, guess never.** A harness that enforces
-//!    [`output_schema`] (Claude Code) reports the answer as a structured
-//!    output, which is read first and checked by the same rules. Otherwise —
-//!    or when it is unusable — the text is read. Agents wrap JSON in prose,
-//!    in fences, or in both. [`extract_output`] takes the *last* JSON object anywhere in the
-//!    answer that has a `choice` key, read by the parser scripts share
+//! 2. **Read robustly, guess never.** No step passes an output schema to its
+//!    harness: the answer is the JSON object that closes the agent's last
+//!    message, read from its text. (A harness that reports a structured
+//!    output anyway has it read first and checked by the same rules.) Agents
+//!    wrap JSON in prose, in fences, or in both. [`extract_output`] takes the
+//!    *last* JSON object anywhere in the answer that has a `choice` key, read by the parser scripts share
 //!    ([`super::answer`]). When there is none, the action fails
 //!    ([`ActionError`]) — it never falls back to `success`. In an unattended
 //!    pipeline a guessed label is a silently wrong transition, which is a far
@@ -53,8 +53,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use narsor_protocol::chat::{
-    summary_line, ChatElement, QuestionSource, TechnicalCategory, UnclassifiedReason,
-    SUMMARY_MAX_CHARS,
+    summary_line, ChatElement, QuestionSource, TechnicalCategory,
+    UnclassifiedReason, SUMMARY_MAX_CHARS,
 };
 use serde_json::{Map, Value};
 use std::process::ExitStatus;
@@ -184,57 +184,8 @@ fn required_names(kind: &str, names: &[String]) -> String {
     format!("  - Required {kind}: {}\n", names.join(", "))
 }
 
-/// Builds the JSON Schema of the answer [`output_contract`] describes, for a
-/// harness that can enforce one (`claude-code` passes it as `--json-schema`).
-///
-/// One flat object with the optional fields of both answers — a `choice`
-/// with its `reason`, `variables`, `artifacts`, `additional_data` and
-/// `additional_artifacts`, or `status: awaiting_input` with a `question` and
-/// `options` — and nothing required (KTD2). The two answers are not two
-/// `anyOf` branches because the API refuses `anyOf`, `oneOf` and `allOf` at
-/// the top level of a schema (measured on `claude` 2.1.302, see
-/// `tests/fixtures/claude-code/README.md`). So the schema only narrows the
-/// answer: which of the two it is, and whether it is complete — `reason`
-/// and what a choice requires included — is checked by narsor itself, the
-/// same way as an answer read from text.
-///
-/// `choice` is limited to the declared labels; with none declared, any
-/// string is allowed, as the text contract then asks for the label the task
-/// names.
-pub fn output_schema(contract: &StepContract<'_>) -> Value {
-    let mut choice = serde_json::json!({ "type": "string" });
-    if !contract.choices.is_empty() {
-        let labels: Vec<&str> = contract
-            .choices
-            .iter()
-            .map(|choice| choice.label.as_str())
-            .collect();
-        choice["enum"] = serde_json::json!(labels);
-    }
-
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "choice": choice,
-            "reason": { "type": "string" },
-            "variables": { "type": "object" },
-            "artifacts": { "type": "object", "additionalProperties": { "type": "string" } },
-            "additional_data": { "type": "object" },
-            "additional_artifacts": { "type": "array", "items": { "type": "string" } },
-            "status": { "type": "string", "enum": [AWAITING_INPUT, PROGRESS] },
-            "question": { "type": "string" },
-            "message": { "type": "string" },
-            "options": { "type": "array", "items": { "type": "string" } },
-        },
-        "additionalProperties": false,
-    })
-}
-
 /// The `status` of an answer that asks a person before the task continues.
 const AWAITING_INPUT: &str = "awaiting_input";
-
-/// The `status` of a note that is not an answer: the step goes on after it.
-const PROGRESS: &str = "progress";
 
 /// The `error_type` of an answer no output label could be extracted from — a
 /// format error the engine answers with a reprompt, not with `retry_policy`
@@ -251,22 +202,6 @@ pub const OUTPUT_REPROMPT: &str = "Your previous reply could not be used by the 
 because it did not end with a valid output object. Do not continue the task and do not \
 change any files: the work is already done. Reply only with the JSON object described \
 below, choosing the label that describes the work you already did.";
-
-/// How many times the engine resumes a session that ended on a `progress`
-/// note before it hands the step to the conductor.
-pub const MAX_PROGRESS_CONTINUATIONS: u32 = 5;
-
-/// The key of an [`MISSING_OUTPUT_LABEL`] error's `details` that says the run
-/// ended on a `progress` note: the agent has not finished the step, and the
-/// engine resumes it instead of asking for a label of work already done.
-pub const PROGRESS_ONLY_DETAIL: &str = "progress_only";
-
-/// What the engine says to an agent whose turn the harness closed on a
-/// `progress` note (a harness may end the turn on any answer it is given).
-pub const PROGRESS_CONTINUATION: &str = "Your previous turn ended on a progress note, so \
-the harness closed it before the step was done. A progress note is not an answer. Continue \
-the step from where you stopped. Send another progress note only if you must stop again. \
-When the step is done, reply with the JSON object described below.";
 
 /// The configuration of the engine's reprompt of an agent (KTD7).
 ///
@@ -291,20 +226,6 @@ pub fn reprompt_config(
         Value::String(harness_session.to_string()),
     );
     config
-}
-
-/// The configuration of the engine's continuation of an agent whose turn ended
-/// on a `progress` note.
-///
-/// Unlike [`reprompt_config`] it keeps the action's workspace access: the
-/// agent has work left to do, and is not asked to repair the form of work
-/// already done.
-pub fn progress_continuation_config(
-    original: &AgentActionConfig,
-    harness: &str,
-    harness_session: &str,
-) -> AgentActionConfig {
-    continuation_config(original, harness, harness_session, PROGRESS_CONTINUATION)
 }
 
 /// What follows the conductor's own words when it asks the agent again
@@ -613,7 +534,7 @@ impl ActionExecutor for AgentExecutor {
         &'a self,
         request: ActionRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
-        Box::pin(async move { self.run(request).await })
+        Box::pin(self.run(request))
     }
 }
 
@@ -676,7 +597,6 @@ impl AgentExecutor {
             config.prompt,
             output_contract(&request.contract, adapter.contract_note())
         );
-        let schema = output_schema(&request.contract);
         let workspace = Path::new(&request.workspace.path);
 
         // Opened before `invocation` (Key Technical Decisions): even an
@@ -691,7 +611,7 @@ impl AgentExecutor {
             prompt: &prompt,
             workspace,
             resume_session: resume,
-            output_schema: Some(&schema),
+            output_schema: None,
         }) {
             Ok(invocation) => invocation,
             Err(error) => {
@@ -1601,22 +1521,28 @@ fn read_response(run: &HarnessRun) -> Result<AgentResponse, ActionError> {
     extract_response(&run.text)
 }
 
-/// Whether `value` is a `progress` note: a status report that is not an
-/// answer and must not stand in for one.
-pub(crate) fn is_progress_note(value: &Value) -> bool {
-    value.get("status").and_then(Value::as_str) == Some(PROGRESS)
-}
-
 /// What kind of final answer `value` is, by the same rule [`read_response`]
-/// uses: `None` for a `progress` note and for anything else that is not an
-/// answer. A label the state does not declare is still a final answer; the
-/// engine rejects it later.
+/// uses: `None` for anything that is not an answer. A label the state does
+/// not declare is still a final answer; the engine rejects it later.
 pub(crate) fn final_answer_kind(value: &Value) -> Option<FinalAnswer> {
     match structured_response(value) {
         Ok(AgentResponse::Completed(_)) => Some(FinalAnswer::Choice),
         Ok(AgentResponse::AwaitingInput { .. }) => Some(FinalAnswer::AwaitingInput),
         Err(_) => None,
     }
+}
+
+/// The final answer a harness's text ends with, and what kind it is: the
+/// output-contract object that closes the text (the contract says "nothing
+/// after it"), when it makes a usable answer.
+///
+/// Stricter than [`extract_response`] on purpose: a harness ends the step on
+/// this, so an example object quoted in the middle of a message must not.
+pub(crate) fn closing_answer(text: &str) -> Option<(Value, FinalAnswer)> {
+    let (_, object) = final_contract(text)?;
+    let value = serde_json::from_str::<Value>(object).ok()?;
+    let kind = final_answer_kind(&value)?;
+    Some((value, kind))
 }
 
 /// Reads an answer from a harness's `structured_output` value, by the same
@@ -1678,19 +1604,10 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         .rev()
         .find_map(|value| value.as_object().filter(|object| is_answer_object(object)))
     else {
-        let progress = objects.iter().rev().any(is_progress_note);
-        let mut error = no_label_error(
-            if progress {
-                "the agent's last answer was a progress note, not a final answer"
-            } else {
-                "the agent's answer contains JSON, but no object with a string 'choice' key"
-            },
+        return Err(no_label_error(
+            "the agent's answer contains JSON, but no object with a string 'choice' key",
             text,
-        );
-        if progress {
-            mark_progress_only(&mut error);
-        }
-        return Err(error);
+        ));
     };
 
     response_from_object(object).map_err(|reason| no_label_error(reason, text))
@@ -1760,14 +1677,6 @@ fn no_label_error(reason: &str, text: &str) -> ActionError {
         details: Some(serde_json::json!({
             "answer_tail": super::harness::tail(text, FAILED_EXTRACTION_QUOTE_BYTES),
         })),
-    }
-}
-
-/// Says in the details of an extraction failure that the run ended on a
-/// `progress` note ([`PROGRESS_ONLY_DETAIL`]).
-fn mark_progress_only(error: &mut ActionError) {
-    if let Some(Value::Object(details)) = error.details.as_mut() {
-        details.insert(PROGRESS_ONLY_DETAIL.to_string(), Value::Bool(true));
     }
 }
 
@@ -1932,6 +1841,11 @@ fn clean_reply(text: &str) -> Option<String> {
 /// before it never hides it. At most [`MAX_BRACE_CANDIDATES`] braces are
 /// tried.
 fn final_contract_start(text: &str) -> Option<usize> {
+    final_contract(text).map(|(cut, _)| cut)
+}
+
+/// [`final_contract_start`], with the text of the closing object as well.
+fn final_contract(text: &str) -> Option<(usize, &str)> {
     let trimmed = text.trim_end();
     let (body, fenced) = match trimmed.strip_suffix("```") {
         Some(rest) => (rest.trim_end(), true),
@@ -1949,7 +1863,7 @@ fn final_contract_start(text: &str) -> Option<usize> {
             continue;
         }
         if !fenced {
-            return Some(start);
+            return Some((start, &body[start..]));
         }
         let before = body[..start].trim_end();
         let opening = before.strip_suffix("```").or_else(|| {
@@ -1961,7 +1875,7 @@ fn final_contract_start(text: &str) -> Option<usize> {
         });
         // A closing fence that does not wrap the object belongs to
         // something else.
-        return opening.map(str::len);
+        return opening.map(|opening| (opening.len(), &body[start..]));
     }
     None
 }
@@ -2067,28 +1981,6 @@ mod json_object_tests {
             label_of("{\"choice\":\"first\"} then { and {\"choice\":\"second\"}"),
             "second"
         );
-    }
-
-    fn progress_only_of(text: &str) -> Option<bool> {
-        let error = extract_response(text).expect_err("no answer");
-        error
-            .details
-            .as_ref()
-            .and_then(|details| details.get(super::PROGRESS_ONLY_DETAIL))
-            .and_then(serde_json::Value::as_bool)
-    }
-
-    #[test]
-    fn a_run_that_ends_on_a_progress_note_is_marked_progress_only() {
-        assert_eq!(
-            progress_only_of("{\"status\":\"progress\",\"message\":\"I read the code\"}"),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn a_run_without_a_label_or_a_progress_note_is_not_marked() {
-        assert_eq!(progress_only_of("{\"reason\":\"no label\"}"), None);
     }
 }
 

@@ -23,10 +23,9 @@ waits in `input_needed`; the person answers with `i` in the TUI or with
 `narsor input`, and the engine runs the same step again in the same agent
 session. The prompts forbid a question tool such as `AskUserQuestion`, which
 cannot work without a terminal. The workflows use only the contract word
-`awaiting_input`. How the answer reaches the engine depends on the harness: the
-`claude-code` adapter adds a note to the output contract (`contract_note`) that
-the answer and every question go through the `StructuredOutput` tool. `codex`
-and `opencode` add nothing. Timeouts are longer than in the original
+`awaiting_input`. Every harness gets the same text contract: the answer and
+every question are the JSON object that closes the last message of the agent
+(`claude-code` is run without `--json-schema`, D69). Timeouts are longer than in the original
 (`globals.timeout: 12h`, 3h for the dialogue steps).
 
 `compound-engineering-debug.yaml` has these gates: `review_diagnosis` (`fix`,

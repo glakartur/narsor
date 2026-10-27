@@ -155,6 +155,9 @@ pub enum PromptPurpose {
     /// A follow-up asking the agent to fix an answer that broke the output
     /// contract.
     Reprompt,
+    /// Written only by older versions, to resume an agent after a `progress`
+    /// note. Kept so old records stay readable.
+    Continuation,
     /// A prompt to the conductor.
     Conductor,
     #[serde(other)]
@@ -349,6 +352,7 @@ impl ChatElement {
             Self::Prompt { text, purpose, .. } => match purpose {
                 PromptPurpose::Step => first_line(text).to_owned(),
                 PromptPurpose::Reprompt => format!("reprompt: {}", first_line(text)),
+                PromptPurpose::Continuation => format!("continue: {}", first_line(text)),
                 PromptPurpose::Conductor => format!("conductor: {}", first_line(text)),
                 PromptPurpose::Unrecognized => first_line(text).to_owned(),
             },
@@ -602,6 +606,12 @@ mod tests {
         assert_eq!(source, QuestionSource::Unrecognized);
         let status: ToolResultStatus = serde_json::from_str("\"partial\"").unwrap();
         assert_eq!(status, ToolResultStatus::Unrecognized);
+    }
+
+    #[test]
+    fn the_continuation_purpose_of_older_records_still_loads() {
+        let purpose: PromptPurpose = serde_json::from_str("\"continuation\"").unwrap();
+        assert_eq!(purpose, PromptPurpose::Continuation);
     }
 
     #[test]

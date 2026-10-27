@@ -198,6 +198,14 @@ impl ConversationWriter {
         if let Some(parent) = path.parent() {
             ensure_dir(parent)?;
         }
+        // A file that already has entries — a step resumed after a `progress`
+        // note writes to the conversation it began — goes on from its last
+        // number: a reader follows the file by entry number.
+        let next_entry = match fs::read(&path) {
+            Ok(existing) => existing.iter().filter(|byte| **byte == b'\n').count() as u64 + 1,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => 1,
+            Err(source) => return Err(PersistenceError::io(&path, source)),
+        };
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -207,7 +215,7 @@ impl ConversationWriter {
         Ok(Self {
             file,
             path,
-            next_entry: 1,
+            next_entry,
         })
     }
 

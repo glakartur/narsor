@@ -949,7 +949,7 @@ fn only_the_prose_after_the_last_tool_call_is_the_reply() {
 }
 
 // ---------------------------------------------------------------------------
-// `progress` notes and the final answer (synthetic recordings)
+// The final answer (structured output, or the closing object of the text)
 // ---------------------------------------------------------------------------
 
 use narsor_engine::engine::actions::harness::FinalAnswer;
@@ -977,36 +977,11 @@ fn feed(lines: &[String]) -> Box<dyn narsor_engine::engine::actions::harness::Ha
 }
 
 #[test]
-fn progress_calls_are_classified_and_summarised() {
-    let summaries: Vec<String> = tool_calls(&classify_all(&recording("schema_progress.ndjson")))
-        .into_iter()
-        .filter(|(_, tool, _)| tool == "StructuredOutput")
-        .map(|(_, _, summary)| summary)
-        .collect();
-    assert_eq!(
-        summaries,
-        ["progress: waiting for the subagent", "choice: done"]
-    );
-    assert!(classify_all(&recording("schema_progress.ndjson"))
-        .iter()
-        .all(|element| !matches!(element, ChatElement::Unclassified { .. })));
-}
-
-#[test]
 fn a_progress_without_a_message_is_summarised_by_its_status() {
     assert_eq!(
         call_summary("StructuredOutput", json!({"status": "progress"})),
         "progress"
     );
-}
-
-#[test]
-fn the_recording_with_progress_has_one_result_line_per_answer() {
-    let results = recording("schema_progress.ndjson")
-        .iter()
-        .filter(|line| line.contains(r#""type":"result""#))
-        .count();
-    assert_eq!(results, 2);
 }
 
 #[test]
@@ -1036,27 +1011,6 @@ fn a_prose_result_is_not_a_final_answer() {
 }
 
 #[test]
-fn a_progress_after_the_answer_does_not_replace_it() {
-    let parser = feed(&[
-        result_line(Some(json!({"choice": "done"})), false),
-        result_line(Some(json!({"status": "progress", "message": "x"})), false),
-    ]);
-    assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
-    let run = parser.finish(0, "");
-    assert_eq!(run.structured_output, Some(json!({"choice": "done"})));
-}
-
-#[test]
-fn an_answer_after_a_progress_is_the_structured_output() {
-    let run = feed(&[
-        result_line(Some(json!({"status": "progress", "message": "x"})), false),
-        result_line(Some(json!({"choice": "done"})), false),
-    ])
-    .finish(0, "");
-    assert_eq!(run.structured_output, Some(json!({"choice": "done"})));
-}
-
-#[test]
 fn an_error_result_is_not_a_final_answer() {
     let parser = feed(&[result_line(Some(json!({"choice": "done"})), true)]);
     assert_eq!(parser.final_answer(), None);
@@ -1071,14 +1025,124 @@ fn a_label_the_state_does_not_declare_is_still_a_final_answer() {
     assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
 }
 
+/// A `result` line of a run without a schema: the answer is in the text only.
+fn text_result_line(text: &str) -> String {
+    json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "session-1",
+        "result": text,
+    })
+    .to_string()
+}
+
 #[test]
-fn a_session_that_ends_in_a_progress_has_no_structured_output() {
-    let mut parser = parser();
-    for line in recording("schema_progress_only.ndjson") {
-        parser.on_stdout_line(line.as_bytes());
-    }
-    assert_eq!(parser.final_answer(), None);
+fn an_object_closing_the_text_is_a_final_answer() {
+    let parser = feed(&[text_result_line(
+        "I wrote the file.\n{\"choice\":\"done\",\"reason\":\"ok\"}",
+    )]);
+    assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
     let run = parser.finish(0, "");
-    assert_eq!(run.structured_output, None);
-    assert!(run.text.contains("progress"), "{}", run.text);
+    assert_eq!(
+        run.structured_output,
+        Some(json!({"choice": "done", "reason": "ok"}))
+    );
+}
+
+#[test]
+fn a_closing_question_is_a_final_answer_only_when_it_asks_something() {
+    let asking = feed(&[text_result_line(
+        r#"{"status":"awaiting_input","question":"Which one?"}"#,
+    )]);
+    assert_eq!(asking.final_answer(), Some(FinalAnswer::AwaitingInput));
+
+    let empty = feed(&[text_result_line(
+        r#"{"status":"awaiting_input","question":""}"#,
+    )]);
+    assert_eq!(empty.final_answer(), None);
+}
+
+#[test]
+fn a_json_block_closing_the_text_is_a_final_answer() {
+    let parser = feed(&[text_result_line(
+        "Done.\n```json\n{\"choice\":\"done\"}\n```",
+    )]);
+    assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
+}
+
+#[test]
+fn text_without_an_answer_is_not_a_final_answer() {
+    assert_eq!(
+        feed(&[text_result_line("Waiting for the task.")]).final_answer(),
+        None
+    );
+}
+
+#[test]
+fn an_object_followed_by_prose_is_not_a_final_answer() {
+    let parser = feed(&[text_result_line(
+        r#"The format is {"choice":"done"}, and I go on."#,
+    )]);
+    assert_eq!(parser.final_answer(), None);
+    assert_eq!(parser.finish(0, "").structured_output, None);
+}
+
+#[test]
+fn a_text_answer_on_an_error_line_is_no_answer() {
+    let mut line: Value =
+        serde_json::from_str(&text_result_line(r#"{"choice":"done"}"#)).expect("json");
+    line["is_error"] = json!(true);
+    let parser = feed(&[line.to_string()]);
+    assert_eq!(parser.final_answer(), None);
+}
+
+#[test]
+fn a_later_text_without_an_answer_keeps_the_answer_of_an_earlier_line() {
+    let parser = feed(&[
+        text_result_line(r#"{"choice":"done"}"#),
+        text_result_line("The subagent is back."),
+    ]);
+    assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
+    let run = parser.finish(0, "");
+    assert_eq!(run.structured_output, Some(json!({"choice": "done"})));
+}
+
+#[test]
+fn a_recording_without_a_schema_ends_on_the_json_of_its_last_message() {
+    let run = run_of("noschema_plain.ndjson");
+
+    assert_eq!(run.failure, None);
+    let output = run.structured_output.expect("the closing object");
+    assert_eq!(output["choice"], "done");
+    assert!(
+        classify_all(&recording("noschema_plain.ndjson"))
+            .iter()
+            .all(|element| !matches!(element, ChatElement::Unclassified { .. }))
+    );
+}
+
+/// With a task in the background the session outlives its first `result`
+/// line: that line is text only, and the answer comes with the second one.
+#[test]
+fn a_recording_with_background_work_answers_only_on_its_second_result_line() {
+    let lines = recording("noschema_background.ndjson");
+    let results: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(r#""type":"result""#))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(results.len(), 2, "two result lines");
+
+    let mut parser = parser();
+    for (index, line) in lines.iter().enumerate() {
+        parser.on_stdout_line(line.as_bytes());
+        if index == results[0] {
+            assert_eq!(parser.final_answer(), None, "no answer yet");
+        }
+    }
+    assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
+    let run = parser.finish(0, "");
+    assert_eq!(run.structured_output.expect("an answer")["choice"], "done");
 }
