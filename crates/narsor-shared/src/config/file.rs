@@ -447,7 +447,7 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
         }
 
         SettingKey::AgentHarness => {
-            let supported = ["claude-code", "codex", "opencode"];
+            let supported = ["claude-code", "codex", "github-copilot", "opencode"];
             if supported.contains(&text) {
                 Ok(SettingValue::Text(text.to_string()))
             } else {

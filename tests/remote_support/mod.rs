@@ -113,7 +113,12 @@ impl RemoteHarness {
         let harness_selector = if harness_selector {
             let selector = DefaultHarnessSelector::load(
                 StatePaths::new(root.path()),
-                vec!["claude-code".into(), "codex".into(), "opencode".into()],
+                vec![
+                    "claude-code".into(),
+                    "codex".into(),
+                    "github-copilot".into(),
+                    "opencode".into(),
+                ],
                 "claude-code",
             )
             .await

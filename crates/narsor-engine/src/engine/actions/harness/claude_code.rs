@@ -213,6 +213,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         Ok(HarnessInvocation {
             program: self.program.clone(),
             args,
+            stdin: None,
         })
     }
 

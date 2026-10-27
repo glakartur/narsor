@@ -143,7 +143,12 @@ impl Harness {
             Some(Arc::new(
                 DefaultHarnessSelector::load(
                     StatePaths::new(root.path()),
-                    vec!["claude-code".into(), "codex".into(), "opencode".into()],
+                    vec![
+                        "claude-code".into(),
+                        "codex".into(),
+                        "github-copilot".into(),
+                        "opencode".into(),
+                    ],
                     "claude-code",
                 )
                 .await

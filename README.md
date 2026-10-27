@@ -780,7 +780,7 @@ returns.
 analyze:
   action:
     type: agent
-    harness: claude-code          # optional; or: codex, opencode
+    harness: claude-code          # optional; or: codex, github-copilot, opencode
     model: opus                   # optional, passed through verbatim
     workspace_access: read-only   # optional; default: read-write
     prompt: |

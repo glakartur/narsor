@@ -298,7 +298,7 @@ Uruchamia agenta AI (np. Claude Code, Codex, OpenCode).
 ```yaml
 action:
   type: agent
-  harness: <claude-code|codex|opencode> # Opcjonalne — bez niego harness instalacji:
+  harness: <claude-code|codex|github-copilot|opencode> # Opcjonalne — bez niego harness instalacji:
                                       # wybór operatora (`narsor harness default set`, `h` w TUI),
                                       # inaczej konfiguracja (`agent_harness`, patrz README →
                                       # Configuration), a w jej braku `claude-code`.

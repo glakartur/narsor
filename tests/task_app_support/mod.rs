@@ -610,7 +610,7 @@ pub fn harness_selection(
 }
 
 /// The harnesses a daemon of the tests supports, in its order.
-pub const HARNESSES: [&str; 3] = ["claude-code", "codex", "opencode"];
+pub const HARNESSES: [&str; 4] = ["claude-code", "codex", "github-copilot", "opencode"];
 
 /// An `Interrupted` task whose loss the control plane counted as `losses`
 /// in a row, lost from `from`; `planned` says an automatic resume is due.

@@ -266,7 +266,12 @@ async fn harness_settings_are_authenticated_and_return_authoritative_snapshots()
     let selector = Arc::new(
         DefaultHarnessSelector::load(
             StatePaths::new(root.path()),
-            vec!["claude-code".into(), "codex".into(), "opencode".into()],
+            vec![
+                "claude-code".into(),
+                "codex".into(),
+                "github-copilot".into(),
+                "opencode".into(),
+            ],
             "claude-code",
         )
         .await
@@ -310,7 +315,12 @@ async fn invalid_harness_setting_is_typed_and_does_not_change_the_snapshot() {
     let selector = Arc::new(
         DefaultHarnessSelector::load(
             StatePaths::new(root.path()),
-            vec!["claude-code".into(), "codex".into(), "opencode".into()],
+            vec![
+                "claude-code".into(),
+                "codex".into(),
+                "github-copilot".into(),
+                "opencode".into(),
+            ],
             "claude-code",
         )
         .await
