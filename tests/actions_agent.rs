@@ -22,7 +22,7 @@ use narsor_engine::domain::{
     EventData, ExecutionStatus, RepromptedBy, VariableDefinition, Workspace, WorkspaceAccess,
 };
 use narsor_engine::engine::actions::agent::{
-    output_contract, output_schema, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
+    output_contract, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
 };
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
@@ -660,93 +660,28 @@ async fn an_answer_without_any_json_is_an_error_and_never_a_guessed_label() {
     );
 }
 
-/// A `progress` note is not an error. A harness may end its turn on it
-/// (Claude Code does when nothing runs in the background), so the executor
-/// resumes the session itself and goes on listening: the step is one action,
-/// with no failed session and no rejected output on the way.
-#[tokio::test]
-async fn a_progress_note_ends_the_run_but_not_the_action() {
-    let root = TempRoot::new();
-    let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers_on_call(
-        1,
-        &final_line(json!({ "status": "progress", "message": "waiting for the subagent" })),
-    )
-    .answers_on_call(2, &final_line(json!({ "choice": "ready" })));
-    let sink = Arc::new(RecordingSink::default());
-    let executor = executor(&fake).with_event_sink(sink.clone());
-
-    let result = complete(&executor, agent_action("look around"), &root.workspace()).await;
-
-    assert_eq!(result.output_label, "ready");
-    assert_eq!(fake.calls(), 2, "the run and its continuation");
-    assert!(has_flag(&fake.args(2), "--resume", "fake-session-1"));
-    let types = sink.types();
-    assert!(
-        !types.contains(&"agent_session_failed".to_string()),
-        "{types:?}"
-    );
-    assert_eq!(
-        types
-            .iter()
-            .filter(|t| *t == "agent_session_completed")
-            .count(),
-        2,
-        "each run ends as a completed session: {types:?}"
-    );
-}
-
-/// The continuation keeps the step's own workspace access: the agent has work
-/// left, and is not asked to repair an answer.
-#[tokio::test]
-async fn the_continuation_after_a_progress_note_keeps_the_workspace_access_of_the_step() {
-    let root = TempRoot::new();
-    let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers_on_call(
-        1,
-        &final_line(json!({ "status": "progress", "message": "x" })),
-    )
-    .answers_on_call(2, &final_line(json!({ "choice": "ready" })));
-
-    complete(
-        &executor(&fake),
-        agent_action("look around"),
-        &root.workspace(),
-    )
-    .await;
-
-    let first = fake.args(1);
-    let second = fake.args(2);
-    let mode = |args: &[String]| {
-        args.windows(2)
-            .find(|pair| pair[0] == "--permission-mode")
-            .map(|pair| pair[1].clone())
-    };
-    assert_eq!(mode(&second), mode(&first), "the access of the step");
-    assert!(
-        !second
-            .last()
-            .expect("a prompt")
-            .contains("the work is already done"),
-        "a progress note is not finished work"
-    );
-}
-
 /// The runs of one step share its conversation, and a reader follows it by
 /// entry number: the numbers go on across a resumed run, none repeats.
 #[tokio::test]
 async fn a_resumed_run_continues_the_numbering_of_the_conversation() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers_on_call(
-        1,
-        &final_line(json!({ "status": "progress", "message": "x" })),
-    )
-    .answers_on_call(2, &final_line(json!({ "choice": "ready" })));
+    fake.answers_on_call(1, &envelope("Nothing to report."))
+        .answers_on_call(2, &final_line(json!({ "choice": "ready" })));
     let conversation = ConversationFixture::new(&root);
+    let executor = executor(&fake);
 
+    let first = execute_with_conversation(
+        &executor,
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await;
+    assert!(first.is_err(), "a run without an answer is a format error");
     let outcome = execute_with_conversation(
-        &executor(&fake),
+        &executor,
         agent_action("look around"),
         &root.workspace(),
         &conversation,
@@ -766,64 +701,6 @@ async fn a_resumed_run_continues_the_numbering_of_the_conversation() {
     let expected: Vec<u64> = (1..=numbers.len() as u64).collect();
     assert_eq!(numbers, expected, "one sequence for the whole step");
     assert!(numbers.len() > 4, "both runs are in it: {numbers:?}");
-}
-
-/// There is no limit on progress notes: only the step's timeout ends a long
-/// series (decision of the requirements, R6).
-#[tokio::test]
-async fn a_long_series_of_progress_notes_is_not_limited() {
-    let root = TempRoot::new();
-    let fake = FakeHarness::install(root.dir("bin"));
-    let notes = 8;
-    for call in 1..=notes {
-        fake.answers_on_call(
-            call,
-            &final_line(json!({ "status": "progress", "message": format!("note {call}") })),
-        );
-    }
-    fake.answers_on_call(notes + 1, &final_line(json!({ "choice": "ready" })));
-
-    let result = complete(
-        &executor(&fake),
-        agent_action("look around"),
-        &root.workspace(),
-    )
-    .await;
-
-    assert_eq!(result.output_label, "ready");
-    assert_eq!(fake.calls(), notes + 1);
-}
-
-/// The timeout of the step covers all its runs, not each one: a series of
-/// progress notes cannot outlast it by resuming.
-#[tokio::test]
-async fn the_timeout_of_the_step_counts_from_its_first_run() {
-    let root = TempRoot::new();
-    let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&final_line(
-        json!({ "status": "progress", "message": "still here" }),
-    ))
-    .sleeps(1);
-
-    let started = std::time::Instant::now();
-    let outcome = execute(
-        &executor(&fake),
-        agent_action("look around"),
-        &root.workspace(),
-        Some(Duration::from_millis(1500)),
-    )
-    .await;
-
-    assert!(
-        matches!(outcome, Ok(ActionOutcome::TimedOut(_))),
-        "{outcome:?}"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "one limit for the whole step: {:?}",
-        started.elapsed()
-    );
-    assert!(fake.calls() <= 2, "no run starts after the limit");
 }
 
 #[tokio::test]
@@ -1798,45 +1675,31 @@ fn the_contract_ends_with_the_harness_note() {
     assert!(contract.ends_with("\ndeliver it this way"), "{contract}");
 }
 
-/// AE4: `claude-code` tells the agent about `StructuredOutput`, `codex` does not.
+/// The agent step gives no harness an output schema, and `claude-code` adds no
+/// note of its own to the contract: its prompt is the same text contract as
+/// the one `codex` gets.
 #[tokio::test]
-async fn covers_ae4_only_the_claude_code_prompt_names_structured_output() {
-    let claude_prompt = prompt_sent_with_choices(&[]).await;
-    assert!(
-        claude_prompt.contains("StructuredOutput"),
-        "{claude_prompt}"
-    );
-    assert!(
-        claude_prompt.contains("does not reach the person"),
-        "{claude_prompt}"
-    );
-    assert!(
-        claude_prompt.contains(r#"{"status":"progress","message":"<text>"}"#),
-        "{claude_prompt}"
-    );
-    assert!(
-        claude_prompt.contains("`choice` exactly once"),
-        "{claude_prompt}"
-    );
+async fn the_claude_code_prompt_carries_the_plain_text_contract_and_no_schema() {
+    assert_eq!(ClaudeCodeAdapter::default().contract_note(), None);
 
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&codex_stream("thread-1", r#"{"choice":"ready"}"#));
-    let executor = AgentExecutor::with_harnesses(
-        HarnessRegistry::defaults()
-            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
-    );
-    let mut config = agent_action("look around");
-    config.harness = Some("codex".to_string());
-    complete(&executor, config, &root.workspace()).await;
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+    complete(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+    )
+    .await;
 
-    let codex_prompt = fake.args(1).join("\n");
-    assert!(codex_prompt.contains("awaiting_input"), "{codex_prompt}");
-    assert!(!codex_prompt.contains("StructuredOutput"), "{codex_prompt}");
-    assert!(!codex_prompt.contains("\"progress\""), "{codex_prompt}");
-    assert!(
-        codex_prompt.contains("`choice` exactly once"),
-        "{codex_prompt}"
+    let args = fake.args(1);
+    assert!(!args.iter().any(|arg| arg == "--json-schema"), "{args:?}");
+    assert_eq!(
+        args.last().expect("a prompt"),
+        &format!(
+            "look around{}",
+            output_contract(&StepContract::default(), None)
+        )
     );
 }
 
@@ -2065,17 +1928,16 @@ async fn a_harness_that_exits_in_the_grace_period_is_not_terminated() {
     );
 }
 
-/// A `progress` note is not an answer: the harness is left running until its
+/// AE2: a `result` line with text and no answer does not end the step: the
+/// harness may still wait for a background task. It is left running until its
 /// time limit.
 #[tokio::test]
-async fn a_progress_note_does_not_end_the_step() {
+async fn a_text_without_an_answer_does_not_end_the_step() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     let conversation = ConversationFixture::new(&root);
-    fake.answers(&final_line(
-        json!({ "status": "progress", "message": "waiting for the subagent" }),
-    ))
-    .sleeps(600);
+    fake.answers(&format!("{}\n", envelope("Waiting for the background task.")))
+        .sleeps(600);
     let executor = executor(&fake).with_final_answer_grace(TEST_GRACE);
 
     let (outcome, elapsed) = run_timed(
@@ -2092,6 +1954,88 @@ async fn a_progress_note_does_not_end_the_step() {
         "{outcome:?}"
     );
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+}
+
+/// AE1: the answer closing the text of a `result` line ends the step, though
+/// the harness itself keeps running (here: for 600 s).
+#[tokio::test]
+async fn an_answer_closing_the_text_ends_the_step_early() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&format!(
+        "{}\n",
+        envelope("I wrote the file.\n{\"choice\":\"done\",\"reason\":\"ok\"}")
+    ))
+    .sleeps(600);
+    let executor = executor(&fake).with_final_answer_grace(TEST_GRACE);
+
+    let (outcome, elapsed) = run_timed(
+        &executor,
+        &conversation,
+        agent_action("work"),
+        &root.workspace(),
+        Some(Duration::from_secs(60)),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Ok(ActionOutcome::Completed(_))),
+        "{outcome:?}"
+    );
+    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+}
+
+/// An example object quoted in the middle of a message, with prose after it,
+/// is not a final answer: the step is not ended early on it.
+#[tokio::test]
+async fn an_example_object_followed_by_prose_does_not_end_the_step() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&format!(
+        "{}\n",
+        envelope("The format is {\"choice\":\"done\"}, and I am still working on it.")
+    ))
+    .sleeps(600);
+    let executor = executor(&fake).with_final_answer_grace(TEST_GRACE);
+
+    let (outcome, _) = run_timed(
+        &executor,
+        &conversation,
+        agent_action("work"),
+        &root.workspace(),
+        Some(Duration::from_secs(2)),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Ok(ActionOutcome::TimedOut(_))),
+        "{outcome:?}"
+    );
+}
+
+/// KTD3: a later `result` line without an answer (prose after a hand-back)
+/// does not take away the answer an earlier line carried.
+#[tokio::test]
+async fn a_later_line_without_an_answer_keeps_the_answer_of_an_earlier_one() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&format!(
+        "{}\n{}\n",
+        envelope(r#"{"choice":"ready"}"#),
+        envelope("Thanks, the subagent is back."),
+    ));
+
+    let result = complete(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+    )
+    .await;
+
+    assert_eq!(result.output_label, "ready");
+    assert_eq!(fake.calls(), 1, "no reprompt");
 }
 
 /// A question does not end the step while `--resume` after a kill is
@@ -2913,35 +2857,6 @@ async fn an_undeclared_label_is_asked_for_again_instead_of_failing_at_once() {
         "{types:?}"
     );
     assert!(!types.contains(&"action_retrying".to_string()), "{types:?}");
-}
-
-/// A `progress` note never reaches the workflow as a rejected output: the
-/// step completes in one action, and its log shows no failed session, no
-/// rejection and no reprompt.
-#[tokio::test]
-async fn a_progress_note_leaves_no_rejection_in_the_log() {
-    let fixture = EngineFixture::new();
-    fixture
-        .fake
-        .answers_on_call(
-            1,
-            &final_line(json!({ "status": "progress", "message": "reading the code" })),
-        )
-        .answers_on_call(2, &final_line(json!({ "choice": "implemented" })));
-
-    let execution = run_reprompt_workflow(&fixture).await;
-
-    assert_eq!(execution.status, ExecutionStatus::Completed);
-    assert_eq!(fixture.fake.calls(), 2);
-    let types = fixture.event_types(&execution.id);
-    for absent in [
-        "agent_session_failed",
-        "action_output_rejected",
-        "output_reprompted",
-        "action_retrying",
-    ] {
-        assert!(!types.contains(&absent.to_string()), "{absent}: {types:?}");
-    }
 }
 
 /// A harness that reported no session cannot be asked again: the action fails
@@ -4141,27 +4056,12 @@ fn structured_envelope(text: &str, structured: Value) -> String {
     .to_string()
 }
 
-fn properties_of(schema: &Value) -> &Value {
-    &schema["properties"]
-}
-
 /// The `done`/`blocked` outputs of the schema tests.
 fn two_labels() -> [ChoiceDefinition; 2] {
     [
         ChoiceDefinition::new("done"),
         ChoiceDefinition::new("blocked"),
     ]
-}
-
-/// The schema passed with `--json-schema` in `args`, parsed, and where the
-/// flag stands.
-fn json_schema_arg(args: &[String]) -> (usize, Value) {
-    let flag = args
-        .iter()
-        .position(|arg| arg == "--json-schema")
-        .unwrap_or_else(|| panic!("no --json-schema in {args:?}"));
-    let schema = serde_json::from_str(&args[flag + 1]).expect("the schema is JSON");
-    (flag, schema)
 }
 
 /// Runs an agent action with `choices` declared.
@@ -4200,7 +4100,7 @@ fn agent_questions(entries: &[ConversationEntry]) -> Vec<(ConversationSource, Ch
 }
 
 #[tokio::test]
-async fn a_claude_step_passes_its_labels_as_a_json_schema_before_the_permission_mode() {
+async fn a_claude_step_passes_no_json_schema_and_lists_its_labels_in_the_prompt() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(r#"{"choice":"done"}"#));
@@ -4216,56 +4116,14 @@ async fn a_claude_step_passes_its_labels_as_a_json_schema_before_the_permission_
     .expect("the action runs");
 
     let args = fake.args(1);
-    let (flag, schema) = json_schema_arg(&args);
-    assert_eq!(schema["type"], "object");
-    assert_eq!(
-        schema["properties"]["choice"]["enum"],
-        json!(["done", "blocked"])
-    );
-    assert_eq!(
-        schema["properties"]["status"]["enum"],
-        json!(["awaiting_input", "progress"])
-    );
-    assert_eq!(
-        properties_of(&schema)["message"],
-        json!({ "type": "string" })
-    );
-    assert_eq!(schema["additionalProperties"], false);
-    let properties = &schema["properties"];
-    assert_eq!(properties["reason"], json!({ "type": "string" }));
-    assert_eq!(
-        properties["artifacts"],
-        json!({ "type": "object", "additionalProperties": { "type": "string" } })
-    );
-    assert_eq!(properties["additional_data"], json!({ "type": "object" }));
-    assert_eq!(
-        properties["additional_artifacts"],
-        json!({ "type": "array", "items": { "type": "string" } })
-    );
-    for old in ["output", "data"] {
-        assert!(properties.get(old).is_none(), "{old} in {schema}");
-    }
-    for keyword in ["anyOf", "oneOf", "allOf", "required"] {
-        assert!(schema.get(keyword).is_none(), "{keyword} in {schema}");
-    }
-
+    assert!(!args.iter().any(|arg| arg == "--json-schema"), "{args:?}");
     let mode = args
         .iter()
         .position(|arg| arg == "--permission-mode")
         .expect("a permission mode");
-    assert!(flag < mode, "{args:?}");
     assert_eq!(mode + 2, args.len() - 1, "the prompt is still last");
-
-    // The text contract stays in the prompt.
     let prompt = args.last().expect("a prompt");
     assert!(prompt.contains("- `done`\n- `blocked`\n"), "{prompt}");
-}
-
-#[test]
-fn without_declared_outputs_the_schema_allows_any_label() {
-    let schema = output_schema(&StepContract::default());
-
-    assert_eq!(schema["properties"]["choice"], json!({ "type": "string" }));
 }
 
 #[tokio::test]
@@ -4414,30 +4272,23 @@ async fn a_question_in_the_text_is_recorded_as_a_narsor_agent_question() {
     );
 }
 
-/// AE5: with neither a structured output nor JSON in the text, the engine
-/// asks the same session again — and the reprompt carries the schema too.
+/// AE3, AE5: with no JSON in the text, the engine asks the same session
+/// again, read-only, and takes the answer of the second run.
 #[tokio::test]
-async fn covers_ae5_without_any_answer_the_reprompt_also_carries_the_schema() {
+async fn covers_ae5_without_any_answer_the_reprompt_resumes_the_session_read_only() {
     let fixture = EngineFixture::new();
     fixture
         .fake
         .answers_on_call(1, &envelope("Done, nothing more to say."))
-        .answers_on_call(
-            2,
-            &structured_envelope("Here it is.", json!({ "choice": "implemented" })),
-        );
+        .answers_on_call(2, &envelope(r#"{"choice":"implemented"}"#));
 
     let execution = run_reprompt_workflow(&fixture).await;
 
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(fixture.fake.calls(), 2, "one attempt and one reprompt");
     for call in [1, 2] {
-        let (_, schema) = json_schema_arg(&fixture.fake.args(call));
-        assert_eq!(
-            schema["properties"]["choice"]["enum"],
-            json!(["implemented", "needs_human_decision"]),
-            "call {call}"
-        );
+        let args = fixture.fake.args(call);
+        assert!(!args.iter().any(|arg| arg == "--json-schema"), "call {call}");
     }
     let second = fixture.fake.args(2);
     assert!(
@@ -4575,11 +4426,12 @@ async fn the_real_claude_binary_resumes_a_session_killed_after_its_question() {
     // when it continues the same conversation, set `KILL_AFTER_QUESTION`.
 }
 
-/// Drives the actual `claude` binary with two labels: the label comes from
-/// its `structured_output` (U5). Ignored for the same reasons as above.
+/// Drives the actual `claude` binary without a schema, with a task in the
+/// background: the step ends on the JSON closing the last message, read from
+/// the text, in one session. Ignored for the same reasons as above.
 #[tokio::test]
 #[ignore = "drives the real `claude` binary: costs money, needs credentials"]
-async fn the_real_claude_binary_answers_through_the_json_schema() {
+async fn the_real_claude_binary_answers_in_the_closing_json_of_its_text() {
     if which("claude").is_none() {
         eprintln!("skipping: `claude` is not on PATH");
         return;
@@ -4587,9 +4439,12 @@ async fn the_real_claude_binary_answers_through_the_json_schema() {
 
     let root = TempRoot::new();
     let mut config = agent_action(
-        "Do not use any tools. The work is already done: finish with the label 'done'.",
+        "Start `sleep 6; echo DONE > bg.txt` with Bash in the background (run_in_background). \
+         Write one sentence of comment that you wait for it and end your turn without calling \
+         a tool. When the task has finished, read bg.txt with `cat` and finish with the label \
+         'done'.",
     );
-    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    config.model = Some("haiku".to_string());
     let conversation = ConversationFixture::new(&root);
 
     let outcome = execute_with_choices(
@@ -4606,18 +4461,24 @@ async fn the_real_claude_binary_answers_through_the_json_schema() {
         panic!("expected a completed action, got {outcome:?}");
     };
     assert_eq!(result.output_label, "done");
-    let structured = conversation
+    let has_structured_output = conversation
         .entries(ACTION_EXECUTION_ID)
         .iter()
         .flat_map(|entry| entry.elements.clone())
-        .find_map(|element| match element {
-            ChatElement::RunResult {
-                structured_output, ..
-            } => structured_output,
-            _ => None,
-        })
-        .expect("the run result carries a structured output");
-    assert_eq!(structured["choice"], "done");
+        .any(|element| {
+            matches!(
+                element,
+                ChatElement::RunResult {
+                    structured_output: Some(_),
+                    ..
+                }
+            )
+        });
+    assert!(!has_structured_output, "no schema, so no structured output");
+    assert!(
+        root.path().join("bg.txt").exists(),
+        "the background task was not cut short"
+    );
 }
 
 /// The first entry of `PATH` holding an executable called `name`.

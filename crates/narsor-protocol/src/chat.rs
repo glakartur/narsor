@@ -155,8 +155,9 @@ pub enum PromptPurpose {
     /// A follow-up asking the agent to fix an answer that broke the output
     /// contract.
     Reprompt,
-    /// A follow-up resuming an agent whose turn the harness closed on a
-    /// `progress` note: the step is not done, and the agent carries on.
+    /// A follow-up resuming an agent to carry on with its work. The engine
+    /// writes it for an operator's answer; older records also carry it for
+    /// the `progress` notes that no longer exist, so it stays readable.
     Continuation,
     /// A prompt to the conductor.
     Conductor,
