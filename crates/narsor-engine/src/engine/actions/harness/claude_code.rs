@@ -250,8 +250,8 @@ struct ClaudeCodeStreamParser {
     reported_error: bool,
     /// The `result` line's `subtype`, for the failure message.
     subtype: Option<String>,
-    /// The latest final answer a `result` line carried. A `progress` note
-    /// or a line with an error never replaces it.
+    /// The latest final answer a `result` line carried. A later line without
+    /// a usable answer, or with an error, never replaces it.
     structured_output: Option<Value>,
     final_answer: Option<FinalAnswer>,
     permission_denials: Vec<PermissionDenial>,

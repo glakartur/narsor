@@ -155,9 +155,8 @@ pub enum PromptPurpose {
     /// A follow-up asking the agent to fix an answer that broke the output
     /// contract.
     Reprompt,
-    /// A follow-up resuming an agent to carry on with its work. The engine
-    /// writes it for an operator's answer; older records also carry it for
-    /// the `progress` notes that no longer exist, so it stays readable.
+    /// Written only by older versions, to resume an agent after a `progress`
+    /// note. Kept so old records stay readable.
     Continuation,
     /// A prompt to the conductor.
     Conductor,
@@ -607,6 +606,12 @@ mod tests {
         assert_eq!(source, QuestionSource::Unrecognized);
         let status: ToolResultStatus = serde_json::from_str("\"partial\"").unwrap();
         assert_eq!(status, ToolResultStatus::Unrecognized);
+    }
+
+    #[test]
+    fn the_continuation_purpose_of_older_records_still_loads() {
+        let purpose: PromptPurpose = serde_json::from_str("\"continuation\"").unwrap();
+        assert_eq!(purpose, PromptPurpose::Continuation);
     }
 
     #[test]
