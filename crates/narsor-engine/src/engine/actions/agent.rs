@@ -72,7 +72,8 @@ use uuid::Uuid;
 
 use super::answer::{self, ChoiceAnswer};
 use super::harness::{
-    FinalAnswer, HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun, HarnessStreamParser,
+    github_copilot::DEFAULT_PROGRAM as GITHUB_COPILOT_PROGRAM, FinalAnswer, HarnessAdapter,
+    HarnessRegistry, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
 use super::process_group::{self, GroupGuard};
@@ -1070,7 +1071,7 @@ async fn run_harness_invocation_with_sdk(
     conversation: &ConversationSink,
     sdk_runtime: &dyn CopilotSdkBackend,
 ) -> Result<SpawnEnding, ActionError> {
-    if program == "copilot-sdk" && args.first().is_some_and(|arg| arg == "agent") {
+    if program == GITHUB_COPILOT_PROGRAM && args.first().is_some_and(|arg| arg == "agent") {
         return run_copilot_sdk(
             args,
             working_dir,
@@ -2012,9 +2013,6 @@ fn last_contract_span(text: &str) -> Option<(usize, usize)> {
         .find(|&(start, end)| is_contract(&text[start..end]))
 }
 
-/// Run an agent through the GitHub Copilot Rust SDK.
-///
-/// The SDK manages the Copilot runtime and its JSON-RPC connection.
 #[allow(clippy::too_many_arguments)]
 async fn run_copilot_sdk(
     args: &[String],
