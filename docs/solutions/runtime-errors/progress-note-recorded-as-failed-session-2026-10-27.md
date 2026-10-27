@@ -87,7 +87,7 @@ Other changes in the same fix:
 ## Risks and open points
 
 - With no limit, a series of notes lasts until `timeout_secs`. A step with no timeout can loop for as long as the agent sends notes. Each note costs a resumed session.
-- Dropping `--json-schema` and reading JSON from plain text was proposed. It would remove the need for `progress` (the note exists only to get around the schema enforcement), but it is a larger change: the output contract, `awaiting_input` as text, the fixtures and the conductor. It needs its own brainstorm and an experiment with the real CLI. It is not part of this fix.
+- Dropping `--json-schema` and reading JSON from plain text, which would remove the need for `progress`: done in D69 (`docs/plans/2026-10-27-0858-feat-agent-bez-json-schema-plan.md`). The step passes no schema, `progress` and the resume after it are gone. This document describes the state before that change.
 - Memory note `claude-code-structuredoutput-ends-turn` was incomplete. The table above is the full picture.
 
 ## Prevention
