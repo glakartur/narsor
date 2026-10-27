@@ -51,6 +51,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
 use chrono::Utc;
 use narsor_protocol::chat::{
     summary_line, ChatElement, QuestionSource, TechnicalCategory,
@@ -636,9 +637,10 @@ impl AgentExecutor {
         );
         session.status = AgentSessionStatus::Running;
 
-        let ending = spawn_and_wait(
+        let ending = run_harness_invocation(
             &invocation.program,
             &invocation.args,
+            invocation.stdin.as_deref(),
             workspace,
             Some(request.action_execution_id),
             request.timeout,
@@ -1008,15 +1010,55 @@ pub(crate) async fn run_harness_process(
     limit: Option<Duration>,
     parser: Box<dyn HarnessStreamParser>,
 ) -> Result<SpawnEnding, ActionError> {
-    spawn_and_wait(
+    run_harness_invocation(
         program,
         args,
+        None,
         working_dir,
         None,
         limit,
         FINAL_ANSWER_GRACE,
         parser,
         &ConversationSink::none(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_harness_invocation(
+    program: &str,
+    args: &[String],
+    stdin_content: Option<&str>,
+    working_dir: &Path,
+    action_execution_id: Option<&str>,
+    limit: Option<Duration>,
+    grace: Duration,
+    parser: Box<dyn HarnessStreamParser>,
+    conversation: &ConversationSink,
+) -> Result<SpawnEnding, ActionError> {
+    if program == "copilot-sdk" && args.first().is_some_and(|arg| arg == "agent") {
+        return run_copilot_sdk(
+            args,
+            working_dir,
+            action_execution_id,
+            limit,
+            grace,
+            parser,
+            conversation,
+        )
+        .await;
+    }
+
+    spawn_and_wait(
+        program,
+        args,
+        stdin_content,
+        working_dir,
+        action_execution_id,
+        limit,
+        grace,
+        parser,
+        conversation,
     )
     .await
 }
@@ -1072,6 +1114,7 @@ type Joined = (io::Result<()>, io::Result<()>, io::Result<ExitStatus>);
 async fn spawn_and_wait(
     program: &str,
     args: &[String],
+    stdin_content: Option<&str>,
     working_dir: &Path,
     action_execution_id: Option<&str>,
     limit: Option<Duration>,
@@ -1085,7 +1128,7 @@ async fn spawn_and_wait(
         command.env(ACTION_ID_ENV_VAR, action_execution_id);
     }
     command
-        .stdin(Stdio::null())
+        .stdin(if stdin_content.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
@@ -1095,6 +1138,14 @@ async fn spawn_and_wait(
         .await
         .map_err(|error| spawn_error(program, working_dir, &error))?;
     let mut group = GroupGuard::new(child.id());
+
+    if let Some(content) = stdin_content {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(content.as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
+    }
 
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
@@ -1925,6 +1976,126 @@ fn last_contract_span(text: &str) -> Option<(usize, usize)> {
         .into_iter()
         .rev()
         .find(|&(start, end)| is_contract(&text[start..end]))
+}
+
+/// Run an agent using GitHub Copilot SDK via JSON-RPC.
+///
+/// This is Phase 2 implementation. The Copilot SDK is run as a subprocess
+/// (`copilot agent`) and communicates with us via JSON-RPC over stdio.
+/// We maintain the same interface as other harnesses but the underlying
+/// communication goes through the SDK.
+async fn run_copilot_sdk(
+    args: &[String],
+    working_dir: &Path,
+    action_execution_id: Option<&str>,
+    limit: Option<Duration>,
+    grace: Duration,
+    parser: Box<dyn HarnessStreamParser>,
+    conversation: &ConversationSink,
+) -> Result<SpawnEnding, ActionError> {
+    // Decode SDK configuration from args
+    if args.len() < 2 {
+        return Err(ActionError {
+            message: "copilot-sdk invocation requires encoded configuration".to_string(),
+            error_type: Some("sdk_config_error".to_string()),
+            details: None,
+        });
+    }
+
+    let config_b64 = &args[1];
+    let config_bytes = base64::engine::general_purpose::STANDARD
+        .decode(config_b64)
+        .map_err(|e| ActionError {
+            message: format!("failed to decode SDK configuration: {}", e),
+            error_type: Some("sdk_config_error".to_string()),
+            details: None,
+        })?;
+
+    let config_str = String::from_utf8(config_bytes).map_err(|e| ActionError {
+        message: format!("SDK configuration is not valid UTF-8: {}", e),
+        error_type: Some("sdk_config_error".to_string()),
+        details: None,
+    })?;
+
+    let config: Value = serde_json::from_str(&config_str).map_err(|e| ActionError {
+        message: format!("failed to parse SDK configuration: {}", e),
+        error_type: Some("sdk_config_error".to_string()),
+        details: None,
+    })?;
+
+    // Extract the prompt (required)
+    let prompt = config
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ActionError {
+            message: "SDK configuration missing 'prompt' field".to_string(),
+            error_type: Some("sdk_config_error".to_string()),
+            details: None,
+        })?;
+
+    // Extract optional parameters
+    let model = config.get("model").and_then(|v| v.as_str());
+    let session_id = config.get("session_id").and_then(|v| v.as_str());
+
+    // Build copilot agent command with SDK flags
+    let mut sdk_args = vec![
+        "agent".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--allow-all-tools".to_string(),
+    ];
+
+    if let Some(m) = model {
+        sdk_args.extend(["--model".to_string(), m.to_string()]);
+    }
+
+    if let Some(sid) = session_id {
+        sdk_args.extend(["--session".to_string(), sid.to_string()]);
+    }
+
+    // Use the existing spawn_and_wait infrastructure, sending prompt via stdin
+    spawn_and_wait(
+        "copilot",
+        &sdk_args,
+        Some(prompt),
+        working_dir,
+        action_execution_id,
+        limit,
+        grace,
+        parser,
+        conversation,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod copilot_sdk_dispatch_tests {
+    use super::{run_harness_invocation, ConversationSink, FINAL_ANSWER_GRACE};
+    use crate::engine::actions::harness::{GitHubCopilotAdapter, HarnessAdapter};
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn agent_spawn_routes_the_copilot_sdk_marker_to_its_runtime() {
+        let adapter = GitHubCopilotAdapter::new();
+        let error = match run_harness_invocation(
+            "copilot-sdk",
+            &["agent".to_string()],
+            None,
+            Path::new("."),
+            None,
+            None,
+            FINAL_ANSWER_GRACE,
+            adapter.stream_parser(),
+            &ConversationSink::none(),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("missing SDK configuration must be rejected"),
+        };
+
+        assert_eq!(error.error_type.as_deref(), Some("sdk_config_error"));
+    }
 }
 
 #[cfg(test)]
