@@ -43,6 +43,7 @@
 //! engine's own `emit` does. Without a sink (a direct unit test) the run is
 //! unchanged and the events simply go nowhere.
 
+use std::fmt::Display;
 use std::future::Future;
 use std::io;
 use std::path::Path;
@@ -53,6 +54,11 @@ use std::time::Duration;
 
 use base64::Engine;
 use chrono::Utc;
+use futures::future::BoxFuture;
+use github_copilot_sdk::{
+    CliProgram, Client, ClientOptions, MessageOptions, ResumeSessionConfig, SessionConfig,
+    SessionId,
+};
 use narsor_protocol::chat::{
     summary_line, ChatElement, QuestionSource, TechnicalCategory,
     UnclassifiedReason, SUMMARY_MAX_CHARS,
@@ -1036,15 +1042,43 @@ async fn run_harness_invocation(
     parser: Box<dyn HarnessStreamParser>,
     conversation: &ConversationSink,
 ) -> Result<SpawnEnding, ActionError> {
+    run_harness_invocation_with_sdk(
+        program,
+        args,
+        stdin_content,
+        working_dir,
+        action_execution_id,
+        limit,
+        grace,
+        parser,
+        conversation,
+        &GitHubCopilotSdkRuntime::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_harness_invocation_with_sdk(
+    program: &str,
+    args: &[String],
+    stdin_content: Option<&str>,
+    working_dir: &Path,
+    action_execution_id: Option<&str>,
+    limit: Option<Duration>,
+    grace: Duration,
+    parser: Box<dyn HarnessStreamParser>,
+    conversation: &ConversationSink,
+    sdk_runtime: &dyn CopilotSdkBackend,
+) -> Result<SpawnEnding, ActionError> {
     if program == "copilot-sdk" && args.first().is_some_and(|arg| arg == "agent") {
         return run_copilot_sdk(
             args,
             working_dir,
             action_execution_id,
             limit,
-            grace,
             parser,
             conversation,
+            sdk_runtime,
         )
         .await;
     }
@@ -1978,22 +2012,19 @@ fn last_contract_span(text: &str) -> Option<(usize, usize)> {
         .find(|&(start, end)| is_contract(&text[start..end]))
 }
 
-/// Run an agent using GitHub Copilot SDK via JSON-RPC.
+/// Run an agent through the GitHub Copilot Rust SDK.
 ///
-/// This is Phase 2 implementation. The Copilot SDK is run as a subprocess
-/// (`copilot agent`) and communicates with us via JSON-RPC over stdio.
-/// We maintain the same interface as other harnesses but the underlying
-/// communication goes through the SDK.
+/// The SDK manages the Copilot runtime and its JSON-RPC connection.
+#[allow(clippy::too_many_arguments)]
 async fn run_copilot_sdk(
     args: &[String],
     working_dir: &Path,
     action_execution_id: Option<&str>,
     limit: Option<Duration>,
-    grace: Duration,
     parser: Box<dyn HarnessStreamParser>,
     conversation: &ConversationSink,
+    sdk_runtime: &dyn CopilotSdkBackend,
 ) -> Result<SpawnEnding, ActionError> {
-    // Decode SDK configuration from args
     if args.len() < 2 {
         return Err(ActionError {
             message: "copilot-sdk invocation requires encoded configuration".to_string(),
@@ -2023,7 +2054,6 @@ async fn run_copilot_sdk(
         details: None,
     })?;
 
-    // Extract the prompt (required)
     let prompt = config
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -2032,47 +2062,300 @@ async fn run_copilot_sdk(
             error_type: Some("sdk_config_error".to_string()),
             details: None,
         })?;
-
-    // Extract optional parameters
-    let model = config.get("model").and_then(|v| v.as_str());
-    let session_id = config.get("session_id").and_then(|v| v.as_str());
-
-    // Build copilot agent command with SDK flags
-    let mut sdk_args = vec![
-        "agent".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
-        "--allow-all-tools".to_string(),
-    ];
-
-    if let Some(m) = model {
-        sdk_args.extend(["--model".to_string(), m.to_string()]);
-    }
-
-    if let Some(sid) = session_id {
-        sdk_args.extend(["--session".to_string(), sid.to_string()]);
-    }
-
-    // Use the existing spawn_and_wait infrastructure, sending prompt via stdin
-    spawn_and_wait(
-        "copilot",
-        &sdk_args,
-        Some(prompt),
-        working_dir,
-        action_execution_id,
+    let request = CopilotSdkRequest {
+        prompt: prompt.to_string(),
+        model: config
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        session_id: config
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        working_dir: working_dir.to_path_buf(),
+        action_execution_id: action_execution_id.map(str::to_string),
         limit,
-        grace,
-        parser,
-        conversation,
-    )
-    .await
+    };
+
+    match sdk_runtime.run(request).await? {
+        CopilotSdkOutcome::TimedOut => Ok(SpawnEnding::TimedOut),
+        CopilotSdkOutcome::Finished(response) => {
+            let mut parser = parser;
+            feed_copilot_sdk_record(
+                &mut parser,
+                conversation,
+                serde_json::json!({"type": "session", "session_id": response.session_id}),
+            );
+            if let Some(text) = &response.text {
+                feed_copilot_sdk_record(
+                    &mut parser,
+                    conversation,
+                    serde_json::json!({"type": "assistant", "content": text}),
+                );
+            }
+            feed_copilot_sdk_record(
+                &mut parser,
+                conversation,
+                serde_json::json!({
+                    "type": "result",
+                    "session_id": response.session_id,
+                    "text": response.text,
+                    "success": true
+                }),
+            );
+            Ok(SpawnEnding::Finished(FinishedRun {
+                run: parser.finish(0, ""),
+                exit_code: 0,
+                stderr: String::new(),
+                terminated_group: None,
+            }))
+        }
+    }
+}
+
+fn feed_copilot_sdk_record(
+    parser: &mut Box<dyn HarnessStreamParser>,
+    conversation: &ConversationSink,
+    record: Value,
+) {
+    let line = record.to_string();
+    let elements = parser.on_stdout_line(line.as_bytes());
+    conversation.append(ConversationSource::Stdout, line.as_bytes(), &elements);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopilotSdkRequest {
+    prompt: String,
+    model: Option<String>,
+    session_id: Option<String>,
+    working_dir: std::path::PathBuf,
+    action_execution_id: Option<String>,
+    limit: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopilotSdkResponse {
+    session_id: String,
+    text: Option<String>,
+}
+
+fn copilot_sdk_wait_timeout(limit: Option<Duration>) -> Duration {
+    // The SDK defaults an omitted timeout to 60 seconds; Tokio treats this
+    // unrepresentably distant deadline as far-future.
+    limit.unwrap_or(Duration::MAX)
+}
+
+async fn run_with_sdk_deadline<F: Future>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await,
+        None => Ok(future.await),
+    }
+}
+
+enum CopilotSdkOutcome {
+    Finished(CopilotSdkResponse),
+    TimedOut,
+}
+
+trait CopilotSdkBackend: Send + Sync {
+    fn run<'a>(
+        &'a self,
+        request: CopilotSdkRequest,
+    ) -> BoxFuture<'a, Result<CopilotSdkOutcome, ActionError>>;
+}
+
+struct GitHubCopilotSdkRuntime {
+    program: CliProgram,
+}
+
+impl Default for GitHubCopilotSdkRuntime {
+    fn default() -> Self {
+        Self {
+            program: CliProgram::Resolve,
+        }
+    }
+}
+
+impl CopilotSdkBackend for GitHubCopilotSdkRuntime {
+    fn run<'a>(
+        &'a self,
+        request: CopilotSdkRequest,
+    ) -> BoxFuture<'a, Result<CopilotSdkOutcome, ActionError>> {
+        Box::pin(async move {
+            let mut options = ClientOptions::default();
+            options.program = self.program.clone();
+            options.working_directory = request.working_dir.clone();
+            if let Some(action_execution_id) = &request.action_execution_id {
+                options
+                    .env
+                    .push((ACTION_ID_ENV_VAR.into(), action_execution_id.into()));
+            }
+
+            let deadline = request
+                .limit
+                .and_then(|limit| tokio::time::Instant::now().checked_add(limit));
+            let client = match run_with_sdk_deadline(deadline, Client::start(options)).await {
+                Ok(Ok(client)) => client,
+                Ok(Err(error)) => {
+                    return Err(copilot_sdk_error("failed to start Copilot SDK", error));
+                }
+                Err(_) => return Ok(CopilotSdkOutcome::TimedOut),
+            };
+            let wait_timeout = copilot_sdk_wait_timeout(request.limit);
+            let run_client = client.clone();
+            let run = async move {
+                let session = if let Some(session_id) = request.session_id {
+                    let mut config = ResumeSessionConfig::new(SessionId::new(session_id))
+                        .with_working_directory(request.working_dir.clone())
+                        .approve_all_permissions();
+                    if let Some(model) = request.model {
+                        config = config.with_model(model);
+                    }
+                    run_client.resume_session(config).await
+                } else {
+                    let mut config = SessionConfig::default()
+                        .with_working_directory(request.working_dir.clone())
+                        .approve_all_permissions();
+                    if let Some(model) = request.model {
+                        config = config.with_model(model);
+                    }
+                    run_client.create_session(config).await
+                }
+                .map_err(|error| {
+                    copilot_sdk_error("failed to create Copilot SDK session", error)
+                })?;
+
+                let session_id = session.id().to_string();
+                let response = session
+                    .send_and_wait(
+                        MessageOptions::new(request.prompt).with_wait_timeout(wait_timeout),
+                    )
+                    .await
+                    .map_err(|error| copilot_sdk_error("Copilot SDK request failed", error));
+                let disconnect = session.disconnect().await.map_err(|error| {
+                    copilot_sdk_error("failed to disconnect Copilot SDK session", error)
+                });
+                let response = match (response, disconnect) {
+                    (Ok(response), Ok(())) => response,
+                    (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+                    (Err(error), Err(cleanup_error)) => {
+                        return Err(combine_sdk_errors(error, cleanup_error));
+                    }
+                };
+                Ok(CopilotSdkResponse {
+                    session_id,
+                    text: response.and_then(|event| {
+                        event
+                            .data
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    }),
+                })
+            };
+
+            let run_and_stop = async {
+                let response = run.await;
+                let stop = client
+                    .stop()
+                    .await
+                    .map_err(|error| copilot_sdk_error("failed to stop Copilot SDK", error));
+
+                match (response, stop) {
+                    (Ok(response), Ok(())) => Ok(response),
+                    (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+                    (Err(error), Err(stop_error)) => Err(combine_sdk_errors(error, stop_error)),
+                }
+            };
+
+            match run_with_sdk_deadline(deadline, run_and_stop).await {
+                Ok(Ok(response)) => Ok(CopilotSdkOutcome::Finished(response)),
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    client.force_stop();
+                    Ok(CopilotSdkOutcome::TimedOut)
+                }
+            }
+        })
+    }
+}
+
+fn copilot_sdk_error(context: &str, error: impl Display) -> ActionError {
+    ActionError {
+        message: format!("{context}: {error}"),
+        error_type: Some("sdk_runtime_error".to_string()),
+        details: None,
+    }
+}
+
+fn combine_sdk_errors(primary: ActionError, cleanup: ActionError) -> ActionError {
+    ActionError {
+        message: format!(
+            "{}; cleanup also failed: {}",
+            primary.message, cleanup.message
+        ),
+        error_type: primary.error_type,
+        details: primary.details,
+    }
 }
 
 #[cfg(test)]
 mod copilot_sdk_dispatch_tests {
-    use super::{run_harness_invocation, ConversationSink, FINAL_ANSWER_GRACE};
+    use super::{
+        copilot_sdk_wait_timeout, run_harness_invocation, run_harness_invocation_with_sdk,
+        run_with_sdk_deadline, ConversationSink, CopilotSdkBackend, CopilotSdkOutcome,
+        CopilotSdkRequest, CopilotSdkResponse, SpawnEnding, FINAL_ANSWER_GRACE,
+    };
     use crate::engine::actions::harness::{GitHubCopilotAdapter, HarnessAdapter};
+    use base64::Engine;
+    use futures::future::BoxFuture;
     use std::path::Path;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn copilot_sdk_deadline_covers_all_lifecycle_phases() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        let result = run_with_sdk_deadline(Some(deadline), async {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        assert!(result.is_err(), "the shared deadline should expire");
+    }
+
+    #[test]
+    fn copilot_sdk_wait_has_no_sixty_second_cap_without_action_timeout() {
+        assert_eq!(copilot_sdk_wait_timeout(None), Duration::MAX);
+        assert_eq!(
+            copilot_sdk_wait_timeout(Some(Duration::from_secs(12))),
+            Duration::from_secs(12)
+        );
+    }
+
+    struct MockCopilotSdk {
+        request: Mutex<Option<CopilotSdkRequest>>,
+    }
+
+    impl CopilotSdkBackend for MockCopilotSdk {
+        fn run<'a>(
+            &'a self,
+            request: CopilotSdkRequest,
+        ) -> BoxFuture<'a, Result<CopilotSdkOutcome, crate::domain::ActionError>> {
+            *self.request.lock().unwrap() = Some(request);
+            Box::pin(async {
+                Ok(CopilotSdkOutcome::Finished(CopilotSdkResponse {
+                    session_id: "sdk-session".to_string(),
+                    text: Some("hello".to_string()),
+                }))
+            })
+        }
+    }
 
     #[tokio::test]
     async fn agent_spawn_routes_the_copilot_sdk_marker_to_its_runtime() {
@@ -2095,6 +2378,107 @@ mod copilot_sdk_dispatch_tests {
         };
 
         assert_eq!(error.error_type.as_deref(), Some("sdk_config_error"));
+    }
+
+    #[tokio::test]
+    async fn copilot_sdk_dispatch_uses_sdk_backend_with_prompt_model_and_resume_session() {
+        let adapter = GitHubCopilotAdapter::new();
+        let config = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::json!({
+                "prompt": "Reply with a short greeting",
+                "model": "gpt-4",
+                "session_id": "resume-me"
+            })
+            .to_string(),
+        );
+        let sdk = MockCopilotSdk {
+            request: Mutex::new(None),
+        };
+        let result = run_harness_invocation_with_sdk(
+            "copilot-sdk",
+            &["agent".to_string(), config],
+            None,
+            Path::new("."),
+            Some("action-123"),
+            None,
+            FINAL_ANSWER_GRACE,
+            adapter.stream_parser(),
+            &ConversationSink::none(),
+            &sdk,
+        )
+        .await
+        .expect("Copilot SDK invocation");
+
+        match result {
+            SpawnEnding::Finished(finished) => {
+                assert!(
+                    finished.run.failure.is_none(),
+                    "the SDK response should parse successfully: {:?}",
+                    finished.run.failure
+                );
+                assert_eq!(finished.run.session_id.as_deref(), Some("sdk-session"));
+                assert_eq!(finished.run.text, "hello");
+            }
+            SpawnEnding::TimedOut => panic!("Copilot SDK invocation timed out"),
+        }
+        assert_eq!(
+            sdk.request.lock().unwrap().as_ref(),
+            Some(&CopilotSdkRequest {
+                prompt: "Reply with a short greeting".to_string(),
+                model: Some("gpt-4".to_string()),
+                session_id: Some("resume-me".to_string()),
+                working_dir: Path::new(".").to_path_buf(),
+                action_execution_id: Some("action-123".to_string()),
+                limit: None,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sdk_runtime_starts_the_cli_server_protocol_not_the_agent_command() {
+        use super::GitHubCopilotSdkRuntime;
+        use github_copilot_sdk::CliProgram;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("narsor-copilot-sdk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let args_file = directory.join("args");
+        let program = directory.join("copilot-stub");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 1\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let runtime = GitHubCopilotSdkRuntime {
+            program: CliProgram::Path(program),
+        };
+        let result = runtime
+            .run(CopilotSdkRequest {
+                prompt: "test".to_string(),
+                model: None,
+                session_id: None,
+                working_dir: directory.clone(),
+                action_execution_id: None,
+                limit: None,
+            })
+            .await;
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            result.is_err(),
+            "the test runtime should exit before connecting"
+        );
+        assert!(args.lines().any(|arg| arg == "--server"), "{args}");
+        assert!(args.lines().any(|arg| arg == "--stdio"), "{args}");
+        assert!(!args.lines().any(|arg| arg == "agent"), "{args}");
     }
 }
 
