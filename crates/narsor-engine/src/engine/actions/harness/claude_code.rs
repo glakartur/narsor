@@ -335,15 +335,16 @@ impl ClaudeCodeStreamParser {
                 .and_then(agent::closing_answer)
                 .map(|(value, kind)| (value, Some(kind)))
         };
-        let has_answer = answered.is_some();
-        if let Some((value, kind)) = answered {
-            self.structured_output = Some(value);
-            self.final_answer = kind;
-        }
         self.permission_denials = result.permission_denials.clone();
-        if !has_answer && self.structured_output.is_some() {
+        let Some((value, kind)) = answered else {
+            // Neither the answer nor the text it came from is replaced.
+            if result.is_error || self.structured_output.is_none() {
+                self.result_text = result.text.clone().unwrap_or_default();
+            }
             return;
-        }
+        };
+        self.structured_output = Some(value);
+        self.final_answer = kind;
         self.result_text = result.text.clone().unwrap_or_default();
     }
 }
