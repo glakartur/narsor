@@ -145,8 +145,17 @@ impl OrchestrationStore {
     }
 
     /// Atomically replaces a record. Call only under the task's lock.
-    pub(crate) fn save_task(&self, record: &TaskRecord) -> Result<()> {
+    pub(crate) fn save_task(&self, record: &mut TaskRecord) -> Result<()> {
         let path = self.paths.orchestration_task_file(record.task_id.as_str());
+        let previous: TaskRecord = read_json(&path)?;
+        record.state_since = if previous.task_state() != record.task_state()
+            || (record.runner_state == super::model::RunnerState::Provisioning
+                && previous.runner_state != super::model::RunnerState::Provisioning)
+        {
+            Some(record.last_event.at)
+        } else {
+            previous.state_since
+        };
         Ok(write_json_atomic(&path, record)?)
     }
 
@@ -272,7 +281,7 @@ impl OrchestrationStore {
             record.rank = rank;
             record.record_version = TASK_RECORD_VERSION;
             record.legacy_priority = None;
-            self.save_task(&record)?;
+            self.save_task(&mut record)?;
         }
         Ok(())
     }

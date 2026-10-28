@@ -8,7 +8,7 @@ use chrono::{Duration, TimeZone, Utc};
 
 use narsor::api::{ClientError, HarnessSelectionSnapshot};
 use narsor::cli::task_text::{
-    age, attention_lines, command_outcome, conversation_lines, conversation_origin,
+    activity_age, age, attention_lines, command_outcome, conversation_lines, conversation_origin,
     default_harness_line, detail_lines, display_lines, event_line, list_line, next_waiting,
     queue_badge, record_unreadable_detail, safe_json, state_hint, Tone,
 };
@@ -66,6 +66,17 @@ fn ages_are_short_and_never_negative() {
     assert_eq!(age(now, now - Duration::minutes(3)), "3m");
     assert_eq!(age(now, now - Duration::hours(2)), "2h");
     assert_eq!(age(now, now + Duration::seconds(30)), "0s");
+}
+
+#[test]
+fn activity_ages_use_two_units_when_helpful_and_never_go_negative() {
+    assert_eq!(activity_age(0), "<1m");
+    assert_eq!(activity_age(59), "<1m");
+    assert_eq!(activity_age(12 * 60), "12m");
+    assert_eq!(activity_age(130 * 60), "2h 10m");
+    assert_eq!(activity_age(24 * 60 * 60), "1d");
+    assert_eq!(activity_age(3 * 24 * 60 * 60), "3d");
+    assert_eq!(activity_age(-10), "<1m");
 }
 
 #[test]

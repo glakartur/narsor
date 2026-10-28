@@ -174,6 +174,7 @@ impl ControlPlane {
             rank,
             legacy_priority: None,
             created_at: now,
+            state_since: Some(now),
             queue_sequence,
             runner_state: RunnerState::Queued,
             generation: 1,
@@ -1010,7 +1011,7 @@ impl ControlPlane {
                     generation: record.generation,
                     kind,
                 };
-                self.store.save_task(&record)?;
+                self.store.save_task(&mut record)?;
                 self.store.publish_last_event(&record)?;
                 Ok((record, value))
             }

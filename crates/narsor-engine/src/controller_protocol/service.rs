@@ -2105,6 +2105,7 @@ impl ProtocolService {
             revision: record.revision,
             rank: record.rank,
             created_at: record.created_at,
+            state_since: record.state_since,
             queue_sequence: record.queue_sequence,
             workflow_id: record.launch_spec.workflow_id.clone(),
             workflow_version: record.launch_spec.workflow_version,

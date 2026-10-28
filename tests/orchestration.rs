@@ -300,6 +300,43 @@ fn creating_a_task_records_a_queued_assignment_with_generation_and_queue_order()
 }
 
 #[test]
+fn owner_state_since_is_stable_until_the_visible_state_changes() {
+    let fx = Fixture::new();
+    let created = fx.create("task-a");
+    let created_since = created.state_since.unwrap();
+    let lease = fx.lease("k8s", "controller-a");
+
+    fx.clock.advance(Duration::seconds(30));
+    fx.control
+        .schedule(&backend_id("k8s"), &BackendCapacity::Limit(1))
+        .unwrap();
+    let admitted = fx.control.task(&task("task-a")).unwrap();
+    assert_eq!(admitted.state_since, Some(created_since));
+
+    fx.clock.advance(Duration::seconds(30));
+    let provisioning = fx
+        .observe("task-a", &lease, Observation::StartAccepted)
+        .unwrap();
+    assert_eq!(provisioning.runner_state, RunnerState::Provisioning);
+    let persisted_provisioning = fx.control.task(&task("task-a")).unwrap();
+    assert_eq!(
+        persisted_provisioning.state_since,
+        Some(provisioning.last_event.at)
+    );
+
+    fx.clock.advance(Duration::minutes(2));
+    let reread = fx.reopen().task(&task("task-a")).unwrap();
+    assert_eq!(reread.state_since, persisted_provisioning.state_since);
+
+    fx.clock.advance(Duration::seconds(30));
+    let running = fx
+        .observe("task-a", &lease, Observation::RunnerReady)
+        .unwrap();
+    let persisted_running = fx.control.task(&task("task-a")).unwrap();
+    assert_eq!(persisted_running.state_since, Some(running.last_event.at));
+}
+
+#[test]
 fn desired_generation_grows_monotonically_through_the_whole_lifecycle() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");

@@ -33,6 +33,7 @@
 
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -141,6 +142,17 @@ pub fn areas(area: Rect, focus: Focus) -> Areas {
 /// Draws one frame of `app`. `now` decides how old the data looks and
 /// whether the notification is still on the bar.
 pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instant) {
+    render_at(frame, app, styles, now, Utc::now());
+}
+
+/// Draws one frame using the supplied UTC clock for task activity ages.
+pub fn render_at(
+    frame: &mut Frame,
+    app: &mut TaskApp,
+    styles: &Styles,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+) {
     let areas = areas(frame.area(), app.focus());
     if areas.screen == Screen::TooSmall {
         render_too_small(frame, areas.outer, styles);
@@ -170,7 +182,7 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
                 .then(|| app.loading_glyph());
             app.list_mut().set_title_mark(mark);
             app.list_mut()
-                .render(frame, list_area, styles, list_focused, stale);
+                .render(frame, list_area, styles, list_focused, stale, now_utc);
             if app.list().tasks().is_empty() && app.list().pending().is_empty() {
                 render_empty(frame, list_area, app, styles);
             }

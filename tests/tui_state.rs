@@ -533,7 +533,13 @@ mod foundations {
         fn help_keys(context: Context) -> Vec<String> {
             help_entries(context)
                 .iter()
-                .flat_map(|entry| entry.keys.split('/').map(str::to_string))
+                .flat_map(|entry| {
+                    if entry.keys == "/" {
+                        vec!["/".to_string()]
+                    } else {
+                        entry.keys.split('/').map(str::to_string).collect()
+                    }
+                })
                 .collect()
         }
 
@@ -1658,8 +1664,8 @@ mod task_app_list {
     use super::key;
     use super::remote_support::RemoteHarness;
     use super::task_app_support::{
-        event, ids, listing, queued, task, titled, waiting, waiting_for_capacity, with_controller,
-        with_runner,
+        at, event, ids, listing, queue_view, queued, task, titled, waiting, waiting_for_capacity,
+        with_controller, with_runner,
     };
 
     fn offline_client() -> ApiClient {
@@ -1894,6 +1900,119 @@ mod task_app_list {
                 "c",
             ));
             assert_eq!(titles(&app), ["done", "queue", "fail", "run"]);
+        }
+
+        #[test]
+        fn slash_filters_by_ticket_title_and_full_id_without_reordering() {
+            let mut app = app();
+            let alpha = titled(queued("task-a", 1), "Alpha");
+            let mut beta = titled(queued("task-b0123456", 2), "Beta");
+            beta.ticket = Some("NAR-42".into());
+            let gamma = titled(queued("task-c", 3), "Parser cleanup");
+            app.load(listing(
+                vec![alpha.clone(), beta.clone(), gamma.clone()],
+                "c",
+            ));
+            app.list_mut().select("task-b0123456");
+
+            ch(&mut app, '/');
+            for character in "nar-42".chars() {
+                ch(&mut app, character);
+            }
+            assert_eq!(app.list().visible_ids(), ["task-b0123456"]);
+            assert_eq!(app.list().selected_id(), Some("task-b0123456"));
+            press(&mut app, KeyCode::Enter);
+
+            ch(&mut app, '/');
+            for _ in "nar-42".chars() {
+                press(&mut app, KeyCode::Backspace);
+            }
+            for character in "PARSER".chars() {
+                ch(&mut app, character);
+            }
+            assert_eq!(app.list().visible_ids(), ["task-c"]);
+            press(&mut app, KeyCode::Enter);
+
+            ch(&mut app, '/');
+            for _ in "PARSER".chars() {
+                press(&mut app, KeyCode::Backspace);
+            }
+            for character in "b012".chars() {
+                ch(&mut app, character);
+            }
+            assert_eq!(app.list().visible_ids(), ["task-b0123456"]);
+            press(&mut app, KeyCode::Enter);
+
+            ch(&mut app, '/');
+            for character in "x".chars() {
+                ch(&mut app, character);
+            }
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.list().visible_ids(), ["task-b0123456"]);
+
+            ch(&mut app, '/');
+            for _ in "b012".chars() {
+                press(&mut app, KeyCode::Backspace);
+            }
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.list().visible_ids(),
+                ["task-a", "task-b0123456", "task-c"]
+            );
+            assert_eq!(
+                app.list()
+                    .tasks()
+                    .iter()
+                    .map(|task| task.task_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["task-a", "task-b0123456", "task-c"]
+            );
+        }
+
+        #[test]
+        fn activity_timestamp_uses_the_state_specific_source_and_skips_final_states() {
+            use narsor::tui::task_app::list::TaskList;
+            use narsor_engine::orchestration::TaskState;
+
+            let now = at();
+            let mut queued = queued("queued", 1);
+            queued.state_since = Some(now - chrono::Duration::hours(2));
+            queued.queue = Some(queue_view(QueueReason::Admitted));
+            let queue_since = queued.queue.as_ref().unwrap().since;
+
+            let mut waiting = task("waiting", "local", "running", 2);
+            waiting.state = TaskState::HumanNeeded;
+            let attention_since = now - chrono::Duration::minutes(12);
+            waiting
+                .attention
+                .push(narsor_protocol::controller::AttentionItem {
+                    kind: AttentionKind::Approval,
+                    state_id: Some("review".into()),
+                    since: attention_since,
+                    waiting_id: "approval-1".into(),
+                });
+
+            let mut provisioning = task("provisioning", "local", "provisioning", 3);
+            provisioning.state_since = Some(now - chrono::Duration::seconds(30));
+            provisioning.queue = Some(queue_view(QueueReason::Admitted));
+            let provisioning_since = provisioning.state_since;
+
+            let mut running = task("running", "local", "running", 4);
+            running.state_since = Some(now - chrono::Duration::minutes(5));
+            let running_since = running.state_since;
+
+            let mut finished = task("finished", "local", "stopped", 5);
+            finished.state = TaskState::Finished;
+            finished.state_since = Some(now - chrono::Duration::minutes(9));
+
+            let mut list = TaskList::new();
+            list.replace(vec![queued, waiting, provisioning, running, finished]);
+            let rows = list.rows();
+            assert_eq!(rows[0].since, Some(queue_since));
+            assert_eq!(rows[1].since, Some(attention_since));
+            assert_eq!(rows[2].since, provisioning_since);
+            assert_eq!(rows[3].since, running_since);
+            assert_eq!(rows[4].since, None);
         }
 
         #[test]

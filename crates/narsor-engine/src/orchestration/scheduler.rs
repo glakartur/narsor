@@ -502,7 +502,7 @@ impl ControlPlane {
         let _lock = self.store().lock_task(task_id)?;
         let mut record = self.store().load_task(task_id)?;
         record.rank = rank;
-        self.store().save_task(&record)
+        self.store().save_task(&mut record)
     }
 
     /// Renumbers equal ranks of every backend (see

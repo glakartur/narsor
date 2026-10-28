@@ -53,7 +53,7 @@ use super::background::{JobKey, OpeningKind, Outcome};
 use super::detail::{
     edge_layout, recorded_attempt, render_view, KeysAt, StepLevel, TaskDetail, ViewOptions,
 };
-use super::list::{fit, row_text, title_of, Attention, RowText, StateIcon};
+use super::list::{fit, history_row_text, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
 use super::tabs::conversation::{read_history_attempt, AttemptRead, ReadFailure};
 use super::tabs::events;
@@ -101,15 +101,23 @@ impl HistoryEntry {
     pub fn row(&self) -> RowText {
         match self {
             Self::Archived(task) => RowText {
+                ticket: None,
+                id: String::new(),
                 attention: Attention::None,
                 icon: StateIcon::Done,
                 title: title_of(task),
+                status: String::new(),
+                since: None,
                 label: "archiwum".to_string(),
             },
             Self::Legacy(legacy) => RowText {
+                ticket: None,
+                id: String::new(),
                 attention: Attention::None,
                 icon: legacy_icon(&legacy.view.status),
                 title: legacy_title(&legacy.view),
+                status: String::new(),
+                since: None,
                 label: legacy.view.status.as_str().to_string(),
             },
         }
@@ -186,6 +194,7 @@ fn legacy_summary(view: &LegacyExecutionView) -> TaskSummary {
         "revision": 1,
         "rank": 1,
         "created_at": view.started_at,
+        "state_since": null,
         "queue_sequence": 0,
         "workflow_id": view.workflow_id,
         "workflow_version": view.workflow_version,
@@ -955,7 +964,7 @@ pub fn render_list(
     let width = usize::from(inner.width.saturating_sub(PREFIX_WIDTH));
     let items: Vec<Vec<Line>> = rows
         .iter()
-        .map(|row| row_text(row, width, styles, stale))
+        .map(|row| history_row_text(row, width, styles, stale))
         .collect();
     let selected = (!rows.is_empty()).then_some(history.selected);
     render_bracketed_list(

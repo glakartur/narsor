@@ -875,6 +875,9 @@ pub struct TaskSummary {
     pub revision: u64,
     pub rank: u32,
     pub created_at: DateTime<Utc>,
+    /// When the task entered its current owner-visible state, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_since: Option<DateTime<Utc>>,
     pub queue_sequence: u64,
     pub workflow_id: String,
     pub workflow_version: u32,
@@ -2072,6 +2075,46 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AttentionKind>(serde_json::json!("future_kind")).unwrap(),
             AttentionKind::Unrecognized
+        );
+    }
+
+    #[test]
+    fn task_summary_state_since_is_optional_on_the_wire() {
+        let value = serde_json::json!({
+            "task_id": "task-1",
+            "backend_id": "local",
+            "runner_state": "queued",
+            "generation": 1,
+            "revision": 1,
+            "rank": 1,
+            "created_at": "2026-10-03T12:00:00Z",
+            "queue_sequence": 1,
+            "workflow_id": "workflow",
+            "workflow_version": 1,
+            "launch_digest": "",
+            "environment_identity": "",
+            "archive": null,
+            "observation": null,
+            "runner": null,
+            "controller": null,
+            "inputs": [],
+            "as_of": "2026-10-03T12:00:00Z"
+        });
+        let summary: super::TaskSummary = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(summary.state_since, None);
+        assert!(serde_json::to_value(&summary)
+            .unwrap()
+            .get("state_since")
+            .is_none());
+
+        let since = chrono::DateTime::parse_from_rfc3339("2026-10-03T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut summary = summary;
+        summary.state_since = Some(since);
+        assert_eq!(
+            serde_json::to_value(summary).unwrap()["state_since"],
+            "2026-10-03T11:00:00Z"
         );
     }
 

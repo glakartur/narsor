@@ -16,35 +16,36 @@
 //!   delivers late;
 //! * hiding finished tasks (`z`) is a filter over the same order
 //!   ([`TaskList::visible`]), not a regrouping.
+//! * text filtering (`/`) matches the ticket, title or full id without
+//!   changing the relative order of the visible tasks.
 //!
 //! # A row
 //!
 //! ```text
-//! ? ●  Refactor parser       attention · state · title
-//!      approval              label, under the title
+//! ? ●  NAR-42
+//!      Refactor parser
+//!      running · 2h 10m · approval
 //! ```
 //!
-//! A row is two lines, so that the title has the whole width (R7). The first
-//! column says what the operator must do (`?` answer, `!` problem — a problem
-//! wins over a question), the second what is happening (`●` running, `◷`
-//! queued, `⟳` provisioning, `‖` paused, `✗` failed, `✓` done), then the title
-//! (`display.title`, else the task id); the second line holds a short label:
-//! the current step, `#n` for a queued task, `offline` when no controller holds
-//! the backend. Everything that comes from the server is passed through
-//! [`one_line`] before it is drawn.
+//! A row has three lines: markers and ticket (or a short `id:`), title, then
+//! state, activity age and the existing short label. Activity age advances
+//! on redraw; it is omitted when its start is unknown or the task is final.
+//! Everything that comes from the server is passed through [`one_line`]
+//! before it is drawn.
 //!
 //! The rows are drawn as a bar marked list ([`render_barred_list`]): tasks
-//! stay stacked directly, and the selected one keeps a left bar beside both
+//! stay stacked directly, and the selected one keeps a left bar beside all
 //! lines instead of reverse video, so its markers keep their colours. Every
-//! task takes the same two rows.
+//! task takes the same three rows.
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::cli::task_text::{task_state_name, without_slot};
+use crate::cli::task_text::{activity_age, task_state_name, without_slot};
 use crate::controller_protocol::{
     Freshness, InputView, OperatorCommandView, QueueView, TaskSummary,
 };
@@ -219,6 +220,22 @@ pub fn title_of(task: &TaskSummary) -> String {
     }
 }
 
+fn activity_since(task: &TaskSummary) -> Option<DateTime<Utc>> {
+    if task.runner_state == RunnerState::Provisioning {
+        return task.state_since;
+    }
+    match task.state {
+        TaskState::Queued => task.queue.as_ref().map(|queue| queue.since),
+        TaskState::HumanNeeded => task.attention.iter().map(|item| item.since).min(),
+        TaskState::Finished | TaskState::Error | TaskState::Archived => None,
+        _ => task.state_since,
+    }
+}
+
+fn short_task_id(task_id: &str) -> String {
+    format!("id:{}", task_id.chars().take(8).collect::<String>())
+}
+
 /// Whether the task's backend has no controller holding its lease right now:
 /// a task that is expected to be worked on is not being.
 fn controller_offline(task: &TaskSummary) -> bool {
@@ -265,13 +282,19 @@ fn current_step(task: &TaskSummary) -> Option<String> {
 /// A task as the list shows it, for tests and the details placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowText {
-    /// Column 1.
+    /// Ticket, when the task has one.
+    pub ticket: Option<String>,
+    /// Short identifier, used when there is no ticket.
+    pub id: String,
     pub attention: Attention,
-    /// Column 2.
     pub icon: StateIcon,
-    /// The title, first line.
+    /// The title, second line.
     pub title: String,
-    /// The label, second line.
+    /// Owner-visible state, third line.
+    pub status: String,
+    /// When the current state began, if known.
+    pub since: Option<DateTime<Utc>>,
+    /// Existing short label, third line.
     pub label: String,
 }
 
@@ -439,9 +462,13 @@ impl PendingRow {
             PendingState::NotSent => (StateIcon::Failed, "nie wysłano"),
         };
         RowText {
+            ticket: None,
+            id: short_task_id(&self.task_id),
             attention: Attention::None,
             icon,
             title: one_line(&self.title),
+            status: String::new(),
+            since: None,
             label: label.to_string(),
         }
     }
@@ -455,6 +482,8 @@ pub struct TaskList {
     pending: Vec<PendingRow>,
     selected: Option<String>,
     hide_done: bool,
+    filter: String,
+    filter_original: Option<String>,
     moving: Option<MoveMode>,
     /// The first row in view, kept between frames so that a refresh does not
     /// scroll the list.
@@ -477,6 +506,8 @@ impl TaskList {
             pending: Vec::new(),
             selected: None,
             hide_done: false,
+            filter: String::new(),
+            filter_original: None,
             moving: None,
             top: 0,
             title_mark: None,
@@ -528,6 +559,7 @@ impl TaskList {
             .iter()
             .enumerate()
             .filter(|(_, task)| !(self.hide_done && state_icon(task) == StateIcon::Done))
+            .filter(|(_, task)| self.matches_task(task))
             .map(|(index, _)| index)
             .collect();
         let Some(mode) = &self.moving else {
@@ -562,8 +594,89 @@ impl TaskList {
         self.visible()
             .into_iter()
             .map(|index| self.tasks[index].task_id.to_string())
-            .chain(self.pending.iter().map(|row| row.task_id.clone()))
+            .chain(
+                self.pending
+                    .iter()
+                    .filter(|row| self.matches_pending(row))
+                    .map(|row| row.task_id.clone()),
+            )
             .collect()
+    }
+
+    /// The active text filter.
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Whether the list is taking text for its filter.
+    pub fn is_filtering(&self) -> bool {
+        self.filter_original.is_some()
+    }
+
+    /// Begins editing the current filter.
+    pub fn begin_filter(&mut self) {
+        if self.filter_original.is_none() {
+            self.filter_original = Some(self.filter.clone());
+        }
+    }
+
+    /// Adds a character to the filter being edited.
+    pub fn push_filter_char(&mut self, character: char) {
+        if self.is_filtering() && !character.is_control() {
+            self.change_filter(|filter| filter.push(character));
+        }
+    }
+
+    /// Removes the last character from the filter being edited.
+    pub fn pop_filter_char(&mut self) {
+        if self.is_filtering() {
+            self.change_filter(|filter| {
+                filter.pop();
+            });
+        }
+    }
+
+    /// Keeps the edited filter and leaves text entry.
+    pub fn finish_filter(&mut self) {
+        self.filter_original = None;
+    }
+
+    /// Restores the filter from before editing.
+    pub fn cancel_filter(&mut self) {
+        let Some(original) = self.filter_original.take() else {
+            return;
+        };
+        let before = self.visible_ids();
+        self.filter = original;
+        self.settle_selection(&before);
+    }
+
+    fn change_filter(&mut self, change: impl FnOnce(&mut String)) {
+        let before = self.visible_ids();
+        change(&mut self.filter);
+        self.settle_selection(&before);
+    }
+
+    fn matches_filter(&self, ticket: Option<&str>, title: &str, task_id: &str) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        let needle = self.filter.to_lowercase();
+        task_id.to_lowercase().contains(&needle)
+            || title.to_lowercase().contains(&needle)
+            || ticket.is_some_and(|ticket| ticket.to_lowercase().contains(&needle))
+    }
+
+    fn matches_task(&self, task: &TaskSummary) -> bool {
+        self.matches_filter(
+            task.ticket.as_deref(),
+            &title_of(task),
+            task.task_id.as_str(),
+        )
+    }
+
+    fn matches_pending(&self, row: &PendingRow) -> bool {
+        self.matches_filter(None, &row.title, &row.task_id)
     }
 
     /// How many finished tasks the filter hides.
@@ -611,9 +724,17 @@ impl TaskList {
     fn row_text_with(&self, index: usize, positions: &HashMap<usize, usize>) -> RowText {
         let task = &self.tasks[index];
         RowText {
+            ticket: task
+                .ticket
+                .as_deref()
+                .map(one_line)
+                .filter(|ticket| !ticket.trim().is_empty()),
+            id: short_task_id(task.task_id.as_str()),
             attention: attention_of(task),
             icon: state_icon(task),
             title: title_of(task),
+            status: task_state_name(task.state).to_string(),
+            since: activity_since(task),
             label: label_of(task, positions.get(&index).copied()),
         }
     }
@@ -624,7 +745,12 @@ impl TaskList {
         self.visible()
             .into_iter()
             .map(|index| self.row_text_with(index, &positions))
-            .chain(self.pending.iter().map(PendingRow::text))
+            .chain(
+                self.pending
+                    .iter()
+                    .filter(|row| self.matches_pending(row))
+                    .map(PendingRow::text),
+            )
             .collect()
     }
 
@@ -1169,11 +1295,19 @@ impl TaskList {
         styles: &Styles,
         focused: bool,
         stale: bool,
+        now: DateTime<Utc>,
     ) {
         let mut title = match self.hidden_count() {
             0 => " Zadania".to_string(),
             hidden => format!(" Zadania · ✓ ukryte {hidden}"),
         };
+        if !self.filter.is_empty() || self.is_filtering() {
+            title.push_str(" / ");
+            title.push_str(&self.filter);
+            if self.is_filtering() {
+                title.push('|');
+            }
+        }
         if let Some(mark) = self.title_mark {
             title.push(' ');
             title.push_str(mark);
@@ -1195,9 +1329,17 @@ impl TaskList {
             .map(|&index| {
                 let task = &self.tasks[index];
                 let mut text = RowText {
+                    ticket: task
+                        .ticket
+                        .as_deref()
+                        .map(one_line)
+                        .filter(|ticket| !ticket.trim().is_empty()),
+                    id: short_task_id(task.task_id.as_str()),
                     attention: attention_of(task),
                     icon: state_icon(task),
                     title: title_of(task),
+                    status: task_state_name(task.state).to_string(),
+                    since: activity_since(task),
                     label: label_of(task, positions.get(&index).copied()),
                 };
                 if let (Some(mode), Some(len)) = (&moving, group_len) {
@@ -1213,13 +1355,14 @@ impl TaskList {
             .chain(
                 self.pending
                     .iter()
+                    .filter(|row| self.matches_pending(row))
                     .map(|row| (row.task_id.clone(), row.text())),
             )
             .collect();
         let width = usize::from(inner.width.saturating_sub(PREFIX_WIDTH).saturating_sub(1));
         let items: Vec<Vec<Line>> = rows
             .iter()
-            .map(|(_, row)| row_text(row, width, styles, stale))
+            .map(|(_, row)| row_text(row, width, styles, stale, now))
             .collect();
         let selected = rows
             .iter()
@@ -1399,23 +1542,45 @@ pub fn fit(text: &str, width: usize) -> String {
     }
 }
 
-/// The columns before the title (and under it, before the label): attention,
-/// a space, state, two spaces.
+/// The columns before the text under the markers: attention, a space, state,
+/// two spaces.
 const ROW_PREFIX: usize = 5;
 
-/// One row as two styled lines laid out in `width` columns — the content
-/// width, the bracket's column already taken off: the markers and the title,
-/// then the label under the title. The second line is there even when the
-/// label is empty, so every row is as tall as the next. The lines carry the
-/// roles of their content only; the selection is drawn around them.
+/// One row as three styled lines laid out in `width` columns — the content
+/// width, the bracket's column already taken off.
 pub(super) fn row_text(
     row: &RowText,
     width: usize,
     styles: &Styles,
     stale: bool,
+    now: DateTime<Utc>,
 ) -> Vec<Line<'static>> {
     let text_width = width.saturating_sub(ROW_PREFIX);
     let grey = |role: Role| if stale { Role::Done } else { role };
+    let identifier = row.ticket.as_deref().unwrap_or(&row.id);
+    let mut label = if let Some(since) = row.since {
+        let age = format!(" · {}", activity_age((now - since).num_seconds()));
+        let status_width = text_width.saturating_sub(age.chars().count());
+        format!("{}{age}", fit(&row.status, status_width))
+    } else {
+        fit(&row.status, text_width)
+    };
+    let status_prefix = format!("{} · ", row.status);
+    let extra_label = row
+        .label
+        .strip_prefix(&status_prefix)
+        .or_else(|| (row.label != row.status).then_some(row.label.as_str()))
+        .unwrap_or_default();
+    if !extra_label.is_empty() {
+        if label.is_empty() {
+            label = fit(extra_label, text_width);
+        } else {
+            let remaining = text_width.saturating_sub(label.chars().count() + 3);
+            if remaining > 0 {
+                label = format!("{label} · {}", fit(extra_label, remaining));
+            }
+        }
+    }
     let label_role = match row.label.as_str() {
         "offline" => Role::Attention,
         "nie wysłano" => Role::Problem,
@@ -1434,11 +1599,51 @@ pub(super) fn row_text(
             styles.of(grey(row.icon.role())),
         ),
         Span::raw("  "),
-        Span::styled(fit(&row.title, text_width), styles.of(grey(Role::Calm))),
+        Span::styled(fit(identifier, text_width), styles.of(grey(Role::Calm))),
     ]);
     let second = Line::from(vec![
         Span::raw(" ".repeat(ROW_PREFIX.min(width))),
-        Span::styled(fit(&row.label, text_width), styles.of(grey(label_role))),
+        Span::styled(fit(&row.title, text_width), styles.of(grey(Role::Calm))),
     ]);
-    vec![first, second]
+    let third = Line::from(vec![
+        Span::raw(" ".repeat(ROW_PREFIX.min(width))),
+        Span::styled(fit(&label, text_width), styles.of(grey(label_role))),
+    ]);
+    vec![first, second, third]
+}
+
+/// The history keeps its existing two-line title and label layout.
+pub(super) fn history_row_text(
+    row: &RowText,
+    width: usize,
+    styles: &Styles,
+    stale: bool,
+) -> Vec<Line<'static>> {
+    let text_width = width.saturating_sub(ROW_PREFIX);
+    let grey = |role: Role| if stale { Role::Done } else { role };
+    let label_role = match row.label.as_str() {
+        "offline" => Role::Attention,
+        "nie wysłano" => Role::Problem,
+        label if label.starts_with('#') => Role::Calm,
+        _ => Role::Done,
+    };
+    vec![
+        Line::from(vec![
+            Span::styled(
+                row.attention.glyph().to_string(),
+                styles.of(grey(row.attention.role())),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                row.icon.glyph().to_string(),
+                styles.of(grey(row.icon.role())),
+            ),
+            Span::raw("  "),
+            Span::styled(fit(&row.title, text_width), styles.of(grey(Role::Calm))),
+        ]),
+        Line::from(vec![
+            Span::raw(" ".repeat(ROW_PREFIX.min(width))),
+            Span::styled(fit(&row.label, text_width), styles.of(grey(label_role))),
+        ]),
+    ]
 }

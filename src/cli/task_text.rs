@@ -156,6 +156,25 @@ pub fn short_age(seconds: i64) -> String {
     }
 }
 
+/// Activity time for the task list: `<1m`, `12m`, `2h 10m` or `3d`.
+pub fn activity_age(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    match seconds {
+        0..=59 => "<1m".to_string(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => {
+            let hours = seconds / 3_600;
+            let minutes = (seconds % 3_600) / 60;
+            if minutes == 0 {
+                format!("{hours}h")
+            } else {
+                format!("{hours}h {minutes}m")
+            }
+        }
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
 /// How old a record is, in the coarse steps people read its age in: under
 /// a minute it is "just now", then whole minutes, hours and days. The TUI
 /// and the CLI word the same bucket in their own language.

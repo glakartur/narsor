@@ -174,6 +174,7 @@ fn assert_bracket(
             "gap in row {row}:\n{screen}"
         );
     }
+
     for row in [y - 1, y + lines] {
         assert!(
             is_rule(buffer, row, x - 2..rule_end, marks),
@@ -184,6 +185,24 @@ fn assert_bracket(
         (y - 1..=y + lines).all(|row| none_reversed(row_cells(buffer, row, x - 2..rule_end))),
         "nothing in the bracket is reversed:\n{screen}"
     );
+}
+
+fn assert_three_lines(screen: &str, first: &str, second: &str, third: &str) {
+    let lines: Vec<String> = screen
+        .lines()
+        .map(|line| {
+            line.chars()
+                .skip(3)
+                .take(usize::from(layout::LIST_WIDTH) - 4)
+                .collect()
+        })
+        .collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(first))
+        .unwrap_or_else(|| panic!("{first:?} is not in the list:\n{screen}"));
+    assert!(lines[at + 1].starts_with(second), "{screen}");
+    assert!(lines[at + 2].starts_with(third), "{screen}");
 }
 
 /// Asserts that the one-line item whose line starts with `needle` (e.g. a
@@ -909,6 +928,7 @@ mod colour_discipline {
 mod task_app_render {
     use super::*;
 
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use narsor::api::{ApiClient, ClientError};
     use narsor::tui::task_app::{layout, TaskApp};
@@ -981,9 +1001,10 @@ mod task_app_render {
         app
     }
 
-    /// The screen row whose list column (the first 28) holds `needle`.
+    /// The first screen row of the task whose list column holds `needle`.
     fn list_row(buffer: &Buffer, needle: &str) -> usize {
-        rows(buffer)
+        let rows = rows(buffer);
+        let found = rows
             .iter()
             .position(|row| {
                 row.chars()
@@ -991,7 +1012,20 @@ mod task_app_render {
                     .collect::<String>()
                     .contains(needle)
             })
-            .unwrap_or_else(|| panic!("{needle:?} is not in the list:\n{}", screen(buffer)))
+            .unwrap_or_else(|| panic!("{needle:?} is not in the list:\n{}", screen(buffer)));
+        let marker_line = |row: &str| {
+            let content: String = row.chars().skip(3).take(5).collect();
+            content.starts_with("? ")
+                || content.starts_with("! ")
+                || ["●", "◷", "◐", "‖", "✗", "✓", "·", "↻"]
+                    .iter()
+                    .any(|icon| content.starts_with(&format!("  {icon}  ")))
+        };
+        if found > 0 && !marker_line(&rows[found]) && marker_line(&rows[found - 1]) {
+            found - 1
+        } else {
+            found
+        }
     }
 
     fn render(width: u16, height: u16, app: &mut TaskApp, styles: &Styles) -> Buffer {
@@ -1020,25 +1054,19 @@ mod task_app_render {
             .iter()
             .map(|row| row.chars().skip(3).take(25).collect::<String>())
             .collect();
-        let find = |needle: &str| {
-            list_rows
-                .iter()
-                .position(|row| row.contains(needle))
-                .unwrap()
-        };
+        let find = |needle: &str| list_row(&buffer, needle);
         assert!(
-            list_rows[find("NAR-14")].starts_with("  ●  NAR-14"),
+            list_rows[find("NAR-14")].starts_with("  ●  id:a"),
             "{:?}",
             list_rows[find("NAR-14")]
         );
-        assert!(list_rows[find("NAR-12")].starts_with("? ●  NAR-12"));
-        assert!(list_rows[find("NAR-9 ")].starts_with("! ✗  NAR-9"));
-        assert!(list_rows[find("NAR-16")].starts_with("  ◷  NAR-16"));
-        // The label is on the second line, under the title.
-        assert!(list_rows[find("NAR-16") + 1].starts_with("     #1"));
-        assert!(list_rows[find("NAR-17") + 1].starts_with("     #2"));
-        assert!(list_rows[find("NAR-8 ")].starts_with("  ✓  NAR-8"));
-        assert!(list_rows[find("NAR-12") + 1].starts_with("     approval"));
+        assert!(list_rows[find("NAR-12")].starts_with("? ●  id:b"));
+        assert!(list_rows[find("NAR-9 ")].starts_with("! ✗  id:c"));
+        assert!(list_rows[find("NAR-16")].starts_with("  ◷  id:d"));
+        assert!(list_rows[find("NAR-16") + 2].contains("#1"));
+        assert!(list_rows[find("NAR-17") + 2].contains("#2"));
+        assert!(list_rows[find("NAR-8 ")].starts_with("  ✓  id:f"));
+        assert!(list_rows[find("NAR-12") + 2].contains("approval"));
         assert!(
             find("NAR-14") < find("NAR-12")
                 && find("NAR-12") < find("NAR-9 ")
@@ -1239,7 +1267,11 @@ mod task_app_render {
         let row = list_row(&buffer, "NAR-14");
         let width = usize::from(buffer.area.width);
         let cells = &buffer.content()[row * width..(row + 1) * width];
-        let title_cell = cells.iter().find(|cell| cell.symbol() == "N").unwrap();
+        let title_cells = &buffer.content()[(row + 1) * width..(row + 2) * width];
+        let title_cell = title_cells
+            .iter()
+            .find(|cell| cell.symbol() == "N")
+            .unwrap();
         assert_eq!(title_cell.fg, Color::DarkGray, "stale data is grey");
         let marker = cells.iter().find(|cell| cell.symbol() == "●").unwrap();
         assert_eq!(marker.fg, Color::DarkGray);
@@ -1257,7 +1289,7 @@ mod task_app_render {
         assert!(screen(&buffer).contains("brak danych"));
     }
 
-    /// AE1: the selected task has a cyan bar beside both lines while the list has the focus,
+    /// AE1: the selected task has a cyan bar beside all lines while the list has the focus,
     /// and its markers keep their colours (R13).
     #[test]
     fn live_markers_keep_their_colours_inside_the_barred_selection() {
@@ -1276,6 +1308,7 @@ mod task_app_render {
         let other = list_row(&buffer, "NAR-14");
         assert_eq!(bar(&buffer, other).0, " ");
         assert_eq!(bar(&buffer, other + 1).0, " ");
+        assert_eq!(bar(&buffer, other + 2).0, " ");
         assert!(no_reversed_in_list(&buffer), "{}", screen(&buffer));
     }
 
@@ -1309,30 +1342,24 @@ mod task_app_render {
             .iter()
             .map(|row| row.chars().skip(3).take(25).collect::<String>())
             .collect();
-        let at = list_rows
-            .iter()
-            .position(|row| row.contains("NAR-1"))
-            .unwrap();
+        let at = list_row(&buffer, "NAR-1");
         assert!(
-            list_rows[at].starts_with("  ✓  NAR-1"),
+            list_rows[at].starts_with("  ✓  id:a"),
             "{:?}",
             list_rows[at]
         );
         assert!(
-            list_rows[at + 1].contains("bez slotu"),
+            list_rows[at + 2].contains("bez slotu"),
             "{:?}",
-            list_rows[at + 1]
+            list_rows[at + 2]
         );
-        let at = list_rows
-            .iter()
-            .position(|row| row.contains("NAR-2"))
-            .unwrap();
+        let at = list_row(&buffer, "NAR-2");
         assert!(
-            list_rows[at].starts_with("  ●  NAR-2"),
+            list_rows[at].starts_with("  ●  id:b"),
             "{:?}",
             list_rows[at]
         );
-        assert!(!list_rows[at + 1].contains("bez slotu"));
+        assert!(!list_rows[at + 2].contains("bez slotu"));
     }
 
     /// Every state has its icon and its label; the rows keep their order.
@@ -1371,25 +1398,22 @@ mod task_app_render {
             .collect();
         app.load(listing(tasks, "c"));
         let buffer = render(120, 40, &mut app, &Styles::new(false));
-        let list_rows: Vec<String> = rows(&buffer)
-            .iter()
-            .map(|row| row.chars().skip(3).take(25).collect::<String>())
-            .collect();
         let mut last = 0;
         for (index, (state, glyph, label)) in cases.iter().enumerate() {
-            let at = list_rows
+            let at = list_row(&buffer, &format!("TASK-{index}"));
+            let list_rows: Vec<String> = rows(&buffer)
                 .iter()
-                .position(|row| row.contains(&format!("TASK-{index}")))
-                .unwrap_or_else(|| panic!("{state:?} is not shown:\n{}", screen(&buffer)));
+                .map(|row| row.chars().skip(3).take(25).collect::<String>())
+                .collect();
             assert!(
                 list_rows[at].contains(glyph),
                 "{state:?}: {:?}",
                 list_rows[at]
             );
             assert!(
-                list_rows[at + 1].contains(label),
+                list_rows[at + 2].contains(label),
                 "{state:?}: {:?}",
-                list_rows[at + 1]
+                list_rows[at + 2]
             );
             assert!(at >= last, "the rows keep their order");
             last = at;
@@ -1412,7 +1436,7 @@ mod task_app_render {
         app.load(listing(vec![old], "c"));
         let buffer = render(120, 30, &mut app, &Styles::new(false));
         let text = screen(&buffer);
-        assert!(text.contains("·  NAR-1"), "{text}");
+        assert!(text.contains("·  id:a"), "{text}");
         assert!(text.contains("unknown"), "{text}");
     }
 
@@ -1556,26 +1580,26 @@ mod task_app_render {
         let row = list_row(&buffer, "Bardzo");
         // The list's inside is 26 columns: 2 for the bar prefix, 5 for the
         // markers, and 1 reserved at the right edge. The title has 18 cells.
-        let kept: String = title.chars().take(17).collect();
-        assert_eq!(
-            content_text(&buffer, row),
-            format!("  ●  {kept}… "),
+        assert!(
+            content_text(&buffer, row).starts_with("  ●  id:a"),
             "{}",
             screen(&buffer)
         );
         assert!(
-            content_text(&buffer, row + 1).starts_with("     a long"),
+            content_text(&buffer, row + 1).starts_with("     Bardzo długi tytu…"),
             "{:?}",
             content_text(&buffer, row + 1)
+        );
+        assert!(
+            content_text(&buffer, row + 2).starts_with("     running · a long"),
+            "{:?}",
+            content_text(&buffer, row + 2)
         );
         let right_edge = layout::LIST_WIDTH - 2;
         assert_eq!(buffer[(right_edge, row as u16)].symbol(), " ");
         assert_eq!(buffer[(right_edge, (row + 1) as u16)].symbol(), " ");
-        assert!(
-            !list_text(&buffer, row + 2).contains("mieści"),
-            "the title does not wrap to a third line:\n{}",
-            screen(&buffer)
-        );
+        assert!(!list_text(&buffer, row + 1).contains("mieści"));
+        assert!(!list_text(&buffer, row + 2).contains("mieści"));
     }
 
     /// The cells of the list column (inside its frame) of screen row `row`.
@@ -1604,7 +1628,7 @@ mod task_app_render {
 
     /// Asserts the task at `row` is marked only by the bar beside its lines.
     fn assert_task_bar(buffer: &Buffer, row: usize, marks: SelectionMarks) {
-        for y in row..row + 2 {
+        for y in row..row + 3 {
             let (symbol, color) = bar(buffer, y);
             assert!(
                 is_mark(&buffer[(1, y as u16)], "│", marks),
@@ -1614,7 +1638,7 @@ mod task_app_render {
         }
         let background = buffer[(1, row as u16)].bg;
         assert!(
-            (row..row + 2).all(|y| {
+            (row..row + 3).all(|y| {
                 row_cells(buffer, y as u16, 1..layout::LIST_WIDTH - 1)
                     .all(|cell| cell.bg == background)
             }),
@@ -1652,7 +1676,7 @@ mod task_app_render {
         app
     }
 
-    /// A selected task keeps its two rows and only adds the left bar; moving
+    /// A selected task keeps its three rows and only adds the left bar; moving
     /// the selection does not move either task.
     #[test]
     fn a_task_takes_two_rows_and_selection_only_adds_the_left_bar() {
@@ -1661,21 +1685,26 @@ mod task_app_render {
         let first = list_row(&buffer, "Refactor parser");
         assert_eq!(first, 2, "selection adds no rows:\n{}", screen(&buffer));
         assert!(
-            content_text(&buffer, first).starts_with("  ●  Refactor parser"),
+            content_text(&buffer, first).starts_with("  ●  id:a"),
             "{:?}",
             content_text(&buffer, first)
         );
         assert!(
-            content_text(&buffer, first + 1).starts_with("     implement"),
+            content_text(&buffer, first + 1).starts_with("     Refactor parser"),
             "{:?}",
             content_text(&buffer, first + 1)
         );
+        assert!(
+            content_text(&buffer, first + 2).starts_with("     running · impleme"),
+            "{:?}",
+            content_text(&buffer, first + 2)
+        );
         let second = list_row(&buffer, "Fix the lexer");
-        assert_eq!(second, first + 2, "the tasks stay adjacent");
+        assert_eq!(second, first + 3, "the tasks stay adjacent");
         assert_task_bar(&buffer, first, marks(true, false));
         assert_eq!(bar(&buffer, second).0, " ");
         assert!(
-            list_text(&buffer, second + 2).trim().is_empty(),
+            list_text(&buffer, second + 3).trim().is_empty(),
             "nothing under the last task"
         );
 
@@ -1686,13 +1715,74 @@ mod task_app_render {
         assert_task_bar(&buffer, second, marks(true, false));
         assert_eq!(bar(&buffer, 2).0, " ");
         assert!(
-            content_text(&buffer, 3).starts_with("     implement"),
+            content_text(&buffer, 4).starts_with("     running · impleme"),
             "the first task's lines are adjacent:\n{}",
             screen(&buffer)
         );
     }
 
-    /// R8: the label keeps its role on the second line.
+    #[test]
+    fn task_rows_show_ticket_title_and_activity_age_that_advances_at_render_time() {
+        use narsor_engine::orchestration::TaskState;
+
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 12, 0).unwrap();
+        let mut subject = crate::task_app_support::task("task-abcdef1234", "local", "running", 1);
+        subject.ticket = Some("NAR-42".into());
+        subject.display.title = "Refaktor parser".into();
+        subject.state = TaskState::HumanNeeded;
+        subject
+            .attention
+            .push(narsor_protocol::controller::AttentionItem {
+                kind: AttentionKind::Approval,
+                state_id: Some("review".into()),
+                since: now - ChronoDuration::minutes(12),
+                waiting_id: "approval-1".into(),
+            });
+        let mut app = app();
+        app.load(listing(vec![subject], "c"));
+
+        let render_at = |app: &mut TaskApp, now| {
+            draw(120, 30, |frame| {
+                layout::render_at(frame, app, &Styles::new(false), Instant::now(), now)
+            })
+        };
+        let first = render_at(&mut app, now);
+        let row = list_row(&first, "Refaktor parser");
+        assert!(content_text(&first, row).contains("◐  NAR-42"));
+        assert!(content_text(&first, row + 1).starts_with("     Refaktor parser"));
+        assert!(
+            content_text(&first, row + 2).contains("12m"),
+            "{}",
+            screen(&first)
+        );
+
+        let later = render_at(&mut app, now + ChronoDuration::minutes(1));
+        let later_row = list_row(&later, "Refaktor parser");
+        assert!(
+            content_text(&later, later_row + 2).contains("13m"),
+            "{}",
+            screen(&later)
+        );
+    }
+
+    #[test]
+    fn a_missing_ticket_uses_an_eight_character_id_prefix_without_colour() {
+        let subject = titled(
+            crate::task_app_support::task("task-abcdef1234", "local", "running", 1),
+            "No ticket",
+        );
+        let mut app = app();
+        app.load(listing(vec![subject], "c"));
+        let buffer = render(120, 30, &mut app, &Styles::new(true));
+        let row = list_row(&buffer, "No ticket");
+        assert!(
+            content_text(&buffer, row).starts_with("  ●  id:task-abc"),
+            "{}",
+            screen(&buffer)
+        );
+    }
+
+    /// R8: the label keeps its role on the third line.
     #[test]
     fn the_labels_keep_their_roles_on_the_second_line() {
         let mut app = app();
@@ -1721,9 +1811,9 @@ mod task_app_render {
         press(&mut app, KeyCode::Char('G'));
         let buffer = render(120, 30, &mut app, &Styles::new(false));
         let label = |title: &str, text: &str| {
-            let row = list_row(&buffer, title) + 1;
+            let row = list_row(&buffer, title) + 2;
             let line = content_text(&buffer, row);
-            assert!(line.starts_with(&format!("     {text}")), "{line:?}");
+            assert!(line.contains(text), "{line:?}");
             list_cells(&buffer, row)[7].fg
         };
         assert_eq!(label("Offline task", "offline"), Color::Yellow);
@@ -1760,27 +1850,28 @@ mod task_app_render {
         let buffer = render(120, 31, &mut app, &Styles::new(true));
         let last = list_row(&buffer, "T-20");
         assert!(
-            content_text(&buffer, last + 1).starts_with("     implement"),
-            "the last task shows both lines:\n{}",
+            content_text(&buffer, last + 1).starts_with("     T-20"),
+            "the last task shows its title:\n{}",
             screen(&buffer)
         );
+        assert!(content_text(&buffer, last + 2).starts_with("     running · impleme"));
         assert_task_bar(&buffer, last, marks(true, true));
         // The first row inside the frame is a whole task.
         assert!(
-            content_text(&buffer, 2).starts_with("  ●  T-"),
+            content_text(&buffer, 2).starts_with("  ●  id:t"),
             "{:?}\n{}",
             content_text(&buffer, 2),
             screen(&buffer)
         );
-        assert!(content_text(&buffer, 3).starts_with("     implement"));
+        assert!(content_text(&buffer, 4).starts_with("     running · impleme"));
 
         // Going up does not scroll while the tasks fit; neither task moves.
         let top = content_text(&buffer, 2);
         press(&mut app, KeyCode::Char('k'));
         let buffer = render(120, 31, &mut app, &Styles::new(true));
         assert_eq!(content_text(&buffer, 2), top, "{}", screen(&buffer));
-        assert_task_bar(&buffer, last - 2, marks(true, true));
-        assert_eq!(list_row(&buffer, "T-19"), last - 2);
+        assert_task_bar(&buffer, last - 3, marks(true, true));
+        assert_eq!(list_row(&buffer, "T-19"), last - 3);
         assert_eq!(list_row(&buffer, "T-20"), last);
     }
 
@@ -1805,10 +1896,10 @@ mod task_app_render {
         assert_task_bar(&after, selected, marks(true, false));
     }
 
-    /// R10: the rows of tasks being sent have the same two lines and the
+    /// R10: the rows of tasks being sent have the same three lines and the
     /// bracket, and `nie wysłano` is a problem.
     #[test]
-    fn pending_rows_take_two_lines_and_not_sent_is_a_problem() {
+    fn pending_rows_take_three_lines_and_not_sent_is_a_problem() {
         use narsor::tui::task_app::list::{PendingRow, PendingState, TaskList};
         let mut list = TaskList::new();
         for (id, state) in [("p1", PendingState::Sending), ("p2", PendingState::NotSent)] {
@@ -1821,20 +1912,34 @@ mod task_app_render {
         }
         let buffer = draw(layout::LIST_WIDTH, 10, |frame| {
             let area = frame.area();
-            list.render(frame, area, &Styles::new(false), true, false)
+            list.render(
+                frame,
+                area,
+                &Styles::new(false),
+                true,
+                false,
+                chrono::Utc::now(),
+            )
         });
         let width = usize::from(buffer.area.width);
         let line =
             |row: usize| -> String { rows(&buffer)[row].chars().skip(3).take(width - 4).collect() };
-        assert!(line(1).starts_with("  ↻  Pending p1"), "{:?}", line(1));
-        assert!(line(2).starts_with("     wysyłanie…"), "{:?}", line(2));
-        assert!(line(3).starts_with("  ✗  Pending p2"), "{:?}", line(3));
-        assert!(line(4).starts_with("     nie wysłano"), "{:?}", line(4));
-        assert_eq!(buffer.content()[4 * width + 8].fg, Color::Red);
+        assert!(line(1).starts_with("  ↻  id:p1"), "{:?}", line(1));
+        assert!(line(2).starts_with("     Pending p1"), "{:?}", line(2));
+        assert!(line(3).starts_with("     wysyłanie…"), "{:?}", line(3));
+        assert!(line(4).starts_with("  ✗  id:p2"), "{:?}", line(4));
+        assert!(line(5).starts_with("     Pending p2"), "{:?}", line(5));
+        assert!(line(6).starts_with("     nie wysłano"), "{:?}", line(6));
+        let problem_x = rows(&buffer)[4]
+            .chars()
+            .position(|character| character == '✗')
+            .unwrap() as u16;
+        assert_eq!(cell_at(&buffer, problem_x, 4).1, Color::Red);
         // The last pushed row is selected: it has only a bar.
         let cell = |x: u16, y: u16| cell_at(&buffer, x, y);
-        assert_eq!(cell(1, 3), ("│".to_string(), Color::Cyan));
         assert_eq!(cell(1, 4), ("│".to_string(), Color::Cyan));
+        assert_eq!(cell(1, 5), ("│".to_string(), Color::Cyan));
+        assert_eq!(cell(1, 6), ("│".to_string(), Color::Cyan));
         assert_eq!(cell(1, 1).0, " ");
         assert!(none_reversed(buffer.content()));
     }
@@ -1853,7 +1958,7 @@ mod task_app_render {
         let buffer = render(120, 30, &mut app, &Styles::new(false));
         let moved = list_row(&buffer, "Queued 1");
         assert!(
-            content_text(&buffer, moved + 1).starts_with("     ↕ 2/5"),
+            content_text(&buffer, moved + 2).contains("↕ 2/5"),
             "{}",
             screen(&buffer)
         );
@@ -3277,11 +3382,12 @@ mod task_app_detail_render {
                 let text = screen(&buffer);
                 assert!(text.contains(words), "{text}");
                 // The list is the first 28 columns.
-                let row = rows(&buffer)
-                    .into_iter()
-                    .map(|row| row.chars().take(28).collect::<String>())
-                    .find(|row| row.contains("NAR-2"))
-                    .expect("the row");
+                let all_rows = rows(&buffer);
+                let index = all_rows
+                    .iter()
+                    .position(|row| row.chars().take(28).collect::<String>().contains("NAR-2"))
+                    .expect("the title row");
+                let row = all_rows[index - 1].chars().take(28).collect::<String>();
                 assert_eq!(row.contains("! "), marked, "{row}");
                 let order: Vec<&str> = app
                     .list()
@@ -5419,9 +5525,10 @@ mod task_app_create_render {
             panic!("a send was expected");
         };
         let sending = draw_app(&mut app, 130, 30, false);
-        assert_two_lines(&sending, "↻  NAR-18", "     wysyłanie…");
+        assert_three_lines(&sending, "  ↻  id:task-", "     NAR-18", "     wysyłanie…");
         for expected in [
-            "↻  NAR-18",
+            "id:task-",
+            "NAR-18",
             "wysyłanie…",
             "Serwer jeszcze nie potwierdził zadania",
         ] {
@@ -5442,8 +5549,14 @@ mod task_app_create_render {
                 .await;
         });
         let unsent = draw_app(&mut app, 130, 30, false);
-        assert_two_lines(&unsent, "✗  NAR-18", "     nie wysłano");
-        for expected in ["✗  NAR-18", "nie wysłano", "Dane zostały zachowane", &id] {
+        assert_three_lines(&unsent, "  ✗  id:task-", "     NAR-18", "     nie wysłano");
+        for expected in [
+            "✗  id:task-",
+            "NAR-18",
+            "nie wysłano",
+            "Dane zostały zachowane",
+            &id,
+        ] {
             assert!(unsent.contains(expected), "{expected}:\n{unsent}");
         }
     }
@@ -5543,7 +5656,7 @@ mod task_app_create_render {
     }
 
     /// The list line holding `first` is followed by one that starts with
-    /// `second` (inside the frame of the list column).
+    /// `second` and `third` (inside the frame of the list column).
     fn assert_two_lines(screen: &str, first: &str, second: &str) {
         let lines: Vec<String> = screen
             .lines()
@@ -5741,8 +5854,7 @@ mod task_app_main_screen {
         );
         assert!(rows[0].contains("sloty"), "{}", rows[0]);
 
-        // The list, in the order of the queue, one row per task: attention,
-        // state, title, label.
+        // The list, in queue order: markers/id, title, then state/time/label.
         let list_part = |row: &String| -> String {
             row.chars().take(usize::from(layout::LIST_WIDTH)).collect()
         };
@@ -5757,27 +5869,25 @@ mod task_app_main_screen {
                 .iter()
                 .position(|row| list_part(row).contains(title))
                 .unwrap_or_else(|| panic!("no row for {title}:\n{screen}"));
-            list_part(&rows[at + 1])
+            list_part(&rows[at + 2])
         };
         // The frame, the bracket's column, then the row; the selected task
         // has the grey bar, the focus being in the details.
         assert!(
-            row_of("NAR-14").starts_with("│    ●  NAR-14"),
+            row_of("NAR-14").starts_with("│    ●  id:NAR-14"),
             "{}",
             row_of("NAR-14")
         );
         assert!(
-            row_of("NAR-12").starts_with("││ ? ●  NAR-12"),
+            row_of("NAR-12").starts_with("││ ? ●  id:NAR-12"),
             "{}",
             row_of("NAR-12")
         );
         assert!(
-            row_of("NAR-16").starts_with("│    ◷  NAR-16")
-                && under("NAR-16").starts_with("│       #1")
+            row_of("NAR-16").starts_with("│    ◷  id:NAR-16") && under("NAR-16").contains("#1")
         );
         assert!(
-            row_of("NAR-17").starts_with("│    ◷  NAR-17")
-                && under("NAR-17").starts_with("│       #2")
+            row_of("NAR-17").starts_with("│    ◷  id:NAR-17") && under("NAR-17").contains("#2")
         );
         let order: Vec<usize> = ["NAR-14", "NAR-12", "NAR-16", "NAR-17"]
             .iter()
