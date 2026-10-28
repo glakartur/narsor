@@ -108,7 +108,7 @@ Przeniesione z origin: R1–R11, AE1–AE5. R12 (filtr otwierany przez `/`) oraz
 - `src/tui/task_app/history.rs` (`legacy_summary`)
 - testy protokołu obok istniejących w `crates/narsor-protocol/src/controller.rs` i `tests/api.rs`
 
-**Approach:** Opcjonalne pole z `serde(default)`. Brak zmiany wersji protokołu. Ustalić źródło czasu dla stanów pochodnych: `HumanNeeded` korzysta z `attention.since`, `Queued` z `queue.since`, a `Provisioning` z utrwalonego czasu wejścia w ten stan. Dla każdego przejścia utrwalić czas wejścia do stanu, zamiast wyliczać go podczas odczytu. Aktualizować literały `TaskSummary` w testach i w `legacy_summary` (`src/tui/task_app/history.rs`) na `None`.
+**Approach:** Opcjonalne pole z `#[serde(default, skip_serializing_if = "Option::is_none")]`: starszy JSON wczytuje się bez pola, a `None` nie dodaje klucza przy serializacji. Brak zmiany wersji protokołu. Ustalić źródło czasu dla stanów pochodnych: `HumanNeeded` korzysta z `attention.since`, `Queued` z `queue.since`, a `Provisioning` z utrwalonego czasu wejścia w ten stan. Dla każdego przejścia utrwalić czas wejścia do stanu, zamiast wyliczać go podczas odczytu. Aktualizować literały `TaskSummary` w testach i w `legacy_summary` (`src/tui/task_app/history.rs`) na `None`.
 
 **Patterns to follow:** pole `ticket` w `TaskSummary`.
 
