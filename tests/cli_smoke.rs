@@ -3138,7 +3138,7 @@ mod remote_cli {
             assert!(get.stdout.contains("Override: -"), "{}", get.stdout);
             assert!(
                 get.stdout
-                    .contains("Supported: claude-code, codex, opencode"),
+                    .contains("Supported: claude-code, codex, github-copilot, opencode"),
                 "{}",
                 get.stdout
             );
@@ -3163,7 +3163,7 @@ mod remote_cli {
         assert_eq!(unknown.code, EXIT_FAILURE, "{}", unknown.output());
         assert!(
             unknown.stderr.contains("unsupported_harness")
-                && unknown.stderr.contains("claude-code, codex, opencode"),
+                && unknown.stderr.contains("claude-code, codex, github-copilot, opencode"),
             "{}",
             unknown.stderr
         );
@@ -3201,7 +3201,7 @@ mod remote_cli {
         assert_eq!(selection["configured"], "claude-code", "{}", get.stdout);
         assert_eq!(
             selection["supported"],
-            serde_json::json!(["claude-code", "codex", "opencode"]),
+            serde_json::json!(["claude-code", "codex", "github-copilot", "opencode"]),
             "{}",
             get.stdout
         );

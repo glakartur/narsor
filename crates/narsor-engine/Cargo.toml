@@ -37,3 +37,4 @@ jsonwebtoken = { version = "11", default-features = false, features = ["rust_cry
 ed25519-dalek = { version = "3", features = ["alloc", "rand_core"] }
 rand = "0.10"
 ipnet = "2"
+github-copilot-sdk = "1.0"

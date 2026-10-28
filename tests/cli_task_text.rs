@@ -268,7 +268,12 @@ fn json_output_is_valid_and_free_of_invisible_characters() {
 
 fn selection(override_harness: Option<&str>) -> HarnessSelectionSnapshot {
     HarnessSelectionSnapshot {
-        supported: vec!["claude-code".into(), "codex".into(), "opencode".into()],
+        supported: vec![
+            "claude-code".into(),
+            "codex".into(),
+            "github-copilot".into(),
+            "opencode".into(),
+        ],
         configured: "claude-code".into(),
         override_harness: override_harness.map(str::to_string),
         effective: override_harness.unwrap_or("claude-code").to_string(),

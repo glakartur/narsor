@@ -30,7 +30,12 @@ impl Drop for TempRoot {
 }
 
 fn supported() -> Vec<String> {
-    vec!["claude-code".into(), "codex".into(), "opencode".into()]
+    vec![
+        "claude-code".into(),
+        "codex".into(),
+        "github-copilot".into(),
+        "opencode".into(),
+    ]
 }
 
 #[tokio::test]

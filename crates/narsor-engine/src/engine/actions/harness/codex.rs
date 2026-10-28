@@ -94,6 +94,7 @@ impl HarnessAdapter for CodexAdapter {
         Ok(HarnessInvocation {
             program: self.program.clone(),
             args,
+            stdin: None,
         })
     }
 

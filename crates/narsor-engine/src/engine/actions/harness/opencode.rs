@@ -141,6 +141,7 @@ impl HarnessAdapter for OpenCodeAdapter {
         Ok(HarnessInvocation {
             program: self.program.clone(),
             args,
+            stdin: None,
         })
     }
 

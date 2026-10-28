@@ -25,6 +25,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod github_copilot;
 pub mod opencode;
 
 use std::path::{Path, PathBuf};
@@ -37,6 +38,7 @@ use crate::domain::{ActionError, AgentActionConfig, WorkspaceAccess};
 
 pub use claude_code::{ClaudeCodeAdapter, CLAUDE_CODE};
 pub use codex::{CodexAdapter, CODEX};
+pub use github_copilot::{GitHubCopilotAdapter, GITHUB_COPILOT};
 pub use opencode::{OpenCodeAdapter, OPENCODE};
 
 /// Everything an adapter needs to build one invocation.
@@ -75,6 +77,9 @@ pub struct HarnessInvocation {
 
     /// Its arguments, each one separately — never a shell string.
     pub args: Vec<String>,
+
+    /// Optional content to write to stdin; avoids argument length limits.
+    pub stdin: Option<String>,
 }
 
 /// What an adapter read out of a finished harness run.
@@ -212,13 +217,14 @@ pub struct HarnessRegistry {
 }
 
 impl HarnessRegistry {
-    /// The harnesses of this version: `claude-code`, `codex`, and `opencode`, each on its
+    /// The harnesses of this version: `claude-code`, `codex`, `github-copilot`, and `opencode`, each on its
     /// default binary.
     pub fn defaults() -> Self {
         Self {
             adapters: vec![
                 Arc::new(ClaudeCodeAdapter::new()),
                 Arc::new(CodexAdapter::new()),
+                Arc::new(GitHubCopilotAdapter::new()),
                 Arc::new(OpenCodeAdapter::new()),
             ],
         }
