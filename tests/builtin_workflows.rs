@@ -451,7 +451,6 @@ fn compound_engineering_revisions_continue_the_author_session() {
         ("review_requirements", "revise"),
         ("review_plan", "revise"),
         ("review_plan", "revise_requirements"),
-        ("review_work", "revise"),
         ("review_work", "revise_plan"),
         ("review_learning", "revise"),
     ] {

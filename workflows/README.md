@@ -112,7 +112,7 @@ default branch and stores its URL as `pr_url`; every later one pushes to it.
 2 plan          plan → plan_review* → publish_plan → review_plan → (check_plan_feedback)
 3 implementation work → simplify → code_review → verify_work → publish_work → review_work → (check_work_feedback)
                 code_review → work_revision → code_review (findings for the agent)
-                code_review → publish_questions → answer_questions → collect_answers → work_revision | verify_work
+                review_work → check_work_feedback → work_revision → code_review (decisions of the person)
 4 learning      compound → publish_learning → review_learning → (check_learning_feedback)
 5 finalize      finalize → finished
 ```
@@ -133,22 +133,24 @@ runs.
 |---|---|---|
 | `review_requirements` | `check_feedback`, `accept`, `revise`, `abandon` | Every later step is measured against the requirements; a wrong scope corrected here costs one conversation. |
 | `review_plan` | `check_feedback`, `accept`, `revise`, `revise_requirements`, `abandon` | The last point before code exists. The plan can also show that the requirements are wrong. |
-| `review_work` | `check_feedback`, `accept`, `revise`, `revise_plan`, `abandon` | The person reviews the published implementation. |
+| `review_work` | `check_feedback`, `accept`, `revise_plan`, `abandon` | The person answers the questions of the code review and gives their own notes, once per round. |
 | `review_learning` | `check_feedback`, `accept`, `revise`, `drop` | The implementation is already accepted, so this gate keeps, revises or drops the learning; it cannot stop the pipeline. |
 
 Every choice that sends a stage back (`revise`, `revise_requirements`,
 `revise_plan`) needs a comment and continues the session of the stage's author
 with it (`resume_comment_field`): `brainstorm` for the requirements, `plan` for
-the plan, `work_revision` for the implementation, `compound` for the learning.
-The comment field is optional for `check_feedback` and `accept`. Only the note
-from `review_requirements` is carried on: the plan reads it.
+the plan or for `revise_plan` at the implementation gate, `compound` for the
+learning. The comment field is optional for `check_feedback` and `accept`. The
+note from `review_requirements` is carried on to the plan; the note
+`work_feedback` from `review_work` goes to `check_work_feedback`.
 
-`check_feedback` runs the stage's `check_*_feedback` step, which runs
-`ce-resolve-pr-feedback` on `pr_url` for the feedback posted while the person
-was reading. For requirements and plan it judges the size of a fix:
-`fixed_minor` publishes and asks for a review again, `fixed_major` goes back to
-the review step. For implementation, `fixed` goes back to `code_review`; for
-learning, it publishes again. `needs_human` returns to the gate, which shows
+`check_feedback` runs the stage's `check_*_feedback` step. For requirements,
+plan and learning it runs `ce-resolve-pr-feedback` on `pr_url`, with `glab` on
+GitLab, for the feedback posted while the person was reading. For requirements
+and plan it judges the size of a fix: `fixed_minor` publishes and asks for a
+review again, `fixed_major` goes back to the review step. For learning, `fixed`
+publishes again. For implementation, `check_work_feedback` changes no code (see
+below). `needs_human` returns to the gate, which shows
 the agent's `reason`. `accept` skips that step and goes at once to the first
 step of the next stage (`plan`, `work`, `compound`, `finalize`): the person who
 accepts takes responsibility for the comments on the merge request.
@@ -162,8 +164,7 @@ answer, so an old blocker does not come back on a later pass. `plan` and
 and `{{ artifacts.learning_doc }}`, empty on the first pass.
 
 Implementation: `simplify` runs once, after `work`. Every later change of code
-— `work_revision`, a fix from `repair_verification` or `check_work_feedback` —
-goes through `code_review → verify_work → publish_work → review_work`.
+— `work_revision` or a fix from `repair_verification` — goes through `code_review → verify_work → publish_work → review_work`.
 `publish_work` rewrites the description of the merge request on every push, so
 it describes the whole change: the code, the requirements and the plan. The
 other publish steps leave the description as it is.
@@ -171,14 +172,17 @@ other publish steps leave the description as it is.
 `code_review` runs `ce-code-review` in `mode:headless`. The skill applies the
 safe fixes itself and returns the other findings with `autofix_class`, `owner`
 and `suggested_fix`. The step sorts them: findings that an agent can fix go to
-`review_findings`; findings that need a decision by the person go to
-`pending_questions`. Findings for the agent always go first. The choice is
-`findings` whenever at least one finding is for the agent, and the questions
-wait for the next review. Only when nothing is left for the agent does the
-step choose `questions`. `work_revision` fixes
-the findings, and also the comments from the gate (`work_feedback`). It reads
-both and clears both in its answer. `work` clears `review_findings` and
-`review_decisions` when it starts a new implementation.
+`review_findings`; findings that need a decision by the person are added to
+`pending_questions`, which keeps the questions of earlier entries. The choice
+is `findings` whenever at least one finding is for the agent, else `clean`:
+questions alone do not stop the review, they wait for `publish_work`. From the
+second entry into `code_review` (the number comes from the step's history),
+only P0/P1 findings and `popraw` decisions the code does not do are reported as
+findings or questions; new P2/P3 findings go only to `reason`.
+`work_revision` fixes the findings and the changes in `work_feedback`, checks
+each one in the code before it chooses `revised`, and clears both in its
+answer. `work` clears `review_findings`, `review_decisions` and
+`pending_questions` when it starts a new implementation.
 
 `review_decisions` is the memory of decisions. Each entry has a number `D<n>`,
 a file, a symbol or region of code, the point of the problem, the decision
@@ -190,20 +194,31 @@ not sure, the finding is new. A finding with the decision `zostaw` is not
 reported again. For `popraw` the review checks that the code does what was
 decided, and reports a finding for the agent when it does not.
 
-Questions in the original workflow go to the merge request: `publish_questions`
-pushes the code and adds one inline comment for each question, marked
-`[narsor:decyzja Q<n>]`. When the line is not in the diff, it adds a general
-comment with the same mark. The gate `answer_questions` has the choices
-`answered` and `abandon`, and no `accept`: the code has not passed
-`verify_work`. `collect_answers` reads the answers only from the threads in
-`review_questions`, and only from the author of the merge request and members
-with write access. It writes the decisions to `review_decisions`. When any
-question has no answer it chooses `unanswered` and the gate asks again, even
-when other decisions need a change. With all answers: `changes_needed` goes to
-`work_revision`, `all_declined` goes to `verify_work`.
+Questions in the original workflow go to the merge request with the verified
+code: after the push, `publish_work` adds one inline comment for each question
+in `pending_questions`, marked `[narsor:decyzja Q<n>]`, or a general comment
+with the same mark when the line is not in the diff. It clears
+`pending_questions` only when it asked every question. It also replies in each
+thread of `feedback_threads` with the commit and what was done, and resolves
+it.
 
-In the chat variants (`-chat`, `-debug`) there is no `questions` choice.
-`code_review` asks in the session with `awaiting_input`, one question for each
+Convention for the person at `review_work`: answer each question in its thread
+(`A`, `B` or your own text), write each note of your own in a new thread or in
+`work_feedback`, and do not resolve threads — the agent resolves them.
+
+`check_work_feedback` changes no code. It reads the open threads and
+`work_feedback`, and accepts comments only from the author of the merge
+request and members with write access. It adds one `D<n>` entry to
+`review_decisions` for each answer and each note (a note is `popraw`), on every
+choice, because a blank note at the next pass clears `work_feedback`. It puts
+each `popraw` the code does not do yet in `work_feedback`. `changes_needed`
+goes to `work_revision` with the `popraw` threads in `feedback_threads`;
+`no_feedback` goes to `compound`; `needs_human` (a question without a clear
+answer) returns to the gate and resolves no thread. With `changes_needed` and
+`no_feedback` it resolves the `zostaw` threads and the answers that need no
+change of code itself.
+
+In the chat variants (`-chat`, `-debug`) `code_review` asks in the session with `awaiting_input`, one question for each
 finding, the recommended option first. It writes the decisions to
 `review_decisions` and chooses `findings` or `clean`. In `-debug` the author
 step is `fix_revision` and the gate is `review_fix`.
@@ -234,7 +249,7 @@ pull request out of Draft or merged.
 
 Loop limits (`max_entries`): `code_review` 10, `repair_verification` 5. The
 counter of `code_review` counts every entry in the task, including the rounds
-after questions and after `revise`.
+after `check_work_feedback` and after `revise_plan`.
 Terminals: `finished` (out of Draft and ready for review, completed),
 `cancelled` (`abandon` at a gate) and `finalize_failed` (a person confirmed at the `finalize_blocked` gate that finalize could not confirm
 that the pull request is out of Draft, failed). `abandon` does not close the pull request.
