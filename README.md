@@ -536,6 +536,13 @@ the same way; a conversation and *Zdarzenia* keep only the bar. `z` hides finish
 a filter; `a` archives one. The selection follows the task, not the row,
 through every refresh.
 
+Each task uses three lines: its ticket (or an `id:` prefix and the first eight
+id characters), title, then state, time in that state and the existing short
+label. Activity time advances on redraw; tasks without a known start time and
+finished tasks show no age. `/` filters by ticket, title or full id without
+changing server order; state changes and refreshes likewise keep rows in place,
+and only an explicit queue move reorders them. `Esc` cancels filter editing.
+
 **The details** show the header (title and links from `display`, lifecycle,
 step, duration) and five tabs: *Przebieg* (the steps and the selected one),
 *Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
@@ -654,7 +661,7 @@ the current step or a draft.
 | Where | Keys |
 |---|---|
 | Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
-| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `c` `r`, `h` default harness |
+| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `c` `r`, `h` default harness |
 | Details | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
 | — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all |

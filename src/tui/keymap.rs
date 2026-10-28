@@ -238,6 +238,8 @@ pub enum Action {
     NewTask,
     /// Hide or show finished tasks.
     ToggleDone,
+    /// Search the task list.
+    Filter,
     /// Open the history.
     History,
     /// Open the repositories.
@@ -576,6 +578,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::ToggleDone,
         "zakończone",
         "ukryj albo pokaż zakończone zadania",
+    ),
+    bind(
+        Context::List,
+        Key::char('/'),
+        Action::Filter,
+        "",
+        "filtruj listę po tickecie, tytule lub identyfikatorze",
     ),
     bind(
         Context::List,

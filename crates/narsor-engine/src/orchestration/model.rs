@@ -238,6 +238,9 @@ pub struct TaskRecord {
     pub(crate) legacy_priority: Option<i32>,
     /// When the task was created.
     pub created_at: DateTime<Utc>,
+    /// When the task entered its current owner-visible state, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_since: Option<DateTime<Utc>>,
     /// Creation order across all tasks, the tie-breaker among equal ranks
     /// (U10). Strictly increasing, never reused.
     pub queue_sequence: u64,

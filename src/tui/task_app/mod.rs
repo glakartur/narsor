@@ -783,6 +783,11 @@ impl TaskApp {
 
     /// Folds a key into the state. Returns what needs the API.
     pub fn on_key(&mut self, key: KeyEvent) -> Request {
+        if matches!(self.view, View::Tasks) && self.focus == Focus::List && self.list.is_filtering()
+        {
+            self.on_filter_key(key);
+            return Request::None;
+        }
         if self.quit_confirm {
             match key {
                 KeyEvent {
@@ -891,6 +896,7 @@ impl TaskApp {
                 self.back_to_axis();
             }
             Action::ToggleDone => self.change_list(TaskList::toggle_hide_done),
+            Action::Filter if context == Context::List => self.list.begin_filter(),
             Action::PrevTab => self.shift_tab(-1),
             Action::NextTab => self.shift_tab(1),
             Action::MoveUp => return self.step_move(true),
@@ -912,6 +918,18 @@ impl TaskApp {
             }
         }
         Request::None
+    }
+
+    fn on_filter_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.list.cancel_filter(),
+            KeyCode::Enter => self.list.finish_filter(),
+            KeyCode::Backspace => self.list.pop_filter_char(),
+            KeyCode::Char(character) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
+                self.list.push_filter_char(character);
+            }
+            _ => {}
+        }
     }
 
     /// `q` opens the exit confirmation; only its second `q` leaves.
