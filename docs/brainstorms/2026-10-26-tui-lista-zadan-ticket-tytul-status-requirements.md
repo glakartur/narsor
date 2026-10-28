@@ -21,7 +21,7 @@ Stan kodu (zweryfikowany):
 - `src/tui/task_app/list.rs`: dokumentacja modułu mówi, że klient nigdy nie sortuje listy. Kolejność wyznacza serwer (grupy po backendzie, w grupie wg `rank`). Tylko zdarzenie `Moved` zmienia kolejność wierszy.
 - `TaskSummary` ma już pola `ticket`, `title`, `display.title`, `created_at`, `state`, `rank`. Ticket jest `Option<String>`.
 - `title_of` zwraca `display.title`, a gdy go brak, `task_id`.
-- Nie znalazłem pola z czasem wejścia w bieżący stan. Źródło czasu aktywności trzeba ustalić (patrz założenia).
+- Nie ma ogólnego pola z czasem wejścia w dowolny stan; `QueueView.since` istnieje dla `Queued`, a `AttentionItem.since` dla elementów uwagi. Źródło czasu dla pozostałych stanów trzeba ustalić.
 - Przyczyny zmiany kolejności po zatwierdzeniu **nie zweryfikowałem**. Kandydaci: odświeżenie listy z serwera (`TaskList::replace`) po zatwierdzeniu, zmiana `rank` po stronie serwera albo zdarzenie `Moved`. Plan musi ją najpierw ustalić odtworzeniem błędu.
 
 ---
@@ -48,6 +48,10 @@ Stan kodu (zweryfikowany):
 - R10. Kolejność zmienia się tylko wtedy, gdy operator sam przenosi zadanie (tryb `m`) albo gdy w kolejce pojawia się lub znika zadanie.
 - R11. Zaznaczone zadanie pozostaje zaznaczone po zatwierdzeniu pracy (zaznaczenie po `task_id`, jak dziś).
 
+**Filtrowanie**
+
+- R12. Naciśnięcie `/` na liście otwiera filtr zadań. Dopasowanie uwzględnia ticket, tytuł i `task_id`; filtrowanie nie zmienia kolejności pozostałych zadań.
+
 ## Acceptance Examples
 
 - AE1. **Covers R1, R2.** Zadanie ma ticket `NAR-42` i tytuł "Refaktor parsera". Wiersz pokazuje `NAR-42` i tytuł.
@@ -62,7 +66,8 @@ Stan kodu (zweryfikowany):
 
 - Operator rozpoznaje zadanie na liście po tickecie albo po skróconym identyfikatorze, bez wchodzenia w szczegóły.
 - Operator widzi, które zadania "stoją" najdłużej w danym statusie.
-- Po zatwierdzeniu pracy żaden wiersz nie zmienia miejsca bez działania operatora.
+- Zatwierdzenie pracy ani zmiana statusu nie zmieniają kolejności; kolejność może się zmienić po jawnym przeniesieniu przez operatora albo dodaniu/usunięciu zadania.
+- Operator może otworzyć filtr klawiszem `/` i znaleźć zadanie po tickecie, tytule lub `task_id`.
 
 ## Scope Boundaries
 
@@ -71,22 +76,22 @@ Stan kodu (zweryfikowany):
 - Poza zakresem: edycja ticketu z poziomu listy.
 - Poza zakresem: zmiany w panelu szczegółów (poza tym, co wynika ze wspólnych funkcji).
 
-## Założenia do potwierdzenia
+## Założenia i decyzje operatora
 
-- A1. "Status, czas aktywności" to jedna informacja: status oraz czas, jaki zadanie jest w tym statusie. Alternatywa: czas od utworzenia zadania lub łączny czas pracy agenta.
-- A2. Skrócona postać `task_id` to pierwsze kilka znaków (ok. 8) identyfikatora.
-- A3. Układ zostaje dwuliniowy: linia 1 to znaczniki, ticket i tytuł. Linia 2 to status, czas aktywności i dotychczasowa etykieta (krok, `#n`, `offline`, `bez slotu`).
-- A4. Czas aktywności dla zadania w kolejce liczymy od wejścia w stan `Queued`. Dla zadań zakończonych pokazujemy czas, który upłynął od zakończenia, albo nic. Przyjmuję: nic.
+- A1. Rozstrzygnięte: "czas aktywności" to czas w bieżącym statusie. `HumanNeeded` korzysta z `attention.since`, `Queued` z `queue.since`, a `Provisioning` z czasu wejścia w ten stan.
+- A2. Rozstrzygnięte: skrót `task_id` ma 8 znaków, jest widoczny tylko bez ticketu i ma tekstowy prefiks `id:`.
+- A3. Wiersz ma trzy linie: znaczniki i ticket (albo skrócony `task_id`), tytuł, a następnie status, czas aktywności i dotychczasową etykietę (krok, `#n`, `offline`, `bez slotu`).
+- A4. Rozstrzygnięte: czas dla `Queued` liczymy od `queue.since`; dla zadań zakończonych nie pokazujemy czasu.
 - A5. Przyczyną zmiany kolejności jest zachowanie listy po zatwierdzeniu (odświeżenie lub zmiana `rank`), a nie sortowanie w kliencie, bo klient nie sortuje. To nie jest zweryfikowane. Plan zaczyna się od odtworzenia problemu.
 - A6. Zmiana kolejności po zatwierdzeniu jest błędem do naprawy, a nie funkcją (np. "zadania wymagające uwagi na górę").
 - A7. Pole czasu wejścia w bieżący stan może wymagać zmiany w protokole serwera (`TaskSummary`). Wymaga to oceny zgodności ze starszymi serwerami, które pola nie wyślą. W takim przypadku wiersz nie pokazuje czasu.
 
-## Pytania otwarte dla użytkownika
+## Decyzje operatora
 
-- Q1. Czy "czas aktywności" oznacza czas w bieżącym statusie, czas od utworzenia, czy łączny czas pracy agenta?
-- Q2. Czy po zatwierdzeniu zadanie ma zostać na swoim miejscu także wtedy, gdy zmieni stan na końcowy (zakończone)? Czy wtedy może zniknąć lub opaść na dół, gdy włączone jest ukrywanie zakończonych (`z`)?
-- Q3. Jak długi ma być skrócony `task_id` i czy pokazywać go razem z tytułem, gdy ticket istnieje?
-- Q4. Czy lista ma być szersza, by pomieścić ticket, czy ticket ma zajmować część miejsca tytułu?
+- Q1. Rozstrzygnięte: czas w bieżącym statusie; `HumanNeeded` używa `attention.since`, a `Provisioning` czasu wejścia w ten stan.
+- Q2. Rozstrzygnięte: po zmianie na stan końcowy zadanie pozostaje na miejscu; ukrywanie zakończonych (`z`) nadal działa jako filtr.
+- Q3. Rozstrzygnięte: skrót ma 8 znaków, pokazuje się tylko bez ticketu i ma prefiks `id:`.
+- Q4. Rozstrzygnięte: szerokość listy i jej minimalna szerokość pozostają bez zmian. Ticket ma własną linię i jest przycinany do dostępnej szerokości.
 
 ## Dependencies / Assumptions
 
@@ -95,5 +100,5 @@ Stan kodu (zweryfikowany):
 
 ## Next Steps
 
-- Operator odpowiada na pytania otwarte w merge requeście.
-- Następnie `/ce-plan`. Plan zaczyna się od odtworzenia zmiany kolejności po zatwierdzeniu.
+- Decyzje dla Q1–Q4 zostały uwzględnione w planie.
+- Po akceptacji planu można rozpocząć implementację; pierwszym krokiem jest odtworzenie zmiany kolejności po zatwierdzeniu.
