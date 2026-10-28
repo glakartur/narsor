@@ -76,7 +76,7 @@
   </header>
   <main>
     <div class="canvas" role="region" aria-label="Diagram przepływu workflow; na wąskim ekranie można przewijać poziomo" tabindex="0">
-      <svg viewBox="0 0 1480 2730" role="img" aria-labelledby="diagram-title diagram-desc">
+      <svg viewBox="0 0 1160 2730" role="img" aria-labelledby="diagram-title diagram-desc">
         <title id="diagram-title">Diagram compound-engineering</title>
         <desc id="diagram-desc">Pięć etapów: wymagania, plan, implementacja, wiedza i zakończenie. Każdy etap publikuje zmiany do tego samego Draft MR i czeka na bramkę przeglądu. Bramka sprawdza komentarze na MR, akceptuje etap od razu albo wraca do autora. Zakończenie tylko zdejmuje Draft z MR; MR scala człowiek.</desc>
         <defs>
@@ -126,18 +126,11 @@
         <path class="edge" d="M425 1232H240V690H425"/>
         <path class="edge" d="M425 1722H270V698H425"/>
         <path class="edge" d="M675 1438H1140V1744H1025"/>
-        <path class="edge" d="M650 1402V1380H1230V1402"/>
-        <path class="edge" d="M1340 1462V1502"/>
-        <path class="edge" d="M1340 1562V1602"/>
-        <path class="edge" d="M1230 1640H1180V1720H1025"/>
-        <path class="edge" d="M1230 1618H1205V1540H1230"/>
-        <path class="edge" d="M1450 1632H1470V1350H710V1532H675"/>
         <path class="edge" d="M675 1532H775"/>
         <path class="edge" d="M1025 1532H1080V1408H675"/>
-        <path class="edge" d="M675 1732H775"/>
         <path class="edge" d="M1025 1732H1100V1404H675"/>
         <path class="edge" d="M425 1832H360V1744H425"/>
-        <path class="edge" d="M425 1846H330V1452H425"/>
+        <path class="edge" d="M675 1832H900V1762"/>
         <path class="edge" d="M550 1862V1958"/>
         <path class="edge" d="M675 1752H740V1938H640V1958"/>
         <path class="edge" d="M550 2018V2058"/>
@@ -190,13 +183,11 @@
         <text class="edge-label" x="232" y="961" text-anchor="start">needs_plan_revision</text>
         <text class="edge-label" x="262" y="1210" text-anchor="start">revise_plan ✎</text>
         <text class="edge-label" x="683" y="1414" text-anchor="start">findings</text>
-        <text class="edge-label" x="683" y="1462" text-anchor="start">fixed</text>
         <text class="edge-label" x="683" y="1526" text-anchor="start">failed</text>
         <text class="edge-label" x="1074" y="1470" text-anchor="end">repaired</text>
-        <text class="edge-label" x="683" y="1726" text-anchor="start">revise ✎</text>
         <text class="edge-label" x="1094" y="1568" text-anchor="end">revised</text>
         <text class="edge-label" x="352" y="1788" text-anchor="start">needs_human</text>
-        <text class="edge-label" x="322" y="1649" text-anchor="start">fixed</text>
+        <text class="edge-label" x="760" y="1826" text-anchor="start">changes_needed</text>
         <text class="edge-label" x="560" y="1914" text-anchor="start">no_feedback</text>
         <text class="edge-label" x="560" y="2042" text-anchor="start">documented</text>
         <text class="edge-label" x="560" y="2142" text-anchor="start">published</text>
@@ -229,15 +220,12 @@
         <g class="node agent"><rect x="425" y="1202" width="250" height="60"/><text class="title" x="550" y="1229">Implementacja</text><text class="sub" x="550" y="1248">work · ce-work</text></g>
         <g class="node agent"><rect x="425" y="1302" width="250" height="60"/><text class="title" x="550" y="1329">Uproszczenie</text><text class="sub" x="550" y="1348">simplify · ce-simplify-code</text></g>
         <g class="node agent"><rect x="425" y="1402" width="250" height="60"/><text class="title" x="550" y="1429">Code review</text><text class="sub" x="550" y="1448">code_review · max 10</text></g>
-        <g class="node agent"><rect x="1230" y="1402" width="220" height="60"/><text class="title" x="1340" y="1429">Pytania w MR</text><text class="sub" x="1340" y="1448">publish_questions</text></g>
-        <g class="node human"><rect x="1230" y="1502" width="220" height="60"/><text class="title" x="1340" y="1529">Decyzje człowieka</text><text class="sub" x="1340" y="1548">answer_questions</text></g>
-        <g class="node agent"><rect x="1230" y="1602" width="220" height="60"/><text class="title" x="1340" y="1629">Odczyt odpowiedzi</text><text class="sub" x="1340" y="1648">collect_answers</text></g>
         <g class="node script"><rect x="425" y="1502" width="250" height="60"/><text class="title" x="550" y="1529">Sprawdzenie</text><text class="sub" x="550" y="1548">verify_work · scripts/verify.sh</text></g>
         <g class="node agent"><rect x="775" y="1502" width="250" height="60"/><text class="title" x="900" y="1529">Naprawa sprawdzenia</text><text class="sub" x="900" y="1548">repair_verification · max 5</text></g>
         <g class="node agent"><rect x="425" y="1602" width="250" height="60"/><text class="title" x="550" y="1629">Publikacja</text><text class="sub" x="550" y="1648">publish_work · przepisuje opis MR</text></g>
         <g class="node human"><rect x="425" y="1702" width="250" height="60"/><text class="title" x="550" y="1729">Przegląd kodu</text><text class="sub" x="550" y="1748">review_work</text></g>
-        <g class="node agent"><rect x="775" y="1702" width="250" height="60"/><text class="title" x="900" y="1729">Zmiany z przeglądu</text><text class="sub" x="900" y="1748">work_revision</text></g>
-        <g class="node agent"><rect x="425" y="1802" width="250" height="60"/><text class="title" x="550" y="1829">Uwagi z MR</text><text class="sub" x="550" y="1848">check_work_feedback</text></g>
+        <g class="node agent"><rect x="775" y="1702" width="250" height="60"/><text class="title" x="900" y="1729">Poprawki</text><text class="sub" x="900" y="1748">work_revision</text></g>
+        <g class="node agent"><rect x="425" y="1802" width="250" height="60"/><text class="title" x="550" y="1829">Decyzje z MR</text><text class="sub" x="550" y="1848">check_work_feedback</text></g>
         <g class="node agent"><rect x="425" y="1958" width="250" height="60"/><text class="title" x="550" y="1985">Zapis wiedzy</text><text class="sub" x="550" y="2004">compound · ce-compound</text></g>
         <g class="node agent"><rect x="425" y="2058" width="250" height="60"/><text class="title" x="550" y="2085">Publikacja</text><text class="sub" x="550" y="2104">publish_learning</text></g>
         <g class="node human"><rect x="425" y="2158" width="250" height="60"/><text class="title" x="550" y="2185">Przegląd wiedzy</text><text class="sub" x="550" y="2204">review_learning</text></g>
@@ -252,7 +240,7 @@
     </div>
     <section class="notes" aria-label="Opis głównych pętli">
       <article class="note"><h2>Wymagania i plan</h2><p>Review poprawia dokument i podsumowuje uwagi. Wynik nie czeka na bramkę: publikacja dodaje podsumowanie do MR jako komentarz, a człowiek czyta je przy bramce. Brainstorm nie zadaje pytań. Założenia i pytania otwarte są w dokumencie, a człowiek odpowiada w MR. Dla małej i oczywistej zmiany agent może pominąć review wymagań (<code>requirements_ready</code>) i podać powód w MR. Pierwsza publikacja tworzy Draft MR. Po <code>check_feedback</code> agent ocenia skalę poprawek z uwag: mała wraca do bramki, duża do review. <code>accept</code> pomija sprawdzenie uwag. Blokada planu wraca do autora wymagań.</p></article>
-      <article class="note"><h2>Implementacja</h2><p>Uproszczenie działa raz. Każda późniejsza zmiana kodu przechodzi przez code review, sprawdzenie i publikację, zanim wróci do człowieka. Code review działa w trybie <code>headless</code>. Findingi do poprawy idą zawsze pierwsze, do kroku <code>work_revision</code>. Pytania do człowieka padają dopiero wtedy, gdy zostały tylko findingi do decyzji: kod i pytania trafiają do MR (<code>publish_questions</code>), człowiek odpowiada w wątkach i wybiera <code>answered</code> (<code>answer_questions</code>), a <code>collect_answers</code> zapisuje decyzje w <code>review_decisions</code>. Review nie zgłasza ponownie findingu z decyzją „zostaw”. Gdy człowiek odrzucił wszystko, kod idzie do <code>verify_work</code>. Publikacja kodu przepisuje opis MR, aby opisywał całą zmianę. Blokada implementacji wraca do autora planu. Pętle napraw mają limity wejść.</p></article>
+      <article class="note"><h2>Implementacja</h2><p>Uproszczenie działa raz. Każda późniejsza zmiana kodu przechodzi przez code review, sprawdzenie i publikację, zanim wróci do człowieka. Code review działa w trybie <code>headless</code>. Uwagi do poprawy idą do <code>work_revision</code>. Pytania do człowieka czekają w <code>pending_questions</code> i nie zatrzymują przeglądu. Od drugiego wejścia przegląd zgłasza tylko uwagi P0/P1 i niespełnione decyzje <code>popraw</code>. <code>publish_work</code> wstawia pytania do MR z oznaczeniem <code>[narsor:decyzja Q&lt;n&gt;]</code> i zamyka wątki już poprawione. W bramce <code>review_work</code> człowiek odpowiada na pytania w ich wątkach, każdą własną uwagę pisze w nowym wątku albo w polu <code>work_feedback</code> i nie zamyka wątków. <code>check_work_feedback</code> nie zmienia kodu: zapisuje decyzje w <code>review_decisions</code>, a zmiany robi <code>work_revision</code>. Publikacja kodu przepisuje opis MR, aby opisywał całą zmianę. Blokada implementacji wraca do autora planu. Pętle napraw mają limity wejść.</p></article>
       <article class="note"><h2>Wiedza i zakończenie</h2><p>Bez nowej wiedzy proces idzie od razu do zakończenia. Agent tylko zdejmuje Draft z MR: nie zatwierdza MR, nie włącza scalenia automatycznego i nie czeka na pipeline. MR scala człowiek. Gdy agent nie potwierdzi zdjęcia Draftu (<code>blocked</code> lub <code>timeout</code>), proces staje na bramce <code>finalize_blocked</code>. <code>retry</code> uruchamia <code>finalize</code> ponownie. <code>confirm_failure</code> kończy proces w <code>finalize_failed</code> z powodem w historii.</p></article>
     </section>
     <footer>Diagram oparty na <code>workflows/compound-engineering.yaml</code>. Na wąskim ekranie przewiń diagram poziomo.</footer>
