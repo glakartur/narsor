@@ -1350,27 +1350,6 @@ fn review_findings() -> Value {
     )
 }
 
-/// A `code_review` answer that asks the person.
-fn review_questions() -> Vec<Value> {
-    vec![
-        reply_with(
-            "questions",
-            json!({ "variables": {
-                "pending_questions": PENDING_QUESTIONS,
-                "review_findings": "",
-            } }),
-        ),
-        // publish_questions
-        reply_with(
-            "published",
-            json!({ "variables": {
-                "pr_url": PR_URL,
-                "review_questions": "Q1 thread-1 src/subscribe.rs:10",
-            } }),
-        ),
-    ]
-}
-
 /// The agent calls up to `code_review` (call 11), the gates before it.
 fn up_to_code_review() -> Vec<Value> {
     [
@@ -1385,22 +1364,33 @@ fn gates_before_work() -> Vec<Answer> {
     [requirements_gates(), plan_gates()].concat()
 }
 
-fn answered() -> Answer {
-    Answer::new("answer_questions", &[("questions_decision", "answered")])
+/// `check_feedback` at the work gate, with a note in `work_feedback` or none.
+fn check_work_gate(note: Option<&'static str>) -> Answer {
+    let mut values = vec![("work_decision", "check_feedback")];
+    if let Some(note) = note {
+        values.push(("work_feedback", note));
+    }
+    Answer::new("review_work", &values)
 }
 
-/// Covers AE2: findings for the author go first and loop through
-/// `work_revision`; the run then reaches the work gate.
+/// Covers AE1: a question waits through the revision of a finding, the next
+/// review is clean, and `publish_work` reads the question.
 #[tokio::test]
-async fn covers_ae2_findings_go_to_the_author_before_any_question() {
+async fn covers_ae1_a_question_waits_for_publish_work_while_a_finding_is_fixed() {
     let replies = [
         up_to_code_review(),
         vec![
-            review_findings(),
-            // 12. work_revision, 13. code_review again, 14. publish_work
-            reply("revised"),
-            reply("clean"),
-            published(),
+            // 11. code_review
+            reply_with(
+                "findings",
+                json!({ "variables": {
+                    "review_findings": REVIEW_FINDINGS,
+                    "pending_questions": PENDING_QUESTIONS,
+                } }),
+            ),
+            reply("revised"), // 12. work_revision
+            reply("clean"),   // 13. code_review
+            published(),      // 14. publish_work (verify_work skips)
         ],
     ]
     .concat();
@@ -1410,167 +1400,25 @@ async fn covers_ae2_findings_go_to_the_author_before_any_question() {
 
     assert!(run.took(&execution.id, "code_review", "findings", "work_revision"));
     assert!(run.took(&execution.id, "work_revision", "revised", "code_review"));
-    assert!(!run.visited(&execution.id, "publish_questions"));
+    assert!(run.took(&execution.id, "code_review", "clean", "verify_work"));
+    assert!(run.took(&execution.id, "publish_work", "published", "review_work"));
     assert_eq!(run.pending(&execution.id).state_id, "review_work");
     assert!(
         run.prompt(12).contains(REVIEW_FINDINGS),
         "the author of the implementation reads the findings"
     );
-}
-
-/// Covers F1 and AE1: a question goes to the merge request, the answer changes
-/// the code, and the next review reads the decision.
-#[tokio::test]
-async fn covers_f1_a_question_is_asked_in_the_merge_request_and_the_decision_reaches_the_next_review(
-) {
-    let replies = [
-        up_to_code_review(),
-        review_questions(), // 11, 12
-        vec![
-            // 13. collect_answers
-            reply_with(
-                "changes_needed",
-                json!({ "variables": {
-                    "review_decisions": REVIEW_DECISIONS,
-                    "review_findings": REVIEW_FINDINGS,
-                } }),
-            ),
-            reply("revised"), // 14. work_revision
-            reply("clean"),   // 15. code_review
-            published(),      // 16. publish_work
-        ],
-    ]
-    .concat();
-    let run = CompoundRun::new(&replies);
-    let gates = [gates_before_work(), vec![answered()]].concat();
-
-    let execution = run.run(&gates).await;
-
-    assert!(run.took(
-        &execution.id,
-        "code_review",
-        "questions",
-        "publish_questions"
-    ));
-    assert!(run.took(
-        &execution.id,
-        "publish_questions",
-        "published",
-        "answer_questions"
-    ));
-    assert!(run.took(
-        &execution.id,
-        "answer_questions",
-        "answered",
-        "collect_answers"
-    ));
-    assert!(run.took(
-        &execution.id,
-        "collect_answers",
-        "changes_needed",
-        "work_revision"
-    ));
-    assert!(run.took(&execution.id, "code_review", "clean", "verify_work"));
-    assert_eq!(run.pending(&execution.id).state_id, "review_work");
     assert!(
-        run.prompt(12).contains(PENDING_QUESTIONS),
-        "publish_questions reads the questions"
+        run.prompt(13).contains(PENDING_QUESTIONS),
+        "the next review reads the questions that wait"
     );
     assert!(
-        run.prompt(13).contains("Q1 thread-1 src/subscribe.rs:10"),
-        "collect_answers reads only the recorded threads"
-    );
-    assert!(
-        run.prompt(15).contains(REVIEW_DECISIONS),
-        "the next review reads the decisions"
-    );
-    assert!(
-        run.prompt(14).contains(REVIEW_FINDINGS),
-        "work_revision reads the findings of the decision"
+        run.prompt(14).contains(PENDING_QUESTIONS),
+        "publish_work reads the questions"
     );
 }
 
-/// Covers AE3 and F2: when the person declined everything, the code goes to
-/// `verify_work`, not back to `code_review`.
-#[tokio::test]
-async fn covers_ae3_all_declined_goes_to_verification() {
-    let replies = [
-        up_to_code_review(),
-        review_questions(),
-        vec![
-            // 13. collect_answers, 14. publish_work (verify_work skips)
-            reply_with(
-                "all_declined",
-                json!({ "variables": { "review_decisions": REVIEW_DECISIONS } }),
-            ),
-            published(),
-        ],
-    ]
-    .concat();
-    let run = CompoundRun::new(&replies);
-    let gates = [gates_before_work(), vec![answered()]].concat();
-
-    let execution = run.run(&gates).await;
-
-    assert!(run.took(
-        &execution.id,
-        "collect_answers",
-        "all_declined",
-        "verify_work"
-    ));
-    assert!(!run.took(
-        &execution.id,
-        "collect_answers",
-        "all_declined",
-        "code_review"
-    ));
-    assert_eq!(run.pending(&execution.id).state_id, "review_work");
-}
-
-/// A missing answer asks the person again, even when another decision needs a
-/// change of code.
-#[tokio::test]
-async fn an_unanswered_question_returns_to_the_gate() {
-    let replies = [
-        up_to_code_review(),
-        review_questions(),
-        vec![reply("unanswered")], // 13. collect_answers
-    ]
-    .concat();
-    let run = CompoundRun::new(&replies);
-    let gates = [gates_before_work(), vec![answered()]].concat();
-
-    let execution = run.run(&gates).await;
-
-    assert!(run.took(
-        &execution.id,
-        "collect_answers",
-        "unanswered",
-        "answer_questions"
-    ));
-    assert_eq!(run.pending(&execution.id).state_id, "answer_questions");
-}
-
-#[tokio::test]
-async fn abandon_at_the_questions_gate_cancels_the_run() {
-    let replies = [up_to_code_review(), review_questions()].concat();
-    let run = CompoundRun::new(&replies);
-    let gates = [
-        gates_before_work(),
-        vec![Answer::new(
-            "answer_questions",
-            &[("questions_decision", "abandon")],
-        )],
-    ]
-    .concat();
-
-    let execution = run.run(&gates).await;
-
-    assert_eq!(execution.current_state.as_deref(), Some("cancelled"));
-}
-
-/// R4 and the prompts: the review applies the decisions, and the steps that
-/// write them copy the earlier entries.
+/// The review loop of the compound pipeline: the review prompts apply the
+/// decisions.
 #[test]
 fn the_review_prompts_carry_the_decision_rules() {
     for file in [
@@ -1593,52 +1441,73 @@ fn the_review_prompts_carry_the_decision_rules() {
         assert!(!prompt.contains("mode:agent"), "{file}");
         assert!(!definition.states.contains_key("fix_findings"), "{file}");
     }
-    let definition = shipped("compound-engineering.yaml");
-    let collect = built_prompt(&definition.states["collect_answers"]);
-    assert!(collect.contains("Copy every earlier entry without a change"));
 }
 
-/// KTD3: the author of the implementation clears what it read, and a revision
-/// at the work gate resumes its session.
+/// Covers AE2: a note at the work gate goes through `check_work_feedback` to
+/// `work_revision`, which clears what it read, and the next review reads the
+/// decision.
 #[tokio::test]
-async fn a_revision_at_the_work_gate_resumes_work_revision_and_clears_what_it_read() {
-    let comment = "rename the subscribe module";
+async fn covers_ae2_a_note_at_the_work_gate_reaches_work_revision_and_the_next_review() {
+    let note = "rename the subscribe module";
+    let change = "src/subscribe.rs rename the module to subscription";
     let replies = [
         up_to_code_review(),
         vec![
-            review_findings(), // 11. code_review
-            reply("revised"),  // 12. work_revision, the first time
-            reply("clean"),    // 13. code_review
-            published(),       // 14. publish_work
-            // 15. work_revision, resumed
+            reply("clean"), // 11. code_review
+            published(),    // 12. publish_work
+            // 13. check_work_feedback
+            reply_with(
+                "changes_needed",
+                json!({ "variables": {
+                    "review_decisions": REVIEW_DECISIONS,
+                    "work_feedback": change,
+                    "feedback_threads": "thread-2",
+                } }),
+            ),
+            // 14. work_revision
             reply_with(
                 "revised",
                 json!({ "variables": { "work_feedback": "", "review_findings": "" } }),
             ),
-            reply("clean"), // 16. code_review
-            published(),    // 17. publish_work
+            reply("clean"), // 15. code_review
+            published(),    // 16. publish_work
         ],
     ]
     .concat();
     let run = CompoundRun::new(&replies);
-    let gates = [
-        gates_before_work(),
-        vec![Answer::new(
-            "review_work",
-            &[("work_decision", "revise"), ("work_feedback", comment)],
-        )],
-    ]
-    .concat();
+    let gates = [gates_before_work(), vec![check_work_gate(Some(note))]].concat();
 
     let execution = run.run(&gates).await;
 
-    assert!(run.took(&execution.id, "review_work", "revise", "work_revision"));
-    let resumed = run.prompt(15);
+    assert!(run.took(
+        &execution.id,
+        "review_work",
+        "check_feedback",
+        "check_work_feedback"
+    ));
+    assert!(run.took(
+        &execution.id,
+        "check_work_feedback",
+        "changes_needed",
+        "work_revision"
+    ));
+    assert_eq!(run.pending(&execution.id).state_id, "review_work");
     assert!(
-        resumed.contains("--resume\n--%ARG%--\nfake-session-1\n"),
-        "{resumed}"
+        run.prompt(13).contains(note),
+        "check_work_feedback reads the note"
     );
-    assert!(resumed.contains(comment), "{resumed}");
+    assert!(
+        run.prompt(14).contains(change),
+        "work_revision reads the change"
+    );
+    assert!(
+        run.prompt(15).contains(REVIEW_DECISIONS),
+        "the next review reads the decisions"
+    );
+    assert!(
+        run.prompt(16).contains("thread-2"),
+        "publish_work reads the threads to resolve"
+    );
     assert_eq!(
         execution.context.variables.get("work_feedback"),
         Some(&json!(""))
@@ -1646,6 +1515,54 @@ async fn a_revision_at_the_work_gate_resumes_work_revision_and_clears_what_it_re
     assert_eq!(
         execution.context.variables.get("review_findings"),
         Some(&json!(""))
+    );
+}
+
+/// Covers AE3: an unanswered question returns to the gate, and a decision
+/// written then stays after a second pass with a blank note.
+#[tokio::test]
+async fn covers_ae3_a_decision_stays_after_needs_human_and_a_blank_note() {
+    let note = "rename the subscribe module";
+    let replies = [
+        up_to_code_review(),
+        vec![
+            reply("clean"), // 11. code_review
+            published(),    // 12. publish_work
+            // 13. check_work_feedback
+            reply_with(
+                "needs_human",
+                json!({ "variables": { "review_decisions": REVIEW_DECISIONS } }),
+            ),
+            reply("needs_human"), // 14. check_work_feedback
+        ],
+    ]
+    .concat();
+    let run = CompoundRun::new(&replies);
+    let gates = [
+        gates_before_work(),
+        vec![check_work_gate(Some(note)), check_work_gate(None)],
+    ]
+    .concat();
+
+    let execution = run.run(&gates).await;
+
+    assert!(run.took(
+        &execution.id,
+        "check_work_feedback",
+        "needs_human",
+        "review_work"
+    ));
+    assert_eq!(run.pending(&execution.id).state_id, "review_work");
+    let second = run.prompt(14);
+    assert!(second.contains(REVIEW_DECISIONS), "{second}");
+    assert!(!second.contains(note), "{second}");
+    assert_eq!(
+        execution.context.variables.get("work_feedback"),
+        Some(&json!(""))
+    );
+    assert_eq!(
+        execution.context.variables.get("review_decisions"),
+        Some(&json!(REVIEW_DECISIONS))
     );
 }
 
@@ -1849,7 +1766,7 @@ fn chat_and_debug_have_no_fix_findings_and_no_questions_label() {
 
 /// The graph of `workflows/compound-engineering.yaml` as the plan draws it:
 /// every state, and every `(state, label, target)` edge.
-const COMPOUND_STATES: [&str; 32] = [
+const COMPOUND_STATES: [&str; 29] = [
     "brainstorm",
     "doc_review",
     "publish_requirements",
@@ -1863,9 +1780,6 @@ const COMPOUND_STATES: [&str; 32] = [
     "work",
     "simplify",
     "code_review",
-    "publish_questions",
-    "answer_questions",
-    "collect_answers",
     "verify_work",
     "repair_verification",
     "publish_work",
@@ -1884,7 +1798,7 @@ const COMPOUND_STATES: [&str; 32] = [
     "finalize_failed",
 ];
 
-const COMPOUND_EDGES: [(&str, &str, &str); 68] = [
+const COMPOUND_EDGES: [(&str, &str, &str); 60] = [
     ("brainstorm", "requirements_drafted", "doc_review"),
     ("brainstorm", "requirements_ready", "publish_requirements"),
     ("doc_review", "reviewed", "publish_requirements"),
@@ -1928,13 +1842,6 @@ const COMPOUND_EDGES: [(&str, &str, &str); 68] = [
     ("simplify", "unchanged", "code_review"),
     ("code_review", "clean", "verify_work"),
     ("code_review", "findings", "work_revision"),
-    ("code_review", "questions", "publish_questions"),
-    ("publish_questions", "published", "answer_questions"),
-    ("answer_questions", "answered", "collect_answers"),
-    ("answer_questions", "abandon", "cancelled"),
-    ("collect_answers", "changes_needed", "work_revision"),
-    ("collect_answers", "all_declined", "verify_work"),
-    ("collect_answers", "unanswered", "answer_questions"),
     ("verify_work", "passed", "publish_work"),
     ("verify_work", "skipped", "publish_work"),
     ("verify_work", "failed", "repair_verification"),
@@ -1942,12 +1849,11 @@ const COMPOUND_EDGES: [(&str, &str, &str); 68] = [
     ("publish_work", "published", "review_work"),
     ("review_work", "check_feedback", "check_work_feedback"),
     ("review_work", "accept", "compound"),
-    ("review_work", "revise", "work_revision"),
     ("review_work", "revise_plan", "plan"),
     ("review_work", "abandon", "cancelled"),
     ("work_revision", "revised", "code_review"),
     ("check_work_feedback", "no_feedback", "compound"),
-    ("check_work_feedback", "fixed", "code_review"),
+    ("check_work_feedback", "changes_needed", "work_revision"),
     ("check_work_feedback", "needs_human", "review_work"),
     ("compound", "documented", "publish_learning"),
     ("compound", "nothing_to_document", "finalize"),

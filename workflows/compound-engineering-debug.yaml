@@ -439,7 +439,7 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process the feedback posted while the fix waited for review. Fixes you make go through code review, verification and review again.
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process the feedback posted while the fix waited for review. Fixes you make go through code review, verification and review again. For GitLab, use `glab` (gitlab-cli).
     choices:
       - label: no_feedback
         description: no actionable feedback remains; capture the learning.
@@ -570,7 +570,7 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process the feedback posted while the learning waited for review.
+        Run the `ce-resolve-pr-feedback` skill with `mode:pipeline {{ context.pr_url }}`. Process the feedback posted while the learning waited for review. For GitLab, use `glab` (gitlab-cli).
     choices:
       - label: no_feedback
         description: no actionable feedback remains; finalize.
