@@ -478,6 +478,7 @@ states:
         Questions that already wait for the person (empty at first):
         {{ context.pending_questions }}
 
+        A finding that matches a waiting question by file and point of the problem is not a new question.
         Return in `pending_questions` these questions unchanged and the new ones at the end: for each, the finding, `file:line`, the question and the options, the recommended option first. Name the questions in `reason`.
         Put the findings for the author in `review_findings`, or an empty text when there are none. Questions alone do not stop the review.
     variables:
@@ -709,7 +710,8 @@ states:
         Copy every earlier entry without a change. Add one entry D<n> for each answer and for each note (a note is `popraw`) that no entry records yet: the file, the symbol or region of code, the point of the problem, `popraw` or `zostaw`, and a short reason in your own words. Return the whole list in `review_decisions` whatever you choose: the gate clears the note on the next pass.
         Put in `work_feedback` each `popraw` the code does not do yet, with file, line and the change; an empty text when there is none.
 
-        A question without a clear answer needs the person: name it in `reason`, resolve no thread and leave `feedback_threads` unset. Otherwise put the identifiers of the `popraw` threads in `feedback_threads`, and reply in and resolve each `zostaw` thread and each answer that needs no change of code.
+        Questions not yet on the merge request (may be empty): {{ context.pending_questions }}
+        Such a question, or a question without a clear answer, needs the person: name it in `reason`, resolve no thread and leave `feedback_threads` unset. Otherwise put the identifiers of the `popraw` threads in `feedback_threads`, and reply in and resolve each `zostaw` thread and each answer that needs no change of code.
     variables:
       - name: review_decisions
         description: >-
