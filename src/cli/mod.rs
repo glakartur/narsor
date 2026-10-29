@@ -29,6 +29,7 @@
 //! which is also the code clap itself returns for a malformed command line.
 
 pub mod commands;
+pub mod connection_profile;
 pub mod control_text;
 pub mod daemon;
 pub mod remote;
@@ -102,6 +103,28 @@ pub struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// What `connection-profile` can be asked to do.
+#[derive(Debug, Subcommand)]
+pub enum ConnectionProfileCommand {
+    /// Writes a non-secret profile for the selected HTTPS server.
+    Export {
+        /// A file to write; without it, the profile is printed to stdout.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+
+    /// Imports a profile after explicitly trusting its HTTPS origin.
+    Import {
+        /// The profile file to import.
+        #[arg(value_name = "FILE")]
+        profile: PathBuf,
+
+        /// Explicitly trust the profile's HTTPS origin without an interactive prompt.
+        #[arg(long)]
+        trust_server: bool,
+    },
 }
 
 /// Everything the operator can ask for.
@@ -277,6 +300,12 @@ pub enum Command {
         /// What to do with the configuration.
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+
+    /// Exports or imports a non-secret remote server connection profile.
+    ConnectionProfile {
+        #[command(subcommand)]
+        command: ConnectionProfileCommand,
     },
 
     /// Creates, inspects and steers remote tasks through the control plane.
@@ -512,6 +541,7 @@ impl Command {
             Command::Config { command } => match command {
                 ConfigCommand::Show { .. } => true,
             },
+            Command::ConnectionProfile { .. } => true,
             Command::Validate { .. }
             | Command::Run { .. }
             | Command::List
@@ -670,6 +700,15 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Repo { command } => remote::repo_admin(command, &target, &state, &flags).await,
         Command::Config { command } => match command {
             ConfigCommand::Show { format } => commands::config_show(&config, format),
+        },
+        Command::ConnectionProfile { command } => match command {
+            ConnectionProfileCommand::Export { output } => {
+                connection_profile::export(target.server.as_deref(), output.as_deref())
+            }
+            ConnectionProfileCommand::Import {
+                profile,
+                trust_server,
+            } => connection_profile::import(&profile, trust_server),
         },
         Command::Task { command } => remote::task(command, &target, &state, &flags).await,
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
