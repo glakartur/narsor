@@ -2,10 +2,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-target="x86_64-unknown-linux-musl"
+target="x86_64-unknown-linux-gnu"
 target_dir="${CARGO_TARGET_DIR:-"$repo_root/target"}/$target/release"
 output_dir="${NARSOR_DIST_DIR:-"$repo_root/dist/release"}"
-archive_name="narsor-linux-x86_64-musl.tar.gz"
+archive_name="narsor-linux-x86_64-gnu.tar.gz"
 binaries=(narsor narsor-cli narsor-server narsor-controller narsor-runner)
 
 fail() {
@@ -13,7 +13,6 @@ fail() {
     exit 1
 }
 
-command -v musl-gcc >/dev/null 2>&1 || fail "musl-gcc is required; install musl-tools before packaging"
 cargo build --workspace --bins --release --locked --target "$target"
 
 for name in "${binaries[@]}"; do
@@ -21,13 +20,10 @@ for name in "${binaries[@]}"; do
     [[ -x "$binary" ]] || fail "required executable is missing: $binary"
 
     header="$(readelf -h "$binary")" || fail "cannot inspect ELF executable: $name"
-    [[ "$header" == *ELF* ]] || fail "not an ELF executable: $name"
+    [[ "$header" == *"Advanced Micro Devices X86-64"* ]] || fail "not an x86_64 ELF executable: $name"
 
     program_headers="$(readelf -l "$binary")" || fail "cannot inspect ELF program headers: $name"
-    [[ "$program_headers" != *INTERP* ]] || fail "executable has a dynamic interpreter: $name"
-
-    dynamic_section="$(readelf -d "$binary" 2>&1)" || fail "cannot inspect ELF dynamic section: $name"
-    [[ "$dynamic_section" != *"(NEEDED)"* ]] || fail "executable has dynamic dependencies: $name"
+    [[ "$program_headers" == *"ld-linux-x86-64.so.2"* ]] || fail "executable does not use the GNU x86_64 dynamic loader: $name"
 done
 
 staging_dir="$(mktemp -d)"

@@ -12,8 +12,8 @@ const BINARIES: &[&str] = &[
     "narsor-controller",
     "narsor-runner",
 ];
-const TARGET: &str = "x86_64-unknown-linux-musl";
-const ARCHIVE: &str = "narsor-linux-x86_64-musl.tar.gz";
+const TARGET: &str = "x86_64-unknown-linux-gnu";
+const ARCHIVE: &str = "narsor-linux-x86_64-gnu.tar.gz";
 
 struct Fixture {
     root: PathBuf,
@@ -47,7 +47,7 @@ impl Fixture {
             "cargo",
             r#"#!/bin/sh
 set -eu
-release_dir="$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release"
+release_dir="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
 mkdir -p "$release_dir"
 for binary in narsor narsor-cli narsor-server narsor-controller narsor-runner; do
     [ "${OMIT_BINARY:-}" != "$binary" ] || continue
@@ -61,19 +61,25 @@ done
             r#"#!/bin/sh
 set -eu
 case "$1" in
-    -h) echo "ELF Header";;
+    -h)
+        echo "ELF Header"
+        if [ "${WRONG_MACHINE:-}" = "$(basename "$2")" ]; then
+            echo "Machine: AArch64"
+        else
+            echo "Machine: Advanced Micro Devices X86-64"
+        fi
+        ;;
     -l)
         echo "Program Headers"
-        [ "${DYNAMIC_BINARY:-}" != "$(basename "$2")" ] || echo "INTERP"
+        echo "INTERP /lib64/ld-linux-x86-64.so.2"
         ;;
     -d)
-        [ "${DYNAMIC_BINARY:-}" != "$(basename "$2")" ] || echo "(NEEDED)"
+        echo "(NEEDED) Shared library: [libc.so.6]"
         ;;
     *) exit 2;;
 esac
 "#,
         );
-        fixture.write_tool("musl-gcc", "#!/bin/sh\nexit 0\n");
         fixture
     }
 
@@ -82,10 +88,6 @@ esac
         fs::write(&path, body).expect("write fake tool");
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
             .expect("make fake tool executable");
-    }
-
-    fn remove_tool(&self, name: &str) {
-        fs::remove_file(self.tools.join(name)).expect("remove fake tool");
     }
 
     fn run(&self, extra_env: &[(&str, &str)]) -> Output {
@@ -114,7 +116,7 @@ impl Drop for Fixture {
 static NEXT_FIXTURE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[test]
-fn packages_all_static_binaries_with_target_manifest_and_checksum() {
+fn packages_all_gnu_binaries_with_target_manifest_and_checksum() {
     let fixture = Fixture::new();
     let result = fixture.run(&[]);
     assert!(
@@ -180,28 +182,25 @@ fn does_not_create_archive_when_a_required_binary_is_missing() {
 }
 
 #[test]
-fn rejects_a_dynamically_linked_binary_before_packaging() {
+fn packages_gnu_binaries_with_a_dynamic_loader() {
     let fixture = Fixture::new();
-    let result = fixture.run(&[("DYNAMIC_BINARY", "narsor-server")]);
-    assert!(!result.status.success());
+    let result = fixture.run(&[]);
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("narsor-server"),
+        result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(!fixture.output.join(ARCHIVE).exists());
+    assert!(fixture.output.join(ARCHIVE).exists());
 }
 
 #[test]
-fn reports_the_missing_musl_compiler_before_building() {
+fn rejects_a_binary_for_another_architecture() {
     let fixture = Fixture::new();
-    fixture.remove_tool("musl-gcc");
-
-    let result = fixture.run(&[]);
+    let result = fixture.run(&[("WRONG_MACHINE", "narsor-server")]);
 
     assert!(!result.status.success());
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("musl-gcc is required"),
+        String::from_utf8_lossy(&result.stderr).contains("narsor-server"),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
