@@ -78,7 +78,7 @@ states:
         description: the requirements document is written.
         requires_artifacts: [requirements_doc]
       - label: requirements_ready
-        description: the requirements document is written and a review adds nothing. only when the change is small and obvious and a review adds nothing. set `review_summary` to one sentence: "Przegląd pominięto: <reason>".
+        description: "the requirements document is written and a review adds nothing. only when the change is small and obvious and a review adds nothing. set `review_summary` to one sentence: \"Przegląd pominięto: <reason>\"."
         requires_artifacts: [requirements_doc]
         requires_variables: [review_summary]
     transitions:
