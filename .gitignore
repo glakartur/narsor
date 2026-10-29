@@ -1,6 +1,7 @@
 # Rust build output
 /target/
 **/*.rs.bk
+/dist/release/
 
 # Local configuration and secrets
 .env
