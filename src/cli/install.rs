@@ -1128,7 +1128,7 @@ fn print_server_commands(backend: &WorkstationBackend) -> Result<()> {
     );
     println!("Start the network server separately: narsor-server");
     println!(
-        "Create the workstation enrollment code (explicit risk consent required):\n  narsor-cli controller enroll-code {} --accept-workstation-risk",
+        "Create the workstation enrollment code (explicit risk consent required):\n  NARSOR_SERVER='https://<corporate-server>' narsor-cli controller enroll-code {} --accept-workstation-risk",
         backend.id
     );
     println!(

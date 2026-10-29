@@ -222,7 +222,9 @@ fn server_role_writes_network_configuration_and_a_workstation_backend() {
     assert_eq!(backend["kind"].as_str(), Some("local"));
     assert_eq!(backend["trust_scope"].as_str(), Some("workstation"));
     let message = output(&result);
-    assert!(message.contains("narsor-cli controller enroll-code vm-worker"));
+    assert!(message.contains(
+        "NARSOR_SERVER='https://<corporate-server>' narsor-cli controller enroll-code vm-worker"
+    ));
     assert!(message.contains("--accept-workstation-risk"));
     assert!(message.contains("without a container"));
     assert_eq!(
