@@ -156,7 +156,7 @@ pub fn run(options: InstallOptions, global_config: Option<&Path>) -> Result<()> 
     );
     println!("Configuration: {}", config_path.display());
     if let Some(backend) = &workstation_backend {
-        print_server_commands(backend)?;
+        print_server_commands(backend, &config_path)?;
     }
     Ok(())
 }
@@ -1122,11 +1122,14 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn print_server_commands(backend: &WorkstationBackend) -> Result<()> {
+fn print_server_commands(backend: &WorkstationBackend, config_path: &Path) -> Result<()> {
     println!(
         "\nWorkstation tasks run as the VM account, without a container, and can access files that account can read."
     );
-    println!("Start the network server separately: narsor-server");
+    println!(
+        "Start the network server separately: narsor-server --config {}",
+        shell_quote(&config_path.to_string_lossy())
+    );
     println!(
         "Create the workstation enrollment code (explicit risk consent required):\n  NARSOR_SERVER='https://<corporate-server>' narsor-cli controller enroll-code {} --accept-workstation-risk",
         backend.id

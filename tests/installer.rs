@@ -225,6 +225,10 @@ fn server_role_writes_network_configuration_and_a_workstation_backend() {
     assert!(message.contains(
         "NARSOR_SERVER='https://<corporate-server>' narsor-cli controller enroll-code vm-worker"
     ));
+    assert!(message.contains(&format!(
+        "Start the network server separately: narsor-server --config '{}'",
+        fixture.config.display()
+    )));
     assert!(message.contains("--accept-workstation-risk"));
     assert!(message.contains("without a container"));
     assert_eq!(
