@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    name: Test and package GNU Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          rustflags: ""
+
+      - name: Test workspace
+        run: cargo test --locked --workspace
+
+      - name: Build and inspect release archive
+        run: bash dist/package-linux.sh
+
+      - name: Smoke-test packaged binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=dist/release/narsor-linux-x86_64-gnu.tar.gz
+          checksum=dist/release/narsor-linux-x86_64-gnu.tar.gz.sha256
+          (cd dist/release && sha256sum --check "$(basename "$checksum")")
+          temp_dir="$(mktemp -d)"
+          trap 'rm -rf "$temp_dir"' EXIT
+          tar -xzf "$archive" -C "$temp_dir"
+          "$temp_dir/narsor-cli" --version
+          "$temp_dir/narsor-cli" validate tests/fixtures/cli/greet.yaml
+          for binary in narsor narsor-server narsor-controller narsor-runner; do
+            "$temp_dir/$binary" --help >/dev/null
+          done
