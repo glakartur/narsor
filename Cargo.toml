@@ -41,6 +41,7 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 
 # Filesystem & Path handling
 # Error handling
@@ -77,7 +78,6 @@ bytes = "1"
 [dev-dependencies]
 axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls"] }
-serde_yaml = "0.9"
 narsor-server = { path = "crates/narsor-server" }
 narsor-controller = { path = "crates/narsor-controller" }
 narsor-controller-runtime = { path = "crates/narsor-controller-runtime" }
