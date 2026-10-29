@@ -179,10 +179,14 @@ questions alone do not stop the review, they wait for `publish_work`. From the
 second entry into `code_review` (the number comes from the step's history),
 only P0/P1 findings and `popraw` decisions the code does not do are reported as
 findings or questions; new P2/P3 findings go only to `reason`.
+`code_review` also records `reviewed_commit` (`git rev-parse HEAD`). On the next
+entry it passes `base:<reviewed_commit>` to the skill, so the review covers the
+changes since that commit and the files related to them; it reviews the whole
+change when the variable is empty or the commit is not an ancestor of `HEAD`.
 `work_revision` fixes the findings and the changes in `work_feedback`, checks
 each one in the code before it chooses `revised`, and clears both in its
-answer. `work` clears `review_findings`, `review_decisions` and
-`pending_questions` when it starts a new implementation.
+answer. `work` clears `review_findings`, `review_decisions`,
+`pending_questions` and `reviewed_commit` when it starts a new implementation.
 
 `review_decisions` is the memory of decisions. Each entry has a number `D<n>`,
 a file, a symbol or region of code, the point of the problem, the decision

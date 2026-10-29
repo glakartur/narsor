@@ -391,7 +391,7 @@ states:
 
         Run the plan's relevant checks before implementation and record their concise result as `test_baseline`. Preserve that baseline: do not repair pre-existing failures or investigate them as part of this plan.
 
-        Set `review_findings`, `review_decisions` and `pending_questions` to an empty text in your answer, whatever you choose: a new implementation starts a new code review.
+        Set `review_findings`, `review_decisions`, `pending_questions` and `reviewed_commit` to an empty text in your answer, whatever you choose: a new implementation starts a new code review.
     variables:
       - name: test_baseline
         description: concise result of checks run before implementation, including pre-existing failures or “all passed”.
@@ -406,6 +406,10 @@ states:
           Set it to an empty text: a new implementation starts a new code
           review.
       - name: pending_questions
+        description: >-
+          Set it to an empty text: a new implementation starts a new code
+          review.
+      - name: reviewed_commit
         description: >-
           Set it to an empty text: a new implementation starts a new code
           review.
@@ -456,6 +460,10 @@ states:
 
         Before you run the skill, run `git add -N .` so that the review sees new files.
 
+        The commit last reviewed (empty at first): {{ context.reviewed_commit }}
+        When it is not empty then review only the changes made since that commit, and the files related to them: the callers, the implementations and the tests of the changed code. Also read the files of each decision `popraw` and of each finding you reported earlier, so that you can check them. When it is empty, or the check fails, review the whole change.
+        When the review is done, put the result of `git rev-parse HEAD` in `reviewed_commit`.
+
         The skill applies the safe fixes itself and returns the other findings with the fields `autofix_class`, `owner` and `suggested_fix`. Sort each finding that is left in this way:
         - A finding that is `pre_existing` or `advisory`, or has `owner: release`, is only reported. Put it in `reason`. It is not a finding and not a question.
         - A finding with `owner: human`, with `autofix_class: gated_auto`, or one that needs a trade-off or a change of behaviour, is a question.
@@ -478,6 +486,8 @@ states:
         Return in `pending_questions` these questions unchanged and the new ones at the end: for each, the finding, `file:line`, the question and the options, the recommended option first. Name the questions in `reason`.
         Put the findings for the author in `review_findings`, or an empty text when there are none. Questions alone do not stop the review.
     variables:
+      - name: reviewed_commit
+        description: the commit (`git rev-parse HEAD`) that this review ended on.
       - name: review_findings
         description: >-
           the findings the author of the implementation fixes, each with file,
