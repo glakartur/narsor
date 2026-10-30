@@ -1,9 +1,8 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -108,13 +107,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            dist/release/install.sh \
-            dist/release/narsor-linux-x86_64-gnu.tar.gz \
-            dist/release/narsor-linux-x86_64-gnu.tar.gz.sha256 \
-            dist/release/provenance.jsonl \
-            --verify-tag \
-            --generate-notes \
+          set -euo pipefail
+          assets=(
+            dist/release/install.sh
+            dist/release/narsor-linux-x86_64-gnu.tar.gz
+            dist/release/narsor-linux-x86_64-gnu.tar.gz.sha256
+            dist/release/provenance.jsonl
+          )
+          # Release (i tag) tworzy człowiek; pipeline dołącza zweryfikowane pliki.
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+            --clobber \
             --repo "$GITHUB_REPOSITORY"
 
       - name: Verify published assets and provenance
