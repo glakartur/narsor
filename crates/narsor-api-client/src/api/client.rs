@@ -1247,7 +1247,7 @@ impl ApiClient {
 }
 
 /// Checks and normalizes the base URL of [`ApiClient::remote`].
-fn normalize_base_url(raw: &str) -> Result<String, String> {
+pub(super) fn normalize_base_url(raw: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(raw.trim())
         .map_err(|error| format!("'{raw}' is not a URL: {error}"))?;
     if !url.username().is_empty() || url.password().is_some() {

@@ -29,8 +29,10 @@
 //! which is also the code clap itself returns for a malformed command line.
 
 pub mod commands;
+pub mod connection_profile;
 pub mod control_text;
 pub mod daemon;
+pub mod install;
 pub mod remote;
 pub mod task_history;
 pub mod task_registry;
@@ -102,6 +104,28 @@ pub struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// What `connection-profile` can be asked to do.
+#[derive(Debug, Subcommand)]
+pub enum ConnectionProfileCommand {
+    /// Writes a non-secret profile for the selected HTTPS server.
+    Export {
+        /// A file to write; without it, the profile is printed to stdout.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+
+    /// Imports a profile after explicitly trusting its HTTPS origin.
+    Import {
+        /// The profile file to import.
+        #[arg(value_name = "FILE")]
+        profile: PathBuf,
+
+        /// Explicitly trust the profile's HTTPS origin without an interactive prompt.
+        #[arg(long)]
+        trust_server: bool,
+    },
 }
 
 /// Everything the operator can ask for.
@@ -278,6 +302,15 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+
+    /// Exports or imports a non-secret remote server connection profile.
+    ConnectionProfile {
+        #[command(subcommand)]
+        command: ConnectionProfileCommand,
+    },
+
+    /// Installs the binaries and configuration for a Narsor role.
+    Install(install::InstallOptions),
 
     /// Creates, inspects and steers remote tasks through the control plane.
     Task {
@@ -503,15 +536,13 @@ impl Command {
     /// subcommand has to decide rather than inherit — and so that the policy
     /// lives beside the commands it is about, where it can be tested without
     /// spawning the binary.
-    ///
-    /// It does not extend to a `--config` path that is not there: that is a
-    /// usage error for every command including this one, because there is
-    /// nothing to diagnose.
     pub fn runs_on_broken_config(&self) -> bool {
         match self {
             Command::Config { command } => match command {
                 ConfigCommand::Show { .. } => true,
             },
+            Command::ConnectionProfile { .. } => true,
+            Command::Install(_) => true,
             Command::Validate { .. }
             | Command::Run { .. }
             | Command::List
@@ -593,6 +624,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         config: cli.config.clone(),
     };
     let target = remote::server_target(cli.server, cli.token_file, cli.token_command);
+    let config_file = cli.config.clone();
     let state = config.state_dir().to_path_buf();
     let outcome = match cli.command {
         Command::Validate { workflow } => commands::validate(&config, &flags, &workflow).await,
@@ -671,6 +703,16 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Config { command } => match command {
             ConfigCommand::Show { format } => commands::config_show(&config, format),
         },
+        Command::ConnectionProfile { command } => match command {
+            ConnectionProfileCommand::Export { output } => {
+                connection_profile::export(target.server.as_deref(), output.as_deref())
+            }
+            ConnectionProfileCommand::Import {
+                profile,
+                trust_server,
+            } => connection_profile::import(&profile, trust_server),
+        },
+        Command::Install(options) => install::run(options, config_file.as_deref()),
         Command::Task { command } => remote::task(command, &target, &state, &flags).await,
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
         Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,
@@ -800,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn config_show_is_the_only_command_that_runs_on_a_broken_configuration() {
+    fn diagnostics_profiles_and_installer_run_on_a_broken_configuration() {
         // D-D. Asserted here rather than by spawning the binary, which is the
         // point of the policy living beside the commands.
         assert!(Command::Config {
@@ -809,6 +851,7 @@ mod tests {
             }
         }
         .runs_on_broken_config());
+        assert!(Command::Install(install::InstallOptions::default()).runs_on_broken_config());
 
         for command in [
             Command::List,

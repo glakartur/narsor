@@ -68,6 +68,46 @@ cargo install --path crates/narsor-controller
 The integration tests run against a real filesystem and spawn real child
 processes — always in temporary directories, never inside the repository.
 
+### Installing a prebuilt Linux release
+
+For x86_64 Linux systems with a compatible glibc, install the latest release
+without Rust or GitHub CLI:
+
+```bash
+curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh | bash
+```
+
+The installer offers **local** (all five binaries), **frontend** (TUI and CLI),
+or **server** (server, controller, and runner) roles. It browses for install
+and data directories, validates the effective configuration, backs up an
+existing config before replacing it, and asks before adding the binary
+directory to `~/.bashrc`. To select a version, pass it to the downloaded
+script, for example `bash -s -- v1.2.3`.
+
+For container builds, supply `--non-interactive`, a role, and explicit
+directories. Server mode also needs a non-loopback `--server-bind`,
+`--oidc-issuer`, `--oidc-audience`, one or more `--trusted-proxy` values, and a
+unique `--backend-id`:
+
+```bash
+curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh |
+  bash -s -- --role frontend --non-interactive \
+    --bin-dir /usr/local/bin --data-dir /var/lib/narsor
+```
+
+Use `--config-file PATH` to choose an alternate configuration target, and
+`--update-bashrc` only when explicitly opting into that startup-file change.
+Server installation creates a separate same-VM workstation backend and prints
+the server and controller commands; it does not install a service manager.
+Tasks run as the VM account without a container, so dedicate and restrict that
+account. See [Linux installation and server operation](docs/operations/installation.md).
+
+The release target is `x86_64-unknown-linux-gnu`, built and smoke-tested on
+Ubuntu 22.04. It requires a compatible glibc; musl-only distributions such as
+Alpine are not supported by this artifact. The checksum detects download
+corruption but is published with the archive; verify GitHub build provenance
+separately when publisher authentication is required.
+
 ---
 
 ## Quick start
@@ -1209,15 +1249,12 @@ version of the file intact.
 
 ## Workflows: built in, by name, overridable
 
-The two shipped workflows — `compound-engineering` and `open-mercato-sdlc` —
-are compiled into `narsor-cli`; install the workspace process binaries as
-shown under [Building and testing](#building-and-testing) to run them from
-anywhere:
+The `template` workflow is compiled into `narsor-cli`; install the workspace
+process binaries as shown under [Building and testing](#building-and-testing)
+to run it from anywhere:
 
 ```bash
-narsor-cli run compound-engineering \
-  --input description="rate-limit the public API" \
-  --input target_repo=acme-api
+narsor-cli run template --input example_text="Hello, engine"
 ```
 
 `run`, `validate` and `--file` take a *workflow reference*: a path, or a name
@@ -1248,17 +1285,16 @@ same name twice:
 
 ```
 NAME                         SOURCE     DESCRIPTION
-compound-engineering         user       The compound engineering chain, end to end: …
+template                     user       A safe, runnable tour of Narsor workflow features.
                                         overrides: built-in
-                                        path: /home/you/.config/narsor/workflows/compound-engineering.yaml
-open-mercato-sdlc            built-in   The Open Mercato software delivery process …
+                                        path: /home/you/.config/narsor/workflows/template.yaml
 ```
 
 ### Making a built-in your own
 
 ```bash
-narsor workflow eject compound-engineering        # → the user directory
-narsor workflow eject compound-engineering --to ./workflows
+narsor workflow eject template        # → the user directory
+narsor workflow eject template --to ./workflows
 ```
 
 `eject` writes the built-in out as a file, creating the directory if needed, and
@@ -1293,57 +1329,25 @@ there, so executions created before this existed keep resolving unchanged;
 
 ---
 
-## Shipped workflows
+## Built-in workflow template
 
-Two runnable pipelines live in `workflows/`, written against `WORKFLOW_SCHEMA.md`
-and modelled on real agentic development processes rather than invented ones:
-
-| File | Process | Modelled on |
-|---|---|---|
-| `workflows/compound-engineering.yaml` | five stages on one Draft merge request — requirements → plan → implementation → learning → finalize (the merge request leaves Draft; a person merges it), with a person at the end of each stage | the `ce-*` skills of the compound-engineering plugin, and `gh` or `glab` |
-| `workflows/open-mercato-sdlc.yaml` | Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | Open Mercato's `SDLC.md` and the `om-*` skills |
+`workflows/template.yaml` is the only workflow shipped in the binary. It
+demonstrates typed inputs, task display links, script output contracts,
+variables, artifact-path metadata, a human choice, terminal statuses, timeouts
+and retry policy. Its `printf` step has no side effects; the artifact path is a
+placeholder and no file is created. The workflow does not invoke an agent or
+external service.
 
 ```sh
-narsor-cli validate open-mercato-sdlc        # by name, from anywhere
-
-narsor-cli repo add acme-web --remote git@github.com:acme/web.git   # once
-narsor-cli run compound-engineering \
-  --input description="let a reviewer subscribe to a run" \
-  --input target_repo=acme-web
-
-narsor-cli show <execution-id>          # where it is waiting
-narsor-cli input <execution-id> ...     # answer the gate and resume
+narsor-cli validate template
+narsor-cli run template --input example_text="Hello, engine"
+narsor-cli show <execution-id>
+narsor-cli input <execution-id> --field decision=finish
 ```
 
-Neither pipeline is autonomous end to end, and that is the point: both stop for a
-person wherever a decision is irreversible, outward-facing, or beyond what an
-agent can settle from the repository alone.
-
-**Compound engineering** opens a PR for the reviewed requirements, then pushes
-the plan, implementation and learning to that same PR. After every push it
-handles existing PR feedback: fixes are pushed for another review, while no
-actionable feedback advances the workflow. A person reviews the scope, plan,
-implementation and final learning on the current PR, and at each gate checks
-the feedback, accepts the stage at once, or sends it back; implementation can
-pause to ask for missing input. Finalize only takes the PR out of Draft; a
-person merges it. Before pushing implementation, it runs the target
-repository's optional `scripts/verify.sh`; a failure returns to repair and
-review, while a missing script skips the check.
-
-**Open Mercato** stops five times, at the gates `SDLC.md` names itself: the
-ticket-level Definition of Ready that only a human can supply (with a
-maintainer's waiver as its own option); the design contract for a user-facing
-change, settled before the code exists and skipped entirely when the change
-touches no UI; the QA sign-off, because "manual means a person judges the result
-and owns `qa-approved`", pinned to the tested commit; the squash-merge, the point
-of no return; and a human-owned `blocked_gate` that every dead end routes to
-rather than failing silently.
-
-Both model the loops the real processes have — review → changes requested →
-re-work → re-review, and a QA failure back into implementation — and both are
-exercised end to end in `tests/workflows.rs` against a fake harness, with the
-human gates answered by script. `workflows/README.md` documents every gate and
-what a maintainer editing these files has to keep true.
+The run pauses at its human gate. Choose `finish` or `cancel`; project-specific
+workflow definitions can live in the project's or user's workflow directory.
+`workflows/README.md` describes the example.
 
 ---
 

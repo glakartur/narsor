@@ -1,0 +1,179 @@
+# Linux installation and server operation
+
+The GitHub Release installer installs prebuilt Narsor binaries and configures
+them for local, frontend, or server use. It requires `curl` or `wget`,
+`sha256sum`, and a Linux x86_64 host; it does not require Rust or GitHub CLI.
+
+The release target is `x86_64-unknown-linux-gnu`, built on Ubuntu 22.04. It
+requires a compatible glibc. A musl-only system such as Alpine is not supported
+by this artifact.
+
+## Install a role
+
+Run the latest release installer and follow its prompts:
+
+```bash
+curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh | bash
+```
+
+To select a version, pass its tag to the script:
+
+```bash
+curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh |
+  bash -s -- v1.2.3
+```
+
+The installer verifies the archive checksum before extracting it. The checksum
+is published alongside the archive, so this detects corruption but is not
+independent publisher authentication. To verify the GitHub build provenance
+yourself, download the archive and `provenance.jsonl` release asset, then use a
+recent GitHub CLI:
+
+```bash
+gh attestation verify narsor-linux-x86_64-gnu.tar.gz \
+  --bundle provenance.jsonl \
+  --repo glakartur/narsor \
+  --signer-workflow glakartur/narsor/.github/workflows/release.yml
+```
+
+Choose one role:
+
+| Role | Installed programs | Intended use |
+| --- | --- | --- |
+| `local` | `narsor`, `narsor-cli`, `narsor-server`, `narsor-controller`, `narsor-runner` | Run the TUI and CLI with the local server and controller. |
+| `frontend` | `narsor`, `narsor-cli` | Connect a TUI/CLI to a separately operated server. |
+| `server` | `narsor-server`, `narsor-controller`, `narsor-runner` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI and CLI too. |
+
+The interactive installer lets you browse for binary and data directories. It
+defaults to a user-writable binary directory and explains how to add it to
+`PATH`; it edits `~/.bashrc` only after consent. Existing configuration is
+validated before the installer changes it. A supported config file is backed
+up byte-for-byte before an atomic replacement, and unrelated supported
+settings are preserved. Malformed or unknown settings stop installation
+without replacing the config.
+
+For container builds, provide the role and directories so the installer never
+prompts. The configuration path is optional; when omitted, the effective
+configuration file is used, or the user's default config path if none exists.
+Use `--config-file` to choose another file explicitly:
+
+```bash
+curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh |
+  bash -s -- --role frontend --non-interactive \
+    --bin-dir /usr/local/bin \
+    --data-dir /var/lib/narsor \
+    --config-file /etc/narsor/config.yaml
+```
+
+For `local` and `frontend`, the installer needs `--role`, `--bin-dir`, and
+`--data-dir` in non-interactive mode. For `server`, also supply:
+
+* `--server-bind` with an address reachable by the corporate proxy, not a
+  loopback address;
+* `--oidc-issuer` using HTTPS and `--oidc-audience`;
+* one or more `--trusted-proxy` IP addresses or CIDR ranges;
+* a unique `--backend-id` other than `local`.
+
+For example, on a dedicated VM behind an existing corporate proxy:
+
+```bash
+curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh |
+  sudo bash -s -- --role server --non-interactive \
+    --bin-dir /usr/local/bin \
+    --data-dir /var/lib/narsor \
+    --config-file /etc/narsor/config.yaml \
+    --server-bind 10.20.0.5:8080 \
+    --oidc-issuer https://login.example.com/realms/narsor \
+    --oidc-audience narsor-api \
+    --trusted-proxy 10.20.0.12/32 \
+    --backend-id workstation
+```
+
+Replace the example addresses and identity settings with the values supplied
+by the network and identity operators. The proxy must terminate HTTPS, forward
+the original authorization header, set `X-Forwarded-Proto: https`, and be the
+only network path to the API. Network policy that restricts the server to the
+corporate network is external to Narsor.
+
+The installer respects effective `NARSOR_*` settings. An environment value
+overrides the same file setting; explicit installer options that disagree
+with the effective value are rejected. If an effective system-wide config is
+not writable, the interactive installer asks for another target. A
+non-interactive invocation must use a writable `--config-file`.
+
+`--update-bashrc` explicitly opts into adding the binary directory to
+`~/.bashrc`. Without it, non-interactive installation never changes a shell
+startup file. The source-checkout workflow remains available as `./install.sh`
+from a cloned repository; it is separate from the Release installer.
+
+## Frontend connection profile
+
+The server operator can export a profile containing only its HTTPS URL:
+
+```bash
+narsor-cli connection-profile export \
+  --server https://narsor.example.com \
+  --output narsor-connection.yaml
+```
+
+Transfer that file to the frontend host and import it. Interactive import
+prints the normalized endpoint and asks whether to trust its HTTPS origin:
+
+```bash
+narsor-cli connection-profile import narsor-connection.yaml
+```
+
+For a non-interactive import, explicitly accept the endpoint:
+
+```bash
+narsor-cli connection-profile import narsor-connection.yaml --trust-server
+```
+
+The imported endpoint is saved to
+`$XDG_CONFIG_HOME/narsor/connection.yaml` (default
+`~/.config/narsor/connection.yaml`). The file contains no token or credential.
+The TUI and CLI continue to get OIDC tokens from the frontend user's own
+`NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND`, or `NARSOR_TOKEN` source.
+`--server` takes precedence over `NARSOR_SERVER`; either takes precedence over
+the imported profile. If none is set, local-daemon discovery remains in use.
+
+## Start the server and workstation controller
+
+Server installation configures `server_mode: network`, proxy TLS termination,
+the trusted proxy list, and a separate `kind: local`,
+`trust_scope: workstation` backend in the catalogue. It prints commands to
+start the server with the selected config file and the controller separately.
+No systemd unit or Kubernetes resources are installed; the VM's existing
+runtime is responsible for starting and supervising both processes.
+
+**Workstation tasks run as the VM account without a container.** The server
+owner can therefore ask the controller to run programs and access every file
+that account can read. Keep this on a dedicated VM with a minimally privileged
+account and no unrelated credentials.
+
+Run the owner commands from an installed CLI (`--with-frontend` adds it to the
+server host) with `NARSOR_SERVER` set to the corporate HTTPS URL and the owner's
+local token source configured. If no `owner_subject` was configured, claim the
+server's one-time owner code before creating the workstation enrollment code:
+
+```bash
+export NARSOR_SERVER=https://narsor.example.com
+export NARSOR_TOKEN_FILE="$HOME/.cache/narsor/token"
+narsor-cli auth claim '<claim-code>'
+```
+
+The owner enrollment command printed by the installer retains the explicit
+risk acknowledgement and names the remote server endpoint. Replace its
+`<corporate-server>` placeholder; keep the owner's `NARSOR_TOKEN_FILE` or
+`NARSOR_TOKEN_COMMAND` configured:
+
+```bash
+NARSOR_SERVER='https://<corporate-server>' \
+  narsor-cli controller enroll-code workstation --accept-workstation-risk
+```
+
+The controller connects outbound to the corporate HTTPS endpoint. Supply its
+enrollment code through `NARSOR_ENROLLMENT_CODE` or a protected file, never as
+a command-line argument. See [Remote execution backends](remote-backends.md)
+for proxy requirements, token handling, controller credentials, and the full
+workstation security boundary.

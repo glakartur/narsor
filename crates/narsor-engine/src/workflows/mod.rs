@@ -1,8 +1,8 @@
 //! Where a workflow definition comes from.
 //!
-//! `narsor run compound-engineering` has to work from an installed
+//! `narsor run template` has to work from an installed
 //! binary, and `cargo install --path .` installs the binary and nothing else.
-//! So the two shipped definitions are **embedded** with `include_str!`
+//! So the shipped definition is **embedded** with `include_str!`
 //! ([`BUILTIN_WORKFLOWS`]): they travel with the binary that runs them and can
 //! never drift from it.
 //!
@@ -65,16 +65,10 @@ pub struct BuiltinWorkflow {
 /// checkout to read from, and an embedded copy cannot fall out of step with
 /// the binary. `tests/builtin_workflows.rs` asserts these strings are
 /// byte-identical to the files under `workflows/`.
-pub const BUILTIN_WORKFLOWS: &[BuiltinWorkflow] = &[
-    BuiltinWorkflow {
-        name: "compound-engineering",
-        source: include_str!("../../../../workflows/compound-engineering.yaml"),
-    },
-    BuiltinWorkflow {
-        name: "open-mercato-sdlc",
-        source: include_str!("../../../../workflows/open-mercato-sdlc.yaml"),
-    },
-];
+pub const BUILTIN_WORKFLOWS: &[BuiltinWorkflow] = &[BuiltinWorkflow {
+    name: "template",
+    source: include_str!("../../../../workflows/template.yaml"),
+}];
 
 /// The built-in of that name, if there is one.
 pub fn builtin(name: &str) -> Option<&'static BuiltinWorkflow> {

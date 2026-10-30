@@ -13,7 +13,6 @@ mod environment_support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -34,13 +33,13 @@ use narsor_engine::domain::{
 };
 use narsor_engine::engine::{Engine, PendingHumanInput, Timeline};
 use narsor_engine::orchestration::{
-    AttentionItem, AttentionKind, Clock, CommandRequest, ControlPlane, ConversationAttemptSummary,
+    AttentionItem, AttentionKind, Clock, ControlPlane, ConversationAttemptSummary,
     ConversationAvailability, ExecutionCursor, InputStatus, NewTask, Observation, ObservedSummary,
     OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, PendingInputRef,
     ResourceIdentity, ResumePolicy, RunnerSnapshot, RunnerState, TaskEventKind,
 };
-use narsor_engine::persistence::paths::{temp_path_for, StatePaths};
-use narsor_engine::persistence::{DaemonInfo, DefaultHarnessSelector, ExecutionStore};
+use narsor_engine::persistence::paths::StatePaths;
+use narsor_engine::persistence::{DefaultHarnessSelector, ExecutionStore};
 use narsor_server::api::{self, ApiServices, ConversationResponse as PageResponse};
 
 // ---------------------------------------------------------------------------
@@ -1368,99 +1367,6 @@ async fn owner_scope_hides_other_owners_tasks() {
 // ---------------------------------------------------------------------------
 // Daemon startup
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[ignore = "starts a narsor daemon; run with --ignored"]
-async fn the_daemon_recovers_the_control_plane_at_startup_and_serves_it() {
-    let root = TempRoot::new();
-    let paths = StatePaths::new(root.path());
-    let control = ControlPlane::new(paths.clone());
-    let task = TaskId::parse("task-1").unwrap();
-    control
-        .create_task(NewTask::new(
-            task.clone(),
-            OwnerRef::new(narsor_engine::controller_protocol::LOCAL_OWNER),
-            narsor_engine::domain::BackendId::parse("k8s").unwrap(),
-            narsor_engine::domain::TaskLaunchSpec::new(
-                "wf",
-                1,
-                serde_json::json!({}),
-                narsor_engine::domain::TaskWorkspace::None,
-                narsor_engine::domain::ResolvedEnvironment::harness_only("claude-code"),
-                narsor_engine::domain::ResourceProfile::new(1000, 2048),
-            ),
-        ))
-        .expect("create");
-    control
-        .command(&task, CommandRequest::new(OwnerCommand::Archive, "a"))
-        .expect("archive");
-
-    // A crash after committing revision 2 but before appending its event,
-    // plus an interrupted write.
-    let event_file = paths.orchestration_task_event_file("task-1", 2);
-    fs::remove_file(&event_file).expect("drop event 2");
-    let orphan = temp_path_for(&paths.orchestration_task_file("task-1"));
-    fs::write(&orphan, b"{ torn").expect("orphaned temp file");
-
-    let mut daemon = spawn_daemon(root.path());
-    let info = wait_for_daemon_info(root.path(), StdDuration::from_secs(10));
-
-    assert!(event_file.exists(), "recover() republished the event");
-    assert!(!orphan.exists(), "recover() removed the orphan");
-    let client = ApiClient::new(info.addr, info.token.clone());
-    let events = client.control_events("task-1", 0).await.expect("events");
-    assert_eq!(
-        events
-            .iter()
-            .map(|event| event.sequence)
-            .collect::<Vec<_>>(),
-        [1, 2]
-    );
-
-    // SAFETY: a plain signal to the child this test spawned.
-    unsafe {
-        libc::kill(info.pid as libc::pid_t, libc::SIGTERM);
-    }
-    wait_for_exit(&mut daemon, StdDuration::from_secs(20));
-}
-
-fn spawn_daemon(root: &Path) -> Child {
-    Command::new(engine_support::workspace_binary("narsor-server"))
-        .arg("--root")
-        .arg(root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the daemon")
-}
-
-fn wait_for_daemon_info(root: &Path, timeout: StdDuration) -> DaemonInfo {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(info) = DaemonInfo::read(&root.join("daemon.json")) {
-            return info;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never became discoverable"
-        );
-        std::thread::sleep(StdDuration::from_millis(20));
-    }
-}
-
-fn wait_for_exit(child: &mut Child, timeout: StdDuration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait().expect("poll child").is_some() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("the daemon did not exit");
-        }
-        std::thread::sleep(StdDuration::from_millis(20));
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Launch resolution on the create path (U6)

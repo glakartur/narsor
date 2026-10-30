@@ -15,6 +15,7 @@ pub mod controller_protocol {
 pub mod api {
     mod client;
     pub mod connect;
+    pub mod connection_profile;
     mod discovery;
     pub mod dto;
     pub mod launch;

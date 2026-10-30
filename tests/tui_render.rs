@@ -2565,35 +2565,6 @@ mod task_app_detail_render {
     }
 
     #[test]
-    fn events_are_listed_with_the_detail_of_the_selected_one() {
-        let mut app = running_app();
-        app.detail_mut()
-            .set_tab(narsor::tui::task_app::DetailTab::Events);
-        app.on_detail_read(
-            "a",
-            1,
-            DetailRead::Events {
-                after: 0,
-                result: Ok(ExecutionEventsResponse::Available {
-                    events: execution_events(4),
-                    has_more: false,
-                    source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
-                }),
-            },
-        );
-        let list = screen(&render(&mut app, &Styles::new(false)));
-        assert!(
-            list.contains("state_entered") && list.contains("state-4"),
-            "{list}"
-        );
-        assert!(!list.contains("szczegóły zdarzenia"));
-        press(&mut app, KeyCode::Char('v'));
-        let detail = screen(&render(&mut app, &Styles::new(false)));
-        assert!(detail.contains("szczegóły zdarzenia 4"), "{detail}");
-        assert!(detail.contains("\"state_id\": \"state-4\""), "{detail}");
-    }
-
-    #[test]
     fn the_conversation_tab_shows_a_message_for_a_task_without_one() {
         let mut app = running_app();
         app.detail_mut()

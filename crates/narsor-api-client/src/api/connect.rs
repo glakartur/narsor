@@ -42,7 +42,14 @@ pub async fn connect(
     state_root: &Path,
     flags: &Flags,
 ) -> Result<ApiClient, String> {
-    match &target.server {
+    let server = match &target.server {
+        Some(server) => Some(server.clone()),
+        None => match super::connection_profile::default_connection_profile_path() {
+            Some(path) => super::connection_profile::read_connection_profile(&path)?,
+            None => None,
+        },
+    };
+    match server {
         Some(server) => {
             let token = target.token.clone().ok_or_else(|| {
                 format!(
@@ -51,7 +58,7 @@ pub async fn connect(
                      control plane's audience"
                 )
             })?;
-            ApiClient::remote(server, token).map_err(|error| error.to_string())
+            ApiClient::remote(&server, token).map_err(|error| error.to_string())
         }
         None => ensure_daemon_running(state_root, flags)
             .await

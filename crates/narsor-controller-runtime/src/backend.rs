@@ -427,7 +427,7 @@ mod tests {
     fn spec() -> Value {
         json!({
             "version": TASK_LAUNCH_SPEC_VERSION,
-            "workflow_id": "compound-engineering",
+            "workflow_id": "example-workflow",
             "workflow_version": 1,
             "inputs": {},
             "workspace": {},

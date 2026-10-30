@@ -958,6 +958,12 @@ that computer and read every file its user can read. Use it only with a
 server you control, and keep the computer's user free of what tasks must not
 see.
 
+For a dedicated Linux VM, the Release installer can write the network-mode
+server configuration and workstation backend entry. It prints separate
+commands for `narsor-server` and the controller, but installs no systemd unit
+or Kubernetes resources. See [Linux installation and server
+operation](installation.md) for role selection and the generated setup.
+
 1. Register the backend under its own id, never `local` (a network server
    refuses `backends/local.yaml` at start; that id belongs to a trusted
    daemon). The trust scope must be `workstation`:
