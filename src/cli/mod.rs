@@ -536,9 +536,6 @@ impl Command {
     /// subcommand has to decide rather than inherit — and so that the policy
     /// lives beside the commands it is about, where it can be tested without
     /// spawning the binary.
-    ///
-    /// The installer also runs here: it owns configuration repair and must
-    /// inspect the path it intends to update before writing it.
     pub fn runs_on_broken_config(&self) -> bool {
         match self {
             Command::Config { command } => match command {

@@ -123,10 +123,10 @@ pub fn run(options: InstallOptions, global_config: Option<&Path>) -> Result<()> 
         options.non_interactive,
     )?;
     let mut config = load_config(&config_path)?;
-    let mut parsed = validate_config(&config_path, &config)?;
+    let (_, mut parsed) = validate_config(&config_path, &config)?;
 
     set_missing_root_paths(&mut config, &parsed, &data_dir)?;
-    parsed = validate_config(&config_path, &config)?;
+    parsed = validate_config(&config_path, &config)?.1;
     let workstation_backend = if role == InstallRole::Server {
         Some(configure_server(
             &mut config,
@@ -138,7 +138,7 @@ pub fn run(options: InstallOptions, global_config: Option<&Path>) -> Result<()> 
         None
     };
 
-    let contents = serialize_and_validate(&config_path, &config)?;
+    let contents = validate_config(&config_path, &config)?.0;
     let binaries = binaries_for(role, options.with_frontend);
     validate_release_binaries(&source_dir, &binaries)?;
     prepare_config_directory(&config_path)?;
@@ -464,10 +464,10 @@ fn load_config(path: &Path) -> Result<Value> {
     Ok(Value::Mapping(std::mem::take(&mut mapping)))
 }
 
-fn validate_config(path: &Path, config: &Value) -> Result<config::FileValues> {
+fn validate_config(path: &Path, config: &Value) -> Result<(String, config::FileValues)> {
     let text = serde_yaml::to_string(config)
         .map_err(|error| CliError::failure(format!("cannot encode configuration: {error}")))?;
-    config::file::parse(path, &text)
+    let parsed = config::file::parse(path, &text)
         .into_result()
         .map_err(|errors| {
             CliError::failure(
@@ -477,7 +477,8 @@ fn validate_config(path: &Path, config: &Value) -> Result<config::FileValues> {
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
-        })
+        })?;
+    Ok((text, parsed))
 }
 
 fn set_missing_root_paths(
@@ -627,7 +628,7 @@ fn configure_server(
         proxy_setting
             .as_ref()
             .and_then(SettingValue::as_text)
-            .map(|value| config::file::split_list(value))
+            .map(config::file::split_list)
     } else {
         Some(options.trusted_proxies.clone())
     };
@@ -806,23 +807,6 @@ fn write_workstation_backend(backend: &WorkstationBackend) -> Result<()> {
         .join(format!("{}.yaml", backend.id));
     let contents = "kind: local\ntrust_scope: workstation\nlimits:\n  max_concurrent_tasks: 1\n  default_resources: { cpu_millicores: 1000, memory_mib: 2048 }\n";
     write_new_atomic(&path, contents.as_bytes(), 0o644)
-}
-
-fn serialize_and_validate(path: &Path, config: &Value) -> Result<String> {
-    let contents = serde_yaml::to_string(config)
-        .map_err(|error| CliError::failure(format!("cannot encode configuration: {error}")))?;
-    config::file::parse(path, &contents)
-        .into_result()
-        .map_err(|errors| {
-            CliError::failure(
-                errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-        })?;
-    Ok(contents)
 }
 
 fn validate_release_binaries(source_dir: &Path, binaries: &[&str]) -> Result<()> {
