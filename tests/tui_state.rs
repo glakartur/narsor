@@ -1597,6 +1597,27 @@ mod foundations {
         }
 
         #[test]
+        fn a_workflow_choice_is_a_background_of_its_own_or_reversed() {
+            let colour = Styles::new(false);
+            let choice = colour.workflow_choice_background();
+            assert!(choice.bg.is_some());
+            assert_eq!(choice.fg, None);
+            assert!(!choice.add_modifier.contains(Modifier::REVERSED));
+            for other in [
+                colour.selection_fill(),
+                colour.task_header_background(),
+                colour.answer_panel_background(),
+                colour.field_editing(),
+            ] {
+                assert_ne!(choice.bg, other.bg, "{other:?}");
+            }
+
+            let plain = Styles::new(true).workflow_choice_background();
+            assert_eq!((plain.fg, plain.bg), (None, None));
+            assert!(plain.add_modifier.contains(Modifier::REVERSED));
+        }
+
+        #[test]
         fn roles_follow_the_origin_table() {
             let styles = Styles::new(false);
             assert_eq!(styles.of(Role::Attention).fg, Some(Color::Yellow));
@@ -3940,6 +3961,35 @@ mod task_app_detail {
             assert_eq!(
                 choice.rendered_lines,
                 ["agent · claude wybrał opcję: done".to_string()]
+            );
+        }
+
+        #[test]
+        fn only_a_choice_is_marked_as_a_workflow_choice() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let events = vec![
+                entered(1, "plan"),
+                agent_chose(2, "done"),
+                conductor_chose(3, "next"),
+                human_chose(4, "plan", "fix"),
+            ];
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild_with_events(&positions, &attempts(&["p"]), &events);
+            for entry in conversation.transcript().entries() {
+                assert_eq!(
+                    entry.workflow_choice,
+                    entry.id.as_str().starts_with("workflow-choice/"),
+                    "{entry:?}"
+                );
+            }
+            assert_eq!(
+                conversation
+                    .transcript()
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.workflow_choice)
+                    .count(),
+                3
             );
         }
 

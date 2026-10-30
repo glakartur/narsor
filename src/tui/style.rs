@@ -9,7 +9,8 @@
 //! * text in the 16 ANSI colours only, so the interface inherits the terminal
 //!   theme and reads on a light background as well as a dark one; the few
 //!   fixed backgrounds (key caps, the task header, the answer panel, the
-//!   selected row) live here and never colour text;
+//!   selected row, a workflow choice in a transcript) live here and never
+//!   colour text;
 //! * colour never carries information alone: every role is shown with an icon
 //!   and a word, which is why `NO_COLOR` can take all colour away
 //!   ([`Styles::new`]) and leave bold, dim and reverse video behind without
@@ -220,6 +221,17 @@ impl Styles {
     /// foreground role. It is drawn in both modes.
     pub fn selection_fill(&self) -> Style {
         Style::default().bg(Color::Indexed(236))
+    }
+
+    /// The block behind a workflow choice in a transcript, from the content
+    /// column to the panel's right edge: a dark olive no other background
+    /// and no conversation kind uses. Without colour the block is reversed.
+    pub fn workflow_choice_background(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().bg(Color::Indexed(58))
+        }
     }
 
     /// Backgrounds that keep the task header and its answer panel distinct

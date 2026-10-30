@@ -1,7 +1,7 @@
 ---
 title: "feat: Wyróżnienie wpisów „WYBÓR WORKFLOW” tłem w zakładce Rozmowa"
 type: feat
-status: active
+status: completed
 date: 2026-10-30
 origin: docs/brainstorms/2026-10-30-tui-wyroznienie-wyborow-workflow-requirements.md
 ---

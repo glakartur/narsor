@@ -6787,3 +6787,333 @@ mod stacked_form {
         }
     }
 }
+
+/// A workflow choice in *Rozmowa* is a block with its own background (or
+/// reversed without colour) from the content column to the right edge; the
+/// bar's two columns and every other entry stay as they are.
+mod workflow_choice_render {
+    use super::*;
+
+    use narsor::tui::task_app::tabs::conversation::{self, AttemptRead, Attempts, Conversation};
+    use narsor::tui::transcript::{
+        DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptPresentation,
+    };
+    use narsor_engine::domain::{ConductorDecisionKind, Event, EventData};
+    use narsor_engine::engine::{ConversationState, PositionStatus};
+
+    use crate::task_app_support::position;
+
+    const PREFIX: u16 = 2;
+
+    fn ev(sequence: u64, data: EventData) -> Event {
+        Event::new("e".to_string(), data, sequence)
+    }
+
+    fn entered(sequence: u64) -> Event {
+        ev(
+            sequence,
+            EventData::StateEntered {
+                state_id: "brainstorm".to_string(),
+            },
+        )
+    }
+
+    fn agent_chose(sequence: u64, label: &str, reasoning: Option<&str>) -> Event {
+        ev(
+            sequence,
+            EventData::DecisionMade {
+                provider: "claude".to_string(),
+                output_label: label.to_string(),
+                reasoning: reasoning.map(str::to_string),
+            },
+        )
+    }
+
+    fn conductor_chose(sequence: u64, label: &str) -> Event {
+        ev(
+            sequence,
+            EventData::ConductorDecision {
+                decision_id: format!("d{sequence}"),
+                kind: ConductorDecisionKind::ChooseOutput,
+                state_id: None,
+                output_label: Some(label.to_string()),
+                episode: None,
+                confidence: Default::default(),
+                rationale: None,
+            },
+        )
+    }
+
+    fn human_chose(sequence: u64, to: &str) -> Event {
+        ev(
+            sequence,
+            EventData::HumanTransitionSelected {
+                from_state: "brainstorm".to_string(),
+                to_state: to.to_string(),
+            },
+        )
+    }
+
+    /// An agent message with `text`, as the step's recorded conversation.
+    fn message(text: &str) -> TranscriptEntry {
+        TranscriptEntry::new(
+            TranscriptEntryId::from("m"),
+            vec![text.to_string()],
+            b"{}".to_vec(),
+        )
+        .with_header("AGENT · claude")
+        .with_presentation(TranscriptPresentation::Agent)
+    }
+
+    /// *Rozmowa* of step `brainstorm` with `messages`, then `choices`.
+    fn conversation(messages: Vec<TranscriptEntry>, choices: Vec<Event>) -> Conversation {
+        let mut step = position("brainstorm", PositionStatus::Succeeded);
+        step.conversation = ConversationState::Recorded;
+        let next_entry = messages.len() as u64;
+        let mut attempts = Attempts::default();
+        attempts.apply(
+            "act-brainstorm",
+            1,
+            0,
+            Ok(AttemptRead {
+                entries: messages,
+                next_entry,
+                closed: true,
+                truncated_tail: false,
+                complete: true,
+                no_record: false,
+                source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
+                recorded_at: None,
+            }),
+        );
+        let mut events = vec![entered(1)];
+        events.extend(choices);
+        let mut conversation = Conversation::new("a");
+        conversation.rebuild_with_events(&[step], &attempts, &events);
+        conversation
+    }
+
+    fn drawn(
+        width: u16,
+        height: u16,
+        conversation: &mut Conversation,
+        styles: &Styles,
+        stale: bool,
+        focused: bool,
+    ) -> Buffer {
+        draw(width, height, |frame| {
+            conversation::render(
+                frame,
+                frame.area(),
+                styles,
+                conversation,
+                stale,
+                focused,
+                "⠋",
+            );
+        })
+    }
+
+    /// The rows of every choice card: from a `WYBÓR WORKFLOW` header to the
+    /// blank row after it.
+    fn choice_rows(buffer: &Buffer) -> Vec<u16> {
+        let mut inside = false;
+        let mut found = Vec::new();
+        for (y, row) in rows(buffer).iter().enumerate() {
+            if row.contains("WYBÓR WORKFLOW") {
+                inside = true;
+            } else if row.trim().is_empty() {
+                inside = false;
+            }
+            if inside {
+                found.push(y as u16);
+            }
+        }
+        found
+    }
+
+    fn highlighted(cell: &Cell, styles: &Styles) -> bool {
+        let choice = styles.workflow_choice_background();
+        match choice.bg {
+            Some(bg) => cell.bg == bg,
+            None => cell.modifier.contains(Modifier::REVERSED),
+        }
+    }
+
+    /// Choice rows are highlighted from column 2 to the last column; their
+    /// bar columns and every other row are not.
+    fn assert_blocks(buffer: &Buffer, styles: &Styles) {
+        let choice = choice_rows(buffer);
+        assert!(!choice.is_empty(), "{}", screen(buffer));
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let expected = choice.contains(&y) && x >= PREFIX;
+                assert_eq!(
+                    highlighted(&buffer[(x, y)], styles),
+                    expected,
+                    "cell ({x}, {y}):\n{}",
+                    screen(buffer)
+                );
+            }
+        }
+    }
+
+    const REASON: &str = "Dokumentu nie zapisano, bo krok nie miał dostępu do katalogu docs.";
+
+    // AE1
+    #[test]
+    fn a_choice_with_a_wrapped_reason_is_one_block_to_the_right_edge() {
+        let styles = Styles::new(false);
+        let mut tab = conversation(
+            vec![message("Piszę wymagania.")],
+            vec![agent_chose(2, "requirements_drafted", Some(REASON))],
+        );
+        let buffer = drawn(60, 16, &mut tab, &styles, false, true);
+        assert!(choice_rows(&buffer).len() >= 4, "{}", screen(&buffer));
+        assert_blocks(&buffer, &styles);
+    }
+
+    // AE2
+    #[test]
+    fn without_colour_a_choice_is_reversed_and_nothing_has_a_colour() {
+        let styles = Styles::new(true);
+        let mut tab = conversation(
+            vec![message("Piszę wymagania.")],
+            vec![agent_chose(2, "requirements_drafted", Some(REASON))],
+        );
+        let buffer = drawn(60, 16, &mut tab, &styles, false, true);
+        assert_blocks(&buffer, &styles);
+        assert!(buffer
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset && cell.fg == Color::Reset));
+    }
+
+    // AE3
+    #[test]
+    fn every_actor_has_the_same_block_and_keeps_its_header_colour() {
+        let styles = Styles::new(false);
+        let mut tab = conversation(
+            vec![message("Piszę wymagania.")],
+            vec![
+                agent_chose(2, "a", None),
+                conductor_chose(3, "b"),
+                human_chose(4, "c"),
+            ],
+        );
+        let buffer = drawn(60, 20, &mut tab, &styles, false, true);
+        assert_blocks(&buffer, &styles);
+        let headers: Vec<Color> = rows(&buffer)
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("WYBÓR WORKFLOW"))
+            .map(|(y, _)| buffer[(PREFIX, y as u16)].fg)
+            .collect();
+        assert_eq!(headers, [Color::Green, Color::Magenta, Color::Cyan]);
+    }
+
+    // AE4
+    #[test]
+    fn the_selection_bar_beside_a_choice_keeps_its_look() {
+        for focused in [true, false] {
+            let styles = Styles::new(false);
+            let mut tab = conversation(
+                vec![message("Piszę wymagania.")],
+                vec![agent_chose(2, "requirements_drafted", None)],
+            );
+            let buffer = drawn(60, 16, &mut tab, &styles, false, focused);
+            assert_blocks(&buffer, &styles);
+            let marks = styles.selection_marks(focused);
+            for y in choice_rows(&buffer) {
+                let bar = &buffer[(0, y)];
+                assert_eq!(bar.symbol(), marks.bar, "row {y}");
+                assert_eq!(bar.fg, marks.style.fg.unwrap(), "row {y}");
+                assert_eq!(bar.bg, Color::Reset, "row {y}");
+            }
+        }
+    }
+
+    // AE5
+    #[test]
+    fn a_message_that_looks_like_a_choice_is_not_highlighted() {
+        let styles = Styles::new(false);
+        let mut tab = conversation(vec![message(r#"{"choice": "x"}"#)], Vec::new());
+        let buffer = drawn(60, 12, &mut tab, &styles, false, true);
+        assert!(buffer
+            .content()
+            .iter()
+            .all(|cell| !highlighted(cell, &styles)));
+    }
+
+    #[test]
+    fn a_stale_choice_keeps_its_block() {
+        let styles = Styles::new(false);
+        let mut tab = conversation(
+            vec![message("Piszę wymagania.")],
+            vec![agent_chose(2, "requirements_drafted", None)],
+        );
+        let buffer = drawn(60, 16, &mut tab, &styles, true, true);
+        assert_blocks(&buffer, &styles);
+    }
+
+    #[test]
+    fn a_pane_no_wider_than_the_bar_draws_without_a_panic() {
+        let styles = Styles::new(false);
+        let mut tab = conversation(
+            vec![message("Piszę wymagania.")],
+            vec![agent_chose(2, "requirements_drafted", Some(REASON))],
+        );
+        for width in 1..=PREFIX + 1 {
+            drawn(width, 8, &mut tab, &styles, false, true);
+        }
+    }
+
+    #[test]
+    fn a_choice_scrolled_partly_out_of_view_is_highlighted_only_where_visible() {
+        let styles = Styles::new(false);
+        let mut tab = conversation(
+            vec![message("Piszę wymagania.")],
+            vec![
+                agent_chose(2, "requirements_drafted", Some(REASON)),
+                agent_chose(3, "done", None),
+            ],
+        );
+        // Following the end, only the tail of the first choice is visible:
+        // every non-blank row is a choice row, the blank row between the two
+        // cards is not.
+        let buffer = drawn(60, 5, &mut tab, &styles, false, true);
+        let visible = rows(&buffer);
+        assert!(
+            !visible[0].contains("WYBÓR WORKFLOW"),
+            "{}",
+            screen(&buffer)
+        );
+        assert!(visible.iter().any(|row| row.trim().is_empty()));
+        for (y, row) in visible.iter().enumerate() {
+            let choice = !row.trim().is_empty();
+            for x in 0..60 {
+                assert_eq!(
+                    highlighted(&buffer[(x, y as u16)], &styles),
+                    choice && x >= PREFIX,
+                    "cell ({x}, {y}):\n{}",
+                    screen(&buffer)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_raw_view_has_no_block() {
+        let styles = Styles::new(false);
+        let mut tab = conversation(
+            vec![message("Piszę wymagania.")],
+            vec![agent_chose(2, "requirements_drafted", None)],
+        );
+        tab.transcript_mut().set_mode(DisplayMode::Raw);
+        let buffer = drawn(60, 12, &mut tab, &styles, false, true);
+        assert!(buffer
+            .content()
+            .iter()
+            .all(|cell| !highlighted(cell, &styles)));
+    }
+}
