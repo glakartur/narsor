@@ -4353,7 +4353,7 @@ mod control_catalog {
         let workflow = list
             .workflows
             .iter()
-            .find(|workflow| workflow.name == "compound-engineering")
+            .find(|workflow| workflow.name == "template")
             .expect("built-in listed");
         assert_eq!(workflow.source, WorkflowSource::BuiltIn);
         assert!(workflow.valid, "{:?}", workflow.violations);
@@ -4361,15 +4361,15 @@ mod control_catalog {
         assert!(workflow
             .description
             .as_deref()
-            .is_some_and(|text| text.starts_with("The compound engineering chain")));
+            .is_some_and(|text| text.starts_with("A safe, runnable tour")));
         let input = workflow
             .inputs
             .iter()
-            .find(|input| input.name == "description")
+            .find(|input| input.name == "example_text")
             .expect("input declared");
         assert!(input.required);
         assert!(input.description.is_some());
-        assert_eq!(workflow.inputs.len(), 2);
+        assert_eq!(workflow.inputs.len(), 1);
         // Never a path of the server.
         assert!(!serde_json::to_string(&list)
             .unwrap()

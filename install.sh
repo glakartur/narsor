@@ -154,10 +154,6 @@ done
 if ! command -v claude >/dev/null 2>&1 && ! command -v opencode >/dev/null 2>&1; then
     echo "Uwaga: brak harnessu agenta ('claude' lub 'opencode') na PATH. Kroki agentowe nie ruszą." >&2
 fi
-if ! command -v glab >/dev/null 2>&1; then
-    echo "Uwaga: brak 'glab' na PATH. Krok finalize workflow compound-engineering wybierze 'blocked'." >&2
-fi
-
 for package in . crates/narsor-server crates/narsor-runner crates/narsor-controller; do
     echo "Instaluję $package ..."
     cargo install --locked --force --path "$package" --bins "${root_args[@]}"

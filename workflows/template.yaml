@@ -1,0 +1,81 @@
+name: template
+version: 1
+description: A safe, runnable tour of Narsor workflow features.
+
+inputs:
+  - name: example_text
+    type: text
+    required: true
+    description: Text shown at the human decision gate.
+
+display:
+  title: Narsor workflow template
+  links:
+    - label: schema
+      text: Workflow schema
+      url: https://github.com/glakartur/narsor/blob/main/WORKFLOW_SCHEMA.md
+
+globals:
+  timeout: 2m
+  retry_policy:
+    max_attempts: 2
+    backoff: 0s
+
+states:
+  demonstrate:
+    description: Prints a structured result without changing files or calling external services.
+    timeout: 10s
+    action:
+      type: script
+      command: /usr/bin/printf
+      args:
+        - '{"choice":"ready","reason":"The no-op script completed.","variables":{"example_value":"sample"},"artifacts":{"example_file":"template-example.txt"}}\n'
+    variables:
+      - name: example_value
+        description: A sample value carried into the next state.
+    artifacts:
+      - name: example_file
+        description: A sample artifact path; this workflow does not create the file.
+    choices:
+      - label: ready
+        description: The sample result and artifact reference are available.
+        requires_variables: [example_value]
+        requires_artifacts: [example_file]
+    transitions:
+      ready: review
+
+  review:
+    description: Shows workflow inputs and script outputs, then waits for a person to choose a route.
+    action:
+      type: human
+      message: |
+        Example input: {{ inputs.example_text }}
+        Script variable: {{ context.example_value }}
+        Artifact path metadata: {{ artifacts.example_file }}
+      inputs:
+        - name: decision
+          type: select
+          required: true
+          options: [finish, cancel]
+        - name: comment
+          type: text
+          required: false
+          description: Optional note; it is recorded with this decision.
+    choices:
+      - label: finish
+        description: Finish the demonstration successfully.
+      - label: cancel
+        description: End the demonstration as cancelled.
+    transitions:
+      finish: completed
+      cancel: cancelled
+
+  completed:
+    description: The demonstration completed.
+
+  cancelled:
+    description: The demonstration was cancelled by the person.
+
+terminal_states:
+  completed: completed
+  cancelled: cancelled

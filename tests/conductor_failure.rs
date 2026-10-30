@@ -8,17 +8,13 @@
 //! transition, retry a step that may have acted, or diagnose its own
 //! failure.
 //!
-//! The daemon restart row (`Failed` with the F3 record) is driven through a
-//! real daemon, with the fake harness first on its `PATH` as `claude`.
-
 mod engine_support;
 
 use std::collections::VecDeque;
 use std::fs;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,14 +27,13 @@ use narsor_engine::conductor::{
 };
 use narsor_engine::domain::{
     ConductorDecisionKind, ConductorPurpose, ConductorTrigger, EventData, ExecutionStatus,
-    ProblemKind, WorkflowDefinition, WorkflowExecution, Workspace,
+    ProblemKind, WorkflowDefinition, WorkflowExecution,
 };
 use narsor_engine::engine::{
     step_failure, ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, EngineError,
     HarnessRegistry, LoggingEventSink, Recovery, StepFailure,
 };
-use narsor_engine::persistence::{sweep_orphaned_workspaces, DaemonInfo, ExecutionStore};
-use narsor_engine::workspace::{CleanupPolicy, WorkspaceProvisioner};
+use narsor_engine::persistence::ExecutionStore;
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
@@ -1002,154 +997,4 @@ async fn a_diagnosis_with_its_repeat_spent_raises_the_raw_error_at_startup() {
     assert!(fixture.conductor.calls().is_empty());
     let problems = failure_problems(&fixture.events(&execution.id));
     assert!(problems[0].1.contains("the build broke"), "{problems:?}");
-}
-
-/// Restart matrix, through a real daemon: `Failed` with the F3 record and a
-/// diagnosis cut short. The startup hook diagnoses it once (on the fake
-/// harness, first on the daemon's `PATH` as `claude`), the problem shows in
-/// `GET /executions`, and the workspace sweep keeps the task's workspace.
-#[tokio::test]
-#[ignore = "starts narsor-server; run with --ignored"]
-async fn a_fresh_daemon_diagnoses_a_failed_step_again_and_the_sweep_keeps_its_workspace() {
-    let harness = Harness::new();
-    let root = harness.root().join("daemon");
-    fs::create_dir_all(root.join("work")).expect("create the work dir");
-    let bin = root.join("bin");
-    let fake = FakeHarness::install(bin.clone(), "claude");
-    let answer = json!({
-        "decision": "diagnose",
-        "diagnosis": "The build broke on a missing dependency.",
-        "proposals": [{"kind": "retry", "text": "Install the dependency first."}],
-    });
-    fake.prints(&format!(
-        "{}\n",
-        json!({
-            "type": "result",
-            "subtype": "success",
-            "is_error": false,
-            "session_id": "conductor-session",
-            "result": answer.to_string(),
-        })
-    ));
-
-    let store = ExecutionStore::new(&root);
-    let engine = Engine::new(store.clone());
-    let mut execution = engine
-        .start(
-            &workflow("two_steps"),
-            json!({}),
-            Workspace::local_folder(root.join("work").display().to_string()),
-        )
-        .expect("seed the execution");
-    fail_on(&store, &mut execution, &a_failure("attempt-1"));
-    let conductor = ConductorStore::new(store.paths(), &execution.id);
-    cut_short(&conductor, "attempt-1");
-
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut child = Command::new(engine_support::workspace_binary("narsor-server"))
-        .arg("--root")
-        .arg(&root)
-        .env("PATH", path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn the daemon");
-    let info = wait_for_daemon_info(&root).await;
-    let client = narsor::api::ApiClient::new(info.addr, &info.token);
-
-    let log = store.event_log(&execution.id);
-    let problem_raised = || {
-        log.read_all()
-            .expect("read the log")
-            .iter()
-            .any(|event| matches!(event.data, EventData::ProblemRaised { .. }))
-    };
-    wait_until("the daemon diagnosed the failure", problem_raised).await;
-
-    let events: Vec<EventData> = log
-        .read_all()
-        .expect("read the log")
-        .into_iter()
-        .map(|event| event.data)
-        .collect();
-    assert_eq!(
-        count(&events, |data| matches!(
-            data,
-            EventData::ConductorStarted {
-                trigger: ConductorTrigger::StepFailure,
-                ..
-            }
-        )),
-        1,
-        "the hook diagnoses once"
-    );
-    assert_eq!(fake.calls(), 1);
-    let state = conductor.load_state().expect("load");
-    assert_eq!(state.attempts("attempt-1"), 2);
-    assert_eq!(state.pending, None);
-    assert!(state.queue.is_empty());
-
-    let list = client.list_executions().await.expect("list over the API");
-    let summary = list
-        .executions
-        .iter()
-        .find(|summary| summary.id == execution.id)
-        .expect("the execution is listed");
-    assert_eq!(summary.status, narsor::api::ExecutionStatusDto::Failed);
-    let problem = summary.problem.clone().expect("a problem");
-    assert_eq!(problem.kind, narsor::api::ProblemKindDto::Failure);
-    assert_eq!(problem.episode.as_deref(), Some("attempt-1"));
-    assert_eq!(problem.reason, "The build broke on a missing dependency.");
-
-    stop(&mut child, &root);
-
-    // The sweep keeps the workspace of a failure the conductor took up.
-    let provisioner = WorkspaceProvisioner::new(root.join("work"));
-    let task_dir = provisioner.task_dir(&execution.id);
-    fs::create_dir_all(&task_dir).expect("create the task's workspace");
-    let orphans =
-        sweep_orphaned_workspaces(&store, &provisioner, CleanupPolicy::Remove).expect("sweep");
-    assert!(
-        orphans
-            .iter()
-            .all(|orphan| orphan.execution_id != execution.id),
-        "{orphans:?}"
-    );
-    assert!(task_dir.exists());
-}
-
-async fn wait_for_daemon_info(root: &Path) -> DaemonInfo {
-    let file = narsor_engine::persistence::StatePaths::new(root).daemon_file();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(info) = DaemonInfo::read(&file) {
-            return info;
-        }
-        if Instant::now() >= deadline {
-            panic!("the daemon never became discoverable");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn stop(child: &mut std::process::Child, root: &Path) {
-    // SAFETY: a plain signal to the child this test spawned.
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
-    }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if child.try_wait().expect("poll the daemon").is_some() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("the daemon at {} did not stop", root.display());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }

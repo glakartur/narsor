@@ -63,8 +63,8 @@
 //! * `metadata.cli.definition_name` — the workflow's *name* in the search path
 //!   ([`crate::workflows`]). This is the key a built-in needs, because a
 //!   built-in is compiled into the binary and has no path at all: without it an
-//!   execution started as `narsor run compound-engineering` could never
-//!   be resumed, and both shipped workflows are full of human gates.
+//!   execution started as `narsor run template` could never
+//!   be resumed, including executions paused at human gates.
 //!
 //! [`resolve_definition`] reads them back, **path first**: an execution written
 //! before `definition_name` existed carries only the path and keeps resolving
