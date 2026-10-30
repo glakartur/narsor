@@ -1,8 +1,8 @@
 //! The `github-copilot` harness — GitHub Copilot SDK.
 //!
 //! The GitHub Copilot SDK provides a production-grade runtime for embedding AI
-//! agents. This adapter uses the Copilot SDK via JSON-RPC instead of spawning 
-//! a separate CLI process. The SDK handles all communication with the GitHub 
+//! agents. This adapter uses the Copilot SDK via JSON-RPC instead of spawning
+//! a separate CLI process. The SDK handles all communication with the GitHub
 //! Copilot service.
 //!
 //! # Integration
@@ -33,8 +33,8 @@
 //!
 //! The system prompt is prepended to the main prompt before passing to the SDK.
 
-use serde_json::Value;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use serde_json::Value;
 
 use super::{
     not_classified, reject_option_like, string_parameter, tail, HarnessAdapter, HarnessInvocation,
@@ -94,7 +94,8 @@ impl HarnessAdapter for GitHubCopilotAdapter {
         let _sandbox = sandbox(request)?;
         let mut prompt = message(request);
 
-        if let Some(system_prompt) = string_parameter(request.config, "append_system_prompt", GITHUB_COPILOT)?
+        if let Some(system_prompt) =
+            string_parameter(request.config, "append_system_prompt", GITHUB_COPILOT)?
         {
             reject_option_like(system_prompt, "append_system_prompt", GITHUB_COPILOT)?;
             prompt = format!("{}\n\n{}", system_prompt, prompt);
@@ -118,10 +119,7 @@ impl HarnessAdapter for GitHubCopilotAdapter {
         // Return SDK marker invocation with encoded configuration
         Ok(HarnessInvocation {
             program: self.program.clone(),
-            args: vec![
-                "agent".to_string(),
-                STANDARD.encode(sdk_config.to_string()),
-            ],
+            args: vec!["agent".to_string(), STANDARD.encode(sdk_config.to_string())],
             stdin: None,
         })
     }
@@ -140,9 +138,7 @@ fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> 
             continue;
         }
         return Err(ActionError {
-            message: format!(
-                "parameter '{key}' is not supported by harness '{GITHUB_COPILOT}'"
-            ),
+            message: format!("parameter '{key}' is not supported by harness '{GITHUB_COPILOT}'"),
             error_type: Some("invalid_parameter".to_string()),
             details: Some(serde_json::json!({
                 "harness": GITHUB_COPILOT,
@@ -251,7 +247,10 @@ impl GitHubCopilotStreamParser {
                 if let Some(text) = value.get("text").and_then(Value::as_str) {
                     self.agent_message = Some(text.to_string());
                 }
-                let success = value.get("success").and_then(Value::as_bool).unwrap_or(false);
+                let success = value
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if !success {
                     if let Some(error) = value.get("error").and_then(Value::as_str) {
                         self.terminal_failure = Some(error.to_string());
@@ -329,11 +328,16 @@ mod tests {
 
     #[test]
     fn parses_session_from_first_line() {
-        let mut parser: Box<dyn HarnessStreamParser> = Box::new(GitHubCopilotStreamParser::default());
-        parser.on_stdout_line(serde_json::json!({
-            "type": "session",
-            "session_id": "copilot-session-123"
-        }).to_string().as_bytes());
+        let mut parser: Box<dyn HarnessStreamParser> =
+            Box::new(GitHubCopilotStreamParser::default());
+        parser.on_stdout_line(
+            serde_json::json!({
+                "type": "session",
+                "session_id": "copilot-session-123"
+            })
+            .to_string()
+            .as_bytes(),
+        );
 
         let run = parser.finish(0, "");
         assert_eq!(run.session_id, Some("copilot-session-123".to_string()));
@@ -341,15 +345,24 @@ mod tests {
 
     #[test]
     fn requires_result_line_for_success() {
-        let mut parser: Box<dyn HarnessStreamParser> = Box::new(GitHubCopilotStreamParser::default());
-        parser.on_stdout_line(serde_json::json!({
-            "type": "session",
-            "session_id": "copilot-session-123"
-        }).to_string().as_bytes());
-        parser.on_stdout_line(serde_json::json!({
-            "type": "assistant",
-            "content": "Here is my answer"
-        }).to_string().as_bytes());
+        let mut parser: Box<dyn HarnessStreamParser> =
+            Box::new(GitHubCopilotStreamParser::default());
+        parser.on_stdout_line(
+            serde_json::json!({
+                "type": "session",
+                "session_id": "copilot-session-123"
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        parser.on_stdout_line(
+            serde_json::json!({
+                "type": "assistant",
+                "content": "Here is my answer"
+            })
+            .to_string()
+            .as_bytes(),
+        );
 
         let run = parser.finish(0, "");
         assert!(run.failure.is_some());
@@ -358,7 +371,8 @@ mod tests {
 
     #[test]
     fn parses_complete_successful_run() {
-        let mut parser: Box<dyn HarnessStreamParser> = Box::new(GitHubCopilotStreamParser::default());
+        let mut parser: Box<dyn HarnessStreamParser> =
+            Box::new(GitHubCopilotStreamParser::default());
         for line in [
             serde_json::json!({"type": "session", "session_id": "copilot-123"}),
             serde_json::json!({"type": "assistant", "content": "My response"}),

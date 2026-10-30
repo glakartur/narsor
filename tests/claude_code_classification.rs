@@ -1115,11 +1115,9 @@ fn a_recording_without_a_schema_ends_on_the_json_of_its_last_message() {
     assert_eq!(run.failure, None);
     let output = run.structured_output.expect("the closing object");
     assert_eq!(output["choice"], "done");
-    assert!(
-        classify_all(&recording("noschema_plain.ndjson"))
-            .iter()
-            .all(|element| !matches!(element, ChatElement::Unclassified { .. }))
-    );
+    assert!(classify_all(&recording("noschema_plain.ndjson"))
+        .iter()
+        .all(|element| !matches!(element, ChatElement::Unclassified { .. })));
 }
 
 /// With a task in the background the session outlives its first `result`

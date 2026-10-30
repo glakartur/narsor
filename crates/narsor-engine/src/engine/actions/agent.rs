@@ -60,8 +60,8 @@ use github_copilot_sdk::{
     SessionId,
 };
 use narsor_protocol::chat::{
-    summary_line, ChatElement, QuestionSource, TechnicalCategory,
-    UnclassifiedReason, SUMMARY_MAX_CHARS,
+    summary_line, ChatElement, QuestionSource, TechnicalCategory, UnclassifiedReason,
+    SUMMARY_MAX_CHARS,
 };
 use serde_json::{Map, Value};
 use std::process::ExitStatus;
@@ -1163,7 +1163,11 @@ async fn spawn_and_wait(
         command.env(ACTION_ID_ENV_VAR, action_execution_id);
     }
     command
-        .stdin(if stdin_content.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if stdin_content.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)

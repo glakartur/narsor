@@ -1936,8 +1936,11 @@ async fn a_text_without_an_answer_does_not_end_the_step() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     let conversation = ConversationFixture::new(&root);
-    fake.answers(&format!("{}\n", envelope("Waiting for the background task.")))
-        .sleeps(600);
+    fake.answers(&format!(
+        "{}\n",
+        envelope("Waiting for the background task.")
+    ))
+    .sleeps(600);
     let executor = executor(&fake).with_final_answer_grace(TEST_GRACE);
 
     let (outcome, elapsed) = run_timed(
@@ -4288,7 +4291,10 @@ async fn covers_ae5_without_any_answer_the_reprompt_resumes_the_session_read_onl
     assert_eq!(fixture.fake.calls(), 2, "one attempt and one reprompt");
     for call in [1, 2] {
         let args = fixture.fake.args(call);
-        assert!(!args.iter().any(|arg| arg == "--json-schema"), "call {call}");
+        assert!(
+            !args.iter().any(|arg| arg == "--json-schema"),
+            "call {call}"
+        );
     }
     let second = fixture.fake.args(2);
     assert!(
