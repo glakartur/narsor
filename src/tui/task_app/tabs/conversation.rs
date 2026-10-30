@@ -824,7 +824,7 @@ pub fn render_transcript(
     let visible = wrap_visible_lines(&lines, width, transcript.scroll_offset(), height);
     let choice_rows: Vec<u16> = visible
         .iter()
-        .zip(area.y..area.y.saturating_add(area.height))
+        .zip(area.top()..area.bottom())
         .filter(|(line, _)| line.workflow_choice)
         .map(|(_, y)| y)
         .collect();
@@ -838,12 +838,11 @@ pub fn render_transcript(
     // the text's own colour.
     let background = styles.workflow_choice_background();
     let content_x = area.x.saturating_add(PREFIX_WIDTH);
+    let content_width = area.right().saturating_sub(content_x);
     for y in choice_rows {
-        for x in content_x..area.x.saturating_add(area.width) {
-            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-                cell.set_style(background);
-            }
-        }
+        frame
+            .buffer_mut()
+            .set_style(Rect::new(content_x, y, content_width, 1), background);
     }
 }
 

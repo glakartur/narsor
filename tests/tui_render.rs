@@ -6794,65 +6794,16 @@ mod stacked_form {
 mod workflow_choice_render {
     use super::*;
 
+    use narsor::tui::selection::PREFIX_WIDTH;
+    use narsor::tui::style::Role;
     use narsor::tui::task_app::tabs::conversation::{self, AttemptRead, Attempts, Conversation};
     use narsor::tui::transcript::{
         DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptPresentation,
     };
-    use narsor_engine::domain::{ConductorDecisionKind, Event, EventData};
+    use narsor_engine::domain::Event;
     use narsor_engine::engine::{ConversationState, PositionStatus};
 
-    use crate::task_app_support::position;
-
-    const PREFIX: u16 = 2;
-
-    fn ev(sequence: u64, data: EventData) -> Event {
-        Event::new("e".to_string(), data, sequence)
-    }
-
-    fn entered(sequence: u64) -> Event {
-        ev(
-            sequence,
-            EventData::StateEntered {
-                state_id: "brainstorm".to_string(),
-            },
-        )
-    }
-
-    fn agent_chose(sequence: u64, label: &str, reasoning: Option<&str>) -> Event {
-        ev(
-            sequence,
-            EventData::DecisionMade {
-                provider: "claude".to_string(),
-                output_label: label.to_string(),
-                reasoning: reasoning.map(str::to_string),
-            },
-        )
-    }
-
-    fn conductor_chose(sequence: u64, label: &str) -> Event {
-        ev(
-            sequence,
-            EventData::ConductorDecision {
-                decision_id: format!("d{sequence}"),
-                kind: ConductorDecisionKind::ChooseOutput,
-                state_id: None,
-                output_label: Some(label.to_string()),
-                episode: None,
-                confidence: Default::default(),
-                rationale: None,
-            },
-        )
-    }
-
-    fn human_chose(sequence: u64, to: &str) -> Event {
-        ev(
-            sequence,
-            EventData::HumanTransitionSelected {
-                from_state: "brainstorm".to_string(),
-                to_state: to.to_string(),
-            },
-        )
-    }
+    use crate::task_app_support::{agent_chose, conductor_chose, entered, human_chose, position};
 
     /// An agent message with `text`, as the step's recorded conversation.
     fn message(text: &str) -> TranscriptEntry {
@@ -6886,7 +6837,7 @@ mod workflow_choice_render {
                 recorded_at: None,
             }),
         );
-        let mut events = vec![entered(1)];
+        let mut events = vec![entered(1, "brainstorm")];
         events.extend(choices);
         let mut conversation = Conversation::new("a");
         conversation.rebuild_with_events(&[step], &attempts, &events);
@@ -6901,16 +6852,29 @@ mod workflow_choice_render {
         stale: bool,
         focused: bool,
     ) -> Buffer {
+        drawn_in(
+            width,
+            height,
+            Rect::new(0, 0, width, height),
+            conversation,
+            styles,
+            stale,
+            focused,
+        )
+    }
+
+    /// `conversation` drawn into `area` of a `width` × `height` screen.
+    fn drawn_in(
+        width: u16,
+        height: u16,
+        area: Rect,
+        conversation: &mut Conversation,
+        styles: &Styles,
+        stale: bool,
+        focused: bool,
+    ) -> Buffer {
         draw(width, height, |frame| {
-            conversation::render(
-                frame,
-                frame.area(),
-                styles,
-                conversation,
-                stale,
-                focused,
-                "⠋",
-            );
+            conversation::render(frame, area, styles, conversation, stale, focused, "⠋");
         })
     }
 
@@ -6943,11 +6907,19 @@ mod workflow_choice_render {
     /// Choice rows are highlighted from column 2 to the last column; their
     /// bar columns and every other row are not.
     fn assert_blocks(buffer: &Buffer, styles: &Styles) {
+        assert_blocks_in(buffer, styles, buffer.area);
+    }
+
+    /// As [`assert_blocks`] for a pane drawn into `area`: the columns and rows
+    /// are those of `area`, and nothing outside it is highlighted.
+    fn assert_blocks_in(buffer: &Buffer, styles: &Styles, area: Rect) {
         let choice = choice_rows(buffer);
         assert!(!choice.is_empty(), "{}", screen(buffer));
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
-                let expected = choice.contains(&y) && x >= PREFIX;
+                let expected = choice.contains(&y)
+                    && (area.top()..area.bottom()).contains(&y)
+                    && (area.x + PREFIX_WIDTH..area.right()).contains(&x);
                 assert_eq!(
                     highlighted(&buffer[(x, y)], styles),
                     expected,
@@ -6998,7 +6970,7 @@ mod workflow_choice_render {
             vec![
                 agent_chose(2, "a", None),
                 conductor_chose(3, "b"),
-                human_chose(4, "c"),
+                human_chose(4, "brainstorm", "c"),
             ],
         );
         let buffer = drawn(60, 20, &mut tab, &styles, false, true);
@@ -7007,7 +6979,7 @@ mod workflow_choice_render {
             .iter()
             .enumerate()
             .filter(|(_, row)| row.contains("WYBÓR WORKFLOW"))
-            .map(|(y, _)| buffer[(PREFIX, y as u16)].fg)
+            .map(|(y, _)| buffer[(PREFIX_WIDTH, y as u16)].fg)
             .collect();
         assert_eq!(headers, [Color::Green, Color::Magenta, Color::Cyan]);
     }
@@ -7054,6 +7026,35 @@ mod workflow_choice_render {
         );
         let buffer = drawn(60, 16, &mut tab, &styles, true, true);
         assert_blocks(&buffer, &styles);
+        let done = styles.of(Role::Done).fg.unwrap();
+        for y in choice_rows(&buffer) {
+            for x in PREFIX_WIDTH..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if !cell.symbol().trim().is_empty() {
+                    assert_eq!(cell.fg, done, "cell ({x}, {y}):\n{}", screen(&buffer));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pane_drawn_with_an_offset_highlights_only_its_own_cells() {
+        let styles = Styles::new(false);
+        let mut tab = conversation(
+            vec![message("Piszę wymagania.")],
+            vec![agent_chose(2, "requirements_drafted", Some(REASON))],
+        );
+        let area = Rect::new(3, 2, 40, 10);
+        let buffer = drawn_in(50, 14, area, &mut tab, &styles, false, true);
+        let choice = choice_rows(&buffer);
+        assert!(
+            choice
+                .iter()
+                .all(|y| (area.top()..area.bottom()).contains(y)),
+            "{}",
+            screen(&buffer)
+        );
+        assert_blocks_in(&buffer, &styles, area);
     }
 
     #[test]
@@ -7063,8 +7064,13 @@ mod workflow_choice_render {
             vec![message("Piszę wymagania.")],
             vec![agent_chose(2, "requirements_drafted", Some(REASON))],
         );
-        for width in 1..=PREFIX + 1 {
-            drawn(width, 8, &mut tab, &styles, false, true);
+        for width in 1..=PREFIX_WIDTH + 1 {
+            let buffer = drawn(width, 8, &mut tab, &styles, false, true);
+            let columns: Vec<u16> = (0..width)
+                .filter(|&x| (0..8).any(|y| highlighted(&buffer[(x, y)], &styles)))
+                .collect();
+            let expected: Vec<u16> = (PREFIX_WIDTH..width).collect();
+            assert_eq!(columns, expected, "width {width}:\n{}", screen(&buffer));
         }
     }
 
@@ -7094,7 +7100,7 @@ mod workflow_choice_render {
             for x in 0..60 {
                 assert_eq!(
                     highlighted(&buffer[(x, y as u16)], &styles),
-                    choice && x >= PREFIX,
+                    choice && x >= PREFIX_WIDTH,
                     "cell ({x}, {y}):\n{}",
                     screen(&buffer)
                 );
