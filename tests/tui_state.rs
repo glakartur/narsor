@@ -13028,12 +13028,13 @@ mod task_app_harness {
                 "● domyślny z konfiguracji (claude-code)",
                 "  claude-code",
                 "  codex",
+                "  github-copilot",
                 "  opencode"
             ]
         );
         assert_eq!(harness_chooser(&app).selected(), 0, "on the one in force");
 
-        for _ in 0..3 {
+        for _ in 0..4 {
             ch(&mut app, 'j');
         }
         let request = press(&mut app, KeyCode::Enter);
@@ -13055,10 +13056,10 @@ mod task_app_harness {
 
         let request = ch(&mut app, 'h');
         app.perform(request).await;
-        assert_eq!(harness_chooser(&app).selected(), 3);
-        assert_eq!(labels(&app)[3], "● opencode");
+        assert_eq!(harness_chooser(&app).selected(), 4);
+        assert_eq!(labels(&app)[4], "● opencode");
         ch(&mut app, 'g');
-        for _ in 0..3 {
+        for _ in 0..4 {
             ch(&mut app, 'k');
         }
         let request = press(&mut app, KeyCode::Enter);
@@ -13280,6 +13281,7 @@ mod task_app_harness {
                 "  domyślny z konfiguracji (claude-code)",
                 "  claude-code",
                 "● codex",
+                "  github-copilot",
                 "  opencode"
             ]
         );
