@@ -11,7 +11,7 @@ use narsor_engine::controller_protocol::{
     TimelineResponse,
 };
 use narsor_engine::domain::display::DisplayLink;
-use narsor_engine::domain::{Event, EventData, ExecutionStatus, TaskId};
+use narsor_engine::domain::{ConductorDecisionKind, Event, EventData, ExecutionStatus, TaskId};
 use narsor_engine::engine::{ConversationState, Position, PositionStatus, Timeline};
 use narsor_engine::orchestration::{
     derive_task_state, AttentionItem, AttentionKind, ExecutionCursor, QueueReason,
@@ -284,6 +284,60 @@ pub fn execution_events(n: u64) -> Vec<Event> {
             )
         })
         .collect()
+}
+
+/// An execution event `data` at `sequence`.
+pub fn ev(sequence: u64, data: EventData) -> Event {
+    Event::new("e".to_string(), data, sequence)
+}
+
+/// The execution entered `state`.
+pub fn entered(sequence: u64, state: &str) -> Event {
+    ev(
+        sequence,
+        EventData::StateEntered {
+            state_id: state.to_string(),
+        },
+    )
+}
+
+/// The agent chose `label`, with its `reasoning` when it gave one.
+pub fn agent_chose(sequence: u64, label: &str, reasoning: Option<&str>) -> Event {
+    ev(
+        sequence,
+        EventData::DecisionMade {
+            provider: "claude".to_string(),
+            output_label: label.to_string(),
+            reasoning: reasoning.map(str::to_string),
+        },
+    )
+}
+
+/// The conductor chose `label`.
+pub fn conductor_chose(sequence: u64, label: &str) -> Event {
+    ev(
+        sequence,
+        EventData::ConductorDecision {
+            decision_id: format!("d{sequence}"),
+            kind: ConductorDecisionKind::ChooseOutput,
+            state_id: None,
+            output_label: Some(label.to_string()),
+            episode: None,
+            confidence: Default::default(),
+            rationale: None,
+        },
+    )
+}
+
+/// A person chose the transition from `from` to `to`.
+pub fn human_chose(sequence: u64, from: &str, to: &str) -> Event {
+    ev(
+        sequence,
+        EventData::HumanTransitionSelected {
+            from_state: from.to_string(),
+            to_state: to.to_string(),
+        },
+    )
 }
 
 /// The form a runner reports as the pending input of a task, from the JSON of

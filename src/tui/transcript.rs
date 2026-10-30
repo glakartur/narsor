@@ -128,6 +128,9 @@ pub struct TranscriptEntry {
     pub presentation: TranscriptPresentation,
     /// Additional lines included only when expanded in rendered mode.
     pub detail_lines: Vec<TranscriptDetailLine>,
+    /// Whether the adapter marked this entry as a workflow choice. Renderers
+    /// highlight its card; the flag never derives from the entry's text.
+    pub workflow_choice: bool,
     /// Normalized adapter fields, formatted only while this entry is expanded.
     pub details: Option<Value>,
     /// Exact retained source bytes. This is never replaced by decoded text.
@@ -172,6 +175,7 @@ impl TranscriptEntry {
             rendered_lines,
             presentation: TranscriptPresentation::Neutral,
             detail_lines: Vec::new(),
+            workflow_choice: false,
             details: None,
             raw: raw.into(),
             shares_previous_raw: false,
@@ -208,6 +212,12 @@ impl TranscriptEntry {
 
     pub fn with_presentation(mut self, presentation: TranscriptPresentation) -> Self {
         self.presentation = presentation;
+        self
+    }
+
+    /// Marks this entry as a workflow choice, highlighted in rendered views.
+    pub fn as_workflow_choice(mut self) -> Self {
+        self.workflow_choice = true;
         self
     }
 
@@ -297,6 +307,8 @@ pub struct TranscriptLine {
     pub header: bool,
     pub indented: bool,
     pub selected: bool,
+    /// Part of a workflow choice card; every wrapped fragment keeps it.
+    pub workflow_choice: bool,
 }
 
 /// Wraps only the visible transcript slice while retaining its semantic
@@ -334,6 +346,7 @@ pub fn wrap_visible_lines(
                 // only own their first wrapped fragment, but body fragments
                 // all remain visibly selected.
                 selected: line.selected && (!line.header || fragment == 0),
+                workflow_choice: line.workflow_choice,
             });
         }
     }
@@ -732,6 +745,7 @@ impl TranscriptState {
                     header: false,
                     indented: false,
                     selected: false,
+                    workflow_choice: false,
                 });
             }
         }
@@ -1147,6 +1161,9 @@ impl TranscriptState {
     }
 
     fn lines_for(&self, entry: &TranscriptEntry) -> Vec<TranscriptLine> {
+        // Raw views show source bytes, not the choice card, so only the
+        // rendered card carries the highlight.
+        let card = self.mode != DisplayMode::Raw && !self.is_raw(&entry.id);
         let lines = match self.mode {
             DisplayMode::Raw => {
                 vec![(
@@ -1223,6 +1240,7 @@ impl TranscriptState {
                     header,
                     indented,
                     selected: self.selected.as_ref() == Some(&entry.id),
+                    workflow_choice: card && entry.workflow_choice,
                 },
             )
             .collect()
@@ -1670,6 +1688,7 @@ mod tests {
             header: false,
             indented: true,
             selected: true,
+            workflow_choice: false,
         }];
         let wrapped = wrap_visible_lines(&lines, 8, 0, 3);
         assert_eq!(
@@ -1839,6 +1858,81 @@ mod tests {
         assert_eq!(
             transcript.selected_entry(),
             Some(&TranscriptEntryId::from("two"))
+        );
+    }
+
+    fn choice(id: &str, lines: Vec<String>) -> TranscriptEntry {
+        TranscriptEntry::new(TranscriptEntryId::from(id), lines, b"{}".to_vec())
+            .with_header("WYBÓR WORKFLOW · Agent")
+            .with_presentation(TranscriptPresentation::Agent)
+    }
+
+    #[test]
+    fn every_card_line_of_a_workflow_choice_carries_the_flag() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            choice("choice", vec!["one".into(), "two".into()]).as_workflow_choice(),
+            choice("plain", vec!["one".into()]),
+        ]);
+
+        let lines = transcript.logical_lines();
+        assert!(lines[..3].iter().all(|line| line.workflow_choice));
+        assert!(lines[3..].iter().all(|line| !line.workflow_choice));
+    }
+
+    #[test]
+    fn every_wrapped_fragment_of_a_workflow_choice_keeps_the_flag() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![choice(
+            "choice",
+            vec!["abcdefghijklmnopqrstuvwxyz".into()],
+        )
+        .as_workflow_choice()]);
+
+        let wrapped = wrap_visible_lines(&transcript.logical_lines(), 10, 0, 20);
+        assert!(wrapped.len() > 3);
+        assert!(wrapped.iter().any(|line| !line.header && !line.indented));
+        assert!(wrapped.iter().all(|line| line.workflow_choice));
+    }
+
+    #[test]
+    fn raw_views_of_a_workflow_choice_are_not_highlighted() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            choice("choice", vec!["one".into()]).as_workflow_choice()
+        ]);
+
+        transcript.toggle_selected_raw();
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .all(|line| !line.workflow_choice));
+
+        transcript.toggle_selected_raw();
+        transcript.set_mode(DisplayMode::Raw);
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .all(|line| !line.workflow_choice));
+
+        transcript.set_mode(DisplayMode::Chronology);
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .all(|line| line.workflow_choice));
+    }
+
+    #[test]
+    fn the_workflow_choice_flag_does_not_change_the_line_count() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.set_width(10);
+        let body = vec!["abcdefghijklmnopqrstuvwxyz".to_owned(), "x".to_owned()];
+        let plain = choice("plain", body.clone());
+        let marked = choice("plain", body).as_workflow_choice();
+
+        assert_eq!(
+            transcript.visual_line_count_for(&plain),
+            transcript.visual_line_count_for(&marked)
         );
     }
 }

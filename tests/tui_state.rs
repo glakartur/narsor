@@ -1597,6 +1597,27 @@ mod foundations {
         }
 
         #[test]
+        fn a_workflow_choice_is_a_background_of_its_own_or_reversed() {
+            let colour = Styles::new(false);
+            let choice = colour.workflow_choice_background();
+            assert!(choice.bg.is_some());
+            assert_eq!(choice.fg, None);
+            assert!(!choice.add_modifier.contains(Modifier::REVERSED));
+            for other in [
+                colour.selection_fill(),
+                colour.task_header_background(),
+                colour.answer_panel_background(),
+                colour.field_editing(),
+            ] {
+                assert_ne!(choice.bg, other.bg, "{other:?}");
+            }
+
+            let plain = Styles::new(true).workflow_choice_background();
+            assert_eq!((plain.fg, plain.bg), (None, None));
+            assert!(plain.add_modifier.contains(Modifier::REVERSED));
+        }
+
+        #[test]
         fn roles_follow_the_origin_table() {
             let styles = Styles::new(false);
             assert_eq!(styles.of(Role::Attention).fg, Some(Color::Yellow));
@@ -3663,8 +3684,10 @@ mod task_app_detail {
     mod choice_order {
         use super::*;
 
-        use narsor_engine::domain::{ConductorDecisionKind, EventData};
+        use narsor_engine::domain::EventData;
         use narsor_protocol::api::Position;
+
+        use crate::task_app_support::{agent_chose, conductor_chose, entered, ev, human_chose};
 
         fn read(ids: &[&str]) -> AttemptRead {
             AttemptRead {
@@ -3706,55 +3729,6 @@ mod task_app_detail {
             attempts
         }
 
-        fn ev(sequence: u64, data: EventData) -> Event {
-            Event::new("e".to_string(), data, sequence)
-        }
-
-        fn entered(sequence: u64, state: &str) -> Event {
-            ev(
-                sequence,
-                EventData::StateEntered {
-                    state_id: state.to_string(),
-                },
-            )
-        }
-
-        fn agent_chose(sequence: u64, label: &str) -> Event {
-            ev(
-                sequence,
-                EventData::DecisionMade {
-                    provider: "claude".to_string(),
-                    output_label: label.to_string(),
-                    reasoning: None,
-                },
-            )
-        }
-
-        fn conductor_chose(sequence: u64, label: &str) -> Event {
-            ev(
-                sequence,
-                EventData::ConductorDecision {
-                    decision_id: format!("d{sequence}"),
-                    kind: ConductorDecisionKind::ChooseOutput,
-                    state_id: None,
-                    output_label: Some(label.to_string()),
-                    episode: None,
-                    confidence: Default::default(),
-                    rationale: None,
-                },
-            )
-        }
-
-        fn human_chose(sequence: u64, from: &str, to: &str) -> Event {
-            ev(
-                sequence,
-                EventData::HumanTransitionSelected {
-                    from_state: from.to_string(),
-                    to_state: to.to_string(),
-                },
-            )
-        }
-
         /// The transcript as a list of tags: a heading is `step:<attempt>`, a
         /// choice `choice:<sequence>`, an entry its own id.
         fn order(positions: &[Position], attempts: &Attempts, events: &[Event]) -> Vec<String> {
@@ -3791,7 +3765,7 @@ mod task_app_detail {
             let events = vec![
                 entered(1, "plan"),
                 entered(2, "code_review"),
-                agent_chose(3, "revise"),
+                agent_chose(3, "revise", None),
                 conductor_chose(4, "fix"),
                 entered(5, "fix"),
             ];
@@ -3832,11 +3806,11 @@ mod task_app_detail {
             ];
             let events = vec![
                 entered(1, "code_review"),
-                agent_chose(2, "revise"),
+                agent_chose(2, "revise", None),
                 entered(3, "fix"),
-                agent_chose(4, "done"),
+                agent_chose(4, "done", None),
                 entered(5, "code_review"),
-                agent_chose(6, "approved"),
+                agent_chose(6, "approved", None),
             ];
             assert_eq!(
                 order(&positions, &attempts(&["r1", "f", "r2"]), &events),
@@ -3857,7 +3831,7 @@ mod task_app_detail {
             ];
             let events = vec![
                 entered(1, "implement"),
-                agent_chose(5, "done"),
+                agent_chose(5, "done", None),
                 entered(6, "code_review"),
             ];
             assert_eq!(
@@ -3873,7 +3847,7 @@ mod task_app_detail {
         fn the_last_choice_ends_the_transcript_and_a_reader_at_the_end_stays_there() {
             let positions = vec![recorded("plan", 1, "p")];
             let attempts = attempts(&["p"]);
-            let mut events = vec![entered(1, "plan"), agent_chose(2, "done")];
+            let mut events = vec![entered(1, "plan"), agent_chose(2, "done", None)];
             let mut conversation = Conversation::new("a");
             conversation.transcript_mut().set_viewport(2);
             conversation.rebuild_with_events(&positions, &attempts, &events);
@@ -3890,9 +3864,9 @@ mod task_app_detail {
         fn a_choice_before_every_entry_stands_before_the_first_heading() {
             let positions = vec![recorded("plan", 1, "p")];
             let events = vec![
-                agent_chose(1, "early"),
+                agent_chose(1, "early", None),
                 entered(2, "plan"),
-                agent_chose(3, "done"),
+                agent_chose(3, "done", None),
             ];
             assert_eq!(
                 order(&positions, &attempts(&["p"]), &events),
@@ -3905,7 +3879,7 @@ mod task_app_detail {
             let positions = vec![recorded("plan", 1, "p")];
             let events = vec![
                 conductor_chose(4, "b"),
-                agent_chose(3, "a"),
+                agent_chose(3, "a", None),
                 entered(1, "plan"),
             ];
             assert_eq!(
@@ -3917,7 +3891,7 @@ mod task_app_detail {
         #[test]
         fn without_step_entries_the_choices_stay_at_the_end() {
             let positions = vec![recorded("plan", 1, "p"), recorded("fix", 1, "f")];
-            let events = vec![agent_chose(1, "a"), conductor_chose(2, "b")];
+            let events = vec![agent_chose(1, "a", None), conductor_chose(2, "b")];
             assert_eq!(
                 order(&positions, &attempts(&["p", "f"]), &events),
                 ["step:p", "p/m", "step:f", "f/m", "choice:1", "choice:2"]
@@ -3931,7 +3905,7 @@ mod task_app_detail {
         #[test]
         fn a_choice_keeps_its_text_header_and_id() {
             let positions = vec![recorded("plan", 1, "p")];
-            let events = vec![entered(1, "plan"), agent_chose(2, "done")];
+            let events = vec![entered(1, "plan"), agent_chose(2, "done", None)];
             let mut conversation = Conversation::new("a");
             conversation.rebuild_with_events(&positions, &attempts(&["p"]), &events);
             let choice = conversation.transcript().entries().last().unwrap();
@@ -3940,6 +3914,35 @@ mod task_app_detail {
             assert_eq!(
                 choice.rendered_lines,
                 ["agent · claude wybrał opcję: done".to_string()]
+            );
+        }
+
+        #[test]
+        fn only_a_choice_is_marked_as_a_workflow_choice() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let events = vec![
+                entered(1, "plan"),
+                agent_chose(2, "done", None),
+                conductor_chose(3, "next"),
+                human_chose(4, "plan", "fix"),
+            ];
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild_with_events(&positions, &attempts(&["p"]), &events);
+            for entry in conversation.transcript().entries() {
+                assert_eq!(
+                    entry.workflow_choice,
+                    entry.id.as_str().starts_with("workflow-choice/"),
+                    "{entry:?}"
+                );
+            }
+            assert_eq!(
+                conversation
+                    .transcript()
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.workflow_choice)
+                    .count(),
+                3
             );
         }
 
@@ -3974,7 +3977,7 @@ mod task_app_detail {
             let positions = vec![recorded("plan", 1, "p"), recorded("fix", 1, "f")];
             let events = vec![
                 entered(1, "plan"),
-                agent_chose(2, "revise"),
+                agent_chose(2, "revise", None),
                 entered(3, "fix"),
             ];
             let mut conversation = Conversation::new("a");

@@ -772,7 +772,8 @@ fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
             "WYBÓR WORKFLOW · {}",
             event.timestamp.format("%H:%M:%S")
         ))
-        .with_presentation(presentation),
+        .with_presentation(presentation)
+        .as_workflow_choice(),
     )
 }
 
@@ -820,11 +821,29 @@ pub fn render_transcript(
     transcript.set_width(width);
     transcript.set_viewport(height);
     let lines = transcript.logical_lines();
-    let rows: Vec<Line> = wrap_visible_lines(&lines, width, transcript.scroll_offset(), height)
+    let visible = wrap_visible_lines(&lines, width, transcript.scroll_offset(), height);
+    let choice_rows: Vec<u16> = visible
+        .iter()
+        .zip(area.top()..area.bottom())
+        .filter(|(line, _)| line.workflow_choice)
+        .map(|(_, y)| y)
+        .collect();
+    let rows: Vec<Line> = visible
         .into_iter()
         .map(|line| transcript_row(line, styles, stale, focused))
         .collect();
     frame.render_widget(Paragraph::new(rows), area);
+    // A workflow choice is a block from the content column to the right
+    // edge; the bar's columns stay as they are. Patching the cells keeps
+    // the text's own colour.
+    let background = styles.workflow_choice_background();
+    let content_x = area.x.saturating_add(PREFIX_WIDTH);
+    let content_width = area.right().saturating_sub(content_x);
+    for y in choice_rows {
+        frame
+            .buffer_mut()
+            .set_style(Rect::new(content_x, y, content_width, 1), background);
+    }
 }
 
 /// The notes on the fixed lines above a conversation: the badge of a record
