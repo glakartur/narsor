@@ -16,51 +16,35 @@ use crate::{
     domain::BackendId,
 };
 
-const ALL_BINARIES: &[&str] = &[
-    "narsor",
-    "narsor-cli",
-    "narsor-server",
-    "narsor-controller",
-    "narsor-runner",
-];
-
 struct WorkstationBackend {
     id: BackendId,
     catalog_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum InstallRole {
+pub enum InitRole {
     Local,
     Frontend,
     Server,
 }
 
-fn role_name(role: InstallRole) -> &'static str {
+fn role_name(role: InitRole) -> &'static str {
     match role {
-        InstallRole::Local => "local",
-        InstallRole::Frontend => "frontend",
-        InstallRole::Server => "server",
+        InitRole::Local => "local",
+        InitRole::Frontend => "frontend",
+        InitRole::Server => "server",
     }
 }
 
 #[derive(Debug, Default, Args)]
-pub struct InstallOptions {
+pub struct InitOptions {
     /// What this installation will do.
     #[arg(long, value_enum)]
-    role: Option<InstallRole>,
+    role: Option<InitRole>,
 
     /// Do not prompt; all role-specific settings must be provided explicitly.
     #[arg(long)]
     non_interactive: bool,
-
-    /// Directory containing the release binaries (defaults to this executable's directory).
-    #[arg(long, value_name = "DIRECTORY")]
-    source_dir: Option<PathBuf>,
-
-    /// Where to install the selected binaries.
-    #[arg(long, value_name = "DIRECTORY")]
-    bin_dir: Option<PathBuf>,
 
     /// Where local state, workspaces, and the catalogue live when not configured already.
     #[arg(long, value_name = "DIRECTORY")]
@@ -89,30 +73,26 @@ pub struct InstallOptions {
     /// Unique catalogue ID for the same-VM workstation backend.
     #[arg(long, value_name = "ID")]
     backend_id: Option<String>,
-
-    /// Also install narsor and narsor-cli in server mode.
-    #[arg(long)]
-    with_frontend: bool,
-
-    /// Explicitly add the selected binary directory to ~/.bashrc.
-    #[arg(long)]
-    update_bashrc: bool,
 }
 
-pub fn run(options: InstallOptions, global_config: Option<&Path>) -> Result<()> {
+#[derive(Debug, Default, Args)]
+pub struct PurgeOptions {
+    /// Do not ask for confirmation.
+    #[arg(long)]
+    yes: bool,
+
+    /// Narsor data directory to remove (defaults to the XDG data directory).
+    #[arg(long, value_name = "DIRECTORY")]
+    data_dir: Option<PathBuf>,
+
+    /// Configuration file to remove instead of the effective Narsor configuration.
+    #[arg(long, value_name = "FILE")]
+    config_file: Option<PathBuf>,
+}
+
+pub fn run(options: InitOptions, global_config: Option<&Path>) -> Result<()> {
     let role = select_role(options.role, options.non_interactive)?;
-    let source_dir = match options.source_dir.clone() {
-        Some(path) => path,
-        None => executable_directory()?,
-    };
-    let bin_dir = select_directory(
-        "Binary installation directory",
-        options.bin_dir.clone(),
-        default_bin_dir()?,
-        options.non_interactive,
-    )?;
-    let data_dir = select_directory(
-        "Narsor data directory",
+    let data_dir = select_data_directory(
         options.data_dir.clone(),
         default_data_dir()?,
         options.non_interactive,
@@ -127,7 +107,7 @@ pub fn run(options: InstallOptions, global_config: Option<&Path>) -> Result<()> 
 
     set_missing_root_paths(&mut config, &parsed, &data_dir)?;
     parsed = validate_config(&config_path, &config)?.1;
-    let workstation_backend = if role == InstallRole::Server {
+    let workstation_backend = if role == InitRole::Server {
         Some(configure_server(
             &mut config,
             &parsed,
@@ -139,21 +119,13 @@ pub fn run(options: InstallOptions, global_config: Option<&Path>) -> Result<()> 
     };
 
     let contents = validate_config(&config_path, &config)?.0;
-    let binaries = binaries_for(role, options.with_frontend);
-    validate_release_binaries(&source_dir, &binaries)?;
     prepare_config_directory(&config_path)?;
-    install_binaries(&source_dir, &bin_dir, &binaries)?;
     if let Some(backend) = &workstation_backend {
         write_workstation_backend(backend)?;
     }
     write_config(&config_path, contents.as_bytes())?;
-    offer_path_update(&bin_dir, options.non_interactive, options.update_bashrc)?;
 
-    println!(
-        "Installed the {} role in '{}'.",
-        role_name(role),
-        bin_dir.display()
-    );
+    println!("Configured the {} role.", role_name(role));
     println!("Configuration: {}", config_path.display());
     if let Some(backend) = &workstation_backend {
         print_server_commands(backend, &config_path)?;
@@ -161,33 +133,32 @@ pub fn run(options: InstallOptions, global_config: Option<&Path>) -> Result<()> 
     Ok(())
 }
 
-fn select_role(role: Option<InstallRole>, non_interactive: bool) -> Result<InstallRole> {
+fn select_role(role: Option<InitRole>, non_interactive: bool) -> Result<InitRole> {
     if let Some(role) = role {
         return Ok(role);
     }
     if non_interactive {
         return Err(CliError::usage(
-            "non-interactive installation requires --role local, frontend, or server",
+            "non-interactive configuration requires --role local, frontend, or server",
         ));
     }
     if !io::stdin().is_terminal() {
         return Err(CliError::usage(
-            "interactive installation needs a terminal; provide --non-interactive and --role",
+            "interactive configuration needs a terminal; provide --non-interactive and --role",
         ));
     }
     loop {
-        println!("Select an installation role:\n  1. Local\n  2. Frontend\n  3. Server");
+        println!("Select a role:\n  1. Local\n  2. Frontend\n  3. Server");
         match prompt("Role [1-3]: ")?.as_str() {
-            "1" => return Ok(InstallRole::Local),
-            "2" => return Ok(InstallRole::Frontend),
-            "3" => return Ok(InstallRole::Server),
+            "1" => return Ok(InitRole::Local),
+            "2" => return Ok(InitRole::Frontend),
+            "3" => return Ok(InitRole::Server),
             _ => eprintln!("Choose 1, 2, or 3."),
         }
     }
 }
 
-fn select_directory(
-    label: &str,
+fn select_data_directory(
     selected: Option<PathBuf>,
     default: PathBuf,
     non_interactive: bool,
@@ -196,16 +167,11 @@ fn select_directory(
         return absolute_path(&path);
     }
     if non_interactive {
-        return Err(CliError::usage(format!(
-            "non-interactive installation requires --{}",
-            if label.starts_with("Binary") {
-                "bin-dir"
-            } else {
-                "data-dir"
-            }
-        )));
+        return Err(CliError::usage(
+            "non-interactive configuration requires --data-dir",
+        ));
     }
-    absolute_path(&browse_directory(label, &default)?)
+    absolute_path(&browse_directory("Narsor data directory", &default)?)
 }
 
 fn browse_directory(label: &str, initial: &Path) -> Result<PathBuf> {
@@ -507,7 +473,7 @@ fn set_missing_root_paths(
 fn configure_server(
     config: &mut Value,
     parsed: &config::FileValues,
-    options: &InstallOptions,
+    options: &InitOptions,
     non_interactive: bool,
 ) -> Result<WorkstationBackend> {
     if non_interactive {
@@ -809,65 +775,6 @@ fn write_workstation_backend(backend: &WorkstationBackend) -> Result<()> {
     write_new_atomic(&path, contents.as_bytes(), 0o644)
 }
 
-fn validate_release_binaries(source_dir: &Path, binaries: &[&str]) -> Result<()> {
-    for name in binaries {
-        let path = source_dir.join(name);
-        let metadata = fs::metadata(&path).map_err(|error| {
-            CliError::failure(format!(
-                "release binary '{}' is unavailable in '{}': {error}",
-                name,
-                source_dir.display()
-            ))
-        })?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-            return Err(CliError::failure(format!(
-                "release binary '{}' is not an executable file",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn install_binaries(source_dir: &Path, bin_dir: &Path, binaries: &[&str]) -> Result<()> {
-    fs::create_dir_all(bin_dir).map_err(|error| {
-        CliError::failure(format!(
-            "cannot create binary directory '{}': {error}",
-            bin_dir.display()
-        ))
-    })?;
-    for name in binaries {
-        let source = source_dir.join(name);
-        let destination = bin_dir.join(name);
-        if source == destination {
-            continue;
-        }
-        fs::copy(&source, &destination).map_err(|error| {
-            CliError::failure(format!(
-                "cannot install '{}' to '{}': {error}",
-                source.display(),
-                destination.display()
-            ))
-        })?;
-        let mut permissions = fs::metadata(&destination)
-            .map_err(|error| {
-                CliError::failure(format!(
-                    "cannot inspect installed binary '{}': {error}",
-                    destination.display()
-                ))
-            })?
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&destination, permissions).map_err(|error| {
-            CliError::failure(format!(
-                "cannot make '{}' executable: {error}",
-                destination.display()
-            ))
-        })?;
-    }
-    Ok(())
-}
-
 fn write_config(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         CliError::failure(format!(
@@ -1042,66 +949,6 @@ fn sync_directory(path: &Path) -> Result<()> {
         })
 }
 
-fn offer_path_update(bin_dir: &Path, non_interactive: bool, update_bashrc: bool) -> Result<()> {
-    let path_missing =
-        !env::split_paths(&env::var_os("PATH").unwrap_or_default()).any(|entry| entry == bin_dir);
-    if !path_missing {
-        return Ok(());
-    }
-    let home = home_dir()?;
-    let bashrc = home.join(".bashrc");
-    let consent = if update_bashrc {
-        true
-    } else if non_interactive || !io::stdin().is_terminal() {
-        false
-    } else {
-        println!("'{}' is not on PATH.", bin_dir.display());
-        matches!(
-            prompt("Add it to ~/.bashrc? [y/N]: ")?
-                .to_ascii_lowercase()
-                .as_str(),
-            "y" | "yes"
-        )
-    };
-    if consent {
-        add_to_bashrc(&bashrc, bin_dir)?;
-        println!("Added '{}' to {}.", bin_dir.display(), bashrc.display());
-    } else {
-        println!(
-            "Add '{}' to PATH in your shell configuration to run Narsor by name.",
-            bin_dir.display()
-        );
-    }
-    Ok(())
-}
-
-fn add_to_bashrc(path: &Path, bin_dir: &Path) -> Result<()> {
-    let mut contents = match fs::read(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(CliError::failure(format!(
-                "cannot read '{}': {error}",
-                path.display()
-            )))
-        }
-    };
-    let line = format!(
-        "export PATH=\"$PATH\":{}",
-        shell_quote(&bin_dir.to_string_lossy())
-    );
-    let text = String::from_utf8_lossy(&contents);
-    if text.lines().any(|existing| existing.trim() == line) {
-        return Ok(());
-    }
-    if !contents.is_empty() && !contents.ends_with(b"\n") {
-        contents.push(b'\n');
-    }
-    contents.extend_from_slice(line.as_bytes());
-    contents.push(b'\n');
-    write_config(path, &contents)
-}
-
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -1128,15 +975,6 @@ fn print_server_commands(backend: &WorkstationBackend, config_path: &Path) -> Re
         )
     );
     Ok(())
-}
-
-fn binaries_for(role: InstallRole, with_frontend: bool) -> Vec<&'static str> {
-    match role {
-        InstallRole::Local => ALL_BINARIES.to_vec(),
-        InstallRole::Frontend => vec!["narsor", "narsor-cli"],
-        InstallRole::Server if with_frontend => ALL_BINARIES.to_vec(),
-        InstallRole::Server => vec!["narsor-server", "narsor-controller", "narsor-runner"],
-    }
 }
 
 fn prompt_required(label: &str, name: &str) -> Result<String> {
@@ -1170,23 +1008,10 @@ fn prompt(label: &str) -> Result<String> {
     Ok(answer.trim().to_string())
 }
 
-fn executable_directory() -> Result<PathBuf> {
-    let executable = env::current_exe()
-        .map_err(|error| CliError::failure(format!("cannot locate narsor-cli: {error}")))?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| CliError::failure("narsor-cli executable has no parent directory"))?;
-    absolute_path(&executable)
-}
-
 fn absolute_path(path: &Path) -> Result<PathBuf> {
     std::path::absolute(path).map_err(|error| {
         CliError::failure(format!("cannot resolve path '{}': {error}", path.display()))
     })
-}
-
-fn default_bin_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".local/bin"))
 }
 
 fn default_data_dir() -> Result<PathBuf> {
@@ -1208,4 +1033,147 @@ fn home_dir() -> Result<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| CliError::failure("HOME is not set; provide explicit installation paths"))
+}
+
+/// Removes the configuration file, its backups and the data directory.
+///
+/// Directories named by the configuration but outside the data directory are
+/// reported and left in place: only the directory `init` itself chooses is
+/// treated as owned by Narsor.
+pub fn purge(options: PurgeOptions, global_config: Option<&Path>) -> Result<()> {
+    let config_path = match (options.config_file.as_deref(), global_config) {
+        (Some(explicit), _) => absolute_path(explicit)?,
+        (None, Some(global)) => absolute_path(global)?,
+        (None, None) => match ConfigCascade::new(None)
+            .resolve()
+            .map_err(|error| CliError::failure(error.to_string()))?
+            .path()
+        {
+            Some(path) => absolute_path(path)?,
+            None => absolute_path(&default_config_path()?)?,
+        },
+    };
+    let data_dir = absolute_path(&options.data_dir.clone().map_or_else(default_data_dir, Ok)?)?;
+    let home = home_dir()?;
+    if data_dir == Path::new("/") || home.starts_with(&data_dir) {
+        return Err(CliError::usage(format!(
+            "refusing to remove '{}': it contains the home directory",
+            data_dir.display()
+        )));
+    }
+
+    let mut files = Vec::new();
+    match fs::symlink_metadata(&config_path) {
+        Ok(metadata) if metadata.file_type().is_file() => files.push(config_path.clone()),
+        Ok(_) => {
+            return Err(CliError::failure(format!(
+                "configuration '{}' is not a regular file; remove it by hand",
+                config_path.display()
+            )))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CliError::failure(format!(
+                "cannot inspect configuration '{}': {error}",
+                config_path.display()
+            )))
+        }
+    }
+    if let (Some(parent), Some(name)) = (config_path.parent(), config_path.file_name()) {
+        let prefix = format!("{}.bak.", name.to_string_lossy());
+        if let Ok(entries) = fs::read_dir(parent) {
+            let mut backups = entries
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+            backups.sort();
+            files.extend(backups);
+        }
+    }
+    let remove_data_dir = match fs::symlink_metadata(&data_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => true,
+        Ok(_) => {
+            return Err(CliError::failure(format!(
+                "data path '{}' is not a directory; remove it by hand",
+                data_dir.display()
+            )))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(CliError::failure(format!(
+                "cannot inspect data directory '{}': {error}",
+                data_dir.display()
+            )))
+        }
+    };
+
+    let outside = directories_outside(&config_path, &data_dir);
+    if files.is_empty() && !remove_data_dir {
+        println!("Nothing to remove.");
+        return Ok(());
+    }
+    println!("The following will be removed permanently:");
+    for file in &files {
+        println!("  {}", file.display());
+    }
+    if remove_data_dir {
+        println!("  {}/ (everything inside)", data_dir.display());
+    }
+    for directory in &outside {
+        println!("Left in place (outside the data directory): {directory}");
+    }
+    if !options.yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::usage(
+                "confirmation needs a terminal; pass --yes to remove without asking",
+            ));
+        }
+        if !matches!(
+            prompt("Remove these? [y/N]: ")?
+                .to_ascii_lowercase()
+                .as_str(),
+            "y" | "yes"
+        ) {
+            return Err(CliError::failure("nothing was removed"));
+        }
+    }
+
+    for file in &files {
+        fs::remove_file(file).map_err(|error| {
+            CliError::failure(format!("cannot remove '{}': {error}", file.display()))
+        })?;
+    }
+    if remove_data_dir {
+        fs::remove_dir_all(&data_dir).map_err(|error| {
+            CliError::failure(format!("cannot remove '{}': {error}", data_dir.display()))
+        })?;
+    }
+    if let Some(parent) = config_path.parent() {
+        // Only an emptied directory goes; anything else is not ours.
+        let _ = fs::remove_dir(parent);
+    }
+    println!("Configuration and data removed.");
+    Ok(())
+}
+
+/// Root directories the configuration names that lie outside `data_dir`.
+fn directories_outside(config_path: &Path, data_dir: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+    let Ok(Value::Mapping(mapping)) = serde_yaml::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    [
+        SettingKey::CatalogDir,
+        SettingKey::StateDir,
+        SettingKey::WorkDir,
+    ]
+    .into_iter()
+    .filter_map(|key| mapping.get(key.key())?.as_str().map(PathBuf::from))
+    .filter(|path| !path.starts_with(data_dir))
+    .map(|path| path.display().to_string())
+    .collect()
 }

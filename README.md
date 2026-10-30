@@ -78,10 +78,11 @@ curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.
 ```
 
 The installer offers **local** (all five binaries), **frontend** (TUI and CLI),
-or **server** (server, controller, and runner) roles. It browses for install
-and data directories, validates the effective configuration, backs up an
-existing config before replacing it, and asks before adding the binary
-directory to `~/.bashrc`. To select a version, pass it to the downloaded
+or **server** (server, controller, and runner) roles. It copies the binaries,
+then `narsor-cli init` validates the effective configuration and backs up an
+existing config before replacing it. It asks before adding the binary
+directory to `~/.bashrc`. To remove Narsor, run the same script with
+`--uninstall` (add `--purge` to delete configuration and data too). To select a version, pass it to the downloaded
 script, for example `bash -s -- v1.2.3`.
 
 For container builds, supply `--non-interactive`, a role, and explicit

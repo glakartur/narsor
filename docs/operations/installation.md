@@ -44,9 +44,12 @@ Choose one role:
 | `frontend` | `narsor`, `narsor-cli` | Connect a TUI/CLI to a separately operated server. |
 | `server` | `narsor-server`, `narsor-controller`, `narsor-runner` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI and CLI too. |
 
-The interactive installer lets you browse for binary and data directories. It
-defaults to a user-writable binary directory and explains how to add it to
-`PATH`; it edits `~/.bashrc` only after consent. Existing configuration is
+The installer script downloads and verifies the archive, copies the binaries,
+and, only after consent, adds the binary directory to `~/.bashrc`. It then
+runs `narsor-cli init`, which only creates or updates the configuration. The
+script asks for the role and binary directory (default `~/.local/bin`);
+`narsor-cli init` asks for the data and configuration directories. The
+prompts read from the terminal, so they also work with `curl ... | bash`. Existing configuration is
 validated before the installer changes it. A supported config file is backed
 up byte-for-byte before an atomic replacement, and unrelated supported
 settings are preserved. Malformed or unknown settings stop installation
@@ -103,8 +106,31 @@ non-interactive invocation must use a writable `--config-file`.
 
 `--update-bashrc` explicitly opts into adding the binary directory to
 `~/.bashrc`. Without it, non-interactive installation never changes a shell
-startup file. The source-checkout workflow remains available as `./install.sh`
+startup file. The line carries a `# narsor-installer` marker so uninstall can
+find it. The source-checkout workflow remains available as `./install.sh`
 from a cloned repository; it is separate from the Release installer.
+
+## Uninstall
+
+The same script removes what it installed:
+
+```bash
+curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh |
+  bash -s -- --uninstall
+```
+
+It deletes only the five Narsor binaries from the binary directory
+(`~/.local/bin` unless `--bin-dir` is given) and the marked `~/.bashrc` line.
+Configuration and data stay in place. Pass the same `--bin-dir`,
+`--data-dir`, and `--config-file` values you used to install.
+
+`--purge` also removes the configuration file, its `.bak.*` backups, and the
+data directory (`--data-dir`, default `~/.local/share/narsor`). It first lists
+what it will delete and asks for confirmation; with `--non-interactive`, the
+`--purge` flag is the confirmation. Directories that the configuration names
+outside the data directory are listed and kept, and a data directory that
+contains your home directory is refused. `--purge` runs the installed
+`narsor-cli purge`, so it needs the binaries to still be present.
 
 ## Frontend connection profile
 

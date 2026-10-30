@@ -410,3 +410,13 @@ GitHub Releases publish `dist/install.sh` as the one-command bootstrap asset; ro
 - The same-VM controller remains a separate workstation backend and retains explicit risk acknowledgement.
 - No systemd unit, public-internet server exposure, or Kubernetes deployment is introduced.
 - Tests, docs, and release artifacts contain no abandoned implementation attempts or stale instructions.
+
+## Update: installer responsibilities and uninstall
+
+- `dist/install.sh` owns the binaries: download, verification, copying, the
+  `~/.bashrc` entry, and `--uninstall` (`--purge` also removes configuration
+  and data).
+- `narsor-cli init` (formerly `install`) only creates or updates the
+  configuration; `narsor-cli purge` removes configuration, its backups, and the
+  data directory. Neither touches binaries.
+- Prompts read from `/dev/tty`, so the installer works through `curl | bash`.

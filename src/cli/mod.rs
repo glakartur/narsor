@@ -32,7 +32,7 @@ pub mod commands;
 pub mod connection_profile;
 pub mod control_text;
 pub mod daemon;
-pub mod install;
+pub mod init;
 pub mod remote;
 pub mod task_history;
 pub mod task_registry;
@@ -309,8 +309,11 @@ pub enum Command {
         command: ConnectionProfileCommand,
     },
 
-    /// Installs the binaries and configuration for a Narsor role.
-    Install(install::InstallOptions),
+    /// Creates or updates the Narsor configuration for a role (binaries are installed by install.sh).
+    Init(init::InitOptions),
+
+    /// Removes the Narsor configuration and data directory (used by install.sh --uninstall --purge).
+    Purge(init::PurgeOptions),
 
     /// Creates, inspects and steers remote tasks through the control plane.
     Task {
@@ -542,7 +545,7 @@ impl Command {
                 ConfigCommand::Show { .. } => true,
             },
             Command::ConnectionProfile { .. } => true,
-            Command::Install(_) => true,
+            Command::Init(_) | Command::Purge(_) => true,
             Command::Validate { .. }
             | Command::Run { .. }
             | Command::List
@@ -712,7 +715,8 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
                 trust_server,
             } => connection_profile::import(&profile, trust_server),
         },
-        Command::Install(options) => install::run(options, config_file.as_deref()),
+        Command::Init(options) => init::run(options, config_file.as_deref()),
+        Command::Purge(options) => init::purge(options, config_file.as_deref()),
         Command::Task { command } => remote::task(command, &target, &state, &flags).await,
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
         Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,
@@ -851,7 +855,7 @@ mod tests {
             }
         }
         .runs_on_broken_config());
-        assert!(Command::Install(install::InstallOptions::default()).runs_on_broken_config());
+        assert!(Command::Init(init::InitOptions::default()).runs_on_broken_config());
 
         for command in [
             Command::List,
