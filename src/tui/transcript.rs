@@ -131,6 +131,9 @@ pub struct TranscriptEntry {
     /// Whether the adapter marked this entry as a workflow choice. Renderers
     /// highlight its card; the flag never derives from the entry's text.
     pub workflow_choice: bool,
+    /// Whether the header (and the first line of a workflow choice) is one
+    /// line by nature: clipped with `…` to the width instead of wrapped.
+    pub clip_head: bool,
     /// Normalized adapter fields, formatted only while this entry is expanded.
     pub details: Option<Value>,
     /// Exact retained source bytes. This is never replaced by decoded text.
@@ -176,6 +179,7 @@ impl TranscriptEntry {
             presentation: TranscriptPresentation::Neutral,
             detail_lines: Vec::new(),
             workflow_choice: false,
+            clip_head: false,
             details: None,
             raw: raw.into(),
             shares_previous_raw: false,
@@ -212,6 +216,13 @@ impl TranscriptEntry {
 
     pub fn with_presentation(mut self, presentation: TranscriptPresentation) -> Self {
         self.presentation = presentation;
+        self
+    }
+
+    /// Makes the header of this entry, and the first line of a workflow
+    /// choice, clip to the width instead of wrapping.
+    pub fn with_clipped_head(mut self) -> Self {
+        self.clip_head = true;
         self
     }
 
@@ -309,6 +320,27 @@ pub struct TranscriptLine {
     pub selected: bool,
     /// Part of a workflow choice card; every wrapped fragment keeps it.
     pub workflow_choice: bool,
+    /// One line by nature: clipped with `…` to the width, not wrapped.
+    pub clipped: bool,
+}
+
+/// The fragments of `line` at `width`: one clipped fragment for a line that
+/// is one line by nature.
+fn fragments(line: &TranscriptLine, width: usize) -> Vec<String> {
+    let width = wrapped_width(line.indented, width);
+    if !line.clipped {
+        return wrap_line(&line.text, width);
+    }
+    let text = line.text.replace('\n', " ");
+    let length = text.chars().count();
+    vec![if length <= width {
+        text
+    } else {
+        text.chars()
+            .take(width.saturating_sub(1))
+            .chain(std::iter::once('…'))
+            .collect()
+    }]
 }
 
 /// Wraps only the visible transcript slice while retaining its semantic
@@ -326,7 +358,7 @@ pub fn wrap_visible_lines(
     let mut window = Vec::with_capacity(height);
     let mut skipped = 0;
     'lines: for line in lines {
-        let wrapped = wrap_line(&line.text, wrapped_width(line.indented, width));
+        let wrapped = fragments(line, width);
         for (fragment, text) in wrapped.into_iter().enumerate() {
             if skipped < offset {
                 skipped += 1;
@@ -347,6 +379,7 @@ pub fn wrap_visible_lines(
                 // all remain visibly selected.
                 selected: line.selected && (!line.header || fragment == 0),
                 workflow_choice: line.workflow_choice,
+                clipped: line.clipped,
             });
         }
     }
@@ -746,6 +779,7 @@ impl TranscriptState {
                     indented: false,
                     selected: false,
                     workflow_choice: false,
+                    clipped: false,
                 });
             }
         }
@@ -1156,7 +1190,7 @@ impl TranscriptState {
     fn visual_line_count_for(&self, entry: &TranscriptEntry) -> usize {
         self.lines_for(entry)
             .iter()
-            .map(|line| wrap_line(&line.text, wrapped_width(line.indented, self.width)).len())
+            .map(|line| fragments(line, self.width).len())
             .sum()
     }
 
@@ -1241,6 +1275,9 @@ impl TranscriptState {
                     indented,
                     selected: self.selected.as_ref() == Some(&entry.id),
                     workflow_choice: card && entry.workflow_choice,
+                    clipped: card
+                        && entry.clip_head
+                        && (header || (entry.workflow_choice && logical_line == 1)),
                 },
             )
             .collect()
@@ -1689,6 +1726,7 @@ mod tests {
             indented: true,
             selected: true,
             workflow_choice: false,
+            clipped: false,
         }];
         let wrapped = wrap_visible_lines(&lines, 8, 0, 3);
         assert_eq!(
@@ -1878,6 +1916,39 @@ mod tests {
         let lines = transcript.logical_lines();
         assert!(lines[..3].iter().all(|line| line.workflow_choice));
         assert!(lines[3..].iter().all(|line| !line.workflow_choice));
+    }
+
+    /// R9: what is one line by nature is clipped with `…`; the prose wraps.
+    #[test]
+    fn clipped_heads_end_with_an_ellipsis_and_the_prose_wraps() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![choice(
+            "choice",
+            vec![
+                "agent · claude wybrał opcję: bardzo_długa_etykieta".into(),
+                "uzasadnienie: abcdefghijklmnopqrstuvwxyz".into(),
+            ],
+        )
+        .with_clipped_head()
+        .as_workflow_choice()]);
+
+        let wrapped = wrap_visible_lines(&transcript.logical_lines(), 20, 0, 20);
+        assert_eq!(wrapped[0].text.chars().count(), 20);
+        assert!(wrapped[0].text.starts_with("· WYBÓR"));
+        assert!(wrapped[0].text.ends_with('…'));
+        assert!(wrapped[1].text.ends_with('…'));
+        assert!(wrapped[2..].len() > 1, "the reason wraps: {wrapped:?}");
+        assert!(wrapped[2..].iter().all(|line| !line.text.ends_with('…')));
+        assert!(wrapped.iter().all(|line| line.workflow_choice));
+    }
+
+    #[test]
+    fn heads_that_are_not_marked_wrap_as_they_did() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![choice("plain", vec!["one".into()])]);
+        let wrapped = wrap_visible_lines(&transcript.logical_lines(), 10, 0, 20);
+        assert!(wrapped.len() > 2);
+        assert!(wrapped.iter().all(|line| !line.text.ends_with('…')));
     }
 
     #[test]

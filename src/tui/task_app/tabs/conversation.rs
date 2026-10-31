@@ -550,82 +550,157 @@ impl Conversation {
     }
 
     /// Rebuilds the transcript and includes workflow output choices made by
-    /// the agent, conductor, or operator. A choice stands after the
-    /// conversation of the step entry it followed and before the heading of
-    /// the next one; the newest choice, with no step after it, ends the
-    /// transcript.
+    /// the agent, conductor, or operator: [`build_conversation`] over the
+    /// whole conversation.
     pub fn rebuild_with_events(
         &mut self,
         positions: &[Position],
         attempts: &Attempts,
         events: &[Event],
     ) {
-        let mut entries = Vec::new();
-        self.loading = false;
-        self.failure = None;
-        self.record = None;
-        let visits = step_entries(events);
-        let mut by_visit: BTreeMap<(&str, u32), Vec<&Position>> = BTreeMap::new();
-        for position in positions {
-            by_visit
-                .entry((position.state_id.as_str(), position.visit))
-                .or_default()
-                .push(position);
-        }
-        let mut seen_attempts = std::collections::HashSet::new();
-        if visits.is_empty() {
-            // No step entry to anchor a choice to (an old or partial log):
-            // the conversation as it is, the choices at its end.
-            for position in positions {
-                self.push_position(&mut entries, &mut seen_attempts, position, attempts);
-            }
-            entries.extend(workflow_choices(events).into_iter().map(|(_, entry)| entry));
-        } else {
-            let mut choices = workflow_choices(events).into_iter().peekable();
-            let mut until = |entries: &mut Vec<TranscriptEntry>, next: Option<u64>| {
-                while let Some((_, entry)) =
-                    choices.next_if(|(sequence, _)| next.is_none_or(|next| *sequence < next))
-                {
-                    entries.push(entry);
-                }
-            };
-            until(&mut entries, Some(visits[0].sequence));
-            for (index, visit) in visits.iter().enumerate() {
-                for position in by_visit
-                    .get(&(visit.state_id.as_str(), visit.visit))
-                    .into_iter()
-                    .flatten()
-                {
-                    self.push_position(&mut entries, &mut seen_attempts, position, attempts);
-                }
-                until(
-                    &mut entries,
-                    visits.get(index + 1).map(|next| next.sequence),
-                );
-            }
-            // A step the events do not tell the entry of: shown, with no
-            // choice of its own.
-            for position in positions {
-                if !visits.iter().any(|visit| {
-                    visit.state_id == position.state_id && visit.visit == position.visit
-                }) {
-                    self.push_position(&mut entries, &mut seen_attempts, position, attempts);
-                }
-            }
-        }
-        self.full.replace_entries(entries);
+        let built = build_conversation(Scope::Whole, positions, attempts, events);
+        self.loading = built.loading;
+        self.failure = built.failure;
+        self.record = built.record;
+        self.full.replace_entries(built.entries);
         self.built = true;
     }
+}
 
-    /// Adds the heading and the entries of `position`'s attempt, and notes
-    /// what its read says: still loading, failed, from the record.
-    fn push_position<'a>(
-        &mut self,
-        entries: &mut Vec<TranscriptEntry>,
-        seen_attempts: &mut std::collections::HashSet<&'a str>,
-        position: &'a Position,
-        attempts: &Attempts,
-    ) {
+/// What a conversation is put together for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope<'a> {
+    /// Every step, each under its heading (*Rozmowa*).
+    Whole,
+    /// One entry into a step: its attempts and the choices made in it, no
+    /// heading (*Przebieg*).
+    Step { state_id: &'a str, visit: u32 },
+}
+
+/// A conversation put together, and what the reads behind it say.
+#[derive(Debug, Clone, Default)]
+pub struct Built {
+    pub entries: Vec<TranscriptEntry>,
+    /// Some attempt has not been read yet.
+    pub loading: bool,
+    /// The first failed read, and the step it was of.
+    pub failure: Option<(String, ReadFailure)>,
+    /// Some attempt was last read from the task's record: when the newest
+    /// such record was written.
+    pub record: Option<Option<DateTime<Utc>>>,
+    /// Some attempt brought entries of its own (not only choices).
+    pub has_conversation: bool,
+    /// Some attempt has no record at the runner.
+    pub no_record: bool,
+}
+
+/// Puts the conversation of `scope` together from the attempts read, in the
+/// order of the `positions`. A choice stands after the conversation of the
+/// step entry it followed and before the heading of the next one; the newest
+/// choice, with no step after it, ends the transcript. In a step scope the
+/// choices are the ones between its entry and the next entry into any step;
+/// a step the events do not tell the entry of has none.
+pub fn build_conversation(
+    scope: Scope<'_>,
+    positions: &[Position],
+    attempts: &Attempts,
+    events: &[Event],
+) -> Built {
+    let mut builder = Builder {
+        built: Built::default(),
+        seen_attempts: std::collections::HashSet::new(),
+        headings: scope == Scope::Whole,
+    };
+    let visits = step_entries(events);
+    if let Scope::Step { state_id, visit } = scope {
+        for position in positions
+            .iter()
+            .filter(|position| position.state_id == state_id && position.visit == visit)
+        {
+            builder.push_position(position, attempts);
+        }
+        if let Some(index) = visits
+            .iter()
+            .position(|entered| entered.state_id == state_id && entered.visit == visit)
+        {
+            let from = visits[index].sequence;
+            let until = visits.get(index + 1).map(|next| next.sequence);
+            builder.built.entries.extend(
+                workflow_choices(events)
+                    .into_iter()
+                    .filter(|(sequence, _)| {
+                        *sequence >= from && until.is_none_or(|until| *sequence < until)
+                    })
+                    .map(|(_, entry)| entry),
+            );
+        }
+        return builder.built;
+    }
+    let mut by_visit: BTreeMap<(&str, u32), Vec<&Position>> = BTreeMap::new();
+    for position in positions {
+        by_visit
+            .entry((position.state_id.as_str(), position.visit))
+            .or_default()
+            .push(position);
+    }
+    if visits.is_empty() {
+        // No step entry to anchor a choice to (an old or partial log): the
+        // conversation as it is, the choices at its end.
+        for position in positions {
+            builder.push_position(position, attempts);
+        }
+        builder
+            .built
+            .entries
+            .extend(workflow_choices(events).into_iter().map(|(_, entry)| entry));
+    } else {
+        let mut choices = workflow_choices(events).into_iter().peekable();
+        let mut until = |entries: &mut Vec<TranscriptEntry>, next: Option<u64>| {
+            while let Some((_, entry)) =
+                choices.next_if(|(sequence, _)| next.is_none_or(|next| *sequence < next))
+            {
+                entries.push(entry);
+            }
+        };
+        until(&mut builder.built.entries, Some(visits[0].sequence));
+        for (index, visit) in visits.iter().enumerate() {
+            for position in by_visit
+                .get(&(visit.state_id.as_str(), visit.visit))
+                .into_iter()
+                .flatten()
+            {
+                builder.push_position(position, attempts);
+            }
+            until(
+                &mut builder.built.entries,
+                visits.get(index + 1).map(|next| next.sequence),
+            );
+        }
+        // A step the events do not tell the entry of: shown, with no choice
+        // of its own.
+        for position in positions {
+            if !visits
+                .iter()
+                .any(|visit| visit.state_id == position.state_id && visit.visit == position.visit)
+            {
+                builder.push_position(position, attempts);
+            }
+        }
+    }
+    builder.built
+}
+
+struct Builder<'a> {
+    built: Built,
+    seen_attempts: std::collections::HashSet<&'a str>,
+    headings: bool,
+}
+
+impl<'a> Builder<'a> {
+    /// Adds the heading (in the whole scope) and the entries of `position`'s
+    /// attempt, and notes what its read says: still loading, failed, from
+    /// the record.
+    fn push_position(&mut self, position: &'a Position, attempts: &Attempts) {
         let (ConversationState::Recorded, Some(attempt_id)) = (
             &position.conversation,
             position.action_execution_id.as_deref(),
@@ -634,38 +709,44 @@ impl Conversation {
         };
         // A workflow retry may point at the same chat as the preceding
         // position. Show that transcript once, at its first occurrence.
-        if !seen_attempts.insert(attempt_id) {
+        if !self.seen_attempts.insert(attempt_id) {
             return;
         }
+        let built = &mut self.built;
         let Some(attempt) = attempts.get(attempt_id) else {
-            self.loading = true;
+            built.loading = true;
             return;
         };
-        if self.failure.is_none() {
-            self.failure = attempt
+        if built.failure.is_none() {
+            built.failure = attempt
                 .failure()
                 .map(|failure| (position.label.clone(), failure.clone()));
         }
         if attempt.from_record() {
-            let newest = self.record.flatten().max(attempt.recorded_at());
-            self.record = Some(newest);
+            let newest = built.record.flatten().max(attempt.recorded_at());
+            built.record = Some(newest);
         }
+        built.no_record |= attempt.no_record();
         if attempt.entries.is_empty() {
             return;
         }
-        entries.push(
-            TranscriptEntry::new(
-                TranscriptEntryId::from(format!("{attempt_id}/step")),
-                Vec::new(),
-                Vec::new(),
-            )
-            .with_header(format!("── {} ──", one_line(&position.label)))
-            .with_presentation(TranscriptPresentation::System),
-        );
-        entries.extend(attempt.entries.iter().map(|entry| {
+        built.has_conversation |= attempt.has_conversation();
+        if self.headings {
+            built.entries.push(
+                TranscriptEntry::new(
+                    TranscriptEntryId::from(format!("{attempt_id}/step")),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_header(format!("── {} ──", one_line(&position.label)))
+                .with_presentation(TranscriptPresentation::System)
+                .with_clipped_head(),
+            );
+        }
+        built.entries.extend(attempt.entries.iter().map(|entry| {
             let mut entry = entry.clone();
             entry.prefix_source_ids(attempt_id);
-            entry
+            entry.with_clipped_head()
         }));
     }
 }
@@ -773,6 +854,7 @@ fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
             event.timestamp.format("%H:%M:%S")
         ))
         .with_presentation(presentation)
+        .with_clipped_head()
         .as_workflow_choice(),
     )
 }
@@ -804,8 +886,22 @@ fn transcript_row(
     ])
 }
 
+/// The window a conversation is drawn in: where it is (the position puts the
+/// highlighted rows of the choices in the right place) and how big (the width
+/// wraps and clips, the height is what scrolls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversationWindow {
+    pub area: Rect,
+}
+
+impl ConversationWindow {
+    pub fn new(area: Rect) -> Self {
+        Self { area }
+    }
+}
+
 /// Draws `transcript` into `area`, wrapped to it. `focused` says the keys
-/// are on it.
+/// are on it. The conductor's way into [`render_conversation`].
 pub fn render_transcript(
     frame: &mut Frame,
     area: Rect,
@@ -814,6 +910,26 @@ pub fn render_transcript(
     stale: bool,
     focused: bool,
 ) {
+    render_conversation(
+        frame,
+        ConversationWindow::new(area),
+        styles,
+        transcript,
+        stale,
+        focused,
+    );
+}
+
+/// Draws a conversation — the whole one or a step's — into `window`.
+pub fn render_conversation(
+    frame: &mut Frame,
+    window: ConversationWindow,
+    styles: &Styles,
+    transcript: &mut TranscriptState,
+    stale: bool,
+    focused: bool,
+) {
+    let area = window.area;
     let width = usize::from(area.width)
         .saturating_sub(usize::from(PREFIX_WIDTH))
         .max(1);
@@ -942,9 +1058,9 @@ pub fn render(
     } else {
         body
     };
-    render_transcript(
+    render_conversation(
         frame,
-        transcript_area,
+        ConversationWindow::new(transcript_area),
         styles,
         conversation.transcript_mut(),
         stale,

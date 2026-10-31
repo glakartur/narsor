@@ -21,7 +21,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use std::collections::BTreeMap;
+
 use crate::controller_protocol::TimelineResponse;
+use crate::domain::Event;
 use crate::tui::style::{Role, Styles};
 use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
@@ -30,10 +33,69 @@ use super::super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::layout::first_row;
 use super::super::list::fit;
 use super::super::StepFocus;
-use super::conversation::{self, Attempt, Attempts};
+use super::conversation::Attempts;
+use super::conversation::{
+    self, build_conversation, Built, ConversationWindow, ReadFailure, Scope,
+};
+use crate::tui::transcript::{TranscriptId, TranscriptState};
 
 /// Widest the axis grows, frame included.
 const AXIS_MAX_WIDTH: u16 = 34;
+
+/// One entry into a step as *Przebieg* reads it: the reader (cursor,
+/// expanded entries, following) and what the reads behind it say. It is the
+/// state of the entry, not of the selection, so it outlives moving the
+/// selection away and back.
+#[derive(Debug, Clone)]
+pub struct StepView {
+    transcript: TranscriptState,
+    loading: bool,
+    failure: Option<ReadFailure>,
+    record: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    has_conversation: bool,
+    no_record: bool,
+}
+
+impl StepView {
+    fn new(state_id: &str, visit: u32) -> Self {
+        Self {
+            transcript: TranscriptState::new(TranscriptId::from(format!(
+                "step/{state_id}/{visit}"
+            ))),
+            loading: false,
+            failure: None,
+            record: None,
+            has_conversation: false,
+            no_record: false,
+        }
+    }
+
+    /// Whether there is a conversation to read: an attempt of the entry
+    /// brought entries of its own. A banner of a failed read over entries
+    /// read before does not take it away.
+    pub fn has_conversation(&self) -> bool {
+        self.has_conversation
+    }
+
+    /// The reader of the step, for keys and for drawing.
+    pub fn transcript_mut(&mut self) -> &mut TranscriptState {
+        &mut self.transcript
+    }
+
+    /// The reader of the step.
+    pub fn transcript(&self) -> &TranscriptState {
+        &self.transcript
+    }
+
+    fn apply(&mut self, built: Built) {
+        self.loading = built.loading;
+        self.failure = built.failure.map(|(_, failure)| failure);
+        self.record = built.record;
+        self.has_conversation = built.has_conversation;
+        self.no_record = built.no_record;
+        self.transcript.replace_entries(built.entries);
+    }
+}
 
 /// What the timeline remembers per task.
 #[derive(Debug, Clone)]
@@ -48,6 +110,11 @@ pub struct Progress {
     paused: bool,
     /// The first step in view on the axis, kept between frames.
     top: usize,
+    /// The conversation of every entry into a step that was put together,
+    /// by `(state, visit)`.
+    step_views: BTreeMap<(String, u32), StepView>,
+    /// The entry the last put-together was of.
+    built_for: Option<(String, u32)>,
 }
 
 impl Default for Progress {
@@ -60,6 +127,8 @@ impl Default for Progress {
             follow: true,
             paused: false,
             top: 0,
+            step_views: BTreeMap::new(),
+            built_for: None,
         }
     }
 }
@@ -117,6 +186,70 @@ impl Progress {
         self.positions()
             .iter()
             .find(|position| position.label == label)
+    }
+
+    fn selected_key(&self) -> Option<(String, u32)> {
+        self.selected_position()
+            .map(|position| (position.state_id.clone(), position.visit))
+    }
+
+    /// The conversation of the selected step.
+    pub fn step_view(&self) -> Option<&StepView> {
+        self.step_views.get(&self.selected_key()?)
+    }
+
+    /// The conversation of the selected step, to scroll it.
+    pub fn step_view_mut(&mut self) -> Option<&mut StepView> {
+        let key = self.selected_key()?;
+        self.step_views.get_mut(&key)
+    }
+
+    /// Whether the selected step's conversation was not put together since
+    /// the selection came to it.
+    pub fn step_unbuilt(&self) -> bool {
+        self.selected_key()
+            .is_some_and(|key| self.built_for.as_ref() != Some(&key))
+    }
+
+    /// Marks every step's conversation as not put together since the last
+    /// read.
+    pub fn invalidate_step(&mut self) {
+        self.built_for = None;
+    }
+
+    /// Puts the selected step's conversation together again from what was
+    /// read. The cursor and the expanded entries stay where they were; a
+    /// reader at the end stays at the end.
+    pub fn rebuild_step(&mut self, attempts: &Attempts, events: &[Event]) {
+        let Some(key) = self.selected_key() else {
+            return;
+        };
+        let built = build_conversation(
+            Scope::Step {
+                state_id: &key.0,
+                visit: key.1,
+            },
+            self.positions(),
+            attempts,
+            events,
+        );
+        self.step_views
+            .entry(key.clone())
+            .or_insert_with(|| StepView::new(&key.0, key.1))
+            .apply(built);
+        self.built_for = Some(key);
+    }
+
+    /// The attempts of the selected step's entry that can be read.
+    pub fn selected_attempts(&self) -> Vec<String> {
+        let Some((state_id, visit)) = self.selected_key() else {
+            return Vec::new();
+        };
+        self.positions()
+            .iter()
+            .filter(|position| position.state_id == state_id && position.visit == visit)
+            .filter_map(super::super::detail::recorded_attempt)
+            .collect()
     }
 
     /// `(n, m)`: the running step is the `n`th of the `m` steps so far.
@@ -327,7 +460,6 @@ pub fn render(
     area: Rect,
     styles: &Styles,
     progress: &mut Progress,
-    attempts: &mut Attempts,
     stale: bool,
     keys: Option<StepFocus>,
     glyph: &str,
@@ -400,7 +532,6 @@ pub fn render(
         content,
         styles,
         progress,
-        attempts,
         stale,
         conversation_focused,
         glyph,
@@ -412,15 +543,15 @@ fn render_step(
     frame: &mut Frame,
     area: Rect,
     styles: &Styles,
-    progress: &Progress,
-    attempts: &mut Attempts,
+    progress: &mut Progress,
     stale: bool,
     focused: bool,
     glyph: &str,
 ) {
-    let Some(position) = progress.selected_position() else {
+    let Some(position) = progress.selected_position().cloned() else {
         return;
     };
+    let position = &position;
     let now = progress
         .timeline()
         .and_then(|response| response.observed_at)
@@ -450,8 +581,8 @@ fn render_step(
         &position.conversation,
         position.action_execution_id.as_deref(),
     ) {
-        (ConversationState::Recorded, Some(attempt_id)) => match attempts.get_mut(attempt_id) {
-            Some(attempt) => render_attempt(frame, body, styles, attempt, stale, focused),
+        (ConversationState::Recorded, Some(_)) => match progress.step_view_mut() {
+            Some(view) => render_step_view(frame, body, styles, view, stale, focused, glyph),
             None => message(frame, format!("{glyph} wczytuję rozmowę kroku…")),
         },
         (ConversationState::Recorded, None) | (ConversationState::NoRecord, _) => {
@@ -464,42 +595,42 @@ fn render_step(
 }
 
 /// The step's conversation: the badge of a record and a failed read on the
-/// fixed lines at the top, then the transcript.
-fn render_attempt(
+/// fixed lines at the top, then the conversation in the window that is left.
+fn render_step_view(
     frame: &mut Frame,
     area: Rect,
     styles: &Styles,
-    attempt: &mut Attempt,
+    view: &mut StepView,
     stale: bool,
     focused: bool,
+    glyph: &str,
 ) {
-    let record = attempt.from_record().then(|| attempt.recorded_at());
-    let failure = attempt.failure().map(|failure| failure.note(None));
-    let failed = failure.is_some();
-    let notes = conversation::notes(record, failure, chrono::Utc::now(), area.width, styles);
+    let failure = view.failure.as_ref().map(|failure| failure.note(None));
+    let notes = conversation::notes(view.record, failure, chrono::Utc::now(), area.width, styles);
     let body = conversation::render_notes(frame, area, notes);
-    if failed && attempt.is_empty() {
-        return;
-    }
-    let empty = if attempt.no_record() {
-        Some("brak zapisanej rozmowy tego kroku")
-    } else if attempt.is_empty() && attempt.from_record() {
-        Some("brak zapisanej rozmowy")
-    } else {
-        None
-    };
-    if let Some(text) = empty {
+    if view.transcript.entries().is_empty() {
+        let text = if view.loading {
+            format!("{glyph} wczytuję rozmowę kroku…")
+        } else if view.failure.is_some() {
+            return;
+        } else if view.no_record {
+            "brak zapisanej rozmowy tego kroku".to_string()
+        } else if view.record.is_some() {
+            "brak zapisanej rozmowy".to_string()
+        } else {
+            return;
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(text, styles.of(Role::Done))),
             body,
         );
         return;
     }
-    conversation::render_transcript(
+    conversation::render_conversation(
         frame,
-        body,
+        ConversationWindow::new(body),
         styles,
-        attempt.transcript_mut(),
+        &mut view.transcript,
         stale,
         focused,
     );

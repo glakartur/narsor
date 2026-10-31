@@ -711,15 +711,20 @@ impl TaskApp {
         }
         match tab {
             DetailTab::Progress => {
-                let attempt = detail
-                    .progress
-                    .selected_position()
-                    .and_then(recorded_attempt);
-                if let Some(attempt) = attempt {
+                for attempt in detail.progress.selected_attempts() {
                     if detail.attempts.needs_read(&attempt, revision) {
                         let from = detail.attempts.from(&attempt);
                         plan.attempts.push((attempt, from));
                     }
+                }
+                if detail.events.needs_read(revision) {
+                    plan.events_after = Some(detail.events.after());
+                }
+                if plan.attempts.is_empty()
+                    && plan.events_after.is_none()
+                    && detail.progress.step_unbuilt()
+                {
+                    super::detail::rebuild_step(detail);
                 }
             }
             DetailTab::Conversation => {
@@ -822,13 +827,20 @@ impl TaskApp {
         for (attempt, from, result) in attempts {
             detail.attempts.apply(&attempt, revision, from, result);
         }
-        if (read_attempts || read_events) && tab == DetailTab::Conversation {
-            let positions = detail.progress.positions().to_vec();
-            detail.conversation.rebuild_with_events(
-                &positions,
-                &detail.attempts,
-                detail.events.events(),
-            );
+        if read_attempts || read_events {
+            detail.progress.invalidate_step();
+            match tab {
+                DetailTab::Conversation => {
+                    let positions = detail.progress.positions().to_vec();
+                    detail.conversation.rebuild_with_events(
+                        &positions,
+                        &detail.attempts,
+                        detail.events.events(),
+                    );
+                }
+                DetailTab::Progress => super::detail::rebuild_step(detail),
+                _ => {}
+            }
         }
         let Some(label) = held else {
             return;

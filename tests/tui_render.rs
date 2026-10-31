@@ -7053,6 +7053,31 @@ mod workflow_choice_render {
         }
     }
 
+    // AE3 of the shared renderer: at 40 columns the one-line parts end with
+    // an ellipsis and the prose wraps.
+    #[test]
+    fn narrow_one_line_parts_are_clipped_and_the_reason_wraps() {
+        let styles = Styles::new(false);
+        let mut tab = conversation(
+            vec![message("Piszę wymagania.")],
+            vec![agent_chose(
+                2,
+                "requirements_drafted_and_waiting_for_the_review",
+                Some(REASON),
+            )],
+        );
+        let buffer = drawn(40, 20, &mut tab, &styles, false, true);
+        let text = rows(&buffer);
+        let choice = text
+            .iter()
+            .find(|row| row.contains("wybrał opcję"))
+            .unwrap_or_else(|| panic!("{}", screen(&buffer)));
+        assert!(choice.trim_end().ends_with('…'), "{}", screen(&buffer));
+        assert!(!screen(&buffer).contains("review"), "{}", screen(&buffer));
+        assert!(text.iter().any(|row| row.contains("dostępu")));
+        assert_blocks(&buffer, &styles);
+    }
+
     // AE5
     #[test]
     fn a_message_that_looks_like_a_choice_is_not_highlighted() {
