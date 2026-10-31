@@ -44,7 +44,7 @@ use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::harness::HarnessHeader;
 use super::list::{fit as fit_text, Counters, Slots, TaskList};
-use super::{actions, detail, history, new_task, repositories};
+use super::{actions, detail, history, new_task, repositories, usage};
 use super::{Focus, TaskApp, View};
 
 /// The narrowest terminal that shows anything but a request for more room.
@@ -191,7 +191,7 @@ pub fn render_at(
     if let Some(detail_area) = areas.detail {
         render_view(frame, detail_area, app, styles, stale);
     }
-    render_bar(frame, areas.bar, app, styles, now);
+    render_bar(frame, areas.bar, app, styles, now, now_utc);
     let body = overlay_area(areas.outer);
     actions::render(frame, body, app, styles);
     if app.form_confirming() {
@@ -449,7 +449,19 @@ fn render_empty(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles) {
     );
 }
 
-fn render_bar(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, now: Instant) {
+/// The bottom bar: the keys on the left; on the right the notification while
+/// it is up, otherwise the usage limits, otherwise nothing (R13, R14). The
+/// right side takes the room it needs up to the whole row; the keys get what
+/// is left but one column, and drop from the end. Public so a test can draw
+/// it into an area that does not start at the corner of the screen.
+pub fn render_bar(
+    frame: &mut Frame,
+    area: Rect,
+    app: &TaskApp,
+    styles: &Styles,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+) {
     if app.quit_confirm {
         let hints = Line::from(vec![
             Span::styled(" q ", styles.key_cap()),
@@ -470,12 +482,10 @@ fn render_bar(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, now
         frame.render_widget(Paragraph::new(hints), area);
         return;
     }
-    let notification = app.notifier().span(styles, now);
-    let note_width = notification
-        .as_ref()
-        .map_or(0, |span| span.content.chars().count() + 1)
-        .min(usize::from(area.width) / 2);
-    let hints_width = usize::from(area.width).saturating_sub(note_width + 1);
+    let room = usize::from(area.width);
+    let right = bar_right(app, styles, now, now_utc, room);
+    let right_width = right.width().min(room);
+    let hints_width = room.saturating_sub(right_width + 1);
     let hints =
         if app.active_agent_transcript_mode() == Some(crate::tui::transcript::DisplayMode::Raw) {
             keymap::raw_conversation_hint_line(app.key_context(), styles, hints_width)
@@ -483,17 +493,30 @@ fn render_bar(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, now
             keymap::hint_line(app.key_context(), styles, hints_width)
         };
     frame.render_widget(Paragraph::new(hints), area);
-    if let Some(span) = notification {
+    if right_width > 0 {
+        let width = u16::try_from(right_width).unwrap_or(area.width);
         frame.render_widget(
-            Paragraph::new(Line::from(span)).alignment(Alignment::Right),
-            Rect::new(
-                area.x + area.width - u16::try_from(note_width).unwrap_or(0),
-                area.y,
-                u16::try_from(note_width).unwrap_or(0),
-                1,
-            ),
+            Paragraph::new(right).alignment(Alignment::Right),
+            Rect::new(area.x + area.width - width, area.y, width, 1),
         );
     }
+}
+
+/// The right of the bar in at most `room` columns: the notification, cut
+/// with `…` when longer, or else the usage limits.
+fn bar_right(
+    app: &TaskApp,
+    styles: &Styles,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+    room: usize,
+) -> Line<'static> {
+    if let Some(note) = app.notifier().span(styles, now) {
+        return Line::from(Span::styled(fit_text(&note.content, room), note.style));
+    }
+    app.harness_usage().map_or_else(Line::default, |state| {
+        Line::from(usage::bar_spans(state, now_utc, styles, room))
+    })
 }
 
 /// The context whose keys the bar and help describe.
