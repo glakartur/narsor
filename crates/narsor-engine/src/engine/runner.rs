@@ -2,7 +2,7 @@
 //!
 //! # The order of events is the contract
 //!
-//! One step emits, in this order (`DOMAIN_MODEL.md` §4.2–4.3):
+//! One step emits, in this order (`docs/dev/domain-model.md` §4.2–4.3):
 //!
 //! ```text
 //! StateEntered -> ActionStarted -> (ActionRetrying)* -> ActionCompleted
@@ -62,7 +62,7 @@
 //! # Terminal states say how they end
 //!
 //! Whether reaching a terminal means success or failure is **declared**, not
-//! guessed: `WORKFLOW_SCHEMA.md` §3.5 lets `terminal_states` be a mapping from
+//! guessed: `docs/dev/workflow-schema.md` §3.5 lets `terminal_states` be a mapping from
 //! state id to the resulting status, which the loader puts on the state as
 //! `terminal_status`. The engine only reads it — it never inspects the state's
 //! name, because a name-based guess reports a terminal called
@@ -183,7 +183,7 @@ struct AgentInput {
 
 /// How an execution ends when it enters the terminal state `state`.
 ///
-/// The answer comes from the workflow's own declaration (`WORKFLOW_SCHEMA.md`
+/// The answer comes from the workflow's own declaration (`docs/dev/workflow-schema.md`
 /// §3.5) and from nowhere else; a terminal that declares nothing completes the
 /// execution.
 pub fn terminal_status(state: &State) -> ExecutionStatus {
@@ -1266,7 +1266,7 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     /// Creates an execution: directories, `state.json`, `context.json`,
-    /// `WorkflowStarted` (`DOMAIN_MODEL.md` §4.1).
+    /// `WorkflowStarted` (`docs/dev/domain-model.md` §4.1).
     ///
     /// The definition is validated first: an invalid workflow must leave nothing
     /// on disk. The context starts out holding the inputs, so that a template
@@ -3435,7 +3435,7 @@ impl Engine {
     // Endings
     // -----------------------------------------------------------------------
 
-    /// Ends the execution in a terminal state (`DOMAIN_MODEL.md` §4.4).
+    /// Ends the execution in a terminal state (`docs/dev/domain-model.md` §4.4).
     fn finish(&self, execution: &mut WorkflowExecution, state: &State) -> Result<(), EngineError> {
         let status = terminal_status(state);
 

@@ -1,6 +1,6 @@
 //! YAML deserialization layer for workflow definitions.
 //!
-//! These structures mirror `WORKFLOW_SCHEMA.md` one to one: field names,
+//! These structures mirror `docs/dev/workflow-schema.md` one to one: field names,
 //! nesting and optionality are the external contract, and every struct uses
 //! `#[serde(deny_unknown_fields)]` so that a typo in a key is reported instead
 //! of being silently ignored.
@@ -17,7 +17,7 @@ pub use crate::config::duration::{parse_duration, DurationParseError};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-/// The whole workflow file (`WORKFLOW_SCHEMA.md` §2).
+/// The whole workflow file (`docs/dev/workflow-schema.md` §2).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowFile {

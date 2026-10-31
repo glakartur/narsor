@@ -1,7 +1,7 @@
 //! Loading of YAML workflow definitions into the domain model (U1).
 //!
 //! The reference fixture is `tests/fixtures/implement_feature.yaml`, copied
-//! verbatim from `WORKFLOW_SCHEMA.md` §4.
+//! verbatim from `docs/dev/workflow-schema.md` §4.
 
 use narsor_engine::domain::{
     ActionConfig, ExecutionStatus, HumanInputType, ParamType, State, TerminalStatus,

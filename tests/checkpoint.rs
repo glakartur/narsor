@@ -430,7 +430,7 @@ fn a_nested_repository_restores_as_an_empty_directory() {
 #[test]
 fn a_plain_directory_round_trips_without_becoming_a_repository() {
     // AE8 / Review Focus 4: a workflow that declares no workspace gets an empty
-    // directory (DOMAIN_MODEL.md §2.8). It must checkpoint through the very same
+    // directory (docs/dev/domain-model.md §2.8). It must checkpoint through the very same
     // code — and must not grow a `.git` of its own.
     let temp = TempRoot::new();
     let work = temp.join("plain");

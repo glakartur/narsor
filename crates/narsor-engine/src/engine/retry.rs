@@ -7,7 +7,7 @@
 //! # `max_attempts` counts attempts, not retries
 //!
 //! [`RetryPolicy::max_attempts`] is the **total** number of attempts including
-//! the first one, exactly as `WORKFLOW_SCHEMA.md` spells it. `max_attempts: 1`
+//! the first one, exactly as `docs/dev/workflow-schema.md` spells it. `max_attempts: 1`
 //! therefore means "no retry" and `max_attempts: 3` means at most two
 //! [`crate::domain::EventData::ActionRetrying`] events. A `max_attempts: 0`
 //! written by hand is read as one attempt rather than none: refusing to run an

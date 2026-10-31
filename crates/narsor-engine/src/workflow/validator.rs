@@ -1,4 +1,4 @@
-//! Static validation of a workflow definition (`WORKFLOW_SCHEMA.md` §5).
+//! Static validation of a workflow definition (`docs/dev/workflow-schema.md` §5).
 //!
 //! The validator implements the four rule groups of the contract — graph
 //! consistency, action correctness, decision correctness and variable

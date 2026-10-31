@@ -1069,7 +1069,7 @@ async fn running_a_paused_execution_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// The reference workflow of WORKFLOW_SCHEMA.md §4
+// The reference workflow of docs/dev/workflow-schema.md §4
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1194,7 +1194,7 @@ async fn the_reference_workflow_runs_end_to_end_on_stubs() {
         ]
     );
 
-    // No gaps in the numbering (DOMAIN_MODEL.md §5).
+    // No gaps in the numbering (docs/dev/domain-model.md §5).
     let sequences: Vec<u64> = harness
         .events(&execution.id)
         .iter()

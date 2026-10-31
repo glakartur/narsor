@@ -1,7 +1,7 @@
 //! Directory layout of the three roots.
 //!
 //! All path construction lives here so that the layout described in
-//! `DOMAIN_MODEL.md` §2.7 is defined exactly once — which is why splitting one
+//! `docs/dev/domain-model.md` §2.7 is defined exactly once — which is why splitting one
 //! root into three did not scatter it into three modules.
 //!
 //! The three are separate *types* rather than three fields of one, because the

@@ -1,4 +1,4 @@
-//! `AgentAction` executor (`WORKFLOW_SCHEMA.md` §3.3.A, decisions D17–D20).
+//! `AgentAction` executor (`docs/dev/workflow-schema.md` §3.3.A, decisions D17–D20).
 //!
 //! Runs an AI coding agent in the execution's workspace through one of the
 //! harness adapters in [`super::harness`], and turns what the agent said into

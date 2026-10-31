@@ -269,5 +269,5 @@ states:
 
 - [GitHub Copilot SDK Documentation](https://docs.github.com/en/copilot/how-tos/copilot-sdk)
 - [Copilot SDK Skills Documentation](https://github.com/github/copilot-sdk/blob/main/docs/features/skills.md)
-- [Narsor Workflow Schema](../../../WORKFLOW_SCHEMA.md)
+- [Narsor Workflow Schema](../dev/workflow-schema.md)
 - [GitHub Copilot SDK Main Documentation](./github_copilot_sdk.md)

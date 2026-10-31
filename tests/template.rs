@@ -1,7 +1,7 @@
 //! Template substitution (U4): `{{ inputs.* }}` and `{{ context.variables.* }}`.
 //!
 //! The reference fixture is `tests/fixtures/implement_feature.yaml`, copied
-//! verbatim from `WORKFLOW_SCHEMA.md` §4.
+//! verbatim from `docs/dev/workflow-schema.md` §4.
 
 use std::collections::HashMap;
 
@@ -66,7 +66,7 @@ fn renders_a_number_without_quotes() {
 
 #[test]
 fn context_shorthand_is_an_alias_for_variables() {
-    // `WORKFLOW_SCHEMA.md` §3.3.D writes the wait filter as
+    // `docs/dev/workflow-schema.md` §3.3.D writes the wait filter as
     // `{{ context.pr_number }}`, which must mean the same variable.
     let context = context(&[("pr_number", json!(123))]);
 

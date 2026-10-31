@@ -1,7 +1,7 @@
 //! Per-execution workspace lifecycle.
 //!
 //! Each execution works in its own directory tree under a configurable root,
-//! laid out as `DOMAIN_MODEL.md` §2.8 describes:
+//! laid out as `docs/dev/domain-model.md` §2.8 describes:
 //!
 //! ```text
 //! {root}/tasks/{execution_id}/code/

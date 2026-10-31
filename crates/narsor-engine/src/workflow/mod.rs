@@ -1,6 +1,6 @@
 //! Workflow definition loading.
 //!
-//! `schema` mirrors the YAML contract from `WORKFLOW_SCHEMA.md` one to one,
+//! `schema` mirrors the YAML contract from `docs/dev/workflow-schema.md` one to one,
 //! `loader` compiles those structures into the domain model. Keeping the two
 //! apart means the file format can evolve (the `version` field) without the
 //! runtime types following along, and error messages can name YAML fields

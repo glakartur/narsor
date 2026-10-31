@@ -1,6 +1,6 @@
 //! Choosing the transition a finished action selects.
 //!
-//! `WORKFLOW_SCHEMA.md` §3.4 knows three decision providers. Two of them exist
+//! `docs/dev/workflow-schema.md` §3.4 knows three decision providers. Two of them exist
 //! in this version:
 //!
 //! * **`rules`** (the default, and what a state without a `decision` block
@@ -59,7 +59,7 @@ pub struct DecisionOutcome {
 }
 
 impl DecisionOutcome {
-    /// The provider name as the event log and `WORKFLOW_SCHEMA.md` spell it.
+    /// The provider name as the event log and `docs/dev/workflow-schema.md` spell it.
     pub fn provider_name(&self) -> &'static str {
         provider_name(&self.provider)
     }
