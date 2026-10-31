@@ -1,7 +1,7 @@
 ---
 title: "feat: Limity abonamentu harnessów w TUI i CLI"
 type: feat
-status: active
+status: completed
 date: 2026-10-31
 revised: 2026-10-31
 origin: docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md
