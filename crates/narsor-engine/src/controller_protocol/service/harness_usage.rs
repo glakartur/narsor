@@ -24,7 +24,9 @@ use narsor_protocol::harness::{self, HARNESSES};
 
 /// The last usage of each harness, keyed by its id in
 /// [`narsor_protocol::harness::HARNESSES`], kept in memory.
-pub(super) type HarnessUsages = std::sync::Mutex<HashMap<&'static str, HeldUsage>>;
+pub(super) type HarnessUsages = std::sync::Mutex<UsageMap>;
+
+type UsageMap = HashMap<&'static str, HeldUsage>;
 
 /// One harness's last report, as the server keeps it.
 #[derive(Debug)]
@@ -93,7 +95,7 @@ impl ProtocolService {
         HarnessUsageResponse { harnesses }
     }
 
-    fn lock_harness_usages(&self) -> std::sync::MutexGuard<'_, HashMap<&'static str, HeldUsage>> {
+    fn lock_harness_usages(&self) -> std::sync::MutexGuard<'_, UsageMap> {
         self.harness_usages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -133,7 +135,7 @@ fn validate_usage_report(
 
 /// Removes the limits that reset already, the harnesses whose report is too
 /// old and the harnesses left without a limit.
-fn prune_usages(usages: &mut HashMap<&'static str, HeldUsage>, now: DateTime<Utc>) {
+fn prune_usages(usages: &mut UsageMap, now: DateTime<Utc>) {
     usages.retain(|_, usage| {
         usage.limits.retain(|limit| limit.resets_at > now);
         usage.received_at + USAGE_STATE_LIFETIME > now && !usage.limits.is_empty()

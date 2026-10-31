@@ -363,11 +363,12 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
         let Some(mut object) = parse_object(line) else {
             return classify::invalid_json();
         };
-        if object.get("type").and_then(Value::as_str) == Some(usage::RATE_LIMIT_EVENT) {
+        let kind = object.get("type").and_then(Value::as_str);
+        if kind == Some(usage::RATE_LIMIT_EVENT) {
             self.usage = Some(usage::limits(&object));
             return Vec::new();
         }
-        if object.get("type").and_then(Value::as_str) == Some("system")
+        if kind == Some("system")
             && object.get("subtype").and_then(Value::as_str) == Some("permission_denied")
         {
             if let Some(id) = object.get("tool_use_id").and_then(Value::as_str) {

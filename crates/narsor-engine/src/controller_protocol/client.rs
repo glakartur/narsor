@@ -134,6 +134,17 @@ impl Transport {
         body: &B,
         timeout: Duration,
     ) -> Result<T, ClientError> {
+        let (request, body) = self.json_post(path, body, timeout)?;
+        self.send(request, body).await
+    }
+
+    /// A `POST path` request carrying `body` as JSON, bounded by `timeout`.
+    fn json_post<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<(reqwest::RequestBuilder, Vec<u8>), ClientError> {
         let body = serde_json::to_vec(body)
             .map_err(|error| ClientError::Server(format!("cannot encode the request: {error}")))?;
         let request = self
@@ -141,19 +152,13 @@ impl Transport {
             .request(Method::POST, self.url(path))
             .header(CONTENT_TYPE, "application/json")
             .timeout(timeout);
-        self.send(request, body).await
+        Ok((request, body))
     }
 
     /// `POST path` answered with `204 No Content`; any other answer is
     /// mapped as [`handle_json_response`] maps it.
     async fn post_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<(), ClientError> {
-        let body = serde_json::to_vec(body)
-            .map_err(|error| ClientError::Server(format!("cannot encode the request: {error}")))?;
-        let request = self
-            .http
-            .request(Method::POST, self.url(path))
-            .header(CONTENT_TYPE, "application/json")
-            .timeout(REQUEST_TIMEOUT);
+        let (request, body) = self.json_post(path, body, REQUEST_TIMEOUT)?;
         let response = self.send_raw(request, body).await?;
         if response.status() == reqwest::StatusCode::NO_CONTENT {
             return Ok(());
