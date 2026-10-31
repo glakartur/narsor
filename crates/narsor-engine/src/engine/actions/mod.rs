@@ -50,7 +50,9 @@ use crate::domain::{
 };
 use crate::persistence::ConversationStore;
 
-pub use agent::{AgentEventSink, AgentExecutor, DefaultHarnessSource, LoggingEventSink};
+pub use agent::{
+    AgentEventSink, AgentExecutor, DefaultHarnessSource, LoggingEventSink, UsageReporter,
+};
 pub use answer::ChoiceAnswer;
 pub use harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry,

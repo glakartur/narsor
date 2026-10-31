@@ -428,10 +428,7 @@ fn group(transcript: TranscriptEntry, event: &TranscriptEvent) -> TranscriptEntr
         ChatElement::Technical { category, .. }
             if matches!(
                 category,
-                TechnicalCategory::Hook
-                    | TechnicalCategory::RateLimit
-                    | TechnicalCategory::Compaction
-                    | TechnicalCategory::System
+                TechnicalCategory::Hook | TechnicalCategory::Compaction | TechnicalCategory::System
             ) =>
         {
             transcript

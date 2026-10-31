@@ -63,6 +63,7 @@ use narsor_protocol::chat::{
     summary_line, ChatElement, QuestionSource, TechnicalCategory, UnclassifiedReason,
     SUMMARY_MAX_CHARS,
 };
+use narsor_protocol::controller::{HarnessUsageReport, UsageLimit};
 use serde_json::{Map, Value};
 use std::process::ExitStatus;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -318,6 +319,61 @@ pub trait AgentEventSink: Send + Sync + std::fmt::Debug {
     fn emit(&self, execution_id: &str, data: EventData);
 }
 
+/// Receives the usage limits a harness reported during a run (R8).
+///
+/// Shared between executions, like [`AgentEventSink`]. The runner installs
+/// one that hands the report to its control loop; without one (the daemon's
+/// engine, a direct unit test) the limits are dropped.
+pub trait UsageReporter: Send + Sync + std::fmt::Debug {
+    /// Takes the latest usage limits of one harness.
+    ///
+    /// Reporting must never block or fail a run: the report is handed on
+    /// and the call returns, whatever becomes of it later.
+    fn report(&self, report: HarnessUsageReport);
+}
+
+/// Where the usage limits read from one harness's stdout go: the reporter,
+/// with the harness they belong to.
+#[derive(Clone, Copy)]
+struct UsageRelay<'a> {
+    harness: &'a str,
+    reporter: &'a dyn UsageReporter,
+}
+
+impl UsageRelay<'_> {
+    /// Reports `limits`, observed now.
+    fn relay(&self, limits: Vec<UsageLimit>) {
+        self.reporter.report(HarnessUsageReport {
+            harness: self.harness.to_string(),
+            observed_at: Utc::now(),
+            limits,
+        });
+    }
+}
+
+/// Records one stdout line the parser has just been fed, with its
+/// `elements`: in the conversation, unless the line was a usage report.
+///
+/// A usage report is not part of the conversation (R8a): its limits go to
+/// `usage` instead, when there are any and somewhere to send them.
+fn record_stdout_line(
+    parser: &mut dyn HarnessStreamParser,
+    conversation: &ConversationSink,
+    usage: Option<UsageRelay<'_>>,
+    line: &[u8],
+    elements: &[ChatElement],
+) {
+    match parser.take_usage() {
+        None => conversation.append(ConversationSource::Stdout, line, elements),
+        Some(limits) if limits.is_empty() => {}
+        Some(limits) => {
+            if let Some(usage) = usage {
+                usage.relay(limits);
+            }
+        }
+    }
+}
+
 /// The sink the engine installs: append to the execution's log, then publish.
 #[derive(Debug, Clone)]
 pub struct LoggingEventSink {
@@ -456,6 +512,7 @@ impl ConversationSink {
 pub struct AgentExecutor {
     harnesses: HarnessRegistry,
     events: Option<Arc<dyn AgentEventSink>>,
+    usage: Option<Arc<dyn UsageReporter>>,
     /// How long a harness may go on after its final answer.
     final_answer_grace: Duration,
 }
@@ -487,11 +544,13 @@ impl DefaultHarnessSource for DefaultHarnessSelector {
 }
 
 impl AgentExecutor {
-    /// An executor with the stock harnesses and no event sink.
+    /// An executor with the stock harnesses, no event sink and no usage
+    /// reporter.
     pub fn new() -> Self {
         Self {
             harnesses: HarnessRegistry::defaults(),
             events: None,
+            usage: None,
             final_answer_grace: FINAL_ANSWER_GRACE,
         }
     }
@@ -508,6 +567,7 @@ impl AgentExecutor {
         Self {
             harnesses,
             events: None,
+            usage: None,
             final_answer_grace: FINAL_ANSWER_GRACE,
         }
     }
@@ -515,6 +575,13 @@ impl AgentExecutor {
     /// Returns the executor with the session events routed to `sink`.
     pub fn with_event_sink(mut self, sink: Arc<dyn AgentEventSink>) -> Self {
         self.events = Some(sink);
+        self
+    }
+
+    /// Returns the executor with the usage limits its harnesses report
+    /// routed to `reporter`.
+    pub fn with_usage_reporter(mut self, reporter: Arc<dyn UsageReporter>) -> Self {
+        self.usage = Some(reporter);
         self
     }
 
@@ -644,6 +711,10 @@ impl AgentExecutor {
         );
         session.status = AgentSessionStatus::Running;
 
+        let usage = self.usage.as_deref().map(|reporter| UsageRelay {
+            harness: adapter.name(),
+            reporter,
+        });
         let ending = run_harness_invocation(
             &invocation.program,
             &invocation.args,
@@ -654,6 +725,7 @@ impl AgentExecutor {
             self.final_answer_grace,
             adapter.stream_parser(),
             &conversation,
+            usage,
         )
         .await;
 
@@ -1010,7 +1082,7 @@ pub(crate) enum SpawnEnding {
 /// the spawning (through [`spawn_retrying_text_busy`]), the pipe draining and
 /// the stream parsing of an agent step without being one. The elements the
 /// parser returns are discarded with the lines: there is nowhere to record
-/// them.
+/// them. So are the usage limits: the conductor has no reporter.
 pub(crate) async fn run_harness_process(
     program: &str,
     args: &[String],
@@ -1028,6 +1100,7 @@ pub(crate) async fn run_harness_process(
         FINAL_ANSWER_GRACE,
         parser,
         &ConversationSink::none(),
+        None,
     )
     .await
 }
@@ -1043,6 +1116,7 @@ async fn run_harness_invocation(
     grace: Duration,
     parser: Box<dyn HarnessStreamParser>,
     conversation: &ConversationSink,
+    usage: Option<UsageRelay<'_>>,
 ) -> Result<SpawnEnding, ActionError> {
     run_harness_invocation_with_sdk(
         program,
@@ -1054,6 +1128,7 @@ async fn run_harness_invocation(
         grace,
         parser,
         conversation,
+        usage,
         &GitHubCopilotSdkRuntime::default(),
     )
     .await
@@ -1070,6 +1145,7 @@ async fn run_harness_invocation_with_sdk(
     grace: Duration,
     parser: Box<dyn HarnessStreamParser>,
     conversation: &ConversationSink,
+    usage: Option<UsageRelay<'_>>,
     sdk_runtime: &dyn CopilotSdkBackend,
 ) -> Result<SpawnEnding, ActionError> {
     if program == GITHUB_COPILOT_PROGRAM && args.first().is_some_and(|arg| arg == "agent") {
@@ -1080,6 +1156,7 @@ async fn run_harness_invocation_with_sdk(
             limit,
             parser,
             conversation,
+            usage,
             sdk_runtime,
         )
         .await;
@@ -1095,6 +1172,7 @@ async fn run_harness_invocation_with_sdk(
         grace,
         parser,
         conversation,
+        usage,
     )
     .await
 }
@@ -1132,7 +1210,8 @@ type Joined = (io::Result<()>, io::Result<()>, io::Result<ExitStatus>);
 
 /// Runs the harness, draining both pipes while it goes and feeding every
 /// stdout line to `parser` and then, with the elements it returned, to the
-/// conversation store.
+/// conversation store — or, for a usage report, its limits to `usage`
+/// ([`record_stdout_line`]).
 ///
 /// Reading is a line loop ([`stream_lines`]) rather than `read_capped` (used
 /// by the script executor, which has no per-line structure to preserve): a
@@ -1157,6 +1236,7 @@ async fn spawn_and_wait(
     grace: Duration,
     parser: Box<dyn HarnessStreamParser>,
     conversation: &ConversationSink,
+    usage: Option<UsageRelay<'_>>,
 ) -> Result<SpawnEnding, ActionError> {
     let mut command = Command::new(program);
     command.args(args).current_dir(working_dir);
@@ -1204,7 +1284,7 @@ async fn spawn_and_wait(
                 reason: UnclassifiedReason::TooLarge,
             }]
         };
-        conversation.append(ConversationSource::Stdout, line, &elements);
+        record_stdout_line(parser.as_mut(), conversation, usage, line, &elements);
         let ends_step = match parser.final_answer() {
             Some(FinalAnswer::Choice) => true,
             Some(FinalAnswer::AwaitingInput) => KILL_AFTER_QUESTION,
@@ -2026,6 +2106,7 @@ async fn run_copilot_sdk(
     limit: Option<Duration>,
     parser: Box<dyn HarnessStreamParser>,
     conversation: &ConversationSink,
+    usage: Option<UsageRelay<'_>>,
     sdk_runtime: &dyn CopilotSdkBackend,
 ) -> Result<SpawnEnding, ActionError> {
     if args.len() < 2 {
@@ -2087,18 +2168,21 @@ async fn run_copilot_sdk(
             feed_copilot_sdk_record(
                 &mut parser,
                 conversation,
+                usage,
                 serde_json::json!({"type": "session", "session_id": response.session_id}),
             );
             if let Some(text) = &response.text {
                 feed_copilot_sdk_record(
                     &mut parser,
                     conversation,
+                    usage,
                     serde_json::json!({"type": "assistant", "content": text}),
                 );
             }
             feed_copilot_sdk_record(
                 &mut parser,
                 conversation,
+                usage,
                 serde_json::json!({
                     "type": "result",
                     "session_id": response.session_id,
@@ -2119,11 +2203,18 @@ async fn run_copilot_sdk(
 fn feed_copilot_sdk_record(
     parser: &mut Box<dyn HarnessStreamParser>,
     conversation: &ConversationSink,
+    usage: Option<UsageRelay<'_>>,
     record: Value,
 ) {
     let line = record.to_string();
     let elements = parser.on_stdout_line(line.as_bytes());
-    conversation.append(ConversationSource::Stdout, line.as_bytes(), &elements);
+    record_stdout_line(
+        parser.as_mut(),
+        conversation,
+        usage,
+        line.as_bytes(),
+        &elements,
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2373,6 +2464,7 @@ mod copilot_sdk_dispatch_tests {
             FINAL_ANSWER_GRACE,
             adapter.stream_parser(),
             &ConversationSink::none(),
+            None,
         )
         .await
         {
@@ -2407,6 +2499,7 @@ mod copilot_sdk_dispatch_tests {
             FINAL_ANSWER_GRACE,
             adapter.stream_parser(),
             &ConversationSink::none(),
+            None,
             &sdk,
         )
         .await

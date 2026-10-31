@@ -324,13 +324,12 @@ fn init_starts_the_session_and_rate_limits_are_not_conversation() {
         }
     );
 
+    // The element a usage report was stored as before carried its
+    // `rate_limit_info` as data.
     assert!(
         !elements.iter().any(|element| matches!(
             element,
-            ChatElement::Technical {
-                category: TechnicalCategory::RateLimit,
-                ..
-            }
+            ChatElement::Technical { data: Some(data), .. } if data.get("rateLimitType").is_some()
         )),
         "{elements:?}"
     );

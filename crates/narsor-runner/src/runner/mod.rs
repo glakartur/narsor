@@ -83,7 +83,9 @@
 //! Work never waits for the control plane, except for that one decision.
 //! Reports that fail are not queued for replay: the next attempt builds a
 //! fresh snapshot from storage, so a reconnect reports the latest cursor
-//! once, and nothing is ever re-executed to produce it.
+//! once, and nothing is ever re-executed to produce it. The usage limits the
+//! harnesses report ([`usage`], R8) are sent once, the latest only, and
+//! dropped when that fails.
 
 pub mod cli;
 mod commands;
@@ -99,6 +101,7 @@ pub mod secrets;
 mod session_tests;
 mod snapshot;
 pub mod storage;
+mod usage;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -119,7 +122,7 @@ use crate::domain::{
     AnsweredBy, ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec,
     TaskWorkspace, WorkflowDefinition, WorkflowExecution, Workspace,
 };
-use crate::engine::{Engine, EngineError, HumanInputDelivery, Recovery};
+use crate::engine::{Engine, EngineError, HumanInputDelivery, Recovery, UsageReporter};
 use crate::orchestration::{
     CommandActor, HarnessUnavailable, OwnerCommand, ResumeMessage, RunnerProblem, RunnerSnapshot,
 };
@@ -421,16 +424,52 @@ pub async fn run(
     }
     apply_environment(&environment);
 
-    let harness = Arc::new(LiveHarness::new(starting_harness(&storage, &spec)));
-    let engine = Arc::new(
-        Engine::new(store)
-            .with_default_harness_source(harness.clone())
-            .with_task_labels(spec.ticket.clone(), spec.title.clone()),
+    let mut session = assemble_session(
+        &config,
+        storage,
+        link,
+        &spec,
+        definition,
+        |engine, _| engine,
+        conductor::ConductorHost::assemble,
     );
+    session.begin(&spec).await
+}
 
-    let conductor =
-        conductor::ConductorHost::assemble(&engine, &storage, Arc::clone(&harness), &definition);
-    let mut session = Session {
+/// Assembles the work phase of one runner process: the usage reporter and
+/// the channel it feeds, the engine given the reporter, the conductor around
+/// the engine, and the session holding them all.
+///
+/// [`run`] and the in-process tests assemble their session here, so the
+/// tests drive the wiring [`run`] does. `customize` gets the engine before
+/// anything else holds it, with the reporter it was given — the tests
+/// register their own agent there — and `conductor` builds the conductor
+/// host.
+fn assemble_session(
+    config: &RunnerConfig,
+    storage: TaskStorage,
+    link: Link,
+    spec: &TaskLaunchSpec,
+    definition: Arc<WorkflowDefinition>,
+    customize: impl FnOnce(Engine, &Arc<dyn UsageReporter>) -> Engine,
+    conductor: impl FnOnce(
+        &Arc<Engine>,
+        &TaskStorage,
+        Arc<LiveHarness>,
+        &Arc<WorkflowDefinition>,
+    ) -> conductor::ConductorHost,
+) -> Session {
+    let (reporter, usage) = usage::LatestUsage::channel();
+    let reporter: Arc<dyn UsageReporter> = reporter;
+    let harness = Arc::new(LiveHarness::new(starting_harness(&storage, spec)));
+    let engine = Engine::new(storage.store())
+        .with_usage_reporter(Arc::clone(&reporter))
+        .with_default_harness_source(harness.clone())
+        .with_task_labels(spec.ticket.clone(), spec.title.clone());
+    let engine = Arc::new(customize(engine, &reporter));
+
+    let conductor = conductor(&engine, &storage, Arc::clone(&harness), &definition);
+    Session {
         storage,
         engine,
         conductor,
@@ -442,6 +481,7 @@ pub async fn run(
         timing: config.timing.clone(),
         link,
         cache: snapshot::ConversationCache::default(),
+        usage,
         execution_id: None,
         directive: RunnerDirective::Continue,
         pass: None,
@@ -449,8 +489,7 @@ pub async fn run(
         material_failures: 0,
         material_retry_at: None,
         title_wanted: spec.title.is_none(),
-    };
-    session.begin(&spec).await
+    }
 }
 
 /// The variables that point the harnesses at their configuration: the
@@ -727,6 +766,8 @@ struct Session {
     timing: RunnerTiming,
     link: Link,
     cache: snapshot::ConversationCache,
+    /// The latest usage limits the engine's harnesses reported, not sent yet.
+    usage: usage::UsageReports,
     execution_id: Option<String>,
     directive: RunnerDirective,
     pass: Option<JoinHandle<Result<WorkflowExecution, EngineError>>>,
@@ -1233,6 +1274,8 @@ impl Session {
         let mut last_report: Option<Instant> = None;
         let mut poll: Option<InFlightPoll> = None;
         let mut pause_asked = false;
+        // Until every reporter is gone, which only a test's engine allows.
+        let mut usage_open = true;
 
         loop {
             // Before a pause or stop is honoured: what the last pass left
@@ -1339,6 +1382,14 @@ impl Session {
                         dirty = true;
                     }
                 }
+                changed = self.usage.changed(), if usage_open => {
+                    match changed {
+                        Ok(()) => {
+                            self.send_usage();
+                        }
+                        Err(_) => usage_open = false,
+                    }
+                }
                 _ = tokio::time::sleep_until(wake) => {}
             }
         }
@@ -1375,6 +1426,18 @@ impl Session {
             .engine
             .pending_input(execution_id)?
             .map(|pending| pending.episode_key().to_string()))
+    }
+
+    /// Sends the latest usage report once, in a task of its own, when there
+    /// is a client to send it with; the task is returned for the tests.
+    ///
+    /// Neither a missing client nor a failed send touches the link's
+    /// backoff: the report is simply dropped (R8), and the next one the
+    /// harness writes takes its place.
+    fn send_usage(&mut self) -> Option<JoinHandle<()>> {
+        let report = self.usage.borrow_and_update().clone()?;
+        let client = self.link.client()?;
+        Some(usage::send(client, report))
     }
 
     /// Sends a fresh snapshot; true when the control plane took it.

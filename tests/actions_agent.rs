@@ -28,7 +28,8 @@ use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry, InputContinuation,
     LoggingEventSink, OpenCodeAdapter, OutputProblem, OutputRejection, PendingHumanInput,
-    StepContract, SuspendedAction, METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
+    StepContract, SuspendedAction, UsageReporter, METADATA_ENGINE_KEY,
+    METADATA_OUTPUT_REJECTION_KEY,
 };
 use narsor_engine::persistence::{
     recover, ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
@@ -38,6 +39,7 @@ use narsor_engine::workflow::{load_from_file, TemplateScope};
 use narsor_protocol::chat::{
     ChatElement, PromptPurpose, QuestionSource, TechnicalCategory, UnclassifiedReason,
 };
+use narsor_protocol::controller::{HarnessUsageReport, UsageStatus};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -4803,4 +4805,224 @@ async fn the_harness_inherits_the_environment_of_the_runner_process() {
         fs::read_to_string(bin.join("home.out")).expect("the harness wrote HOME"),
         std::env::var("HOME").unwrap_or_default()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Usage limits (R8, R8a): reported, never part of the conversation
+// ---------------------------------------------------------------------------
+
+/// A usage reporter that keeps what it was given.
+#[derive(Debug, Default)]
+struct RecordingReporter {
+    reports: Mutex<Vec<HarnessUsageReport>>,
+}
+
+impl RecordingReporter {
+    fn reports(&self) -> Vec<HarnessUsageReport> {
+        self.reports.lock().expect("reports").clone()
+    }
+}
+
+impl UsageReporter for RecordingReporter {
+    fn report(&self, report: HarnessUsageReport) {
+        self.reports.lock().expect("reports").push(report);
+    }
+}
+
+/// The recorded `rate_limit_event` line with a five-hour and a seven-day
+/// window, both `allowed`.
+fn recorded_rate_limit_event() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude-code/noschema_background.ndjson");
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        .lines()
+        .find(|line| line.contains("\"type\":\"rate_limit_event\""))
+        .expect("the recording has a rate_limit_event line")
+        .to_string()
+}
+
+/// A `rate_limit_event` line whose only window is one narsor does not know.
+fn unknown_window_rate_limit_event() -> String {
+    json!({
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "allowed",
+            "rateLimitType": "opus_weekly",
+            "unifiedWindows": {
+                "opus_weekly": { "utilization": 0.3, "resetsAt": 1793390400, "status": "allowed" },
+            },
+        },
+        "session_id": "fake-session-1",
+    })
+    .to_string()
+}
+
+/// [`claude_stream`] with `usage_line` written just before its `result`.
+fn claude_stream_with_usage(usage_line: &str) -> String {
+    let stream = claude_stream("fake-session-1", r#"{"choice":"ready"}"#);
+    let mut lines: Vec<&str> = stream.lines().collect();
+    lines.insert(lines.len() - 1, usage_line);
+    lines.iter().map(|line| format!("{line}\n")).collect()
+}
+
+/// The stdout entries of the attempt's conversation.
+fn stdout_entries(conversation: &ConversationFixture) -> Vec<ConversationEntry> {
+    conversation
+        .entries(ACTION_EXECUTION_ID)
+        .into_iter()
+        .filter(|entry| entry.source == ConversationSource::Stdout)
+        .collect()
+}
+
+/// Whether any stdout entry is the `rate_limit_event` line, raw or parsed.
+fn records_usage(entries: &[ConversationEntry]) -> bool {
+    entries.iter().any(|entry| {
+        entry_text(entry).contains("rate_limit_event")
+            || entry.elements.iter().any(|element| {
+                matches!(element, ChatElement::Technical { data: Some(data), .. }
+                    if data.get("rateLimitType").is_some())
+            })
+    })
+}
+
+/// Covers AE1. The limits of a `rate_limit_event` go to the reporter,
+/// once, under the harness that ran; the line itself is not in the
+/// conversation, neither raw nor as an element.
+#[tokio::test]
+async fn a_usage_report_reaches_the_reporter_and_not_the_conversation() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&claude_stream_with_usage(&recorded_rate_limit_event()));
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = executor(&fake).with_usage_reporter(reporter.clone());
+
+    let before = chrono::Utc::now();
+    let outcome = execute_with_conversation(
+        &executor,
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+
+    let reports = reporter.reports();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert_eq!(report.harness, "claude-code");
+    assert!(report.observed_at >= before);
+    let windows: Vec<(&str, f64, Option<UsageStatus>)> = report
+        .limits
+        .iter()
+        .map(|limit| (limit.window.as_str(), limit.utilization, limit.status))
+        .collect();
+    assert_eq!(
+        windows,
+        [
+            ("5h", 0.22, Some(UsageStatus::Allowed)),
+            ("7d", 0.55, Some(UsageStatus::Allowed)),
+        ]
+    );
+
+    let stdout = stdout_entries(&conversation);
+    assert_eq!(stdout.len(), 4, "the four other lines: {stdout:?}");
+    assert!(!records_usage(&stdout), "{stdout:?}");
+}
+
+/// Without a reporter the limits are dropped; the step and its
+/// conversation are the same.
+#[tokio::test]
+async fn without_a_reporter_a_usage_report_is_dropped_and_the_step_completes() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&claude_stream_with_usage(&recorded_rate_limit_event()));
+
+    let outcome = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action");
+    };
+    assert_eq!(result.output_label, "ready");
+
+    let stdout = stdout_entries(&conversation);
+    assert_eq!(stdout.len(), 4, "{stdout:?}");
+    assert!(!records_usage(&stdout), "{stdout:?}");
+}
+
+/// A `rate_limit_event` without a window narsor knows is still no part of
+/// the conversation, and there is nothing to report.
+#[tokio::test]
+async fn a_usage_report_without_known_windows_is_neither_reported_nor_recorded() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&claude_stream_with_usage(&unknown_window_rate_limit_event()));
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = executor(&fake).with_usage_reporter(reporter.clone());
+
+    let outcome = execute_with_conversation(
+        &executor,
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+
+    assert_eq!(reporter.reports(), []);
+    let stdout = stdout_entries(&conversation);
+    assert_eq!(stdout.len(), 4, "{stdout:?}");
+    assert!(!records_usage(&stdout), "{stdout:?}");
+}
+
+/// Only a parser that knows usage reports takes lines out of the
+/// conversation: a `codex` step keeps every stdout line, even one that
+/// looks like Claude Code's report, and reports nothing.
+#[tokio::test]
+async fn a_codex_step_keeps_every_stdout_line_and_reports_nothing() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    let stream = codex_stream("thread-7", r#"{"choice":"ready"}"#);
+    let mut lines: Vec<String> = stream.lines().map(str::to_string).collect();
+    lines.insert(1, recorded_rate_limit_event());
+    fake.answers(
+        &lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    )
+    .with_usage_reporter(reporter.clone());
+    let mut config = agent_action("look around");
+    config.harness = Some("codex".to_string());
+
+    let outcome =
+        execute_with_conversation(&executor, config, &root.workspace(), &conversation, None)
+            .await
+            .expect("the run completes");
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+
+    assert_eq!(reporter.reports(), []);
+    let stdout = stdout_entries(&conversation);
+    let raw: Vec<String> = stdout.iter().map(entry_text).collect();
+    assert_eq!(raw, lines);
 }

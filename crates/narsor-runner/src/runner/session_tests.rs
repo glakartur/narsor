@@ -31,12 +31,14 @@ use crate::conductor::{
     ChatAuthor, ConductorAnswer, ConductorInvoker, ConductorView, Invocation, InvocationOutcome,
     ProposalState,
 };
-use crate::controller_protocol::{ConductorReadRequest, DeliveredOperatorCommand};
+use crate::controller_protocol::{
+    ConductorReadRequest, DeliveredOperatorCommand, HarnessUsageReport, UsageLimit,
+};
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, ConductorPurpose, EventData, ResolvedEnvironment,
     ResourceProfile,
 };
-use crate::engine::{ActionExecutor, ActionKind, ActionOutcome, ActionRequest};
+use crate::engine::{ActionExecutor, ActionKind, ActionOutcome, ActionRequest, UsageReporter};
 use crate::orchestration::{AttentionKind, OperatorCommand};
 
 // ---------------------------------------------------------------------------
@@ -98,6 +100,9 @@ enum Reply {
     Hang,
     /// Answers with this label once the notify is opened.
     After(Arc<Notify>, &'static str),
+    /// Reports these usage limits, in order, then answers with this label,
+    /// as the agent executor does with what its harness reported.
+    Reports(Vec<HarnessUsageReport>, &'static str),
     /// Fails, as a harness that exited with an error.
     Fail,
     /// Answers with text that names no output label.
@@ -117,6 +122,8 @@ struct Agent {
     replies: Mutex<VecDeque<Reply>>,
     fallback: Reply,
     calls: Mutex<Vec<Call>>,
+    /// The usage reporter of the last session's engine the agent joined.
+    usage: Mutex<Option<Arc<dyn UsageReporter>>>,
 }
 
 impl Agent {
@@ -125,6 +132,7 @@ impl Agent {
             replies: Mutex::new(replies.into()),
             fallback,
             calls: Mutex::new(Vec::new()),
+            usage: Mutex::new(None),
         })
     }
 
@@ -173,6 +181,14 @@ impl ActionExecutor for Agent {
                 Reply::Hang => std::future::pending().await,
                 Reply::After(gate, label) => {
                     gate.notified().await;
+                    completed(label, json!({}))
+                }
+                Reply::Reports(reports, label) => {
+                    let reporter = self.usage.lock().unwrap().clone();
+                    let reporter = reporter.expect("the session's usage reporter");
+                    for report in reports {
+                        reporter.report(report);
+                    }
                     completed(label, json!({}))
                 }
                 Reply::Fail => Err(ActionError {
@@ -344,40 +360,27 @@ impl Fixture {
         )
         .expect("initialize the storage");
         let definition = Arc::new(spec.definition().expect("the definition"));
-        let harness = Arc::new(LiveHarness::new(starting_harness(&storage, spec)));
-        let engine = Arc::new(
-            Engine::new(storage.store())
-                .with_executor(ActionKind::Agent, agent.clone())
-                .with_default_harness_source(harness.clone())
-                .with_task_labels(spec.ticket.clone(), spec.title.clone()),
-        );
-        let host = ConductorHost::assemble_with(
-            &engine,
-            Arc::clone(&harness),
-            &definition,
-            conductor.clone(),
-            HarnessProbe::on_path(path.as_os_str()),
-        );
-        let session = Session {
+        let link = Link::new(&config);
+        let session = assemble_session(
+            &config,
             storage,
-            engine,
-            conductor: host,
-            harness,
-            harness_unavailable: None,
-            report_forced: false,
+            link,
+            spec,
             definition,
-            incarnation: config.incarnation.clone(),
-            timing: config.timing.clone(),
-            link: Link::new(&config),
-            cache: snapshot::ConversationCache::default(),
-            execution_id: None,
-            directive: RunnerDirective::Continue,
-            pass: None,
-            outbox_due: true,
-            material_failures: 0,
-            material_retry_at: None,
-            title_wanted: spec.title.is_none(),
-        };
+            |engine, reporter| {
+                *agent.usage.lock().unwrap() = Some(Arc::clone(reporter));
+                engine.with_executor(ActionKind::Agent, agent.clone())
+            },
+            |engine, _, harness, definition| {
+                ConductorHost::assemble_with(
+                    engine,
+                    harness,
+                    definition,
+                    conductor.clone(),
+                    HarnessProbe::on_path(path.as_os_str()),
+                )
+            },
+        );
         Self {
             session,
             agent,
@@ -725,6 +728,98 @@ fn a_refused_credential_is_renewed_and_failures_back_off() {
         link.renew_due(Duration::from_secs(5 * 60)),
         "renewed ahead of its expiry"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Usage limits (R8)
+// ---------------------------------------------------------------------------
+
+/// A report of `claude-code`'s five-hour limit at `utilization`.
+fn usage_report(utilization: f64) -> HarnessUsageReport {
+    HarnessUsageReport {
+        harness: "claude-code".to_string(),
+        observed_at: Utc::now(),
+        limits: vec![UsageLimit {
+            window: "5h".to_string(),
+            utilization,
+            resets_at: Utc::now() + chrono::Duration::hours(4),
+            status: None,
+        }],
+    }
+}
+
+/// A one-step task whose step reports two usage reports, one after the
+/// other, and completes.
+fn reporting(root: &TempRoot) -> Fixture {
+    let agent = Agent::new(
+        vec![Reply::Reports(
+            vec![usage_report(0.1), usage_report(0.2)],
+            "done",
+        )],
+        Reply::Label("done"),
+    );
+    Fixture::start(root, &spec(ONE_STEP, "claude-code"), agent)
+}
+
+/// Covers AE3. The usage limits a step reports leave the control loop
+/// once, the latest only, in a task of their own. A control plane that
+/// cannot be reached costs the step nothing and leaves the link's backoff
+/// as it was: the report is dropped, not retried.
+#[tokio::test]
+async fn only_the_latest_usage_report_is_sent_once_and_a_failure_leaves_the_link_alone() {
+    let root = TempRoot::new();
+    let mut fixture = reporting(&root);
+    // A credential, for a control plane that is not there.
+    fs::write(root.0.join("no-credential"), "credential\n").unwrap();
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+
+    let session = &mut fixture.session;
+    let (failures, next_attempt) = (session.link.failures, session.link.next_attempt);
+    tokio::time::timeout(PATIENCE, session.usage.changed())
+        .await
+        .expect("a report waits")
+        .expect("the reporter is alive");
+    let waiting = session.usage.borrow().clone().expect("a report");
+    assert_eq!(waiting.limits[0].utilization, 0.2, "only the latest waits");
+
+    let sent = session.send_usage().expect("one attempt to send it");
+    tokio::time::timeout(PATIENCE, sent)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt does not panic");
+
+    assert!(
+        !session.usage.has_changed().expect("the reporter is alive"),
+        "nothing is left to send again"
+    );
+    assert_eq!(session.link.failures, failures);
+    assert_eq!(session.link.next_attempt, next_attempt);
+}
+
+/// Without a credential there is no client: the report is dropped and the
+/// link is left as it was.
+#[tokio::test]
+async fn without_a_client_the_usage_report_is_dropped() {
+    let root = TempRoot::new();
+    let mut fixture = reporting(&root);
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+
+    let session = &mut fixture.session;
+    let (failures, next_attempt) = (session.link.failures, session.link.next_attempt);
+    tokio::time::timeout(PATIENCE, session.usage.changed())
+        .await
+        .expect("a report waits")
+        .expect("the reporter is alive");
+    assert!(session.send_usage().is_none(), "no client to send with");
+    assert!(!session.usage.has_changed().expect("the reporter is alive"));
+    assert_eq!(session.link.failures, failures);
+    assert_eq!(session.link.next_attempt, next_attempt);
 }
 
 // ---------------------------------------------------------------------------
