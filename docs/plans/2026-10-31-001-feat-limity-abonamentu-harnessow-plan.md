@@ -3,6 +3,7 @@ title: "feat: Limity abonamentu harnessów w TUI i CLI"
 type: feat
 status: active
 date: 2026-10-31
+revised: 2026-10-31
 origin: docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md
 ---
 
@@ -231,6 +232,27 @@ flowchart TB
     U5 --> U9
     U7 --> U8
 ```
+
+### Etapy wykonania
+
+Dziewięć jednostek to za dużo na jeden krok wykonania. Dwie sesje skończyły się przed końcem pracy. Dlatego pracę dzielimy na etapy. Każdy etap to osobny commit. Na końcu każdego etapu muszą przejść: build całego workspace, `clippy` i testy z plików, które etap zmienia. Etap nie zaczyna pracy z następnego etapu.
+
+| Etap | Jednostki | Wynik etapu | Stan przy rewizji planu |
+|---|---|---|---|
+| 0 | U1, U2, dokumentacja (D70, README) | Wspólna lista harnessów, kontrakt na drucie | Zrobione: commit `4d63793` i `516b9da` |
+| 1 | U3 | Parser oddaje limity, `RateLimit` usunięte | Częściowa praca bez commitu (nie sprawdzona) |
+| 2 | U4, U5 | Stan w `ProtocolService`, endpointy, klienci | Częściowa praca bez commitu (nie sprawdzona) |
+| 3 | U6 | Raport z runnera do serwera (F1 od początku do końca) | Nie zaczęte |
+| 4 | U7, U8 | Limity w dolnym wierszu TUI (F2) | Nie zaczęte |
+| 5 | U9 | Komenda `narsor-cli usage` (F3) | Nie zaczęte |
+
+Zasady etapów:
+
+- **Etap 1 i 2 są niezależne.** Oba zależą tylko od U2. Można je zrobić w dowolnej kolejności.
+- **Etap 5 zależy tylko od etapu 2.** Może być przed etapem 3 lub 4.
+- **Częściowa praca z poprzednich sesji to materiał pomocniczy, nie gotowy wynik.** Praca U3 jest w `.claude/worktrees/agent-ae37fdadd0cd826be`. Praca U4 i U5 jest w `.claude/worktrees/agent-a1343166e67af61c5`. Obie gałęzie startują od `4d63793`. Implementujący porównuje zmiany z tym planem (pliki, test scenarios), uzupełnia braki i uruchamia testy. Jeżeli zmiany są niezgodne z planem, implementujący pisze je od nowa. Po przeniesieniu pracy do gałęzi głównej worktree trzeba usunąć.
+- **Etap 4 jest największy.** Jeżeli sesja jest za krótka, U7 i U8 mogą mieć osobne commity w tym samym etapie. U7 sam nic nie rysuje, ale nie psuje TUI.
+- **README opisuje już `narsor-cli usage`** (commit `516b9da`), chociaż komenda powstaje dopiero w etapie 5. Etap 5 sprawdza, czy opis w README zgadza się z gotową komendą.
 
 ### U1. Wspólna lista harnessów
 
