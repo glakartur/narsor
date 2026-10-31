@@ -60,6 +60,20 @@ type ProtocolResult<T> = Result<T, HttpProtocolError>;
 #[derive(Debug)]
 struct HttpProtocolError(ProtocolError);
 
+/// Runs a synchronous service call (file I/O under advisory locks) on the
+/// blocking pool, so a loaded machine cannot starve the async workers.
+async fn blocking<T, F>(service: &Service, work: F) -> ProtocolResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&ProtocolService) -> Result<T, ProtocolError> + Send + 'static,
+{
+    let service = Arc::clone(service);
+    tokio::task::spawn_blocking(move || work(&service))
+        .await
+        .map_err(|error| HttpProtocolError(ProtocolError::Internal(error.to_string())))?
+        .map_err(HttpProtocolError)
+}
+
 impl From<ProtocolError> for HttpProtocolError {
     fn from(error: ProtocolError) -> Self {
         Self(error)
@@ -375,7 +389,7 @@ async fn create_task(
     Extension(owner): Extension<OwnerRef>,
     Json(request): Json<CreateTaskRequest>,
 ) -> ProtocolResult<(StatusCode, Json<TaskSummary>)> {
-    let summary = service.create_task(&owner, request)?;
+    let summary = blocking(&service, move |s| s.create_task(&owner, request)).await?;
     Ok((StatusCode::CREATED, Json(summary)))
 }
 
@@ -384,7 +398,12 @@ async fn list_tasks(
     Extension(owner): Extension<OwnerRef>,
     Query(query): Query<TaskListQuery>,
 ) -> ProtocolResult<Json<TaskListResponse>> {
-    Ok(Json(service.list_tasks_where(&owner, query.archived)?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.list_tasks_where(&owner, query.archived)
+        })
+        .await?,
+    ))
 }
 
 async fn get_task(
@@ -392,7 +411,9 @@ async fn get_task(
     Extension(owner): Extension<OwnerRef>,
     Path(task_id): Path<String>,
 ) -> ProtocolResult<Json<TaskSummary>> {
-    Ok(Json(service.task(&owner, &task_id)?))
+    Ok(Json(
+        blocking(&service, move |s| s.task(&owner, &task_id)).await?,
+    ))
 }
 
 async fn post_command(
@@ -401,7 +422,9 @@ async fn post_command(
     Path(task_id): Path<String>,
     Json(request): Json<OwnerCommandRequest>,
 ) -> ProtocolResult<Json<OwnerCommandResponse>> {
-    Ok(Json(service.command(&owner, &task_id, request)?))
+    Ok(Json(
+        blocking(&service, move |s| s.command(&owner, &task_id, request)).await?,
+    ))
 }
 
 async fn post_move(
@@ -410,14 +433,16 @@ async fn post_move(
     Path(task_id): Path<String>,
     Json(request): Json<MoveTaskRequest>,
 ) -> ProtocolResult<Json<TaskSummary>> {
-    Ok(Json(service.move_task(&owner, &task_id, request)?))
+    Ok(Json(
+        blocking(&service, move |s| s.move_task(&owner, &task_id, request)).await?,
+    ))
 }
 
 async fn get_default_backend(
     State(service): State<Service>,
     Extension(_owner): Extension<OwnerRef>,
 ) -> ProtocolResult<Json<DefaultBackendView>> {
-    Ok(Json(service.default_backend()?))
+    Ok(Json(blocking(&service, |s| s.default_backend()).await?))
 }
 
 async fn put_default_backend(
@@ -425,7 +450,9 @@ async fn put_default_backend(
     Extension(_owner): Extension<OwnerRef>,
     Json(request): Json<SetDefaultBackendRequest>,
 ) -> ProtocolResult<Json<DefaultBackendView>> {
-    Ok(Json(service.set_default_backend(request)?))
+    Ok(Json(
+        blocking(&service, move |s| s.set_default_backend(request)).await?,
+    ))
 }
 
 async fn get_backend_limit(
@@ -433,7 +460,9 @@ async fn get_backend_limit(
     Extension(_owner): Extension<OwnerRef>,
     Path(backend_id): Path<String>,
 ) -> ProtocolResult<Json<BackendLimitView>> {
-    Ok(Json(service.backend_limit_view(&backend_id)?))
+    Ok(Json(
+        blocking(&service, move |s| s.backend_limit_view(&backend_id)).await?,
+    ))
 }
 
 async fn put_backend_limit(
@@ -442,7 +471,12 @@ async fn put_backend_limit(
     Path(backend_id): Path<String>,
     Json(request): Json<SetBackendLimitRequest>,
 ) -> ProtocolResult<Json<BackendLimitView>> {
-    Ok(Json(service.set_backend_limit(&backend_id, request.limit)?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.set_backend_limit(&backend_id, request.limit)
+        })
+        .await?,
+    ))
 }
 
 async fn delete_backend_limit(
@@ -450,7 +484,9 @@ async fn delete_backend_limit(
     Extension(_owner): Extension<OwnerRef>,
     Path(backend_id): Path<String>,
 ) -> ProtocolResult<Json<BackendLimitView>> {
-    Ok(Json(service.clear_backend_limit(&backend_id)?))
+    Ok(Json(
+        blocking(&service, move |s| s.clear_backend_limit(&backend_id)).await?,
+    ))
 }
 
 async fn get_usage(
@@ -465,7 +501,9 @@ async fn get_timeline(
     Extension(owner): Extension<OwnerRef>,
     Path(task_id): Path<String>,
 ) -> ProtocolResult<Json<TimelineResponse>> {
-    Ok(Json(service.timeline(&owner, &task_id)?))
+    Ok(Json(
+        blocking(&service, move |s| s.timeline(&owner, &task_id)).await?,
+    ))
 }
 
 async fn get_execution_events(
@@ -515,7 +553,7 @@ async fn post_input(
     Path(task_id): Path<String>,
     Json(request): Json<SubmitInputRequest>,
 ) -> ProtocolResult<(StatusCode, Json<SubmitInputResponse>)> {
-    let response = service.submit_input(&owner, &task_id, request)?;
+    let response = blocking(&service, move |s| s.submit_input(&owner, &task_id, request)).await?;
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -525,7 +563,10 @@ async fn post_comment(
     Path(task_id): Path<String>,
     Json(request): Json<SubmitCommentRequest>,
 ) -> ProtocolResult<(StatusCode, Json<SubmitCommentResponse>)> {
-    let response = service.submit_comment(&owner, &task_id, request)?;
+    let response = blocking(&service, move |s| {
+        s.submit_comment(&owner, &task_id, request)
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -535,7 +576,10 @@ async fn post_operator_command(
     Path(task_id): Path<String>,
     Json(request): Json<SubmitOperatorCommandRequest>,
 ) -> ProtocolResult<(StatusCode, Json<SubmitOperatorCommandResponse>)> {
-    let response = service.submit_operator_command(&owner, &task_id, request)?;
+    let response = blocking(&service, move |s| {
+        s.submit_operator_command(&owner, &task_id, request)
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -545,7 +589,9 @@ async fn get_events(
     Path(task_id): Path<String>,
     Query(query): Query<EventsAfterQuery>,
 ) -> ProtocolResult<Json<Vec<TaskEvent>>> {
-    Ok(Json(service.events(&owner, &task_id, query.after)?))
+    Ok(Json(
+        blocking(&service, move |s| s.events(&owner, &task_id, query.after)).await?,
+    ))
 }
 
 async fn post_enrollment(
@@ -555,7 +601,7 @@ async fn post_enrollment(
     Json(request): Json<CreateEnrollmentRequest>,
 ) -> ProtocolResult<(StatusCode, Json<EnrollmentResponse>)> {
     require_operator(operator)?;
-    let response = service.create_enrollment(&backend_id, request)?;
+    let response = blocking(&service, move |s| s.create_enrollment(&backend_id, request)).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -564,7 +610,7 @@ async fn list_controllers(
     operator: Option<Extension<Operator>>,
 ) -> ProtocolResult<Json<ControllerListResponse>> {
     require_operator(operator)?;
-    Ok(Json(service.controllers()?))
+    Ok(Json(blocking(&service, |s| s.controllers()).await?))
 }
 
 async fn post_revoke_controller(
@@ -573,7 +619,9 @@ async fn post_revoke_controller(
     Path(controller_id): Path<String>,
 ) -> ProtocolResult<Json<ControllerView>> {
     require_operator(operator)?;
-    Ok(Json(service.revoke_controller(&controller_id)?))
+    Ok(Json(
+        blocking(&service, move |s| s.revoke_controller(&controller_id)).await?,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -629,7 +677,16 @@ async fn get_stream(
     };
 
     let changes = service.subscribe();
-    let replay = service.catch_up(&owner, only.as_ref(), &mut cursor)?;
+    let replay = {
+        let (service, owner, only) = (Arc::clone(&service), owner.clone(), only.clone());
+        tokio::task::spawn_blocking(move || {
+            let events = service.catch_up(&owner, only.as_ref(), &mut cursor)?;
+            Ok::<_, ProtocolError>((events, cursor))
+        })
+        .await
+        .map_err(|error| ProtocolError::Internal(error.to_string()))??
+    };
+    let (replay, cursor) = replay;
     let state = StreamState {
         service,
         owner,
@@ -673,11 +730,20 @@ async fn next_stream_event(
             // Missed notifications: rescan everything this stream covers.
             Err(RecvError::Lagged(_)) => state.only.clone(),
             Err(RecvError::Closed) => return None,
+        };        
+        let service = Arc::clone(&state.service);
+        let owner = state.owner.clone();
+        let mut cursor = state.cursor.clone();
+        let caught_up = tokio::task::spawn_blocking(move || {
+            let result = service.catch_up(&owner, only.as_ref(), &mut cursor);
+            (result, cursor)
+        })
+        .await;
+        let Ok((result, cursor)) = caught_up else {
+            return None;
         };
-        match state
-            .service
-            .catch_up(&state.owner, only.as_ref(), &mut state.cursor)
-        {
+        state.cursor = cursor;
+        match result {
             Ok(events) => state.queue.extend(events),
             Err(error) => {
                 tracing::warn!(error = %error, "control stream: could not read new events");
@@ -694,7 +760,7 @@ async fn post_enroll(
     State(service): State<Service>,
     Json(request): Json<EnrollRequest>,
 ) -> ProtocolResult<(StatusCode, Json<EnrollResponse>)> {
-    let response = service.enroll(request)?;
+    let response = blocking(&service, move |s| s.enroll(request)).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -703,14 +769,21 @@ async fn post_rotate_key(
     Extension(identity): Extension<ControllerIdentity>,
     Json(request): Json<RotateKeyRequest>,
 ) -> ProtocolResult<Json<RotateKeyResponse>> {
-    Ok(Json(service.rotate_controller_key(&identity, request)?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.rotate_controller_key(&identity, request)
+        })
+        .await?,
+    ))
 }
 
 async fn post_heartbeat(
     State(service): State<Service>,
     Extension(identity): Extension<ControllerIdentity>,
 ) -> ProtocolResult<Json<HeartbeatResponse>> {
-    Ok(Json(service.heartbeat(&identity)?))
+    Ok(Json(
+        blocking(&service, move |s| s.heartbeat(&identity)).await?,
+    ))
 }
 
 async fn post_acquire_lease(
@@ -718,7 +791,9 @@ async fn post_acquire_lease(
     Extension(identity): Extension<ControllerIdentity>,
     Json(request): Json<AcquireLeaseRequest>,
 ) -> ProtocolResult<Json<LeaseView>> {
-    Ok(Json(service.acquire_lease(&identity, request)?))
+    Ok(Json(
+        blocking(&service, move |s| s.acquire_lease(&identity, request)).await?,
+    ))
 }
 
 async fn post_renew_lease(
@@ -726,7 +801,9 @@ async fn post_renew_lease(
     Extension(identity): Extension<ControllerIdentity>,
     Json(request): Json<LeaseEpochRequest>,
 ) -> ProtocolResult<Json<LeaseView>> {
-    Ok(Json(service.renew_lease(&identity, request)?))
+    Ok(Json(
+        blocking(&service, move |s| s.renew_lease(&identity, request)).await?,
+    ))
 }
 
 async fn post_release_lease(
@@ -734,7 +811,9 @@ async fn post_release_lease(
     Extension(identity): Extension<ControllerIdentity>,
     Json(request): Json<LeaseEpochRequest>,
 ) -> ProtocolResult<Json<LeaseView>> {
-    Ok(Json(service.release_lease(&identity, request)?))
+    Ok(Json(
+        blocking(&service, move |s| s.release_lease(&identity, request)).await?,
+    ))
 }
 
 async fn get_commands(
@@ -750,7 +829,9 @@ async fn post_acks(
     Extension(identity): Extension<ControllerIdentity>,
     Json(request): Json<AckRequest>,
 ) -> ProtocolResult<Json<AckResponse>> {
-    Ok(Json(service.acknowledge(&identity, request)?))
+    Ok(Json(
+        blocking(&service, move |s| s.acknowledge(&identity, request)).await?,
+    ))
 }
 
 async fn post_report(
@@ -758,7 +839,9 @@ async fn post_report(
     Extension(identity): Extension<ControllerIdentity>,
     Json(request): Json<ReportRequest>,
 ) -> ProtocolResult<Json<ReportResponse>> {
-    Ok(Json(service.report(&identity, request)?))
+    Ok(Json(
+        blocking(&service, move |s| s.report(&identity, request)).await?,
+    ))
 }
 
 async fn post_runner_credential(
@@ -767,7 +850,10 @@ async fn post_runner_credential(
     Path(task_id): Path<String>,
     Json(request): Json<RunnerCredentialRequest>,
 ) -> ProtocolResult<(StatusCode, Json<RunnerCredentialResponse>)> {
-    let response = service.issue_runner_credential(&identity, &task_id, request)?;
+    let response = blocking(&service, move |s| {
+        s.issue_runner_credential(&identity, &task_id, request)
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -777,7 +863,10 @@ async fn post_reader_credential(
     Path(task_id): Path<String>,
     Json(request): Json<RunnerCredentialRequest>,
 ) -> ProtocolResult<(StatusCode, Json<RunnerCredentialResponse>)> {
-    let response = service.issue_reader_credential(&identity, &task_id, request)?;
+    let response = blocking(&service, move |s| {
+        s.issue_reader_credential(&identity, &task_id, request)
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -790,7 +879,9 @@ async fn post_snapshot(
     Extension(identity): Extension<RunnerIdentity>,
     Json(snapshot): Json<RunnerSnapshotRequest>,
 ) -> ProtocolResult<Json<RunnerSnapshotResponse>> {
-    Ok(Json(service.runner_snapshot(&identity, snapshot)?))
+    Ok(Json(
+        blocking(&service, move |s| s.runner_snapshot(&identity, snapshot)).await?,
+    ))
 }
 
 async fn post_usage(
@@ -798,7 +889,7 @@ async fn post_usage(
     Extension(identity): Extension<RunnerIdentity>,
     Json(report): Json<HarnessUsageReport>,
 ) -> ProtocolResult<StatusCode> {
-    service.runner_usage(&identity, report)?;
+    blocking(&service, move |s| s.runner_usage(&identity, report)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -814,7 +905,9 @@ async fn post_renew(
     State(service): State<Service>,
     Extension(identity): Extension<RunnerIdentity>,
 ) -> ProtocolResult<Json<RunnerRenewResponse>> {
-    Ok(Json(service.runner_renew(&identity)?))
+    Ok(Json(
+        blocking(&service, move |s| s.runner_renew(&identity)).await?,
+    ))
 }
 
 async fn post_input_ack(
@@ -824,7 +917,10 @@ async fn post_input_ack(
     Json(request): Json<InputAckRequest>,
 ) -> ProtocolResult<Json<InputAckResponse>> {
     Ok(Json(
-        service.runner_ack_input(&identity, &input_id, request)?,
+        blocking(&service, move |s| {
+            s.runner_ack_input(&identity, &input_id, request)
+        })
+        .await?,
     ))
 }
 
@@ -834,11 +930,12 @@ async fn post_command_ack(
     Path(command_id): Path<String>,
     Json(request): Json<OperatorCommandAckRequest>,
 ) -> ProtocolResult<Json<OperatorCommandAckResponse>> {
-    Ok(Json(service.runner_ack_command(
-        &identity,
-        &command_id,
-        request,
-    )?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_ack_command(&identity, &command_id, request)
+        })
+        .await?,
+    ))
 }
 
 async fn post_conversation_page(
@@ -847,11 +944,12 @@ async fn post_conversation_page(
     Path(request_id): Path<String>,
     Json(page): Json<ConversationPage>,
 ) -> ProtocolResult<Json<ConversationPageAccepted>> {
-    Ok(Json(service.runner_conversation_page(
-        &identity,
-        &request_id,
-        page,
-    )?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_conversation_page(&identity, &request_id, page)
+        })
+        .await?,
+    ))
 }
 
 async fn post_conductor_read(
@@ -860,11 +958,12 @@ async fn post_conductor_read(
     Path(request_id): Path<String>,
     Json(view): Json<narsor_engine::conductor::ConductorView>,
 ) -> ProtocolResult<Json<ConversationPageAccepted>> {
-    Ok(Json(service.runner_conductor_read(
-        &identity,
-        &request_id,
-        view,
-    )?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_conductor_read(&identity, &request_id, view)
+        })
+        .await?,
+    ))
 }
 
 async fn post_relay_failure(
@@ -873,11 +972,12 @@ async fn post_relay_failure(
     Path(request_id): Path<String>,
     Json(failure): Json<RelayFailure>,
 ) -> ProtocolResult<Json<ConversationPageAccepted>> {
-    Ok(Json(service.runner_relay_failure(
-        &identity,
-        &request_id,
-        &failure.reason,
-    )?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_relay_failure(&identity, &request_id, &failure.reason)
+        })
+        .await?,
+    ))
 }
 
 async fn post_execution_events(
@@ -886,11 +986,12 @@ async fn post_execution_events(
     Path(request_id): Path<String>,
     Json(page): Json<ExecutionEventsPage>,
 ) -> ProtocolResult<Json<ConversationPageAccepted>> {
-    Ok(Json(service.runner_execution_events(
-        &identity,
-        &request_id,
-        page,
-    )?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_execution_events(&identity, &request_id, page)
+        })
+        .await?,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -952,7 +1053,9 @@ async fn list_materials(
     Extension(owner): Extension<OwnerRef>,
     Path(task_id): Path<String>,
 ) -> ProtocolResult<Json<MaterialListResponse>> {
-    Ok(Json(service.list_materials(&owner, &task_id)?))
+    Ok(Json(
+        blocking(&service, move |s| s.list_materials(&owner, &task_id)).await?,
+    ))
 }
 
 async fn get_material(
@@ -960,7 +1063,12 @@ async fn get_material(
     Extension(owner): Extension<OwnerRef>,
     Path((task_id, material_id)): Path<(String, String)>,
 ) -> ProtocolResult<Json<MaterialView>> {
-    Ok(Json(service.material(&owner, &task_id, &material_id)?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.material(&owner, &task_id, &material_id)
+        })
+        .await?,
+    ))
 }
 
 async fn get_material_blob(
@@ -968,7 +1076,11 @@ async fn get_material_blob(
     Extension(owner): Extension<OwnerRef>,
     Path((task_id, material_id, sha256)): Path<(String, String, String)>,
 ) -> ProtocolResult<Response> {
-    blob_response(service.material_blob(&owner, &task_id, &material_id, &sha256)?).await
+    let path = blocking(&service, move |s| {
+        s.material_blob(&owner, &task_id, &material_id, &sha256)
+    })
+    .await?;
+    blob_response(path).await
 }
 
 async fn delete_material(
@@ -976,11 +1088,12 @@ async fn delete_material(
     Extension(owner): Extension<OwnerRef>,
     Path((task_id, material_id)): Path<(String, String)>,
 ) -> ProtocolResult<Json<MaterialSummary>> {
-    Ok(Json(service.delete_material(
-        &owner,
-        &task_id,
-        &material_id,
-    )?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.delete_material(&owner, &task_id, &material_id)
+        })
+        .await?,
+    ))
 }
 
 async fn post_runner_material(
@@ -1006,7 +1119,12 @@ async fn get_runner_material(
     Extension(identity): Extension<RunnerIdentity>,
     Path(material_id): Path<String>,
 ) -> ProtocolResult<Json<MaterialView>> {
-    Ok(Json(service.runner_material(&identity, &material_id)?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_material(&identity, &material_id)
+        })
+        .await?,
+    ))
 }
 
 async fn get_runner_material_blob(
@@ -1014,7 +1132,11 @@ async fn get_runner_material_blob(
     Extension(identity): Extension<RunnerIdentity>,
     Path((material_id, sha256)): Path<(String, String)>,
 ) -> ProtocolResult<Response> {
-    blob_response(service.runner_material_blob(&identity, &material_id, &sha256)?).await
+    let path = blocking(&service, move |s| {
+        s.runner_material_blob(&identity, &material_id, &sha256)
+    })
+    .await?;
+    blob_response(path).await
 }
 
 async fn post_runner_material_ack(
@@ -1023,11 +1145,12 @@ async fn post_runner_material_ack(
     Path(material_id): Path<String>,
     Json(request): Json<MaterialAckRequest>,
 ) -> ProtocolResult<Json<MaterialAckResponse>> {
-    Ok(Json(service.runner_ack_material(
-        &identity,
-        &material_id,
-        request,
-    )?))
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_ack_material(&identity, &material_id, request)
+        })
+        .await?,
+    ))
 }
 
 #[cfg(test)]
