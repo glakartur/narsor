@@ -1040,12 +1040,17 @@ pub fn render_details(
         queue_place: None,
         tab,
         detail,
+        deferred: false,
+        details_opened: true,
     };
     let options = ViewOptions {
         stale,
         keys,
         hyperlinks,
         glyph,
+        deferred: false,
+        details_opened: true,
+        loading: false,
     };
     render_view(frame, inner, view, styles, options);
 }
