@@ -47,13 +47,22 @@ Choose one role:
 The installer script downloads and verifies the archive, copies the binaries,
 and, only after consent, adds the binary directory to `~/.bashrc`. It then
 runs `narsor-cli init`, which only creates or updates the configuration. The
-script asks for the role and binary directory (default `~/.local/bin`);
-`narsor-cli init` asks for the data and configuration directories. The
-prompts read from the terminal, so they also work with `curl ... | bash`. Existing configuration is
-validated before the installer changes it. A supported config file is backed
-up byte-for-byte before an atomic replacement, and unrelated supported
-settings are preserved. Malformed or unknown settings stop installation
-without replacing the config.
+script asks for the role (arrow keys and Enter) and the binary directory
+(default `~/.local/bin`, Tab completes); `narsor-cli init` asks for the Narsor
+data directory (default `~/.narsor`). The prompts read from the terminal, so
+they also work with `curl ... | bash`.
+
+The data directory is a root: the configuration gets
+`catalog_dir: ROOT/catalog`, `state_dir: ROOT/state` and `work_dir: ROOT/work`,
+followed by the other settings as commented-out defaults (remove the `#` to
+change one). The number of tasks processed in parallel is a backend limit
+(`limits.max_concurrent_tasks` in `<catalog_dir>/backends/<id>.yaml`), so it is
+mentioned in the file but not set there.
+
+If a configuration file already exists, it is left untouched. The installer
+writes `config.yaml.new` next to it with the default values and does not ask
+for the data directory (use `--data-dir` to choose another root); compare the
+two files and copy over what you need.
 
 For container builds, provide the role and directories so the installer never
 prompts. The configuration path is optional; when omitted, the effective
@@ -68,8 +77,8 @@ curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.
     --config-file /etc/narsor/config.yaml
 ```
 
-For `local` and `frontend`, the installer needs `--role`, `--bin-dir`, and
-`--data-dir` in non-interactive mode. For `server`, also supply:
+For `local` and `frontend`, the installer needs `--role` and `--bin-dir` in
+non-interactive mode; `--data-dir` defaults to `~/.narsor`. For `server`, also supply:
 
 * `--server-bind` with an address reachable by the corporate proxy, not a
   loopback address;
@@ -107,8 +116,7 @@ non-interactive invocation must use a writable `--config-file`.
 `--update-bashrc` explicitly opts into adding the binary directory to
 `~/.bashrc`. Without it, non-interactive installation never changes a shell
 startup file. The line carries a `# narsor-installer` marker so uninstall can
-find it. The source-checkout workflow remains available as `./install.sh`
-from a cloned repository; it is separate from the Release installer.
+find it. To build from source, see the README.
 
 ## Uninstall
 
@@ -124,8 +132,8 @@ It deletes only the five Narsor binaries from the binary directory
 Configuration and data stay in place. Pass the same `--bin-dir`,
 `--data-dir`, and `--config-file` values you used to install.
 
-`--purge` also removes the configuration file, its `.bak.*` backups, and the
-data directory (`--data-dir`, default `~/.local/share/narsor`). It first lists
+`--purge` also removes the configuration file, its `.bak.*` backups and generated `.new` file, and the
+data directory (`--data-dir`, default `~/.narsor`). It first lists
 what it will delete and asks for confirmation; with `--non-interactive`, the
 `--purge` flag is the confirmation. Directories that the configuration names
 outside the data directory are listed and kept, and a data directory that

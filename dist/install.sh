@@ -8,7 +8,9 @@
 #                           [--data-dir KATALOG] [--config-file PLIK] [--non-interactive]
 #
 # Skrypt pobiera i weryfikuje archiwum, kopiuje binaria i (za zgodą) dopisuje
-# katalog do ~/.bashrc. Konfigurację tworzy `narsor-cli init`.
+# katalog do ~/.bashrc. Konfigurację tworzy `narsor-cli init`: pyta o katalog
+# główny danych (domyślnie ~/.narsor; w pliku trafiają catalog_dir, state_dir
+# i work_dir). Istniejącej konfiguracji nie rusza: obok zapisuje config.yaml.new.
 set -euo pipefail
 
 repository="glakartur/narsor"
@@ -60,18 +62,51 @@ ask() {
     printf '%s\n' "$answer"
 }
 
+# Menu sterowany strzałkami (lub j/k) i Enter.
 select_role() {
-    local choice
+    local -a keys=(local frontend server)
+    local -a labels=(
+        "Local     TUI, CLI, server and controller on this machine"
+        "Frontend  TUI and CLI for a separately operated server"
+        "Server    network server, controller and runner"
+    )
+    local index=0 key rest position count=${#keys[@]}
+    printf 'Role (↑/↓ to move, Enter to confirm)\n' >&2
     while true; do
-        printf 'Select a role:\n  1. Local\n  2. Frontend\n  3. Server\n' >&2
-        choice="$(ask 'Role [1-3]: ')"
-        case "$choice" in
-            1) role=local; return ;;
-            2) role=frontend; return ;;
-            3) role=server; return ;;
-            *) printf 'Choose 1, 2, or 3.\n' >&2 ;;
+        for position in "${!labels[@]}"; do
+            if ((position == index)); then
+                printf '  \033[7m› %s \033[0m\n' "${labels[position]}" >&2
+            else
+                printf '    %s\n' "${labels[position]}" >&2
+            fi
+        done
+        IFS= read -rsn1 key </dev/tty || fail "cannot read from the terminal"
+        if [[ "$key" == $'\033' ]]; then
+            rest=
+            IFS= read -rsn2 -t 0.1 rest </dev/tty || true
+            case "$rest" in
+                '[A') key=k ;;
+                '[B') key=j ;;
+                *) key=none ;;
+            esac
+        fi
+        case "$key" in
+            k) index=$(((index + count - 1) % count)) ;;
+            j) index=$(((index + 1) % count)) ;;
+            '') break ;;
         esac
+        printf '\033[%dA\033[J' "$count" >&2
     done
+    printf '\033[%dA\033[J' "$((count + 1))" >&2
+    role=${keys[index]}
+    printf 'Role: %s\n' "$role" >&2
+}
+
+# Pole z podpowiedzią (edytowalną) i uzupełnianiem ścieżek klawiszem Tab.
+ask_path() {
+    local answer=
+    IFS= read -r -e -i "$2" -p "$1: " answer </dev/tty || true
+    printf '%s\n' "$answer"
 }
 
 binaries_for_role() {
@@ -219,8 +254,12 @@ install() {
     esac
     if [[ -z "$bin_dir" ]]; then
         ((interactive)) || fail "non-interactive installation requires --bin-dir"
-        bin_dir="$(ask "Binary installation directory [$HOME/.local/bin]: ")"
+        bin_dir="$(ask_path 'Binary installation directory (Tab completes, Enter accepts)' "$HOME/.local/bin")"
         bin_dir="${bin_dir:-$HOME/.local/bin}"
+        case "$bin_dir" in
+            '~') bin_dir=$HOME ;;
+            '~/'*) bin_dir="$HOME/${bin_dir#\~/}" ;;
+        esac
     fi
     bin_dir="$(absolute "$bin_dir")"
 

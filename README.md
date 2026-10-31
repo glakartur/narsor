@@ -55,8 +55,7 @@ The workspace build keeps `narsor`, `narsor-cli`, `narsor-server`,
 `target/release`), so the client can find the server and the server can find
 the local controller and runner. In trusted mode the server starts
 `narsor-controller local` as its child process; it does not start without that
-binary next to it. To install all process binaries into the same directory, run
-`./install.sh` (add `--root DIR` to install into `DIR/bin`), or by hand:
+binary next to it. To install all process binaries into the same directory:
 
 ```bash
 cargo install --path . --bins
@@ -79,14 +78,17 @@ curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.
 
 The installer offers **local** (all five binaries), **frontend** (TUI and CLI),
 or **server** (server, controller, and runner) roles. It copies the binaries,
-then `narsor-cli init` validates the effective configuration and backs up an
-existing config before replacing it. It asks before adding the binary
-directory to `~/.bashrc`. To remove Narsor, run the same script with
+then `narsor-cli init` asks for the Narsor data directory (default
+`~/.narsor`) and writes `catalog_dir`, `state_dir` and `work_dir` under it,
+plus the other settings as commented-out defaults. An existing config is never
+touched: the new one is written next to it as `config.yaml.new`, with defaults.
+Menus use arrow keys and paths complete with Tab. It asks before adding the
+binary directory to `~/.bashrc`. To remove Narsor, run the same script with
 `--uninstall` (add `--purge` to delete configuration and data too). To select a version, pass it to the downloaded
 script, for example `bash -s -- v1.2.3`.
 
-For container builds, supply `--non-interactive`, a role, and explicit
-directories. Server mode also needs a non-loopback `--server-bind`,
+For container builds, supply `--non-interactive`, a role, and a binary
+directory (`--data-dir` is optional and defaults to `~/.narsor`). Server mode also needs a non-loopback `--server-bind`,
 `--oidc-issuer`, `--oidc-audience`, one or more `--trusted-proxy` values, and a
 unique `--backend-id`:
 

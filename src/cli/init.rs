@@ -2,7 +2,7 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +11,10 @@ use clap::{Args, ValueEnum};
 use serde_yaml::{Mapping, Value};
 
 use crate::{
-    cli::commands::{CliError, Result},
+    cli::{
+        commands::{CliError, Result},
+        prompt,
+    },
     config::{self, ConfigCascade, SettingKey, SettingValue},
     domain::BackendId,
 };
@@ -46,7 +49,7 @@ pub struct InitOptions {
     #[arg(long)]
     non_interactive: bool,
 
-    /// Where local state, workspaces, and the catalogue live when not configured already.
+    /// Root directory for Narsor data (default ~/.narsor); `catalog`, `state` and `work` are created under it.
     #[arg(long, value_name = "DIRECTORY")]
     data_dir: Option<PathBuf>,
 
@@ -81,7 +84,7 @@ pub struct PurgeOptions {
     #[arg(long)]
     yes: bool,
 
-    /// Narsor data directory to remove (defaults to the XDG data directory).
+    /// Narsor data directory to remove (defaults to ~/.narsor).
     #[arg(long, value_name = "DIRECTORY")]
     data_dir: Option<PathBuf>,
 
@@ -92,21 +95,27 @@ pub struct PurgeOptions {
 
 pub fn run(options: InitOptions, global_config: Option<&Path>) -> Result<()> {
     let role = select_role(options.role, options.non_interactive)?;
-    let data_dir = select_data_directory(
-        options.data_dir.clone(),
-        default_data_dir()?,
-        options.non_interactive,
-    )?;
     let config_path = select_config_path(
         options.config_file.clone(),
         global_config,
         options.non_interactive,
     )?;
-    let mut config = load_config(&config_path)?;
-    let (_, mut parsed) = validate_config(&config_path, &config)?;
+    let keep_existing = config_exists(&config_path)?;
+    let target = if keep_existing {
+        let mut name = config_path.as_os_str().to_owned();
+        name.push(".new");
+        PathBuf::from(name)
+    } else {
+        config_path.clone()
+    };
+    let data_dir = select_data_directory(
+        options.data_dir.clone(),
+        options.non_interactive || keep_existing,
+    )?;
 
-    set_missing_root_paths(&mut config, &parsed, &data_dir)?;
-    parsed = validate_config(&config_path, &config)?.1;
+    let mut config = Value::Mapping(Mapping::new());
+    set_root_paths(&mut config, &data_dir)?;
+    let parsed = validate_config(&target, &config)?.1;
     let workstation_backend = if role == InitRole::Server {
         Some(configure_server(
             &mut config,
@@ -118,19 +127,43 @@ pub fn run(options: InitOptions, global_config: Option<&Path>) -> Result<()> {
         None
     };
 
-    let contents = validate_config(&config_path, &config)?.0;
-    prepare_config_directory(&config_path)?;
+    let contents = render_config(&validate_config(&target, &config)?.0, &config);
+    prepare_config_directory(&target)?;
     if let Some(backend) = &workstation_backend {
         write_workstation_backend(backend)?;
     }
-    write_config(&config_path, contents.as_bytes())?;
+    if keep_existing {
+        replace_file(&target, contents.as_bytes())?;
+    } else {
+        write_new_atomic(&target, contents.as_bytes(), 0o600)?;
+    }
 
     println!("Configured the {} role.", role_name(role));
-    println!("Configuration: {}", config_path.display());
+    if keep_existing {
+        println!(
+            "Existing configuration left unchanged: {}",
+            config_path.display()
+        );
+        println!("New defaults written to: {}", target.display());
+        println!("Compare them and copy over what you want.");
+    } else {
+        println!("Configuration: {}", target.display());
+    }
     if let Some(backend) = &workstation_backend {
-        print_server_commands(backend, &config_path)?;
+        print_server_commands(backend, &target)?;
     }
     Ok(())
+}
+
+fn config_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CliError::failure(format!(
+            "cannot inspect configuration '{}': {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn select_role(role: Option<InitRole>, non_interactive: bool) -> Result<InitRole> {
@@ -142,94 +175,55 @@ fn select_role(role: Option<InitRole>, non_interactive: bool) -> Result<InitRole
             "non-interactive configuration requires --role local, frontend, or server",
         ));
     }
-    if !io::stdin().is_terminal() {
+    if !prompt::is_available() {
         return Err(CliError::usage(
             "interactive configuration needs a terminal; provide --non-interactive and --role",
         ));
     }
-    loop {
-        println!("Select a role:\n  1. Local\n  2. Frontend\n  3. Server");
-        match prompt("Role [1-3]: ")?.as_str() {
-            "1" => return Ok(InitRole::Local),
-            "2" => return Ok(InitRole::Frontend),
-            "3" => return Ok(InitRole::Server),
-            _ => eprintln!("Choose 1, 2, or 3."),
-        }
-    }
+    let roles = [
+        (
+            InitRole::Local,
+            "Local",
+            "TUI, CLI, server and controller on this machine",
+        ),
+        (
+            InitRole::Frontend,
+            "Frontend",
+            "TUI and CLI for a separately operated server",
+        ),
+        (
+            InitRole::Server,
+            "Server",
+            "network server, controller and runner",
+        ),
+    ];
+    let items: Vec<(&str, &str)> = roles.iter().map(|(_, name, text)| (*name, *text)).collect();
+    Ok(roles[prompt::select("Role", &items)?].0)
 }
 
-fn select_data_directory(
-    selected: Option<PathBuf>,
-    default: PathBuf,
-    non_interactive: bool,
-) -> Result<PathBuf> {
+/// The root directory for all Narsor data. Without `--data-dir` it is asked
+/// for (default `~/.narsor`), unless `use_default` says to take the default.
+fn select_data_directory(selected: Option<PathBuf>, use_default: bool) -> Result<PathBuf> {
     if let Some(path) = selected {
-        return absolute_path(&path);
+        return absolute_path(&prompt::expand_tilde(&path.to_string_lossy()));
     }
-    if non_interactive {
-        return Err(CliError::usage(
-            "non-interactive configuration requires --data-dir",
-        ));
+    let default = default_data_dir()?;
+    if use_default {
+        return absolute_path(&default);
     }
-    absolute_path(&browse_directory("Narsor data directory", &default)?)
-}
-
-fn browse_directory(label: &str, initial: &Path) -> Result<PathBuf> {
-    let mut current = initial.to_path_buf();
-    while !current.is_dir() {
-        if !current.pop() {
-            return Err(CliError::failure(format!(
-                "cannot find an existing directory above '{}'",
-                initial.display()
-            )));
-        }
+    let label = "Narsor data directory (Tab completes, Enter accepts)";
+    let answer = if prompt::is_available() {
+        prompt::input_path(label, DEFAULT_DATA_DIR_TEXT)?
+    } else {
+        prompt_with_default(
+            &format!("Narsor data directory [{DEFAULT_DATA_DIR_TEXT}]: "),
+            DEFAULT_DATA_DIR_TEXT,
+        )?
+    };
+    if answer.trim().is_empty() {
+        return absolute_path(&default);
     }
-    loop {
-        println!("\n{label}: {}", current.display());
-        println!("  0. Use this directory");
-        let parent = current.parent().map(Path::to_path_buf);
-        if parent.is_some() {
-            println!("  p. Parent directory");
-        }
-        let mut children = fs::read_dir(&current)
-            .map_err(|error| {
-                CliError::failure(format!("cannot browse '{}': {error}", current.display()))
-            })?
-            .map(|entry| {
-                entry.map_err(|error| {
-                    CliError::failure(format!(
-                        "cannot read a directory entry under '{}': {error}",
-                        current.display()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        children.retain(|entry| entry.path().is_dir());
-        children.sort_by_key(|entry| entry.file_name());
-        for (index, entry) in children.iter().enumerate() {
-            println!("  {}. {}/", index + 1, entry.file_name().to_string_lossy());
-        }
-        println!("  c. Enter a path");
-        let choice = prompt("Choose a directory: ")?;
-        match choice.as_str() {
-            "0" => return Ok(current),
-            "p" if parent.is_some() => current = parent.expect("parent checked above"),
-            "c" => {
-                let path = PathBuf::from(prompt("Directory path: ")?);
-                if path.is_dir() {
-                    current = path;
-                } else {
-                    eprintln!("That path is not an existing directory.");
-                }
-            }
-            value => match value.parse::<usize>() {
-                Ok(index) if index > 0 && index <= children.len() => {
-                    current = children[index - 1].path();
-                }
-                _ => eprintln!("Choose one of the listed directories."),
-            },
-        }
-    }
+    absolute_path(&prompt::expand_tilde(answer.trim()))
 }
 
 fn select_config_path(
@@ -254,15 +248,7 @@ fn select_config_path(
     if let Some(path) = resolution.path() {
         return select_writable_config_path(absolute_path(path)?, true, non_interactive);
     }
-    let default = default_config_path()?;
-    if non_interactive {
-        return absolute_path(&default);
-    }
-    let directory = browse_directory(
-        "Configuration directory (config.yaml will be written here)",
-        default.parent().expect("default config has parent"),
-    )?;
-    absolute_path(&directory.join("config.yaml"))
+    absolute_path(&default_config_path()?)
 }
 
 fn select_writable_config_path(
@@ -360,76 +346,6 @@ fn prepare_config_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_config(path: &Path) -> Result<Value> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(CliError::failure(format!(
-                "configuration '{}' is a symbolic link; refusing to replace it atomically",
-                path.display()
-            )))
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(CliError::failure(format!(
-                "configuration path '{}' is not a regular file",
-                path.display()
-            )))
-        }
-        Ok(_) => Some(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(CliError::failure(format!(
-                "cannot read configuration '{}': {error}",
-                path.display()
-            )))
-        }
-    };
-    let Some(()) = metadata else {
-        return Ok(Value::Mapping(Mapping::new()));
-    };
-    let bytes = fs::read(path).map_err(|error| {
-        CliError::failure(format!(
-            "cannot read configuration '{}': {error}",
-            path.display()
-        ))
-    })?;
-    let contents = String::from_utf8(bytes).map_err(|_| {
-        CliError::failure(format!(
-            "configuration '{}' is not UTF-8; it was not changed",
-            path.display()
-        ))
-    })?;
-    let _parsed = config::file::parse(path, &contents)
-        .into_result()
-        .map_err(|errors| {
-            CliError::failure(format!(
-                "configuration '{}' cannot be safely updated:\n{}",
-                path.display(),
-                errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ))
-        })?;
-    let document: Value = serde_yaml::from_str(&contents).map_err(|error| {
-        CliError::failure(format!(
-            "cannot parse configuration '{}': {error}",
-            path.display()
-        ))
-    })?;
-    let mut mapping = match document {
-        Value::Null => Mapping::new(),
-        Value::Mapping(mapping) => mapping,
-        _ => {
-            return Err(CliError::failure(format!(
-                "configuration '{}' must contain a mapping; it was not changed",
-                path.display()
-            )))
-        }
-    };
-    Ok(Value::Mapping(std::mem::take(&mut mapping)))
-}
-
 fn validate_config(path: &Path, config: &Value) -> Result<(String, config::FileValues)> {
     let text = serde_yaml::to_string(config)
         .map_err(|error| CliError::failure(format!("cannot encode configuration: {error}")))?;
@@ -447,23 +363,118 @@ fn validate_config(path: &Path, config: &Value) -> Result<(String, config::FileV
     Ok((text, parsed))
 }
 
-fn set_missing_root_paths(
-    config: &mut Value,
-    parsed: &config::FileValues,
-    data_dir: &Path,
-) -> Result<()> {
+/// Optional settings with their built-in values, written as comments so the
+/// file documents what can be tuned without changing behaviour.
+const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
+    (
+        SettingKey::AgentHarness,
+        "claude-code",
+        "Agent harness used by actions that name none.",
+    ),
+    (
+        SettingKey::AgentTimeout,
+        "none",
+        "Time limit of an agent action, e.g. 30m, 2h, or none.",
+    ),
+    (
+        SettingKey::LogLevel,
+        "off",
+        "off, error, warn, info, debug or trace (RUST_LOG wins).",
+    ),
+    (
+        SettingKey::TuiRefreshInterval,
+        "10",
+        "Seconds between automatic TUI refreshes, or none.",
+    ),
+    (
+        SettingKey::DefaultBackend,
+        "local",
+        "Backend a new task goes to when it names none.",
+    ),
+    (
+        SettingKey::DefaultProfile,
+        "default",
+        "Profile a new task uses when it names none.",
+    ),
+    (
+        SettingKey::LocalHome,
+        "host",
+        "HOME for local tasks' tools: host or private.",
+    ),
+    (
+        SettingKey::LocalWorkspaceRoots,
+        "[]",
+        "Host directories a local task may use as workspace.",
+    ),
+    (
+        SettingKey::LocalCodexHome,
+        "\"\"",
+        "CODEX_HOME for local tasks; empty leaves it to the harness.",
+    ),
+    (
+        SettingKey::LocalClaudeConfigDir,
+        "\"\"",
+        "CLAUDE_CONFIG_DIR for local tasks; empty leaves it to the harness.",
+    ),
+    (
+        SettingKey::LocalClaudeProfileSource,
+        "\"\"",
+        "Claude Code profile copied into local tasks before each start.",
+    ),
+    (
+        SettingKey::CorsAllowedOrigins,
+        "[]",
+        "Browser origins allowed to call the API.",
+    ),
+    (
+        SettingKey::ServerMode,
+        "trusted",
+        "trusted (loopback) or network (OIDC); see the server role.",
+    ),
+    (
+        SettingKey::ServerBind,
+        "127.0.0.1:0",
+        "Address the server listens on.",
+    ),
+];
+
+/// The generated file: the settings chosen by the installer followed by the
+/// remaining ones as commented-out defaults.
+fn render_config(yaml: &str, config: &Value) -> String {
+    let mapping = config.as_mapping().expect("configuration mapping checked");
+    let mut text = String::from(
+        "# Narsor configuration generated by `narsor-cli init`.\n\
+         # Lines starting with # show the default value; remove the # to change it.\n\
+         # Every setting can also be given as a NARSOR_<NAME> environment variable.\n\n",
+    );
+    text.push_str(yaml);
+    text.push_str("\n# Optional settings (defaults shown)\n");
+    for (key, default, description) in OPTIONAL_SETTINGS {
+        if !mapping.contains_key(Value::String(key.key().to_string())) {
+            text.push_str(&format!("\n# {description}\n# {}: {default}\n", key.key()));
+        }
+    }
+    text.push_str(
+        "\n# The number of tasks processed in parallel is a limit of each backend,\n\
+         # not of this file: set `limits.max_concurrent_tasks` in\n\
+         # <catalog_dir>/backends/<id>.yaml (the TUI can also change it).\n",
+    );
+    text
+}
+
+fn set_root_paths(config: &mut Value, root: &Path) -> Result<()> {
     let mapping = config
         .as_mapping_mut()
         .expect("configuration mapping checked");
-    for key in [
-        SettingKey::CatalogDir,
-        SettingKey::StateDir,
-        SettingKey::WorkDir,
+    for (key, directory) in [
+        (SettingKey::CatalogDir, "catalog"),
+        (SettingKey::StateDir, "state"),
+        (SettingKey::WorkDir, "work"),
     ] {
-        if parsed.get(key).is_none() && environment_setting(key)?.is_none() {
+        if environment_setting(key)?.is_none() {
             mapping.insert(
                 Value::String(key.key().to_string()),
-                Value::String(data_dir.to_string_lossy().into_owned()),
+                Value::String(root.join(directory).to_string_lossy().into_owned()),
             );
         }
     }
@@ -775,108 +786,50 @@ fn write_workstation_backend(backend: &WorkstationBackend) -> Result<()> {
     write_new_atomic(&path, contents.as_bytes(), 0o644)
 }
 
-fn write_config(path: &Path, contents: &[u8]) -> Result<()> {
+fn replace_file(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         CliError::failure(format!(
             "configuration path '{}' has no parent directory",
             path.display()
         ))
     })?;
-    fs::create_dir_all(parent).map_err(|error| {
-        CliError::failure(format!(
-            "cannot create configuration directory '{}': {error}",
-            parent.display()
-        ))
-    })?;
-    let existing = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(CliError::failure(format!(
-                "configuration '{}' is a symbolic link; refusing to replace it atomically",
-                path.display()
-            )))
-        }
+    match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_file() => {
             return Err(CliError::failure(format!(
-                "configuration path '{}' is not a regular file",
+                "'{}' is not a regular file; refusing to replace it",
                 path.display()
             )))
         }
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(CliError::failure(format!(
-                "cannot inspect configuration '{}': {error}",
+                "cannot inspect '{}': {error}",
                 path.display()
             )))
         }
-    };
-    let mode = existing
-        .as_ref()
-        .map(|metadata| metadata.permissions().mode() & 0o777)
-        .unwrap_or(0o600);
-    if existing.is_some() {
-        create_backup(path, mode)?;
     }
     let temporary = temporary_path(path, "tmp")?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(mode)
+        .mode(0o600)
         .open(&temporary)
         .map_err(|error| {
             CliError::failure(format!(
-                "cannot create temporary configuration '{}': {error}",
+                "cannot create temporary file '{}': {error}",
                 temporary.display()
             ))
         })?;
-    file.write_all(contents).map_err(|error| {
-        CliError::failure(format!(
-            "cannot write temporary configuration '{}': {error}",
-            temporary.display()
-        ))
-    })?;
-    file.sync_all().map_err(|error| {
-        CliError::failure(format!(
-            "cannot flush temporary configuration '{}': {error}",
-            temporary.display()
-        ))
-    })?;
-    fs::rename(&temporary, path).map_err(|error| {
-        CliError::failure(format!(
-            "cannot atomically replace configuration '{}': {error}",
-            path.display()
-        ))
-    })?;
-    sync_directory(parent)?;
-    Ok(())
-}
-
-fn create_backup(path: &Path, mode: u32) -> Result<()> {
-    let backup = temporary_path(path, "bak")?;
-    let mut source = File::open(path).map_err(|error| {
-        CliError::failure(format!(
-            "cannot read configuration '{}' for backup: {error}",
-            path.display()
-        ))
-    })?;
-    let mut destination = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&backup)
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
         .map_err(|error| {
-            CliError::failure(format!(
-                "cannot create configuration backup '{}': {error}",
-                backup.display()
-            ))
+            CliError::failure(format!("cannot write '{}': {error}", temporary.display()))
         })?;
-    io::copy(&mut source, &mut destination).map_err(|error| {
-        CliError::failure(format!("cannot write configuration backup: {error}"))
+    fs::rename(&temporary, path).map_err(|error| {
+        CliError::failure(format!("cannot replace '{}': {error}", path.display()))
     })?;
-    destination.sync_all().map_err(|error| {
-        CliError::failure(format!("cannot flush configuration backup: {error}"))
-    })?;
-    Ok(())
+    sync_directory(parent)
 }
 
 fn write_new_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
@@ -1014,11 +967,10 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
+const DEFAULT_DATA_DIR_TEXT: &str = "~/.narsor";
+
 fn default_data_dir() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
-        return Ok(PathBuf::from(path).join("narsor"));
-    }
-    Ok(home_dir()?.join(".local/share/narsor"))
+    Ok(home_dir()?.join(".narsor"))
 }
 
 fn default_config_path() -> Result<PathBuf> {
@@ -1081,10 +1033,14 @@ pub fn purge(options: PurgeOptions, global_config: Option<&Path>) -> Result<()> 
     }
     if let (Some(parent), Some(name)) = (config_path.parent(), config_path.file_name()) {
         let prefix = format!("{}.bak.", name.to_string_lossy());
+        let generated = format!("{}.new", name.to_string_lossy());
         if let Ok(entries) = fs::read_dir(parent) {
             let mut backups = entries
                 .filter_map(std::result::Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.starts_with(&prefix) || name == generated
+                })
                 .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
                 .map(|entry| entry.path())
                 .collect::<Vec<_>>();
@@ -1176,4 +1132,34 @@ fn directories_outside(config_path: &Path, data_dir: &Path) -> Vec<String> {
     .filter(|path| !path.starts_with(data_dir))
     .map(|path| path.display().to_string())
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commented_defaults_are_valid_settings() {
+        let mut config = Value::Mapping(Mapping::new());
+        config.as_mapping_mut().unwrap().insert(
+            Value::String("catalog_dir".into()),
+            Value::String("/data/catalog".into()),
+        );
+        let rendered = render_config("catalog_dir: /data/catalog\n", &config);
+        let uncommented: String = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix("# "))
+            .filter(|line| {
+                line.split_once(": ")
+                    .is_some_and(|(key, _)| SettingKey::from_key(key).is_some())
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(uncommented.contains("agent_timeout: none"));
+        let parsed = config::file::parse(Path::new("config.yaml"), &uncommented).into_result();
+        assert!(parsed.is_ok(), "{parsed:?}");
+        assert!(config::file::parse(Path::new("config.yaml"), &rendered)
+            .into_result()
+            .is_ok());
+    }
 }

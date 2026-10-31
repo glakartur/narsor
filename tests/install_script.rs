@@ -298,17 +298,24 @@ fn server_role_can_also_install_frontend_binaries() {
 #[test]
 fn invalid_configuration_leaves_the_binary_directory_untouched() {
     let release = Release::with_real_cli();
-    fs::create_dir_all(release.config().parent().unwrap()).unwrap();
-    fs::write(release.config(), "unknown_setting: keep\n").unwrap();
 
-    let result = release.install("local", &[]);
+    let result = release.install("server", &[]);
 
     assert!(!result.status.success());
     assert!(!release.bin().exists());
-    assert_eq!(
-        fs::read(release.config()).unwrap(),
-        b"unknown_setting: keep\n"
-    );
+    assert!(!release.config().exists());
+}
+
+#[test]
+fn existing_configuration_is_kept_and_defaults_go_to_a_new_file() {
+    let release = Release::with_real_cli();
+    fs::create_dir_all(release.config().parent().unwrap()).unwrap();
+    fs::write(release.config(), "log_level: debug\n").unwrap();
+
+    assert_success(&release.install("local", &[]));
+
+    assert_eq!(fs::read(release.config()).unwrap(), b"log_level: debug\n");
+    assert!(release.config().with_file_name("config.yaml.new").is_file());
 }
 
 #[test]
@@ -386,7 +393,7 @@ fn uninstall_does_not_download_anything() {
 }
 
 #[test]
-fn purge_also_removes_configuration_backups_and_data() {
+fn purge_also_removes_generated_configuration_and_data() {
     let release = Release::with_real_cli();
     fs::create_dir_all(release.config().parent().unwrap()).unwrap();
     fs::write(release.config(), "log_level: debug\n").unwrap();
@@ -397,7 +404,7 @@ fn purge_also_removes_configuration_backups_and_data() {
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .contains(".bak.")));
+            .ends_with(".new")));
     fs::create_dir_all(release.data()).unwrap();
     fs::write(release.data().join("state.db"), "x").unwrap();
 
