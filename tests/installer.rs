@@ -74,7 +74,29 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn local_role_preserves_existing_settings() {
+fn fresh_configuration_names_the_three_directories_and_documents_defaults() {
+    let fixture = Fixture::new();
+
+    assert_success(&fixture.run("local", &[]));
+
+    let config = read_yaml(&fixture.config);
+    for (key, directory) in [
+        ("catalog_dir", "catalog"),
+        ("state_dir", "state"),
+        ("work_dir", "work"),
+    ] {
+        assert_eq!(
+            config[key].as_str(),
+            Some(fixture.data.join(directory).to_str().unwrap())
+        );
+    }
+    let text = fs::read_to_string(&fixture.config).unwrap();
+    assert!(text.contains("# agent_timeout: none"));
+    assert!(text.contains("max_concurrent_tasks"));
+}
+
+#[test]
+fn existing_configuration_is_kept_and_defaults_go_to_a_new_file() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.config.parent().expect("config parent")).unwrap();
     let original = "log_level: debug\n";
@@ -83,13 +105,15 @@ fn local_role_preserves_existing_settings() {
     let result = fixture.run("local", &[]);
 
     assert_success(&result);
-    let config = read_yaml(&fixture.config);
-    assert_eq!(config["log_level"].as_str(), Some("debug"));
+    assert_eq!(fs::read_to_string(&fixture.config).unwrap(), original);
+    let new = fixture.config.with_file_name("config.yaml.new");
+    let config = read_yaml(&new);
     assert_eq!(
         config["catalog_dir"].as_str(),
-        Some(fixture.data.to_str().unwrap())
+        Some(fixture.data.join("catalog").to_str().unwrap())
     );
-    assert!(backup_contains(&fixture.config, original.as_bytes()));
+    assert!(config.get("log_level").is_none());
+    assert!(output(&result).contains("config.yaml.new"));
 }
 
 #[test]
@@ -144,7 +168,7 @@ fn server_role_writes_network_configuration_and_a_workstation_backend() {
             .and_then(serde_yaml::Value::as_str),
         Some("10.0.0.0/8")
     );
-    let backend = fixture.data.join("backends/vm-worker.yaml");
+    let backend = fixture.data.join("catalog/backends/vm-worker.yaml");
     let backend = read_yaml(&backend);
     assert_eq!(backend["kind"].as_str(), Some("local"));
     assert_eq!(backend["trust_scope"].as_str(), Some("workstation"));
@@ -214,15 +238,14 @@ fn server_role_rejects_loopback_binds_before_writing() {
 }
 
 #[test]
-fn invalid_configuration_is_left_unchanged() {
+fn unreadable_existing_configuration_is_left_unchanged() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.config.parent().expect("config parent")).unwrap();
     let original = b"unknown_setting: keep\n";
     fs::write(&fixture.config, original).unwrap();
 
-    let result = fixture.run("local", &[]);
+    assert_success(&fixture.run("local", &[]));
 
-    assert!(!result.status.success());
     assert_eq!(fs::read(&fixture.config).unwrap(), original);
 }
 
@@ -240,16 +263,4 @@ fn output(result: &Output) -> String {
 
 fn read_yaml(path: &Path) -> serde_yaml::Value {
     serde_yaml::from_slice(&fs::read(path).expect("read YAML file")).expect("parse YAML")
-}
-
-fn backup_contains(path: &Path, contents: &[u8]) -> bool {
-    let parent = path.parent().expect("config parent");
-    let prefix = format!("{}.bak.", path.file_name().unwrap().to_string_lossy());
-    fs::read_dir(parent)
-        .expect("read config directory")
-        .filter_map(Result::ok)
-        .any(|entry| {
-            entry.file_name().to_string_lossy().starts_with(&prefix)
-                && fs::read(entry.path()).is_ok_and(|backup| backup == contents)
-        })
 }

@@ -33,6 +33,7 @@ pub mod connection_profile;
 pub mod control_text;
 pub mod daemon;
 pub mod init;
+mod prompt;
 pub mod remote;
 pub mod task_history;
 pub mod task_registry;
@@ -309,10 +310,10 @@ pub enum Command {
         command: ConnectionProfileCommand,
     },
 
-    /// Creates or updates the Narsor configuration for a role (binaries are installed by install.sh).
+    /// Creates or updates the Narsor configuration for a role (binaries are installed by the release installer).
     Init(init::InitOptions),
 
-    /// Removes the Narsor configuration and data directory (used by install.sh --uninstall --purge).
+    /// Removes the Narsor configuration and data directory (used by the release installer's --uninstall --purge).
     Purge(init::PurgeOptions),
 
     /// Creates, inspects and steers remote tasks through the control plane.
