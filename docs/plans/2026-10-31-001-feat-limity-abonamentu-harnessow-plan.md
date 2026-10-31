@@ -39,7 +39,7 @@ Fakty z kodu, które kształtują plan:
 - **Komenda CLI to `narsor-cli usage`.** Origin mówi „`narsor usage` w grupie komend zdalnych, obok `workflows`”. Binarny `narsor` nie ma podkomend (to tylko TUI). Plan dodaje komendę najwyższego poziomu `Usage` w `narsor-cli`, obok `Workflow`, `Backend` i `Harness`.
 - **Tekst CLI jest po angielsku.** Każdy tekst `narsor-cli` jest dziś po angielsku. Komunikat braku danych to `No usage limit data.` (sens „brak danych o limitach” z AE7 i AE8). TUI zostaje po polsku, ale format limitów (R11) nie ma słów.
 - **Krótkie nazwy harnessów spoza Claude Code:** `codex` → `codex` / `Codex`, `opencode` → `opencode` / `OpenCode`, `github-copilot` → `copilot` / `GitHub Copilot`. Origin podaje tylko przykład dla Claude Code.
-- **Znak `!` bez koloru stoi przed typem limitu:** `claude 5h 1% ↻4h10m · !7d 90% ↻2d3h`. Znak na początku segmentu nie znika przy obcinaniu końca tekstu.
+- **Znak `!` bez koloru stoi przed typem limitu** (dla `AllowedWarning` i dla `Rejected`, wg R12): `claude 5h 1% ↻4h10m · !7d 90% ↻2d3h`. Znak na początku segmentu nie znika przy obcinaniu końca tekstu.
 - **Czas odnowienia krótszy niż 1 h ma postać `Ym`** (np. `↻45m`, `↻0m`). Origin daje `XhYm` dla < 24 h i `↻0m` dla czasu, który minął. Plan łączy te dwa zapisy.
 - **Runner pomija nieznane okna i nieznane statusy.** Okno inne niż `five_hour` i `seven_day` nie trafia do raportu. Status spoza `allowed`, `allowed_warning`, `rejected` daje limit bez statusu. Okno bez `utilization` lub `resetsAt` nie trafia do raportu. Raport bez limitów nie jest wysyłany.
 - **Odczyt limitów w TUI nie włącza spinnera ładowania** i nie zmienia stanu połączenia w nagłówku. To mały odczyt w tle co 15 s.
@@ -75,7 +75,7 @@ Carried from origin:
 
 - Brak trwałego zapisu i historii limitów na serwerze.
 - Brak alarmów i blokowania nowych zadań przy wysokim wykorzystaniu.
-- Brak parserów limitów dla `codex`, `opencode` i `github_copilot`. Cecha parsera ma domyślną implementację „brak limitów”.
+- Brak parserów limitów dla `codex`, `opencode` i `github-copilot`. Cecha parsera ma domyślną implementację „brak limitów”.
 - Brak migracji starych wpisów `rate_limit`. Stare rozmowy pokazują je jako `Unrecognized`.
 - Brak pól `overage*` w kontrakcie, w TUI i w CLI.
 - Brak konfiguracji interwału 15 s.
@@ -84,7 +84,7 @@ Carried from origin:
 Plan-local:
 
 - Silnik demona w procesie (stare `/executions`) nie raportuje limitów. Linia limitów też nie trafia tam do logu (R8a), ale raport przepada, bo ten silnik nie ma `UsageReporter`.
-- Dyrygent (`run_harness_process` w `conductor/invoke.rs`) nie raportuje limitów. Dyrygent już dziś nie zapisuje rozmowy.
+- Dyrygent (`run_harness_process` w `engine/actions/agent.rs`, wywoływany z `conductor/invoke.rs`) nie raportuje limitów. Dyrygent już dziś nie zapisuje rozmowy.
 - Literały `"claude-code"` w kodzie testów zostają. R0 dotyczy kodu produkcyjnego. Testy, które sprawdzają wartość na drucie, mogą mieć literał.
 - Nagłówek TUI `harness claude-code` (`src/tui/task_app/harness.rs`) dalej pokazuje identyfikator. To identyfikator, nie nazwa.
 
@@ -108,7 +108,7 @@ Plan-local:
 - Klient właściciela: `ApiClient::control_workflows`, `control_backend_limit` w `crates/narsor-api-client/src/api/client.rs`.
 - Odczyt TUI w tle: `start_limit_read` w `src/tui/task_app/limit.rs`, `JobKey` i `Outcome` w `src/tui/task_app/background.rs`, pętla w `src/tui/mod.rs::run` (`start_refresh_if_due`, `wait_until_next_due`).
 - Dolny wiersz: `render_bar` w `src/tui/task_app/layout.rs`, `hint_line` i `hint_line_from` w `src/tui/keymap.rs`, `Notifier::span` i `current` w `src/tui/task_app/notify.rs`.
-- Dopasowanie tekstu w nagłówku: `Fit` i `header_lines` w `layout.rs`, `fit_text` w `src/tui/task_app/list.rs`.
+- Dopasowanie tekstu w nagłówku: `Fit` i `header_lines` w `layout.rs`, `fit` w `src/tui/task_app/list.rs` (tekst bez stylu).
 - Style: `Styles` w `src/tui/style.rs` (`Role::Attention`, `Role::Problem`, gałąź `no_color`).
 - CLI: `Command` i `runs_on_broken_config` w `src/cli/mod.rs`, `workflows` w `src/cli/task_registry.rs`, `json_output` i `failure` w `src/cli/remote.rs`, czyste funkcje tekstu w `src/cli/control_text.rs`.
 - Stałe harnessów dziś: `CLAUDE_CODE`, `CODEX`, `OPENCODE`, `GITHUB_COPILOT` w adapterach `crates/narsor-engine/src/engine/actions/harness/`. Kopie: `crates/narsor-shared/src/config/file.rs` (lista `supported`), `crates/narsor-shared/src/config/settings.rs` (domyślna wartość), `crates/narsor-engine/src/engine/actions/human.rs`, `crates/narsor-engine/src/engine/decision.rs`, `crates/narsor-engine/src/conductor/invoke.rs` (`SANDBOXED_HARNESSES`), `agent.rs` (`BUILT_IN_HARNESS`). Nazwa „Claude Code” w tekstach: `agent.rs`, `crates/narsor-protocol/src/panel/permission.rs`, `crates/narsor-controller/src/controller.rs`, `crates/narsor-controller/src/profile_edit.rs`, `src/cli/remote.rs`.
@@ -240,7 +240,7 @@ Dziewięć jednostek to za dużo na jeden krok wykonania. Dwie sesje skończyły
 | Etap | Jednostki | Wynik etapu | Stan przy rewizji planu |
 |---|---|---|---|
 | 0 | U1, U2, dokumentacja (D70, README) | Wspólna lista harnessów, kontrakt na drucie | Zrobione: commit `4d63793` i `516b9da` |
-| 1 | U3 | Parser oddaje limity, `RateLimit` usunięte | Częściowa praca bez commitu (nie sprawdzona) |
+| 1 | U3 | Parser oddaje limity, klasyfikator nie tworzy wpisu `rate_limit` (wariant `TechnicalCategory::RateLimit` usuwa U6 w etapie 3) | Częściowa praca bez commitu (nie sprawdzona) |
 | 2 | U4, U5 | Stan w `ProtocolService`, endpointy, klienci | Częściowa praca bez commitu (nie sprawdzona) |
 | 3 | U6 | Raport z runnera do serwera (F1 od początku do końca) | Nie zaczęte |
 | 4 | U7, U8 | Limity w dolnym wierszu TUI (F2) | Nie zaczęte |
@@ -465,7 +465,7 @@ Zasady etapów:
 **Dependencies:** U3, U5
 
 **Files:**
-- Modify: `crates/narsor-engine/src/engine/actions/agent.rs` (cecha `UsageReporter`, pole i builder `AgentExecutor`, `spawn_and_wait`, `feed_copilot_sdk_record`)
+- Modify: `crates/narsor-engine/src/engine/actions/agent.rs` (cecha `UsageReporter`, pole i builder `AgentExecutor`, `spawn_and_wait`, `run_harness_invocation`, `run_harness_process`, `feed_copilot_sdk_record`)
 - Modify: `crates/narsor-engine/src/engine/runner.rs` (builder `Engine`, przekazanie do `agent_executor`)
 - Create: `crates/narsor-runner/src/runner/usage.rs`
 - Modify: `crates/narsor-runner/src/runner/mod.rs` (wstrzyknięcie reportera, wysyłka w pętli `Session`)
@@ -475,8 +475,9 @@ Zasady etapów:
 
 **Approach:**
 - Cecha `UsageReporter: Send + Sync + Debug` z jedną metodą bez wyniku. Komentarz: wywołanie nie może blokować ani oblać kroku (jak `AgentEventSink`).
-- W pętli: po `on_stdout_line` zapytać parser o limity. Gdy wynik to `Some` (także pusta lista): pominąć `conversation.append`. Gdy wynik to `None`: zapisać linię jak dziś. Gdy lista nie jest pusta i reporter jest: zbudować `HarnessUsageReport` (identyfikator z adaptera, `observed_at` = teraz) i wywołać reporter. Ten sam warunek w `feed_copilot_sdk_record`.
-- Builder: `Engine::new` od razu wstawia `AgentExecutor` do mapy wykonawców. Dlatego `Engine` trzyma opcjonalny reporter, a `with_usage_reporter` buduje od nowa tylko domyślnego wykonawcę agenta (`agent_executor(...).with_usage_reporter(..)`). Testy z własnym `AgentExecutor` (`with_executor(ActionKind::Agent, ..)`) wołają `AgentExecutor::with_usage_reporter` same. Test sesji runnera przekazuje do swojego wykonawcy ten sam reporter, którego używa `Session`.
+- W pętli: po `on_stdout_line` zapytać parser o limity. Gdy wynik to `Some` (także pusta lista): pominąć `conversation.append`. Gdy wynik to `None`: zapisać linię jak dziś. Gdy lista nie jest pusta i reporter jest: zbudować `HarnessUsageReport` (identyfikator z adaptera, `observed_at` = teraz) i wywołać reporter. Ten sam warunek w `feed_copilot_sdk_record`. `spawn_and_wait` i dyrygent dzielą `run_harness_invocation`. `run_harness_process` (dyrygent) przekazuje brak reportera.
+- Builder: `Engine::new` od razu wstawia `AgentExecutor` do mapy wykonawców. Dlatego `Engine` trzyma opcjonalny reporter, a `with_usage_reporter` buduje od nowa tylko domyślnego wykonawcę agenta (`agent_executor(...).with_usage_reporter(..)`). Testy z własnym `AgentExecutor` (`with_executor(ActionKind::Agent, ..)`) wołają `AgentExecutor::with_usage_reporter` same. Test sesji runnera używa atrapy `Agent` (nie `AgentExecutor`). Atrapa dostaje uchwyt tego samego reportera, którego używa `Session`, i sama woła `report`.
+- Budowę reportera, kanału, `Engine` i `Session` w `runner::run` przenieść do jednej funkcji. `Fixture::new` w `session_tests.rs` używa tej samej funkcji. Wtedy test sprawdza to samo połączenie co produkcja.
 - Runner: reporter zapisuje raport do kanału „ostatnia wartość”. Pętla `Session` widzi nową wartość, bierze klienta z `Link::client()` i wysyła raport w osobnym zadaniu `tokio`. Błąd → `tracing::debug`, raport zapomniany. Brak klienta → raport zapomniany. Błąd raportu nie zmienia stanu `Link` (backoff snapshotów zostaje bez zmian).
 - Usunąć `TechnicalCategory::RateLimit`. Stare `"rate_limit"` czyta się jako `Unrecognized` przez istniejące `#[serde(other)]`.
 
@@ -490,7 +491,8 @@ Zasady etapów:
 - Edge case: `rate_limit_event` bez znanych okien → brak raportu, brak linii w rozmowie.
 - Edge case: krok `codex` → wszystkie linie stdout są w rozmowie jak dziś.
 - Covers AE3. Error path: runner z serwerem, który odrzuca `/runner/v1/usage` (lub nie odpowiada) → krok kończy się sukcesem, brak ponowienia raportu.
-- Integration (runner): po kroku z limitami serwer testowy ma stan `claude-code` z `GET /control/v1/usage`.
+- Integration (sesja runnera, `session_tests.rs`): reporter dostaje dwa raporty jeden po drugim. `Session` bierze tylko ostatni raport i próbuje go wysłać jeden raz. Przy nieosiągalnej centrali (`offline_config`) krok kończy się sukcesem, a stan `Link` (`failures`, `next_attempt`) się nie zmienia.
+- Crate `narsor-runner` nie zależy od `narsor-server`, więc nie uruchamia serwera testowego. Pełną ścieżkę F1 pokrywają razem: test AE1 (wykonawca → reporter), test sesji (reporter → próba wysłania) i test integracyjny U5 (`RunnerClient` → serwer → `GET /control/v1/usage`).
 - Happy path: surowy JSON technicznego elementu z `"category": "rate_limit"` → `TechnicalCategory::Unrecognized`.
 - Happy path: `every_variant_round_trips_unchanged` przechodzi bez `RateLimit`.
 
@@ -555,25 +557,27 @@ Zasady etapów:
 **Approach:**
 - Segment harnessu: krótka nazwa z listy R0 (nieznany identyfikator → identyfikator po `one_line`), potem limity rozdzielone ` · `. Harnessy rozdzielone ` | `.
 - Limit: `[!]typ procent% ↻czas`. Procent = zaokrąglone `utilization × 100`. Czas: ≥ 24 h → `XdYh`, ≥ 1 h → `XhYm`, inaczej `Ym`, czas miniony → `0m`.
-- Styl: `AllowedWarning` → `Role::Attention`, `Rejected` → `Role::Problem`. Znak `!` tylko bez koloru (Assumptions).
-- Dopasowanie: najpierw całe segmenty harnessów od końca. Gdy jeden harness nadal się nie mieści, obciąć koniec i dodać `…` (`fit_text`).
+- Styl: `AllowedWarning` → `Role::Attention`, `Rejected` → `Role::Problem`. Znak `!` tylko bez koloru, dla obu statusów (R12, Assumptions).
+- Dopasowanie: najpierw całe segmenty harnessów od końca. Gdy jeden harness nadal się nie mieści, obciąć koniec i dodać `…`. Obcięcie działa na liście `Span`: zachowuje styl każdego segmentu, obcina ostatni widoczny span i dodaje `…`. Funkcja `fit` z `list.rs` daje tekst bez stylu, więc służy tylko do powiadomienia.
 - `render_bar`:
   - Gałęzie ze stałym tekstem (`quit_confirm`, `View::Opening`) zostają bez zmian i bez limitów (R16).
-  - Prawa strona: widoczne powiadomienie (`notifier.current(now)`), inaczej tekst limitów, inaczej nic. Prawa strona dostaje całą szerokość, jakiej potrzebuje (bez dzisiejszej granicy połowy szerokości), ale nie więcej niż szerokość wiersza. Dłuższe powiadomienie `fit_text` obcina na końcu i dodaje `…`. Wtedy podpowiedzi mają szerokość 0. Dziś `area.x + area.width - note_width` daje przepełnienie, gdy `note_width` > `area.width`.
+  - Prawa strona: widoczne powiadomienie (`notifier.current(now)`), inaczej tekst limitów, inaczej nic. Prawa strona dostaje całą szerokość, jakiej potrzebuje (bez dzisiejszej granicy połowy szerokości), ale nie więcej niż szerokość wiersza. Dłuższe powiadomienie `fit` obcina na końcu i dodaje `…`. Wtedy podpowiedzi mają szerokość 0. Dziś `area.x + area.width - note_width` daje przepełnienie, gdy `note_width` > `area.width`.
   - Podpowiedzi dostają szerokość minus prawa strona minus 1. `hint_line_from` usuwa podpowiedzi od końca. Przy szerokości 0 nie ma podpowiedzi.
 - Tekst z serwera przechodzi przez `one_line` (R6a, ostatnia linia: znaki sterujące).
 
 **Patterns to follow:**
-- `Fit` i `header_lines` w `layout.rs`, `fit_text` w `list.rs`.
+- `Fit` i `header_lines` w `layout.rs`, `fit` w `list.rs`.
 - Test `the_notification_sits_on_the_bar` w `tests/tui_render.rs`.
 
 **Test scenarios:**
 - Covers AE4. Happy path: 160 kolumn, stan z AE1, `now_utc` ustalony → ostatni wiersz ma podpowiedzi po lewej i `claude 5h 1% ↻4h10m · 7d 90% ↻2d3h` przy prawej krawędzi. Komórki segmentu `7d` mają kolor `Role::Attention`.
 - Happy path: `Rejected` → kolor `Role::Problem`.
 - Happy path: `Styles::new(true)` → `· !7d 90%`, brak znaku `!` przy `5h`.
+- Happy path: `Styles::new(true)`, limit `Rejected` → znak `!` przed typem limitu.
 - Covers AE5. Edge case: szerokość ≥ 60, tekst limitów zostawia mniej miejsca niż najkrótsza podpowiedź → wiersz ma tylko limity.
 - Edge case: dwa harnessy, miejsce tylko na pierwszy → drugi segment usunięty cały, brak ` | `.
 - Edge case: jeden harness dłuższy niż wiersz → koniec obcięty, ostatni znak `…`.
+- Edge case: obcięty segment `7d` z `AllowedWarning` → widoczne komórki `7d` mają dalej kolor `Role::Attention`.
 - Covers AE6. Integration: powiadomienie widoczne → prawa strona to powiadomienie. Render z `now + LIFETIME` → prawa strona to limity.
 - Edge case: długie powiadomienie przy limitach → podpowiedzi ukryte, powiadomienie całe.
 - Edge case: powiadomienie dłuższe niż wiersz, szerokości od 1 do 80, przesunięty `Rect` → brak paniki, koniec obcięty, ostatni znak `…`.
@@ -605,7 +609,15 @@ Zasady etapów:
 - Test: `tests/cli_control_text.rs`, `tests/cli_smoke.rs`
 
 **Approach:**
-- Tekst: jeden blok na harness. Nagłówek: pełna nazwa z listy R0 i identyfikator, czas raportu (`observed_at`, czas lokalny). Wiersz na limit: typ, procent, status (`allowed`, `warning`, `rejected`, `-`), czas odnowienia (lokalny) i czas do odnowienia (ta sama funkcja formatu co TUI albo jej kopia w CLI).
+- Tekst: jeden blok na harness. Nagłówek: pełna nazwa z listy R0 i identyfikator, czas raportu (`observed_at`, czas lokalny). Wiersz na limit: typ, procent, status (`allowed`, `warning`, `rejected`, `-`), czas odnowienia (lokalny) i czas do odnowienia. Kolumny są wyrównane. Bloki rozdziela pusty wiersz.
+- CLI i TUI używają jednej funkcji formatu czasu do odnowienia (np. `4h10m`). Funkcja jest w module dostępnym dla obu, w crate głównym. Kopia w CLI jest niedozwolona.
+- Przykład wyjścia dla AE1 (czas lokalny i daty są przykładowe):
+
+  ```text
+  Claude Code (claude-code), reported 2026-10-31 14:02
+    5h    1%  allowed   resets 2026-10-31 18:12  (in 4h10m)
+    7d   90%  warning   resets 2026-11-02 17:02  (in 2d3h)
+  ```
 - Pusty stan: `No usage limit data.` na stdout, kod 0.
 - `--json`: `json_output` z całej odpowiedzi.
 - Błąd połączenia lub autoryzacji: `failure("Could not read the usage limits", error)`, stderr, kod 1.
