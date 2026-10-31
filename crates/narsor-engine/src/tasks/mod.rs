@@ -38,7 +38,7 @@
 //! without touching the disk ([`WorkspaceProvisioner::validate`]) runs *before*
 //! the execution is created, so a bad remote leaves nothing behind; the actual
 //! clone runs *after*, because the task directory is named for the execution id
-//! (`DOMAIN_MODEL.md` §2.8) and that id only exists once the execution does.
+//! (`docs/dev/domain-model.md` §2.8) and that id only exists once the execution does.
 //! The execution record is then saved again with the real workspace. If the
 //! clone fails, the freshly created execution is marked `Failed` with an
 //! `Error` event rather than left `Running` with no directory to run in.
@@ -372,7 +372,7 @@ pub fn workspace_request(
 ///
 /// # Precedence: registry id first, raw remote as fallback
 ///
-/// `WORKFLOW_SCHEMA.md` §3.2 defines `repository` as the id of a registered
+/// `docs/dev/workflow-schema.md` §3.2 defines `repository` as the id of a registered
 /// repository, so the value is looked up in `{catalog}/repositories/` first.
 /// A hit provisions from the entry's `remote`, checks out its `default_branch`
 /// when the workflow declares no `ref` of its own, and names the checkout

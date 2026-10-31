@@ -1,6 +1,6 @@
 //! Registry of the repositories a workflow may name by id.
 //!
-//! `WORKFLOW_SCHEMA.md` §3.2 describes `globals.workspace.repository` as "the
+//! `docs/dev/workflow-schema.md` §3.2 describes `globals.workspace.repository` as "the
 //! id of a repository registered in the system". This module is that system: a
 //! small, file-backed catalogue mapping a stable id to a git remote, so a
 //! definition can say `repository: acme-api` instead of embedding a URL that

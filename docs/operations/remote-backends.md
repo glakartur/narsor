@@ -826,7 +826,7 @@ reasoned override), `start` (`s`), `archive` (`a`), `input` and
 (`n`, also `create --file` for a path, with `workflows` and `validate` for the
 catalogue and the check), `list --archived` and `history …` (`H`), `repo …`
 (`R`) and `capabilities`; besides those, `h` is `narsor-cli harness default set`
-/ `reset`, the installation's default harness the header names. `?` shows the keys, README.md ("`tui`") describes the screens.
+/ `reset`, the installation's default harness the header names. `?` shows the keys, [the TUI guide](../user/tui.md) describes the screens.
 
 ### Task materials
 

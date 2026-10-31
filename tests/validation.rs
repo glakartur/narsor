@@ -1,4 +1,4 @@
-//! Static validation of workflow definitions (U2, `WORKFLOW_SCHEMA.md` §5).
+//! Static validation of workflow definitions (U2, `docs/dev/workflow-schema.md` §5).
 //!
 //! Every rule has its own fixture under `tests/fixtures/invalid/`, so the
 //! offending YAML is readable as YAML instead of as struct literals. The two

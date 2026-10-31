@@ -221,7 +221,7 @@ pub fn status_name(status: &ExecutionStatus) -> &'static str {
 /// An `agent` executor that answers from a fixed list of labels.
 ///
 /// `AgentAction` is out of scope for this plan (D17 puts the harness adapters
-/// in Phase 3), but the reference workflow of `WORKFLOW_SCHEMA.md` §4 has three
+/// in Phase 3), but the reference workflow of `docs/dev/workflow-schema.md` §4 has three
 /// agent states. This stub stands in for them so the engine loop can be driven
 /// end to end over the real fixture, and it records the prompts it was given so
 /// a test can check that templates were expanded before the executor saw them.

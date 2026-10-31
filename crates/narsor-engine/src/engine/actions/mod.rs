@@ -1,6 +1,6 @@
 //! Action executors.
 //!
-//! Every action type of `WORKFLOW_SCHEMA.md` §3.3 — `script`, `agent`, `human`
+//! Every action type of `docs/dev/workflow-schema.md` §3.3 — `script`, `agent`, `human`
 //! and `wait` — is executed through the single [`ActionExecutor`] trait, so the
 //! engine loop stays the same no matter what the state actually does.
 //!

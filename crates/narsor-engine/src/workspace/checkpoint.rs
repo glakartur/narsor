@@ -26,7 +26,7 @@
 //!
 //! [`Base::None`] points `GIT_DIR` at a scratch repository beside the execution
 //! and `GIT_WORK_TREE` at the directory, so a workflow with no repository at
-//! all (`DOMAIN_MODEL.md` §2.8, D39) checkpoints through this very code with no
+//! all (`docs/dev/domain-model.md` §2.8, D39) checkpoints through this very code with no
 //! second path — and without a `.git` appearing in its workspace.
 
 use std::fs;

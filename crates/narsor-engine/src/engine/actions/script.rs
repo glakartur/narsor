@@ -1,4 +1,4 @@
-//! `ScriptAction` executor (`WORKFLOW_SCHEMA.md` §3.3.B).
+//! `ScriptAction` executor (`docs/dev/workflow-schema.md` §3.3.B).
 //!
 //! Runs a command in the workspace and turns the way it ended into an output
 //! label. The label is decided in the order §3.3.B prescribes:

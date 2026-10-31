@@ -1,4 +1,4 @@
-//! `HumanAction` executor and the suspend/resume mechanism (`WORKFLOW_SCHEMA.md` §3.3.C).
+//! `HumanAction` executor and the suspend/resume mechanism (`docs/dev/workflow-schema.md` §3.3.C).
 //!
 //! A human action is the one action that cannot be *run*. Entering such a state
 //! records what the user is being asked for, moves the execution to

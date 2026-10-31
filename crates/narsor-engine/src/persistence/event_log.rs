@@ -92,7 +92,7 @@ impl EventLog {
     /// Reads the whole log, ordered by sequence number.
     ///
     /// An empty or missing directory yields an empty list. A hole in the
-    /// numbering is corruption (`DOMAIN_MODEL.md` §5: monotonic, no gaps) and
+    /// numbering is corruption (`docs/dev/domain-model.md` §5: monotonic, no gaps) and
     /// is reported as [`PersistenceError::SequenceGap`].
     pub fn read_all(&self) -> Result<Vec<Event>> {
         Ok(self.read_after(0, usize::MAX)?.0)

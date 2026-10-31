@@ -1,7 +1,7 @@
 name: test-fix-loop
 version: 1
 description: >
-  The `test -> fix_code -> test` cycle of WORKFLOW_SCHEMA.md §4, with the agent
+  The `test -> fix_code -> test` cycle of docs/dev/workflow-schema.md §4, with the agent
   replaced by a script. The test state fails the first time and passes the
   second, so the loop runs twice and leaves through `success`.
 
