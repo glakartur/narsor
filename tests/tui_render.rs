@@ -3010,12 +3010,17 @@ mod task_app_detail_render {
             .enumerate()
             .flat_map(|(index, line)| {
                 use base64::Engine as _;
+                let elements = parser.on_stdout_line(line.as_bytes());
+                // Like the stdout loop: a usage report line is not recorded.
+                if parser.take_usage().is_some() {
+                    return Vec::new();
+                }
                 conversation_projection::transcript_entries(&narsor::api::ConversationEntryDto {
                     entry_number: index as u64 + 1,
                     timestamp: chrono::Utc::now(),
                     source: narsor::api::ConversationEntrySource::Stdout,
                     raw_base64: base64::engine::general_purpose::STANDARD.encode(line),
-                    elements: parser.on_stdout_line(line.as_bytes()),
+                    elements,
                 })
             })
             .collect()
