@@ -687,6 +687,20 @@ fn app_reading(usage: &Arc<UsageDouble>) -> TaskApp {
     app
 }
 
+/// [`app_reading`] with two tasks taken in as a read of the list would
+/// bring them: a live connection, with no server.
+fn app_reading_with_list(usage: &Arc<UsageDouble>) -> TaskApp {
+    let mut app = app_reading(usage);
+    app.load(listing(
+        vec![
+            task("t1", "local", "running", 1),
+            task("t2", "local", "running", 2),
+        ],
+        "c1",
+    ));
+    app
+}
+
 #[tokio::test]
 async fn the_usage_limits_are_read_at_start_and_again_after_fifteen_seconds() {
     let usage = UsageDouble::answering(claude_usage());
@@ -751,11 +765,8 @@ async fn a_usage_read_that_hangs_keeps_no_key_waiting_and_starts_no_second_read(
 
 #[tokio::test]
 async fn a_failed_usage_read_clears_the_limits_and_leaves_the_connection_alone() {
-    let stub = Stub::start().await;
     let usage = UsageDouble::answering(claude_usage());
-    let mut app = app_with_list(&stub)
-        .await
-        .with_usage_source(Arc::clone(&usage) as Arc<dyn UsageSource>);
+    let mut app = app_reading_with_list(&usage);
     assert!(app.start_usage_if_due(Instant::now()));
     app.drain_jobs().await;
     assert!(app.harness_usage().is_some());
@@ -793,11 +804,8 @@ async fn an_empty_usage_answer_forgets_the_harness_shown_before() {
 
 #[tokio::test]
 async fn a_usage_answer_closes_no_dialog_and_moves_no_focus() {
-    let stub = Stub::start().await;
     let (usage, gate) = UsageDouble::gated(claude_usage());
-    let mut app = app_with_list(&stub)
-        .await
-        .with_usage_source(Arc::clone(&usage) as Arc<dyn UsageSource>);
+    let mut app = app_reading_with_list(&usage);
 
     assert!(app.start_usage_if_due(Instant::now()));
     usage.reached(1).await;

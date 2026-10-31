@@ -479,11 +479,11 @@ pub struct TaskApp {
     /// A write asked for a read while one ran: that one began before the
     /// write, so its answer settles nothing and one more read follows it.
     refresh_again: bool,
-    /// The usage limits of the harnesses, as last read (U7); `None` before
-    /// the first answer, after a failed read or when none is held.
     /// Where the usage limits are read from: the client, unless a test
     /// set another.
     usage_source: Arc<dyn UsageSource>,
+    /// The usage limits of the harnesses, as last read (U7); `None` before
+    /// the first answer, after a failed read or when none is held.
     harness_usage: Option<HarnessUsageResponse>,
     /// When the next read of the usage limits is due: at once, then a period
     /// after the previous read finished ([`usage::USAGE_PERIOD`]).
