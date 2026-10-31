@@ -74,6 +74,7 @@ Narsor obsługuje kilka harnessów (`claude_code`, `codex`, `opencode`, `github_
 **Runner**
 
 - R7. Runner rozpoznaje komunikat `rate_limit_event` Claude Code. Dane limitów są w obiekcie `rate_limit_info`. Runner mapuje okna `five_hour` → `5h` i `seven_day` → `7d` z `unifiedWindows`. Gdy `unifiedWindows` nie ma, runner bierze jedno okno z `rateLimitType`, `utilization`, `resetsAt` i `status`. Typ tego okna mapuje się tak samo (`five_hour` → `5h`, `seven_day` → `7d`). Status okna pochodzi z pola `status` tego okna w `unifiedWindows`. Gdy okno, które odpowiada polu `rateLimitType`, nie ma pola `status`, runner bierze `status` z poziomu `rate_limit_info`. W każdym innym przypadku limit nie ma statusu.
+- R7a. Runner odczytuje ze stanu sesji GitHub Copilot SDK snapshot `premium_interactions` przez `session.rpc().quota().get()`. Procent wykorzystania to `1 - remaining_percentage / 100`, a `reset_date_epoch_ms` jest czasem odnowienia. Nielimitowane, brakujące lub niepoprawne snapshoty są pomijane; miesięczny limit używa etykiety `30d` wspólnego kontraktu.
 - R8. Runner wysyła raport do serwera i nie zapisuje komunikatu o limitach w logu rozmowy. Runner nie trzyma raportu po wysłaniu. Błąd wysłania nie przerywa ani nie oblewa kroku. Runner nie ponawia nieudanego raportu: następny komunikat harnessu da świeży stan.
 - R8a. Klasyfikator Claude Code nie tworzy już wpisu `RateLimit`. Wspólna pętla stdout w wykonawcy agenta (`crates/narsor-engine/src/engine/actions/agent.rs`) nie zapisuje linii, którą parser harnessu oznaczył jako raport limitów. Ani surowa linia, ani wpis nie trafiają do logu rozmowy. Wariant `TechnicalCategory::RateLimit` jest usunięty. Stare rozmowy z wpisem `rate_limit` czytają się jako nieznany typ (`#[serde(other)] Unrecognized`) i to jest akceptowalne.
 
@@ -123,7 +124,7 @@ Narsor obsługuje kilka harnessów (`claude_code`, `codex`, `opencode`, `github_
 
 - Brak trwałego zapisu i historii limitów na serwerze (tylko ostatni stan w pamięci).
 - Brak alarmów i blokowania nowych zadań przy wysokim wykorzystaniu.
-- Brak parserów limitów dla `codex`, `opencode` i `github_copilot` w tej zmianie. Kontrakt jest gotowy na nie.
+- Brak parserów limitów dla `codex` i `opencode` w tej zmianie. GitHub Copilot raportuje wyłącznie swój limit `premium_interactions`; kontrakt jest gotowy na kolejne typy.
 - Brak migracji wpisów `rate_limit`, które już są w zapisanych rozmowach. Stare rozmowy pokazują je jako wpisy nieznanego typu.
 - Brak pól `overage*` (`overageStatus`, `isUsingOverage`, `overageDisabledReason`) w kontrakcie.
 - Brak konfiguracji interwału 15 s przez użytkownika.
