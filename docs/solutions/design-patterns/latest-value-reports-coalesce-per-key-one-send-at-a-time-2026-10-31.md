@@ -1,6 +1,7 @@
 ---
 title: "Latest-value reports to the control plane: coalesce per key, send one at a time"
 date: 2026-10-31
+last_updated: 2026-10-31
 category: design-patterns
 module: narsor-runner/runner/usage
 problem_type: design_pattern
@@ -46,7 +47,8 @@ Put the whole policy in one small component (`UsageForwarder` in `crates/narsor-
 ```rust
 // Session loop: the loop only drives the forwarder.
 () = self.usage.ready() => {
-    self.usage.forward(self.link.client());
+    let sender = self.usage_sender(); // the RunnerClient of the link, or a test's double
+    self.usage.forward(sender);
 }
 ```
 
@@ -101,3 +103,4 @@ Related hardening from the same review (`f76d270`): the server answers a report 
 - `docs/plans/2026-10-31-001-feat-limity-abonamentu-harnessow-plan.md` (R6a, R8)
 - `ARCHITECTURE_DECISIONS.md` D70 (usage state only in memory)
 - `docs/solutions/logic-errors/tui-list-read-on-every-runner-report-2026-10-22.md` (other side of runner reports: TUI reads)
+- `docs/solutions/conventions/test-network-features-through-trait-seams-not-tcp-servers-2026-10-31.md` (how these tests use a sender double instead of a TCP server)
