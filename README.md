@@ -547,7 +547,13 @@ header — the connection and its state on the left; on the right the
 installation's default agent harness (`harness claude-code (konfiguracja)`
 when it comes from the configuration, `harness opencode` when the operator
 chose it, `harness ?` before the first read), the slots and the counters of
-what waits. The last row is the shortcut bar. Every panel between them has a
+what waits. The last row is the shortcut bar. On its right it shows a
+notification while one is visible, otherwise the subscription limits the
+runners last reported for each harness (`claude 5h 1% ↻4h10m · 7d 90% ↻2d3h`:
+window, use, time to reset; a warning in the attention colour, a rejection in
+the problem colour, with `!` before the window when colours are off). The TUI
+reads them every 15 s; when they do not fit, the last harness goes first, then
+the end is cut with `…`, and the shortcuts give way to them. Every panel between them has a
 frame of its own with rounded corners: in the focus colour (cyan, with a bold
 title and a `▸` before it) on the panel that has the keys, grey on the others —
 so the active panel reads without colour too. The details frame is named after
@@ -739,6 +745,7 @@ or a runner directly.
 narsor-cli backend default                        # which backend new tasks get (set/reset to change)
 narsor-cli backend limit <backend> [get|set <n>|reset]   # concurrent tasks of a backend, changed without a restart (ad hoc, lasts until the daemon restarts)
 narsor-cli harness default [--json]               # the default agent harness, for new and running tasks (set/reset to change)
+narsor-cli usage [--json]                         # the subscription limits each harness last reported (in memory only, gone after 15 min, a reset or a daemon restart)
 narsor-cli task create implement-feature --input ticket=NAR-1 [--backend k8s]
 narsor-cli task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
 narsor-cli task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
