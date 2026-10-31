@@ -11,7 +11,7 @@ origin: docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md
 
 ## Summary
 
-Nowy moduł `narsor-protocol::harness` ma jedną listę harnessów (identyfikator, krótka nazwa, pełna nazwa). Parser Claude Code nie zamienia już `rate_limit_event` na wpis rozmowy. Parser oddaje limity przez nową metodę cechy `HarnessStreamParser`. Wspólna pętla stdout w `agent.rs` pomija zapis tej linii i przekazuje raport do opcjonalnego `UsageReporter`. Runner wysyła raport `POST /runner/v1/usage` bez ponawiania. `ProtocolService` trzyma ostatni stan każdego harnessu w pamięci i usuwa nieaktualne dane przy każdym zapisie i odczycie. `GET /control/v1/usage` zwraca stan. TUI czyta stan zadaniem w tle co 15 s i rysuje go po prawej stronie dolnego wiersza. Nowa komenda `narsor-cli usage` wypisuje ten sam stan (see origin: `docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md`).
+Nowy moduł `narsor-protocol::harness` ma jedną listę harnessów (identyfikator, krótka nazwa, pełna nazwa). Parser Claude Code nie zamienia już `rate_limit_event` na wpis rozmowy. Copilot SDK odczytuje stan limitu `premium_interactions` z sesji i przekazuje raport przez wspólny `UsageReporter`. Runner wysyła raport `POST /runner/v1/usage` bez ponawiania. `ProtocolService` trzyma ostatni stan każdego harnessu w pamięci i usuwa nieaktualne dane przy każdym zapisie i odczycie. `GET /control/v1/usage` zwraca stan. TUI czyta stan zadaniem w tle co 15 s i rysuje go po prawej stronie dolnego wiersza. Nowa komenda `narsor-cli usage` wypisuje ten sam stan (see origin: `docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md`).
 
 ---
 
@@ -57,7 +57,7 @@ Plan realizuje R0–R19, R5a, R6a i R8a z origin. Tabela łączy wymagania z jed
 | R1–R4, R6a (kontrakt i walidacja) | U2, U4 |
 | R5, R5a (ostatni stan w pamięci, wygasanie) | U4 |
 | R6 (endpointy i autoryzacja) | U5 |
-| R7 (mapowanie Claude Code) | U3 |
+| R7, R7a (mapowanie Claude Code i GitHub Copilot) | U3 |
 | R8, R8a (wysłanie bez logu, usunięcie `RateLimit`) | U3, U6 |
 | R9 (odczyt co 15 s, bez blokady) | U7 |
 | R10–R16 (dolny wiersz TUI) | U8 |
@@ -75,7 +75,7 @@ Carried from origin:
 
 - Brak trwałego zapisu i historii limitów na serwerze.
 - Brak alarmów i blokowania nowych zadań przy wysokim wykorzystaniu.
-- Brak parserów limitów dla `codex`, `opencode` i `github-copilot`. Cecha parsera ma domyślną implementację „brak limitów”.
+- Brak parserów limitów dla `codex` i `opencode`. GitHub Copilot raportuje limit `premium_interactions` odczytany ze stanu sesji SDK.
 - Brak migracji starych wpisów `rate_limit`. Stare rozmowy pokazują je jako `Unrecognized`.
 - Brak pól `overage*` w kontrakcie, w TUI i w CLI.
 - Brak konfiguracji interwału 15 s.

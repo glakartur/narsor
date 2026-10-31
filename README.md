@@ -745,7 +745,7 @@ or a runner directly.
 narsor-cli backend default                        # which backend new tasks get (set/reset to change)
 narsor-cli backend limit <backend> [get|set <n>|reset]   # concurrent tasks of a backend, changed without a restart (ad hoc, lasts until the daemon restarts)
 narsor-cli harness default [--json]               # the default agent harness, for new and running tasks (set/reset to change)
-narsor-cli usage [--json]                         # the subscription limits each harness last reported (in memory only, gone after 15 min, a reset or a daemon restart)
+narsor-cli usage [--json]                         # reported Claude/Copilot limits (in memory only; expires after 15 min, reset or daemon restart)
 narsor-cli task create implement-feature --input ticket=NAR-1 [--backend k8s]
 narsor-cli task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
 narsor-cli task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history

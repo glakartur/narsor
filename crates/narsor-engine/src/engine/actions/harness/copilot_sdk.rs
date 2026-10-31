@@ -4,11 +4,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use github_copilot_sdk::{
     CliProgram, Client, ClientOptions, MessageOptions, ResumeSessionConfig, SessionConfig,
     SessionId,
 };
+use narsor_protocol::controller::{UsageLimit, UsageStatus};
 use serde_json::Value;
 
 use crate::domain::ActionError;
@@ -111,6 +113,17 @@ pub(crate) async fn run_copilot_sdk(
                     "success": true
                 }),
             );
+            if !response.usage_limits.is_empty() {
+                feed_copilot_sdk_record(
+                    &mut parser,
+                    conversation,
+                    usage,
+                    serde_json::json!({
+                        "type": "usage",
+                        "limits": response.usage_limits
+                    }),
+                );
+            }
             Ok(SpawnEnding::Finished(FinishedRun {
                 run: parser.finish(0, ""),
                 exit_code: 0,
@@ -148,10 +161,51 @@ pub(crate) struct CopilotSdkRequest {
     limit: Option<Duration>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CopilotSdkResponse {
     session_id: String,
     text: Option<String>,
+    usage_limits: Vec<UsageLimit>,
+}
+
+/// Reads the subscription quota snapshot maintained by the Copilot SDK.
+fn copilot_usage_limits(
+    projection: &github_copilot_sdk::rpc::SessionQuotaProjection,
+) -> Vec<UsageLimit> {
+    let Some(quota) = projection.snapshots.get("premium_interactions") else {
+        return Vec::new();
+    };
+    if quota.is_unlimited_entitlement || !quota.remaining_percentage.is_finite() {
+        return Vec::new();
+    }
+    let Some(reset_millis) = quota.reset_date_epoch_ms else {
+        return Vec::new();
+    };
+    if !reset_millis.is_finite() || reset_millis < i64::MIN as f64 || reset_millis > i64::MAX as f64
+    {
+        return Vec::new();
+    }
+    let Some(resets_at) = DateTime::<Utc>::from_timestamp_millis(reset_millis as i64) else {
+        return Vec::new();
+    };
+    if resets_at <= Utc::now() {
+        return Vec::new();
+    }
+
+    let status = match quota.has_quota {
+        Some(true) => Some(UsageStatus::Allowed),
+        Some(false) if quota.usage_allowed_with_exhausted_quota => Some(UsageStatus::Allowed),
+        Some(false) => Some(UsageStatus::Rejected),
+        None => None,
+    };
+    vec![UsageLimit {
+        // Copilot reports a monthly premium-interaction allowance; the shared
+        // usage contract represents its cycle with the closest supported label.
+        window: "30d".to_string(),
+        utilization: (100.0 - quota.remaining_percentage.clamp(0.0, 100.0)) / 100.0,
+        resets_at,
+        status,
+    }]
 }
 
 fn copilot_sdk_wait_timeout(limit: Option<Duration>) -> Duration {
@@ -250,6 +304,13 @@ impl CopilotSdkBackend for GitHubCopilotSdkRuntime {
                     )
                     .await
                     .map_err(|error| copilot_sdk_error("Copilot SDK request failed", error));
+                let usage_limits = match session.rpc().quota().get().await {
+                    Ok(projection) => copilot_usage_limits(&projection),
+                    Err(error) => {
+                        tracing::debug!(%error, "could not read Copilot subscription usage");
+                        Vec::new()
+                    }
+                };
                 let disconnect = session.disconnect().await.map_err(|error| {
                     copilot_sdk_error("failed to disconnect Copilot SDK session", error)
                 });
@@ -269,6 +330,7 @@ impl CopilotSdkBackend for GitHubCopilotSdkRuntime {
                             .and_then(Value::as_str)
                             .map(str::to_string)
                     }),
+                    usage_limits,
                 })
             };
 
@@ -320,8 +382,8 @@ fn combine_sdk_errors(primary: ActionError, cleanup: ActionError) -> ActionError
 #[cfg(test)]
 mod copilot_sdk_dispatch_tests {
     use super::{
-        copilot_sdk_wait_timeout, run_with_sdk_deadline, CopilotSdkBackend, CopilotSdkOutcome,
-        CopilotSdkRequest, CopilotSdkResponse,
+        copilot_sdk_wait_timeout, copilot_usage_limits, run_with_sdk_deadline, CopilotSdkBackend,
+        CopilotSdkOutcome, CopilotSdkRequest, CopilotSdkResponse,
     };
     use crate::engine::actions::agent::conversation::ConversationSink;
     use crate::engine::actions::agent::process::{
@@ -329,7 +391,9 @@ mod copilot_sdk_dispatch_tests {
     };
     use crate::engine::actions::harness::{GitHubCopilotAdapter, HarnessAdapter};
     use base64::Engine;
+    use chrono::Utc;
     use futures::future::BoxFuture;
+    use narsor_protocol::controller::UsageStatus;
     use std::path::Path;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -356,6 +420,64 @@ mod copilot_sdk_dispatch_tests {
         );
     }
 
+    #[test]
+    fn copilot_subscription_quota_maps_remaining_percentage_and_reset() {
+        use github_copilot_sdk::rpc::{SessionQuotaProjection, SessionQuotaSnapshot};
+
+        let reset = Utc::now() + chrono::Duration::days(5);
+        let projection = SessionQuotaProjection {
+            snapshots: [(
+                "premium_interactions".to_string(),
+                SessionQuotaSnapshot {
+                    remaining_percentage: 37.5,
+                    reset_date_epoch_ms: Some(reset.timestamp_millis() as f64),
+                    has_quota: Some(true),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        let limits = copilot_usage_limits(&projection);
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].window, "30d");
+        assert_eq!(limits[0].utilization, 0.625);
+        assert_eq!(
+            limits[0].resets_at.timestamp_millis(),
+            reset.timestamp_millis()
+        );
+        assert_eq!(limits[0].status, Some(UsageStatus::Allowed));
+    }
+
+    #[test]
+    fn copilot_subscription_quota_omits_unlimited_and_unknown_snapshots() {
+        use github_copilot_sdk::rpc::{SessionQuotaProjection, SessionQuotaSnapshot};
+
+        let unlimited = SessionQuotaProjection {
+            snapshots: [(
+                "premium_interactions".to_string(),
+                SessionQuotaSnapshot {
+                    is_unlimited_entitlement: true,
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert!(copilot_usage_limits(&unlimited).is_empty());
+
+        let other_bucket = SessionQuotaProjection {
+            snapshots: [("chat".to_string(), SessionQuotaSnapshot::default())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert!(copilot_usage_limits(&other_bucket).is_empty());
+    }
+
     struct MockCopilotSdk {
         request: Mutex<Option<CopilotSdkRequest>>,
     }
@@ -370,6 +492,7 @@ mod copilot_sdk_dispatch_tests {
                 Ok(CopilotSdkOutcome::Finished(CopilotSdkResponse {
                     session_id: "sdk-session".to_string(),
                     text: Some("hello".to_string()),
+                    usage_limits: Vec::new(),
                 }))
             })
         }

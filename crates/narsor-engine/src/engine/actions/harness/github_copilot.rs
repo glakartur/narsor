@@ -43,6 +43,7 @@ use super::{
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
 use narsor_protocol::chat::ChatElement;
+use narsor_protocol::controller::UsageLimit;
 
 /// The `harness:` value this adapter answers to.
 pub use narsor_protocol::harness::GITHUB_COPILOT;
@@ -208,12 +209,14 @@ struct GitHubCopilotStreamParser {
     completed: bool,
     terminal_failure: Option<String>,
     malformed_json: bool,
+    usage: Option<Vec<UsageLimit>>,
 }
 
 impl GitHubCopilotStreamParser {
     /// Folds one stdout line into what [`HarnessStreamParser::finish`]
     /// needs; lines that carry none of it are ignored.
     fn accumulate(&mut self, line: &[u8]) {
+        self.usage = None;
         let Ok(text) = std::str::from_utf8(line) else {
             self.malformed_json = true;
             return;
@@ -261,6 +264,14 @@ impl GitHubCopilotStreamParser {
             "error" => {
                 self.terminal_failure = Some(error_text(&value));
             }
+            "usage" => {
+                self.usage = Some(
+                    value
+                        .get("limits")
+                        .and_then(|limits| serde_json::from_value(limits.clone()).ok())
+                        .unwrap_or_default(),
+                );
+            }
             _ => {}
         }
     }
@@ -272,6 +283,10 @@ impl HarnessStreamParser for GitHubCopilotStreamParser {
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {
         self.accumulate(line);
         not_classified()
+    }
+
+    fn take_usage(&mut self) -> Option<Vec<UsageLimit>> {
+        self.usage.take()
     }
 
     fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun {
@@ -385,6 +400,37 @@ mod tests {
         assert_eq!(run.failure, None);
         assert_eq!(run.text, "My response");
         assert_eq!(run.session_id, Some("copilot-123".to_string()));
+    }
+
+    #[test]
+    fn subscription_usage_is_reported_once_and_not_classified_as_chat() {
+        let reset = chrono::Utc::now() + chrono::Duration::days(1);
+        let mut parser = GitHubCopilotStreamParser::default();
+        let elements = parser.on_stdout_line(
+            serde_json::json!({
+                "type": "usage",
+                "limits": [{
+                    "window": "30d",
+                    "utilization": 0.4,
+                    "resets_at": reset,
+                    "status": "allowed"
+                }]
+            })
+            .to_string()
+            .as_bytes(),
+        );
+
+        assert_eq!(elements, not_classified());
+        assert_eq!(
+            parser.take_usage(),
+            Some(vec![UsageLimit {
+                window: "30d".to_string(),
+                utilization: 0.4,
+                resets_at: reset,
+                status: Some(narsor_protocol::controller::UsageStatus::Allowed),
+            }])
+        );
+        assert_eq!(parser.take_usage(), None);
     }
 
     #[test]
