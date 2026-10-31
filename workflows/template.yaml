@@ -13,7 +13,7 @@ display:
   links:
     - label: schema
       text: Workflow schema
-      url: https://github.com/glakartur/narsor/blob/main/WORKFLOW_SCHEMA.md
+      url: https://github.com/glakartur/narsor/blob/main/docs/dev/workflow-schema.md
 
 globals:
   timeout: 2m

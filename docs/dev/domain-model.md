@@ -1,266 +1,266 @@
 # Domain Model
 
-Niniejszy dokument opisuje model domenowy systemu **AI Workflow Narsor**. Model został zaprojektowany zgodnie z zasadą **deterministycznego rdzenia**, gdzie AI jest jedynie wykonawcą akcji, a nie właścicielem procesu decyzyjnego.
+This document describes the domain model of the **AI Workflow Narsor** system. The model was designed according to the principle of a **deterministic core**, where the AI is only an executor of actions and not the owner of the decision-making process.
 
-## 1. Przegląd encji
+## 1. Entity overview
 
-Poniżej przedstawiono główne encje systemu i ich odpowiedzialności:
+The main entities of the system and their responsibilities are presented below:
 
-| Encja | Odpowiedzialność | Trwałość |
+| Entity | Responsibility | Persistence |
 |-------|------------------|----------|
-| `WorkflowDefinition` | Deklaracja grafu stanów, akcji i przejść | Plik YAML w `/workflows/` |
-| `WorkflowExecution` | Instancja wykonania konkretnego workflow | Folder w `/executions/` + `state.json` |
-| `State` | Pojedynczy węzeł wgrafie workflow | Część definicji + stan w `state.json` |
-| `Action` | Operacja do wykonania w danym stanie | Część definicji |
-| `ActionExecution` | Historia wykonania konkretnej akcji | Wpis w `events/` + `state.json` |
-| `Context` | Dane współdzielone między krokami workflow | `context.json` w folderze wykonania |
-| `Artifact` | Fizyczne pliki wynikowe działania | Pliki w `/artifacts/` + metadata w `context.json` |
-| `Workspace` | Środowisko izolowane dla wykonania (filesystem) | Folder `/code/` w tasku |
-| `Event` | Niezmienny zapis zdarzenia w systemie | Plik w `/events/` (append-only) |
-| `Decision` | Wynik wyboru przejścia na podstawie wyniku akcji | Wpis w `events/` |
-| `AgentSession` | Sesja komunikacji z zewnętrznym harnessem AI | Metadata w `state.json` + logi |
+| `WorkflowDefinition` | Declaration of the graph of states, actions and transitions | YAML file in `/workflows/` |
+| `WorkflowExecution` | An instance of executing a specific workflow | Folder in `/executions/` + `state.json` |
+| `State` | A single node in the workflow graph | Part of the definition + state in `state.json` |
+| `Action` | An operation to perform in a given state | Part of the definition |
+| `ActionExecution` | History of the execution of a specific action | Entry in `events/` + `state.json` |
+| `Context` | Data shared between workflow steps | `context.json` in the execution folder |
+| `Artifact` | Physical output files of an action | Files in `/artifacts/` + metadata in `context.json` |
+| `Workspace` | An isolated environment for the execution (filesystem) | `/code/` folder in the task |
+| `Event` | An immutable record of an event in the system | File in `/events/` (append-only) |
+| `Decision` | The result of choosing a transition based on an action result | Entry in `events/` |
+| `AgentSession` | A communication session with an external AI harness | Metadata in `state.json` + logs |
 
 ---
 
-## 2. Szczegółowy opis encji
+## 2. Detailed description of entities
 
 ### 2.1 WorkflowDefinition
 
-Reprezentuje szablon procesu biznesowego. Jest niezmienny po utworzeniu (wersjonowany).
+Represents a business process template. It is immutable after creation (versioned).
 
-**Atrybuty:**
-- `id`: Unikalny identyfikator (np. slug lub UUID).
-- `version`: Wersja semantyczna definicji.
-- `name`: Nazwa czytelna dla człowieka.
-- `description`: Opis celu workflow.
-- `inputs`: Schema oczekiwanych danych wejściowych.
-- `states`: Mapa stanów (klucz -> definicja stanu).
-- `created_at`: Timestamp utworzenia.
+**Attributes:**
+- `id`: Unique identifier (e.g. a slug or UUID).
+- `version`: Semantic version of the definition.
+- `name`: Human-readable name.
+- `description`: Description of the workflow's purpose.
+- `inputs`: Schema of expected input data.
+- `states`: Map of states (key -> state definition).
+- `created_at`: Creation timestamp.
 
-**Struktura stanu (w definicji):**
-- `id`: Identyfikator stanu.
-- `action`: Definicja akcji do wykonania (typ, konfiguracja).
-- `variables`: Zmienne kroku (`name`, `description`). Nazwa z prefiksem `local.` oznacza zmienną lokalną kroku. Tylko kroki `agent` i `script`; `local.*` tylko `agent`.
-- `artifacts`: Nazwane artefakty kroku (`name`, `description`). Tylko kroki `agent` i `script`.
-- `choices`: Lista możliwych wyborów. Każdy ma `label`, opcjonalny `description`, listę `requires_variables` i listę `requires_artifacts` (nazwy z definicji kroku) oraz opcjonalne `requires_human_approval` i `resume_comment_field`.
-- `transitions`: Mapa etykieta -> ID następnego stanu.
-- `decision_provider`: Typ dostarczyciela decyzji (`rule`, `human`, `agent`).
-- `allow_manual_override`: Czy użytkownik może wymusić przejście ręczne.
+**State structure (in the definition):**
+- `id`: State identifier.
+- `action`: Definition of the action to execute (type, configuration).
+- `variables`: Step variables (`name`, `description`). A name with the `local.` prefix denotes a step-local variable. Only `agent` and `script` steps; `local.*` only for `agent`.
+- `artifacts`: Named step artifacts (`name`, `description`). Only `agent` and `script` steps.
+- `choices`: List of possible choices. Each has a `label`, an optional `description`, a `requires_variables` list and a `requires_artifacts` list (names from the step definition), and the optional `requires_human_approval` and `resume_comment_field`.
+- `transitions`: Map of label -> ID of the next state.
+- `decision_provider`: Type of decision provider (`rule`, `human`, `agent`).
+- `allow_manual_override`: Whether the user can force a manual transition.
 
 ### 2.2 WorkflowExecution
 
-Konkretna instancja uruchomionego workflow. Posiada własny stan, kontekst i historię.
+A concrete instance of a running workflow. It has its own state, context and history.
 
-**Atrybuty:**
-- `id`: Unikalny identyfikator wykonania (UUID).
-- `workflow_definition_id`: Referencja do definicji.
-- `workflow_version`: Wersja definicji, na której bazuje wykonanie.
+**Attributes:**
+- `id`: Unique execution identifier (UUID).
+- `workflow_definition_id`: Reference to the definition.
+- `workflow_version`: Version of the definition the execution is based on.
 - `status`: `RUNNING`, `PAUSED`, `COMPLETED`, `FAILED`, `CANCELLED`.
-- `current_state_id`: ID aktualnie wykonywanego stanu (lub ostatniego).
-- `started_at`: Timestamp startu.
-- `finished_at`: Timestamp zakończenia (jeśli dotyczy).
-- `input_data`: Dane wejściowe przekazane przy starcie.
+- `current_state_id`: ID of the currently executing state (or the last one).
+- `started_at`: Start timestamp.
+- `finished_at`: Completion timestamp (if applicable).
+- `input_data`: Input data passed at start.
 
-**Cykl życia:**
-1. Tworzenie na podstawie `WorkflowDefinition` i inputów.
-2. Przejście do stanu `RUNNING`.
-3. Iteracyjne wykonywanie stanów aż do stanu terminalnego.
-4. Zmiana statusu na `COMPLETED`/`FAILED`.
+**Lifecycle:**
+1. Creation based on a `WorkflowDefinition` and inputs.
+2. Transition to the `RUNNING` state.
+3. Iterative execution of states until a terminal state.
+4. Status change to `COMPLETED`/`FAILED`.
 
-### 2.3 State (Instancja)
+### 2.3 State (Instance)
 
-Reprezentuje aktualną pozycję wykonania w grafie. Nie jest przechowywana jako osobny obiekt, lecz jako pole `current_state_id` w `WorkflowExecution` oraz wpis w historii eventów.
+Represents the current position of the execution in the graph. It is not stored as a separate object, but as the `current_state_id` field in `WorkflowExecution` and an entry in the event history.
 
-**Dane runtime:**
-- `entered_at`: Czas wejścia w stan.
-- `action_execution_id`: ID trwającego/wykonanego ActionExecution.
-- `retry_count`: Liczba prób ponowienia w tym stanie.
+**Runtime data:**
+- `entered_at`: Time of entering the state.
+- `action_execution_id`: ID of the ongoing/executed ActionExecution.
+- `retry_count`: Number of retry attempts in this state.
 
 ### 2.4 Action
 
-Abstrakcja operacji do wykonania. W modelu domenowym Action jest częścią definicji stanu.
+An abstraction of an operation to execute. In the domain model, an Action is part of a state definition.
 
-**Typy akcji (MVP):**
-- `AgentAction`: Uruchomienie harnessa AI (Claude Code/OpenCode).
-- `ScriptAction`: Wykonanie polecenia shell/skryptu.
-- `HumanAction`: Oczekiwanie na interwencję człowieka.
-- `WaitAction`: Oczekiwanie na zdarzenie zewnętrzne.
+**Action types (MVP):**
+- `AgentAction`: Launching an AI harness (Claude Code/OpenCode).
+- `ScriptAction`: Executing a shell command/script.
+- `HumanAction`: Waiting for human intervention.
+- `WaitAction`: Waiting for an external event.
 
-**Konfiguracja Action:**
-- `type`: Typ akcji.
-- `config`: Specyficzne parametry (np. prompt, command, timeout).
-- `workspace_scope`: Określenie, które repozytoria są RW, a które RO.
-- `history` (tylko `AgentAction`): Czy silnik dodaje do promptu historię ponownego wejścia (domyślnie `true`).
+**Action configuration:**
+- `type`: Action type.
+- `config`: Specific parameters (e.g. prompt, command, timeout).
+- `workspace_scope`: Specifies which repositories are RW and which are RO.
+- `history` (`AgentAction` only): Whether the engine adds the re-entry history to the prompt (default `true`).
 
-Możliwe wyniki akcji deklaruje stan w `choices`, a nie akcja.
+The possible results of an action are declared by the state in `choices`, not by the action.
 
 ### 2.5 ActionExecution
 
-Reprezentuje pojedyncze wykonanie akcji w ramach stanu.
+Represents a single execution of an action within a state.
 
-**Atrybuty:**
-- `id`: Unikalny ID wykonania.
-- `workflow_execution_id`: FK do wykonania.
-- `state_id`: ID stanu, w którym wystąpiło.
-- `action_type`: Typ wykonanej akcji.
+**Attributes:**
+- `id`: Unique execution ID.
+- `workflow_execution_id`: FK to the execution.
+- `state_id`: ID of the state in which it occurred.
+- `action_type`: Type of the executed action.
 - `status`: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `UNKNOWN`.
-- `started_at`, `finished_at`: Timestampy.
-- `result`: Ustrukturyzowany wynik (`ActionResult`, kontrakt D64).
-  - `output_label`: Etykieta przejścia. Agent i skrypt podają ją w polu `choice` odpowiedzi.
-  - `reason`: Jedna linia uzasadnienia wyboru. Pusty tekst, gdy akcja go nie podała. Wynik `timeout` dostaje `reason` od silnika.
-  - `variables`: Zmienne zdefiniowane na kroku (globalne i `local.*`). Silnik usuwa z nich zmienne spoza definicji kroku przed zapisem wyniku (wyjątek: `agent_session_id`).
-  - `artifacts`: Nazwane artefakty kroku, mapa nazwa → ścieżka.
-  - `additional_data`: Dowolny obiekt spoza definicji kroku. Silnik go nie interpretuje. Trafiają tu też zmienne spoza definicji kroku.
-  - `additional_artifacts`: Lista ścieżek plików spoza definicji kroku.
-  - `data`: Tylko zapisy silnika (`agent_session`, `timeout_secs`). Agent i skrypt nie piszą do tego pola.
-  - `exit_code`, `stdout`, `stderr`, `reply`: Dane obserwowane przez executor.
-- `error`: Komunikat błędu (jeśli wystąpił).
-- `agent_session_id`: Referencja do sesji agenta (jeśli dotyczy).
+- `started_at`, `finished_at`: Timestamps.
+- `result`: Structured result (`ActionResult`, the D64 contract).
+  - `output_label`: Transition label. The agent and script provide it in the `choice` field of the response.
+  - `reason`: A single line of rationale for the choice. Empty text when the action did not provide it. A `timeout` result gets `reason` from the engine.
+  - `variables`: Variables defined on the step (global and `local.*`). The engine removes from them variables outside the step definition before saving the result (exception: `agent_session_id`).
+  - `artifacts`: Named step artifacts, a name → path map.
+  - `additional_data`: Any object outside the step definition. The engine does not interpret it. Variables outside the step definition also end up here.
+  - `additional_artifacts`: A list of file paths outside the step definition.
+  - `data`: Engine writes only (`agent_session`, `timeout_secs`). The agent and script do not write to this field.
+  - `exit_code`, `stdout`, `stderr`, `reply`: Data observed by the executor.
+- `error`: Error message (if one occurred).
+- `agent_session_id`: Reference to the agent session (if applicable).
 
 ### 2.6 Context
 
-Magazyn danych współdzielonych przez wszystkie kroki workflow. Przechowywany jako `context.json`.
+A data store shared by all workflow steps. Stored as `context.json`.
 
-**Struktura:**
-- `variables`: Płaska mapa kluczy i wartości prostych typów (string, int, bool, list).
-  - Przykład: `{ "branch_name": "feature/login", "pr_number": 123 }`.
-  - Nie zawiera zmiennych `local.*` (patrz niżej).
-- `artifacts_index`: Mapa nazw artefaktów do ich lokalizacji/metadanych. Nazwany artefakt kroku jest dostępny w szablonie jako `{{ artifacts.NAZWA }}` (ścieżka ostatniego zapisu).
-- `workspace_info`: Informacje o aktywnym workspace (ścieżki do repo).
+**Structure:**
+- `variables`: A flat map of keys and values of simple types (string, int, bool, list).
+  - Example: `{ "branch_name": "feature/login", "pr_number": 123 }`.
+  - Does not contain `local.*` variables (see below).
+- `artifacts_index`: A map of artifact names to their locations/metadata. A named step artifact is available in a template as `{{ artifacts.NAME }}` (the path of the last write).
+- `workspace_info`: Information about the active workspace (paths to repos).
 
-**Zasady:**
-- Aktualizowany wyłącznie przez Workflow Engine na podstawie pola `variables` z wyniku Action. Silnik zapisuje tylko zmienne globalne zdefiniowane na kroku i wartości pól bramki `human`.
-- Zmienne `local.*` nie trafiają do kontekstu. Silnik trzyma je w `metadata.engine.step_locals` wykonania (`state.json`), osobno dla każdego kroku (`state_id → { "local.NAZWA": wartość }`). Wartość żyje w obrębie jednego wykonania. Nowa wartość zastępuje starą w całości. Gdy próba nie poda wartości, zostaje poprzednia. Szablon `{{ local.NAZWA }}` czyta ją tylko w tym samym kroku.
-- Nie przechowuje dużych blobów danych (tylko referencje do Artifact).
-- Nie przechowuje historii rozmów agentów.
+**Rules:**
+- Updated exclusively by the Workflow Engine based on the `variables` field of the Action result. The engine writes only the global variables defined on the step and the values of `human` gate fields.
+- `local.*` variables do not go into the context. The engine keeps them in the execution's `metadata.engine.step_locals` (`state.json`), separately for each step (`state_id → { "local.NAME": value }`). The value lives within a single execution. A new value replaces the old one entirely. When an attempt does not provide a value, the previous one stays. The template `{{ local.NAME }}` reads it only in the same step.
+- Does not store large data blobs (only references to Artifact).
+- Does not store agent conversation history.
 
 ### 2.7 Artifact
 
-Reprezentuje fizyczny plik lub zbiór plików wygenerowany podczas wykonania.
+Represents a physical file or a set of files generated during the execution.
 
-**Atrybuty (metadata):**
-- `id`: Unikalny ID.
-- `name`: Nazwa logiczna (np. `analysis_report`).
-- `type`: Typ MIME lub kategoria (np. `text/markdown`, `application/patch`).
-- `path`: Ścieżka względna w folderze `/artifacts/`.
-- `size`: Rozmiar w bajtach.
-- `created_by`: ID ActionExecution, która wygenerowała artefakt.
+**Attributes (metadata):**
+- `id`: Unique ID.
+- `name`: Logical name (e.g. `analysis_report`).
+- `type`: MIME type or category (e.g. `text/markdown`, `application/patch`).
+- `path`: Relative path in the `/artifacts/` folder.
+- `size`: Size in bytes.
+- `created_by`: ID of the ActionExecution that generated the artifact.
 - `created_at`: Timestamp.
 
 **Storage:**
-- Pliki fizycznie zapisywane w `/executions/{exec_id}/artifacts/{artifact_id}/{filename}`.
+- Files physically stored in `/executions/{exec_id}/artifacts/{artifact_id}/{filename}`.
 
 ### 2.8 Workspace
 
-Reprezentuje środowisko filesystemowe, w którym działają akcje.
+Represents the filesystem environment in which actions run.
 
-**Model MVP:**
-- Jeden workspace na `WorkflowExecution` (lub na Task w modelu wielozadaniowym).
-- Struktura:
+**MVP model:**
+- One workspace per `WorkflowExecution` (or per Task in the multi-task model).
+- Structure:
   ```text
   /tasks/{task_id}/code/
-    ├── repo_a/  (RW lub RO zależnie od kroku)
+    ├── repo_a/  (RW or RO depending on the step)
     └── repo_b/
   ```
-- Izolacja realizowana przez uprawnienia filesystemu i montowanie RO/RW.
-- Workspace jest tworzony przy starcie execution i czyszczony po zakończeniu (zgodnie z polityką).
+- Isolation implemented through filesystem permissions and RO/RW mounting.
+- The workspace is created at the start of the execution and cleaned up after it finishes (according to policy).
 
-**Checkpoint i materializacja:**
-Workspace jest samodzielnie odtwarzalny za sprawą checkpointu — git bundle'a zawierającego deltę zmian względem pinned base commit (zarejestrowanego w `base_commit` na WorkflowExecution). Checkpoint przechowuje tylko różnicę między stanem początkowym a stanem workspace'u po wykonaniu, nie całą historię. Materializacja (przywrócenie workspace'u w innym miejscu lub na innej maszynie) zawsze odbywa się wyłącznie z checkpointu, ignorując ocalałe katalogi na ścieżce — zapewnia to powtarzalność i bezpieczeństwo.
+**Checkpoint and materialization:**
+The workspace is self-reproducible thanks to a checkpoint — a git bundle containing the delta of changes relative to the pinned base commit (recorded in `base_commit` on WorkflowExecution). The checkpoint stores only the difference between the initial state and the state of the workspace after execution, not the whole history. Materialization (restoring the workspace in another place or on another machine) always happens solely from the checkpoint, ignoring surviving directories on the path — this ensures repeatability and safety.
 
 ### 2.9 Event
 
-Niezmienny rekord faktu, który wydarzył się w systemie. Podstawa obserwowalności i recovery.
+An immutable record of a fact that happened in the system. The basis of observability and recovery.
 
-**Typy eventów (MVP):**
+**Event types (MVP):**
 - `WorkflowStarted`
 - `StateEntered`
 - `ActionStarted`
-- `ActionAttemptFailed` (U1, `docs/plans/2026-09-26-002-*.md`): nieudana próba, po której
-  nastąpi retry — `action_execution_id`, `state_id`, `error`, `retry_in_ms`. Emitowane zaraz po
-  próbie, przed uśpieniem backoffu; ostatnia, wyczerpująca próba wciąż emituje tylko
-  `ActionFailed`, bez tego zdarzenia. Neutralne dla `reconcile` (D23): akcja pozostaje
-  niedomknięta do `ActionFailed` albo `ActionCompleted`.
+- `ActionAttemptFailed` (U1, `docs/plans/2026-09-26-002-*.md`): a failed attempt after which a
+  retry will follow — `action_execution_id`, `state_id`, `error`, `retry_in_ms`. Emitted right after the
+  attempt, before the backoff sleep; the last, exhausting attempt still emits only
+  `ActionFailed`, without this event. Neutral for `reconcile` (D23): the action remains
+  unclosed until `ActionFailed` or `ActionCompleted`.
 - `ActionCompleted` (`action_execution_id`, `output_label`, `reason`, `additional_data`,
-  `warnings`): `warnings` zawiera m.in. ostrzeżenie o zmiennej spoza definicji kroku.
+  `warnings`): `warnings` contains, among other things, a warning about a variable outside the step definition.
 - `ActionFailed` (`action_execution_id`, `error`, `error_type`)
-- `DecisionMade` (z wybraną transition; `reasoning` to `reason` kroku albo komentarz człowieka)
+- `DecisionMade` (with the chosen transition; `reasoning` is the step's `reason` or the human's comment)
 - `TransitionTaken`
-- `EntryLimitReached` (`state_id`, `entries`, `max_entries`): przejście doszło do kroku,
-  który osiągnął `max_entries`; krok nie startuje. Kolejność opisuje sekcja 6.
-- `EntryLimitCounterReset` (`state_id`, `previous_entries`): operator wyzerował licznik.
-- `EntryLimitDecision` (`state_id`, `decision`: `continue` albo `reset_counter`): decyzja
-  operatora na limicie.
+- `EntryLimitReached` (`state_id`, `entries`, `max_entries`): a transition reached a step
+  that has hit `max_entries`; the step does not start. The order is described in section 6.
+- `EntryLimitCounterReset` (`state_id`, `previous_entries`): the operator reset the counter.
+- `EntryLimitDecision` (`state_id`, `decision`: `continue` or `reset_counter`): the operator's
+  decision at the limit.
 - `WorkflowPaused` / `WorkflowResumed`
 - `WorkflowCompleted` / `WorkflowFailed`
 - `HumanInputRequested` (`instruction`, `reason`, `required_values`, `answer_tail`, `episode`):
-  bramka po kroku `agent` albo `script` pokazuje `reason` kroku i wartości, których wymagał
-  jego wybór. Pola `question` nie ma.
-- `HumanInputReceived` (`input`, `output_label`, `artifacts`, `variables`, `comment` i inne):
-  `artifacts` to nazwane artefakty kroku podane przez operatora przy rozwiązaniu problemu
-  (dawniej pole `data`).
+  a gate after an `agent` or `script` step shows the step's `reason` and the values its
+  choice required. There is no `question` field.
+- `HumanInputReceived` (`input`, `output_label`, `artifacts`, `variables`, `comment` and others):
+  `artifacts` are the named step artifacts provided by the operator when resolving a problem
+  (formerly the `data` field).
 - `ExternalEventReceived`
 
-U1 dodał też opcjonalne pola `#[serde(default)]` do zdarzeń istniejących, bez zmiany ich
-znaczenia: `action_execution_id` na `AgentSessionStarted`/`AgentSessionCompleted`/
-`AgentSessionFailed`/`AgentMessage` (jawne powiązanie próby z jej zdarzeniami agenta, zamiast
-wywodzenia go pozycyjnie z logu), `state_id` na `ActionRetrying`, `harness_session_id` na
-`AgentSessionCompleted`/`AgentSessionFailed`, i `resumed_session` na `AgentSessionStarted`. Stary
-log bez tych pól wczytuje się nadal — deserializują się jako `None`.
+U1 also added optional `#[serde(default)]` fields to existing events, without changing their
+meaning: `action_execution_id` on `AgentSessionStarted`/`AgentSessionCompleted`/
+`AgentSessionFailed`/`AgentMessage` (an explicit link between an attempt and its agent events, instead of
+deriving it positionally from the log), `state_id` on `ActionRetrying`, `harness_session_id` on
+`AgentSessionCompleted`/`AgentSessionFailed`, and `resumed_session` on `AgentSessionStarted`. An old
+log without these fields still loads — they deserialize as `None`.
 
-**Struktura:**
-- `id`: Unikalny ID (UUID lub ULID).
-- `timestamp`: Czas wystąpienia.
-- `type`: Typ eventu.
-- `aggregate_id`: ID WorkflowExecution.
-- `payload`: Dane specyficzne dla typu (JSON).
-- `sequence_number`: Numer sekwencyjny w ramach execution (do porządkowania).
+**Structure:**
+- `id`: Unique ID (UUID or ULID).
+- `timestamp`: Time of occurrence.
+- `type`: Event type.
+- `aggregate_id`: ID of the WorkflowExecution.
+- `payload`: Type-specific data (JSON).
+- `sequence_number`: Sequence number within the execution (for ordering).
 
 **Storage:**
-- Append-only log w `/executions/{exec_id}/events/{sequence_number}.json`.
+- Append-only log in `/executions/{exec_id}/events/{sequence_number}.json`.
 
 ### 2.10 Decision
 
-Reprezentuje akt wyboru ścieżki przejścia. Może być podjęty przez reguły, agenta lub człowieka.
+Represents the act of choosing a transition path. It can be made by rules, an agent or a human.
 
-**Atrybuty:**
-- `id`: Unikalny ID.
+**Attributes:**
+- `id`: Unique ID.
 - `provider_type`: `rule`, `agent`, `human`.
-- `input_result`: Wynik akcji, na podstawie którego podjęto decyzję.
-- `selected_transition`: Wybrana etykieta przejścia.
-- `reason`: Uzasadnienie (opcjonalne). Dla decyzji reguł po kroku `agent` albo `script` to `reason` z odpowiedzi kroku (pole `DecisionMade.reasoning`). Dla decyzji człowieka to jego komentarz.
-- `timestamp`: Czas podjęcia decyzji.
+- `input_result`: The action result on the basis of which the decision was made.
+- `selected_transition`: The chosen transition label.
+- `reason`: Rationale (optional). For a rule decision after an `agent` or `script` step, this is the `reason` from the step's response (the `DecisionMade.reasoning` field). For a human decision, it is their comment.
+- `timestamp`: Time the decision was made.
 
 ### 2.11 AgentSession
 
-Reprezentuje połączenie z zewnętrznym harnessem AI.
+Represents a connection to an external AI harness.
 
-**Atrybuty:**
-- `id`: Unikalny ID sesji.
+**Attributes:**
+- `id`: Unique session ID.
 - `harness_type`: `claude-code`, `opencode`.
 - `status`: `ACTIVE`, `COMPLETED`, `TERMINATED`, `FAILED`.
-- `working_directory`: Ścieżka, w której działa agent.
-- ~~`log_path`: Ścieżka do logu surowej sesji.~~ — zastąpione **zapisem rozmowy per
-  `action_execution_id`** (U2/U3 z `docs/plans/2026-09-26-002-*.md`, D51): każda próba akcji
-  agenta ma własny, przyrostowo dopisywany plik JSONL w
-  `{state}/executions/{id}/conversations/{action_execution_id}.jsonl`, kompresowany do
-  `.jsonl.zst` po zamknięciu próby. `AgentSession` nie ma jednego logu na sesję, bo sesja
-  harnessu (`--resume`) i próba akcji nie są tym samym pojęciem — próba dostaje zawsze nowy
-  zapis, sesja harnessu bywa kontynuowana (`resumed_session` w `AgentSessionStarted`). Klucz
-  zapisu jest ten sam, co klucz idempotencji próby (D24), więc nie ma osobnego identyfikatora do
-  zarządzania.
-- `resume_token`: Token umożliwiający wznowienie (jeśli harness obsługuje) — odpowiada polu
-  `harness_session_id`/`resumed_session` na zdarzeniach `AgentSession*` (U1).
+- `working_directory`: The path in which the agent runs.
+- ~~`log_path`: Path to the raw session log.~~ — replaced by a **conversation record per
+  `action_execution_id`** (U2/U3 from `docs/plans/2026-09-26-002-*.md`, D51): every attempt of an
+  agent action has its own, incrementally appended JSONL file in
+  `{state}/executions/{id}/conversations/{action_execution_id}.jsonl`, compressed to
+  `.jsonl.zst` after the attempt closes. `AgentSession` has no single log per session, because a
+  harness session (`--resume`) and an action attempt are not the same concept — an attempt always gets a new
+  record, while a harness session may be continued (`resumed_session` in `AgentSessionStarted`). The record
+  key is the same as the attempt's idempotency key (D24), so there is no separate identifier to
+  manage.
+- `resume_token`: A token enabling resumption (if the harness supports it) — corresponds to the
+  `harness_session_id`/`resumed_session` field on the `AgentSession*` events (U1).
 
-**Relacja:**
-- Jedno `ActionExecution` typu `AgentAction` może mieć jedną aktywną `AgentSession`.
-- Po restarcie systemu stara sesja może być nieważna; tworzona jest nowa sesja z kontekstem poprzedniej.
-- Każda próba (`retry`) tej samej `ActionExecution` dostaje własny zapis rozmowy, tak jak dostaje
-  własny `action_execution_id` — dwie próby tego samego stanu nigdy nie dzielą jednego pliku.
+**Relationship:**
+- A single `ActionExecution` of type `AgentAction` may have one active `AgentSession`.
+- After a system restart the old session may be invalid; a new session is created with the context of the previous one.
+- Every attempt (`retry`) of the same `ActionExecution` gets its own conversation record, just as it gets
+  its own `action_execution_id` — two attempts of the same state never share one file.
 
 ---
 
-## 3. Relacje między encjami
+## 3. Relationships between entities
 
 ```mermaid
 erDiagram
@@ -308,101 +308,101 @@ erDiagram
     }
 ```
 
-### Kluczowe zasady relacji:
+### Key relationship rules:
 
-1. **Jeden do wielu**: Jedna definicja workflow może mieć wiele wykonań.
-2. **Własność kontekstu**: `WorkflowExecution` jest jedynym właścicielem `Context`. Akcje mogą tylko sugerować zmiany (`variables` w wyniku), ale to Engine zatwierdza aktualizację.
-3. **Niezależność sesji**: `AgentSession` jest podporządkowana `ActionExecution`. Jeśli akcja zostanie powtórzona (retry), tworzona jest nowa sesja.
-4. **Artefakty jako skutek uboczny**: Artefakty są produktem `ActionExecution`, ale żyją dłużej niż sama akcja – są dostępne przez cały czas trwania execution.
-5. **Eventy jako źródło prawdy**: Stan `WorkflowExecution` jest projekcją serii eventów. Każda zmiana stanu musi być poprzedzona eventem.
+1. **One to many**: One workflow definition can have many executions.
+2. **Context ownership**: `WorkflowExecution` is the sole owner of `Context`. Actions can only suggest changes (`variables` in the result), but the Engine approves the update.
+3. **Session independence**: `AgentSession` is subordinate to `ActionExecution`. If an action is repeated (retry), a new session is created.
+4. **Artifacts as a side effect**: Artifacts are a product of `ActionExecution`, but they live longer than the action itself – they are available for the whole duration of the execution.
+5. **Events as the source of truth**: The state of `WorkflowExecution` is a projection of a series of events. Every state change must be preceded by an event.
 
 ---
 
-## 4. Cykl życia danych
+## 4. Data lifecycle
 
 ### 4.1 Start Execution
-1. Utworzenie folderu `/executions/{id}/`.
-2. Zapisanie `state.json` (status: `RUNNING`, current_state: pierwszy).
-3. Zapisanie `context.json` (z inputów).
-4. Emit eventu `WorkflowStarted`.
+1. Create the `/executions/{id}/` folder.
+2. Write `state.json` (status: `RUNNING`, current_state: the first one).
+3. Write `context.json` (from the inputs).
+4. Emit the `WorkflowStarted` event.
 
-### 4.2 Wykonanie kroku
+### 4.2 Step execution
 1. Emit `StateEntered`.
-2. Utworzenie `ActionExecution` (status: `RUNNING`).
+2. Create an `ActionExecution` (status: `RUNNING`).
 3. Emit `ActionStarted`.
-4. Wykonanie akcji (np. start agenta).
-5. Odebranie wyniku JSON.
-6. Zapisanie wyniku w `ActionExecution`.
-7. Emit `ActionCompleted` (z payloadem result).
+4. Execute the action (e.g. start the agent).
+5. Receive the JSON result.
+6. Save the result in `ActionExecution`.
+7. Emit `ActionCompleted` (with the result payload).
 
-### 4.3 Decyzja i przejście
-1. Evaluation DecisionProvider (reguły/human/agent).
-2. Utworzenie obiektu `Decision`.
+### 4.3 Decision and transition
+1. Evaluation of the DecisionProvider (rules/human/agent).
+2. Create a `Decision` object.
 3. Emit `DecisionMade`.
-4. Aktualizacja `context.json` (zmienne z wyniku).
+4. Update `context.json` (variables from the result).
 5. Emit `TransitionTaken`.
-6. Aktualizacja `state.json` (next_state).
+6. Update `state.json` (next_state).
 
-### 4.4 Zakończenie
-1. Wejście w stan terminalny.
+### 4.4 Completion
+1. Enter a terminal state.
 2. Emit `WorkflowCompleted`.
-3. Zmiana statusu na `COMPLETED`.
-4. (Opcjonalnie) Czyszczenie workspace zgodnie z polityką.
+3. Change the status to `COMPLETED`.
+4. (Optionally) Clean up the workspace according to policy.
 
 ---
 
-## 5. Walidacja spójności
+## 5. Consistency validation
 
-System musi zapewniać następujące inwarianty:
+The system must ensure the following invariants:
 
-- **Spójność wersji**: `WorkflowExecution` zawsze odnosi się do istniejącej wersji `WorkflowDefinition`.
-- **Istnienie przejść**: Transition wybrany w `Decision` musi istnieć w definicji stanu.
-- **Unikalność ID**: Wszystkie ID (execution, action, event, artifact) muszą być unikalne globalnie lub w zakresie execution.
-- **Atomowość kontekstu**: Aktualizacja `context.json` musi być atomowa (zapis do pliku tymczasowego + rename), aby uniknąć uszkodzeń przy crashu.
-- **Monotoniczność eventów**: `sequence_number` eventów musi być rosnący bez luk (w granicach jednego execution).
+- **Version consistency**: `WorkflowExecution` always refers to an existing version of `WorkflowDefinition`.
+- **Existence of transitions**: A transition chosen in a `Decision` must exist in the state definition.
+- **ID uniqueness**: All IDs (execution, action, event, artifact) must be unique globally or within the scope of an execution.
+- **Context atomicity**: Updating `context.json` must be atomic (write to a temporary file + rename) to avoid corruption on a crash.
+- **Event monotonicity**: The `sequence_number` of events must be increasing without gaps (within a single execution).
 
 ---
 
-## 6. Rozszerzalność modelu
+## 6. Model extensibility
 
-### Odpowiedzi kroków i limity wejść
+### Step responses and entry limits
 
-`metadata.engine.step_replies` przechowuje mapę `state_id → action_execution_id`.
-Treść odpowiedzi znajduje się w `step-replies/{action_execution_id}.txt` i jest
-zapisywana atomowo przed zatwierdzeniem wskaźnika w `state.json`. Nieudane
-wejście nie zastępuje ostatniej odpowiedzi. `metadata.engine.state_entries`
-przechowuje liczbę wejść do kroków; licznik jest aktualizowany razem z
-przejściem i przetrwa restart procesu.
+`metadata.engine.step_replies` stores a `state_id → action_execution_id` map.
+The response content is in `step-replies/{action_execution_id}.txt` and is
+written atomically before the pointer in `state.json` is committed. A failed
+entry does not replace the last response. `metadata.engine.state_entries`
+stores the number of entries into steps; the counter is updated together with
+the transition and survives a process restart.
 
-Oczekiwanie na limicie pozostaje w statusie `InputNeeded` i używa trwałego
-`pending_input.json`. Historia zdarzeń opisuje zatrzymanie, decyzję operatora
-i ewentualne wyzerowanie licznika. Wybór etykiety na limicie rozstrzyga wynik
-kroku przez ścieżkę `ResolveOutput`, z walidacją wymaganych zmiennych i
-artefaktów.
+A wait at the limit remains in the `InputNeeded` status and uses a durable
+`pending_input.json`. The event history describes the stop, the operator's
+decision and any counter reset. Choosing a label at the limit settles the step
+result through the `ResolveOutput` path, with validation of the required variables and
+artifacts.
 
-Kolejność zdarzeń na limicie:
+The order of events at the limit:
 
-1. `TransitionTaken` do kroku na limicie.
-2. `HumanInputRequested`, potem `EntryLimitReached`. Brak `StateEntered` i
-   `ActionStarted`: krok nie startuje.
-3. Po decyzji operatora: `HumanInputReceived`, potem `EntryLimitCounterReset`
-   (tylko dla `reset_counter`), potem `EntryLimitDecision`.
-4. Krok startuje: `StateEntered`, `ActionStarted`. `continue` zwiększa licznik
-   o 1, `reset_counter` ustawia go na 1.
+1. `TransitionTaken` to the step at the limit.
+2. `HumanInputRequested`, then `EntryLimitReached`. No `StateEntered` or
+   `ActionStarted`: the step does not start.
+3. After the operator's decision: `HumanInputReceived`, then `EntryLimitCounterReset`
+   (only for `reset_counter`), then `EntryLimitDecision`.
+4. The step starts: `StateEntered`, `ActionStarted`. `continue` increments the counter
+   by 1, `reset_counter` sets it to 1.
 
-Wybór etykiety na limicie nie emituje `EntryLimitDecision`: krok kończy się
-wybranym wynikiem i nie startuje.
+Choosing a label at the limit does not emit `EntryLimitDecision`: the step ends with
+the chosen result and does not start.
 
-Cofnięcie wyboru wyjścia przez dyrygenta (KTD13) przywraca `context`,
-`metadata.engine.state_entries`, `metadata.engine.step_attempts` i
-`metadata.engine.step_locals` sprzed decyzji. Problem otwarty ponownie
-zawiera odpowiedź kroku (`reply`), więc nowe rozstrzygnięcie zapisuje ją
-znowu we wskaźniku `metadata.engine.step_replies`.
+Undoing an output choice by the conductor (KTD13) restores `context`,
+`metadata.engine.state_entries`, `metadata.engine.step_attempts` and
+`metadata.engine.step_locals` from before the decision. A problem reopened
+contains the step's response (`reply`), so the new resolution writes it
+again into the `metadata.engine.step_replies` pointer.
 
-### Wejścia, próby i pamięć kroku
+### Entries, attempts and step memory
 
-`metadata.engine.step_attempts` przechowuje dla każdego kroku liczbę wejść
-(`entries`) i listę prób (`attempts`), od najstarszej:
+`metadata.engine.step_attempts` stores for each step the number of entries
+(`entries`) and a list of attempts (`attempts`), from the oldest:
 
 ```json
 {"plan": {"entries": 3, "attempts": [
@@ -411,32 +411,32 @@ znowu we wskaźniku `metadata.engine.step_replies`.
 ]}}
 ```
 
-Wejście to przejście do kroku (`TransitionTaken`), stan początkowy, ręczne
-przejście operatora albo cofnięcie decyzji przez dyrygenta. Nowym wejściem nie
-jest: wznowienie po pytaniu agenta, powrót z akceptacji, reprompt, ponowienie z
-`retry_policy` ani odzyskanie po awarii. Próba to wynik wejścia: wybór z
-`reason` (`ended: choice`) albo błąd kończący krok z rodzajem błędu
-(`ended: failure`). Silnik zapisuje wejścia i próby dla każdego kroku, ale blok
-historii renderuje tylko w prompcie kroku `agent` (`WORKFLOW_SCHEMA.md` §3.3).
+An entry is a transition into a step (`TransitionTaken`), the initial state, a manual
+operator transition or an undo of a decision by the conductor. Not a new entry:
+resumption after an agent question, return from an approval, a reprompt, a retry from
+`retry_policy` or recovery after a crash. An attempt is the outcome of an entry: a choice with
+`reason` (`ended: choice`) or an error ending the step with an error kind
+(`ended: failure`). The engine records entries and attempts for every step, but renders the history
+block only in the prompt of an `agent` step (`workflow-schema.md` §3.3).
 
-`metadata.engine.step_locals` przechowuje wartości `local.*` każdego kroku
+`metadata.engine.step_locals` stores the `local.*` values of each step
 (§2.6).
 
-Oba zapisy powstają w tym samym zapisie `state.json` co kontekst (albo co
-oznaczenie wykonania jako nieudanego), więc po awarii nie różnią się od
-kontekstu. Licznik `state_entries` i `max_entries` są osobne. Wyzerowanie
-licznika `state_entries` nie zmienia numeracji historii.
+Both records are made in the same `state.json` write as the context (or as
+marking the execution as failed), so after a crash they do not differ from the
+context. The `state_entries` counter and `max_entries` are separate. Resetting the
+`state_entries` counter does not change the history numbering.
 
-Model został zaprojektowany z myślą o przyszłych rozszerzeniach:
+The model was designed with future extensions in mind:
 
-- **Parallel States**: Dodanie pola `parallel_group_id` do stanu pozwoliłoby na grupowanie stanów wykonywanych równolegle.
-- **Sub-workflows**: Możliwość zagnieżdżania `WorkflowExecution` wewnątrz `ActionExecution` (typ `WorkflowAction`).
-- **Policy Engine**: Oddzielenie logiki decyzyjnej do zewnętrznych modułów poprzez uogólnienie `DecisionProvider`.
-- **Multi-tenancy**: Dodanie `tenant_id` do wszystkich encji głównych pozwoli na obsługę wielu użytkowników.
+- **Parallel States**: Adding a `parallel_group_id` field to a state would allow grouping states executed in parallel.
+- **Sub-workflows**: The ability to nest `WorkflowExecution` inside `ActionExecution` (a `WorkflowAction` type).
+- **Policy Engine**: Separating decision logic into external modules by generalizing `DecisionProvider`.
+- **Multi-tenancy**: Adding `tenant_id` to all main entities will allow supporting multiple users.
 
 
-## Ticket i tytuł zadania
+## Ticket and task title
 
-`TaskLaunchSpec` ma dwa opcjonalne pola: `ticket` (do 64 znaków) i `title` (do 200 znaków). Operator wpisuje je w formularzu nowego zadania. Serwer je przycina i sprawdza: jedna linia, bez znaków sterujących. Pusta wartość znaczy „brak". Po utworzeniu zadania pól nie można zmienić.
+`TaskLaunchSpec` has two optional fields: `ticket` (up to 64 characters) and `title` (up to 200 characters). The operator enters them in the new task form. The server trims and validates them: one line, no control characters. An empty value means "none". After the task is created the fields cannot be changed.
 
-Gdy operator nie poda tytułu, dyrygent nadaje go raz z opisu zadania (do 50 znaków). Runner zapisuje go w magazynie dyrygenta i raportuje w migawce (`generated_title`). Serwer pokazuje w `TaskSummary.title` tytuł operatora, a gdy go brak — tytuł od dyrygenta. Tytuł operatora ma zawsze pierwszeństwo. Szablony czytają oba pola jako `{{ task.ticket }}` i `{{ task.title }}`.
+When the operator does not provide a title, the conductor assigns one once from the task description (up to 50 characters). The runner stores it in the conductor store and reports it in the snapshot (`generated_title`). The server shows in `TaskSummary.title` the operator's title, and when it is missing — the title from the conductor. The operator's title always takes precedence. Templates read both fields as `{{ task.ticket }}` and `{{ task.title }}`.

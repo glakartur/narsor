@@ -81,7 +81,7 @@ fn select_field(name: &str, options: &[&str], required: bool) -> HumanInputField
     }
 }
 
-/// `human_clarification` of `WORKFLOW_SCHEMA.md` §4: one required text field,
+/// `human_clarification` of `docs/dev/workflow-schema.md` §4: one required text field,
 /// outputs `clarified` / `abort`.
 fn clarification_action() -> ActionConfig {
     ActionConfig::Human(HumanActionConfig {

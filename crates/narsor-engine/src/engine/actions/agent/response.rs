@@ -243,7 +243,7 @@ fn no_label_error(reason: &str, text: &str) -> ActionError {
         message: format!(
             "no output label could be extracted from the agent's answer: {reason}. \
              The agent must end with a JSON object carrying a 'choice' key \
-             (WORKFLOW_SCHEMA.md §3.3.A)"
+             (docs/dev/workflow-schema.md §3.3.A)"
         ),
         error_type: Some(MISSING_OUTPUT_LABEL.to_string()),
         details: Some(serde_json::json!({

@@ -2,7 +2,7 @@
 //!
 //! Represents the immutable definition of a workflow (the blueprint).
 //!
-//! The external contract for this model is `WORKFLOW_SCHEMA.md`; the YAML
+//! The external contract for this model is `docs/dev/workflow-schema.md`; the YAML
 //! layer lives in `crate::workflow::schema` and is compiled into these types
 //! by `crate::workflow::loader`.
 
@@ -23,7 +23,7 @@ pub struct WorkflowDefinition {
     /// Unique identifier for this workflow.
     ///
     /// The YAML contract has no `id` field, so the loader derives it from
-    /// `name`, which `WORKFLOW_SCHEMA.md` §2 declares to be unique.
+    /// `name`, which `docs/dev/workflow-schema.md` §2 declares to be unique.
     pub id: WorkflowDefinitionId,
 
     /// Human-readable name
@@ -144,7 +144,7 @@ pub type StateId = String;
 
 /// The execution status a terminal state produces when it is entered.
 ///
-/// This is the explicit marker of `WORKFLOW_SCHEMA.md` §3.5: a workflow says
+/// This is the explicit marker of `docs/dev/workflow-schema.md` §3.5: a workflow says
 /// what reaching a terminal means instead of leaving the engine to guess from
 /// the state's name. The variants mirror the terminal variants of
 /// [`crate::domain::ExecutionStatus`].
@@ -184,7 +184,7 @@ pub struct State {
 
     /// The action to execute when entering this state.
     ///
-    /// Terminal states carry no action — see `WORKFLOW_SCHEMA.md` §4, where
+    /// Terminal states carry no action — see `docs/dev/workflow-schema.md` §4, where
     /// `completed` and `failed` only have a description.
     #[serde(default)]
     pub action: Option<ActionConfig>,
@@ -223,7 +223,7 @@ pub struct State {
 
     /// How the execution ends when this terminal state is entered.
     ///
-    /// Declared explicitly in the YAML contract (`WORKFLOW_SCHEMA.md` §3.5,
+    /// Declared explicitly in the YAML contract (`docs/dev/workflow-schema.md` §3.5,
     /// the mapping form of `terminal_states`). `None` means the workflow did
     /// not declare one — the list form of `terminal_states`, or a `state.json`
     /// written before this field existed — and the engine then treats the
@@ -618,7 +618,7 @@ impl Default for RetryPolicy {
 }
 
 impl WorkflowDefinition {
-    /// Validates the workflow definition against `WORKFLOW_SCHEMA.md` §5.
+    /// Validates the workflow definition against `docs/dev/workflow-schema.md` §5.
     ///
     /// All violations are reported at once, so that the author of a workflow
     /// does not have to fix them one file save at a time. The rules themselves

@@ -3,7 +3,7 @@
 //! A workflow declares how its tasks introduce themselves — a title and a few
 //! links (ticket, pull request) — as templates ([`DisplaySpec`]). Rendering
 //! against a task's inputs and variables yields a [`TaskDisplay`], the plain
-//! values a client shows. `WORKFLOW_SCHEMA.md` §3.6 is the external contract.
+//! values a client shows. `docs/dev/workflow-schema.md` §3.6 is the external contract.
 
 use crate::controller::{ResumeState, RunnerState};
 use serde::{Deserialize, Serialize};

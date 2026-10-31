@@ -10,16 +10,22 @@ by this artifact.
 
 ## Install a role
 
-Run the latest release installer and follow its prompts:
+Run the installer of the newest release and follow its prompts:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh | bash
 ```
 
-To select a version, pass its tag to the script:
+The URL pins a release tag because every release is currently published as a
+pre-release, and GitHub's `/releases/latest/download/` URL ignores
+pre-releases (it returns 404). The tag is bumped with each release (see
+`CONTRIBUTING.md`). The script itself still defaults to `latest` when run
+without a version.
+
+To select a different version, pass its tag to the script:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
   bash -s -- v1.2.3
 ```
 
@@ -70,7 +76,7 @@ configuration file is used, or the user's default config path if none exists.
 Use `--config-file` to choose another file explicitly:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
   bash -s -- --role frontend --non-interactive \
     --bin-dir /usr/local/bin \
     --data-dir /var/lib/narsor \
@@ -89,7 +95,7 @@ non-interactive mode; `--data-dir` defaults to `~/.narsor`. For `server`, also s
 For example, on a dedicated VM behind an existing corporate proxy:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
   sudo bash -s -- --role server --non-interactive \
     --bin-dir /usr/local/bin \
     --data-dir /var/lib/narsor \
@@ -123,7 +129,7 @@ find it. To build from source, see the README.
 The same script removes what it installed:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/latest/download/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
   bash -s -- --uninstall
 ```
 

@@ -1,7 +1,7 @@
 //! Provisioning and teardown of per-execution workspaces.
 //!
 //! Every execution gets its own directory tree, laid out as described in
-//! `DOMAIN_MODEL.md` §2.8:
+//! `docs/dev/domain-model.md` §2.8:
 //!
 //! ```text
 //! {root}/tasks/{execution_id}/code/

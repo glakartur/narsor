@@ -3,7 +3,7 @@
 //! The scope is deliberately minimal (D6): the only things recognised inside
 //! `{{ }}` are a workflow input (`inputs.NAME`), a context variable
 //! (`context.variables.NAME`, or the shorthand `context.NAME` used by
-//! `WORKFLOW_SCHEMA.md` §3.3.D), a named artifact (`artifacts.NAME`, the path
+//! `docs/dev/workflow-schema.md` §3.3.D), a named artifact (`artifacts.NAME`, the path
 //! it was last written to, KTD7), selected step fields (`reply`,
 //! `stdout`, `stderr`), the current step's own memory (`local.NAME`, R13)
 //! and the history of its earlier attempts (`step.history`, R18). There are
