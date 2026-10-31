@@ -1,10 +1,17 @@
 # Narsor
 
-A workflow engine for tasks carried out by AI agents and by people. A process
-is described in YAML (a graph of states, actions and transitions) and Narsor
-runs it step by step, persisting every state and every event to disk — so an
-interrupted execution can be recovered and the whole run can be audited
-afterwards.
+**Narsor is a software factory built on AI agents and a flexibly defined
+workflow.** It is not just a workflow processor: the goal is to turn an idea
+or a task into delivered software by orchestrating agents (Claude Code, Codex,
+OpenCode, GitHub Copilot) and people along a process you define yourself.
+
+The process is described in YAML — a graph of states, actions, decisions and
+transitions — so the same factory can be shaped to different teams, projects
+and ways of working: from a single agent fixing a bug to a multi-stage line
+with analysis, implementation, review and human approval. Agents do the work,
+people stay in control where it matters, and every run is traceable and
+recoverable (state and events are persisted, so runs can be resumed and
+audited).
 
 ## Features
 
