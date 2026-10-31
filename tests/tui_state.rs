@@ -2316,6 +2316,96 @@ mod task_app_list {
         }
     }
 
+    mod row_title {
+        use super::*;
+
+        fn with_title(
+            id: &str,
+            display: &str,
+            title: Option<&str>,
+        ) -> narsor_engine::controller_protocol::TaskSummary {
+            let mut task = titled(queued(id, 1), display);
+            task.title = title.map(str::to_string);
+            task
+        }
+
+        fn row_title_after_load(task: narsor_engine::controller_protocol::TaskSummary) -> String {
+            let mut app = app();
+            app.load(listing(vec![task], "c"));
+            titles(&app).remove(0)
+        }
+
+        #[test]
+        fn the_row_shows_the_task_title_instead_of_the_description() {
+            let task = with_title(
+                "a",
+                "Proszę przerobić endpoint zamówień tak, żeby…",
+                Some("Zmiana API zamówień"),
+            );
+            assert_eq!(row_title_after_load(task), "Zmiana API zamówień");
+        }
+
+        #[test]
+        fn without_a_title_the_row_shows_the_description_until_a_refresh_brings_one() {
+            let mut app = app();
+            app.load(listing(vec![with_title("a", "Opis", None)], "c1"));
+            assert_eq!(titles(&app), ["Opis"]);
+
+            let mut retitled = with_title("a", "Opis", Some("Tytuł dyrygenta"));
+            retitled.revision = 2;
+            app.load(listing(vec![retitled], "c2"));
+            assert_eq!(titles(&app), ["Tytuł dyrygenta"]);
+        }
+
+        #[test]
+        fn a_blank_title_falls_back_to_the_description() {
+            let task = with_title("a", "Opis", Some("   "));
+            assert_eq!(row_title_after_load(task), "Opis");
+        }
+
+        #[test]
+        fn without_a_title_and_a_description_the_row_shows_the_task_id() {
+            let task = with_title("task-a", "", None);
+            assert_eq!(row_title_after_load(task), "task-a");
+        }
+
+        #[test]
+        fn a_title_with_a_new_line_is_shown_on_one_line() {
+            let task = with_title("a", "Opis", Some("Linia1\nLinia2"));
+            let title = row_title_after_load(task);
+            assert!(!title.contains('\n'), "{title:?}");
+            assert!(
+                title.starts_with("Linia1") && title.ends_with("Linia2"),
+                "{title:?}"
+            );
+        }
+
+        #[test]
+        fn the_filter_matches_the_task_title_and_still_the_description() {
+            let mut app = app();
+            app.load(listing(
+                vec![
+                    with_title("task-a", "Parser cleanup", Some("Zmiana API zamówień")),
+                    with_title("task-b", "Inne", None),
+                ],
+                "c",
+            ));
+
+            ch(&mut app, '/');
+            for character in "api zam".chars() {
+                ch(&mut app, character);
+            }
+            assert_eq!(app.list().visible_ids(), ["task-a"]);
+            for _ in "api zam".chars() {
+                press(&mut app, KeyCode::Backspace);
+            }
+            for character in "parser".chars() {
+                ch(&mut app, character);
+            }
+            assert_eq!(app.list().visible_ids(), ["task-a"]);
+        }
+    }
+
     mod refresh_and_filter {
         use super::*;
 

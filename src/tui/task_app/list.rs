@@ -16,8 +16,9 @@
 //!   delivers late;
 //! * hiding finished tasks (`z`) is a filter over the same order
 //!   ([`TaskList::visible`]), not a regrouping.
-//! * text filtering (`/`) matches the ticket, title or full id without
-//!   changing the relative order of the visible tasks.
+//! * text filtering (`/`) matches the ticket, the task's title, its
+//!   `display.title` or the full id without changing the relative order of
+//!   the visible tasks.
 //!
 //! # A row
 //!
@@ -218,6 +219,19 @@ pub fn title_of(task: &TaskSummary) -> String {
     } else {
         title
     }
+}
+
+/// The title a list row shows: the task's own `title` when it has one that is
+/// not blank, otherwise [`title_of`]. For a task without a ticket this is the
+/// rule of the detail frame's edge (`edge_layout`), so the row and the frame
+/// show the same title; a task with a ticket and no title shows only the
+/// ticket on the frame, while its row falls back to `display.title`.
+pub fn row_title_of(task: &TaskSummary) -> String {
+    task.title
+        .as_deref()
+        .map(one_line)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| title_of(task))
 }
 
 fn activity_since(task: &TaskSummary) -> Option<DateTime<Utc>> {
@@ -667,12 +681,12 @@ impl TaskList {
             || ticket.is_some_and(|ticket| ticket.to_lowercase().contains(&needle))
     }
 
+    /// The row title and `display.title` both match, so a task with a title
+    /// is still found by the words of its description.
     fn matches_task(&self, task: &TaskSummary) -> bool {
-        self.matches_filter(
-            task.ticket.as_deref(),
-            &title_of(task),
-            task.task_id.as_str(),
-        )
+        let (ticket, task_id) = (task.ticket.as_deref(), task.task_id.as_str());
+        self.matches_filter(ticket, &row_title_of(task), task_id)
+            || self.matches_filter(ticket, &title_of(task), task_id)
     }
 
     fn matches_pending(&self, row: &PendingRow) -> bool {
@@ -732,7 +746,7 @@ impl TaskList {
             id: short_task_id(task.task_id.as_str()),
             attention: attention_of(task),
             icon: state_icon(task),
-            title: title_of(task),
+            title: row_title_of(task),
             status: task_state_name(task.state).to_string(),
             since: activity_since(task),
             label: label_of(task, positions.get(&index).copied()),
@@ -1328,20 +1342,7 @@ impl TaskList {
             .iter()
             .map(|&index| {
                 let task = &self.tasks[index];
-                let mut text = RowText {
-                    ticket: task
-                        .ticket
-                        .as_deref()
-                        .map(one_line)
-                        .filter(|ticket| !ticket.trim().is_empty()),
-                    id: short_task_id(task.task_id.as_str()),
-                    attention: attention_of(task),
-                    icon: state_icon(task),
-                    title: title_of(task),
-                    status: task_state_name(task.state).to_string(),
-                    since: activity_since(task),
-                    label: label_of(task, positions.get(&index).copied()),
-                };
+                let mut text = self.row_text_with(index, &positions);
                 if let (Some(mode), Some(len)) = (&moving, group_len) {
                     if mode.task_id == task.task_id.as_str() {
                         text.label = format!("↕ {}/{len}", mode.slot + 1);

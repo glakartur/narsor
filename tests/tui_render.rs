@@ -1564,6 +1564,38 @@ mod task_app_render {
     }
 
     #[test]
+    fn a_long_task_title_is_cut_on_the_second_line_of_a_three_line_row() {
+        let mut app = app();
+        let mut long = titled(
+            with_runner(
+                with_controller(crate::task_app_support::task("a", "local", "running", 1)),
+                ExecutionStatus::Running,
+                "review",
+            ),
+            "Krótki opis",
+        );
+        long.title = Some("Bardzo długi tytuł zadania który nie mieści się w kolumnie".into());
+        app.load(listing(vec![long], "c"));
+        let buffer = render(120, 30, &mut app, &Styles::new(true));
+        let row = list_row(&buffer, "Bardzo");
+        assert!(
+            content_text(&buffer, row).starts_with("  ●  id:a"),
+            "{}",
+            screen(&buffer)
+        );
+        assert!(
+            content_text(&buffer, row + 1).starts_with("     Bardzo długi tytu…"),
+            "{:?}",
+            content_text(&buffer, row + 1)
+        );
+        assert!(
+            content_text(&buffer, row + 2).starts_with("     running · review"),
+            "{:?}",
+            content_text(&buffer, row + 2)
+        );
+    }
+
+    #[test]
     fn a_long_title_is_cut_with_an_ellipsis_and_the_label_goes_under_it() {
         let mut app = app();
         let title = "Bardzo długi tytuł zadania który nie mieści się w kolumnie";
@@ -3600,6 +3632,17 @@ mod task_app_detail_render {
             .sum::<usize>()
             + edge.left.len().saturating_sub(1)
             + edge.plain.as_ref().map_or(0, |text| text.chars().count())
+    }
+
+    #[test]
+    fn the_list_row_and_the_edge_show_the_same_title() {
+        let mut summary = displayed(task("a", "local", "running", 1), "Opis zadania", &[]);
+        summary.title = Some("Zmiana API zamówień".into());
+        let edge = narsor::tui::task_app::detail::edge_layout(&summary, 200, 4, false, None);
+        let mut app = app();
+        app.load(listing(vec![summary], "c"));
+        let row = app.list().rows().remove(0).title;
+        assert_eq!(edge.left, vec![row]);
     }
 
     #[test]
