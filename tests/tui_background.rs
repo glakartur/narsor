@@ -584,3 +584,154 @@ async fn an_opening_harness_list_waits_for_its_read_and_then_opens_over_it() {
     app.drain_jobs().await;
     assert_eq!(app.view_kind(), ViewKind::Tasks);
 }
+
+// The usage limits of the harnesses (U7): read at start and every 15 s, on a
+// clock of their own.
+
+const USAGE: &str = "/control/v1/usage";
+
+/// Fifteen seconds and a little: the period of the usage limits has passed.
+fn past_the_period() -> Instant {
+    Instant::now() + Duration::from_secs(15) + Duration::from_millis(100)
+}
+
+fn claude_usage() -> serde_json::Value {
+    serde_json::json!({
+        "harnesses": [{
+            "harness": "claude-code",
+            "observed_at": "2026-10-31T12:00:00Z",
+            "received_at": "2026-10-31T12:00:01Z",
+            "limits": [
+                {"window": "5h", "utilization": 0.4, "resets_at": "2026-10-31T16:00:00Z"},
+                {"window": "7d", "utilization": 0.9, "resets_at": "2026-11-04T09:00:00Z",
+                 "status": "allowed_warning"}
+            ]
+        }]
+    })
+}
+
+#[tokio::test]
+async fn the_usage_limits_are_read_at_start_and_again_after_fifteen_seconds() {
+    let stub = Stub::start().await;
+    stub.open(USAGE, claude_usage());
+    let mut app = app_over(&stub);
+
+    assert!(app.start_usage_if_due(Instant::now()));
+    app.drain_jobs().await;
+    assert_eq!(stub.hits(USAGE), 1);
+    let usage = app.harness_usage().expect("the limits that were read");
+    assert_eq!(usage.harnesses[0].harness, "claude-code");
+    assert_eq!(usage.harnesses[0].limits.len(), 2);
+
+    // Not before the period has passed since the read finished.
+    assert!(!app.start_usage_if_due(Instant::now()));
+    let due = app.next_usage_due().expect("a next read");
+    assert!(due > Instant::now() + Duration::from_secs(14), "{due:?}");
+
+    assert!(app.start_usage_if_due(past_the_period()));
+    app.drain_jobs().await;
+    assert_eq!(stub.hits(USAGE), 2);
+}
+
+#[tokio::test]
+async fn the_usage_limits_are_read_when_the_list_is_never_read_again() {
+    let stub = Stub::start().await;
+    stub.open(USAGE, claude_usage());
+    // `NARSOR_TUI_REFRESH_INTERVAL=none`: no period for the list.
+    let mut app = TaskApp::new(stub.client(), "local", None);
+    assert_eq!(app.next_refresh_due(), None);
+
+    assert!(app.start_usage_if_due(Instant::now()));
+    app.drain_jobs().await;
+    assert!(app.start_usage_if_due(past_the_period()));
+    app.drain_jobs().await;
+    assert_eq!(stub.hits(USAGE), 2);
+}
+
+#[tokio::test]
+async fn a_usage_read_that_hangs_keeps_no_key_waiting_and_starts_no_second_read() {
+    let stub = Stub::start().await;
+    let gate = stub.gated(USAGE, claude_usage());
+    let mut app = app_over(&stub);
+
+    assert!(app.start_usage_if_due(Instant::now()));
+    stub.reached(USAGE, 1).await;
+    assert!(app.is_reading_usage() && app.has_running());
+    // Nothing on the screen waits for it: no marker moves.
+    assert!(!app.is_loading());
+    assert_eq!(app.next_usage_due(), None);
+
+    assert!(!app.start_usage_if_due(past_the_period()));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(stub.hits(USAGE), 1);
+
+    // A key is handled before the answer.
+    press(&mut app, KeyCode::Char('?'));
+    assert!(app.is_help_open());
+
+    gate.add_permits(1);
+    app.drain_jobs().await;
+    assert!(!app.is_reading_usage());
+    assert!(app.harness_usage().is_some());
+}
+
+#[tokio::test]
+async fn a_failed_usage_read_clears_the_limits_and_leaves_the_connection_alone() {
+    let stub = Stub::start().await;
+    let mut app = app_with_list(&stub).await;
+    stub.open(USAGE, claude_usage());
+    assert!(app.start_usage_if_due(Instant::now()));
+    app.drain_jobs().await;
+    assert!(app.harness_usage().is_some());
+    let link = app.connection().state();
+    let notice = app.notifier().latest().map(|notice| notice.text.clone());
+
+    let gate = stub.failing(USAGE);
+    gate.add_permits(1);
+    assert!(app.start_usage_if_due(past_the_period()));
+    app.drain_jobs().await;
+
+    assert_eq!(app.harness_usage(), None);
+    assert_eq!(app.connection().state(), link);
+    assert_eq!(
+        app.notifier().latest().map(|notice| notice.text.clone()),
+        notice
+    );
+    // The next read waits the period, as after an answer.
+    assert!(!app.start_usage_if_due(Instant::now()));
+}
+
+#[tokio::test]
+async fn an_empty_usage_answer_forgets_the_harness_shown_before() {
+    let stub = Stub::start().await;
+    stub.open(USAGE, claude_usage());
+    let mut app = app_over(&stub);
+    assert!(app.start_usage_if_due(Instant::now()));
+    app.drain_jobs().await;
+    assert!(app.harness_usage().is_some());
+
+    // AE8: the report expired on the server; the interface keeps nothing.
+    stub.open(USAGE, serde_json::json!({"harnesses": []}));
+    assert!(app.start_usage_if_due(past_the_period()));
+    app.drain_jobs().await;
+    assert_eq!(app.harness_usage(), None);
+}
+
+#[tokio::test]
+async fn a_usage_answer_closes_no_dialog_and_moves_no_focus() {
+    let stub = Stub::start().await;
+    let mut app = app_with_list(&stub).await;
+    let gate = stub.gated(USAGE, claude_usage());
+
+    assert!(app.start_usage_if_due(Instant::now()));
+    stub.reached(USAGE, 1).await;
+    press(&mut app, KeyCode::Char('.'));
+    assert!(app.overlay().is_some(), "the action menu is open");
+    let focus = app.focus();
+
+    gate.add_permits(1);
+    app.drain_jobs().await;
+    assert!(app.harness_usage().is_some());
+    assert!(app.overlay().is_some(), "the action menu is still open");
+    assert_eq!(app.focus(), focus);
+}

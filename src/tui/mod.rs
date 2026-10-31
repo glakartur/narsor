@@ -262,6 +262,7 @@ pub async fn run(
         if first_read_pending {
             first_read_pending = false;
             app.start_refresh();
+            app.start_usage_if_due(Instant::now());
             feed.ensure_open(&app);
             continue;
         }
@@ -287,6 +288,7 @@ pub async fn run(
 
         feed.ensure_open(&app);
         app.start_refresh_if_due(Instant::now());
+        app.start_usage_if_due(Instant::now());
         app.retry_outgoing_if_due(Instant::now()).await;
         app.start_detail_reads();
         feed.ensure_open(&app);
@@ -298,14 +300,19 @@ pub async fn run(
     Ok(())
 }
 
-/// How long the loop may sleep: until the next due read or resend, but no
-/// longer than [`TICK`], so relative ages and the notification stay honest.
+/// How long the loop may sleep: until the next due read (the list or the
+/// usage limits) or resend, but no longer than [`TICK`], so relative ages and
+/// the notification stay honest.
 fn wait_until_next_due(app: &TaskApp, now: Instant) -> Duration {
-    [app.next_refresh_due(), app.next_outgoing_due()]
-        .into_iter()
-        .flatten()
-        .map(|due| due.saturating_duration_since(now))
-        .fold(TICK, Duration::min)
+    [
+        app.next_refresh_due(),
+        app.next_outgoing_due(),
+        app.next_usage_due(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|due| due.saturating_duration_since(now))
+    .fold(TICK, Duration::min)
 }
 
 /// Forwards terminal events until the loop asks it to stop.
