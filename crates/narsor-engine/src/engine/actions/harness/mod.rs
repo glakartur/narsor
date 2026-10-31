@@ -25,6 +25,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub(crate) mod copilot_sdk;
 pub mod github_copilot;
 pub mod opencode;
 
