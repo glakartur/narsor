@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use narsor_protocol::harness::HARNESSES;
 use narsor_protocol::identifier::BackendId;
 
 use super::settings::{self, SettingKey, SettingValue, LOG_LEVELS, NO_LIMIT};
@@ -447,10 +448,10 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
         }
 
         SettingKey::AgentHarness => {
-            let supported = ["claude-code", "codex", "github-copilot", "opencode"];
-            if supported.contains(&text) {
+            if HARNESSES.iter().any(|harness| harness.id == text) {
                 Ok(SettingValue::Text(text.to_string()))
             } else {
+                let supported: Vec<_> = HARNESSES.iter().map(|harness| harness.id).collect();
                 Err(format!(
                     "unknown agent harness '{text}'; supported harnesses are: {}",
                     supported.join(", ")

@@ -39,9 +39,11 @@
 //! }
 //! feed.ensure_open(&app);            // once a read gave it a cursor
 //! app.start_refresh_if_due(Instant::now());
+//! app.start_usage_if_due(Instant::now());   // the usage limits, every 15 s
 //! app.retry_outgoing_if_due(Instant::now()).await; // a new task whose answer was lost
 //! app.start_detail_reads();          // what the visible tab of the selected task lacks
-//! // the tick also wakes at `app.next_refresh_due()` and `app.next_outgoing_due()`
+//! // the tick also wakes at `app.next_refresh_due()`, `app.next_outgoing_due()`
+//! // and `app.next_usage_due()`
 //! terminal.draw(|frame| layout::render(frame, &mut app, &styles, Instant::now()))
 //! ```
 //!
@@ -103,19 +105,21 @@ pub mod notify;
 pub mod panel;
 pub mod repositories;
 pub mod tabs;
+pub mod usage;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::stream::{BoxStream, StreamExt as _};
 
-use crate::api::{reconnect_delay, ApiClient, ClientError, HarnessSelectionSnapshot};
+use crate::api::{reconnect_delay, ApiClient, ClientError, HarnessSelectionSnapshot, UsageSource};
 use crate::controller_protocol::{
     CapabilitiesView, ControlEventEnvelope, CreateRepositoryRequest, MoveTaskRequest,
     TaskListResponse,
 };
-use narsor_protocol::controller::{MoveTaskTarget, TaskState};
+use narsor_protocol::controller::{HarnessUsageResponse, MoveTaskTarget, TaskState};
 
 use super::connection::Connection;
 use super::keymap::{self, Action, Context, Stack};
@@ -475,6 +479,15 @@ pub struct TaskApp {
     /// A write asked for a read while one ran: that one began before the
     /// write, so its answer settles nothing and one more read follows it.
     refresh_again: bool,
+    /// Where the usage limits are read from: the client, unless a test
+    /// set another.
+    usage_source: Arc<dyn UsageSource>,
+    /// The usage limits of the harnesses, as last read (U7); `None` before
+    /// the first answer, after a failed read or when none is held.
+    harness_usage: Option<HarnessUsageResponse>,
+    /// When the next read of the usage limits is due: at once, then a period
+    /// after the previous read finished ([`usage::USAGE_PERIOD`]).
+    next_usage_at: Instant,
 }
 
 /// What a read of the list must tell after work was sent to a task without a
@@ -493,6 +506,7 @@ impl TaskApp {
         connection_name: impl Into<String>,
         refresh_interval: Option<Duration>,
     ) -> Self {
+        let usage_source: Arc<dyn UsageSource> = Arc::new(client.clone());
         Self {
             client,
             list: TaskList::new(),
@@ -526,6 +540,9 @@ impl TaskApp {
             queue_check: None,
             last_word: None,
             refresh_again: false,
+            usage_source,
+            harness_usage: None,
+            next_usage_at: Instant::now(),
         }
     }
 

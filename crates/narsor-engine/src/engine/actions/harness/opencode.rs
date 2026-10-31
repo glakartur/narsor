@@ -48,7 +48,7 @@ use narsor_protocol::chat::ChatElement;
 use serde_json::Value;
 
 /// The `harness:` value this adapter answers to.
-pub const OPENCODE: &str = "opencode";
+pub use narsor_protocol::harness::OPENCODE;
 
 /// The binary the adapter runs unless it is built with another one.
 pub const DEFAULT_PROGRAM: &str = "opencode";

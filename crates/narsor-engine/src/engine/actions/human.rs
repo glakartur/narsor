@@ -59,6 +59,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use super::harness::CLAUDE_CODE;
 use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction};
 use crate::domain::{
     ActionConfig, ActionError, ActionExecutionId, ActionResult, AnsweredBy, Artifact,
@@ -1143,7 +1144,7 @@ pub fn resolve_permission(
     let granted = match (decision.decision, decision.scope) {
         (PermissionDecisionKind::Deny, None) => Vec::new(),
         (PermissionDecisionKind::Allow, Some(_)) => {
-            if pending.request.agent_harness.as_deref() != Some("claude-code")
+            if pending.request.agent_harness.as_deref() != Some(CLAUDE_CODE)
                 || pending
                     .request
                     .agent_session_id

@@ -15,7 +15,7 @@ use crate::domain::WorkspaceAccess;
 use narsor_protocol::chat::ChatElement;
 
 /// The `harness:` value this adapter answers to.
-pub const CODEX: &str = "codex";
+pub use narsor_protocol::harness::CODEX;
 
 /// The binary the adapter runs unless configured with another program.
 pub const DEFAULT_PROGRAM: &str = "codex";

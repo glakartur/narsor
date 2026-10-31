@@ -28,7 +28,7 @@ use super::task_text::{
 };
 use crate::api::{
     ApiClient, ClientError, ConversationResponse as PageResponse, HumanInputDeliveryDto,
-    ServerTarget, TokenSource,
+    ServerTarget, TokenSource, UsageSource,
 };
 use crate::conductor::{ChatAuthor, ChatEntry, ConductorView};
 use crate::config::Flags;
@@ -44,9 +44,11 @@ use narsor_protocol::api::MaterialOrigin;
 use narsor_protocol::controller::{
     MoveTaskTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskEvent,
 };
+use narsor_protocol::harness::{display_name, CLAUDE_CODE};
 use narsor_protocol::identifier::TaskId;
 
 use super::commands::{conversation_entry_lines, permission_decision, CliError, Result};
+use super::control_text::usage_lines;
 use super::task_history::{history, HistoryCommand};
 use super::task_registry::{
     capabilities, create_from_file, repo, validate, workflows, RepoCommand,
@@ -1153,9 +1155,10 @@ pub async fn task(
                 ));
             }
             if !permission_wait && permission.is_some() {
-                return Err(CliError::failure(
-                    "--permission can only answer a Claude Code permission request.",
-                ));
+                return Err(CliError::failure(format!(
+                    "--permission can only answer a {} permission request.",
+                    display_name(CLAUDE_CODE)
+                )));
             }
             let mut delivery = delivery.expect("built above");
             delivery.episode = Some(pending.id.clone());
@@ -1842,6 +1845,34 @@ pub async fn harness(
         without_unsafe_chars(&selection.supported.join(", "))
     );
     Ok(())
+}
+
+/// `narsor-cli usage` — the subscription limits each harness last reported,
+/// as text in local time or, with `json`, the server's whole answer.
+pub async fn usage(json: bool, target: &ServerTarget, state: &Path, flags: &Flags) -> Result<()> {
+    let client = client(target, state, flags).await?;
+    print!("{}", usage_output(&client, json, chrono::Utc::now()).await?);
+    Ok(())
+}
+
+/// What `narsor-cli usage` prints, read from `source`: the text, with the
+/// time left counted from `now`, or with `json` the whole answer.
+pub async fn usage_output(
+    source: &dyn UsageSource,
+    json: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<String> {
+    let response = source
+        .read_usage()
+        .await
+        .map_err(|error| failure("Could not read the usage limits", error))?;
+    if json {
+        return Ok(format!("{}\n", json_output(&response)?));
+    }
+    Ok(usage_lines(&response, now, &chrono::Local)
+        .into_iter()
+        .map(|line| line.text + "\n")
+        .collect())
 }
 
 /// Runs one `narsor auth` command.

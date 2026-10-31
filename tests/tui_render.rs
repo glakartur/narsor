@@ -3010,12 +3010,17 @@ mod task_app_detail_render {
             .enumerate()
             .flat_map(|(index, line)| {
                 use base64::Engine as _;
+                let elements = parser.on_stdout_line(line.as_bytes());
+                // Like the stdout loop: a usage report line is not recorded.
+                if parser.take_usage().is_some() {
+                    return Vec::new();
+                }
                 conversation_projection::transcript_entries(&narsor::api::ConversationEntryDto {
                     entry_number: index as u64 + 1,
                     timestamp: chrono::Utc::now(),
                     source: narsor::api::ConversationEntrySource::Stdout,
                     raw_base64: base64::engine::general_purpose::STANDARD.encode(line),
-                    elements: parser.on_stdout_line(line.as_bytes()),
+                    elements,
                 })
             })
             .collect()
@@ -7121,5 +7126,486 @@ mod workflow_choice_render {
             .content()
             .iter()
             .all(|cell| !highlighted(cell, &styles)));
+    }
+}
+
+/// The usage limits on the right of the bottom bar (U8, R10–R16, AE4–AE7).
+mod task_app_usage_render {
+    use super::*;
+
+    use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::api::{ApiClient, ClientError};
+    use narsor::tui::style::Role;
+    use narsor::tui::task_app::notify::LIFETIME;
+    use narsor::tui::task_app::{layout, TaskApp};
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_protocol::api::LegacyExecutionListResponse;
+    use narsor_protocol::controller::{
+        HarnessUsageResponse, HarnessUsageView, UsageLimit, UsageStatus,
+    };
+
+    use crate::task_app_support::{archived, listing, titled, with_controller, with_runner};
+
+    /// The text of AE4.
+    const AE4: &str = "claude 5h 1% ↻4h10m · 7d 90% ↻2d3h";
+
+    fn now_utc() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 31, 14, 2, 0).unwrap()
+    }
+
+    fn limit(
+        window: &str,
+        utilization: f64,
+        in_: ChronoDuration,
+        status: UsageStatus,
+    ) -> UsageLimit {
+        UsageLimit {
+            window: window.into(),
+            utilization,
+            resets_at: now_utc() + in_,
+            status: Some(status),
+        }
+    }
+
+    fn harness(id: &str, limits: Vec<UsageLimit>) -> HarnessUsageView {
+        HarnessUsageView {
+            harness: id.into(),
+            observed_at: now_utc(),
+            received_at: now_utc(),
+            limits,
+        }
+    }
+
+    /// The state of AE1, `7d` in `status_7d`.
+    fn claude(status_7d: UsageStatus) -> HarnessUsageView {
+        harness(
+            "claude-code",
+            vec![
+                limit(
+                    "5h",
+                    0.01,
+                    ChronoDuration::hours(4) + ChronoDuration::minutes(10),
+                    UsageStatus::Allowed,
+                ),
+                limit(
+                    "7d",
+                    0.9,
+                    ChronoDuration::days(2) + ChronoDuration::hours(3),
+                    status_7d,
+                ),
+            ],
+        )
+    }
+
+    fn short(id: &str) -> HarnessUsageView {
+        harness(
+            id,
+            vec![limit(
+                "5h",
+                0.12,
+                ChronoDuration::hours(3),
+                UsageStatus::Allowed,
+            )],
+        )
+    }
+
+    fn state(harnesses: Vec<HarnessUsageView>) -> Option<HarnessUsageResponse> {
+        Some(HarnessUsageResponse { harnesses })
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// Two running tasks, the list holding the keys.
+    fn app() -> TaskApp {
+        let mut app = TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        );
+        let running = |id: &str, rank, title: &str| {
+            titled(
+                with_runner(
+                    with_controller(crate::task_app_support::task(id, "local", "running", rank)),
+                    ExecutionStatus::Running,
+                    "edit",
+                ),
+                title,
+            )
+        };
+        app.load(listing(
+            vec![running("a", 1, "NAR-14"), running("b", 2, "NAR-12")],
+            "c",
+        ));
+        app
+    }
+
+    fn render_at(app: &mut TaskApp, width: u16, styles: &Styles, now: Instant) -> Buffer {
+        draw(width, 30, |frame| {
+            layout::render_at(frame, app, styles, now, now_utc())
+        })
+    }
+
+    fn render(app: &mut TaskApp, width: u16, styles: &Styles) -> Buffer {
+        render_at(app, width, styles, Instant::now())
+    }
+
+    fn bar_row(buffer: &Buffer) -> String {
+        rows(buffer).pop().expect("a bar row")
+    }
+
+    /// The cells of the bar row from the column where `needle` starts, as
+    /// many as `needle` has characters.
+    fn bar_cells<'a>(buffer: &'a Buffer, needle: &str) -> Vec<&'a Cell> {
+        let row = bar_row(buffer);
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not on the bar: {row:?}"));
+        let x = row[..byte].chars().count() as u16;
+        let y = buffer.area.height - 1;
+        (0..needle.chars().count() as u16)
+            .map(|offset| &buffer[(x + offset, y)])
+            .collect()
+    }
+
+    /// The bar of `app` with no usage limits: the keys alone.
+    fn keys_only(app: &mut TaskApp, width: u16, styles: &Styles) -> String {
+        let usage = app.harness_usage().cloned();
+        app.set_harness_usage(None);
+        let row = bar_row(&render(app, width, styles));
+        app.set_harness_usage(usage);
+        row
+    }
+
+    fn assert_usage_at_the_right_edge(buffer: &Buffer, text: &str) {
+        let row = bar_row(buffer);
+        assert!(
+            row.ends_with(text),
+            "{text:?} not at the right edge: {row:?}"
+        );
+    }
+
+    /// AE4: the keys on the left, the limits at the right edge, the `7d`
+    /// near its end in the warning colour.
+    #[test]
+    fn wide_the_bar_has_the_keys_and_the_usage_limits() {
+        let styles = Styles::new(false);
+        let mut app = app();
+        app.set_harness_usage(state(vec![claude(UsageStatus::AllowedWarning)]));
+        let keys = keys_only(&mut app, 160, &styles);
+        let buffer = render(&mut app, 160, &styles);
+        let row = bar_row(&buffer);
+        assert_usage_at_the_right_edge(&buffer, AE4);
+        let first_key: String = keys.trim_end().chars().take(12).collect();
+        assert!(row.starts_with(&first_key), "{row:?} vs {keys:?}");
+        let before = row.chars().count() - AE4.chars().count() - 1;
+        assert_eq!(row.chars().nth(before), Some(' '), "{row:?}");
+
+        let attention = styles.of(Role::Attention).fg;
+        assert!(bar_cells(&buffer, "7d 90% ↻2d3h")
+            .iter()
+            .all(|cell| Some(cell.fg) == attention));
+        assert!(bar_cells(&buffer, "5h 1% ↻4h10m")
+            .iter()
+            .all(|cell| Some(cell.fg) != attention));
+    }
+
+    #[test]
+    fn a_rejected_limit_is_in_the_problem_colour() {
+        let styles = Styles::new(false);
+        let mut app = app();
+        app.set_harness_usage(state(vec![claude(UsageStatus::Rejected)]));
+        let buffer = render(&mut app, 160, &styles);
+        let problem = styles.of(Role::Problem).fg;
+        assert!(bar_cells(&buffer, "7d 90% ↻2d3h")
+            .iter()
+            .all(|cell| Some(cell.fg) == problem));
+    }
+
+    #[test]
+    fn without_colour_a_warning_carries_a_sign_before_its_window() {
+        let mut app = app();
+        app.set_harness_usage(state(vec![claude(UsageStatus::AllowedWarning)]));
+        let row = bar_row(&render(&mut app, 160, &Styles::new(true)));
+        assert!(row.contains("· !7d 90%"), "{row:?}");
+        assert!(!row.contains("!5h"), "{row:?}");
+    }
+
+    #[test]
+    fn without_colour_a_rejection_carries_a_sign_before_its_window() {
+        let mut app = app();
+        app.set_harness_usage(state(vec![claude(UsageStatus::Rejected)]));
+        let row = bar_row(&render(&mut app, 160, &Styles::new(true)));
+        assert!(
+            row.ends_with("claude 5h 1% ↻4h10m · !7d 90% ↻2d3h"),
+            "{row:?}"
+        );
+    }
+
+    /// AE5: the limits leave no room for a key, so the bar has only them.
+    #[test]
+    fn narrow_the_usage_limits_push_the_keys_out() {
+        let styles = Styles::new(true);
+        let mut app = app();
+        app.set_harness_usage(state(vec![claude(UsageStatus::Allowed), short("codex")]));
+        let text = format!("{AE4} | codex 5h 12% ↻3h0m");
+        let buffer = render(&mut app, layout::MIN_WIDTH, &styles);
+        assert_eq!(bar_row(&buffer).trim_start(), text);
+        let y = buffer.area.height - 1;
+        assert!(
+            row_cells(&buffer, y, 0..layout::MIN_WIDTH)
+                .all(|cell| !cell.modifier.contains(Modifier::REVERSED)),
+            "no key cap: {:?}",
+            bar_row(&buffer)
+        );
+    }
+
+    #[test]
+    fn the_last_harness_goes_whole_when_it_does_not_fit() {
+        let mut app = app();
+        app.set_harness_usage(state(vec![
+            claude(UsageStatus::Allowed),
+            short("codex"),
+            short("github-copilot"),
+        ]));
+        let row = bar_row(&render(&mut app, layout::MIN_WIDTH, &Styles::new(false)));
+        assert_eq!(row.trim_start(), format!("{AE4} | codex 5h 12% ↻3h0m"));
+        assert!(!row.contains("copilot"), "{row:?}");
+    }
+
+    #[test]
+    fn one_harness_longer_than_the_bar_is_cut_with_an_ellipsis() {
+        let mut app = app();
+        let mut long = claude(UsageStatus::Allowed);
+        for window in ["30d", "1d"] {
+            long.limits.push(limit(
+                window,
+                0.5,
+                ChronoDuration::hours(5),
+                UsageStatus::Allowed,
+            ));
+        }
+        app.set_harness_usage(state(vec![long]));
+        let row = bar_row(&render(&mut app, layout::MIN_WIDTH, &Styles::new(false)));
+        assert_eq!(row.chars().count(), usize::from(layout::MIN_WIDTH));
+        assert!(row.starts_with("claude 5h 1%"), "{row:?}");
+        assert!(row.ends_with('…'), "{row:?}");
+    }
+
+    #[test]
+    fn a_cut_limit_near_its_end_keeps_its_colour() {
+        let styles = Styles::new(false);
+        let mut app = app();
+        // 40 columns of name, so the `7d` starts four columns before the end.
+        let mut view = claude(UsageStatus::AllowedWarning);
+        view.harness = "x".repeat(40);
+        app.set_harness_usage(state(vec![view]));
+        let buffer = render(&mut app, layout::MIN_WIDTH, &styles);
+        let row = bar_row(&buffer);
+        assert!(row.ends_with("· 7d …"), "{row:?}");
+        let attention = styles.of(Role::Attention).fg;
+        assert!(bar_cells(&buffer, "7d …")
+            .iter()
+            .all(|cell| Some(cell.fg) == attention));
+    }
+
+    /// The notification of a stream that ended, longer the longer `detail`.
+    fn notify(app: &mut TaskApp, detail: &str) {
+        app.on_stream(Some(Err(ClientError::Request {
+            code: "bad".into(),
+            message: detail.into(),
+        })));
+    }
+
+    /// AE6: the notification takes the right while it is up; the limits
+    /// come back after it.
+    #[test]
+    fn the_notification_goes_before_the_usage_limits() {
+        let mut app = app();
+        app.set_harness_usage(state(vec![claude(UsageStatus::Allowed)]));
+        notify(&mut app, "x");
+        let now = Instant::now();
+        let shown = bar_row(&render_at(&mut app, 160, &Styles::new(false), now));
+        assert!(
+            shown
+                .trim_end()
+                .ends_with("strumień zdarzeń zakończony: API request rejected (bad): x"),
+            "{shown:?}"
+        );
+        assert!(!shown.contains("claude"), "{shown:?}");
+
+        let gone = bar_row(&render_at(
+            &mut app,
+            160,
+            &Styles::new(false),
+            now + LIFETIME,
+        ));
+        assert!(gone.ends_with(AE4), "{gone:?}");
+        assert!(!gone.contains("strumień"), "{gone:?}");
+    }
+
+    #[test]
+    fn a_long_notification_hides_the_keys_and_is_shown_whole() {
+        let styles = Styles::new(true);
+        let mut app = app();
+        app.set_harness_usage(state(vec![claude(UsageStatus::Allowed)]));
+        let width: u16 = 100;
+        let prefix = "✗ strumień zdarzeń zakończony: API request rejected (bad): ";
+        let detail = "y".repeat(usize::from(width) - prefix.chars().count() - 2);
+        notify(&mut app, &detail);
+        let buffer = render(&mut app, width, &styles);
+        let row = bar_row(&buffer);
+        assert!(row.ends_with(&format!("{prefix}{detail}")), "{row:?}");
+        let y = buffer.area.height - 1;
+        assert!(
+            row_cells(&buffer, y, 0..width).all(|cell| !cell.modifier.contains(Modifier::REVERSED)),
+            "no key cap: {row:?}"
+        );
+    }
+
+    /// A notification longer than the bar, drawn into an area away from the
+    /// corner at every width, is cut with `…` and stays inside the area.
+    #[test]
+    fn a_notification_longer_than_the_bar_is_cut_at_any_width() {
+        let styles = Styles::new(false);
+        let mut app = app();
+        app.set_harness_usage(state(vec![claude(UsageStatus::Allowed)]));
+        notify(&mut app, &"z".repeat(200));
+        for width in 1..=80u16 {
+            let area = Rect::new(5, 1, width, 1);
+            let buffer = draw(width + 9, 3, |frame| {
+                layout::render_bar(frame, area, &app, &styles, Instant::now(), now_utc())
+            });
+            let row = &rows(&buffer)[1];
+            let inside: String = row.chars().skip(5).take(usize::from(width)).collect();
+            assert!(inside.ends_with('…'), "{width}: {row:?}");
+            assert!(row.chars().take(5).all(|c| c == ' '), "{width}: {row:?}");
+            assert!(
+                row.chars().skip(5 + usize::from(width)).all(|c| c == ' '),
+                "{width}: {row:?}"
+            );
+            assert!(rows(&buffer)[0].trim().is_empty() && rows(&buffer)[2].trim().is_empty());
+        }
+    }
+
+    /// The usage limits drawn into an area away from the corner, at every
+    /// width, stay inside it.
+    #[test]
+    fn the_usage_limits_fit_any_shifted_area() {
+        let styles = Styles::new(false);
+        let mut app = app();
+        app.set_harness_usage(state(vec![
+            claude(UsageStatus::AllowedWarning),
+            short("codex"),
+        ]));
+        for width in 1..=80u16 {
+            let area = Rect::new(5, 1, width, 1);
+            let buffer = draw(width + 9, 3, |frame| {
+                layout::render_bar(frame, area, &app, &styles, Instant::now(), now_utc())
+            });
+            let row = &rows(&buffer)[1];
+            assert!(row.chars().take(5).all(|c| c == ' '), "{width}: {row:?}");
+            assert!(
+                row.chars().skip(5 + usize::from(width)).all(|c| c == ' '),
+                "{width}: {row:?}"
+            );
+            let inside: String = row.chars().skip(5).take(usize::from(width)).collect();
+            assert!(
+                inside.ends_with('…') || inside.ends_with("↻3h0m") || inside.ends_with("↻2d3h"),
+                "{width}: {row:?}"
+            );
+        }
+    }
+
+    /// AE7: no state, the bar is the keys as it always was.
+    #[test]
+    fn without_usage_limits_the_bar_is_the_keys_alone() {
+        let styles = Styles::new(false);
+        let mut app = app();
+        app.set_harness_usage(None);
+        let row = bar_row(&render(&mut app, 160, &styles));
+        let keys: String = keymap::hint_line(app.key_context(), &styles, 159)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(row, format!("{keys:<160}"));
+    }
+
+    #[test]
+    fn a_reset_already_past_reads_zero_minutes() {
+        let mut app = app();
+        app.set_harness_usage(state(vec![harness(
+            "claude-code",
+            vec![limit(
+                "5h",
+                0.4,
+                -ChronoDuration::minutes(2),
+                UsageStatus::Allowed,
+            )],
+        )]));
+        let row = bar_row(&render(&mut app, 160, &Styles::new(false)));
+        assert!(row.ends_with("claude 5h 40% ↻0m"), "{row:?}");
+    }
+
+    /// R16: the bars with a fixed text show no limits.
+    #[test]
+    fn the_exit_confirmation_has_no_usage_limits() {
+        let mut quitting = app();
+        quitting.set_harness_usage(state(vec![claude(UsageStatus::Allowed)]));
+        press(&mut quitting, KeyCode::Char('q'));
+        let row = bar_row(&render(&mut quitting, 160, &Styles::new(false)));
+        assert!(row.contains("anuluj"), "{row:?}");
+        assert!(!row.contains("claude"), "{row:?}");
+    }
+
+    /// R16: the opening screen waits for its read with a fixed bar.
+    #[tokio::test]
+    async fn the_opening_screen_has_no_usage_limits() {
+        let mut opening = app();
+        opening.set_harness_usage(state(vec![claude(UsageStatus::Allowed)]));
+        let request = opening.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
+        opening.dispatch(request).await;
+        let row = bar_row(&render(&mut opening, 160, &Styles::new(false)));
+        assert!(row.contains("wróć"), "{row:?}");
+        assert!(!row.contains("claude"), "{row:?}");
+    }
+
+    /// R16: the views whose bar lists the keys show the limits, an overlay
+    /// open or not.
+    #[test]
+    fn the_list_the_details_the_history_and_an_overlay_show_the_usage_limits() {
+        let usage = || state(vec![claude(UsageStatus::Allowed)]);
+        let shown = |app: &mut TaskApp| bar_row(&render(app, 160, &Styles::new(false)));
+
+        let mut list = app();
+        list.set_harness_usage(usage());
+        assert!(list.keys_on_list());
+        assert!(shown(&mut list).ends_with(AE4));
+
+        let mut details = app();
+        details.set_harness_usage(usage());
+        press(&mut details, KeyCode::Enter);
+        assert!(!details.keys_on_list());
+        assert!(shown(&mut details).ends_with(AE4));
+
+        let mut history = app();
+        history.set_harness_usage(usage());
+        press(&mut history, KeyCode::Char('H'));
+        history.open_history(
+            listing(vec![archived("old", "NAR-9", 5)], "c"),
+            Ok(LegacyExecutionListResponse { executions: vec![] }),
+        );
+        let screen_text = screen(&render(&mut history, 160, &Styles::new(false)));
+        assert!(screen_text.contains("Historia"), "{screen_text}");
+        assert!(shown(&mut history).ends_with(AE4));
+
+        let mut overlay = app();
+        overlay.set_harness_usage(usage());
+        press(&mut overlay, KeyCode::Char('.'));
+        assert!(overlay.overlay().is_some());
+        assert!(shown(&mut overlay).ends_with(AE4));
     }
 }

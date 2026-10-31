@@ -31,12 +31,14 @@ use crate::conductor::{
     ChatAuthor, ConductorAnswer, ConductorInvoker, ConductorView, Invocation, InvocationOutcome,
     ProposalState,
 };
-use crate::controller_protocol::{ConductorReadRequest, DeliveredOperatorCommand};
+use crate::controller_protocol::{
+    ConductorReadRequest, DeliveredOperatorCommand, HarnessUsageReport, UsageLimit,
+};
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, ConductorPurpose, EventData, ResolvedEnvironment,
     ResourceProfile,
 };
-use crate::engine::{ActionExecutor, ActionKind, ActionOutcome, ActionRequest};
+use crate::engine::{ActionExecutor, ActionKind, ActionOutcome, ActionRequest, UsageReporter};
 use crate::orchestration::{AttentionKind, OperatorCommand};
 
 // ---------------------------------------------------------------------------
@@ -98,6 +100,9 @@ enum Reply {
     Hang,
     /// Answers with this label once the notify is opened.
     After(Arc<Notify>, &'static str),
+    /// Reports these usage limits, in order, then answers with this label,
+    /// as the agent executor does with what its harness reported.
+    Reports(Vec<HarnessUsageReport>, &'static str),
     /// Fails, as a harness that exited with an error.
     Fail,
     /// Answers with text that names no output label.
@@ -117,6 +122,8 @@ struct Agent {
     replies: Mutex<VecDeque<Reply>>,
     fallback: Reply,
     calls: Mutex<Vec<Call>>,
+    /// The usage reporter of the last session's engine the agent joined.
+    usage: Mutex<Option<Arc<dyn UsageReporter>>>,
 }
 
 impl Agent {
@@ -125,6 +132,7 @@ impl Agent {
             replies: Mutex::new(replies.into()),
             fallback,
             calls: Mutex::new(Vec::new()),
+            usage: Mutex::new(None),
         })
     }
 
@@ -173,6 +181,14 @@ impl ActionExecutor for Agent {
                 Reply::Hang => std::future::pending().await,
                 Reply::After(gate, label) => {
                     gate.notified().await;
+                    completed(label, json!({}))
+                }
+                Reply::Reports(reports, label) => {
+                    let reporter = self.usage.lock().unwrap().clone();
+                    let reporter = reporter.expect("the session's usage reporter");
+                    for report in reports {
+                        reporter.report(report);
+                    }
                     completed(label, json!({}))
                 }
                 Reply::Fail => Err(ActionError {
@@ -344,40 +360,27 @@ impl Fixture {
         )
         .expect("initialize the storage");
         let definition = Arc::new(spec.definition().expect("the definition"));
-        let harness = Arc::new(LiveHarness::new(starting_harness(&storage, spec)));
-        let engine = Arc::new(
-            Engine::new(storage.store())
-                .with_executor(ActionKind::Agent, agent.clone())
-                .with_default_harness_source(harness.clone())
-                .with_task_labels(spec.ticket.clone(), spec.title.clone()),
-        );
-        let host = ConductorHost::assemble_with(
-            &engine,
-            Arc::clone(&harness),
-            &definition,
-            conductor.clone(),
-            HarnessProbe::on_path(path.as_os_str()),
-        );
-        let session = Session {
+        let link = Link::new(&config);
+        let session = assemble_session(
+            &config,
             storage,
-            engine,
-            conductor: host,
-            harness,
-            harness_unavailable: None,
-            report_forced: false,
+            link,
+            spec,
             definition,
-            incarnation: config.incarnation.clone(),
-            timing: config.timing.clone(),
-            link: Link::new(&config),
-            cache: snapshot::ConversationCache::default(),
-            execution_id: None,
-            directive: RunnerDirective::Continue,
-            pass: None,
-            outbox_due: true,
-            material_failures: 0,
-            material_retry_at: None,
-            title_wanted: spec.title.is_none(),
-        };
+            |engine, reporter| {
+                *agent.usage.lock().unwrap() = Some(Arc::clone(reporter));
+                engine.with_executor(ActionKind::Agent, agent.clone())
+            },
+            |engine, _, harness, definition| {
+                ConductorHost::assemble_with(
+                    engine,
+                    harness,
+                    definition,
+                    conductor.clone(),
+                    HarnessProbe::on_path(path.as_os_str()),
+                )
+            },
+        );
         Self {
             session,
             agent,
@@ -725,6 +728,273 @@ fn a_refused_credential_is_renewed_and_failures_back_off() {
         link.renew_due(Duration::from_secs(5 * 60)),
         "renewed ahead of its expiry"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Usage limits (R8)
+// ---------------------------------------------------------------------------
+
+/// A report of `claude-code`'s five-hour limit at `utilization`.
+fn usage_report(utilization: f64) -> HarnessUsageReport {
+    harness_usage_report("claude-code", utilization)
+}
+
+/// A report of `harness`'s five-hour limit at `utilization`.
+fn harness_usage_report(harness: &str, utilization: f64) -> HarnessUsageReport {
+    HarnessUsageReport {
+        harness: harness.to_string(),
+        observed_at: Utc::now(),
+        limits: vec![UsageLimit {
+            window: "5h".to_string(),
+            utilization,
+            resets_at: Utc::now() + chrono::Duration::hours(4),
+            status: None,
+        }],
+    }
+}
+
+/// A one-step task whose step reports two usage reports, one after the
+/// other, and completes.
+fn reporting(root: &TempRoot) -> Fixture {
+    let agent = Agent::new(
+        vec![Reply::Reports(
+            vec![usage_report(0.1), usage_report(0.2)],
+            "done",
+        )],
+        Reply::Label("done"),
+    );
+    Fixture::start(root, &spec(ONE_STEP, "claude-code"), agent)
+}
+
+/// The harness and utilization of each report waiting in the session.
+fn waiting_usage(session: &Session) -> Vec<(String, f64)> {
+    session
+        .usage
+        .waiting()
+        .into_iter()
+        .map(|report| (report.harness, report.limits[0].utilization))
+        .collect()
+}
+
+/// Waits until the session's usage forwarder can start a send, and starts
+/// it with the session's sender.
+async fn forward_usage(session: &mut Session) -> Option<JoinHandle<()>> {
+    tokio::time::timeout(PATIENCE, session.usage.ready())
+        .await
+        .expect("a report waits and no send is on its way");
+    let sender = session.usage_sender();
+    session.usage.forward(sender)
+}
+
+/// A control plane double for usage reports: it records the utilization of
+/// every report it receives, in order. A holding one holds its answer to the
+/// first report until `release` is opened; a refusing one refuses them all.
+#[derive(Default)]
+struct UsageControlPlane {
+    received: Mutex<Vec<f64>>,
+    arrived: Notify,
+    release: Notify,
+    holds_first: bool,
+    refuses: bool,
+}
+
+impl UsageControlPlane {
+    fn holding() -> Arc<Self> {
+        Arc::new(Self {
+            holds_first: true,
+            ..Self::default()
+        })
+    }
+
+    fn refusing() -> Arc<Self> {
+        Arc::new(Self {
+            refuses: true,
+            ..Self::default()
+        })
+    }
+
+    fn received(&self) -> Vec<f64> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+/// The double behind an `Arc`, so a send can outlive the test's borrow.
+struct UsageControlPlaneSender(Arc<UsageControlPlane>);
+
+impl usage::UsageSender for UsageControlPlaneSender {
+    fn send(&self, report: HarnessUsageReport) -> usage::UsageSend {
+        let plane = Arc::clone(&self.0);
+        Box::pin(async move {
+            let first = {
+                let mut received = plane.received.lock().unwrap();
+                received.push(report.limits[0].utilization);
+                received.len() == 1
+            };
+            plane.arrived.notify_one();
+            if first && plane.holds_first {
+                plane.release.notified().await;
+            }
+            if plane.refuses {
+                return Err(crate::api::ClientError::Unavailable(
+                    "the control plane is not there".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+}
+
+/// The fixture's session sending its usage reports to `plane`, with the
+/// reporter its engine was given.
+fn usage_session<'a>(
+    fixture: &'a mut Fixture,
+    plane: &Arc<UsageControlPlane>,
+) -> (&'a mut Session, Arc<dyn UsageReporter>) {
+    let reporter = fixture
+        .agent
+        .usage
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the session's usage reporter");
+    let session = &mut fixture.session;
+    session.usage_sender = Some(Arc::new(UsageControlPlaneSender(Arc::clone(plane))));
+    (session, reporter)
+}
+
+/// Waits until `send` ended.
+async fn sent(send: Option<JoinHandle<()>>) {
+    tokio::time::timeout(PATIENCE, send.expect("a send under way"))
+        .await
+        .expect("the send ends")
+        .expect("the send does not panic");
+}
+
+/// Covers AE3. The usage limits a step reports leave the control loop
+/// once, the latest only, in a task of their own. A control plane that
+/// refuses them costs the step nothing and leaves the link's backoff as it
+/// was: the report is dropped, not retried.
+#[tokio::test]
+async fn only_the_latest_usage_report_is_sent_once_and_a_failure_leaves_the_link_alone() {
+    let root = TempRoot::new();
+    let mut fixture = reporting(&root);
+    let plane = UsageControlPlane::refusing();
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+
+    let (session, _) = usage_session(&mut fixture, &plane);
+    let (failures, next_attempt) = (session.link.failures, session.link.next_attempt);
+    assert_eq!(
+        waiting_usage(session),
+        [("claude-code".to_string(), 0.2)],
+        "only the latest waits"
+    );
+
+    sent(forward_usage(session).await).await;
+
+    assert_eq!(plane.received(), vec![0.2], "one attempt to send it");
+    assert!(
+        session.usage.waiting().is_empty(),
+        "nothing is left to send again"
+    );
+    let sender = session.usage_sender();
+    assert!(session.usage.forward(sender).is_none(), "no retry");
+    assert_eq!(session.link.failures, failures);
+    assert_eq!(session.link.next_attempt, next_attempt);
+}
+
+/// Without a credential there is no client: the report is dropped and the
+/// link is left as it was.
+#[tokio::test]
+async fn without_a_client_the_usage_report_is_dropped() {
+    let root = TempRoot::new();
+    let mut fixture = reporting(&root);
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+
+    let session = &mut fixture.session;
+    let (failures, next_attempt) = (session.link.failures, session.link.next_attempt);
+    assert!(
+        forward_usage(session).await.is_none(),
+        "no client to send with"
+    );
+    assert!(session.usage.waiting().is_empty());
+    assert_eq!(session.link.failures, failures);
+    assert_eq!(session.link.next_attempt, next_attempt);
+}
+
+/// A newer usage report waits while an older one is still on its way, and
+/// goes out only after it: the control plane, which keeps whichever report
+/// came last, ends with the newer one.
+#[tokio::test]
+async fn a_newer_usage_report_waits_for_the_send_under_way_and_arrives_last() {
+    let root = TempRoot::new();
+    let mut fixture = reporting(&root);
+    let plane = UsageControlPlane::holding();
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+    let (session, reporter) = usage_session(&mut fixture, &plane);
+
+    let first = forward_usage(session).await;
+    assert!(first.is_some(), "the first send starts");
+    tokio::time::timeout(PATIENCE, plane.arrived.notified())
+        .await
+        .expect("the first report reaches the control plane");
+    assert_eq!(plane.received(), vec![0.2]);
+
+    reporter.report(usage_report(0.3));
+    let sender = session.usage_sender();
+    assert!(
+        session.usage.forward(sender).is_none(),
+        "no second send while the first is on its way"
+    );
+    assert_eq!(
+        waiting_usage(session),
+        [("claude-code".to_string(), 0.3)],
+        "the newer report waits"
+    );
+
+    plane.release.notify_one();
+    sent(first).await;
+    sent(forward_usage(session).await).await;
+
+    assert_eq!(
+        plane.received(),
+        vec![0.2, 0.3],
+        "the newer one arrives last"
+    );
+}
+
+/// Reports of two harnesses made before a send both reach the control
+/// plane, one after the other; two reports of one harness are merged, so
+/// only the newer goes out.
+#[tokio::test]
+async fn the_latest_report_of_each_harness_reaches_the_control_plane() {
+    let root = TempRoot::new();
+    let mut fixture = reporting(&root);
+    let plane = UsageControlPlane::holding();
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+    let (session, reporter) = usage_session(&mut fixture, &plane);
+    reporter.report(harness_usage_report("codex", 0.5));
+    reporter.report(usage_report(0.6));
+    assert_eq!(
+        waiting_usage(session),
+        [("claude-code".to_string(), 0.6), ("codex".to_string(), 0.5)]
+    );
+
+    plane.release.notify_one();
+    sent(forward_usage(session).await).await;
+    sent(forward_usage(session).await).await;
+
+    assert_eq!(plane.received(), vec![0.6, 0.5]);
+    assert!(session.usage.waiting().is_empty());
 }
 
 // ---------------------------------------------------------------------------

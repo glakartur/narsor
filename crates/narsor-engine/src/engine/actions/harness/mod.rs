@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
+use narsor_protocol::controller::UsageLimit;
 use serde_json::Value;
 
 use crate::domain::{ActionError, AgentActionConfig, WorkspaceAccess};
@@ -154,6 +155,22 @@ pub trait HarnessStreamParser: Send {
     /// make sense of becomes an [`ChatElement::Unclassified`] element, never
     /// an error.
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement>;
+
+    /// The subscription usage limits the last line fed to
+    /// [`Self::on_stdout_line`] reported, given once: a second call, or a call
+    /// after any other line, gives `None`.
+    ///
+    /// * `None`: the line is no usage report, and belongs in the
+    ///   conversation like any other. The default, for a harness that never
+    ///   reports its limits.
+    /// * `Some` of an empty list: the line is a usage report without a limit
+    ///   narsor knows. It is not part of the conversation, and there is
+    ///   nothing to report.
+    /// * `Some` of limits: the line is a usage report. It is not part of the
+    ///   conversation; the limits are.
+    fn take_usage(&mut self) -> Option<Vec<UsageLimit>> {
+        None
+    }
 
     /// The final answer the stream has delivered so far, once a `result`
     /// line has carried one. The executor ends the step shortly after it,

@@ -135,6 +135,12 @@ impl Styles {
         Self { no_color }
     }
 
+    /// Whether colour is off: a meaning a colour would carry needs a sign
+    /// of its own then, e.g. the `!` before a usage limit near its end.
+    pub fn no_color(&self) -> bool {
+        self.no_color
+    }
+
     /// Styles for the environment: reads `NO_COLOR`. Call once at startup.
     pub fn from_env() -> Self {
         Self::new(no_color_requested(std::env::var_os("NO_COLOR")))

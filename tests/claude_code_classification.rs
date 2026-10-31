@@ -7,11 +7,13 @@
 use std::fs;
 use std::path::PathBuf;
 
+use chrono::DateTime;
 use narsor_engine::engine::actions::harness::HarnessStreamParser;
-use narsor_engine::engine::{ClaudeCodeAdapter, HarnessAdapter};
+use narsor_engine::engine::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter};
 use narsor_protocol::chat::{
     ChatElement, QuestionSource, TechnicalCategory, ToolResultStatus, UnclassifiedReason,
 };
+use narsor_protocol::controller::{UsageLimit, UsageStatus};
 use serde_json::{json, Value};
 
 fn fixtures_dir() -> PathBuf {
@@ -111,8 +113,17 @@ fn every_recording_classifies_every_line() {
 
     for name in names {
         let lines = recording(&name);
-        for (index, elements) in classify(&lines).into_iter().enumerate() {
-            assert!(!elements.is_empty(), "{name}:{} gave no element", index + 1);
+        let mut parser = parser();
+        for (index, line) in lines.iter().enumerate() {
+            let elements = parser.on_stdout_line(line.as_bytes());
+            // A rate limit report is no conversation element (R8a).
+            let usage = parser.take_usage();
+            assert_eq!(
+                elements.is_empty(),
+                usage.is_some(),
+                "{name}:{} gave {elements:?} and {usage:?}",
+                index + 1
+            );
             for element in elements {
                 assert!(
                     !matches!(
@@ -296,7 +307,7 @@ fn an_unknown_content_block_is_unclassified() {
 
 // Covers AE7.
 #[test]
-fn init_starts_the_session_and_rate_limits_are_technical() {
+fn init_starts_the_session_and_rate_limits_are_not_conversation() {
     let elements = classify_all(&recording("tools.ndjson"));
     let started = elements
         .iter()
@@ -313,19 +324,230 @@ fn init_starts_the_session_and_rate_limits_are_technical() {
         }
     );
 
-    let rate_limit = elements
-        .iter()
-        .find_map(|element| match element {
-            ChatElement::Technical {
-                category: TechnicalCategory::RateLimit,
-                summary,
-                ..
-            } => Some(summary.clone()),
-            _ => None,
-        })
-        .expect("a rate limit element");
-    assert!(rate_limit.contains("allowed"), "{rate_limit}");
-    assert!(rate_limit.contains("five_hour"), "{rate_limit}");
+    // The element a usage report was stored as before carried its
+    // `rate_limit_info` as data.
+    assert!(
+        !elements.iter().any(|element| matches!(
+            element,
+            ChatElement::Technical { data: Some(data), .. } if data.get("rateLimitType").is_some()
+        )),
+        "{elements:?}"
+    );
+}
+
+/// A `rate_limit_event` line with `info` as its `rate_limit_info`.
+fn rate_limit_event(info: Value) -> String {
+    json!({
+        "type": "rate_limit_event",
+        "rate_limit_info": info,
+        "uuid": "u-1",
+        "session_id": "s-1",
+    })
+    .to_string()
+}
+
+/// The recorded `rate_limit_event` line of one recording.
+fn recorded_rate_limit_event(name: &str) -> String {
+    recording(name)
+        .into_iter()
+        .find(|line| line.contains("\"type\":\"rate_limit_event\""))
+        .unwrap_or_else(|| panic!("{name} has a rate_limit_event line"))
+}
+
+/// The elements and the usage limits of one line on a fresh parser.
+fn usage_of(line: &str) -> (Vec<ChatElement>, Option<Vec<UsageLimit>>) {
+    let mut parser = parser();
+    let elements = parser.on_stdout_line(line.as_bytes());
+    (elements, parser.take_usage())
+}
+
+fn limit(
+    window: &str,
+    utilization: f64,
+    resets_at: i64,
+    status: Option<UsageStatus>,
+) -> UsageLimit {
+    UsageLimit {
+        window: window.into(),
+        utilization,
+        resets_at: DateTime::from_timestamp(resets_at, 0).expect("timestamp"),
+        status,
+    }
+}
+
+// Covers AE1.
+#[test]
+fn a_rate_limit_event_gives_its_windows_and_no_element() {
+    let line = rate_limit_event(json!({
+        "status": "allowed",
+        "resetsAt": 1792203000,
+        "rateLimitType": "five_hour",
+        "unifiedWindows": {
+            "five_hour": {"utilization": 0.01, "resetsAt": 1792203000, "status": "allowed"},
+            "seven_day": {"utilization": 0.9, "resetsAt": 1792785600, "status": "allowed_warning"},
+        },
+    }));
+    let (elements, usage) = usage_of(&line);
+    assert!(elements.is_empty(), "{elements:?}");
+    assert_eq!(
+        usage,
+        Some(vec![
+            limit("5h", 0.01, 1792203000, Some(UsageStatus::Allowed)),
+            limit("7d", 0.9, 1792785600, Some(UsageStatus::AllowedWarning)),
+        ])
+    );
+}
+
+#[test]
+fn a_window_without_a_status_takes_it_only_when_it_is_the_limit_type() {
+    let (elements, usage) = usage_of(&recorded_rate_limit_event("ask_user_question.ndjson"));
+    assert!(elements.is_empty(), "{elements:?}");
+    assert_eq!(
+        usage,
+        Some(vec![
+            limit("5h", 0.05, 1792203000, Some(UsageStatus::Allowed)),
+            limit("7d", 0.01, 1792785600, None),
+        ])
+    );
+}
+
+#[test]
+fn a_window_keeps_its_own_status() {
+    let (elements, usage) = usage_of(&recorded_rate_limit_event("noschema_background.ndjson"));
+    assert!(elements.is_empty(), "{elements:?}");
+    assert_eq!(
+        usage,
+        Some(vec![
+            limit("5h", 0.22, 1793100000, Some(UsageStatus::Allowed)),
+            limit("7d", 0.55, 1793390400, Some(UsageStatus::Allowed)),
+        ])
+    );
+}
+
+#[test]
+fn without_unified_windows_the_limit_type_is_the_only_window() {
+    let line = rate_limit_event(json!({
+        "status": "rejected",
+        "resetsAt": 1792785600,
+        "rateLimitType": "seven_day",
+        "utilization": 0.97,
+    }));
+    assert_eq!(
+        usage_of(&line).1,
+        Some(vec![limit(
+            "7d",
+            0.97,
+            1792785600,
+            Some(UsageStatus::Rejected)
+        )])
+    );
+}
+
+#[test]
+fn unknown_windows_and_windows_without_a_reset_are_skipped() {
+    let line = rate_limit_event(json!({
+        "status": "allowed",
+        "rateLimitType": "five_hour",
+        "unifiedWindows": {
+            "opus_weekly": {"utilization": 0.3, "resetsAt": 1792785600, "status": "allowed"},
+            "five_hour": {"utilization": 0.1, "resetsAt": 1792203000},
+            "seven_day": {"utilization": 0.2},
+        },
+    }));
+    assert_eq!(
+        usage_of(&line).1,
+        Some(vec![limit(
+            "5h",
+            0.1,
+            1792203000,
+            Some(UsageStatus::Allowed)
+        )])
+    );
+}
+
+#[test]
+fn a_window_without_utilization_is_skipped() {
+    let line = rate_limit_event(json!({
+        "unifiedWindows": {
+            "five_hour": {"resetsAt": 1792203000, "status": "allowed"},
+            "seven_day": {"utilization": 0.2, "resetsAt": 1792785600},
+        },
+    }));
+    assert_eq!(
+        usage_of(&line).1,
+        Some(vec![limit("7d", 0.2, 1792785600, None)])
+    );
+}
+
+#[test]
+fn a_utilization_outside_zero_to_one_is_brought_to_the_nearest_end() {
+    let line = rate_limit_event(json!({
+        "unifiedWindows": {
+            "five_hour": {"utilization": 1.07, "resetsAt": 1792203000, "status": "rejected"},
+            "seven_day": {"utilization": -0.2, "resetsAt": 1792785600},
+        },
+    }));
+    assert_eq!(
+        usage_of(&line).1,
+        Some(vec![
+            limit("5h", 1.0, 1792203000, Some(UsageStatus::Rejected)),
+            limit("7d", 0.0, 1792785600, None),
+        ])
+    );
+}
+
+#[test]
+fn an_unknown_status_gives_a_limit_without_a_status() {
+    let line = rate_limit_event(json!({
+        "unifiedWindows": {
+            "five_hour": {"utilization": 0.1, "resetsAt": 1792203000, "status": "something_new"},
+        },
+    }));
+    assert_eq!(
+        usage_of(&line).1,
+        Some(vec![limit("5h", 0.1, 1792203000, None)])
+    );
+}
+
+#[test]
+fn a_rate_limit_event_without_known_windows_is_an_empty_report() {
+    let line = rate_limit_event(json!({
+        "status": "allowed",
+        "rateLimitType": "opus_weekly",
+        "unifiedWindows": {
+            "opus_weekly": {"utilization": 0.3, "resetsAt": 1792785600, "status": "allowed"},
+        },
+    }));
+    let (elements, usage) = usage_of(&line);
+    assert!(elements.is_empty(), "{elements:?}");
+    assert_eq!(usage, Some(Vec::new()));
+}
+
+#[test]
+fn usage_is_taken_once_and_only_for_its_line() {
+    let mut parser = parser();
+    assert_eq!(parser.take_usage(), None);
+
+    parser.on_stdout_line(recorded_rate_limit_event("tools.ndjson").as_bytes());
+    assert!(parser.take_usage().is_some());
+    assert_eq!(parser.take_usage(), None);
+
+    parser.on_stdout_line(recorded_rate_limit_event("tools.ndjson").as_bytes());
+    let elements =
+        parser.on_stdout_line(assistant(json!([{"type": "text", "text": "hi"}])).as_bytes());
+    assert!(!elements.is_empty());
+    assert_eq!(parser.take_usage(), None);
+
+    parser.on_stdout_line(recorded_rate_limit_event("tools.ndjson").as_bytes());
+    parser.on_stdout_line(b"not json");
+    assert_eq!(parser.take_usage(), None);
+}
+
+#[test]
+fn other_harnesses_report_no_usage() {
+    let mut parser = CodexAdapter::new().stream_parser();
+    parser.on_stdout_line(recorded_rate_limit_event("tools.ndjson").as_bytes());
+    assert_eq!(parser.take_usage(), None);
 }
 
 #[test]

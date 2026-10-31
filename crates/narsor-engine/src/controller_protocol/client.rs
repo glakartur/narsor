@@ -134,6 +134,17 @@ impl Transport {
         body: &B,
         timeout: Duration,
     ) -> Result<T, ClientError> {
+        let (request, body) = self.json_post(path, body, timeout)?;
+        self.send(request, body).await
+    }
+
+    /// A `POST path` request carrying `body` as JSON, bounded by `timeout`.
+    fn json_post<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<(reqwest::RequestBuilder, Vec<u8>), ClientError> {
         let body = serde_json::to_vec(body)
             .map_err(|error| ClientError::Server(format!("cannot encode the request: {error}")))?;
         let request = self
@@ -141,7 +152,23 @@ impl Transport {
             .request(Method::POST, self.url(path))
             .header(CONTENT_TYPE, "application/json")
             .timeout(timeout);
-        self.send(request, body).await
+        Ok((request, body))
+    }
+
+    /// `POST path` answered with `204 No Content`; any other answer is
+    /// mapped as [`handle_json_response`] maps it.
+    async fn post_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<(), ClientError> {
+        let (request, body) = self.json_post(path, body, REQUEST_TIMEOUT)?;
+        let response = self.send_raw(request, body).await?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        Err(
+            match handle_json_response::<serde_json::Value>(response).await {
+                Err(error) => error,
+                Ok(_) => ClientError::Server("unexpected answer, expected no content".to_string()),
+            },
+        )
     }
 
     /// `GET path`, answered with raw bytes (a material blob).
@@ -502,6 +529,14 @@ impl RunnerClient {
     pub async fn renew(&self) -> Result<RunnerRenewResponse, ClientError> {
         self.transport
             .post("/runner/v1/renew", &serde_json::json!({}))
+            .await
+    }
+
+    /// `POST /runner/v1/usage` — the latest usage limits of one harness;
+    /// they replace what the control plane held for it.
+    pub async fn report_usage(&self, report: &HarnessUsageReport) -> Result<(), ClientError> {
+        self.transport
+            .post_no_content("/runner/v1/usage", report)
             .await
     }
 

@@ -21,7 +21,7 @@ pub mod api {
     pub mod launch;
     pub mod token;
 
-    pub use client::{reconnect_delay, ApiClient};
+    pub use client::{reconnect_delay, ApiClient, UsageRead, UsageSource};
     pub use connect::{connect, ServerTarget};
     pub use discovery::{ensure_daemon_running, DiscoveryError};
     pub use narsor_protocol::api::*;

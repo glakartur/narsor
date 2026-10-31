@@ -192,7 +192,6 @@ impl Classifier {
             "assistant" => self.assistant(take_message_content(&mut line)),
             "user" => self.user(take_message_content(&mut line)),
             "system" => vec![system(&mut line)],
-            "rate_limit_event" => vec![rate_limit(&line)],
             _ => unclassified(UnclassifiedReason::UnknownType),
         }
     }
@@ -499,23 +498,6 @@ fn small_remainder(line: &Map<String, Value>) -> Option<Value> {
     }
     let value = Value::Object(remainder);
     (value.to_string().len() <= SYSTEM_DATA_MAX_BYTES).then_some(value)
-}
-
-/// `<status> (<limit type>)`, e.g. `allowed (five_hour)`.
-fn rate_limit(line: &Map<String, Value>) -> ChatElement {
-    let info = line.get("rate_limit_info");
-    let field = |name: &str| info.and_then(|info| info.get(name)).and_then(Value::as_str);
-    let summary = match (field("status"), field("rateLimitType")) {
-        (Some(status), Some(kind)) => format!("{status} ({kind})"),
-        (Some(status), None) => status.to_string(),
-        (None, Some(kind)) => kind.to_string(),
-        (None, None) => "rate limit".to_string(),
-    };
-    ChatElement::Technical {
-        category: TechnicalCategory::RateLimit,
-        summary,
-        data: info.cloned(),
-    }
 }
 
 /// The `result` line: the run result.

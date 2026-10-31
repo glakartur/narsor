@@ -92,7 +92,8 @@ use crate::domain::{
     WorkspaceSpec, LOCAL_VARIABLE_PREFIX,
 };
 use crate::engine::actions::agent::{
-    self, DefaultHarnessSource, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL, SESSION_DATA_KEY,
+    self, DefaultHarnessSource, UsageReporter, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL,
+    SESSION_DATA_KEY,
 };
 use crate::engine::actions::harness;
 use crate::engine::actions::human::{
@@ -1191,6 +1192,19 @@ impl Engine {
     /// for no gain. From M2 on, the hub's worker turns it on unconditionally.
     pub fn with_checkpoints(mut self) -> Self {
         self.checkpoints = true;
+        self
+    }
+
+    /// Returns the engine with the usage limits its agent steps' harnesses
+    /// report routed to `reporter` (R8).
+    ///
+    /// Rebuilds the stock agent executor with the reporter, so it replaces
+    /// an executor registered for `agent` actions before; one registered
+    /// after is the caller's to give the reporter to
+    /// ([`AgentExecutor::with_usage_reporter`]).
+    pub fn with_usage_reporter(mut self, reporter: Arc<dyn UsageReporter>) -> Self {
+        let agent = agent_executor(&self.store, &self.events).with_usage_reporter(reporter);
+        self.executors.insert(ActionKind::Agent, Arc::new(agent));
         self
     }
 

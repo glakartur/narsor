@@ -337,6 +337,14 @@ pub enum Command {
         command: remote::HarnessCommand,
     },
 
+    /// The subscription limits each agent harness last reported: the part
+    /// used and when it resets.
+    Usage {
+        /// Prints the server's answer as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Network-mode identity: claim the installation, see who you are.
     Auth {
         /// What to do.
@@ -562,6 +570,7 @@ impl Command {
             | Command::Task { .. }
             | Command::Backend { .. }
             | Command::Harness { .. }
+            | Command::Usage { .. }
             | Command::Auth { .. }
             | Command::Daemon { .. } => false,
             // Configured by its own flags and environment only, like the
@@ -720,6 +729,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Task { command } => remote::task(command, &target, &state, &flags).await,
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
         Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,
+        Command::Usage { json } => remote::usage(json, &target, &state, &flags).await,
         Command::Auth { command } => remote::auth(command, &target, &state, &flags).await,
         Command::Controller(ControllerCli { admin, .. }) => match admin {
             Some(command) => remote::controller_admin(command, &target, &state, &flags).await,

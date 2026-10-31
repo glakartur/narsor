@@ -83,7 +83,9 @@
 //! Work never waits for the control plane, except for that one decision.
 //! Reports that fail are not queued for replay: the next attempt builds a
 //! fresh snapshot from storage, so a reconnect reports the latest cursor
-//! once, and nothing is ever re-executed to produce it.
+//! once, and nothing is ever re-executed to produce it. The usage limits the
+//! harnesses report ([`usage`], R8) are sent once, the latest of each
+//! harness only, one at a time, and dropped when that fails.
 
 pub mod cli;
 mod commands;
@@ -99,6 +101,7 @@ pub mod secrets;
 mod session_tests;
 mod snapshot;
 pub mod storage;
+mod usage;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -119,7 +122,7 @@ use crate::domain::{
     AnsweredBy, ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec,
     TaskWorkspace, WorkflowDefinition, WorkflowExecution, Workspace,
 };
-use crate::engine::{Engine, EngineError, HumanInputDelivery, Recovery};
+use crate::engine::{Engine, EngineError, HumanInputDelivery, Recovery, UsageReporter};
 use crate::orchestration::{
     CommandActor, HarnessUnavailable, OwnerCommand, ResumeMessage, RunnerProblem, RunnerSnapshot,
 };
@@ -421,16 +424,52 @@ pub async fn run(
     }
     apply_environment(&environment);
 
-    let harness = Arc::new(LiveHarness::new(starting_harness(&storage, &spec)));
-    let engine = Arc::new(
-        Engine::new(store)
-            .with_default_harness_source(harness.clone())
-            .with_task_labels(spec.ticket.clone(), spec.title.clone()),
+    let mut session = assemble_session(
+        &config,
+        storage,
+        link,
+        &spec,
+        definition,
+        |engine, _| engine,
+        conductor::ConductorHost::assemble,
     );
+    session.begin(&spec).await
+}
 
-    let conductor =
-        conductor::ConductorHost::assemble(&engine, &storage, Arc::clone(&harness), &definition);
-    let mut session = Session {
+/// Assembles the work phase of one runner process: the usage forwarder,
+/// the engine given it as its usage reporter, the conductor around
+/// the engine, and the session holding them all.
+///
+/// [`run`] and the in-process tests assemble their session here, so the
+/// tests drive the wiring [`run`] does. `customize` gets the engine before
+/// anything else holds it, with the reporter it was given — the tests
+/// register their own agent there — and `conductor` builds the conductor
+/// host.
+fn assemble_session(
+    config: &RunnerConfig,
+    storage: TaskStorage,
+    link: Link,
+    spec: &TaskLaunchSpec,
+    definition: Arc<WorkflowDefinition>,
+    customize: impl FnOnce(Engine, &Arc<dyn UsageReporter>) -> Engine,
+    conductor: impl FnOnce(
+        &Arc<Engine>,
+        &TaskStorage,
+        Arc<LiveHarness>,
+        &Arc<WorkflowDefinition>,
+    ) -> conductor::ConductorHost,
+) -> Session {
+    let usage = usage::UsageForwarder::new();
+    let reporter: Arc<dyn UsageReporter> = usage.clone();
+    let harness = Arc::new(LiveHarness::new(starting_harness(&storage, spec)));
+    let engine = Engine::new(storage.store())
+        .with_usage_reporter(Arc::clone(&reporter))
+        .with_default_harness_source(harness.clone())
+        .with_task_labels(spec.ticket.clone(), spec.title.clone());
+    let engine = Arc::new(customize(engine, &reporter));
+
+    let conductor = conductor(&engine, &storage, Arc::clone(&harness), &definition);
+    Session {
         storage,
         engine,
         conductor,
@@ -442,6 +481,8 @@ pub async fn run(
         timing: config.timing.clone(),
         link,
         cache: snapshot::ConversationCache::default(),
+        usage,
+        usage_sender: None,
         execution_id: None,
         directive: RunnerDirective::Continue,
         pass: None,
@@ -449,8 +490,7 @@ pub async fn run(
         material_failures: 0,
         material_retry_at: None,
         title_wanted: spec.title.is_none(),
-    };
-    session.begin(&spec).await
+    }
 }
 
 /// The variables that point the harnesses at their configuration: the
@@ -727,6 +767,12 @@ struct Session {
     timing: RunnerTiming,
     link: Link,
     cache: snapshot::ConversationCache,
+    /// The usage limits the engine's harnesses report, on their way to the
+    /// control plane; the loop only drives it.
+    usage: Arc<usage::UsageForwarder>,
+    /// What sends the usage reports in place of the link's client; `None`
+    /// in production, a test double in the tests.
+    usage_sender: Option<Arc<dyn usage::UsageSender>>,
     execution_id: Option<String>,
     directive: RunnerDirective,
     pass: Option<JoinHandle<Result<WorkflowExecution, EngineError>>>,
@@ -809,6 +855,17 @@ impl Decision {
 }
 
 impl Session {
+    /// What sends the next usage report: the injected sender, else the
+    /// link's client, when there is one.
+    fn usage_sender(&mut self) -> Option<Arc<dyn usage::UsageSender>> {
+        if let Some(sender) = &self.usage_sender {
+            return Some(Arc::clone(sender));
+        }
+        self.link
+            .client()
+            .map(|client| Arc::new(client) as Arc<dyn usage::UsageSender>)
+    }
+
     /// Decides how to continue, starts the work and drives it.
     async fn begin(&mut self, spec: &TaskLaunchSpec) -> Result<RunnerExit, RunnerError> {
         if let Some(exit) = self.start_work(spec).await? {
@@ -1338,6 +1395,11 @@ impl Session {
                     if !matches!(event, Err(broadcast::error::RecvError::Closed)) {
                         dirty = true;
                     }
+                }
+                // Only once a report waits and no other is on its way.
+                () = self.usage.ready() => {
+                    let sender = self.usage_sender();
+                    self.usage.forward(sender);
                 }
                 _ = tokio::time::sleep_until(wake) => {}
             }

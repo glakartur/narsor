@@ -22,6 +22,7 @@ mod backend_limit;
 mod conductor;
 mod conversation;
 mod events;
+mod harness_usage;
 mod materials;
 mod panel;
 mod reader;
@@ -299,6 +300,7 @@ pub struct ProtocolService {
     conductor_reads: Mutex<ConductorRelay>,
     materials: MaterialStore,
     limit_overrides: backend_limit::LimitOverrides,
+    harness_usages: harness_usage::HarnessUsages,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -347,6 +349,7 @@ impl ProtocolService {
             event_reads: Mutex::new(EventsRelay::default()),
             conductor_reads: Mutex::new(ConductorRelay::default()),
             limit_overrides: Mutex::default(),
+            harness_usages: Mutex::default(),
         }
     }
 

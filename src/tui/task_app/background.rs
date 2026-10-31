@@ -160,6 +160,9 @@ pub(super) enum JobKey {
     Reload(OpeningKind),
     /// The read of the limit of one backend (`L`).
     Limit(String),
+    /// The read of the usage limits of the harnesses, in the background: no
+    /// screen waits for it, so it does not animate the marker.
+    Usage,
 }
 
 impl JobKey {
@@ -246,7 +249,10 @@ impl TaskApp {
     /// Whether a read is under way whose answer the screen waits for: what
     /// animates the marker.
     pub fn is_loading(&self) -> bool {
-        !self.background.running.is_empty()
+        self.background
+            .running
+            .keys()
+            .any(|key| *key != JobKey::Usage)
     }
 
     /// Whether the list of tasks is being read.

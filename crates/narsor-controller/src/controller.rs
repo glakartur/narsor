@@ -63,6 +63,7 @@ use narsor_controller_runtime::{
 use narsor_engine::config::CLAUDE_CONFIG_DIR_ENV;
 use narsor_engine::controller_protocol::ControllerClient;
 use narsor_engine::controller_runtime::load_or_enroll as load_controller_identity;
+use narsor_protocol::harness::{display_name, CLAUDE_CODE};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_FAILURE: i32 = 1;
@@ -413,10 +414,11 @@ pub async fn edit_profile(args: EditProfileArgs) -> Result<(), ControllerError> 
     )
     .map_err(ControllerError::failure)?;
 
-    eprintln!("Starting Claude Code on the profile of Secret '{secret}'. Close it to continue.");
+    let claude_code = display_name(CLAUDE_CODE);
+    eprintln!("Starting {claude_code} on the profile of Secret '{secret}'. Close it to continue.");
     let status = run_claude(&args.claude_command, &session).await?;
     if !status.success() {
-        eprintln!("Claude Code exited with {status}; its changes can still be saved.");
+        eprintln!("{claude_code} exited with {status}; its changes can still be saved.");
     }
     let changes = session
         .changes(&current)

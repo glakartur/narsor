@@ -1254,6 +1254,134 @@ mod remote_cli {
         );
     }
 
+    /// A control plane double for `narsor-cli usage`: it answers with what
+    /// it was given.
+    struct UsageAnswer(
+        std::sync::Mutex<
+            Option<
+                Result<narsor_protocol::controller::HarnessUsageResponse, narsor::api::ClientError>,
+            >,
+        >,
+    );
+
+    impl UsageAnswer {
+        fn with(
+            answer: Result<
+                narsor_protocol::controller::HarnessUsageResponse,
+                narsor::api::ClientError,
+            >,
+        ) -> Self {
+            Self(std::sync::Mutex::new(Some(answer)))
+        }
+    }
+
+    impl narsor::api::UsageSource for UsageAnswer {
+        fn read_usage(&self) -> narsor::api::UsageRead {
+            let answer = self.0.lock().unwrap().take().expect("asked once");
+            Box::pin(std::future::ready(answer))
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_limits_are_read_through_the_control_plane() {
+        use narsor::cli::remote::usage_output;
+        use narsor_protocol::controller::{
+            HarnessUsageResponse, HarnessUsageView, UsageLimit, UsageStatus,
+        };
+        use narsor_protocol::harness::CLAUDE_CODE;
+
+        let now = chrono::Utc::now();
+
+        // AE7 / AE8: nothing reported yet is a state, not a failure.
+        let empty = UsageAnswer::with(Ok(HarnessUsageResponse::default()));
+        assert_eq!(
+            usage_output(&empty, false, now).await.expect("the usage"),
+            "No usage limit data.\n"
+        );
+
+        let reported = || HarnessUsageResponse {
+            harnesses: vec![HarnessUsageView {
+                harness: CLAUDE_CODE.to_string(),
+                observed_at: now,
+                received_at: now,
+                limits: vec![
+                    UsageLimit {
+                        window: "5h".to_string(),
+                        utilization: 0.01,
+                        resets_at: now + chrono::Duration::hours(4),
+                        status: Some(UsageStatus::Allowed),
+                    },
+                    UsageLimit {
+                        window: "7d".to_string(),
+                        utilization: 0.9,
+                        resets_at: now + chrono::Duration::days(2),
+                        status: Some(UsageStatus::AllowedWarning),
+                    },
+                ],
+            }],
+        };
+
+        let text = usage_output(&UsageAnswer::with(Ok(reported())), false, now)
+            .await
+            .expect("the usage");
+        assert!(
+            text.starts_with("Claude Code (claude-code), reported "),
+            "{text}"
+        );
+        for needle in ["5h", "1%", "allowed", "7d", "90%", "warning", "resets "] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+
+        let json = usage_output(&UsageAnswer::with(Ok(reported())), true, now)
+            .await
+            .expect("the usage");
+        let response: serde_json::Value = serde_json::from_str(&json).expect("the usage as JSON");
+        let harnesses = response["harnesses"].as_array().expect("harnesses");
+        assert_eq!(harnesses.len(), 1, "{json}");
+        assert_eq!(harnesses[0]["harness"], "claude-code", "{json}");
+        assert_eq!(harnesses[0]["limits"][1]["status"], "allowed_warning");
+    }
+
+    #[tokio::test]
+    async fn usage_fails_on_a_wrong_token_and_on_an_unreachable_server() {
+        use narsor::api::ClientError;
+        use narsor::cli::remote::usage_output;
+
+        let now = chrono::Utc::now();
+        let wrong = usage_output(
+            &UsageAnswer::with(Err(ClientError::Unauthorized)),
+            false,
+            now,
+        )
+        .await
+        .expect_err("a refused token fails");
+        assert_eq!(wrong.exit_code, EXIT_FAILURE);
+        assert!(
+            wrong.message.contains("Could not read the usage limits")
+                && wrong.message.contains("rejected the token"),
+            "{}",
+            wrong.message
+        );
+
+        let unreachable = usage_output(
+            &UsageAnswer::with(Err(ClientError::Unavailable(
+                "connection refused".to_string(),
+            ))),
+            false,
+            now,
+        )
+        .await
+        .expect_err("an unreachable server fails");
+        assert_eq!(unreachable.exit_code, EXIT_FAILURE);
+        assert!(
+            unreachable
+                .message
+                .contains("Could not read the usage limits"),
+            "{}",
+            unreachable.message
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn text_a_runner_sends_never_reaches_the_terminal_raw() {
         use narsor_engine::controller_protocol::SubmitOperatorCommandRequest;

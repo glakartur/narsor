@@ -203,8 +203,6 @@ impl ToolResultStatus {
 pub enum TechnicalCategory {
     /// A harness hook ran.
     Hook,
-    /// The harness reported a rate limit.
-    RateLimit,
     /// The harness compacted the context.
     Compaction,
     /// Any other harness system message.
@@ -222,7 +220,6 @@ impl TechnicalCategory {
     pub fn label(self) -> &'static str {
         match self {
             Self::Hook => "hook",
-            Self::RateLimit => "rate_limit",
             Self::Compaction => "compaction",
             Self::System => "system",
             Self::Stderr => "stderr",
@@ -549,9 +546,9 @@ mod tests {
                 duration_ms: Some(1500),
             },
             ChatElement::Technical {
-                category: TechnicalCategory::RateLimit,
-                summary: "five_hour allowed".into(),
-                data: Some(json!({"status": "allowed"})),
+                category: TechnicalCategory::Hook,
+                summary: "SessionStart".into(),
+                data: Some(json!({"hook_name": "SessionStart"})),
             },
             ChatElement::Unclassified {
                 reason: UnclassifiedReason::UnknownBlock,
@@ -606,6 +603,27 @@ mod tests {
         assert_eq!(source, QuestionSource::Unrecognized);
         let status: ToolResultStatus = serde_json::from_str("\"partial\"").unwrap();
         assert_eq!(status, ToolResultStatus::Unrecognized);
+    }
+
+    /// Usage limits are not part of the conversation any more (R8a); a
+    /// record written before still loads.
+    #[test]
+    fn a_rate_limit_element_of_older_records_is_unrecognized() {
+        let element: ChatElement = serde_json::from_value(json!({
+            "kind": "technical",
+            "category": "rate_limit",
+            "summary": "allowed (five_hour)",
+            "data": {"status": "allowed"},
+        }))
+        .unwrap();
+        assert_eq!(
+            element,
+            ChatElement::Technical {
+                category: TechnicalCategory::Unrecognized,
+                summary: "allowed (five_hour)".into(),
+                data: Some(json!({"status": "allowed"})),
+            }
+        );
     }
 
     #[test]
