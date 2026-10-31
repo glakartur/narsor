@@ -39,7 +39,7 @@ Narsor obsługuje kilka harnessów (`claude_code`, `codex`, `opencode`, `github_
   - **Outcome:** serwer ma najnowszy stan limitów harnessu. Log rozmowy nie ma wpisu o limitach.
   - **Expiry:** czas odnowienia limitu minął → serwer zapomina ten limit. 15 min po ostatnim raporcie harnessu → serwer zapomina cały stan tego harnessu.
   - **Escape:** serwer jest niedostępny → runner pomija raport, krok działa dalej bez błędu.
-  - **Covered by:** R0, R1–R8
+  - **Covered by:** R0, R1–R8, R5a, R6a, R8a
 - F2. Odczyt w TUI
   - **Trigger:** co 15 s oraz przy starcie TUI.
   - **Actors:** A1, A4
@@ -67,21 +67,21 @@ Narsor obsługuje kilka harnessów (`claude_code`, `codex`, `opencode`, `github_
 - R3. Raport zawiera listę limitów. Każdy limit ma: typ limitu (ogólna nazwa okna, np. `5h`, `7d`), wykorzystanie jako ułamek 0–1, czas następnego odnowienia (znacznik czasu UTC) i opcjonalny status (np. dozwolony / ostrzeżenie / odrzucony). TUI i CLI liczą procent przy wyświetlaniu.
 - R4. Raport zawiera czas, w którym runner odebrał komunikat od harnessu.
 - R5. Serwer trzyma w pamięci tylko ostatni stan każdego harnessu. Nowy raport zastępuje poprzedni. Po restarcie serwera stan jest pusty, aż przyjdzie nowy raport.
-- R5a. Serwer zapomina nieaktualny stan. Gdy czas odnowienia limitu minął, serwer usuwa ten limit. Gdy od ostatniego raportu harnessu minęło 15 min, serwer usuwa cały stan tego harnessu (wartość jest wtedy prawdopodobnie błędna). Harness bez limitów nie jest w odpowiedzi. Endpoint odczytu nigdy nie zwraca usuniętego stanu.
+- R5a. Serwer zapomina nieaktualny stan. Gdy czas odnowienia limitu minął, serwer usuwa ten limit. Gdy od ostatniego raportu harnessu minęło 15 min, serwer usuwa cały stan tego harnessu (wartość jest wtedy prawdopodobnie błędna). Serwer liczy 15 min od czasu, w którym serwer przyjął raport, a nie od czasu z raportu (R4). Harness bez limitów nie jest w odpowiedzi. Endpoint odczytu nigdy nie zwraca usuniętego stanu.
 - R6. Serwer wystawia endpoint odczytu stanu wszystkich harnessów. Odczyt wymaga tej samej autoryzacji co inne odczyty klienta. Przyjęcie raportu wymaga autoryzacji runnera (jak inne endpointy `/runner/v1/...`).
-- R6a. Serwer sprawdza raport przed zapisem. Serwer odrzuca raport z harnessem, którego nie ma na liście R0. Status jest wartością z zamkniętego zbioru. Typ limitu ma stały wzorzec i krótki limit długości. Wykorzystanie mieści się w 0–1. Liczba limitów w raporcie i rozmiar żądania mają górną granicę. TUI i CLI nie wypisują znaków sterujących z danych raportu.
+- R6a. Serwer sprawdza raport przed zapisem. Serwer odrzuca raport z harnessem, którego nie ma na liście R0. Status jest wartością z zamkniętego zbioru: `allowed`, `allowed_warning`, `rejected`. Czas odnowienia nie jest dalej niż 7 dni od czasu serwera. Typ limitu ma stały wzorzec i krótki limit długości. Wykorzystanie mieści się w 0–1. Liczba limitów w raporcie i rozmiar żądania mają górną granicę. TUI i CLI nie wypisują znaków sterujących z danych raportu.
 
 **Runner**
 
-- R7. Runner rozpoznaje komunikat `rate_limit_event` Claude Code. Mapuje okna `five_hour` → `5h` i `seven_day` → `7d` z `unifiedWindows`. Gdy `unifiedWindows` nie ma, runner bierze jedno okno z `rateLimitType`, `utilization`, `resetsAt` i `status`. Status okna pochodzi z pola `status` tego okna w `unifiedWindows`. Gdy okno nie ma tego pola, a jest oknem z `rateLimitType`, runner bierze `status` z poziomu komunikatu. W innym przypadku limit nie ma statusu.
-- R8. Runner wysyła raport do serwera i nie zapisuje komunikatu o limitach w logu rozmowy ani w transkrypcie kroku. Runner nie trzyma raportu po wysłaniu. Błąd wysłania nie przerywa ani nie oblewa kroku. Runner nie ponawia nieudanego raportu: następny komunikat harnessu da świeży stan.
-- R8a. Klasyfikator Claude Code nie tworzy już wpisu `RateLimit`. Wspólna pętla stdout w wykonawcy agenta (`crates/narsor-engine/src/engine/actions/agent.rs`) nie zapisuje linii, którą parser harnessu oznaczył jako raport limitów. Ani surowa linia, ani wpis nie trafiają do pliku rozmowy. Wariant `TechnicalCategory::RateLimit` jest usunięty. Stare rozmowy z wpisem `rate_limit` czytają się jako nieznany typ (`#[serde(other)] Unrecognized`) i to jest akceptowalne.
+- R7. Runner rozpoznaje komunikat `rate_limit_event` Claude Code. Dane limitów są w obiekcie `rate_limit_info`. Runner mapuje okna `five_hour` → `5h` i `seven_day` → `7d` z `unifiedWindows`. Gdy `unifiedWindows` nie ma, runner bierze jedno okno z `rateLimitType`, `utilization`, `resetsAt` i `status`. Typ tego okna mapuje się tak samo (`five_hour` → `5h`, `seven_day` → `7d`). Status okna pochodzi z pola `status` tego okna w `unifiedWindows`. Gdy okno, które odpowiada polu `rateLimitType`, nie ma pola `status`, runner bierze `status` z poziomu `rate_limit_info`. W każdym innym przypadku limit nie ma statusu.
+- R8. Runner wysyła raport do serwera i nie zapisuje komunikatu o limitach w logu rozmowy. Runner nie trzyma raportu po wysłaniu. Błąd wysłania nie przerywa ani nie oblewa kroku. Runner nie ponawia nieudanego raportu: następny komunikat harnessu da świeży stan.
+- R8a. Klasyfikator Claude Code nie tworzy już wpisu `RateLimit`. Wspólna pętla stdout w wykonawcy agenta (`crates/narsor-engine/src/engine/actions/agent.rs`) nie zapisuje linii, którą parser harnessu oznaczył jako raport limitów. Ani surowa linia, ani wpis nie trafiają do logu rozmowy. Wariant `TechnicalCategory::RateLimit` jest usunięty. Stare rozmowy z wpisem `rate_limit` czytają się jako nieznany typ (`#[serde(other)] Unrecognized`) i to jest akceptowalne.
 
 **TUI — dolny wiersz**
 
 - R9. TUI pobiera stan limitów z serwera przy starcie i potem co 15 s. Interwał jest stały, bez konfiguracji. Pobieranie nie blokuje interfejsu.
 - R10. TUI pokazuje stan w dolnym wierszu (wiersz podpowiedzi klawiszy), wyrównany do prawej, z co najmniej jedną spacją odstępu od podpowiedzi.
-- R11. Format jest skrócony i czytelny. Dla każdego harnessu: krótka nazwa z listy R0, a dla każdego limitu typ, procent (zaokrąglony do liczby całkowitej) i czas do odnowienia. Przykład: `claude 5h 1% ↻4h10m · 7d 90% ↻2d3h`. Czas odnowienia krótszy niż 24 h ma postać `XhYm`, dłuższy `XdYh`.
+- R11. Format jest skrócony i czytelny. Dla każdego harnessu: krótka nazwa z listy R0, a dla każdego limitu typ, procent (zaokrąglony do liczby całkowitej) i czas do odnowienia. Harnessy są w kolejności listy R0. Limity jednego harnessu są w kolejności rosnącego okna (`5h` przed `7d`). Limity jednego harnessu oddziela ` · `, a harnessy oddziela ` | `. Przykład: `claude 5h 1% ↻4h10m · 7d 90% ↻2d3h`. Czas odnowienia krótszy niż 24 h ma postać `XhYm`, dłuższy `XdYh`.
 - R12. Limit ze statusem ostrzeżenia (`allowed_warning`) ma kolor ostrzeżenia. Limit odrzucony (`rejected`) ma kolor błędu. Bez koloru (`NO_COLOR`) stan ostrzeżenia lub odrzucenia jest oznaczony znakiem `!`.
 - R13. Gdy tekst limitów i podpowiedzi nie mieszczą się razem, TUI ukrywa podpowiedzi klawiszy, a nie limity. Gdy sam tekst limitów nie mieści się w wierszu, TUI najpierw usuwa całe segmenty ostatniego harnessu. Gdy tekst nadal się nie mieści, TUI obcina koniec tekstu i dodaje `…`. Gdy powiadomienie jest widoczne i nie mieści się obok podpowiedzi klawiszy, TUI ukrywa podpowiedzi klawiszy.
 - R14. Powiadomienie (dziś też wyrównane do prawej w dolnym wierszu) ma pierwszeństwo przed limitami w czasie, gdy jest widoczne. Po zniknięciu powiadomienia limity wracają.
@@ -92,7 +92,7 @@ Narsor obsługuje kilka harnessów (`claude_code`, `codex`, `opencode`, `github_
 
 - R17. Nowa komenda CLI `narsor usage` (w grupie komend zdalnych, obok `workflows`) pobiera stan limitów z serwera i wypisuje go. Komenda ma tryb `--json`, jeśli inne komendy listujące go mają.
 - R18. Wynik pokazuje dla każdego harnessu i każdego limitu: typ, wykorzystanie w procentach, status, czas odnowienia (lokalny czas i czas do odnowienia) oraz czas raportu.
-- R19. Gdy serwer nie ma danych, komenda wypisuje jasny komunikat i kończy się kodem 0.
+- R19. Gdy serwer nie ma danych, komenda wypisuje jasny komunikat i kończy się kodem 0. Gdy serwer jest niedostępny lub odrzuca autoryzację, komenda wypisuje błąd na stderr i kończy się kodem innym niż 0.
 
 ---
 
@@ -147,6 +147,7 @@ Narsor obsługuje kilka harnessów (`claude_code`, `codex`, `opencode`, `github_
 ## Dependencies / Assumptions
 
 - Runner ma już połączenie z serwerem i autoryzację (`/runner/v1/snapshots`, `/runner/v1/materials`). Nowy raport używa tej samej drogi.
+- Claude Code wysyła `rate_limit_event` zwykle raz na przebieg, na początku sesji (nagrania w `tests/fixtures/claude-code`). Stan na serwerze pokazuje więc wykorzystanie z początku ostatniego przebiegu. W części nagrań okna w `unifiedWindows` nie mają pola `status`.
 - Zadania mogą działać przez lokalny controller i przez Kubernetes. W obu przypadkach runner raportuje do tego samego serwera.
 - Lokalny daemon to `narsor-server` (`src/cli/daemon.rs`). `narsor run` też działa przez daemon i runner. Endpointy z R6 są więc dostępne także w trybie lokalnym.
 
