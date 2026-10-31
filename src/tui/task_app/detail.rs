@@ -74,11 +74,11 @@ use super::notify::Severity;
 use super::panel::WaitingPanel;
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{
-    self, transcript_action, Attempt, AttemptRead, Attempts, Conversation, ReadFailure,
+    self, transcript_action, AttemptRead, Attempts, Conversation, ReadFailure,
 };
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
-use super::tabs::progress::{self, Progress};
+use super::tabs::progress::{self, Progress, StepView};
 use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
 
 /// Everything the details of one task remember.
@@ -232,33 +232,35 @@ impl TaskDetail {
         ) {
             return;
         }
-        let attempt = self
-            .progress
-            .selected_position()
-            .and_then(|position| position.action_execution_id.clone());
-        if let Some(attempt) = attempt.and_then(|id| self.attempts.get_mut(&id)) {
-            transcript_action(attempt.transcript_mut(), action);
+        self.ensure_step_built();
+        if let Some(view) = self.progress.step_view_mut() {
+            transcript_action(view.transcript_mut(), action);
         }
     }
 
-    /// The selected step's attempt when it has a conversation to show (R2):
-    /// recorded under an attempt's id, read, with a record and at least one
+    /// Puts the selected step's conversation together when the selection
+    /// came to it, or a read changed it, since it was last put together.
+    pub(super) fn ensure_step_built(&mut self) {
+        if self.progress.step_unbuilt() {
+            rebuild_step(self);
+        }
+    }
+
+    /// The selected step's conversation when it has something to show (R2):
+    /// an attempt of the entry was read, with a record and at least one
     /// entry. A banner of a failed read over entries read before does not
     /// take it away.
-    pub fn step_conversation(&self) -> Option<&Attempt> {
-        let attempt = self
-            .progress
-            .selected_position()
-            .and_then(recorded_attempt)?;
-        self.attempts
-            .get(&attempt)
-            .filter(|attempt| attempt.has_conversation())
+    pub fn step_conversation(&self) -> Option<&StepView> {
+        self.progress
+            .step_view()
+            .filter(|view| view.has_conversation())
     }
 
     /// `Enter` / `→` on the timeline: whether the selected step's
     /// conversation can take the focus. When it can, the timeline holds the
     /// step until [`Self::leave_step`].
     pub(super) fn enter_step(&mut self) -> bool {
+        self.ensure_step_built();
         if self.step_conversation().is_none() {
             return false;
         }
@@ -557,6 +559,10 @@ impl TaskApp {
         let held = self
             .step_focus
             .held(&self.detail.views, self.list.selected_id(), task_id);
+        let changed = matches!(
+            read,
+            DetailRead::Timeline(_) | DetailRead::Events { .. } | DetailRead::Attempt { .. }
+        );
         match read {
             DetailRead::Timeline(result) => {
                 let result = self.settle(result);
@@ -585,6 +591,14 @@ impl TaskApp {
                     .apply(&attempt_id, revision, from, result);
             }
             DetailRead::Conductor(result) => self.apply_conductor_read(task_id, revision, result),
+        }
+        if changed {
+            if self.detail.tab() == DetailTab::Progress && self.list.selected_id() == Some(task_id)
+            {
+                rebuild_step(self.detail.view_mut(task_id));
+            } else {
+                self.detail.view_mut(task_id).progress.invalidate_step();
+            }
         }
         if let Some(label) = held {
             let notice = self
@@ -670,14 +684,16 @@ impl TaskApp {
         self.start_conductor_read(&id, revision);
         match tab {
             DetailTab::Progress => {
-                let attempt = self
-                    .detail
-                    .view_mut(&id)
-                    .progress
-                    .selected_position()
-                    .and_then(recorded_attempt);
-                if let Some(attempt) = attempt {
-                    self.start_attempt_read(&id, revision, &attempt);
+                self.start_events_read(&id, revision);
+                let attempts = self.detail.view_mut(&id).progress.selected_attempts();
+                for attempt in &attempts {
+                    self.start_attempt_read(&id, revision, attempt);
+                }
+                if !self.background.task_running(&id) {
+                    let view = self.detail.view_mut(&id);
+                    if view.progress.step_unbuilt() {
+                        rebuild_step(view);
+                    }
                 }
             }
             DetailTab::Conversation => {
@@ -843,6 +859,12 @@ fn rebuild_conversation(view: &mut TaskDetail) {
     let positions = view.progress.positions().to_vec();
     view.conversation
         .rebuild_with_events(&positions, &view.attempts, view.events.events());
+}
+
+/// Puts the selected step's conversation together again from what was read.
+pub(super) fn rebuild_step(view: &mut TaskDetail) {
+    view.progress
+        .rebuild_step(&view.attempts, view.events.events());
 }
 
 /// The attempt of a position whose conversation can be read.
@@ -1207,16 +1229,18 @@ pub(super) fn render_view(
                 content,
             );
         }
-        (DetailTab::Progress, None) => progress::render(
-            frame,
-            content,
-            styles,
-            &mut view.detail.progress,
-            &mut view.detail.attempts,
-            stale,
-            content_keys,
-            glyph,
-        ),
+        (DetailTab::Progress, None) => {
+            view.detail.ensure_step_built();
+            progress::render(
+                frame,
+                content,
+                styles,
+                &mut view.detail.progress,
+                stale,
+                content_keys,
+                glyph,
+            )
+        }
         (DetailTab::Conversation, None) => {
             conversation::render(
                 frame,

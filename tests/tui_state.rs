@@ -3403,14 +3403,31 @@ mod task_app_detail {
             app.key_context().layer
         }
 
+        fn draw(app: &mut TaskApp, width: u16, height: u16) {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    narsor::tui::task_app::layout::render(
+                        frame,
+                        app,
+                        &Styles::new(false),
+                        std::time::Instant::now(),
+                    )
+                })
+                .unwrap();
+        }
+
         fn selected_entry(app: &TaskApp, state: &str) -> Option<String> {
-            app.detail()
-                .view("a")?
-                .attempts()
-                .get(&format!("act-{state}"))?
+            let view = app.detail().view("a")?;
+            assert_eq!(
+                view.progress().selected_label(),
+                Some(format!("{state} #1").as_str())
+            );
+            view.step_conversation()?
                 .transcript()
                 .selected_entry()
-                .map(|id| id.as_str().to_string())
+                .map(|id| id.as_str().rsplit('/').next().unwrap().to_string())
         }
 
         fn note(app: &TaskApp) -> Option<String> {
@@ -3668,6 +3685,83 @@ mod task_app_detail {
             );
         }
 
+        fn read_events(app: &mut TaskApp, events: Vec<narsor_engine::domain::Event>) {
+            use narsor_engine::controller_protocol::{
+                ExecutionEventsResponse, ExecutionEventsSource,
+            };
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Events {
+                    after: 0,
+                    result: Ok(ExecutionEventsResponse::Available {
+                        events,
+                        has_more: false,
+                        source: ExecutionEventsSource::Runner,
+                    }),
+                },
+            );
+        }
+
+        fn choice_ids(app: &TaskApp) -> Vec<String> {
+            app.detail()
+                .view("a")
+                .unwrap()
+                .progress()
+                .step_view()
+                .map(|view| {
+                    view.transcript()
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.workflow_choice)
+                        .map(|entry| entry.id.as_str().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// R1, R13: *Przebieg* shows the choice made in the step, and the
+        /// step still running has none until an event tells it.
+        #[test]
+        fn the_step_shows_its_choice_and_a_running_step_has_none() {
+            use crate::task_app_support::{agent_chose, entered};
+            let mut app = on_the_axis();
+            read_events(
+                &mut app,
+                vec![
+                    entered(1, "plan"),
+                    agent_chose(2, "ready", None),
+                    entered(3, "implement"),
+                ],
+            );
+            assert!(choice_ids(&app).is_empty(), "implement is still running");
+            ch(&mut app, 'k');
+            draw(&mut app, 120, 30);
+            assert_eq!(choice_ids(&app), ["workflow-choice/2"]);
+            ch(&mut app, 'j');
+            draw(&mut app, 120, 30);
+            assert!(choice_ids(&app).is_empty());
+        }
+
+        /// R11, AE4: the cursor of a step survives moving the selection
+        /// away and back, and a resize of the terminal.
+        #[test]
+        fn a_steps_cursor_survives_the_selection_and_a_resize() {
+            let mut app = on_the_axis();
+            press(&mut app, KeyCode::Enter);
+            ch(&mut app, 'k');
+            assert_eq!(selected_entry(&app, "implement").as_deref(), Some("2"));
+            press(&mut app, KeyCode::Esc);
+            ch(&mut app, 'k');
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("plan #1"));
+            ch(&mut app, 'j');
+            assert_eq!(selected_entry(&app, "implement").as_deref(), Some("2"));
+            for (width, height) in [(120, 30), (60, 16), (120, 30)] {
+                draw(&mut app, width, height);
+                assert_eq!(selected_entry(&app, "implement").as_deref(), Some("2"));
+            }
+        }
+
         #[test]
         fn new_entries_keep_the_picked_entry_and_the_conversation() {
             let mut app = on_the_axis();
@@ -3843,6 +3937,119 @@ mod task_app_detail {
                     }
                 })
                 .collect()
+        }
+
+        fn step_order(
+            state: &str,
+            visit: u32,
+            positions: &[Position],
+            attempts: &Attempts,
+            events: &[Event],
+        ) -> Vec<String> {
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            let scope = Scope::Step {
+                state_id: state,
+                visit,
+            };
+            build_conversation(scope, positions, attempts, events)
+                .entries
+                .iter()
+                .map(|entry| {
+                    let id = entry.id.as_str();
+                    match id.strip_prefix("workflow-choice/") {
+                        Some(sequence) => format!("choice:{sequence}"),
+                        None => id.to_string(),
+                    }
+                })
+                .collect()
+        }
+
+        /// AE1: the choice stands after the conversation of `code_review` and
+        /// before the heading of the next step in the whole conversation, and
+        /// at the end of the step's own.
+        #[test]
+        fn ae1_a_step_scope_ends_with_the_choice_and_has_no_heading() {
+            let positions = vec![recorded("code_review", 1, "c"), recorded("fix", 1, "f")];
+            let events = vec![
+                entered(1, "code_review"),
+                agent_chose(2, "needs_fix", None),
+                entered(3, "fix"),
+            ];
+            let attempts = attempts(&["c", "f"]);
+            assert_eq!(
+                order(&positions, &attempts, &events),
+                ["step:c", "c/m", "choice:2", "step:f", "f/m"]
+            );
+            assert_eq!(
+                step_order("code_review", 1, &positions, &attempts, &events),
+                ["c/m", "choice:2"]
+            );
+            assert_eq!(
+                step_order("fix", 1, &positions, &attempts, &events),
+                ["f/m"]
+            );
+        }
+
+        /// AE2: in a loop each entry into the step has only its own choices.
+        #[test]
+        fn ae2_a_loop_gives_each_entry_its_own_choices() {
+            let positions = vec![
+                recorded("code_review", 1, "c1"),
+                recorded("fix", 1, "f"),
+                recorded("code_review", 2, "c2"),
+            ];
+            let events = vec![
+                entered(1, "code_review"),
+                agent_chose(2, "needs_fix", None),
+                entered(3, "fix"),
+                agent_chose(4, "fixed", None),
+                entered(5, "code_review"),
+                agent_chose(6, "approved", None),
+            ];
+            let attempts = attempts(&["c1", "f", "c2"]);
+            assert_eq!(
+                step_order("code_review", 1, &positions, &attempts, &events),
+                ["c1/m", "choice:2"]
+            );
+            assert_eq!(
+                step_order("code_review", 2, &positions, &attempts, &events),
+                ["c2/m", "choice:6"]
+            );
+            assert_eq!(
+                step_order("fix", 1, &positions, &attempts, &events),
+                ["f/m", "choice:4"]
+            );
+        }
+
+        #[test]
+        fn an_entry_the_events_do_not_tell_has_no_choices_in_its_scope() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let events = vec![agent_chose(1, "a", None)];
+            assert_eq!(
+                step_order("plan", 1, &positions, &attempts(&["p"]), &events),
+                ["p/m"]
+            );
+        }
+
+        #[test]
+        fn every_attempt_of_an_entry_is_in_its_scope_and_a_shared_one_once() {
+            let positions = vec![
+                recorded("plan", 1, "p1"),
+                recorded("plan", 1, "p2"),
+                recorded("plan", 1, "p2"),
+                recorded("fix", 1, "f"),
+            ];
+            let events = vec![entered(1, "plan"), entered(2, "fix")];
+            assert_eq!(
+                step_order(
+                    "plan",
+                    1,
+                    &positions,
+                    &attempts(&["p1", "p2", "f"]),
+                    &events
+                ),
+                ["p1/m", "p2/m"]
+            );
         }
 
         #[test]
@@ -11965,8 +12172,9 @@ mod task_app_create {
             assert_eq!(app.key_context().layer, Some(Context::StepConversation));
             let picked = |app: &TaskApp| {
                 let detail = app.history().unwrap().selected_detail().unwrap();
-                let attempt = detail.attempts().get("attempt-1").unwrap();
-                attempt
+                detail
+                    .step_conversation()
+                    .unwrap()
                     .transcript()
                     .selected_entry()
                     .map(|id| id.as_str().to_string())

@@ -603,7 +603,12 @@ step. `Enter` / `→` on a step that has a conversation to show go into it
 (a running step from its first entry on), and there `j` / `k` pick an entry
 and the keys of *Rozmowa* work; `Esc` / `←` go back to the same step. While
 the keys are in a step's conversation the timeline does not move by itself,
-even when following the current step; going back catches up. The history's
+even when following the current step; going back catches up. *Przebieg* and
+*Rozmowa* draw the conversation with the same code: a step's conversation is
+the whole one narrowed to that entry into the step, so the workflow choices
+(`WYBÓR WORKFLOW`) made in the step show in both, and the one-line parts (the
+headers and the choices) are clipped with `…` in a narrow window while the text
+wraps. The history's
 details work the same way, without following. A task that has not started says so and where it stands in
 the queue. When a running task cannot follow the default harness — its
 backend does not run it, or the binary is not on the runner's `PATH` — one
