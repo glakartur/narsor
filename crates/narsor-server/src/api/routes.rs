@@ -784,8 +784,12 @@ async fn get_events(
     Path(execution_id): Path<String>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
-    let store = owner_execution_store_for(&state, &owner, &execution_id)?;
-    Ok(Json(read_events(&store, &execution_id, query.after)?))
+    let events = run_blocking(move || {
+        let store = owner_execution_store_for(&state, &owner, &execution_id)?;
+        read_events(&store, &execution_id, query.after)
+    })
+    .await?;
+    Ok(Json(events))
 }
 
 /// The events of `execution_id` with `sequence > after` — shared by
@@ -811,8 +815,12 @@ async fn get_conductor_state(
     State(state): State<AppState>,
     Path(execution_id): Path<String>,
 ) -> Result<Json<ConductorStateResponse>, ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    Ok(Json(read_conductor_state(&state.store, &execution_id)?))
+    let response = run_blocking(move || {
+        require_legacy_execution(&state, &execution_id)?;
+        read_conductor_state(&state.store, &execution_id)
+    })
+    .await?;
+    Ok(Json(response))
 }
 
 /// What the conductor of `execution_id` keeps, from its store.
@@ -840,12 +848,12 @@ async fn get_conductor_chat(
     Path(execution_id): Path<String>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<ConductorChatResponse>, ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    Ok(Json(read_conductor_chat(
-        &state.store,
-        &execution_id,
-        query.after,
-    )?))
+    let response = run_blocking(move || {
+        require_legacy_execution(&state, &execution_id)?;
+        read_conductor_chat(&state.store, &execution_id, query.after)
+    })
+    .await?;
+    Ok(Json(response))
 }
 
 /// The conductor's chat of `execution_id` after sequence `after`.
@@ -1026,8 +1034,12 @@ async fn get_timeline(
     Extension(owner): Extension<OwnerRef>,
     Path(execution_id): Path<String>,
 ) -> Result<Json<Timeline>, ApiError> {
-    let store = owner_execution_store_for(&state, &owner, &execution_id)?;
-    Ok(Json(read_timeline(&store, &execution_id)?))
+    let timeline = run_blocking(move || {
+        let store = owner_execution_store_for(&state, &owner, &execution_id)?;
+        read_timeline(&store, &execution_id)
+    })
+    .await?;
+    Ok(Json(timeline))
 }
 
 /// The step timeline of `execution_id`, computed from its own store.
@@ -1526,6 +1538,23 @@ async fn get_executions(
     State(state): State<AppState>,
     Extension(owner): Extension<OwnerRef>,
 ) -> Result<Json<ExecutionListResponse>, ApiError> {
+    Ok(Json(
+        run_blocking(move || list_executions(&state, &owner)).await?,
+    ))
+}
+
+/// Runs blocking store reads off the async workers.
+async fn run_blocking<T, F>(work: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+}
+
+fn list_executions(state: &AppState, owner: &OwnerRef) -> Result<ExecutionListResponse, ApiError> {    
     let mut executions = std::collections::BTreeMap::new();
     let mut ambiguous = std::collections::BTreeSet::new();
     for store in std::iter::once(state.store.clone()) {
@@ -1541,7 +1570,7 @@ async fn get_executions(
         }
     }
     if let Some(control) = &state.control {
-        let tasks = control.list_tasks(&owner).map_err(|error| {
+        let tasks = control.list_tasks(owner).map_err(|error| {
             ApiError::Internal(format!("could not resolve task projection: {error}"))
         })?;
         for task in tasks.tasks {
@@ -1557,7 +1586,7 @@ async fn get_executions(
                 continue;
             }
             let store = ExecutionStore::new(
-                local_storage_root(&state)
+                local_storage_root(state)
                     .join(task.task_id.as_str())
                     .join("state"),
             );
@@ -1568,9 +1597,9 @@ async fn get_executions(
             executions.insert(execution_id.to_string(), build_summary(&store, &execution)?);
         }
     }
-    Ok(Json(ExecutionListResponse {
+    Ok(ExecutionListResponse {
         executions: executions.into_values().collect(),
-    }))
+    })
 }
 
 /// An [`ExecutionSummary`] carrying the freshest context variables
