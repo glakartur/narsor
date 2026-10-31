@@ -736,8 +736,13 @@ fn a_refused_credential_is_renewed_and_failures_back_off() {
 
 /// A report of `claude-code`'s five-hour limit at `utilization`.
 fn usage_report(utilization: f64) -> HarnessUsageReport {
+    harness_usage_report("claude-code", utilization)
+}
+
+/// A report of `harness`'s five-hour limit at `utilization`.
+fn harness_usage_report(harness: &str, utilization: f64) -> HarnessUsageReport {
     HarnessUsageReport {
-        harness: "claude-code".to_string(),
+        harness: harness.to_string(),
         observed_at: Utc::now(),
         limits: vec![UsageLimit {
             window: "5h".to_string(),
@@ -761,6 +766,25 @@ fn reporting(root: &TempRoot) -> Fixture {
     Fixture::start(root, &spec(ONE_STEP, "claude-code"), agent)
 }
 
+/// The harness and utilization of each report waiting in the session.
+fn waiting_usage(session: &Session) -> Vec<(String, f64)> {
+    session
+        .usage
+        .waiting()
+        .into_iter()
+        .map(|report| (report.harness, report.limits[0].utilization))
+        .collect()
+}
+
+/// Waits until the session's usage forwarder can start a send, and starts
+/// it with the session's client.
+async fn forward_usage(session: &mut Session) -> Option<JoinHandle<()>> {
+    tokio::time::timeout(PATIENCE, session.usage.ready())
+        .await
+        .expect("a report waits and no send is on its way");
+    session.usage.forward(session.link.client())
+}
+
 /// Covers AE3. The usage limits a step reports leave the control loop
 /// once, the latest only, in a task of their own. A control plane that
 /// cannot be reached costs the step nothing and leaves the link's backoff
@@ -778,23 +802,27 @@ async fn only_the_latest_usage_report_is_sent_once_and_a_failure_leaves_the_link
 
     let session = &mut fixture.session;
     let (failures, next_attempt) = (session.link.failures, session.link.next_attempt);
-    tokio::time::timeout(PATIENCE, session.usage.changed())
-        .await
-        .expect("a report waits")
-        .expect("the reporter is alive");
-    let waiting = session.usage.borrow().clone().expect("a report");
-    assert_eq!(waiting.limits[0].utilization, 0.2, "only the latest waits");
+    assert_eq!(
+        waiting_usage(session),
+        [("claude-code".to_string(), 0.2)],
+        "only the latest waits"
+    );
 
-    assert!(session.send_usage(), "one attempt to send it");
-    let sent = session.usage_send.take().expect("the send under way");
+    let sent = forward_usage(session)
+        .await
+        .expect("one attempt to send it");
     tokio::time::timeout(PATIENCE, sent)
         .await
         .expect("the attempt ends")
         .expect("the attempt does not panic");
 
     assert!(
-        !session.usage.has_changed().expect("the reporter is alive"),
+        session.usage.waiting().is_empty(),
         "nothing is left to send again"
+    );
+    assert!(
+        session.usage.forward(session.link.client()).is_none(),
+        "no retry"
     );
     assert_eq!(session.link.failures, failures);
     assert_eq!(session.link.next_attempt, next_attempt);
@@ -813,13 +841,11 @@ async fn without_a_client_the_usage_report_is_dropped() {
 
     let session = &mut fixture.session;
     let (failures, next_attempt) = (session.link.failures, session.link.next_attempt);
-    tokio::time::timeout(PATIENCE, session.usage.changed())
-        .await
-        .expect("a report waits")
-        .expect("the reporter is alive");
-    assert!(!session.send_usage(), "no client to send with");
-    assert!(session.usage_send.is_none());
-    assert!(!session.usage.has_changed().expect("the reporter is alive"));
+    assert!(
+        forward_usage(session).await.is_none(),
+        "no client to send with"
+    );
+    assert!(session.usage.waiting().is_empty());
     assert_eq!(session.link.failures, failures);
     assert_eq!(session.link.next_attempt, next_attempt);
 }
@@ -915,6 +941,33 @@ impl UsageServer {
     }
 }
 
+/// The fixture's session pointed at `server`, with the reporter its engine
+/// was given.
+fn usage_session<'a>(
+    fixture: &'a mut Fixture,
+    server: &UsageServer,
+) -> (&'a mut Session, Arc<dyn UsageReporter>) {
+    let reporter = fixture
+        .agent
+        .usage
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the session's usage reporter");
+    let session = &mut fixture.session;
+    session.link.base_url = server.url.clone();
+    session.link.client = None;
+    (session, reporter)
+}
+
+/// Waits until `send` ended.
+async fn sent(send: Option<JoinHandle<()>>) {
+    tokio::time::timeout(PATIENCE, send.expect("a send under way"))
+        .await
+        .expect("the send ends")
+        .expect("the send does not panic");
+}
+
 /// A newer usage report waits while an older one is still on its way, and
 /// goes out only after it: the control plane, which keeps whichever report
 /// came last, ends with the newer one.
@@ -927,22 +980,10 @@ async fn a_newer_usage_report_waits_for_the_send_under_way_and_arrives_last() {
 
     assert_eq!(fixture.begin().await, None);
     fixture.settled().await;
-    let reporter = fixture
-        .agent
-        .usage
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("the session's usage reporter");
-    let session = &mut fixture.session;
-    session.link.base_url = server.url.clone();
-    session.link.client = None;
-    tokio::time::timeout(PATIENCE, session.usage.changed())
-        .await
-        .expect("a report waits")
-        .expect("the reporter is alive");
+    let (session, reporter) = usage_session(&mut fixture, &server);
 
-    assert!(session.send_usage(), "the first send starts");
+    let first = forward_usage(session).await;
+    assert!(first.is_some(), "the first send starts");
     tokio::time::timeout(PATIENCE, server.arrived.notified())
         .await
         .expect("the first report reaches the control plane");
@@ -950,32 +991,52 @@ async fn a_newer_usage_report_waits_for_the_send_under_way_and_arrives_last() {
 
     reporter.report(usage_report(0.3));
     assert!(
-        !session.send_usage(),
+        session.usage.forward(session.link.client()).is_none(),
         "no second send while the first is on its way"
     );
-    assert!(
-        session.usage.has_changed().expect("the reporter is alive"),
-        "the newer report stays unread"
+    assert_eq!(
+        waiting_usage(session),
+        [("claude-code".to_string(), 0.3)],
+        "the newer report waits"
     );
 
     server.release.notify_one();
-    let first = session.usage_send.take().expect("the first send");
-    tokio::time::timeout(PATIENCE, first)
-        .await
-        .expect("the first send ends")
-        .expect("the first send does not panic");
-    assert!(session.send_usage(), "the newer report goes out now");
-    let second = session.usage_send.take().expect("the second send");
-    tokio::time::timeout(PATIENCE, second)
-        .await
-        .expect("the second send ends")
-        .expect("the second send does not panic");
+    sent(first).await;
+    sent(forward_usage(session).await).await;
 
     assert_eq!(
         server.received(),
         vec![0.2, 0.3],
         "the newer one arrives last"
     );
+}
+
+/// Reports of two harnesses made before a send both reach the control
+/// plane, one after the other; two reports of one harness are merged, so
+/// only the newer goes out.
+#[tokio::test]
+async fn the_latest_report_of_each_harness_reaches_the_control_plane() {
+    let root = TempRoot::new();
+    let mut fixture = reporting(&root);
+    let server = UsageServer::start().await;
+    fs::write(root.0.join("no-credential"), "credential\n").unwrap();
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+    let (session, reporter) = usage_session(&mut fixture, &server);
+    reporter.report(harness_usage_report("codex", 0.5));
+    reporter.report(usage_report(0.6));
+    assert_eq!(
+        waiting_usage(session),
+        [("claude-code".to_string(), 0.6), ("codex".to_string(), 0.5)]
+    );
+
+    server.release.notify_one();
+    sent(forward_usage(session).await).await;
+    sent(forward_usage(session).await).await;
+
+    assert_eq!(server.received(), vec![0.6, 0.5]);
+    assert!(session.usage.waiting().is_empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -48,13 +48,20 @@ pub(super) fn limits(line: &Map<String, Value>) -> Vec<UsageLimit> {
 }
 
 /// One limit from a window's fields; `None` without `utilization` or
-/// `resetsAt`. `fallback` is the status to use when the window has none.
+/// `resetsAt`. `fallback` is the status to use when the window has none. A
+/// finite utilization outside 0 to 1 is brought to the nearest end: the
+/// control plane refuses a report with one.
 fn limit(
     window: &str,
     fields: &Map<String, Value>,
     fallback: Option<&Value>,
 ) -> Option<UsageLimit> {
     let utilization = fields.get("utilization")?.as_f64()?;
+    let utilization = if utilization.is_finite() {
+        utilization.clamp(0.0, 1.0)
+    } else {
+        utilization
+    };
     let resets_at = unix_seconds(fields.get("resetsAt")?)?;
     let status = fields
         .get("status")

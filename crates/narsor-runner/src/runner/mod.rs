@@ -84,8 +84,8 @@
 //! Reports that fail are not queued for replay: the next attempt builds a
 //! fresh snapshot from storage, so a reconnect reports the latest cursor
 //! once, and nothing is ever re-executed to produce it. The usage limits the
-//! harnesses report ([`usage`], R8) are sent once, the latest only, and
-//! dropped when that fails.
+//! harnesses report ([`usage`], R8) are sent once, the latest of each
+//! harness only, one at a time, and dropped when that fails.
 
 pub mod cli;
 mod commands;
@@ -436,8 +436,8 @@ pub async fn run(
     session.begin(&spec).await
 }
 
-/// Assembles the work phase of one runner process: the usage reporter and
-/// the channel it feeds, the engine given the reporter, the conductor around
+/// Assembles the work phase of one runner process: the usage forwarder,
+/// the engine given it as its usage reporter, the conductor around
 /// the engine, and the session holding them all.
 ///
 /// [`run`] and the in-process tests assemble their session here, so the
@@ -459,8 +459,8 @@ fn assemble_session(
         &Arc<WorkflowDefinition>,
     ) -> conductor::ConductorHost,
 ) -> Session {
-    let (reporter, usage) = usage::LatestUsage::channel();
-    let reporter: Arc<dyn UsageReporter> = reporter;
+    let usage = usage::UsageForwarder::new();
+    let reporter: Arc<dyn UsageReporter> = usage.clone();
     let harness = Arc::new(LiveHarness::new(starting_harness(&storage, spec)));
     let engine = Engine::new(storage.store())
         .with_usage_reporter(Arc::clone(&reporter))
@@ -482,7 +482,6 @@ fn assemble_session(
         link,
         cache: snapshot::ConversationCache::default(),
         usage,
-        usage_send: None,
         execution_id: None,
         directive: RunnerDirective::Continue,
         pass: None,
@@ -767,11 +766,9 @@ struct Session {
     timing: RunnerTiming,
     link: Link,
     cache: snapshot::ConversationCache,
-    /// The latest usage limits the engine's harnesses reported, not sent yet.
-    usage: usage::UsageReports,
-    /// The usage report on its way, if any: the next one waits for it, so
-    /// the control plane cannot receive an older report after a newer one.
-    usage_send: Option<JoinHandle<()>>,
+    /// The usage limits the engine's harnesses report, on their way to the
+    /// control plane; the loop only drives it.
+    usage: Arc<usage::UsageForwarder>,
     execution_id: Option<String>,
     directive: RunnerDirective,
     pass: Option<JoinHandle<Result<WorkflowExecution, EngineError>>>,
@@ -1278,8 +1275,6 @@ impl Session {
         let mut last_report: Option<Instant> = None;
         let mut poll: Option<InFlightPoll> = None;
         let mut pause_asked = false;
-        // Until every reporter is gone, which only a test's engine allows.
-        let mut usage_open = true;
 
         loop {
             // Before a pause or stop is honoured: what the last pass left
@@ -1386,17 +1381,10 @@ impl Session {
                         dirty = true;
                     }
                 }
-                // Not while a report is on its way: a newer one stays in the
-                // channel and goes out once that send ended.
-                changed = self.usage.changed(), if usage_open && self.usage_send.is_none() => {
-                    match changed {
-                        Ok(()) => {
-                            self.send_usage();
-                        }
-                        Err(_) => usage_open = false,
-                    }
+                // Only once a report waits and no other is on its way.
+                () = self.usage.ready() => {
+                    self.usage.forward(self.link.client());
                 }
-                _ = wait_for(&mut self.usage_send) => self.usage_send = None,
                 _ = tokio::time::sleep_until(wake) => {}
             }
         }
@@ -1433,34 +1421,6 @@ impl Session {
             .engine
             .pending_input(execution_id)?
             .map(|pending| pending.episode_key().to_string()))
-    }
-
-    /// Sends the latest usage report once, in a task of its own kept in
-    /// `usage_send`, when there is a client to send it with; true when the
-    /// send started.
-    ///
-    /// While the previous send is still on its way nothing starts and the
-    /// report stays unread in the channel: one send at a time keeps the
-    /// reports in order. Neither a missing client nor a failed send touches
-    /// the link's backoff: the report is simply dropped (R8), and the next
-    /// one the harness writes takes its place.
-    fn send_usage(&mut self) -> bool {
-        if self
-            .usage_send
-            .as_ref()
-            .is_some_and(|send| !send.is_finished())
-        {
-            return false;
-        }
-        self.usage_send = None;
-        let Some(report) = self.usage.borrow_and_update().clone() else {
-            return false;
-        };
-        let Some(client) = self.link.client() else {
-            return false;
-        };
-        self.usage_send = Some(usage::send(client, report));
-        true
     }
 
     /// Sends a fresh snapshot; true when the control plane took it.

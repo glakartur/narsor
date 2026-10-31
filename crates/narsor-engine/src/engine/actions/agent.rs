@@ -322,10 +322,11 @@ pub trait AgentEventSink: Send + Sync + std::fmt::Debug {
 /// Receives the usage limits a harness reported during a run (R8).
 ///
 /// Shared between executions, like [`AgentEventSink`]. The runner installs
-/// one that hands the report to its control loop; without one (the daemon's
-/// engine, a direct unit test) the limits are dropped.
+/// its usage forwarder, which buffers and sends the reports; without one
+/// (the daemon's engine, a direct unit test) the limits are dropped.
 pub trait UsageReporter: Send + Sync + std::fmt::Debug {
-    /// Takes the latest usage limits of one harness.
+    /// Takes the latest usage limits of one harness, marked with its id in
+    /// `report.harness`.
     ///
     /// Reporting must never block or fail a run: the report is handed on
     /// and the call returns, whatever becomes of it later.
@@ -333,7 +334,9 @@ pub trait UsageReporter: Send + Sync + std::fmt::Debug {
 }
 
 /// Where the usage limits read from one harness's stdout go: the reporter,
-/// with the harness they belong to.
+/// with the harness they belong to. It only passes each recognized report
+/// on, marked with the harness id: it holds no state, and the buffering and
+/// sending are the reporter's business.
 #[derive(Clone, Copy)]
 struct UsageRelay<'a> {
     harness: &'a str,

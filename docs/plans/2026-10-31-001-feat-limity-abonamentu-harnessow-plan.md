@@ -141,7 +141,7 @@ Plan-local:
 - **Parser zwraca limity, wykonawca składa raport:** identyfikator harnessu pochodzi z `HarnessAdapter::name()`, czas odbioru (R4) to czas zegara w chwili odczytu linii. Parser zostaje czysty i łatwy w testach.
 - **`UsageReporter` to opcjonalna cecha w silniku**, wstrzyknięta przez nowy builder `Engine` → `AgentExecutor`. Wywołanie `report` nie blokuje i nie zwraca błędu. Bez reportera raport przepada. Tak działa silnik demona w procesie.
 - **Stan limitów jest wspólny dla całej instalacji.** Klucz to tylko identyfikator harnessu (R2). Każda tożsamość `Worker` może zastąpić stan każdego harnessu. Każdy właściciel po bramce `require_owner` czyta cały stan. Ta decyzja jest poprawna dla instalacji z jednym użytkownikiem (D35). Przy wielu właścicielach stan trzeba podzielić wg właściciela. To jest poza zakresem tej zmiany.
-- **Runner przekazuje raport do pętli `Session` kanałem „tylko ostatnia wartość”** (np. `tokio::sync::watch`). Pętla bierze klienta z `Link::client()` i wysyła raport w osobnym zadaniu. Błąd ląduje w logu `debug` i nic więcej. Brak ponawiania (R8). Kanał z ostatnią wartością sam usuwa starsze raporty.
+- **Runner ma jeden komponent dla limitów: `UsageForwarder`** (`crates/narsor-runner/src/runner/usage.rs`). Komponent implementuje `UsageReporter` i dostaje raporty oznaczone identyfikatorem harnessu. Bufor trzyma ostatni niewysłany raport każdego harnessu. Nowy raport zastępuje tylko niewysłany raport tego samego harnessu. Pętla wysyłki bierze klienta z `Link::client()` i wysyła oczekujące raporty po kolei, jeden naraz, w kolejności ich nadejścia. Błąd ląduje w logu `debug` i nic więcej. Brak ponawiania (R8). `Session` tylko uruchamia komponent i go napędza. Krok silnika tylko przekazuje rozpoznany raport z identyfikatorem harnessu i nie ma stanu ani logiki transportu.
 - **Stan na serwerze w `ProtocolService`**, nowy podmoduł `service/harness_usage.rs`, wzór `backend_limit.rs`. Jedno miejsce dla trasy runnera i trasy właściciela. Zegar to `self.control.now()`, więc `ManualClock` w testach steruje wygasaniem.
 - **Wygasanie przy dostępie, bez zadania okresowego:** każdy zapis i odczyt usuwa limity z `resets_at <= now`, harnessy z `received_at + 15 min <= now` i harnessy bez limitów. Endpoint odczytu nigdy nie zwraca usuniętego stanu (R5a), a kod nie potrzebuje `run_periodic_pass`.
 - **Kontrakt na drucie** (w `crates/narsor-protocol/src/controller.rs`):
@@ -153,8 +153,8 @@ Plan-local:
   - harness spoza listy R0;
   - status `Unrecognized`;
   - `window` poza wzorcem;
-  - `utilization` poza 0–1 albo nie jest liczbą skończoną;
-  - `resets_at` dalej niż 7 dni od czasu serwera;
+  - `utilization` poza 0–1 albo nie jest liczbą skończoną (parser runnera przycina skończoną wartość do 0–1, zanim wyśle raport);
+  - `resets_at` wcześniej niż czas serwera. Ten błąd dodatkowo usuwa stan harnessu z raportu: GET już go nie pokazuje. Brak górnej granicy dla `resets_at`. Limit z `resets_at` równym czasowi serwera serwer pomija przy zapisie;
   - więcej niż 8 limitów albo dwa limity z tym samym `window`;
   - tylko rola `Worker` (`require_worker`).
   - Trasa ma `DefaultBodyLimit` 16 KiB.
@@ -307,7 +307,7 @@ Zasady etapów:
 
 **Approach:**
 - `HarnessUsageReport`, `UsageLimit`, `UsageStatus`, `HarnessUsageView`, `HarnessUsageResponse` (kształt w Key Technical Decisions).
-- Stałe granic w protokole: liczba limitów (8), wzorzec okna, horyzont odnowienia (7 dni), czas życia stanu (15 min). Funkcja pomocnicza, która zamienia `window` na długość (do sortowania w U4).
+- Stałe granic w protokole: liczba limitów (8), wzorzec okna, czas życia stanu (15 min). Funkcja pomocnicza, która zamienia `window` na długość (do sortowania w U4).
 - Dodać nowe typy do jawnej listy w `wire.rs`.
 
 **Patterns to follow:**
@@ -387,7 +387,7 @@ Zasady etapów:
 
 **Approach:**
 - Pole `Mutex<HashMap<harness id, stan>>`. Stan = raport po walidacji + `received_at` (czas serwera).
-- Zapis: `require_worker`, walidacja (lista w Key Technical Decisions), usunięcie starych wpisów, zastąpienie stanu harnessu. Limity z `resets_at <= now` usunięte już przy zapisie. Raport, który po tym nie ma limitów, usuwa stan harnessu.
+- Zapis: `require_worker`, walidacja (lista w Key Technical Decisions), usunięcie starych wpisów, zastąpienie stanu harnessu. Raport z limitem, którego `resets_at < now`, dostaje 400 i usuwa stan harnessu. Limity z `resets_at == now` usunięte już przy zapisie. Raport, który po tym nie ma limitów, usuwa stan harnessu.
 - Odczyt: usunięcie starych wpisów, potem lista w kolejności R0, limity rosnąco po długości okna.
 - Granica 15 min liczona od `received_at`, nie od `observed_at`.
 - Wszystkie czasy z `self.control.now()`.
@@ -402,12 +402,14 @@ Zasady etapów:
 - Covers AE8. Edge case: raport, potem `ManualClock` +16 min → odczyt nie zwraca `claude-code`.
 - Edge case: raport, potem +14 min 59 s → odczyt zwraca `claude-code`.
 - Covers AE9. Edge case: raport, `ManualClock` +5 min, `resets_at` limitu `5h` minął minutę temu → odczyt zwraca tylko `7d`.
-- Edge case: oba limity mają `resets_at` w przeszłości → harness nie jest w odpowiedzi.
+- Edge case: oba limity odnawiają się w czasie, gdy serwer trzyma stan → harness nie jest w odpowiedzi.
+- Error path: raport z `resets_at` sekundę przed czasem serwera → 400 `invalid_usage_report`, stan tego harnessu usunięty (GET go nie pokazuje), stan innych harnessów bez zmian.
+- Edge case: limit z `resets_at` równym czasowi serwera → pominięty, harness bez limitów nie jest w odpowiedzi.
 - Edge case: `observed_at` sprzed godziny, `received_at` teraz → harness jest w odpowiedzi (liczy się `received_at`).
 - Error path: harness `unknown` → 400 `invalid_usage_report`, stan bez zmian.
 - Error path: status `Unrecognized` → 400.
 - Error path: `utilization` 1.5, -0.1, NaN → 400.
-- Error path: `resets_at` = teraz + 7 dni + 1 s → 400. Teraz + 7 dni → przyjęty.
+- Happy path: `resets_at` = teraz + 400 dni → przyjęty (brak górnej granicy).
 - Error path: `window` `5x`, `0h`, `12345h`, tekst ze znakiem sterującym → 400.
 - Error path: 9 limitów → 400. Dwa limity `5h` → 400.
 - Error path: tożsamość `Reader` → `Forbidden`.
@@ -435,7 +437,7 @@ Zasady etapów:
 **Approach:**
 - Trasa runnera za `require_runner`, z `DefaultBodyLimit` 16 KiB tylko na tej trasie. Odpowiedź `204`.
 - `RunnerClient` dostaje metodę POST, dla której `204` to sukces z wynikiem `()`. Dziś `handle_json_response` (`crates/narsor-shared/src/api_error.rs`) przyjmuje tylko 200, 201 i 202, a dla 204 zwraca błąd. Inne statusy nowa metoda mapuje przez `handle_json_response`.
-- Testy, w których raport trafia do serwera, używają syntetycznej linii `rate_limit_event`. Jej `resetsAt` liczy się od czasu `ManualClock` serwera testowego (np. +4h10m i +2d3h). Nagrania z `tests/fixtures/claude-code` mają `resetsAt` 14–27 dni po starcie `ManualClock`, więc serwer odrzuci je (granica 7 dni). Nagrania zostają w testach parsera i w testach z testowym reporterem.
+- Testy, w których raport trafia do serwera, używają syntetycznej linii `rate_limit_event`. Jej `resetsAt` liczy się od czasu `ManualClock` serwera testowego (np. +4h10m i +2d3h). Nagrania z `tests/fixtures/claude-code` mają stałe `resetsAt`, więc po zmianie zegara testu mogą być w przeszłości, a wtedy serwer je odrzuci. Nagrania zostają w testach parsera i w testach z testowym reporterem.
 - Trasa odczytu w `owner_routes` (stan `Arc<ProtocolService>`), więc dostaje bramkę `require_owner` jak `/control/v1/backends/{id}/limit`.
 - Nie edytować nieskompilowanej kopii `crates/narsor-engine/src/controller_protocol/http.rs`.
 

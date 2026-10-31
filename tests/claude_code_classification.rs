@@ -480,6 +480,23 @@ fn a_window_without_utilization_is_skipped() {
 }
 
 #[test]
+fn a_utilization_outside_zero_to_one_is_brought_to_the_nearest_end() {
+    let line = rate_limit_event(json!({
+        "unifiedWindows": {
+            "five_hour": {"utilization": 1.07, "resetsAt": 1792203000, "status": "rejected"},
+            "seven_day": {"utilization": -0.2, "resetsAt": 1792785600},
+        },
+    }));
+    assert_eq!(
+        usage_of(&line).1,
+        Some(vec![
+            limit("5h", 1.0, 1792203000, Some(UsageStatus::Rejected)),
+            limit("7d", 0.0, 1792785600, None),
+        ])
+    );
+}
+
+#[test]
 fn an_unknown_status_gives_a_limit_without_a_status() {
     let line = rate_limit_event(json!({
         "unifiedWindows": {

@@ -7,7 +7,10 @@
 //! ages it out in the background: every write and every read first removes
 //! the limits that already reset, the harnesses whose report the server
 //! received [`USAGE_STATE_LIFETIME`] ago or earlier, and the harnesses left
-//! without a limit. A read never shows what the rules removed.
+//! without a limit. A read never shows what the rules removed. A report has
+//! no upper bound on when a limit resets, but a report with a limit that
+//! reset before the server's clock is refused and removes what the server
+//! held for that harness: the runner's view is stale or its clock is wrong.
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,7 +21,7 @@ use crate::controller_protocol::credentials::RunnerIdentity;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use narsor_protocol::controller::{
     usage_window_length, HarnessUsageReport, HarnessUsageResponse, HarnessUsageView, UsageLimit,
-    UsageStatus, MAX_USAGE_LIMITS, USAGE_RESETS_HORIZON, USAGE_STATE_LIFETIME,
+    UsageStatus, MAX_USAGE_LIMITS, USAGE_STATE_LIFETIME,
 };
 use narsor_protocol::harness::{self, HARNESSES};
 
@@ -39,8 +42,11 @@ pub(super) struct HeldUsage {
 
 impl ProtocolService {
     /// Replaces what the server holds for the report's harness with the
-    /// report. A report that is not valid is refused and changes nothing; a
-    /// report whose limits all reset already removes the harness.
+    /// report. A report that is not valid is refused and changes nothing,
+    /// except a report of a known harness with a limit that reset before
+    /// `now`: it is refused and removes what the server held for the
+    /// harness. A limit that resets exactly at `now` is dropped; a report
+    /// left without a limit removes the harness.
     pub fn runner_usage(
         &self,
         identity: &RunnerIdentity,
@@ -48,9 +54,13 @@ impl ProtocolService {
     ) -> ProtocolResult<()> {
         Self::require_worker(identity)?;
         let now = self.control.now();
-        let harness = validate_usage_report(&report, now).map_err(|message| {
-            ProtocolError::bad_request("invalid_usage_report", message.to_string())
-        })?;
+        let harness = validate_usage_report(&report).map_err(refuse_usage_report)?;
+        if report.limits.iter().any(|limit| limit.resets_at < now) {
+            let mut usages = self.lock_harness_usages();
+            prune_usages(&mut usages, now);
+            usages.remove(harness);
+            return Err(refuse_usage_report("a limit reset already"));
+        }
         let mut limits: Vec<UsageLimit> = report
             .limits
             .into_iter()
@@ -102,12 +112,14 @@ impl ProtocolService {
     }
 }
 
+fn refuse_usage_report(message: &'static str) -> ProtocolError {
+    ProtocolError::bad_request("invalid_usage_report", message.to_string())
+}
+
 /// The report's harness id, or why the report is refused (R6a). The reasons
-/// never repeat what the runner sent: it is not trusted text.
-fn validate_usage_report(
-    report: &HarnessUsageReport,
-    now: DateTime<Utc>,
-) -> Result<&'static str, &'static str> {
+/// never repeat what the runner sent: it is not trusted text. When a limit
+/// resets is checked by the caller, against the server's clock.
+fn validate_usage_report(report: &HarnessUsageReport) -> Result<&'static str, &'static str> {
     let harness = harness::find(&report.harness).ok_or("the harness is not known")?;
     if report.limits.len() > MAX_USAGE_LIMITS {
         return Err("the report has too many limits");
@@ -122,9 +134,6 @@ fn validate_usage_report(
         }
         if !(0.0..=1.0).contains(&limit.utilization) {
             return Err("a limit utilization is not a number from 0 to 1");
-        }
-        if limit.resets_at > now + USAGE_RESETS_HORIZON {
-            return Err("a limit resets too far in the future");
         }
         if limit.status == Some(UsageStatus::Unrecognized) {
             return Err("a limit status is not known");

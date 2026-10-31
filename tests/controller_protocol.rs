@@ -7965,22 +7965,63 @@ async fn a_harness_whose_limits_all_reset_is_not_shown() {
         .unwrap();
     harness.clock.advance(Duration::minutes(4));
     assert!(harness.service.harness_usage().harnesses.is_empty());
+}
 
-    // A report whose limits reset already removes what the harness had.
+#[tokio::test]
+async fn a_report_with_a_past_reset_is_refused_and_removes_the_harness() {
+    let harness = Harness::start().await;
     harness
         .service
         .runner_usage(&worker(), claude_report(&harness, 0.2, 0.1))
         .unwrap();
-    let now = harness.clock.now();
     harness
         .service
         .runner_usage(
             &worker(),
             usage_report(
-                "claude-code",
-                now,
-                vec![usage_limit("5h", 0.2, now - Duration::seconds(1))],
+                "codex",
+                harness.clock.now(),
+                vec![usage_limit(
+                    "5h",
+                    0.1,
+                    harness.clock.now() + Duration::hours(1),
+                )],
             ),
+        )
+        .unwrap();
+    let now = harness.clock.now();
+
+    let refused = harness.service.runner_usage(
+        &worker(),
+        usage_report(
+            "claude-code",
+            now,
+            vec![
+                usage_limit("5h", 0.2, now - Duration::seconds(1)),
+                usage_limit("7d", 0.1, now + Duration::hours(51)),
+            ],
+        ),
+    );
+
+    assert_eq!(usage_refusal(refused), "invalid_usage_report");
+    let usage = harness.service.harness_usage();
+    let names: Vec<&str> = usage
+        .harnesses
+        .iter()
+        .map(|view| view.harness.as_str())
+        .collect();
+    assert_eq!(names, ["codex"], "only the refused harness is removed");
+}
+
+#[tokio::test]
+async fn a_limit_resetting_exactly_now_is_dropped() {
+    let harness = Harness::start().await;
+    let now = harness.clock.now();
+    harness
+        .service
+        .runner_usage(
+            &worker(),
+            usage_report("claude-code", now, vec![usage_limit("5h", 0.2, now)]),
         )
         .unwrap();
     assert!(harness.service.harness_usage().harnesses.is_empty());
@@ -8054,14 +8095,6 @@ async fn an_invalid_usage_report_is_refused_and_changes_nothing() {
             one(usage_limit("5h", f64::INFINITY, soon)),
         ),
         (
-            "resets after 7 days",
-            one(usage_limit(
-                "5h",
-                0.5,
-                now + Duration::days(7) + Duration::seconds(1),
-            )),
-        ),
-        (
             "two 5h limits",
             usage_report(
                 "claude-code",
@@ -8097,7 +8130,7 @@ async fn an_invalid_usage_report_is_refused_and_changes_nothing() {
 }
 
 #[tokio::test]
-async fn a_limit_resetting_exactly_seven_days_ahead_is_accepted() {
+async fn a_limit_resetting_far_in_the_future_is_accepted() {
     let harness = Harness::start().await;
     let now = harness.clock.now();
     harness
@@ -8107,7 +8140,7 @@ async fn a_limit_resetting_exactly_seven_days_ahead_is_accepted() {
             usage_report(
                 "claude-code",
                 now,
-                vec![usage_limit("7d", 0.5, now + Duration::days(7))],
+                vec![usage_limit("7d", 0.5, now + Duration::days(400))],
             ),
         )
         .unwrap();
@@ -8161,6 +8194,30 @@ async fn an_invalid_usage_report_over_http_is_a_400_with_its_code() {
 
     assert_eq!(
         bad_request_code(running.runner.report_usage(&report).await),
+        "invalid_usage_report"
+    );
+    let usage = harness.owner.control_usage().await.expect("usage");
+    assert!(usage.harnesses.is_empty());
+}
+
+#[tokio::test]
+async fn a_past_reset_over_http_is_a_400_and_the_owner_no_longer_sees_the_harness() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    running
+        .runner
+        .report_usage(&claude_report(&harness, 0.2, 0.1))
+        .await
+        .expect("the server answers 204");
+    let now = harness.clock.now();
+    let stale = usage_report(
+        "claude-code",
+        now,
+        vec![usage_limit("5h", 0.3, now - Duration::minutes(1))],
+    );
+
+    assert_eq!(
+        bad_request_code(running.runner.report_usage(&stale).await),
         "invalid_usage_report"
     );
     let usage = harness.owner.control_usage().await.expect("usage");

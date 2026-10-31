@@ -1678,10 +1678,6 @@ pub struct SetBackendLimitRequest {
 /// Most limits one harness usage report may carry.
 pub const MAX_USAGE_LIMITS: usize = 8;
 
-/// How far after the server's clock a limit may reset; a report naming a
-/// later reset is refused.
-pub const USAGE_RESETS_HORIZON: Duration = Duration::days(7);
-
 /// How long the server keeps a harness's usage after the report that set it,
 /// counted from when the server received the report, not from `observed_at`.
 pub const USAGE_STATE_LIFETIME: Duration = Duration::minutes(15);
