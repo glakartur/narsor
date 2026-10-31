@@ -82,6 +82,13 @@ albo `awaiting_input`).
 6. **Typy linii.** `system` z podtypami: `init`, `hook_started`, `hook_response`, `thinking_tokens`,
    `permission_denied`. Poza tym: `assistant`, `user`, `rate_limit_event`, `result`. W nagraniach nie
    ma kompaktowania (`compact_boundary`); jest testowane na linii syntetycznej.
+   Linia `rate_limit_event` nie daje wpisu rozmowy. Parser oddaje limity abonamentu z
+   `rate_limit_info` (`take_usage`): okna `five_hour` → `5h` i `seven_day` → `7d` z `unifiedWindows`,
+   `resetsAt` w sekundach Unix. W nagraniach okna mają `status` (`noschema_*`) albo go nie mają
+   (`ask_user_question.ndjson`, `tools.ndjson`). Okno bez `status` bierze `status` linii tylko wtedy,
+   gdy jest oknem z `rateLimitType`. Bez `unifiedWindows` jedynym oknem jest `rateLimitType` z polami
+   `utilization`, `resetsAt` i `status` z `rate_limit_info` (testowane na linii syntetycznej). Okno
+   nieznane, bez `utilization` albo bez `resetsAt` parser pomija.
 7. **Myślenie.** Blok `thinking` ma pusty tekst (`"thinking": ""`) i podpis. Treść myślenia nie jest
    widoczna w strumieniu.
 8. **`result` i metadane.** `total_cost_usd`, `usage`, `num_turns`, `duration_ms`, `stop_reason`,

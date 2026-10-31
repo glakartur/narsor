@@ -63,6 +63,7 @@
 
 mod classify;
 mod tools;
+mod usage;
 
 use std::path::Path;
 
@@ -77,6 +78,7 @@ use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
 use crate::engine::actions::agent;
 use narsor_protocol::chat::ChatElement;
+use narsor_protocol::controller::UsageLimit;
 
 /// The `harness:` value this adapter answers to.
 pub use narsor_protocol::harness::CLAUDE_CODE;
@@ -227,8 +229,10 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 /// Each line is parsed once and used twice:
 ///
 /// * It is classified into chat elements ([`classify`]): every `assistant`,
-///   `user`, `system`, `rate_limit_event` and `result` line becomes
-///   conversation elements, with tool results tied to their calls.
+///   `user`, `system` and `result` line becomes conversation elements, with
+///   tool results tied to their calls. A `rate_limit_event` line is no part
+///   of the conversation: it gives no element, and its limits ([`usage`]) wait
+///   for [`HarnessStreamParser::take_usage`].
 /// * It is accumulated into a [`HarnessRun`]: a `system`/`init` line may
 ///   carry the session id before anything else does, and the `result` line
 ///   — the last line a well-behaved run ever prints — carries the final text
@@ -257,6 +261,8 @@ struct ClaudeCodeStreamParser {
     final_answer: Option<FinalAnswer>,
     permission_denials: Vec<PermissionDenial>,
     denial_reasons: std::collections::HashMap<String, (Option<String>, Option<String>)>,
+    /// The limits of the last line, when it was a `rate_limit_event`.
+    usage: Option<Vec<UsageLimit>>,
 }
 
 impl ClaudeCodeStreamParser {
@@ -352,9 +358,15 @@ impl ClaudeCodeStreamParser {
 
 impl HarnessStreamParser for ClaudeCodeStreamParser {
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {
+        // Limits belong to the line that reported them, and to no later one.
+        self.usage = None;
         let Some(mut object) = parse_object(line) else {
             return classify::invalid_json();
         };
+        if object.get("type").and_then(Value::as_str) == Some(usage::RATE_LIMIT_EVENT) {
+            self.usage = Some(usage::limits(&object));
+            return Vec::new();
+        }
         if object.get("type").and_then(Value::as_str) == Some("system")
             && object.get("subtype").and_then(Value::as_str) == Some("permission_denied")
         {
@@ -385,6 +397,10 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
         }
         self.accumulate(&object, result.as_ref());
         self.classifier.classify(object, result)
+    }
+
+    fn take_usage(&mut self) -> Option<Vec<UsageLimit>> {
+        self.usage.take()
     }
 
     fn final_answer(&self) -> Option<FinalAnswer> {
