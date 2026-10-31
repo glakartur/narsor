@@ -61,6 +61,7 @@ impl TaskApp {
         self.focus = crate::tui::task_app::Focus::Details;
         self.panel_focus = false;
         self.back_to_axis();
+        self.detail.view_mut(&id).details_opened = true;
         self.sync_waiting();
         if let Some(view) = self.detail.views.get_mut(&id) {
             if view.waiting.is_present() {

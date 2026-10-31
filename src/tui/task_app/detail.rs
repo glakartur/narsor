@@ -30,7 +30,9 @@
 //! read twice for the same revision. Every answer goes through
 //! [`TaskApp::on_detail_read`], so a test can hand over any answer — a relay
 //! error included — without a server. A failed read stays in its tab; only an
-//! unreachable server counts against the connection.
+//! unreachable server counts against the connection. A finished task without
+//! a runner defers these reads until Enter; once opened, its reads continue in
+//! the background if the operator switches to another task.
 //!
 //! The conductor's tab is read with the same answer as the answer panel's
 //! ([`DetailRead::Conductor`]); see [`super::tabs::conductor`].
@@ -90,6 +92,14 @@ pub struct TaskDetail {
     pub(super) conductor: Conductor,
     /// The answer panel at the bottom (U10).
     pub(super) waiting: WaitingPanel,
+    /// Whether the operator explicitly opened this task's details.
+    pub(super) details_opened: bool,
+}
+
+/// Finished tasks whose runner is gone need an explicit open before their
+/// execution details are fetched.
+pub(super) fn requires_explicit_open(task: &TaskSummary) -> bool {
+    task.state == TaskState::Finished && task.runner.is_none()
 }
 
 impl TaskDetail {
@@ -103,6 +113,7 @@ impl TaskDetail {
             info: Info::default(),
             conductor: Conductor::new(task_id),
             waiting: WaitingPanel::default(),
+            details_opened: false,
         }
     }
 
@@ -635,6 +646,15 @@ impl TaskApp {
         let Some(task) = self.list.selected() else {
             return;
         };
+        if requires_explicit_open(task)
+            && !self
+                .detail
+                .views
+                .get(task.task_id.as_str())
+                .is_some_and(|view| view.details_opened)
+        {
+            return;
+        }
         if readiness(task) != Readiness::Started {
             return;
         }
@@ -999,6 +1019,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         keys,
         hyperlinks,
         glyph,
+        deferred: view.deferred,
+        details_opened: view.details_opened,
+        loading,
     };
     render_view(frame, inner, view, styles, options);
 }
@@ -1025,6 +1048,12 @@ pub(super) struct ViewOptions {
     pub(super) hyperlinks: bool,
     /// The glyph of the loading marker at the current frame.
     pub(super) glyph: &'static str,
+    /// The task is awaiting Enter before showing its execution details.
+    pub(super) deferred: bool,
+    /// Enter has requested its execution details.
+    pub(super) details_opened: bool,
+    /// A background read of the selected task is under way.
+    pub(super) loading: bool,
 }
 
 /// Draws `view` — the details of a task, or of an entry of the history —
@@ -1041,6 +1070,9 @@ pub(super) fn render_view(
         keys,
         hyperlinks,
         glyph,
+        deferred,
+        details_opened,
+        loading,
     } = options;
     let content_keys = match keys {
         KeysAt::Content(step) => Some(step),
@@ -1061,7 +1093,6 @@ pub(super) fn render_view(
         parts.content.width.saturating_sub(3),
         parts.content.height.saturating_sub(2),
     );
-
     let (mut lines, spots) = header(
         view.task,
         view.queue_place,
@@ -1095,6 +1126,22 @@ pub(super) fn render_view(
     }
     if hyperlinks {
         link_spots(frame.buffer_mut(), header_content, &spots);
+    }
+    if deferred {
+        let message = Rect::new(
+            area.x.saturating_add(2),
+            area.y.saturating_add(parts.header.height),
+            area.width.saturating_sub(3),
+            area.height.saturating_sub(parts.header.height),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "więcej danych pojawi się po wejściu w zadanie (Enter)",
+                styles.of(Role::Attention),
+            )),
+            message,
+        );
+        return;
     }
     let header_background = styles.task_header_background().bg;
     if let Some(color) = header_background {
@@ -1130,6 +1177,20 @@ pub(super) fn render_view(
                 cell.bg = ratatui::style::Color::Reset;
             }
         }
+    }
+    if requires_explicit_open(view.task)
+        && details_opened
+        && view.detail.progress.timeline().is_none()
+        && loading
+    {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "wczytuję dane szczegółowe…",
+                styles.of(Role::Done),
+            )),
+            content,
+        );
+        return;
     }
 
     let unstarted = unstarted_message(view.task, view.queue_place);

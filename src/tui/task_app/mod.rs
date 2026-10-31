@@ -128,7 +128,7 @@ use super::scroll::one_line;
 use super::spinner::Spinner;
 use actions::{availability, ActionRequest, Availability, LinkRequest, Overlay, TaskAction};
 use background::{read_for_opening, Background, JobKey, OpeningKind, OpeningRead, Outcome};
-use detail::{StepLevel, TaskDetail};
+use detail::{requires_explicit_open, StepLevel, TaskDetail};
 use history::History;
 use list::{title_of, MoveRequest, Removal, ResumeNotice, ResumeNoticeKind, TaskList};
 use new_task::{NewTaskForm, Outgoing};
@@ -327,6 +327,8 @@ pub(super) struct DetailView<'a> {
     pub(super) queue_place: Option<usize>,
     pub(super) tab: DetailTab,
     pub(super) detail: &'a mut TaskDetail,
+    pub(super) deferred: bool,
+    pub(super) details_opened: bool,
 }
 
 /// What the details area shows, apart from the selected task: the screens
@@ -1009,9 +1011,20 @@ impl TaskApp {
         let answer = change(&mut self.list);
         if self.list.selected_id() != before.as_deref() {
             self.back_to_axis();
-            // The reads of the task that was left are not wanted any more.
-            if let Some(before) = &before {
-                self.abort_detail_jobs(before);
+            // An explicitly opened finished task keeps its detail reads in
+            // the background, so returning to it can show data or progress.
+            let keep_background_reads = before.as_ref().is_some_and(|id| {
+                self.list
+                    .tasks()
+                    .iter()
+                    .find(|task| task.task_id.as_str() == id)
+                    .is_some_and(requires_explicit_open)
+                    && self.detail.view(id).is_some_and(|view| view.details_opened)
+            });
+            if !keep_background_reads {
+                if let Some(before) = before.as_deref() {
+                    self.abort_detail_jobs(before);
+                }
             }
         }
         answer
@@ -1028,11 +1041,15 @@ impl TaskApp {
             .views
             .entry(task.task_id.to_string())
             .or_insert_with(|| TaskDetail::new(task.task_id.as_str()));
+        let details_opened = detail.details_opened;
+        let deferred = requires_explicit_open(task) && !details_opened;
         Some(DetailView {
             task,
             queue_place,
             tab,
             detail,
+            deferred,
+            details_opened,
         })
     }
 

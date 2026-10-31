@@ -23,8 +23,8 @@ use narsor::api::{ApiClient, ClientError, UsageRead, UsageSource};
 use narsor::tui::spinner::Spinner;
 use narsor::tui::style::Styles;
 use narsor::tui::task_app::background::OpeningKind;
-use narsor::tui::task_app::{layout, Request, TaskApp, ViewKind};
-use narsor_protocol::controller::HarnessUsageResponse;
+use narsor::tui::task_app::{layout, Focus, Request, TaskApp, ViewKind};
+use narsor_protocol::controller::{HarnessUsageResponse, TaskState};
 
 mod task_app_support;
 use task_app_support::{archived, listing, task, timeline};
@@ -410,6 +410,71 @@ async fn the_reads_of_a_task_that_was_left_are_aborted_and_never_shown_for_anoth
     assert!(second.is_some(), "the read of t2 was taken in");
     let screen = screen_of(&mut app, 100, 30);
     assert!(!screen.contains("wczytuję przebieg"), "{screen}");
+}
+
+#[tokio::test]
+async fn finished_tasks_without_a_runner_load_on_enter_and_keep_loading_in_the_background() {
+    let stub = Stub::start().await;
+    let mut first = task("t1", "local", "interrupted", 1);
+    first.state = TaskState::Finished;
+    let mut second = task("t2", "local", "interrupted", 2);
+    second.state = TaskState::Finished;
+    let listing = serde_json::to_value(listing(vec![first, second], "c1")).expect("a listing");
+    stub.open(LIST, listing);
+    stub.open(HARNESS, serde_json::json!({}));
+    let timeline_path = "/control/v1/tasks/t1/timeline";
+    let gate = stub.gated(timeline_path, timeline_body("t1"));
+    let mut app = app_over(&stub);
+    app.refresh().await;
+
+    app.start_detail_reads();
+    assert_eq!(stub.hits(timeline_path), 0);
+    let screen = screen_of(&mut app, 120, 40);
+    assert!(
+        screen.contains("więcej danych pojawi się po wejściu"),
+        "{screen}"
+    );
+    assert!(!screen.contains("Przebieg"), "{screen}");
+
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.focus(), Focus::Details);
+    app.start_detail_reads();
+    stub.reached(timeline_path, 1).await;
+    assert!(app.detail_loading());
+    let screen = screen_of(&mut app, 120, 40);
+    assert!(screen.contains("wczytuję dane szczegółowe"), "{screen}");
+
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.list().selected_id(), Some("t2"));
+    press(&mut app, KeyCode::Char('k'));
+    assert_eq!(app.list().selected_id(), Some("t1"));
+    app.start_detail_reads();
+    assert!(
+        app.detail_loading(),
+        "the original request is still in flight"
+    );
+
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('j'));
+    gate.add_permits(1);
+    app.drain_jobs().await;
+    assert!(
+        app.detail()
+            .view("t1")
+            .and_then(|view| view.progress().timeline())
+            .is_some(),
+        "the read is cached even when its task is not selected"
+    );
+
+    press(&mut app, KeyCode::Char('k'));
+    assert_eq!(app.list().selected_id(), Some("t1"));
+    assert!(!app.detail_loading());
+    assert!(app
+        .detail()
+        .view("t1")
+        .and_then(|view| view.progress().timeline())
+        .is_some());
 }
 
 #[tokio::test]

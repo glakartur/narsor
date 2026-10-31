@@ -11,9 +11,10 @@
 //! * One job per [`JobKey`] at a time: starting a key that runs does nothing
 //!   (R4). A job that failed has left the map by the time its outcome is
 //!   applied, so the next start is free.
-//! * A job of a scope that is no longer shown is aborted
-//!   ([`TaskApp::abort_detail_jobs`]), so a newer operation replaces an older
-//!   one (R4a). What it asked is lost; nothing was changed yet.
+//! * A job of a scope that is no longer shown is normally aborted
+//!   ([`TaskApp::abort_detail_jobs`]); detail reads of an explicitly opened
+//!   finished task stay in the background so the operator can return to them.
+//!   What an aborted job asked is lost; nothing was changed yet.
 //! * The jobs live in a [`JoinSet`], which aborts them when the application is
 //!   dropped: leaving the interface never waits for a read (R11).
 //! * The frame of the loading marker is a counter of the application, raised
