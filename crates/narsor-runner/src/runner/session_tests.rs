@@ -777,30 +777,114 @@ fn waiting_usage(session: &Session) -> Vec<(String, f64)> {
 }
 
 /// Waits until the session's usage forwarder can start a send, and starts
-/// it with the session's client.
+/// it with the session's sender.
 async fn forward_usage(session: &mut Session) -> Option<JoinHandle<()>> {
     tokio::time::timeout(PATIENCE, session.usage.ready())
         .await
         .expect("a report waits and no send is on its way");
-    session.usage.forward(session.link.client())
+    let sender = session.usage_sender();
+    session.usage.forward(sender)
+}
+
+/// A control plane double for usage reports: it records the utilization of
+/// every report it receives, in order. A holding one holds its answer to the
+/// first report until `release` is opened; a refusing one refuses them all.
+#[derive(Default)]
+struct UsageControlPlane {
+    received: Mutex<Vec<f64>>,
+    arrived: Notify,
+    release: Notify,
+    holds_first: bool,
+    refuses: bool,
+}
+
+impl UsageControlPlane {
+    fn holding() -> Arc<Self> {
+        Arc::new(Self {
+            holds_first: true,
+            ..Self::default()
+        })
+    }
+
+    fn refusing() -> Arc<Self> {
+        Arc::new(Self {
+            refuses: true,
+            ..Self::default()
+        })
+    }
+
+    fn received(&self) -> Vec<f64> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+/// The double behind an `Arc`, so a send can outlive the test's borrow.
+struct UsageControlPlaneSender(Arc<UsageControlPlane>);
+
+impl usage::UsageSender for UsageControlPlaneSender {
+    fn send(&self, report: HarnessUsageReport) -> usage::UsageSend {
+        let plane = Arc::clone(&self.0);
+        Box::pin(async move {
+            let first = {
+                let mut received = plane.received.lock().unwrap();
+                received.push(report.limits[0].utilization);
+                received.len() == 1
+            };
+            plane.arrived.notify_one();
+            if first && plane.holds_first {
+                plane.release.notified().await;
+            }
+            if plane.refuses {
+                return Err(crate::api::ClientError::Unavailable(
+                    "the control plane is not there".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+}
+
+/// The fixture's session sending its usage reports to `plane`, with the
+/// reporter its engine was given.
+fn usage_session<'a>(
+    fixture: &'a mut Fixture,
+    plane: &Arc<UsageControlPlane>,
+) -> (&'a mut Session, Arc<dyn UsageReporter>) {
+    let reporter = fixture
+        .agent
+        .usage
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the session's usage reporter");
+    let session = &mut fixture.session;
+    session.usage_sender = Some(Arc::new(UsageControlPlaneSender(Arc::clone(plane))));
+    (session, reporter)
+}
+
+/// Waits until `send` ended.
+async fn sent(send: Option<JoinHandle<()>>) {
+    tokio::time::timeout(PATIENCE, send.expect("a send under way"))
+        .await
+        .expect("the send ends")
+        .expect("the send does not panic");
 }
 
 /// Covers AE3. The usage limits a step reports leave the control loop
 /// once, the latest only, in a task of their own. A control plane that
-/// cannot be reached costs the step nothing and leaves the link's backoff
-/// as it was: the report is dropped, not retried.
+/// refuses them costs the step nothing and leaves the link's backoff as it
+/// was: the report is dropped, not retried.
 #[tokio::test]
 async fn only_the_latest_usage_report_is_sent_once_and_a_failure_leaves_the_link_alone() {
     let root = TempRoot::new();
     let mut fixture = reporting(&root);
-    // A credential, for a control plane that is not there.
-    fs::write(root.0.join("no-credential"), "credential\n").unwrap();
+    let plane = UsageControlPlane::refusing();
 
     assert_eq!(fixture.begin().await, None);
     fixture.settled().await;
     assert_eq!(fixture.status(), ExecutionStatus::Completed);
 
-    let session = &mut fixture.session;
+    let (session, _) = usage_session(&mut fixture, &plane);
     let (failures, next_attempt) = (session.link.failures, session.link.next_attempt);
     assert_eq!(
         waiting_usage(session),
@@ -808,22 +892,15 @@ async fn only_the_latest_usage_report_is_sent_once_and_a_failure_leaves_the_link
         "only the latest waits"
     );
 
-    let sent = forward_usage(session)
-        .await
-        .expect("one attempt to send it");
-    tokio::time::timeout(PATIENCE, sent)
-        .await
-        .expect("the attempt ends")
-        .expect("the attempt does not panic");
+    sent(forward_usage(session).await).await;
 
+    assert_eq!(plane.received(), vec![0.2], "one attempt to send it");
     assert!(
         session.usage.waiting().is_empty(),
         "nothing is left to send again"
     );
-    assert!(
-        session.usage.forward(session.link.client()).is_none(),
-        "no retry"
-    );
+    let sender = session.usage_sender();
+    assert!(session.usage.forward(sender).is_none(), "no retry");
     assert_eq!(session.link.failures, failures);
     assert_eq!(session.link.next_attempt, next_attempt);
 }
@@ -850,124 +927,6 @@ async fn without_a_client_the_usage_report_is_dropped() {
     assert_eq!(session.link.next_attempt, next_attempt);
 }
 
-/// A control plane on a local port that records the utilization of every
-/// usage report it receives, in order, and holds its answer to the first
-/// one until `release` is opened.
-struct UsageServer {
-    url: String,
-    received: Arc<Mutex<Vec<f64>>>,
-    arrived: Arc<Notify>,
-    release: Arc<Notify>,
-}
-
-impl UsageServer {
-    async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a local port");
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let arrived = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let (seen, signal, held) = (received.clone(), arrived.clone(), release.clone());
-        tokio::spawn(async move {
-            while let Ok((connection, _)) = listener.accept().await {
-                let (seen, signal, held) = (seen.clone(), signal.clone(), held.clone());
-                tokio::spawn(Self::serve(connection, seen, signal, held));
-            }
-        });
-        Self {
-            url,
-            received,
-            arrived,
-            release,
-        }
-    }
-
-    /// Answers the requests of one connection with no content.
-    async fn serve(
-        mut connection: tokio::net::TcpStream,
-        received: Arc<Mutex<Vec<f64>>>,
-        arrived: Arc<Notify>,
-        release: Arc<Notify>,
-    ) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut buffer = Vec::new();
-        loop {
-            let Some(head_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
-                let mut chunk = [0u8; 4096];
-                match connection.read(&mut chunk).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                }
-                continue;
-            };
-            let head = String::from_utf8_lossy(&buffer[..head_end]).to_lowercase();
-            let length: usize = head
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .map(|value| value.trim().parse().expect("a length"))
-                .unwrap_or(0);
-            let body_start = head_end + 4;
-            while buffer.len() < body_start + length {
-                let mut chunk = [0u8; 4096];
-                match connection.read(&mut chunk).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                }
-            }
-            let report: HarnessUsageReport =
-                serde_json::from_slice(&buffer[body_start..body_start + length])
-                    .expect("a usage report");
-            buffer.drain(..body_start + length);
-            let first = {
-                let mut received = received.lock().unwrap();
-                received.push(report.limits[0].utilization);
-                received.len() == 1
-            };
-            arrived.notify_one();
-            if first {
-                release.notified().await;
-            }
-            let answer = b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n";
-            if connection.write_all(answer).await.is_err() {
-                return;
-            }
-        }
-    }
-
-    fn received(&self) -> Vec<f64> {
-        self.received.lock().unwrap().clone()
-    }
-}
-
-/// The fixture's session pointed at `server`, with the reporter its engine
-/// was given.
-fn usage_session<'a>(
-    fixture: &'a mut Fixture,
-    server: &UsageServer,
-) -> (&'a mut Session, Arc<dyn UsageReporter>) {
-    let reporter = fixture
-        .agent
-        .usage
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("the session's usage reporter");
-    let session = &mut fixture.session;
-    session.link.base_url = server.url.clone();
-    session.link.client = None;
-    (session, reporter)
-}
-
-/// Waits until `send` ended.
-async fn sent(send: Option<JoinHandle<()>>) {
-    tokio::time::timeout(PATIENCE, send.expect("a send under way"))
-        .await
-        .expect("the send ends")
-        .expect("the send does not panic");
-}
-
 /// A newer usage report waits while an older one is still on its way, and
 /// goes out only after it: the control plane, which keeps whichever report
 /// came last, ends with the newer one.
@@ -975,23 +934,23 @@ async fn sent(send: Option<JoinHandle<()>>) {
 async fn a_newer_usage_report_waits_for_the_send_under_way_and_arrives_last() {
     let root = TempRoot::new();
     let mut fixture = reporting(&root);
-    let server = UsageServer::start().await;
-    fs::write(root.0.join("no-credential"), "credential\n").unwrap();
+    let plane = UsageControlPlane::holding();
 
     assert_eq!(fixture.begin().await, None);
     fixture.settled().await;
-    let (session, reporter) = usage_session(&mut fixture, &server);
+    let (session, reporter) = usage_session(&mut fixture, &plane);
 
     let first = forward_usage(session).await;
     assert!(first.is_some(), "the first send starts");
-    tokio::time::timeout(PATIENCE, server.arrived.notified())
+    tokio::time::timeout(PATIENCE, plane.arrived.notified())
         .await
         .expect("the first report reaches the control plane");
-    assert_eq!(server.received(), vec![0.2]);
+    assert_eq!(plane.received(), vec![0.2]);
 
     reporter.report(usage_report(0.3));
+    let sender = session.usage_sender();
     assert!(
-        session.usage.forward(session.link.client()).is_none(),
+        session.usage.forward(sender).is_none(),
         "no second send while the first is on its way"
     );
     assert_eq!(
@@ -1000,12 +959,12 @@ async fn a_newer_usage_report_waits_for_the_send_under_way_and_arrives_last() {
         "the newer report waits"
     );
 
-    server.release.notify_one();
+    plane.release.notify_one();
     sent(first).await;
     sent(forward_usage(session).await).await;
 
     assert_eq!(
-        server.received(),
+        plane.received(),
         vec![0.2, 0.3],
         "the newer one arrives last"
     );
@@ -1018,12 +977,11 @@ async fn a_newer_usage_report_waits_for_the_send_under_way_and_arrives_last() {
 async fn the_latest_report_of_each_harness_reaches_the_control_plane() {
     let root = TempRoot::new();
     let mut fixture = reporting(&root);
-    let server = UsageServer::start().await;
-    fs::write(root.0.join("no-credential"), "credential\n").unwrap();
+    let plane = UsageControlPlane::holding();
 
     assert_eq!(fixture.begin().await, None);
     fixture.settled().await;
-    let (session, reporter) = usage_session(&mut fixture, &server);
+    let (session, reporter) = usage_session(&mut fixture, &plane);
     reporter.report(harness_usage_report("codex", 0.5));
     reporter.report(usage_report(0.6));
     assert_eq!(
@@ -1031,11 +989,11 @@ async fn the_latest_report_of_each_harness_reaches_the_control_plane() {
         [("claude-code".to_string(), 0.6), ("codex".to_string(), 0.5)]
     );
 
-    server.release.notify_one();
+    plane.release.notify_one();
     sent(forward_usage(session).await).await;
     sent(forward_usage(session).await).await;
 
-    assert_eq!(server.received(), vec![0.6, 0.5]);
+    assert_eq!(plane.received(), vec![0.6, 0.5]);
     assert!(session.usage.waiting().is_empty());
 }
 

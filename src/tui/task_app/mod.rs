@@ -108,12 +108,13 @@ pub mod tabs;
 pub mod usage;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::stream::{BoxStream, StreamExt as _};
 
-use crate::api::{reconnect_delay, ApiClient, ClientError, HarnessSelectionSnapshot};
+use crate::api::{reconnect_delay, ApiClient, ClientError, HarnessSelectionSnapshot, UsageSource};
 use crate::controller_protocol::{
     CapabilitiesView, ControlEventEnvelope, CreateRepositoryRequest, MoveTaskRequest,
     TaskListResponse,
@@ -480,6 +481,9 @@ pub struct TaskApp {
     refresh_again: bool,
     /// The usage limits of the harnesses, as last read (U7); `None` before
     /// the first answer, after a failed read or when none is held.
+    /// Where the usage limits are read from: the client, unless a test
+    /// set another.
+    usage_source: Arc<dyn UsageSource>,
     harness_usage: Option<HarnessUsageResponse>,
     /// When the next read of the usage limits is due: at once, then a period
     /// after the previous read finished ([`usage::USAGE_PERIOD`]).
@@ -502,6 +506,7 @@ impl TaskApp {
         connection_name: impl Into<String>,
         refresh_interval: Option<Duration>,
     ) -> Self {
+        let usage_source: Arc<dyn UsageSource> = Arc::new(client.clone());
         Self {
             client,
             list: TaskList::new(),
@@ -535,6 +540,7 @@ impl TaskApp {
             queue_check: None,
             last_word: None,
             refresh_again: false,
+            usage_source,
             harness_usage: None,
             next_usage_at: Instant::now(),
         }

@@ -482,6 +482,7 @@ fn assemble_session(
         link,
         cache: snapshot::ConversationCache::default(),
         usage,
+        usage_sender: None,
         execution_id: None,
         directive: RunnerDirective::Continue,
         pass: None,
@@ -769,6 +770,9 @@ struct Session {
     /// The usage limits the engine's harnesses report, on their way to the
     /// control plane; the loop only drives it.
     usage: Arc<usage::UsageForwarder>,
+    /// What sends the usage reports in place of the link's client; `None`
+    /// in production, a test double in the tests.
+    usage_sender: Option<Arc<dyn usage::UsageSender>>,
     execution_id: Option<String>,
     directive: RunnerDirective,
     pass: Option<JoinHandle<Result<WorkflowExecution, EngineError>>>,
@@ -851,6 +855,17 @@ impl Decision {
 }
 
 impl Session {
+    /// What sends the next usage report: the injected sender, else the
+    /// link's client, when there is one.
+    fn usage_sender(&mut self) -> Option<Arc<dyn usage::UsageSender>> {
+        if let Some(sender) = &self.usage_sender {
+            return Some(Arc::clone(sender));
+        }
+        self.link
+            .client()
+            .map(|client| Arc::new(client) as Arc<dyn usage::UsageSender>)
+    }
+
     /// Decides how to continue, starts the work and drives it.
     async fn begin(&mut self, spec: &TaskLaunchSpec) -> Result<RunnerExit, RunnerError> {
         if let Some(exit) = self.start_work(spec).await? {
@@ -1383,7 +1398,8 @@ impl Session {
                 }
                 // Only once a report waits and no other is on its way.
                 () = self.usage.ready() => {
-                    self.usage.forward(self.link.client());
+                    let sender = self.usage_sender();
+                    self.usage.forward(sender);
                 }
                 _ = tokio::time::sleep_until(wake) => {}
             }

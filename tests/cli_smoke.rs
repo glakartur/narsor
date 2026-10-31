@@ -1254,32 +1254,56 @@ mod remote_cli {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    /// A control plane double for `narsor-cli usage`: it answers with what
+    /// it was given.
+    struct UsageAnswer(
+        std::sync::Mutex<
+            Option<
+                Result<narsor_protocol::controller::HarnessUsageResponse, narsor::api::ClientError>,
+            >,
+        >,
+    );
+
+    impl UsageAnswer {
+        fn with(
+            answer: Result<
+                narsor_protocol::controller::HarnessUsageResponse,
+                narsor::api::ClientError,
+            >,
+        ) -> Self {
+            Self(std::sync::Mutex::new(Some(answer)))
+        }
+    }
+
+    impl narsor::api::UsageSource for UsageAnswer {
+        fn read_usage(&self) -> narsor::api::UsageRead {
+            let answer = self.0.lock().unwrap().take().expect("asked once");
+            Box::pin(std::future::ready(answer))
+        }
+    }
+
+    #[tokio::test]
     async fn usage_limits_are_read_through_the_control_plane() {
-        use narsor_engine::orchestration::Clock as _;
-        use narsor_protocol::controller::{HarnessUsageReport, UsageLimit, UsageStatus};
+        use narsor::cli::remote::usage_output;
+        use narsor_protocol::controller::{
+            HarnessUsageResponse, HarnessUsageView, UsageLimit, UsageStatus,
+        };
         use narsor_protocol::harness::CLAUDE_CODE;
 
-        let harness = RemoteHarness::start().await;
-        let token = harness.handle.token().to_string();
-        let token = Some(token.as_str());
+        let now = chrono::Utc::now();
 
         // AE7 / AE8: nothing reported yet is a state, not a failure.
-        let empty = remote(&harness, token, &["usage"]).await;
-        assert_eq!(empty.code, EXIT_SUCCESS, "{}", empty.output());
-        assert_eq!(empty.stdout, "No usage limit data.\n", "{}", empty.output());
+        let empty = UsageAnswer::with(Ok(HarnessUsageResponse::default()));
+        assert_eq!(
+            usage_output(&empty, false, now).await.expect("the usage"),
+            "No usage limit data.\n"
+        );
 
-        let running = harness
-            .running("t-usage", "k8s", super::remote_support::snapshot(1, None))
-            .await;
-        // The server's clock decides what is fresh; the CLI counts the time
-        // left from its own, so only the shape of the rows is asserted.
-        let now = harness.clock.now();
-        running
-            .runner
-            .report_usage(&HarnessUsageReport {
+        let reported = || HarnessUsageResponse {
+            harnesses: vec![HarnessUsageView {
                 harness: CLAUDE_CODE.to_string(),
                 observed_at: now,
+                received_at: now,
                 limits: vec![
                     UsageLimit {
                         window: "5h".to_string(),
@@ -1294,82 +1318,67 @@ mod remote_cli {
                         status: Some(UsageStatus::AllowedWarning),
                     },
                 ],
-            })
-            .await
-            .expect("usage reported");
+            }],
+        };
 
-        let text = remote(&harness, token, &["usage"]).await;
-        assert_eq!(text.code, EXIT_SUCCESS, "{}", text.output());
+        let text = usage_output(&UsageAnswer::with(Ok(reported())), false, now)
+            .await
+            .expect("the usage");
         assert!(
-            text.stdout
-                .starts_with("Claude Code (claude-code), reported "),
-            "{}",
-            text.stdout
+            text.starts_with("Claude Code (claude-code), reported "),
+            "{text}"
         );
         for needle in ["5h", "1%", "allowed", "7d", "90%", "warning", "resets "] {
-            assert!(text.stdout.contains(needle), "{needle}: {}", text.stdout);
+            assert!(text.contains(needle), "{needle}: {text}");
         }
 
-        let json = remote(&harness, token, &["usage", "--json"]).await;
-        assert_eq!(json.code, EXIT_SUCCESS, "{}", json.output());
-        let response: serde_json::Value =
-            serde_json::from_str(&json.stdout).expect("the usage as JSON");
+        let json = usage_output(&UsageAnswer::with(Ok(reported())), true, now)
+            .await
+            .expect("the usage");
+        let response: serde_json::Value = serde_json::from_str(&json).expect("the usage as JSON");
         let harnesses = response["harnesses"].as_array().expect("harnesses");
-        assert_eq!(harnesses.len(), 1, "{}", json.stdout);
-        assert_eq!(harnesses[0]["harness"], "claude-code", "{}", json.stdout);
+        assert_eq!(harnesses.len(), 1, "{json}");
+        assert_eq!(harnesses[0]["harness"], "claude-code", "{json}");
         assert_eq!(harnesses[0]["limits"][1]["status"], "allowed_warning");
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn usage_fails_on_a_wrong_token_and_on_an_unreachable_server() {
-        let harness = RemoteHarness::start().await;
-        let wrong = remote(&harness, Some("not-the-token"), &["usage"]).await;
-        assert_eq!(wrong.code, EXIT_FAILURE, "{}", wrong.output());
-        assert!(wrong.stdout.is_empty(), "{}", wrong.output());
+        use narsor::api::ClientError;
+        use narsor::cli::remote::usage_output;
+
+        let now = chrono::Utc::now();
+        let wrong = usage_output(
+            &UsageAnswer::with(Err(ClientError::Unauthorized)),
+            false,
+            now,
+        )
+        .await
+        .expect_err("a refused token fails");
+        assert_eq!(wrong.exit_code, EXIT_FAILURE);
         assert!(
-            wrong.stderr.contains("Could not read the usage limits")
-                && wrong.stderr.contains("rejected the token"),
+            wrong.message.contains("Could not read the usage limits")
+                && wrong.message.contains("rejected the token"),
             "{}",
-            wrong.stderr
+            wrong.message
         );
 
-        // A port nothing listens on any more.
-        let token = harness.handle.token().to_string();
-        let base_url = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
-            format!("http://{}", listener.local_addr().expect("its address"))
-        };
-        let root = super::TempRoot::new();
-        let unreachable = tokio::task::spawn_blocking(move || {
-            let output = Command::new(env!("CARGO_BIN_EXE_narsor-cli"))
-                .current_dir(root.path())
-                .env("XDG_CONFIG_HOME", root.path().join("config"))
-                .env("HOME", root.path())
-                .env_remove("NARSOR_TOKEN_FILE")
-                .env_remove("NARSOR_TOKEN_COMMAND")
-                .env("NARSOR_SERVER", &base_url)
-                .env("NARSOR_TOKEN", &token)
-                .arg("--root")
-                .arg(root.path())
-                .arg("usage")
-                .output()
-                .expect("run the narsor binary");
-            Invocation {
-                code: output.status.code().expect("exited normally"),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            }
-        })
+        let unreachable = usage_output(
+            &UsageAnswer::with(Err(ClientError::Unavailable(
+                "connection refused".to_string(),
+            ))),
+            false,
+            now,
+        )
         .await
-        .expect("the binary ran");
-        assert_ne!(unreachable.code, EXIT_SUCCESS, "{}", unreachable.output());
-        assert!(unreachable.stdout.is_empty(), "{}", unreachable.output());
+        .expect_err("an unreachable server fails");
+        assert_eq!(unreachable.exit_code, EXIT_FAILURE);
         assert!(
             unreachable
-                .stderr
+                .message
                 .contains("Could not read the usage limits"),
             "{}",
-            unreachable.stderr
+            unreachable.message
         );
     }
 

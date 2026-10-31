@@ -19,11 +19,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-use narsor::api::ApiClient;
+use narsor::api::{ApiClient, ClientError, UsageRead, UsageSource};
 use narsor::tui::spinner::Spinner;
 use narsor::tui::style::Styles;
 use narsor::tui::task_app::background::OpeningKind;
 use narsor::tui::task_app::{layout, Request, TaskApp, ViewKind};
+use narsor_protocol::controller::HarnessUsageResponse;
 
 mod task_app_support;
 use task_app_support::{archived, listing, task, timeline};
@@ -588,15 +589,13 @@ async fn an_opening_harness_list_waits_for_its_read_and_then_opens_over_it() {
 // The usage limits of the harnesses (U7): read at start and every 15 s, on a
 // clock of their own.
 
-const USAGE: &str = "/control/v1/usage";
-
 /// Fifteen seconds and a little: the period of the usage limits has passed.
 fn past_the_period() -> Instant {
     Instant::now() + Duration::from_secs(15) + Duration::from_millis(100)
 }
 
-fn claude_usage() -> serde_json::Value {
-    serde_json::json!({
+fn claude_usage() -> HarnessUsageResponse {
+    serde_json::from_value(serde_json::json!({
         "harnesses": [{
             "harness": "claude-code",
             "observed_at": "2026-10-31T12:00:00Z",
@@ -607,21 +606,98 @@ fn claude_usage() -> serde_json::Value {
                  "status": "allowed_warning"}
             ]
         }]
-    })
+    }))
+    .expect("a usage answer")
+}
+
+/// A source of usage limits the test drives, in place of the server: it
+/// counts the reads started and answers each with what it holds when the
+/// read runs — `None` is a failed read. A gated one answers only once the
+/// test adds a permit to its gate.
+struct UsageDouble {
+    answer: Arc<Mutex<Option<HarnessUsageResponse>>>,
+    gate: Option<Arc<Semaphore>>,
+    reads: AtomicUsize,
+}
+
+impl UsageDouble {
+    fn answering(answer: HarnessUsageResponse) -> Arc<Self> {
+        Arc::new(Self {
+            answer: Arc::new(Mutex::new(Some(answer))),
+            gate: None,
+            reads: AtomicUsize::new(0),
+        })
+    }
+
+    /// A double whose reads wait for the returned gate.
+    fn gated(answer: HarnessUsageResponse) -> (Arc<Self>, Arc<Semaphore>) {
+        let gate = Arc::new(Semaphore::new(0));
+        let double = Arc::new(Self {
+            answer: Arc::new(Mutex::new(Some(answer))),
+            gate: Some(Arc::clone(&gate)),
+            reads: AtomicUsize::new(0),
+        });
+        (double, gate)
+    }
+
+    fn answer(&self, answer: Option<HarnessUsageResponse>) {
+        *self.answer.lock().unwrap() = answer;
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+
+    /// Waits until `reads` reads have started.
+    async fn reached(&self, reads: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.reads() < reads {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the reads start");
+    }
+}
+
+impl UsageSource for UsageDouble {
+    fn read_usage(&self) -> UsageRead {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let (answer, gate) = (Arc::clone(&self.answer), self.gate.clone());
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.acquire().await.expect("an open gate").forget();
+            }
+            answer
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| ClientError::Server("the read failed".to_string()))
+        })
+    }
+}
+
+/// An application that reads its usage limits from `usage` and has no
+/// server: nothing but the usage limits is read.
+fn app_reading(usage: &Arc<UsageDouble>) -> TaskApp {
+    let nowhere = ApiClient::new(SocketAddr::from(([127, 0, 0, 1], 9)), "token");
+    let mut app = TaskApp::new(nowhere, "local", None)
+        .with_usage_source(Arc::clone(usage) as Arc<dyn UsageSource>);
+    app.set_spinner(Spinner::braille());
+    app
 }
 
 #[tokio::test]
 async fn the_usage_limits_are_read_at_start_and_again_after_fifteen_seconds() {
-    let stub = Stub::start().await;
-    stub.open(USAGE, claude_usage());
-    let mut app = app_over(&stub);
+    let usage = UsageDouble::answering(claude_usage());
+    let mut app = app_reading(&usage);
 
     assert!(app.start_usage_if_due(Instant::now()));
     app.drain_jobs().await;
-    assert_eq!(stub.hits(USAGE), 1);
-    let usage = app.harness_usage().expect("the limits that were read");
-    assert_eq!(usage.harnesses[0].harness, "claude-code");
-    assert_eq!(usage.harnesses[0].limits.len(), 2);
+    assert_eq!(usage.reads(), 1);
+    let read = app.harness_usage().expect("the limits that were read");
+    assert_eq!(read.harnesses[0].harness, "claude-code");
+    assert_eq!(read.harnesses[0].limits.len(), 2);
 
     // Not before the period has passed since the read finished.
     assert!(!app.start_usage_if_due(Instant::now()));
@@ -630,32 +706,30 @@ async fn the_usage_limits_are_read_at_start_and_again_after_fifteen_seconds() {
 
     assert!(app.start_usage_if_due(past_the_period()));
     app.drain_jobs().await;
-    assert_eq!(stub.hits(USAGE), 2);
+    assert_eq!(usage.reads(), 2);
 }
 
 #[tokio::test]
 async fn the_usage_limits_are_read_when_the_list_is_never_read_again() {
-    let stub = Stub::start().await;
-    stub.open(USAGE, claude_usage());
+    let usage = UsageDouble::answering(claude_usage());
     // `NARSOR_TUI_REFRESH_INTERVAL=none`: no period for the list.
-    let mut app = TaskApp::new(stub.client(), "local", None);
+    let mut app = app_reading(&usage);
     assert_eq!(app.next_refresh_due(), None);
 
     assert!(app.start_usage_if_due(Instant::now()));
     app.drain_jobs().await;
     assert!(app.start_usage_if_due(past_the_period()));
     app.drain_jobs().await;
-    assert_eq!(stub.hits(USAGE), 2);
+    assert_eq!(usage.reads(), 2);
 }
 
 #[tokio::test]
 async fn a_usage_read_that_hangs_keeps_no_key_waiting_and_starts_no_second_read() {
-    let stub = Stub::start().await;
-    let gate = stub.gated(USAGE, claude_usage());
-    let mut app = app_over(&stub);
+    let (usage, gate) = UsageDouble::gated(claude_usage());
+    let mut app = app_reading(&usage);
 
     assert!(app.start_usage_if_due(Instant::now()));
-    stub.reached(USAGE, 1).await;
+    usage.reached(1).await;
     assert!(app.is_reading_usage() && app.has_running());
     // Nothing on the screen waits for it: no marker moves.
     assert!(!app.is_loading());
@@ -663,7 +737,7 @@ async fn a_usage_read_that_hangs_keeps_no_key_waiting_and_starts_no_second_read(
 
     assert!(!app.start_usage_if_due(past_the_period()));
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(stub.hits(USAGE), 1);
+    assert_eq!(usage.reads(), 1);
 
     // A key is handled before the answer.
     press(&mut app, KeyCode::Char('?'));
@@ -678,16 +752,17 @@ async fn a_usage_read_that_hangs_keeps_no_key_waiting_and_starts_no_second_read(
 #[tokio::test]
 async fn a_failed_usage_read_clears_the_limits_and_leaves_the_connection_alone() {
     let stub = Stub::start().await;
-    let mut app = app_with_list(&stub).await;
-    stub.open(USAGE, claude_usage());
+    let usage = UsageDouble::answering(claude_usage());
+    let mut app = app_with_list(&stub)
+        .await
+        .with_usage_source(Arc::clone(&usage) as Arc<dyn UsageSource>);
     assert!(app.start_usage_if_due(Instant::now()));
     app.drain_jobs().await;
     assert!(app.harness_usage().is_some());
     let link = app.connection().state();
     let notice = app.notifier().latest().map(|notice| notice.text.clone());
 
-    let gate = stub.failing(USAGE);
-    gate.add_permits(1);
+    usage.answer(None);
     assert!(app.start_usage_if_due(past_the_period()));
     app.drain_jobs().await;
 
@@ -703,15 +778,14 @@ async fn a_failed_usage_read_clears_the_limits_and_leaves_the_connection_alone()
 
 #[tokio::test]
 async fn an_empty_usage_answer_forgets_the_harness_shown_before() {
-    let stub = Stub::start().await;
-    stub.open(USAGE, claude_usage());
-    let mut app = app_over(&stub);
+    let usage = UsageDouble::answering(claude_usage());
+    let mut app = app_reading(&usage);
     assert!(app.start_usage_if_due(Instant::now()));
     app.drain_jobs().await;
     assert!(app.harness_usage().is_some());
 
     // AE8: the report expired on the server; the interface keeps nothing.
-    stub.open(USAGE, serde_json::json!({"harnesses": []}));
+    usage.answer(Some(HarnessUsageResponse::default()));
     assert!(app.start_usage_if_due(past_the_period()));
     app.drain_jobs().await;
     assert_eq!(app.harness_usage(), None);
@@ -720,11 +794,13 @@ async fn an_empty_usage_answer_forgets_the_harness_shown_before() {
 #[tokio::test]
 async fn a_usage_answer_closes_no_dialog_and_moves_no_focus() {
     let stub = Stub::start().await;
-    let mut app = app_with_list(&stub).await;
-    let gate = stub.gated(USAGE, claude_usage());
+    let (usage, gate) = UsageDouble::gated(claude_usage());
+    let mut app = app_with_list(&stub)
+        .await
+        .with_usage_source(Arc::clone(&usage) as Arc<dyn UsageSource>);
 
     assert!(app.start_usage_if_due(Instant::now()));
-    stub.reached(USAGE, 1).await;
+    usage.reached(1).await;
     press(&mut app, KeyCode::Char('.'));
     assert!(app.overlay().is_some(), "the action menu is open");
     let focus = app.focus();

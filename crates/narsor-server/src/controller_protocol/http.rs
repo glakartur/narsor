@@ -115,6 +115,11 @@ const MAX_CONTROLLER_BODY: usize = 1024 * 1024;
 /// few limits; anything larger is refused before it is read.
 const MAX_USAGE_REPORT_BODY: usize = 16 * 1024;
 
+/// The body limit of `POST /runner/v1/usage`.
+fn usage_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(MAX_USAGE_REPORT_BODY)
+}
+
 /// Owner-facing routes. They expect the caller's [`OwnerRef`] in the
 /// request extensions, put there by the API's owner gate.
 pub fn owner_routes<S>(service: Service) -> Router<S>
@@ -226,7 +231,7 @@ where
         .route("/runner/v1/poll", get(get_poll))
         .route(
             "/runner/v1/usage",
-            post(post_usage).layer(DefaultBodyLimit::max(MAX_USAGE_REPORT_BODY)),
+            post(post_usage).layer(usage_body_limit()),
         )
         .route("/runner/v1/inputs/{input_id}/ack", post(post_input_ack))
         .route(
@@ -1023,4 +1028,75 @@ async fn post_runner_material_ack(
         &material_id,
         request,
     )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    fn report_json() -> serde_json::Value {
+        let resets_at = chrono::Utc::now() + chrono::Duration::hours(4);
+        serde_json::to_value(HarnessUsageReport {
+            harness: "claude-code".to_string(),
+            observed_at: chrono::Utc::now(),
+            limits: vec![UsageLimit {
+                window: "5h".to_string(),
+                utilization: 0.2,
+                resets_at,
+                status: None,
+            }],
+        })
+        .unwrap()
+    }
+
+    /// The usage route's body limit in front of a handler that reads the
+    /// report as `post_usage` does.
+    async fn post_to_the_usage_limit(body: &serde_json::Value) -> StatusCode {
+        let router = Router::new().route(
+            "/",
+            post(|Json(_): Json<HarnessUsageReport>| async { StatusCode::NO_CONTENT })
+                .layer(usage_body_limit()),
+        );
+        let request = Request::post("/")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        router.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn a_usage_report_over_sixteen_kib_is_refused_before_it_is_read() {
+        let mut oversized = report_json();
+        oversized["padding"] = serde_json::Value::String("x".repeat(16 * 1024));
+
+        assert_eq!(
+            post_to_the_usage_limit(&oversized).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_usage_report_of_a_normal_size_passes_the_limit() {
+        assert_eq!(
+            post_to_the_usage_limit(&report_json()).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_usage_report_is_a_400_with_its_code() {
+        let response = HttpProtocolError(ProtocolError::bad_request(
+            "invalid_usage_report",
+            "the harness is not known",
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: RequestErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "invalid_usage_report");
+    }
 }

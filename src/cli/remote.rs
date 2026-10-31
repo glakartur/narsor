@@ -28,7 +28,7 @@ use super::task_text::{
 };
 use crate::api::{
     ApiClient, ClientError, ConversationResponse as PageResponse, HumanInputDeliveryDto,
-    ServerTarget, TokenSource,
+    ServerTarget, TokenSource, UsageSource,
 };
 use crate::conductor::{ChatAuthor, ChatEntry, ConductorView};
 use crate::config::Flags;
@@ -1851,18 +1851,28 @@ pub async fn harness(
 /// as text in local time or, with `json`, the server's whole answer.
 pub async fn usage(json: bool, target: &ServerTarget, state: &Path, flags: &Flags) -> Result<()> {
     let client = client(target, state, flags).await?;
-    let response = client
-        .control_usage()
+    print!("{}", usage_output(&client, json, chrono::Utc::now()).await?);
+    Ok(())
+}
+
+/// What `narsor-cli usage` prints, read from `source`: the text, with the
+/// time left counted from `now`, or with `json` the whole answer.
+pub async fn usage_output(
+    source: &dyn UsageSource,
+    json: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<String> {
+    let response = source
+        .read_usage()
         .await
         .map_err(|error| failure("Could not read the usage limits", error))?;
     if json {
-        println!("{}", json_output(&response)?);
-        return Ok(());
+        return Ok(format!("{}\n", json_output(&response)?));
     }
-    for line in usage_lines(&response, chrono::Utc::now(), &chrono::Local) {
-        println!("{}", line.text);
-    }
-    Ok(())
+    Ok(usage_lines(&response, now, &chrono::Local)
+        .into_iter()
+        .map(|line| line.text + "\n")
+        .collect())
 }
 
 /// Runs one `narsor auth` command.

@@ -33,6 +33,7 @@
 //! span by span so every visible part keeps its look, and closed with `…`.
 //! Text from the server goes through [`one_line`].
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -42,7 +43,7 @@ use narsor_protocol::controller::{
 use narsor_protocol::harness;
 use ratatui::text::Span;
 
-use crate::api::ClientError;
+use crate::api::{ClientError, UsageSource};
 use crate::usage_text::{percent, time_to_reset};
 
 use super::super::scroll::one_line;
@@ -58,6 +59,14 @@ impl TaskApp {
     /// failed read, and when the server holds no fresh report.
     pub fn harness_usage(&self) -> Option<&HarnessUsageResponse> {
         self.harness_usage.as_ref()
+    }
+
+    /// Reads the usage limits from `source` in place of the client: what a
+    /// test of the reads sets.
+    #[must_use]
+    pub fn with_usage_source(mut self, source: Arc<dyn UsageSource>) -> Self {
+        self.usage_source = source;
+        self
     }
 
     /// Takes `usage` in as an answer of the server would: what a test of the
@@ -85,9 +94,9 @@ impl TaskApp {
         if now < self.next_usage_at {
             return false;
         }
-        let client = self.client.clone();
+        let source = Arc::clone(&self.usage_source);
         self.background.start(JobKey::Usage, async move {
-            let read = client.control_usage().await;
+            let read = source.read_usage().await;
             Outcome::new(move |app: &mut TaskApp| app.on_usage_read(read, Instant::now()))
         })
     }

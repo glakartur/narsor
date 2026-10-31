@@ -1581,6 +1581,25 @@ fn material_sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
+/// One read of the usage limits, ready to be awaited anywhere.
+pub type UsageRead = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<HarnessUsageResponse, ClientError>> + Send>,
+>;
+
+/// Where the usage limits of the harnesses are read from: the control plane
+/// through an [`ApiClient`], or a test double.
+pub trait UsageSource: Send + Sync {
+    /// Reads the usage limits as [`ApiClient::control_usage`] does.
+    fn read_usage(&self) -> UsageRead;
+}
+
+impl UsageSource for ApiClient {
+    fn read_usage(&self) -> UsageRead {
+        let client = self.clone();
+        Box::pin(async move { client.control_usage().await })
+    }
+}
+
 #[cfg(test)]
 mod material_transfer_tests {
     use super::{material_blob_order, material_sha256_hex};

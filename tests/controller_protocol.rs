@@ -4159,7 +4159,7 @@ async fn a_reader_may_not_write_anything() {
     ));
     assert!(matches!(
         reader
-            .report_usage(&claude_report(&harness, 0.2, 0.1))
+            .report_usage(&claude_report(&harness.clock, 0.2, 0.1))
             .await,
         Err(ClientError::Forbidden)
     ));
@@ -7796,6 +7796,33 @@ async fn a_revoked_workstation_controller_is_refused_and_can_be_replaced() {
 // Harness usage limits (U4, U5)
 // ---------------------------------------------------------------------------
 
+/// A protocol service on its own, with no server in front of it: the usage
+/// tests drive it directly. The HTTP binding of the usage route (its body
+/// limit, its 400) is tested in the server's `http` module.
+struct UsagePlane {
+    _root: TempRoot,
+    clock: Arc<ManualClock>,
+    service: ProtocolService,
+}
+
+impl UsagePlane {
+    fn new() -> Self {
+        let root = TempRoot::new();
+        let clock = ManualClock::new();
+        let control = ControlPlane::with_clock(StatePaths::new(root.path()), clock.clone());
+        let service = ProtocolService::with_config(
+            control,
+            environment_support::seeded_resolver(root.path()),
+            test_config(),
+        );
+        Self {
+            _root: root,
+            clock,
+            service,
+        }
+    }
+}
+
 fn usage_limit(window: &str, utilization: f64, resets_at: DateTime<Utc>) -> UsageLimit {
     UsageLimit {
         window: window.to_string(),
@@ -7820,8 +7847,8 @@ fn usage_report(
 /// Claude Code's two windows as the server's clock reads now: `5h` resets
 /// in 4h10m, `7d` in 2d3h. The recordings reset too far ahead of the
 /// test clock for the server to accept them.
-fn claude_report(harness: &Harness, five_hours: f64, seven_days: f64) -> HarnessUsageReport {
-    let now = harness.clock.now();
+fn claude_report(clock: &ManualClock, five_hours: f64, seven_days: f64) -> HarnessUsageReport {
+    let now = clock.now();
     usage_report(
         "claude-code",
         now,
@@ -7859,72 +7886,72 @@ fn windows(view: &HarnessUsageView) -> Vec<&str> {
 /// Covers AE7.
 #[tokio::test]
 async fn usage_without_a_report_is_empty() {
-    let harness = Harness::start().await;
-    assert!(harness.service.harness_usage().harnesses.is_empty());
+    let plane = UsagePlane::new();
+    assert!(plane.service.harness_usage().harnesses.is_empty());
 }
 
 /// Covers AE2.
 #[tokio::test]
 async fn the_last_usage_report_of_a_harness_replaces_the_earlier_one() {
-    let harness = Harness::start().await;
-    harness
+    let plane = UsagePlane::new();
+    plane
         .service
-        .runner_usage(&worker(), claude_report(&harness, 0.2, 0.1))
+        .runner_usage(&worker(), claude_report(&plane.clock, 0.2, 0.1))
         .unwrap();
-    harness.clock.advance(Duration::minutes(1));
-    let second = claude_report(&harness, 0.4, 0.3);
-    harness
+    plane.clock.advance(Duration::minutes(1));
+    let second = claude_report(&plane.clock, 0.4, 0.3);
+    plane
         .service
         .runner_usage(&worker(), second.clone())
         .unwrap();
 
-    let usage = harness.service.harness_usage();
+    let usage = plane.service.harness_usage();
     assert_eq!(usage.harnesses.len(), 1);
     let claude = &usage.harnesses[0];
     assert_eq!(claude.harness, "claude-code");
     assert_eq!(claude.observed_at, second.observed_at);
-    assert_eq!(claude.received_at, harness.clock.now());
+    assert_eq!(claude.received_at, plane.clock.now());
     assert_eq!(claude.limits, second.limits);
 }
 
 /// Covers AE8: the state lives 15 minutes from when the server received it.
 #[tokio::test]
 async fn harness_usage_expires_fifteen_minutes_after_it_was_received() {
-    let harness = Harness::start().await;
-    harness
+    let plane = UsagePlane::new();
+    plane
         .service
-        .runner_usage(&worker(), claude_report(&harness, 0.2, 0.1))
+        .runner_usage(&worker(), claude_report(&plane.clock, 0.2, 0.1))
         .unwrap();
 
-    harness
+    plane
         .clock
         .advance(Duration::minutes(14) + Duration::seconds(59));
-    assert_eq!(harness.service.harness_usage().harnesses.len(), 1);
+    assert_eq!(plane.service.harness_usage().harnesses.len(), 1);
 
-    harness
+    plane
         .clock
         .advance(Duration::minutes(1) + Duration::seconds(1));
-    assert!(harness.service.harness_usage().harnesses.is_empty());
+    assert!(plane.service.harness_usage().harnesses.is_empty());
 }
 
 #[tokio::test]
 async fn usage_age_counts_from_receipt_not_from_observation() {
-    let harness = Harness::start().await;
-    let mut report = claude_report(&harness, 0.2, 0.1);
-    report.observed_at = harness.clock.now() - Duration::hours(1);
-    harness.service.runner_usage(&worker(), report).unwrap();
+    let plane = UsagePlane::new();
+    let mut report = claude_report(&plane.clock, 0.2, 0.1);
+    report.observed_at = plane.clock.now() - Duration::hours(1);
+    plane.service.runner_usage(&worker(), report).unwrap();
 
-    let usage = harness.service.harness_usage();
+    let usage = plane.service.harness_usage();
     assert_eq!(usage.harnesses.len(), 1);
-    assert_eq!(usage.harnesses[0].received_at, harness.clock.now());
+    assert_eq!(usage.harnesses[0].received_at, plane.clock.now());
 }
 
 /// Covers AE9.
 #[tokio::test]
 async fn a_limit_that_reset_is_dropped_and_the_others_stay() {
-    let harness = Harness::start().await;
-    let now = harness.clock.now();
-    harness
+    let plane = UsagePlane::new();
+    let now = plane.clock.now();
+    plane
         .service
         .runner_usage(
             &worker(),
@@ -7939,17 +7966,17 @@ async fn a_limit_that_reset_is_dropped_and_the_others_stay() {
         )
         .unwrap();
 
-    harness.clock.advance(Duration::minutes(5));
-    let usage = harness.service.harness_usage();
+    plane.clock.advance(Duration::minutes(5));
+    let usage = plane.service.harness_usage();
     assert_eq!(usage.harnesses.len(), 1);
     assert_eq!(windows(&usage.harnesses[0]), ["7d"]);
 }
 
 #[tokio::test]
 async fn a_harness_whose_limits_all_reset_is_not_shown() {
-    let harness = Harness::start().await;
-    let now = harness.clock.now();
-    harness
+    let plane = UsagePlane::new();
+    let now = plane.clock.now();
+    plane
         .service
         .runner_usage(
             &worker(),
@@ -7963,35 +7990,35 @@ async fn a_harness_whose_limits_all_reset_is_not_shown() {
             ),
         )
         .unwrap();
-    harness.clock.advance(Duration::minutes(4));
-    assert!(harness.service.harness_usage().harnesses.is_empty());
+    plane.clock.advance(Duration::minutes(4));
+    assert!(plane.service.harness_usage().harnesses.is_empty());
 }
 
 #[tokio::test]
 async fn a_report_with_a_past_reset_is_refused_and_removes_the_harness() {
-    let harness = Harness::start().await;
-    harness
+    let plane = UsagePlane::new();
+    plane
         .service
-        .runner_usage(&worker(), claude_report(&harness, 0.2, 0.1))
+        .runner_usage(&worker(), claude_report(&plane.clock, 0.2, 0.1))
         .unwrap();
-    harness
+    plane
         .service
         .runner_usage(
             &worker(),
             usage_report(
                 "codex",
-                harness.clock.now(),
+                plane.clock.now(),
                 vec![usage_limit(
                     "5h",
                     0.1,
-                    harness.clock.now() + Duration::hours(1),
+                    plane.clock.now() + Duration::hours(1),
                 )],
             ),
         )
         .unwrap();
-    let now = harness.clock.now();
+    let now = plane.clock.now();
 
-    let refused = harness.service.runner_usage(
+    let refused = plane.service.runner_usage(
         &worker(),
         usage_report(
             "claude-code",
@@ -8004,7 +8031,7 @@ async fn a_report_with_a_past_reset_is_refused_and_removes_the_harness() {
     );
 
     assert_eq!(usage_refusal(refused), "invalid_usage_report");
-    let usage = harness.service.harness_usage();
+    let usage = plane.service.harness_usage();
     let names: Vec<&str> = usage
         .harnesses
         .iter()
@@ -8015,23 +8042,23 @@ async fn a_report_with_a_past_reset_is_refused_and_removes_the_harness() {
 
 #[tokio::test]
 async fn a_limit_resetting_exactly_now_is_dropped() {
-    let harness = Harness::start().await;
-    let now = harness.clock.now();
-    harness
+    let plane = UsagePlane::new();
+    let now = plane.clock.now();
+    plane
         .service
         .runner_usage(
             &worker(),
             usage_report("claude-code", now, vec![usage_limit("5h", 0.2, now)]),
         )
         .unwrap();
-    assert!(harness.service.harness_usage().harnesses.is_empty());
+    assert!(plane.service.harness_usage().harnesses.is_empty());
 }
 
 #[tokio::test]
 async fn usage_comes_in_harness_order_with_the_shortest_window_first() {
-    let harness = Harness::start().await;
-    let now = harness.clock.now();
-    harness
+    let plane = UsagePlane::new();
+    let now = plane.clock.now();
+    plane
         .service
         .runner_usage(
             &worker(),
@@ -8042,7 +8069,7 @@ async fn usage_comes_in_harness_order_with_the_shortest_window_first() {
             ),
         )
         .unwrap();
-    harness
+    plane
         .service
         .runner_usage(
             &worker(),
@@ -8057,7 +8084,7 @@ async fn usage_comes_in_harness_order_with_the_shortest_window_first() {
         )
         .unwrap();
 
-    let usage = harness.service.harness_usage();
+    let usage = plane.service.harness_usage();
     let names: Vec<&str> = usage
         .harnesses
         .iter()
@@ -8069,13 +8096,10 @@ async fn usage_comes_in_harness_order_with_the_shortest_window_first() {
 
 #[tokio::test]
 async fn an_invalid_usage_report_is_refused_and_changes_nothing() {
-    let harness = Harness::start().await;
-    let held = claude_report(&harness, 0.2, 0.1);
-    harness
-        .service
-        .runner_usage(&worker(), held.clone())
-        .unwrap();
-    let now = harness.clock.now();
+    let plane = UsagePlane::new();
+    let held = claude_report(&plane.clock, 0.2, 0.1);
+    plane.service.runner_usage(&worker(), held.clone()).unwrap();
+    let now = plane.clock.now();
     let soon = now + Duration::hours(1);
     let one = |limit: UsageLimit| usage_report("claude-code", now, vec![limit]);
 
@@ -8118,22 +8142,22 @@ async fn an_invalid_usage_report_is_refused_and_changes_nothing() {
     }
     for (case, report) in invalid {
         assert_eq!(
-            usage_refusal(harness.service.runner_usage(&worker(), report)),
+            usage_refusal(plane.service.runner_usage(&worker(), report)),
             "invalid_usage_report",
             "{case}"
         );
     }
 
-    let usage = harness.service.harness_usage();
+    let usage = plane.service.harness_usage();
     assert_eq!(usage.harnesses.len(), 1);
     assert_eq!(usage.harnesses[0].limits, held.limits, "the state is kept");
 }
 
 #[tokio::test]
 async fn a_limit_resetting_far_in_the_future_is_accepted() {
-    let harness = Harness::start().await;
-    let now = harness.clock.now();
-    harness
+    let plane = UsagePlane::new();
+    let now = plane.clock.now();
+    plane
         .service
         .runner_usage(
             &worker(),
@@ -8144,136 +8168,42 @@ async fn a_limit_resetting_far_in_the_future_is_accepted() {
             ),
         )
         .unwrap();
-    assert_eq!(harness.service.harness_usage().harnesses.len(), 1);
+    assert_eq!(plane.service.harness_usage().harnesses.len(), 1);
 }
 
 #[tokio::test]
 async fn a_reader_may_not_report_usage() {
-    let harness = Harness::start().await;
+    let plane = UsagePlane::new();
     let reader = RunnerIdentity {
         role: RunnerRole::Reader,
         ..worker()
     };
     assert!(matches!(
-        harness
+        plane
             .service
-            .runner_usage(&reader, claude_report(&harness, 0.2, 0.1)),
+            .runner_usage(&reader, claude_report(&plane.clock, 0.2, 0.1)),
         Err(ProtocolError::Forbidden)
     ));
-    assert!(harness.service.harness_usage().harnesses.is_empty());
+    assert!(plane.service.harness_usage().harnesses.is_empty());
 }
 
-/// A runner reports over HTTP and the owner reads the same state back.
+/// What a runner reports is what the owner reads back, stamped with the
+/// time the control plane received it.
 #[tokio::test]
-async fn a_runners_usage_report_reaches_the_owner() {
-    let harness = Harness::start().await;
-    let running = harness.running("task-1", "k8s").await;
-    let report = claude_report(&harness, 0.42, 0.17);
+async fn a_runners_usage_report_is_what_the_owner_reads() {
+    let plane = UsagePlane::new();
+    let report = claude_report(&plane.clock, 0.42, 0.17);
 
-    running
-        .runner
-        .report_usage(&report)
-        .await
-        .expect("the server answers 204");
+    plane
+        .service
+        .runner_usage(&worker(), report.clone())
+        .expect("accepted");
 
-    let usage = harness.owner.control_usage().await.expect("usage");
+    let usage = plane.service.harness_usage();
     assert_eq!(usage.harnesses.len(), 1);
     let claude = &usage.harnesses[0];
     assert_eq!(claude.harness, "claude-code");
     assert_eq!(claude.observed_at, report.observed_at);
-    assert_eq!(claude.received_at, harness.clock.now());
+    assert_eq!(claude.received_at, plane.clock.now());
     assert_eq!(claude.limits, report.limits);
-}
-
-#[tokio::test]
-async fn an_invalid_usage_report_over_http_is_a_400_with_its_code() {
-    let harness = Harness::start().await;
-    let running = harness.running("task-1", "k8s").await;
-    let mut report = claude_report(&harness, 0.2, 0.1);
-    report.harness = "unknown".to_string();
-
-    assert_eq!(
-        bad_request_code(running.runner.report_usage(&report).await),
-        "invalid_usage_report"
-    );
-    let usage = harness.owner.control_usage().await.expect("usage");
-    assert!(usage.harnesses.is_empty());
-}
-
-#[tokio::test]
-async fn a_past_reset_over_http_is_a_400_and_the_owner_no_longer_sees_the_harness() {
-    let harness = Harness::start().await;
-    let running = harness.running("task-1", "k8s").await;
-    running
-        .runner
-        .report_usage(&claude_report(&harness, 0.2, 0.1))
-        .await
-        .expect("the server answers 204");
-    let now = harness.clock.now();
-    let stale = usage_report(
-        "claude-code",
-        now,
-        vec![usage_limit("5h", 0.3, now - Duration::minutes(1))],
-    );
-
-    assert_eq!(
-        bad_request_code(running.runner.report_usage(&stale).await),
-        "invalid_usage_report"
-    );
-    let usage = harness.owner.control_usage().await.expect("usage");
-    assert!(usage.harnesses.is_empty());
-}
-
-#[tokio::test]
-async fn a_usage_report_over_sixteen_kib_is_refused() {
-    let harness = Harness::start().await;
-    harness.create("task-1", "k8s").await;
-    let (controller, epoch) = harness.controller("k8s").await;
-    controller
-        .report(&report(
-            "task-1",
-            epoch,
-            1,
-            Observation::StartAccepted,
-            None,
-        ))
-        .await
-        .expect("start accepted");
-    let credential = controller
-        .issue_runner_credential(
-            "task-1",
-            &RunnerCredentialRequest {
-                lease_epoch: epoch,
-                generation: 1,
-                incarnation: "pod-1".to_string(),
-            },
-        )
-        .await
-        .expect("runner credential")
-        .credential;
-    let raw = reqwest::Client::new();
-    let url = format!("{}/runner/v1/usage", harness.base_url());
-
-    let mut oversized = serde_json::to_value(claude_report(&harness, 0.2, 0.1)).unwrap();
-    oversized["padding"] = serde_json::Value::String("x".repeat(16 * 1024));
-    let response = raw
-        .post(&url)
-        .bearer_auth(&credential)
-        .json(&oversized)
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(harness.service.harness_usage().harnesses.is_empty());
-
-    // The same credential with a report of a normal size is accepted.
-    let response = raw
-        .post(&url)
-        .bearer_auth(&credential)
-        .json(&claude_report(&harness, 0.2, 0.1))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
-    assert_eq!(harness.service.harness_usage().harnesses.len(), 1);
 }
