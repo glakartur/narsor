@@ -48,6 +48,7 @@ use narsor_protocol::harness::{display_name, CLAUDE_CODE};
 use narsor_protocol::identifier::TaskId;
 
 use super::commands::{conversation_entry_lines, permission_decision, CliError, Result};
+use super::control_text::usage_lines;
 use super::task_history::{history, HistoryCommand};
 use super::task_registry::{
     capabilities, create_from_file, repo, validate, workflows, RepoCommand,
@@ -1843,6 +1844,24 @@ pub async fn harness(
         "Supported: {}",
         without_unsafe_chars(&selection.supported.join(", "))
     );
+    Ok(())
+}
+
+/// `narsor-cli usage` — the subscription limits each harness last reported,
+/// as text in local time or, with `json`, the server's whole answer.
+pub async fn usage(json: bool, target: &ServerTarget, state: &Path, flags: &Flags) -> Result<()> {
+    let client = client(target, state, flags).await?;
+    let response = client
+        .control_usage()
+        .await
+        .map_err(|error| failure("Could not read the usage limits", error))?;
+    if json {
+        println!("{}", json_output(&response)?);
+        return Ok(());
+    }
+    for line in usage_lines(&response, chrono::Utc::now(), &chrono::Local) {
+        println!("{}", line.text);
+    }
     Ok(())
 }
 

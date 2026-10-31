@@ -1,14 +1,19 @@
 //! The text `narsor task history|workflows|validate|capabilities|repo` print
-//! (`narsor::cli::control_text`) and the typing of `task create --file` inputs.
+//! (`narsor::cli::control_text`), the text of `narsor-cli usage` and the
+//! typing of `task create --file` inputs.
 
+use chrono::{DateTime, TimeZone, Utc};
 use narsor::cli::control_text::{
     capabilities_lines, history_detail_lines, history_row, repository_row, typed_inputs,
-    validation_lines, workflow_lines,
+    usage_lines, validation_lines, workflow_lines, NO_USAGE,
 };
 use narsor_engine::controller_protocol::{
     ValidateWorkflowResponse, WorkflowInputView, WorkflowSource,
 };
 use narsor_engine::domain::ParamType;
+use narsor_protocol::controller::{
+    HarnessUsageResponse, HarnessUsageView, UsageLimit, UsageStatus,
+};
 use serde_json::json;
 
 mod task_app_support;
@@ -210,4 +215,127 @@ fn what_a_server_sends_never_reaches_a_terminal_as_control_sequences() {
     for line in history_detail_lines(&legacy(hostile, hostile, "failed", 0, false, Some(hostile))) {
         assert!(clean(&line.text), "{:?}", line.text);
     }
+}
+
+// ---------------------------------------------------------------------------
+// `narsor-cli usage` (U9)
+// ---------------------------------------------------------------------------
+
+fn usage_now() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 31, 14, 2, 0).unwrap()
+}
+
+fn limit(
+    window: &str,
+    utilization: f64,
+    resets_at: DateTime<Utc>,
+    status: Option<UsageStatus>,
+) -> UsageLimit {
+    UsageLimit {
+        window: window.to_string(),
+        utilization,
+        resets_at,
+        status,
+    }
+}
+
+fn harness_usage(harness: &str, limits: Vec<UsageLimit>) -> HarnessUsageView {
+    HarnessUsageView {
+        harness: harness.to_string(),
+        observed_at: usage_now(),
+        received_at: usage_now(),
+        limits,
+    }
+}
+
+fn claude_usage() -> HarnessUsageView {
+    harness_usage(
+        "claude-code",
+        vec![
+            limit(
+                "5h",
+                0.01,
+                Utc.with_ymd_and_hms(2026, 10, 31, 18, 12, 0).unwrap(),
+                Some(UsageStatus::Allowed),
+            ),
+            limit(
+                "7d",
+                0.9,
+                Utc.with_ymd_and_hms(2026, 11, 2, 17, 2, 0).unwrap(),
+                Some(UsageStatus::AllowedWarning),
+            ),
+        ],
+    )
+}
+
+fn usage_texts(response: &HarnessUsageResponse) -> Vec<String> {
+    texts(usage_lines(response, usage_now(), &Utc))
+}
+
+#[test]
+fn usage_prints_a_block_per_harness_with_aligned_limit_rows() {
+    let response = HarnessUsageResponse {
+        harnesses: vec![claude_usage()],
+    };
+    assert_eq!(
+        usage_texts(&response),
+        vec![
+            "Claude Code (claude-code), reported 2026-10-31 14:02",
+            "  5h    1%  allowed   resets 2026-10-31 18:12  (in 4h10m)",
+            "  7d   90%  warning   resets 2026-11-02 17:02  (in 2d3h)",
+        ]
+    );
+}
+
+#[test]
+fn usage_blocks_are_kept_apart_by_an_empty_line_and_a_missing_status_is_a_dash() {
+    let resets = Utc.with_ymd_and_hms(2026, 10, 31, 14, 47, 0).unwrap();
+    let response = HarnessUsageResponse {
+        harnesses: vec![
+            claude_usage(),
+            harness_usage(
+                "codex",
+                vec![
+                    limit("90m", 1.0, resets, Some(UsageStatus::Rejected)),
+                    limit("7d", 0.3, resets, None),
+                ],
+            ),
+        ],
+    };
+    let lines = usage_texts(&response);
+    assert_eq!(lines[3], "");
+    assert_eq!(
+        &lines[4..],
+        [
+            "Codex (codex), reported 2026-10-31 14:02",
+            "  90m  100%  rejected  resets 2026-10-31 14:47  (in 45m)",
+            "  7d    30%  -         resets 2026-10-31 14:47  (in 45m)",
+        ]
+    );
+}
+
+#[test]
+fn usage_without_a_harness_says_there_is_no_data() {
+    assert_eq!(
+        usage_texts(&HarnessUsageResponse::default()),
+        vec![NO_USAGE.to_string()]
+    );
+    assert_eq!(NO_USAGE, "No usage limit data.");
+}
+
+#[test]
+fn usage_text_from_the_server_carries_no_control_characters() {
+    let mut view = claude_usage();
+    view.harness = "claude\u{1b}[2J-code\u{202e}".to_string();
+    view.limits[0].window = "5\u{1b}]8;;x\u{7}h".to_string();
+    let lines = usage_texts(&HarnessUsageResponse {
+        harnesses: vec![view],
+    });
+    for line in &lines {
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\u{202e}') && !line.contains('\u{7}'),
+            "{line:?}"
+        );
+    }
+    assert!(lines[0].contains("claude[2J-code"), "{lines:?}");
 }

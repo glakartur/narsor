@@ -1,12 +1,14 @@
-//! The text `narsor task history|repo|workflows|validate|capabilities` print:
-//! what the control plane says about old executions, the repository
-//! registry and the workflow catalogue.
+//! The text `narsor task history|repo|workflows|validate|capabilities` and
+//! `narsor-cli usage` print: what the control plane says about old
+//! executions, the repository registry, the workflow catalogue and the usage
+//! limits of the harnesses' subscriptions.
 //!
 //! Pure functions of what the control plane returned, like
 //! [`super::task_text`]. Everything in them may come from a server, a
 //! runner or a workflow file, so every line goes through [`ToneLine`]
 //! (terminal-unsafe characters never get into it).
 
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Map, Value};
 
 use crate::controller_protocol::{
@@ -14,7 +16,11 @@ use crate::controller_protocol::{
     WorkflowInputView, WorkflowSource, WorkflowView,
 };
 use crate::domain::without_unsafe_chars;
-use narsor_protocol::controller::WorkflowInputType;
+use crate::usage_text::{percent, time_to_reset};
+use narsor_protocol::controller::{
+    HarnessUsageResponse, HarnessUsageView, UsageLimit, UsageStatus, WorkflowInputType,
+};
+use narsor_protocol::harness::display_name;
 
 use super::commands::{CliError, Result};
 use super::task_text::{Tone, ToneLine};
@@ -202,6 +208,102 @@ pub fn capabilities_lines(view: &CapabilitiesView) -> Vec<ToneLine> {
             Tone::Normal,
         ),
     ]
+}
+
+/// What `narsor-cli usage` prints when the server holds no usage limits.
+pub const NO_USAGE: &str = "No usage limit data.";
+
+/// The format of a date and time in `narsor-cli usage`, to the minute.
+const USAGE_TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
+
+/// The usage limits the server holds (R17, R18): one block per harness,
+/// its full name, id and the time of the report; one row per limit with its
+/// window, part used, status, reset time and the time left until it, in
+/// aligned columns. Blocks are kept apart by an empty line. Times are shown
+/// in `zone` (the local time zone for the operator); the time left counts
+/// from `now`. Without a harness, the one line [`NO_USAGE`].
+pub fn usage_lines<Tz: TimeZone>(
+    response: &HarnessUsageResponse,
+    now: DateTime<Utc>,
+    zone: &Tz,
+) -> Vec<ToneLine>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    if response.harnesses.is_empty() {
+        return vec![ToneLine::new(NO_USAGE, Tone::Muted)];
+    }
+    let mut lines = Vec::new();
+    for (index, view) in response.harnesses.iter().enumerate() {
+        if index > 0 {
+            lines.push(ToneLine::new("", Tone::Normal));
+        }
+        lines.extend(harness_usage_lines(view, now, zone));
+    }
+    lines
+}
+
+fn harness_usage_lines<Tz: TimeZone>(
+    view: &HarnessUsageView,
+    now: DateTime<Utc>,
+    zone: &Tz,
+) -> Vec<ToneLine>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let window_width = view
+        .limits
+        .iter()
+        .map(|limit| limit.window.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![ToneLine::new(
+        format!(
+            "{} ({}), reported {}",
+            display_name(&view.harness),
+            view.harness,
+            local_time(view.observed_at, zone)
+        ),
+        Tone::Normal,
+    )];
+    lines.extend(view.limits.iter().map(|limit| {
+        ToneLine::new(
+            format!(
+                "  {:<window_width$}  {:>4}  {:<8}  resets {}  (in {})",
+                limit.window,
+                format!("{}%", percent(limit.utilization)),
+                usage_status_name(limit.status),
+                local_time(limit.resets_at, zone),
+                time_to_reset(now, limit.resets_at)
+            ),
+            usage_tone(limit),
+        )
+    }));
+    lines
+}
+
+fn local_time<Tz: TimeZone>(at: DateTime<Utc>, zone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    at.with_timezone(zone).format(USAGE_TIME_FORMAT).to_string()
+}
+
+fn usage_status_name(status: Option<UsageStatus>) -> &'static str {
+    match status {
+        Some(UsageStatus::Allowed) => "allowed",
+        Some(UsageStatus::AllowedWarning) => "warning",
+        Some(UsageStatus::Rejected) => "rejected",
+        Some(UsageStatus::Unrecognized) | None => "-",
+    }
+}
+
+fn usage_tone(limit: &UsageLimit) -> Tone {
+    match limit.status {
+        Some(UsageStatus::Rejected) => Tone::Error,
+        Some(UsageStatus::AllowedWarning) => Tone::Warning,
+        _ => Tone::Normal,
+    }
 }
 
 /// The heading of the `narsor task repo list` table.
