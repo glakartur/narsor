@@ -227,11 +227,12 @@ pub fn title_of(task: &TaskSummary) -> String {
 /// show the same title; a task with a ticket and no title shows only the
 /// ticket on the frame, while its row falls back to `display.title`.
 pub fn row_title_of(task: &TaskSummary) -> String {
-    task.title
-        .as_deref()
-        .map(one_line)
-        .filter(|title| !title.trim().is_empty())
-        .unwrap_or_else(|| title_of(task))
+    non_blank_line(task.title.as_deref()).unwrap_or_else(|| title_of(task))
+}
+
+/// `text` on one line, or `None` when it is missing or blank.
+fn non_blank_line(text: Option<&str>) -> Option<String> {
+    text.map(one_line).filter(|text| !text.trim().is_empty())
 }
 
 fn activity_since(task: &TaskSummary) -> Option<DateTime<Utc>> {
@@ -738,11 +739,7 @@ impl TaskList {
     fn row_text_with(&self, index: usize, positions: &HashMap<usize, usize>) -> RowText {
         let task = &self.tasks[index];
         RowText {
-            ticket: task
-                .ticket
-                .as_deref()
-                .map(one_line)
-                .filter(|ticket| !ticket.trim().is_empty()),
+            ticket: non_blank_line(task.ticket.as_deref()),
             id: short_task_id(task.task_id.as_str()),
             attention: attention_of(task),
             icon: state_icon(task),
