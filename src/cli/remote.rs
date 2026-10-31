@@ -44,6 +44,7 @@ use narsor_protocol::api::MaterialOrigin;
 use narsor_protocol::controller::{
     MoveTaskTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskEvent,
 };
+use narsor_protocol::harness::{display_name, CLAUDE_CODE};
 use narsor_protocol::identifier::TaskId;
 
 use super::commands::{conversation_entry_lines, permission_decision, CliError, Result};
@@ -1153,9 +1154,10 @@ pub async fn task(
                 ));
             }
             if !permission_wait && permission.is_some() {
-                return Err(CliError::failure(
-                    "--permission can only answer a Claude Code permission request.",
-                ));
+                return Err(CliError::failure(format!(
+                    "--permission can only answer a {} permission request.",
+                    display_name(CLAUDE_CODE)
+                )));
             }
             let mut delivery = delivery.expect("built above");
             delivery.episode = Some(pending.id.clone());

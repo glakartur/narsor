@@ -1,6 +1,6 @@
 //! Shared controller protocol values that do not depend on service internals.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::api::HumanInputDeliveryDto;
@@ -1675,6 +1675,93 @@ pub struct SetBackendLimitRequest {
     pub limit: u32,
 }
 
+/// Most limits one harness usage report may carry.
+pub const MAX_USAGE_LIMITS: usize = 8;
+
+/// How far after the server's clock a limit may reset; a report naming a
+/// later reset is refused.
+pub const USAGE_RESETS_HORIZON: Duration = Duration::days(7);
+
+/// How long the server keeps a harness's usage after the report that set it,
+/// counted from when the server received the report, not from `observed_at`.
+pub const USAGE_STATE_LIFETIME: Duration = Duration::minutes(15);
+
+/// The length of a usage limit window (`5h`, `7d`, `90m`), or `None` when
+/// `window` is not one: a count from 1 to 9999 without a leading zero, then
+/// `m`, `h` or `d`.
+pub fn usage_window_length(window: &str) -> Option<Duration> {
+    let (count, unit) = window.split_at_checked(window.len().checked_sub(1)?)?;
+    if !(1..=4).contains(&count.len())
+        || count.starts_with('0')
+        || !count.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let count = count.parse().ok()?;
+    match unit {
+        "m" => Some(Duration::minutes(count)),
+        "h" => Some(Duration::hours(count)),
+        "d" => Some(Duration::days(count)),
+        _ => None,
+    }
+}
+
+/// What a harness said about one usage limit, when it said it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageStatus {
+    Allowed,
+    /// Still allowed, close to the limit.
+    AllowedWarning,
+    Rejected,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// One usage limit of a harness subscription, the same for every harness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UsageLimit {
+    /// The window the limit counts over, e.g. `5h` or `7d`
+    /// ([`usage_window_length`]).
+    pub window: String,
+    /// The used part of the limit, from 0 to 1.
+    pub utilization: f64,
+    pub resets_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<UsageStatus>,
+}
+
+/// `POST /runner/v1/usage`: the latest usage limits of one harness. It
+/// replaces whatever the server held for that harness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessUsageReport {
+    /// A harness id of [`crate::harness::HARNESSES`].
+    pub harness: String,
+    /// When the runner read the limits from the harness.
+    pub observed_at: DateTime<Utc>,
+    pub limits: Vec<UsageLimit>,
+}
+
+/// The usage limits the server holds for one harness, as presented to an
+/// owner client.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessUsageView {
+    pub harness: String,
+    /// When the runner read the limits from the harness.
+    pub observed_at: DateTime<Utc>,
+    /// When the server received the report.
+    pub received_at: DateTime<Utc>,
+    /// Shortest window first.
+    pub limits: Vec<UsageLimit>,
+}
+
+/// `GET /control/v1/usage`: the harnesses with current usage, in the order of
+/// [`crate::harness::HARNESSES`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HarnessUsageResponse {
+    pub harnesses: Vec<HarnessUsageView>,
+}
+
 /// A workflow input's declared value type in the owner API.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2051,6 +2138,7 @@ mod tests {
     use crate::api::HumanInputDeliveryDto;
     use chrono::Utc;
 
+    use super::{usage_window_length, HarnessUsageReport, UsageLimit, UsageStatus};
     use super::{
         AttentionItem, AttentionKind, CapabilitiesView, ConductorReadQuery, ControllerListResponse,
         ControllerView, ConversationPageQuery, ConversationUnavailableReason,
@@ -2665,5 +2753,77 @@ mod tests {
             serde_json::to_value(attention).unwrap()["waiting_id"],
             "input-1"
         );
+    }
+
+    #[test]
+    fn harness_usage_report_round_trips_unchanged() {
+        let report = HarnessUsageReport {
+            harness: "claude-code".into(),
+            observed_at: "2026-10-31T12:00:00Z".parse().unwrap(),
+            limits: vec![
+                UsageLimit {
+                    window: "5h".into(),
+                    utilization: 0.01,
+                    resets_at: "2026-10-31T16:10:00Z".parse().unwrap(),
+                    status: Some(UsageStatus::Allowed),
+                },
+                UsageLimit {
+                    window: "7d".into(),
+                    utilization: 0.9,
+                    resets_at: "2026-11-02T15:00:00Z".parse().unwrap(),
+                    status: Some(UsageStatus::AllowedWarning),
+                },
+            ],
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["limits"][1]["status"], "allowed_warning");
+        assert_eq!(
+            serde_json::from_value::<HarnessUsageReport>(value).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn a_usage_limit_without_status_leaves_it_out() {
+        let limit: UsageLimit = serde_json::from_value(serde_json::json!({
+            "window": "5h",
+            "utilization": 0.5,
+            "resets_at": "2026-10-31T16:10:00Z"
+        }))
+        .unwrap();
+        assert_eq!(limit.status, None);
+        assert!(serde_json::to_value(&limit)
+            .unwrap()
+            .get("status")
+            .is_none());
+    }
+
+    #[test]
+    fn usage_statuses_keep_snake_case_and_unknown_ones_fall_back() {
+        assert_eq!(
+            serde_json::from_value::<UsageStatus>(serde_json::json!("allowed_warning")).unwrap(),
+            UsageStatus::AllowedWarning
+        );
+        assert_eq!(
+            serde_json::from_value::<UsageStatus>(serde_json::json!("something_new")).unwrap(),
+            UsageStatus::Unrecognized
+        );
+    }
+
+    #[test]
+    fn usage_windows_are_ordered_by_length() {
+        let length = |window| usage_window_length(window).unwrap();
+        assert!(length("5h") < length("7d"));
+        assert!(length("90m") < length("5h"));
+        assert_eq!(length("9999d"), chrono::Duration::days(9999));
+    }
+
+    #[test]
+    fn usage_windows_outside_the_pattern_have_no_length() {
+        for window in [
+            "", "h", "5", "5x", "0h", "05h", "12345h", "-5h", "+5h", "5H", "5h\n", "5 h", "５h",
+        ] {
+            assert_eq!(usage_window_length(window), None, "{window:?}");
+        }
     }
 }

@@ -10,6 +10,7 @@ use crate::api::{
     PendingHumanInputView, PermissionDecisionDto, PermissionDecisionKindDto, PermissionDenialView,
     PermissionGrantScopeDto,
 };
+use crate::harness::{display_name, CLAUDE_CODE};
 
 /// The field the operator types a Bash pattern into.
 pub const PATTERN_FIELD: &str = "Wzorzec polecenia";
@@ -168,11 +169,11 @@ impl Builder {
                     PanelField::text(PATTERN_FIELD)
                         .required()
                         .with_value(first)
-                        .described(
-                            "Polecenie złożone (&&, ;, |, pętla) Claude Code sprawdza \
-                             po częściach: wtedy pomoże tylko *. Sam * zezwala na KAŻDE \
-                             polecenie Bash.",
-                        ),
+                        .described(format!(
+                            "Polecenie złożone (&&, ;, |, pętla) {} sprawdza po częściach: \
+                             wtedy pomoże tylko *. Sam * zezwala na KAŻDE polecenie Bash.",
+                            display_name(CLAUDE_CODE)
+                        )),
                 ),
                 decision(
                     None,
@@ -225,7 +226,8 @@ fn denial_command(denial: &PermissionDenialView) -> Option<&str> {
 fn why_not_grantable(denial: &PermissionDenialView, resumable: bool) -> Option<String> {
     if !is_approvable_permission_reason(denial.reason_type.as_deref()) {
         return Some(format!(
-            "blokada polityki Claude Code ({})",
+            "blokada polityki {} ({})",
+            display_name(CLAUDE_CODE),
             denial.reason_type.as_deref().unwrap_or("bez powodu")
         ));
     }

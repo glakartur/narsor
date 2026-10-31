@@ -765,9 +765,10 @@ impl AgentExecutor {
             return Ok(ActionOutcome::Suspended(
                 SuspendedAction::AwaitingAgentInput(HumanInputRequest {
                     action_execution_id: request.action_execution_id.to_string(),
-                    instruction:
-                        "Claude Code needs a permission decision before this task can continue."
-                            .to_string(),
+                    instruction: format!(
+                        "{} needs a permission decision before this task can continue.",
+                        narsor_protocol::harness::display_name(harness)
+                    ),
                     fields: Vec::new(),
                     reason: None,
                     required_values: Vec::new(),

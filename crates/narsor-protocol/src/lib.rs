@@ -5,6 +5,7 @@ pub mod chat;
 pub mod controller;
 pub mod display;
 pub mod event;
+pub mod harness;
 pub mod identifier;
 pub mod launch;
 pub mod panel;

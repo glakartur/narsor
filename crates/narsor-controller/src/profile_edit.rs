@@ -24,6 +24,8 @@ use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
+use narsor_protocol::harness::{display_name, CLAUDE_CODE};
+
 /// Files at the top of Claude's configuration directory that belong to the
 /// profile.
 const PROFILE_FILES: [&str; 6] = [
@@ -215,7 +217,8 @@ fn review_warnings(path: &str, old: Option<&[u8]>, new: &[u8]) -> Vec<String> {
     }
     if !matches!(path, "settings.json" | "settings.local.json") {
         return vec![format!(
-            "{shown}: instructions, tools or code for Claude Code changed"
+            "{shown}: instructions, tools or code for {} changed",
+            display_name(CLAUDE_CODE)
         )];
     }
     let parse = |bytes: &[u8]| {
@@ -238,8 +241,9 @@ fn review_warnings(path: &str, old: Option<&[u8]>, new: &[u8]) -> Vec<String> {
         .into_iter()
         .map(|key| {
             format!(
-                "{shown}: '{}' changed; it can change what Claude Code runs or reaches",
-                printable(key)
+                "{shown}: '{}' changed; it can change what {} runs or reaches",
+                printable(key),
+                display_name(CLAUDE_CODE)
             )
         })
         .collect()

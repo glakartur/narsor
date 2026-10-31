@@ -59,6 +59,10 @@ use crate::orchestration::{
     MoveTarget, PendingInputRef, QueueStatus, QueuedInput, QueuedOperatorCommand, RunnerSnapshot,
 };
 pub use narsor_protocol::controller::{
+    usage_window_length, HarnessUsageReport, HarnessUsageResponse, HarnessUsageView, UsageLimit,
+    UsageStatus, MAX_USAGE_LIMITS, USAGE_RESETS_HORIZON, USAGE_STATE_LIFETIME,
+};
+pub use narsor_protocol::controller::{
     TaskDefaultHarness, WORKSTATION_RISK, WORKSTATION_RISK_NOT_ACCEPTED,
 };
 

@@ -19,6 +19,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use narsor_protocol::harness::CLAUDE_CODE;
+
 /// Prefix of every environment variable that carries a setting.
 ///
 /// `ORCHESTRATOR_ACTION_ID` lives outside this prefix on purpose: it is a
@@ -289,7 +291,7 @@ impl SettingKey {
             SettingKey::CatalogDir | SettingKey::StateDir | SettingKey::WorkDir => {
                 SettingValue::Path(PathBuf::from("./.narsor"))
             }
-            SettingKey::AgentHarness => SettingValue::Text("claude-code".to_string()),
+            SettingKey::AgentHarness => SettingValue::Text(CLAUDE_CODE.to_string()),
             SettingKey::AgentTimeout => SettingValue::Duration(None),
             SettingKey::LogLevel => SettingValue::Text(LOG_OFF.to_string()),
             SettingKey::TuiRefreshInterval => {

@@ -79,7 +79,7 @@ use crate::engine::actions::agent;
 use narsor_protocol::chat::ChatElement;
 
 /// The `harness:` value this adapter answers to.
-pub const CLAUDE_CODE: &str = "claude-code";
+pub use narsor_protocol::harness::CLAUDE_CODE;
 
 /// The binary the adapter runs unless it is built with another one.
 pub const DEFAULT_PROGRAM: &str = "claude";

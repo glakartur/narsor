@@ -45,7 +45,7 @@ use crate::domain::WorkspaceAccess;
 use narsor_protocol::chat::ChatElement;
 
 /// The `harness:` value this adapter answers to.
-pub const GITHUB_COPILOT: &str = "github-copilot";
+pub use narsor_protocol::harness::GITHUB_COPILOT;
 
 /// Marker for SDK-based invocation (not a real binary).
 pub const DEFAULT_PROGRAM: &str = "copilot-sdk";
