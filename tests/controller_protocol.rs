@@ -22,11 +22,12 @@ use narsor_engine::controller_protocol::{
     CommandAck, ConductorReadQuery, ConductorReadResponse, ControllerClient, ConversationPageQuery,
     ConversationResponse, ConversationUnavailableReason, CreateEnrollmentRequest,
     CreateTaskRequest, DesiredAction, ExecutionEventsPage, ExecutionEventsQuery,
-    ExecutionEventsResponse, ExecutionEventsSource, Freshness, LaunchRequest, OwnerCommandRequest,
-    PanelFormKind, PanelOffer, ProtocolConfig, ProtocolService, RelayFailure, ReportRequest,
-    RunnerClient, RunnerCredentialRequest, RunnerDirective, SubmitCommentRequest,
+    ExecutionEventsResponse, ExecutionEventsSource, Freshness, HarnessUsageReport,
+    HarnessUsageView, LaunchRequest, OwnerCommandRequest, PanelFormKind, PanelOffer,
+    ProtocolConfig, ProtocolError, ProtocolService, RelayFailure, ReportRequest, RunnerClient,
+    RunnerCredentialRequest, RunnerDirective, RunnerIdentity, RunnerRole, SubmitCommentRequest,
     SubmitInputRequest, SubmitOperatorCommandRequest, TaskActionId, TaskActionOffer,
-    TaskDefaultHarness, TaskState, TaskSummary, LOCAL_OWNER,
+    TaskDefaultHarness, TaskState, TaskSummary, UsageLimit, UsageStatus, LOCAL_OWNER,
 };
 use narsor_engine::domain::{
     BackendId, DisplayLink, Event, EventData, ExecutionStatus, TaskDisplay, TaskId,
@@ -439,8 +440,10 @@ async fn unauthenticated_requests_get_bare_status_codes() {
         ("GET", "/control/v1/tasks"),
         ("GET", "/controller/v1/commands"),
         ("POST", "/controller/v1/heartbeat"),
+        ("GET", "/control/v1/usage"),
         ("GET", "/runner/v1/poll"),
         ("POST", "/runner/v1/renew"),
+        ("POST", "/runner/v1/usage"),
     ] {
         for token in [
             None,
@@ -4154,6 +4157,16 @@ async fn a_reader_may_not_write_anything() {
         reader.publish_material(vec![0; 4]).await,
         Err(ClientError::Forbidden)
     ));
+    assert!(matches!(
+        reader
+            .report_usage(&claude_report(&harness, 0.2, 0.1))
+            .await,
+        Err(ClientError::Forbidden)
+    ));
+    assert!(
+        harness.service.harness_usage().harnesses.is_empty(),
+        "a reader reports no usage"
+    );
     let after = control_task(&harness, "task-1");
     assert_eq!(after.revision, before.revision, "nothing was written");
     assert_eq!(after.runner, before.runner);
@@ -7777,4 +7790,433 @@ async fn a_revoked_workstation_controller_is_refused_and_can_be_replaced() {
         .await
         .expect("enroll again");
     replacement.acquire_lease(None).await.expect("lease again");
+}
+
+// ---------------------------------------------------------------------------
+// Harness usage limits (U4, U5)
+// ---------------------------------------------------------------------------
+
+fn usage_limit(window: &str, utilization: f64, resets_at: DateTime<Utc>) -> UsageLimit {
+    UsageLimit {
+        window: window.to_string(),
+        utilization,
+        resets_at,
+        status: Some(UsageStatus::Allowed),
+    }
+}
+
+fn usage_report(
+    harness: &str,
+    observed_at: DateTime<Utc>,
+    limits: Vec<UsageLimit>,
+) -> HarnessUsageReport {
+    HarnessUsageReport {
+        harness: harness.to_string(),
+        observed_at,
+        limits,
+    }
+}
+
+/// Claude Code's two windows as the server's clock reads now: `5h` resets
+/// in 4h10m, `7d` in 2d3h. The recordings reset too far ahead of the
+/// test clock for the server to accept them.
+fn claude_report(harness: &Harness, five_hours: f64, seven_days: f64) -> HarnessUsageReport {
+    let now = harness.clock.now();
+    usage_report(
+        "claude-code",
+        now,
+        vec![
+            usage_limit("5h", five_hours, now + Duration::minutes(250)),
+            usage_limit("7d", seven_days, now + Duration::hours(51)),
+        ],
+    )
+}
+
+/// A working runner; the usage state does not depend on its task.
+fn worker() -> RunnerIdentity {
+    RunnerIdentity {
+        role: RunnerRole::Worker,
+        task_id: TaskId::parse("task-1").unwrap(),
+        launch_generation: 1,
+        incarnation: "pod-1".to_string(),
+    }
+}
+
+fn usage_refusal(result: Result<(), ProtocolError>) -> &'static str {
+    match result {
+        Err(ProtocolError::BadRequest { code, .. }) => code,
+        other => panic!("expected a 400 with a code, got {other:?}"),
+    }
+}
+
+fn windows(view: &HarnessUsageView) -> Vec<&str> {
+    view.limits
+        .iter()
+        .map(|limit| limit.window.as_str())
+        .collect()
+}
+
+/// Covers AE7.
+#[tokio::test]
+async fn usage_without_a_report_is_empty() {
+    let harness = Harness::start().await;
+    assert!(harness.service.harness_usage().harnesses.is_empty());
+}
+
+/// Covers AE2.
+#[tokio::test]
+async fn the_last_usage_report_of_a_harness_replaces_the_earlier_one() {
+    let harness = Harness::start().await;
+    harness
+        .service
+        .runner_usage(&worker(), claude_report(&harness, 0.2, 0.1))
+        .unwrap();
+    harness.clock.advance(Duration::minutes(1));
+    let second = claude_report(&harness, 0.4, 0.3);
+    harness
+        .service
+        .runner_usage(&worker(), second.clone())
+        .unwrap();
+
+    let usage = harness.service.harness_usage();
+    assert_eq!(usage.harnesses.len(), 1);
+    let claude = &usage.harnesses[0];
+    assert_eq!(claude.harness, "claude-code");
+    assert_eq!(claude.observed_at, second.observed_at);
+    assert_eq!(claude.received_at, harness.clock.now());
+    assert_eq!(claude.limits, second.limits);
+}
+
+/// Covers AE8: the state lives 15 minutes from when the server received it.
+#[tokio::test]
+async fn harness_usage_expires_fifteen_minutes_after_it_was_received() {
+    let harness = Harness::start().await;
+    harness
+        .service
+        .runner_usage(&worker(), claude_report(&harness, 0.2, 0.1))
+        .unwrap();
+
+    harness
+        .clock
+        .advance(Duration::minutes(14) + Duration::seconds(59));
+    assert_eq!(harness.service.harness_usage().harnesses.len(), 1);
+
+    harness
+        .clock
+        .advance(Duration::minutes(1) + Duration::seconds(1));
+    assert!(harness.service.harness_usage().harnesses.is_empty());
+}
+
+#[tokio::test]
+async fn usage_age_counts_from_receipt_not_from_observation() {
+    let harness = Harness::start().await;
+    let mut report = claude_report(&harness, 0.2, 0.1);
+    report.observed_at = harness.clock.now() - Duration::hours(1);
+    harness.service.runner_usage(&worker(), report).unwrap();
+
+    let usage = harness.service.harness_usage();
+    assert_eq!(usage.harnesses.len(), 1);
+    assert_eq!(usage.harnesses[0].received_at, harness.clock.now());
+}
+
+/// Covers AE9.
+#[tokio::test]
+async fn a_limit_that_reset_is_dropped_and_the_others_stay() {
+    let harness = Harness::start().await;
+    let now = harness.clock.now();
+    harness
+        .service
+        .runner_usage(
+            &worker(),
+            usage_report(
+                "claude-code",
+                now,
+                vec![
+                    usage_limit("5h", 0.9, now + Duration::minutes(4)),
+                    usage_limit("7d", 0.3, now + Duration::hours(51)),
+                ],
+            ),
+        )
+        .unwrap();
+
+    harness.clock.advance(Duration::minutes(5));
+    let usage = harness.service.harness_usage();
+    assert_eq!(usage.harnesses.len(), 1);
+    assert_eq!(windows(&usage.harnesses[0]), ["7d"]);
+}
+
+#[tokio::test]
+async fn a_harness_whose_limits_all_reset_is_not_shown() {
+    let harness = Harness::start().await;
+    let now = harness.clock.now();
+    harness
+        .service
+        .runner_usage(
+            &worker(),
+            usage_report(
+                "claude-code",
+                now,
+                vec![
+                    usage_limit("5h", 0.9, now + Duration::minutes(2)),
+                    usage_limit("7d", 0.3, now + Duration::minutes(3)),
+                ],
+            ),
+        )
+        .unwrap();
+    harness.clock.advance(Duration::minutes(4));
+    assert!(harness.service.harness_usage().harnesses.is_empty());
+
+    // A report whose limits reset already removes what the harness had.
+    harness
+        .service
+        .runner_usage(&worker(), claude_report(&harness, 0.2, 0.1))
+        .unwrap();
+    let now = harness.clock.now();
+    harness
+        .service
+        .runner_usage(
+            &worker(),
+            usage_report(
+                "claude-code",
+                now,
+                vec![usage_limit("5h", 0.2, now - Duration::seconds(1))],
+            ),
+        )
+        .unwrap();
+    assert!(harness.service.harness_usage().harnesses.is_empty());
+}
+
+#[tokio::test]
+async fn usage_comes_in_harness_order_with_the_shortest_window_first() {
+    let harness = Harness::start().await;
+    let now = harness.clock.now();
+    harness
+        .service
+        .runner_usage(
+            &worker(),
+            usage_report(
+                "codex",
+                now,
+                vec![usage_limit("5h", 0.1, now + Duration::hours(1))],
+            ),
+        )
+        .unwrap();
+    harness
+        .service
+        .runner_usage(
+            &worker(),
+            usage_report(
+                "claude-code",
+                now,
+                vec![
+                    usage_limit("7d", 0.3, now + Duration::hours(51)),
+                    usage_limit("5h", 0.2, now + Duration::minutes(250)),
+                ],
+            ),
+        )
+        .unwrap();
+
+    let usage = harness.service.harness_usage();
+    let names: Vec<&str> = usage
+        .harnesses
+        .iter()
+        .map(|view| view.harness.as_str())
+        .collect();
+    assert_eq!(names, ["claude-code", "codex"]);
+    assert_eq!(windows(&usage.harnesses[0]), ["5h", "7d"]);
+}
+
+#[tokio::test]
+async fn an_invalid_usage_report_is_refused_and_changes_nothing() {
+    let harness = Harness::start().await;
+    let held = claude_report(&harness, 0.2, 0.1);
+    harness
+        .service
+        .runner_usage(&worker(), held.clone())
+        .unwrap();
+    let now = harness.clock.now();
+    let soon = now + Duration::hours(1);
+    let one = |limit: UsageLimit| usage_report("claude-code", now, vec![limit]);
+
+    let mut unrecognized = usage_limit("5h", 0.5, soon);
+    unrecognized.status = Some(UsageStatus::Unrecognized);
+    let mut invalid = vec![
+        (
+            "unknown harness",
+            usage_report("unknown", now, vec![usage_limit("5h", 0.5, soon)]),
+        ),
+        ("unrecognized status", one(unrecognized)),
+        ("utilization 1.5", one(usage_limit("5h", 1.5, soon))),
+        ("utilization -0.1", one(usage_limit("5h", -0.1, soon))),
+        ("utilization NaN", one(usage_limit("5h", f64::NAN, soon))),
+        (
+            "utilization infinite",
+            one(usage_limit("5h", f64::INFINITY, soon)),
+        ),
+        (
+            "resets after 7 days",
+            one(usage_limit(
+                "5h",
+                0.5,
+                now + Duration::days(7) + Duration::seconds(1),
+            )),
+        ),
+        (
+            "two 5h limits",
+            usage_report(
+                "claude-code",
+                now,
+                vec![usage_limit("5h", 0.5, soon), usage_limit("5h", 0.6, soon)],
+            ),
+        ),
+        (
+            "nine limits",
+            usage_report(
+                "claude-code",
+                now,
+                (1..=9)
+                    .map(|hours| usage_limit(&format!("{hours}h"), 0.5, soon))
+                    .collect(),
+            ),
+        ),
+    ];
+    for window in ["5x", "0h", "12345h", "5\u{1b}h", "\u{7}5h"] {
+        invalid.push(("bad window", one(usage_limit(window, 0.5, soon))));
+    }
+    for (case, report) in invalid {
+        assert_eq!(
+            usage_refusal(harness.service.runner_usage(&worker(), report)),
+            "invalid_usage_report",
+            "{case}"
+        );
+    }
+
+    let usage = harness.service.harness_usage();
+    assert_eq!(usage.harnesses.len(), 1);
+    assert_eq!(usage.harnesses[0].limits, held.limits, "the state is kept");
+}
+
+#[tokio::test]
+async fn a_limit_resetting_exactly_seven_days_ahead_is_accepted() {
+    let harness = Harness::start().await;
+    let now = harness.clock.now();
+    harness
+        .service
+        .runner_usage(
+            &worker(),
+            usage_report(
+                "claude-code",
+                now,
+                vec![usage_limit("7d", 0.5, now + Duration::days(7))],
+            ),
+        )
+        .unwrap();
+    assert_eq!(harness.service.harness_usage().harnesses.len(), 1);
+}
+
+#[tokio::test]
+async fn a_reader_may_not_report_usage() {
+    let harness = Harness::start().await;
+    let reader = RunnerIdentity {
+        role: RunnerRole::Reader,
+        ..worker()
+    };
+    assert!(matches!(
+        harness
+            .service
+            .runner_usage(&reader, claude_report(&harness, 0.2, 0.1)),
+        Err(ProtocolError::Forbidden)
+    ));
+    assert!(harness.service.harness_usage().harnesses.is_empty());
+}
+
+/// A runner reports over HTTP and the owner reads the same state back.
+#[tokio::test]
+async fn a_runners_usage_report_reaches_the_owner() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    let report = claude_report(&harness, 0.42, 0.17);
+
+    running
+        .runner
+        .report_usage(&report)
+        .await
+        .expect("the server answers 204");
+
+    let usage = harness.owner.control_usage().await.expect("usage");
+    assert_eq!(usage.harnesses.len(), 1);
+    let claude = &usage.harnesses[0];
+    assert_eq!(claude.harness, "claude-code");
+    assert_eq!(claude.observed_at, report.observed_at);
+    assert_eq!(claude.received_at, harness.clock.now());
+    assert_eq!(claude.limits, report.limits);
+}
+
+#[tokio::test]
+async fn an_invalid_usage_report_over_http_is_a_400_with_its_code() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    let mut report = claude_report(&harness, 0.2, 0.1);
+    report.harness = "unknown".to_string();
+
+    assert_eq!(
+        bad_request_code(running.runner.report_usage(&report).await),
+        "invalid_usage_report"
+    );
+    let usage = harness.owner.control_usage().await.expect("usage");
+    assert!(usage.harnesses.is_empty());
+}
+
+#[tokio::test]
+async fn a_usage_report_over_sixteen_kib_is_refused() {
+    let harness = Harness::start().await;
+    harness.create("task-1", "k8s").await;
+    let (controller, epoch) = harness.controller("k8s").await;
+    controller
+        .report(&report(
+            "task-1",
+            epoch,
+            1,
+            Observation::StartAccepted,
+            None,
+        ))
+        .await
+        .expect("start accepted");
+    let credential = controller
+        .issue_runner_credential(
+            "task-1",
+            &RunnerCredentialRequest {
+                lease_epoch: epoch,
+                generation: 1,
+                incarnation: "pod-1".to_string(),
+            },
+        )
+        .await
+        .expect("runner credential")
+        .credential;
+    let raw = reqwest::Client::new();
+    let url = format!("{}/runner/v1/usage", harness.base_url());
+
+    let mut oversized = serde_json::to_value(claude_report(&harness, 0.2, 0.1)).unwrap();
+    oversized["padding"] = serde_json::Value::String("x".repeat(16 * 1024));
+    let response = raw
+        .post(&url)
+        .bearer_auth(&credential)
+        .json(&oversized)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(harness.service.harness_usage().harnesses.is_empty());
+
+    // The same credential with a report of a normal size is accepted.
+    let response = raw
+        .post(&url)
+        .bearer_auth(&credential)
+        .json(&claude_report(&harness, 0.2, 0.1))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(harness.service.harness_usage().harnesses.len(), 1);
 }

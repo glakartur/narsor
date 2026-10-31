@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -111,6 +111,10 @@ const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Controllers send small JSON documents; nothing legitimate comes close.
 const MAX_CONTROLLER_BODY: usize = 1024 * 1024;
 
+/// Largest harness usage report a runner may send (R6a). A report holds a
+/// few limits; anything larger is refused before it is read.
+const MAX_USAGE_REPORT_BODY: usize = 16 * 1024;
+
 /// Owner-facing routes. They expect the caller's [`OwnerRef`] in the
 /// request extensions, put there by the API's owner gate.
 pub fn owner_routes<S>(service: Service) -> Router<S>
@@ -132,6 +136,7 @@ where
                 .put(put_backend_limit)
                 .delete(delete_backend_limit),
         )
+        .route("/control/v1/usage", get(get_usage))
         .route("/control/v1/tasks/{task_id}/timeline", get(get_timeline))
         .route(
             "/control/v1/tasks/{task_id}/execution-events",
@@ -219,6 +224,10 @@ where
     Router::new()
         .route("/runner/v1/snapshots", post(post_snapshot))
         .route("/runner/v1/poll", get(get_poll))
+        .route(
+            "/runner/v1/usage",
+            post(post_usage).layer(DefaultBodyLimit::max(MAX_USAGE_REPORT_BODY)),
+        )
         .route("/runner/v1/inputs/{input_id}/ack", post(post_input_ack))
         .route(
             "/runner/v1/commands/{command_id}/ack",
@@ -437,6 +446,13 @@ async fn delete_backend_limit(
     Path(backend_id): Path<String>,
 ) -> ProtocolResult<Json<BackendLimitView>> {
     Ok(Json(service.clear_backend_limit(&backend_id)?))
+}
+
+async fn get_usage(
+    State(service): State<Service>,
+    Extension(_owner): Extension<OwnerRef>,
+) -> Json<HarnessUsageResponse> {
+    Json(service.harness_usage())
 }
 
 async fn get_timeline(
@@ -770,6 +786,15 @@ async fn post_snapshot(
     Json(snapshot): Json<RunnerSnapshotRequest>,
 ) -> ProtocolResult<Json<RunnerSnapshotResponse>> {
     Ok(Json(service.runner_snapshot(&identity, snapshot)?))
+}
+
+async fn post_usage(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Json(report): Json<HarnessUsageReport>,
+) -> ProtocolResult<StatusCode> {
+    service.runner_usage(&identity, report)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_poll(

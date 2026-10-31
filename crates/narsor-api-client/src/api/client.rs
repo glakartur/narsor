@@ -86,10 +86,10 @@ use narsor_protocol::controller::{
     BackendLimitView, CapabilitiesView, ConductorReadQuery, ControllerListResponse, ControllerView,
     ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest, CreateTaskRequest,
     DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery, ExecutionEventsResponse,
-    OwnerCommandRequest, RepositoryListResponse, RepositoryView, SetBackendLimitRequest,
-    SetDefaultBackendRequest, SubmitInputRequest, SubmitOperatorCommandRequest,
-    ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest,
-    WorkflowSourceResponse,
+    HarnessUsageResponse, OwnerCommandRequest, RepositoryListResponse, RepositoryView,
+    SetBackendLimitRequest, SetDefaultBackendRequest, SubmitInputRequest,
+    SubmitOperatorCommandRequest, ValidateWorkflowRequest, ValidateWorkflowResponse,
+    WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
 };
 
 use super::token::{TokenCell, TokenSource};
@@ -738,6 +738,14 @@ impl ApiClient {
     ) -> Result<BackendLimitView, ClientError> {
         let url = format!("{}/control/v1/backends/{backend_id}/limit", self.base_url);
         self.delete_json(&url).await
+    }
+
+    /// The latest usage limits of the harnesses' subscriptions, as the
+    /// runners reported them: known harnesses in their fixed order, the
+    /// shortest window first. Empty when no fresh report is held.
+    pub async fn control_usage(&self) -> Result<HarnessUsageResponse, ClientError> {
+        let url = format!("{}/control/v1/usage", self.base_url);
+        self.get_json(&url).await
     }
 
     /// The last timeline the remote task's runner reported.
