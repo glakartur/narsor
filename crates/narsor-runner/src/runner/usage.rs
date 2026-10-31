@@ -3,7 +3,8 @@
 //!
 //! The engine hands every report to [`LatestUsage`] without waiting; the
 //! [`super::Session`] loop takes the latest one when it can and sends it in
-//! a task of its own ([`send`]). A report that does not get through is
+//! a task of its own ([`send`]), one at a time, so the reports reach the
+//! control plane in the order they were made. A report that does not get through is
 //! logged and forgotten: the next one replaces it anyway, and the snapshot
 //! backoff of the link is not this report's business.
 

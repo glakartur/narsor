@@ -482,6 +482,7 @@ fn assemble_session(
         link,
         cache: snapshot::ConversationCache::default(),
         usage,
+        usage_send: None,
         execution_id: None,
         directive: RunnerDirective::Continue,
         pass: None,
@@ -768,6 +769,9 @@ struct Session {
     cache: snapshot::ConversationCache,
     /// The latest usage limits the engine's harnesses reported, not sent yet.
     usage: usage::UsageReports,
+    /// The usage report on its way, if any: the next one waits for it, so
+    /// the control plane cannot receive an older report after a newer one.
+    usage_send: Option<JoinHandle<()>>,
     execution_id: Option<String>,
     directive: RunnerDirective,
     pass: Option<JoinHandle<Result<WorkflowExecution, EngineError>>>,
@@ -1382,7 +1386,9 @@ impl Session {
                         dirty = true;
                     }
                 }
-                changed = self.usage.changed(), if usage_open => {
+                // Not while a report is on its way: a newer one stays in the
+                // channel and goes out once that send ended.
+                changed = self.usage.changed(), if usage_open && self.usage_send.is_none() => {
                     match changed {
                         Ok(()) => {
                             self.send_usage();
@@ -1390,6 +1396,7 @@ impl Session {
                         Err(_) => usage_open = false,
                     }
                 }
+                _ = wait_for(&mut self.usage_send) => self.usage_send = None,
                 _ = tokio::time::sleep_until(wake) => {}
             }
         }
@@ -1428,16 +1435,32 @@ impl Session {
             .map(|pending| pending.episode_key().to_string()))
     }
 
-    /// Sends the latest usage report once, in a task of its own, when there
-    /// is a client to send it with; the task is returned for the tests.
+    /// Sends the latest usage report once, in a task of its own kept in
+    /// `usage_send`, when there is a client to send it with; true when the
+    /// send started.
     ///
-    /// Neither a missing client nor a failed send touches the link's
-    /// backoff: the report is simply dropped (R8), and the next one the
-    /// harness writes takes its place.
-    fn send_usage(&mut self) -> Option<JoinHandle<()>> {
-        let report = self.usage.borrow_and_update().clone()?;
-        let client = self.link.client()?;
-        Some(usage::send(client, report))
+    /// While the previous send is still on its way nothing starts and the
+    /// report stays unread in the channel: one send at a time keeps the
+    /// reports in order. Neither a missing client nor a failed send touches
+    /// the link's backoff: the report is simply dropped (R8), and the next
+    /// one the harness writes takes its place.
+    fn send_usage(&mut self) -> bool {
+        if self
+            .usage_send
+            .as_ref()
+            .is_some_and(|send| !send.is_finished())
+        {
+            return false;
+        }
+        self.usage_send = None;
+        let Some(report) = self.usage.borrow_and_update().clone() else {
+            return false;
+        };
+        let Some(client) = self.link.client() else {
+            return false;
+        };
+        self.usage_send = Some(usage::send(client, report));
+        true
     }
 
     /// Sends a fresh snapshot; true when the control plane took it.

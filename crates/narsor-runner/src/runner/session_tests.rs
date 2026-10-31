@@ -785,7 +785,8 @@ async fn only_the_latest_usage_report_is_sent_once_and_a_failure_leaves_the_link
     let waiting = session.usage.borrow().clone().expect("a report");
     assert_eq!(waiting.limits[0].utilization, 0.2, "only the latest waits");
 
-    let sent = session.send_usage().expect("one attempt to send it");
+    assert!(session.send_usage(), "one attempt to send it");
+    let sent = session.usage_send.take().expect("the send under way");
     tokio::time::timeout(PATIENCE, sent)
         .await
         .expect("the attempt ends")
@@ -816,10 +817,165 @@ async fn without_a_client_the_usage_report_is_dropped() {
         .await
         .expect("a report waits")
         .expect("the reporter is alive");
-    assert!(session.send_usage().is_none(), "no client to send with");
+    assert!(!session.send_usage(), "no client to send with");
+    assert!(session.usage_send.is_none());
     assert!(!session.usage.has_changed().expect("the reporter is alive"));
     assert_eq!(session.link.failures, failures);
     assert_eq!(session.link.next_attempt, next_attempt);
+}
+
+/// A control plane on a local port that records the utilization of every
+/// usage report it receives, in order, and holds its answer to the first
+/// one until `release` is opened.
+struct UsageServer {
+    url: String,
+    received: Arc<Mutex<Vec<f64>>>,
+    arrived: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl UsageServer {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local port");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (seen, signal, held) = (received.clone(), arrived.clone(), release.clone());
+        tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                let (seen, signal, held) = (seen.clone(), signal.clone(), held.clone());
+                tokio::spawn(Self::serve(connection, seen, signal, held));
+            }
+        });
+        Self {
+            url,
+            received,
+            arrived,
+            release,
+        }
+    }
+
+    /// Answers the requests of one connection with no content.
+    async fn serve(
+        mut connection: tokio::net::TcpStream,
+        received: Arc<Mutex<Vec<f64>>>,
+        arrived: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buffer = Vec::new();
+        loop {
+            let Some(head_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                let mut chunk = [0u8; 4096];
+                match connection.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                }
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buffer[..head_end]).to_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map(|value| value.trim().parse().expect("a length"))
+                .unwrap_or(0);
+            let body_start = head_end + 4;
+            while buffer.len() < body_start + length {
+                let mut chunk = [0u8; 4096];
+                match connection.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let report: HarnessUsageReport =
+                serde_json::from_slice(&buffer[body_start..body_start + length])
+                    .expect("a usage report");
+            buffer.drain(..body_start + length);
+            let first = {
+                let mut received = received.lock().unwrap();
+                received.push(report.limits[0].utilization);
+                received.len() == 1
+            };
+            arrived.notify_one();
+            if first {
+                release.notified().await;
+            }
+            let answer = b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n";
+            if connection.write_all(answer).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn received(&self) -> Vec<f64> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+/// A newer usage report waits while an older one is still on its way, and
+/// goes out only after it: the control plane, which keeps whichever report
+/// came last, ends with the newer one.
+#[tokio::test]
+async fn a_newer_usage_report_waits_for_the_send_under_way_and_arrives_last() {
+    let root = TempRoot::new();
+    let mut fixture = reporting(&root);
+    let server = UsageServer::start().await;
+    fs::write(root.0.join("no-credential"), "credential\n").unwrap();
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+    let reporter = fixture
+        .agent
+        .usage
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the session's usage reporter");
+    let session = &mut fixture.session;
+    session.link.base_url = server.url.clone();
+    session.link.client = None;
+    tokio::time::timeout(PATIENCE, session.usage.changed())
+        .await
+        .expect("a report waits")
+        .expect("the reporter is alive");
+
+    assert!(session.send_usage(), "the first send starts");
+    tokio::time::timeout(PATIENCE, server.arrived.notified())
+        .await
+        .expect("the first report reaches the control plane");
+    assert_eq!(server.received(), vec![0.2]);
+
+    reporter.report(usage_report(0.3));
+    assert!(
+        !session.send_usage(),
+        "no second send while the first is on its way"
+    );
+    assert!(
+        session.usage.has_changed().expect("the reporter is alive"),
+        "the newer report stays unread"
+    );
+
+    server.release.notify_one();
+    let first = session.usage_send.take().expect("the first send");
+    tokio::time::timeout(PATIENCE, first)
+        .await
+        .expect("the first send ends")
+        .expect("the first send does not panic");
+    assert!(session.send_usage(), "the newer report goes out now");
+    let second = session.usage_send.take().expect("the second send");
+    tokio::time::timeout(PATIENCE, second)
+        .await
+        .expect("the second send ends")
+        .expect("the second send does not panic");
+
+    assert_eq!(
+        server.received(),
+        vec![0.2, 0.3],
+        "the newer one arrives last"
+    );
 }
 
 // ---------------------------------------------------------------------------
