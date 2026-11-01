@@ -23,10 +23,8 @@ cargo build --workspace --bins --release
 
 Some tests are `#[ignore]`d on purpose: they start real processes
 (`narsor-controller`), drive the real `claude` binary (costs money, needs
-credentials), need a live Kubernetes cluster (`NARSOR_K8S_SMOKE_*`), or are
-waiting for the unified task scheduler follow-up (four cases in
-`tests/cli_smoke.rs`). Run them with `-- --ignored` or `--include-ignored`;
-the scheduler-related cases are expected to fail for now.
+credentials), or need a live Kubernetes cluster (`NARSOR_K8S_SMOKE_*`). Run
+them with `-- --ignored` or `--include-ignored`.
 
 ## Architecture
 

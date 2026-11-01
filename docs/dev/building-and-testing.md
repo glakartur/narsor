@@ -27,14 +27,27 @@ cargo test --workspace -- --include-ignored  # also process lifecycle tests
 cargo build --workspace --bins --release
 ```
 
-The include-ignored run also exercises four CLI cases in `tests/cli_smoke.rs`
-that remain marked ignored because conductor status/chat and problem recovery
-are not yet wired to scheduler-admitted runner executions; they are not
-expected to pass until the unified task scheduler follow-up lands. Other
-ignored tests drive the real `claude` binary (they cost money and need
+Ignored tests drive the real `claude` binary (they cost money and need
 credentials), start `narsor-controller` processes, or need a live Kubernetes
 cluster (the smoke test also requires its documented `NARSOR_K8S_SMOKE_*`
 environment variables).
+
+### Test layout
+
+The integration tests of the `narsor` package are one test crate,
+`tests/integration/main.rs`; each file next to it is a module and **must be
+declared there with `mod`** to run (Cargo does not discover it otherwise).
+Shared helpers are the `*_support` modules, used as `crate::<name>_support`.
+All modules run concurrently in one process, so they must not use
+process-global state (`set_var`, `set_current_dir`, fixed ports) and must use
+temporary directories and ephemeral (`:0`) ports. Tests that spawn the built
+binaries (`CARGO_BIN_EXE_*`) or `cargo` do not belong in this crate.
+
+### Keeping `target/` small
+
+`Cargo.toml` lowers debug info of external dependencies
+(`line-tables-only`) and strips release binaries. Remove stale artifacts
+periodically with `cargo sweep --time 14`.
 
 The workspace build keeps `narsor`, `narsor-cli`, `narsor-server`,
 `narsor-runner`, and `narsor-controller` together in `target/debug` (or

@@ -101,9 +101,21 @@ U1 → U2 → U3 (niezależne od U2, można równolegle) → U4 → U5. U4 to na
 
 | Metryka | Przed | Po |
 |---|---|---|
-| `target/` razem | | |
-| `target/debug/deps` | | |
-| `target/debug/incremental` | | |
-| `target/release` | | |
-| liczba plików wykonywalnych testów | ok. 65 | |
-| czas czystego `cargo test --no-run` | | |
+| `target/` razem (debug) | 30G | ok. 6G (bez release) |
+| `target/debug/deps` | 26G | 5,2G |
+| `target/debug/incremental` | 3,9G | 3,1G |
+| `target/release` | nie mierzono | 2,6G (strip = symbols) |
+| liczba plików wykonywalnych testów | 82 (bez rozszerzenia w `deps`) | 19 |
+| czas czystego `cargo test --no-run` | nie mierzono osobno (czysty `cargo test`: 6m03) | 4m34 (po samych profilach: 4m56) |
+
+Pośrednio po U2 (same profile): `target/debug` 23G, `deps` 19G.
+
+Usunięte w U4 (zgodnie z U4.3–4; 249 passed, 1 failed, 17 ignored): pliki
+uruchamiające podprocesy (`CARGO_BIN_EXE_*`, `Command::new`, `cargo`) –
+`auth`, `bin_targets`, `checkpoint`, `cli_smoke`, `config_show`,
+`config_startup`, `connection_profile`, `controller_cli`, `controller_local`,
+`docs_install_url`, `engine_execution`, `installer`, `install_script`,
+`materials`, `release_artifacts`, `takeover`, `tasks`, `workspace`.
+Testy z efemerycznymi portami loopback (`:0`) zostały, bo nie dzielą stanu
+procesu. Suma po scaleniu: 2660 passed (2909 − 249), 1 failed (istniejący
+`conductor_invoke::claude_runs_read_only_...`), 3 uruchomienia bez flaky.
