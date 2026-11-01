@@ -74,11 +74,11 @@ execution: code
 - **Podejście (etapowe, żeby diff był przeglądalny):**
   1. Utworzyć `tests/integration/main.rs` z `mod <nazwa>;` dla każdego scalanego pliku. Przenieść `tests/<nazwa>.rs` → `tests/integration/<nazwa>.rs` (`git mv`, zachowuje historię). Katalogi `*_support` przenieść do `tests/integration/` (lub zostawić i wskazać `#[path]`), tak by `mod xyz_support;` w modułach nadal się rozwiązywało – po przeniesieniu moduł `foo.rs` ma submoduły w `integration/foo/`, więc `mod engine_support;` zadeklarowany w `foo.rs` wymaga `#[path]` lub przeniesienia deklaracji do `main.rs` i zmiany na `crate::engine_support`. Wybrać jedną konwencję: deklaracje `mod *_support;` w `main.rs`, użycia jako `crate::*_support::...`.
   2. Naprawić: ścieżki względne `include_str!`/`include_bytes!`/`#[path]` (liczone od pliku źródłowego – po przeniesieniu o poziom głębiej wymagają korekty; `grep -rn 'include_\(str\|bytes\)!\|#\[path' tests`), inner doc comments `//!` (zostają w module, ok), `#![...]` atrybuty wewnętrzne (przenieść do `main.rs`), kolizje nazw globalnych (`static`, `#[test]` w tym samym module nie kolidują; kolizje dotyczą wspólnych helperów – są już w osobnych modułach).
-  3. Uwaga na testy zależne od stanu procesu: zmienne środowiskowe (`std::env::set_var`), `cwd`, singletony, porty. Dotąd każdy plik działał w osobnym procesie; w jednym procesie testy z różnych plików będą współbieżne. Wyszukać `set_var`/`set_current_dir`/globalne `static` i zabezpieczyć (np. wspólny mutex w module support) lub zostawić takie pliki jako osobne crate'y testowe (wyjątek udokumentowany w `main.rs`).
-  4. Testy łączące się z `CARGO_BIN_EXE_*` i uruchamiające podprocesy (`bin_targets.rs`, `auth.rs`, `cli_smoke.rs`) – scalić po weryfikacji, że `bin_targets.rs` (wywołuje `cargo`) nie blokuje blokady katalogu build przy równoległym uruchomieniu; jeśli tak, zostawić osobno.
+  3. Testy zależne od infrastruktury (porty, singletony/stan globalny procesu, `set_var`/`set_current_dir` wymagające izolacji procesu) są **usuwane**, nie zabezpieczane mutexami ani zostawiane jako osobne crate'y testowe – nie utrzymujemy testów zależnych od infrastruktury. Wyszukać `set_var`/`set_current_dir`/globalne `static`/bindowanie portów, wypisać usuwane testy w opisie commita i w sekcji Wyniki. Pozostałe testy z różnych plików działają współbieżnie w jednym procesie – nie mogą współdzielić stanu globalnego.
+  4. Testy uruchamiające dodatkowe procesy (podprocesy przez `CARGO_BIN_EXE_*`, wywołania `cargo`, np. `bin_targets.rs`, `auth.rs`, `cli_smoke.rs`) lub zależne od innych komponentów/procesów są **usuwane**. Przed usunięciem wypisać je i sprawdzić, czy nie pokrywają jedynego wymagania (`tests/release_artifacts.rs` – zob. U2); w razie wątpliwości zgłosić w PR zamiast usuwać po cichu. Jeśli po usunięciu plik nie ma już testów – usunąć plik.
   5. `crates/narsor-controller/tests/cli.rs` – pojedynczy plik, bez scalania.
   6. Dodać `autotests`-bezpieczeństwo: dzięki układowi `tests/integration/main.rs` Cargo wykrywa tylko jeden cel, więc nowe pliki muszą być dodane jako `mod` – odnotować w `docs/dev/` lub nagłówku `main.rs` (sprawdzić, czy istnieje dokument o konwencji testów i go uaktualnić).
-- **Test:** `cargo test --locked --workspace` – liczba wykonanych testów identyczna z bazową (zapisać `cargo test --workspace 2>&1 | grep "test result"` suma `passed` przed i po). Uruchomić pakiet 3 razy, aby wykryć flaky wynikające z współbieżności.
+- **Test:** `cargo test --locked --workspace` – suma `passed` po scaleniu równa bazowej pomniejszonej dokładnie o liczbę świadomie usuniętych testów (kroki 3–4; zapisać `cargo test --workspace 2>&1 | grep "test result"` przed i po). Uruchomić pakiet 3 razy, aby wykryć flaky wynikające z współbieżności.
 - **Weryfikacja:** liczba plików wykonywalnych w `target/debug/deps` spada z ok. 65 do kilku; rozmiar i czas (R4) zmierzone.
 
 ### U5. Pomiar końcowy i dokumentacja
@@ -92,7 +92,7 @@ U1 → U2 → U3 (niezależne od U2, można równolegle) → U4 → U5. U4 to na
 
 ## Ryzyka
 
-- Scalone testy działają współbieżnie w jednym procesie (stan globalny, env, cwd, porty) → flaky; mitygacja w U4.3.
+- Scalone testy działają współbieżnie w jednym procesie → flaky; mitygacja: testy zależne od stanu procesu/infrastruktury są usuwane (U4.3–4).
 - `strip = "symbols"` może zmienić backtrace'y w binarkach release i zależności `dist/` → sprawdzić w U2.
 - Czas kompilacji jednego dużego crate'u testowego bywa dłuższy przy zmianie jednego pliku (inkrementalnie), choć czysty build jest szybszy.
 - Obniżone debug zależności pogarsza debugowanie w gdb/lldb (zaakceptowane).
