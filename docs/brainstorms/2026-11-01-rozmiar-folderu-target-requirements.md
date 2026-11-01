@@ -69,6 +69,7 @@ Folder `target/` rośnie, bo workspace (9 crate'ów, ok. 65 plików testów inte
 - R2. Zmiany profili nie zmieniają zachowania produkcyjnych binarek poza rozmiarem (bez zmiany `opt-level`/`panic` bez osobnej zgody).
 - R3. `cargo test --workspace` i `cargo build --workspace --bins --release` nadal przechodzą.
 - R4. Zmiany w CI nie wydłużają istotnie czasu czystego builda.
+- R5. Decyzja właściciela: testy zależne od infrastruktury, uruchamiające dodatkowe procesy lub zależne od innych komponentów są usuwane (nie zabezpieczane), a ich lista trafia do opisu PR; R3 dotyczy testów, które zostają.
 
 ## Założenia do potwierdzenia
 
