@@ -3870,7 +3870,9 @@ mod task_app_detail {
         use narsor_engine::domain::EventData;
         use narsor_protocol::api::Position;
 
-        use crate::task_app_support::{agent_chose, conductor_chose, entered, ev, human_chose};
+        use crate::task_app_support::{
+            agent_chose, conductor_chose, decided, entered, ev, human_chose, operator_answered,
+        };
 
         fn read(ids: &[&str]) -> AttemptRead {
             AttemptRead {
@@ -4079,7 +4081,14 @@ mod task_app_detail {
                 human_chose(3, "gate", "implement"),
                 entered(4, "implement"),
             ];
-            let expected = ["step:p", "p/m", "choice:3", "step:i", "i/m"];
+            let expected = [
+                "step:p",
+                "p/m",
+                "step:step-visit/gate/1",
+                "choice:3",
+                "step:i",
+                "i/m",
+            ];
             let attempts = attempts(&["p", "i"]);
             // The gate has no position at all.
             let positions = vec![recorded("plan", 1, "p"), recorded("implement", 1, "i")];
@@ -4091,6 +4100,209 @@ mod task_app_detail {
                 recorded("implement", 1, "i"),
             ];
             assert_eq!(order(&positions, &attempts, &events), expected);
+        }
+
+        fn choice_lines(events: &[Event]) -> Vec<String> {
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            build_conversation(Scope::Whole, &[], &Attempts::default(), events)
+                .entries
+                .iter()
+                .filter(|entry| entry.id.as_str().starts_with("workflow-choice/"))
+                .map(|entry| entry.rendered_lines.join(" "))
+                .collect()
+        }
+
+        #[test]
+        fn a_users_answer_and_the_decision_it_produced_are_one_user_choice() {
+            let events = vec![
+                entered(1, "gate"),
+                operator_answered(2, Some("check_feedback")),
+                decided(3, "rules", "check_feedback"),
+            ];
+            assert_eq!(
+                choice_lines(&events),
+                ["użytkownik wybrał opcję: check_feedback"]
+            );
+        }
+
+        #[test]
+        fn a_manual_transition_is_one_user_choice() {
+            for provider in ["human", "human_override"] {
+                let events = vec![
+                    entered(1, "gate"),
+                    decided(2, provider, "implement"),
+                    human_chose(3, "gate", "implement"),
+                ];
+                assert_eq!(
+                    choice_lines(&events),
+                    ["użytkownik wybrał opcję: implement"]
+                );
+            }
+        }
+
+        #[test]
+        fn a_decision_of_another_provider_stays_the_agents() {
+            let events = vec![entered(1, "gate"), decided(2, "rules", "published")];
+            assert_eq!(
+                choice_lines(&events),
+                ["agent · rules wybrał opcję: published"]
+            );
+        }
+
+        #[test]
+        fn the_same_label_chosen_by_the_user_in_two_entries_gives_two_user_choices() {
+            let events = vec![
+                entered(1, "gate"),
+                operator_answered(2, Some("again")),
+                decided(3, "rules", "again"),
+                entered(4, "gate"),
+                operator_answered(5, Some("again")),
+                decided(6, "rules", "again"),
+            ];
+            assert_eq!(
+                choice_lines(&events),
+                [
+                    "użytkownik wybrał opcję: again",
+                    "użytkownik wybrał opcję: again"
+                ]
+            );
+        }
+
+        #[test]
+        fn an_answer_without_a_label_shows_nothing_and_its_human_decision_is_the_users() {
+            let events = vec![entered(1, "gate"), operator_answered(2, None)];
+            assert!(choice_lines(&events).is_empty());
+            let events = vec![
+                entered(1, "gate"),
+                operator_answered(2, None),
+                decided(3, "human", "approved"),
+            ];
+            assert_eq!(choice_lines(&events), ["użytkownik wybrał opcję: approved"]);
+        }
+
+        #[test]
+        fn a_decision_with_another_label_than_the_answer_is_shown_too() {
+            let events = vec![
+                entered(1, "gate"),
+                operator_answered(2, Some("a")),
+                decided(3, "rules", "b"),
+            ];
+            assert_eq!(
+                choice_lines(&events),
+                [
+                    "użytkownik wybrał opcję: a",
+                    "agent · rules wybrał opcję: b"
+                ]
+            );
+        }
+
+        #[test]
+        fn an_answer_does_not_hide_the_decision_of_a_later_entry() {
+            let events = vec![
+                entered(1, "gate"),
+                operator_answered(2, Some("a")),
+                entered(3, "review"),
+                decided(4, "rules", "a"),
+            ];
+            assert_eq!(
+                choice_lines(&events),
+                [
+                    "użytkownik wybrał opcję: a",
+                    "agent · rules wybrał opcję: a"
+                ]
+            );
+        }
+
+        #[test]
+        fn a_step_scope_shows_the_user_choice_once_and_no_headings() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let events = vec![
+                entered(1, "plan"),
+                operator_answered(2, Some("go")),
+                decided(3, "rules", "go"),
+            ];
+            assert_eq!(
+                step_order("plan", 1, &positions, &attempts(&["p"]), &events),
+                ["p/m", "choice:2"]
+            );
+        }
+
+        #[test]
+        fn a_gate_between_two_steps_gets_a_heading_before_its_choice() {
+            let positions = vec![
+                recorded("publish", 1, "p"),
+                position("gate", PositionStatus::Succeeded),
+                recorded("check", 1, "c"),
+            ];
+            let events = vec![
+                entered(1, "publish"),
+                decided(2, "rules", "published"),
+                entered(3, "gate"),
+                operator_answered(4, Some("check")),
+                decided(5, "rules", "check"),
+                entered(6, "check"),
+            ];
+            assert_eq!(
+                order(&positions, &attempts(&["p", "c"]), &events),
+                [
+                    "step:p",
+                    "p/m",
+                    "choice:2",
+                    "step:step-visit/gate/1",
+                    "choice:4",
+                    "step:c",
+                    "c/m"
+                ]
+            );
+            // Rebuilding on the same data gives the same entries.
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild_with_events(&positions, &attempts(&["p", "c"]), &events);
+            let first = tags(&conversation);
+            conversation.rebuild_with_events(&positions, &attempts(&["p", "c"]), &events);
+            assert_eq!(tags(&conversation), first);
+        }
+
+        #[test]
+        fn a_step_with_a_conversation_has_one_heading_and_a_loading_one_none() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let events = vec![entered(1, "plan")];
+            assert_eq!(
+                order(&positions, &attempts(&["p"]), &events),
+                ["step:p", "p/m"]
+            );
+            assert!(order(&positions, &Attempts::default(), &events).is_empty());
+        }
+
+        #[test]
+        fn a_shared_chat_gets_one_heading_and_a_loop_visit_its_number() {
+            let positions = vec![
+                recorded("plan", 1, "p"),
+                recorded("plan", 2, "p"),
+                position("gate", PositionStatus::Succeeded),
+            ];
+            let events = vec![
+                entered(1, "plan"),
+                entered(2, "plan"),
+                entered(3, "gate"),
+                entered(4, "gate"),
+            ];
+            assert_eq!(
+                order(&positions, &attempts(&["p"]), &events),
+                [
+                    "step:p",
+                    "p/m",
+                    "step:step-visit/gate/1",
+                    "step:step-visit/gate/2"
+                ]
+            );
+        }
+
+        #[test]
+        fn a_gate_heading_reads_the_step_and_its_visit() {
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            let events = vec![entered(1, "gate")];
+            let built = build_conversation(Scope::Whole, &[], &Attempts::default(), &events);
+            assert_eq!(built.entries[0].header, "── gate #1 ──");
         }
 
         #[test]

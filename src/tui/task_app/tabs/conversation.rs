@@ -664,12 +664,16 @@ pub fn build_conversation(
         };
         until(&mut builder.built.entries, Some(visits[0].sequence));
         for (index, visit) in visits.iter().enumerate() {
+            let mut shown = false;
             for position in by_visit
                 .get(&(visit.state_id.as_str(), visit.visit))
                 .into_iter()
                 .flatten()
             {
-                builder.push_position(position, attempts);
+                shown |= builder.push_position(position, attempts) != Pushed::Nothing;
+            }
+            if !shown {
+                builder.push_step_heading(&visit.state_id, visit.visit);
             }
             until(
                 &mut builder.built.entries,
@@ -700,22 +704,22 @@ impl<'a> Builder<'a> {
     /// Adds the heading (in the whole scope) and the entries of `position`'s
     /// attempt, and notes what its read says: still loading, failed, from
     /// the record.
-    fn push_position(&mut self, position: &'a Position, attempts: &Attempts) {
+    fn push_position(&mut self, position: &'a Position, attempts: &Attempts) -> Pushed {
         let (ConversationState::Recorded, Some(attempt_id)) = (
             &position.conversation,
             position.action_execution_id.as_deref(),
         ) else {
-            return;
+            return Pushed::Nothing;
         };
         // A workflow retry may point at the same chat as the preceding
         // position. Show that transcript once, at its first occurrence.
         if !self.seen_attempts.insert(attempt_id) {
-            return;
+            return Pushed::Covered;
         }
         let built = &mut self.built;
         let Some(attempt) = attempts.get(attempt_id) else {
             built.loading = true;
-            return;
+            return Pushed::Covered;
         };
         if built.failure.is_none() {
             built.failure = attempt
@@ -728,27 +732,47 @@ impl<'a> Builder<'a> {
         }
         built.no_record |= attempt.no_record();
         if attempt.entries.is_empty() {
-            return;
+            return Pushed::Nothing;
         }
         built.has_conversation |= attempt.has_conversation();
         if self.headings {
-            built.entries.push(
-                TranscriptEntry::new(
-                    TranscriptEntryId::from(format!("{attempt_id}/step")),
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .with_header(format!("── {} ──", one_line(&position.label)))
-                .with_presentation(TranscriptPresentation::System)
-                .with_clipped_head(),
-            );
+            built
+                .entries
+                .push(heading(format!("{attempt_id}/step"), &position.label));
         }
         built.entries.extend(attempt.entries.iter().map(|entry| {
             let mut entry = entry.clone();
             entry.prefix_source_ids(attempt_id);
             entry.with_clipped_head()
         }));
+        Pushed::Entries
     }
+
+    /// The heading of a step entry that has no conversation of its own.
+    fn push_step_heading(&mut self, state_id: &str, visit: u32) {
+        if self.headings {
+            self.built.entries.push(heading(
+                format!("step-visit/{state_id}/{visit}/step"),
+                &format!("{state_id} #{visit}"),
+            ));
+        }
+    }
+}
+
+/// What `push_position` did for a position: added its entries, left them to a
+/// read still running or to an attempt shown elsewhere, or added nothing.
+#[derive(PartialEq, Eq)]
+enum Pushed {
+    Entries,
+    Covered,
+    Nothing,
+}
+
+fn heading(id: String, label: &str) -> TranscriptEntry {
+    TranscriptEntry::new(TranscriptEntryId::from(id), Vec::new(), Vec::new())
+        .with_header(format!("── {} ──", one_line(label)))
+        .with_presentation(TranscriptPresentation::System)
+        .with_clipped_head()
 }
 
 /// One entry into a step, as the events tell it: the same `(state, visit)`
@@ -785,19 +809,72 @@ fn step_entries(events: &[Event]) -> Vec<StepEntry> {
         .collect()
 }
 
-/// The workflow choices of `events` with their sequence, in that order.
+/// The provider names of a choice a person made through the manual
+/// transition (the engine's `MANUAL_PROVIDER` and `OVERRIDE_PROVIDER`).
+const HUMAN_PROVIDERS: [&str; 2] = ["human", "human_override"];
+
+/// The workflow choices of `events` with their sequence, in that order. A
+/// person's choice is one entry: the `DecisionMade` the engine records after
+/// it (same label within the same step entry, or a human provider paired with
+/// a `HumanTransitionSelected`) is not shown a second time.
 fn workflow_choices(events: &[Event]) -> Vec<(u64, TranscriptEntry)> {
-    let mut choices: Vec<_> = events
-        .iter()
-        .filter_map(|event| Some((event.sequence, workflow_choice_entry(event)?)))
-        .collect();
-    choices.sort_by_key(|(sequence, _)| *sequence);
+    let mut sorted: Vec<&Event> = events.iter().collect();
+    sorted.sort_by_key(|event| event.sequence);
+    // Whether a manual transition follows within the same step entry.
+    let mut transition_ahead = vec![false; sorted.len()];
+    let mut ahead = false;
+    for (index, event) in sorted.iter().enumerate().rev() {
+        match &event.data {
+            EventData::StateEntered { .. } => ahead = false,
+            EventData::HumanTransitionSelected { .. } => ahead = true,
+            _ => {}
+        }
+        transition_ahead[index] = ahead;
+    }
+    let mut answered: Vec<&str> = Vec::new();
+    let mut choices = Vec::new();
+    for (index, event) in sorted.into_iter().enumerate() {
+        let entry = match &event.data {
+            EventData::StateEntered { .. } => {
+                answered.clear();
+                None
+            }
+            EventData::HumanInputReceived {
+                answered_by,
+                output_label: Some(label),
+                ..
+            } => {
+                if answered_by.unwrap_or_default() == crate::domain::event::AnsweredBy::Operator {
+                    answered.push(label);
+                }
+                workflow_choice_entry(event, false)
+            }
+            EventData::DecisionMade {
+                provider,
+                output_label,
+                ..
+            } => {
+                let human = HUMAN_PROVIDERS.contains(&provider.as_str());
+                if let Some(at) = answered.iter().position(|label| *label == output_label) {
+                    answered.remove(at);
+                    None
+                } else if human && transition_ahead[index] {
+                    None
+                } else {
+                    workflow_choice_entry(event, human)
+                }
+            }
+            _ => workflow_choice_entry(event, false),
+        };
+        choices.extend(entry.map(|entry| (event.sequence, entry)));
+    }
     choices
 }
 
 /// Projects only events that record a person or decision-maker choosing a
 /// workflow output. Routine runner state events remain in the dedicated log.
-fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
+/// `by_person` marks a `DecisionMade` that a person's choice produced.
+fn workflow_choice_entry(event: &Event, by_person: bool) -> Option<TranscriptEntry> {
     use crate::domain::event::AnsweredBy;
     use crate::domain::ConductorDecisionKind;
     use TranscriptPresentation::{Agent, Conductor, Operator};
@@ -810,11 +887,15 @@ fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
             reasoning,
         } => {
             reason = reasoning.as_deref().filter(|text| !text.trim().is_empty());
-            (
-                format!("agent · {}", one_line(provider)),
-                output_label.clone(),
-                Agent,
-            )
+            if by_person {
+                ("użytkownik".to_string(), output_label.clone(), Operator)
+            } else {
+                (
+                    format!("agent · {}", one_line(provider)),
+                    output_label.clone(),
+                    Agent,
+                )
+            }
         }
         EventData::ConductorDecision {
             kind,
