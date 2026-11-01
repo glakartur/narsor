@@ -313,6 +313,33 @@ pub fn agent_chose(sequence: u64, label: &str, reasoning: Option<&str>) -> Event
     )
 }
 
+/// `provider` recorded the decision for `label`.
+pub fn decided(sequence: u64, provider: &str, label: &str) -> Event {
+    ev(
+        sequence,
+        EventData::DecisionMade {
+            provider: provider.to_string(),
+            output_label: label.to_string(),
+            reasoning: None,
+        },
+    )
+}
+
+/// The operator answered a pending input, choosing `label` when it is given.
+pub fn operator_answered(sequence: u64, label: Option<&str>) -> Event {
+    let mut data = EventData::human_input_received(serde_json::json!({}));
+    if let EventData::HumanInputReceived {
+        answered_by,
+        output_label,
+        ..
+    } = &mut data
+    {
+        *answered_by = Some(narsor_engine::domain::event::AnsweredBy::Operator);
+        *output_label = label.map(str::to_string);
+    }
+    ev(sequence, data)
+}
+
 /// The conductor chose `label`.
 pub fn conductor_chose(sequence: u64, label: &str) -> Event {
     ev(
