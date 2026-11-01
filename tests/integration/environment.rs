@@ -20,8 +20,8 @@ use narsor_engine::domain::{
     ResourceProfile, SecretDelivery, TaskLaunchSpec, TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
 };
 use narsor_engine::environment::{
-    BackendKind, BackendLimits, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent,
-    LaunchResolver, ProfileRecord, ResolvedLaunch, StaticImageResolver, TrustScope,
+    BackendKind, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent, LaunchResolver,
+    ProfileRecord, ResolvedLaunch, StaticImageResolver, TrustScope,
 };
 use narsor_engine::registry::{RepositoryEntry, RepositoryRegistry};
 

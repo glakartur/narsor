@@ -13,7 +13,7 @@
 use super::ProtocolService;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::domain::BackendId;
-use crate::orchestration::{BackendCapacity, OrchestrationError};
+use crate::orchestration::{BackendAvailability, OrchestrationError, SchedulingPolicy};
 use narsor_protocol::controller::{ConcurrencyLimitView, MAX_CONCURRENT_TASKS_LIMIT};
 
 impl ProtocolService {
@@ -44,8 +44,8 @@ impl ProtocolService {
     }
 
     /// The limit as the safe-point decision reads it.
-    pub(super) fn shared_limit(&self) -> BackendCapacity {
-        BackendCapacity::Limit((*self.lock_max_concurrent_tasks()).unwrap_or(u32::MAX))
+    pub(super) fn shared_limit(&self) -> Option<u32> {
+        *self.lock_max_concurrent_tasks()
     }
 
     /// Asks running tasks to stop at a safe point while more tasks hold slots
@@ -58,7 +58,7 @@ impl ProtocolService {
     /// asked while earlier requests wait for their safe point. Failures are
     /// logged; the next pass retries.
     pub fn limit_stop_pass(&self) {
-        let BackendCapacity::Limit(limit) = self.shared_limit() else {
+        let Some(limit) = self.shared_limit() else {
             return;
         };
         let load = match self.control.total_load() {
@@ -105,26 +105,16 @@ impl ProtocolService {
         }
     }
 
-    /// The backend's capacity: the shared limit less what the other backends
-    /// hold, or the backend's failure to be usable.
-    pub(super) fn effective_capacity(&self, backend_id: &BackendId) -> BackendCapacity {
-        if let Err(error) = self.launch.check_backend(backend_id) {
-            return BackendCapacity::Unavailable(error.to_string());
+    /// Backend availability and the global task budget are separate inputs
+    /// to the scheduler; neither is derived from the other's current load.
+    pub(super) fn scheduling_policy(&self, backend_id: &BackendId) -> SchedulingPolicy {
+        let backend = match self.launch.check_backend(backend_id) {
+            Ok(()) => BackendAvailability::Available,
+            Err(error) => BackendAvailability::Unavailable(error.to_string()),
+        };
+        SchedulingPolicy {
+            backend,
+            max_concurrent_tasks: self.shared_limit(),
         }
-        let Some(global) = *self.lock_max_concurrent_tasks() else {
-            return BackendCapacity::Limit(u32::MAX);
-        };
-        let (Ok(total), Ok(here)) = (
-            self.control.total_capacity_in_use(),
-            self.control.capacity_in_use(backend_id),
-        ) else {
-            return BackendCapacity::Limit(global);
-        };
-        // Over the limit, the backend gives up its share of the excess: its
-        // reservations are taken back, and running tasks stop at safe points.
-        BackendCapacity::Limit(
-            here.saturating_add(global.saturating_sub(total))
-                .saturating_sub(total.saturating_sub(global)),
-        )
     }
 }

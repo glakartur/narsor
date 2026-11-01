@@ -513,7 +513,7 @@ impl TaskRecord {
         })
     }
 
-    /// Whether the task occupies one of its backend's capacity slots.
+    /// Whether the task occupies one slot in the global task budget.
     ///
     /// Conservative on purpose (R6, R11, R13): a slot is free only once the
     /// control plane *knows* the task has no compute.
@@ -709,7 +709,7 @@ impl TaskRecord {
 ///
 /// Durable on the task record itself, so a reservation and the task it
 /// belongs to are committed together and survive a restart: what counts
-/// against a backend's limit is always derivable from the records alone.
+/// against the global task limit is always derivable from the records alone.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapacityReservation {
     /// When the scheduler granted it.
@@ -725,14 +725,23 @@ pub struct QueueStatus {
     pub since: DateTime<Utc>,
 }
 
-/// Capacity of a backend as configuration states it right now (U10).
+/// Scheduler inputs, read fresh for each admission decision.
 ///
-/// Read fresh by the caller on every scheduling decision, so a changed
-/// limit applies to the next decision without a restart.
+/// Backend availability determines whether a task can start on that backend;
+/// `max_concurrent_tasks` is one shared budget across all backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BackendCapacity {
-    /// `max_concurrent_tasks` of a usable backend record.
-    Limit(u32),
+pub struct SchedulingPolicy {
+    /// Whether this task's backend can currently accept work.
+    pub backend: BackendAvailability,
+    /// Maximum tasks holding capacity across all backends; `None` is unlimited.
+    pub max_concurrent_tasks: Option<u32>,
+}
+
+/// Whether a backend can accept new work, independently of the global limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendAvailability {
+    /// The backend is configured and usable.
+    Available,
     /// The backend cannot be used; why.
     Unavailable(String),
 }

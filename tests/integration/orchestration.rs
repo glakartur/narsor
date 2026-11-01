@@ -8,11 +8,11 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
 use narsor_engine::orchestration::scheduler::{BackendLoad, LimitStopDecision};
 use narsor_engine::orchestration::{
-    exhaustion_loss, loss_state, BackendCapacity, BackendLease, Clock, CommandActor,
+    exhaustion_loss, loss_state, BackendAvailability, BackendLease, Clock, CommandActor,
     CommandRequest, ControlPlane, ControllerReport, LossState, MoveTarget, NewTask, Observation,
     ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
-    ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, RunnerState, TaskEventKind,
-    TaskRecord, WorkloadLoss,
+    ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, RunnerState, SchedulingPolicy,
+    TaskEventKind, TaskRecord, WorkloadLoss,
 };
 use narsor_engine::persistence::paths::{temp_path_for, StatePaths};
 use narsor_engine::persistence::ExecutionStore;
@@ -92,7 +92,7 @@ impl Fixture {
     /// One scheduling pass on the `k8s` backend.
     fn schedule_once(&self) {
         self.control
-            .schedule(&backend_id("k8s"), &BackendCapacity::Limit(1))
+            .schedule(&backend_id("k8s"), &limit(1))
             .expect("schedule");
     }
 
@@ -145,7 +145,7 @@ impl Fixture {
     fn admit(&self, id: &str) {
         let record = self.control.task(&task(id)).unwrap();
         self.control
-            .schedule(&record.assignment.backend_id, &BackendCapacity::Limit(16))
+            .schedule(&record.assignment.backend_id, &limit(16))
             .expect("admission pass");
     }
 
@@ -307,9 +307,7 @@ fn owner_state_since_is_stable_until_the_visible_state_changes() {
     let lease = fx.lease("k8s", "controller-a");
 
     fx.clock.advance(Duration::seconds(30));
-    fx.control
-        .schedule(&backend_id("k8s"), &BackendCapacity::Limit(1))
-        .unwrap();
+    fx.control.schedule(&backend_id("k8s"), &limit(1)).unwrap();
     let admitted = fx.control.task(&task("task-a")).unwrap();
     assert_eq!(admitted.state_since, Some(created_since));
 
@@ -1218,8 +1216,11 @@ fn k8s() -> BackendId {
     backend_id("k8s")
 }
 
-fn limit(slots: u32) -> BackendCapacity {
-    BackendCapacity::Limit(slots)
+fn limit(slots: u32) -> SchedulingPolicy {
+    SchedulingPolicy {
+        backend: BackendAvailability::Available,
+        max_concurrent_tasks: Some(slots),
+    }
 }
 
 fn reason(fx: &Fixture, id: &str) -> Option<QueueReason> {
@@ -1304,6 +1305,33 @@ fn a_controller_cannot_start_a_task_the_scheduler_did_not_admit() {
     assert_eq!(started.reservation, None);
     assert_eq!(started.queue, None);
     assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 1);
+}
+
+#[test]
+fn one_global_budget_is_shared_by_queues_on_different_backends() {
+    let fx = Fixture::new();
+    fx.lease("k8s", "controller-k8s");
+    fx.lease("backend-b", "controller-b");
+    fx.create("task-k8s");
+    fx.control
+        .create_task(new_task("task-b", "backend-b"))
+        .unwrap();
+
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    fx.control
+        .schedule(&backend_id("backend-b"), &limit(1))
+        .unwrap();
+
+    assert_eq!(reason(&fx, "task-k8s"), Some(QueueReason::Admitted));
+    assert_eq!(
+        reason(&fx, "task-b"),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1,
+        })
+    );
+    assert_eq!(fx.control.total_capacity_in_use().unwrap(), 1);
 }
 
 #[test]
@@ -1423,7 +1451,10 @@ fn an_unknown_backend_admits_nothing_and_says_so() {
     fx.control
         .schedule(
             &k8s(),
-            &BackendCapacity::Unavailable("backend 'k8s' is not registered".into()),
+            &SchedulingPolicy {
+                backend: BackendAvailability::Unavailable("backend 'k8s' is not registered".into()),
+                max_concurrent_tasks: Some(1),
+            },
         )
         .unwrap();
     assert_eq!(
@@ -4901,10 +4932,8 @@ fn two_running_asked_to_stop(fx: &Fixture, lease: &BackendLease) {
     }
 }
 
-fn decide(fx: &Fixture, id: &str, capacity: BackendCapacity) -> LimitStopDecision {
-    fx.control
-        .decide_limit_stop(&task(id), || capacity)
-        .unwrap()
+fn decide(fx: &Fixture, id: &str, policy: SchedulingPolicy) -> LimitStopDecision {
+    fx.control.decide_limit_stop(&task(id), || policy).unwrap()
 }
 
 #[test]
@@ -4947,7 +4976,10 @@ fn an_unknown_limit_withdraws_the_safe_point_instead_of_stopping_the_task() {
     let lease = fx.lease("k8s", "controller-a");
     two_running_asked_to_stop(&fx, &lease);
 
-    let unavailable = BackendCapacity::Unavailable("backend file is unreadable".to_string());
+    let unavailable = SchedulingPolicy {
+        backend: BackendAvailability::Unavailable("backend file is unreadable".to_string()),
+        max_concurrent_tasks: Some(1),
+    };
     assert_eq!(decide(&fx, "a", unavailable), LimitStopDecision::Withdrawn);
     assert_eq!(
         fx.control.task(&task("a")).unwrap().runner_state,

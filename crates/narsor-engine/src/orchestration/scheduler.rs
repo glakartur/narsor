@@ -1,17 +1,20 @@
-//! Admission of queued tasks by backend capacity (U10: R3, R6, R10, R11).
+//! Admission of queued tasks under backend availability and a global task
+//! budget (U10: R3, R6, R10, R11).
 //!
 //! The control plane — not a controller — decides which queued task may
 //! start. A queued task is offered `Start` only once it holds a
 //! [`CapacityReservation`], and a controller's `StartAccepted` for a task
-//! without one is refused, so no controller can exceed a backend's
-//! `max_concurrent_tasks` however stale or eager it is.
+//! without one is refused, so no controller can exceed the shared
+//! `max_concurrent_tasks` budget however stale or eager it is.
 //!
-//! # One decision per backend at a time
+//! # One global scheduling decision at a time
 //!
-//! [`ControlPlane::schedule`] runs under the backend's schedule lock and
-//! is the only place that grants reservations; the only other way into a
-//! capacity-holding state from a free one — resuming a paused task — goes
-//! through [`ControlPlane::command_with_capacity`] under the same lock.
+//! [`ControlPlane::schedule`] and
+//! [`ControlPlane::command_with_capacity`] run under the global schedule
+//! lock, so admissions on different backends share one consistent count.
+//! Scheduling also takes the backend lock to preserve that backend's queue
+//! order. These are the only ways into a capacity-holding state from a free
+//! one; resuming a paused task goes through `command_with_capacity`.
 //! Every other transition either keeps a task's slot (an admitted start
 //! becoming `Provisioning`, a retry of an interrupted task) or frees one,
 //! so a count taken under the lock can only be too high, never too low: a
@@ -55,9 +58,10 @@
 use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, CommandEffect};
 use super::model::{
-    BackendCapacity, CapacityReservation, CommandActor, CommandOutcome, CommandRequest,
+    BackendAvailability, CapacityReservation, CommandActor, CommandOutcome, CommandRequest,
     DefaultBackendSelection, MoveTarget, OwnerCommand, QueueReason, QueueStatus, RunnerState,
-    SlotReleaseReason, TaskEventKind, TaskRecord, DEFAULT_BACKEND_SELECTION_VERSION,
+    SchedulingPolicy, SlotReleaseReason, TaskEventKind, TaskRecord,
+    DEFAULT_BACKEND_SELECTION_VERSION,
 };
 use super::resume::limit_stop_key;
 use super::{control_plane::Mutation, ControlPlane};
@@ -79,36 +83,36 @@ impl ControlPlane {
     /// record changed (a reservation granted, a reason updated), so the
     /// caller can announce them.
     ///
-    /// `capacity` is the backend's limit as configuration states it *now*;
-    /// the caller reads it fresh for every pass. Idempotent: a pass over an
-    /// unchanged backend writes nothing.
+    /// The caller reads backend availability and the global task limit fresh
+    /// for every pass. Idempotent: a pass over an unchanged backend writes
+    /// nothing.
     pub fn schedule(
         &self,
         backend_id: &BackendId,
-        capacity: &BackendCapacity,
+        policy: &SchedulingPolicy,
     ) -> Result<Vec<TaskId>> {
-        self.schedule_with(backend_id, || capacity.clone())
+        self.schedule_with(backend_id, || policy.clone())
     }
 
-    /// [`Self::schedule`] reading the limit *after* the schedule lock is
-    /// taken, so a decision never uses a limit that a change made while it
-    /// waited for the lock has already replaced (R15).
+    /// [`Self::schedule`] reading its policy after the schedule locks are
+    /// taken, so a decision never uses a limit that changed while it waited
+    /// for the lock (R15).
     pub fn schedule_with(
         &self,
         backend_id: &BackendId,
-        capacity: impl FnOnce() -> BackendCapacity,
+        policy: impl FnOnce() -> SchedulingPolicy,
     ) -> Result<Vec<TaskId>> {
         let _global = self.store().lock_global_schedule()?;
         let _lock = self.store().lock_schedule(backend_id)?;
-        let capacity = &capacity();
+        let policy = policy();
         let tasks = self.dense_backend_tasks(backend_id)?;
         let online = self.controller_online(backend_id)?;
-        let mut in_use = slots_in_use(&tasks);
+        let mut in_use = slots_in_use(&self.store().list_tasks()?);
 
         // Reservations over a lowered limit are taken back, those of the
         // lowest priority first. A task that holds compute is never one.
         let mut revoked: Vec<&TaskId> = Vec::new();
-        if let BackendCapacity::Limit(limit) = capacity {
+        if let Some(limit) = policy.max_concurrent_tasks {
             let mut reserved: Vec<&TaskRecord> = tasks
                 .iter()
                 .filter(|task| {
@@ -117,7 +121,7 @@ impl ControlPlane {
                 .collect();
             reserved.sort_by_key(|task| std::cmp::Reverse((task.rank, task.queue_sequence)));
             for task in reserved {
-                if in_use <= *limit {
+                if in_use <= limit {
                     break;
                 }
                 in_use -= 1;
@@ -145,8 +149,10 @@ impl ControlPlane {
             .collect();
         let mut still_waiting = Vec::new();
         for task in waiting {
-            match capacity {
-                BackendCapacity::Limit(limit) if online && in_use < *limit => {
+            match (&policy.backend, policy.max_concurrent_tasks) {
+                (BackendAvailability::Available, limit)
+                    if online && limit.map_or(true, |limit| in_use < limit) =>
+                {
                     in_use += 1;
                     verdicts.push((task.task_id.clone(), Verdict::Admit));
                 }
@@ -157,15 +163,15 @@ impl ControlPlane {
         // grants, so every reason describes the same, final state.
         for (index, task) in still_waiting.into_iter().enumerate() {
             let position = u32::try_from(index + 1).unwrap_or(u32::MAX);
-            let reason = match capacity {
-                BackendCapacity::Unavailable(detail) => QueueReason::BackendUnknown {
+            let reason = match (&policy.backend, policy.max_concurrent_tasks) {
+                (BackendAvailability::Unavailable(detail), _) => QueueReason::BackendUnknown {
                     detail: detail.clone(),
                 },
-                BackendCapacity::Limit(_) if !online => QueueReason::ControllerOffline,
-                BackendCapacity::Limit(limit) => QueueReason::WaitingForCapacity {
+                (BackendAvailability::Available, _) if !online => QueueReason::ControllerOffline,
+                (BackendAvailability::Available, limit) => QueueReason::WaitingForCapacity {
                     position,
                     running: in_use,
-                    limit: *limit,
+                    limit: limit.unwrap_or(u32::MAX),
                 },
             };
             let verdict = if revoked.contains(&&task.task_id) {
@@ -191,7 +197,7 @@ impl ControlPlane {
     }
 
     /// Asks the task running at `generation` to stop at a safe point,
-    /// because the backend's limit is exceeded: a `Pause` of
+    /// because the global task limit is exceeded: a `Pause` of
     /// [`CommandActor::Policy`], keyed [`limit_stop_key`]`(generation)`.
     ///
     /// Allowed only while [`TaskRecord::limit_stop_candidate`]. An owner
@@ -221,12 +227,12 @@ impl ControlPlane {
     pub fn decide_limit_stop(
         &self,
         task_id: &TaskId,
-        capacity: impl FnOnce() -> BackendCapacity,
+        policy: impl FnOnce() -> SchedulingPolicy,
     ) -> Result<LimitStopDecision> {
         let backend_id = self.task(task_id)?.assignment.backend_id;
         let _global = self.store().lock_global_schedule()?;
         let _lock = self.store().lock_schedule(&backend_id)?;
-        let capacity = capacity();
+        let policy = policy();
         let load = BackendLoad::of(&self.store().list_tasks()?);
         let (_, decision) = self.mutate(task_id, |record, _now| {
             if !record.pause_requested_by_limit() {
@@ -235,9 +241,9 @@ impl ControlPlane {
             if record.limit_stop_accepted {
                 return Ok(Mutation::Unchanged(LimitStopDecision::Accepted));
             }
-            let overshoot = match &capacity {
-                BackendCapacity::Limit(limit) => load.overshoot(*limit),
-                BackendCapacity::Unavailable(_) => 0,
+            let overshoot = match (&policy.backend, policy.max_concurrent_tasks) {
+                (BackendAvailability::Available, Some(limit)) => load.overshoot(limit),
+                _ => 0,
             };
             if overshoot > 0 && !record.owner_work_pending() {
                 record.limit_stop_accepted = true;
@@ -304,9 +310,9 @@ impl ControlPlane {
         &self,
         task_id: &TaskId,
         request: CommandRequest,
-        capacity: &BackendCapacity,
+        policy: &SchedulingPolicy,
     ) -> Result<CommandOutcome> {
-        self.command_with_capacity_from(task_id, request, || capacity.clone())
+        self.command_with_capacity_from(task_id, request, || policy.clone())
     }
 
     /// [`Self::command_with_capacity`] reading the limit after the schedule
@@ -315,7 +321,7 @@ impl ControlPlane {
         &self,
         task_id: &TaskId,
         request: CommandRequest,
-        capacity: impl FnOnce() -> BackendCapacity,
+        policy: impl FnOnce() -> SchedulingPolicy,
     ) -> Result<CommandOutcome> {
         let backend_id = self.task(task_id)?.assignment.backend_id;
         let _global = self.store().lock_global_schedule()?;
@@ -335,15 +341,18 @@ impl ControlPlane {
             );
         let mut queue_resume = false;
         if takes_slot {
-            match &capacity() {
-                BackendCapacity::Unavailable(detail) => {
+            let policy = policy();
+            match &policy.backend {
+                BackendAvailability::Unavailable(detail) => {
                     return Err(OrchestrationError::BackendUnavailable {
                         backend_id,
                         detail: detail.clone(),
                     })
                 }
-                BackendCapacity::Limit(limit) => {
-                    queue_resume = self.capacity_in_use(&backend_id)? >= *limit;
+                BackendAvailability::Available => {
+                    if let Some(limit) = policy.max_concurrent_tasks {
+                        queue_resume = self.total_capacity_in_use()? >= limit;
+                    }
                 }
             }
         }
