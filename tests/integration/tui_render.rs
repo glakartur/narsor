@@ -23,7 +23,6 @@ use narsor::tui::keymap::{self, Context};
 use narsor::tui::style::{SelectionMarks, Styles};
 use narsor::tui::task_app::{layout, TaskApp};
 
-
 fn draw(width: u16, height: u16, paint: impl FnOnce(&mut ratatui::Frame)) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
     terminal.draw(paint).expect("draw");

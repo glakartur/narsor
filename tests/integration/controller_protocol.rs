@@ -162,7 +162,10 @@ impl Harness {
             ),
             None => environment_support::seeded_resolver(root.path()),
         };
-        let service = Arc::new(ProtocolService::with_config(control, resolver, config));
+        let service = Arc::new(
+            ProtocolService::with_config(control, resolver, config)
+                .with_max_concurrent_tasks(Some(3)),
+        );
         let services = ApiServices {
             control: Some(Arc::clone(&service)),
             harness_selector: selector,
@@ -1403,7 +1406,7 @@ async fn a_launch_that_does_not_resolve_is_refused_and_stores_nothing() {
     let harness = Harness::start().await;
     let catalog = narsor_engine::environment::EnvironmentCatalog::new(harness.root.path());
     let mut bad_limits = environment_support::backend("backend-a");
-    bad_limits.limits.max_concurrent_tasks = 0;
+    bad_limits.limits.slot_release_grace_secs = 0;
     fs::write(
         harness.root.path().join("backends/backend-a.yaml"),
         serde_yaml::to_string(&bad_limits).unwrap(),
@@ -4881,11 +4884,7 @@ async fn an_owner_cannot_use_the_slot_release_keys() {
 
 /// Makes `limit` the backend's `max_concurrent_tasks`; read fresh.
 fn set_backend_limit(harness: &Harness, limit: u32) {
-    let mut record = environment_support::backend("k8s");
-    record.limits.max_concurrent_tasks = limit;
-    narsor_engine::environment::EnvironmentCatalog::new(harness.root.path())
-        .save_backend(&record)
-        .expect("save the backend");
+    harness.service.set_max_concurrent_tasks(Some(limit));
 }
 
 /// Creates `task` and brings it to `Running` under the controller that
@@ -5586,101 +5585,6 @@ async fn at_safe_point(
 }
 
 #[tokio::test]
-async fn an_ad_hoc_limit_has_priority_over_the_file_until_it_is_cleared() {
-    let harness = Harness::start().await;
-    set_backend_limit(&harness, 3);
-
-    let view = harness
-        .owner
-        .control_set_backend_limit("k8s", 5)
-        .await
-        .expect("set the limit");
-    assert_eq!(view.effective, 5);
-    assert_eq!(view.file_value, 3);
-    assert_eq!(view.override_value, Some(5));
-    assert_eq!(
-        view.source,
-        narsor_protocol::controller::BackendLimitSource::AdHoc
-    );
-
-    let view = harness
-        .owner
-        .control_clear_backend_limit("k8s")
-        .await
-        .expect("clear the limit");
-    assert_eq!(view.effective, 3);
-    assert_eq!(view.override_value, None);
-    assert_eq!(
-        view.source,
-        narsor_protocol::controller::BackendLimitSource::File
-    );
-}
-
-#[tokio::test]
-async fn a_limit_outside_the_range_is_refused_and_changes_nothing() {
-    let harness = Harness::start().await;
-    set_backend_limit(&harness, 2);
-
-    for bad in [0, 2000] {
-        let refused = harness.owner.control_set_backend_limit("k8s", bad).await;
-        assert_eq!(bad_request_code(refused), "invalid_backend_limit");
-    }
-    for good in [1, 1024] {
-        harness
-            .owner
-            .control_set_backend_limit("k8s", good)
-            .await
-            .expect("a limit in range");
-    }
-    harness
-        .owner
-        .control_clear_backend_limit("k8s")
-        .await
-        .expect("clear");
-    let view = harness
-        .owner
-        .control_backend_limit("k8s")
-        .await
-        .expect("view");
-    assert_eq!(view.effective, 2);
-    assert_eq!(view.override_value, None);
-}
-
-#[tokio::test]
-async fn a_limit_of_an_unknown_backend_is_not_found() {
-    let harness = Harness::start().await;
-    let refused = harness.owner.control_set_backend_limit("nowhere", 2).await;
-    assert!(matches!(refused, Err(ClientError::NotFound)), "{refused:?}");
-    assert!(harness
-        .owner
-        .control_backend_limit("nowhere")
-        .await
-        .is_err());
-}
-
-#[tokio::test]
-async fn an_ad_hoc_limit_does_not_outlive_the_control_plane() {
-    let harness = Harness::start().await;
-    set_backend_limit(&harness, 3);
-    harness
-        .owner
-        .control_set_backend_limit("k8s", 5)
-        .await
-        .expect("set");
-
-    // A new service on the same state: the file is as it was, and the
-    // override is gone.
-    let fresh = ProtocolService::with_config(
-        harness.control_plane(),
-        environment_support::seeded_resolver(harness.root.path()),
-        test_config(),
-    );
-    let view = fresh.backend_limit_view("k8s").expect("view");
-    assert_eq!(view.effective, 3);
-    assert_eq!(view.override_value, None);
-}
-
-#[tokio::test]
 async fn a_higher_limit_starts_a_waiting_task_at_once() {
     let harness = Harness::start().await;
     set_backend_limit(&harness, 1);
@@ -5689,11 +5593,7 @@ async fn a_higher_limit_starts_a_waiting_task_at_once() {
     harness.create("task-2", "k8s").await;
     assert!(!control_task(&harness, "task-2").holds_capacity());
 
-    harness
-        .owner
-        .control_set_backend_limit("k8s", 2)
-        .await
-        .expect("raise");
+    harness.service.set_max_concurrent_tasks(Some(2));
 
     // No periodic pass ran.
     let waiting = control_task(&harness, "task-2");
@@ -5705,33 +5605,33 @@ async fn a_higher_limit_starts_a_waiting_task_at_once() {
 }
 
 #[tokio::test]
-async fn two_changes_of_the_limit_at_once_end_in_one_committed_value() {
+async fn the_owner_changes_the_limit_of_tasks_through_the_api() {
     let harness = Harness::start().await;
-    set_backend_limit(&harness, 3);
-    let _first = harness.running("task-1", "k8s").await;
-    harness.create("task-2", "k8s").await;
-    harness.create("task-3", "k8s").await;
-
-    let (lower, higher) = tokio::join!(
-        harness.owner.control_set_backend_limit("k8s", 1),
-        harness.owner.control_set_backend_limit("k8s", 2),
-    );
-    lower.expect("lower");
-    higher.expect("higher");
-
-    // The value that was stored last is the one the tasks follow.
     let view = harness
         .owner
-        .control_backend_limit("k8s")
+        .control_set_concurrency_limit(5)
         .await
-        .expect("view");
-    assert_eq!(Some(view.effective), view.override_value);
-    assert!([1, 2].contains(&view.effective), "{view:?}");
-    let held = ["task-1", "task-2", "task-3"]
-        .into_iter()
-        .filter(|task| control_task(&harness, task).holds_capacity())
-        .count();
-    assert_eq!(held as u32, view.effective, "{view:?}");
+        .expect("set");
+    assert_eq!(view.limit, Some(5));
+    assert_eq!(
+        harness
+            .owner
+            .control_concurrency_limit()
+            .await
+            .expect("get"),
+        view
+    );
+    for bad in [0, 2000] {
+        assert!(harness
+            .owner
+            .control_set_concurrency_limit(bad)
+            .await
+            .is_err());
+    }
+    assert_eq!(
+        harness.service.concurrency_limit_view().unwrap().limit,
+        Some(5)
+    );
 }
 
 #[tokio::test]
@@ -5742,11 +5642,7 @@ async fn a_lower_limit_takes_back_a_reservation_over_it() {
     harness.create("task-2", "k8s").await;
     assert!(control_task(&harness, "task-2").holds_capacity());
 
-    harness
-        .owner
-        .control_set_backend_limit("k8s", 1)
-        .await
-        .expect("lower");
+    harness.service.set_max_concurrent_tasks(Some(1));
 
     let waiting = control_task(&harness, "task-2");
     assert!(!waiting.holds_capacity(), "nothing started on it");
@@ -5765,12 +5661,7 @@ async fn a_lowered_limit_stops_the_first_task_at_a_safe_point_and_queues_it_agai
     let first = harness.running("task-1", "k8s").await;
     let second_runner = run_beside(&harness, &first, "task-2", "pod-2").await;
 
-    let view = harness
-        .owner
-        .control_set_backend_limit("k8s", 1)
-        .await
-        .expect("lower");
-    assert_eq!(view.overshoot, 1);
+    harness.service.set_max_concurrent_tasks(Some(1));
 
     // Both are asked, and neither looks paused to its owner.
     for task in ["task-1", "task-2"] {
@@ -5825,13 +5716,6 @@ async fn a_lowered_limit_stops_the_first_task_at_a_safe_point_and_queues_it_agai
         control_task(&harness, "task-2").runner_state,
         RunnerState::Running
     );
-    let view = harness
-        .owner
-        .control_backend_limit("k8s")
-        .await
-        .expect("view");
-    assert_eq!(view.overshoot, 0);
-    assert_eq!(view.slots_held, 1);
 }
 
 #[tokio::test]
@@ -5840,19 +5724,11 @@ async fn a_stop_for_the_limit_is_taken_back_once_the_overshoot_is_gone() {
     set_backend_limit(&harness, 2);
     let first = harness.running("task-1", "k8s").await;
     let _second = run_beside(&harness, &first, "task-2", "pod-2").await;
-    harness
-        .owner
-        .control_set_backend_limit("k8s", 1)
-        .await
-        .expect("lower");
+    harness.service.set_max_concurrent_tasks(Some(1));
     assert!(control_task(&harness, "task-1").pause_requested_by_limit());
 
     // The operator raises the limit again before any safe point.
-    harness
-        .owner
-        .control_set_backend_limit("k8s", 2)
-        .await
-        .expect("raise");
+    harness.service.set_max_concurrent_tasks(Some(2));
     let answer = at_safe_point(&first.runner, 2).await;
 
     assert_eq!(answer.directive, RunnerDirective::Continue);
@@ -5886,11 +5762,7 @@ async fn a_task_the_limit_stopped_gets_the_next_free_slot_by_its_rank() {
     set_backend_limit(&harness, 2);
     let first = harness.running("task-1", "k8s").await;
     let _second = run_beside(&harness, &first, "task-2", "pod-2").await;
-    harness
-        .owner
-        .control_set_backend_limit("k8s", 1)
-        .await
-        .expect("lower");
+    harness.service.set_max_concurrent_tasks(Some(1));
     at_safe_point(&first.runner, 2).await;
     first
         .controller
@@ -5907,11 +5779,7 @@ async fn a_task_the_limit_stopped_gets_the_next_free_slot_by_its_rank() {
     harness.create("task-3", "k8s").await;
     assert!(!control_task(&harness, "task-1").holds_capacity());
 
-    harness
-        .owner
-        .control_set_backend_limit("k8s", 2)
-        .await
-        .expect("raise");
+    harness.service.set_max_concurrent_tasks(Some(2));
 
     assert!(control_task(&harness, "task-1").holds_capacity());
     assert!(!control_task(&harness, "task-3").holds_capacity());
@@ -7610,7 +7478,6 @@ fn register_local_backend(
         kind,
         trust_scope,
         narsor_engine::environment::BackendLimits::new(
-            1,
             narsor_engine::domain::ResourceProfile::new(1000, 2048),
             None,
         ),

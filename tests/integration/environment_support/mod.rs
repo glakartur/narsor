@@ -43,7 +43,6 @@ pub fn backend(id: &str) -> BackendRecord {
         BackendKind::Kubernetes,
         TrustScope::Dedicated,
         BackendLimits::new(
-            3,
             ResourceProfile::new(1000, 2048),
             Some(ResourceProfile::new(4000, 8192)),
         ),

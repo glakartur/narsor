@@ -396,19 +396,17 @@ pub enum Request {
     OpenLink(LinkRequest),
     /// `h`: read the default harness and open the list to change it.
     OpenHarness,
+    /// `L`: read the limit of tasks processed at once and open the list to
+    /// change it.
+    OpenLimit,
+    /// Set the limit of tasks processed at once.
+    SetLimit {
+        /// The new limit.
+        limit: u32,
+    },
     /// Make this harness the installation's default; `None` goes back to
     /// the configured one.
     SetHarness(Option<String>),
-    /// `L`: read the limit of the selected task's backend and open the list
-    /// to change it.
-    OpenLimit,
-    /// Set the ad hoc limit of a backend; `None` removes it.
-    SetLimit {
-        /// The backend's id.
-        backend: String,
-        /// The new limit, or `None` for the file's value.
-        limit: Option<u32>,
-    },
 }
 
 /// A fresh key for a command that must not run twice (an owner command, an
@@ -1155,9 +1153,9 @@ impl TaskApp {
             Request::Act(request) => self.act(*request).await,
             Request::OpenLink(link) => self.open_link(link),
             Request::OpenHarness => self.start_opening(OpeningKind::Harness),
-            Request::SetHarness(harness) => self.change_harness(harness).await,
             Request::OpenLimit => self.start_limit_read(),
-            Request::SetLimit { backend, limit } => self.change_limit(backend, limit).await,
+            Request::SetLimit { limit } => self.change_limit(limit).await,
+            Request::SetHarness(harness) => self.change_harness(harness).await,
         }
     }
 

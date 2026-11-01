@@ -470,10 +470,10 @@ async fn start_control_plane_server(root: &TempRoot) -> api::ApiHandle {
         root.path().to_path_buf(),
         root.path().to_path_buf(),
         api::ApiServices {
-            control: Some(Arc::new(ProtocolService::new(
-                control,
-                environment_support::seeded_resolver(root.path()),
-            ))),
+            control: Some(Arc::new(
+                ProtocolService::new(control, environment_support::seeded_resolver(root.path()))
+                    .with_max_concurrent_tasks(Some(3)),
+            )),
             ..api::ApiServices::default()
         },
     )

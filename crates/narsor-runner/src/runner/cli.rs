@@ -129,6 +129,11 @@ pub struct RunnerArgs {
     #[arg(long, value_name = "DIRECTORY")]
     pub claude_profile_source: Option<PathBuf>,
 
+    /// An extra argument for every harness run, as `--agent-arg=<ARG>`;
+    /// repeat it for each argument. It wins over the same flag Narsor chose.
+    #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub agent_args: Vec<String>,
+
     /// Only answer reads of the storage (conversation pages, events, the
     /// conductor's chat) and change nothing on it: no preparation,
     /// initialization, session, snapshot or work. `--launch-spec`,
@@ -223,6 +228,7 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
             codex_home: args.codex_home,
             claude_config_dir: args.claude_config_dir,
             claude_profile_source: args.claude_profile_source,
+            agent_args: args.agent_args,
         },
         incarnation: args.incarnation,
         timing: RunnerTiming {
@@ -319,6 +325,7 @@ mod tests {
                 codex_home: Some("/srv/codex".into()),
                 claude_config_dir: Some("/srv/claude".into()),
                 claude_profile_source: Some("/srv/profile".into()),
+                agent_args: Vec::new(),
             }
         );
     }

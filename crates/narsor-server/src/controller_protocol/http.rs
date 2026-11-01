@@ -150,10 +150,8 @@ where
             get(get_default_backend).put(put_default_backend),
         )
         .route(
-            "/control/v1/backends/{backend_id}/limit",
-            get(get_backend_limit)
-                .put(put_backend_limit)
-                .delete(delete_backend_limit),
+            "/control/v1/concurrency-limit",
+            get(get_concurrency_limit).put(put_concurrency_limit),
         )
         .route("/control/v1/usage", get(get_usage))
         .route("/control/v1/tasks/{task_id}/timeline", get(get_timeline))
@@ -455,37 +453,22 @@ async fn put_default_backend(
     ))
 }
 
-async fn get_backend_limit(
+async fn get_concurrency_limit(
     State(service): State<Service>,
     Extension(_owner): Extension<OwnerRef>,
-    Path(backend_id): Path<String>,
-) -> ProtocolResult<Json<BackendLimitView>> {
+) -> ProtocolResult<Json<ConcurrencyLimitView>> {
     Ok(Json(
-        blocking(&service, move |s| s.backend_limit_view(&backend_id)).await?,
+        blocking(&service, move |s| s.concurrency_limit_view()).await?,
     ))
 }
 
-async fn put_backend_limit(
+async fn put_concurrency_limit(
     State(service): State<Service>,
     Extension(_owner): Extension<OwnerRef>,
-    Path(backend_id): Path<String>,
-    Json(request): Json<SetBackendLimitRequest>,
-) -> ProtocolResult<Json<BackendLimitView>> {
+    Json(request): Json<SetConcurrencyLimitRequest>,
+) -> ProtocolResult<Json<ConcurrencyLimitView>> {
     Ok(Json(
-        blocking(&service, move |s| {
-            s.set_backend_limit(&backend_id, request.limit)
-        })
-        .await?,
-    ))
-}
-
-async fn delete_backend_limit(
-    State(service): State<Service>,
-    Extension(_owner): Extension<OwnerRef>,
-    Path(backend_id): Path<String>,
-) -> ProtocolResult<Json<BackendLimitView>> {
-    Ok(Json(
-        blocking(&service, move |s| s.clear_backend_limit(&backend_id)).await?,
+        blocking(&service, move |s| s.change_concurrency_limit(request.limit)).await?,
     ))
 }
 
@@ -730,7 +713,7 @@ async fn next_stream_event(
             // Missed notifications: rescan everything this stream covers.
             Err(RecvError::Lagged(_)) => state.only.clone(),
             Err(RecvError::Closed) => return None,
-        };        
+        };
         let service = Arc::clone(&state.service);
         let owner = state.owner.clone();
         let mut cursor = state.cursor.clone();

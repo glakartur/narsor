@@ -3695,10 +3695,10 @@ async fn start_scheduling_server(
 ) {
     let control = narsor_engine::orchestration::ControlPlane::new(StatePaths::new(root.path()));
     let launch = environment_support::seeded_catalog_resolver(root.path());
-    let service = Arc::new(narsor_engine::controller_protocol::ProtocolService::new(
-        control,
-        launch.clone(),
-    ));
+    let service = Arc::new(
+        narsor_engine::controller_protocol::ProtocolService::new(control, launch.clone())
+            .with_max_concurrent_tasks(Some(3)),
+    );
     let handle = api::start_with_services(
         Arc::new(Engine::new(root.store())),
         root.path().to_path_buf(),
@@ -3948,7 +3948,7 @@ async fn local_and_control_plane_creates_share_one_ranked_queue() {
 
     let root = TempRoot::new();
     let (handle, service) = start_scheduling_server(&root).await;
-    set_backend_limit(&root, "k8s", 1);
+    service.set_max_concurrent_tasks(Some(1));
     let client = handle.client();
     let reason = |summary: narsor_engine::controller_protocol::TaskSummary| {
         summary.queue.map(|queue| queue.reason)
@@ -4046,14 +4046,6 @@ async fn local_and_control_plane_creates_share_one_ranked_queue() {
         .report("first", Observation::ResourcesDeleted)
         .expect("deleted");
     assert_eq!(controller.offered_starts(), ["remote-d"]);
-}
-
-fn set_backend_limit(root: &TempRoot, backend: &str, limit: u32) {
-    let mut record = environment_support::backend(backend);
-    record.limits.max_concurrent_tasks = limit;
-    narsor_engine::environment::EnvironmentCatalog::new(root.path())
-        .save_backend(&record)
-        .expect("save backend");
 }
 
 fn inheriting_task(task_id: &str) -> narsor_engine::controller_protocol::CreateTaskRequest {
@@ -4156,7 +4148,7 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
     let root = TempRoot::new();
     let (handle, service) = start_scheduling_server(&root).await;
     // Read fresh by every decision: no restart needed.
-    set_backend_limit(&root, "k8s", 1);
+    service.set_max_concurrent_tasks(Some(1));
     let client = handle.client();
 
     // Nobody can start anything yet: the controller is offline.

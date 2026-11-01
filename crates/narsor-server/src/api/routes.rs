@@ -1554,7 +1554,7 @@ where
         .map_err(|error| ApiError::Internal(error.to_string()))?
 }
 
-fn list_executions(state: &AppState, owner: &OwnerRef) -> Result<ExecutionListResponse, ApiError> {    
+fn list_executions(state: &AppState, owner: &OwnerRef) -> Result<ExecutionListResponse, ApiError> {
     let mut executions = std::collections::BTreeMap::new();
     let mut ambiguous = std::collections::BTreeSet::new();
     for store in std::iter::once(state.store.clone()) {

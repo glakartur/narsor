@@ -24,11 +24,11 @@ use serde::{Deserialize, Serialize};
 pub use narsor_protocol::api::{LegacyExecutionListResponse, LegacyExecutionView};
 pub use narsor_protocol::controller::ConductorReadResponse;
 pub use narsor_protocol::controller::{
-    AckRequest, AckResponse, AcquireLeaseRequest, ArchiveTombstone, BackendLimitSource,
-    BackendLimitView, CapabilitiesView, CommandAck, CommandActor, CommandReceipt, CommandsQuery,
-    CommandsResponse, ConductorReadQuery, ConductorReadRequest, ControlEventEnvelope,
-    ControllerListResponse, ControllerPresence, ControllerView, ConversationAttemptSummary,
-    ConversationPageAccepted, ConversationPageQuery, ConversationPageRequest, ConversationResponse,
+    AckRequest, AckResponse, AcquireLeaseRequest, ArchiveTombstone, CapabilitiesView, CommandAck,
+    CommandActor, CommandReceipt, CommandsQuery, CommandsResponse, ConcurrencyLimitView,
+    ConductorReadQuery, ConductorReadRequest, ControlEventEnvelope, ControllerListResponse,
+    ControllerPresence, ControllerView, ConversationAttemptSummary, ConversationPageAccepted,
+    ConversationPageQuery, ConversationPageRequest, ConversationResponse,
     ConversationUnavailableReason, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, DeliveredInput, DeliveredOperatorCommand, DesiredAction,
     DesiredCommand, EnrollRequest, EnrollResponse, EnrollmentResponse, ExecutionCursor,
@@ -43,15 +43,16 @@ pub use narsor_protocol::controller::{
     ResourceProfileRequest, ResumeExhaustion, ResumeState, RotateKeyRequest, RotateKeyResponse,
     RunnerCredentialRequest, RunnerCredentialResponse, RunnerDirective, RunnerLaunchView,
     RunnerPollQuery, RunnerPollResponse, RunnerProblem, RunnerProgress, RunnerRenewResponse,
-    RunnerSnapshotRequest, RunnerSnapshotResponse, RunnerState, RunnerView, SetBackendLimitRequest,
-    SetDefaultBackendRequest, SubmitCommentRequest, SubmitCommentResponse, SubmitInputRequest,
-    SubmitInputResponse, SubmitOperatorCommandRequest, SubmitOperatorCommandResponse, TaskActionId,
-    TaskActionOffer, TaskActionOption, TaskEvent, TaskEventKind, TaskListResponse, TaskState,
-    TaskSummary, TimelineResponse, TransitionExit, TransitionOffer, ValidateWorkflowRequest,
-    ValidateWorkflowResponse, WorkflowInputType, WorkflowInputView, WorkflowListResponse,
-    WorkflowSource, WorkflowSourceRequest, WorkflowSourceResponse, WorkflowView, WorkspaceRequest,
-    CONVERSATION_READER_STARTING, CONVERSATION_RECORD_UNREADABLE,
-    CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
+    RunnerSnapshotRequest, RunnerSnapshotResponse, RunnerState, RunnerView,
+    SetConcurrencyLimitRequest, SetDefaultBackendRequest, SubmitCommentRequest,
+    SubmitCommentResponse, SubmitInputRequest, SubmitInputResponse, SubmitOperatorCommandRequest,
+    SubmitOperatorCommandResponse, TaskActionId, TaskActionOffer, TaskActionOption, TaskEvent,
+    TaskEventKind, TaskListResponse, TaskState, TaskSummary, TimelineResponse, TransitionExit,
+    TransitionOffer, ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType,
+    WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowSourceRequest,
+    WorkflowSourceResponse, WorkflowView, WorkspaceRequest, CONVERSATION_READER_STARTING,
+    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
+    CONVERSATION_UNAVAILABLE,
 };
 
 use crate::domain::TaskId;

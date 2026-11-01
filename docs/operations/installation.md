@@ -61,9 +61,8 @@ they also work with `curl ... | bash`.
 The data directory is a root: the configuration gets
 `catalog_dir: ROOT/catalog`, `state_dir: ROOT/state` and `work_dir: ROOT/work`,
 followed by the other settings as commented-out defaults (remove the `#` to
-change one). The number of tasks processed in parallel is a backend limit
-(`limits.max_concurrent_tasks` in `<catalog_dir>/backends/<id>.yaml`), so it is
-mentioned in the file but not set there.
+change one). The number of tasks processed in parallel is the global
+`max_concurrent_tasks` setting (default 1).
 
 If a configuration file already exists, it is left untouched. The installer
 writes `config.yaml.new` next to it with the default values and does not ask

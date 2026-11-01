@@ -63,7 +63,8 @@ use uuid::Uuid;
 
 use super::answer::{self, ChoiceAnswer};
 use super::harness::{
-    FinalAnswer, HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun, HarnessStreamParser,
+    apply_extra_args, FinalAnswer, HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun,
+    HarnessStreamParser,
 };
 use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
 use super::process_group::{self, GroupGuard};
@@ -118,6 +119,8 @@ pub struct AgentExecutor {
     usage: Option<Arc<dyn UsageReporter>>,
     /// How long a harness may go on after its final answer.
     final_answer_grace: Duration,
+    /// Extra arguments of every run, winning over the adapter's own.
+    extra_args: Vec<String>,
 }
 
 impl AgentExecutor {
@@ -129,6 +132,7 @@ impl AgentExecutor {
             events: None,
             usage: None,
             final_answer_grace: FINAL_ANSWER_GRACE,
+            extra_args: Vec::new(),
         }
     }
 
@@ -139,6 +143,13 @@ impl AgentExecutor {
         self
     }
 
+    /// The same executor, adding `args` to every harness run; on a conflict
+    /// they replace the arguments the adapter decided on.
+    pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
+        self.extra_args = args;
+        self
+    }
+
     /// An executor with a registry of its own.
     pub fn with_harnesses(harnesses: HarnessRegistry) -> Self {
         Self {
@@ -146,6 +157,7 @@ impl AgentExecutor {
             events: None,
             usage: None,
             final_answer_grace: FINAL_ANSWER_GRACE,
+            extra_args: Vec::new(),
         }
     }
 
@@ -265,7 +277,10 @@ impl AgentExecutor {
             resume_session: resume,
             output_schema: None,
         }) {
-            Ok(invocation) => invocation,
+            Ok(mut invocation) => {
+                apply_extra_args(&mut invocation, &prompt, &self.extra_args);
+                invocation
+            }
             Err(error) => {
                 conversation.append_outcome(
                     &format!("harness did not start: {}", error.message),

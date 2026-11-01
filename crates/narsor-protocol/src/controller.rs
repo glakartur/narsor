@@ -1631,47 +1631,28 @@ pub struct SetDefaultBackendRequest {
     pub backend_id: Option<String>,
 }
 
-/// Where a backend's effective limit of concurrent tasks comes from.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendLimitSource {
-    /// `max_concurrent_tasks` of the backend file.
-    File,
-    /// A value the operator set in the running control plane.
-    AdHoc,
-    #[serde(other)]
-    Unrecognized,
-}
-
-/// Most concurrent tasks a backend record may declare. A sanity bound, not a
-/// scheduling policy: Narsor targets a handful of parallel tasks (R6).
+/// Most concurrent tasks the `max_concurrent_tasks` setting may allow. A sanity
+/// bound, not a scheduling policy: Narsor targets a handful of parallel tasks (R6).
 pub const MAX_CONCURRENT_TASKS_LIMIT: u32 = 1024;
 
-/// A backend's limit of concurrent tasks as presented to an owner client.
+/// The limit of tasks processed at once, as presented to an owner client.
 /// The control plane computes every field; a client shows them as they are.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BackendLimitView {
-    pub backend_id: String,
-    /// The limit the scheduler applies now.
-    pub effective: u32,
-    pub source: BackendLimitSource,
-    /// `max_concurrent_tasks` of the backend file, read now.
-    pub file_value: u32,
-    /// The ad hoc value; it lasts until the control plane restarts.
-    #[serde(rename = "override")]
-    pub override_value: Option<u32>,
+pub struct ConcurrencyLimitView {
+    /// The limit the scheduler applies now; `None` for no limit.
+    pub limit: Option<u32>,
     /// Slots held by tasks that have, or may have, compute.
     pub slots_held: u32,
-    /// How many tasks still have to stop for the effective limit.
+    /// How many tasks still have to stop for the limit.
     pub overshoot: u32,
     /// Tasks that wait for a pause a lowered limit asked for, and tasks
     /// whose safe point was accepted and whose compute is not removed yet.
     pub waiting_to_stop: u32,
 }
 
-/// Request to set (`limit: Some`) the ad hoc limit of a backend.
+/// Request to change the limit of tasks processed at once.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SetBackendLimitRequest {
+pub struct SetConcurrencyLimitRequest {
     pub limit: u32,
 }
 

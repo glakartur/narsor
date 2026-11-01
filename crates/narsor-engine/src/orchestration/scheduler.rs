@@ -98,6 +98,7 @@ impl ControlPlane {
         backend_id: &BackendId,
         capacity: impl FnOnce() -> BackendCapacity,
     ) -> Result<Vec<TaskId>> {
+        let _global = self.store().lock_global_schedule()?;
         let _lock = self.store().lock_schedule(backend_id)?;
         let capacity = &capacity();
         let tasks = self.dense_backend_tasks(backend_id)?;
@@ -208,7 +209,7 @@ impl ControlPlane {
     /// Decides what happens to the task whose runner reports a safe point
     /// while it waits for a pause a lowered limit asked for.
     ///
-    /// Under the backend's schedule lock, with the limit read after it is
+    /// Under the schedule locks, with the limit read after they are
     /// taken: the stops accepted so far and not yet carried out count
     /// against the overshoot, so two reports at once never stop two tasks
     /// for an overshoot of one. With an overshoot left the safe point is
@@ -223,9 +224,10 @@ impl ControlPlane {
         capacity: impl FnOnce() -> BackendCapacity,
     ) -> Result<LimitStopDecision> {
         let backend_id = self.task(task_id)?.assignment.backend_id;
+        let _global = self.store().lock_global_schedule()?;
         let _lock = self.store().lock_schedule(&backend_id)?;
         let capacity = capacity();
-        let load = BackendLoad::of(&self.backend_tasks(&backend_id)?);
+        let load = BackendLoad::of(&self.store().list_tasks()?);
         let (_, decision) = self.mutate(task_id, |record, _now| {
             if !record.pause_requested_by_limit() {
                 return Ok(Mutation::Unchanged(LimitStopDecision::NotApplicable));
@@ -256,10 +258,20 @@ impl ControlPlane {
         Ok(decision)
     }
 
+    /// What all tasks together hold, whatever the backend.
+    pub fn total_load(&self) -> Result<BackendLoad> {
+        Ok(BackendLoad::of(&self.store().list_tasks()?))
+    }
+
     /// Slots of `backend_id` in use right now (see
     /// [`TaskRecord::holds_capacity`]).
     pub fn capacity_in_use(&self, backend_id: &BackendId) -> Result<u32> {
         Ok(slots_in_use(&self.backend_tasks(backend_id)?))
+    }
+
+    /// Slots in use right now across every backend.
+    pub fn total_capacity_in_use(&self) -> Result<u32> {
+        Ok(slots_in_use(&self.store().list_tasks()?))
     }
 
     /// Whether a controller holds an unexpired lease of `backend_id` — the
@@ -306,6 +318,7 @@ impl ControlPlane {
         capacity: impl FnOnce() -> BackendCapacity,
     ) -> Result<CommandOutcome> {
         let backend_id = self.task(task_id)?.assignment.backend_id;
+        let _global = self.store().lock_global_schedule()?;
         let _lock = self.store().lock_schedule(&backend_id)?;
         let record = self.task(task_id)?;
         let takes_slot = record.receipt(&request.idempotency_key).is_none()

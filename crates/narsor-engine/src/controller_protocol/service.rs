@@ -299,8 +299,9 @@ pub struct ProtocolService {
     event_reads: Mutex<EventsRelay>,
     conductor_reads: Mutex<ConductorRelay>,
     materials: MaterialStore,
-    limit_overrides: backend_limit::LimitOverrides,
     harness_usages: harness_usage::HarnessUsages,
+    /// Most tasks processed at once across all backends; `None` for no limit.
+    max_concurrent_tasks: Mutex<Option<u32>>,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -311,6 +312,9 @@ impl std::fmt::Debug for ProtocolService {
             .finish_non_exhaustive()
     }
 }
+
+/// The limit of tasks processed at once when nothing sets one.
+pub const DEFAULT_MAX_CONCURRENT_TASKS: u32 = 1;
 
 impl ProtocolService {
     /// A service with the default policy and file-backed bearer credentials.
@@ -348,9 +352,31 @@ impl ProtocolService {
             pages: Mutex::new(PageRelay::default()),
             event_reads: Mutex::new(EventsRelay::default()),
             conductor_reads: Mutex::new(ConductorRelay::default()),
-            limit_overrides: Mutex::default(),
             harness_usages: Mutex::default(),
+            max_concurrent_tasks: Mutex::new(Some(DEFAULT_MAX_CONCURRENT_TASKS)),
         }
+    }
+
+    /// Returns the service with a limit of tasks processed at once across
+    /// all backends, `None` for no limit.
+    pub fn with_max_concurrent_tasks(self, limit: Option<u32>) -> Self {
+        *self.lock_max_concurrent_tasks() = limit;
+        self
+    }
+
+    /// Changes the limit of tasks processed at once. Waiting tasks start at
+    /// once under a higher limit; a lower one stops new starts, takes back
+    /// reservations over it, and asks running tasks to stop at a safe point.
+    pub fn set_max_concurrent_tasks(&self, limit: Option<u32>) {
+        *self.lock_max_concurrent_tasks() = limit;
+        self.reschedule_all();
+        self.limit_stop_pass();
+    }
+
+    fn lock_max_concurrent_tasks(&self) -> std::sync::MutexGuard<'_, Option<u32>> {
+        self.max_concurrent_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Replaces how controller requests are verified (the default checks
@@ -793,7 +819,7 @@ impl ProtocolService {
             Some(backend) => {
                 let backend = parse_identifier(BackendId::parse(backend))?;
                 self.launch
-                    .backend_limit(&backend)
+                    .check_backend(&backend)
                     .map_err(launch_refusal)?;
                 Some(backend)
             }
@@ -1765,9 +1791,9 @@ impl ProtocolService {
             && current.pause_requested_by_limit()
             && !current.supersedes_launch(identity.launch_generation)
         {
-            let decision = self.control.decide_limit_stop(&identity.task_id, || {
-                self.capacity(&current.assignment.backend_id)
-            })?;
+            let decision = self
+                .control
+                .decide_limit_stop(&identity.task_id, || self.shared_limit())?;
             if decision != crate::orchestration::scheduler::LimitStopDecision::NotApplicable {
                 self.notify(&identity.task_id);
             }

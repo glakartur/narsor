@@ -185,12 +185,16 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     });
     // A stopped task is read by a read-only runner its controller starts
     // (D63): the control plane reads no task storage, local backend or not.
-    let control = Arc::new(ProtocolService::new(control_plane, launch.clone()));
+    let control = Arc::new(
+        ProtocolService::new(control_plane, launch.clone())
+            .with_max_concurrent_tasks(config.max_concurrent_tasks()),
+    );
     let _scheduler = spawn_periodic_admission(Arc::clone(&control));
     let agent_timeout_secs = defaults.timeout_secs;
     let engine = Arc::new(
         Engine::new(store.clone())
             .with_agent_timeout(defaults.timeout_secs)
+            .with_agent_args(defaults.args.clone())
             .with_default_harness_source(selector.clone()),
     );
 
@@ -205,6 +209,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         config.work_dir().to_path_buf(),
     )
     .with_default_harness_source(selector.clone())
+    .with_extra_args(defaults.args.clone())
     .with_agent_timeout(agent_timeout_secs);
     // Held here for the daemon's whole life: the engine only holds it
     // weakly, and hands a step without a usable output label to it (F1).

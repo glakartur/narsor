@@ -187,6 +187,7 @@ fn resolve_home(
     let configured = if untrusted {
         HarnessHome {
             mode: configured.mode,
+            agent_args: configured.agent_args,
             ..HarnessHome::default()
         }
     } else {
@@ -203,6 +204,7 @@ fn resolve_home(
             .claude_profile_source
             .clone()
             .or(configured.claude_profile_source),
+        agent_args: configured.agent_args,
     })
 }
 

@@ -298,13 +298,12 @@ pub trait LaunchResolver: Send + Sync {
     /// Resolves and validates `intent`, reading but never writing.
     fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError>;
 
-    /// `max_concurrent_tasks` of a registered, usable backend, read fresh
-    /// from configuration on every call, so the scheduler applies a changed
-    /// limit to its next decision (U10).
-    fn backend_limit(&self, backend: &BackendId) -> Result<u32, LaunchError>;
+    /// Whether `backend` is registered and usable, read fresh from
+    /// configuration on every call.
+    fn check_backend(&self, backend: &BackendId) -> Result<(), LaunchError>;
 
     /// The slot-release periods of a registered, usable backend, read fresh
-    /// from configuration on every call, like [`Self::backend_limit`].
+    /// from configuration on every call, like [`Self::check_backend`].
     fn slot_release_timings(&self, backend: &BackendId) -> Result<SlotReleaseTimings, LaunchError>;
 
     /// The configured `default_backend` — the fallback when the owner has
@@ -1026,8 +1025,8 @@ impl SecretSet {
 }
 
 impl LaunchResolver for CatalogLaunchResolver {
-    fn backend_limit(&self, backend: &BackendId) -> Result<u32, LaunchError> {
-        Ok(self.usable_backend(backend)?.limits.max_concurrent_tasks)
+    fn check_backend(&self, backend: &BackendId) -> Result<(), LaunchError> {
+        self.usable_backend(backend).map(|_| ())
     }
 
     fn slot_release_timings(&self, backend: &BackendId) -> Result<SlotReleaseTimings, LaunchError> {

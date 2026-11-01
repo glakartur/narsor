@@ -21,10 +21,10 @@ use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
 use super::task_text::{
-    age, awaiting_input, backend_limit_lines, command_outcome, conversation_lines,
-    conversation_origin, default_backend_line, default_harness_line, detail_lines, event_line,
-    list_line, next_waiting, record_unreadable_detail, safe_json, status_badge, task_state_name,
-    waiting_summary, PAGE_BYTE_BUDGET,
+    age, awaiting_input, command_outcome, conversation_lines, conversation_origin,
+    default_backend_line, default_harness_line, detail_lines, event_line, list_line, next_waiting,
+    record_unreadable_detail, safe_json, status_badge, task_state_name, waiting_summary,
+    PAGE_BYTE_BUDGET,
 };
 use crate::api::{
     ApiClient, ClientError, ConversationResponse as PageResponse, HumanInputDeliveryDto,
@@ -619,33 +619,6 @@ pub enum BackendCommand {
         #[command(subcommand)]
         action: Option<DefaultBackendAction>,
     },
-    /// Shows or changes the limit of concurrent tasks of a backend, without
-    /// a restart and without editing the backend file.
-    Limit {
-        /// A registered backend id.
-        #[arg(value_name = "BACKEND")]
-        backend: String,
-        /// What to do; `get` when omitted.
-        #[command(subcommand)]
-        action: Option<BackendLimitAction>,
-    },
-}
-
-/// `narsor backend limit BACKEND …`.
-#[derive(Debug, Subcommand)]
-pub enum BackendLimitAction {
-    /// Prints the limit, its source and what the tasks hold.
-    Get,
-    /// Sets the limit until the control plane restarts. A higher limit
-    /// starts waiting tasks at once. A lower one stops new starts and asks
-    /// running tasks to stop at a safe point.
-    Set {
-        /// Between 1 and 1024.
-        #[arg(value_name = "LIMIT")]
-        limit: u32,
-    },
-    /// Removes the ad hoc limit: the value in the backend file applies.
-    Reset,
 }
 
 /// `narsor backend default …`.
@@ -1764,20 +1737,6 @@ pub async fn backend(
     let client = client(target, state, flags).await?;
     let action = match command {
         BackendCommand::Default { action } => action,
-        BackendCommand::Limit { backend, action } => {
-            let view = match action.unwrap_or(BackendLimitAction::Get) {
-                BackendLimitAction::Get => client.control_backend_limit(&backend).await,
-                BackendLimitAction::Set { limit } => {
-                    client.control_set_backend_limit(&backend, limit).await
-                }
-                BackendLimitAction::Reset => client.control_clear_backend_limit(&backend).await,
-            }
-            .map_err(|error| failure("Backend limit", error))?;
-            for line in backend_limit_lines(&view) {
-                println!("{line}");
-            }
-            return Ok(());
-        }
     };
     let view = match action.unwrap_or(DefaultBackendAction::Get) {
         DefaultBackendAction::Get => client.control_default_backend().await,

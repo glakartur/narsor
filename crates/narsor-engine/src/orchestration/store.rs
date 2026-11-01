@@ -476,6 +476,12 @@ impl OrchestrationStore {
         FileLock::acquire(self.paths.backend_schedule_lock_file(backend_id.as_str()))
     }
 
+    /// Exclusive lock for admission decisions across all backends, taken
+    /// before any backend's schedule lock.
+    pub(crate) fn lock_global_schedule(&self) -> Result<FileLock> {
+        FileLock::acquire(self.paths.global_schedule_lock_file())
+    }
+
     /// Exclusive lock for changing the default-backend override.
     pub(crate) fn lock_default_backend(&self) -> Result<FileLock> {
         FileLock::acquire(self.paths.default_backend_lock_file())

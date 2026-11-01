@@ -65,6 +65,10 @@ pub struct HarnessHome {
     /// the harness on its directory as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_profile_source: Option<PathBuf>,
+    /// Extra arguments of every harness run, from the `agent_args` setting;
+    /// they win over the arguments Narsor chooses itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_args: Vec<String>,
 }
 
 impl HarnessHome {
@@ -82,6 +86,11 @@ impl HarnessHome {
         if let Some(dir) = &self.claude_profile_source {
             args.push("--claude-profile-source".into());
             args.push(dir.into());
+        }
+        for arg in &self.agent_args {
+            // The `=` form keeps an argument that starts with `-` from being
+            // read as a flag of the runner.
+            args.push(format!("--agent-arg={arg}").into());
         }
         args
     }
@@ -112,6 +121,7 @@ mod tests {
             codex_home: Some(PathBuf::from("/home/me/.codex")),
             claude_config_dir: None,
             claude_profile_source: None,
+            agent_args: Vec::new(),
         };
         assert_eq!(
             home.runner_args(),
@@ -132,6 +142,7 @@ mod tests {
             codex_home: Some(PathBuf::from("/c")),
             claude_config_dir: Some(PathBuf::from("/a")),
             claude_profile_source: Some(PathBuf::from("/s")),
+            agent_args: Vec::new(),
         };
         assert_eq!(
             home.variables(),
@@ -141,6 +152,25 @@ mod tests {
             ]
         );
         assert!(HarnessHome::default().variables().is_empty());
+    }
+
+    #[test]
+    fn runner_args_carry_the_agent_args_one_each() {
+        let home = HarnessHome {
+            agent_args: vec!["--dangerously-skip-permissions".into(), "--effort".into()],
+            ..HarnessHome::default()
+        };
+        assert_eq!(
+            home.runner_args(),
+            [
+                "--home",
+                "private",
+                "--agent-arg=--dangerously-skip-permissions",
+                "--agent-arg=--effort"
+            ]
+            .map(OsString::from)
+            .to_vec()
+        );
     }
 
     #[test]

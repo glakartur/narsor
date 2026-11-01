@@ -943,6 +943,8 @@ pub struct Engine {
     store: ExecutionStore,
     executors: HashMap<ActionKind, Arc<dyn ActionExecutor>>,
     agent_timeout_secs: Option<u64>,
+    agent_args: Vec<String>,
+    usage_reporter: Option<Arc<dyn UsageReporter>>,
     default_harness: Arc<dyn DefaultHarnessSource>,
     events: broadcast::Sender<Event>,
     pause_requests: Mutex<HashSet<ExecutionId>>,
@@ -1114,6 +1116,8 @@ impl Engine {
             store,
             executors,
             agent_timeout_secs: None,
+            agent_args: Vec::new(),
+            usage_reporter: None,
             default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
             events,
             pause_requests: Mutex::new(HashSet::new()),
@@ -1166,7 +1170,27 @@ impl Engine {
     /// a fixed default harness and the time limit.
     pub fn with_agent_defaults(self, defaults: AgentDefaults) -> Self {
         self.with_agent_timeout(defaults.timeout_secs)
+            .with_agent_args(defaults.args)
             .with_default_harness_source(Arc::new(defaults.harness))
+    }
+
+    /// Returns the engine adding `args` to every harness run of its agent
+    /// steps; on a conflict they replace the arguments Narsor chose.
+    ///
+    /// Rebuilds the stock agent executor, like [`Self::with_usage_reporter`].
+    pub fn with_agent_args(mut self, args: Vec<String>) -> Self {
+        self.agent_args = args;
+        self.rebuild_agent_executor();
+        self
+    }
+
+    fn rebuild_agent_executor(&mut self) {
+        let mut agent =
+            agent_executor(&self.store, &self.events).with_extra_args(self.agent_args.clone());
+        if let Some(reporter) = &self.usage_reporter {
+            agent = agent.with_usage_reporter(Arc::clone(reporter));
+        }
+        self.executors.insert(ActionKind::Agent, Arc::new(agent));
     }
 
     /// Returns the engine with the time limit of an `agent` action that
@@ -1203,8 +1227,8 @@ impl Engine {
     /// after is the caller's to give the reporter to
     /// ([`AgentExecutor::with_usage_reporter`]).
     pub fn with_usage_reporter(mut self, reporter: Arc<dyn UsageReporter>) -> Self {
-        let agent = agent_executor(&self.store, &self.events).with_usage_reporter(reporter);
-        self.executors.insert(ActionKind::Agent, Arc::new(agent));
+        self.usage_reporter = Some(reporter);
+        self.rebuild_agent_executor();
         self
     }
 
