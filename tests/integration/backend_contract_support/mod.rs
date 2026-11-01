@@ -222,19 +222,22 @@ impl<T: ContractTarget> Harness<T> {
         narsor_engine::environment::EnvironmentCatalog::new(&state)
             .save_backend(&crate::environment_support::backend(BACKEND))
             .expect("register the contract backend");
-        let service = Arc::new(ProtocolService::with_config(
-            narsor_engine::orchestration::ControlPlane::new(StatePaths::new(&state)),
-            launch,
-            ProtocolConfig {
-                resume: test_resume_policy(),
-                // A finished task keeps its runner here (AE9's scenario
-                // archives it), so the policy that would stop it is off; it
-                // has its own tests. Reading a stopped task is the reader's
-                // contract (U10).
-                slot_release: false,
-                ..ProtocolConfig::default()
-            },
-        ));
+        let service = Arc::new(
+            ProtocolService::with_config(
+                narsor_engine::orchestration::ControlPlane::new(StatePaths::new(&state)),
+                launch,
+                ProtocolConfig {
+                    resume: test_resume_policy(),
+                    // A finished task keeps its runner here (AE9's scenario
+                    // archives it), so the policy that would stop it is off; it
+                    // has its own tests. Reading a stopped task is the reader's
+                    // contract (U10).
+                    slot_release: false,
+                    ..ProtocolConfig::default()
+                },
+            )
+            .with_max_concurrent_tasks(Some(3)),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the control plane");
@@ -329,11 +332,7 @@ impl<T: ContractTarget> Harness<T> {
     /// Changes the backend's `max_concurrent_tasks` in the catalogue; the
     /// scheduler reads it fresh at its next decision (U10).
     pub fn set_limit(&self, limit: u32) {
-        let mut record = crate::environment_support::backend(BACKEND);
-        record.limits.max_concurrent_tasks = limit;
-        narsor_engine::environment::EnvironmentCatalog::new(self.root.0.join("control"))
-            .save_backend(&record)
-            .expect("save the backend");
+        self.service.set_max_concurrent_tasks(Some(limit));
     }
 
     /// The controller currently holding the backend's lease, if any.

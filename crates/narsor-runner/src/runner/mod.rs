@@ -431,7 +431,15 @@ pub async fn run(
         &spec,
         definition,
         |engine, _| engine,
-        conductor::ConductorHost::assemble,
+        |engine, storage, harness, definition| {
+            conductor::ConductorHost::assemble(
+                engine,
+                storage,
+                harness,
+                definition,
+                config.harness_home.agent_args.clone(),
+            )
+        },
     );
     session.begin(&spec).await
 }
@@ -463,6 +471,7 @@ fn assemble_session(
     let reporter: Arc<dyn UsageReporter> = usage.clone();
     let harness = Arc::new(LiveHarness::new(starting_harness(&storage, spec)));
     let engine = Engine::new(storage.store())
+        .with_agent_args(config.harness_home.agent_args.clone())
         .with_usage_reporter(Arc::clone(&reporter))
         .with_default_harness_source(harness.clone())
         .with_task_labels(spec.ticket.clone(), spec.title.clone());
@@ -1881,6 +1890,7 @@ mod tests {
             codex_home: Some(PathBuf::from("/srv/codex")),
             claude_config_dir: Some(PathBuf::from("/srv/claude")),
             claude_profile_source: None,
+            agent_args: Vec::new(),
         };
         let environment = MountedSecrets::new(None)
             .materialize(
@@ -1937,6 +1947,7 @@ mod tests {
             codex_home: None,
             claude_config_dir: Some(claude.clone()),
             claude_profile_source: Some(claude.clone()),
+            agent_args: Vec::new(),
         };
 
         let variables = harness_variables(&local, &storage.0).unwrap();

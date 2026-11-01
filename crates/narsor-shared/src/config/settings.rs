@@ -122,6 +122,11 @@ pub enum SettingKey {
     AgentHarness,
     /// The time limit of an `agent` action that declares none itself.
     AgentTimeout,
+    /// Extra command-line arguments for every harness run. They win over the
+    /// same arguments Narsor works out itself.
+    AgentArgs,
+    /// Most tasks processed at once, across all backends; `none` for no limit.
+    MaxConcurrentTasks,
     /// The logging level, when `RUST_LOG` does not say otherwise.
     LogLevel,
     /// How often the terminal interface re-reads the daemon on its own
@@ -174,12 +179,14 @@ pub enum SettingKey {
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 22] = [
+    pub const ALL: [SettingKey; 24] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
         SettingKey::AgentHarness,
         SettingKey::AgentTimeout,
+        SettingKey::AgentArgs,
+        SettingKey::MaxConcurrentTasks,
         SettingKey::LogLevel,
         SettingKey::TuiRefreshInterval,
         SettingKey::DefaultBackend,
@@ -214,6 +221,8 @@ impl SettingKey {
             SettingKey::WorkDir => "work_dir",
             SettingKey::AgentHarness => "agent_harness",
             SettingKey::AgentTimeout => "agent_timeout",
+            SettingKey::AgentArgs => "agent_args",
+            SettingKey::MaxConcurrentTasks => "max_concurrent_tasks",
             SettingKey::LogLevel => "log_level",
             SettingKey::TuiRefreshInterval => "tui_refresh_interval",
             SettingKey::DefaultBackend => "default_backend",
@@ -259,6 +268,8 @@ impl SettingKey {
             | SettingKey::WorkDir
             | SettingKey::AgentHarness
             | SettingKey::AgentTimeout
+            | SettingKey::AgentArgs
+            | SettingKey::MaxConcurrentTasks
             | SettingKey::LogLevel
             | SettingKey::TuiRefreshInterval
             | SettingKey::DefaultBackend
@@ -293,6 +304,7 @@ impl SettingKey {
             }
             SettingKey::AgentHarness => SettingValue::Text(CLAUDE_CODE.to_string()),
             SettingKey::AgentTimeout => SettingValue::Duration(None),
+            SettingKey::MaxConcurrentTasks => SettingValue::Text("1".to_string()),
             SettingKey::LogLevel => SettingValue::Text(LOG_OFF.to_string()),
             SettingKey::TuiRefreshInterval => {
                 SettingValue::Duration(Some(DEFAULT_TUI_REFRESH_SECS))
@@ -308,6 +320,7 @@ impl SettingKey {
             SettingKey::OidcIssuer
             | SettingKey::OidcAudience
             | SettingKey::OwnerSubject
+            | SettingKey::AgentArgs
             | SettingKey::TrustedProxies
             | SettingKey::CorsAllowedOrigins
             | SettingKey::LocalWorkspaceRoots
@@ -322,7 +335,8 @@ impl SettingKey {
     pub fn is_list(self) -> bool {
         matches!(
             self,
-            SettingKey::TrustedProxies
+            SettingKey::AgentArgs
+                | SettingKey::TrustedProxies
                 | SettingKey::CorsAllowedOrigins
                 | SettingKey::LocalWorkspaceRoots
         )
@@ -551,6 +565,8 @@ mod tests {
                 "work_dir",
                 "agent_harness",
                 "agent_timeout",
+                "agent_args",
+                "max_concurrent_tasks",
                 "log_level",
                 "tui_refresh_interval",
                 "default_backend",

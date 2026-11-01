@@ -46,11 +46,10 @@ use crate::engine::{
 use crate::environment::{BackendKind, LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
-    AttentionItem, AttentionKind, BackendCapacity, BackendLease, CommandActor, CommandRequest,
-    ControlPlane, ControllerReport, ConversationAvailability, InputRequest, InputStatus,
-    LeaseToken, MoveTarget, NewTask, Observation, OperatorCommand, OperatorCommandRequest,
-    OwnerRef, ResumePolicy, RunnerObservation, RunnerState, TaskEvent, TaskRecord,
-    RETIRED_CONDUCTOR_HARNESS,
+    AttentionItem, AttentionKind, BackendLease, CommandActor, CommandRequest, ControlPlane,
+    ControllerReport, ConversationAvailability, InputRequest, InputStatus, LeaseToken, MoveTarget,
+    NewTask, Observation, OperatorCommand, OperatorCommandRequest, OwnerRef, ResumePolicy,
+    RunnerObservation, RunnerState, TaskEvent, TaskRecord, RETIRED_CONDUCTOR_HARNESS,
 };
 use crate::workflow::TemplateScope;
 use relay::Relay;
@@ -299,8 +298,9 @@ pub struct ProtocolService {
     event_reads: Mutex<EventsRelay>,
     conductor_reads: Mutex<ConductorRelay>,
     materials: MaterialStore,
-    limit_overrides: backend_limit::LimitOverrides,
     harness_usages: harness_usage::HarnessUsages,
+    /// Most tasks processed at once across all backends; `None` for no limit.
+    max_concurrent_tasks: Mutex<Option<u32>>,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -311,6 +311,9 @@ impl std::fmt::Debug for ProtocolService {
             .finish_non_exhaustive()
     }
 }
+
+/// The limit of tasks processed at once when nothing sets one.
+pub const DEFAULT_MAX_CONCURRENT_TASKS: u32 = 1;
 
 impl ProtocolService {
     /// A service with the default policy and file-backed bearer credentials.
@@ -348,9 +351,31 @@ impl ProtocolService {
             pages: Mutex::new(PageRelay::default()),
             event_reads: Mutex::new(EventsRelay::default()),
             conductor_reads: Mutex::new(ConductorRelay::default()),
-            limit_overrides: Mutex::default(),
             harness_usages: Mutex::default(),
+            max_concurrent_tasks: Mutex::new(Some(DEFAULT_MAX_CONCURRENT_TASKS)),
         }
+    }
+
+    /// Returns the service with a limit of tasks processed at once across
+    /// all backends, `None` for no limit.
+    pub fn with_max_concurrent_tasks(self, limit: Option<u32>) -> Self {
+        *self.lock_max_concurrent_tasks() = limit;
+        self
+    }
+
+    /// Changes the limit of tasks processed at once. Waiting tasks start at
+    /// once under a higher limit; a lower one stops new starts, takes back
+    /// reservations over it, and asks running tasks to stop at a safe point.
+    pub fn set_max_concurrent_tasks(&self, limit: Option<u32>) {
+        *self.lock_max_concurrent_tasks() = limit;
+        self.reschedule_all();
+        self.limit_stop_pass();
+    }
+
+    fn lock_max_concurrent_tasks(&self) -> std::sync::MutexGuard<'_, Option<u32>> {
+        self.max_concurrent_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Replaces how controller requests are verified (the default checks
@@ -681,7 +706,7 @@ impl ProtocolService {
                 expected_generation: request.expected_generation,
                 actor: CommandActor::Owner,
             },
-            || self.capacity(&record.assignment.backend_id),
+            || self.scheduling_policy(&record.assignment.backend_id),
         )?;
         if command == crate::orchestration::OwnerCommand::Archive {
             // Archive removes the task's materials too (U9) — also on a
@@ -691,8 +716,8 @@ impl ProtocolService {
         let mut task = outcome.task;
         if !outcome.replayed {
             self.notify(&record.task_id);
-            // An archive releases a slot (or a queued task's place).
-            self.reschedule(&record.assignment.backend_id);
+            // An archive can release a slot for queued work on any backend.
+            self.reschedule_all();
             task = self.control.task(&record.task_id)?;
         }
         let queued_for_slot = outcome.receipt.command == crate::orchestration::OwnerCommand::Resume
@@ -793,7 +818,7 @@ impl ProtocolService {
             Some(backend) => {
                 let backend = parse_identifier(BackendId::parse(backend))?;
                 self.launch
-                    .backend_limit(&backend)
+                    .check_backend(&backend)
                     .map_err(launch_refusal)?;
                 Some(backend)
             }
@@ -810,7 +835,7 @@ impl ProtocolService {
     ///
     /// The daemon calls it periodically, because some inputs change without
     /// any request: a controller's lease runs out, the operator edits a
-    /// backend's limit. Failures are logged; the next pass retries.
+    /// global task limit. Failures are logged; the next pass retries.
     pub fn reschedule_all(&self) {
         let backends: std::collections::BTreeSet<BackendId> = match self.control.list_tasks() {
             Ok(tasks) => tasks
@@ -828,8 +853,8 @@ impl ProtocolService {
         }
     }
 
-    /// Re-evaluates admission on `backend_id` against its limit as
-    /// configured right now, announcing every task that changed.
+    /// Re-evaluates admission on `backend_id` against its current availability
+    /// and the shared task budget, announcing every task that changed.
     ///
     /// Runs after the mutation that prompted it was committed, so a failure
     /// here must not fail that request: it is logged, and the next trigger
@@ -838,7 +863,7 @@ impl ProtocolService {
         // Read under the schedule lock: a limit changed meanwhile applies.
         match self
             .control
-            .schedule_with(backend_id, || self.capacity(backend_id))
+            .schedule_with(backend_id, || self.scheduling_policy(backend_id))
         {
             Ok(changed) => {
                 for task_id in changed {
@@ -849,12 +874,6 @@ impl ProtocolService {
                 tracing::warn!(backend = %backend_id, %error, "scheduler: admission pass failed");
             }
         }
-    }
-
-    /// The backend's capacity: the ad hoc limit or the configured one, read
-    /// fresh (see [`Self::effective_capacity`]).
-    fn capacity(&self, backend_id: &BackendId) -> BackendCapacity {
-        self.effective_capacity(backend_id)
     }
 
     /// The owner's task, re-read and summarized.
@@ -994,7 +1013,7 @@ impl ProtocolService {
                 expected_generation: None,
                 actor: CommandActor::Owner,
             },
-            || self.capacity(&current.assignment.backend_id),
+            || self.scheduling_policy(&current.assignment.backend_id),
         );
         match outcome {
             Ok(outcome) => {
@@ -1607,8 +1626,12 @@ impl ProtocolService {
         })?;
         if outcome.applied {
             self.notify(&record.task_id);
-            // A pause, a loss, a completed archive may each free a slot.
-            self.reschedule(&identity.backend_id);
+            if record.holds_capacity() && !outcome.task.holds_capacity() {
+                // A released global slot can admit queued work on any backend.
+                self.reschedule_all();
+            } else {
+                self.reschedule(&identity.backend_id);
+            }
             if record.pause_requested_by_policy() {
                 self.resume_for_stranded_work(&outcome.task, request.observation);
             }
@@ -1766,7 +1789,7 @@ impl ProtocolService {
             && !current.supersedes_launch(identity.launch_generation)
         {
             let decision = self.control.decide_limit_stop(&identity.task_id, || {
-                self.capacity(&current.assignment.backend_id)
+                self.scheduling_policy(&current.assignment.backend_id)
             })?;
             if decision != crate::orchestration::scheduler::LimitStopDecision::NotApplicable {
                 self.notify(&identity.task_id);

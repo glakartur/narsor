@@ -410,7 +410,7 @@ pub enum Overlay {
     Links(LinkList),
     /// The installation's default harness (`h`); about no task.
     Harness(HarnessList),
-    /// The limit of concurrent tasks of a backend (`L`); about no task.
+    /// The limit of tasks processed at once (`L`); about no task.
     Limit(LimitList),
     /// The text of a comment (`c`).
     Comment(CommentForm),
@@ -1578,8 +1578,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
                 render_list(frame, area, "Domyślny harness", list.chooser_mut(), styles);
             }
             Overlay::Limit(list) => {
-                let title = format!("Limit zadań · {}", list.backend());
-                render_list(frame, area, &title, list.chooser_mut(), styles);
+                render_list(frame, area, "Limit zadań", list.chooser_mut(), styles);
             }
         }
     }

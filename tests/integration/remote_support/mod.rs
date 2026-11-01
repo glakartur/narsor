@@ -140,7 +140,9 @@ impl RemoteHarness {
         let resolver: Arc<dyn narsor_engine::environment::LaunchResolver> = catalog.clone();
         let services = ApiServices {
             harness_selector,
-            control: Some(Arc::new(ProtocolService::new(control, resolver))),
+            control: Some(Arc::new(
+                ProtocolService::new(control, resolver).with_max_concurrent_tasks(Some(3)),
+            )),
             local_launch: Some(catalog),
             workflows: Some(WorkflowResolver::with_user_dir(root.path(), None)),
             ..ApiServices::default()

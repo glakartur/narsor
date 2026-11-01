@@ -101,6 +101,13 @@ line under the header says so (`opencode niedostępny tutaj — zostaje
 claude-code`) and *Info* gives the full reason in the runner's section. It is
 information, not a problem: no list mark, no attention count.
 
+**The task limit** (`L` on the list and in the details) opens a list with two
+entries: raise the limit by 1, or lower it by 1. The first line shows the
+daemon's figures: the limit, slots held, the excess and tasks waiting to stop.
+A higher limit starts waiting tasks at once; a lower one stops new starts and
+asks running tasks to stop at a safe point (only as many as the excess), and
+they return to the queue. The change lasts until the daemon restarts.
+
 **The default harness** (`h` on the list, in the details, the history and the
 repositories — never in a text field, a menu or over another overlay) opens a
 list: first `domyślny z konfiguracji (<name>)`, which removes the operator's
@@ -160,6 +167,7 @@ danych". An action marked `!` asks `y` / `n` first.
 | `H` | history: archived tasks, and executions from before the scheduler (`w` recovers a failed one) | `narsor-cli task list --archived`; `narsor-cli task history list` / `show` / `events` / `steps` / `conversation` / `conductor` / `recover` |
 | `R` | repositories: `a` registers, `d` removes (`!`) | `narsor-cli task repo list` / `add` / `remove` (the same registry on any server; `narsor-cli repo …` is the local one) |
 | `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor-cli harness default set <harness>` / `reset` (`narsor-cli harness default` shows it) |
+| `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `max_concurrent_tasks` applies again) | `max_concurrent_tasks` in the configuration |
 | the header | what the connection offers | `narsor-cli task capabilities` |
 
 The CLI of the remote-aware commands has a machine form too: `narsor-cli task list
@@ -200,8 +208,8 @@ the current step or a draft.
 | Where | Keys |
 |---|---|
 | Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
-| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `c` `r`, `h` default harness |
-| Details | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
+| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `c` `r`, `h` default harness, `L` task limit |
+| Details | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
 | — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all |
 | — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |

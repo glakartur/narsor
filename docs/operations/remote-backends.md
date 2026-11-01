@@ -649,8 +649,9 @@ unreadable, and 0 or more than 86400 makes the backend unusable with a clear
 message. The control plane reads them again at every decision, so a change
 applies without a restart.
 
-* Each backend has `max_concurrent_tasks` slots (D62). A slot is held by
-  work, not by a live process alone. Slots are held by tasks in
+* `max_concurrent_tasks` in the daemon configuration is one global task
+  budget shared by every backend (default `1`; `none` is unlimited). A slot
+  is held by work, not by a live process alone. Slots are held by tasks in
   `Provisioning`, `Running`, `PauseRequested`, `Interrupted`, `Unknown`,
   `Archiving`, and by an admitted `Queued` task. `Stopped` and `Archived` hold
   none. An interrupted task still blocks a slot until it is resumed

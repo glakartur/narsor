@@ -12,7 +12,8 @@
 //! * [`control_plane`] — the API owners and controllers mutate tasks through;
 //! * `runner_state` — runner snapshots and owner input on the same record;
 //! * [`resume`] — counting workload losses for the automatic resume;
-//! * [`scheduler`] — admission of queued tasks by backend capacity (U10).
+//! * [`scheduler`] — admission of queued tasks under backend availability and
+//!   the global task budget (U10).
 //!
 //! Records live under `{state}/orchestration/`, outside `executions/`, so
 //! local crash recovery (`persistence::recovery`) never sees them; use

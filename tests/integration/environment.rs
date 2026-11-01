@@ -20,8 +20,8 @@ use narsor_engine::domain::{
     ResourceProfile, SecretDelivery, TaskLaunchSpec, TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
 };
 use narsor_engine::environment::{
-    BackendKind, BackendLimits, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent,
-    LaunchResolver, ProfileRecord, ResolvedLaunch, StaticImageResolver, TrustScope,
+    BackendKind, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent, LaunchResolver,
+    ProfileRecord, ResolvedLaunch, StaticImageResolver, TrustScope,
 };
 use narsor_engine::registry::{RepositoryEntry, RepositoryRegistry};
 
@@ -449,7 +449,7 @@ fn invalid_backend_limits_are_refused_with_every_problem() {
     let root = TempRoot::new();
     fs::write(
         root.path().join("backends/k8s.yaml"),
-        "kind: kubernetes\ntrust_scope: shared\nlimits:\n  max_concurrent_tasks: 0\n  \
+        "kind: kubernetes\ntrust_scope: shared\nlimits:\n  \
          default_resources: { cpu_millicores: 0, memory_mib: 512 }\n  \
          max_resources: { cpu_millicores: 100, memory_mib: 256 }\n",
     )
@@ -461,10 +461,6 @@ fn invalid_backend_limits_are_refused_with_every_problem() {
     };
     assert_eq!(error.code(), "invalid_backend");
     assert!(
-        problems.iter().any(|p| p.contains("max_concurrent_tasks")),
-        "{problems:?}"
-    );
-    assert!(
         problems.iter().any(|p| p.contains("cpu_millicores")),
         "{problems:?}"
     );
@@ -475,7 +471,7 @@ fn invalid_backend_limits_are_refused_with_every_problem() {
 
     // The catalogue refuses to store such a record in the first place.
     let mut bad = backend("k8s");
-    bad.limits.max_concurrent_tasks = 0;
+    bad.limits.slot_release_grace_secs = 0;
     assert!(root.catalog().save_backend(&bad).is_err());
 }
 
@@ -1022,10 +1018,7 @@ fn a_backend_record_round_trips_through_its_file() {
     let root = TempRoot::new();
     let mut record = backend("k8s");
     record.description = Some("team cluster".to_string());
-    record.limits = BackendLimits {
-        max_concurrent_tasks: 5,
-        ..record.limits
-    };
+    record.limits.slot_release_grace_secs = 5;
     root.catalog().save_backend(&record).unwrap();
     assert_eq!(root.catalog().backend("k8s").unwrap(), Some(record));
     assert_eq!(root.catalog().backend("../k8s").unwrap(), None);

@@ -83,11 +83,11 @@ use crate::controller_protocol::{
     ConductorReadResponse, LegacyExecutionListResponse, LegacyExecutionView,
 };
 use narsor_protocol::controller::{
-    BackendLimitView, CapabilitiesView, ConductorReadQuery, ControllerListResponse, ControllerView,
-    ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest, CreateTaskRequest,
-    DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery, ExecutionEventsResponse,
-    HarnessUsageResponse, OwnerCommandRequest, RepositoryListResponse, RepositoryView,
-    SetBackendLimitRequest, SetDefaultBackendRequest, SubmitInputRequest,
+    CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
+    ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
+    CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
+    ExecutionEventsResponse, HarnessUsageResponse, OwnerCommandRequest, RepositoryListResponse,
+    RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest, SubmitInputRequest,
     SubmitOperatorCommandRequest, ValidateWorkflowRequest, ValidateWorkflowResponse,
     WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
 };
@@ -710,34 +710,21 @@ impl ApiClient {
         self.put_json(&url, request).await
     }
 
-    /// The limit of concurrent tasks of a backend: its source, the file's
-    /// value and what the tasks hold.
-    pub async fn control_backend_limit(
-        &self,
-        backend_id: &str,
-    ) -> Result<BackendLimitView, ClientError> {
-        let url = format!("{}/control/v1/backends/{backend_id}/limit", self.base_url);
+    /// The limit of tasks processed at once and what the tasks hold.
+    pub async fn control_concurrency_limit(&self) -> Result<ConcurrencyLimitView, ClientError> {
+        let url = format!("{}/control/v1/concurrency-limit", self.base_url);
         self.get_json(&url).await
     }
 
-    /// Sets the ad hoc limit of a backend; it lasts until the control plane
-    /// restarts.
-    pub async fn control_set_backend_limit(
+    /// Changes the limit of tasks processed at once; it lasts until the
+    /// control plane restarts.
+    pub async fn control_set_concurrency_limit(
         &self,
-        backend_id: &str,
         limit: u32,
-    ) -> Result<BackendLimitView, ClientError> {
-        let url = format!("{}/control/v1/backends/{backend_id}/limit", self.base_url);
-        self.put_json(&url, &SetBackendLimitRequest { limit }).await
-    }
-
-    /// Removes the ad hoc limit of a backend: the file's value applies.
-    pub async fn control_clear_backend_limit(
-        &self,
-        backend_id: &str,
-    ) -> Result<BackendLimitView, ClientError> {
-        let url = format!("{}/control/v1/backends/{backend_id}/limit", self.base_url);
-        self.delete_json(&url).await
+    ) -> Result<ConcurrencyLimitView, ClientError> {
+        let url = format!("{}/control/v1/concurrency-limit", self.base_url);
+        self.put_json(&url, &SetConcurrencyLimitRequest { limit })
+            .await
     }
 
     /// The latest usage limits of the harnesses' subscriptions, as the

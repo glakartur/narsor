@@ -700,33 +700,3 @@ fn a_resume_that_waits_for_a_slot_says_so() {
     let starts = command_outcome(OwnerCommand::Resume, &Ok(response(false)));
     assert!(!starts.text.contains("waits"), "{starts:?}");
 }
-
-#[test]
-fn the_backend_limit_prints_the_figures_of_the_control_plane_in_a_fixed_order() {
-    use narsor::cli::task_text::backend_limit_lines;
-    use narsor_protocol::controller::{BackendLimitSource, BackendLimitView};
-
-    let lines = backend_limit_lines(&BackendLimitView {
-        backend_id: "k8s".to_string(),
-        effective: 2,
-        source: BackendLimitSource::AdHoc,
-        file_value: 3,
-        override_value: Some(2),
-        slots_held: 3,
-        overshoot: 1,
-        waiting_to_stop: 1,
-    });
-
-    assert_eq!(
-        lines,
-        vec![
-            "Backend: k8s",
-            "Limit: 2 (ad hoc, until the control plane restarts)",
-            "File: 3",
-            "Ad hoc: 2",
-            "Slots held: 3",
-            "Over the limit: 1",
-            "Waiting to stop: 1",
-        ]
-    );
-}

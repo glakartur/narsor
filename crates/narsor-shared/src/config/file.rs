@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use narsor_protocol::controller::MAX_CONCURRENT_TASKS_LIMIT;
 use narsor_protocol::harness::HARNESSES;
 use narsor_protocol::identifier::BackendId;
 
@@ -415,8 +416,21 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
     // are validated by one path.
     if setting.is_list() {
         if let Some(items) = raw.as_sequence() {
-            let texts = items.iter().map(text_of).collect::<Result<Vec<_>, _>>()?;
+            let texts = items
+                .iter()
+                .map(|item| match item.as_i64() {
+                    // `--max-turns 5` reads naturally unquoted.
+                    Some(number) if setting == SettingKey::AgentArgs => Ok(number.to_string()),
+                    _ => text_of(item),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             return value_from_text(setting, &texts.join(","));
+        }
+    }
+
+    if setting == SettingKey::MaxConcurrentTasks {
+        if let Some(number) = raw.as_u64() {
+            return value_from_text(setting, &number.to_string());
         }
     }
 
@@ -508,6 +522,24 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
 
         SettingKey::OidcAudience | SettingKey::OwnerSubject => {
             Ok(SettingValue::Text(text.trim().to_string()))
+        }
+
+        SettingKey::AgentArgs => Ok(SettingValue::Text(split_list(text).join(","))),
+
+        SettingKey::MaxConcurrentTasks => {
+            let written = text.trim();
+            if written.is_empty() || written.eq_ignore_ascii_case(NO_LIMIT) {
+                return Ok(SettingValue::Text(String::new()));
+            }
+            match written.parse::<u32>() {
+                Ok(limit) if (1..=MAX_CONCURRENT_TASKS_LIMIT).contains(&limit) => {
+                    Ok(SettingValue::Text(limit.to_string()))
+                }
+                _ => Err(format!(
+                    "a number of tasks between 1 and {MAX_CONCURRENT_TASKS_LIMIT} was expected, \
+                     or '{NO_LIMIT}', but '{written}' was found"
+                )),
+            }
         }
 
         SettingKey::TrustedProxies => {

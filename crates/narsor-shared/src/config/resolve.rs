@@ -81,6 +81,8 @@ impl Flags {
                 .map(|root| (SettingValue::Path(root), "--root")),
             SettingKey::AgentHarness
             | SettingKey::AgentTimeout
+            | SettingKey::AgentArgs
+            | SettingKey::MaxConcurrentTasks
             | SettingKey::LogLevel
             | SettingKey::TuiRefreshInterval
             | SettingKey::DefaultBackend
@@ -295,6 +297,7 @@ impl Resolved {
             claude_profile_source: self
                 .text(SettingKey::LocalClaudeProfileSource)
                 .map(PathBuf::from),
+            agent_args: self.list(SettingKey::AgentArgs),
         }
     }
 
@@ -317,7 +320,14 @@ impl Resolved {
         AgentDefaults {
             harness: self.agent_harness().to_string(),
             timeout_secs: self.agent_timeout(),
+            args: self.list(SettingKey::AgentArgs),
         }
+    }
+
+    /// The limit of tasks processed at once across all backends, if any.
+    pub fn max_concurrent_tasks(&self) -> Option<u32> {
+        self.text(SettingKey::MaxConcurrentTasks)
+            .and_then(|text| text.parse().ok())
     }
 
     /// The `tracing` filter to install, or `None` for "install nothing".
@@ -344,6 +354,8 @@ pub struct AgentDefaults {
     pub harness: String,
     /// The fallback timeout, or no limit.
     pub timeout_secs: Option<u64>,
+    /// Extra arguments of every harness run; they win over Narsor's own.
+    pub args: Vec<String>,
 }
 
 /// Works out every setting, reading the environment that was handed in.

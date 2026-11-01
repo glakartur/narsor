@@ -11,7 +11,6 @@
 //! description: Team cluster, namespace narsor-tasks
 //! trust_scope: dedicated
 //! limits:
-//!   max_concurrent_tasks: 3
 //!   default_resources: { cpu_millicores: 2000, memory_mib: 4096 }
 //!   max_resources: { cpu_millicores: 4000, memory_mib: 8192 }
 //! harnesses: [claude-code, codex]
@@ -35,8 +34,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{BackendId, ResourceProfile, SecretDelivery, SecretReference};
 
-pub use narsor_protocol::controller::MAX_CONCURRENT_TASKS_LIMIT;
-
 /// Default wait before the control plane frees the slot of a task that waits
 /// in a transient state (`slot_release_grace_secs`).
 pub const DEFAULT_SLOT_RELEASE_GRACE_SECS: u64 = 300;
@@ -48,17 +45,6 @@ pub const DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS: u64 = 180;
 pub const DEFAULT_SLOT_READER_IDLE_SECS: u64 = 120;
 /// Longest period a slot-release setting may have: one day.
 pub const MAX_SLOT_PERIOD_SECS: u64 = 86_400;
-
-/// Checks a limit of concurrent tasks, whether the backend file or the
-/// operator states it. The error names what is wrong, to follow a field name.
-pub fn validate_concurrent_tasks(value: u32) -> Result<(), String> {
-    if value == 0 || value > MAX_CONCURRENT_TASKS_LIMIT {
-        return Err(format!(
-            "must be between 1 and {MAX_CONCURRENT_TASKS_LIMIT}, not {value}"
-        ));
-    }
-    Ok(())
-}
 
 pub use narsor_controller_runtime::backend::{BackendCapabilities, BackendKind};
 
@@ -107,8 +93,11 @@ pub enum SecretDeliveryMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendLimits {
-    /// Tasks that may hold compute at once.
-    pub max_concurrent_tasks: u32,
+    /// Retired: the daemon's `max_concurrent_tasks` setting limits the tasks
+    /// of all backends. Still read, so an older backend file loads, and
+    /// ignored.
+    #[serde(default, rename = "max_concurrent_tasks", skip_serializing)]
+    retired_max_concurrent_tasks: Option<u32>,
     /// What a task gets when it asks for nothing.
     pub default_resources: ResourceProfile,
     /// The most one task may ask for; `default_resources` when absent.
@@ -157,14 +146,10 @@ impl Default for SlotReleaseTimings {
 }
 
 impl BackendLimits {
-    /// Limits with the given capacity and resources and default slot periods.
-    pub fn new(
-        max_concurrent_tasks: u32,
-        default_resources: ResourceProfile,
-        max_resources: Option<ResourceProfile>,
-    ) -> Self {
+    /// Limits with the given resources and default slot periods.
+    pub fn new(default_resources: ResourceProfile, max_resources: Option<ResourceProfile>) -> Self {
         Self {
-            max_concurrent_tasks,
+            retired_max_concurrent_tasks: None,
             default_resources,
             max_resources,
             slot_release_grace_secs: DEFAULT_SLOT_RELEASE_GRACE_SECS,
@@ -246,7 +231,7 @@ impl BackendRecord {
             Self::LOCAL_ID,
             BackendKind::Local,
             TrustScope::Workstation,
-            BackendLimits::new(1, ResourceProfile::new(1000, 2048), None),
+            BackendLimits::new(ResourceProfile::new(1000, 2048), None),
         )
     }
 
@@ -293,9 +278,6 @@ impl BackendRecord {
         }
 
         let limits = &self.limits;
-        if let Err(problem) = validate_concurrent_tasks(limits.max_concurrent_tasks) {
-            problems.push(format!("limits.max_concurrent_tasks {problem}"));
-        }
         for (name, secs) in [
             ("slot_release_grace_secs", limits.slot_release_grace_secs),
             (
@@ -421,7 +403,7 @@ pub(crate) fn is_reference_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    const BASE: &str = "kind: kubernetes\ntrust_scope: dedicated\nlimits:\n  max_concurrent_tasks: 2\n  default_resources: { cpu_millicores: 1000, memory_mib: 2048 }\n";
+    const BASE: &str = "kind: kubernetes\ntrust_scope: dedicated\nlimits:\n  default_resources: { cpu_millicores: 1000, memory_mib: 2048 }\n";
 
     fn parse(extra: &str) -> Result<BackendRecord, serde_yaml::Error> {
         let mut record: BackendRecord = serde_yaml::from_str(&format!("{BASE}{extra}"))?;

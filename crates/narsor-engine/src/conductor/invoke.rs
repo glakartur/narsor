@@ -59,7 +59,9 @@ use crate::domain::{
 use crate::engine::actions::agent::{
     run_harness_process, DefaultHarnessSource, SpawnEnding, BUILT_IN_HARNESS,
 };
-use crate::engine::actions::harness::{HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX};
+use crate::engine::actions::harness::{
+    apply_extra_args, HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX,
+};
 use crate::persistence::{ExecutionStore, WorkPaths};
 
 /// The time limit of an invocation when no `agent_timeout` is configured.
@@ -135,6 +137,7 @@ pub struct HarnessInvoker {
     pinned_definition: Option<Arc<WorkflowDefinition>>,
     timeout: Duration,
     budget: SnapshotBudget,
+    extra_args: Vec<String>,
 }
 
 impl HarnessInvoker {
@@ -156,7 +159,15 @@ impl HarnessInvoker {
             pinned_definition: None,
             timeout: DEFAULT_CONDUCTOR_TIMEOUT,
             budget: SnapshotBudget::default(),
+            extra_args: Vec::new(),
         }
+    }
+
+    /// Returns the invoker adding `args` to every harness run; on a conflict
+    /// they replace the arguments the adapter decided on.
+    pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
+        self.extra_args = args;
+        self
     }
 
     /// Returns the invoker with a registry of its own.
@@ -255,7 +266,7 @@ impl HarnessInvoker {
 
         let config = conductor_config(&prompt);
         let schema = answer_schema(invocation.request.purpose);
-        let command = adapter
+        let mut command = adapter
             .invocation(&HarnessRequest {
                 config: &config,
                 workspace_access: Some(WorkspaceAccess::ReadOnly),
@@ -265,6 +276,7 @@ impl HarnessInvoker {
                 output_schema: Some(&schema),
             })
             .map_err(|error| error.message)?;
+        apply_extra_args(&mut command, &prompt, &self.extra_args);
 
         let ending = run_harness_process(
             &command.program,

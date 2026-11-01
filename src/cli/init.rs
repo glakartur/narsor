@@ -377,6 +377,16 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "Time limit of an agent action, e.g. 30m, 2h, or none.",
     ),
     (
+        SettingKey::AgentArgs,
+        "[]",
+        "Extra harness arguments, e.g. [--dangerously-skip-permissions]; they win over Narsor's own.",
+    ),
+    (
+        SettingKey::MaxConcurrentTasks,
+        "none",
+        "Tasks processed at once across all backends (replaces backend limits), or none.",
+    ),
+    (
         SettingKey::LogLevel,
         "off",
         "off, error, warn, info, debug or trace (RUST_LOG wins).",
@@ -454,11 +464,6 @@ fn render_config(yaml: &str, config: &Value) -> String {
             text.push_str(&format!("\n# {description}\n# {}: {default}\n", key.key()));
         }
     }
-    text.push_str(
-        "\n# The number of tasks processed in parallel is a limit of each backend,\n\
-         # not of this file: set `limits.max_concurrent_tasks` in\n\
-         # <catalog_dir>/backends/<id>.yaml (the TUI can also change it).\n",
-    );
     text
 }
 
@@ -782,7 +787,7 @@ fn write_workstation_backend(backend: &WorkstationBackend) -> Result<()> {
         .catalog_dir
         .join("backends")
         .join(format!("{}.yaml", backend.id));
-    let contents = "kind: local\ntrust_scope: workstation\nlimits:\n  max_concurrent_tasks: 1\n  default_resources: { cpu_millicores: 1000, memory_mib: 2048 }\n";
+    let contents = "kind: local\ntrust_scope: workstation\nlimits:\n  default_resources: { cpu_millicores: 1000, memory_mib: 2048 }\n";
     write_new_atomic(&path, contents.as_bytes(), 0o644)
 }
 

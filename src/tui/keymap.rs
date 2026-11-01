@@ -320,7 +320,7 @@ pub enum Action {
     /// Choose the installation's default agent harness (the header says
     /// which one is in force).
     ChooseHarness,
-    /// Change the limit of concurrent tasks of the selected task's backend.
+    /// Change the limit of tasks processed at once.
     ChooseLimit,
     /// Send a task again that did not get through (the new-task form).
     RetrySend,
@@ -467,8 +467,7 @@ const CHOOSE_HARNESS: &str =
     "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji";
 
 /// What `L` does, in every context that has it.
-const CHOOSE_LIMIT: &str =
-    "limit zadań równoległych backendu zaznaczonego zadania: o 1 więcej, o 1 mniej albo wartość z pliku";
+const CHOOSE_LIMIT: &str = "limit zadań równoległych: o 1 więcej albo o 1 mniej";
 
 /// The key map.
 pub static BINDINGS: &[Binding] = &[

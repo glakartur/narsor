@@ -282,6 +282,7 @@ fn the_runner_is_told_the_backends_home_mode() {
         codex_home: Some("/mnt/codex".into()),
         claude_config_dir: None,
         claude_profile_source: None,
+        agent_args: Vec::new(),
     };
     let args = runner_args(&generated_pod_with(&config, spec()).0);
     let tail: Vec<&str> = args[args.len() - 4..].iter().map(String::as_str).collect();

@@ -179,6 +179,8 @@ pub const DEFAULT_BACKEND_FILE: &str = "default-backend.json";
 
 /// Advisory lock serializing changes of [`DEFAULT_BACKEND_FILE`].
 pub const DEFAULT_BACKEND_LOCK_FILE: &str = "default-backend.lock";
+/// The lock serializing admission across all backends.
+pub const GLOBAL_SCHEDULE_LOCK_FILE: &str = "global-schedule.lock";
 
 /// Directory of one sub-directory per enrolled controller identity (R37),
 /// inside [`ORCHESTRATION_DIR`].
@@ -419,6 +421,11 @@ impl StatePaths {
     /// `{root}/orchestration/default-backend.lock`
     pub fn default_backend_lock_file(&self) -> PathBuf {
         self.orchestration_dir().join(DEFAULT_BACKEND_LOCK_FILE)
+    }
+
+    /// `{root}/orchestration/global-schedule.lock`
+    pub fn global_schedule_lock_file(&self) -> PathBuf {
+        self.orchestration_dir().join(GLOBAL_SCHEDULE_LOCK_FILE)
     }
 
     /// `{root}/launch-specs`

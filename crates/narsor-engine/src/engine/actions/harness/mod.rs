@@ -84,6 +84,74 @@ pub struct HarnessInvocation {
     pub stdin: Option<String>,
 }
 
+/// Puts the operator's extra arguments into an invocation, ahead of the
+/// prompt. An extra flag replaces the same flag (and the values it takes)
+/// that the adapter chose, so the operator's word wins on a conflict.
+///
+/// A flag is a token starting with `-`; the tokens after it, up to the next
+/// flag, are its values. Avoid flags that take a variable number of values:
+/// they would swallow the prompt.
+pub fn apply_extra_args(invocation: &mut HarnessInvocation, prompt: &str, extra: &[String]) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut groups: Vec<(&str, usize)> = Vec::new();
+    for token in extra {
+        if token.starts_with('-') {
+            let (name, values) = match token.split_once('=') {
+                Some((name, _)) => (name, 1),
+                None => (token.as_str(), 0),
+            };
+            groups.push((name, values));
+        } else if let Some(last) = groups.last_mut() {
+            if !last.0.is_empty() && !extra_group_has_inline_value(extra, last.0) {
+                last.1 += 1;
+            }
+        }
+    }
+
+    let prompt_at = invocation.args.iter().rposition(|arg| arg == prompt);
+    let mut kept: Vec<String> = Vec::with_capacity(invocation.args.len() + extra.len());
+    let mut skip = 0usize;
+    for (index, arg) in invocation.args.drain(..).enumerate() {
+        if Some(index) == prompt_at {
+            skip = 0;
+            kept.push(arg);
+            continue;
+        }
+        if skip > 0 && !arg.starts_with('-') {
+            skip -= 1;
+            continue;
+        }
+        skip = 0;
+        if arg.starts_with('-') {
+            let (name, inline) = match arg.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (arg.as_str(), false),
+            };
+            if let Some((_, values)) = groups.iter().find(|(flag, _)| *flag == name) {
+                skip = if inline { 0 } else { *values };
+                continue;
+            }
+        }
+        kept.push(arg);
+    }
+
+    let at = kept
+        .iter()
+        .rposition(|arg| arg == prompt)
+        .unwrap_or(kept.len());
+    kept.splice(at..at, extra.iter().cloned());
+    invocation.args = kept;
+}
+
+/// Whether `flag` was written as `flag=value` in `extra`.
+fn extra_group_has_inline_value(extra: &[String], flag: &str) -> bool {
+    extra
+        .iter()
+        .any(|token| token.split_once('=').is_some_and(|(name, _)| name == flag))
+}
+
 /// What an adapter read out of a finished harness run.
 #[derive(Debug, Clone, Default)]
 pub struct HarnessRun {
@@ -409,4 +477,48 @@ pub(crate) fn tail(text: &str, max: usize) -> String {
     }
 
     format!("…{}", &text[start..])
+}
+
+#[cfg(test)]
+mod extra_args_tests {
+    use super::*;
+
+    fn invocation(args: &[&str]) -> HarnessInvocation {
+        HarnessInvocation {
+            program: "claude".into(),
+            args: args.iter().map(ToString::to_string).collect(),
+            stdin: None,
+        }
+    }
+
+    fn extra(args: &[&str]) -> Vec<String> {
+        args.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn an_extra_flag_replaces_the_same_flag_and_its_value() {
+        let mut run = invocation(&["--print", "--effort", "low", "--model", "m", "prompt"]);
+        apply_extra_args(&mut run, "prompt", &extra(&["--effort", "high"]));
+        assert_eq!(
+            run.args,
+            ["--print", "--model", "m", "--effort", "high", "prompt"]
+        );
+    }
+
+    #[test]
+    fn a_new_flag_goes_before_the_prompt() {
+        let mut run = invocation(&["--print", "-p"]);
+        apply_extra_args(&mut run, "-p", &extra(&["--dangerously-skip-permissions"]));
+        assert_eq!(
+            run.args,
+            ["--print", "--dangerously-skip-permissions", "-p"]
+        );
+    }
+
+    #[test]
+    fn the_inline_form_replaces_too_and_no_prompt_means_append() {
+        let mut run = invocation(&["--effort", "low"]);
+        apply_extra_args(&mut run, "x", &extra(&["--effort=high"]));
+        assert_eq!(run.args, ["--effort=high"]);
+    }
 }
