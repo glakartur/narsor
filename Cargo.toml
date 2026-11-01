@@ -31,6 +31,14 @@ members = [
 ]
 resolver = "2"
 
+# Keep `target/` small: external dependencies only need line tables for
+# backtraces; workspace crates keep full debug info.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
+[profile.release]
+strip = "symbols"
+
 [dependencies]
 narsor-protocol = { path = "crates/narsor-protocol" }
 narsor-shared = { path = "crates/narsor-shared" }
