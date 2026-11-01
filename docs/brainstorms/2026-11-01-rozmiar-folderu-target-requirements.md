@@ -15,7 +15,7 @@ Folder `target/` rośnie, bo workspace (9 crate'ów, ok. 65 plików testów inte
 - Nie ma `.cargo/config.toml` ani wspólnego `CARGO_TARGET_DIR`.
 - `run.sh` buduje `--workspace --bins --release`, a CI (`.github/workflows/ci.yml`, `release.yml`) buduje osobno – artefakty release i dev rosną równolegle.
 - `target/` jest już w `.gitignore`, więc problem dotyczy dysku (lokalnego, runnerów CI, obrazów kontenerów), nie repozytorium.
-- Nie zmierzono jeszcze, co zajmuje miejsce (`target/` nie było obecne w tym środowisku). Pierwszy krok to pomiar.
+- Według użytkownika `target/` ma ok. 35 GB (release ok. 500 MB), więc problem dotyczy głównie dev/test. Podział na `debug/deps`, `incremental`, `build` nadal wymaga pomiaru.
 
 ## Możliwości
 
@@ -24,11 +24,11 @@ Folder `target/` rośnie, bo workspace (9 crate'ów, ok. 65 plików testów inte
 - A2. `cargo install cargo-sweep` / `cargo-cache`; `cargo bloat`/`cargo-diet` zbędne na tym etapie.
 
 **B. Mniej informacji debug (największy zysk w dev/test, zwykle 30–60%)**
-- B1. `[profile.dev] debug = "line-tables-only"` (lub `debug = 0`) – backtrace'y nadal mają numery linii.
+- B1. Dla zależności wystarczą numery linii: `[profile.dev.package."*"] debug = "line-tables-only"`. Własny kod wymaga pełnego debug – **nie** obniżamy `debug` dla crate'ów workspace'u.
 - B2. `[profile.dev] split-debuginfo = "unpacked"` (Linux: tylko przy wsparciu toolchaina) – mniej danych w linkowanych plikach.
-- B3. `[profile.dev.package."*"] debug = false` – bez debug dla zależności; własny kod zostaje debugowalny.
+- B3. Alternatywnie `[profile.dev.package."*"] debug = false` – bez debug dla zależności (własny kod zostaje w pełni debugowalny).
 - B4. `[profile.release] strip = "symbols"` – mniejsze binarki w `dist/` i `target/release`.
-- Koszt: gorsze debugowanie w gdb/lldb (B1, B3); B4 usuwa symbole z backtrace'ów panik w binarkach release (sprawdzić z założeniem o `dist/` poniżej). Zysk bez wpływu na zachowanie programu.
+- Koszt: gorsze debugowanie zależności w gdb/lldb (B1, B3); B4 usuwa symbole z backtrace'ów panik w binarkach release (sprawdzić z założeniem o `dist/` poniżej). Zysk bez wpływu na zachowanie programu.
 
 **C. Mniej osobnych plików wykonywalnych testów**
 - C1. Połączenie ok. 65 testów integracyjnych w jeden crate testowy (`tests/integration/main.rs` + moduły) – jeden link zamiast ok. 65; zwykle największy pojedynczy zysk, także na czasie budowania.
@@ -49,7 +49,8 @@ Folder `target/` rośnie, bo workspace (9 crate'ów, ok. 65 plików testów inte
 **F. Współdzielenie katalogu**
 - F1. Wspólny `CARGO_TARGET_DIR` (lub `build.target-dir`) dla wielu kopii roboczych/worktree – jeden zestaw artefaktów zamiast N. Ważne przy równoległych workspace'ach agentów.
 - F2. Cache kompilacji `sccache` – zmniejsza ponowne budowanie, ale nie sam rozmiar `target/`; wymaga osobnego cache na dysku.
-- Koszt F1: blokady Cargo serializują równoległe buildy; ryzyko mieszania wersji toolchaina.
+- **Odrzucone przez użytkownika:** wspólny `CARGO_TARGET_DIR` – w środowiskach agentów (np. GitHub) nie ma nad tym kontroli, a ryzyko konfliktów między agentami jest zbyt duże.
+- Koszt F1 (informacyjnie): blokady Cargo serializują równoległe buildy; ryzyko mieszania wersji toolchaina.
 
 **G. Zmiana linkera / kompresja (opcjonalnie)**
 - G1. Szybszy linker (`mold`/`lld`) skraca czas, nieznacznie wpływa na rozmiar.
@@ -58,10 +59,9 @@ Folder `target/` rośnie, bo workspace (9 crate'ów, ok. 65 plików testów inte
 ## Rekomendacja (kolejność)
 
 1. A1 – zmierzyć, co zajmuje miejsce.
-2. B1 + B3 (+ B4 dla release) – zmiana tylko w `Cargo.toml`, niskie ryzyko.
+2. B1 (lub B3) tylko dla zależności (+ B4 dla release) – zmiana tylko w `Cargo.toml`, niskie ryzyko; własny kod bez zmian debug.
 3. E3 + E4 w CI.
-4. C1, jeśli pomiar potwierdzi dominację artefaktów testów.
-5. F1, jeśli równolegle istnieje wiele kopii roboczych.
+4. C1 (zgoda użytkownika) – przy ok. 35 GB prawdopodobnie największy zysk; można wykonać zaraz po pomiarze.
 
 ## Requirements (do zatwierdzenia)
 
@@ -73,13 +73,13 @@ Folder `target/` rośnie, bo workspace (9 crate'ów, ok. 65 plików testów inte
 ## Założenia do potwierdzenia
 
 - Celem jest rozmiar na dysku (lokalnie i/lub CI), nie rozmiar artefaktów wydawniczych w `dist/`.
-- Utrata pełnego debug info dla zależności jest akceptowalna.
-- Nie znamy dziś rzeczywistego rozmiaru `target/`; rekomendacje opierają się na typowych proporcjach dla Rust workspace'ów.
-- Refaktor testów (C1) jest dopuszczalny, ale nie jest pierwszym krokiem.
+- Utrata pełnego debug info dla zależności jest akceptowalna (zostają numery linii); dla własnego kodu pełne debug info zostaje.
+- Rekomendacje opierają się na typowych proporcjach dla Rust workspace'ów, dopóki nie ma podziału rozmiaru z A1.
+- Refaktor testów (C1) jest zatwierdzony przez użytkownika; kolejność po pomiarze.
 
-## Pytania otwarte dla użytkownika
+## Rozstrzygnięte pytania
 
-- Ile `target/` zajmuje dziś i gdzie boli: dysk lokalny, runnery CI, czy obrazy/cache?
-- Czy używacie debuggera (gdb/lldb) na zależnościach, czy wystarczą backtrace'y z numerami linii?
-- Czy równolegle istnieje wiele kopii roboczych (worktree/workspace agentów), dla których sensowny jest wspólny `CARGO_TARGET_DIR`?
-- Czy zgoda na połączenie testów integracyjnych w jeden crate (C1)?
+- Rozmiar: `target/` ok. 35 GB, release ok. 500 MB; „wszystko jest bolesne” (lokalnie, CI i cache).
+- Debugger: w zależnościach wystarczą numery linii, w własnym kodzie potrzebne pełne debug info.
+- Wspólny `CARGO_TARGET_DIR`: nie (brak kontroli w środowiskach agentów, ryzyko konfliktów).
+- Połączenie testów integracyjnych w jeden crate (C1): tak.
