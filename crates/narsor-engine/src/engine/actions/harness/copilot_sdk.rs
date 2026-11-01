@@ -84,24 +84,16 @@ pub(crate) async fn run_copilot_sdk(
         limit,
     };
 
-    match sdk_runtime.run(request).await? {
+    let mut parser = parser;
+    let mut on_event = |record| {
+        feed_copilot_sdk_record(&mut parser, conversation, usage, record);
+    };
+    let outcome = sdk_runtime.run(request, &mut on_event).await?;
+    drop(on_event);
+
+    match outcome {
         CopilotSdkOutcome::TimedOut => Ok(SpawnEnding::TimedOut),
         CopilotSdkOutcome::Finished(response) => {
-            let mut parser = parser;
-            feed_copilot_sdk_record(
-                &mut parser,
-                conversation,
-                usage,
-                serde_json::json!({"type": "session", "session_id": response.session_id}),
-            );
-            if let Some(text) = &response.text {
-                feed_copilot_sdk_record(
-                    &mut parser,
-                    conversation,
-                    usage,
-                    serde_json::json!({"type": "assistant", "content": text}),
-                );
-            }
             feed_copilot_sdk_record(
                 &mut parser,
                 conversation,
@@ -208,12 +200,6 @@ fn copilot_usage_limits(
     }]
 }
 
-fn copilot_sdk_wait_timeout(limit: Option<Duration>) -> Duration {
-    // The SDK defaults an omitted timeout to 60 seconds; Tokio treats this
-    // unrepresentably distant deadline as far-future.
-    limit.unwrap_or(Duration::MAX)
-}
-
 async fn run_with_sdk_deadline<F: Future>(
     deadline: Option<tokio::time::Instant>,
     future: F,
@@ -233,6 +219,7 @@ pub(crate) trait CopilotSdkBackend: Send + Sync {
     fn run<'a>(
         &'a self,
         request: CopilotSdkRequest,
+        on_event: &'a mut (dyn FnMut(serde_json::Value) + Send),
     ) -> BoxFuture<'a, Result<CopilotSdkOutcome, ActionError>>;
 }
 
@@ -252,6 +239,7 @@ impl CopilotSdkBackend for GitHubCopilotSdkRuntime {
     fn run<'a>(
         &'a self,
         request: CopilotSdkRequest,
+        on_event: &'a mut (dyn FnMut(serde_json::Value) + Send),
     ) -> BoxFuture<'a, Result<CopilotSdkOutcome, ActionError>> {
         Box::pin(async move {
             let mut options = ClientOptions::default();
@@ -273,7 +261,6 @@ impl CopilotSdkBackend for GitHubCopilotSdkRuntime {
                 }
                 Err(_) => return Ok(CopilotSdkOutcome::TimedOut),
             };
-            let wait_timeout = copilot_sdk_wait_timeout(request.limit);
             let run_client = client.clone();
             let run = async move {
                 let session = if let Some(session_id) = request.session_id {
@@ -298,12 +285,128 @@ impl CopilotSdkBackend for GitHubCopilotSdkRuntime {
                 })?;
 
                 let session_id = session.id().to_string();
-                let response = session
-                    .send_and_wait(
-                        MessageOptions::new(request.prompt).with_wait_timeout(wait_timeout),
-                    )
+                let mut events = session.subscribe();
+                on_event(serde_json::json!({
+                    "type": "session",
+                    "session_id": session_id.clone()
+                }));
+                let message_id = session
+                    .send(MessageOptions::new(request.prompt))
                     .await
-                    .map_err(|error| copilot_sdk_error("Copilot SDK request failed", error));
+                    .map_err(|error| copilot_sdk_error("Copilot SDK request failed", error))?;
+                let mut request_started = false;
+                let mut final_message = None;
+                let response = loop {
+                    let event = events.recv().await.map_err(|error| {
+                        copilot_sdk_error("failed to receive Copilot SDK event", error)
+                    })?;
+                    let event_type = event.event_type.as_str();
+                    let is_root = event.agent_id.as_deref().is_none_or(str::is_empty);
+                    let data = &event.data;
+
+                    let record = serde_json::to_value(&event).map_err(|error| {
+                        copilot_sdk_error("failed to serialize Copilot SDK event", error)
+                    })?;
+                    on_event(record);
+
+                    if is_root && event_type == "user.message" {
+                        request_started |= data.get("messageId").and_then(Value::as_str)
+                            == Some(message_id.as_str());
+                    }
+                    if is_root
+                        && event_type == "session.warning"
+                        && data.get("warningType").and_then(Value::as_str) == Some("policy_blocked")
+                        && data.get("originatingMessageId").and_then(Value::as_str)
+                            == Some(message_id.as_str())
+                    {
+                        request_started = true;
+                    }
+                    if is_root && event_type == "assistant.message" {
+                        let origin = data.get("originatingMessageId").and_then(Value::as_str);
+                        if origin == Some(message_id.as_str())
+                            || (origin.is_none() && request_started)
+                        {
+                            request_started = true;
+                            final_message = if data
+                                .get("toolRequests")
+                                .and_then(Value::as_array)
+                                .is_some_and(|tools| !tools.is_empty())
+                            {
+                                None
+                            } else {
+                                Some(data.clone())
+                            };
+                        }
+                    }
+
+                    if event_type == "session.quota_observation" {
+                        match session.rpc().quota().get().await {
+                            Ok(projection) => {
+                                let limits = copilot_usage_limits(&projection);
+                                if !limits.is_empty() {
+                                    on_event(serde_json::json!({
+                                        "type": "usage",
+                                        "limits": limits
+                                    }));
+                                }
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "could not read Copilot subscription usage");
+                            }
+                        }
+                    }
+
+                    if !is_root {
+                        continue;
+                    }
+                    match event_type {
+                        "session.idle" if request_started => {
+                            if data.get("aborted").and_then(Value::as_bool) == Some(true) {
+                                break Err(copilot_sdk_error(
+                                    "Copilot SDK request failed",
+                                    "session aborted before the response completed",
+                                ));
+                            }
+                            if data.get("mode").and_then(Value::as_str) != Some("autopilot") {
+                                break Ok(final_message);
+                            }
+                        }
+                        "session.autopilot_stopped"
+                            if data.get("requestId").and_then(Value::as_str)
+                                == Some(message_id.as_str()) =>
+                        {
+                            match data.get("reason").and_then(Value::as_str) {
+                                Some("error") => {
+                                    break Err(copilot_sdk_error(
+                                        "Copilot SDK request failed",
+                                        "autopilot request failed",
+                                    ));
+                                }
+                                Some("aborted") => {
+                                    break Err(copilot_sdk_error(
+                                        "Copilot SDK request failed",
+                                        "session aborted before the response completed",
+                                    ));
+                                }
+                                _ => break Ok(final_message),
+                            }
+                        }
+                        "session.error"
+                            if data
+                                .get("originatingMessageId")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .is_none_or(|origin| origin == message_id) =>
+                        {
+                            let message = data
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("session error");
+                            break Err(copilot_sdk_error("Copilot SDK request failed", message));
+                        }
+                        _ => {}
+                    }
+                };
                 let usage_limits = match session.rpc().quota().get().await {
                     Ok(projection) => copilot_usage_limits(&projection),
                     Err(error) => {
@@ -325,7 +428,6 @@ impl CopilotSdkBackend for GitHubCopilotSdkRuntime {
                     session_id,
                     text: response.and_then(|event| {
                         event
-                            .data
                             .get("content")
                             .and_then(Value::as_str)
                             .map(str::to_string)
@@ -382,8 +484,8 @@ fn combine_sdk_errors(primary: ActionError, cleanup: ActionError) -> ActionError
 #[cfg(test)]
 mod copilot_sdk_dispatch_tests {
     use super::{
-        copilot_sdk_wait_timeout, copilot_usage_limits, run_with_sdk_deadline, CopilotSdkBackend,
-        CopilotSdkOutcome, CopilotSdkRequest, CopilotSdkResponse,
+        copilot_usage_limits, run_with_sdk_deadline, CopilotSdkBackend, CopilotSdkOutcome,
+        CopilotSdkRequest, CopilotSdkResponse,
     };
     use crate::engine::actions::agent::conversation::ConversationSink;
     use crate::engine::actions::agent::process::{
@@ -409,15 +511,6 @@ mod copilot_sdk_dispatch_tests {
         .await;
 
         assert!(result.is_err(), "the shared deadline should expire");
-    }
-
-    #[test]
-    fn copilot_sdk_wait_has_no_sixty_second_cap_without_action_timeout() {
-        assert_eq!(copilot_sdk_wait_timeout(None), Duration::MAX);
-        assert_eq!(
-            copilot_sdk_wait_timeout(Some(Duration::from_secs(12))),
-            Duration::from_secs(12)
-        );
     }
 
     #[test]
@@ -486,8 +579,25 @@ mod copilot_sdk_dispatch_tests {
         fn run<'a>(
             &'a self,
             request: CopilotSdkRequest,
+            on_event: &'a mut (dyn FnMut(serde_json::Value) + Send),
         ) -> BoxFuture<'a, Result<CopilotSdkOutcome, crate::domain::ActionError>> {
             *self.request.lock().unwrap() = Some(request);
+            on_event(serde_json::json!({
+                "type": "session",
+                "session_id": "sdk-session"
+            }));
+            on_event(serde_json::json!({
+                "type": "assistant.message_delta",
+                "data": {"messageId": "message-1", "deltaContent": "hello"}
+            }));
+            on_event(serde_json::json!({
+                "type": "assistant.message",
+                "data": {
+                    "messageId": "message-1",
+                    "originatingMessageId": "request-1",
+                    "content": "hello"
+                }
+            }));
             Box::pin(async {
                 Ok(CopilotSdkOutcome::Finished(CopilotSdkResponse {
                     session_id: "sdk-session".to_string(),
@@ -602,15 +712,19 @@ mod copilot_sdk_dispatch_tests {
         let runtime = GitHubCopilotSdkRuntime {
             program: CliProgram::Path(program),
         };
+        let mut on_event = |_| {};
         let result = runtime
-            .run(CopilotSdkRequest {
-                prompt: "test".to_string(),
-                model: None,
-                session_id: None,
-                working_dir: directory.clone(),
-                action_execution_id: None,
-                limit: None,
-            })
+            .run(
+                CopilotSdkRequest {
+                    prompt: "test".to_string(),
+                    model: None,
+                    session_id: None,
+                    working_dir: directory.clone(),
+                    action_execution_id: None,
+                    limit: None,
+                },
+                &mut on_event,
+            )
             .await;
 
         let args = std::fs::read_to_string(&args_file).unwrap();
