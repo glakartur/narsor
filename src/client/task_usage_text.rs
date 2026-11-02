@@ -5,7 +5,7 @@
 //! up as they are: `in` and `out` are the `input` and `output` of
 //! [`TokenCounts`], and the cache counts are neither added to them nor read.
 
-use narsor_protocol::api::{Position, TokenCounts};
+use narsor_protocol::api::{Position, PositionUsage, TokenCounts};
 
 const THOUSAND: u64 = 1_000;
 const MILLION: u64 = 1_000_000;
@@ -69,6 +69,59 @@ pub fn line(usage: &TaskUsage, with_subagents: bool) -> String {
         }
     }
     text
+}
+
+/// What one step used, as the cells of a table row: each one is empty when
+/// the harness did not say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepCells {
+    pub cost: String,
+    pub input: String,
+    pub output: String,
+    pub subagent_count: String,
+    pub subagent_input: String,
+    pub subagent_output: String,
+}
+
+impl StepCells {
+    /// Whether the step has anything to show on the main part of its row.
+    pub fn has_main(&self) -> bool {
+        !(self.cost.is_empty() && self.input.is_empty())
+    }
+
+    /// Whether the step has subagents to show.
+    pub fn has_subagents(&self) -> bool {
+        !self.subagent_input.is_empty()
+    }
+}
+
+/// The cells of the usage of one step; all empty for a step without a report.
+/// Subagents that used nothing, or were not reported, are empty.
+pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
+    let Some(usage) = usage else {
+        return StepCells::default();
+    };
+    let mut cells = StepCells {
+        cost: usage
+            .cost_usd
+            .map_or_else(String::new, |cost| format!("${cost:.2}")),
+        ..StepCells::default()
+    };
+    if let Some(counts) = usage.total {
+        cells.input = format!("↓{}", scaled(counts.input));
+        cells.output = format!("↑{}", scaled(counts.output));
+    }
+    if let Some(counts) = usage
+        .subagents
+        .filter(|counts| counts.input + counts.output > 0)
+    {
+        cells.subagent_input = format!("↓{}", scaled(counts.input));
+        cells.subagent_output = format!("↑{}", scaled(counts.output));
+        if let Some(count) = usage.subagent_count.filter(|count| *count > 0) {
+            cells.subagent_count = format!("{count}×");
+        }
+    }
+    cells
 }
 
 fn tokens(counts: Option<TokenCounts>) -> String {
@@ -242,5 +295,71 @@ mod tests {
         };
         let usage = sum(&[position(Some(cached))]).unwrap();
         assert_eq!(line(&usage, true), "— · in 2k out 100");
+    }
+
+    #[test]
+    fn a_step_reads_as_cells() {
+        let cells = step_cells(Some(&used((120_000, 8_000), Some((40_000, 3_000)), 0.42)));
+        assert_eq!(
+            (
+                cells.cost.as_str(),
+                cells.input.as_str(),
+                cells.output.as_str(),
+                cells.subagent_count.as_str(),
+                cells.subagent_input.as_str(),
+                cells.subagent_output.as_str(),
+            ),
+            ("$0.42", "↓120k", "↑8k", "1×", "↓40k", "↑3k")
+        );
+        assert!(cells.has_main() && cells.has_subagents());
+    }
+
+    #[test]
+    fn what_a_step_did_not_report_is_an_empty_cell() {
+        assert_eq!(step_cells(None), StepCells::default());
+        let only_cost = PositionUsage {
+            cost_usd: Some(0.5),
+            ..PositionUsage::default()
+        };
+        let cells = step_cells(Some(&only_cost));
+        assert_eq!(cells.cost, "$0.50");
+        assert!(cells.input.is_empty() && !cells.has_subagents());
+        let only_tokens = PositionUsage {
+            total: Some(counts(950, 2_400_000)),
+            ..PositionUsage::default()
+        };
+        let cells = step_cells(Some(&only_tokens));
+        assert_eq!(
+            (cells.input.as_str(), cells.output.as_str()),
+            ("↓950", "↑2.4M")
+        );
+        assert!(cells.cost.is_empty());
+        assert!(!step_cells(Some(&PositionUsage::default())).has_main());
+    }
+
+    #[test]
+    fn subagents_that_used_nothing_are_no_cells() {
+        for subagents in [None, Some((0, 0))] {
+            let cells = step_cells(Some(&used((1_000, 100), subagents, 0.1)));
+            assert!(!cells.has_subagents() && cells.subagent_count.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_cache_does_not_change_the_cells() {
+        let cached = PositionUsage {
+            total: Some(TokenCounts {
+                input: 2_000,
+                output: 100,
+                cache_read: 500_000,
+                cache_write: 90_000,
+            }),
+            ..PositionUsage::default()
+        };
+        let cells = step_cells(Some(&cached));
+        assert_eq!(
+            (cells.input.as_str(), cells.output.as_str()),
+            ("↓2k", "↑100")
+        );
     }
 }
