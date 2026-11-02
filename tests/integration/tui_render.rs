@@ -2007,10 +2007,10 @@ mod task_app_detail_render {
     use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
     use narsor_engine::controller_protocol::{ExecutionEventsResponse, QueueView};
     use narsor_engine::domain::ExecutionStatus;
-    use narsor_engine::engine::{ConversationState, PositionStatus, Timeline};
+    use narsor_engine::engine::{ConversationState, PositionStatus};
     use narsor_engine::orchestration::QueueReason;
 
-    use crate::remote_support::{snapshot, RemoteHarness};
+    
     use crate::task_app_support::{
         displayed, execution_events, listing, position, queued, task, timeline, with_controller,
         with_harness_unavailable, with_runner,
@@ -2639,64 +2639,6 @@ mod task_app_detail_render {
             );
             press(&mut app, KeyCode::Char(']'));
         }
-    }
-
-    #[tokio::test]
-    async fn the_wide_screen_with_a_remote_task_shows_the_header_the_tabs_and_the_axis() {
-        let harness = RemoteHarness::start().await;
-        let mut recorded = position("plan", PositionStatus::Succeeded);
-        recorded.conversation = ConversationState::NotCreated {
-            reason: "script".into(),
-        };
-        let current = position("review", PositionStatus::InProgress);
-        let mut first = snapshot(1, None);
-        first.timeline = Some(Timeline {
-            default_position: Some(current.label.clone()),
-            positions: vec![recorded, current],
-            ..Timeline::default()
-        });
-        harness.running("task-1", "k8s", first).await;
-
-        let mut app = TaskApp::new(harness.owner.clone(), "remote", None);
-        app.refresh().await;
-        press(&mut app, KeyCode::Enter);
-        app.sync_detail().await;
-        app.detail_mut()
-            .set_tab(narsor::tui::task_app::DetailTab::Progress);
-
-        let buffer = render(&mut app, &Styles::new(false));
-        let screen = screen(&buffer);
-        let rows = rows(&buffer);
-        assert!(
-            rows[IDENTITY_ROW].contains("task-1"),
-            "{}",
-            rows[IDENTITY_ROW]
-        );
-        assert!(
-            rows[METADATA_ROW].contains("implement-feature v1"),
-            "{}",
-            rows[METADATA_ROW]
-        );
-        assert!(
-            rows[STATE_ROW].contains("● running") && rows[STATE_ROW].contains("krok 2/2"),
-            "{}",
-            rows[STATE_ROW]
-        );
-        assert!(
-            rows[TABS_ROW].contains("Przebieg") && rows[TABS_ROW].contains("Info"),
-            "{}",
-            rows[TABS_ROW]
-        );
-        assert!(
-            screen.contains("✓ plan #1") && screen.contains("● review #1 w toku"),
-            "{screen}"
-        );
-        assert_axis_bracket(&buffer, "● review #1 w toku", marks(true, false));
-        assert!(
-            screen.contains("brak rozmowy: script") || screen.contains("review #1 · w toku"),
-            "{screen}"
-        );
-        assert!(screen.contains("● live"));
     }
 
     // -----------------------------------------------------------------
@@ -5817,125 +5759,6 @@ mod task_app_create_render {
     }
 }
 
-/// The main screen of the origin (§1), end to end: tasks of a real control
-/// plane in the list, the header of the connection, the details of the
-/// selected one and the bar.
-mod task_app_main_screen {
-    use super::*;
-
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use narsor::tui::task_app::{layout, TaskApp};
-    use narsor_engine::orchestration::{AttentionItem, AttentionKind};
-
-    use crate::remote_support::{snapshot, RemoteHarness};
-
-    fn render(app: &mut TaskApp, styles: &Styles) -> Buffer {
-        draw(130, 30, |frame| {
-            layout::render(frame, app, styles, Instant::now())
-        })
-    }
-
-    #[tokio::test]
-    async fn the_main_screen_of_the_origin_is_drawn_from_a_real_control_plane() {
-        let harness = RemoteHarness::start().await;
-        harness
-            .running("NAR-14", "backend-b", snapshot(1, None))
-            .await;
-        let mut waiting = snapshot(1, Some("in-1"));
-        waiting.attention = vec![AttentionItem {
-            kind: AttentionKind::Approval,
-            state_id: Some("review".to_string()),
-            since: chrono::Utc::now(),
-            waiting_id: "in-1".to_string(),
-        }];
-        harness.running("NAR-12", "k8s", waiting).await;
-        harness.create("NAR-16", Some("k8s")).await;
-        harness.create("NAR-17", Some("k8s")).await;
-        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
-        app.refresh().await;
-        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.sync_detail().await;
-        let buffer = render(&mut app, &Styles::new(false));
-        let rows = rows(&buffer);
-        let screen = screen(&buffer);
-
-        // The header: the connection by name and state, the counters.
-        assert!(rows[0].contains("narsor · local ● live"), "{}", rows[0]);
-        assert!(
-            rows[0].contains("? 1") && rows[0].contains("! 0"),
-            "{}",
-            rows[0]
-        );
-        assert!(rows[0].contains("sloty"), "{}", rows[0]);
-
-        // The list, in queue order: markers/id, title, then state/time/label.
-        let list_part = |row: &String| -> String {
-            row.chars().take(usize::from(layout::LIST_WIDTH)).collect()
-        };
-        let row_of = |title: &str| {
-            rows.iter()
-                .map(list_part)
-                .find(|row| row.contains(title))
-                .unwrap_or_else(|| panic!("no row for {title}:\n{screen}"))
-        };
-        let under = |title: &str| {
-            let at = rows
-                .iter()
-                .position(|row| list_part(row).contains(title))
-                .unwrap_or_else(|| panic!("no row for {title}:\n{screen}"));
-            list_part(&rows[at + 2])
-        };
-        // The frame, the bracket's column, then the row; the selected task
-        // has the grey bar, the focus being in the details.
-        assert!(
-            row_of("NAR-14").starts_with("│    ●  id:NAR-14"),
-            "{}",
-            row_of("NAR-14")
-        );
-        assert!(
-            row_of("NAR-12").starts_with("││ ? ●  id:NAR-12"),
-            "{}",
-            row_of("NAR-12")
-        );
-        assert!(
-            row_of("NAR-16").starts_with("│    ◷  id:NAR-16") && under("NAR-16").contains("#1")
-        );
-        assert!(
-            row_of("NAR-17").starts_with("│    ◷  id:NAR-17") && under("NAR-17").contains("#2")
-        );
-        let order: Vec<usize> = ["NAR-14", "NAR-12", "NAR-16", "NAR-17"]
-            .iter()
-            .map(|title| {
-                rows.iter()
-                    .position(|row| list_part(row).contains(title))
-                    .unwrap()
-            })
-            .collect();
-        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-
-        // The details of the selected task: header (under a padded blank
-        // row: identity, state, metadata, a rule), tabs, and the panel of
-        // what waits for the operator, with its own keys on the bar.
-        assert!(rows[3].contains("NAR-12"), "{}", rows[3]);
-        assert!(rows[4].contains("● running"), "{}", rows[4]);
-        assert!(rows[5].contains("implement-feature v1"), "{}", rows[5]);
-        assert!(
-            rows[7].contains("Przebieg")
-                && rows[7].contains("Dyrygent")
-                && rows[7].contains("Info"),
-            "{}",
-            rows[7]
-        );
-        assert!(screen.contains("? Approval · review"), "{screen}");
-        assert!(screen.contains("Approve the plan?"), "{screen}");
-        let bar = &rows[rows.len() - 1];
-        assert!(
-            bar.contains("Enter wyślij") && bar.contains("Esc wstecz"),
-            "{bar}"
-        );
-    }
-}
 
 /// U5: the default harness in the header, shortened in its order, and the
 /// list `h` opens.

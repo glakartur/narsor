@@ -62,6 +62,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::config::{agent_args_for, AgentArgs};
+use crate::engine::timeline_file::ReadingSink;
 
 use super::answer::{self, ChoiceAnswer};
 use super::harness::{
@@ -119,6 +120,7 @@ pub struct AgentExecutor {
     harnesses: HarnessRegistry,
     events: Option<Arc<dyn AgentEventSink>>,
     usage: Option<Arc<dyn UsageReporter>>,
+    readings: Option<Arc<dyn ReadingSink>>,
     /// How long a harness may go on after its final answer.
     final_answer_grace: Duration,
     /// Extra arguments of every run, winning over the adapter's own.
@@ -133,6 +135,7 @@ impl AgentExecutor {
             harnesses: HarnessRegistry::defaults(),
             events: None,
             usage: None,
+            readings: None,
             final_answer_grace: FINAL_ANSWER_GRACE,
             extra_args: AgentArgs::new(),
         }
@@ -158,6 +161,7 @@ impl AgentExecutor {
             harnesses,
             events: None,
             usage: None,
+            readings: None,
             final_answer_grace: FINAL_ANSWER_GRACE,
             extra_args: AgentArgs::new(),
         }
@@ -173,6 +177,13 @@ impl AgentExecutor {
     /// routed to `reporter`.
     pub fn with_usage_reporter(mut self, reporter: Arc<dyn UsageReporter>) -> Self {
         self.usage = Some(reporter);
+        self
+    }
+
+    /// Returns the executor with the tokens and cost its harnesses report
+    /// handed to `sink`.
+    pub fn with_reading_sink(mut self, sink: Arc<dyn ReadingSink>) -> Self {
+        self.readings = Some(sink);
         self
     }
 
@@ -233,7 +244,15 @@ impl AgentExecutor {
             purpose: request.purpose,
         };
         sink.append_narsor(&entry, &[element]);
-        sink
+        match (&self.readings, request.execution_id) {
+            (Some(readings), Some(execution_id)) => sink.with_readings(conversation::ReadingTap {
+                sink: Arc::clone(readings),
+                execution_id: execution_id.to_string(),
+                attempt_id: request.action_execution_id.to_string(),
+                harness: harness.to_string(),
+            }),
+            _ => sink,
+        }
     }
 
     /// One agent run, from the session record to the output label.
@@ -305,6 +324,9 @@ impl AgentExecutor {
                 harness: harness.to_string(),
                 action_execution_id: Some(request.action_execution_id.to_string()),
                 resumed_session: resume.map(ToString::to_string),
+                model: flag_value(&invocation.args, &["--model", "-m"])
+                    .or_else(|| config.model.clone()),
+                effort: flag_value(&invocation.args, &["--effort", "--reasoning-effort"]),
             },
         );
         session.status = AgentSessionStatus::Running;
@@ -582,5 +604,45 @@ fn action_type_name(action: &ActionConfig) -> &'static str {
         ActionConfig::Script(_) => "script",
         ActionConfig::Human(_) => "human",
         ActionConfig::Wait(_) => "wait",
+    }
+}
+
+/// The value of the first of `flags` on a harness command line, written as
+/// `--flag value` or `--flag=value`.
+fn flag_value(args: &[String], flags: &[&str]) -> Option<String> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if let Some((name, value)) = arg.split_once('=') {
+            if flags.contains(&name) && !value.is_empty() {
+                return Some(value.to_string());
+            }
+        } else if flags.contains(&arg.as_str()) {
+            return args.next().filter(|v| !v.starts_with('-')).cloned();
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod flag_value_tests {
+    use super::flag_value;
+
+    fn args(args: &[&str]) -> Vec<String> {
+        args.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_flag_gives_its_value_either_way() {
+        let flags = ["--model", "-m"];
+        assert_eq!(
+            flag_value(&args(&["-p", "--model", "opus"]), &flags),
+            Some("opus".into())
+        );
+        assert_eq!(
+            flag_value(&args(&["--model=sonnet"]), &flags),
+            Some("sonnet".into())
+        );
+        assert_eq!(flag_value(&args(&["--model"]), &flags), None);
+        assert_eq!(flag_value(&args(&["--other", "x"]), &flags), None);
     }
 }

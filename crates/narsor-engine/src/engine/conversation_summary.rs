@@ -57,10 +57,10 @@ pub fn summaries(
     let state_of: HashMap<&str, &str> = timeline
         .positions
         .iter()
-        .filter_map(|position| {
+        .flat_map(|position| {
             position
-                .action_execution_id
-                .as_deref()
+                .attempt_ids()
+                .into_iter()
                 .map(|attempt| (attempt, position.state_id.as_str()))
         })
         .collect();
@@ -69,11 +69,11 @@ pub fn summaries(
         .positions
         .iter()
         .enumerate()
-        .filter_map(|(index, position)| {
+        .flat_map(|(index, position)| {
             position
-                .action_execution_id
-                .as_deref()
-                .map(|attempt| (attempt, index))
+                .attempt_ids()
+                .into_iter()
+                .map(move |attempt| (attempt, index))
         })
         .collect();
     ordered.sort_by_key(|attempt| (order.get(attempt.as_str()).copied(), (*attempt).clone()));

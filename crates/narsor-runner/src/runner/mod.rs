@@ -472,9 +472,14 @@ fn assemble_session(
     let usage = usage::UsageForwarder::new();
     let reporter: Arc<dyn UsageReporter> = usage.clone();
     let harness = Arc::new(LiveHarness::new(starting_harness(&storage, spec)));
+    let readings_changed = Arc::new(tokio::sync::Notify::new());
     let engine = Engine::new(storage.store())
         .with_agent_args(config.agent_args.clone())
         .with_usage_reporter(Arc::clone(&reporter))
+        .with_reading_notifier({
+            let readings_changed = Arc::clone(&readings_changed);
+            Arc::new(move || readings_changed.notify_one())
+        })
         .with_default_harness_source(harness.clone())
         .with_task_labels(spec.ticket.clone(), spec.title.clone());
     let engine = Arc::new(customize(engine, &reporter));
@@ -493,6 +498,7 @@ fn assemble_session(
         link,
         cache: snapshot::ConversationCache::default(),
         usage,
+        readings_changed,
         usage_sender: None,
         execution_id: None,
         directive: RunnerDirective::Continue,
@@ -784,6 +790,9 @@ struct Session {
     /// What sends the usage reports in place of the link's client; `None`
     /// in production, a test double in the tests.
     usage_sender: Option<Arc<dyn usage::UsageSender>>,
+    /// Told when tokens or cost a harness reported reached the timeline
+    /// file: the snapshot is out of date.
+    readings_changed: Arc<tokio::sync::Notify>,
     execution_id: Option<String>,
     directive: RunnerDirective,
     pass: Option<JoinHandle<Result<WorkflowExecution, EngineError>>>,
@@ -1297,6 +1306,7 @@ impl Session {
     /// The control loop: reports, polls, delivers, until told to stop.
     async fn drive(&mut self) -> Result<RunnerExit, RunnerError> {
         let mut events = self.engine.subscribe();
+        let readings_changed = Arc::clone(&self.readings_changed);
         let mut dirty = true;
         let mut last_report: Option<Instant> = None;
         let mut poll: Option<InFlightPoll> = None;
@@ -1406,6 +1416,9 @@ impl Session {
                     if !matches!(event, Err(broadcast::error::RecvError::Closed)) {
                         dirty = true;
                     }
+                }
+                () = readings_changed.notified() => {
+                    dirty = true;
                 }
                 // Only once a report waits and no other is on its way.
                 () = self.usage.ready() => {

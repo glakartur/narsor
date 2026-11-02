@@ -704,7 +704,7 @@ impl TaskApp {
                     .progress
                     .positions()
                     .iter()
-                    .filter_map(recorded_attempt)
+                    .flat_map(recorded_attempts)
                     .collect();
                 for attempt in &attempts {
                     self.start_attempt_read(&id, revision, attempt);
@@ -867,11 +867,15 @@ pub(super) fn rebuild_step(view: &mut TaskDetail) {
         .rebuild_step(&view.attempts, view.events.events());
 }
 
-/// The attempt of a position whose conversation can be read.
-pub(super) fn recorded_attempt(position: &narsor_protocol::api::Position) -> Option<String> {
-    match (&position.conversation, &position.action_execution_id) {
-        (ConversationState::Recorded, Some(id)) => Some(id.clone()),
-        _ => None,
+/// The attempts of a position whose conversation can be read.
+pub(super) fn recorded_attempts(position: &narsor_protocol::api::Position) -> Vec<String> {
+    match position.conversation {
+        ConversationState::Recorded => position
+            .attempt_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

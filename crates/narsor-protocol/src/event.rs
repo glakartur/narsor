@@ -176,6 +176,14 @@ pub enum EventData {
         /// (D18).
         #[serde(default)]
         resumed_session: Option<String>,
+        /// The model the run was asked for, when the workflow or the
+        /// harness arguments name one. A harness left to its default says
+        /// nothing here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The reasoning effort the run was asked for, likewise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
     AgentSessionCompleted {
         session_id: String,

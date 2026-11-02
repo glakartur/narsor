@@ -108,6 +108,7 @@ use crate::engine::actions::{
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
+use crate::engine::timeline_file::FileReadingSink;
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
 use crate::workflow::template::{step_reply_references, step_stream_references};
 use crate::workflow::{
@@ -194,11 +195,17 @@ pub fn terminal_status(state: &State) -> ExecutionStatus {
 }
 
 /// The agent executor this engine runs, wired to its own store and channel.
-fn agent_executor(store: &ExecutionStore, events: &broadcast::Sender<Event>) -> AgentExecutor {
-    AgentExecutor::new().with_event_sink(Arc::new(LoggingEventSink::new(
-        store.clone(),
-        Some(events.clone()),
-    )))
+fn agent_executor(
+    store: &ExecutionStore,
+    events: &broadcast::Sender<Event>,
+    on_reading: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> AgentExecutor {
+    AgentExecutor::new()
+        .with_event_sink(Arc::new(LoggingEventSink::new(
+            store.clone(),
+            Some(events.clone()),
+        )))
+        .with_reading_sink(Arc::new(FileReadingSink::new(store.clone(), on_reading)))
 }
 
 /// The action types an executor can be registered for.
@@ -945,6 +952,7 @@ pub struct Engine {
     agent_timeout_secs: Option<u64>,
     agent_args: AgentArgs,
     usage_reporter: Option<Arc<dyn UsageReporter>>,
+    reading_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     default_harness: Arc<dyn DefaultHarnessSource>,
     events: broadcast::Sender<Event>,
     pause_requests: Mutex<HashSet<ExecutionId>>,
@@ -1105,7 +1113,7 @@ impl Engine {
     pub fn new(store: ExecutionStore) -> Self {
         let events = broadcast::channel(EVENT_CHANNEL_CAPACITY).0;
 
-        let agent = agent_executor(&store, &events);
+        let agent = agent_executor(&store, &events, None);
 
         let mut executors: HashMap<ActionKind, Arc<dyn ActionExecutor>> = HashMap::new();
         executors.insert(ActionKind::Script, Arc::new(ScriptExecutor::new()));
@@ -1118,6 +1126,7 @@ impl Engine {
             agent_timeout_secs: None,
             agent_args: AgentArgs::new(),
             usage_reporter: None,
+            reading_notifier: None,
             default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
             events,
             pause_requests: Mutex::new(HashSet::new()),
@@ -1186,7 +1195,8 @@ impl Engine {
 
     fn rebuild_agent_executor(&mut self) {
         let mut agent =
-            agent_executor(&self.store, &self.events).with_extra_args(self.agent_args.clone());
+            agent_executor(&self.store, &self.events, self.reading_notifier.clone())
+                .with_extra_args(self.agent_args.clone());
         if let Some(reporter) = &self.usage_reporter {
             agent = agent.with_usage_reporter(Arc::clone(reporter));
         }
@@ -1228,6 +1238,16 @@ impl Engine {
     /// ([`AgentExecutor::with_usage_reporter`]).
     pub fn with_usage_reporter(mut self, reporter: Arc<dyn UsageReporter>) -> Self {
         self.usage_reporter = Some(reporter);
+        self.rebuild_agent_executor();
+        self
+    }
+
+    /// Returns the engine calling `notify` whenever the tokens or cost its
+    /// agents report have been written to the execution's timeline file.
+    ///
+    /// Rebuilds the stock agent executor, like [`Self::with_usage_reporter`].
+    pub fn with_reading_notifier(mut self, notify: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.reading_notifier = Some(notify);
         self.rebuild_agent_executor();
         self
     }

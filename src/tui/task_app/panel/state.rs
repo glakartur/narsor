@@ -431,7 +431,7 @@ fn input_panel(
     let state_of = |attempt: &str| {
         positions
             .iter()
-            .find(|position| position.action_execution_id.as_deref() == Some(attempt))
+            .find(|position| position.attempt_ids().contains(&attempt))
             .map(|position| position.state_id.clone())
     };
     let definition = task

@@ -7,7 +7,12 @@
 use std::collections::HashSet;
 
 use narsor_engine::domain::{Event, EventData, ExecutionStatus, RepromptedBy};
-use narsor_engine::engine::{build_timeline, ConversationState, EventLink, PositionStatus};
+use narsor_engine::engine::{
+    build_timeline, current_timeline, ConversationState, EventLink, PositionStatus, ReadingBasis,
+    UsageReading,
+};
+use narsor_engine::persistence::ExecutionStore;
+use narsor_protocol::api::TokenCounts;
 use serde_json::json;
 
 const EXEC: &str = "exec-1";
@@ -375,6 +380,8 @@ fn a_salvaged_timeout_stays_succeeded_but_flags_the_session() {
         harness: "claude-code".to_string(),
         action_execution_id: Some("a1".to_string()),
         resumed_session: None,
+        model: None,
+        effort: None,
     });
     log.push(EventData::AgentSessionFailed {
         session_id: "s1".to_string(),
@@ -425,6 +432,8 @@ fn an_old_format_log_still_attributes_events_but_has_no_conversation() {
         harness: "claude-code".to_string(),
         action_execution_id: None,
         resumed_session: None,
+        model: None,
+        effort: None,
     });
     let agent_message_seq = log.push(EventData::AgentMessage {
         session_id: "s1".to_string(),
@@ -553,4 +562,190 @@ fn a_present_conversation_reads_as_recorded() {
         timeline.positions[0].conversation,
         ConversationState::Recorded
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sessions on a step
+// ---------------------------------------------------------------------------
+
+/// One agent run: the action, its session start and the session's end.
+fn agent_run(log: &mut Log, id: &str, state: &str, resumed: Option<&str>, session: &str) {
+    log.push(action_started(id, state, "agent"));
+    log.push(EventData::AgentSessionStarted {
+        session_id: format!("narsor-{id}"),
+        harness: "claude-code".to_string(),
+        action_execution_id: Some(id.to_string()),
+        resumed_session: resumed.map(str::to_string),
+        model: Some("opus".to_string()),
+        effort: Some("high".to_string()),
+    });
+    log.push(EventData::AgentSessionCompleted {
+        session_id: format!("narsor-{id}"),
+        action_execution_id: Some(id.to_string()),
+        harness_session_id: Some(session.to_string()),
+    });
+    log.push(action_completed(id, "done"));
+}
+
+#[test]
+fn a_position_names_the_harness_model_effort_and_session() {
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a1", "plan", None, "hs-A");
+
+    let timeline = build_timeline(&log.events, ExecutionStatus::Completed, &HashSet::new());
+    let position = &timeline.positions[0];
+    assert_eq!(position.harness.as_deref(), Some("claude-code"));
+    assert_eq!(position.model.as_deref(), Some("opus"));
+    assert_eq!(position.effort.as_deref(), Some("high"));
+    assert_eq!(position.harness_session_id.as_deref(), Some("hs-A"));
+    assert_eq!(position.session_number, Some(1));
+}
+
+/// The agent asked, the answer went back into its session: one entry, which
+/// is under way again.
+#[test]
+fn an_answer_to_the_agent_in_its_session_is_the_same_entry() {
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a1", "plan", None, "hs-A");
+    log.push(state_entered("plan"));
+    log.push(action_started("a2", "plan", "agent"));
+    let resumed_seq = log.push(EventData::AgentSessionStarted {
+        session_id: "narsor-a2".to_string(),
+        harness: "claude-code".to_string(),
+        action_execution_id: Some("a2".to_string()),
+        resumed_session: Some("hs-A".to_string()),
+        model: None,
+        effort: None,
+    });
+
+    let timeline = build_timeline(&log.events, ExecutionStatus::Running, &presence(&["a1", "a2"]));
+
+    assert_eq!(timeline.positions.len(), 1);
+    let position = &timeline.positions[0];
+    assert_eq!(position.label, "plan #1");
+    assert_eq!(position.attempts, ["a1", "a2"]);
+    assert_eq!(position.action_execution_id.as_deref(), Some("a2"));
+    assert_eq!(position.status, PositionStatus::InProgress);
+    assert_eq!(position.model.as_deref(), Some("opus"));
+    assert_eq!(position.conversation, ConversationState::Recorded);
+    assert_eq!(
+        timeline.link(resumed_seq),
+        Some(&EventLink::Position("plan #1".to_string()))
+    );
+}
+
+/// The workflow came back to an earlier session after another step: a new
+/// entry, numbered like that session.
+#[test]
+fn a_return_to_a_session_after_another_step_is_a_new_entry_with_its_number() {
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a1", "plan", None, "hs-A");
+    log.push(state_entered("review"));
+    agent_run(&mut log, "b1", "review", None, "hs-B");
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a2", "plan", Some("hs-A"), "hs-A");
+
+    let timeline = build_timeline(&log.events, ExecutionStatus::Completed, &HashSet::new());
+
+    let shape: Vec<(&str, Option<u32>)> = timeline
+        .positions
+        .iter()
+        .map(|p| (p.label.as_str(), p.session_number))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            ("plan #1", Some(1)),
+            ("review #1", Some(1)),
+            ("plan #1.2", Some(1))
+        ]
+    );
+    assert_eq!(timeline.positions[2].attempts, ["a2"]);
+}
+
+/// A session that is not one resumed, on the same step, is the next number.
+#[test]
+fn a_new_session_on_a_step_has_the_next_number() {
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a1", "plan", None, "hs-A");
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a2", "plan", None, "hs-B");
+
+    let timeline = build_timeline(&log.events, ExecutionStatus::Completed, &HashSet::new());
+
+    let labels: Vec<&str> = timeline.positions.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(labels, ["plan #1", "plan #2"]);
+    assert_eq!(timeline.positions[1].session_number, Some(2));
+}
+
+// ---------------------------------------------------------------------------
+// timeline.json
+// ---------------------------------------------------------------------------
+
+fn scratch(name: &str) -> ExecutionStore {
+    let root = std::env::temp_dir().join(format!("narsor-timeline-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    ExecutionStore::new(root)
+}
+
+fn increment(input: u64, output: u64, cost: f64) -> UsageReading {
+    UsageReading {
+        basis: ReadingBasis::Increment,
+        total: Some(TokenCounts {
+            input,
+            output,
+            ..TokenCounts::default()
+        }),
+        cost_usd: Some(cost),
+        ..UsageReading::default()
+    }
+}
+
+#[test]
+fn readings_reach_the_timeline_through_the_file_without_an_event() {
+    let store = scratch("readings");
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a1", "plan", None, "hs-A");
+    let none = HashSet::new();
+
+    let before = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
+    assert_eq!(before.positions[0].usage, None);
+
+    narsor_engine::engine::timeline_file::record_reading(&store, EXEC, "a1", increment(10, 4, 0.5))
+        .unwrap();
+    let during = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
+    let usage = during.positions[0].usage.expect("usage");
+    assert_eq!(usage.total.map(|t| t.output), Some(4));
+    assert_eq!(usage.cost_usd, Some(0.5));
+
+    narsor_engine::engine::timeline_file::record_reading(&store, EXEC, "a1", increment(1, 1, 0.25))
+        .unwrap();
+    let after = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
+    assert_eq!(after.positions[0].usage.unwrap().cost_usd, Some(0.75));
+
+    // The log moves on: the timeline is built again and keeps the readings.
+    log.push(EventData::WorkflowCompleted { result: json!({}) });
+    let later = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
+    assert_eq!(later.positions[0].usage.unwrap().cost_usd, Some(0.75));
+}
+
+#[test]
+fn a_timeline_file_in_the_wrong_state_is_made_again() {
+    let store = scratch("rebuild");
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a1", "plan", None, "hs-A");
+    let none = HashSet::new();
+    current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
+    let path = store.execution_dir(EXEC).join("timeline.json");
+    std::fs::write(&path, b"not json").unwrap();
+
+    let timeline = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
+    assert_eq!(timeline.positions.len(), 1);
+    assert!(std::fs::read_to_string(&path).unwrap().contains("\"positions\""));
 }

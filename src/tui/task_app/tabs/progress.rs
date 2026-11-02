@@ -248,7 +248,7 @@ impl Progress {
         self.positions()
             .iter()
             .filter(|position| position.state_id == state_id && position.visit == visit)
-            .filter_map(super::super::detail::recorded_attempt)
+            .flat_map(super::super::detail::recorded_attempts)
             .collect()
     }
 

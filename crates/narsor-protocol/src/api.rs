@@ -694,6 +694,23 @@ mod tests {
                 conversation: super::ConversationState::NotCreated {
                     reason: "not an agent action".into(),
                 },
+                session_number: Some(1),
+                attempts: vec!["attempt-1".into()],
+                harness: Some("claude-code".into()),
+                model: Some("sonnet".into()),
+                effort: Some("high".into()),
+                harness_session_id: Some("session-1".into()),
+                usage: Some(super::PositionUsage {
+                    total: Some(super::TokenCounts {
+                        input: 3,
+                        output: 4,
+                        cache_read: 5,
+                        cache_write: 6,
+                    }),
+                    subagents: None,
+                    subagent_count: Some(2),
+                    cost_usd: Some(0.5),
+                }),
             }],
             links: BTreeMap::from([(7, EventLink::Position("review #1".into()))]),
             default_position: Some("review #1".into()),
@@ -706,6 +723,34 @@ mod tests {
         );
         assert_eq!(value["links"]["7"]["link"], "position");
         assert_eq!(value["default_position"], "review #1");
+        assert_eq!(value["positions"][0]["session_number"], 1);
+        assert_eq!(value["positions"][0]["harness_session_id"], "session-1");
+        assert_eq!(value["positions"][0]["usage"]["total"]["output"], 4);
+        assert_eq!(value["positions"][0]["usage"]["subagent_count"], 2);
+        assert_eq!(value["positions"][0]["usage"]["cost_usd"], 0.5);
+    }
+
+    #[test]
+    fn a_position_of_an_older_runner_still_reads() {
+        let older = serde_json::json!({
+            "label": "review #1",
+            "state_id": "review",
+            "visit": 1,
+            "action_execution_id": "attempt-1",
+            "action_type": "agent",
+            "status": "succeeded",
+            "started_at": null,
+            "ended_at": null,
+            "error": null,
+            "resumed_harness_session": null,
+            "harness_session_interrupted": false,
+            "retry_pending": false,
+            "conversation": { "state": "recorded" }
+        });
+        let position: Position = serde_json::from_value(older).unwrap();
+        assert_eq!(position.attempt_ids(), ["attempt-1"]);
+        assert_eq!(position.usage, None);
+        assert_eq!(position.harness_session_id, None);
     }
 
     #[test]
