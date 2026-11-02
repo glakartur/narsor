@@ -400,7 +400,6 @@ mod tests {
                 codex_home: None,
                 claude_config_dir: work,
                 claude_profile_source: source,
-                agent_args: Vec::new(),
             }
         }
     }

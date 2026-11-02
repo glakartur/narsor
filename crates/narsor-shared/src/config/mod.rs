@@ -42,6 +42,6 @@ pub use resolve::AgentDefaults;
 pub use resolve::{resolve, ConfigError, Environment, Flags, Resolved};
 pub use security_validation::is_loopback_host;
 pub use settings::{
-    render_value, SettingKey, SettingValue, Source, DEFAULT_BACKEND, DEFAULT_TUI_REFRESH_SECS,
-    ENV_PREFIX, MASK, NO_LIMIT,
+    agent_args_for, agent_args_key, render_value, AgentArgs, SettingKey, SettingValue, Source,
+    AGENT_ARGS_ENV, DEFAULT_BACKEND, DEFAULT_TUI_REFRESH_SECS, ENV_PREFIX, MASK, NO_LIMIT,
 };

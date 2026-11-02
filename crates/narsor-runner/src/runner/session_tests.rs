@@ -311,6 +311,7 @@ fn offline_config(root: &TempRoot, storage: &Path, incarnation: &str) -> RunnerC
         credential_file: root.0.join("no-credential"),
         secrets_dir: None,
         harness_home: HarnessHome::default(),
+        agent_args: Default::default(),
         incarnation: incarnation.to_string(),
         timing: RunnerTiming {
             problem_report_deadline: Duration::ZERO,

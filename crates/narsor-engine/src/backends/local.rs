@@ -699,6 +699,7 @@ impl ExecutionBackend for LocalBackend {
 /// which a runner never inherits.
 fn is_controller_setting(name: &std::ffi::OsStr) -> bool {
     name.as_encoded_bytes().starts_with(ENV_PREFIX.as_bytes())
+        && name != std::ffi::OsStr::new(crate::config::AGENT_ARGS_ENV)
 }
 
 /// Variables through which a runner or a harness would reach the user's
@@ -846,6 +847,9 @@ mod tests {
         ] {
             assert!(is_controller_setting(name.as_ref()), "{name}");
         }
+        assert!(!is_controller_setting(
+            crate::config::AGENT_ARGS_ENV.as_ref()
+        ));
         for name in ["PATH", "HOME", "RUST_LOG", "narsor_lower", "XNARSOR_"] {
             assert!(!is_controller_setting(name.as_ref()), "{name}");
         }

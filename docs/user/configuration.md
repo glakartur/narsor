@@ -51,7 +51,8 @@ sits right there is the failure this layer exists to prevent.
 data_dir: /srv/narsor        # executions, workspaces, the registry
 agent_harness: claude-code   # for an agent action that names none itself (unless `narsor-cli harness default set` overrides it)
 agent_timeout: 30m           # for an agent action that declares none; `none` for no limit
-agent_args: [--dangerously-skip-permissions, --effort, high]  # added to every harness command; win over Narsor's own values of the same flag
+agent_args:                  # by harness (claude, codex, opencode, copilot); only the running harness's list is added to its command
+  claude: [--dangerously-skip-permissions, --effort, high]  # one list entry is one argument, spaces included; win over Narsor's own values of the same flag
 max_concurrent_tasks: 10     # tasks processed at once across all backends; default 1; `none` removes the limit; `L` in the TUI changes it until the daemon restarts
 log_level: info              # off, error, warn, info, debug, trace
 tui_refresh_interval: 10s    # how often the TUI re-reads the daemon; `none` turns it off
@@ -64,10 +65,15 @@ Every one of them is available as an environment variable too, mechanically:
 | `data_dir` | `NARSOR_DATA_DIR` | `./.narsor` |
 | `agent_harness` | `NARSOR_AGENT_HARNESS` | `claude-code` |
 | `agent_timeout` | `NARSOR_AGENT_TIMEOUT` | `none` |
-| `agent_args` | `NARSOR_AGENT_ARGS` (comma-separated) | empty |
+| `agent_args` | `NARSOR_AGENT_ARGS` (a mapping, e.g. `{claude: [--effort, high]}`) | empty |
 | `max_concurrent_tasks` | `NARSOR_MAX_CONCURRENT_TASKS` | `1` |
 | `log_level` | `NARSOR_LOG_LEVEL` | `off` |
 | `tui_refresh_interval` | `NARSOR_TUI_REFRESH_INTERVAL` | `10s` |
+
+For Kubernetes runners, put `NARSOR_AGENT_ARGS` in the controller ConfigMap
+(`narsor-controller-config`). The controller forwards this one key to the
+runner as an environment variable; it does not parse or rewrite the mapping.
+Each list item remains one argument, including items containing spaces.
 
 An **empty** variable counts as unset, because that is how Kubernetes renders
 an unset key of a ConfigMap.

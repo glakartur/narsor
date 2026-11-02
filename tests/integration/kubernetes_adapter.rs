@@ -282,7 +282,6 @@ fn the_runner_is_told_the_backends_home_mode() {
         codex_home: Some("/mnt/codex".into()),
         claude_config_dir: None,
         claude_profile_source: None,
-        agent_args: Vec::new(),
     };
     let args = runner_args(&generated_pod_with(&config, spec()).0);
     let tail: Vec<&str> = args[args.len() - 4..].iter().map(String::as_str).collect();
@@ -385,12 +384,21 @@ fn the_pod_has_one_runner_one_init_container_and_separate_volumes() {
         "no secrets, no secrets dir"
     );
     let env = runner["env"].as_array().unwrap();
-    assert_eq!(env.len(), 1, "PATH only; HOME is the runner's: {env:?}");
+    assert_eq!(env.len(), 2, "PATH and optional agent args: {env:?}");
     assert_eq!(env[0]["name"], "PATH");
     assert!(env[0]["value"]
         .as_str()
         .unwrap()
         .starts_with("/opt/narsor/bin:"));
+    assert_eq!(env[1]["name"], "NARSOR_AGENT_ARGS");
+    assert_eq!(
+        env[1]["valueFrom"]["configMapKeyRef"],
+        serde_json::json!({
+            "name": "narsor-controller-config",
+            "key": "NARSOR_AGENT_ARGS",
+            "optional": true,
+        })
+    );
 
     assert_eq!(
         init["image"],
@@ -881,9 +889,10 @@ fn tool_secrets_are_projected_files_never_values() {
         "the credential is not in the Pod"
     );
     let runner = &pod["spec"]["containers"][0];
-    assert_eq!(
-        runner["env"].as_array().unwrap().len(),
-        1,
+    let env = runner["env"].as_array().unwrap();
+    assert_eq!(env.len(), 2);
+    assert!(
+        env.iter().all(|entry| entry["name"] != "GH_TOKEN"),
         "no GH_TOKEN env in the Pod"
     );
     let args = runner["args"].as_array().unwrap();

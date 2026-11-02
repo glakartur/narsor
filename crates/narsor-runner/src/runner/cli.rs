@@ -54,8 +54,8 @@
 //! | [`EXIT_PROBLEM`] | the runner could not work and reported why (base image, secret, initialization, launch spec) |
 //! | [`EXIT_OWNER_DECISION`] | the storage was left by an unexpected stop and no newer launch generation (the owner's or the resume policy's) authorizes recovering it |
 //!
-//! The runner reads no configuration file and no catalogue: everything it
-//! runs is in the launch spec.
+//! The runner reads application configuration for its own runtime settings;
+//! task workflows and repositories still come only from the launch spec.
 
 use std::path::PathBuf;
 
@@ -84,6 +84,10 @@ const EXIT_USAGE: i32 = 2;
 /// Arguments of `narsor-runner`.
 #[derive(Debug, Clone, Args)]
 pub struct RunnerArgs {
+    /// Optional explicit application configuration file.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
     /// The task this runner works for.
     #[arg(long, value_name = "TASK_ID")]
     pub task_id: String,
@@ -128,11 +132,6 @@ pub struct RunnerArgs {
     /// every start (in Kubernetes, the read-only profile Secret mount).
     #[arg(long, value_name = "DIRECTORY")]
     pub claude_profile_source: Option<PathBuf>,
-
-    /// An extra argument for every harness run, as `--agent-arg=<ARG>`;
-    /// repeat it for each argument. It wins over the same flag Narsor chose.
-    #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
-    pub agent_args: Vec<String>,
 
     /// Only answer reads of the storage (conversation pages, events, the
     /// conductor's chat) and change nothing on it: no preparation,
@@ -188,6 +187,7 @@ pub async fn run_command(args: RunnerArgs) -> i32 {
         }
     };
 
+    std::env::remove_var(narsor_engine::config::AGENT_ARGS_ENV);
     exit_code(run(config, apply_environment).await)
 }
 
@@ -215,6 +215,21 @@ fn exit_code(ended: Result<RunnerExit, RunnerError>) -> i32 {
 /// argument that is not valid.
 pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
     let task_id = TaskId::parse(&args.task_id).map_err(|error| error.to_string())?;
+    let resolved = narsor_engine::config::resolve::resolve(
+        &narsor_engine::config::Flags {
+            config: args.config,
+            ..Default::default()
+        },
+        &narsor_engine::config::resolve::environment_from_process(),
+    );
+    if !resolved.is_ok() {
+        return Err(resolved
+            .errors()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
     let defaults = RunnerTiming::default();
     Ok(RunnerConfig {
         task_id,
@@ -228,8 +243,8 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
             codex_home: args.codex_home,
             claude_config_dir: args.claude_config_dir,
             claude_profile_source: args.claude_profile_source,
-            agent_args: args.agent_args,
         },
+        agent_args: resolved.agent_args(),
         incarnation: args.incarnation,
         timing: RunnerTiming {
             poll_wait: std::time::Duration::from_secs(args.poll_wait_secs),
@@ -325,7 +340,6 @@ mod tests {
                 codex_home: Some("/srv/codex".into()),
                 claude_config_dir: Some("/srv/claude".into()),
                 claude_profile_source: Some("/srv/profile".into()),
-                agent_args: Vec::new(),
             }
         );
     }
