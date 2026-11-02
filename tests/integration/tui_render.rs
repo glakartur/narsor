@@ -2009,8 +2009,8 @@ mod task_app_detail_render {
     use narsor_engine::domain::ExecutionStatus;
     use narsor_engine::engine::{ConversationState, PositionStatus};
     use narsor_engine::orchestration::QueueReason;
+    use narsor_protocol::api::{PositionUsage, TokenCounts};
 
-    
     use crate::task_app_support::{
         displayed, execution_events, listing, position, queued, task, timeline, with_controller,
         with_harness_unavailable, with_runner,
@@ -2205,6 +2205,112 @@ mod task_app_detail_render {
             rows[IDENTITY_ROW].contains("…  RUN-1"),
             "identity survives fitting: {}",
             rows[IDENTITY_ROW]
+        );
+    }
+
+    /// `running_app` whose steps reported `usage` (one entry per step).
+    fn running_app_with_usage(usage: Vec<Option<PositionUsage>>) -> TaskApp {
+        let mut app = running_app();
+        let positions = usage
+            .into_iter()
+            .enumerate()
+            .map(|(index, usage)| {
+                let mut step = position(&format!("step{index}"), PositionStatus::Succeeded);
+                step.usage = usage;
+                step
+            })
+            .collect();
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", positions, None))),
+        );
+        app
+    }
+
+    fn reported(input: u64, output: u64, sub: (u64, u64), cost: f64) -> Option<PositionUsage> {
+        let counts = |input, output| TokenCounts {
+            input,
+            output,
+            ..TokenCounts::default()
+        };
+        Some(PositionUsage {
+            total: Some(counts(input, output)),
+            subagents: Some(counts(sub.0, sub.1)),
+            subagent_count: Some(1),
+            cost_usd: Some(cost),
+        })
+    }
+
+    #[test]
+    fn the_header_shows_what_the_task_used_in_a_row_under_the_links() {
+        let mut app = running_app_with_usage(vec![
+            reported(80_000, 5_000, (30_000, 2_000), 0.8),
+            None,
+            reported(40_000, 3_000, (10_000, 1_000), 0.4),
+        ]);
+        let rows = rows(&render(&mut app, &Styles::new(false)));
+        assert!(
+            rows[METADATA_ROW].contains("Jira NAR-12 ↗"),
+            "{}",
+            rows[METADATA_ROW]
+        );
+        assert!(
+            rows[METADATA_ROW + 1]
+                .contains("$1.20 · in 120k out 8k · w tym subagenci in 40k out 3k (2)"),
+            "{}",
+            rows[METADATA_ROW + 1]
+        );
+        assert!(
+            rows[TABS_ROW + 1].contains("Przebieg"),
+            "{}",
+            rows[TABS_ROW + 1]
+        );
+    }
+
+    #[test]
+    fn a_task_without_a_usage_report_keeps_the_header_as_it_was() {
+        let mut app = running_app_with_usage(vec![None, None]);
+        let rows = rows(&render(&mut app, &Styles::new(false)));
+        assert!(rows[TABS_ROW].contains("Przebieg"), "{}", rows[TABS_ROW]);
+    }
+
+    #[test]
+    fn a_narrow_header_drops_the_subagents_part_first() {
+        let mut app = running_app_with_usage(vec![reported(120_000, 8_000, (40_000, 3_000), 1.2)]);
+        let wide = rows(&render_at(&mut app, &Styles::new(false), 120, 30));
+        assert!(wide[METADATA_ROW + 1].contains("w tym subagenci in 40k out 3k (1)"));
+        let narrow = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
+        let row = &narrow[METADATA_ROW + 1];
+        assert!(row.contains("$1.20 · in 120k out 8k"), "{row}");
+        assert!(!row.contains("subagenci"), "{row}");
+    }
+
+    #[test]
+    fn the_usage_row_comes_before_a_notice() {
+        let mut app = app_without_the_default_harness("opencode");
+        let mut step = position("review", PositionStatus::InProgress);
+        step.usage = reported(1_000, 100, (0, 0), 0.1);
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", vec![step], Some("review #1")))),
+        );
+        let rows = rows(&render(&mut app, &Styles::new(false)));
+        assert!(
+            rows[METADATA_ROW + 1].contains("$0.10 · in 1k out 100"),
+            "{}",
+            rows[METADATA_ROW + 1]
+        );
+        assert!(
+            rows[METADATA_ROW + 2].contains("opencode niedostępny"),
+            "{}",
+            rows[METADATA_ROW + 2]
+        );
+        assert!(
+            rows[TABS_ROW + 2].contains("Przebieg"),
+            "{}",
+            rows[TABS_ROW + 2]
         );
     }
 
@@ -5758,7 +5864,6 @@ mod task_app_create_render {
         }
     }
 }
-
 
 /// U5: the default harness in the header, shortened in its order, and the
 /// list `h` opens.

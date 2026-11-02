@@ -47,5 +47,7 @@ pub mod domain {
 
 #[path = "client/materials.rs"]
 pub mod materials;
+#[path = "client/task_usage_text.rs"]
+pub mod task_usage_text;
 #[path = "client/usage_text.rs"]
 pub mod usage_text;
