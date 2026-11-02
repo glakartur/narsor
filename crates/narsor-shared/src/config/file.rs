@@ -416,16 +416,13 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
     // are validated by one path.
     if setting.is_list() {
         if let Some(items) = raw.as_sequence() {
-            let texts = items
-                .iter()
-                .map(|item| match item.as_i64() {
-                    // `--max-turns 5` reads naturally unquoted.
-                    Some(number) if setting == SettingKey::AgentArgs => Ok(number.to_string()),
-                    _ => text_of(item),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let texts = items.iter().map(text_of).collect::<Result<Vec<_>, _>>()?;
             return value_from_text(setting, &texts.join(","));
         }
+    }
+
+    if setting == SettingKey::AgentArgs {
+        return agent_args_value(raw);
     }
 
     if setting == SettingKey::MaxConcurrentTasks {
@@ -435,6 +432,59 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
     }
 
     value_from_text(setting, &text_of(raw)?)
+}
+
+/// The `agent_args` mapping — harness name to a list of arguments — held as
+/// YAML text, the text the environment variable carries too. Each list
+/// entry is one argument, whatever characters it holds; an empty mapping is
+/// "not set".
+fn agent_args_value(raw: &serde_yaml::Value) -> Result<SettingValue, String> {
+    let mapping = match raw {
+        serde_yaml::Value::Null => return Ok(SettingValue::Text(String::new())),
+        serde_yaml::Value::Mapping(mapping) => mapping,
+        other => {
+            return Err(format!(
+                "a mapping of harness name to a list of arguments was expected, \
+                 like '{{ claude: [--flag] }}', but {} was found",
+                describe(other)
+            ))
+        }
+    };
+    let mut args = super::settings::AgentArgs::new();
+    for (name, list) in mapping {
+        let name = text_of(name)?;
+        let key = super::settings::agent_args_key(&name).ok_or_else(|| {
+            let supported: Vec<_> = HARNESSES.iter().map(|harness| harness.short_name).collect();
+            format!(
+                "unknown agent harness '{name}'; supported harnesses are: {}",
+                supported.join(", ")
+            )
+        })?;
+        let items = list.as_sequence().ok_or_else(|| {
+            format!(
+                "the arguments of '{name}' were expected as a list, but {} was found",
+                describe(list)
+            )
+        })?;
+        let entries = items
+            .iter()
+            .map(|item| match item {
+                // `--max-turns 5` reads naturally unquoted.
+                serde_yaml::Value::Number(number) => Ok(number.to_string()),
+                other => text_of(other),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if args.insert(key.to_string(), entries).is_some() {
+            return Err(format!("the harness '{name}' is listed more than once"));
+        }
+    }
+    args.retain(|_, entries| !entries.is_empty());
+    if args.is_empty() {
+        return Ok(SettingValue::Text(String::new()));
+    }
+    Ok(SettingValue::Text(
+        serde_yaml::to_string(&args).expect("a map of text lists is valid YAML"),
+    ))
 }
 
 /// The entries of a comma-separated list setting, trimmed, empties dropped.
@@ -524,7 +574,15 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             Ok(SettingValue::Text(text.trim().to_string()))
         }
 
-        SettingKey::AgentArgs => Ok(SettingValue::Text(split_list(text).join(","))),
+        SettingKey::AgentArgs => {
+            if text.trim().is_empty() {
+                return Ok(SettingValue::Text(String::new()));
+            }
+            let raw: serde_yaml::Value = serde_yaml::from_str(text).map_err(|error| {
+                format!("a mapping like '{{ claude: [--flag] }}' was expected: {error}")
+            })?;
+            agent_args_value(&raw)
+        }
 
         SettingKey::MaxConcurrentTasks => {
             let written = text.trim();

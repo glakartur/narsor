@@ -53,6 +53,7 @@ use crate::conductor::prompt::{answer_schema, conductor_prompt};
 use crate::conductor::response::ConductorResponse;
 use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
 use crate::conductor::store::ConductorStore;
+use crate::config::{agent_args_for, AgentArgs};
 use crate::domain::{
     AgentActionConfig, ChoiceDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
 };
@@ -137,7 +138,7 @@ pub struct HarnessInvoker {
     pinned_definition: Option<Arc<WorkflowDefinition>>,
     timeout: Duration,
     budget: SnapshotBudget,
-    extra_args: Vec<String>,
+    extra_args: AgentArgs,
 }
 
 impl HarnessInvoker {
@@ -159,13 +160,13 @@ impl HarnessInvoker {
             pinned_definition: None,
             timeout: DEFAULT_CONDUCTOR_TIMEOUT,
             budget: SnapshotBudget::default(),
-            extra_args: Vec::new(),
+            extra_args: AgentArgs::new(),
         }
     }
 
     /// Returns the invoker adding `args` to every harness run; on a conflict
     /// they replace the arguments the adapter decided on.
-    pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
+    pub fn with_extra_args(mut self, args: AgentArgs) -> Self {
         self.extra_args = args;
         self
     }
@@ -276,7 +277,11 @@ impl HarnessInvoker {
                 output_schema: Some(&schema),
             })
             .map_err(|error| error.message)?;
-        apply_extra_args(&mut command, &prompt, &self.extra_args);
+        apply_extra_args(
+            &mut command,
+            &prompt,
+            agent_args_for(&self.extra_args, &harness),
+        );
 
         let ending = run_harness_process(
             &command.program,

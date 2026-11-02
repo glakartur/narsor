@@ -187,7 +187,6 @@ fn resolve_home(
     let configured = if untrusted {
         HarnessHome {
             mode: configured.mode,
-            agent_args: configured.agent_args,
             ..HarnessHome::default()
         }
     } else {
@@ -204,7 +203,6 @@ fn resolve_home(
             .claude_profile_source
             .clone()
             .or(configured.claude_profile_source),
-        agent_args: configured.agent_args,
     })
 }
 
@@ -299,6 +297,10 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
         ControllerError::failure(format!("cannot configure the local backend: {error}"))
     })?;
     backend_config.runner_args = home.runner_args();
+    if let Some(path) = config.and_then(|resolved| resolved.file().path().map(Path::to_path_buf)) {
+        backend_config.runner_args.push("--config".into());
+        backend_config.runner_args.push(path.as_os_str().into());
+    }
     if place == ControlPlanePlace::Remote {
         backend_config.launch_check = Some(untrusted_check(&args)?);
         if home.mode == HomeMode::Private {

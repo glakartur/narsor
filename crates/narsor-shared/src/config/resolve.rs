@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{HarnessHome, HomeMode};
+use crate::config::{AgentArgs, HarnessHome, HomeMode};
 
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
@@ -297,7 +297,6 @@ impl Resolved {
             claude_profile_source: self
                 .text(SettingKey::LocalClaudeProfileSource)
                 .map(PathBuf::from),
-            agent_args: self.list(SettingKey::AgentArgs),
         }
     }
 
@@ -315,12 +314,19 @@ impl Resolved {
             .unwrap_or_default()
     }
 
+    /// The `agent_args` setting: extra arguments by harness.
+    pub fn agent_args(&self) -> AgentArgs {
+        self.text(SettingKey::AgentArgs)
+            .and_then(|text| serde_yaml::from_str(text).ok())
+            .unwrap_or_default()
+    }
+
     /// What the engine needs from the configuration for an `agent` action.
     pub fn agent_defaults(&self) -> AgentDefaults {
         AgentDefaults {
             harness: self.agent_harness().to_string(),
             timeout_secs: self.agent_timeout(),
-            args: self.list(SettingKey::AgentArgs),
+            args: self.agent_args(),
         }
     }
 
@@ -354,8 +360,9 @@ pub struct AgentDefaults {
     pub harness: String,
     /// The fallback timeout, or no limit.
     pub timeout_secs: Option<u64>,
-    /// Extra arguments of every harness run; they win over Narsor's own.
-    pub args: Vec<String>,
+    /// Extra arguments of the harness runs, by harness; those of the harness
+    /// that runs win over Narsor's own.
+    pub args: AgentArgs,
 }
 
 /// Works out every setting, reading the environment that was handed in.

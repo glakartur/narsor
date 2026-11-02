@@ -378,8 +378,8 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
     ),
     (
         SettingKey::AgentArgs,
-        "[]",
-        "Extra harness arguments, e.g. [--dangerously-skip-permissions]; they win over Narsor's own.",
+        "{}",
+        "Extra arguments by harness, e.g. { claude: [--dangerously-skip-permissions] }; they win over Narsor's own.",
     ),
     (
         SettingKey::MaxConcurrentTasks,

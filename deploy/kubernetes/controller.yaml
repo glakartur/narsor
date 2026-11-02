@@ -49,6 +49,12 @@ data:
     # claude_profile_files:
     #   - settings=settings.json
     #   - auth=.credentials.json
+  # Optional. The controller forwards only this key to runner Pods; it does
+  # not parse or rewrite the value. Each list item is one argv token.
+  # NARSOR_AGENT_ARGS: |
+  #   claude:
+  #     - --dangerously-skip-permissions
+  #     - "--append-system-prompt=value with spaces"
 ---
 # The controller's identity lives here; it survives restarts and upgrades.
 apiVersion: v1

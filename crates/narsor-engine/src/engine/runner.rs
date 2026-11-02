@@ -83,7 +83,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::conductor::ConductorRegistry;
-use crate::config::AgentDefaults;
+use crate::config::{AgentArgs, AgentDefaults};
 use crate::domain::{
     effective_title, ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy,
     Artifact, ArtifactReference, ChoiceDefinition, DecisionProviderType, Event, EventData,
@@ -943,7 +943,7 @@ pub struct Engine {
     store: ExecutionStore,
     executors: HashMap<ActionKind, Arc<dyn ActionExecutor>>,
     agent_timeout_secs: Option<u64>,
-    agent_args: Vec<String>,
+    agent_args: AgentArgs,
     usage_reporter: Option<Arc<dyn UsageReporter>>,
     default_harness: Arc<dyn DefaultHarnessSource>,
     events: broadcast::Sender<Event>,
@@ -1116,7 +1116,7 @@ impl Engine {
             store,
             executors,
             agent_timeout_secs: None,
-            agent_args: Vec::new(),
+            agent_args: AgentArgs::new(),
             usage_reporter: None,
             default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
             events,
@@ -1178,7 +1178,7 @@ impl Engine {
     /// steps; on a conflict they replace the arguments Narsor chose.
     ///
     /// Rebuilds the stock agent executor, like [`Self::with_usage_reporter`].
-    pub fn with_agent_args(mut self, args: Vec<String>) -> Self {
+    pub fn with_agent_args(mut self, args: AgentArgs) -> Self {
         self.agent_args = args;
         self.rebuild_agent_executor();
         self

@@ -88,6 +88,9 @@ pub const BUNDLE_PAYLOAD: &str = "/narsor";
 pub const INSTALL_COMMAND: [&str; 4] = ["cp", "-a", "/narsor/.", "/opt/narsor/"];
 /// Name of the main container.
 pub const RUNNER_CONTAINER: &str = "runner";
+/// Controller ConfigMap key containing the runner's `NARSOR_AGENT_ARGS`.
+const RUNNER_ARGS_CONFIG_MAP: &str = "narsor-controller-config";
+const RUNNER_ARGS_CONFIG_KEY: &str = "NARSOR_AGENT_ARGS";
 /// Key of the runner credential in the launch Secret.
 pub const CREDENTIAL_KEY: &str = "credential";
 /// Key of the launch spec in the launch Secret.
@@ -775,10 +778,19 @@ pub fn pod(
                 "image": plan.base_image,
                 "command": [format!("{RUNTIME_MOUNT}/bin/narsor-runner")],
                 "args": args,
-                // PATH only: HOME is the runner's to set (a private HOME on
-                // the task storage, R17), and tool secrets reach their
-                // tools through the runner, never through the Pod spec.
-                "env": [{ "name": "PATH", "value": runner_path(plan) }],
+                // HOME is the runner's to set (R17). Only the non-secret
+                // agent-args setting may also come from the controller ConfigMap.
+                "env": [
+                    { "name": "PATH", "value": runner_path(plan) },
+                    {
+                        "name": "NARSOR_AGENT_ARGS",
+                        "valueFrom": { "configMapKeyRef": {
+                            "name": RUNNER_ARGS_CONFIG_MAP,
+                            "key": RUNNER_ARGS_CONFIG_KEY,
+                            "optional": true,
+                        }},
+                    },
+                ],
                 "volumeMounts": mounts,
                 "resources": resources,
                 "securityContext": container_security(),
@@ -1059,16 +1071,31 @@ pub fn check_pod_shape(pod: &Value, policy: &ShapePolicy) -> Result<(), Vec<Stri
         if host_port {
             problems.push(format!("container '{cname}' must not use a host port"));
         }
-        // A `secretKeyRef` would hand any Secret of the namespace to the
-        // task; secrets arrive only through the approved volume mappings.
-        let env_reference = container.get("envFrom").is_some()
+        let env_from_other_objects = container.get("envFrom").is_some()
             || container
                 .get("env")
                 .and_then(Value::as_array)
-                .is_some_and(|env| env.iter().any(|var| var.get("valueFrom").is_some()));
-        if env_reference {
+                .is_some_and(|env| {
+                    env.iter().any(|var| {
+                        let Some(reference) = var.get("valueFrom") else {
+                            return false;
+                        };
+                        let key_ref = reference.get("configMapKeyRef");
+                        var.get("name").and_then(Value::as_str) != Some(RUNNER_ARGS_CONFIG_KEY)
+                            || key_ref
+                                .and_then(|key| key.get("name"))
+                                .and_then(Value::as_str)
+                                != Some(RUNNER_ARGS_CONFIG_MAP)
+                            || key_ref
+                                .and_then(|key| key.get("key"))
+                                .and_then(Value::as_str)
+                                != Some(RUNNER_ARGS_CONFIG_KEY)
+                            || reference.as_object().is_none_or(|value| value.len() != 1)
+                    })
+                });
+        if env_from_other_objects {
             problems.push(format!(
-                "container '{cname}' must not take environment values from other objects"
+                "container '{cname}' may only read NARSOR_AGENT_ARGS from the controller ConfigMap"
             ));
         }
     }

@@ -61,6 +61,8 @@ use tokio::process::Command;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::config::{agent_args_for, AgentArgs};
+
 use super::answer::{self, ChoiceAnswer};
 use super::harness::{
     apply_extra_args, FinalAnswer, HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun,
@@ -120,7 +122,7 @@ pub struct AgentExecutor {
     /// How long a harness may go on after its final answer.
     final_answer_grace: Duration,
     /// Extra arguments of every run, winning over the adapter's own.
-    extra_args: Vec<String>,
+    extra_args: AgentArgs,
 }
 
 impl AgentExecutor {
@@ -132,7 +134,7 @@ impl AgentExecutor {
             events: None,
             usage: None,
             final_answer_grace: FINAL_ANSWER_GRACE,
-            extra_args: Vec::new(),
+            extra_args: AgentArgs::new(),
         }
     }
 
@@ -145,7 +147,7 @@ impl AgentExecutor {
 
     /// The same executor, adding `args` to every harness run; on a conflict
     /// they replace the arguments the adapter decided on.
-    pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
+    pub fn with_extra_args(mut self, args: AgentArgs) -> Self {
         self.extra_args = args;
         self
     }
@@ -157,7 +159,7 @@ impl AgentExecutor {
             events: None,
             usage: None,
             final_answer_grace: FINAL_ANSWER_GRACE,
-            extra_args: Vec::new(),
+            extra_args: AgentArgs::new(),
         }
     }
 
@@ -278,7 +280,11 @@ impl AgentExecutor {
             output_schema: None,
         }) {
             Ok(mut invocation) => {
-                apply_extra_args(&mut invocation, &prompt, &self.extra_args);
+                apply_extra_args(
+                    &mut invocation,
+                    &prompt,
+                    agent_args_for(&self.extra_args, harness),
+                );
                 invocation
             }
             Err(error) => {

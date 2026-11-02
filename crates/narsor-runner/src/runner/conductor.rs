@@ -45,6 +45,7 @@ use crate::conductor::{
 use crate::controller_protocol::ConductorReadRequest;
 use crate::domain::{WorkflowDefinition, WorkflowExecution};
 use crate::engine::{Engine, HarnessRegistry};
+use narsor_engine::config::AgentArgs;
 
 /// The conductor of one runner, and whether it can run right now.
 pub(super) struct ConductorHost {
@@ -74,7 +75,7 @@ impl ConductorHost {
         storage: &TaskStorage,
         harness: Arc<LiveHarness>,
         definition: &Arc<WorkflowDefinition>,
-        extra_args: Vec<String>,
+        extra_args: AgentArgs,
     ) -> Self {
         let invoker = HarnessInvoker::new(
             engine.store().clone(),

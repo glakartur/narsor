@@ -19,7 +19,28 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use narsor_protocol::harness::CLAUDE_CODE;
+use narsor_protocol::harness::{CLAUDE_CODE, HARNESSES};
+
+/// Extra harness arguments by harness name; each value is a sequence of argv tokens.
+pub type AgentArgs = std::collections::BTreeMap<String, Vec<String>>;
+
+/// Environment variable runners may receive from a backend's configuration map.
+pub const AGENT_ARGS_ENV: &str = "NARSOR_AGENT_ARGS";
+
+/// Canonical configuration key for a known harness name or id.
+pub fn agent_args_key(harness: &str) -> Option<&'static str> {
+    HARNESSES
+        .iter()
+        .find(|known| known.short_name == harness || known.id == harness)
+        .map(|known| known.short_name)
+}
+
+/// Arguments configured for a harness name or id.
+pub fn agent_args_for<'a>(args: &'a AgentArgs, harness: &str) -> &'a [String] {
+    agent_args_key(harness)
+        .and_then(|key| args.get(key))
+        .map_or(&[], Vec::as_slice)
+}
 
 /// Prefix of every environment variable that carries a setting.
 ///
@@ -122,8 +143,9 @@ pub enum SettingKey {
     AgentHarness,
     /// The time limit of an `agent` action that declares none itself.
     AgentTimeout,
-    /// Extra command-line arguments for every harness run. They win over the
-    /// same arguments Narsor works out itself.
+    /// Extra command-line arguments of the harness runs, listed by harness
+    /// (`claude: [--flag]`). They win over the same arguments Narsor works
+    /// out itself.
     AgentArgs,
     /// Most tasks processed at once, across all backends; `none` for no limit.
     MaxConcurrentTasks,
@@ -335,8 +357,7 @@ impl SettingKey {
     pub fn is_list(self) -> bool {
         matches!(
             self,
-            SettingKey::AgentArgs
-                | SettingKey::TrustedProxies
+            SettingKey::TrustedProxies
                 | SettingKey::CorsAllowedOrigins
                 | SettingKey::LocalWorkspaceRoots
         )

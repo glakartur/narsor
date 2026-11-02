@@ -437,7 +437,6 @@ fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
             codex_home: None,
             claude_config_dir: None,
             claude_profile_source: None,
-            agent_args: Vec::new(),
         }
     );
 
@@ -453,7 +452,6 @@ fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
             codex_home: Some(PathBuf::from("/home/me/.codex")),
             claude_config_dir: Some(PathBuf::from("/home/me/.claude")),
             claude_profile_source: Some(PathBuf::from("/srv/claude-profile")),
-            agent_args: Vec::new(),
         }
     );
 }
@@ -462,16 +460,23 @@ fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
 fn agent_args_and_the_task_limit_come_from_the_file() {
     let root = TempRoot::new();
     root.user_config(
-        "agent_args: [--dangerously-skip-permissions, --max-turns, 5]\nmax_concurrent_tasks: 10\n",
+        "agent_args:\n  claude: [--dangerously-skip-permissions, --max-turns, 5, \"--append-system-prompt=a b\", \"--search=a,b\"]\n  codex: [--x]\nmax_concurrent_tasks: 10\n",
     );
     let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
     assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    let args = resolved.agent_defaults().args;
     assert_eq!(
-        resolved.agent_defaults().args,
-        ["--dangerously-skip-permissions", "--max-turns", "5"]
+        args["claude"],
+        [
+            "--dangerously-skip-permissions",
+            "--max-turns",
+            "5",
+            "--append-system-prompt=a b",
+            "--search=a,b"
+        ]
     );
+    assert_eq!(args["codex"], ["--x"]);
     assert_eq!(resolved.max_concurrent_tasks(), Some(10));
-    assert_eq!(resolved.local_harness_home().agent_args.len(), 3);
 
     let none = resolve_with(
         &Flags::default(),
@@ -484,6 +489,25 @@ fn agent_args_and_the_task_limit_come_from_the_file() {
     root.user_config("max_concurrent_tasks: 0\n");
     let bad = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
     assert!(!bad.is_ok());
+}
+
+#[test]
+fn agent_args_come_from_the_environment_as_a_mapping_and_are_checked() {
+    let root = TempRoot::new();
+    let env = environment(&[("NARSOR_AGENT_ARGS", "{claude-code: [--a, \"b c\"]}")]);
+    let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    assert_eq!(resolved.agent_defaults().args["claude"], ["--a", "b c"]);
+
+    for bad in ["[--a]", "{nobody: [--a]}", "{claude: --a}"] {
+        let env = environment(&[("NARSOR_AGENT_ARGS", bad)]);
+        let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
+        assert!(!resolved.is_ok(), "{bad}");
+    }
+
+    root.user_config("agent_args: [--a]\n");
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert!(!resolved.is_ok());
 }
 
 #[test]

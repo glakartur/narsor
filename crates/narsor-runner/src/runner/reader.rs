@@ -447,6 +447,7 @@ terminal_states: [completed]
             credential_file: root.0.join("no-credential"),
             secrets_dir: None,
             harness_home: HarnessHome::default(),
+            agent_args: Default::default(),
             incarnation: "reader-1".to_string(),
             timing: RunnerTiming::default(),
             contract: crate::runner::BaseImageContract::default(),
