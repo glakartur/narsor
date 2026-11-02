@@ -505,6 +505,11 @@ fn clean_timeline(timeline: &mut Timeline) {
         clean_opt(&mut position.action_type);
         clean_opt(&mut position.error);
         clean_opt(&mut position.resumed_harness_session);
+        clean_opt(&mut position.harness);
+        clean_opt(&mut position.model);
+        clean_opt(&mut position.effort);
+        clean_opt(&mut position.harness_session_id);
+        position.attempts.iter_mut().for_each(clean);
         if let ConversationState::NotCreated { reason } = &mut position.conversation {
             clean(reason);
         }

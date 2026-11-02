@@ -51,7 +51,7 @@ use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::background::{JobKey, OpeningKind, Outcome};
 use super::detail::{
-    edge_layout, recorded_attempt, render_view, KeysAt, StepLevel, TaskDetail, ViewOptions,
+    edge_layout, recorded_attempts, render_view, KeysAt, StepLevel, TaskDetail, ViewOptions,
 };
 use super::list::{fit, history_row_text, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
@@ -732,7 +732,7 @@ impl TaskApp {
                     .progress
                     .positions()
                     .iter()
-                    .filter_map(recorded_attempt)
+                    .flat_map(recorded_attempts)
                     .collect();
                 for attempt in wanted {
                     if detail.attempts.needs_read(&attempt, revision) {

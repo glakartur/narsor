@@ -13,22 +13,32 @@
 //!
 //! # What a position is
 //!
-//! One [`Position`] is one action attempt: an `ActionStarted` or
-//! `ActionRetrying` event and everything that happens to that attempt after
-//! it, keyed by `action_execution_id` (D24's idempotency key, already a
-//! fresh id per attempt). A state visited twice, or retried once, produces
-//! two or three positions, never one position mutated in place — R7 asks for
-//! every attempt and every re-entry to show up on its own.
+//! One [`Position`] is one entry of the timeline: the attempts of one
+//! agent session on a step, or one script or human attempt. The fold first
+//! follows every attempt (an `ActionStarted`, `ActionRetrying` or
+//! `OutputReprompted` event and what happens to it, keyed by
+//! `action_execution_id`) and then groups them:
+//!
+//! - an attempt that resumes a harness session of its step, when nothing
+//!   else came after that session's entry (the agent asked and was
+//!   answered, or was reprompted), joins that entry: same position, with
+//!   the attempt added to [`Position::attempts`] and its status that of the
+//!   latest attempt, so it is active again;
+//! - one that resumes a session of its step after other entries (another
+//!   step, or another session) is an entry of its own, numbered like the
+//!   session it returns to;
+//! - any other attempt starts a session (or a script run) and takes the
+//!   next number of its step.
 //!
 //! # Why the label is the identity
 //!
-//! A position's label is `"<state> #n"`, where `n` counts attempts of that
-//! state across the *whole* execution, not per visit — so a loop's second
-//! visit continues the count rather than restarting it. Because `n` only
-//! grows, a label assigned to a position never changes as later events are
-//! appended, which is exactly what lets a caller hold onto a label as a
-//! selection across a refresh (R6). There is deliberately no separate
-//! position id: the label already is one.
+//! A label is `"<state> #<session number>"`, with `".k"` after the number on
+//! the `k`th entry (from the second) of one session. Numbers only grow and a
+//! label is unique, so a caller can hold onto it as a selection across a
+//! refresh (R6). It changes only when a later attempt joins an entry that
+//! was shown alone for a moment (the resumed session is known once its
+//! start is logged). What the agents used is not in the log: see
+//! [`crate::engine::timeline_file`].
 //!
 //! # The status precedence rule
 //!
@@ -95,9 +105,15 @@ mod reasons {
     pub const NO_ATTEMPT_YET: &str = "no attempt has started in this visit yet";
 }
 
+/// An event's link while folding: positions are not labelled until attempts
+/// have been grouped into entries.
+enum Link {
+    Position(usize),
+    NoLink(String),
+}
+
 /// One attempt under construction while folding the log.
 struct Draft {
-    label: String,
     state_id: String,
     visit: u32,
     action_execution_id: Option<String>,
@@ -112,6 +128,10 @@ struct Draft {
     resumed_harness_session: Option<String>,
     harness_session_interrupted: bool,
     has_agent_event_missing_id: bool,
+    harness: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    harness_session_id: Option<String>,
     /// Set only for the synthesized "template error before the executor
     /// ran" position, which already knows its final conversation state and
     /// outcome at creation time.
@@ -141,12 +161,11 @@ pub fn build_timeline(
 ) -> Timeline {
     let mut drafts: Vec<Draft> = Vec::new();
     let mut by_attempt: HashMap<String, usize> = HashMap::new();
-    let mut state_attempt_counts: HashMap<String, u32> = HashMap::new();
     let mut state_visit_counts: HashMap<String, u32> = HashMap::new();
     let mut current_visit_state: Option<String> = None;
     let mut current_visit_last_position: Option<usize> = None;
     let mut open_position: Option<usize> = None;
-    let mut links: BTreeMap<u64, EventLink> = BTreeMap::new();
+    let mut links: BTreeMap<u64, Link> = BTreeMap::new();
 
     for event in events {
         let seq = event.sequence;
@@ -161,9 +180,7 @@ pub fn build_timeline(
             | EventData::WorkflowCancelled { .. } => {
                 links.insert(
                     seq,
-                    EventLink::NoLink {
-                        reason: reasons::WORKFLOW_LIFECYCLE.to_string(),
-                    },
+                    Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()),
                 );
             }
 
@@ -181,9 +198,7 @@ pub fn build_timeline(
                 current_visit_last_position = None;
                 links.insert(
                     seq,
-                    EventLink::NoLink {
-                        reason: reasons::STATE_ENTERED.to_string(),
-                    },
+                    Link::NoLink(reasons::STATE_ENTERED.to_string()),
                 );
             }
 
@@ -194,7 +209,6 @@ pub fn build_timeline(
             } => {
                 let idx = push_attempt(
                     &mut drafts,
-                    &mut state_attempt_counts,
                     &state_visit_counts,
                     state_id.clone(),
                     Some(action_execution_id.clone()),
@@ -204,7 +218,7 @@ pub fn build_timeline(
                 by_attempt.insert(action_execution_id.clone(), idx);
                 current_visit_last_position = Some(idx);
                 open_position = Some(idx);
-                links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                links.insert(seq, Link::Position(idx));
             }
 
             EventData::ActionRetrying {
@@ -218,9 +232,7 @@ pub fn build_timeline(
                     // with neither field) — nothing sensible to attach it to.
                     links.insert(
                         seq,
-                        EventLink::NoLink {
-                            reason: reasons::NO_ATTEMPT_YET.to_string(),
-                        },
+                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
                     );
                     continue;
                 };
@@ -228,7 +240,6 @@ pub fn build_timeline(
                     current_visit_last_position.and_then(|idx| drafts[idx].action_type.clone());
                 let idx = push_attempt(
                     &mut drafts,
-                    &mut state_attempt_counts,
                     &state_visit_counts,
                     state_id,
                     Some(action_execution_id.clone()),
@@ -238,7 +249,7 @@ pub fn build_timeline(
                 by_attempt.insert(action_execution_id.clone(), idx);
                 current_visit_last_position = Some(idx);
                 open_position = Some(idx);
-                links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                links.insert(seq, Link::Position(idx));
             }
 
             EventData::OutputReprompted {
@@ -252,7 +263,6 @@ pub fn build_timeline(
                     current_visit_last_position.and_then(|idx| drafts[idx].action_type.clone());
                 let idx = push_attempt(
                     &mut drafts,
-                    &mut state_attempt_counts,
                     &state_visit_counts,
                     state_id.clone(),
                     Some(action_execution_id.clone()),
@@ -262,7 +272,7 @@ pub fn build_timeline(
                 by_attempt.insert(action_execution_id.clone(), idx);
                 current_visit_last_position = Some(idx);
                 open_position = Some(idx);
-                links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                links.insert(seq, Link::Position(idx));
             }
 
             EventData::ActionOutputRejected {
@@ -279,13 +289,11 @@ pub fn build_timeline(
                     if open_position == Some(idx) {
                         open_position = None;
                     }
-                    links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                    links.insert(seq, Link::Position(idx));
                 } else {
                     links.insert(
                         seq,
-                        EventLink::NoLink {
-                            reason: reasons::NO_ATTEMPT_YET.to_string(),
-                        },
+                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
                     );
                 }
             }
@@ -300,13 +308,11 @@ pub fn build_timeline(
                     if open_position == Some(idx) {
                         open_position = None;
                     }
-                    links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                    links.insert(seq, Link::Position(idx));
                 } else {
                     links.insert(
                         seq,
-                        EventLink::NoLink {
-                            reason: reasons::NO_ATTEMPT_YET.to_string(),
-                        },
+                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
                     );
                 }
             }
@@ -323,13 +329,11 @@ pub fn build_timeline(
                     if open_position == Some(idx) {
                         open_position = None;
                     }
-                    links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                    links.insert(seq, Link::Position(idx));
                 } else {
                     links.insert(
                         seq,
-                        EventLink::NoLink {
-                            reason: reasons::NO_ATTEMPT_YET.to_string(),
-                        },
+                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
                     );
                 }
             }
@@ -347,13 +351,11 @@ pub fn build_timeline(
                     if open_position == Some(idx) {
                         open_position = None;
                     }
-                    links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                    links.insert(seq, Link::Position(idx));
                 } else {
                     links.insert(
                         seq,
-                        EventLink::NoLink {
-                            reason: reasons::NO_ATTEMPT_YET.to_string(),
-                        },
+                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
                     );
                 }
             }
@@ -361,6 +363,9 @@ pub fn build_timeline(
             EventData::AgentSessionStarted {
                 action_execution_id,
                 resumed_session,
+                harness,
+                model,
+                effort,
                 ..
             } => {
                 link_agent_event(
@@ -374,12 +379,16 @@ pub fn build_timeline(
                         if let Some(resumed) = resumed_session {
                             draft.resumed_harness_session = Some(resumed.clone());
                         }
+                        draft.harness = Some(harness.clone());
+                        draft.model = model.clone();
+                        draft.effort = effort.clone();
                     },
                 );
             }
 
             EventData::AgentSessionCompleted {
                 action_execution_id,
+                harness_session_id,
                 ..
             } => {
                 link_agent_event(
@@ -389,12 +398,17 @@ pub fn build_timeline(
                     action_execution_id,
                     &mut links,
                     seq,
-                    |_draft| {},
+                    |draft| {
+                        if harness_session_id.is_some() {
+                            draft.harness_session_id = harness_session_id.clone();
+                        }
+                    },
                 );
             }
 
             EventData::AgentSessionFailed {
                 action_execution_id,
+                harness_session_id,
                 ..
             } => {
                 link_agent_event(
@@ -404,7 +418,12 @@ pub fn build_timeline(
                     action_execution_id,
                     &mut links,
                     seq,
-                    |draft| draft.harness_session_interrupted = true,
+                    |draft| {
+                        draft.harness_session_interrupted = true;
+                        if harness_session_id.is_some() {
+                            draft.harness_session_id = harness_session_id.clone();
+                        }
+                    },
                 );
             }
 
@@ -426,9 +445,7 @@ pub fn build_timeline(
             EventData::DecisionRequested { .. } => {
                 links.insert(
                     seq,
-                    EventLink::NoLink {
-                        reason: reasons::WORKFLOW_LIFECYCLE.to_string(),
-                    },
+                    Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()),
                 );
             }
 
@@ -437,9 +454,7 @@ pub fn build_timeline(
             | EventData::EntryLimitCounterReset { .. } => {
                 links.insert(
                     seq,
-                    EventLink::NoLink {
-                        reason: reasons::WORKFLOW_LIFECYCLE.to_string(),
-                    },
+                    Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()),
                 );
             }
 
@@ -452,19 +467,17 @@ pub fn build_timeline(
             | EventData::ConductorFinished { .. }
             | EventData::ConductorDecision { .. }
             | EventData::ConductorDecisionUndone { .. } => {
-                link_positional(current_visit_last_position, &drafts, &mut links, seq);
+                link_positional(current_visit_last_position, &mut links, seq);
             }
 
             EventData::TransitionTaken { .. } => {
                 if let Some(idx) = current_visit_last_position {
                     drafts[idx].visit_closed = true;
-                    links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                    links.insert(seq, Link::Position(idx));
                 } else {
                     links.insert(
                         seq,
-                        EventLink::NoLink {
-                            reason: reasons::NO_ATTEMPT_YET.to_string(),
-                        },
+                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
                     );
                 }
             }
@@ -472,13 +485,11 @@ pub fn build_timeline(
             EventData::StateExited { .. } => {
                 if let Some(idx) = current_visit_last_position {
                     drafts[idx].visit_closed = true;
-                    links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                    links.insert(seq, Link::Position(idx));
                 } else {
                     links.insert(
                         seq,
-                        EventLink::NoLink {
-                            reason: reasons::NO_ATTEMPT_YET.to_string(),
-                        },
+                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
                     );
                 }
             }
@@ -486,9 +497,7 @@ pub fn build_timeline(
             EventData::HumanInputRequested { .. } | EventData::HumanInputReceived { .. } => {
                 links.insert(
                     seq,
-                    EventLink::NoLink {
-                        reason: reasons::HUMAN_OR_MANUAL.to_string(),
-                    },
+                    Link::NoLink(reasons::HUMAN_OR_MANUAL.to_string()),
                 );
             }
 
@@ -498,18 +507,14 @@ pub fn build_timeline(
                 }
                 links.insert(
                     seq,
-                    EventLink::NoLink {
-                        reason: reasons::HUMAN_OR_MANUAL.to_string(),
-                    },
+                    Link::NoLink(reasons::HUMAN_OR_MANUAL.to_string()),
                 );
             }
 
             EventData::ExternalEventReceived { .. } => {
                 links.insert(
                     seq,
-                    EventLink::NoLink {
-                        reason: reasons::WORKFLOW_LIFECYCLE.to_string(),
-                    },
+                    Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()),
                 );
             }
 
@@ -528,7 +533,7 @@ pub fn build_timeline(
                         if open_position == Some(idx) {
                             open_position = None;
                         }
-                        links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                        links.insert(seq, Link::Position(idx));
                         continue;
                     }
                 }
@@ -543,7 +548,6 @@ pub fn build_timeline(
                         .unwrap_or_else(|| "unknown".to_string());
                     let idx = push_attempt(
                         &mut drafts,
-                        &mut state_attempt_counts,
                         &state_visit_counts,
                         state_id,
                         None,
@@ -557,25 +561,93 @@ pub fn build_timeline(
                         reason: message.clone(),
                     });
                     current_visit_last_position = Some(idx);
-                    links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                    links.insert(seq, Link::Position(idx));
                 } else {
-                    link_positional(current_visit_last_position, &drafts, &mut links, seq);
+                    link_positional(current_visit_last_position, &mut links, seq);
                 }
             }
         }
     }
 
-    let last_index = drafts.len().checked_sub(1);
-    let positions: Vec<Position> = drafts
+    let entries = group_entries(&drafts);
+    let mut entry_of_draft = vec![0usize; drafts.len()];
+    for (entry_idx, entry) in entries.iter().enumerate() {
+        for &draft_idx in &entry.drafts {
+            entry_of_draft[draft_idx] = entry_idx;
+        }
+    }
+
+    let last_entry = entries.len().checked_sub(1);
+    let attempt_ids: Vec<Vec<Option<String>>> = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .drafts
+                .iter()
+                .map(|&idx| drafts[idx].action_execution_id.clone())
+                .collect()
+        })
+        .collect();
+    let mut slots: Vec<Option<Draft>> = drafts.into_iter().map(Some).collect();
+    let mut positions: Vec<Position> = Vec::with_capacity(entries.len());
+    for (entry_idx, entry) in entries.iter().enumerate() {
+        let mut members: Vec<Draft> = entry
+            .drafts
+            .iter()
+            .map(|&idx| slots[idx].take().expect("a draft belongs to one entry"))
+            .collect();
+        let mut latest = members.pop().expect("an entry has an attempt");
+        let first = members.first();
+        if let Some(first) = first {
+            latest.started_at = first.started_at;
+            latest.resumed_harness_session = first
+                .resumed_harness_session
+                .clone()
+                .or(latest.resumed_harness_session);
+        }
+        latest.has_agent_event_missing_id |= members.iter().any(|m| m.has_agent_event_missing_id);
+        latest.harness = latest
+            .harness
+            .or_else(|| members.iter().rev().find_map(|m| m.harness.clone()));
+        latest.model = latest
+            .model
+            .or_else(|| members.iter().rev().find_map(|m| m.model.clone()));
+        latest.effort = latest
+            .effort
+            .or_else(|| members.iter().rev().find_map(|m| m.effort.clone()));
+        latest.harness_session_id = latest
+            .harness_session_id
+            .or_else(|| members.iter().rev().find_map(|m| m.harness_session_id.clone()));
+        let earlier_recorded = members.iter().any(|m| {
+            m.action_execution_id
+                .as_ref()
+                .is_some_and(|id| conversation_presence.contains(id))
+        });
+        let mut position = finalize(
+            latest,
+            execution_status,
+            Some(entry_idx) == last_entry,
+            conversation_presence,
+        );
+        if earlier_recorded && position.conversation != ConversationState::Recorded {
+            position.conversation = ConversationState::Recorded;
+        }
+        position.session_number = Some(entry.session_number);
+        position.label = entry.label(&position.state_id);
+        position.attempts = attempt_ids[entry_idx].iter().flatten().cloned().collect();
+        positions.push(position);
+    }
+
+    let links: BTreeMap<u64, EventLink> = links
         .into_iter()
-        .enumerate()
-        .map(|(idx, draft)| {
-            finalize(
-                draft,
-                execution_status,
-                Some(idx) == last_index,
-                conversation_presence,
-            )
+        .map(|(seq, link)| {
+            let link = match link {
+                Link::Position(idx) => {
+                    EventLink::Position(positions[entry_of_draft[idx]].label.clone())
+                }
+                Link::NoLink(reason) => EventLink::NoLink { reason },
+            };
+            (seq, link)
         })
         .collect();
 
@@ -592,27 +664,99 @@ pub fn build_timeline(
     }
 }
 
-/// Creates a new draft attempt, assigning it the next `#n` for `state_id`
-/// (global across the execution) and its current visit number, and returns
-/// its index.
+/// The attempts that make up one entry of the timeline.
+struct Entry {
+    drafts: Vec<usize>,
+    session_number: u32,
+    /// Which entry of its session this is, from 1.
+    ordinal: u32,
+}
+
+impl Entry {
+    fn label(&self, state_id: &str) -> String {
+        if self.ordinal <= 1 {
+            format!("{state_id} #{}", self.session_number)
+        } else {
+            format!("{state_id} #{}.{}", self.session_number, self.ordinal)
+        }
+    }
+}
+
+/// Groups attempts into timeline entries and numbers their sessions.
+///
+/// - An attempt that resumes a session of the step the workflow has not left
+///   since (nothing else came after that session's entry) continues that
+///   entry: the agent was asked again, or answered, in the same session.
+/// - One that resumes a session of the step after other entries came in
+///   between is a new entry numbered like the session it returns to.
+/// - Anything else is a new session, with the next number of its step.
+fn group_entries(drafts: &[Draft]) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut next_number: HashMap<&str, u32> = HashMap::new();
+    for (idx, draft) in drafts.iter().enumerate() {
+        let session_of = |entry: &Entry| -> Option<&str> {
+            entry
+                .drafts
+                .iter()
+                .rev()
+                .find_map(|&d| drafts[d].harness_session_id.as_deref())
+        };
+        let state_of = |entry: &Entry| drafts[entry.drafts[0]].state_id.as_str();
+        let resumed = draft.resumed_harness_session.as_deref();
+        let origin = resumed.and_then(|resumed| {
+            entries.iter().rposition(|entry| {
+                state_of(entry) == draft.state_id
+                    && session_of(entry) == Some(resumed)
+                    && match (&drafts[entry.drafts[0]].harness, &draft.harness) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    }
+            })
+        });
+        match origin {
+            Some(pos) if pos + 1 == entries.len() => entries[pos].drafts.push(idx),
+            Some(pos) => {
+                let session_number = entries[pos].session_number;
+                let ordinal = entries
+                    .iter()
+                    .filter(|entry| {
+                        state_of(entry) == draft.state_id && entry.session_number == session_number
+                    })
+                    .count() as u32
+                    + 1;
+                entries.push(Entry {
+                    drafts: vec![idx],
+                    session_number,
+                    ordinal,
+                });
+            }
+            None => {
+                let number = next_number.entry(draft.state_id.as_str()).or_insert(0);
+                *number += 1;
+                entries.push(Entry {
+                    drafts: vec![idx],
+                    session_number: *number,
+                    ordinal: 1,
+                });
+            }
+        }
+    }
+    entries
+}
+
+/// Creates a new draft attempt with its state's current visit number and
+/// returns its index.
 fn push_attempt(
     drafts: &mut Vec<Draft>,
-    state_attempt_counts: &mut HashMap<String, u32>,
     state_visit_counts: &HashMap<String, u32>,
     state_id: String,
     action_execution_id: Option<String>,
     action_type: Option<String>,
     started_at: DateTime<Utc>,
 ) -> usize {
-    let n = *state_attempt_counts
-        .entry(state_id.clone())
-        .and_modify(|count| *count += 1)
-        .or_insert(1);
     let visit = *state_visit_counts.get(&state_id).unwrap_or(&1);
-    let label = format!("{state_id} #{n}");
     let idx = drafts.len();
     drafts.push(Draft {
-        label,
         state_id,
         visit,
         action_execution_id,
@@ -627,6 +771,10 @@ fn push_attempt(
         resumed_harness_session: None,
         harness_session_interrupted: false,
         has_agent_event_missing_id: false,
+        harness: None,
+        model: None,
+        effort: None,
+        harness_session_id: None,
         conversation_override: None,
     });
     idx
@@ -641,7 +789,7 @@ fn link_agent_event(
     by_attempt: &HashMap<String, usize>,
     current_visit_last_position: Option<usize>,
     action_execution_id: &Option<String>,
-    links: &mut BTreeMap<u64, EventLink>,
+    links: &mut BTreeMap<u64, Link>,
     seq: u64,
     apply: impl FnOnce(&mut Draft),
 ) {
@@ -658,14 +806,12 @@ fn link_agent_event(
     match idx {
         Some(idx) => {
             apply(&mut drafts[idx]);
-            links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+            links.insert(seq, Link::Position(idx));
         }
         None => {
             links.insert(
                 seq,
-                EventLink::NoLink {
-                    reason: reasons::NO_ATTEMPT_YET.to_string(),
-                },
+                Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
             );
         }
     }
@@ -674,20 +820,17 @@ fn link_agent_event(
 /// Links an event positionally, to the last attempt of the current visit.
 fn link_positional(
     current_visit_last_position: Option<usize>,
-    drafts: &[Draft],
-    links: &mut BTreeMap<u64, EventLink>,
+    links: &mut BTreeMap<u64, Link>,
     seq: u64,
 ) {
     match current_visit_last_position {
         Some(idx) => {
-            links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+            links.insert(seq, Link::Position(idx));
         }
         None => {
             links.insert(
                 seq,
-                EventLink::NoLink {
-                    reason: reasons::NO_ATTEMPT_YET.to_string(),
-                },
+                Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
             );
         }
     }
@@ -753,7 +896,7 @@ fn finalize(
     };
 
     Position {
-        label: draft.label,
+        label: String::new(),
         state_id: draft.state_id,
         visit: draft.visit,
         action_execution_id: draft.action_execution_id,
@@ -766,6 +909,13 @@ fn finalize(
         harness_session_interrupted: draft.harness_session_interrupted,
         retry_pending,
         conversation,
+        session_number: None,
+        attempts: Vec::new(),
+        harness: draft.harness,
+        model: draft.model,
+        effort: draft.effort,
+        harness_session_id: draft.harness_session_id,
+        usage: None,
     }
 }
 

@@ -229,6 +229,7 @@ fn an_old_format_agent_session_event_deserializes_with_the_new_fields_absent() {
             harness,
             action_execution_id,
             resumed_session,
+            ..
         } => {
             assert_eq!(session_id, "session-1");
             assert_eq!(harness, "claude-code");

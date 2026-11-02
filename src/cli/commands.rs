@@ -510,7 +510,7 @@ pub(crate) fn print_position(position: &Position) {
     }
     match &position.conversation {
         ConversationState::Recorded => {
-            if let Some(attempt_id) = &position.action_execution_id {
+            for attempt_id in position.attempt_ids() {
                 println!("    attempt id: {}", without_unsafe_chars(attempt_id));
             }
         }

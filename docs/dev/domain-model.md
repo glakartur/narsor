@@ -12,6 +12,7 @@ The main entities of the system and their responsibilities are presented below:
 | `WorkflowExecution` | An instance of executing a specific workflow | Folder in `/executions/` + `state.json` |
 | `State` | A single node in the workflow graph | Part of the definition + state in `state.json` |
 | `Action` | An operation to perform in a given state | Part of the definition |
+| `Timeline` | Entries of an execution: one per agent session run on a step (several attempts when the agent is asked again in its session), with harness, model, effort, harness session id and tokens/cost as the harness reported them | Built from `events/`; kept in `timeline.json` of the execution folder, which also holds the per-attempt usage readings and is rebuilt when stale or lost |
 | `ActionExecution` | History of the execution of a specific action | Entry in `events/` + `state.json` |
 | `Context` | Data shared between workflow steps | `context.json` in the execution folder |
 | `Artifact` | Physical output files of an action | Files in `/artifacts/` + metadata in `context.json` |

@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::timeline_file::{reading_from_element, ReadingSink};
 use narsor_protocol::chat::TechnicalCategory;
 
 /// Receives the agent-session events of a run.
@@ -119,19 +120,32 @@ impl AgentEventSink for LoggingEventSink {
 /// following the same "recording must never fail a run" rule as
 /// [`AgentEventSink`].
 #[derive(Clone)]
-pub(crate) struct ConversationSink(Option<Arc<Mutex<ConversationWriter>>>);
+pub(crate) struct ConversationSink(
+    Option<Arc<Mutex<ConversationWriter>>>,
+    Option<ReadingTap>,
+);
+
+/// Where the use a harness reports in its output is handed on, and what it
+/// is a reading of.
+#[derive(Clone)]
+pub(super) struct ReadingTap {
+    pub(super) sink: Arc<dyn ReadingSink>,
+    pub(super) execution_id: String,
+    pub(super) attempt_id: String,
+    pub(super) harness: String,
+}
 
 impl ConversationSink {
     /// No file to write to.
     pub(crate) fn none() -> Self {
-        Self(None)
+        Self(None, None)
     }
 
     /// Opens `attempt_id`'s conversation file in `store`, or answers `none()`
     /// and logs why when that fails.
     pub(super) fn open(store: &ConversationStore, attempt_id: &str) -> Self {
         match store.writer(attempt_id) {
-            Ok(writer) => Self(Some(Arc::new(Mutex::new(writer)))),
+            Ok(writer) => Self(Some(Arc::new(Mutex::new(writer))), None),
             Err(error) => {
                 tracing::warn!(
                     attempt_id,
@@ -144,9 +158,24 @@ impl ConversationSink {
         }
     }
 
+    /// The sink handing the use that the harness reports on to `tap`.
+    pub(super) fn with_readings(mut self, tap: ReadingTap) -> Self {
+        self.1 = Some(tap);
+        self
+    }
+
     /// Appends one entry with its elements, logging (and otherwise
     /// ignoring) a failure to.
     pub(super) fn append(&self, source: ConversationSource, raw: &[u8], elements: &[ChatElement]) {
+        if source == ConversationSource::Stdout {
+            if let Some(tap) = &self.1 {
+                for element in elements {
+                    if let Some(reading) = reading_from_element(element, Some(&tap.harness)) {
+                        tap.sink.record(&tap.execution_id, &tap.attempt_id, reading);
+                    }
+                }
+            }
+        }
         let Some(writer) = &self.0 else { return };
         let mut writer = writer
             .lock()

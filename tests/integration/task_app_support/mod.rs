@@ -250,6 +250,13 @@ pub fn position(state: &str, status: PositionStatus) -> Position {
         harness_session_interrupted: false,
         retry_pending: false,
         conversation: ConversationState::NoRecord,
+        session_number: Some(1),
+        attempts: Vec::new(),
+        harness: None,
+        model: None,
+        effort: None,
+        harness_session_id: None,
+        usage: None,
     }
 }
 

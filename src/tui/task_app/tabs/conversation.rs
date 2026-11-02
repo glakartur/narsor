@@ -705,12 +705,31 @@ impl<'a> Builder<'a> {
     /// attempt, and notes what its read says: still loading, failed, from
     /// the record.
     fn push_position(&mut self, position: &'a Position, attempts: &Attempts) -> Pushed {
-        let (ConversationState::Recorded, Some(attempt_id)) = (
-            &position.conversation,
-            position.action_execution_id.as_deref(),
-        ) else {
+        if position.conversation != ConversationState::Recorded {
             return Pushed::Nothing;
-        };
+        }
+        let mut result = Pushed::Nothing;
+        let mut headed = false;
+        for attempt_id in position.attempt_ids() {
+            match self.push_attempt(position, attempt_id, attempts, !headed) {
+                Pushed::Entries => {
+                    headed = true;
+                    result = Pushed::Entries;
+                }
+                Pushed::Covered if result == Pushed::Nothing => result = Pushed::Covered,
+                _ => {}
+            }
+        }
+        result
+    }
+
+    fn push_attempt(
+        &mut self,
+        position: &'a Position,
+        attempt_id: &'a str,
+        attempts: &Attempts,
+        heading_wanted: bool,
+    ) -> Pushed {
         // A workflow retry may point at the same chat as the preceding
         // position. Show that transcript once, at its first occurrence.
         if !self.seen_attempts.insert(attempt_id) {
@@ -735,7 +754,7 @@ impl<'a> Builder<'a> {
             return Pushed::Nothing;
         }
         built.has_conversation |= attempt.has_conversation();
-        if self.headings {
+        if self.headings && heading_wanted {
             built
                 .entries
                 .push(heading(format!("{attempt_id}/step"), &position.label));

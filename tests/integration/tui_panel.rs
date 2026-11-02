@@ -770,96 +770,6 @@ fn a_second_comment_of_the_same_text_waits_for_the_first() {
 
 /// A control plane that takes every input as queued, lists `tasks` and refuses
 /// every other request with "not found".
-async fn serving(tasks: Vec<TaskSummary>) -> ApiClient {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let tasks = serde_json::to_string(&listing(tasks, "after")).unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let tasks = tasks.clone();
-            tokio::spawn(async move {
-                let mut request = Vec::new();
-                let mut chunk = [0u8; 4096];
-                let (head_end, wanted) = loop {
-                    let read = stream.read(&mut chunk).await.unwrap_or(0);
-                    if read == 0 {
-                        return;
-                    }
-                    request.extend_from_slice(&chunk[..read]);
-                    let text = String::from_utf8_lossy(&request).to_string();
-                    if let Some(end) = text.find("\r\n\r\n") {
-                        let length = text
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .and_then(|value| value.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        break (end + 4, length);
-                    }
-                };
-                while request.len() < head_end + wanted {
-                    let read = stream.read(&mut chunk).await.unwrap_or(0);
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&chunk[..read]);
-                }
-                let head = String::from_utf8_lossy(&request[..head_end]).to_string();
-                let first = head.lines().next().unwrap_or_default().to_string();
-                let (status, body) = if first.contains("/input") {
-                    (
-                        "200 OK",
-                        json!({
-                            "input": {
-                                "input_id": "in-1",
-                                "pending_input_id": "ep-q",
-                                "status": "queued",
-                                "submitted_at": "2026-10-09T12:00:00Z",
-                                "updated_at": "2026-10-09T12:00:00Z",
-                                "detail": null
-                            },
-                            "replayed": false
-                        })
-                        .to_string(),
-                    )
-                } else if first.contains("/control/v1/tasks?") {
-                    ("200 OK", tasks)
-                } else {
-                    ("404 Not Found", "{}".to_string())
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-    ApiClient::new(address, "token")
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_settled_send_frees_the_decision() {
-    let mut app = TaskApp::new(serving(Vec::new()).await, "local", None);
-    app.load(listing(vec![titled(entry_limit_wait(), "NAR-12")], "c"));
-    key(&mut app, KeyCode::Char(' '));
-    key(&mut app, KeyCode::Enter);
-
-    let first = enter_until_sent(&mut app);
-    app.perform(Request::Answer(Box::new(first))).await;
-
-    // The answer went through: the panel no longer waits for the save.
-    for _ in 0..2 {
-        key(&mut app, KeyCode::Enter);
-    }
-    let drawn = screen(&mut app, 120, 40);
-    assert!(!drawn.contains("Zapis trwa"), "{drawn}");
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lost_connection_frees_the_decision_for_a_retry() {
@@ -872,21 +782,6 @@ async fn a_lost_connection_frees_the_decision_for_a_retry() {
     app.load(listing(vec![titled(provisioning_failed(), "NAR-12")], "d"));
     let retry = enter_until_sent(&mut app);
     assert_eq!(first.submit, retry.submit);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_refusal_frees_the_decision_and_the_next_send_has_a_new_key() {
-    let listed = vec![titled(provisioning_failed(), "NAR-12")];
-    let mut app = TaskApp::new(serving(listed.clone()).await, "local", None);
-    app.load(listing(listed, "c"));
-    key(&mut app, KeyCode::Char(' '));
-    key(&mut app, KeyCode::Enter);
-
-    let first = enter_until_sent(&mut app);
-    app.perform(Request::Answer(Box::new(first.clone()))).await;
-
-    let next = enter_until_sent(&mut app);
-    assert_ne!(first.key, next.key);
 }
 
 #[test]

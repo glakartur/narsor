@@ -906,6 +906,7 @@ async fn the_session_events_are_emitted_and_the_harness_session_id_is_captured()
         harness,
         action_execution_id,
         resumed_session,
+        ..
     } = started
     else {
         panic!("the first event is the session start: {started:?}");

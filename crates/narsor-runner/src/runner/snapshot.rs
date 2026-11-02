@@ -20,7 +20,7 @@ use crate::domain::{
 };
 use crate::engine::conversation_summary::summaries;
 pub(crate) use crate::engine::conversation_summary::ConversationCache;
-use crate::engine::{build_timeline, step_failure, Engine, InputContinuation, PendingHumanInput};
+use crate::engine::{current_timeline, step_failure, Engine, InputContinuation, PendingHumanInput};
 use crate::orchestration::{
     AttentionItem, AttentionKind, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
     PendingInputRef, RunnerProblem, RunnerSnapshot,
@@ -91,7 +91,7 @@ pub(crate) fn build(
     let event_cursor = events.last().map_or(0, |event| event.sequence);
     let conversations = store.conversation_store(execution_id);
     let recorded = conversations.recorded_attempt_ids()?;
-    let timeline = build_timeline(&events, execution.status, &recorded);
+    let timeline = current_timeline(store, execution_id, &events, execution.status, &recorded);
 
     adopt_stored_title(engine, execution_id);
     let observed_at = Utc::now();
