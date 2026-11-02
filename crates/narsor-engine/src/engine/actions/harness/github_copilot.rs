@@ -215,6 +215,7 @@ struct GitHubCopilotStreamParser {
     malformed_json: bool,
     usage: Option<Vec<UsageLimit>>,
     streamed_messages: HashSet<String>,
+    reasoning_seen: bool,
     calls: HashMap<String, (String, String)>,
 }
 
@@ -328,8 +329,9 @@ impl GitHubCopilotStreamParser {
                     })
                     .unwrap_or_default()
             }
-            "assistant.reasoning_delta" => data
-                .get("deltaContent")
+            "assistant.reasoning_delta" => {
+                self.reasoning_seen = true;
+                data.get("deltaContent")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
                 .map(|text| {
@@ -338,9 +340,11 @@ impl GitHubCopilotStreamParser {
                         redacted: false,
                     }]
                 })
-                .unwrap_or_default(),
-            "assistant.reasoning" => data
-                .get("content")
+                .unwrap_or_default()
+            }
+            "assistant.reasoning" => {
+                self.reasoning_seen = true;
+                data.get("content")
                 .and_then(Value::as_str)
                 .map(|text| {
                     vec![ChatElement::Thinking {
@@ -348,7 +352,8 @@ impl GitHubCopilotStreamParser {
                         redacted: false,
                     }]
                 })
-                .unwrap_or_else(|| vec![technical_event(kind, data)]),
+                .unwrap_or_else(|| vec![technical_event(kind, data)])
+            }
             "assistant.message" => {
                 let content = data.get("content").and_then(Value::as_str);
                 let has_tool_requests = data
@@ -364,13 +369,27 @@ impl GitHubCopilotStreamParser {
                     .get("messageId")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if content.is_some() && !self.streamed_messages.contains(message_id) {
-                    vec![ChatElement::AgentText {
-                        text: content.unwrap_or_default().to_string(),
-                    }]
-                } else {
-                    Vec::new()
+                let mut elements = Vec::new();
+                if !std::mem::take(&mut self.reasoning_seen) {
+                    if let Some(text) = data
+                        .get("reasoningText")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        elements.push(ChatElement::Thinking {
+                            text: text.to_string(),
+                            redacted: false,
+                        });
+                    }
                 }
+                if let Some(text) = content.filter(|text| !text.trim().is_empty()) {
+                    if !self.streamed_messages.contains(message_id) {
+                        elements.push(ChatElement::AgentText {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+                elements
             }
             "tool.execution_start" => {
                 let call_id = data
