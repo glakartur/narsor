@@ -2427,6 +2427,37 @@ mod task_app_detail_render {
     }
 
     #[test]
+    fn the_axis_shows_what_each_step_used_and_moves_subagents_down_when_narrow() {
+        let steps = || {
+            vec![
+                reported(120_000, 8_000, (40_000, 3_000), 0.42),
+                reported(2_100, 400, (0, 0), 0.03),
+            ]
+        };
+        let mut app = running_app_with_usage(steps());
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
+        let wide = rows(&render_at(&mut app, &Styles::new(false), 200, 30));
+        let row = |rows: &[String], needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} in\n{}", rows.join("\n")))
+        };
+        let step0 = row(&wide, "$0.42");
+        assert!(wide[step0].contains("1× ↓40k ↑3k"), "{}", wide.join("\n"));
+        assert!(wide[row(&wide, "$0.03")].contains("↓2.1k"));
+
+        let mut app = running_app_with_usage(steps());
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
+        let narrow = rows(&render_at(&mut app, &Styles::new(false), 62, 30));
+        let step0 = row(&narrow, "$0.42");
+        assert!(!narrow[step0].contains('×'), "{}", narrow.join("\n"));
+        assert!(narrow[step0 + 1].contains("1× ↓40k ↑3k"));
+        assert!(!narrow[row(&narrow, "$0.03") + 1].contains('×'));
+    }
+
+    #[test]
     fn the_axis_has_a_row_per_step_and_brackets_the_selected_one() {
         let mut app = running_app();
         app.detail_mut()

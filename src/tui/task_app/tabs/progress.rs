@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 
 use crate::controller_protocol::TimelineResponse;
 use crate::domain::Event;
+use crate::task_usage_text::{step_cells, StepCells};
 use crate::tui::style::{Role, Styles};
 use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
@@ -39,8 +40,10 @@ use super::conversation::{
 };
 use crate::tui::transcript::{TranscriptId, TranscriptState};
 
-/// Widest the axis grows, frame included.
+/// Widest the axis grows, frame included, while no step reports usage.
 const AXIS_MAX_WIDTH: u16 = 34;
+/// Narrowest a step's label is cut to before the status word goes.
+const MIN_LABEL: usize = 8;
 
 /// One entry into a step as *Przebieg* reads it: the reader (cursor,
 /// expanded entries, following) and what the reads behind it say. It is the
@@ -395,6 +398,209 @@ fn axis_line(position: &Position, width: usize, styles: &Styles, stale: bool) ->
     ])
 }
 
+/// The axis: its width and the lines of each step. While a step reports
+/// usage the axis is a table — status, label, cost, tokens in and out, the
+/// subagents — whose columns are as wide as their widest value, the axis as
+/// wide as the columns need within the share of the tab it may take.
+struct AxisLayout {
+    width: u16,
+    rows: Vec<Vec<Line<'static>>>,
+}
+
+/// One column of the table: its text in each step and how it is aligned.
+struct Column {
+    cells: Vec<String>,
+    right: bool,
+}
+
+impl Column {
+    fn new(right: bool, cells: Vec<String>) -> Self {
+        Self { cells, right }
+    }
+
+    fn width(&self) -> usize {
+        self.cells
+            .iter()
+            .map(|cell| cell.chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn text(&self, row: usize) -> String {
+        let width = self.width();
+        if self.right {
+            format!("{:>width$}", self.cells[row])
+        } else {
+            format!("{:<width$}", self.cells[row])
+        }
+    }
+}
+
+/// The columns of a table row, each after a space; empty columns take none.
+fn columns_width(columns: &[&Column]) -> usize {
+    columns
+        .iter()
+        .map(|column| column.width())
+        .filter(|width| *width > 0)
+        .map(|width| width + 1)
+        .sum()
+}
+
+impl AxisLayout {
+    fn new(positions: &[Position], area_width: u16, styles: &Styles, stale: bool) -> Self {
+        let today = (area_width / 3).clamp(18, AXIS_MAX_WIDTH).min(area_width);
+        let cells: Vec<StepCells> = positions
+            .iter()
+            .map(|position| step_cells(position.usage.as_ref()))
+            .collect();
+        if !cells
+            .iter()
+            .any(|cells| cells.has_main() || cells.has_subagents())
+        {
+            let line_width = usize::from(today.saturating_sub(PREFIX_WIDTH));
+            return Self {
+                width: today,
+                rows: positions
+                    .iter()
+                    .map(|position| vec![axis_line(position, line_width, styles, stale)])
+                    .collect(),
+            };
+        }
+        Self::table(positions, &cells, area_width, today, styles, stale)
+    }
+
+    fn table(
+        positions: &[Position],
+        cells: &[StepCells],
+        area_width: u16,
+        today: u16,
+        styles: &Styles,
+        stale: bool,
+    ) -> Self {
+        let grey = |role: Role| if stale { Role::Done } else { role };
+        let column = |right: bool, pick: fn(&StepCells) -> &String| {
+            Column::new(
+                right,
+                cells.iter().map(|cells| pick(cells).clone()).collect(),
+            )
+        };
+        let labels: Vec<String> = positions
+            .iter()
+            .map(|position| one_line(&position.label))
+            .collect();
+        let label = Column::new(false, labels);
+        let word = Column::new(
+            false,
+            positions
+                .iter()
+                .map(|position| status_look(position.status).2.to_string())
+                .collect(),
+        );
+        let main = [
+            column(true, |cells| &cells.cost),
+            column(true, |cells| &cells.input),
+            column(true, |cells| &cells.output),
+        ];
+        let subs = [
+            column(true, |cells| &cells.subagent_count),
+            column(true, |cells| &cells.subagent_input),
+            column(true, |cells| &cells.subagent_output),
+        ];
+        let main_refs: Vec<&Column> = main.iter().collect();
+        let sub_refs: Vec<&Column> = subs.iter().collect();
+        let main_width = columns_width(&main_refs);
+        let subs_width = columns_width(&sub_refs);
+        let has_subs = subs_width > 0;
+
+        // 2: the glyph and its space; the label and the word are columns too.
+        let first = |label: usize, word: usize| {
+            2 + label + if word > 0 { word + 1 } else { 0 } + main_width
+        };
+        let prefix = usize::from(PREFIX_WIDTH);
+        let area = usize::from(area_width);
+        let cap = area
+            .saturating_sub(1 + (area * 3).div_ceil(10))
+            .min(area * 7 / 10)
+            .max(usize::from(today));
+        let (label_width, word_width) = (label.width(), word.width());
+        let inline = prefix + first(label_width, word_width) + subs_width <= cap;
+        let second_line = has_subs && !inline;
+        let needed = |label: usize, word: usize| {
+            let first = first(label, word) + if inline { subs_width } else { 0 };
+            prefix
+                + if second_line {
+                    first.max(2 + subs_width - 1)
+                } else {
+                    first
+                }
+        };
+        let target = needed(label_width, word_width)
+            .min(cap)
+            .max(usize::from(today));
+        let content = target.saturating_sub(prefix);
+        let content_needed = |label: usize, word: usize| needed(label, word).saturating_sub(prefix);
+        let shrink = |word: usize| {
+            let over = content_needed(label_width, word).saturating_sub(content);
+            label_width
+                .saturating_sub(over)
+                .max(MIN_LABEL.min(label_width))
+        };
+        let mut shown_word = word_width;
+        let mut shown_label = shrink(word_width);
+        if content_needed(shown_label, shown_word) > content {
+            shown_word = 0;
+            shown_label = shrink(0);
+        }
+
+        let rows = positions
+            .iter()
+            .enumerate()
+            .map(|(index, position)| {
+                let (glyph, role, _) = status_look(position.status);
+                let text = fit(&label.cells[index], shown_label);
+                let mut spans = vec![
+                    Span::styled(glyph, styles.of(grey(role))),
+                    Span::raw(" "),
+                    Span::styled(format!("{text:<shown_label$}"), styles.of(grey(Role::Calm))),
+                ];
+                if shown_word > 0 {
+                    spans.push(Span::styled(
+                        format!(" {}", word.text(index)),
+                        styles.of(Role::Done),
+                    ));
+                }
+                let mut push = |columns: &[Column]| {
+                    for column in columns.iter().filter(|column| column.width() > 0) {
+                        spans.push(Span::styled(
+                            format!(" {}", column.text(index)),
+                            styles.of(Role::Done),
+                        ));
+                    }
+                };
+                push(&main);
+                if inline {
+                    push(&subs);
+                }
+                let mut lines = vec![Line::from(spans)];
+                if second_line && cells[index].has_subagents() {
+                    let text = subs
+                        .iter()
+                        .filter(|column| column.width() > 0)
+                        .map(|column| column.text(index))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    lines.push(Line::styled(format!("  {text}"), styles.of(Role::Done)));
+                }
+                lines
+            })
+            .collect();
+        Self {
+            width: u16::try_from(target).unwrap_or(u16::MAX),
+            rows,
+        }
+    }
+}
+
 /// How long a step took, or has been taking.
 fn duration_of(position: &Position, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
     let started = position.started_at?;
@@ -499,7 +705,8 @@ pub fn render(
         return;
     }
 
-    let axis_width = (area.width / 3).clamp(18, AXIS_MAX_WIDTH).min(area.width);
+    let layout = AxisLayout::new(progress.positions(), area.width, styles, stale);
+    let axis_width = layout.width.min(area.width);
     let axis = Rect::new(area.x, area.y, axis_width, area.height);
     let content = Rect::new(
         area.x + axis_width + 1,
@@ -508,12 +715,7 @@ pub fn render(
         area.height,
     );
 
-    let line_width = usize::from(axis.width.saturating_sub(PREFIX_WIDTH));
-    let items: Vec<Vec<Line>> = progress
-        .positions()
-        .iter()
-        .map(|position| vec![axis_line(position, line_width, styles, stale)])
-        .collect();
+    let items = layout.rows;
     let selected = progress.selected_index();
     render_bracketed_list(
         frame,
@@ -634,4 +836,172 @@ fn render_step_view(
         stale,
         focused,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use narsor_protocol::api::{PositionUsage, TokenCounts};
+
+    use super::*;
+
+    fn counts(input: u64, output: u64) -> TokenCounts {
+        TokenCounts {
+            input,
+            output,
+            ..TokenCounts::default()
+        }
+    }
+
+    fn step(label: &str, usage: Option<PositionUsage>) -> Position {
+        Position {
+            label: label.into(),
+            state_id: label.into(),
+            visit: 1,
+            action_execution_id: None,
+            action_type: None,
+            status: PositionStatus::Succeeded,
+            started_at: None,
+            ended_at: None,
+            error: None,
+            resumed_harness_session: None,
+            harness_session_interrupted: false,
+            retry_pending: false,
+            conversation: ConversationState::Recorded,
+            session_number: Some(1),
+            attempts: Vec::new(),
+            harness: None,
+            model: None,
+            effort: None,
+            harness_session_id: None,
+            usage,
+        }
+    }
+
+    fn used(total: (u64, u64), subagents: Option<(u64, u64)>, cost: f64) -> Option<PositionUsage> {
+        Some(PositionUsage {
+            total: Some(counts(total.0, total.1)),
+            subagents: subagents.map(|(input, output)| counts(input, output)),
+            subagent_count: subagents.map(|_| 2),
+            cost_usd: Some(cost),
+        })
+    }
+
+    fn text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn layout(positions: &[Position], width: u16) -> AxisLayout {
+        AxisLayout::new(positions, width, &Styles::new(false), false)
+    }
+
+    fn column_of(row: &str, needle: &str) -> usize {
+        let at = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} in {row:?}"));
+        row[..at].chars().count() + needle.chars().count()
+    }
+
+    fn sample() -> Vec<Position> {
+        vec![
+            step(
+                "review_api",
+                used((120_000, 8_000), Some((40_000, 3_000)), 0.42),
+            ),
+            step("lint", used((2_100, 400), None, 0.03)),
+        ]
+    }
+
+    #[test]
+    fn values_of_a_kind_stand_in_one_column() {
+        let axis = layout(&sample(), 200);
+        let rows: Vec<String> = axis.rows.iter().map(|rows| text(&rows[0])).collect();
+        assert!(rows[0].contains("2× ↓40k ↑3k"), "{}", rows[0]);
+        for (a, b) in [("$0.42", "$0.03"), ("↓120k", "↓2.1k"), ("↑8k", "↑400")] {
+            assert_eq!(column_of(&rows[0], a), column_of(&rows[1], b), "{rows:?}");
+        }
+        assert_eq!(axis.rows[0].len(), 1, "wide: the subagents stay in the row");
+    }
+
+    #[test]
+    fn a_step_without_a_report_has_empty_usage_fields() {
+        let mut steps = sample();
+        steps.push(step("script", None));
+        let axis = layout(&steps, 200);
+        let row = text(&axis.rows[2][0]);
+        assert!(row.starts_with("✓ script"), "{row}");
+        assert!(
+            row.contains("ok") && !row.contains('$') && !row.contains('—'),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn the_axis_stays_within_seventy_percent_and_leaves_the_rest_to_the_step() {
+        for width in 60..=220u16 {
+            let axis = layout(&sample(), width);
+            let today = (width / 3).clamp(18, AXIS_MAX_WIDTH);
+            assert!(
+                axis.width <= (width * 7 / 10).max(today),
+                "{width}: {}",
+                axis.width
+            );
+            assert!(
+                width - axis.width > (width * 3).div_ceil(10),
+                "{width}: {}",
+                axis.width
+            );
+        }
+        assert!(layout(&sample(), 200).width > 34);
+    }
+
+    #[test]
+    fn a_narrow_tab_moves_the_subagents_under_the_label_of_the_steps_that_have_them() {
+        let axis = layout(&sample(), 60);
+        let first = text(&axis.rows[0][0]);
+        assert!(
+            first.contains("$0.42") && first.contains("↓120k") && first.contains("↑8k"),
+            "{first}"
+        );
+        assert!(!first.contains('×'), "{first}");
+        assert_eq!(axis.rows[0].len(), 2);
+        assert_eq!(text(&axis.rows[0][1]).trim(), "2× ↓40k ↑3k");
+        assert!(text(&axis.rows[0][1]).starts_with("  "));
+        assert_eq!(axis.rows[1].len(), 1, "no second line without subagents");
+    }
+
+    #[test]
+    fn without_a_report_the_axis_is_as_it_was() {
+        for usage in [None, Some(PositionUsage::default())] {
+            let steps = [step("review #1", usage)];
+            for width in [20, 60, 200] {
+                let axis = layout(&steps, width);
+                assert_eq!(axis.width, (width / 3).clamp(18, AXIS_MAX_WIDTH));
+                let line = usize::from(axis.width - PREFIX_WIDTH);
+                assert_eq!(
+                    text(&axis.rows[0][0]),
+                    text(&axis_line(&steps[0], line, &Styles::new(false), false))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_very_narrow_tab_cuts_the_label_and_never_panics() {
+        let steps = [
+            step(
+                "a_really_long_step_label",
+                used((120_000, 8_000), Some((40_000, 3_000)), 0.42),
+            ),
+            step("b", None),
+        ];
+        for width in 0..=60u16 {
+            let axis = layout(&steps, width);
+            assert_eq!(axis.rows.len(), 2);
+        }
+        let row = text(&layout(&steps, 50).rows[0][0]);
+        assert!(row.contains('…'), "{row}");
+    }
 }
