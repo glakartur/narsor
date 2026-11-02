@@ -78,7 +78,9 @@ changing server order; state changes and refreshes likewise keep rows in place,
 and only an explicit queue move reorders them. `Esc` cancels filter editing.
 
 **The details** show the header (title and links from `display`, lifecycle,
-step, duration) and five tabs: *Przebieg* (the steps and the selected one),
+step, duration; under the links, once a harness reported any, a row with the
+usage it reported for the whole task: cost, tokens `in` / `out` and the
+subagents' part) and five tabs: *Przebieg* (the steps and the selected one),
 *Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
 chat and decisions; its status line names the harness the conductor runs on)
 and *Info* (the sealed inputs, the observations with their age, the runner and

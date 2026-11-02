@@ -1,10 +1,12 @@
-//! The details of the selected task (U9): a three-line header made of the
+//! The details of the selected task (U9): a three-line header (with a fourth
+//! line of the task's usage when a harness reported any) made of the
 //! workflow's `display` and an optional notice, a separator, the tabs, and
 //! what the active tab shows. The separator makes the tabs a distinct strip.
 //!
 //! ```text
 //! NAR-12  Zmiana API zamówień                             implement v3
 //! Jira NAR-12 ↗   PR: —   ● running · krok 3/5 · 14m
+//! $1.20 · in 120k out 8k · w tym subagenci in 40k out 3k (2)
 //! ────────────────────────────────────────────────────────────────────
 //!  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info          podąża
 //!   ✓ plan ok         …
@@ -62,6 +64,7 @@ use crate::controller_protocol::{
     TimelineResponse,
 };
 use crate::domain::display::{safe_link_url, DisplayLink, EMPTY_LINK_TEXT};
+use crate::task_usage_text::{self, TaskUsage};
 use narsor_protocol::api::ConversationState;
 use narsor_protocol::controller::{QueueReason, TaskState};
 
@@ -1106,8 +1109,12 @@ pub(super) fn render_view(
     };
     let focused = content_keys.is_some();
     let inner_width = area.width.saturating_sub(3);
+    let timeline = view.detail.progress.timeline();
+    let usage = timeline
+        .and_then(|response| response.timeline.as_ref())
+        .and_then(|timeline| task_usage_text::sum(&timeline.positions));
     let notice = notice(view.task, styles, stale, inner_width);
-    let base_lines = HEADER_LINES + u16::from(notice.is_some());
+    let base_lines = HEADER_LINES + u16::from(notice.is_some()) + u16::from(usage.is_some());
     let panel_height = view
         .detail
         .waiting
@@ -1123,6 +1130,7 @@ pub(super) fn render_view(
         view.task,
         view.queue_place,
         &view.detail.progress,
+        usage.as_ref(),
         styles,
         stale,
         inner_width,
@@ -1385,11 +1393,13 @@ fn tab_bar(
     ]
 }
 
-/// The three header lines of `task`, and where its links are on the third.
+/// The header lines of `task` — a fourth with what it used, when `usage` is
+/// there — and where its links are on the third.
 fn header(
     task: &TaskSummary,
     queue_place: Option<usize>,
     progress: &Progress,
+    usage: Option<&TaskUsage>,
     styles: &Styles,
     stale: bool,
     width: u16,
@@ -1492,7 +1502,22 @@ fn header(
     if column + Span::raw(workflow.as_str()).width() <= width {
         third.push(Span::styled(workflow, styles.of(Role::Done)));
     }
-    (vec![first, Line::from(second), Line::from(third)], spots)
+    let mut lines = vec![first, Line::from(second), Line::from(third)];
+
+    // Line 4: what the task used, when a harness reported any.
+    if let Some(usage) = usage {
+        let full = task_usage_text::line(usage, true);
+        let text = if cells(&full) <= width {
+            full
+        } else {
+            fit_cells(&task_usage_text::line(usage, false), width)
+        };
+        lines.push(Line::from(Span::styled(
+            text,
+            styles.of(if stale { Role::Done } else { Role::Calm }),
+        )));
+    }
+    (lines, spots)
 }
 
 /// Display width of `text` in terminal cells.
