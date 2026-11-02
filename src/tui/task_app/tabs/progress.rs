@@ -42,6 +42,8 @@ use crate::tui::transcript::{TranscriptId, TranscriptState};
 
 /// Widest the axis grows, frame included, while no step reports usage.
 const AXIS_MAX_WIDTH: u16 = 34;
+/// Columns between the axis and the step's content.
+const AXIS_GAP: u16 = 3;
 /// Narrowest a step's label is cut to before the status word goes.
 const MIN_LABEL: usize = 8;
 
@@ -519,7 +521,7 @@ impl AxisLayout {
         let prefix = usize::from(PREFIX_WIDTH);
         let area = usize::from(area_width);
         let cap = area
-            .saturating_sub(1 + (area * 3).div_ceil(10))
+            .saturating_sub(usize::from(AXIS_GAP) + (area * 3).div_ceil(10))
             .min(area * 7 / 10)
             .max(usize::from(today));
         let (label_width, word_width) = (label.width(), word.width());
@@ -709,9 +711,9 @@ pub fn render(
     let axis_width = layout.width.min(area.width);
     let axis = Rect::new(area.x, area.y, axis_width, area.height);
     let content = Rect::new(
-        area.x + axis_width + 1,
+        area.x + axis_width + AXIS_GAP,
         area.y,
-        area.width.saturating_sub(axis_width + 1),
+        area.width.saturating_sub(axis_width + AXIS_GAP),
         area.height,
     );
 
@@ -949,7 +951,7 @@ mod tests {
                 axis.width
             );
             assert!(
-                width - axis.width > (width * 3).div_ceil(10),
+                width - axis.width - AXIS_GAP >= (width * 3).div_ceil(10),
                 "{width}: {}",
                 axis.width
             );
