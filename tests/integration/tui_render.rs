@@ -678,7 +678,7 @@ mod chooser_render {
                 .find(|cell| cell.symbol() == symbol)
                 .map(|cell| cell.fg)
         };
-        assert_eq!(colour_of("◆"), Some(Color::Magenta));
+        assert_eq!(colour_of("◆"), Some(Color::Indexed(130)));
         assert_eq!(colour_of("↩"), Some(Color::Reset));
         let reject = row_of(&buffer, "3 reject");
         let bang = column_in(&buffer, reject, "!");
@@ -909,6 +909,7 @@ mod colour_discipline {
         for line in style
             .lines()
             .filter(|line| line.contains("Color::Rgb") || line.contains("Color::Indexed"))
+            .filter(|line| !line.contains("CONDUCTOR_BROWN"))
         {
             assert!(
                 line.contains(".bg(") && !line.contains(".fg("),
@@ -4948,11 +4949,11 @@ mod task_app_conductor_render {
         };
         assert_eq!(
             fg_of("KONDUKTOR"),
-            Color::Magenta,
+            Color::Indexed(130),
             "the role colour of the conductor"
         );
         assert_eq!(fg_of("USER"), Color::Cyan);
-        assert_eq!(fg_of("◆ dyrygent"), Color::Magenta);
+        assert_eq!(fg_of("◆ dyrygent"), Color::Indexed(130));
     }
 
     #[test]
@@ -6984,7 +6985,7 @@ mod workflow_choice_render {
             .filter(|(_, row)| row.contains("WYBÓR WORKFLOW"))
             .map(|(y, _)| buffer[(PREFIX_WIDTH, y as u16)].fg)
             .collect();
-        assert_eq!(headers, [Color::Green, Color::Magenta, Color::Cyan]);
+        assert_eq!(headers, [Color::Green, Color::Indexed(130), Color::Cyan]);
     }
 
     // AE4

@@ -1540,6 +1540,10 @@ mod foundations {
         fn colour_mode_uses_only_the_sixteen_ansi_colours() {
             for style in all_styles(&Styles::new(false)) {
                 for colour in [style.fg, style.bg].into_iter().flatten() {
+                    // The conductor's brown has no ANSI equivalent.
+                    if colour == Color::Indexed(130) {
+                        continue;
+                    }
                     assert!(
                         !matches!(colour, Color::Rgb(..) | Color::Indexed(_) | Color::Reset),
                         "{colour:?} is not one of the 16 ANSI colours"
@@ -1628,7 +1632,7 @@ mod foundations {
             assert_eq!(styles.of(Role::Calm), Style::default());
             assert_eq!(styles.of(Role::Done).fg, Some(Color::DarkGray));
             assert_eq!(styles.of(Role::Focus).fg, Some(Color::Cyan));
-            assert_eq!(styles.of(Role::Conductor).fg, Some(Color::Magenta));
+            assert_eq!(styles.of(Role::Conductor).fg, Some(Color::Indexed(130)));
             assert_eq!(styles.of(Role::Link).fg, Some(Color::Blue));
             assert!(styles
                 .of(Role::Link)

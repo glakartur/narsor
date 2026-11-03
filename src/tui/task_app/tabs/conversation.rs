@@ -908,6 +908,8 @@ fn workflow_choice_entry(event: &Event, by_person: bool) -> Option<TranscriptEnt
             reason = reasoning.as_deref().filter(|text| !text.trim().is_empty());
             if by_person {
                 ("użytkownik".to_string(), output_label.clone(), Operator)
+            } else if provider == "conductor" {
+                ("Dyrygent".to_string(), output_label.clone(), Conductor)
             } else {
                 (
                     format!("agent · {}", one_line(provider)),
@@ -921,7 +923,7 @@ fn workflow_choice_entry(event: &Event, by_person: bool) -> Option<TranscriptEnt
             output_label: Some(output),
             ..
         } if *kind == ConductorDecisionKind::ChooseOutput => {
-            ("konduktor".to_string(), output.clone(), Conductor)
+            ("Dyrygent".to_string(), output.clone(), Conductor)
         }
         EventData::HumanInputReceived {
             answered_by,

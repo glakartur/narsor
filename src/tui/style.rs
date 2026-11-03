@@ -51,6 +51,9 @@ use ratatui::Frame;
 
 use super::transcript::TranscriptPresentation;
 
+/// The conductor's colour: the 16 ANSI colours have no brown.
+const CONDUCTOR_BROWN: Color = Color::Indexed(130);
+
 /// What a piece of text means. Views pick roles, [`Styles`] picks looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -164,7 +167,7 @@ impl Styles {
             Role::Calm => Style::default(),
             Role::Done => Style::default().fg(Color::DarkGray),
             Role::Focus => Style::default().fg(Color::Cyan),
-            Role::Conductor => Style::default().fg(Color::Magenta),
+            Role::Conductor => Style::default().fg(CONDUCTOR_BROWN),
             Role::Link => Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::UNDERLINED),
@@ -418,7 +421,7 @@ impl Styles {
             TranscriptPresentation::Neutral => Style::default(),
             TranscriptPresentation::Operator => bold.fg(Color::Cyan),
             TranscriptPresentation::Agent => bold.fg(Color::Green),
-            TranscriptPresentation::Conductor => bold.fg(Color::Magenta),
+            TranscriptPresentation::Conductor => bold.fg(CONDUCTOR_BROWN),
             TranscriptPresentation::System => Style::default().fg(Color::DarkGray),
             TranscriptPresentation::Technical => Style::default()
                 .fg(Color::DarkGray)
