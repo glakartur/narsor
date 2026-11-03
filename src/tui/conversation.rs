@@ -528,6 +528,7 @@ mod tests {
                     is_error: false,
                     cost_usd: None,
                     usage: None,
+                    subagent_stats: None,
                     turns: None,
                     duration_ms: None,
                 },

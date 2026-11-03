@@ -8,11 +8,11 @@
 //! the timeline built from the log, so a reading changes the file and nothing
 //! else: no event is written for it.
 //!
-//! The file is a cache that can always be made again. It says which log
-//! position, execution status and conversation records it was built from;
-//! when any of them is not the current one the timeline is built again from
-//! the log and the readings are put on it. A lost file loses nothing but the
-//! time to read the conversation records, which keep every reading.
+//! The file is the only place the readings are kept: the conversation
+//! records hold no tokens or cost. It says which log position, execution
+//! status and conversation records the timeline was built from; when any of
+//! them is not the current one the timeline is built again from the log and
+//! the file's readings are put on it. A lost file loses its readings.
 //!
 //! # Readings
 //!
@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use narsor_protocol::api::{PositionUsage, TokenCounts};
+use narsor_protocol::api::{PositionUsage, SubagentStats, TokenCounts};
 use narsor_protocol::chat::ChatElement;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,6 +71,10 @@ pub struct UsageReading {
     pub subagents: Option<TokenCounts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_count: Option<u32>,
+    /// Counts for the whole harness process, so a later reading replaces an
+    /// earlier one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_stats: Option<SubagentStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
 }
@@ -80,6 +84,7 @@ impl UsageReading {
         self.model.is_none()
             && self.total.is_none()
             && self.subagents.is_none()
+            && self.subagent_stats.is_none()
             && self.cost_usd.is_none()
     }
 
@@ -98,6 +103,7 @@ impl UsageReading {
             },
             ReadingBasis::SessionTotal => later.subagent_count.or(self.subagent_count),
         };
+        self.subagent_stats = later.subagent_stats.or(self.subagent_stats);
         self.cost_usd = match later.basis {
             ReadingBasis::Increment => match (self.cost_usd, later.cost_usd) {
                 (Some(a), Some(b)) => Some(a + b),
@@ -262,13 +268,7 @@ pub fn current_timeline(
         }
     }
 
-    let mut file = match existing {
-        Some(file) => file,
-        None => TimelineFile {
-            readings: readings_from_conversations(store, execution_id, recorded),
-            ..TimelineFile::default()
-        },
-    };
+    let mut file = existing.unwrap_or_default();
     let mut timeline = build_timeline(events, execution_status, recorded);
     apply_usage(&mut timeline, &file.readings);
     file.version = VERSION;
@@ -280,30 +280,6 @@ pub fn current_timeline(
         save(&path, &file);
     }
     timeline
-}
-
-/// The readings the conversation records of `recorded` hold: what a lost
-/// file is made again from.
-fn readings_from_conversations(
-    store: &ExecutionStore,
-    execution_id: &str,
-    recorded: &HashSet<String>,
-) -> BTreeMap<String, UsageReading> {
-    let conversations = store.conversation_store(execution_id);
-    let mut readings: BTreeMap<String, UsageReading> = BTreeMap::new();
-    for attempt in recorded {
-        let Ok(Some(snapshot)) = conversations.read(attempt, 0, usize::MAX) else {
-            continue;
-        };
-        for entry in &snapshot.entries {
-            for element in &entry.elements {
-                if let Some(reading) = reading_from_element(element, None) {
-                    readings.entry(attempt.clone()).or_default().absorb(reading);
-                }
-            }
-        }
-    }
-    readings
 }
 
 /// Puts what `readings` say on the positions of `timeline`.
@@ -323,6 +299,7 @@ pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageRea
         let mut total: Option<TokenCounts> = None;
         let mut subagents: Option<TokenCounts> = None;
         let mut count: Option<u32> = None;
+        let mut stats: Option<SubagentStats> = None;
         let mut cost: Option<f64> = None;
         for attempt in attempts {
             let Some(reading) = readings.get(&attempt) else {
@@ -359,6 +336,10 @@ pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageRea
                     n = n.map(|n| n.saturating_sub(before.3));
                 }
             }
+            stats = match (stats, reading.subagent_stats) {
+                (Some(x), Some(y)) => Some(x.plus(y)),
+                (x, y) => x.or(y),
+            };
             total = plus(total, a);
             subagents = plus(subagents, s);
             count = match (count, n) {
@@ -370,14 +351,18 @@ pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageRea
                 (x, y) => x.or(y),
             };
         }
-        position.usage =
-            (total.is_some() || subagents.is_some() || count.is_some() || cost.is_some())
-                .then_some(PositionUsage {
-                    total,
-                    subagents,
-                    subagent_count: count,
-                    cost_usd: cost,
-                });
+        position.usage = (total.is_some()
+            || subagents.is_some()
+            || count.is_some()
+            || stats.is_some()
+            || cost.is_some())
+        .then_some(PositionUsage {
+            total,
+            subagents,
+            subagent_count: count,
+            subagent_stats: stats,
+            cost_usd: cost,
+        });
     }
 }
 
@@ -391,9 +376,13 @@ pub fn reading_from_element(element: &ChatElement, harness: Option<&str>) -> Opt
     match element {
         ChatElement::SessionStarted { model, .. } => reading.model = model.clone(),
         ChatElement::RunResult {
-            cost_usd, usage, ..
+            cost_usd,
+            usage,
+            subagent_stats,
+            ..
         } => {
             reading.cost_usd = *cost_usd;
+            reading.subagent_stats = *subagent_stats;
             // Claude's `usage` is the whole run's; which part was a
             // subagent's is not in it, so `subagents` stays unreported.
             reading.total = usage.as_ref().map(token_counts);
@@ -483,6 +472,32 @@ mod tests {
     }
 
     #[test]
+    fn subagent_stats_of_one_attempt_are_the_latest_and_those_of_attempts_add_up() {
+        let stats = |spawned| SubagentStats {
+            spawned,
+            completed: spawned,
+            ..SubagentStats::default()
+        };
+        let mut first = reading(ReadingBasis::Increment, 1, 1, 0.1);
+        first.subagent_stats = Some(stats(3));
+        let mut later = reading(ReadingBasis::Increment, 1, 1, 0.1);
+        later.subagent_stats = Some(stats(7));
+        first.absorb(later);
+        assert_eq!(first.subagent_stats, Some(stats(7)));
+
+        let mut other = reading(ReadingBasis::Increment, 1, 1, 0.1);
+        other.subagent_stats = Some(stats(2));
+        let mut timeline = Timeline {
+            positions: vec![position("s #1", &["a1", "a2"], Some("x"))],
+            ..Timeline::default()
+        };
+        let readings = BTreeMap::from([("a1".to_string(), first), ("a2".to_string(), other)]);
+        apply_usage(&mut timeline, &readings);
+        let usage = timeline.positions[0].usage.unwrap();
+        assert_eq!(usage.subagent_stats, Some(stats(9)));
+    }
+
+    #[test]
     fn a_session_total_loses_what_an_earlier_entry_of_the_session_had() {
         let mut timeline = Timeline {
             positions: vec![
@@ -512,6 +527,35 @@ mod tests {
         assert_eq!(of(1).total, tokens(7, 7));
         assert_eq!(of(2).total, tokens(15, 5));
         assert_eq!(of(2).cost_usd, Some(0.75));
+    }
+
+    #[test]
+    fn subagent_stats_are_the_last_of_an_attempt_and_the_sum_of_its_attempts() {
+        let stats = |spawned| SubagentStats {
+            spawned,
+            completed: spawned,
+            ..SubagentStats::default()
+        };
+        let mut first = UsageReading {
+            subagent_stats: Some(stats(2)),
+            ..UsageReading::default()
+        };
+        first.absorb(UsageReading {
+            subagent_stats: Some(stats(2)),
+            ..UsageReading::default()
+        });
+        let second = UsageReading {
+            subagent_stats: Some(stats(3)),
+            ..UsageReading::default()
+        };
+        let mut timeline = Timeline {
+            positions: vec![position("s #1", &["a1", "a2"], None)],
+            ..Timeline::default()
+        };
+        let readings = BTreeMap::from([("a1".to_string(), first), ("a2".to_string(), second)]);
+        apply_usage(&mut timeline, &readings);
+        let usage = timeline.positions[0].usage.expect("usage");
+        assert_eq!(usage.subagent_stats, Some(stats(5)));
     }
 
     #[test]

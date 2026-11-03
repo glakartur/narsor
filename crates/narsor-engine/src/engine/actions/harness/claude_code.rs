@@ -251,6 +251,9 @@ struct ClaudeCodeStreamParser {
     /// `result`/`errors` of the `result` line, already turned into text.
     result_text: String,
     reply_text: String,
+    /// The last text block of the main conversation; a `result` line that
+    /// only repeats it adds nothing to show.
+    last_text: String,
     /// `is_error`, or `subtype` naming anything other than `success`.
     reported_error: bool,
     /// The `result` line's `subtype`, for the failure message.
@@ -299,6 +302,7 @@ impl ClaudeCodeStreamParser {
                             }
                             Some("text") => {
                                 if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                    self.last_text = text.to_string();
                                     if !self.reply_text.is_empty() {
                                         self.reply_text.push('\n');
                                     }
@@ -397,6 +401,14 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
             }
         }
         self.accumulate(&object, result.as_ref());
+        if let Some(result) = result.as_mut() {
+            let repeats_reply = result.text.as_deref().is_some_and(|text| {
+                !text.trim().is_empty() && text.trim() == self.last_text.trim()
+            });
+            if repeats_reply && !result.is_error && result.structured_output.is_none() {
+                result.text = None;
+            }
+        }
         self.classifier.classify(object, result)
     }
 

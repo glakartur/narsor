@@ -285,6 +285,7 @@ impl GitHubCopilotStreamParser {
                     is_error: !success,
                     cost_usd: None,
                     usage: None,
+                    subagent_stats: None,
                     turns: None,
                     duration_ms: None,
                 }]

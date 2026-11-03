@@ -358,10 +358,12 @@ impl AgentExecutor {
                         serde_json::json!({ "process_group": group, "reason": "final_answer" }),
                     );
                 }
-                conversation.append_outcome(
-                    &format!("harness exited with code {}", finished.exit_code),
-                    serde_json::json!({ "exit_code": finished.exit_code }),
-                );
+                if finished.exit_code != 0 {
+                    conversation.append_outcome(
+                        &format!("harness exited with code {}", finished.exit_code),
+                        serde_json::json!({ "exit_code": finished.exit_code }),
+                    );
+                }
                 finished
             }
             Ok(SpawnEnding::TimedOut) => {

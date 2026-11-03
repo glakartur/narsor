@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use crate::controller_protocol::TimelineResponse;
 use crate::domain::Event;
-use crate::task_usage_text::{step_cells, StepCells};
+use crate::task_usage_text::{step_cells, subagent_stats_text, StepCells};
 use crate::tui::style::{Role, Styles};
 use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
@@ -438,18 +438,129 @@ impl Column {
     }
 }
 
-/// The columns of a table row, each after a space; empty columns take none.
+/// Spaces before each column of a table row.
+const COLUMN_GAP: usize = 2;
+
+/// The columns of a table row, each after the gap; empty columns take none.
 fn columns_width(columns: &[&Column]) -> usize {
     columns
         .iter()
         .map(|column| column.width())
         .filter(|width| *width > 0)
-        .map(|width| width + 1)
+        .map(|width| width + COLUMN_GAP)
         .sum()
 }
 
+/// The most columns the axis may take: the step's content keeps its 30%.
+fn axis_cap(area_width: u16, today: u16) -> usize {
+    let area = usize::from(area_width);
+    area.saturating_sub(usize::from(AXIS_GAP) + (area * 3).div_ceil(10))
+        .min(area * 7 / 10)
+        .max(usize::from(today))
+}
+
+/// When a step started or ended, as the axis shows it.
+fn clock(time: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    time.map_or_else(String::new, |time| {
+        time.with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M:%S")
+            .to_string()
+    })
+}
+
 impl AxisLayout {
-    fn new(positions: &[Position], area_width: u16, styles: &Styles, stale: bool) -> Self {
+    fn new(
+        positions: &[Position],
+        area_width: u16,
+        now: chrono::DateTime<chrono::Utc>,
+        styles: &Styles,
+        stale: bool,
+    ) -> Self {
+        let mut layout = Self::usage(positions, area_width, styles, stale);
+        layout.add_details(positions, area_width, now, styles);
+        layout
+    }
+
+    /// Under each step that has them, a row of when it ran and a row of what
+    /// ran it, each value in a column of its own across the steps. The axis
+    /// grows to fit them within its share of the tab; a longer value is cut.
+    fn add_details(
+        &mut self,
+        positions: &[Position],
+        area_width: u16,
+        now: chrono::DateTime<chrono::Utc>,
+        styles: &Styles,
+    ) {
+        let text = |value: &Option<String>| value.as_deref().map(one_line).unwrap_or_default();
+        let times = [
+            Column::new(
+                false,
+                positions.iter().map(|p| clock(p.started_at)).collect(),
+            ),
+            Column::new(false, positions.iter().map(|p| clock(p.ended_at)).collect()),
+            Column::new(
+                true,
+                positions
+                    .iter()
+                    .map(|p| duration_of(p, now).unwrap_or_default())
+                    .collect(),
+            ),
+        ];
+        let agent = [
+            Column::new(false, positions.iter().map(|p| text(&p.harness)).collect()),
+            Column::new(false, positions.iter().map(|p| text(&p.model)).collect()),
+            Column::new(false, positions.iter().map(|p| text(&p.effort)).collect()),
+            Column::new(
+                false,
+                positions
+                    .iter()
+                    .map(|p| subagent_stats_text(p.usage.as_ref()))
+                    .collect(),
+            ),
+        ];
+        let has_times: Vec<bool> = positions.iter().map(|p| p.started_at.is_some()).collect();
+        let has_agent: Vec<bool> = (0..positions.len())
+            .map(|index| agent.iter().any(|column| !column.cells[index].is_empty()))
+            .collect();
+        let indent = 2;
+        let row_width = |columns: &[Column], used: &[bool]| {
+            if !used.iter().any(|used| *used) {
+                return 0;
+            }
+            let refs: Vec<&Column> = columns.iter().collect();
+            indent + columns_width(&refs).saturating_sub(COLUMN_GAP)
+        };
+        let wanted = usize::from(PREFIX_WIDTH)
+            + row_width(&times, &has_times).max(row_width(&agent, &has_agent));
+        let today = self.width;
+        let width = usize::from(self.width)
+            .max(wanted.min(axis_cap(area_width, today)))
+            .min(usize::from(u16::MAX));
+        self.width = u16::try_from(width).unwrap_or(u16::MAX);
+        let content = width.saturating_sub(usize::from(PREFIX_WIDTH));
+        let line = |columns: &[Column], index: usize| {
+            let joined = columns
+                .iter()
+                .filter(|column| column.width() > 0)
+                .map(|column| column.text(index))
+                .collect::<Vec<_>>()
+                .join(&" ".repeat(COLUMN_GAP));
+            Line::styled(
+                fit(&format!("{:indent$}{}", "", joined.trim_end()), content),
+                styles.of(Role::Done),
+            )
+        };
+        for (index, rows) in self.rows.iter_mut().enumerate() {
+            if has_times[index] {
+                rows.push(line(&times, index));
+            }
+            if has_agent[index] {
+                rows.push(line(&agent, index));
+            }
+        }
+    }
+
+    fn usage(positions: &[Position], area_width: u16, styles: &Styles, stale: bool) -> Self {
         let today = (area_width / 3).clamp(18, AXIS_MAX_WIDTH).min(area_width);
         let cells: Vec<StepCells> = positions
             .iter()
@@ -519,11 +630,7 @@ impl AxisLayout {
             2 + label + if word > 0 { word + 1 } else { 0 } + main_width
         };
         let prefix = usize::from(PREFIX_WIDTH);
-        let area = usize::from(area_width);
-        let cap = area
-            .saturating_sub(usize::from(AXIS_GAP) + (area * 3).div_ceil(10))
-            .min(area * 7 / 10)
-            .max(usize::from(today));
+        let cap = axis_cap(area_width, today);
         let (label_width, word_width) = (label.width(), word.width());
         let inline = prefix + first(label_width, word_width) + subs_width <= cap;
         let second_line = has_subs && !inline;
@@ -531,7 +638,7 @@ impl AxisLayout {
             let first = first(label, word) + if inline { subs_width } else { 0 };
             prefix
                 + if second_line {
-                    first.max(2 + subs_width - 1)
+                    first.max(2 + subs_width - COLUMN_GAP)
                 } else {
                     first
                 }
@@ -574,7 +681,7 @@ impl AxisLayout {
                 let mut push = |columns: &[Column]| {
                     for column in columns.iter().filter(|column| column.width() > 0) {
                         spans.push(Span::styled(
-                            format!(" {}", column.text(index)),
+                            format!("{:COLUMN_GAP$}{}", "", column.text(index)),
                             styles.of(Role::Done),
                         ));
                     }
@@ -590,7 +697,7 @@ impl AxisLayout {
                         .filter(|column| column.width() > 0)
                         .map(|column| column.text(index))
                         .collect::<Vec<_>>()
-                        .join(" ");
+                        .join("  ");
                     lines.push(Line::styled(format!("  {text}"), styles.of(Role::Done)));
                 }
                 lines
@@ -707,7 +814,11 @@ pub fn render(
         return;
     }
 
-    let layout = AxisLayout::new(progress.positions(), area.width, styles, stale);
+    let now = progress
+        .timeline()
+        .and_then(|response| response.observed_at)
+        .unwrap_or_else(chrono::Utc::now);
+    let layout = AxisLayout::new(progress.positions(), area.width, now, styles, stale);
     let axis_width = layout.width.min(area.width);
     let axis = Rect::new(area.x, area.y, axis_width, area.height);
     let content = Rect::new(
@@ -842,7 +953,7 @@ fn render_step_view(
 
 #[cfg(test)]
 mod tests {
-    use narsor_protocol::api::{PositionUsage, TokenCounts};
+    use narsor_protocol::api::{PositionUsage, SubagentStats, TokenCounts};
 
     use super::*;
 
@@ -884,6 +995,7 @@ mod tests {
             total: Some(counts(total.0, total.1)),
             subagents: subagents.map(|(input, output)| counts(input, output)),
             subagent_count: subagents.map(|_| 2),
+            subagent_stats: None,
             cost_usd: Some(cost),
         })
     }
@@ -896,7 +1008,13 @@ mod tests {
     }
 
     fn layout(positions: &[Position], width: u16) -> AxisLayout {
-        AxisLayout::new(positions, width, &Styles::new(false), false)
+        AxisLayout::new(
+            positions,
+            width,
+            chrono::Utc::now(),
+            &Styles::new(false),
+            false,
+        )
     }
 
     fn column_of(row: &str, needle: &str) -> usize {
@@ -920,7 +1038,7 @@ mod tests {
     fn values_of_a_kind_stand_in_one_column() {
         let axis = layout(&sample(), 200);
         let rows: Vec<String> = axis.rows.iter().map(|rows| text(&rows[0])).collect();
-        assert!(rows[0].contains("2× ↓40k ↑3k"), "{}", rows[0]);
+        assert!(rows[0].contains("2×  ↓40k  ↑3k"), "{}", rows[0]);
         for (a, b) in [("$0.42", "$0.03"), ("↓120k", "↓2.1k"), ("↑8k", "↑400")] {
             assert_eq!(column_of(&rows[0], a), column_of(&rows[1], b), "{rows:?}");
         }
@@ -969,7 +1087,7 @@ mod tests {
         );
         assert!(!first.contains('×'), "{first}");
         assert_eq!(axis.rows[0].len(), 2);
-        assert_eq!(text(&axis.rows[0][1]).trim(), "2× ↓40k ↑3k");
+        assert_eq!(text(&axis.rows[0][1]).trim(), "2×  ↓40k  ↑3k");
         assert!(text(&axis.rows[0][1]).starts_with("  "));
         assert_eq!(axis.rows[1].len(), 1, "no second line without subagents");
     }
@@ -988,6 +1106,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn metric_columns_are_two_spaces_apart() {
+        let axis = layout(&sample(), 200);
+        let row = text(&axis.rows[0][0]);
+        assert!(row.contains("$0.42  ↓120k   ↑8k"), "{row}");
+    }
+
+    #[test]
+    fn when_harness_model_and_effort_are_known_they_get_a_row_of_columns() {
+        let mut steps = sample();
+        steps[0].started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(90));
+        steps[0].ended_at = Some(chrono::Utc::now());
+        steps[0].harness = Some("claude-code".into());
+        steps[0].model = Some("sonnet".into());
+        steps[0].effort = Some("high".into());
+        steps[1].harness = Some("codex".into());
+        let axis = layout(&steps, 200);
+        assert_eq!(axis.rows[0].len(), 3, "usage, times, agent");
+        assert_eq!(axis.rows[1].len(), 2, "usage, agent");
+        assert!(text(&axis.rows[0][1]).contains("1m"), "{:?}", axis.rows[0]);
+        assert_eq!(text(&axis.rows[0][2]).trim(), "claude-code  sonnet  high");
+        assert!(text(&axis.rows[1][1]).trim().starts_with("codex"));
+    }
+
+    #[test]
+    fn what_became_of_the_subagents_goes_on_the_agent_row() {
+        let mut steps = sample();
+        steps[0].harness = Some("claude-code".into());
+        steps[0].usage.as_mut().unwrap().subagent_stats = Some(SubagentStats {
+            spawned: 3,
+            completed: 2,
+            failed: 1,
+            ..SubagentStats::default()
+        });
+        let axis = layout(&steps, 200);
+        assert_eq!(text(&axis.rows[0][1]).trim(), "claude-code  sub 3 ✓2 ✗1");
     }
 
     #[test]

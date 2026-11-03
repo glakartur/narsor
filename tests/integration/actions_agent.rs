@@ -703,7 +703,7 @@ async fn a_resumed_run_continues_the_numbering_of_the_conversation() {
         .collect();
     let expected: Vec<u64> = (1..=numbers.len() as u64).collect();
     assert_eq!(numbers, expected, "one sequence for the whole step");
-    assert!(numbers.len() > 4, "both runs are in it: {numbers:?}");
+    assert!(numbers.len() > 3, "both runs are in it: {numbers:?}");
 }
 
 #[tokio::test]
@@ -3513,8 +3513,8 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
     assert_eq!(result.output_label, "ready");
 
     let entries = conversation.entries(ACTION_EXECUTION_ID);
-    // Prompt, four stdout lines, one completion entry.
-    assert_eq!(entries.len(), 6, "{entries:?}");
+    // Prompt and four stdout lines; a clean exit adds no completion entry.
+    assert_eq!(entries.len(), 5, "{entries:?}");
     assert_eq!(entries[0].source, ConversationSource::Narsor);
     assert!(entry_text(&entries[0]).contains("look around"));
     let (prompt, resumed, purpose) = prompt_element(&entries[0]);
@@ -3545,21 +3545,13 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
         entry_text(&entries[4])
     );
 
-    let last = entries.last().expect("a completion entry");
-    assert_eq!(last.source, ConversationSource::Narsor);
+    // A clean exit leaves no completion entry; only a failing one does.
     assert!(
-        entry_text(last).contains("exited with code 0"),
-        "{}",
-        entry_text(last)
-    );
-    assert_eq!(process_summary(last), entry_text(last));
-    assert!(
-        matches!(
-            last.elements.as_slice(),
-            [ChatElement::Technical { data: Some(data), .. }] if data["exit_code"] == 0
-        ),
-        "{:?}",
-        last.elements
+        entries
+            .iter()
+            .all(|entry| entry.source != ConversationSource::Narsor
+                || !entry_text(entry).contains("exited with code")),
+        "{entries:?}"
     );
 
     // Closing (and compressing) the attempt is the runner's job, done once
@@ -3600,8 +3592,8 @@ async fn an_opencode_stream_is_captured_and_the_label_comes_from_its_text_line()
     );
 
     let entries = conversation.entries(ACTION_EXECUTION_ID);
-    // Prompt, four stdout lines, one completion entry.
-    assert_eq!(entries.len(), 6, "{entries:?}");
+    // Prompt and four stdout lines; a clean exit adds no completion entry.
+    assert_eq!(entries.len(), 5, "{entries:?}");
     assert!(!conversation.is_closed(ACTION_EXECUTION_ID));
 
     // Covers AE8: opencode output is not classified, line by line.

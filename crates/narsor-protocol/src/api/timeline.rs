@@ -108,6 +108,37 @@ impl TokenCounts {
     }
 }
 
+/// What the harness said about the subagents of one entry, all of them
+/// together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentStats {
+    /// How many subagents were started.
+    #[serde(default)]
+    pub spawned: u32,
+    #[serde(default)]
+    pub completed: u32,
+    #[serde(default)]
+    pub failed: u32,
+    /// Stopped by the parent, the user or the system.
+    #[serde(default)]
+    pub killed: u32,
+    /// Not started because of a depth, concurrency or budget limit.
+    #[serde(default)]
+    pub refused: u32,
+}
+
+impl SubagentStats {
+    pub fn plus(self, other: SubagentStats) -> SubagentStats {
+        SubagentStats {
+            spawned: self.spawned.saturating_add(other.spawned),
+            completed: self.completed.saturating_add(other.completed),
+            failed: self.failed.saturating_add(other.failed),
+            killed: self.killed.saturating_add(other.killed),
+            refused: self.refused.saturating_add(other.refused),
+        }
+    }
+}
+
 /// What the runs of one entry used. A part the harness did not report is
 /// `None`, which is not the same as none used.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -121,6 +152,9 @@ pub struct PositionUsage {
     /// How many subagents ran, when the harness says.
     #[serde(default)]
     pub subagent_count: Option<u32>,
+    /// What became of the subagents, when the harness says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_stats: Option<SubagentStats>,
     /// The cost the harness reported, in US dollars.
     #[serde(default)]
     pub cost_usd: Option<f64>,
