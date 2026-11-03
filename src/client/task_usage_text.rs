@@ -126,7 +126,8 @@ pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
 
 /// What became of a step's subagents, e.g. `sub 11 ✓10 ✗1`: how many were
 /// started and finished, then each count that is not zero (`✗` failed, `†`
-/// killed, `⊘` refused). Empty when none were started.
+/// killed, `⊘` refused) and the tokens they used together (`↕`). Empty when
+/// none were started.
 pub fn subagent_stats_text(usage: Option<&PositionUsage>) -> String {
     let Some(stats) = usage.and_then(|usage| usage.subagent_stats) else {
         return String::new();
@@ -143,6 +144,9 @@ pub fn subagent_stats_text(usage: Option<&PositionUsage>) -> String {
         if count > 0 {
             text.push_str(&format!(" {mark}{count}"));
         }
+    }
+    if stats.tokens > 0 {
+        text.push_str(&format!(" ↕{}", scaled(stats.tokens)));
     }
     text
 }
@@ -370,6 +374,7 @@ mod tests {
                 failed,
                 killed,
                 refused,
+                tokens: 0,
             }),
             ..PositionUsage::default()
         };
@@ -381,6 +386,9 @@ mod tests {
             subagent_stats_text(Some(&usage(5, 2, 1, 1, 1))),
             "sub 5 ✓2 ✗1 †1 ⊘1"
         );
+        let mut with_tokens = usage(2, 2, 0, 0, 0);
+        with_tokens.subagent_stats.as_mut().unwrap().tokens = 8_000;
+        assert_eq!(subagent_stats_text(Some(&with_tokens)), "sub 2 ✓2 ↕8k");
         assert_eq!(subagent_stats_text(Some(&usage(0, 0, 0, 0, 0))), "");
         assert_eq!(subagent_stats_text(None), "");
     }

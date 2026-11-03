@@ -125,6 +125,10 @@ pub struct SubagentStats {
     /// Not started because of a depth, concurrency or budget limit.
     #[serde(default)]
     pub refused: u32,
+    /// Tokens, in and out, the subagents used together; 0 when the harness
+    /// does not say.
+    #[serde(default)]
+    pub tokens: u64,
 }
 
 impl SubagentStats {
@@ -135,6 +139,7 @@ impl SubagentStats {
             failed: self.failed.saturating_add(other.failed),
             killed: self.killed.saturating_add(other.killed),
             refused: self.refused.saturating_add(other.refused),
+            tokens: self.tokens.saturating_add(other.tokens),
         }
     }
 }

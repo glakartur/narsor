@@ -546,6 +546,7 @@ fn subagent_stats(line: &Map<String, Value>) -> Option<SubagentStats> {
         failed: count(stats.get("failed")),
         killed: sum("killed"),
         refused: sum("refused"),
+        tokens: 0,
     })
 }
 
