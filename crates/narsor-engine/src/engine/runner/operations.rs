@@ -20,6 +20,7 @@
 
 use super::*;
 use crate::domain::Context;
+use narsor_protocol::chat::PromptAuthor;
 
 /// Where an execution stands, as a key (KTD9): what a proposal of the
 /// conductor's names, so that a proposal about a moment that has passed is
@@ -289,6 +290,7 @@ impl Engine {
                 Some(session.harness.as_str()),
                 Some(session.session_id.as_str()),
                 Vec::new(),
+                PromptAuthor::User,
             )?,
             None => {
                 engine_metadata_mut(&mut execution).insert(

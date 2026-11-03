@@ -284,6 +284,9 @@ impl Engine {
                             );
                         }
                         RepromptEnd::Stopped => return Ok(Flow::Stop),
+                        RepromptEnd::Asked(request) => {
+                            return self.route_agent_question(execution, state, request).await;
+                        }
                         RepromptEnd::Unlabelled(failure) => {
                             rescue.record(&failure);
                             self.begin_rescue(execution, &rescue)?;
@@ -333,6 +336,69 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Routes a question the agent asked in reply to a reprompt: to the
+    /// operator, or — when the context variable `autopilot` is on and a
+    /// conductor is attached — first to the conductor, which answers only
+    /// when it is sure. The step then waits on the agent's own question
+    /// (`ResumeAgent`) or goes on with the conductor's answer.
+    pub(super) async fn route_agent_question(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        request: HumanInputRequest,
+    ) -> Result<Flow, EngineError> {
+        clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+        clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
+
+        let conductor = self.conductor().filter(|_| {
+            request.permission.is_none() && autopilot_is_on(&execution.context.variables)
+        });
+        if let Some(conductor) = conductor {
+            let asked = QueuedRequest::new(
+                ConductorTrigger::OutputRescue,
+                ConductorPurpose::AnswerAgentQuestion,
+            )
+            .with_episode(&request.action_execution_id)
+            .with_payload(json!({
+                "state_id": state.id,
+                "question": request.instruction,
+                "options": request.fields,
+            }));
+            let outcome = conductor.choose_output(&execution.id, asked).await?;
+            let answer = match outcome {
+                InvocationOutcome::Answered(answer) => ConductorResponse::from_value(
+                    answer.response,
+                    ConductorPurpose::AnswerAgentQuestion,
+                )
+                .ok(),
+                _ => None,
+            };
+            let answer = answer
+                .filter(|response| {
+                    matches!(response.decision, Decision::Reply)
+                        && response.confidence == Confidence::High
+                })
+                .and_then(|response| response.message)
+                .map(|message| message.trim().to_string())
+                .filter(|message| !message.is_empty());
+            if let Some(answer) = answer {
+                self.store_agent_input(
+                    execution,
+                    &state.id,
+                    &answer,
+                    request.agent_harness.as_deref(),
+                    request.agent_session_id.as_deref(),
+                    Vec::new(),
+                    PromptAuthor::Conductor,
+                )?;
+                return Ok(Flow::Continue);
+            }
+        }
+
+        self.suspend_for_agent_input(execution, state, request)?;
+        Ok(Flow::Stop)
     }
 
     /// Applies the conductor's saved choice (a): `ConductorDecision`, then
@@ -484,6 +550,16 @@ impl Engine {
     }
 }
 
+/// Whether the context variable `autopilot` is switched on. Unset, or any
+/// other value, is off.
+fn autopilot_is_on(variables: &HashMap<String, Value>) -> bool {
+    match variables.get("autopilot") {
+        Some(Value::Bool(on)) => *on,
+        Some(Value::String(text)) => matches!(text.trim().to_lowercase().as_str(), "on" | "true"),
+        _ => false,
+    }
+}
+
 /// A label and the values that go with it, as the conductor gave them.
 #[derive(Debug, Default)]
 struct Choice {
@@ -622,4 +698,20 @@ fn set_output_rescue(
     rescue: &OutputRescue,
 ) -> Result<(), EngineError> {
     write_engine_record(execution, METADATA_OUTPUT_RESCUE_KEY, rescue)
+}
+
+#[cfg(test)]
+mod autopilot_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn autopilot_is_off_unless_switched_on() {
+        let with = |value: Value| HashMap::from([("autopilot".to_string(), value)]);
+        assert!(!autopilot_is_on(&HashMap::new()));
+        assert!(!autopilot_is_on(&with(json!("off"))));
+        assert!(!autopilot_is_on(&with(json!("maybe"))));
+        assert!(autopilot_is_on(&with(json!("On"))));
+        assert!(autopilot_is_on(&with(json!(true))));
+    }
 }

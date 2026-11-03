@@ -22,16 +22,9 @@ use narsor_protocol::controller::HarnessUsageResponse;
 use crate::task_app_support;
 use task_app_support::{listing, task};
 
-
-
 fn press(app: &mut TaskApp, code: KeyCode) -> Request {
     app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
 }
-
-
-
-
-
 
 // The usage limits of the harnesses (U7): read at start and every 15 s, on a
 // clock of their own.

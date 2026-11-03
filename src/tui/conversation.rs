@@ -21,7 +21,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use narsor_protocol::chat::{
-    ChatCategory, ChatElement, TechnicalCategory, ToolResultStatus, UnclassifiedReason,
+    ChatCategory, ChatElement, PromptAuthor, TechnicalCategory, ToolResultStatus,
+    UnclassifiedReason,
 };
 use serde_json::Value;
 
@@ -223,7 +224,9 @@ pub(crate) fn agent_transcript_entry(event: &TranscriptEvent) -> TranscriptEntry
 fn voice(element: &ChatElement) -> (TranscriptPresentation, &'static str) {
     use TranscriptPresentation as P;
     match element {
-        ChatElement::Prompt { .. } => (P::Operator, "Narsor"),
+        ChatElement::Prompt { author, .. } => {
+            (P::Operator, author.map_or("Narsor", PromptAuthor::label))
+        }
         ChatElement::UserMessage { .. } => (P::Operator, "Operator"),
         ChatElement::AgentText { .. } | ChatElement::AgentQuestion { .. } => (P::Agent, "Agent"),
         ChatElement::RunResult { is_error, .. } => {
@@ -483,6 +486,7 @@ mod tests {
             text: text.to_owned(),
             resumed_session: None,
             purpose: PromptPurpose::Step,
+            author: None,
         }
     }
 

@@ -560,6 +560,8 @@ Whitespace inside `{{ }}` is ignored. There are no filters (`| default(...)`), e
 
 Thanks to this a step can refer to its own document or to a variable that is set only by a later step. On the first entry the render is empty. On the next entry the template yields the value.
 
+**Reserved variable `autopilot`.** It decides who gets an agent's question (`awaiting_input`) asked in reply to a reprompt: unset, `off` or any other value — the operator; `on` or `true` — the conductor first, then the operator if the conductor does not answer with high confidence. A step can set it like any variable, or the workflow can declare it with a `default`.
+
 Non-string values render as JSON: a number and a boolean without quotes (`123`, `true`), a list and an object in compact form (`["a","b"]`).
 
 ---

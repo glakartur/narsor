@@ -158,6 +158,7 @@ fn elements_are_stored_with_their_raw_line_and_survive_compression() {
         text: "do the thing".to_string(),
         resumed_session: Some("session-1".to_string()),
         purpose: PromptPurpose::Step,
+        author: None,
     }];
     let stdout = vec![
         ChatElement::AgentText {

@@ -177,7 +177,8 @@ pub const MISSING_OUTPUT_LABEL: &str = "missing_output_label";
 pub const OUTPUT_REPROMPT: &str = "Your previous reply could not be used by the workflow, \
 because it did not end with a valid output object. Do not continue the task and do not \
 change any files: the work is already done. Reply only with the JSON object described \
-below, choosing the label that describes the work you already did.";
+below, choosing the label that describes the work you already did. If you cannot choose \
+because you need an answer from a person first, ask it with `awaiting_input` instead.";
 
 /// The configuration of the engine's reprompt of an agent (KTD7).
 ///
@@ -207,7 +208,8 @@ pub fn reprompt_config(
 /// What follows the conductor's own words when it asks the agent again
 /// (F1): the same boundaries as the engine's reprompt.
 pub const CONDUCTOR_REPROMPT_GUARD: &str = "Do not continue the task and do not change any \
-files. Reply only with the JSON object described below.";
+files. Reply only with the JSON object described below, or ask your question with \
+`awaiting_input` if you need an answer first.";
 
 /// The configuration of the conductor's reprompt of an agent (F1, R17):
 /// [`reprompt_config`] with the conductor's `prompt` in place of the

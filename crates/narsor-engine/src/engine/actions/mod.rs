@@ -42,7 +42,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use narsor_protocol::chat::PromptPurpose;
+use narsor_protocol::chat::{PromptAuthor, PromptPurpose};
 
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, ArtifactDefinition, ChoiceDefinition, OutputLabel,
@@ -129,6 +129,10 @@ pub struct ActionRequest<'a> {
     /// again for its output label. Only [`AgentExecutor`] reads it, to record
     /// the prompt in the conversation.
     pub purpose: PromptPurpose,
+
+    /// Who wrote the prompt, for the conversation. `None` lets
+    /// [`AgentExecutor`] decide from `purpose`.
+    pub author: Option<PromptAuthor>,
 }
 
 impl<'a> ActionRequest<'a> {
@@ -147,6 +151,7 @@ impl<'a> ActionRequest<'a> {
             conversation_store: None,
             contract: StepContract::default(),
             purpose: PromptPurpose::Step,
+            author: None,
         }
     }
 
@@ -171,6 +176,12 @@ impl<'a> ActionRequest<'a> {
     /// Returns the same request carrying the state's contract.
     pub fn with_contract(mut self, contract: StepContract<'a>) -> Self {
         self.contract = contract;
+        self
+    }
+
+    /// Returns the same request whose prompt `author` wrote.
+    pub fn with_author(mut self, author: PromptAuthor) -> Self {
+        self.author = Some(author);
         self
     }
 

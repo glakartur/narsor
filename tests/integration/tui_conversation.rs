@@ -333,6 +333,7 @@ fn narsor_and_stderr_entries_have_their_speakers() {
             text: "Fix it".to_string(),
             resumed_session: Some("s-1".to_string()),
             purpose: PromptPurpose::Step,
+            author: None,
         }],
     );
     prompt.source = ConversationSource::Narsor;

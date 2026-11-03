@@ -76,6 +76,13 @@ step with the output label that describes the work the agent actually did (`choo
 hand the step to the operator as a problem (`escalate`). Choose an output only when the \
 conversation shows it, with every value the label needs; otherwise escalate."
         }
+        ConductorPurpose::AnswerAgentQuestion => {
+            "The agent of the current state did not give an output label and asked a question \
+instead (`question` in the request). Answer it yourself in `message` (`reply`) only when the \
+snapshot and the task give you a sure answer; the agent then continues its work with your \
+answer. Otherwise hand the question to the operator (`escalate`), who is asked exactly what the \
+agent asked. When in doubt, escalate: a wrong answer costs more than a question."
+        }
         ConductorPurpose::DiagnoseFailure => {
             "A step of the execution failed and its retry policy is exhausted. Diagnose why \
 (`diagnose`). Only when the failed attempt had no side effects — it changed no files and started \
@@ -120,6 +127,8 @@ Without it, your decision counts as `low`.\n\
     );
     if purpose == ConductorPurpose::ReplyToChat {
         text.push_str("`message` is required: it is your answer in the chat.\n");
+    } else if purpose == ConductorPurpose::AnswerAgentQuestion {
+        text.push_str("`message` is required for `reply`: it is the answer the agent receives.\n");
     } else {
         text.push_str("`message` is optional: a note for the operator's chat.\n");
     }

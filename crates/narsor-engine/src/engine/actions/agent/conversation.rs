@@ -120,10 +120,7 @@ impl AgentEventSink for LoggingEventSink {
 /// following the same "recording must never fail a run" rule as
 /// [`AgentEventSink`].
 #[derive(Clone)]
-pub(crate) struct ConversationSink(
-    Option<Arc<Mutex<ConversationWriter>>>,
-    Option<ReadingTap>,
-);
+pub(crate) struct ConversationSink(Option<Arc<Mutex<ConversationWriter>>>, Option<ReadingTap>);
 
 /// Where the use a harness reports in its output is handed on, and what it
 /// is a reading of.

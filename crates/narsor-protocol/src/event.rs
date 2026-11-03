@@ -559,6 +559,9 @@ pub enum ConductorPurpose {
     /// Choose the output after the conductor's own reprompt failed too: a
     /// second reprompt is no longer allowed (R17).
     ChooseOutputAfterReprompt,
+    /// Answer, or hand to the operator, a question the agent asked in reply
+    /// to a request for its output label.
+    AnswerAgentQuestion,
     /// Diagnose a failed step and propose what to do (F3).
     DiagnoseFailure,
     /// Answer the operator's chat message (F4).
@@ -575,6 +578,7 @@ impl ConductorPurpose {
         match self {
             Self::ChooseOutput => "choose_output",
             Self::ChooseOutputAfterReprompt => "choose_output_after_reprompt",
+            Self::AnswerAgentQuestion => "answer_agent_question",
             Self::DiagnoseFailure => "diagnose_failure",
             Self::ReplyToChat => "reply_to_chat",
             Self::SummarizeGate => "summarize_gate",
@@ -904,6 +908,7 @@ impl From<ConductorPurpose> for ConductorPurposeDto {
         match purpose {
             ConductorPurpose::ChooseOutput => Self::ChooseOutput,
             ConductorPurpose::ChooseOutputAfterReprompt => Self::ChooseOutputAfterReprompt,
+            ConductorPurpose::AnswerAgentQuestion => Self::AnswerAgentQuestion,
             ConductorPurpose::DiagnoseFailure => Self::DiagnoseFailure,
             ConductorPurpose::ReplyToChat => Self::ReplyToChat,
             ConductorPurpose::SummarizeGate => Self::SummarizeGate,

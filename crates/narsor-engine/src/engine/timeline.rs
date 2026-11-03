@@ -178,10 +178,7 @@ pub fn build_timeline(
             | EventData::WorkflowCompleted { .. }
             | EventData::WorkflowFailed { .. }
             | EventData::WorkflowCancelled { .. } => {
-                links.insert(
-                    seq,
-                    Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()),
-                );
+                links.insert(seq, Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()));
             }
 
             EventData::StateEntered { state_id } => {
@@ -196,10 +193,7 @@ pub fn build_timeline(
                     .or_insert(1);
                 current_visit_state = Some(state_id.clone());
                 current_visit_last_position = None;
-                links.insert(
-                    seq,
-                    Link::NoLink(reasons::STATE_ENTERED.to_string()),
-                );
+                links.insert(seq, Link::NoLink(reasons::STATE_ENTERED.to_string()));
             }
 
             EventData::ActionStarted {
@@ -230,10 +224,7 @@ pub fn build_timeline(
                 let Some(state_id) = state_id else {
                     // No idea which state this belongs to (an ancient log
                     // with neither field) — nothing sensible to attach it to.
-                    links.insert(
-                        seq,
-                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
-                    );
+                    links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
                     continue;
                 };
                 let inherited_action_type =
@@ -291,10 +282,7 @@ pub fn build_timeline(
                     }
                     links.insert(seq, Link::Position(idx));
                 } else {
-                    links.insert(
-                        seq,
-                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
-                    );
+                    links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
                 }
             }
 
@@ -310,10 +298,7 @@ pub fn build_timeline(
                     }
                     links.insert(seq, Link::Position(idx));
                 } else {
-                    links.insert(
-                        seq,
-                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
-                    );
+                    links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
                 }
             }
 
@@ -331,10 +316,7 @@ pub fn build_timeline(
                     }
                     links.insert(seq, Link::Position(idx));
                 } else {
-                    links.insert(
-                        seq,
-                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
-                    );
+                    links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
                 }
             }
 
@@ -353,10 +335,7 @@ pub fn build_timeline(
                     }
                     links.insert(seq, Link::Position(idx));
                 } else {
-                    links.insert(
-                        seq,
-                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
-                    );
+                    links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
                 }
             }
 
@@ -443,19 +422,13 @@ pub fn build_timeline(
             }
 
             EventData::DecisionRequested { .. } => {
-                links.insert(
-                    seq,
-                    Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()),
-                );
+                links.insert(seq, Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()));
             }
 
             EventData::EntryLimitReached { .. }
             | EventData::EntryLimitDecision { .. }
             | EventData::EntryLimitCounterReset { .. } => {
-                links.insert(
-                    seq,
-                    Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()),
-                );
+                links.insert(seq, Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()));
             }
 
             // The conductor's work is not an attempt of its own (D55): it is
@@ -475,10 +448,7 @@ pub fn build_timeline(
                     drafts[idx].visit_closed = true;
                     links.insert(seq, Link::Position(idx));
                 } else {
-                    links.insert(
-                        seq,
-                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
-                    );
+                    links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
                 }
             }
 
@@ -487,35 +457,23 @@ pub fn build_timeline(
                     drafts[idx].visit_closed = true;
                     links.insert(seq, Link::Position(idx));
                 } else {
-                    links.insert(
-                        seq,
-                        Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
-                    );
+                    links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
                 }
             }
 
             EventData::HumanInputRequested { .. } | EventData::HumanInputReceived { .. } => {
-                links.insert(
-                    seq,
-                    Link::NoLink(reasons::HUMAN_OR_MANUAL.to_string()),
-                );
+                links.insert(seq, Link::NoLink(reasons::HUMAN_OR_MANUAL.to_string()));
             }
 
             EventData::HumanTransitionSelected { .. } => {
                 if let Some(idx) = open_position.take() {
                     drafts[idx].interrupted = true;
                 }
-                links.insert(
-                    seq,
-                    Link::NoLink(reasons::HUMAN_OR_MANUAL.to_string()),
-                );
+                links.insert(seq, Link::NoLink(reasons::HUMAN_OR_MANUAL.to_string()));
             }
 
             EventData::ExternalEventReceived { .. } => {
-                links.insert(
-                    seq,
-                    Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()),
-                );
+                links.insert(seq, Link::NoLink(reasons::WORKFLOW_LIFECYCLE.to_string()));
             }
 
             EventData::Error { message, context } => {
@@ -615,9 +573,12 @@ pub fn build_timeline(
         latest.effort = latest
             .effort
             .or_else(|| members.iter().rev().find_map(|m| m.effort.clone()));
-        latest.harness_session_id = latest
-            .harness_session_id
-            .or_else(|| members.iter().rev().find_map(|m| m.harness_session_id.clone()));
+        latest.harness_session_id = latest.harness_session_id.or_else(|| {
+            members
+                .iter()
+                .rev()
+                .find_map(|m| m.harness_session_id.clone())
+        });
         let earlier_recorded = members.iter().any(|m| {
             m.action_execution_id
                 .as_ref()
@@ -809,10 +770,7 @@ fn link_agent_event(
             links.insert(seq, Link::Position(idx));
         }
         None => {
-            links.insert(
-                seq,
-                Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
-            );
+            links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
         }
     }
 }
@@ -828,10 +786,7 @@ fn link_positional(
             links.insert(seq, Link::Position(idx));
         }
         None => {
-            links.insert(
-                seq,
-                Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()),
-            );
+            links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
         }
     }
 }

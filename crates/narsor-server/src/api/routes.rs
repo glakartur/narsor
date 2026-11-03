@@ -1047,7 +1047,13 @@ fn read_timeline(store: &ExecutionStore, execution_id: &str) -> Result<Timeline,
     let execution = store.load_execution(execution_id)?;
     let events = store.event_log(execution_id).read_all()?;
     let presence = conversation_presence(store, execution_id)?;
-    Ok(current_timeline(store, execution_id, &events, execution.status, &presence))
+    Ok(current_timeline(
+        store,
+        execution_id,
+        &events,
+        execution.status,
+        &presence,
+    ))
 }
 
 /// Every attempt id with a conversation record on disk, open or closed —

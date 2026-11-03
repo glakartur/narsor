@@ -447,6 +447,7 @@ impl ConductorTriggerDto {
 pub enum ConductorPurposeDto {
     ChooseOutput,
     ChooseOutputAfterReprompt,
+    AnswerAgentQuestion,
     DiagnoseFailure,
     ReplyToChat,
     SummarizeGate,
@@ -458,6 +459,7 @@ impl ConductorPurposeDto {
         match self {
             Self::ChooseOutput => "choose_output",
             Self::ChooseOutputAfterReprompt => "choose_output_after_reprompt",
+            Self::AnswerAgentQuestion => "answer_agent_question",
             Self::DiagnoseFailure => "diagnose_failure",
             Self::ReplyToChat => "reply_to_chat",
             Self::SummarizeGate => "summarize_gate",

@@ -142,6 +142,7 @@ fn a_narsor_entry_prints_its_own_text_once() {
             text: "do the thing".to_string(),
             resumed_session: None,
             purpose: PromptPurpose::Step,
+            author: None,
         }],
     ));
 

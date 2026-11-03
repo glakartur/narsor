@@ -70,6 +70,18 @@ adds the answer to the next agent prompt. Harness, sandbox, permission and tool
 failures remain action failures: the execution is `failed` on the current state
 and no workflow transition is taken.
 
+The same question is allowed as an answer to a reprompt. When an agent's answer
+has no valid JSON, narsor reprompts it once; if the agent replies to the
+reprompt with `awaiting_input`, that is a normal question, not a format error.
+Who gets it depends on the context variable `autopilot`. Unset or any value
+other than `on`/`true`, the operator gets the question at once. With `autopilot`
+set to `on`, the conductor tries to answer first and forwards the question to
+the operator when it is not sure. The answer resumes the same agent session
+with the state's normal permissions. `autopilot` does not change the rescue of a
+missing JSON answer. The conversation shows who wrote each prompt: Narsor,
+Narsor + user (a template that embeds `inputs` or `task` content), Conductor or
+User. A human answer pasted into a template is not detected and shows as Narsor.
+
 **The harness binary is a runtime prerequisite, like `git`.** It is never
 bundled and never installed; a missing one is reported as an action error
 naming the binary and saying it must be on `PATH`, not as
