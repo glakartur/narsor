@@ -18,10 +18,13 @@
 //! kubelet, and a cached copy would expire under a long-running controller.
 
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::{Method, StatusCode};
+pub use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
 use narsor_engine::backends::{BackendError, BackendResult};
@@ -135,13 +138,92 @@ pub enum Created {
     AlreadyExists,
 }
 
+/// A boxed future, so [`KubeTransport`] stays object-safe.
+pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// One HTTP exchange with the API server: the boundary with the
+/// infrastructure. Everything above it — paths, bodies, status and error
+/// categorization — is the adapter's own and runs in tests unchanged;
+/// tests supply an in-memory implementation instead of a server.
+pub trait KubeTransport: fmt::Debug + Send + Sync {
+    /// Sends the request; the status and the JSON body (`Null` when there is
+    /// none). `Err` is a failure to get any answer.
+    fn send<'a>(
+        &'a self,
+        method: Method,
+        path: &'a str,
+        body: Option<&'a Value>,
+    ) -> TransportFuture<'a, BackendResult<(StatusCode, Value)>>;
+}
+
+/// The reqwest transport to a real API server.
+#[derive(Debug)]
+struct HttpTransport {
+    http: reqwest::Client,
+    base: String,
+    token: TokenSource,
+}
+
+impl HttpTransport {
+    async fn exchange(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> BackendResult<(StatusCode, Value)> {
+        let mut request = self
+            .http
+            .request(method, format!("{}{path}", self.base))
+            .header("Accept", "application/json");
+        if let Some(token) = self.token()? {
+            request = request.bearer_auth(token);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await.map_err(|error| {
+            BackendError::transient(format!("the Kubernetes API is unreachable: {error}"))
+        })?;
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(|error| {
+            BackendError::transient(format!("the Kubernetes API answer was cut off: {error}"))
+        })?;
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
+    fn token(&self) -> BackendResult<Option<String>> {
+        match &self.token {
+            TokenSource::None => Ok(None),
+            TokenSource::Static(token) => Ok(Some(token.clone())),
+            TokenSource::File(path) => std::fs::read_to_string(path)
+                .map(|token| Some(token.trim().to_string()))
+                .map_err(|error| {
+                    BackendError::transient(format!(
+                        "cannot read the API token {}: {error}",
+                        path.display()
+                    ))
+                }),
+        }
+    }
+}
+
+impl KubeTransport for HttpTransport {
+    fn send<'a>(
+        &'a self,
+        method: Method,
+        path: &'a str,
+        body: Option<&'a Value>,
+    ) -> TransportFuture<'a, BackendResult<(StatusCode, Value)>> {
+        Box::pin(self.exchange(method, path, body))
+    }
+}
+
 /// The client. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct KubeClient {
-    http: reqwest::Client,
-    base: String,
+    transport: Arc<dyn KubeTransport>,
     namespace: String,
-    token: TokenSource,
 }
 
 impl KubeClient {
@@ -161,12 +243,23 @@ impl KubeClient {
         let http = builder
             .build()
             .map_err(|error| format!("cannot build the HTTP client: {error}"))?;
-        Ok(Self {
+        let transport = HttpTransport {
             http,
             base: access.api_server.trim_end_matches('/').to_string(),
-            namespace: access.namespace.clone(),
             token: access.token.clone(),
-        })
+        };
+        Ok(Self::with_transport(
+            Arc::new(transport),
+            access.namespace.clone(),
+        ))
+    }
+
+    /// A client over `transport`, working in `namespace`.
+    pub fn with_transport(transport: Arc<dyn KubeTransport>, namespace: String) -> Self {
+        Self {
+            transport,
+            namespace,
+        }
     }
 
     /// The namespace this client works in.
@@ -247,40 +340,7 @@ impl KubeClient {
         path: &str,
         body: Option<&Value>,
     ) -> BackendResult<(StatusCode, Value)> {
-        let mut request = self
-            .http
-            .request(method, format!("{}{path}", self.base))
-            .header("Accept", "application/json");
-        if let Some(token) = self.token()? {
-            request = request.bearer_auth(token);
-        }
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let response = request.send().await.map_err(|error| {
-            BackendError::transient(format!("the Kubernetes API is unreachable: {error}"))
-        })?;
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(|error| {
-            BackendError::transient(format!("the Kubernetes API answer was cut off: {error}"))
-        })?;
-        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        Ok((status, body))
-    }
-
-    fn token(&self) -> BackendResult<Option<String>> {
-        match &self.token {
-            TokenSource::None => Ok(None),
-            TokenSource::Static(token) => Ok(Some(token.clone())),
-            TokenSource::File(path) => std::fs::read_to_string(path)
-                .map(|token| Some(token.trim().to_string()))
-                .map_err(|error| {
-                    BackendError::transient(format!(
-                        "cannot read the API token {}: {error}",
-                        path.display()
-                    ))
-                }),
-        }
+        self.transport.send(method, path, body).await
     }
 }
 
