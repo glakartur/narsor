@@ -43,6 +43,7 @@ use super::{
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
+use narsor_protocol::api::SubagentStats;
 use narsor_protocol::chat::{
     summary_line, ChatElement, TechnicalCategory, ToolResultStatus, UnclassifiedReason,
 };
@@ -217,6 +218,7 @@ struct GitHubCopilotStreamParser {
     streamed_messages: HashSet<String>,
     reasoning_seen: bool,
     calls: HashMap<String, (String, String)>,
+    subagents: SubagentStats,
 }
 
 impl GitHubCopilotStreamParser {
@@ -285,6 +287,7 @@ impl GitHubCopilotStreamParser {
                     is_error: !success,
                     cost_usd: None,
                     usage: None,
+                    subagent_stats: (self.subagents.spawned > 0).then_some(self.subagents),
                     turns: None,
                     duration_ms: None,
                 }]
@@ -455,6 +458,21 @@ impl GitHubCopilotStreamParser {
                     content: summary_line(content),
                     truncated: content.chars().count() > 200,
                 }]
+            }
+            "subagent.started" => {
+                self.subagents.spawned = self.subagents.spawned.saturating_add(1);
+                vec![technical_event(kind, data)]
+            }
+            "subagent.completed" | "subagent.failed" => {
+                let stats = &mut self.subagents;
+                if kind == "subagent.completed" {
+                    stats.completed = stats.completed.saturating_add(1);
+                } else {
+                    stats.failed = stats.failed.saturating_add(1);
+                }
+                let tokens = data.get("totalTokens").and_then(Value::as_u64);
+                stats.tokens = stats.tokens.saturating_add(tokens.unwrap_or(0));
+                vec![technical_event(kind, data)]
             }
             kind if kind.starts_with("session.") || kind.starts_with("assistant.") => {
                 vec![technical_event(kind, data)]
@@ -733,6 +751,46 @@ mod tests {
                 ..
             } if id == "call-1" && tool == "read_file" && summary == "src/main.rs" && content == "file contents"
         ));
+    }
+
+    #[test]
+    fn the_subagents_of_a_run_are_counted_on_its_result() {
+        let mut parser = GitHubCopilotStreamParser::default();
+        let event = |kind: &str, data: serde_json::Value| {
+            serde_json::json!({"type": kind, "data": data}).to_string()
+        };
+        for line in [
+            event("subagent.started", serde_json::json!({"toolCallId": "a"})),
+            event("subagent.started", serde_json::json!({"toolCallId": "b"})),
+            event(
+                "subagent.completed",
+                serde_json::json!({"toolCallId": "a", "totalTokens": 7978}),
+            ),
+            event(
+                "subagent.failed",
+                serde_json::json!({"toolCallId": "b", "totalTokens": 22, "error": "x"}),
+            ),
+        ] {
+            parser.on_stdout_line(line.as_bytes());
+        }
+        let elements = parser.on_stdout_line(
+            serde_json::json!({"type": "result", "success": true, "text": "done"})
+                .to_string()
+                .as_bytes(),
+        );
+        let Some(ChatElement::RunResult { subagent_stats, .. }) = elements.last() else {
+            panic!("expected a run result, got {elements:?}");
+        };
+        assert_eq!(
+            *subagent_stats,
+            Some(SubagentStats {
+                spawned: 2,
+                completed: 1,
+                failed: 1,
+                tokens: 8000,
+                ..SubagentStats::default()
+            })
+        );
     }
 
     #[test]

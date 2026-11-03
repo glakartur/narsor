@@ -700,6 +700,34 @@ fn user_text_is_a_user_message() {
 }
 
 #[test]
+fn a_result_sums_the_killed_and_refused_subagents() {
+    let line = json!({
+        "type": "result", "subtype": "success", "is_error": false, "result": "",
+        "subagent_stats": {
+            "spawned": 5, "completed": 2, "failed": 1,
+            "killed": {"parent": 1, "user": 0, "system": 1},
+            "refused": {"depth_limit": 0, "concurrency_limit": 1, "budget": 0},
+        },
+    })
+    .to_string();
+    let elements = classify_one(&line);
+    let Some(ChatElement::RunResult { subagent_stats, .. }) = elements.last() else {
+        panic!("expected a run result, got {elements:?}");
+    };
+    let stats = subagent_stats.expect("stats");
+    assert_eq!(
+        (
+            stats.spawned,
+            stats.completed,
+            stats.failed,
+            stats.killed,
+            stats.refused
+        ),
+        (5, 2, 1, 2, 1)
+    );
+}
+
+#[test]
 fn a_successful_result_carries_the_run_metadata() {
     let elements = classify_all(&recording("tools.ndjson"));
     let last = elements.last().expect("elements");
@@ -713,10 +741,10 @@ fn a_successful_result_carries_the_run_metadata() {
             usage,
             turns,
             duration_ms,
+            subagent_stats: _,
         } => {
-            assert!(text
-                .as_deref()
-                .is_some_and(|text| text.starts_with("Hello from the hello skill.")));
+            // The text repeats the last reply, which is already shown.
+            assert_eq!(*text, None);
             assert_eq!(*structured_output, None);
             assert_eq!(stop_reason.as_deref(), Some("end_turn"));
             assert!(!is_error);
@@ -729,6 +757,35 @@ fn a_successful_result_carries_the_run_metadata() {
         }
         other => panic!("expected a run result last, got {other:?}"),
     }
+}
+
+#[test]
+fn a_result_sums_the_subagent_stats_of_the_harness() {
+    let line = json!({
+        "type": "result",
+        "subtype": "success",
+        "result": "ok",
+        "subagent_stats": {
+            "spawned": 5, "completed": 3, "failed": 1,
+            "killed": {"parent": 1, "user": 0, "system": 0},
+            "refused": {"depth_limit": 0, "concurrency_limit": 2, "budget": 1},
+        },
+    });
+    let elements = classify_one(&line.to_string());
+    let Some(ChatElement::RunResult { subagent_stats, .. }) = elements.last() else {
+        panic!("expected a run result, got {elements:?}");
+    };
+    let stats = subagent_stats.expect("stats");
+    assert_eq!(
+        (
+            stats.spawned,
+            stats.completed,
+            stats.failed,
+            stats.killed,
+            stats.refused
+        ),
+        (5, 3, 1, 1, 3)
+    );
 }
 
 #[test]

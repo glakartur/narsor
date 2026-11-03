@@ -128,6 +128,9 @@ pub enum ChatElement {
         /// Token usage exactly as the harness reported it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Value>,
+        /// What the harness said about the subagents of the run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_stats: Option<crate::api::SubagentStats>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turns: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -576,6 +579,11 @@ mod tests {
                 is_error: true,
                 cost_usd: Some(0.125),
                 usage: Some(json!({"input_tokens": 10, "output_tokens": 5})),
+                subagent_stats: Some(crate::api::SubagentStats {
+                    spawned: 2,
+                    completed: 1,
+                    ..crate::api::SubagentStats::default()
+                }),
                 turns: Some(3),
                 duration_ms: Some(1500),
             },

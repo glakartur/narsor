@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use narsor_protocol::api::SubagentStats;
 use narsor_protocol::chat::{
     summary_line, ChatElement, QuestionSource, TechnicalCategory, ToolResultStatus,
     UnclassifiedReason,
@@ -511,11 +512,42 @@ fn run_result(mut line: Map<String, Value>, result: ResultLine) -> ChatElement {
         is_error: result.is_error,
         cost_usd: line.get("total_cost_usd").and_then(Value::as_f64),
         usage: line.remove("usage").filter(|usage| !usage.is_null()),
+        subagent_stats: subagent_stats(&line),
         turns: line.get("num_turns").and_then(Value::as_u64),
         duration_ms: line.get("duration_ms").and_then(Value::as_u64),
         text: result.text,
         structured_output: result.structured_output,
     }
+}
+
+/// The `subagent_stats` of a `result` line: counts for the whole process,
+/// so the same in every `result` of it.
+fn subagent_stats(line: &Map<String, Value>) -> Option<SubagentStats> {
+    let stats = line.get("subagent_stats")?.as_object()?;
+    let count = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_u64)
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+    };
+    let sum = |key: &str| {
+        stats
+            .get(key)
+            .and_then(Value::as_object)
+            .map_or(0, |parts| {
+                parts
+                    .values()
+                    .map(|n| count(Some(n)))
+                    .fold(0, u32::saturating_add)
+            })
+    };
+    Some(SubagentStats {
+        spawned: count(stats.get("spawned")),
+        completed: count(stats.get("completed")),
+        failed: count(stats.get("failed")),
+        killed: sum("killed"),
+        refused: sum("refused"),
+        tokens: 0,
+    })
 }
 
 /// Why the run ended, most telling first: a non-`success` `subtype`

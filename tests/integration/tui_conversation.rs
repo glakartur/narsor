@@ -402,6 +402,7 @@ fn a_run_result_shows_its_text_and_expands_to_its_metadata() {
             is_error: false,
             cost_usd: Some(0.5),
             usage: None,
+            subagent_stats: None,
             turns: Some(3),
             duration_ms: Some(1500),
         }],

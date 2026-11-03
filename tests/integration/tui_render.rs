@@ -2239,6 +2239,7 @@ mod task_app_detail_render {
             total: Some(counts(input, output)),
             subagents: Some(counts(sub.0, sub.1)),
             subagent_count: Some(1),
+            subagent_stats: None,
             cost_usd: Some(cost),
         })
     }
@@ -2445,7 +2446,7 @@ mod task_app_detail_render {
                 .unwrap_or_else(|| panic!("{needle:?} in\n{}", rows.join("\n")))
         };
         let step0 = row(&wide, "$0.42");
-        assert!(wide[step0].contains("1× ↓40k ↑3k"), "{}", wide.join("\n"));
+        assert!(wide[step0].contains("1×  ↓40k  ↑3k"), "{}", wide.join("\n"));
         assert!(wide[row(&wide, "$0.03")].contains("↓2.1k"));
 
         let mut app = running_app_with_usage(steps());
@@ -2454,7 +2455,7 @@ mod task_app_detail_render {
         let narrow = rows(&render_at(&mut app, &Styles::new(false), 62, 30));
         let step0 = row(&narrow, "$0.42");
         assert!(!narrow[step0].contains('×'), "{}", narrow.join("\n"));
-        assert!(narrow[step0 + 1].contains("1× ↓40k ↑3k"));
+        assert!(narrow[step0 + 1].contains("1×  ↓40k  ↑3k"));
         assert!(!narrow[row(&narrow, "$0.03") + 1].contains('×'));
     }
 
@@ -2487,14 +2488,14 @@ mod task_app_detail_render {
                 && row("edit #1") < row("review #1")
                 && row("review #1") < row("test #1")
         );
-        assert_eq!(row("plan #1") + 1, row("edit #1"), "unselected steps stack");
+        assert_eq!(row("plan #1") + 2, row("edit #1"), "unselected steps stack");
         assert_eq!(
-            row("edit #1") + 2,
+            row("edit #1") + 3,
             row("review #1"),
             "the rule above the selected step"
         );
         assert_eq!(
-            row("review #1") + 2,
+            row("review #1") + 3,
             row("test #1"),
             "the rule below the selected step"
         );
@@ -2796,7 +2797,8 @@ mod task_app_detail_render {
     /// `marks`, the rules checked at its first column.
     fn assert_axis_bracket(buffer: &Buffer, needle: &str, marks: SelectionMarks) {
         let (y, x) = spot(buffer, needle);
-        assert_bracket(buffer, (x, y), 1, x + 1, marks);
+        // A step is two rows: its row and the row of when it ran.
+        assert_bracket(buffer, (x, y), 2, x + 1, marks);
     }
 
     /// Whether no cell of the axis around the row of `needle` is in reverse

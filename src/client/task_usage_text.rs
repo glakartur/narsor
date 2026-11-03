@@ -124,6 +124,33 @@ pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
     cells
 }
 
+/// What became of a step's subagents, e.g. `sub 11 ✓10 ✗1`: how many were
+/// started and finished, then each count that is not zero (`✗` failed, `†`
+/// killed, `⊘` refused) and the tokens they used together (`↕`). Empty when
+/// none were started.
+pub fn subagent_stats_text(usage: Option<&PositionUsage>) -> String {
+    let Some(stats) = usage.and_then(|usage| usage.subagent_stats) else {
+        return String::new();
+    };
+    if stats.spawned == 0 {
+        return String::new();
+    }
+    let mut text = format!("sub {} ✓{}", stats.spawned, stats.completed);
+    for (mark, count) in [
+        ("✗", stats.failed),
+        ("†", stats.killed),
+        ("⊘", stats.refused),
+    ] {
+        if count > 0 {
+            text.push_str(&format!(" {mark}{count}"));
+        }
+    }
+    if stats.tokens > 0 {
+        text.push_str(&format!(" ↕{}", scaled(stats.tokens)));
+    }
+    text
+}
+
 fn tokens(counts: Option<TokenCounts>) -> String {
     match counts {
         Some(counts) => format!("in {} out {}", scaled(counts.input), scaled(counts.output)),
@@ -156,7 +183,7 @@ fn unit(count: u64, divisor: u64, suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use narsor_protocol::api::{ConversationState, PositionStatus, PositionUsage};
+    use narsor_protocol::api::{ConversationState, PositionStatus, PositionUsage, SubagentStats};
 
     use super::*;
 
@@ -198,6 +225,7 @@ mod tests {
             total: Some(counts(total.0, total.1)),
             subagents: subagents.map(|(input, output)| counts(input, output)),
             subagent_count: subagents.map(|_| 1),
+            subagent_stats: None,
             cost_usd: Some(cost),
         }
     }
@@ -335,6 +363,34 @@ mod tests {
         );
         assert!(cells.cost.is_empty());
         assert!(!step_cells(Some(&PositionUsage::default())).has_main());
+    }
+
+    #[test]
+    fn the_subagent_stats_show_only_the_counts_that_are_not_zero() {
+        let usage = |spawned, completed, failed, killed, refused| PositionUsage {
+            subagent_stats: Some(SubagentStats {
+                spawned,
+                completed,
+                failed,
+                killed,
+                refused,
+                tokens: 0,
+            }),
+            ..PositionUsage::default()
+        };
+        assert_eq!(
+            subagent_stats_text(Some(&usage(11, 11, 0, 0, 0))),
+            "sub 11 ✓11"
+        );
+        assert_eq!(
+            subagent_stats_text(Some(&usage(5, 2, 1, 1, 1))),
+            "sub 5 ✓2 ✗1 †1 ⊘1"
+        );
+        let mut with_tokens = usage(2, 2, 0, 0, 0);
+        with_tokens.subagent_stats.as_mut().unwrap().tokens = 8_000;
+        assert_eq!(subagent_stats_text(Some(&with_tokens)), "sub 2 ✓2 ↕8k");
+        assert_eq!(subagent_stats_text(Some(&usage(0, 0, 0, 0, 0))), "");
+        assert_eq!(subagent_stats_text(None), "");
     }
 
     #[test]

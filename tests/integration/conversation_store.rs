@@ -317,6 +317,7 @@ fn a_structured_output_nested_past_the_parse_limit_is_stored_and_reads() {
             is_error: false,
             cost_usd: None,
             usage: None,
+            subagent_stats: None,
             turns: None,
             duration_ms: None,
         },

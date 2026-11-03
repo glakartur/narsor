@@ -132,6 +132,45 @@ pub(super) struct ReadingTap {
     pub(super) harness: String,
 }
 
+/// The elements as the conversation file keeps them. What an agent used lives
+/// in the timeline file alone, so a result loses its tokens and cost; one
+/// left with nothing to say (its text repeats the reply, and it is no
+/// error) is not kept.
+fn without_usage(elements: &[ChatElement]) -> Vec<ChatElement> {
+    elements
+        .iter()
+        .filter_map(|element| match element {
+            ChatElement::RunResult {
+                text,
+                structured_output,
+                is_error,
+                ..
+            } if !*is_error
+                && structured_output.is_none()
+                && text.as_deref().is_none_or(|text| text.trim().is_empty()) =>
+            {
+                None
+            }
+            ChatElement::RunResult { .. } => {
+                let mut element = element.clone();
+                if let ChatElement::RunResult {
+                    cost_usd,
+                    usage,
+                    subagent_stats,
+                    ..
+                } = &mut element
+                {
+                    *cost_usd = None;
+                    *subagent_stats = None;
+                    *usage = None;
+                }
+                Some(element)
+            }
+            other => Some(other.clone()),
+        })
+        .collect()
+}
+
 impl ConversationSink {
     /// No file to write to.
     pub(crate) fn none() -> Self {
@@ -164,6 +203,7 @@ impl ConversationSink {
     /// Appends one entry with its elements, logging (and otherwise
     /// ignoring) a failure to.
     pub(super) fn append(&self, source: ConversationSource, raw: &[u8], elements: &[ChatElement]) {
+        let already_empty = elements.is_empty();
         if source == ConversationSource::Stdout {
             if let Some(tap) = &self.1 {
                 for element in elements {
@@ -174,10 +214,14 @@ impl ConversationSink {
             }
         }
         let Some(writer) = &self.0 else { return };
+        let elements = without_usage(elements);
+        if elements.is_empty() && !already_empty {
+            return;
+        }
         let mut writer = writer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Err(error) = writer.append(source, raw, elements) {
+        if let Err(error) = writer.append(source, raw, &elements) {
             tracing::warn!(%error, "could not append a conversation entry");
         }
     }
@@ -222,6 +266,42 @@ impl ConversationSink {
                     "the conversation writer still had outstanding references at the \
                      end of the attempt; it was not synced explicitly"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(text: Option<&str>, is_error: bool) -> ChatElement {
+        ChatElement::RunResult {
+            text: text.map(str::to_string),
+            structured_output: None,
+            stop_reason: None,
+            is_error,
+            cost_usd: Some(0.5),
+            usage: Some(serde_json::json!({ "input_tokens": 1 })),
+            subagent_stats: None,
+            turns: Some(2),
+            duration_ms: Some(3),
+        }
+    }
+
+    #[test]
+    fn a_result_with_nothing_to_say_is_not_kept() {
+        assert!(without_usage(&[result(None, false)]).is_empty());
+    }
+
+    #[test]
+    fn a_kept_result_has_no_tokens_or_cost() {
+        for element in [result(Some("answer"), false), result(None, true)] {
+            match without_usage(&[element]).as_slice() {
+                [ChatElement::RunResult {
+                    cost_usd, usage, ..
+                }] => assert!(cost_usd.is_none() && usage.is_none()),
+                other => panic!("expected the result, got {other:?}"),
             }
         }
     }

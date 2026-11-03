@@ -711,6 +711,7 @@ mod tests {
                     }),
                     subagents: None,
                     subagent_count: Some(2),
+                    subagent_stats: None,
                     cost_usd: Some(0.5),
                 }),
             }],
