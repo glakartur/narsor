@@ -92,7 +92,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use serde_json::Value;
 
-use self::client::{ClusterAccess, Created, KubeClient};
+use self::client::{ClusterAccess, Created, KubeClient, KubeTransport};
 pub use self::manifest::KubernetesBackendConfig;
 use self::manifest::{EPOCH_KEY, GENERATION_KEY, INCARNATION_ANNOTATION, RESOURCE_KEY_ANNOTATION};
 use self::objects::{PersistentVolumeClaim, Pod, StorageClass};
@@ -114,6 +114,26 @@ pub struct KubernetesBackend {
 impl KubernetesBackend {
     /// An adapter working in `access`'s namespace.
     pub fn new(access: &ClusterAccess, config: KubernetesBackendConfig) -> Result<Self, String> {
+        Self::checked(access.namespace.clone(), config, || KubeClient::new(access))
+    }
+
+    /// An adapter over `transport` instead of an HTTP connection, working in
+    /// `namespace`: the seam tests use to stand in for the API server.
+    pub fn with_transport(
+        transport: Arc<dyn KubeTransport>,
+        namespace: &str,
+        config: KubernetesBackendConfig,
+    ) -> Result<Self, String> {
+        Self::checked(namespace.to_string(), config, || {
+            Ok(KubeClient::with_transport(transport, namespace.to_string()))
+        })
+    }
+
+    fn checked(
+        namespace: String,
+        config: KubernetesBackendConfig,
+        client: impl FnOnce() -> Result<KubeClient, String>,
+    ) -> Result<Self, String> {
         let problems = config.problems();
         if !problems.is_empty() {
             return Err(format!(
@@ -121,14 +141,11 @@ impl KubernetesBackend {
                 problems.join("; ")
             ));
         }
-        if !names::is_dns_label(&access.namespace) {
-            return Err(format!(
-                "namespace '{}' is not a DNS-1123 label",
-                access.namespace
-            ));
+        if !names::is_dns_label(&namespace) {
+            return Err(format!("namespace '{namespace}' is not a DNS-1123 label"));
         }
         Ok(Self {
-            client: KubeClient::new(access)?,
+            client: client()?,
             config: Arc::new(config),
         })
     }

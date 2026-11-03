@@ -387,6 +387,22 @@ pub async fn edit_profile_command(args: EditProfileArgs) -> i32 {
 
 /// One edit session, its failure unprinted.
 pub async fn edit_profile(args: EditProfileArgs) -> Result<(), ControllerError> {
+    edit_profile_with(args, |cluster, config| {
+        let access = cluster_access(cluster, config.namespace.clone())?;
+        KubernetesBackend::new(&access, config).map_err(ControllerError::usage)
+    })
+    .await
+}
+
+/// [`edit_profile`] with the backend built by `connect` from the cluster
+/// arguments and the configuration.
+pub async fn edit_profile_with(
+    args: EditProfileArgs,
+    connect: impl FnOnce(
+        &ClusterArgs,
+        KubernetesBackendConfig,
+    ) -> Result<KubernetesBackend, ControllerError>,
+) -> Result<(), ControllerError> {
     let mut config = read_backend_config(&args.kubernetes_config)?;
     if args.cluster.namespace.is_some() {
         config.namespace = args.cluster.namespace.clone();
@@ -397,8 +413,7 @@ pub async fn edit_profile(args: EditProfileArgs) -> Result<(), ControllerError> 
             args.kubernetes_config.display()
         )));
     };
-    let access = cluster_access(&args.cluster, config.namespace.clone())?;
-    let backend = KubernetesBackend::new(&access, config).map_err(ControllerError::usage)?;
+    let backend = connect(&args.cluster, config)?;
     let current = backend
         .read_claude_profile()
         .await

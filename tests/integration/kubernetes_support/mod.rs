@@ -1,5 +1,10 @@
-//! An in-process mock of the Kubernetes API the adapter uses, with a
+//! An in-memory stand-in for the Kubernetes API the adapter uses, with a
 //! "kubelet" that runs a runner program for every Pod (U5, AE2).
+//!
+//! It sits at the adapter's boundary with the infrastructure: it implements
+//! [`KubeTransport`], the one HTTP exchange, so the adapter's own client
+//! code (paths, bodies, status categorization) runs for real while no
+//! socket, server or timer exists.
 //!
 //! # The API
 //!
@@ -8,13 +13,14 @@
 //! and delete; Secrets create only (a read or delete of a Secret answers
 //! 403, as RBAC would); StorageClasses get. Creates answer 409
 //! `AlreadyExists` for a taken name, deletes honour a UID precondition
-//! (409 on mismatch), a missing object is a 404 `Status`, and a request
-//! without the expected bearer token is a 401. Every request and every
-//! created object is recorded for the tests to inspect.
+//! (409 on mismatch), and a missing object is a 404 `Status`. Every request
+//! and every created object is recorded for the tests to inspect.
 //!
 //! # The kubelet
 //!
-//! A ticker that does what a node would, just faster:
+//! It does what a node would, but deterministically: it advances once at
+//! the start of every API request (and on [`MockCluster::tick`]), never on
+//! a timer, so what a test observes depends only on the calls it makes.
 //!
 //! * a Pending Pod whose volumes all exist is "started": its volumes are
 //!   materialized as directories (the PVC as a per-claim directory, the
@@ -27,7 +33,8 @@
 //!   in for the runtime bundle;
 //! * a runner that exits makes its Pod `Succeeded` or `Failed` with the
 //!   exit code (128 + signal when killed, like a container runtime);
-//! * a Pod with a `deletionTimestamp` has its runner killed and disappears,
+//! * a Pod with a `deletionTimestamp` has its runner killed and disappears
+//!   (unless a test holds it),
 //!   taking the Secrets it owns with it (garbage collection);
 //! * a PVC with a `deletionTimestamp` disappears once no Pod mounts it
 //!   (`kubernetes.io/pvc-protection`) — or not at all while a test holds
@@ -40,23 +47,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
-use axum::extract::{Path as UrlPath, State};
-use axum::http::{HeaderMap, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use narsor_controller::kubernetes::client::{ClusterAccess, TokenSource};
+use narsor_controller::kubernetes::client::{KubeTransport, Method, StatusCode, TransportFuture};
 use narsor_controller::kubernetes::manifest::RUNNER_CONTAINER;
+use narsor_controller::kubernetes::{KubernetesBackend, KubernetesBackendConfig};
+use narsor_engine::backends::BackendResult;
 
 /// Namespace of the mock cluster.
 pub const NAMESPACE: &str = "narsor-user";
-
-/// The bearer token the mock expects.
-pub const TOKEN: &str = "mock-service-account-token";
 /// The one Secret the controller's Role may read and update by name.
 pub const PROFILE_SECRET: &str = "narsor-claude-profile";
 
@@ -88,6 +88,7 @@ struct ClusterState {
     created: Vec<Value>,
     next_version: u64,
     hold_pvc_deletion: bool,
+    hold_pod_deletion: bool,
     kubelet: bool,
     fail_requests: u32,
 }
@@ -102,19 +103,31 @@ pub struct MockCluster {
     state: Mutex<ClusterState>,
     scratch: PathBuf,
     program: PathBuf,
-    /// Base URL of the API server.
-    pub url: String,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for MockCluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MockCluster")
+    }
+}
+
+impl KubeTransport for MockCluster {
+    fn send<'a>(
+        &'a self,
+        method: Method,
+        path: &'a str,
+        body: Option<&'a Value>,
+    ) -> TransportFuture<'a, BackendResult<(StatusCode, Value)>> {
+        let answer = self.handle(method, path, body.cloned());
+        Box::pin(async move { Ok(answer) })
+    }
 }
 
 impl MockCluster {
-    /// Serves a mock cluster on loopback. With `kubelet`, Pods run
-    /// `program …`; without, they stay Pending.
+    /// A mock cluster. With `kubelet`, Pods run `program …`; without, they
+    /// stay Pending.
     pub fn start(scratch: &Path, program: impl Into<PathBuf>, kubelet: bool) -> Arc<Self> {
         fs::create_dir_all(scratch).expect("scratch");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the mock API");
-        listener.set_nonblocking(true).expect("nonblocking");
-        let url = format!("http://{}", listener.local_addr().expect("address"));
         let mut state = ClusterState {
             kubelet,
             ..ClusterState::default()
@@ -131,50 +144,26 @@ impl MockCluster {
                 }),
             );
         }
-        let cluster = Arc::new(Self {
+        Arc::new(Self {
             state: Mutex::new(state),
             scratch: scratch.to_path_buf(),
             program: program.into(),
-            url,
-            tasks: Mutex::new(Vec::new()),
-        });
-        let router = Router::new()
-            .route(
-                "/api/v1/namespaces/{namespace}/{plural}",
-                get(collection).post(collection),
-            )
-            .route(
-                "/api/v1/namespaces/{namespace}/{plural}/{name}",
-                get(object).put(object).delete(object),
-            )
-            .route(
-                "/apis/storage.k8s.io/v1/storageclasses/{name}",
-                get(storage_class),
-            )
-            .with_state(Arc::clone(&cluster));
-        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("serve");
-        });
-        let weak = Arc::downgrade(&cluster);
-        let kubelet = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                let Some(cluster) = weak.upgrade() else {
-                    return;
-                };
-                cluster.tick();
-            }
-        });
-        cluster.tasks.lock().unwrap().extend([server, kubelet]);
-        cluster
+        })
     }
 
-    /// How the adapter reaches it.
-    pub fn access(&self) -> ClusterAccess {
-        let mut access = ClusterAccess::explicit(&self.url, NAMESPACE);
-        access.token = TokenSource::Static(TOKEN.to_string());
-        access
+    /// An adapter working against this cluster.
+    pub fn backend(self: &Arc<Self>, config: KubernetesBackendConfig) -> KubernetesBackend {
+        KubernetesBackend::with_transport(
+            Arc::clone(self) as Arc<dyn KubeTransport>,
+            NAMESPACE,
+            config,
+        )
+        .expect("adapter")
+    }
+
+    /// Lets the kubelet act once, as it does before every request.
+    pub fn tick(&self) {
+        self.tick_locked(&mut self.lock());
     }
 
     fn lock(&self) -> MutexGuard<'_, ClusterState> {
@@ -296,6 +285,11 @@ impl MockCluster {
         self.lock().hold_pvc_deletion = hold;
     }
 
+    /// While held, deleted Pods stay Terminating (a slow shutdown).
+    pub fn hold_pod_deletion(&self, hold: bool) {
+        self.lock().hold_pod_deletion = hold;
+    }
+
     /// The next `count` API requests fail with HTTP 503.
     pub fn fail_requests(&self, count: u32) {
         self.lock().fail_requests = count;
@@ -337,8 +331,7 @@ impl MockCluster {
         true
     }
 
-    /// Kills every runner and stops serving. The server holds the cluster,
-    /// so this — not a drop — is what ends it.
+    /// Kills every runner.
     pub fn shutdown(&self) {
         let mut state = self.lock();
         for runner in state.runners.values_mut() {
@@ -349,10 +342,6 @@ impl MockCluster {
             let _ = runner.child.wait();
         }
         state.runners.clear();
-        drop(state);
-        for task in self.tasks.lock().unwrap().drain(..) {
-            task.abort();
-        }
     }
 
     /// The local directory standing in for a PVC.
@@ -371,42 +360,24 @@ impl MockCluster {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn handle(
-        &self,
-        method: Method,
-        path: String,
-        headers: &HeaderMap,
-        namespace: Option<&str>,
-        plural: &str,
-        name: Option<&str>,
-        body: Option<Value>,
-    ) -> Response {
+    fn handle(&self, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
         let mut state = self.lock();
-        let (status, answer) =
-            self.answer(&mut state, &method, headers, namespace, plural, name, body);
-        self.record(&mut state, &method, &path, status);
-        (status, Json(answer)).into_response()
+        self.tick_locked(&mut state);
+        let (status, answer) = self.answer(&mut state, &method, path, body);
+        self.record(&mut state, &method, path, status);
+        (status, answer)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn answer(
         &self,
         state: &mut ClusterState,
         method: &Method,
-        headers: &HeaderMap,
-        namespace: Option<&str>,
-        plural: &str,
-        name: Option<&str>,
+        path: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        let authorized = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            == Some(&format!("Bearer {TOKEN}"));
-        if !authorized {
-            return status(StatusCode::UNAUTHORIZED, "Unauthorized", "no valid token");
-        }
+        let Some((namespace, plural, name)) = parse(path) else {
+            return status(StatusCode::NOT_FOUND, "NotFound", "no such endpoint");
+        };
         if state.fail_requests > 0 {
             state.fail_requests -= 1;
             return status(
@@ -523,10 +494,7 @@ impl MockCluster {
 
     // -- the kubelet ---------------------------------------------------------
 
-    fn tick(&self) {
-        let mut state = self.lock();
-        let state = &mut *state;
-
+    fn tick_locked(&self, state: &mut ClusterState) {
         // Exits.
         let mut exited = Vec::new();
         for (name, runner) in state.runners.iter_mut() {
@@ -569,14 +537,15 @@ impl MockCluster {
             })
             .collect();
         for (name, uid) in deleting {
+            if state.hold_pod_deletion {
+                break;
+            }
             if let Some(runner) = state.runners.get_mut(&name) {
                 // SAFETY: the process group the kubelet created.
                 unsafe {
                     libc::kill(-(runner.child.id() as libc::pid_t), libc::SIGKILL);
                 }
-                if !matches!(runner.child.try_wait(), Ok(Some(_))) {
-                    continue;
-                }
+                let _ = runner.child.wait();
                 state.runners.remove(&name);
             }
             state.pods.remove(&name);
@@ -803,58 +772,19 @@ fn not_found(name: &str) -> (StatusCode, Value) {
     )
 }
 
-async fn collection(
-    State(cluster): State<Arc<MockCluster>>,
-    method: Method,
-    UrlPath((namespace, plural)): UrlPath<(String, String)>,
-    headers: HeaderMap,
-    body: Option<Json<Value>>,
-) -> Response {
-    let path = format!("/api/v1/namespaces/{namespace}/{plural}");
-    cluster.handle(
-        method,
-        path,
-        &headers,
-        Some(&namespace),
-        &plural,
-        None,
-        body.map(|Json(body)| body),
-    )
-}
-
-async fn object(
-    State(cluster): State<Arc<MockCluster>>,
-    method: Method,
-    UrlPath((namespace, plural, name)): UrlPath<(String, String, String)>,
-    headers: HeaderMap,
-    body: Option<Json<Value>>,
-) -> Response {
-    let path = format!("/api/v1/namespaces/{namespace}/{plural}/{name}");
-    cluster.handle(
-        method,
-        path,
-        &headers,
-        Some(&namespace),
-        &plural,
-        Some(&name),
-        body.map(|Json(body)| body),
-    )
-}
-
-async fn storage_class(
-    State(cluster): State<Arc<MockCluster>>,
-    method: Method,
-    UrlPath(name): UrlPath<String>,
-    headers: HeaderMap,
-) -> Response {
-    let path = format!("/apis/storage.k8s.io/v1/storageclasses/{name}");
-    cluster.handle(
-        method,
-        path,
-        &headers,
-        None,
-        "storageclasses",
-        Some(&name),
-        None,
-    )
+/// `(namespace, plural, name)` of an API path.
+fn parse(path: &str) -> Option<(Option<&str>, &str, Option<&str>)> {
+    let mut parts = path.trim_start_matches('/').split('/');
+    match (parts.next()?, parts.next()?, parts.next()?) {
+        ("api", "v1", "namespaces") => {
+            let namespace = parts.next()?;
+            let plural = parts.next()?;
+            Some((Some(namespace), plural, parts.next()))
+        }
+        ("apis", "storage.k8s.io", "v1") => {
+            (parts.next()? == "storageclasses").then_some(())?;
+            Some((None, "storageclasses", parts.next()))
+        }
+        _ => None,
+    }
 }
