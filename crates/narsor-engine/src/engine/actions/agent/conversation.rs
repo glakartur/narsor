@@ -283,6 +283,7 @@ mod tests {
             is_error,
             cost_usd: Some(0.5),
             usage: Some(serde_json::json!({ "input_tokens": 1 })),
+            subagent_stats: None,
             turns: Some(2),
             duration_ms: Some(3),
         }

@@ -584,6 +584,7 @@ mod tests {
                 "cache_creation_input_tokens": 50,
             })),
             turns: None,
+            subagent_stats: None,
             duration_ms: None,
         };
         let reading = reading_from_element(&element, Some("claude-code")).unwrap();
