@@ -45,7 +45,7 @@ steps — an agent harness (for example `claude`, `codex` or `opencode`) on
 `PATH`. Rust is not needed.
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh | bash
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.11.0/install.sh | bash
 ```
 
 The installer offers three roles: **local** (everything on one machine),
@@ -56,7 +56,7 @@ overwrites an existing configuration file.
 Unattended install, for example in a container build:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.11.0/install.sh |
   bash -s -- --role frontend --non-interactive \
     --bin-dir /usr/local/bin --data-dir /var/lib/narsor
 ```
@@ -64,7 +64,7 @@ curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.
 Uninstall (add `--purge` to delete configuration and data as well):
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.11.0/install.sh |
   bash -s -- --uninstall
 ```
 
