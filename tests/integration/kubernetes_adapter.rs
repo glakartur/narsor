@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use backend_contract_support::{stub_runner, ContractTarget, Harness};
 use kubernetes_support::{MockCluster, DELETE_CLASS, NAMESPACE, PROFILE_SECRET, RETAIN_CLASS};
-use narsor_controller::controller::{edit_profile, ClusterArgs, EditProfileArgs};
+use narsor_controller::controller::{
+    edit_profile_with, ClusterArgs, ControllerError, EditProfileArgs,
+};
 use narsor_controller::kubernetes::manifest::{self, check_pod_shape, KubernetesBackendConfig};
 use narsor_controller::kubernetes::{launched_under_epoch, names, KubernetesBackend};
 use narsor_engine::backends::{
@@ -152,7 +154,7 @@ impl Quiet {
     fn with(config: KubernetesBackendConfig) -> Self {
         let dir = scratch();
         let cluster = MockCluster::start(&dir, dir.join("never-run"), false);
-        let backend = KubernetesBackend::new(&cluster.access(), config).expect("adapter");
+        let backend = cluster.backend(config);
         Self {
             cluster,
             backend,
@@ -200,7 +202,7 @@ impl ContractTarget for KubernetesTarget {
 
     fn backend(&self) -> KubernetesBackend {
         // A new instance per controller, sharing only the cluster.
-        KubernetesBackend::new(&self.cluster.access(), config()).expect("adapter")
+        self.cluster.backend(config())
     }
 
     fn launch_spec(&self) -> TaskLaunchSpec {
@@ -558,8 +560,6 @@ fn edit_args(quiet: &Quiet, harness: &str) -> EditProfileArgs {
         serde_yaml::to_string(quiet.backend.config()).unwrap(),
     )
     .unwrap();
-    let token_file = quiet.dir.join("token");
-    std::fs::write(&token_file, kubernetes_support::TOKEN).unwrap();
     let script = quiet.dir.join("claude.sh");
     std::fs::write(&script, format!("#!/bin/sh\nset -e\n{harness}\n")).unwrap();
     use std::os::unix::fs::PermissionsExt as _;
@@ -568,14 +568,22 @@ fn edit_args(quiet: &Quiet, harness: &str) -> EditProfileArgs {
         kubernetes_config: config_file,
         cluster: ClusterArgs {
             namespace: Some(NAMESPACE.into()),
-            api_server: Some(quiet.cluster.url.clone()),
-            token_file: Some(token_file),
+            api_server: None,
+            token_file: None,
             ca_file: None,
         },
         claude_command: script,
         session_parent: Some(quiet.dir.clone()),
         yes: true,
     }
+}
+
+/// One edit session against the mock cluster.
+async fn edit(quiet: &Quiet, harness: &str) -> Result<(), ControllerError> {
+    edit_profile_with(edit_args(quiet, harness), |_, config| {
+        Ok(quiet.cluster.backend(config))
+    })
+    .await
 }
 
 #[tokio::test]
@@ -600,9 +608,7 @@ printf 'history' > "$CLAUDE_CONFIG_DIR/history.jsonl""#,
         seen = seen.display(),
     );
 
-    edit_profile(edit_args(&quiet, &harness))
-        .await
-        .expect("the session is saved");
+    edit(&quiet, &harness).await.expect("the session is saved");
 
     let data = quiet.cluster.profile_secret_data();
     assert_eq!(
@@ -645,7 +651,7 @@ async fn a_change_that_runs_programs_is_never_saved_unseen() {
         .seed_profile_secret(&[("settings", r#"{"model":"opus"}"#)]);
     let harness =
         r#"printf '{"model":"opus","hooks":{"Stop":[]}}' > "$CLAUDE_CONFIG_DIR/settings.json""#;
-    let error = edit_profile(edit_args(&quiet, harness))
+    let error = edit(&quiet, harness)
         .await
         .expect_err("--yes does not cover hooks");
     assert!(error.message.contains("without --yes"), "{}", error.message);
@@ -658,7 +664,7 @@ async fn an_unchanged_profile_is_not_written() {
     quiet
         .cluster
         .seed_profile_secret(&[("settings", r#"{"model":"opus"}"#)]);
-    edit_profile(edit_args(&quiet, "true")).await.unwrap();
+    edit(&quiet, "true").await.unwrap();
     assert!(quiet.cluster.mutations().is_empty());
 }
 
@@ -692,7 +698,7 @@ async fn the_last_profile_write_wins_over_an_external_change() {
 #[tokio::test]
 async fn a_profile_edit_needs_the_configured_secret() {
     let quiet = Quiet::new();
-    let error = edit_profile(edit_args(&quiet, "true")).await.unwrap_err();
+    let error = edit(&quiet, "true").await.unwrap_err();
     assert!(
         error.message.contains("claude_profile_secret"),
         "{}",
@@ -700,7 +706,7 @@ async fn a_profile_edit_needs_the_configured_secret() {
     );
 
     let quiet = Quiet::with(profile_config());
-    let error = edit_profile(edit_args(&quiet, "exit 9")).await.unwrap_err();
+    let error = edit(&quiet, "exit 9").await.unwrap_err();
     assert!(error.message.contains(PROFILE_SECRET), "{}", error.message);
     assert!(quiet.cluster.mutations().is_empty());
 }
@@ -1401,26 +1407,27 @@ async fn release_keeps_the_storage_and_resume_reuses_it() {
         .unwrap();
     let pvc_uid = quiet.cluster.pvc(&task.storage).unwrap()["metadata"]["uid"].clone();
 
-    let removal = quiet.backend.release_compute(&task).await.unwrap();
-    assert!(
-        matches!(removal, Removal::Initiated | Removal::Removed),
-        "{removal:?}"
+    quiet.cluster.hold_pod_deletion(true);
+    assert_eq!(
+        quiet.backend.release_compute(&task).await.unwrap(),
+        Removal::Initiated
     );
-    let observed = quiet.backend.observe(&task).await.unwrap();
-    if let Some(workload) = &observed.workload {
-        assert_eq!(workload.phase, WorkloadPhase::Deleting);
-        assert!(workload.resource_generation > first.workload.resource_generation);
-        assert_eq!(
-            quiet.backend.release_compute(&task).await.unwrap(),
-            Removal::InProgress
-        );
-    }
-    let backend = quiet.backend.clone();
-    let probe = task.clone();
-    wait_until("the Pod to go", async || {
-        backend.observe(&probe).await.unwrap().workload.is_none()
-    })
-    .await;
+    let workload = quiet.backend.observe(&task).await.unwrap().workload;
+    let workload = workload.expect("the Pod is still terminating");
+    assert_eq!(workload.phase, WorkloadPhase::Deleting);
+    assert!(workload.resource_generation > first.workload.resource_generation);
+    assert_eq!(
+        quiet.backend.release_compute(&task).await.unwrap(),
+        Removal::InProgress
+    );
+    quiet.cluster.hold_pod_deletion(false);
+    assert!(quiet
+        .backend
+        .observe(&task)
+        .await
+        .unwrap()
+        .workload
+        .is_none());
     assert_eq!(
         quiet.backend.release_compute(&task).await.unwrap(),
         Removal::AlreadyAbsent
@@ -1776,6 +1783,7 @@ async fn an_evicted_pod_waits_for_the_owner_without_the_policy() {
     h.wait_runner_state("task-1", RunnerState::Interrupted)
         .await;
     h.settle().await;
+    cluster.tick();
     assert_eq!(h.runner_state("task-1"), RunnerState::Interrupted);
     assert!(
         cluster.pod(&task.workload).is_none(),
