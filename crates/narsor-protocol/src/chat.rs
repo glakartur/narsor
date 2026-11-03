@@ -36,6 +36,10 @@ pub enum ChatElement {
         resumed_session: Option<String>,
         /// Why Narsor sent the prompt.
         purpose: PromptPurpose,
+        /// Who wrote the prompt. Absent in records written before authors
+        /// were kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<PromptAuthor>,
     },
     /// A user message the harness reported as sent to the agent.
     UserMessage { text: String },
@@ -162,6 +166,35 @@ pub enum PromptPurpose {
     Conductor,
     #[serde(other)]
     Unrecognized,
+}
+
+/// Who wrote a prompt the agent received.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptAuthor {
+    /// The engine, from the workflow template or its own wording.
+    Engine,
+    /// The engine, from a template that embeds content the user supplied.
+    EngineUser,
+    /// The conductor.
+    Conductor,
+    /// A person.
+    User,
+    #[serde(other)]
+    Unrecognized,
+}
+
+impl PromptAuthor {
+    /// The speaker label the conversation shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Engine => "Narsor",
+            Self::EngineUser => "Narsor + user",
+            Self::Conductor => "Conductor",
+            Self::User => "User",
+            Self::Unrecognized => "Narsor",
+        }
+    }
 }
 
 /// Where an agent question came from.
@@ -497,6 +530,7 @@ mod tests {
                 text: "Plan the ticket.".into(),
                 resumed_session: Some("sess-1".into()),
                 purpose: PromptPurpose::Reprompt,
+                author: Some(PromptAuthor::Conductor),
             },
             ChatElement::UserMessage {
                 text: "hello".into(),

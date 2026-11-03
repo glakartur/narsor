@@ -25,13 +25,14 @@ use narsor_engine::conductor::{
 };
 use narsor_engine::domain::{
     ActionConfig, ActionError, ActionResult, AnsweredBy, ConductorDecisionKind, ConductorPurpose,
-    ConductorTrigger, Confidence, EventData, ExecutionStatus, ProblemKind, RepromptedBy,
-    WorkflowExecution,
+    ConductorTrigger, Confidence, EventData, ExecutionStatus, HumanInputField, HumanInputType,
+    ProblemKind, RepromptedBy, WorkflowExecution,
 };
 use narsor_engine::engine::actions::agent::MISSING_OUTPUT_LABEL;
 use narsor_engine::engine::{
     owed_output_rescue, ActionExecutor, ActionKind, ActionOutcome, ActionRequest, Engine,
-    HumanInputDelivery, InputContinuation, OutputProblem, PendingHumanInput,
+    HumanInputDelivery, HumanInputRequest, InputContinuation, OutputProblem, PendingHumanInput,
+    SuspendedAction,
 };
 use serde_json::{json, Map, Value};
 use tokio::sync::Notify;
@@ -47,6 +48,8 @@ enum Reply {
     NoLabel { tail: &'static str, session: bool },
     /// This label, with `data`.
     Label(&'static str),
+    /// A question, in the agent's own session.
+    Ask(&'static str),
 }
 
 /// What the scripted agent was handed on one call.
@@ -93,6 +96,7 @@ impl ActionExecutor for ScriptedAgent {
                 .map(ToString::to_string),
             action_execution_id: request.action_execution_id.to_string(),
         });
+        let action_execution_id = request.action_execution_id.to_string();
         let reply = self
             .replies
             .lock()
@@ -114,6 +118,26 @@ impl ActionExecutor for ScriptedAgent {
                         details: Some(details),
                     })
                 }
+                Reply::Ask(question) => Ok(ActionOutcome::Suspended(
+                    SuspendedAction::AwaitingAgentInput(HumanInputRequest {
+                        action_execution_id,
+                        instruction: question.to_string(),
+                        fields: vec![HumanInputField {
+                            name: "answer".to_string(),
+                            field_type: HumanInputType::Text,
+                            required: true,
+                            description: None,
+                            options: Vec::new(),
+                        }],
+                        reason: None,
+                        required_values: Vec::new(),
+                        answer_tail: None,
+                        agent_harness: Some("claude-code".to_string()),
+                        agent_session_id: Some("agent-session".to_string()),
+                        prefilled_answer: None,
+                        permission: None,
+                    }),
+                )),
                 Reply::Label(label) => Ok(ActionOutcome::Completed(ActionResult {
                     output_label: label.to_string(),
                     data: json!({}),
@@ -1317,4 +1341,143 @@ async fn a_required_variable_missing_twice_goes_to_the_conductor() {
         execution.context.variables.get("plan_doc"),
         Some(&json!("docs/plan.md"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// A question in reply to a reprompt
+// ---------------------------------------------------------------------------
+
+/// The agent's first answer has no label, and its answer to the engine's
+/// reprompt is a question; then it gives `label` once it has its answer.
+fn question_after_reprompt(label: &'static str) -> Vec<Reply> {
+    vec![
+        Reply::NoLabel {
+            tail: "done, I think",
+            session: true,
+        },
+        Reply::Ask("Which API version?"),
+        Reply::Label(label),
+    ]
+}
+
+/// A started execution whose context carries `autopilot`.
+async fn run_with_autopilot(fixture: &Fixture, autopilot: Option<&str>) -> WorkflowExecution {
+    let definition = workflow("agent_problem");
+    let mut execution = fixture
+        .engine
+        .start(&definition, json!({}), fixture.harness.workspace())
+        .expect("start the workflow");
+    if let Some(autopilot) = autopilot {
+        execution
+            .context
+            .variables
+            .insert("autopilot".to_string(), json!(autopilot));
+        fixture
+            .harness
+            .store()
+            .save_execution(&execution)
+            .expect("save the execution");
+    }
+    fixture
+        .engine
+        .run(&definition, &execution.id)
+        .await
+        .expect("run the workflow")
+}
+
+fn agent_question(fixture: &Fixture, execution: &WorkflowExecution) -> PendingHumanInput {
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    let pending: PendingHumanInput = fixture
+        .harness
+        .store()
+        .load_pending_input(&execution.id)
+        .expect("read the pending input")
+        .expect("a pending input");
+    assert_eq!(pending.continuation, InputContinuation::ResumeAgent);
+    assert_eq!(pending.request.instruction, "Which API version?");
+    pending
+}
+
+/// AE1: without `autopilot` the question goes to the operator, the
+/// conductor is not asked, and the answer takes the agent on.
+#[tokio::test]
+async fn a_question_in_a_reprompt_waits_for_the_operator_by_default() {
+    let fixture = Fixture::new(question_after_reprompt("implemented"), Vec::new());
+    let execution = run_with_autopilot(&fixture, None).await;
+
+    let pending = agent_question(&fixture, &execution);
+    assert!(fixture.conductor.calls().is_empty());
+    let types = fixture.events(&execution.id);
+    assert_eq!(
+        count(&types, |data| matches!(
+            data,
+            EventData::ProblemRaised { .. }
+        )),
+        0
+    );
+
+    let delivery = HumanInputDelivery::with_values(
+        json!({ "answer": "version 2" })
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .for_episode(pending.episode_key());
+    let execution = fixture
+        .engine
+        .deliver_human_input(&workflow("agent_problem"), &execution.id, &delivery)
+        .await
+        .expect("answer the agent");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 3);
+    assert!(calls[2].prompt.contains("version 2"), "{}", calls[2].prompt);
+    assert_eq!(calls[2].resume_session.as_deref(), Some("agent-session"));
+}
+
+/// With `autopilot` on, a sure conductor answers; the agent goes on with it.
+#[tokio::test]
+async fn with_autopilot_on_the_conductor_answers_the_question() {
+    let fixture = Fixture::new(
+        question_after_reprompt("implemented"),
+        vec![Script::Answer(json!({
+            "decision": "reply",
+            "confidence": "high",
+            "rationale": "the task names it",
+            "message": "Use version 2.",
+        }))],
+    );
+    let execution = run_with_autopilot(&fixture, Some("on")).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(
+        fixture.conductor.purposes(),
+        vec![(ConductorPurpose::AnswerAgentQuestion, 1)]
+    );
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 3);
+    assert!(
+        calls[2].prompt.contains("Use version 2."),
+        "{}",
+        calls[2].prompt
+    );
+}
+
+/// AE2: when the conductor hands the question back, the operator gets the
+/// agent's question, not an output problem.
+#[tokio::test]
+async fn with_autopilot_on_an_unsure_conductor_forwards_the_question() {
+    let fixture = Fixture::new(
+        question_after_reprompt("implemented"),
+        vec![Script::Answer(json!({
+            "decision": "escalate",
+            "confidence": "low",
+            "rationale": "the task does not say",
+        }))],
+    );
+    let execution = run_with_autopilot(&fixture, Some("on")).await;
+
+    agent_question(&fixture, &execution);
+    assert_eq!(fixture.conductor.calls().len(), 1);
 }

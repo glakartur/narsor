@@ -656,6 +656,14 @@ pub fn places_step_history(template: &str) -> bool {
     expressions(template).contains(&"step.history")
 }
 
+/// Whether a template embeds content the user supplied: a task input
+/// (`inputs.*`) or the task's own ticket and title (`task.*`).
+pub fn embeds_user_content(template: &str) -> bool {
+    expressions(template)
+        .into_iter()
+        .any(|expression| expression.starts_with("inputs.") || expression.starts_with("task."))
+}
+
 /// Workflow step ids referenced through `steps.<id>.reply`, in first-use order.
 pub fn step_reply_references(template: &str) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
@@ -827,5 +835,18 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::String(_) => "a string",
         Value::Array(_) => "an array",
         Value::Object(_) => "an object",
+    }
+}
+
+#[cfg(test)]
+mod user_content_tests {
+    use super::embeds_user_content;
+
+    #[test]
+    fn only_inputs_and_task_count_as_user_content() {
+        assert!(embeds_user_content("Do {{ inputs.description }}"));
+        assert!(embeds_user_content("{{ task.title }}"));
+        assert!(!embeds_user_content("Implement {{ context.summary }}"));
+        assert!(!embeds_user_content("Implement the feature."));
     }
 }

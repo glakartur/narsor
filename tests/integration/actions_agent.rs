@@ -353,6 +353,7 @@ fn prompt_element(entry: &ConversationEntry) -> (String, Option<String>, PromptP
             text,
             resumed_session,
             purpose,
+            ..
         }] => (text.clone(), resumed_session.clone(), *purpose),
         other => panic!("expected one prompt element, got {other:?}"),
     }
@@ -3018,10 +3019,10 @@ async fn a_reprompt_that_fails_outright_is_a_problem_too() {
     assert_eq!(rejected, 2, "the reprompt attempt is closed as well");
 }
 
-/// KTD7: a question in reply to a reprompt is a failed reprompt, not a
-/// suspension that would restart the step in a fresh session.
+/// A question in reply to a reprompt is an ordinary agent question: the
+/// operator gets it (`ResumeAgent`), it is no output problem.
 #[tokio::test]
-async fn a_question_in_reply_to_a_reprompt_is_a_failed_reprompt() {
+async fn a_question_in_reply_to_a_reprompt_is_an_agent_question() {
     let fixture = EngineFixture::new();
     fixture
         .fake
@@ -3033,13 +3034,23 @@ async fn a_question_in_reply_to_a_reprompt_is_a_failed_reprompt() {
 
     let execution = run_reprompt_workflow(&fixture).await;
 
-    // Not an agent question (`ResumeAgent`) but a problem about the output.
-    let (_, problem) = output_problem(&fixture, &execution);
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    let pending: PendingHumanInput = fixture
+        .store()
+        .load_pending_input(&execution.id)
+        .expect("read the pending input")
+        .expect("a pending input");
+    assert_eq!(pending.continuation, InputContinuation::ResumeAgent);
     assert!(
-        problem.reason.contains("Which label do you mean?"),
+        pending
+            .request
+            .instruction
+            .contains("Which label do you mean?"),
         "{}",
-        problem.reason
+        pending.request.instruction
     );
+    let types = fixture.event_types(&execution.id);
+    assert!(!types.contains(&"problem_raised".to_string()), "{types:?}");
 }
 
 /// A timeout is an action failure, not a format error: it goes through the

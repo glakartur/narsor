@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
-use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
+use narsor_protocol::chat::{ChatElement, PromptAuthor, UnclassifiedReason};
 use narsor_protocol::controller::{HarnessUsageReport, UsageLimit};
 use serde_json::{Map, Value};
 use std::process::ExitStatus;
@@ -242,6 +242,7 @@ impl AgentExecutor {
             text: prompt.to_string(),
             resumed_session: resume.map(str::to_string),
             purpose: request.purpose,
+            author: Some(request.author.unwrap_or(PromptAuthor::Engine)),
         };
         sink.append_narsor(&entry, &[element]);
         match (&self.readings, request.execution_id) {

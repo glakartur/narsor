@@ -75,7 +75,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use chrono::Utc;
-use narsor_protocol::chat::PromptPurpose;
+use narsor_protocol::chat::{PromptAuthor, PromptPurpose};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
@@ -110,7 +110,9 @@ use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequ
 use crate::engine::retry::RetrySchedule;
 use crate::engine::timeline_file::FileReadingSink;
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
-use crate::workflow::template::{step_reply_references, step_stream_references};
+use crate::workflow::template::{
+    embeds_user_content, step_reply_references, step_stream_references,
+};
 use crate::workflow::{
     action_context_references, places_step_history, DeclaredNames, StepMemory, TemplateScope,
 };
@@ -180,6 +182,16 @@ struct AgentInput {
     /// Claude Code allow rules a resolved permission request grants this
     /// one resumed run; empty for any other answer.
     permission_rules: Vec<String>,
+    /// Who wrote the answer; records without one came from a person.
+    author: PromptAuthor,
+}
+
+/// The author of the prompt that carries an answer back to the agent.
+fn prompt_author(answered_by: AnsweredBy) -> PromptAuthor {
+    match answered_by {
+        AnsweredBy::Operator => PromptAuthor::User,
+        AnsweredBy::Conductor => PromptAuthor::Conductor,
+    }
 }
 
 /// How an execution ends when it enters the terminal state `state`.
@@ -843,6 +855,8 @@ pub(super) enum RepromptEnd {
     },
     /// It gave none; the attempt is still to be closed.
     Unlabelled(UnlabelledAnswer),
+    /// It asked a question instead; the attempt stays open until answered.
+    Asked(HumanInputRequest),
     /// The execution failed, and that is already persisted.
     Stopped,
 }
@@ -1194,9 +1208,8 @@ impl Engine {
     }
 
     fn rebuild_agent_executor(&mut self) {
-        let mut agent =
-            agent_executor(&self.store, &self.events, self.reading_notifier.clone())
-                .with_extra_args(self.agent_args.clone());
+        let mut agent = agent_executor(&self.store, &self.events, self.reading_notifier.clone())
+            .with_extra_args(self.agent_args.clone());
         if let Some(reporter) = &self.usage_reporter {
             agent = agent.with_usage_reporter(Arc::clone(reporter));
         }
@@ -1726,6 +1739,7 @@ impl Engine {
             resumed.pending.request.agent_harness.as_deref(),
             resumed.pending.request.agent_session_id.as_deref(),
             permission_rules,
+            PromptAuthor::User,
         )?;
         Ok(HandleState::Ready(execution))
     }
@@ -1799,6 +1813,7 @@ impl Engine {
                 candidate.agent_harness.as_deref(),
                 candidate.agent_session_id.as_deref(),
                 Vec::new(),
+                PromptAuthor::User,
             )?;
             return Ok(HandleState::Ready(execution));
         }
@@ -1846,6 +1861,7 @@ impl Engine {
                 resumed.pending.request.agent_harness.as_deref(),
                 resumed.pending.request.agent_session_id.as_deref(),
                 Vec::new(),
+                prompt_author(delivery.answered_by),
             )?;
             return Ok(HandleState::Ready(execution));
         }
@@ -1871,6 +1887,7 @@ impl Engine {
                 resumed.pending.request.agent_harness.as_deref(),
                 resumed.pending.request.agent_session_id.as_deref(),
                 Vec::new(),
+                prompt_author(delivery.answered_by),
             )?;
             return Ok(HandleState::Ready(execution));
         }
@@ -2011,6 +2028,7 @@ impl Engine {
                             .as_ref()
                             .map(|session| session.session_id.as_str()),
                         Vec::new(),
+                        PromptAuthor::User,
                     )?;
                     return Ok(HandleState::Ready(execution));
                 }
@@ -2470,6 +2488,12 @@ impl Engine {
         // explicit recovery. It remains durable until this point, so a daemon
         // restart before the attempt begins cannot silently discard it.
         let mut resumed_input = None;
+        let mut author = match action {
+            ActionConfig::Agent(template) if embeds_user_content(&template.prompt) => {
+                PromptAuthor::EngineUser
+            }
+            _ => PromptAuthor::Engine,
+        };
         if let (ActionConfig::Agent(config), ActionConfig::Agent(template)) =
             (&mut rendered, action)
         {
@@ -2489,6 +2513,7 @@ impl Engine {
                     config.prompt.push_str(&input.answer);
                 }
                 config.permission_grants = input.permission_rules.clone();
+                author = input.author;
                 resumed_input = Some(input);
             }
             if let Some(note) = self.take_operator_recovery_note(execution)? {
@@ -2505,6 +2530,7 @@ impl Engine {
                 &rendered,
                 action_execution_id,
                 PromptPurpose::Step,
+                author,
                 timeout,
             )
             .await?;
@@ -2618,6 +2644,7 @@ impl Engine {
         rendered: &ActionConfig,
         action_execution_id: &str,
         purpose: PromptPurpose,
+        author: PromptAuthor,
         timeout: Option<Duration>,
     ) -> Result<Result<ActionOutcome, ActionError>, AttemptFailure> {
         let kind = ActionKind::of(rendered);
@@ -2636,7 +2663,8 @@ impl Engine {
             .with_execution_id(&execution.id)
             .with_conversation_store(&conversation_store)
             .with_contract(StepContract::of(state))
-            .with_purpose(purpose);
+            .with_purpose(purpose)
+            .with_author(author);
 
         let outcome = executor.execute(request).await;
 
@@ -2789,6 +2817,10 @@ impl Engine {
                 result,
             }),
             RepromptEnd::Stopped => Ok(ActionUpshot::Stopped),
+            RepromptEnd::Asked(request) => {
+                let flow = self.route_agent_question(execution, state, request).await?;
+                Ok(ActionUpshot::settled(flow))
+            }
             RepromptEnd::Unlabelled(failure) => {
                 rescue.record(&failure);
                 // The record before the event that closes the attempt: a
@@ -2847,6 +2879,10 @@ impl Engine {
                 &rendered,
                 &action_execution_id,
                 PromptPurpose::Reprompt,
+                match by {
+                    RepromptedBy::Engine => PromptAuthor::Engine,
+                    RepromptedBy::Conductor => PromptAuthor::Conductor,
+                },
                 timeout,
             )
             .await
@@ -2887,14 +2923,18 @@ impl Engine {
                     Err(error) => RepromptFailure::Failed(error.message),
                 }
             }
-            Ok(ActionOutcome::Suspended(
-                SuspendedAction::AwaitingAgentInput(request)
-                | SuspendedAction::AwaitingHumanInput(request),
-            )) => RepromptFailure::Rejected(OutputRejection::from_question(
-                state,
-                &action_execution_id,
-                &request.instruction,
-            )),
+            // A question is the agent's to ask, here as in any step: it is
+            // answered and the agent goes on in its own session.
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(request))) => {
+                return Ok(RepromptEnd::Asked(request));
+            }
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingHumanInput(request))) => {
+                RepromptFailure::Rejected(OutputRejection::from_question(
+                    state,
+                    &action_execution_id,
+                    &request.instruction,
+                ))
+            }
             Err(error) => match OutputRejection::from_error(state, &action_execution_id, &error) {
                 Some(rejection) => RepromptFailure::Rejected(rejection),
                 None => RepromptFailure::Failed(error.message),
@@ -3839,6 +3879,7 @@ impl Engine {
         harness: Option<&str>,
         session: Option<&str>,
         permission_rules: Vec<String>,
+        author: PromptAuthor,
     ) -> Result<(), EngineError> {
         engine_metadata_mut(execution).insert(
             METADATA_AGENT_INPUT_KEY.to_string(),
@@ -3848,6 +3889,7 @@ impl Engine {
                 "harness": harness,
                 "session": session,
                 "permission_rules": permission_rules,
+                "author": author,
             }),
         );
         self.store.save_execution(execution)?;
@@ -3892,6 +3934,10 @@ impl Engine {
                 .get("session")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
+            author: record
+                .get("author")
+                .and_then(|author| serde_json::from_value(author.clone()).ok())
+                .unwrap_or(PromptAuthor::User),
             // A record of an earlier version holds one rule.
             permission_rules: match record.get("permission_rules") {
                 Some(Value::Array(rules)) => rules

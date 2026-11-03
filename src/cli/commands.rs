@@ -608,7 +608,14 @@ pub fn conversation_entry_lines(entry: &crate::api::ConversationEntryDto) -> Vec
         .filter(|classified| !narsor || classified.element_index == 0)
         .map(|classified| {
             let body = if narsor {
-                crate::tui::scroll::sanitize(&String::from_utf8_lossy(&classified.raw))
+                let text = crate::tui::scroll::sanitize(&String::from_utf8_lossy(&classified.raw));
+                match &classified.element {
+                    ChatElement::Prompt {
+                        author: Some(author),
+                        ..
+                    } => format!("[{}] {text}", author.label()),
+                    _ => text,
+                }
             } else if matches!(
                 classified.element,
                 ChatElement::Unclassified { .. } | ChatElement::Unrecognized

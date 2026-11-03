@@ -415,6 +415,7 @@ fn purpose_word(purpose: ConductorPurpose) -> &'static str {
         ConductorPurpose::ChooseOutput | ConductorPurpose::ChooseOutputAfterReprompt => {
             "wybiera wyjście kroku"
         }
+        ConductorPurpose::AnswerAgentQuestion => "odpowiada na pytanie agenta",
         ConductorPurpose::DiagnoseFailure => "diagnozuje nieudany krok",
         ConductorPurpose::ReplyToChat => "odpowiada na wiadomość",
         ConductorPurpose::SummarizeGate => "streszcza bramkę",

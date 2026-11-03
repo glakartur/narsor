@@ -1669,15 +1669,13 @@ mod task_app_list {
     use std::time::Instant;
 
     use crossterm::event::KeyCode;
-    
-    
 
     use narsor::api::{ApiClient, ClientError};
     use narsor::tui::connection::LinkState;
     use narsor::tui::task_app::list::{Attention, StateIcon};
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{layout, DetailTab, EventFeed, Focus, Request, TaskApp};
-    
+
     use narsor_engine::domain::ExecutionStatus;
     use narsor_engine::orchestration::{
         AttentionKind, Observation, QueueReason, RunnerState, TaskEventKind,
@@ -1685,7 +1683,7 @@ mod task_app_list {
     use narsor_protocol::controller::MoveTaskTarget;
 
     use super::key;
-    
+
     use super::task_app_support::{
         at, event, ids, listing, queue_view, queued, task, titled, waiting, waiting_for_capacity,
         with_controller, with_runner,
@@ -2520,7 +2518,6 @@ mod task_app_list {
             assert_eq!(app.list().selected_id(), Some("a"));
             assert!(note(&app).contains("zaznaczono a"), "{}", note(&app));
         }
-
     }
 
     mod layouts {
@@ -2734,7 +2731,6 @@ mod task_app_list {
             assert!(!app.mutation_allowed());
             assert!(note(&app).contains("łączę"), "{}", note(&app));
         }
-
     }
 
     mod connection {
@@ -2800,7 +2796,6 @@ mod task_app_list {
             feed.ensure_open(&app);
             assert!(!feed.is_open());
         }
-
     }
 }
 
@@ -2827,7 +2822,6 @@ mod task_app_detail {
     use narsor_engine::engine::{ConversationState, PositionStatus};
     use narsor_engine::orchestration::{QueueReason, RunnerState, TaskEventKind};
 
-    
     use super::task_app_support::{
         event, execution_events, listing, position, queued, task, timeline, titled,
         with_controller, with_runner,
@@ -4523,10 +4517,6 @@ mod task_app_detail {
     mod relay {
         use super::*;
 
-
-
-
-
         /// Any other reason is shown with what was read last, and is not asked
         /// again until the task changes.
         #[test]
@@ -4614,7 +4604,6 @@ mod task_app_detail {
             assert_eq!(conductor.note(), Some("paused"));
             assert!(!conductor.needs_read(1, later + std::time::Duration::from_secs(3600)));
         }
-
     }
 
     mod odds_and_ends {
@@ -4845,7 +4834,6 @@ mod task_app_waiting {
     use narsor_protocol::controller::ConductorView;
     use narsor_protocol::controller::{ConductorReadResponse, ExecutionEventsSource};
 
-    
     use super::task_app_support::{
         event, listing, position, task, timeline, titled, waiting_on, with_controller,
         with_pending, with_runner,
@@ -5321,7 +5309,6 @@ mod task_app_waiting {
             .map(|note| note.text.clone())
             .unwrap_or_default()
     }
-
 
     #[test]
     fn a_rejected_resume_gives_the_reply_back_in_the_field() {
@@ -6691,15 +6678,10 @@ mod task_app_waiting {
     }
 
     // -- against a served control plane -----------------------------------------
-
-
-
-
 }
 
 /// U11: the action menu, the confirmations and the commands of the operator.
 mod task_app_actions {
-    
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -6718,7 +6700,6 @@ mod task_app_actions {
         TaskEventKind,
     };
 
-    
     use super::task_app_support::{
         displayed, event, listing, offered, queued, task, titled, waiting_on, with_controller,
         with_runner, with_transitions,
@@ -8208,7 +8189,6 @@ mod task_app_actions {
     }
 
     // -- against a served control plane ------------------------------------------
-
 }
 
 /// U12: the *Dyrygent* tab — the chat, the decisions with their undo, the
@@ -8238,7 +8218,6 @@ mod task_app_conductor {
     use narsor_protocol::controller::ConductorReadResponse;
     use narsor_protocol::controller::ConductorView;
 
-    
     use super::task_app_support::{
         chat_entry, conductor_view, event, listing, task, titled, waiting_on, with_conductor,
         with_controller, with_runner, without_conductor,
@@ -9274,12 +9253,11 @@ mod task_app_conductor {
     }
 
     // -- against a served control plane -------------------------------------------
-
 }
 
 /// U13: the new-task form, the history and the repositories.
 mod task_app_create {
-    
+
     use std::time::Instant;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9299,11 +9277,9 @@ mod task_app_create {
         RepositoryListResponse, TaskSummary, ValidateWorkflowResponse, WorkflowListResponse,
     };
     use narsor_engine::domain::ParamType;
-    
-    
+
     use narsor_protocol::api::LegacyExecutionListResponse;
 
-    
     use super::task_app_support::{
         archived, capabilities, catalogue, catalogue_workflow, legacy, listing, queued, registry,
         repository, titled, workflow_input,
@@ -9481,8 +9457,6 @@ mod task_app_create {
             .map(|row| (row.icon.glyph(), row.title, row.label))
             .collect()
     }
-
-
 
     // -- the form -------------------------------------------------------------
 
@@ -10630,32 +10604,11 @@ mod task_app_create {
             let entry = app.history().unwrap().selected_entry().unwrap();
             assert!(matches!(entry, HistoryEntry::Archived(_)));
         }
-
-
-
-
     }
 
     // -- over the wire ---------------------------------------------------------
 
-    mod over_the_wire {
-        
-
-        
-        
-
-        
-
-
-
-
-
-
-
-
-
-
-    }
+    mod over_the_wire {}
 
     // -- the repositories ------------------------------------------------------
 
@@ -10790,10 +10743,6 @@ mod task_app_create {
     mod repositories {
         use super::*;
 
-        
-
-
-
         fn names(app: &TaskApp) -> Vec<String> {
             app.repositories()
                 .unwrap()
@@ -10896,7 +10845,6 @@ mod task_app_create {
             assert_eq!(app.view_kind(), ViewKind::Tasks);
             assert_eq!(app.list().selected_id(), Some("a"));
         }
-
     }
 }
 
@@ -10904,20 +10852,16 @@ mod task_app_create {
 /// it from the list, the details, the history and the repositories, never
 /// from a field being typed into or over another window (R12–R15, AE3, AE4).
 mod task_app_harness {
-    
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 
     use narsor::api::ApiClient;
     use narsor::tui::keymap::{self, Action, Context, BINDINGS};
-    
-    
-    
+
     use narsor::tui::task_app::{DetailTab, Focus, Request, TaskApp};
     use narsor_engine::domain::ExecutionStatus;
 
-    
     use super::task_app_support::{
         capabilities, catalogue, catalogue_workflow, harness_selection, listing, registry, task,
         titled, with_controller, with_pending, with_runner, HARNESSES,
@@ -10967,10 +10911,6 @@ mod task_app_harness {
     fn h() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)
     }
-
-
-
-
 
     #[test]
     fn h_opens_the_choice_from_the_list_and_from_every_tab_of_the_details() {

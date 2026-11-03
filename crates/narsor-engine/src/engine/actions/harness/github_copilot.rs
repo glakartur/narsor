@@ -332,27 +332,27 @@ impl GitHubCopilotStreamParser {
             "assistant.reasoning_delta" => {
                 self.reasoning_seen = true;
                 data.get("deltaContent")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(|text| {
-                    vec![ChatElement::Thinking {
-                        text: text.to_string(),
-                        redacted: false,
-                    }]
-                })
-                .unwrap_or_default()
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| {
+                        vec![ChatElement::Thinking {
+                            text: text.to_string(),
+                            redacted: false,
+                        }]
+                    })
+                    .unwrap_or_default()
             }
             "assistant.reasoning" => {
                 self.reasoning_seen = true;
                 data.get("content")
-                .and_then(Value::as_str)
-                .map(|text| {
-                    vec![ChatElement::Thinking {
-                        text: text.to_string(),
-                        redacted: false,
-                    }]
-                })
-                .unwrap_or_else(|| vec![technical_event(kind, data)])
+                    .and_then(Value::as_str)
+                    .map(|text| {
+                        vec![ChatElement::Thinking {
+                            text: text.to_string(),
+                            redacted: false,
+                        }]
+                    })
+                    .unwrap_or_else(|| vec![technical_event(kind, data)])
             }
             "assistant.message" => {
                 let content = data.get("content").and_then(Value::as_str);

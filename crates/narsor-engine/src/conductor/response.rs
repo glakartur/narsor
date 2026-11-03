@@ -102,6 +102,7 @@ pub fn allowed_decisions(purpose: ConductorPurpose) -> &'static [DecisionKind] {
         ConductorPurpose::ChooseOutputAfterReprompt => {
             &[DecisionKind::ChooseOutput, DecisionKind::Escalate]
         }
+        ConductorPurpose::AnswerAgentQuestion => &[DecisionKind::Reply, DecisionKind::Escalate],
         ConductorPurpose::DiagnoseFailure => &[DecisionKind::Diagnose, DecisionKind::Retry],
         ConductorPurpose::ReplyToChat => &[DecisionKind::Reply],
         ConductorPurpose::SummarizeGate => &[DecisionKind::Annotate],

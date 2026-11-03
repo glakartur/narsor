@@ -244,6 +244,7 @@ impl Conductor {
 /// Which answer a request takes, by what it asks.
 fn answer_key(purpose: ConductorPurpose) -> &'static str {
     match purpose {
+        ConductorPurpose::AnswerAgentQuestion => "reply",
         ConductorPurpose::DiagnoseFailure => "diagnose",
         ConductorPurpose::ReplyToChat => "reply",
         ConductorPurpose::SummarizeGate => "annotate",

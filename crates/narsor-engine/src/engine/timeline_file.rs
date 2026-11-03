@@ -370,13 +370,14 @@ pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageRea
                 (x, y) => x.or(y),
             };
         }
-        position.usage = (total.is_some() || subagents.is_some() || count.is_some() || cost.is_some())
-            .then_some(PositionUsage {
-                total,
-                subagents,
-                subagent_count: count,
-                cost_usd: cost,
-            });
+        position.usage =
+            (total.is_some() || subagents.is_some() || count.is_some() || cost.is_some())
+                .then_some(PositionUsage {
+                    total,
+                    subagents,
+                    subagent_count: count,
+                    cost_usd: cost,
+                });
     }
 }
 
@@ -465,8 +466,14 @@ mod tests {
             ..Timeline::default()
         };
         let readings = BTreeMap::from([
-            ("a1".to_string(), reading(ReadingBasis::Increment, 10, 4, 0.5)),
-            ("a2".to_string(), reading(ReadingBasis::Increment, 1, 2, 0.25)),
+            (
+                "a1".to_string(),
+                reading(ReadingBasis::Increment, 10, 4, 0.5),
+            ),
+            (
+                "a2".to_string(),
+                reading(ReadingBasis::Increment, 1, 2, 0.25),
+            ),
         ]);
         apply_usage(&mut timeline, &readings);
         let usage = timeline.positions[0].usage.unwrap();
@@ -486,9 +493,18 @@ mod tests {
             ..Timeline::default()
         };
         let readings = BTreeMap::from([
-            ("a1".to_string(), reading(ReadingBasis::SessionTotal, 10, 4, 1.0)),
-            ("b1".to_string(), reading(ReadingBasis::SessionTotal, 7, 7, 0.7)),
-            ("a2".to_string(), reading(ReadingBasis::SessionTotal, 25, 9, 1.75)),
+            (
+                "a1".to_string(),
+                reading(ReadingBasis::SessionTotal, 10, 4, 1.0),
+            ),
+            (
+                "b1".to_string(),
+                reading(ReadingBasis::SessionTotal, 7, 7, 0.7),
+            ),
+            (
+                "a2".to_string(),
+                reading(ReadingBasis::SessionTotal, 25, 9, 1.75),
+            ),
         ]);
         apply_usage(&mut timeline, &readings);
         let of = |i: usize| timeline.positions[i].usage.unwrap();

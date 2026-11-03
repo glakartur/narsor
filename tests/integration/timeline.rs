@@ -620,7 +620,11 @@ fn an_answer_to_the_agent_in_its_session_is_the_same_entry() {
         effort: None,
     });
 
-    let timeline = build_timeline(&log.events, ExecutionStatus::Running, &presence(&["a1", "a2"]));
+    let timeline = build_timeline(
+        &log.events,
+        ExecutionStatus::Running,
+        &presence(&["a1", "a2"]),
+    );
 
     assert_eq!(timeline.positions.len(), 1);
     let position = &timeline.positions[0];
@@ -677,7 +681,11 @@ fn a_new_session_on_a_step_has_the_next_number() {
 
     let timeline = build_timeline(&log.events, ExecutionStatus::Completed, &HashSet::new());
 
-    let labels: Vec<&str> = timeline.positions.iter().map(|p| p.label.as_str()).collect();
+    let labels: Vec<&str> = timeline
+        .positions
+        .iter()
+        .map(|p| p.label.as_str())
+        .collect();
     assert_eq!(labels, ["plan #1", "plan #2"]);
     assert_eq!(timeline.positions[1].session_number, Some(2));
 }
@@ -747,5 +755,7 @@ fn a_timeline_file_in_the_wrong_state_is_made_again() {
 
     let timeline = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
     assert_eq!(timeline.positions.len(), 1);
-    assert!(std::fs::read_to_string(&path).unwrap().contains("\"positions\""));
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("\"positions\""));
 }
