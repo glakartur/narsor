@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/narsor-logo.svg" alt="Narsor" width="232">
+</p>
+
 # Narsor
 
 **Narsor is a software factory built on AI agents and a flexibly defined
