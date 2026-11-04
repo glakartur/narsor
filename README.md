@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/narsor-logo.svg" alt="Narsor" width="232">
+  <img src="docs/assets/narsor-banner.svg" alt="Narsor" width="100%">
 </p>
 
 # Narsor
