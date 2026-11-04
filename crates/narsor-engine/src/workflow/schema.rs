@@ -17,10 +17,20 @@ pub use crate::config::duration::{parse_duration, DurationParseError};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+use crate::domain::SchemaVersion;
+
 /// The whole workflow file (`docs/dev/workflow-schema.md` §2).
+///
+/// Which schema the file is written in is read from `schema` and enforced
+/// while parsing: a `v2` file that still uses `globals.workspace` or an
+/// agent's `workspace_access`, and a `v1` file that uses `globals.repositories`
+/// or a step's `workspace`, is rejected with an error naming the field.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawWorkflowFile")]
 pub struct WorkflowFile {
+    /// Schema the file is written in; a missing `schema` means `v1`.
+    pub schema: SchemaVersion,
+
     /// Unique workflow name; the loader also derives the definition id from it.
     pub name: String,
 
@@ -28,31 +38,101 @@ pub struct WorkflowFile {
     pub version: u32,
 
     /// Optional description of the workflow's purpose.
-    #[serde(default)]
     pub description: Option<String>,
 
     /// Inputs required to start an execution.
-    #[serde(default)]
     pub inputs: Vec<InputSchema>,
 
     /// Workflow-wide defaults.
-    #[serde(default)]
     pub globals: Option<GlobalsSchema>,
 
     /// How a task introduces itself: title and links (§3.6).
-    #[serde(default)]
     pub display: Option<DisplaySchema>,
 
     /// The state graph. Order is significant: without an explicit
     /// `initial: true` flag the first state is the entry point, so the mapping
     /// is kept as a vector of pairs instead of a `HashMap`.
-    #[serde(deserialize_with = "deserialize_ordered_states")]
     pub states: Vec<(String, StateSchema)>,
 
     /// States whose entry ends the execution, with the status each one
     /// produces. Accepts both forms of §3.5 — see [`TerminalStatesSchema`].
-    #[serde(default)]
     pub terminal_states: TerminalStatesSchema,
+}
+
+/// The file as it is written, before the schema rules are applied.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWorkflowFile {
+    #[serde(default)]
+    schema: SchemaVersion,
+    name: String,
+    version: u32,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    inputs: Vec<InputSchema>,
+    #[serde(default)]
+    globals: Option<GlobalsSchema>,
+    #[serde(default)]
+    display: Option<DisplaySchema>,
+    #[serde(deserialize_with = "deserialize_ordered_states")]
+    states: Vec<(String, StateSchema)>,
+    #[serde(default)]
+    terminal_states: TerminalStatesSchema,
+}
+
+impl TryFrom<RawWorkflowFile> for WorkflowFile {
+    type Error = String;
+
+    fn try_from(raw: RawWorkflowFile) -> Result<Self, Self::Error> {
+        let globals = raw.globals.as_ref();
+        match raw.schema {
+            SchemaVersion::V1 => {
+                if globals.is_some_and(|globals| globals.repositories.is_some()) {
+                    return Err("'globals.repositories' requires 'schema: v2'".to_string());
+                }
+                if let Some((id, _)) = raw
+                    .states
+                    .iter()
+                    .find(|(_, state)| state.workspace.is_some())
+                {
+                    return Err(format!("'states.{id}.workspace' requires 'schema: v2'"));
+                }
+            }
+            SchemaVersion::V2 => {
+                if globals.is_some_and(|globals| globals.workspace.is_some()) {
+                    return Err(
+                        "'globals.workspace' is not allowed in 'schema: v2'; declare \
+                         'globals.repositories'"
+                            .to_string(),
+                    );
+                }
+                let with_access = raw.states.iter().find(|(_, state)| {
+                    matches!(
+                        &state.action,
+                        Some(ActionSchema::Agent(agent)) if agent.workspace_access.is_some()
+                    )
+                });
+                if let Some((id, _)) = with_access {
+                    return Err(format!(
+                        "'states.{id}.action.workspace_access' is not allowed in 'schema: v2'; \
+                         use the step's 'workspace' section"
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            schema: raw.schema,
+            name: raw.name,
+            version: raw.version,
+            description: raw.description,
+            inputs: raw.inputs,
+            globals: raw.globals,
+            display: raw.display,
+            states: raw.states,
+            terminal_states: raw.terminal_states,
+        })
+    }
 }
 
 /// The `display` section (§3.6): templates for a task's title and links.
@@ -251,9 +331,13 @@ pub struct GlobalsSchema {
     #[serde(default)]
     pub retry_policy: Option<RetryPolicySchema>,
 
-    /// Default workspace for the execution.
+    /// Default workspace for the execution (`schema: v1` only).
     #[serde(default)]
     pub workspace: Option<WorkspaceSchema>,
+
+    /// Repositories of the workflow (`schema: v2` only).
+    #[serde(default)]
+    pub repositories: Option<Vec<RepositorySchema>>,
 
     /// Base image for every step of a remote task, overriding the
     /// repository's own (R15). A reference string, or a mapping with
@@ -337,6 +421,96 @@ pub struct LocalWorkspaceSchema {
     pub preserve_paths: Vec<String>,
 }
 
+/// One entry of `globals.repositories` (`schema: v2`).
+///
+/// Exactly one of `repository` and `path` names the source.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "RawRepositorySchema")]
+pub struct RepositorySchema {
+    /// Label of the repository and name of its folder in the task directory.
+    pub name: String,
+
+    /// Marks the primary repository; exactly one repository is primary.
+    pub primary: bool,
+
+    /// Branch a new task starts on.
+    pub default_branch: Option<String>,
+
+    /// Where the repository comes from.
+    pub source: RepositorySourceSchema,
+
+    /// Paths captured into a checkpoint even though the repository ignores
+    /// them; the same caveats as [`GitWorkspaceSchema::preserve_paths`].
+    pub preserve_paths: Vec<String>,
+}
+
+/// The source of a `globals.repositories` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositorySourceSchema {
+    /// Repository id from the registry; may be a `{{ }}` template.
+    Repository(String),
+    /// Local folder, relative to the task directory.
+    Path(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRepositorySchema {
+    name: String,
+    #[serde(default)]
+    primary: bool,
+    #[serde(default)]
+    default_branch: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    preserve_paths: Vec<String>,
+}
+
+impl TryFrom<RawRepositorySchema> for RepositorySchema {
+    type Error = String;
+
+    fn try_from(raw: RawRepositorySchema) -> Result<Self, Self::Error> {
+        let source = match (raw.repository, raw.path) {
+            (Some(repository), None) => RepositorySourceSchema::Repository(repository),
+            (None, Some(path)) => RepositorySourceSchema::Path(path),
+            _ => {
+                return Err(format!(
+                    "repository '{}' needs exactly one of 'repository' and 'path'",
+                    raw.name
+                ))
+            }
+        };
+        Ok(Self {
+            name: raw.name,
+            primary: raw.primary,
+            default_branch: raw.default_branch,
+            source,
+            preserve_paths: raw.preserve_paths,
+        })
+    }
+}
+
+/// The `workspace` section of a step (`schema: v2`): which repositories the
+/// step gets and where the agent starts.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepWorkspaceSchema {
+    /// A repository name, or `.` for the directory holding all of them.
+    #[serde(default)]
+    pub root: Option<String>,
+
+    /// Repositories the step may change.
+    #[serde(default)]
+    pub write: Vec<String>,
+
+    /// Repositories the step may only read.
+    #[serde(default)]
+    pub read: Vec<String>,
+}
+
 /// A single state of the graph (§3.3).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -392,6 +566,11 @@ pub struct StateSchema {
     /// repository's (R15).
     #[serde(default)]
     pub image: Option<crate::domain::ImageSpec>,
+
+    /// Repositories the step gets (`schema: v2` only). Without it the step
+    /// gets all of them, the primary one writable.
+    #[serde(default)]
+    pub workspace: Option<StepWorkspaceSchema>,
 }
 
 /// One entry of a state's `variables` or `artifacts` list: a name and what

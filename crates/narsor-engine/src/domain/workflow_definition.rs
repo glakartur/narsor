@@ -45,11 +45,18 @@ pub struct WorkflowDefinition {
     #[serde(default)]
     pub globals: GlobalsConfig,
 
-    /// Default workspace for every execution of this workflow
-    /// (`globals.workspace` in YAML). Workspaces are per execution, never
-    /// per state.
+    /// The schema the definition was written in. Everything past the loader
+    /// sees `v2`; this only lets diagnostics name the fields the author
+    /// actually wrote (a converted `v1` definition reports
+    /// `globals.workspace`, not `globals.repositories[0]`).
+    #[serde(default, skip_serializing_if = "SchemaVersion::is_v2")]
+    pub source_schema: SchemaVersion,
+
+    /// Repositories the workflow works on (`globals.repositories` in YAML,
+    /// or the converted `globals.workspace` of a `v1` file). Repositories are
+    /// per execution, never per state. Empty for a workflow without any.
     #[serde(default)]
-    pub workspace: Option<WorkspaceSpec>,
+    pub repositories: Vec<RepositoryDefinition>,
 
     /// How a task of this workflow introduces itself: title and links, still
     /// templated (`display` in YAML).
@@ -61,6 +68,128 @@ pub struct WorkflowDefinition {
 
     /// The entry point state
     pub initial_state: StateId,
+}
+
+impl WorkflowDefinition {
+    /// The primary repository, if the workflow declares any.
+    pub fn primary_repository(&self) -> Option<&RepositoryDefinition> {
+        self.repositories
+            .iter()
+            .find(|repository| repository.primary)
+    }
+
+    /// The primary repository as the single-workspace declaration the
+    /// single-repository runtime still consumes.
+    pub fn primary_workspace_spec(&self) -> Option<WorkspaceSpec> {
+        self.primary_repository()
+            .map(RepositoryDefinition::workspace_spec)
+    }
+}
+
+/// Version of the YAML schema a definition was written in (`schema` in YAML).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SchemaVersion {
+    /// The original single-workspace schema; also what a missing `schema`
+    /// means.
+    #[default]
+    V1,
+    V2,
+}
+
+impl SchemaVersion {
+    fn is_v2(&self) -> bool {
+        *self == SchemaVersion::V2
+    }
+}
+
+/// One repository of a workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryDefinition {
+    /// Label of the repository and name of its folder in the task directory.
+    pub name: String,
+
+    /// Whether this is the workflow's primary repository. Exactly one
+    /// repository is.
+    pub primary: bool,
+
+    /// Branch a new task starts on. `None` leaves the choice to the
+    /// registry's default branch.
+    #[serde(default)]
+    pub default_branch: Option<String>,
+
+    /// Where the repository comes from.
+    pub source: RepositorySource,
+
+    /// Paths captured into a checkpoint even though the repository ignores
+    /// them (`preserve_paths` in YAML).
+    #[serde(default)]
+    pub preserve_paths: Vec<String>,
+}
+
+impl RepositoryDefinition {
+    /// The repository as the single-workspace declaration of the
+    /// single-repository runtime; `default_branch` plays the part of `ref`.
+    pub fn workspace_spec(&self) -> WorkspaceSpec {
+        match &self.source {
+            RepositorySource::Git { repository } => WorkspaceSpec::Git {
+                repository: repository.clone(),
+                git_ref: self.default_branch.clone(),
+                preserve_paths: self.preserve_paths.clone(),
+            },
+            RepositorySource::Local { path } => WorkspaceSpec::Local {
+                path: path.clone(),
+                preserve_paths: self.preserve_paths.clone(),
+            },
+        }
+    }
+}
+
+/// Where a workflow repository comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RepositorySource {
+    /// Registered repository: a registry id, or a `{{ inputs.x }}` template
+    /// naming an input of type `repository`.
+    Git { repository: String },
+    /// Plain local folder, relative to the task directory.
+    Local { path: String },
+}
+
+/// What a step may touch: the `workspace` section of a step.
+///
+/// `write` and `read` name repositories of the workflow; a step without the
+/// section gets every repository (the primary one writable). See
+/// [`WorkspaceAccess`] for how the section maps onto a harness permission.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepWorkspace {
+    /// Where the agent starts: a repository name or [`WORKSPACE_ROOT`].
+    /// Omitted means the first `write` repository, else the first `read` one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+
+    /// Repositories the step may change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write: Vec<String>,
+
+    /// Repositories the step may only read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<String>,
+}
+
+/// The `root` value that means the directory holding every repository folder.
+pub const WORKSPACE_ROOT: &str = ".";
+
+impl StepWorkspace {
+    /// The coarse permission this section amounts to: writable when it
+    /// lists a repository to write, read-only otherwise.
+    pub fn access(&self) -> WorkspaceAccess {
+        if self.write.is_empty() {
+            WorkspaceAccess::ReadOnly
+        } else {
+            WorkspaceAccess::ReadWrite
+        }
+    }
 }
 
 /// Workflow-wide defaults from the `globals` section
@@ -81,7 +210,9 @@ pub struct GlobalsConfig {
     pub image: Option<ImageSpec>,
 }
 
-/// Default workspace configuration for an execution
+/// Single-repository workspace declaration: the shape of a `v1`
+/// `globals.workspace`, kept as the view the single-repository runtime has of
+/// the primary repository (see [`WorkflowDefinition::primary_workspace_spec`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkspaceSpec {
@@ -235,10 +366,24 @@ pub struct State {
     #[serde(default)]
     pub allow_manual_override: bool,
 
+    /// Repositories this step may touch (`workspace` in YAML). `None` means
+    /// all of them, the primary one writable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<StepWorkspace>,
+
     /// Base-image override for this step (R15): wins over `globals.image`
     /// and over the repository's base image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageSpec>,
+}
+
+impl State {
+    /// The permission the step's agent runs with: `None` for a step without a
+    /// `workspace` section, which leaves the harness's own configuration in
+    /// effect.
+    pub fn workspace_access(&self) -> Option<WorkspaceAccess> {
+        self.workspace.as_ref().map(StepWorkspace::access)
+    }
 }
 
 /// Configuration for an action
@@ -275,9 +420,13 @@ pub struct AgentActionConfig {
 
     /// Access the agent receives to its execution workspace.
     ///
-    /// This is intentionally independent of a particular harness: each
-    /// adapter translates it to its native permission mechanism.
-    #[serde(default = "legacy_workspace_access")]
+    /// Never loaded from workflow source or persisted definitions: the engine
+    /// derives it from the step's `workspace` section
+    /// ([`State::workspace_access`]) when the action runs, or sets it for
+    /// its own read-only runs (reprompts, the conductor). This is
+    /// intentionally independent of a particular harness: each adapter
+    /// translates it to its native permission mechanism.
+    #[serde(skip)]
     pub workspace_access: Option<WorkspaceAccess>,
 
     /// Prompt to send to the agent
@@ -305,17 +454,8 @@ fn default_history() -> bool {
     true
 }
 
-fn legacy_workspace_access() -> Option<WorkspaceAccess> {
-    // Records written before omitted access was preserved serialized the
-    // schema's read-write default as an explicit value.
-    Some(WorkspaceAccess::ReadWrite)
-}
-
-/// The workflow-level workspace permission for an agent action.
-///
-/// New actions are writable unless they explicitly opt into report-only work.
-/// `serde(default)` also makes executions stored before this field existed
-/// retain that historical effective behaviour.
+/// The workspace permission an agent action runs with, derived from the
+/// step's `workspace` section by [`StepWorkspace::access`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceAccess {
@@ -775,9 +915,17 @@ pub enum ValidationError {
     },
 
     #[error("Field '{field}' references unknown input '{variable}'")]
-    UnknownInputReferenceInGlobals {
+    UnknownInputReferenceInGlobals { field: String, variable: String },
+
+    // --- Repositories (schema v2) ---
+    #[error("Field '{field}' is invalid: {reason}")]
+    InvalidRepository { field: String, reason: String },
+
+    #[error("State '{state}': field 'workspace.{field}' is invalid: {reason}")]
+    InvalidStepWorkspace {
+        state: StateId,
         field: &'static str,
-        variable: String,
+        reason: String,
     },
 
     // --- Display (§3.6) ---

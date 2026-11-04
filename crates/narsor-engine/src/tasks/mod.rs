@@ -336,9 +336,10 @@ pub fn workspace_request(
     definition: &WorkflowDefinition,
     inputs: &Map<String, Value>,
 ) -> Result<Option<WorkspaceRequest>> {
-    let Some(spec) = &definition.workspace else {
+    let Some(spec) = definition.primary_workspace_spec() else {
         return Ok(None);
     };
+    let spec = &spec;
 
     let context = Context::new();
     let scope = TemplateScope::new(inputs, &context);

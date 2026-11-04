@@ -4,7 +4,7 @@
 //! verbatim from `docs/dev/workflow-schema.md` §4.
 
 use narsor_engine::domain::{
-    ActionConfig, ExecutionStatus, HumanInputType, ParamType, State, TerminalStatus,
+    ActionConfig, ExecutionStatus, HumanInputType, ParamType, State, StepWorkspace, TerminalStatus,
     WorkflowDefinition, WorkspaceAccess, WorkspaceSpec,
 };
 use narsor_engine::engine::terminal_status;
@@ -264,7 +264,7 @@ fn global_workspace_becomes_a_definition_level_spec() {
     let definition = load_reference();
 
     match definition
-        .workspace
+        .primary_workspace_spec()
         .expect("globals.workspace must be kept")
     {
         WorkspaceSpec::Git {
@@ -306,7 +306,7 @@ terminal_states: [done]
     let definition = load_from_str(yaml).unwrap();
 
     match definition
-        .workspace
+        .primary_workspace_spec()
         .expect("globals.workspace must be kept")
     {
         WorkspaceSpec::Local {
@@ -345,7 +345,7 @@ terminal_states: [done]
     let definition = load_from_str(yaml).unwrap();
 
     match definition
-        .workspace
+        .primary_workspace_spec()
         .expect("globals.workspace must be kept")
     {
         WorkspaceSpec::Local { preserve_paths, .. } => {
@@ -382,7 +382,7 @@ terminal_states: [done]
     let definition = load_from_str(yaml).unwrap();
 
     match definition
-        .workspace
+        .primary_workspace_spec()
         .expect("globals.workspace must be kept")
     {
         WorkspaceSpec::Git {
@@ -423,7 +423,7 @@ terminal_states: [done]
     let definition = load_from_str(yaml).unwrap();
 
     match definition
-        .workspace
+        .primary_workspace_spec()
         .expect("globals.workspace must be kept")
     {
         WorkspaceSpec::Git { preserve_paths, .. } => {
@@ -660,7 +660,7 @@ terminal_states: [done]
     let definition = load_from_str(yaml).unwrap();
 
     assert!(definition.inputs.is_empty());
-    assert!(definition.workspace.is_none());
+    assert!(definition.repositories.is_empty());
     assert!(definition.globals.timeout_secs.is_none());
     assert!(definition.globals.retry_policy.is_none());
     assert!(state(&definition, "only").timeout_secs.is_none());
@@ -1089,19 +1089,31 @@ fn an_agent_action_stored_before_the_harness_became_optional_still_reads() {
     let config: AgentActionConfig =
         serde_json::from_value(new).expect("a record written since must read too");
     assert_eq!(config.harness, None);
-    assert_eq!(config.workspace_access, Some(WorkspaceAccess::ReadWrite));
+    assert_eq!(config.workspace_access, None);
 }
 
 #[test]
-fn agent_workspace_access_keeps_omission_distinct_from_explicit_values() {
+fn v1_workspace_access_becomes_a_step_workspace_section() {
     let yaml = r#"
 name: access
 version: 1
+globals:
+  workspace:
+    type: git
+    repository: some-repo
+    ref: main
 states:
   write:
     action:
       type: agent
       prompt: write a report
+    choices: [done]
+    transitions: { done: read }
+  edit:
+    action:
+      type: agent
+      workspace_access: read-write
+      prompt: edit
     choices: [done]
     transitions: { done: read }
   read:
@@ -1117,12 +1129,25 @@ terminal_states: { completed: completed }
 "#;
 
     let definition = load_from_str(yaml).expect("workspace access values should load");
-    let access = |state_id| match state(&definition, state_id).action.as_ref().unwrap() {
-        ActionConfig::Agent(config) => config.workspace_access,
-        other => panic!("expected agent action, got {other:?}"),
-    };
-    assert_eq!(access("write"), None);
-    assert_eq!(access("read"), Some(WorkspaceAccess::ReadOnly));
+    let section = |state_id| state(&definition, state_id).workspace.clone();
+    assert_eq!(section("write"), None);
+    assert_eq!(
+        section("read"),
+        Some(StepWorkspace {
+            root: None,
+            write: vec![],
+            read: vec!["some-repo".to_string()],
+        })
+    );
+    assert_eq!(
+        state(&definition, "edit").workspace_access(),
+        Some(WorkspaceAccess::ReadWrite)
+    );
+    assert_eq!(state(&definition, "write").workspace_access(), None);
+    assert_eq!(
+        state(&definition, "read").workspace_access(),
+        Some(WorkspaceAccess::ReadOnly)
+    );
 }
 
 // ---------------------------------------------------------------------------

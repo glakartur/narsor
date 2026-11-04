@@ -686,7 +686,8 @@ impl CatalogLaunchResolver {
                 .map_err(|error| LaunchError::InvalidInputs(error.to_string()))
         };
 
-        let (repository, workflow_ref) = match (&intent.repository, &definition.workspace) {
+        let primary = definition.primary_workspace_spec();
+        let (repository, workflow_ref) = match (&intent.repository, &primary) {
             (Some(repository), _) => (Some(repository.clone()), None),
             (
                 None,

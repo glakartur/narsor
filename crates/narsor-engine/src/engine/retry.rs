@@ -179,6 +179,7 @@ mod tests {
             terminal: false,
             terminal_status: None,
             allow_manual_override: false,
+            workspace: None,
             image: None,
         };
 

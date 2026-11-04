@@ -297,6 +297,7 @@ fn initial_state_that_does_not_exist_is_rejected() {
             terminal: true,
             terminal_status: None,
             allow_manual_override: false,
+            workspace: None,
             image: None,
         },
     );
@@ -308,7 +309,8 @@ fn initial_state_that_does_not_exist_is_rejected() {
         description: None,
         inputs: Vec::new(),
         globals: Default::default(),
-        workspace: None,
+        source_schema: Default::default(),
+        repositories: Vec::new(),
         display: None,
         states,
         initial_state: "missing".to_string(),
