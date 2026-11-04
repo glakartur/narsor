@@ -2429,7 +2429,7 @@ mod task_app_detail_render {
     }
 
     #[test]
-    fn the_axis_shows_what_each_step_used_and_moves_subagents_down_when_narrow() {
+    fn the_axis_shows_what_each_step_used_and_keeps_subagents_in_its_first_row() {
         let steps = || {
             vec![
                 reported(120_000, 8_000, (40_000, 3_000), 0.42),
@@ -2454,9 +2454,8 @@ mod task_app_detail_render {
             .set_tab(narsor::tui::task_app::DetailTab::Progress);
         let narrow = rows(&render_at(&mut app, &Styles::new(false), 62, 30));
         let step0 = row(&narrow, "$0.42");
-        assert!(!narrow[step0].contains('×'), "{}", narrow.join("\n"));
-        assert!(narrow[step0 + 1].contains("1×  ↓40k  ↑3k"));
-        assert!(!narrow[row(&narrow, "$0.03") + 1].contains('×'));
+        assert!(narrow[step0].contains("↓120k"), "{}", narrow.join("\n"));
+        assert!(!narrow[row(&narrow, "$0.03")].contains('×'));
     }
 
     #[test]

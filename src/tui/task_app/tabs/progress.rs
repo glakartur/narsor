@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use crate::controller_protocol::TimelineResponse;
 use crate::domain::Event;
-use crate::task_usage_text::{step_cells, subagent_stats_text, StepCells};
+use crate::task_usage_text::{step_cells, StepCells};
 use crate::tui::style::{Role, Styles};
 use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
@@ -440,6 +440,9 @@ impl Column {
 
 /// Spaces before each column of a table row.
 const COLUMN_GAP: usize = 2;
+/// Spaces before the detail row, and between its times and its agent.
+const DETAIL_INDENT: usize = 3;
+const DETAIL_GAP: usize = 4;
 
 /// The columns of a table row, each after the gap; empty columns take none.
 fn columns_width(columns: &[&Column]) -> usize {
@@ -481,9 +484,10 @@ impl AxisLayout {
         layout
     }
 
-    /// Under each step that has them, a row of when it ran and a row of what
-    /// ran it, each value in a column of its own across the steps. The axis
-    /// grows to fit them within its share of the tab; a longer value is cut.
+    /// Under each step, one row: when it started and how long it ran, then,
+    /// further off, the model, effort and harness that ran it, each value in a
+    /// column of its own across the steps. The axis grows to fit the row
+    /// within its share of the tab; a longer row is cut.
     fn add_details(
         &mut self,
         positions: &[Position],
@@ -492,12 +496,11 @@ impl AxisLayout {
         styles: &Styles,
     ) {
         let text = |value: &Option<String>| value.as_deref().map(one_line).unwrap_or_default();
-        let times = [
+        let when = [
             Column::new(
                 false,
                 positions.iter().map(|p| clock(p.started_at)).collect(),
             ),
-            Column::new(false, positions.iter().map(|p| clock(p.ended_at)).collect()),
             Column::new(
                 true,
                 positions
@@ -507,56 +510,55 @@ impl AxisLayout {
             ),
         ];
         let agent = [
-            Column::new(false, positions.iter().map(|p| text(&p.harness)).collect()),
             Column::new(false, positions.iter().map(|p| text(&p.model)).collect()),
             Column::new(false, positions.iter().map(|p| text(&p.effort)).collect()),
-            Column::new(
-                false,
-                positions
-                    .iter()
-                    .map(|p| subagent_stats_text(p.usage.as_ref()))
-                    .collect(),
-            ),
+            Column::new(false, positions.iter().map(|p| text(&p.harness)).collect()),
         ];
-        let has_times: Vec<bool> = positions.iter().map(|p| p.started_at.is_some()).collect();
-        let has_agent: Vec<bool> = (0..positions.len())
-            .map(|index| agent.iter().any(|column| !column.cells[index].is_empty()))
-            .collect();
-        let indent = 2;
-        let row_width = |columns: &[Column], used: &[bool]| {
-            if !used.iter().any(|used| *used) {
-                return 0;
-            }
-            let refs: Vec<&Column> = columns.iter().collect();
-            indent + columns_width(&refs).saturating_sub(COLUMN_GAP)
+        let used = |columns: &[Column], index: usize| {
+            columns.iter().any(|column| !column.cells[index].is_empty())
         };
+        let has_row: Vec<bool> = (0..positions.len())
+            .map(|index| used(&when, index) || used(&agent, index))
+            .collect();
+        let joined = |columns: &[Column], index: usize| {
+            columns
+                .iter()
+                .filter(|column| column.width() > 0)
+                .map(|column| column.text(index))
+                .collect::<Vec<_>>()
+                .join(&" ".repeat(COLUMN_GAP))
+        };
+        let width_of = |columns: &[Column]| {
+            let refs: Vec<&Column> = columns.iter().collect();
+            columns_width(&refs).saturating_sub(COLUMN_GAP)
+        };
+        let (when_width, agent_width) = (width_of(&when), width_of(&agent));
         let wanted = usize::from(PREFIX_WIDTH)
-            + row_width(&times, &has_times).max(row_width(&agent, &has_agent));
+            + DETAIL_INDENT
+            + when_width
+            + if agent_width > 0 {
+                DETAIL_GAP + agent_width
+            } else {
+                0
+            };
         let today = self.width;
         let width = usize::from(self.width)
             .max(wanted.min(axis_cap(area_width, today)))
             .min(usize::from(u16::MAX));
         self.width = u16::try_from(width).unwrap_or(u16::MAX);
         let content = width.saturating_sub(usize::from(PREFIX_WIDTH));
-        let line = |columns: &[Column], index: usize| {
-            let joined = columns
-                .iter()
-                .filter(|column| column.width() > 0)
-                .map(|column| column.text(index))
-                .collect::<Vec<_>>()
-                .join(&" ".repeat(COLUMN_GAP));
-            Line::styled(
-                fit(&format!("{:indent$}{}", "", joined.trim_end()), content),
-                styles.of(Role::Done),
-            )
-        };
         for (index, rows) in self.rows.iter_mut().enumerate() {
-            if has_times[index] {
-                rows.push(line(&times, index));
+            if !has_row[index] {
+                continue;
             }
-            if has_agent[index] {
-                rows.push(line(&agent, index));
+            let mut row = format!("{:DETAIL_INDENT$}{:<when_width$}", "", joined(&when, index));
+            if agent_width > 0 {
+                row.push_str(&format!("{:DETAIL_GAP$}{}", "", joined(&agent, index)));
             }
+            rows.push(Line::styled(
+                fit(row.trim_end(), content),
+                styles.of(Role::Done),
+            ));
         }
     }
 
@@ -618,30 +620,18 @@ impl AxisLayout {
             column(true, |cells| &cells.subagent_count),
             column(true, |cells| &cells.subagent_input),
             column(true, |cells| &cells.subagent_output),
+            column(true, |cells| &cells.subagent_total),
         ];
         let main_refs: Vec<&Column> = main.iter().collect();
         let sub_refs: Vec<&Column> = subs.iter().collect();
-        let main_width = columns_width(&main_refs);
-        let subs_width = columns_width(&sub_refs);
-        let has_subs = subs_width > 0;
+        let columns_width = columns_width(&main_refs) + columns_width(&sub_refs);
 
         // 2: the glyph and its space; the label and the word are columns too.
-        let first = |label: usize, word: usize| {
-            2 + label + if word > 0 { word + 1 } else { 0 } + main_width
-        };
         let prefix = usize::from(PREFIX_WIDTH);
         let cap = axis_cap(area_width, today);
         let (label_width, word_width) = (label.width(), word.width());
-        let inline = prefix + first(label_width, word_width) + subs_width <= cap;
-        let second_line = has_subs && !inline;
         let needed = |label: usize, word: usize| {
-            let first = first(label, word) + if inline { subs_width } else { 0 };
-            prefix
-                + if second_line {
-                    first.max(2 + subs_width - COLUMN_GAP)
-                } else {
-                    first
-                }
+            prefix + 2 + label + if word > 0 { word + 1 } else { 0 } + columns_width
         };
         let target = needed(label_width, word_width)
             .min(cap)
@@ -687,20 +677,8 @@ impl AxisLayout {
                     }
                 };
                 push(&main);
-                if inline {
-                    push(&subs);
-                }
-                let mut lines = vec![Line::from(spans)];
-                if second_line && cells[index].has_subagents() {
-                    let text = subs
-                        .iter()
-                        .filter(|column| column.width() > 0)
-                        .map(|column| column.text(index))
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    lines.push(Line::styled(format!("  {text}"), styles.of(Role::Done)));
-                }
-                lines
+                push(&subs);
+                vec![Line::from(spans)]
             })
             .collect();
         Self {
@@ -1078,18 +1056,15 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_tab_moves_the_subagents_under_the_label_of_the_steps_that_have_them() {
+    fn the_subagents_stay_in_the_first_row_even_on_a_narrow_tab() {
         let axis = layout(&sample(), 60);
+        assert_eq!(axis.rows[0].len(), 1);
         let first = text(&axis.rows[0][0]);
         assert!(
-            first.contains("$0.42") && first.contains("↓120k") && first.contains("↑8k"),
+            first.contains("$0.42") && first.contains("↓120k"),
             "{first}"
         );
-        assert!(!first.contains('×'), "{first}");
-        assert_eq!(axis.rows[0].len(), 2);
-        assert_eq!(text(&axis.rows[0][1]).trim(), "2×  ↓40k  ↑3k");
-        assert!(text(&axis.rows[0][1]).starts_with("  "));
-        assert_eq!(axis.rows[1].len(), 1, "no second line without subagents");
+        assert_eq!(axis.rows[1].len(), 1);
     }
 
     #[test]
@@ -1116,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn when_harness_model_and_effort_are_known_they_get_a_row_of_columns() {
+    fn a_step_is_two_rows_the_second_with_the_start_the_duration_and_the_agent() {
         let mut steps = sample();
         steps[0].started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(90));
         steps[0].ended_at = Some(chrono::Utc::now());
@@ -1125,25 +1100,34 @@ mod tests {
         steps[0].effort = Some("high".into());
         steps[1].harness = Some("codex".into());
         let axis = layout(&steps, 200);
-        assert_eq!(axis.rows[0].len(), 3, "usage, times, agent");
-        assert_eq!(axis.rows[1].len(), 2, "usage, agent");
-        assert!(text(&axis.rows[0][1]).contains("1m"), "{:?}", axis.rows[0]);
-        assert_eq!(text(&axis.rows[0][2]).trim(), "claude-code  sonnet  high");
-        assert!(text(&axis.rows[1][1]).trim().starts_with("codex"));
+        assert_eq!(axis.rows[0].len(), 2);
+        assert_eq!(axis.rows[1].len(), 2);
+        let second = text(&axis.rows[0][1]);
+        assert!(
+            second.starts_with("   ") && !second.starts_with("    "),
+            "{second:?}"
+        );
+        assert!(second.contains("1m"), "{second:?}");
+        assert!(second.ends_with("sonnet  high  claude-code"), "{second:?}");
+        assert!(second.contains("    sonnet"), "{second:?}");
+        assert!(text(&axis.rows[1][1]).trim() == "codex");
     }
 
     #[test]
-    fn what_became_of_the_subagents_goes_on_the_agent_row() {
-        let mut steps = sample();
-        steps[0].harness = Some("claude-code".into());
+    fn the_subagent_stats_stand_in_the_first_row() {
+        let mut steps = [step("a", used((1_000, 100), None, 0.1))];
         steps[0].usage.as_mut().unwrap().subagent_stats = Some(SubagentStats {
             spawned: 3,
             completed: 2,
             failed: 1,
+            tokens: 45_000,
             ..SubagentStats::default()
         });
         let axis = layout(&steps, 200);
-        assert_eq!(text(&axis.rows[0][1]).trim(), "claude-code  sub 3 ✓2 ✗1");
+        assert_eq!(axis.rows[0].len(), 1);
+        let first = text(&axis.rows[0][0]);
+        assert!(first.contains("3×") && first.contains("↕45k"), "{first}");
+        assert!(!first.contains("✗") && !first.contains("sub 3"), "{first}");
     }
 
     #[test]

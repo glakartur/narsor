@@ -82,9 +82,11 @@ step, duration; under the links, once a harness reported any, a row with the
 usage it reported for the whole task: cost, tokens `in` / `out` and the
 subagents' part) and five tabs: *Przebieg* (the steps and the selected one; once a harness reported usage,
 each step's row also shows its cost and its tokens `↓in ↑out`, with the
-subagents' count and tokens after them, in columns aligned across the steps —
-in a narrow window the subagents move to a second line under the step's label,
-and a step that reported nothing leaves those fields empty),
+subagents' count and tokens after them (`3× ↓40k ↑3k`, or `3× ↕45k` when the
+harness gave only their sum), in columns aligned across the steps; a second row
+under each step gives its start time and duration, then its model, effort and
+harness. The step list may take up to 70% of the tab, and a step that reported
+nothing leaves those fields empty),
 *Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
 chat and decisions; its status line names the harness the conductor runs on)
 and *Info* (the sealed inputs, the observations with their age, the runner and

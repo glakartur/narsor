@@ -81,6 +81,8 @@ pub struct StepCells {
     pub subagent_count: String,
     pub subagent_input: String,
     pub subagent_output: String,
+    /// The tokens of the subagents together, when the harness gave no split.
+    pub subagent_total: String,
 }
 
 impl StepCells {
@@ -91,12 +93,16 @@ impl StepCells {
 
     /// Whether the step has subagents to show.
     pub fn has_subagents(&self) -> bool {
-        !self.subagent_input.is_empty()
+        !(self.subagent_count.is_empty()
+            && self.subagent_input.is_empty()
+            && self.subagent_total.is_empty())
     }
 }
 
 /// The cells of the usage of one step; all empty for a step without a report.
-/// Subagents that used nothing, or were not reported, are empty.
+/// Subagents come from what the harness said: their tokens in and out when it
+/// split them, else their tokens together; the count is those it started.
+/// Subagents that used nothing and were not counted are empty.
 pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
     let Some(usage) = usage else {
         return StepCells::default();
@@ -121,34 +127,14 @@ pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
             cells.subagent_count = format!("{count}×");
         }
     }
-    cells
-}
-
-/// What became of a step's subagents, e.g. `sub 11 ✓10 ✗1`: how many were
-/// started and finished, then each count that is not zero (`✗` failed, `†`
-/// killed, `⊘` refused) and the tokens they used together (`↕`). Empty when
-/// none were started.
-pub fn subagent_stats_text(usage: Option<&PositionUsage>) -> String {
-    let Some(stats) = usage.and_then(|usage| usage.subagent_stats) else {
-        return String::new();
-    };
-    if stats.spawned == 0 {
-        return String::new();
-    }
-    let mut text = format!("sub {} ✓{}", stats.spawned, stats.completed);
-    for (mark, count) in [
-        ("✗", stats.failed),
-        ("†", stats.killed),
-        ("⊘", stats.refused),
-    ] {
-        if count > 0 {
-            text.push_str(&format!(" {mark}{count}"));
+    let stats = usage.subagent_stats.filter(|stats| stats.spawned > 0);
+    if let Some(stats) = stats {
+        cells.subagent_count = format!("{}×", stats.spawned);
+        if cells.subagent_input.is_empty() && stats.tokens > 0 {
+            cells.subagent_total = format!("↕{}", scaled(stats.tokens));
         }
     }
-    if stats.tokens > 0 {
-        text.push_str(&format!(" ↕{}", scaled(stats.tokens)));
-    }
-    text
+    cells
 }
 
 fn tokens(counts: Option<TokenCounts>) -> String {
@@ -366,31 +352,50 @@ mod tests {
     }
 
     #[test]
-    fn the_subagent_stats_show_only_the_counts_that_are_not_zero() {
-        let usage = |spawned, completed, failed, killed, refused| PositionUsage {
+    fn the_subagent_stats_fill_the_count_and_the_tokens_together() {
+        let stats = |spawned, tokens| PositionUsage {
             subagent_stats: Some(SubagentStats {
                 spawned,
-                completed,
-                failed,
-                killed,
-                refused,
-                tokens: 0,
+                completed: spawned,
+                failed: 1,
+                tokens,
+                ..SubagentStats::default()
             }),
             ..PositionUsage::default()
         };
+        let cells = step_cells(Some(&stats(3, 45_000)));
         assert_eq!(
-            subagent_stats_text(Some(&usage(11, 11, 0, 0, 0))),
-            "sub 11 ✓11"
+            (
+                cells.subagent_count.as_str(),
+                cells.subagent_input.as_str(),
+                cells.subagent_total.as_str()
+            ),
+            ("3×", "", "↕45k")
         );
+        assert!(cells.has_subagents());
+        let cells = step_cells(Some(&stats(2, 0)));
+        assert_eq!(cells.subagent_count, "2×");
+        assert!(cells.subagent_total.is_empty() && cells.has_subagents());
+        assert!(!step_cells(Some(&stats(0, 0))).has_subagents());
+    }
+
+    #[test]
+    fn a_split_of_the_subagent_tokens_wins_over_their_sum() {
+        let mut usage = used((1_000, 100), Some((40_000, 3_000)), 0.1);
+        usage.subagent_stats = Some(SubagentStats {
+            spawned: 4,
+            tokens: 43_000,
+            ..SubagentStats::default()
+        });
+        let cells = step_cells(Some(&usage));
         assert_eq!(
-            subagent_stats_text(Some(&usage(5, 2, 1, 1, 1))),
-            "sub 5 ✓2 ✗1 †1 ⊘1"
+            (
+                cells.subagent_count.as_str(),
+                cells.subagent_input.as_str(),
+                cells.subagent_total.as_str()
+            ),
+            ("4×", "↓40k", "")
         );
-        let mut with_tokens = usage(2, 2, 0, 0, 0);
-        with_tokens.subagent_stats.as_mut().unwrap().tokens = 8_000;
-        assert_eq!(subagent_stats_text(Some(&with_tokens)), "sub 2 ✓2 ↕8k");
-        assert_eq!(subagent_stats_text(Some(&usage(0, 0, 0, 0, 0))), "");
-        assert_eq!(subagent_stats_text(None), "");
     }
 
     #[test]
