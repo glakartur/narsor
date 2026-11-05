@@ -110,6 +110,11 @@ const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// for the runner's next poll before it can answer.
 const CONVERSATION_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long listing the branches of a remote may take: the server lets
+/// `git ls-remote` run for 20 seconds, so the client waits a little longer
+/// and the server's own answer is the failure signal.
+const BRANCH_LISTING_TIMEOUT: Duration = Duration::from_secs(25);
+
 /// How long one material upload or blob download may take: tens of
 /// megabytes over a real network, far beyond a control request's bound.
 const MATERIAL_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
@@ -560,7 +565,14 @@ impl ApiClient {
         id: &str,
     ) -> Result<RepositoryBranchesResponse, ClientError> {
         let url = format!("{}/control/v1/repositories/{id}/branches", self.base_url);
-        self.get_json(&url).await
+        let response = self
+            .send(&self.stream_http, |http, token| {
+                http.get(&url)
+                    .bearer_auth(token)
+                    .timeout(BRANCH_LISTING_TIMEOUT)
+            })
+            .await?;
+        handle_json_response(response).await
     }
 
     /// Registers a repository.
