@@ -1594,7 +1594,7 @@ async fn every_repository_of_a_task_is_checkpointed_and_materialised_on_its_own(
         RepositoryDefinition {
             name: "code".to_string(),
             primary: true,
-            default_branch: None,
+            base_branch: None,
             source: RepositorySource::Git {
                 repository: "code".to_string(),
             },
@@ -1603,7 +1603,7 @@ async fn every_repository_of_a_task_is_checkpointed_and_materialised_on_its_own(
         RepositoryDefinition {
             name: "docs".to_string(),
             primary: false,
-            default_branch: None,
+            base_branch: None,
             source: RepositorySource::Git {
                 repository: "docs".to_string(),
             },

@@ -712,10 +712,7 @@ fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<Valid
                 ));
             }
             if matches!(repository.source, RepositorySource::Git { .. })
-                && repository
-                    .default_branch
-                    .as_deref()
-                    .is_none_or(str::is_empty)
+                && repository.base_branch.as_deref().is_none_or(str::is_empty)
             {
                 errors.push(invalid(
                     repository_field(definition, &repository.name, "base_branch"),

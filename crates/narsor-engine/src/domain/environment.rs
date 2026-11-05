@@ -779,7 +779,7 @@ pub struct TaskRepository {
     /// Name of the repository and of its folder below `workspace/`.
     pub name: String,
     /// The branch the repository starts on, resolved at creation from the
-    /// workflow's `default_branch` or the registry. `None` leaves the choice
+    /// workflow's `base_branch` or the registry. `None` leaves the choice
     /// to the remote's `HEAD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,

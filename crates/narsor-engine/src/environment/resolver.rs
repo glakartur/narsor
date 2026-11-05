@@ -718,7 +718,7 @@ impl CatalogLaunchResolver {
             ) {
                 (Some(repository), _) => (None, Some(repository.clone()), None),
                 (None, RepositorySource::Git { repository }) => {
-                    let git_ref = match &definition_repository.default_branch {
+                    let git_ref = match &definition_repository.base_branch {
                         Some(branch) => Some(render(branch, &field(definition_repository, "ref"))?),
                         None => None,
                     };

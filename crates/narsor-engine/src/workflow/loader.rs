@@ -190,7 +190,7 @@ fn compile_repository(repository: &RepositorySchema) -> RepositoryDefinition {
     RepositoryDefinition {
         name: repository.name.clone(),
         primary: repository.primary,
-        default_branch: repository.default_branch.clone(),
+        base_branch: repository.base_branch.clone(),
         source: match &repository.source {
             RepositorySourceSchema::Repository(repository) => RepositorySource::Git {
                 repository: repository.clone(),
@@ -212,7 +212,7 @@ fn convert_v1_workspace(workspace: &WorkspaceSchema) -> RepositoryDefinition {
                 .unwrap_or("repository")
                 .to_string(),
             primary: true,
-            default_branch: git.git_ref.clone(),
+            base_branch: git.git_ref.clone(),
             source: RepositorySource::Git {
                 repository: git.repository.clone(),
             },
@@ -228,7 +228,7 @@ fn convert_v1_workspace(workspace: &WorkspaceSchema) -> RepositoryDefinition {
                 .unwrap_or("workspace")
                 .to_string(),
             primary: true,
-            default_branch: None,
+            base_branch: None,
             source: RepositorySource::Local {
                 path: local.path.clone(),
             },
@@ -491,7 +491,7 @@ inputs:
             vec![RepositoryDefinition {
                 name: "my-repo".to_string(),
                 primary: true,
-                default_branch: Some("develop".to_string()),
+                base_branch: Some("develop".to_string()),
                 source: RepositorySource::Git {
                     repository: "my-repo".to_string()
                 },
@@ -516,7 +516,7 @@ inputs:
         };
         assert_eq!(repository.name, "site");
         assert!(repository.primary);
-        assert_eq!(repository.default_branch, None);
+        assert_eq!(repository.base_branch, None);
         assert_eq!(
             repository.source,
             RepositorySource::Local {
@@ -625,7 +625,7 @@ terminal_states: [done]
             }
         );
         assert_eq!(
-            definition.repositories[1].default_branch.as_deref(),
+            definition.repositories[1].base_branch.as_deref(),
             Some("trunk")
         );
         assert_eq!(

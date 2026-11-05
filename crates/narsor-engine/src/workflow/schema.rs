@@ -435,7 +435,7 @@ pub struct RepositorySchema {
     pub primary: bool,
 
     /// Branch a new task starts from (`base_branch`).
-    pub default_branch: Option<String>,
+    pub base_branch: Option<String>,
 
     /// Where the repository comes from.
     pub source: RepositorySourceSchema,
@@ -484,7 +484,7 @@ impl RawRepositorySchema {
         Ok(RepositorySchema {
             name,
             primary: raw.primary,
-            default_branch: raw.base_branch,
+            base_branch: raw.base_branch,
             source,
             preserve_paths: raw.preserve_paths,
         })

@@ -116,7 +116,7 @@ pub struct RepositoryDefinition {
     /// Branch a new task starts on. `None` leaves the choice to the
     /// registry's default branch.
     #[serde(default)]
-    pub default_branch: Option<String>,
+    pub base_branch: Option<String>,
 
     /// Where the repository comes from.
     pub source: RepositorySource,
@@ -129,12 +129,12 @@ pub struct RepositoryDefinition {
 
 impl RepositoryDefinition {
     /// The repository as the single-workspace declaration of the
-    /// single-repository runtime; `default_branch` plays the part of `ref`.
+    /// single-repository runtime; `base_branch` plays the part of `ref`.
     pub fn workspace_spec(&self) -> WorkspaceSpec {
         match &self.source {
             RepositorySource::Git { repository } => WorkspaceSpec::Git {
                 repository: repository.clone(),
-                git_ref: self.default_branch.clone(),
+                git_ref: self.base_branch.clone(),
                 preserve_paths: self.preserve_paths.clone(),
             },
             RepositorySource::Local { path } => WorkspaceSpec::Local {
