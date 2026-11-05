@@ -33,6 +33,10 @@ audited).
   any step that is waiting.
 - **Conductor** — a per-execution assistant that proposes actions you confirm
   or reject.
+- **Multi-repository workflows** — a workflow (`schema: v2`) declares several
+  repositories, and each step says which ones an agent or script may write,
+  which it may only read, and which is its working directory. Every repository
+  is checkpointed separately.
 - **Repositories and workspaces** — a registry of repositories; each task gets
   its own git or directory workspace.
 - **Remote backends and a server** — run tasks on registered backends
