@@ -14,6 +14,7 @@
 //! `NARSOR_TOKEN_FILE`) or a helper command (`--token-command`,
 //! `NARSOR_TOKEN_COMMAND`); the latter two are re-read after a `401`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
@@ -227,7 +228,8 @@ pub enum TaskCommand {
             long,
             value_name = "PATH",
             conflicts_with_all = [
-                "workflow_version", "backend", "profile", "harness", "repository", "commit"
+                "workflow_version", "backend", "profile", "harness", "repository", "commit",
+                "branches"
             ]
         )]
         file: Option<PathBuf>,
@@ -238,6 +240,10 @@ pub enum TaskCommand {
         /// JSON is taken as that; with `--file` the declared type decides.
         #[arg(long = "input", value_name = "NAME=VALUE")]
         inputs: Vec<String>,
+        /// Gałąź dla wejścia typu repozytorium, `WEJŚCIE=GAŁĄŹ` (powtarzalne).
+        /// Wejście bez gałęzi startuje na gałęzi domyślnej repozytorium.
+        #[arg(long = "branch", value_name = "INPUT=BRANCH")]
+        branches: Vec<String>,
         /// Backend to pin the task to; the default backend when omitted.
         #[arg(long, value_name = "BACKEND")]
         backend: Option<String>,
@@ -883,20 +889,16 @@ pub(super) fn print_conversation_entries(
 // task
 // ---------------------------------------------------------------------------
 
-/// Runs one `narsor task` command.
-pub async fn task(
-    command: TaskCommand,
-    target: &ServerTarget,
-    state: &Path,
-    flags: &Flags,
-) -> Result<()> {
-    // Parse everything local before connecting: a usage error never needs
-    // the control plane.
-    let create = match &command {
+/// The request of `task create` from its command-line pieces, with the
+/// workflow version the operator asked for; `None` for any other command or
+/// a definition file.
+pub fn create_request(command: &TaskCommand) -> Result<Option<(CreateTaskRequest, Option<u32>)>> {
+    Ok(match command {
         TaskCommand::Create {
             workflow: Some(workflow),
             workflow_version,
             inputs,
+            branches,
             backend,
             profile,
             harness,
@@ -918,7 +920,7 @@ pub async fn task(
                             commit: commit.clone(),
                         }
                     }),
-                    branches: Default::default(),
+                    branches: parse_branches(branches)?,
                     profile: profile.clone(),
                     harness: harness.clone(),
                     resources: None,
@@ -929,7 +931,19 @@ pub async fn task(
             *workflow_version,
         )),
         _ => None,
-    };
+    })
+}
+
+/// Runs one `narsor task` command.
+pub async fn task(
+    command: TaskCommand,
+    target: &ServerTarget,
+    state: &Path,
+    flags: &Flags,
+) -> Result<()> {
+    // Parse everything local before connecting: a usage error never needs
+    // the control plane.
+    let create = create_request(&command)?;
     let delivery = match &command {
         TaskCommand::Input {
             fields,
@@ -1710,6 +1724,17 @@ fn parse_pairs(flag: &str, pairs: &[String]) -> Result<Map<String, Value>> {
         values.insert(name.to_string(), value);
     }
     Ok(values)
+}
+
+/// `input=branch` pairs of `--branch`; a branch name is always text.
+fn parse_branches(pairs: &[String]) -> Result<BTreeMap<String, String>> {
+    pairs
+        .iter()
+        .map(|pair| {
+            split_pair("branch", pair)
+                .map(|(input, branch)| (input.to_string(), branch.to_string()))
+        })
+        .collect()
 }
 
 /// `name=value` of `--{flag}`, the name trimmed; a usage error otherwise.

@@ -26,6 +26,7 @@ mod builtin_workflows;
 mod claude_code_classification;
 mod cli_control_text;
 mod cli_conversation_text;
+mod cli_task_create;
 mod cli_task_text;
 mod conductor_chat;
 mod conductor_failure;
