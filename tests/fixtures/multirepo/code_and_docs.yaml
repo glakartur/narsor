@@ -20,7 +20,7 @@ globals:
 
 states:
   implement:
-    description: Works in code; docs is read-only (no workspace section).
+    description: Works in code; docs is read-only (no workspaces section).
     action:
       type: agent
       prompt: Implement the change.
@@ -33,8 +33,8 @@ states:
     action:
       type: agent
       prompt: Document the change.
-    workspace:
-      write: [docs]
+    workspaces:
+      root: docs
       read: [code]
     choices: [done]
     transitions:
@@ -45,7 +45,7 @@ states:
     action:
       type: agent
       prompt: Review both repositories.
-    workspace:
+    workspaces:
       root: .
       read: [code, docs]
     choices: [done]

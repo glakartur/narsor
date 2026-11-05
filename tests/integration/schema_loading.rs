@@ -1134,7 +1134,7 @@ terminal_states: { completed: completed }
     assert_eq!(
         section("read"),
         Some(StepWorkspace {
-            root: None,
+            root: "some-repo".to_string(),
             write: vec![],
             read: vec!["some-repo".to_string()],
         })
@@ -1169,8 +1169,8 @@ fn a_two_repository_v2_fixture_loads_and_validates() {
     assert_eq!(
         state(&definition, "document").workspace,
         Some(StepWorkspace {
-            root: None,
-            write: vec!["docs".to_string()],
+            root: "docs".to_string(),
+            write: vec![],
             read: vec!["code".to_string()],
         })
     );
@@ -1179,9 +1179,8 @@ fn a_two_repository_v2_fixture_loads_and_validates() {
             .workspace
             .as_ref()
             .unwrap()
-            .root
-            .as_deref(),
-        Some(".")
+            .root,
+        "."
     );
 }
 

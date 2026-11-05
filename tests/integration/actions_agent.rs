@@ -5077,8 +5077,8 @@ async fn run_scoped(
 async fn a_docs_step_starts_in_docs_and_is_told_code_is_read_only() {
     let root = TempRoot::new();
     let section = narsor_engine::domain::StepWorkspace {
-        root: None,
-        write: vec!["docs".to_string()],
+        root: "docs".to_string(),
+        write: vec![],
         read: vec!["code".to_string()],
     };
     let fake = run_scoped(&root, Some(&section), agent_action("document it")).await;

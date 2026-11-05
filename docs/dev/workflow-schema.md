@@ -79,10 +79,10 @@ states:                     # State graph (required)
     decision:               # Decision provider configuration (optional, rules by default)
       type: <rules|agent|human>
       # ... configuration specific to the decision type
-    workspace:              # schema v2: repositories of this step (optional, §3.2.1)
-      root: <name|.>
-      write: [<name>]
+    workspaces:             # schema v2: repositories of this step (optional, §3.2.1)
+      root: <name|.>        # required when the section is given
       read: [<name>]
+      write: [<name>]
     timeout: <duration>     # Timeout for this state (overrides the global one)
     retry_policy:           # Retry policy for this action (overrides the global one)
 
@@ -165,7 +165,7 @@ error. The file is checked against its own schema: a `v2` file cannot use `v1` c
 
 *   `name`: the label of the repository and the name of its folder, `workspace/<name>/`, in the
     task directory. It must be a usable folder name, unique in the list, and cannot be a template.
-*   `primary`: exactly one repository is primary. A step without a `workspace` section starts there,
+*   `primary`: exactly one repository is primary. A step without a `workspaces` section starts there,
     and the conductor reads task artifacts from it.
 *   `default_branch`: the branch a new task starts on. It is required for a registered repository.
     The task keeps for each repository its name and branch.
@@ -174,12 +174,16 @@ error. The file is checked against its own schema: a `v2` file cannot use `v1` c
     `globals.workspace` of type `local`).
 *   `preserve_paths`: as in §3.2, per repository.
 
-**Step `workspace` (v2).** Says which repositories a step gets.
+**Step `workspaces` (v2).** Says which repositories a step gets.
 
-*   `write` and `read` are lists of repository names. A step may write several repositories.
-*   `root` is where the agent (or script) starts: a repository name, or `.` for the `workspace/`
-    directory holding the folders of all repositories. When missing, the step starts in the first
-    `write` repository, else in the first `read` one.
+*   `root` is required when the section is given. It is where the agent (or script) starts: a
+    repository name, or `.` for the `workspace/` directory holding the folders of all repositories.
+    The `root` repository is writable unless `read` lists it, so a step that only starts in a
+    repository needs no `write` entry for it.
+*   `read` lists repositories that are read-only. Listing the `root` repository there restricts a
+    harness started in it.
+*   `write` lists the further repositories the step may change. With `root: .` no repository is
+    writable except those listed here.
 *   A step **without** the section gets every repository: the primary one writable, the others
     read-only, and it starts in the primary one.
 *   A step **with** the section gets only the repositories it names; the others are not offered.
@@ -198,19 +202,18 @@ error. The file is checked against its own schema: a `v2` file cannot use `v1` c
 **Validation (v2).**
 
 *   `globals.workspace` and the agent's `workspace_access` are errors; `globals.repositories` and a
-    step `workspace` in a `v1` file are errors too.
+    step `workspaces` in a `v1` file are errors too.
 *   Names are usable folder names and unique; exactly one repository is primary.
-*   `root`, `write` and `read` refer only to declared names; a name is not both in `write` and in
-    `read`; the section names at least one repository.
-*   `root` is a repository listed in `write` or `read`, or `.` (which is also allowed with a single
-    repository).
+*   `root` is required; it and the names in `write` and `read` refer only to declared repositories
+    (`root` may also be `.`, which is also allowed with a single repository).
+*   A name is not both in `write` and in `read`, and appears at most once in each list.
 
 **Converting `v1` to `v2`.** A `v1` file is converted in memory when it is loaded, and the file on
 disk is not changed; the rest of the system knows only `v2`. `globals.workspace` becomes one
 primary repository, named after the registry ID (for `git`) or the last segment of the path (for
 `local`), with `ref` as its default branch. A step's `workspace_access: read-only` becomes
-`workspace: { read: [<primary>] }`, and an explicit `workspace_access: read-write` becomes
-`workspace: { write: [<primary>] }`, so that the harness is still told to write; with the field
+`workspaces: { root: <primary>, read: [<primary>] }`, and an explicit `workspace_access: read-write` becomes
+`workspaces: { root: <primary> }`, so that the harness is still told to write; with the field
 missing there is no section and the harness keeps its own permission configuration as in `v1`. (The
 earlier design mapped `read-write` to no section; an explicit `read-write` would then have lost the
 permission it asked for.) Validation errors of a `v1` file name its original
@@ -384,7 +387,7 @@ action:
                                       # Only an explicit `harness:` pins the action; without it the action
                                       # takes the default at the first attempt and keeps it to the end.
   model: <string>                     # AI model (optional, e.g. "sonnet-3.5")
-  workspace_access: <read-write|read-only> # schema v1 only; read-write by default (v2: step `workspace`, §3.2.1).
+  workspace_access: <read-write|read-only> # schema v1 only; read-write by default (v2: step `workspaces`, §3.2.1).
   prompt: |                           # Instruction for the agent
     Analyze the code in the current directory.
     Find potential security bugs.

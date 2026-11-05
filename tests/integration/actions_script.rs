@@ -450,8 +450,8 @@ async fn a_script_starts_in_the_step_scope_start_dir() {
     workspace.repositories = vec![repository("code", true), repository("docs", false)];
 
     let section = StepWorkspace {
-        root: Some("docs".to_string()),
-        write: vec!["docs".to_string()],
+        root: "docs".to_string(),
+        write: vec![],
         read: vec!["code".to_string()],
     };
     let scope = StepScope::resolve(Some(&section), &workspace);

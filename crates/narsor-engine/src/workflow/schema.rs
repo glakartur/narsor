@@ -96,7 +96,7 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
                     .iter()
                     .find(|(_, state)| state.workspace.is_some())
                 {
-                    return Err(format!("'states.{id}.workspace' requires 'schema: v2'"));
+                    return Err(format!("'states.{id}.workspaces' requires 'schema: v2'"));
                 }
             }
             SchemaVersion::V2 => {
@@ -116,7 +116,7 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
                 if let Some((id, _)) = with_access {
                     return Err(format!(
                         "'states.{id}.action.workspace_access' is not allowed in 'schema: v2'; \
-                         use the step's 'workspace' section"
+                         use the step's 'workspaces' section"
                     ));
                 }
             }
@@ -493,16 +493,16 @@ impl TryFrom<RawRepositorySchema> for RepositorySchema {
     }
 }
 
-/// The `workspace` section of a step (`schema: v2`): which repositories the
+/// The `workspaces` section of a step (`schema: v2`): which repositories the
 /// step gets and where the agent starts.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StepWorkspaceSchema {
-    /// A repository name, or `.` for the directory holding all of them.
-    #[serde(default)]
-    pub root: Option<String>,
+    /// A repository name, or `.` for the directory holding all of them. The
+    /// repository is writable unless `read` lists it.
+    pub root: String,
 
-    /// Repositories the step may change.
+    /// Further repositories the step may change.
     #[serde(default)]
     pub write: Vec<String>,
 
@@ -569,7 +569,7 @@ pub struct StateSchema {
 
     /// Repositories the step gets (`schema: v2` only). Without it the step
     /// gets all of them, the primary one writable.
-    #[serde(default)]
+    #[serde(default, rename = "workspaces")]
     pub workspace: Option<StepWorkspaceSchema>,
 }
 

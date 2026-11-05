@@ -156,23 +156,22 @@ pub enum RepositorySource {
     Local { path: String },
 }
 
-/// What a step may touch: the `workspace` section of a step.
+/// What a step may touch: the `workspaces` section of a step.
 ///
-/// `write` and `read` name repositories of the workflow; a step without the
-/// section gets every repository (the primary one writable). See
+/// `root` is where the harness starts. That repository is writable unless it
+/// is listed in `read`; `write` adds further writable repositories. A step
+/// without the section gets every repository (the primary one writable). See
 /// [`WorkspaceAccess`] for how the section maps onto a harness permission.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepWorkspace {
     /// Where the agent starts: a repository name or [`WORKSPACE_ROOT`].
-    /// Omitted means the first `write` repository, else the first `read` one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root: Option<String>,
+    pub root: String,
 
-    /// Repositories the step may change.
+    /// Further repositories the step may change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub write: Vec<String>,
 
-    /// Repositories the step may only read.
+    /// Repositories the step may only read, `root` included when named here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read: Vec<String>,
 }
@@ -181,10 +180,16 @@ pub struct StepWorkspace {
 pub const WORKSPACE_ROOT: &str = ".";
 
 impl StepWorkspace {
+    /// Whether `root` is a repository the step may change: it is one, and
+    /// `read` does not take it away.
+    pub fn root_is_writable(&self) -> bool {
+        self.root != WORKSPACE_ROOT && !self.read.contains(&self.root)
+    }
+
     /// The coarse permission this section amounts to: writable when it
-    /// lists a repository to write, read-only otherwise.
+    /// has a repository to write, read-only otherwise.
     pub fn access(&self) -> WorkspaceAccess {
-        if self.write.is_empty() {
+        if self.write.is_empty() && !self.root_is_writable() {
             WorkspaceAccess::ReadOnly
         } else {
             WorkspaceAccess::ReadWrite

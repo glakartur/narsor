@@ -38,9 +38,9 @@ impl StepScope {
     /// Resolves `section` (`None` for a step without one) against `workspace`.
     ///
     /// Without a section the step gets every repository, the primary one
-    /// writable and starting there (R9); with one, only the repositories it
-    /// names (R10), starting at `root`, else at the first `write` repository,
-    /// else at the first `read` one. A name the workspace does not have is
+    /// writable and starting there (R9); with one, only `root` and the
+    /// repositories it names (R10), starting at `root`, which is writable
+    /// unless `read` lists it. A name the workspace does not have is
     /// skipped: the validator rejects it before a task runs.
     pub fn resolve(section: Option<&StepWorkspace>, workspace: &Workspace) -> Self {
         let entries = workspace.repository_entries();
@@ -70,12 +70,20 @@ impl StepScope {
             };
         };
 
-        let write: Vec<_> = section.write.iter().filter_map(|name| find(name)).collect();
+        let mut write: Vec<_> = Vec::new();
+        if section.root_is_writable() {
+            write.extend(find(&section.root));
+        }
+        for repository in section.write.iter().filter_map(|name| find(name)) {
+            if !write.contains(&repository) {
+                write.push(repository);
+            }
+        }
         let read: Vec<_> = section.read.iter().filter_map(|name| find(name)).collect();
-        let start_dir = match section.root.as_deref() {
-            Some(WORKSPACE_ROOT) => Some(PathBuf::from(workspace.root_dir())),
-            Some(name) => find(name).map(|repository| repository.path),
-            None => write.first().or(read.first()).map(|r| r.path.clone()),
+        let start_dir = if section.root == WORKSPACE_ROOT {
+            Some(PathBuf::from(workspace.root_dir()))
+        } else {
+            find(&section.root).map(|repository| repository.path)
         }
         .unwrap_or_else(|| PathBuf::from(&workspace.path));
 
@@ -154,9 +162,9 @@ mod tests {
         repositories.iter().map(|r| r.name.as_str()).collect()
     }
 
-    fn section(root: Option<&str>, write: &[&str], read: &[&str]) -> StepWorkspace {
+    fn section(root: &str, write: &[&str], read: &[&str]) -> StepWorkspace {
         StepWorkspace {
-            root: root.map(str::to_string),
+            root: root.to_string(),
             write: write.iter().map(ToString::to_string).collect(),
             read: read.iter().map(ToString::to_string).collect(),
         }
@@ -165,10 +173,7 @@ mod tests {
     #[test]
     fn root_dot_starts_in_the_parent_and_lists_only_named_repositories() {
         let workspace = workspace(&["a", "b", "c", "d", "e"]);
-        let scope = StepScope::resolve(
-            Some(&section(Some("."), &["d"], &["a", "b", "c"])),
-            &workspace,
-        );
+        let scope = StepScope::resolve(Some(&section(".", &["d"], &["a", "b", "c"])), &workspace);
         assert_eq!(scope.start_dir, PathBuf::from("/task/workspace"));
         assert_eq!(names(&scope.write), ["d"]);
         assert_eq!(names(&scope.read), ["a", "b", "c"]);
@@ -186,11 +191,24 @@ mod tests {
     #[test]
     fn a_docs_step_starts_in_docs_and_reads_code() {
         let workspace = workspace(&["code", "docs"]);
-        let scope = StepScope::resolve(Some(&section(None, &["docs"], &["code"])), &workspace);
+        let scope = StepScope::resolve(Some(&section("docs", &[], &["code"])), &workspace);
         assert_eq!(scope.start_dir, PathBuf::from("/task/workspace/docs"));
         let block = scope.prompt_block();
         assert!(block.contains("- code (/task/workspace/code): read-only"));
         assert!(block.contains("- docs (/task/workspace/docs): write"));
+    }
+
+    #[test]
+    fn root_is_writable_unless_read_lists_it() {
+        let workspace = workspace(&["a", "b", "c"]);
+        let scope = StepScope::resolve(Some(&section("a", &["c"], &["b"])), &workspace);
+        assert_eq!(names(&scope.write), ["a", "c"]);
+        assert_eq!(names(&scope.read), ["b"]);
+
+        let scope = StepScope::resolve(Some(&section("a", &["c"], &["a", "b"])), &workspace);
+        assert_eq!(scope.start_dir, PathBuf::from("/task/workspace/a"));
+        assert_eq!(names(&scope.write), ["c"]);
+        assert_eq!(names(&scope.read), ["a", "b"]);
     }
 
     #[test]

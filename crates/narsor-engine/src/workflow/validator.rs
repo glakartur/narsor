@@ -760,7 +760,7 @@ fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<Valid
     }
 }
 
-/// The rules of a step's `workspace` section (KTD7).
+/// The rules of a step's `workspaces` section (KTD7).
 fn validate_step_workspace(
     definition: &WorkflowDefinition,
     state: &State,
@@ -776,12 +776,6 @@ fn validate_step_workspace(
     };
     let declared = |name: &str| definition.repositories.iter().any(|r| r.name == name);
 
-    if section.write.is_empty() && section.read.is_empty() {
-        errors.push(invalid(
-            "write",
-            "the section must list at least one repository in 'write' or 'read'".to_string(),
-        ));
-    }
     for (field, names) in [("write", &section.write), ("read", &section.read)] {
         let mut seen = HashSet::new();
         for name in names {
@@ -800,14 +794,14 @@ fn validate_step_workspace(
             ));
         }
     }
-    if let Some(root) = &section.root {
-        let listed = section.write.contains(root) || section.read.contains(root);
-        if root != WORKSPACE_ROOT && !listed {
-            errors.push(invalid(
-                "root",
-                format!("'{root}' is neither '{WORKSPACE_ROOT}' nor a repository listed in 'write' or 'read'"),
-            ));
-        }
+    if section.root != WORKSPACE_ROOT && !declared(&section.root) {
+        errors.push(invalid(
+            "root",
+            format!(
+                "'{}' is neither '{WORKSPACE_ROOT}' nor a repository of the workflow",
+                section.root
+            ),
+        ));
     }
 }
 
@@ -982,7 +976,7 @@ globals:
 "#;
 
     fn workspace_errors(section: &str) -> Vec<ValidationError> {
-        errors_of(REPOS, &format!("    workspace: {section}\n"))
+        errors_of(REPOS, &format!("    workspaces: {section}\n"))
     }
 
     fn rejected_field(errors: &[ValidationError], expected: &str) -> bool {
@@ -1001,11 +995,11 @@ globals:
     #[test]
     fn unknown_names_in_root_write_and_read_name_the_step_and_field() {
         assert!(rejected_field(
-            &workspace_errors("{ write: [nope] }"),
+            &workspace_errors("{ root: code, write: [nope] }"),
             "write"
         ));
         assert!(rejected_field(
-            &workspace_errors("{ read: [nope] }"),
+            &workspace_errors("{ root: code, read: [nope] }"),
             "read"
         ));
         assert!(rejected_field(
@@ -1017,29 +1011,39 @@ globals:
     #[test]
     fn a_repository_cannot_be_both_written_and_read() {
         assert!(rejected_field(
-            &workspace_errors("{ write: [code], read: [code] }"),
+            &workspace_errors("{ root: docs, write: [code], read: [code] }"),
             "read"
         ));
     }
 
     #[test]
-    fn root_must_be_listed_or_the_parent_directory() {
-        assert!(rejected_field(
-            &workspace_errors("{ root: docs, write: [code] }"),
-            "root"
-        ));
+    fn root_is_required_and_need_not_be_listed() {
+        assert!(workspace_errors("{ root: docs }").is_empty());
+        assert!(workspace_errors("{ root: docs, write: [code] }").is_empty());
         assert!(workspace_errors("{ root: \".\", write: [code] }").is_empty());
+        assert!(validate_source(&format!(
+            "{REPOS}{}",
+            TAIL.replace("  work:\n", "  work:\n    workspaces: { write: [code] }\n")
+        ))
+        .is_err());
     }
 
     #[test]
-    fn an_empty_workspace_section_is_rejected() {
-        assert!(rejected_field(&workspace_errors("{}"), "write"));
+    fn a_repository_is_listed_once_per_list() {
+        assert!(rejected_field(
+            &workspace_errors("{ root: docs, write: [code, code] }"),
+            "write"
+        ));
+        assert!(rejected_field(
+            &workspace_errors("{ root: docs, read: [code, code] }"),
+            "read"
+        ));
     }
 
     #[test]
     fn root_dot_is_allowed_with_a_single_repository() {
         let header = "schema: v2\nname: one\nversion: 1\nglobals:\n  repositories:\n    - { name: only, primary: true, default_branch: main, path: ../only }\n";
-        assert!(errors_of(header, "    workspace: { root: \".\", write: [only] }\n").is_empty());
+        assert!(errors_of(header, "    workspaces: { root: \".\", write: [only] }\n").is_empty());
     }
 
     fn repository_errors(repositories: &str) -> Vec<String> {

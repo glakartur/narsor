@@ -13,8 +13,9 @@
 //!   (`schema: v2`) becomes the definition's repository list, and a `v1` file is
 //!   converted to the same shape — `globals.workspace` becomes one primary
 //!   repository, and an agent's `workspace_access` becomes the step's
-//!   `workspace` section (`read-only` reads the primary repository,
-//!   `read-write` writes it). The file on disk is never touched.
+//!   `workspaces` section rooted in it (`read-only` lists the primary
+//!   repository in `read`; `read-write` leaves it writable). The file on disk
+//!   is never touched.
 //!
 //! No graph rules are checked here: an entry of `terminal_states` that names a
 //! state which does not exist is carried through without complaint, and
@@ -297,11 +298,12 @@ fn compile_state(
         (None, Some(ActionSchema::Agent(agent)), Some(primary)) => {
             agent.workspace_access.map(|access| match access {
                 WorkspaceAccess::ReadOnly => StepWorkspace {
+                    root: primary.to_string(),
                     read: vec![primary.to_string()],
                     ..StepWorkspace::default()
                 },
                 WorkspaceAccess::ReadWrite => StepWorkspace {
-                    write: vec![primary.to_string()],
+                    root: primary.to_string(),
                     ..StepWorkspace::default()
                 },
             })
@@ -565,7 +567,7 @@ terminal_states: [done]
         assert_eq!(
             review.workspace,
             Some(StepWorkspace {
-                root: None,
+                root: "repo-a".to_string(),
                 write: vec![],
                 read: vec!["repo-a".to_string()],
             })
@@ -601,7 +603,7 @@ terminal_states: [done]
             r#"
 states:
   work:
-    workspace: { root: ".", write: [docs], read: [code] }
+    workspaces: { root: ".", write: [docs], read: [code] }
     action: { type: agent, prompt: write the docs }
     choices: [success]
     transitions: { success: done }
@@ -629,7 +631,7 @@ terminal_states: [done]
         assert_eq!(
             definition.states["work"].workspace,
             Some(StepWorkspace {
-                root: Some(".".to_string()),
+                root: ".".to_string(),
                 write: vec!["docs".to_string()],
                 read: vec!["code".to_string()],
             })
