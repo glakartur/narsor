@@ -686,8 +686,13 @@ pub fn takeover(
 
     let mut execution = store.load_execution(execution_id)?;
 
-    let bundle = store.paths().checkpoint_file(execution_id);
-    if !bundle.is_file() {
+    let repositories = execution.workspace.repository_entries();
+    if !repositories.iter().any(|repository| {
+        store
+            .paths()
+            .checkpoint_file(execution_id, &repository.name)
+            .is_file()
+    }) {
         return Err(TakeoverError::NoCheckpoint {
             execution_id: execution_id.to_string(),
         });
@@ -715,30 +720,24 @@ pub fn takeover(
     };
 
     // Every repository has its own base and its own bundle (KTD10). The
-    // provisioner above rebuilds the primary one; another repository is laid
-    // back only when its directory exists again.
-    for repository in execution.workspace.repository_entries() {
-        let (path, bundle, scratch) = if repository.primary {
-            (
-                work_tree.clone(),
-                bundle.clone(),
-                store.paths().checkpoint_scratch(execution_id),
-            )
+    // provisioner above rebuilds the primary checkout; another repository is
+    // laid back only when its directory exists again.
+    for repository in repositories {
+        let path = if repository.primary {
+            work_tree.clone()
         } else {
             let path = PathBuf::from(&repository.path);
             if !path.is_dir() {
                 continue;
             }
-            (
-                path,
-                store
-                    .paths()
-                    .checkpoint_repository_file(execution_id, &repository.name),
-                store
-                    .paths()
-                    .checkpoint_repository_scratch(execution_id, &repository.name),
-            )
+            path
         };
+        let bundle = store
+            .paths()
+            .checkpoint_file(execution_id, &repository.name);
+        let scratch = store
+            .paths()
+            .checkpoint_scratch(execution_id, &repository.name);
         if !bundle.is_file() {
             continue;
         }

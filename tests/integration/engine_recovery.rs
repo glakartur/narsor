@@ -1646,14 +1646,14 @@ async fn every_repository_of_a_task_is_checkpointed_and_materialised_on_its_own(
         (
             "code",
             &code_base,
-            paths.checkpoint_file(&execution.id),
+            paths.checkpoint_file(&execution.id, "code"),
             ("uncommitted.txt", "wip\n"),
             None,
         ),
         (
             "docs",
             &docs_base,
-            paths.checkpoint_repository_file(&execution.id, "docs"),
+            paths.checkpoint_file(&execution.id, "docs"),
             ("tracked.txt", "edited\n"),
             Some(("ignored.log", "kept anyway\n")),
         ),

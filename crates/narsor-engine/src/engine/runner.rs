@@ -3521,17 +3521,8 @@ impl Engine {
                         .filter(|_| repository.primary)
                 })
                 .map_or(&[], |declared| &declared.preserve_paths);
-            let (scratch, bundle) = if repository.primary {
-                (
-                    paths.checkpoint_scratch(&execution.id),
-                    paths.checkpoint_file(&execution.id),
-                )
-            } else {
-                (
-                    paths.checkpoint_repository_scratch(&execution.id, &repository.name),
-                    paths.checkpoint_repository_file(&execution.id, &repository.name),
-                )
-            };
+            let scratch = paths.checkpoint_scratch(&execution.id, &repository.name);
+            let bundle = paths.checkpoint_file(&execution.id, &repository.name);
             let request = crate::workspace::CaptureRequest {
                 work_tree: std::path::Path::new(&repository.path),
                 base,

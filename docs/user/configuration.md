@@ -155,8 +155,8 @@ Under the `--root` directory (`./.narsor` by default):
 │   ├── context.json                # the context projection (variables, artifacts, workspace)
 │   ├── pending_input.json          # the question an input-needed execution is waiting on
 │   ├── definition.yaml             # pinned copy of the workflow definition for this execution
-│   ├── checkpoint.bundle           # git bundle of the workspace delta against base_commit
-│   ├── checkpoint.git/             # scratch area for materialising the checkpoint
+│   ├── checkpoint.<repo>.bundle    # per workflow repository: git bundle of its delta against base_commit
+│   ├── checkpoint.<repo>.git/      # scratch area for materialising that checkpoint
 │   ├── events/{sequence:08}.json   # append-only event log
 │   ├── conversations/{action_execution_id}.jsonl(.zst)  # per-attempt agent conversation record
 │   └── artifacts/{artifact_id}/    # files produced by actions

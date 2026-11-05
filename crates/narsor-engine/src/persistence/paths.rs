@@ -236,15 +236,6 @@ pub const MATERIAL_RECORD_FILE: &str = "material.json";
 /// Directory of one material's content-addressed blobs.
 pub const MATERIAL_BLOBS_DIR: &str = "blobs";
 
-/// The one checkpoint kept for an execution (R25).
-pub const CHECKPOINT_FILE: &str = "checkpoint.bundle";
-
-/// Git's own scratch area for producing and applying a checkpoint.
-///
-/// Deliberately outside the work tree, so that a workspace which is not a git
-/// repository does not acquire a `.git` directory it never asked for.
-pub const CHECKPOINT_SCRATCH_DIR: &str = "checkpoint.git";
-
 /// Suffix of a not-yet-renamed atomic write. Never a file to read from.
 pub const TEMP_SUFFIX: &str = ".tmp";
 
@@ -528,28 +519,16 @@ impl StatePaths {
             .join(ENROLLMENTS_LOCK_FILE)
     }
 
-    /// `{state}/executions/{id}/checkpoint.bundle`.
-    pub fn checkpoint_file(&self, execution_id: &str) -> PathBuf {
-        self.execution_dir(execution_id).join(CHECKPOINT_FILE)
-    }
-
-    /// `{state}/executions/{id}/checkpoint.git`.
-    pub fn checkpoint_scratch(&self, execution_id: &str) -> PathBuf {
-        self.execution_dir(execution_id)
-            .join(CHECKPOINT_SCRATCH_DIR)
-    }
-
-    /// `{state}/executions/{id}/checkpoint.{name}.bundle`: the checkpoint of a
-    /// repository other than the primary one, which keeps
-    /// [`Self::checkpoint_file`].
-    pub fn checkpoint_repository_file(&self, execution_id: &str, repository: &str) -> PathBuf {
+    /// `{state}/executions/{id}/checkpoint.{name}.bundle`: the checkpoint of
+    /// the workflow repository `name`.
+    pub fn checkpoint_file(&self, execution_id: &str, repository: &str) -> PathBuf {
         self.execution_dir(execution_id)
             .join(format!("checkpoint.{repository}.bundle"))
     }
 
     /// `{state}/executions/{id}/checkpoint.{name}.git`: scratch of
-    /// [`Self::checkpoint_repository_file`].
-    pub fn checkpoint_repository_scratch(&self, execution_id: &str, repository: &str) -> PathBuf {
+    /// [`Self::checkpoint_file`].
+    pub fn checkpoint_scratch(&self, execution_id: &str, repository: &str) -> PathBuf {
         self.execution_dir(execution_id)
             .join(format!("checkpoint.{repository}.git"))
     }
