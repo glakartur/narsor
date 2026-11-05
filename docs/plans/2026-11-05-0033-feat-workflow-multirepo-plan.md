@@ -40,15 +40,15 @@ Workflow ma dziś jedno repozytorium (`globals.workspace`, `crates/narsor-engine
 
 **Repozytoria w definicji**
 
-- R5. Definicja `v2` deklaruje listę nazwanych repozytoriów. Nazwa jest zarazem nazwą folderu repozytorium. Dokładnie jedno repozytorium jest oznaczone jako główne.
-- R6. Każde repozytorium w definicji ma domyślny branch. Repozytorium można związać z rejestrem repozytoriów na stałe albo z inputem typu `repository`.
+- R5. Definicja `v2` deklaruje w `globals.workspaces` mapę nazwanych przestrzeni roboczych, z których każda to jedno repozytorium. Klucz jest zarazem nazwą folderu. Dokładnie jedno repozytorium jest oznaczone jako główne.
+- R6. Każde repozytorium w definicji ma `base_branch`: branch, z którego zadanie startuje i na który trafia PR. Narsor nie tworzy brancha roboczego, robi to krok. Repozytorium można związać z rejestrem repozytoriów na stałe albo z inputem typu `repository`.
 
 **Repozytoria w kroku**
 
-- R7. Krok może mieć sekcję `workspace` z polami `root`, `write` i `read`. `write` i `read` to listy nazw repozytoriów, a `write` może zawierać więcej niż jedno.
-- R8. `root` wskazuje katalog, w którym startuje agent: nazwę repozytorium albo `.`. `.` oznacza katalog nadrzędny zawierający foldery wszystkich repozytoriów workflow.
-- R9. Krok bez sekcji `workspace` dostaje wszystkie repozytoria workflow: główne w zapisie, pozostałe tylko do odczytu.
-- R10. Krok z sekcją `workspace` dostaje wyłącznie repozytoria w niej wymienione.
+- R7. Krok może mieć sekcję `workspaces` z polami `root`, `read` i `write`. `read` i `write` to listy nazw przestrzeni roboczych, a `write` może zawierać więcej niż jedną.
+- R8. `root` jest wymagane, gdy sekcja jest podana. Wskazuje katalog, w którym startuje agent: nazwę przestrzeni albo `.`, czyli katalog nadrzędny zawierający foldery wszystkich przestrzeni workflow. Repozytorium z `root` jest zapisywalne, chyba że `read` je wymienia; `read` pozwala więc ograniczyć agenta uruchomionego w `root`.
+- R9. Krok bez sekcji `workspaces` dostaje wszystkie repozytoria workflow: główne w zapisie, pozostałe tylko do odczytu.
+- R10. Krok z sekcją `workspaces` dostaje wyłącznie `root` i repozytoria w niej wymienione. Ta sama nazwa nie może być jednocześnie w `read` i `write` ani wystąpić dwa razy na jednej liście.
 - R11. Repozytorium tylko do odczytu pokazuje aktualny stan zadania, łącznie ze zmianami wprowadzonymi we wcześniejszych krokach, także niezacommitowanymi i niewypchniętymi.
 - R12. Krok może mieć repozytorium dokumentacji w zapisie, a repozytorium kodu tylko do odczytu, i widzi w nim zmiany kodu z wcześniejszych kroków workflow.
 
@@ -78,7 +78,7 @@ Workflow ma dziś jedno repozytorium (`globals.workspace`, `crates/narsor-engine
   - **Covered by:** R7, R10, R11, R12, R13
 - F2. Brainstorm z dostępem do dokumentacji
   - **Trigger:** Krok brainstorm w workflow z repozytoriami `code` (główne) i `docs`.
-  - **Steps:** Krok nie ma sekcji `workspace` (R9), więc agent pracuje w `code` i dostaje `docs` tylko do odczytu.
+  - **Steps:** Krok nie ma sekcji `workspaces` (R9), więc agent pracuje w `code` i dostaje `docs` tylko do odczytu.
   - **Covered by:** R9, R13, R14
 - F3. Wczytanie istniejącej definicji
   - **Trigger:** Workflow bez pola `schema` z `globals.workspace`.
@@ -89,8 +89,8 @@ Workflow ma dziś jedno repozytorium (`globals.workspace`, `crates/narsor-engine
 
 - AE1. **Covers R3.** Workflow `v1` z jednym `globals.workspace` uruchamia się bez zmiany pliku i zachowuje się jak przed zmianą.
 - AE2. **Covers R2.** Definicja `schema: v2` z `globals.workspace` jest odrzucona przy walidacji.
-- AE3. **Covers R8, R10.** Krok z `root: .`, `read: [a, b, c]` i `write: [d]` startuje w katalogu nadrzędnym i widzi cztery repozytoria. Inne repozytoria workflow nie są mu udostępnione.
-- AE4. **Covers R9.** Krok bez sekcji `workspace` w workflow z repozytoriami `code` (główne) i `docs` ma `code` w zapisie, a `docs` tylko do odczytu.
+- AE3. **Covers R8, R10.** Krok z `root: .`, `read: [a, b, c]` i `write: [d]` startuje w katalogu nadrzędnym i widzi cztery repozytoria. Inne repozytoria workflow nie są mu udostępnione. Krok z `root: a`, `read: [a, b]` i `write: [c]` ma `a` tylko do odczytu, a `c` w zapisie.
+- AE4. **Covers R9.** Krok bez sekcji `workspaces` w workflow z repozytoriami `code` (główne) i `docs` ma `code` w zapisie, a `docs` tylko do odczytu.
 - AE5. **Covers R11, R12.** Krok dokumentacji widzi w repozytorium kodu plik zmieniony i niezacommitowany przez wcześniejszy krok.
 - AE6. **Covers R16.** Dyrygent wywołany w zadaniu z dwoma repozytoriami może przeczytać oba.
 
@@ -119,7 +119,7 @@ Workflow ma dziś jedno repozytorium (`globals.workspace`, `crates/narsor-engine
 ### Dependencies / Assumptions
 
 - Definicja ma dziś jedno `globals.workspace` (`crates/narsor-engine/src/workflow/schema.rs:256`) i inputy typu `repository` (`docs/dev/workflow-schema.md`, sekcja inputów), które pozostają sposobem wyboru konkretnego repozytorium.
-- Krok ma dziś `workspace_access` dla całego workspace (`schema.rs:541`). Sekcja `workspace` kroku zastępuje to w `v2` (KTD6).
+- Krok ma dziś `workspace_access` dla całego workspace (`schema.rs:541`). Sekcja `workspaces` kroku zastępuje to w `v2` (KTD6).
 - Zakładam, że nazwa repozytorium w definicji jest etykietą i nazwą folderu, a konkretne repozytorium i branch wiąże się z nią osobno (R6).
 - Zakładam, że `root: .` ma sens także dla jednego repozytorium (KTD7).
 
@@ -131,13 +131,13 @@ Workflow ma dziś jedno repozytorium (`globals.workspace`, `crates/narsor-engine
 
 ### Key Technical Decisions
 
-- KTD1. **Składnia `v2` deklaruje repozytoria w `globals.repositories`, a `v1` konwerter tworzy z `globals.workspace` jedno repozytorium główne.** Każdy wpis ma `name`, `primary` (dokładnie jeden, R5), `default_branch` (R6) oraz źródło: `repository` (id z rejestru lub szablon `{{ inputs.x }}`, jak dziś w `WorkspaceSpec::Git`) albo `path` (jak `WorkspaceSpec::Local`), z `preserve_paths` per repozytorium. Konwerter nadaje repozytorium nazwę z id rejestru, a dla `local` z ostatniego członu ścieżki. Governs R3, R5, R6.
-- KTD2. **Typy domenowe znają tylko `v2`; konwersja dzieje się raz w loaderze, a `schema.rs` trzyma dwa kształty YAML.** `WorkflowFile` rozpoznaje `schema` przed pełnym deserializowaniem i wybiera `v1` albo `v2` jako osobny kształt `serde` z `deny_unknown_fields`. Dzięki temu `v2` odrzuca `globals.workspace` już przy parsowaniu (R2). Governs R1-R4.
+- KTD1. **Składnia `v2` deklaruje repozytoria w `globals.workspaces`, mapie nazwa → wpis, a `v1` konwerter tworzy z `globals.workspace` jedno repozytorium główne.** Kluczem jest nazwa, a kolejność pliku jest zachowana. Wpis ma `primary` (dokładnie jedno, R5), `base_branch` (R6; w typach domenowych nadal `default_branch`, a `ref` z `v1` trafia do niego) oraz źródło: `repository` (id z rejestru lub szablon `{{ inputs.x }}`, jak dziś w `WorkspaceSpec::Git`) albo `path` (jak `WorkspaceSpec::Local`), z `preserve_paths` per repozytorium. Konwerter nadaje repozytorium nazwę z id rejestru, a dla `local` z ostatniego członu ścieżki. Governs R3, R5, R6.
+- KTD2. **Typy domenowe znają tylko `v2`; konwersja dzieje się raz w loaderze, a `schema.rs` trzyma jeden zestaw struktur `serde` z kontrolą zgodności z wersją.** `WorkflowFile` rozpoznaje `schema` i odrzuca konstrukcje drugiej wersji już przy parsowaniu (R2). Zduplikowana nazwa w `globals.workspaces` też jest błędem parsowania. Governs R1-R4.
 - KTD3. **Wszystkie repozytoria zadania leżą w katalogu zadania jako `workspace/<name>`; `root: .` to `workspace/`.** To jeden układ na obu backendach, bo katalog zadania i tak odtwarza runner (`crates/narsor-runner/src/runner/init.rs`), a nie kontroler. Repozytorium tylko do odczytu nie jest kopią, więc widzi bieżący stan zadania razem z zmianami niezacommitowanymi (R11, R12), a R17 wynika z tego, że backend zdalny uruchamia ten sam runner. Wynika z decyzji produktowej o braku montowania read-only. Governs R8, R11, R12, R17.
 - KTD4. **Stan zadania trzyma listę repozytoriów w `TaskLaunchSpec`, a nie pojedynczy `TaskWorkspace`.** Wpis ma `name`, `branch` i tożsamość źródła (dotychczasowe `GitIdentity` albo ścieżka lokalna). Zmiana kształtu podnosi `TASK_LAUNCH_SPEC_VERSION` (`crates/narsor-protocol/src/launch.rs:19`) z 3 na 4. Starsze rekordy są odrzucane z jasnym komunikatem, zgodnie z istniejącą polityką `TaskLaunchSpec` (`crates/narsor-engine/src/domain/task.rs:107-125`), bo nie ma wierności, z jaką można je podnieść. Governs R15.
-- KTD5. **Zakres kroku wylicza jeden resolver w engine: z definicji kroku daje `root`, listę zapisu i listę odczytu.** Brak sekcji `workspace` daje wszystkie repozytoria (główne w zapisie, reszta odczyt, R9), a sekcja zawęża do wymienionych (R10). Pominięty `root` oznacza repozytorium główne w kroku bez sekcji i pierwsze repozytorium z `write` w kroku z sekcją. Governs R7-R10.
-- KTD6. **Sekcja `workspace` kroku zastępuje `workspace_access` w `v2`; konwerter mapuje `workspace_access: read_only` na `workspace: { read: [główne] }`, a `read_write` i brak pola na brak sekcji.** `v2` z `workspace_access` jest błędem walidacji (R2). Istniejący `read_only_paths` agenta zostaje i jest nadal rozwiązywany względem katalogu startowego (`crates/narsor-engine/src/engine/actions/harness/mod.rs:453`). Governs R2, R3.
-- KTD7. **Reguły walidacji `v2`:** nazwy repozytoriów to poprawne, unikalne nazwy folderów (`is_usable_directory_name`); `root`, `write`, `read` odwołują się tylko do zadeklarowanych nazw; to samo repozytorium nie może być w `write` i `read`; `root` wskazuje repozytorium z `write` lub `read` albo `.`; `root: .` jest dozwolone także przy jednym repozytorium; sekcja `workspace` musi wymieniać co najmniej jedno repozytorium. Błędy `v1` zachowują oryginalne nazwy pól dzięki temu, że konwerter przenosi ścieżkę pola źródłowego razem z konwertowaną wartością (R4). Governs R2, R4, R5, R7, R8.
+- KTD5. **Zakres kroku wylicza jeden resolver w engine: z definicji kroku daje `root`, listę zapisu i listę odczytu.** Brak sekcji `workspaces` daje wszystkie repozytoria (główne w zapisie, reszta odczyt, R9), a sekcja zawęża do wymienionych (R10). `root` jest wymagany w sekcji i jest zapisywalny, o ile `read` go nie wymienia; przy `root: .` zapisywalne jest tylko to, co jest w `write`. Governs R7-R10.
+- KTD6. **Sekcja `workspaces` kroku zastępuje `workspace_access` w `v2`; konwerter mapuje `workspace_access: read_only` na `workspaces: { root: główne, read: [główne] }`, `read_write` na `workspaces: { root: główne }`, a brak pola na brak sekcji.** `v2` z `workspace_access` jest błędem walidacji (R2). Istniejący `read_only_paths` agenta zostaje i jest nadal rozwiązywany względem katalogu startowego (`crates/narsor-engine/src/engine/actions/harness/mod.rs:453`). Governs R2, R3.
+- KTD7. **Reguły walidacji `v2`:** nazwy repozytoriów to poprawne, unikalne nazwy folderów (`is_usable_directory_name`); `root` jest wymagane; `root`, `write`, `read` odwołują się tylko do zadeklarowanych nazw (`root` może też być `.`, także przy jednym repozytorium); to samo repozytorium nie może być w `write` i `read` ani wystąpić dwa razy na jednej liście; `root` nie musi być wymienione na listach. Błędy `v1` zachowują oryginalne nazwy pól dzięki temu, że konwerter przenosi ścieżkę pola źródłowego razem z konwertowaną wartością (R4). Governs R2, R4, R5, R7, R8.
 - KTD8. **Prompt kroku dostaje blok z listą repozytoriów (nazwa, ścieżka, tryb); ograniczenie zapisu stosują harnessy, które to potrafią.** Adapter dostaje listę katalogów zapisywalnych i tylko do odczytu zamiast jednej flagi `WorkspaceAccess`; adaptery bez mechanizmu ograniczenia polegają na bloku w prompcie (R14). Naruszenia nie są wykrywane (decyzja produktowa, bez zmian). Governs R13, R14.
 - KTD9. **Dyrygent dostaje katalog `workspace/` z wszystkimi repozytoriami w trybie `ReadOnly`, a jego prompt zawiera ten sam blok z listą (KTD8).** Zmiana ogranicza się do ścieżki, którą `invoke.rs` już otwiera tylko do odczytu (`crates/narsor-engine/src/conductor/invoke.rs:245-275`). Governs R16.
 - KTD10. **Checkpointy są liczone per repozytorium.** `capture` i `materialise` dostają dziś jeden `work_tree` (`crates/narsor-engine/src/workspace/checkpoint.rs:52-66`), więc runner wywołuje je w pętli po repozytoriach, a paczka checkpointu niesie nazwę repozytorium. Governs R11.
@@ -182,12 +182,13 @@ flowchart TB
 - **Requirements:** R1, R2, R3, R4, R5, R6, R7; KTD1, KTD2, KTD6.
 - **Dependencies:** Brak.
 - **Files:** `crates/narsor-engine/src/workflow/schema.rs`, `crates/narsor-engine/src/workflow/loader.rs`, `crates/narsor-engine/src/domain/workflow_definition.rs`; testy w `crates/narsor-engine/src/workflow/loader.rs` (moduł testów) i fixtury w `tests/fixtures/`.
-- **Approach:** Dodać `schema` do `WorkflowFile`, kształt `v2` z `globals.repositories` i `workspace` kroku, oraz zastąpić `WorkflowDefinition.workspace` listą repozytoriów i `workspace_access` sekcją kroku w typach domenowych. Konwerter zachowuje ścieżki pól źródłowych dla walidatora (KTD7). Wzorzec błędów: istniejące `LoadError` z kontekstem pliku (`loader.rs:50-78`).
+- **Approach:** Dodać `schema` do `WorkflowFile`, kształt `v2` z `globals.workspaces` i `workspaces` kroku, oraz zastąpić `WorkflowDefinition.workspace` listą repozytoriów i `workspace_access` sekcją kroku w typach domenowych. Konwerter zachowuje ścieżki pól źródłowych dla walidatora (KTD7). Wzorzec błędów: istniejące `LoadError` z kontekstem pliku (`loader.rs:50-78`).
 - **Test scenarios:**
   - AE1: `v1` z jednym `globals.workspace` typu `git` i typu `local` (z `preserve_paths`) daje definicję `v2` z jednym repozytorium głównym i niezmienionym plikiem.
   - AE2: `schema: v2` z `globals.workspace` oraz z `workspace_access` w kroku jest odrzucone.
   - Brak `schema` jest `v1`; `schema: v3` i nieznane pole są błędem; `version` zachowuje znaczenie.
-  - `workspace_access: read_only` w `v1` daje `workspace: { read: [główne] }` (KTD6).
+  - `workspace_access: read_only` w `v1` daje `workspaces: { root: główne, read: [główne] }`, a `read_write` daje `workspaces: { root: główne }` (KTD6).
+  - Zduplikowana nazwa w `globals.workspaces` jest błędem.
   - Dwa repozytoria główne lub żadne w `v2` jest błędem (R5).
 - **Verification:** `cargo test -p narsor-engine workflow::`.
 
@@ -200,7 +201,7 @@ flowchart TB
 - **Approach:** Rozszerzyć walidator o reguły KTD7 i zbierać wszystkie naruszenia jak dziś. Szablony w polach źródła repozytorium walidować jak obecne `globals.workspace.repository`.
 - **Test scenarios:**
   - Nieznana nazwa w `root`, `write` albo `read` daje błąd z nazwą kroku i pola.
-  - To samo repozytorium w `write` i `read`; `root` spoza wymienionych; pusta sekcja `workspace`.
+  - To samo repozytorium w `write` i `read`; duplikat na jednej liście; brak `root`; `root` spoza zadeklarowanych nazw. `root` poza listami i sekcja z samym `root` przechodzą.
   - `root: .` przy jednym repozytorium przechodzi.
   - Błąd w `v1` (zły szablon w `globals.workspace.repository`) wskazuje `globals.workspace.repository`, nie pole `v2` (R4).
   - Nazwa niebędąca poprawną nazwą folderu lub zduplikowana jest błędem.
@@ -241,9 +242,9 @@ flowchart TB
 - **Files:** nowy moduł resolvera w `crates/narsor-engine/src/engine/actions/` (obok `agent.rs`), `crates/narsor-engine/src/engine/actions/agent.rs` (`:286-296`), `crates/narsor-engine/src/engine/actions/script.rs` (`:80-154`), `crates/narsor-engine/src/engine/actions/harness/mod.rs`, adaptery `claude_code.rs`, `codex.rs`, `github_copilot.rs`, `opencode.rs`, `crates/narsor-engine/src/engine/actions/agent/contract.rs` (`:197`); testy przy tych plikach.
 - **Approach:** Resolver zwraca katalog startowy, zapis i odczyt (KTD5). Żądanie harnessu dostaje listy katalogów zamiast jednej flagi; adaptery mapują je na natywne mechanizmy, a pozostałe polegają na bloku promptu. Ponowienie kontraktu wymuszające `ReadOnly` ma obejmować wszystkie katalogi.
 - **Test scenarios:**
-  - AE3: `root: .`, `read: [a, b, c]`, `write: [d]` daje katalog `workspace/` i cztery repozytoria; piąte nie jest wymienione.
-  - AE4: brak sekcji `workspace` daje główne w zapisie i resztę tylko do odczytu.
-  - F1/AE5: krok z `write: [docs]`, `read: [code]` startuje w `docs`, a prompt wymienia `code` jako tylko do odczytu.
+  - AE3: `root: .`, `read: [a, b, c]`, `write: [d]` daje katalog `workspace/` i cztery repozytoria; piąte nie jest wymienione. `root: a`, `read: [a, b]`, `write: [c]` daje `a` tylko do odczytu.
+  - AE4: brak sekcji `workspaces` daje główne w zapisie i resztę tylko do odczytu.
+  - F1/AE5: krok z `root: docs`, `read: [code]` startuje w `docs`, a prompt wymienia `code` jako tylko do odczytu.
   - Prompt zawiera nazwę, ścieżkę i tryb każdego repozytorium (R13).
   - Adapter bez wsparcia ograniczeń nie zgłasza błędu i polega na prompcie.
   - Skrypt z `working_dir` w konwertowanym `v1` działa jak przed zmianą.
@@ -267,7 +268,7 @@ flowchart TB
 - **Requirements:** R18.
 - **Dependencies:** U1-U6.
 - **Files:** `docs/dev/workflow-schema.md`, `README.md` (przykład, jeśli odwołuje się do `globals.workspace`), nowe fixtury `v2` w `tests/fixtures/`, `tests/integration/`.
-- **Approach:** Opisać pola `schema`, `globals.repositories`, `workspace` kroku, reguły walidacji (KTD7) i krótką sekcję konwersji `v1` (KTD1, KTD6). Dodać notatkę o odrzuceniu zadań zapisanych w wersji 3 (KTD4). Jeśli istnieje tabela użytkowa workflow w `docs/user`, zaktualizować ją.
+- **Approach:** Opisać pola `schema`, `globals.workspaces`, `workspaces` kroku, reguły walidacji (KTD7) i krótką sekcję konwersji `v1` (KTD1, KTD6). Dodać notatkę o odrzuceniu zadań zapisanych w wersji 3 (KTD4). Jeśli istnieje tabela użytkowa workflow w `docs/user`, zaktualizować ją.
 - **Test scenarios:** Test integracyjny ładujący fixturę `v2` z dwoma repozytoriami i walidujący ją poleceniem `narsor-cli validate`.
 - **Verification:** `cargo test --workspace`.
 
