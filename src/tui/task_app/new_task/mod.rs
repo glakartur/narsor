@@ -203,15 +203,10 @@ pub struct NewTaskForm {
     /// The id of the task last made from this form, so that its success can
     /// clear what was remembered.
     submitted: Option<String>,
-    /// What the server said of the branches of each repository read so far:
-    /// the list, or why there is none.
     branch_lists: BTreeMap<String, Result<Vec<String>, String>>,
-    /// The repositories whose branches were asked for and not yet answered.
     branch_reads: BTreeSet<String>,
 }
 
-/// A `repository` input of an entry that offers the registered repositories,
-/// and where its branch is typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BranchSlot {
     entry: usize,
@@ -268,7 +263,6 @@ impl NewTaskForm {
             .collect();
         self.repositories = repositories.to_vec();
         self.path_access = path_access;
-        // The remotes may have new branches by now: they are read again.
         self.branch_lists.clear();
         self.branch_reads.clear();
         let items = self.items();
@@ -296,8 +290,6 @@ impl NewTaskForm {
         &self.repositories
     }
 
-    /// The branch fields of every entry that stand under a repository chosen
-    /// from the registry.
     fn branch_slots(&self) -> Vec<BranchSlot> {
         let mut slots = Vec::new();
         for (entry, kind) in self.entries.iter().enumerate() {
@@ -326,7 +318,6 @@ impl NewTaskForm {
         slots
     }
 
-    /// [`Self::branch_slots`] of the entry that is highlighted.
     fn selected_branch_slots(&self) -> Vec<BranchSlot> {
         let selected = self.chooser.selected();
         let mut slots = self.branch_slots();
@@ -340,7 +331,9 @@ impl NewTaskForm {
     /// repositories of the highlighted entry that were never asked for, now
     /// marked as asked.
     fn after_key(&mut self, before: &[BranchSlot]) -> Vec<String> {
-        for slot in self.selected_branch_slots() {
+        let selected = self.chooser.selected();
+        let slots = self.branch_slots();
+        for slot in slots.iter().filter(|slot| slot.entry == selected) {
             let changed = before.iter().any(|earlier| {
                 earlier.entry == slot.entry
                     && earlier.input == slot.input
@@ -354,43 +347,42 @@ impl NewTaskForm {
                 self.branch_reads.remove(&slot.repository);
             }
         }
-        self.show_branch_lists();
-        self.unasked_repositories()
+        self.show_branch_lists(&slots);
+        self.unasked_repositories(slots.iter().filter(|slot| slot.entry == selected))
     }
 
-    /// The repositories of the highlighted entry whose branches were not asked
-    /// for, now marked as asked.
-    fn unasked_repositories(&mut self) -> Vec<String> {
+    fn unasked_repositories<'a>(
+        &mut self,
+        selected_slots: impl Iterator<Item = &'a BranchSlot>,
+    ) -> Vec<String> {
         let mut unasked = Vec::new();
-        for slot in self.selected_branch_slots() {
+        for slot in selected_slots {
             let known = self.branch_lists.contains_key(&slot.repository)
                 || self.branch_reads.contains(&slot.repository);
             if !known {
                 self.branch_reads.insert(slot.repository.clone());
-                unasked.push(slot.repository);
+                unasked.push(slot.repository.clone());
             }
         }
         unasked
     }
 
-    /// Every branch field suggests the branches known of its repository, and
-    /// none while they are not known.
-    fn show_branch_lists(&mut self) {
-        for slot in self.branch_slots() {
+    fn show_branch_lists(&mut self, slots: &[BranchSlot]) {
+        for slot in slots {
             let suggestions = match self.branch_lists.get(&slot.repository) {
-                Some(Ok(branches)) => branches.clone(),
-                _ => Vec::new(),
+                Some(Ok(branches)) => branches.as_slice(),
+                _ => &[],
             };
             self.chooser
                 .set_field_suggestions(slot.entry, &slot.branch_field, suggestions);
         }
     }
 
-    /// Takes in what the server said of the branches of `repository`.
     fn take_branch_list(&mut self, repository: &str, list: Result<Vec<String>, String>) {
         self.branch_reads.remove(repository);
         self.branch_lists.insert(repository.to_string(), list);
-        self.show_branch_lists();
+        let slots = self.branch_slots();
+        self.show_branch_lists(&slots);
     }
 
     fn first_available(&self) -> usize {
@@ -741,8 +733,6 @@ impl TaskApp {
         self
     }
 
-    /// Starts the reads of the branches of `repositories`, one job for each;
-    /// what they bring becomes the suggestions of the branch fields.
     pub(super) fn start_branch_reads(&mut self, repositories: &[String]) {
         for repository in repositories {
             let source = Arc::clone(&self.branch_source);
@@ -755,15 +745,19 @@ impl TaskApp {
         }
     }
 
-    /// The branches of `repository` are back. A list that could not be read
-    /// leaves the fields as plain text, and the bar says why.
     fn on_branches_read(&mut self, repository: &str, read: Result<Vec<String>, ClientError>) {
         // A remote that cannot be listed is not a server that cannot be
         // reached: only a lost connection counts against the connection.
         if let Err(error @ ClientError::Unavailable(_)) = &read {
             self.note_transport(error);
         }
-        let list = read.as_ref().map(Clone::clone).map_err(failure_reason);
+        let (list, failure) = match read {
+            Ok(branches) => (Ok(branches), None),
+            Err(error) => {
+                let reason = failure_reason(&error);
+                (Err(reason.clone()), Some(reason))
+            }
+        };
         let form = match &mut self.view {
             View::NewTask(form) => Some(&mut **form),
             _ => self.new_task_memory.as_mut(),
@@ -772,14 +766,14 @@ impl TaskApp {
             return;
         };
         form.take_branch_list(repository, list);
-        if let Err(error) = read {
+        if let Some(reason) = failure {
             if matches!(self.view, View::NewTask(_)) {
                 self.notify(
                     Severity::Warning,
                     format!(
                         "nie udało się wczytać gałęzi repozytorium {} ({}) — pole gałęzi będzie tekstem",
                         one_line(repository),
-                        failure_reason(&error)
+                        reason
                     ),
                 );
             }
@@ -825,7 +819,7 @@ impl TaskApp {
             }
             None => NewTaskForm::new(&workflows, &repositories.repositories, access),
         };
-        let unasked = form.unasked_repositories();
+        let unasked = form.unasked_repositories(form.selected_branch_slots().iter());
         self.show_new_task(form);
         Self::reading(unasked)
     }

@@ -224,10 +224,6 @@ fn a_local_path_is_the_only_remote_that_may_use_the_file_transport() {
     assert_eq!(allowed.as_deref(), Some("file"));
 }
 
-// ---------------------------------------------------------------------------
-// The route and the client, with a double in place of git
-// ---------------------------------------------------------------------------
-
 struct Double {
     answer: Result<Vec<String>, BranchListError>,
     asked: Mutex<Vec<String>>,

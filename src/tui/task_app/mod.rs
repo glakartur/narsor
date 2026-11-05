@@ -401,8 +401,6 @@ pub enum Request {
     /// `L`: read the limit of tasks processed at once and open the list to
     /// change it.
     OpenLimit,
-    /// Read the branches of these registered repositories, to suggest in the
-    /// new-task form.
     ReadBranches(Vec<String>),
     /// Set the limit of tasks processed at once.
     SetLimit {

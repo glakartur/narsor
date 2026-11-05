@@ -77,8 +77,6 @@ fn a_launch_request_without_branches_serializes_exactly_as_before() {
     let plain = launch_request(serde_json::Value::Null);
     let request: LaunchRequest = serde_json::from_value(plain.clone()).unwrap();
     assert!(request.branches.is_empty());
-    // The request digest hashes this value: an extra key would change the
-    // digest of every request that chooses no branch.
     assert_eq!(serde_json::to_value(&request).unwrap(), plain);
 }
 

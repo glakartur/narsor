@@ -206,17 +206,41 @@ impl ChooserField {
         let FieldKind::Suggest(suggestions) = &self.kind else {
             return Vec::new();
         };
-        let typed = match &self.narrowed_by {
-            Some(typed) => typed.as_str(),
-            None if self.preset.as_deref() == Some(self.value()) => "",
-            None => self.value(),
-        };
-        let typed = typed.trim().to_lowercase();
+        let typed = self.narrowing_text().trim().to_lowercase();
         suggestions
             .iter()
             .map(String::as_str)
             .filter(|suggestion| suggestion.to_lowercase().contains(&typed))
             .collect()
+    }
+
+    /// Whether any suggestion fits what is typed.
+    pub fn has_matching_suggestions(&self) -> bool {
+        let FieldKind::Suggest(suggestions) = &self.kind else {
+            return false;
+        };
+        let typed = self.narrowing_text().trim().to_lowercase();
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.to_lowercase().contains(&typed))
+    }
+
+    /// What the operator typed: nothing while the value is the one the form
+    /// put there.
+    fn typed(&self) -> &str {
+        if self.preset.as_deref() == Some(self.value()) {
+            ""
+        } else {
+            self.value()
+        }
+    }
+
+    /// The text the suggestions are narrowed by.
+    fn narrowing_text(&self) -> &str {
+        match &self.narrowed_by {
+            Some(typed) => typed.as_str(),
+            None => self.typed(),
+        }
     }
 
     /// Puts the next suggestion in the field, as `→` at the end of the text
@@ -233,21 +257,17 @@ impl ChooserField {
         }
         .to_string();
         if self.narrowed_by.is_none() {
-            let typed = match self.preset.as_deref() == Some(self.value()) {
-                true => String::new(),
-                false => self.value().to_string(),
-            };
-            self.narrowed_by = Some(typed);
+            self.narrowed_by = Some(self.typed().to_string());
         }
         self.buffer.set(next);
         true
     }
 
     /// Replaces the suggestions of a suggesting field; what was typed stays.
-    fn set_suggestions(&mut self, suggestions: Vec<String>) {
+    fn set_suggestions(&mut self, suggestions: &[String]) {
         if let FieldKind::Suggest(current) = &mut self.kind {
-            if *current != suggestions {
-                *current = suggestions;
+            if current != suggestions {
+                *current = suggestions.to_vec();
                 self.narrowed_by = None;
             }
         }
@@ -847,7 +867,7 @@ impl Chooser {
         &mut self,
         index: usize,
         name: &str,
-        suggestions: Vec<String>,
+        suggestions: &[String],
     ) -> bool {
         let Some(field) = self.suggesting_field(index, name) else {
             return false;

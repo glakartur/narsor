@@ -1042,10 +1042,6 @@ fn a_repository_chosen_by_an_unknown_input_is_refused() {
     assert_eq!(error.code(), "unknown_repository", "{error}");
 }
 
-// ---------------------------------------------------------------------------
-// A branch chosen when the task is created
-// ---------------------------------------------------------------------------
-
 const CHOOSY: &str = "schema: v2\nname: choosy\nversion: 1\ninputs:\n  - { name: code, \
 type: repository }\n  - { name: extra, type: repository }\nglobals:\n  workspaces:\n    \
 code: { primary: true, base_branch: main, repository: \"{{ inputs.code }}\" }\n    \

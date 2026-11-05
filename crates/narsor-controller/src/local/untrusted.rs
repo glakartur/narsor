@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use narsor_engine::domain::{GitIdentity, SecretDelivery, TaskLaunchSpec, TaskRepositorySource};
-use narsor_engine::registry::check_https_remote;
+use narsor_engine::registry::{check_https_remote, RemoteWording};
 
 /// The variables a secret may be delivered as without `--allow-env`: the
 /// credentials of the harnesses and tools the runner supports.
@@ -114,7 +114,7 @@ impl UntrustedServer {
 /// Refuses a Git remote other than an `https://` URL naming a host beyond
 /// this machine and its private network.
 fn check_remote(identity: &GitIdentity) -> Result<(), String> {
-    check_https_remote(&identity.remote_url)
+    check_https_remote(&identity.remote_url, &RemoteWording::UNTRUSTED_SERVER)
 }
 
 #[cfg(test)]

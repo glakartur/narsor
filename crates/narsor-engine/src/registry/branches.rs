@@ -16,53 +16,43 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use super::remote_policy::{check_https_remote, without_credentials};
+use super::remote_policy::{check_https_remote, without_credentials, RemoteWording};
 use crate::workspace::provisioner::{
-    check_remote, redact_credentials, restrict_git_access, GitAccess, WorkspaceError,
+    check_remote, git_command, redact_credentials, GitAccess, WorkspaceError,
 };
 
-/// How long a listing may take before it is given up.
 pub const DEFAULT_LISTING_LIMIT: Duration = Duration::from_secs(20);
 
 /// The most of git's answer that is read: a remote with more refs than this
 /// is not a list a branch field can use.
 const MAX_ANSWER_BYTES: u64 = 8 * 1024 * 1024;
 
-/// How often a running listing is checked for its end.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Why a list of branches could not be given.
 #[derive(Debug, Error)]
 pub enum BranchListError {
     /// The remote is not one this server lists, and git was not run.
     #[error("{0}")]
     Refused(String),
-    /// Git did not answer within the limit.
     #[error("git ls-remote did not answer within {} s", .limit.as_secs())]
-    TimedOut {
-        /// The limit that was exceeded.
-        limit: Duration,
-    },
+    TimedOut { limit: Duration },
     /// Git ran and failed, or could not be run. The text has no credentials.
     #[error("could not list the branches: {0}")]
     Failed(String),
 }
 
-/// A source of the branch names of a remote.
 pub trait BranchLister: Send + Sync {
     /// The names of the branches of `remote`, without the `refs/heads/`
     /// prefix. Tags and other refs are not branches.
     fn list_branches(&self, remote: &str) -> Result<Vec<String>, BranchListError>;
 }
 
-/// [`BranchLister`] that runs `git ls-remote --heads`.
 #[derive(Debug, Clone)]
 pub struct GitBranchLister {
     limit: Duration,
 }
 
 impl GitBranchLister {
-    /// A lister that gives up after `limit`.
     pub fn new(limit: Duration) -> Self {
         Self { limit }
     }
@@ -88,12 +78,8 @@ impl BranchLister for GitBranchLister {
 /// The `git ls-remote --heads` command for `remote`: hardened as the module
 /// says, with the remote after `--` so it is never read as an option.
 pub fn ls_remote_command(remote: &str) -> Command {
-    let mut command = Command::new("git");
-    command
-        .args(["ls-remote", "--heads", "--", remote])
-        .env("GIT_TERMINAL_PROMPT", "0");
-    restrict_git_access(
-        &mut command,
+    let mut command = git_command(
+        &["ls-remote", "--heads", "--", remote],
         &GitAccess::PinnedOnly {
             home: PathBuf::from("/nonexistent"),
         },
@@ -117,7 +103,7 @@ fn check_listable(remote: &str) -> Result<(), BranchListError> {
     if is_local_path(remote) {
         return Ok(());
     }
-    check_https_remote(remote).map_err(BranchListError::Refused)
+    check_https_remote(remote, &RemoteWording::BRANCH_LISTING).map_err(BranchListError::Refused)
 }
 
 /// Whether git reads `remote` as a path on this disk: no `scheme://`, and no

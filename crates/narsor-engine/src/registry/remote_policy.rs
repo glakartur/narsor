@@ -4,14 +4,40 @@
 //! user's SSH keys, or let the caller probe the private network through
 //! git's error messages.
 
+/// How a refusal names the remote and states the rule, for each caller.
+pub struct RemoteWording {
+    subject: &'static str,
+    not_https_rule: &'static str,
+    internal_rule: &'static str,
+}
+
+impl RemoteWording {
+    /// A control plane beyond this machine launching a task.
+    pub const UNTRUSTED_SERVER: Self = Self {
+        subject: "Git workspace",
+        not_https_rule: "a control plane beyond this machine may only have repositories \
+                         cloned over https://",
+        internal_rule: "a control plane beyond this machine may only have repositories \
+                        cloned from beyond it",
+    };
+
+    /// Listing the branches of a remote.
+    pub const BRANCH_LISTING: Self = Self {
+        subject: "Git remote",
+        not_https_rule: "only repositories reachable over https:// are allowed here",
+        internal_rule: "only repositories beyond it are allowed here",
+    };
+}
+
 /// Refuses a Git remote other than an `https://` URL naming a host beyond
 /// this machine and its private network.
-pub fn check_https_remote(remote: &str) -> Result<(), String> {
+pub fn check_https_remote(remote: &str, wording: &RemoteWording) -> Result<(), String> {
     let not_https = || {
         format!(
-            "the Git remote '{}' is not an https:// URL; only repositories reachable over \
-             https:// are allowed here",
-            without_credentials(remote)
+            "the {} '{}' is not an https:// URL; {}",
+            wording.subject,
+            without_credentials(remote),
+            wording.not_https_rule
         )
     };
     // Git reads the text, not a parser's view of it: to git `https:host/x`
@@ -25,9 +51,10 @@ pub fn check_https_remote(remote: &str) -> Result<(), String> {
     let url = reqwest::Url::parse(remote).map_err(|_| not_https())?;
     match url.host_str() {
         Some(host) if is_internal(host) => Err(format!(
-            "the Git remote '{}' names {host}, this machine or its private network; only \
-             repositories beyond it are allowed here",
-            without_credentials(remote)
+            "the {} '{}' names {host}, this machine or its private network; {}",
+            wording.subject,
+            without_credentials(remote),
+            wording.internal_rule
         )),
         Some(_) => Ok(()),
         None => Err(not_https()),

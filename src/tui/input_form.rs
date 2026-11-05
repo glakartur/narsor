@@ -237,11 +237,13 @@ const BOOLEAN_OPTIONS: [&str; 2] = ["true", "false"];
 /// name stays the key of the value; an input not listed is drawn under its name.
 const INPUT_LABELS: [(&str, &str); 2] = [("target_repo", "Repozytorium"), ("description", "Opis")];
 
+const BRANCH_SUFFIX: &str = " · gałąź";
+
 /// The name of the field that holds the branch of the `repository` input
 /// `input`: it stands right after that input and keeps the name of its value
 /// apart from every declared input.
 pub fn branch_field_name(input: &str) -> String {
-    format!("{input} · gałąź")
+    format!("{input}{BRANCH_SUFFIX}")
 }
 
 /// One field per declared input, in declaration order.
@@ -316,22 +318,17 @@ fn input_field(input: &WorkflowInputView, repositories: &[RepositoryView]) -> Ch
     }
 }
 
-/// The branch the task starts from in the repository `field` holds: free
-/// text that suggests the branches the server lists, starting from the
-/// repository's default branch, or empty when it has none.
 fn branch_field(
     input: &WorkflowInputView,
     field: &ChooserField,
     repositories: &[RepositoryView],
 ) -> ChooserField {
     ChooserField::suggest(branch_field_name(&input.name), Vec::new())
-        .labelled(format!("{} · gałąź", field.label()))
+        .labelled(format!("{}{BRANCH_SUFFIX}", field.label()))
         .starting_from(default_branch_of(repositories, field.value()))
         .described("z niej startuje zadanie; → bierze podpowiedź, własną można wpisać")
 }
 
-/// The default branch of the registered repository `id`; empty when there is
-/// no such repository or it has none.
 pub fn default_branch_of(repositories: &[RepositoryView], id: &str) -> String {
     repositories
         .iter()

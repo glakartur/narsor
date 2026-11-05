@@ -769,12 +769,9 @@ impl CatalogLaunchResolver {
             } else {
                 None
             };
-            let user_ref = match &definition_repository.source {
-                RepositorySource::Git { repository } => sole_input_reference(repository)
-                    .and_then(|input| chosen.get(input.as_str()))
-                    .map(String::as_str),
-                RepositorySource::Local { .. } => None,
-            };
+            let user_ref = linked_input(&definition_repository.source)
+                .and_then(|input| chosen.get(input.as_str()))
+                .map(String::as_str);
             let (entry, task_repository) = self.git_repository(
                 Some(&definition_repository.name),
                 &repository,
@@ -1123,6 +1120,14 @@ impl CatalogLaunchResolver {
     }
 }
 
+/// The input a Git workspace takes its whole repository from, if any.
+fn linked_input(source: &RepositorySource) -> Option<String> {
+    match source {
+        RepositorySource::Git { repository } => sole_input_reference(repository),
+        RepositorySource::Local { .. } => None,
+    }
+}
+
 /// The branches the owner chose, by input name: trimmed, a blank one dropped
 /// as no choice.
 ///
@@ -1137,10 +1142,7 @@ fn chosen_branches(
     let linked: BTreeSet<String> = definition
         .repositories
         .iter()
-        .filter_map(|repository| match &repository.source {
-            RepositorySource::Git { repository } => sole_input_reference(repository),
-            RepositorySource::Local { .. } => None,
-        })
+        .filter_map(|repository| linked_input(&repository.source))
         .collect();
     let mut chosen = BTreeMap::new();
     for (input, branch) in &intent.branches {

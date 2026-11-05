@@ -14,7 +14,6 @@ use crate::tui::style::{Role, Styles};
 const PROMPT: &str = "> ";
 const CONTINUATION: &str = "  ";
 
-/// Between two suggestions on their row.
 const SUGGESTION_SEPARATOR: &str = " · ";
 
 /// `text` as spans with the cell at `cursor` reversed. At the end of the text
@@ -175,12 +174,12 @@ pub fn value_rows(field: &ChooserField, width: usize, focused: bool) -> usize {
         return 1;
     }
     let text = text_width(width);
-    let value_rows = wrap(field.value(), focused.then(|| field.cursor()), text)
+    let text_rows = wrap(field.value(), focused.then(|| field.cursor()), text)
         .rows
         .len()
         .max(1);
-    let suggestion_rows = usize::from(focused && !field.matching_suggestions().is_empty());
-    value_rows + suggestion_rows
+    let suggestion_rows = usize::from(focused && field.has_matching_suggestions());
+    text_rows + suggestion_rows
 }
 
 /// The row above a field's value: its label, `(wymagane)`, `◆` and ` · description`.

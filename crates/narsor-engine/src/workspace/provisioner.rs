@@ -1027,11 +1027,16 @@ fn git_run(args: &[&str]) -> io::Result<GitRun> {
     git_run_with(args, &GitAccess::User)
 }
 
-fn git_run_with(args: &[&str], access: &GitAccess) -> io::Result<GitRun> {
+/// A `git` command that never prompts and is restricted as `access` says.
+pub(crate) fn git_command(args: &[&str], access: &GitAccess) -> Command {
     let mut command = Command::new("git");
     command.args(args).env("GIT_TERMINAL_PROMPT", "0");
     restrict_git_access(&mut command, access);
-    let output = command.output()?;
+    command
+}
+
+fn git_run_with(args: &[&str], access: &GitAccess) -> io::Result<GitRun> {
+    let output = git_command(args, access).output()?;
     Ok(GitRun {
         ok: output.status.success(),
         code: output.status.code(),

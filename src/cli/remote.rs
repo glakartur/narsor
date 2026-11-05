@@ -889,9 +889,7 @@ pub(super) fn print_conversation_entries(
 // task
 // ---------------------------------------------------------------------------
 
-/// The request of `task create` from its command-line pieces, with the
-/// workflow version the operator asked for; `None` for any other command or
-/// a definition file.
+/// `None` for any command but `create` with a workflow, not a definition file.
 pub fn create_request(command: &TaskCommand) -> Result<Option<(CreateTaskRequest, Option<u32>)>> {
     Ok(match command {
         TaskCommand::Create {
@@ -934,7 +932,6 @@ pub fn create_request(command: &TaskCommand) -> Result<Option<(CreateTaskRequest
     })
 }
 
-/// Runs one `narsor task` command.
 pub async fn task(
     command: TaskCommand,
     target: &ServerTarget,
