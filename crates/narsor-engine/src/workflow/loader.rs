@@ -309,11 +309,17 @@ fn compile_state(
         _ => None,
     };
 
+    // A `v1` agent on a workflow with no repository has no section to carry
+    // its access, so the action keeps it.
+    let keeps_v1_access = workspace.is_none();
+
     State {
         id,
         max_entries: state.max_entries,
         description: state.description,
-        action: state.action.map(compile_action),
+        action: state
+            .action
+            .map(|action| compile_action(action, keeps_v1_access)),
         variables: state
             .variables
             .into_iter()
@@ -369,13 +375,17 @@ fn non_blank(text: Option<String>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn compile_action(action: ActionSchema) -> ActionConfig {
+fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
     match action {
         ActionSchema::Agent(agent) => ActionConfig::Agent(AgentActionConfig {
             harness: agent.harness,
             permission_grants: Vec::new(),
             model: agent.model,
-            workspace_access: None,
+            workspace_access: if keep_v1_access {
+                agent.workspace_access
+            } else {
+                None
+            },
             prompt: agent.prompt,
             // The YAML contract has no per-action workspace (§6 lists it as a
             // future extension), so this stays unset.
@@ -561,6 +571,27 @@ terminal_states: [done]
             })
         );
         assert_eq!(review.workspace_access(), Some(WorkspaceAccess::ReadOnly));
+    }
+
+    #[test]
+    fn v1_read_only_access_survives_without_a_declared_repository() {
+        let yaml = r#"
+name: legacy
+version: 1
+states:
+  review:
+    action: { type: agent, prompt: look, workspace_access: read-only }
+    choices: [done]
+    transitions: { done: done }
+  done:
+    description: end
+terminal_states: [done]
+"#;
+        let definition = load_from_str(yaml).unwrap();
+        let Some(ActionConfig::Agent(agent)) = &definition.states["review"].action else {
+            panic!("an agent action");
+        };
+        assert_eq!(agent.workspace_access, Some(WorkspaceAccess::ReadOnly));
     }
 
     #[test]

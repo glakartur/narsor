@@ -76,6 +76,8 @@ impl HarnessAdapter for CodexAdapter {
         }
         // The sandbox makes only the working directory and these writable,
         // so a read-only repository outside it is protected by the sandbox.
+        // A read-only repository that is the working directory (`root: "."`)
+        // is writable to the sandbox and is protected by the prompt only.
         for dir in request.outside_workspace(request.writable_dirs) {
             common.extend(["--add-dir".to_string(), dir.to_string_lossy().into_owned()]);
         }

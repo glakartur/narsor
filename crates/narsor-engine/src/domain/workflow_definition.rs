@@ -420,13 +420,14 @@ pub struct AgentActionConfig {
 
     /// Access the agent receives to its execution workspace.
     ///
-    /// Never loaded from workflow source or persisted definitions: the engine
-    /// derives it from the step's `workspace` section
-    /// ([`State::workspace_access`]) when the action runs, or sets it for
-    /// its own read-only runs (reprompts, the conductor). This is
+    /// Normally derived from the step's `workspace` section
+    /// ([`State::workspace_access`]) when the action runs, or set by the
+    /// engine for its own read-only runs (reprompts, the conductor). It is
+    /// stored only for definitions persisted before step sections existed and
+    /// for a `v1` agent on a workflow without a repository. This is
     /// intentionally independent of a particular harness: each adapter
     /// translates it to its native permission mechanism.
-    #[serde(skip)]
+    #[serde(default)]
     pub workspace_access: Option<WorkspaceAccess>,
 
     /// Prompt to send to the agent
