@@ -1,0 +1,59 @@
+schema: v2
+name: code-and-docs
+version: 1
+description: Implements a change in the code repository, then documents it in the docs repository.
+
+inputs:
+  - name: code_repo
+    type: repository
+    required: true
+
+globals:
+  repositories:
+    - name: code
+      primary: true
+      repository: "{{ inputs.code_repo }}"
+      default_branch: main
+    - name: docs
+      repository: acme-docs
+      default_branch: main
+
+states:
+  implement:
+    description: Works in code; docs is read-only (no workspace section).
+    action:
+      type: agent
+      prompt: Implement the change.
+    choices: [done]
+    transitions:
+      done: document
+
+  document:
+    description: Starts in docs and reads the code changes of earlier steps.
+    action:
+      type: agent
+      prompt: Document the change.
+    workspace:
+      write: [docs]
+      read: [code]
+    choices: [done]
+    transitions:
+      done: review
+
+  review:
+    description: Reads both repositories from their common parent directory.
+    action:
+      type: agent
+      prompt: Review both repositories.
+    workspace:
+      root: .
+      read: [code, docs]
+    choices: [done]
+    transitions:
+      done: completed
+
+  completed:
+    description: Finished.
+
+terminal_states:
+  completed: completed

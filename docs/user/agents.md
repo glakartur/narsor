@@ -145,6 +145,11 @@ sandbox. Codex always passes `approval_policy=never` and never allows
 `danger-full-access`; its operator-provided environment and profile are
 otherwise preserved for authentication and skills.
 
+A workflow in `schema: v2` states the access per repository instead, in the step's `workspace`
+section (see [the workflow schema](../dev/workflow-schema.md), §3.2.1): the step prompt lists each
+repository with its path and mode, and `claude-code` and `codex` are given the extra directories;
+other harnesses rely on that prompt.
+
 **The security consequence is real and is not hypothetical.** Containerisation
 (D14) is still deferred, so the only boundary around an agent is D15's
 filesystem layout and permission bits — which protects against a mistake, not

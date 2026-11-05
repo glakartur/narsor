@@ -20,6 +20,7 @@ This document defines the declarative format of the YAML files used to describe 
 A workflow file consists of the following sections:
 
 ```yaml
+schema: <v1|v2>             # Schema of this file (optional, v1 when missing; §3.2.1)
 name: <string>              # Unique workflow name (e.g. "code-review")
 version: <integer>          # Definition version (e.g. 1)
 description: <string>       # Description of the workflow's purpose (optional)
@@ -49,6 +50,12 @@ globals:                    # Global settings for the whole workflow (optional)
     path: <string>          # Relative path in the task folder
     preserve_paths:         # Paths ignored by the repo that should nevertheless survive to the checkpoint (git and local); it must not be a file with secrets/credentials (the checkpoint is unencrypted)
       - <string>
+  repositories:             # schema v2: named repositories (replaces `workspace`, §3.2.1)
+    - name: <string>        # Label and folder name in the task directory
+      primary: <boolean>    # Exactly one repository is primary
+      default_branch: <string>
+      repository: <string>  # Registry ID or {{ inputs.x }} (or `path:` instead)
+      preserve_paths: [<string>]
   image: <image>            # Base image of the remote task, overrides the repository image (optional)
 
 states:                     # State graph (required)
@@ -72,6 +79,10 @@ states:                     # State graph (required)
     decision:               # Decision provider configuration (optional, rules by default)
       type: <rules|agent|human>
       # ... configuration specific to the decision type
+    workspace:              # schema v2: repositories of this step (optional, §3.2.1)
+      root: <name|.>
+      write: [<name>]
+      read: [<name>]
     timeout: <duration>     # Timeout for this state (overrides the global one)
     retry_policy:           # Retry policy for this action (overrides the global one)
 
@@ -142,6 +153,74 @@ An optional section defining default behavior for the whole workflow.
     digest; a bare tag (or an implicit `latest`) is a validation error. The chosen image, its
     digest and its source go into the task's `ResolvedEnvironment` and do not change after a later
     change to the definition.
+
+### 3.2.1. Schema versions, repositories and step workspaces
+
+`schema` says which standard the file is written in: `v1` or `v2`. A missing field means `v1`. It
+is not the `version` field, which stays the version of the workflow itself. Any other value is an
+error. The file is checked against its own schema: a `v2` file cannot use `v1` constructs, and a
+`v1` file cannot use `v2` ones.
+
+**`globals.repositories` (v2).** A list of named repositories, replacing `globals.workspace`.
+
+*   `name`: the label of the repository and the name of its folder, `workspace/<name>/`, in the
+    task directory. It must be a usable folder name, unique in the list, and cannot be a template.
+*   `primary`: exactly one repository is primary. A step without a `workspace` section starts there,
+    and the conductor reads task artifacts from it.
+*   `default_branch`: the branch a new task starts on. It is required for a registered repository.
+    The task keeps for each repository its name and branch.
+*   Exactly one source: `repository` (a registry ID or an `{{ inputs.x }}` template naming an input
+    of type `repository`, as in `globals.workspace.repository`) or `path` (a local folder, as in
+    `globals.workspace` of type `local`).
+*   `preserve_paths`: as in §3.2, per repository.
+
+**Step `workspace` (v2).** Says which repositories a step gets.
+
+*   `write` and `read` are lists of repository names. A step may write several repositories.
+*   `root` is where the agent (or script) starts: a repository name, or `.` for the `workspace/`
+    directory holding the folders of all repositories. When missing, the step starts in the first
+    `write` repository, else in the first `read` one.
+*   A step **without** the section gets every repository: the primary one writable, the others
+    read-only, and it starts in the primary one.
+*   A step **with** the section gets only the repositories it names; the others are not offered.
+*   A read-only repository shows the current state of the task, including changes of earlier steps
+    that are uncommitted or not pushed. It is the same directory, not a copy.
+*   Read-only is enforced where the harness can do it, and otherwise by the prompt. When the
+    workflow has more than one repository, the step prompt lists each repository with its absolute
+    path and whether it is `write` or `read-only`. `claude-code` is given the extra directories with
+    `--add-dir`; `codex` is given the writable ones with `--add-dir` and its sandbox keeps the rest
+    read-only when they lie outside its starting directory; `github-copilot` and `opencode` rely on
+    the prompt. Violations are not detected. The `read_only_paths` of an agent keep working,
+    resolved against the starting directory. A script's relative `working_dir` is resolved against it
+    too.
+*   The conductor opens `workspace/` with all repositories read-only and lists them in its prompt.
+
+**Validation (v2).**
+
+*   `globals.workspace` and the agent's `workspace_access` are errors; `globals.repositories` and a
+    step `workspace` in a `v1` file are errors too.
+*   Names are usable folder names and unique; exactly one repository is primary.
+*   `root`, `write` and `read` refer only to declared names; a name is not both in `write` and in
+    `read`; the section names at least one repository.
+*   `root` is a repository listed in `write` or `read`, or `.` (which is also allowed with a single
+    repository).
+
+**Converting `v1` to `v2`.** A `v1` file is converted in memory when it is loaded, and the file on
+disk is not changed; the rest of the system knows only `v2`. `globals.workspace` becomes one
+primary repository, named after the registry ID (for `git`) or the last segment of the path (for
+`local`), with `ref` as its default branch. A step's `workspace_access: read-only` becomes
+`workspace: { read: [<primary>] }`, and an explicit `workspace_access: read-write` becomes
+`workspace: { write: [<primary>] }`, so that the harness is still told to write; with the field
+missing there is no section and the harness keeps its own permission configuration as in `v1`. (The
+earlier design mapped `read-write` to no section; an explicit `read-write` would then have lost the
+permission it asked for.) Validation errors of a `v1` file name its original
+fields (`globals.workspace.…`, `workspace_access`).
+
+**Compatibility.** Task launch spec version 4 lists the repositories of the task. A task saved in
+version 3 is rejected with a message naming both versions, including one that would be resumed after
+upgrading. The task directory also changes from `workspace/` to `workspace/<name>/`.
+
+For a complete example see `tests/fixtures/multirepo/code_and_docs.yaml`.
 
 ### 3.3. States
 
@@ -305,7 +384,7 @@ action:
                                       # Only an explicit `harness:` pins the action; without it the action
                                       # takes the default at the first attempt and keeps it to the end.
   model: <string>                     # AI model (optional, e.g. "sonnet-3.5")
-  workspace_access: <read-write|read-only> # Optional; read-write by default.
+  workspace_access: <read-write|read-only> # schema v1 only; read-write by default (v2: step `workspace`, §3.2.1).
   prompt: |                           # Instruction for the agent
     Analyze the code in the current directory.
     Find potential security bugs.

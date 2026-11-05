@@ -1150,6 +1150,41 @@ terminal_states: { completed: completed }
     );
 }
 
+#[test]
+fn a_two_repository_v2_fixture_loads_and_validates() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/multirepo/code_and_docs.yaml");
+    let definition = load_from_file(&path).expect("the v2 fixture must load");
+
+    definition
+        .validate()
+        .unwrap_or_else(|errors| panic!("the v2 fixture must validate: {errors:?}"));
+    let names: Vec<_> = definition
+        .repositories
+        .iter()
+        .map(|repository| (repository.name.as_str(), repository.primary))
+        .collect();
+    assert_eq!(names, [("code", true), ("docs", false)]);
+    assert_eq!(state(&definition, "implement").workspace, None);
+    assert_eq!(
+        state(&definition, "document").workspace,
+        Some(StepWorkspace {
+            root: None,
+            write: vec!["docs".to_string()],
+            read: vec!["code".to_string()],
+        })
+    );
+    assert_eq!(
+        state(&definition, "review")
+            .workspace
+            .as_ref()
+            .unwrap()
+            .root
+            .as_deref(),
+        Some(".")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Output labels with descriptions (§3.3)
 // ---------------------------------------------------------------------------
