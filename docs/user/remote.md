@@ -15,6 +15,7 @@ narsor-cli backend default                        # which backend new tasks get 
 narsor-cli harness default [--json]               # the default agent harness, for new and running tasks (set/reset to change)
 narsor-cli usage [--json]                         # reported Claude/Copilot limits (in memory only; expires after 15 min, reset or daemon restart)
 narsor-cli task create implement-feature --input ticket=NAR-1 [--backend k8s]
+narsor-cli task create implement-feature --input repo=acme-api --branch repo=develop   # start from another branch
 narsor-cli task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
 narsor-cli task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
 narsor-cli task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
