@@ -91,6 +91,7 @@ use narsor_engine::persistence::{
     DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
     HarnessSelectionSnapshot as PersistenceHarnessSelectionSnapshot, PersistenceError,
 };
+use narsor_engine::registry::{BranchLister, GitBranchLister};
 use narsor_engine::tasks::{self, TaskError};
 use narsor_engine::workflows::WorkflowResolver;
 
@@ -276,6 +277,8 @@ struct AppState {
     local: bool,
     /// What a client calls this connection.
     connection_name: String,
+    /// Lists the branches of a registered repository's remote.
+    branch_lister: Arc<dyn BranchLister>,
 }
 
 /// Builds the router: the three original read-only endpoints (U5/U2) plus
@@ -325,6 +328,9 @@ pub fn router(
         conductor: services.conductor,
         control: control.clone(),
         local_launch: services.local_launch,
+        branch_lister: services
+            .branch_lister
+            .unwrap_or_else(|| Arc::new(GitBranchLister::default())),
     };
     let mut owner = Router::new()
         .route("/executions/{execution_id}/events", get(get_events))

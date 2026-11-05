@@ -517,6 +517,7 @@ impl ProtocolService {
                 inputs: launch.inputs,
                 repository: workspace.repository,
                 commit: workspace.commit,
+                branches: launch.branches,
                 profile: launch.profile,
                 harness: launch.harness,
                 resources: launch.resources.map(|resources| {

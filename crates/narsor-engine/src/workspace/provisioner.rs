@@ -916,7 +916,7 @@ struct GitRun {
 /// carrying an embedded token would otherwise write that token into
 /// `state.json` and into the log the moment a clone fails. Redaction happens
 /// where the error is built, so no call site can forget it.
-fn redact_credentials(text: &str) -> String {
+pub(crate) fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -981,12 +981,21 @@ fn origin_note(origin: Option<RefOrigin>) -> String {
         .unwrap_or_default()
 }
 
-/// Rejects a reference `git` would read as an option rather than a revision.
-fn check_ref(repository: &str, git_ref: &str) -> Result<()> {
+/// Longest reference accepted: the name limit of a file on common systems,
+/// since git keeps a branch as a file.
+const MAX_REF_LEN: usize = 255;
+
+/// Rejects a reference `git` would read as an option rather than a revision,
+/// one with control characters, and one too long to be a branch.
+pub(crate) fn check_ref(repository: &str, git_ref: &str) -> Result<()> {
     let reason = if git_ref.trim().is_empty() {
         Some("it is empty")
     } else if git_ref.starts_with('-') {
         Some("a value starting with '-' is read by git as an option")
+    } else if git_ref.chars().any(char::is_control) {
+        Some("it contains a control character")
+    } else if git_ref.len() > MAX_REF_LEN {
+        Some("it is too long")
     } else {
         None
     };
@@ -1018,11 +1027,16 @@ fn git_run(args: &[&str]) -> io::Result<GitRun> {
     git_run_with(args, &GitAccess::User)
 }
 
-fn git_run_with(args: &[&str], access: &GitAccess) -> io::Result<GitRun> {
+/// A `git` command that never prompts and is restricted as `access` says.
+pub(crate) fn git_command(args: &[&str], access: &GitAccess) -> Command {
     let mut command = Command::new("git");
     command.args(args).env("GIT_TERMINAL_PROMPT", "0");
     restrict_git_access(&mut command, access);
-    let output = command.output()?;
+    command
+}
+
+fn git_run_with(args: &[&str], access: &GitAccess) -> io::Result<GitRun> {
+    let output = git_command(args, access).output()?;
     Ok(GitRun {
         ok: output.status.success(),
         code: output.status.code(),
@@ -1034,7 +1048,7 @@ fn git_run_with(args: &[&str], access: &GitAccess) -> io::Result<GitRun> {
 /// Takes from `command` what `access` does not allow of the user's own git
 /// setup. A [`GitAccess::PinnedOnly`] git also follows no HTTP redirect, so
 /// a public host cannot send the clone on to a private network.
-fn restrict_git_access(command: &mut Command, access: &GitAccess) {
+pub(crate) fn restrict_git_access(command: &mut Command, access: &GitAccess) {
     if let GitAccess::PinnedOnly { home } = access {
         for name in USER_GIT_ACCESS_ENVS {
             command.env_remove(name);

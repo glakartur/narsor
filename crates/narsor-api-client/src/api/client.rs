@@ -86,10 +86,10 @@ use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
-    ExecutionEventsResponse, HarnessUsageResponse, OwnerCommandRequest, RepositoryListResponse,
-    RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest, SubmitInputRequest,
-    SubmitOperatorCommandRequest, ValidateWorkflowRequest, ValidateWorkflowResponse,
-    WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
+    ExecutionEventsResponse, HarnessUsageResponse, OwnerCommandRequest, RepositoryBranchesResponse,
+    RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
+    SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
+    ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
 };
 
 use super::token::{TokenCell, TokenSource};
@@ -109,6 +109,11 @@ const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a relayed conversation page may take: the control plane waits
 /// for the runner's next poll before it can answer.
 const CONVERSATION_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long listing the branches of a remote may take: the server lets
+/// `git ls-remote` run for 20 seconds, so the client waits a little longer
+/// and the server's own answer is the failure signal.
+const BRANCH_LISTING_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// How long one material upload or blob download may take: tens of
 /// megabytes over a real network, far beyond a control request's bound.
@@ -550,6 +555,24 @@ impl ApiClient {
     pub async fn control_repositories(&self) -> Result<RepositoryListResponse, ClientError> {
         let url = format!("{}/control/v1/repositories", self.base_url);
         self.get_json(&url).await
+    }
+
+    /// The branches of a registered repository on its remote;
+    /// [`ClientError::NotFound`] for an unknown id, and an error with the
+    /// reason when the remote cannot be listed.
+    pub async fn control_repository_branches(
+        &self,
+        id: &str,
+    ) -> Result<RepositoryBranchesResponse, ClientError> {
+        let url = format!("{}/control/v1/repositories/{id}/branches", self.base_url);
+        let response = self
+            .send(&self.stream_http, |http, token| {
+                http.get(&url)
+                    .bearer_auth(token)
+                    .timeout(BRANCH_LISTING_TIMEOUT)
+            })
+            .await?;
+        handle_json_response(response).await
     }
 
     /// Registers a repository.
@@ -1584,6 +1607,31 @@ impl UsageSource for ApiClient {
     fn read_usage(&self) -> UsageRead {
         let client = self.clone();
         Box::pin(async move { client.control_usage().await })
+    }
+}
+
+/// One read of the branches of a registered repository, ready to be awaited
+/// anywhere.
+pub type BranchRead =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, ClientError>> + Send>>;
+
+/// Where the branches of a registered repository are read from: the control
+/// plane through an [`ApiClient`], or a test double.
+pub trait BranchSource: Send + Sync {
+    /// Reads the branches of the repository `id` as
+    /// [`ApiClient::control_repository_branches`] does.
+    fn read_branches(&self, id: &str) -> BranchRead;
+}
+
+impl BranchSource for ApiClient {
+    fn read_branches(&self, id: &str) -> BranchRead {
+        let (client, id) = (self.clone(), id.to_string());
+        Box::pin(async move {
+            client
+                .control_repository_branches(&id)
+                .await
+                .map(|response| response.branches)
+        })
     }
 }
 

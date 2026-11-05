@@ -171,7 +171,12 @@ error. The file is checked against its own schema: a `v2` file cannot use `v1` c
     and the conductor reads task artifacts from it.
 *   `base_branch`: the branch a new task starts from, and the one a pull request targets. It is
     required for a registered repository. Narsor does not create a working branch: a step does.
-    The task keeps for each repository its name and branch.
+    The task keeps for each repository its name and branch. For a repository whose source is an
+    `{{ inputs.x }}` template, the owner can choose another branch when creating the task
+    (`--branch x=<branch>` in the CLI, the branch field in the TUI form). That branch replaces
+    `base_branch` for that repository only; a repository fixed in the workflow keeps its own. On a
+    backend that runs container images the primary repository still needs a pinned commit, so a
+    chosen branch there works only together with `--commit`.
 *   Exactly one source: `repository` (a registry ID or an `{{ inputs.x }}` template naming an input
     of type `repository`, as in `globals.workspace.repository`) or `path` (a local folder, as in
     `globals.workspace` of type `local`).

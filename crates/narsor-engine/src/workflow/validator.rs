@@ -890,6 +890,13 @@ fn extract_input_references(text: &str) -> Vec<String> {
     references
 }
 
+/// The input a template names and nothing else: `{{ inputs.x }}` gives `x`,
+/// while `{{ inputs.x }}/y` or a filtered expression gives `None`.
+pub(crate) fn sole_input_reference(template: &str) -> Option<String> {
+    let inner = template.trim().strip_prefix("{{")?.strip_suffix("}}")?;
+    plain_input_reference(inner.trim())
+}
+
 /// Returns the input name of a bare `inputs.<name>` expression, or `None` for
 /// anything more complicated.
 fn plain_input_reference(expression: &str) -> Option<String> {

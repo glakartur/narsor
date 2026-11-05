@@ -676,6 +676,8 @@ pub enum RefOrigin {
     Workflow,
     /// The `default_branch` of the repository configuration.
     Repository,
+    /// The branch the user chose when creating the task.
+    User,
 }
 
 impl RefOrigin {
@@ -684,6 +686,7 @@ impl RefOrigin {
         match self {
             Self::Workflow => "z workflow",
             Self::Repository => "z konfiguracji repozytorium",
+            Self::User => "wybrany przez użytkownika",
         }
     }
 }

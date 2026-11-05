@@ -159,6 +159,7 @@ pub(super) enum JobKey {
     Open(OpeningKind),
     /// The read that brings an open view up to date after a write.
     Reload(OpeningKind),
+    Branches(String),
     /// The read of the limit of tasks processed at once (`L`).
     Limit,
     /// The read of the usage limits of the harnesses, in the background: no

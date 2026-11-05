@@ -96,6 +96,7 @@ use narsor_engine::controller_protocol::ProtocolService;
 use narsor_engine::engine::Engine;
 use narsor_engine::environment::CatalogLaunchResolver;
 use narsor_engine::persistence::DefaultHarnessSelector;
+use narsor_engine::registry::BranchLister;
 use narsor_engine::workflows::WorkflowResolver;
 use std::fmt;
 use std::net::SocketAddr;
@@ -255,6 +256,7 @@ pub async fn start_with_harness_selector(
             local_launch: None,
             workflows: None,
             connection_name: None,
+            branch_lister: None,
         },
     )
     .await
@@ -284,6 +286,9 @@ pub struct ApiServices {
     /// What a client shows as the name of this connection (U6); `local` for
     /// a trusted daemon and `remote` for a network-mode server by default.
     pub connection_name: Option<String>,
+    /// How the branches of a repository's remote are listed. Defaults to
+    /// `git ls-remote`; a test names its own so it never runs git.
+    pub branch_lister: Option<Arc<dyn BranchLister>>,
 }
 
 impl fmt::Debug for ApiServices {
@@ -296,6 +301,7 @@ impl fmt::Debug for ApiServices {
             .field("local_launch", &self.local_launch.is_some())
             .field("workflows", &self.workflows)
             .field("connection_name", &self.connection_name)
+            .field("branch_lister", &self.branch_lister.is_some())
             .finish()
     }
 }

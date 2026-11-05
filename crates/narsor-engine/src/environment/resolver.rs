@@ -46,8 +46,11 @@ use crate::domain::{
 };
 use crate::persistence::{DefaultHarnessSelector, HarnessSelectionSnapshot};
 use crate::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
+use crate::workflow::validator::sole_input_reference;
 use crate::workflow::TemplateScope;
 use crate::workflows::WorkflowResolver;
+use crate::workspace::provisioner::check_ref;
+use narsor_protocol::display::without_unsafe_chars;
 
 use super::backend::{BackendRecord, SlotReleaseTimings};
 use super::catalog::{CatalogError, EnvironmentCatalog};
@@ -70,6 +73,9 @@ pub struct LaunchIntent {
     pub repository: Option<String>,
     /// The pinned commit to clone (R39).
     pub commit: Option<String>,
+    /// Branch chosen for the workspace of each `repository` input, by input
+    /// name. An input without an entry starts on its default branch.
+    pub branches: BTreeMap<String, String>,
     /// Explicit profile.
     pub profile: Option<String>,
     /// Explicit harness.
@@ -670,7 +676,8 @@ impl CatalogLaunchResolver {
     /// base image. `intent.repository` and `intent.commit` replace the primary
     /// repository only; the others are resolved from the definition (a
     /// registry id or an input of type `repository`, rendered from the inputs)
-    /// and start on their `default_branch`, else the registry's.
+    /// and start on their `base_branch`. A branch the owner chose for an input
+    /// replaces it, for a workspace whose repository is exactly that input.
     fn workspace(
         &self,
         intent: &LaunchIntent,
@@ -700,6 +707,7 @@ impl CatalogLaunchResolver {
                 .map_err(|error| LaunchError::InvalidInputs(error.to_string()))
         };
 
+        let chosen = chosen_branches(intent, definition)?;
         let primary = definition.primary_repository();
         let ordered = primary.into_iter().chain(
             definition
@@ -761,9 +769,13 @@ impl CatalogLaunchResolver {
             } else {
                 None
             };
+            let user_ref = linked_input(&definition_repository.source)
+                .and_then(|input| chosen.get(input.as_str()))
+                .map(String::as_str);
             let (entry, task_repository) = self.git_repository(
                 Some(&definition_repository.name),
                 &repository,
+                user_ref,
                 workflow_ref.as_deref(),
                 commit,
                 is_primary,
@@ -784,6 +796,7 @@ impl CatalogLaunchResolver {
                     let (entry, task_repository) = self.git_repository(
                         None,
                         repository,
+                        None,
                         None,
                         intent.commit.as_deref(),
                         true,
@@ -816,6 +829,7 @@ impl CatalogLaunchResolver {
         &self,
         name: Option<&str>,
         repository: &str,
+        user_ref: Option<&str>,
         workflow_ref: Option<&str>,
         commit: Option<&str>,
         require_commit: bool,
@@ -871,7 +885,7 @@ impl CatalogLaunchResolver {
         // images always needs the commit up front.
         // Without a workflow `ref`, the branch of the repository configuration
         // is used; with neither, the clone takes the remote's `HEAD`.
-        let named_ref = entry.named_ref(workflow_ref);
+        let named_ref = entry.named_ref(user_ref, workflow_ref);
         let branch = named_ref.as_ref().map(|(git_ref, _)| git_ref.clone());
         let (commit, git_ref, ref_origin) = match (commit, named_ref) {
             (Some(commit), _) => (commit.to_string(), None, None),
@@ -1104,6 +1118,55 @@ impl CatalogLaunchResolver {
         .with_labels(intent.ticket.clone(), intent.title.clone());
         Ok(ResolvedLaunch { backend_id, spec })
     }
+}
+
+/// The input a Git workspace takes its whole repository from, if any.
+fn linked_input(source: &RepositorySource) -> Option<String> {
+    match source {
+        RepositorySource::Git { repository } => sole_input_reference(repository),
+        RepositorySource::Local { .. } => None,
+    }
+}
+
+/// The branches the owner chose, by input name: trimmed, a blank one dropped
+/// as no choice.
+///
+/// Only a Git workspace whose repository is exactly `{{ inputs.<name> }}`
+/// takes a chosen branch, so a key naming any other input is refused, as is a
+/// value `git` could not use as a branch. Both are caught here, when the task
+/// is created, rather than when a runner clones.
+fn chosen_branches(
+    intent: &LaunchIntent,
+    definition: &WorkflowDefinition,
+) -> Result<BTreeMap<String, String>, LaunchError> {
+    let linked: BTreeSet<String> = definition
+        .repositories
+        .iter()
+        .filter_map(|repository| linked_input(&repository.source))
+        .collect();
+    let mut chosen = BTreeMap::new();
+    for (input, branch) in &intent.branches {
+        let shown = without_unsafe_chars(input);
+        if !linked.contains(input) {
+            return Err(LaunchError::InvalidInputs(format!(
+                "a branch was chosen for '{shown}', which is not the repository input of any \
+                 workspace of workflow '{}'",
+                definition.id
+            )));
+        }
+        let branch = branch.trim();
+        if branch.is_empty() {
+            continue;
+        }
+        check_ref(&shown, branch).map_err(|error| {
+            LaunchError::InvalidInputs(format!(
+                "the branch chosen for '{shown}' is not usable: {}",
+                without_unsafe_chars(&error.to_string())
+            ))
+        })?;
+        chosen.insert(input.clone(), branch.to_string());
+    }
+    Ok(chosen)
 }
 
 /// The secret references a task collects, deduplicated by name.

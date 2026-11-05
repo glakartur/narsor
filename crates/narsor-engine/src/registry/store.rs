@@ -272,12 +272,18 @@ impl RepositoryEntry {
 
     /// The branch or ref to fetch and where it came from.
     ///
-    /// An explicit workflow `ref` wins; otherwise the trimmed `default_branch`
-    /// of the entry; with neither, `None` — the clone takes the remote's `HEAD`.
-    pub fn named_ref(&self, workflow_ref: Option<&str>) -> Option<(String, RefOrigin)> {
-        match workflow_ref {
-            Some(git_ref) => Some((git_ref.to_string(), RefOrigin::Workflow)),
-            None => self
+    /// The ref the user chose wins, then an explicit workflow `ref`; otherwise
+    /// the trimmed `default_branch` of the entry; with none, `None` — the
+    /// clone takes the remote's `HEAD`.
+    pub fn named_ref(
+        &self,
+        user_ref: Option<&str>,
+        workflow_ref: Option<&str>,
+    ) -> Option<(String, RefOrigin)> {
+        match (user_ref, workflow_ref) {
+            (Some(git_ref), _) => Some((git_ref.to_string(), RefOrigin::User)),
+            (None, Some(git_ref)) => Some((git_ref.to_string(), RefOrigin::Workflow)),
+            (None, None) => self
                 .default_branch
                 .as_deref()
                 .map(str::trim)

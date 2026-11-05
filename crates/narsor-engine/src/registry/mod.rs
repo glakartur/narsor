@@ -36,7 +36,14 @@
 //! used. Duplicated validation drifts, and drift here is a command-execution
 //! hole.
 
+pub mod branches;
+pub mod remote_policy;
 pub mod store;
+
+pub use branches::{
+    ls_remote_command, BranchListError, BranchLister, GitBranchLister, DEFAULT_LISTING_LIMIT,
+};
+pub use remote_policy::{check_https_remote, without_credentials, RemoteWording};
 
 pub use store::{
     infer_provider, RegistryError, RegistryFailure, RegistryListing, RepositoryEntry,

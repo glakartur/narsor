@@ -1042,6 +1042,257 @@ fn a_repository_chosen_by_an_unknown_input_is_refused() {
     assert_eq!(error.code(), "unknown_repository", "{error}");
 }
 
+const CHOOSY: &str = "schema: v2\nname: choosy\nversion: 1\ninputs:\n  - { name: code, \
+type: repository }\n  - { name: extra, type: repository }\nglobals:\n  workspaces:\n    \
+code: { primary: true, base_branch: main, repository: \"{{ inputs.code }}\" }\n    \
+docs: { base_branch: main, repository: handbook }\n    \
+extra: { base_branch: lts, repository: \"{{ inputs.extra }}\" }\n\
+states:\n  done:\n    description: done\nterminal_states: [done]\n";
+
+fn choosy_root() -> TempRoot {
+    let root = TempRoot::new();
+    for entry in [
+        RepositoryEntry::new("app", "https://example.com/app.git")
+            .with_default_branch("main")
+            .with_base_image(ImageSpec::pinned(pinned('d'))),
+        RepositoryEntry::new("handbook", "https://example.com/handbook.git")
+            .with_default_branch("trunk"),
+        RepositoryEntry::new("lib", "https://example.com/lib.git"),
+    ] {
+        root.registry().add(entry).unwrap();
+    }
+    root.write_workflow("choosy", CHOOSY);
+    root
+}
+
+fn choosy_intent(branches: &[(&str, &str)]) -> LaunchIntent {
+    LaunchIntent {
+        backend: Some("local".to_string()),
+        inputs: serde_json::json!({"code": "app", "extra": "lib"}),
+        branches: branches
+            .iter()
+            .map(|(input, branch)| (input.to_string(), branch.to_string()))
+            .collect(),
+        ..intent("choosy")
+    }
+}
+
+/// The git identity and recorded branch of every repository, by name.
+fn chosen(launch: &ResolvedLaunch) -> Vec<(String, Option<String>, Option<RefOrigin>)> {
+    launch
+        .spec
+        .workspace
+        .repositories
+        .iter()
+        .map(|repository| {
+            let TaskRepositorySource::Git(git) = &repository.source else {
+                panic!("a git repository");
+            };
+            assert_eq!(repository.branch, git.git_ref, "{}", repository.name);
+            (repository.name.clone(), git.git_ref.clone(), git.ref_origin)
+        })
+        .collect()
+}
+
+#[test]
+fn a_branch_chosen_for_an_input_wins_over_the_workflow_base_branch() {
+    let root = choosy_root();
+    let launch = root
+        .resolve(&choosy_intent(&[("code", "develop")]))
+        .unwrap();
+    assert_eq!(
+        chosen(&launch),
+        [
+            (
+                "code".to_string(),
+                Some("develop".to_string()),
+                Some(RefOrigin::User)
+            ),
+            (
+                "docs".to_string(),
+                Some("main".to_string()),
+                Some(RefOrigin::Workflow)
+            ),
+            (
+                "extra".to_string(),
+                Some("lts".to_string()),
+                Some(RefOrigin::Workflow)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_workspace_with_a_fixed_repository_keeps_its_base_branch() {
+    let root = choosy_root();
+    let launch = root.resolve(&choosy_intent(&[("extra", "next")])).unwrap();
+    let docs = &chosen(&launch)[1];
+    assert_eq!(
+        docs,
+        &(
+            "docs".to_string(),
+            Some("main".to_string()),
+            Some(RefOrigin::Workflow)
+        )
+    );
+}
+
+#[test]
+fn without_a_chosen_branch_the_workflow_base_branch_applies() {
+    let root = choosy_root();
+    let launch = root.resolve(&choosy_intent(&[])).unwrap();
+    let names = chosen(&launch);
+    assert_eq!(names[0].1.as_deref(), Some("main"));
+    assert_eq!(names[2].1.as_deref(), Some("lts"));
+    assert!(names
+        .iter()
+        .all(|(_, _, origin)| *origin == Some(RefOrigin::Workflow)));
+}
+
+/// A workflow of the first schema may name no branch at all: the repository's
+/// `default_branch`, else the remote's `HEAD`, applies.
+#[test]
+fn a_chosen_branch_wins_over_the_repository_default_and_the_remote_head() {
+    let root = TempRoot::new();
+    root.registry()
+        .add(app_entry().with_default_branch("develop"))
+        .unwrap();
+    root.registry()
+        .add(RepositoryEntry::new(
+            "bare",
+            "https://example.invalid/bare.git",
+        ))
+        .unwrap();
+    root.write_workflow(
+        "pick",
+        "name: pick\nversion: 1\ninputs:\n  - { name: repo, type: repository }\nglobals:\n  \
+         workspace:\n    type: git\n    repository: \"{{ inputs.repo }}\"\nstates:\n  done:\n    \
+         description: done\nterminal_states: [done]\n",
+    );
+    let launch = |repo: &str, branch: &str| {
+        let branches = if branch.is_empty() {
+            Default::default()
+        } else {
+            [("repo".to_string(), branch.to_string())].into()
+        };
+        let launch = root
+            .resolve(&LaunchIntent {
+                backend: Some("local".to_string()),
+                inputs: serde_json::json!({ "repo": repo }),
+                branches,
+                ..intent("pick")
+            })
+            .unwrap();
+        chosen(&launch).remove(0)
+    };
+    assert_eq!(launch("app", "release").1.as_deref(), Some("release"));
+    assert_eq!(launch("app", "release").2, Some(RefOrigin::User));
+    assert_eq!(launch("bare", "release").1.as_deref(), Some("release"));
+    assert_eq!(launch("app", "").1.as_deref(), Some("develop"));
+    assert_eq!(launch("bare", "").1, None);
+}
+
+#[test]
+fn every_repository_input_takes_its_own_chosen_branch() {
+    let root = choosy_root();
+    let launch = root
+        .resolve(&choosy_intent(&[("code", "develop"), ("extra", "next")]))
+        .unwrap();
+    let names = chosen(&launch);
+    assert_eq!(names[0].1.as_deref(), Some("develop"));
+    assert_eq!(names[2].1.as_deref(), Some("next"));
+    assert_eq!(names[2].2, Some(RefOrigin::User));
+}
+
+#[test]
+fn a_blank_chosen_branch_counts_as_no_choice_and_the_rest_is_trimmed() {
+    let root = choosy_root();
+    let launch = root
+        .resolve(&choosy_intent(&[("code", "   "), ("extra", "  next ")]))
+        .unwrap();
+    let names = chosen(&launch);
+    assert_eq!(
+        names[0],
+        (
+            "code".to_string(),
+            Some("main".to_string()),
+            Some(RefOrigin::Workflow)
+        )
+    );
+    assert_eq!(names[2].1.as_deref(), Some("next"));
+}
+
+#[test]
+fn a_chosen_branch_that_looks_like_a_commit_stays_a_ref() {
+    let root = choosy_root();
+    let launch = root.resolve(&choosy_intent(&[("extra", COMMIT)])).unwrap();
+    let TaskRepositorySource::Git(git) = &launch.spec.workspace.repositories[2].source else {
+        panic!("a git repository");
+    };
+    assert!(!git.is_pinned());
+    assert_eq!(git.git_ref.as_deref(), Some(COMMIT));
+    assert_eq!(git.ref_origin, Some(RefOrigin::User));
+}
+
+#[test]
+fn a_chosen_branch_for_no_repository_input_is_refused_naming_the_key() {
+    let root = choosy_root();
+    for key in ["nonesuch", "docs"] {
+        let error = root
+            .resolve(&choosy_intent(&[(key, "develop")]))
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_inputs", "{error}");
+        assert!(error.to_string().contains(key), "{error}");
+    }
+}
+
+#[test]
+fn an_unusable_chosen_branch_is_refused_when_the_task_is_created() {
+    let root = choosy_root();
+    let too_long = "b".repeat(300);
+    for branch in [
+        "-x",
+        "--upload-pack=evil",
+        "a\nb",
+        "a\u{1b}[31mb",
+        &too_long,
+    ] {
+        let error = root
+            .resolve(&choosy_intent(&[("code", branch)]))
+            .expect_err(branch);
+        assert_eq!(error.code(), "invalid_inputs", "{error}");
+        let message = error.to_string();
+        assert!(message.contains("'code'"), "{message}");
+        assert!(
+            !message.chars().any(char::is_control),
+            "the message must be safe to print: {message:?}"
+        );
+    }
+}
+
+#[test]
+fn an_image_backend_still_needs_a_commit_for_a_chosen_branch() {
+    let root = choosy_root();
+    let error = root
+        .resolve(&LaunchIntent {
+            backend: None,
+            ..choosy_intent(&[("code", "develop")])
+        })
+        .unwrap_err();
+    assert_eq!(error.code(), "missing_commit", "{error}");
+}
+
+#[test]
+fn a_user_ref_origin_is_saved_as_user_and_read_back() {
+    let json = serde_json::to_value(RefOrigin::User).unwrap();
+    assert_eq!(json, serde_json::json!("user"));
+    assert_eq!(
+        serde_json::from_value::<RefOrigin>(json).unwrap(),
+        RefOrigin::User
+    );
+    assert!(RefOrigin::User.describe().contains("użytkownik"));
+}
+
 #[test]
 fn a_launch_spec_of_an_older_version_is_refused_naming_both_versions() {
     let root = TempRoot::new();

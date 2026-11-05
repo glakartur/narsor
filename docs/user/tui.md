@@ -169,7 +169,7 @@ danych". An action marked `!` asks `y` / `n` first.
 | `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
 | `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor-cli task conductor undo` |
 | the panel | confirm / reject a proposal, restart a failed step with a note | `narsor-cli task conductor confirm` / `reject`, `narsor-cli task restart-step` |
-| `n` | new task (a catalogue workflow, or the path of a definition) | `narsor-cli task create <workflow>`, `narsor-cli task create --file <path>`; the catalogue is `narsor-cli task workflows`, the check of a file `narsor-cli task validate <path>` |
+| `n` | new task (a catalogue workflow, or the path of a definition); each repository input has a branch field next to it, preselected with the repository's default branch, with the branches of the remote as suggestions (you can always type another one) | `narsor-cli task create <workflow> [--branch INPUT=BRANCH]`, `narsor-cli task create --file <path>`; the catalogue is `narsor-cli task workflows`, the check of a file `narsor-cli task validate <path>` |
 | `i` / the panel | answer what waits: fields, `artifacts`, `variables`, label, comment | `narsor-cli task input <task> --field … --artifact … --variable … [--waiting-id ID]` |
 | `Space` | the next task that waits | `narsor-cli task show` ends with `Next       waiting: <task>` |
 | `H` | history: archived tasks, and executions from before the scheduler (`w` recovers a failed one) | `narsor-cli task list --archived`; `narsor-cli task history list` / `show` / `events` / `steps` / `conversation` / `conductor` / `recover` |

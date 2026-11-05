@@ -3,6 +3,7 @@
 
 use narsor_controller_runtime::backend::validate_launch_input;
 use narsor_engine::domain::{ResolvedEnvironment, ResourceProfile, TaskLaunchSpec, TaskWorkspace};
+use narsor_protocol::controller::LaunchRequest;
 use narsor_protocol::launch::LaunchSpecEnvelope;
 
 fn plain() -> TaskLaunchSpec {
@@ -57,4 +58,32 @@ fn every_serialized_key_exists_in_the_envelope() {
     // does not know.
     let envelope: LaunchSpecEnvelope = serde_json::from_value(value).unwrap();
     assert!(envelope.ticket.is_some() && envelope.title.is_some() && envelope.definition.is_some());
+}
+
+fn launch_request(branches: serde_json::Value) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "workflow_id": "wf",
+        "workflow_version": 1,
+        "inputs": {"code": "app"},
+    });
+    if !branches.is_null() {
+        value["branches"] = branches;
+    }
+    value
+}
+
+#[test]
+fn a_launch_request_without_branches_serializes_exactly_as_before() {
+    let plain = launch_request(serde_json::Value::Null);
+    let request: LaunchRequest = serde_json::from_value(plain.clone()).unwrap();
+    assert!(request.branches.is_empty());
+    assert_eq!(serde_json::to_value(&request).unwrap(), plain);
+}
+
+#[test]
+fn a_launch_request_carries_a_branch_per_input() {
+    let with = launch_request(serde_json::json!({"code": "develop"}));
+    let request: LaunchRequest = serde_json::from_value(with.clone()).unwrap();
+    assert_eq!(request.branches["code"], "develop");
+    assert_eq!(serde_json::to_value(&request).unwrap(), with);
 }

@@ -396,7 +396,7 @@ pub fn resolve_repository(
 
     match registered {
         Some(entry) => {
-            let (git_ref, ref_origin) = match entry.named_ref(git_ref) {
+            let (git_ref, ref_origin) = match entry.named_ref(None, git_ref) {
                 Some((git_ref, origin)) => (Some(git_ref), Some(origin)),
                 None => (None, None),
             };
