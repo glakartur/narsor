@@ -15,6 +15,7 @@
 //! ([`without_unsafe_chars`]); nothing here returns a path of the server.
 
 use std::path::Path as FsPath;
+use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -31,9 +32,10 @@ use narsor_engine::api::dto::{
 };
 use narsor_engine::controller_protocol::{
     CapabilitiesView, CreateRepositoryRequest, LegacyExecutionListResponse, LegacyExecutionView,
-    ProtocolError, RepositoryListResponse, RepositoryView, ValidateWorkflowRequest,
-    ValidateWorkflowResponse, WorkflowInputType, WorkflowInputView, WorkflowListResponse,
-    WorkflowSource, WorkflowSourceRequest, WorkflowSourceResponse, WorkflowView,
+    ProtocolError, RepositoryBranchesResponse, RepositoryListResponse, RepositoryView,
+    ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType, WorkflowInputView,
+    WorkflowListResponse, WorkflowSource, WorkflowSourceRequest, WorkflowSourceResponse,
+    WorkflowView,
 };
 use narsor_engine::domain::display::{
     without_unsafe_chars, without_unsafe_chars_json, without_unsafe_chars_multiline,
@@ -41,7 +43,9 @@ use narsor_engine::domain::display::{
 use narsor_engine::domain::{Event, ExecutionStatus, ParamType, WorkflowDefinition};
 use narsor_engine::engine::Timeline;
 use narsor_engine::persistence::ExecutionStore;
-use narsor_engine::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
+use narsor_engine::registry::{
+    BranchListError, RegistryError, RepositoryEntry, RepositoryRegistry,
+};
 use narsor_engine::tasks::{self, TaskError};
 use narsor_engine::workflows::{WorkflowEntry, WorkflowOrigin, WorkflowResolver};
 
@@ -68,6 +72,10 @@ pub(super) fn routes() -> Router<AppState> {
             get(get_repositories).post(post_repository),
         )
         .route("/control/v1/repositories/{id}", delete(delete_repository))
+        .route(
+            "/control/v1/repositories/{id}/branches",
+            get(get_repository_branches),
+        )
         .route("/control/v1/executions", get(get_history))
         .route(
             "/control/v1/executions/{execution_id}",
@@ -457,6 +465,45 @@ async fn delete_repository(
             other => registry_refusal(other),
         })?;
     Ok(Json(repository_view(&removed)))
+}
+
+/// `GET /control/v1/repositories/:id/branches` — the branches the
+/// repository's remote has. An id nobody registered is `404`; a remote that
+/// cannot be listed is an error with its reason, never an empty list.
+async fn get_repository_branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<RepositoryBranchesResponse>, ApiError> {
+    let registry = RepositoryRegistry::new(&state.catalog_dir);
+    let entry = blocking(move || registry.get(&id))
+        .await?
+        .map_err(|error| match error {
+            // An id that cannot name an entry names none.
+            RegistryError::InvalidId { .. } => ProtocolError::NotFound,
+            other => registry_refusal(other),
+        })?
+        .ok_or(ProtocolError::NotFound)?;
+    let lister = Arc::clone(&state.branch_lister);
+    let branches = blocking(move || lister.list_branches(&entry.remote))
+        .await?
+        .map_err(branch_listing_refusal)?;
+    Ok(Json(RepositoryBranchesResponse {
+        branches: branches
+            .iter()
+            .map(|name| without_unsafe_chars(name))
+            .collect(),
+    }))
+}
+
+/// What a listing that gave no branches is to the caller.
+fn branch_listing_refusal(error: BranchListError) -> ProtocolError {
+    let reason = without_unsafe_chars(&error.to_string());
+    match error {
+        BranchListError::Refused(_) => ProtocolError::bad_request("branches_refused", reason),
+        BranchListError::TimedOut { .. } | BranchListError::Failed(_) => {
+            ProtocolError::unavailable("branches_unavailable", reason)
+        }
+    }
 }
 
 fn repository_view(entry: &RepositoryEntry) -> RepositoryView {

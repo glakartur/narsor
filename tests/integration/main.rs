@@ -22,6 +22,7 @@ mod actions_human;
 mod actions_script;
 mod agent_harness_selection;
 mod backend_contract;
+mod branches;
 mod builtin_workflows;
 mod claude_code_classification;
 mod cli_control_text;

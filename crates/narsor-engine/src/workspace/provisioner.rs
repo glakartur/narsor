@@ -916,7 +916,7 @@ struct GitRun {
 /// carrying an embedded token would otherwise write that token into
 /// `state.json` and into the log the moment a clone fails. Redaction happens
 /// where the error is built, so no call site can forget it.
-fn redact_credentials(text: &str) -> String {
+pub(crate) fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -1043,7 +1043,7 @@ fn git_run_with(args: &[&str], access: &GitAccess) -> io::Result<GitRun> {
 /// Takes from `command` what `access` does not allow of the user's own git
 /// setup. A [`GitAccess::PinnedOnly`] git also follows no HTTP redirect, so
 /// a public host cannot send the clone on to a private network.
-fn restrict_git_access(command: &mut Command, access: &GitAccess) {
+pub(crate) fn restrict_git_access(command: &mut Command, access: &GitAccess) {
     if let GitAccess::PinnedOnly { home } = access {
         for name in USER_GIT_ACCESS_ENVS {
             command.env_remove(name);

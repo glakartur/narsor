@@ -1876,6 +1876,13 @@ pub struct RepositoryListResponse {
     pub unreadable: Vec<String>,
 }
 
+/// The branches a registered repository has on its remote: names only, no
+/// tags and no commits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryBranchesResponse {
+    pub branches: Vec<String>,
+}
+
 /// Request to register a repository.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

@@ -86,10 +86,10 @@ use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
-    ExecutionEventsResponse, HarnessUsageResponse, OwnerCommandRequest, RepositoryListResponse,
-    RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest, SubmitInputRequest,
-    SubmitOperatorCommandRequest, ValidateWorkflowRequest, ValidateWorkflowResponse,
-    WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
+    ExecutionEventsResponse, HarnessUsageResponse, OwnerCommandRequest, RepositoryBranchesResponse,
+    RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
+    SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
+    ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
 };
 
 use super::token::{TokenCell, TokenSource};
@@ -549,6 +549,17 @@ impl ApiClient {
     /// The registered repositories.
     pub async fn control_repositories(&self) -> Result<RepositoryListResponse, ClientError> {
         let url = format!("{}/control/v1/repositories", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// The branches of a registered repository on its remote;
+    /// [`ClientError::NotFound`] for an unknown id, and an error with the
+    /// reason when the remote cannot be listed.
+    pub async fn control_repository_branches(
+        &self,
+        id: &str,
+    ) -> Result<RepositoryBranchesResponse, ClientError> {
+        let url = format!("{}/control/v1/repositories/{id}/branches", self.base_url);
         self.get_json(&url).await
     }
 
