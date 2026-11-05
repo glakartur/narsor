@@ -1598,6 +1598,31 @@ impl UsageSource for ApiClient {
     }
 }
 
+/// One read of the branches of a registered repository, ready to be awaited
+/// anywhere.
+pub type BranchRead =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, ClientError>> + Send>>;
+
+/// Where the branches of a registered repository are read from: the control
+/// plane through an [`ApiClient`], or a test double.
+pub trait BranchSource: Send + Sync {
+    /// Reads the branches of the repository `id` as
+    /// [`ApiClient::control_repository_branches`] does.
+    fn read_branches(&self, id: &str) -> BranchRead;
+}
+
+impl BranchSource for ApiClient {
+    fn read_branches(&self, id: &str) -> BranchRead {
+        let (client, id) = (self.clone(), id.to_string());
+        Box::pin(async move {
+            client
+                .control_repository_branches(&id)
+                .await
+                .map(|response| response.branches)
+        })
+    }
+}
+
 #[cfg(test)]
 mod material_transfer_tests {
     use super::{material_blob_order, material_sha256_hex};

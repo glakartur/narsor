@@ -82,6 +82,9 @@ pub enum FieldKind {
     Select(Vec<String>),
     /// A whole number.
     Integer,
+    /// One line of free text, with a list of suggestions that narrows to
+    /// what was typed. The text is never checked against the list.
+    Suggest(Vec<String>),
 }
 
 /// One field of an entry, with what has been typed into it.
@@ -102,6 +105,11 @@ pub struct ChooserField {
     buffer: TextBuffer,
     proposed: bool,
     error: Option<String>,
+    /// The text the suggestions are narrowed by while the operator steps
+    /// through them: what was typed before the first step.
+    narrowed_by: Option<String>,
+    /// The value a suggesting field was given by the form; it is not a draft.
+    preset: Option<String>,
     /// The width the text was last wrapped to, so that `↑`/`↓` walk the rows
     /// that are drawn.
     wrap_width: WrapWidth,
@@ -121,6 +129,8 @@ impl ChooserField {
             buffer: TextBuffer::default(),
             proposed: false,
             error: None,
+            narrowed_by: None,
+            preset: None,
             wrap_width: WrapWidth::default(),
             window_row: WindowRow::default(),
         }
@@ -144,6 +154,12 @@ impl ChooserField {
         }
         field.kind = FieldKind::Select(options);
         field
+    }
+
+    /// A single-line text field that suggests `suggestions` while it is
+    /// typed in. Any text is allowed, listed or not.
+    pub fn suggest(name: impl Into<String>, suggestions: Vec<String>) -> Self {
+        Self::new(name, FieldKind::Suggest(suggestions))
     }
 
     /// A whole-number field.
@@ -181,6 +197,72 @@ impl ChooserField {
         self
     }
 
+    /// The suggestions that fit what is typed: those that contain it, in the
+    /// order given, ignoring case. A value the form put there and the operator
+    /// did not change narrows nothing, so the whole list shows. While the
+    /// operator steps through the list, what was typed before the first step
+    /// is what narrows it. Empty for a field that does not suggest.
+    pub fn matching_suggestions(&self) -> Vec<&str> {
+        let FieldKind::Suggest(suggestions) = &self.kind else {
+            return Vec::new();
+        };
+        let typed = match &self.narrowed_by {
+            Some(typed) => typed.as_str(),
+            None if self.preset.as_deref() == Some(self.value()) => "",
+            None => self.value(),
+        };
+        let typed = typed.trim().to_lowercase();
+        suggestions
+            .iter()
+            .map(String::as_str)
+            .filter(|suggestion| suggestion.to_lowercase().contains(&typed))
+            .collect()
+    }
+
+    /// Puts the next suggestion in the field, as `→` at the end of the text
+    /// does: the one after the value as it stands among those that fit what
+    /// was typed, wrapping round. Returns whether there was one to take.
+    fn take_next_suggestion(&mut self) -> bool {
+        let matching = self.matching_suggestions();
+        let next = match matching.iter().position(|text| *text == self.value()) {
+            Some(index) => matching[(index + 1) % matching.len()],
+            None => match matching.first() {
+                Some(first) => first,
+                None => return false,
+            },
+        }
+        .to_string();
+        if self.narrowed_by.is_none() {
+            let typed = match self.preset.as_deref() == Some(self.value()) {
+                true => String::new(),
+                false => self.value().to_string(),
+            };
+            self.narrowed_by = Some(typed);
+        }
+        self.buffer.set(next);
+        true
+    }
+
+    /// Replaces the suggestions of a suggesting field; what was typed stays.
+    fn set_suggestions(&mut self, suggestions: Vec<String>) {
+        if let FieldKind::Suggest(current) = &mut self.kind {
+            if *current != suggestions {
+                *current = suggestions;
+                self.narrowed_by = None;
+            }
+        }
+    }
+
+    /// Gives a suggesting field `value` as the one it starts from: it is not
+    /// the operator's draft, and what was typed over the earlier one is gone.
+    fn reset(&mut self, value: &str) {
+        self.buffer.set(value);
+        self.preset = Some(value.to_string());
+        self.narrowed_by = None;
+        self.proposed = false;
+        self.error = None;
+    }
+
     /// How many characters can still be added.
     fn room(&self) -> usize {
         self.max_chars.map_or(usize::MAX, |max| {
@@ -202,6 +284,15 @@ impl ChooserField {
         self
     }
 
+    /// The same suggesting field starting from `value`, which is what the
+    /// form chose for it, not something the operator wrote: it narrows the
+    /// suggestions by nothing and is no draft until it is changed.
+    pub fn starting_from(mut self, value: impl Into<String>) -> Self {
+        let value = value.into();
+        self.reset(&value);
+        self
+    }
+
     fn set_value(&mut self, value: impl Into<String>) {
         self.buffer.set(value);
     }
@@ -217,6 +308,11 @@ impl ChooserField {
         self.buffer = from.buffer.clone();
         self.proposed = false;
         self.error = from.error.clone();
+        if let (FieldKind::Suggest(_), FieldKind::Suggest(_)) = (&self.kind, &from.kind) {
+            self.kind = from.kind.clone();
+            self.preset = from.preset.clone();
+            self.narrowed_by = from.narrowed_by.clone();
+        }
     }
 
     /// Whether `other` asks for the same thing: name, kind, wording and
@@ -234,7 +330,10 @@ impl ChooserField {
     /// Whether the operator wrote something here that is not sent yet: a
     /// text value that is not blank and not the conductor's untouched one.
     pub fn is_drafted(&self) -> bool {
-        !matches!(self.kind, FieldKind::Select(_)) && !self.proposed && !self.is_blank()
+        !matches!(self.kind, FieldKind::Select(_))
+            && !self.proposed
+            && !self.is_blank()
+            && self.preset.as_deref() != Some(self.value())
     }
 
     /// What is in the field.
@@ -268,6 +367,7 @@ impl ChooserField {
             return false;
         }
         self.buffer.insert_str(&text);
+        self.narrowed_by = None;
         self.proposed = false;
         self.error = None;
         true
@@ -294,6 +394,15 @@ impl ChooserField {
 
     /// Folds one key into the field. Returns whether it was used.
     fn edit(&mut self, event: &KeyEvent, newline: bool) -> bool {
+        let takes_suggestion = !newline
+            && event.code == KeyCode::Right
+            && matches!(self.kind, FieldKind::Suggest(_))
+            && self.buffer.cursor() == self.buffer.len();
+        if takes_suggestion && self.take_next_suggestion() {
+            self.proposed = false;
+            self.error = None;
+            return true;
+        }
         let used = match (&self.kind, event.code) {
             // The new line key is never text: in a one-line field it is ignored.
             (FieldKind::Text { multiline: true }, _) if newline => {
@@ -301,10 +410,11 @@ impl ChooserField {
                 true
             }
             _ if newline => return false,
-            (FieldKind::Text { .. }, KeyCode::Char(character)) => {
+            (FieldKind::Text { .. } | FieldKind::Suggest(_), KeyCode::Char(character)) => {
                 if self.room() > 0 {
                     self.buffer.insert(character);
                 }
+                self.narrowed_by = None;
                 true
             }
             (FieldKind::Integer, KeyCode::Char(character))
@@ -313,27 +423,46 @@ impl ChooserField {
                 self.buffer.insert(character);
                 true
             }
-            (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Backspace) => {
+            (
+                FieldKind::Text { .. } | FieldKind::Suggest(_) | FieldKind::Integer,
+                KeyCode::Backspace,
+            ) => {
                 self.buffer.backspace();
+                self.narrowed_by = None;
                 true
             }
-            (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Delete) => {
+            (
+                FieldKind::Text { .. } | FieldKind::Suggest(_) | FieldKind::Integer,
+                KeyCode::Delete,
+            ) => {
                 self.buffer.delete();
+                self.narrowed_by = None;
                 true
             }
-            (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Left) => {
+            (
+                FieldKind::Text { .. } | FieldKind::Suggest(_) | FieldKind::Integer,
+                KeyCode::Left,
+            ) => {
                 self.buffer.left();
+                self.narrowed_by = None;
                 return true;
             }
-            (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Right) => {
+            (
+                FieldKind::Text { .. } | FieldKind::Suggest(_) | FieldKind::Integer,
+                KeyCode::Right,
+            ) => {
                 self.buffer.right();
                 return true;
             }
-            (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::Home) => {
+            (
+                FieldKind::Text { .. } | FieldKind::Suggest(_) | FieldKind::Integer,
+                KeyCode::Home,
+            ) => {
                 self.buffer.home();
+                self.narrowed_by = None;
                 return true;
             }
-            (FieldKind::Text { .. } | FieldKind::Integer, KeyCode::End) => {
+            (FieldKind::Text { .. } | FieldKind::Suggest(_) | FieldKind::Integer, KeyCode::End) => {
                 self.buffer.end();
                 return true;
             }
@@ -710,6 +839,40 @@ impl Chooser {
         self.focus = ChooserFocus::Fields;
         self.field = position;
         true
+    }
+
+    /// Replaces the suggestions of the field `name` of entry `index`; what was
+    /// typed in it stays. Returns whether there is such a field.
+    pub fn set_field_suggestions(
+        &mut self,
+        index: usize,
+        name: &str,
+        suggestions: Vec<String>,
+    ) -> bool {
+        let Some(field) = self.suggesting_field(index, name) else {
+            return false;
+        };
+        field.set_suggestions(suggestions);
+        true
+    }
+
+    /// Gives the suggesting field `name` of entry `index` the value the form
+    /// chose for it, in place of what was there. Returns whether there is
+    /// such a field.
+    pub fn reset_field(&mut self, index: usize, name: &str, value: &str) -> bool {
+        let Some(field) = self.suggesting_field(index, name) else {
+            return false;
+        };
+        field.reset(value);
+        true
+    }
+
+    fn suggesting_field(&mut self, index: usize, name: &str) -> Option<&mut ChooserField> {
+        self.items
+            .get_mut(index)?
+            .fields
+            .iter_mut()
+            .find(|field| field.name == name && matches!(field.kind, FieldKind::Suggest(_)))
     }
 
     /// The same chooser over new `items`, as when what an entry offers became

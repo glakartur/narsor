@@ -114,7 +114,9 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::stream::{BoxStream, StreamExt as _};
 
-use crate::api::{reconnect_delay, ApiClient, ClientError, HarnessSelectionSnapshot, UsageSource};
+use crate::api::{
+    reconnect_delay, ApiClient, BranchSource, ClientError, HarnessSelectionSnapshot, UsageSource,
+};
 use crate::controller_protocol::{
     CapabilitiesView, ControlEventEnvelope, CreateRepositoryRequest, MoveTaskRequest,
     TaskListResponse,
@@ -399,6 +401,9 @@ pub enum Request {
     /// `L`: read the limit of tasks processed at once and open the list to
     /// change it.
     OpenLimit,
+    /// Read the branches of these registered repositories, to suggest in the
+    /// new-task form.
+    ReadBranches(Vec<String>),
     /// Set the limit of tasks processed at once.
     SetLimit {
         /// The new limit.
@@ -482,6 +487,9 @@ pub struct TaskApp {
     /// Where the usage limits are read from: the client, unless a test
     /// set another.
     usage_source: Arc<dyn UsageSource>,
+    /// Where the branches of a repository are read from: the client, unless a
+    /// test set another.
+    branch_source: Arc<dyn BranchSource>,
     /// The usage limits of the harnesses, as last read (U7); `None` before
     /// the first answer, after a failed read or when none is held.
     harness_usage: Option<HarnessUsageResponse>,
@@ -507,6 +515,7 @@ impl TaskApp {
         refresh_interval: Option<Duration>,
     ) -> Self {
         let usage_source: Arc<dyn UsageSource> = Arc::new(client.clone());
+        let branch_source: Arc<dyn BranchSource> = Arc::new(client.clone());
         Self {
             client,
             list: TaskList::new(),
@@ -541,6 +550,7 @@ impl TaskApp {
             last_word: None,
             refresh_again: false,
             usage_source,
+            branch_source,
             harness_usage: None,
             next_usage_at: Instant::now(),
         }
@@ -1154,6 +1164,7 @@ impl TaskApp {
             Request::OpenLink(link) => self.open_link(link),
             Request::OpenHarness => self.start_opening(OpeningKind::Harness),
             Request::OpenLimit => self.start_limit_read(),
+            Request::ReadBranches(repositories) => self.start_branch_reads(&repositories),
             Request::SetLimit { limit } => self.change_limit(limit).await,
             Request::SetHarness(harness) => self.change_harness(harness).await,
         }

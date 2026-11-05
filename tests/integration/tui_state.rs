@@ -9393,10 +9393,11 @@ mod task_app_create {
     }
 
     /// Types the workflow's `ticket_id`. The form opens on its own ticket;
-    /// `ticket_id` is the fourth field, after the title and the repository.
+    /// `ticket_id` is the fifth field, after the title, the repository and its
+    /// branch.
     fn fill_ticket(app: &mut TaskApp, ticket: &str) {
         press(app, KeyCode::Enter);
-        for _ in 0..3 {
+        for _ in 0..4 {
             press(app, KeyCode::Down);
         }
         typed(app, ticket);
@@ -9503,19 +9504,20 @@ mod task_app_create {
                     TICKET_FIELD,
                     TITLE_FIELD,
                     "target_repo",
+                    "target_repo · gałąź",
                     "ticket_id",
                     "attempts",
                     "dry_run",
                 ]
             );
-            assert!(item.fields[3].required);
-            assert_eq!(
-                item.fields[3].description.as_deref(),
-                Some("numer zgłoszenia")
-            );
-            assert!(!item.fields[4].required);
+            assert!(item.fields[4].required);
             assert_eq!(
                 item.fields[4].description.as_deref(),
+                Some("numer zgłoszenia")
+            );
+            assert!(!item.fields[5].required);
+            assert_eq!(
+                item.fields[5].description.as_deref(),
                 Some("liczba całkowita · ile razy ponawiać")
             );
         }
@@ -9547,7 +9549,14 @@ mod task_app_create {
             ]);
             assert_eq!(
                 names,
-                ["Ticket", "Tytuł", "repository", "dry_run", "prompt"]
+                [
+                    "Ticket",
+                    "Tytuł",
+                    "repository",
+                    "repository · gałąź",
+                    "dry_run",
+                    "prompt"
+                ]
             );
         }
 
@@ -9565,7 +9574,13 @@ mod task_app_create {
                     workflow_input("repository", ParamType::Repository, false, None),
                     workflow_input("count", ParamType::Integer, false, None),
                 ]),
-                ["Ticket", "Tytuł", "repository", "count"]
+                [
+                    "Ticket",
+                    "Tytuł",
+                    "repository",
+                    "repository · gałąź",
+                    "count"
+                ]
             );
         }
 
@@ -9609,7 +9624,7 @@ mod task_app_create {
             let mut app = app_with(vec![]);
             open_form(&mut app);
             press(&mut app, KeyCode::Enter);
-            for _ in 0..3 {
+            for _ in 0..4 {
                 press(&mut app, KeyCode::Down);
             }
             typed(&mut app, &"x".repeat(40));
@@ -9626,18 +9641,22 @@ mod task_app_create {
             open_form(&mut app);
             let item = chooser_item(&app, "implement-feature");
             assert_eq!(
-                item.fields[5].kind,
+                item.fields[6].kind,
                 narsor::tui::chooser::FieldKind::Select(vec!["true".into(), "false".into()])
             );
-            assert_eq!(item.fields[5].value(), "false");
+            assert_eq!(item.fields[6].value(), "false");
             assert_eq!(
                 item.fields[2].kind,
                 narsor::tui::chooser::FieldKind::Select(vec!["docs".into(), "narsor".into()])
             );
-            assert_eq!(
-                app.new_task_form().unwrap().repositories(),
-                ["docs", "narsor"]
-            );
+            let offered: Vec<&str> = app
+                .new_task_form()
+                .unwrap()
+                .repositories()
+                .iter()
+                .map(|repository| repository.id.as_str())
+                .collect();
+            assert_eq!(offered, ["docs", "narsor"]);
         }
 
         #[test]
@@ -9647,9 +9666,16 @@ mod task_app_create {
             app.open_new_task(workflows(), registry(vec![]));
             let item = chooser_item(&app, "implement-feature");
             assert!(matches!(
-                item.fields[3].kind,
+                item.fields[2].kind,
                 narsor::tui::chooser::FieldKind::Text { .. }
             ));
+            assert!(
+                matches!(
+                    item.fields[3].kind,
+                    narsor::tui::chooser::FieldKind::Suggest(_)
+                ),
+                "a typed repository still has a branch field"
+            );
         }
 
         #[test]
@@ -9662,11 +9688,11 @@ mod task_app_create {
             }
             let item = chooser_item(&app, "implement-feature");
             assert!(
-                item.fields[3]
+                item.fields[4]
                     .error()
                     .is_some_and(|error| error.contains("ticket_id")),
                 "{:?}",
-                item.fields[3].error()
+                item.fields[4].error()
             );
             assert_eq!(app.view_kind(), ViewKind::NewTask);
             assert!(app.outgoing().is_empty());
@@ -9682,13 +9708,13 @@ mod task_app_create {
             assert_eq!(enter_until_send(&mut app), Request::None);
             let item = chooser_item(&app, "implement-feature");
             assert!(
-                item.fields[4]
+                item.fields[5]
                     .error()
                     .is_some_and(|error| error.contains("attempts") && error.contains("liczby")),
                 "{:?}",
-                item.fields[4].error()
+                item.fields[5].error()
             );
-            assert!(item.fields[3].error().is_none());
+            assert!(item.fields[4].error().is_none());
             assert_eq!(app.view_kind(), ViewKind::NewTask);
             assert!(app.outgoing().is_empty());
             assert!(app.list().pending().is_empty());
@@ -10156,9 +10182,9 @@ mod task_app_create {
         #[test]
         fn the_typed_ticket_and_title_go_to_the_request_as_typed() {
             let mut app = filled();
-            // From `attempts`: up past `ticket_id` and `target_repo` and the
-            // title to the ticket.
-            for _ in 0..4 {
+            // From `attempts`: up past `ticket_id`, the branch, `target_repo`
+            // and the title to the ticket.
+            for _ in 0..5 {
                 press(&mut app, KeyCode::Up);
             }
             typed(&mut app, "  NAR-12 ");
@@ -10737,6 +10763,492 @@ mod task_app_create {
             app.on_paste("q\nq\n");
             assert_eq!(app.view_kind(), ViewKind::History);
             assert!(!app.should_quit());
+        }
+    }
+
+    /// The branch of each repository input: preselected, suggested from the
+    /// server's list, typed freely, and sent only when it is a choice.
+    mod branch_field {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        use super::*;
+        use narsor::api::{BranchRead, BranchSource};
+        use narsor::tui::chooser::FieldKind;
+        use narsor::tui::input_form::branch_field_name;
+
+        /// The branches the server would list, by repository id; a repository
+        /// that is not in the map fails to list.
+        #[derive(Default)]
+        struct Remotes {
+            lists: Mutex<HashMap<String, Result<Vec<String>, String>>>,
+            reads: Mutex<Vec<String>>,
+        }
+
+        impl Remotes {
+            fn listing(entries: &[(&str, &[&str])]) -> Arc<Self> {
+                let remotes = Arc::new(Self::default());
+                for (id, branches) in entries {
+                    remotes.set(id, Ok(branches.iter().map(|b| (*b).to_string()).collect()));
+                }
+                remotes
+            }
+
+            fn set(&self, id: &str, answer: Result<Vec<String>, String>) {
+                self.lists.lock().unwrap().insert(id.to_string(), answer);
+            }
+
+            fn reads(&self) -> Vec<String> {
+                self.reads.lock().unwrap().clone()
+            }
+        }
+
+        impl BranchSource for Remotes {
+            fn read_branches(&self, id: &str) -> BranchRead {
+                self.reads.lock().unwrap().push(id.to_string());
+                let answer = self.lists.lock().unwrap().get(id).cloned();
+                Box::pin(async move {
+                    match answer {
+                        Some(Ok(branches)) => Ok(branches),
+                        Some(Err(reason)) => Err(ClientError::Degraded {
+                            code: "branches_unavailable".to_string(),
+                            message: reason,
+                        }),
+                        None => Err(ClientError::NotFound),
+                    }
+                })
+            }
+        }
+
+        fn branch_of(input: &str) -> String {
+            branch_field_name(input)
+        }
+
+        fn repository_with(
+            id: &str,
+            default_branch: Option<&str>,
+        ) -> narsor_protocol::controller::RepositoryView {
+            let mut view = repository(id, &format!("https://example.com/{id}.git"));
+            view.default_branch = default_branch.map(str::to_string);
+            view
+        }
+
+        fn app_reading(remotes: &Arc<Remotes>) -> TaskApp {
+            app_with(vec![]).with_branch_source(Arc::clone(remotes) as Arc<dyn BranchSource>)
+        }
+
+        /// The form opened over `workflows` and `repositories`, with the reads
+        /// the opening asks for done.
+        async fn opened(
+            app: &mut TaskApp,
+            workflows: WorkflowListResponse,
+            repositories: Vec<narsor_protocol::controller::RepositoryView>,
+        ) {
+            ch(app, 'n');
+            let request = app.open_new_task(workflows, registry(repositories));
+            app.perform(request).await;
+        }
+
+        async fn open_default(
+            app: &mut TaskApp,
+            repositories: Vec<narsor_protocol::controller::RepositoryView>,
+        ) {
+            opened(app, workflows(), repositories).await;
+        }
+
+        fn two_repository_inputs() -> WorkflowListResponse {
+            catalogue(vec![catalogue_workflow(
+                "compare",
+                "Porównuje dwa repozytoria.",
+                vec![
+                    workflow_input("ticket_id", ParamType::String, true, None),
+                    workflow_input("code", ParamType::Repository, false, None),
+                    workflow_input("docs_repo", ParamType::Repository, false, None),
+                ],
+            )])
+        }
+
+        /// A key, and the reads it asks for.
+        async fn key(app: &mut TaskApp, code: KeyCode) {
+            let request = press(app, code);
+            app.perform(request).await;
+        }
+
+        /// `Enter` into the fields, then `Down` to the field `name` of
+        /// `label`.
+        fn go_to(app: &mut TaskApp, label: &str, name: &str) {
+            press(app, KeyCode::Enter);
+            let chooser = app.new_task_form().unwrap().chooser();
+            let index = chooser.selected();
+            assert_eq!(chooser.selected_item().unwrap().label, label);
+            let target = chooser
+                .fields_of(index)
+                .iter()
+                .position(|field| field.name == name)
+                .unwrap_or_else(|| panic!("{name} is not a field of {label}"));
+            for _ in 0..target {
+                press(app, KeyCode::Down);
+            }
+        }
+
+        fn erase(app: &mut TaskApp, characters: usize) {
+            for _ in 0..characters {
+                press(app, KeyCode::Backspace);
+            }
+        }
+
+        fn suggestions(app: &TaskApp, label: &str, name: &str) -> Vec<String> {
+            let chooser = app.new_task_form().unwrap().chooser();
+            let index = chooser
+                .items()
+                .iter()
+                .position(|item| item.label == label)
+                .unwrap();
+            chooser
+                .fields_of(index)
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap()
+                .matching_suggestions()
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// What the form sends for the workflow it is on, with the ticket
+        /// filled in.
+        fn sent_branches(app: &mut TaskApp) -> std::collections::BTreeMap<String, String> {
+            let Request::SendTask(_) = enter_until_send(app) else {
+                panic!("a send was expected");
+            };
+            let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
+                panic!("a workflow of the catalogue goes through the control plane");
+            };
+            request.launch.branches.clone()
+        }
+
+        /// Types the ticket into the field under the one the keys are in,
+        /// which is the `ticket_id` after the last branch field.
+        fn fill_ticket_below(app: &mut TaskApp) {
+            press(app, KeyCode::Down);
+            typed(app, "NAR-18");
+        }
+
+        #[tokio::test]
+        async fn a_repository_input_has_a_branch_field_right_after_it_that_starts_on_the_default() {
+            let remotes = Remotes::listing(&[("docs", &["develop", "main"])]);
+            let mut app = app_reading(&remotes);
+            open_default(
+                &mut app,
+                vec![
+                    repository_with("docs", Some("develop")),
+                    repository_with("narsor", Some("main")),
+                ],
+            )
+            .await;
+            let names: Vec<String> = chooser_item(&app, "implement-feature")
+                .fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    "Ticket".to_string(),
+                    "Tytuł".to_string(),
+                    "target_repo".to_string(),
+                    branch_of("target_repo"),
+                    "ticket_id".to_string(),
+                    "attempts".to_string(),
+                    "dry_run".to_string(),
+                ]
+            );
+            assert_eq!(
+                field_value(&app, "implement-feature", &branch_of("target_repo")),
+                "develop"
+            );
+            assert_eq!(
+                chooser_item(&app, "fix-bug").fields.len(),
+                3,
+                "a workflow without a repository input has no branch field"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_list_of_the_server_is_offered_and_narrows_to_what_is_typed() {
+            let remotes = Remotes::listing(&[("docs", &["main", "develop", "feature/x"])]);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
+            let name = branch_of("target_repo");
+            go_to(&mut app, "implement-feature", &name);
+            assert_eq!(remotes.reads(), ["docs"]);
+            assert_eq!(
+                suggestions(&app, "implement-feature", &name),
+                ["main", "develop", "feature/x"],
+                "the untouched default does not narrow the list"
+            );
+            erase(&mut app, 4);
+            typed(&mut app, "dev");
+            assert_eq!(suggestions(&app, "implement-feature", &name), ["develop"]);
+            erase(&mut app, 3);
+            typed(&mut app, "X");
+            assert_eq!(suggestions(&app, "implement-feature", &name), ["feature/x"]);
+        }
+
+        #[tokio::test]
+        async fn a_suggestion_taken_with_the_right_arrow_is_what_is_sent() {
+            let remotes = Remotes::listing(&[("docs", &["main", "develop", "feature/x"])]);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
+            let name = branch_of("target_repo");
+            go_to(&mut app, "implement-feature", &name);
+            erase(&mut app, 4);
+            typed(&mut app, "dev");
+            press(&mut app, KeyCode::Right);
+            assert_eq!(field_value(&app, "implement-feature", &name), "develop");
+            fill_ticket_below(&mut app);
+            assert_eq!(
+                sent_branches(&mut app),
+                [("target_repo".to_string(), "develop".to_string())].into()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_right_arrow_steps_through_the_suggestions_of_what_was_typed() {
+            let remotes = Remotes::listing(&[("docs", &["main", "release/1", "release/2"])]);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
+            let name = branch_of("target_repo");
+            go_to(&mut app, "implement-feature", &name);
+            erase(&mut app, 4);
+            typed(&mut app, "rel");
+            for expected in ["release/1", "release/2", "release/1"] {
+                press(&mut app, KeyCode::Right);
+                assert_eq!(field_value(&app, "implement-feature", &name), expected);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_branch_the_list_does_not_have_is_accepted_and_sent() {
+            let remotes = Remotes::listing(&[("docs", &["main", "develop"])]);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
+            let name = branch_of("target_repo");
+            go_to(&mut app, "implement-feature", &name);
+            erase(&mut app, 4);
+            typed(&mut app, "feature/nowy");
+            assert!(suggestions(&app, "implement-feature", &name).is_empty());
+            fill_ticket_below(&mut app);
+            assert_eq!(
+                sent_branches(&mut app),
+                [("target_repo".to_string(), "feature/nowy".to_string())].into()
+            );
+            assert!(app.outgoing()[0].task_id.starts_with("task-"));
+        }
+
+        #[tokio::test]
+        async fn a_list_that_cannot_be_read_says_why_and_leaves_a_plain_text_field() {
+            let remotes = Remotes::default();
+            remotes.set("docs", Err("brak dostępu do remote".to_string()));
+            let remotes = Arc::new(remotes);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
+            let warning = app.notifier().latest().expect("a warning").clone();
+            assert_eq!(warning.severity, Severity::Warning);
+            assert!(
+                warning.text.contains("brak dostępu do remote"),
+                "{}",
+                warning.text
+            );
+            assert!(warning.text.contains("docs"), "{}", warning.text);
+            let name = branch_of("target_repo");
+            go_to(&mut app, "implement-feature", &name);
+            assert!(suggestions(&app, "implement-feature", &name).is_empty());
+            erase(&mut app, 4);
+            typed(&mut app, "feature/x");
+            fill_ticket_below(&mut app);
+            assert_eq!(
+                sent_branches(&mut app),
+                [("target_repo".to_string(), "feature/x".to_string())].into()
+            );
+        }
+
+        #[tokio::test]
+        async fn changing_the_repository_puts_its_default_in_the_field_and_reads_its_list() {
+            let remotes = Remotes::listing(&[
+                ("docs", &["develop", "main"]),
+                ("narsor", &["main", "trunk"]),
+            ]);
+            let mut app = app_reading(&remotes);
+            open_default(
+                &mut app,
+                vec![
+                    repository_with("docs", Some("develop")),
+                    repository_with("narsor", Some("trunk")),
+                ],
+            )
+            .await;
+            let name = branch_of("target_repo");
+            go_to(&mut app, "implement-feature", &name);
+            erase(&mut app, 7);
+            typed(&mut app, "wlasny");
+            press(&mut app, KeyCode::Up);
+            key(&mut app, KeyCode::Right).await;
+            assert_eq!(
+                field_value(&app, "implement-feature", "target_repo"),
+                "narsor"
+            );
+            assert_eq!(field_value(&app, "implement-feature", &name), "trunk");
+            assert_eq!(
+                suggestions(&app, "implement-feature", &name),
+                ["main", "trunk"]
+            );
+            assert_eq!(remotes.reads(), ["docs", "narsor"]);
+        }
+
+        #[tokio::test]
+        async fn two_repository_inputs_have_two_independent_branch_fields() {
+            let remotes = Remotes::listing(&[("docs", &["main", "a"]), ("narsor", &["main", "b"])]);
+            let mut app = app_reading(&remotes);
+            opened(
+                &mut app,
+                two_repository_inputs(),
+                vec![
+                    repository_with("docs", Some("main")),
+                    repository_with("narsor", Some("main")),
+                ],
+            )
+            .await;
+            let names: Vec<String> = chooser_item(&app, "compare")
+                .fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    "Ticket".to_string(),
+                    "Tytuł".to_string(),
+                    "code".to_string(),
+                    branch_of("code"),
+                    "docs_repo".to_string(),
+                    branch_of("docs_repo"),
+                    "ticket_id".to_string(),
+                ]
+            );
+            // The second repository is another one.
+            go_to(&mut app, "compare", "docs_repo");
+            key(&mut app, KeyCode::Right).await;
+            press(&mut app, KeyCode::Down);
+            erase(&mut app, 4);
+            typed(&mut app, "b");
+            assert_eq!(field_value(&app, "compare", &branch_of("code")), "main");
+            fill_ticket_below(&mut app);
+            assert_eq!(
+                sent_branches(&mut app),
+                [("docs_repo".to_string(), "b".to_string())].into(),
+                "the first input kept its default, so it sends nothing"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_repository_without_a_default_starts_empty_and_sends_nothing_untouched() {
+            let remotes = Remotes::listing(&[("docs", &["master"])]);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", None)]).await;
+            assert_eq!(field_value_or_empty(&app, &branch_of("target_repo")), "");
+            fill_ticket(&mut app, "NAR-18");
+            assert!(sent_branches(&mut app).is_empty());
+        }
+
+        fn field_value_or_empty(app: &TaskApp, name: &str) -> String {
+            let chooser = app.new_task_form().unwrap().chooser();
+            let index = chooser
+                .items()
+                .iter()
+                .position(|item| item.label == "implement-feature")
+                .unwrap();
+            chooser
+                .fields_of(index)
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap()
+                .value()
+                .to_string()
+        }
+
+        #[tokio::test]
+        async fn an_untouched_form_sends_no_branches_and_asks_nothing_when_left() {
+            let remotes = Remotes::listing(&[("docs", &["main"])]);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
+            assert_eq!(app.new_task_form().unwrap().draft_text(), "");
+            fill_ticket(&mut app, "NAR-18");
+            assert!(sent_branches(&mut app).is_empty());
+        }
+
+        #[tokio::test]
+        async fn typing_the_default_back_is_no_choice_and_sends_nothing() {
+            let remotes = Remotes::listing(&[("docs", &["main", "develop"])]);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
+            let name = branch_of("target_repo");
+            go_to(&mut app, "implement-feature", &name);
+            erase(&mut app, 4);
+            typed(&mut app, "develop");
+            assert_ne!(app.new_task_form().unwrap().draft_text(), "");
+            erase(&mut app, 7);
+            typed(&mut app, "main");
+            fill_ticket_below(&mut app);
+            assert!(sent_branches(&mut app).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_pasted_branch_goes_into_the_field_and_narrows_the_list() {
+            let remotes = Remotes::listing(&[("docs", &["main", "feature/x", "feature/y"])]);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
+            let name = branch_of("target_repo");
+            go_to(&mut app, "implement-feature", &name);
+            erase(&mut app, 4);
+            app.on_paste("feature/\n");
+            assert_eq!(field_value(&app, "implement-feature", &name), "feature/ ");
+            assert_eq!(
+                suggestions(&app, "implement-feature", &name),
+                ["feature/x", "feature/y"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_workflow_file_has_no_branch_field() {
+            let remotes = Remotes::listing(&[("docs", &["main"])]);
+            let mut app = app_reading(&remotes);
+            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
+            choose(&mut app, PATH_LABEL);
+            press(&mut app, KeyCode::Enter);
+            typed(&mut app, "/srv/ok.yaml");
+            app.on_path_checked(
+                "/srv/ok.yaml",
+                Ok(ValidateWorkflowResponse {
+                    valid: true,
+                    name: Some("my-flow".to_string()),
+                    version: Some(4),
+                    state_count: 2,
+                    initial_state: Some("start".to_string()),
+                    inputs: vec![workflow_input("repo", ParamType::Repository, false, None)],
+                    violations: vec![],
+                }),
+            );
+            let item = chooser_item(&app, PATH_LABEL);
+            assert!(item.fields.iter().any(|field| field.name == "repo"));
+            assert!(
+                !item
+                    .fields
+                    .iter()
+                    .any(|field| matches!(field.kind, FieldKind::Suggest(_))),
+                "{:?}",
+                item.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+            );
         }
     }
 

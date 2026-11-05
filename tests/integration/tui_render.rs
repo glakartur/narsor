@@ -5135,10 +5135,10 @@ mod task_app_create_render {
         );
     }
 
-    /// The form opens on the ticket; the workflow's `ticket_id` is the fourth
-    /// field, after the title and the repository.
+    /// The form opens on the ticket; the workflow's `ticket_id` is the fifth
+    /// field, after the title, the repository and its branch.
     fn to_ticket_id(app: &mut TaskApp) {
-        for _ in 0..3 {
+        for _ in 0..4 {
             press(app, KeyCode::Down);
         }
     }
@@ -5234,8 +5234,8 @@ mod task_app_create_render {
 
             press(&mut app, KeyCode::Enter);
             // The focus starts on the first field; the prompt is the last,
-            // after the form's own ticket and title fields.
-            for _ in 0..5 {
+            // after the form's own ticket and title fields and the branch.
+            for _ in 0..6 {
                 press(&mut app, KeyCode::Down);
             }
             keys(&mut app, "pierwsza");
@@ -5453,9 +5453,10 @@ mod task_app_create_render {
         open_prompt_form(&mut app, &["prompt", "notatki", "dodatki"]);
         press(&mut app, KeyCode::Enter);
         // The prompt is the main field, so it stands last: after the ticket,
-        // the title, the repository, `ticket_id`, `dry_run` and the two others.
-        // The arrow leaves a multi-line field only on the second press.
-        for _ in 0..9 {
+        // the title, the repository and its branch, `ticket_id`, `dry_run` and
+        // the two others. The arrow leaves a multi-line field only on the
+        // second press.
+        for _ in 0..10 {
             press(&mut app, KeyCode::Down);
         }
         for _ in 0..3 {
@@ -6442,6 +6443,44 @@ mod active_field_fill {
     }
 
     #[test]
+    fn a_field_with_suggestions_is_filled_like_text_and_lists_what_fits_below() {
+        let styles = Styles::new(false);
+        let suggest = || {
+            ChooserField::suggest(
+                "branch",
+                vec!["main".into(), "develop".into(), "feature/x".into()],
+            )
+        };
+        let mut chooser = form(suggest());
+        let rows = drawn(&mut chooser, &styles);
+        assert_eq!(rows.len(), 1, "only the field itself carries the fill");
+        assert_filled(&rows[0], &styles);
+        let drawn_screen = screen(&draw_chooser(WIDTH, 12, &mut chooser, &styles));
+        assert!(
+            drawn_screen.contains("main") && drawn_screen.contains("feature/x"),
+            "{drawn_screen}"
+        );
+
+        type_text(&mut chooser, "dev");
+        let rows = drawn(&mut chooser, &styles);
+        assert_eq!(rows.len(), 1);
+        assert_filled(&rows[0], &styles);
+        let drawn_screen = screen(&draw_chooser(WIDTH, 12, &mut chooser, &styles));
+        assert!(drawn_screen.contains("develop"), "{drawn_screen}");
+        assert!(!drawn_screen.contains("feature/x"), "{drawn_screen}");
+    }
+
+    #[test]
+    fn a_field_with_suggestions_has_no_fill_without_the_focus_and_no_list() {
+        let styles = Styles::new(false);
+        let mut chooser = form(ChooserField::suggest("branch", vec!["main".into()]));
+        let buffer = draw_chooser_focused(WIDTH, 12, &mut chooser, &styles, false);
+        let fill = styles.field_editing().bg;
+        assert!(buffer.content().iter().all(|cell| Some(cell.bg) != fill));
+        assert!(!screen(&buffer).contains("main"), "{}", screen(&buffer));
+    }
+
+    #[test]
     fn the_cursor_stays_the_only_reversed_cell() {
         let styles = Styles::new(false);
         let mut chooser = form(ChooserField::text("a"));
@@ -6561,6 +6600,32 @@ mod stacked_form {
             .iter()
             .map(|cell| Some(cell.bg) == fill)
             .collect()
+    }
+
+    #[test]
+    fn a_branch_field_in_the_form_is_filled_and_lists_the_suggestions_under_its_value() {
+        let styles = Styles::new(false);
+        let mut chooser = entered(vec![
+            ChooserField::text("Ticket"),
+            ChooserField::suggest("branch", vec!["main".into(), "develop".into()])
+                .starting_from("main"),
+        ]);
+        press(&mut chooser, KeyCode::Down);
+        let buffer = draw_chooser(WIDTH, 12, &mut chooser, &styles);
+        let rows = rows(&buffer);
+        let value = rows
+            .iter()
+            .position(|row| row.starts_with("> main"))
+            .unwrap();
+        let cells = filled(&buffer, value, &styles);
+        assert!(cells[2..usize::from(WIDTH) - 2].iter().all(|&on| on));
+        assert!(!cells[0] && !cells[1], "the prompt has no fill");
+        assert!(
+            rows[value + 1].contains("main") && rows[value + 1].contains("develop"),
+            "{}",
+            screen(&buffer)
+        );
+        assert!(!filled(&buffer, value + 1, &styles).iter().any(|&on| on));
     }
 
     #[test]
@@ -6760,16 +6825,34 @@ mod stacked_form {
             workflow_input("target_repo", ParamType::Repository, false, None),
             workflow_input("custom_input", ParamType::String, false, None),
         ];
-        let fields = workflow_input_fields(&inputs, &["acme/web".to_string()]);
+        let fields = workflow_input_fields(
+            &inputs,
+            &[crate::task_app_support::repository(
+                "acme/web",
+                "https://example.com/web.git",
+            )],
+        );
         let labels: Vec<&str> = fields.iter().map(ChooserField::label).collect();
         assert_eq!(
             labels,
-            ["ticket_id", "Opis", "Repozytorium", "custom_input"]
+            [
+                "ticket_id",
+                "Opis",
+                "Repozytorium",
+                "Repozytorium · gałąź",
+                "custom_input"
+            ]
         );
         let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
         assert_eq!(
             names,
-            ["ticket_id", "description", "target_repo", "custom_input"]
+            [
+                "ticket_id",
+                "description",
+                "target_repo",
+                "target_repo · gałąź",
+                "custom_input"
+            ]
         );
         let mut chooser = entered(fields);
         let screen = screen(&draw_chooser(WIDTH, 20, &mut chooser, &Styles::new(false)));

@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::domain::display::is_invisible_format;
 use crate::tui::chooser::{ChooserField, FieldKind};
-use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView};
+use narsor_protocol::controller::{RepositoryView, WorkflowInputType, WorkflowInputView};
 use narsor_protocol::event::{AnsweredBy, EventData, InputCloseReason};
 use narsor_protocol::panel::value_as_text;
 
@@ -153,7 +153,7 @@ pub fn pasted_text(kind: &FieldKind, pasted: &str) -> Option<String> {
     }
     Some(match kind {
         FieldKind::Text { multiline: true } => text,
-        FieldKind::Text { multiline: false } => text.replace('\n', " "),
+        FieldKind::Text { multiline: false } | FieldKind::Suggest(_) => text.replace('\n', " "),
         _ => text
             .chars()
             .filter(|character| character.is_ascii_digit() || *character == '-')
@@ -237,6 +237,13 @@ const BOOLEAN_OPTIONS: [&str; 2] = ["true", "false"];
 /// name stays the key of the value; an input not listed is drawn under its name.
 const INPUT_LABELS: [(&str, &str); 2] = [("target_repo", "Repozytorium"), ("description", "Opis")];
 
+/// The name of the field that holds the branch of the `repository` input
+/// `input`: it stands right after that input and keeps the name of its value
+/// apart from every declared input.
+pub fn branch_field_name(input: &str) -> String {
+    format!("{input} · gałąź")
+}
+
 /// One field per declared input, in declaration order.
 ///
 /// * `boolean` is a choice between `true` and `false`; with no default it
@@ -250,48 +257,89 @@ const INPUT_LABELS: [(&str, &str); 2] = [("target_repo", "Repozytorium"), ("desc
 ///   field, before anything is sent;
 /// * `string` is a free line.
 ///
+/// Right after every `repository` input stands the field of its branch
+/// ([`branch_field_name`]): a free line that suggests, and starts from the
+/// repository's default branch.
+///
 /// An input is required when the workflow says so and gives no default; a
 /// default is shown as the value the field starts with.
 pub fn workflow_input_fields(
     inputs: &[WorkflowInputView],
-    repositories: &[String],
+    repositories: &[RepositoryView],
 ) -> Vec<ChooserField> {
     inputs
         .iter()
-        .map(|input| {
-            let mut field = match input.input_type {
-                WorkflowInputType::Boolean => ChooserField::select(
-                    input.name.clone(),
-                    BOOLEAN_OPTIONS
-                        .iter()
-                        .map(|option| option.to_string())
-                        .collect(),
-                )
-                .with_value(BOOLEAN_OPTIONS[1]),
-                WorkflowInputType::Repository if !repositories.is_empty() => {
-                    ChooserField::select(input.name.clone(), repositories.to_vec())
-                }
-                WorkflowInputType::Integer => ChooserField::integer(input.name.clone()),
-                WorkflowInputType::Text => ChooserField::multiline(input.name.clone()),
-                WorkflowInputType::String | WorkflowInputType::Repository => {
-                    ChooserField::text(input.name.clone())
-                }
-            };
-            if let Some(default) = &input.default {
-                field = field.with_value(value_as_text(default));
-            }
-            if input.required && input.default.is_none() {
-                field = field.required();
-            }
-            if let Some((_, label)) = INPUT_LABELS.iter().find(|(name, _)| *name == input.name) {
-                field = field.labelled(*label);
-            }
-            match input_description(input) {
-                Some(description) => field.described(description),
-                None => field,
-            }
+        .flat_map(|input| {
+            let field = input_field(input, repositories);
+            let branch = matches!(input.input_type, WorkflowInputType::Repository)
+                .then(|| branch_field(input, &field, repositories));
+            std::iter::once(field).chain(branch)
         })
         .collect()
+}
+
+fn input_field(input: &WorkflowInputView, repositories: &[RepositoryView]) -> ChooserField {
+    let mut field = match input.input_type {
+        WorkflowInputType::Boolean => ChooserField::select(
+            input.name.clone(),
+            BOOLEAN_OPTIONS
+                .iter()
+                .map(|option| option.to_string())
+                .collect(),
+        )
+        .with_value(BOOLEAN_OPTIONS[1]),
+        WorkflowInputType::Repository if !repositories.is_empty() => ChooserField::select(
+            input.name.clone(),
+            repositories
+                .iter()
+                .map(|repository| repository.id.clone())
+                .collect(),
+        ),
+        WorkflowInputType::Integer => ChooserField::integer(input.name.clone()),
+        WorkflowInputType::Text => ChooserField::multiline(input.name.clone()),
+        WorkflowInputType::String | WorkflowInputType::Repository => {
+            ChooserField::text(input.name.clone())
+        }
+    };
+    if let Some(default) = &input.default {
+        field = field.with_value(value_as_text(default));
+    }
+    if input.required && input.default.is_none() {
+        field = field.required();
+    }
+    if let Some((_, label)) = INPUT_LABELS.iter().find(|(name, _)| *name == input.name) {
+        field = field.labelled(*label);
+    }
+    match input_description(input) {
+        Some(description) => field.described(description),
+        None => field,
+    }
+}
+
+/// The branch the task starts from in the repository `field` holds: free
+/// text that suggests the branches the server lists, starting from the
+/// repository's default branch, or empty when it has none.
+fn branch_field(
+    input: &WorkflowInputView,
+    field: &ChooserField,
+    repositories: &[RepositoryView],
+) -> ChooserField {
+    ChooserField::suggest(branch_field_name(&input.name), Vec::new())
+        .labelled(format!("{} · gałąź", field.label()))
+        .starting_from(default_branch_of(repositories, field.value()))
+        .described("z niej startuje zadanie; → bierze podpowiedź, własną można wpisać")
+}
+
+/// The default branch of the registered repository `id`; empty when there is
+/// no such repository or it has none.
+pub fn default_branch_of(repositories: &[RepositoryView], id: &str) -> String {
+    repositories
+        .iter()
+        .find(|repository| repository.id == id)
+        .and_then(|repository| repository.default_branch.as_deref())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// What the current field is for: its type when that is not obvious, then

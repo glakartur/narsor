@@ -21,6 +21,16 @@
 //! `Enter` validates the path (every violation, as `narsor validate` prints
 //! them, goes in the description) and the inputs of the definition appear.
 //!
+//! # The branch of a repository
+//!
+//! Every `repository` input of a workflow is followed by the field of its
+//! branch: a free line that starts from the repository's default branch and
+//! suggests the branches the server lists for it ([`Request::ReadBranches`]).
+//! Choosing another repository puts that repository's default in the field and
+//! reads its list again; a list that cannot be read leaves a plain line and
+//! says why. What is typed is never checked against the list. Only a branch
+//! that is not empty and not the default the field started from is sent.
+//!
 //! # Sending
 //!
 //! The id of the task is made when `Enter` is pressed, before the first
@@ -57,6 +67,8 @@
 
 mod layout;
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -66,22 +78,25 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use serde_json::{Map, Value};
 
-use crate::api::ClientError;
+use crate::api::{BranchSource, ClientError};
 use crate::controller_protocol::{
-    CreateTaskRequest, LaunchRequest, RepositoryListResponse, TaskSummary,
+    CreateTaskRequest, LaunchRequest, RepositoryListResponse, RepositoryView, TaskSummary,
     ValidateWorkflowResponse, WorkflowInputView, WorkflowListResponse, WorkflowSource,
     WorkflowView,
 };
 use narsor_protocol::controller::WorkflowInputType;
 use narsor_protocol::display::GENERATED_TITLE_MAX_CHARS;
 
-use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem};
-use super::super::input_form::{workflow_input_fields, workflow_input_values};
+use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, FieldKind};
+use super::super::input_form::{
+    branch_field_name, default_branch_of, workflow_input_fields, workflow_input_values,
+};
 use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::scroll::sanitize;
 use super::super::style::{Role, Styles};
 use super::actions::chooser_context;
+use super::background::{JobKey, Outcome};
 use super::list::{fit, PendingRow, PendingState};
 use super::notify::Severity;
 use super::{failure_reason, is_transport, Focus, Request, TaskApp, View};
@@ -181,13 +196,28 @@ pub struct PathCheck {
 pub struct NewTaskForm {
     chooser: Chooser,
     entries: Vec<Entry>,
-    repositories: Vec<String>,
+    repositories: Vec<RepositoryView>,
     /// `Err(reason)` when the server does not read workflow files.
     path_access: Result<(), String>,
     check: Option<PathCheck>,
     /// The id of the task last made from this form, so that its success can
     /// clear what was remembered.
     submitted: Option<String>,
+    /// What the server said of the branches of each repository read so far:
+    /// the list, or why there is none.
+    branch_lists: BTreeMap<String, Result<Vec<String>, String>>,
+    /// The repositories whose branches were asked for and not yet answered.
+    branch_reads: BTreeSet<String>,
+}
+
+/// A `repository` input of an entry that offers the registered repositories,
+/// and where its branch is typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchSlot {
+    entry: usize,
+    repository: String,
+    input: String,
+    branch_field: String,
 }
 
 impl NewTaskForm {
@@ -195,7 +225,7 @@ impl NewTaskForm {
     /// `ścieżka…` entry must be greyed out.
     pub fn new(
         workflows: &WorkflowListResponse,
-        repositories: &[String],
+        repositories: &[RepositoryView],
         path_access: Result<(), String>,
     ) -> Self {
         let mut form = Self {
@@ -205,6 +235,8 @@ impl NewTaskForm {
             path_access,
             check: None,
             submitted: None,
+            branch_lists: BTreeMap::new(),
+            branch_reads: BTreeSet::new(),
         };
         form.entries = workflows
             .workflows
@@ -225,7 +257,7 @@ impl NewTaskForm {
     pub fn refreshed(
         mut self,
         workflows: &WorkflowListResponse,
-        repositories: &[String],
+        repositories: &[RepositoryView],
         path_access: Result<(), String>,
     ) -> Self {
         self.entries = workflows
@@ -236,6 +268,9 @@ impl NewTaskForm {
             .collect();
         self.repositories = repositories.to_vec();
         self.path_access = path_access;
+        // The remotes may have new branches by now: they are read again.
+        self.branch_lists.clear();
+        self.branch_reads.clear();
         let items = self.items();
         self.chooser = self.chooser.rebuilt(items);
         self
@@ -257,8 +292,105 @@ impl NewTaskForm {
     }
 
     /// The repositories the `repository` fields offer.
-    pub fn repositories(&self) -> &[String] {
+    pub fn repositories(&self) -> &[RepositoryView] {
         &self.repositories
+    }
+
+    /// The branch fields of every entry that stand under a repository chosen
+    /// from the registry.
+    fn branch_slots(&self) -> Vec<BranchSlot> {
+        let mut slots = Vec::new();
+        for (entry, kind) in self.entries.iter().enumerate() {
+            let Entry::Workflow(workflow) = kind else {
+                continue;
+            };
+            let fields = self.chooser.fields_of(entry);
+            for input in &workflow.inputs {
+                let branch_field = branch_field_name(&input.name);
+                let repository = fields
+                    .iter()
+                    .find(|field| field.name == input.name)
+                    .filter(|field| matches!(field.kind, FieldKind::Select(_)))
+                    .map(|field| field.value().to_string());
+                let has_branch = fields.iter().any(|field| field.name == branch_field);
+                if let (Some(repository), true) = (repository, has_branch) {
+                    slots.push(BranchSlot {
+                        entry,
+                        repository,
+                        input: input.name.clone(),
+                        branch_field,
+                    });
+                }
+            }
+        }
+        slots
+    }
+
+    /// [`Self::branch_slots`] of the entry that is highlighted.
+    fn selected_branch_slots(&self) -> Vec<BranchSlot> {
+        let selected = self.chooser.selected();
+        let mut slots = self.branch_slots();
+        slots.retain(|slot| slot.entry == selected);
+        slots
+    }
+
+    /// After a key: a repository that changed gives its branch field the
+    /// default of the new repository and is read again; then every branch
+    /// field shows what is known of its repository's branches. Returns the
+    /// repositories of the highlighted entry that were never asked for, now
+    /// marked as asked.
+    fn after_key(&mut self, before: &[BranchSlot]) -> Vec<String> {
+        for slot in self.selected_branch_slots() {
+            let changed = before.iter().any(|earlier| {
+                earlier.entry == slot.entry
+                    && earlier.input == slot.input
+                    && earlier.repository != slot.repository
+            });
+            if changed {
+                let default = default_branch_of(&self.repositories, &slot.repository);
+                self.chooser
+                    .reset_field(slot.entry, &slot.branch_field, &default);
+                self.branch_lists.remove(&slot.repository);
+                self.branch_reads.remove(&slot.repository);
+            }
+        }
+        self.show_branch_lists();
+        self.unasked_repositories()
+    }
+
+    /// The repositories of the highlighted entry whose branches were not asked
+    /// for, now marked as asked.
+    fn unasked_repositories(&mut self) -> Vec<String> {
+        let mut unasked = Vec::new();
+        for slot in self.selected_branch_slots() {
+            let known = self.branch_lists.contains_key(&slot.repository)
+                || self.branch_reads.contains(&slot.repository);
+            if !known {
+                self.branch_reads.insert(slot.repository.clone());
+                unasked.push(slot.repository);
+            }
+        }
+        unasked
+    }
+
+    /// Every branch field suggests the branches known of its repository, and
+    /// none while they are not known.
+    fn show_branch_lists(&mut self) {
+        for slot in self.branch_slots() {
+            let suggestions = match self.branch_lists.get(&slot.repository) {
+                Some(Ok(branches)) => branches.clone(),
+                _ => Vec::new(),
+            };
+            self.chooser
+                .set_field_suggestions(slot.entry, &slot.branch_field, suggestions);
+        }
+    }
+
+    /// Takes in what the server said of the branches of `repository`.
+    fn take_branch_list(&mut self, repository: &str, list: Result<Vec<String>, String>) {
+        self.branch_reads.remove(repository);
+        self.branch_lists.insert(repository.to_string(), list);
+        self.show_branch_lists();
     }
 
     fn first_available(&self) -> usize {
@@ -300,7 +432,7 @@ impl NewTaskForm {
 }
 
 /// How a workflow of the catalogue reads in the list and the description.
-fn workflow_item(workflow: &WorkflowView, repositories: &[String]) -> ChooserItem {
+fn workflow_item(workflow: &WorkflowView, repositories: &[RepositoryView]) -> ChooserItem {
     let source = match workflow.source {
         WorkflowSource::BuiltIn => "wbudowany",
         WorkflowSource::Catalog => "z katalogu",
@@ -346,13 +478,21 @@ fn workflow_item(workflow: &WorkflowView, repositories: &[String]) -> ChooserIte
 }
 
 /// The fields of a workflow's form, in the order they stand on the screen:
-/// ticket, title, the repository, the other inputs and last the main text
-/// field, which takes the rest of the room.
-fn form_fields(inputs: &[WorkflowInputView], repositories: &[String]) -> Vec<ChooserField> {
+/// ticket, title, the repositories each followed by its branch, the other
+/// inputs and last the main text field, which takes the rest of the room.
+fn form_fields(inputs: &[WorkflowInputView], repositories: &[RepositoryView]) -> Vec<ChooserField> {
     let mut fields = workflow_input_fields(inputs, repositories);
-    let mut is_repository: Vec<bool> = inputs
+    let repository_inputs: Vec<&str> = inputs
         .iter()
-        .map(|input| matches!(input.input_type, WorkflowInputType::Repository))
+        .filter(|input| matches!(input.input_type, WorkflowInputType::Repository))
+        .map(|input| input.name.as_str())
+        .collect();
+    let mut is_repository: Vec<bool> = fields
+        .iter()
+        .map(|field| {
+            repository_inputs.contains(&field.name.as_str())
+                || matches!(field.kind, FieldKind::Suggest(_))
+        })
         .collect();
     let main = chooser::main_field_of(&fields).map(|index| {
         is_repository.remove(index);
@@ -402,7 +542,7 @@ fn violations_text(violations: &[String]) -> String {
 fn path_item(
     access: &Result<(), String>,
     check: Option<&PathCheck>,
-    repositories: &[String],
+    repositories: &[RepositoryView],
 ) -> ChooserItem {
     let mut item = ChooserItem::new(PATH_LABEL, path_description(check)).with_field(
         ChooserField::text(PATH_FIELD)
@@ -423,7 +563,12 @@ fn path_item(
     {
         // Only once the file is accepted: until then `Enter` on the path asks
         // the server to check it, as the path is the last field.
-        for field in form_fields(inputs, repositories) {
+        // A workflow file is created through the local façade, which takes no
+        // branch: its repositories have none to choose.
+        for field in form_fields(inputs, repositories)
+            .into_iter()
+            .filter(|field| !matches!(field.kind, FieldKind::Suggest(_)))
+        {
             item = item.with_field(field);
         }
     }
@@ -492,6 +637,39 @@ pub enum CreateHow {
     },
 }
 
+/// The branches the operator chose: for each `repository` input that has a
+/// value, what was typed in its branch field, unless that is empty or the
+/// default branch the field started from. An input left on its default sends
+/// nothing, so what the workflow says of its branch holds.
+fn chosen_branches(
+    declared: &[WorkflowInputView],
+    repositories: &[RepositoryView],
+    inputs: &Map<String, Value>,
+    values: &[(String, String)],
+) -> BTreeMap<String, String> {
+    let mut branches = BTreeMap::new();
+    for input in declared
+        .iter()
+        .filter(|input| matches!(input.input_type, WorkflowInputType::Repository))
+    {
+        let Some(repository) = inputs.get(&input.name).and_then(Value::as_str) else {
+            continue;
+        };
+        let field = branch_field_name(&input.name);
+        let typed = values
+            .iter()
+            .find(|(name, _)| *name == field)
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty());
+        if let Some(typed) =
+            typed.filter(|typed| *typed != default_branch_of(repositories, repository))
+        {
+            branches.insert(input.name.clone(), typed.to_string());
+        }
+    }
+    branches
+}
+
 /// A task being created: the id it will have, made before the first attempt,
 /// and what every attempt sends.
 #[derive(Debug, Clone, PartialEq)]
@@ -555,6 +733,59 @@ impl TaskApp {
         self.new_task_memory.as_ref()
     }
 
+    /// Reads the branches from `source` in place of the client: what a test
+    /// of the reads sets.
+    #[must_use]
+    pub fn with_branch_source(mut self, source: Arc<dyn BranchSource>) -> Self {
+        self.branch_source = source;
+        self
+    }
+
+    /// Starts the reads of the branches of `repositories`, one job for each;
+    /// what they bring becomes the suggestions of the branch fields.
+    pub(super) fn start_branch_reads(&mut self, repositories: &[String]) {
+        for repository in repositories {
+            let source = Arc::clone(&self.branch_source);
+            let id = repository.clone();
+            self.background
+                .start(JobKey::Branches(repository.clone()), async move {
+                    let read = source.read_branches(&id).await;
+                    Outcome::new(move |app: &mut TaskApp| app.on_branches_read(&id, read))
+                });
+        }
+    }
+
+    /// The branches of `repository` are back. A list that could not be read
+    /// leaves the fields as plain text, and the bar says why.
+    fn on_branches_read(&mut self, repository: &str, read: Result<Vec<String>, ClientError>) {
+        // A remote that cannot be listed is not a server that cannot be
+        // reached: only a lost connection counts against the connection.
+        if let Err(error @ ClientError::Unavailable(_)) = &read {
+            self.note_transport(error);
+        }
+        let list = read.as_ref().map(Clone::clone).map_err(failure_reason);
+        let form = match &mut self.view {
+            View::NewTask(form) => Some(&mut **form),
+            _ => self.new_task_memory.as_mut(),
+        };
+        let Some(form) = form else {
+            return;
+        };
+        form.take_branch_list(repository, list);
+        if let Err(error) = read {
+            if matches!(self.view, View::NewTask(_)) {
+                self.notify(
+                    Severity::Warning,
+                    format!(
+                        "nie udało się wczytać gałęzi repozytorium {} ({}) — pole gałęzi będzie tekstem",
+                        one_line(repository),
+                        failure_reason(&error)
+                    ),
+                );
+            }
+        }
+    }
+
     /// The tasks being created that the server has not confirmed.
     pub fn outgoing(&self) -> &[Outgoing] {
         &self.outbox
@@ -580,23 +811,32 @@ impl TaskApp {
     }
 
     /// `n`, after the catalogue and the repositories were read: opens the form
-    /// over the details. What was typed the last time is still in it.
+    /// over the details. What was typed the last time is still in it. Returns
+    /// the read of the branches of the repositories the form starts on.
     pub fn open_new_task(
         &mut self,
         workflows: WorkflowListResponse,
         repositories: RepositoryListResponse,
-    ) {
-        let ids: Vec<String> = repositories
-            .repositories
-            .iter()
-            .map(|repository| repository.id.clone())
-            .collect();
+    ) -> Request {
         let access = self.path_access();
-        let form = match self.new_task_memory.take() {
-            Some(remembered) => remembered.refreshed(&workflows, &ids, access),
-            None => NewTaskForm::new(&workflows, &ids, access),
+        let mut form = match self.new_task_memory.take() {
+            Some(remembered) => {
+                remembered.refreshed(&workflows, &repositories.repositories, access)
+            }
+            None => NewTaskForm::new(&workflows, &repositories.repositories, access),
         };
+        let unasked = form.unasked_repositories();
         self.show_new_task(form);
+        Self::reading(unasked)
+    }
+
+    /// The request that reads the branches of `repositories`, or none.
+    fn reading(repositories: Vec<String>) -> Request {
+        if repositories.is_empty() {
+            Request::None
+        } else {
+            Request::ReadBranches(repositories)
+        }
     }
 
     fn show_new_task(&mut self, form: NewTaskForm) {
@@ -626,7 +866,10 @@ impl TaskApp {
                         unreadable: Vec::new(),
                     }
                 });
-                self.open_new_task(workflows, repositories);
+                if let Request::ReadBranches(unasked) = self.open_new_task(workflows, repositories)
+                {
+                    self.start_branch_reads(&unasked);
+                }
             }
             Err(error) => {
                 self.note_transport(&error);
@@ -700,8 +943,11 @@ impl TaskApp {
                 _ => {}
             }
         }
-        let request = match form.chooser.on_key(key) {
-            ChooserAction::None => Request::None,
+        let slots_before = form.selected_branch_slots();
+        let action = form.chooser.on_key(key);
+        let unasked = form.after_key(&slots_before);
+        let request = match action {
+            ChooserAction::None => Self::reading(unasked),
             ChooserAction::Cancel => {
                 self.close_new_task();
                 Request::None
@@ -779,6 +1025,7 @@ impl TaskApp {
                 return Request::None;
             }
         };
+        let branches = chosen_branches(&declared, &form.repositories, &inputs, &submission.values);
         if !self.mutation_allowed() {
             return Request::None;
         }
@@ -796,7 +1043,7 @@ impl TaskApp {
                         workflow_version: version,
                         inputs: Value::Object(inputs.clone()),
                         workspace: None,
-                        branches: Default::default(),
+                        branches,
                         profile: None,
                         harness: None,
                         resources: None,

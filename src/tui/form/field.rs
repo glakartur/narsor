@@ -14,6 +14,9 @@ use crate::tui::style::{Role, Styles};
 const PROMPT: &str = "> ";
 const CONTINUATION: &str = "  ";
 
+/// Between two suggestions on their row.
+const SUGGESTION_SEPARATOR: &str = " · ";
+
 /// `text` as spans with the cell at `cursor` reversed. At the end of the text
 /// the cursor is one reversed space after it.
 pub fn cursor_spans(
@@ -98,7 +101,7 @@ pub fn value_lines(
         return (vec![Line::from(spans)], 0);
     }
     let wrapped = layout_of(field, width, focused);
-    let lines = wrapped
+    let mut lines: Vec<Line<'static>> = wrapped
         .rows
         .iter()
         .enumerate()
@@ -126,7 +129,44 @@ pub fn value_lines(
             Line::from(spans)
         })
         .collect();
+    if let Some(line) = suggestion_line(field, width, focused, styles) {
+        lines.push(line);
+    }
     (lines, wrapped.cursor_row)
+}
+
+/// The row under a suggesting field being edited: what fits what is typed,
+/// the one the value stands on in brackets, cut with `…` at the edge. `None`
+/// when the field does not suggest, has no focus, or nothing fits.
+fn suggestion_line(
+    field: &ChooserField,
+    width: usize,
+    focused: bool,
+    styles: &Styles,
+) -> Option<Line<'static>> {
+    if !focused {
+        return None;
+    }
+    let matching = field.matching_suggestions();
+    if matching.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = matching
+        .iter()
+        .map(|suggestion| {
+            let text = sanitize(suggestion);
+            if *suggestion == field.value() {
+                format!("[{text}]")
+            } else {
+                text
+            }
+        })
+        .collect();
+    let text = clip(&listed.join(SUGGESTION_SEPARATOR), text_width(width));
+    Some(Line::from(vec![
+        Span::styled(CONTINUATION, styles.of(Role::Done)),
+        Span::styled(text, styles.of(Role::Done)),
+    ]))
 }
 
 /// How many rows the value of a field takes in `width` columns.
@@ -135,10 +175,12 @@ pub fn value_rows(field: &ChooserField, width: usize, focused: bool) -> usize {
         return 1;
     }
     let text = text_width(width);
-    wrap(field.value(), focused.then(|| field.cursor()), text)
+    let value_rows = wrap(field.value(), focused.then(|| field.cursor()), text)
         .rows
         .len()
-        .max(1)
+        .max(1);
+    let suggestion_rows = usize::from(focused && !field.matching_suggestions().is_empty());
+    value_rows + suggestion_rows
 }
 
 /// The row above a field's value: its label, `(wymagane)`, `◆` and ` · description`.
