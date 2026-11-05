@@ -16,7 +16,9 @@ use serde_json::Value;
 /// Version 3 added the `definition` snapshot, so a runner never has to find
 /// the workflow again in a catalogue that may have changed (or that it cannot
 /// even see) since the task was created.
-pub const TASK_LAUNCH_SPEC_VERSION: u32 = 3;
+/// Version 4 replaced the single `workspace` source with a list of named
+/// repositories, each with its branch, for workflows of several repositories.
+pub const TASK_LAUNCH_SPEC_VERSION: u32 = 4;
 
 /// Every top-level field of a current-version launch spec.
 ///
@@ -59,7 +61,7 @@ mod tests {
 
     fn base() -> Value {
         json!({
-            "version": 3,
+            "version": 4,
             "workflow_id": "wf",
             "workflow_version": 1,
             "inputs": {},

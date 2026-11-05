@@ -196,14 +196,18 @@ fn backend_id(id: &str) -> BackendId {
 }
 
 fn git_workspace() -> narsor_engine::domain::TaskWorkspace {
-    narsor_engine::domain::TaskWorkspace::Git(narsor_engine::domain::GitIdentity {
-        repository: Some("narsor".to_string()),
-        remote_url: "https://example.com/narsor.git".to_string(),
-        commit: "614c3a8".repeat(5) + "abcde",
-        git_ref: None,
-        ref_origin: None,
-        credential: None,
-    })
+    use narsor_engine::domain::{GitIdentity, TaskRepository, TaskRepositorySource, TaskWorkspace};
+    TaskWorkspace::single(TaskRepository::new(
+        "narsor",
+        TaskRepositorySource::Git(GitIdentity {
+            repository: Some("narsor".to_string()),
+            remote_url: "https://example.com/narsor.git".to_string(),
+            commit: "614c3a8".repeat(5) + "abcde",
+            git_ref: None,
+            ref_origin: None,
+            credential: None,
+        }),
+    ))
 }
 
 fn launch_spec() -> TaskLaunchSpec {

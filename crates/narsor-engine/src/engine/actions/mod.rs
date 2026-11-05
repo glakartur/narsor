@@ -36,6 +36,7 @@ pub mod answer;
 pub mod harness;
 pub mod human;
 mod process_group;
+pub mod scope;
 pub mod script;
 
 use std::future::Future;
@@ -64,6 +65,7 @@ pub use human::{
     PermissionDecisionKind, PermissionDenialDetails, PermissionGrantScope,
     PermissionRequestDetails, RejectedAnswer, ResumedHumanAction,
 };
+pub use scope::{ScopedRepository, StepScope};
 pub use script::ScriptExecutor;
 
 /// Environment variable carrying the [`crate::domain::ActionExecution`] id into
@@ -133,6 +135,10 @@ pub struct ActionRequest<'a> {
     /// Who wrote the prompt, for the conversation. `None` lets
     /// [`AgentExecutor`] decide from `purpose`.
     pub author: Option<PromptAuthor>,
+
+    /// What the step may touch (KTD5). `None` means a step without a
+    /// `workspace` section: every repository, starting in the primary one.
+    pub scope: Option<&'a StepScope>,
 }
 
 impl<'a> ActionRequest<'a> {
@@ -152,7 +158,21 @@ impl<'a> ActionRequest<'a> {
             contract: StepContract::default(),
             purpose: PromptPurpose::Step,
             author: None,
+            scope: None,
         }
+    }
+
+    /// Returns the same request restricted to `scope`.
+    pub fn with_scope(mut self, scope: &'a StepScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    /// The step's scope: the one given, else the default for the workspace.
+    pub fn step_scope(&self) -> StepScope {
+        self.scope
+            .cloned()
+            .unwrap_or_else(|| StepScope::resolve(None, self.workspace))
     }
 
     /// Returns the same request with a time limit applied.

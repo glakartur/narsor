@@ -77,7 +77,7 @@ impl ActionExecutor for ScriptExecutor {
     ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
         Box::pin(async move {
             let config = script_config(request.action)?;
-            let working_dir = resolve_working_dir(&request.workspace.path, config);
+            let working_dir = resolve_working_dir(&request.step_scope().start_dir, config);
             let limit = request
                 .timeout
                 .or_else(|| config.timeout_secs.map(Duration::from_secs));
@@ -112,10 +112,10 @@ fn action_type_name(action: &ActionConfig) -> &'static str {
     }
 }
 
-/// The directory the command runs in: the workspace, or `working_dir` resolved
-/// against it. An absolute `working_dir` is taken as given.
-fn resolve_working_dir(workspace_path: &str, config: &ScriptActionConfig) -> PathBuf {
-    let workspace = PathBuf::from(workspace_path);
+/// The directory the command runs in: the step's start directory, or
+/// `working_dir` resolved against it. An absolute `working_dir` is taken as given.
+fn resolve_working_dir(start_dir: &Path, config: &ScriptActionConfig) -> PathBuf {
+    let workspace = start_dir.to_path_buf();
 
     match &config.working_dir {
         Some(dir) => {

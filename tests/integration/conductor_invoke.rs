@@ -169,9 +169,39 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let harness = Harness::new();
+        let workspace = harness.workspace();
+        Self::with_workspace(harness, workspace)
+    }
+
+    /// A task of two repositories, `code` (primary) and `docs`, under
+    /// `workspace/`.
+    fn new_multi_repository() -> Self {
+        let harness = Harness::new();
+        let root = harness.workspace_dir();
+        let repository = |name: &str, primary: bool| {
+            let path = root.join(name);
+            fs::create_dir_all(&path).expect("create the repository");
+            narsor_engine::domain::WorkspaceRepository {
+                name: name.to_string(),
+                path: path.to_string_lossy().into_owned(),
+                primary,
+                branch: None,
+                repository: None,
+                base_commit: None,
+            }
+        };
+        let repositories = vec![repository("code", true), repository("docs", false)];
+        let mut workspace =
+            narsor_engine::domain::Workspace::local_folder(repositories[0].path.clone());
+        workspace.root = Some(root.to_string_lossy().into_owned());
+        workspace.repositories = repositories;
+        Self::with_workspace(harness, workspace)
+    }
+
+    fn with_workspace(harness: Harness, workspace: narsor_engine::domain::Workspace) -> Self {
         let engine = Arc::new(harness.engine());
         let execution = engine
-            .start(&workflow("two_steps"), json!({}), harness.workspace())
+            .start(&workflow("two_steps"), json!({}), workspace)
             .expect("start an execution");
         let yaml = fs::read_to_string(fixtures().join("engine/two_steps.yaml"))
             .expect("read the definition");
@@ -348,6 +378,40 @@ async fn claude_runs_read_only_in_the_workspace_without_an_action_attempt() {
         "no conversation is written: {recorded:?}"
     );
     assert!(!fixture.work_dir().exists(), "no scratch directory is made");
+}
+
+/// AE6: with two repositories the conductor starts in the directory holding
+/// both, and its prompt lists each as read-only.
+#[tokio::test]
+async fn the_conductor_opens_every_repository_read_only() {
+    let fixture = Fixture::new_multi_repository();
+    fixture.claude.answers(&claude_answer(CHOOSE_DONE));
+
+    fixture
+        .invoker("claude-code")
+        .invoke_once(&fixture.rescue())
+        .await;
+
+    let args = fixture.claude.args(1);
+    let root = fixture.harness.workspace_dir();
+    assert_eq!(
+        fixture.claude.cwd(1).canonicalize().unwrap(),
+        root.canonicalize().unwrap()
+    );
+    let mode = args
+        .iter()
+        .position(|arg| arg == "--permission-mode")
+        .unwrap();
+    assert_eq!(args[mode + 1], "plan");
+    let prompt = args.last().unwrap();
+    for name in ["code", "docs"] {
+        let path = root.join(name);
+        assert!(
+            prompt.contains(&format!("  - {name} ({})", path.display())),
+            "{prompt}"
+        );
+    }
+    assert!(prompt.contains("all read-only"), "{prompt}");
 }
 
 #[tokio::test]

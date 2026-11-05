@@ -18,7 +18,7 @@ use narsor_engine::conductor::{
 };
 use narsor_engine::domain::{
     ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence, EventData,
-    ExecutionStatus, RepromptedBy, WorkflowExecution,
+    ExecutionStatus, RepositoryDefinition, RepositorySource, RepromptedBy, WorkflowExecution,
 };
 use narsor_engine::engine::{
     owed_output_rescue, step_failure, ActionKind, Engine, EngineError, PendingHumanInput,
@@ -1542,4 +1542,149 @@ async fn a_comment_is_refused_by_an_execution_that_is_not_to_run_on() {
         matches!(error, EngineError::NotRunnable { .. }),
         "{error:?}"
     );
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A repository with one commit holding `tracked.txt`.
+fn committed_repository(dir: &std::path::Path) -> String {
+    std::fs::create_dir_all(dir).expect("create repository");
+    git_in(dir, &["init", "-q"]);
+    std::fs::write(dir.join("tracked.txt"), "base\n").expect("write");
+    git_in(dir, &["add", "tracked.txt"]);
+    git_in(dir, &["commit", "-q", "-m", "base"]);
+    git_in(dir, &["rev-parse", "HEAD"])
+}
+
+/// Each repository of a task is checkpointed on its own, with its own base
+/// and its own `preserve_paths`, and an uncommitted change of one survives
+/// materialising into a fresh checkout (AE5).
+#[tokio::test]
+async fn every_repository_of_a_task_is_checkpointed_and_materialised_on_its_own() {
+    use narsor_engine::domain::{RepositoryInfo, WorkspaceRepository};
+    use narsor_engine::workspace::{materialise, Base, MaterialiseRequest};
+
+    let harness = Harness::new();
+    // `code` is the workspace the scripts run in; `docs` sits beside it.
+    let code = harness.workspace_dir();
+    let docs = harness.root().join("docs");
+    let code_base = committed_repository(&code);
+    let docs_base = committed_repository(&docs);
+    std::fs::write(code.join("uncommitted.txt"), "wip\n").unwrap();
+    std::fs::write(docs.join("tracked.txt"), "edited\n").unwrap();
+    std::fs::write(docs.join(".gitignore"), "ignored.log\n").unwrap();
+    std::fs::write(docs.join("ignored.log"), "kept anyway\n").unwrap();
+
+    let mut definition = workflow("two_steps");
+    definition.repositories = vec![
+        RepositoryDefinition {
+            name: "code".to_string(),
+            primary: true,
+            base_branch: None,
+            source: RepositorySource::Git {
+                repository: "code".to_string(),
+            },
+            preserve_paths: Vec::new(),
+        },
+        RepositoryDefinition {
+            name: "docs".to_string(),
+            primary: false,
+            base_branch: None,
+            source: RepositorySource::Git {
+                repository: "docs".to_string(),
+            },
+            preserve_paths: vec!["ignored.log".to_string()],
+        },
+    ];
+    let entry =
+        |name: &str, path: &std::path::Path, primary: bool, base: &str| WorkspaceRepository {
+            name: name.to_string(),
+            path: path.display().to_string(),
+            primary,
+            branch: None,
+            repository: Some(RepositoryInfo {
+                id: name.to_string(),
+                name: name.to_string(),
+                provider: "git".to_string(),
+                remote: path.display().to_string(),
+            }),
+            base_commit: Some(base.to_string()),
+        };
+    let mut workspace = harness.workspace();
+    workspace.root = Some(harness.root().display().to_string());
+    workspace.repositories = vec![
+        entry("code", &code, true, &code_base),
+        entry("docs", &docs, false, &docs_base),
+    ];
+
+    let engine = harness.engine().with_checkpoints();
+    let execution = engine
+        .start(&definition, json!({}), workspace)
+        .expect("start");
+    engine
+        .run_steps(&definition, &execution.id, 1)
+        .await
+        .expect("one step");
+
+    let paths = harness.store().paths().clone();
+    let scratch = harness.root().join("scratch");
+    for (name, base, bundle, expected, preserved) in [
+        (
+            "code",
+            &code_base,
+            paths.checkpoint_file(&execution.id, "code"),
+            ("uncommitted.txt", "wip\n"),
+            None,
+        ),
+        (
+            "docs",
+            &docs_base,
+            paths.checkpoint_file(&execution.id, "docs"),
+            ("tracked.txt", "edited\n"),
+            Some(("ignored.log", "kept anyway\n")),
+        ),
+    ] {
+        assert!(bundle.is_file(), "{name} has its own bundle");
+        let fresh = harness.root().join(format!("fresh-{name}"));
+        let source = if name == "code" { &code } else { &docs };
+        git_in(
+            harness.root(),
+            &[
+                "clone",
+                "-q",
+                &source.display().to_string(),
+                &fresh.display().to_string(),
+            ],
+        );
+        git_in(&fresh, &["checkout", "-q", "--detach", base]);
+        materialise(MaterialiseRequest {
+            work_tree: &fresh,
+            base: Base::Commit(base.clone()),
+            scratch: &scratch.join(name),
+            bundle: &bundle,
+        })
+        .expect("materialise");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join(expected.0)).unwrap(),
+            expected.1,
+            "{name}"
+        );
+        if let Some((file, content)) = preserved {
+            assert_eq!(std::fs::read_to_string(fresh.join(file)).unwrap(), content);
+        }
+    }
 }

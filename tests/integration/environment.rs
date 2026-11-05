@@ -17,7 +17,8 @@ use environment_support::{
 };
 use narsor_engine::domain::{
     ImageDigest, ImageSource, ImageSpec, LaunchDefinitionError, RefOrigin, ResolvedEnvironment,
-    ResourceProfile, SecretDelivery, TaskLaunchSpec, TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
+    ResourceProfile, SecretDelivery, TaskLaunchSpec, TaskRepository, TaskRepositorySource,
+    TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
 };
 use narsor_engine::environment::{
     BackendKind, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent, LaunchResolver,
@@ -137,14 +138,18 @@ fn a_repository_without_a_base_image_is_refused_before_anything_exists() {
         }
     );
     assert!(!base.tag_resolved);
-    match launch.spec.workspace {
-        TaskWorkspace::Git(git) => {
-            assert_eq!(git.remote_url, "https://example.com/app.git");
-            assert_eq!(git.commit, COMMIT);
-            assert_eq!(git.repository.as_deref(), Some("app"));
-        }
-        other => panic!("expected a git workspace, got {other:?}"),
-    }
+    // A converted `v1` workflow is one primary repository named after the
+    // registry id.
+    let [repository] = launch.spec.workspace.repositories.as_slice() else {
+        panic!("expected one repository, got {:?}", launch.spec.workspace);
+    };
+    assert_eq!(repository.name, "app");
+    let TaskRepositorySource::Git(git) = &repository.source else {
+        panic!("expected a git repository, got {repository:?}");
+    };
+    assert_eq!(git.remote_url, "https://example.com/app.git");
+    assert_eq!(git.commit, COMMIT);
+    assert_eq!(git.repository.as_deref(), Some("app"));
 }
 
 #[test]
@@ -316,9 +321,12 @@ fn a_local_workspace_is_sealed_only_for_the_local_backend() {
         .expect("local workspace seals on the local backend");
     assert_eq!(
         launch.spec.workspace,
-        TaskWorkspace::Local {
-            path: source.canonicalize().unwrap().display().to_string()
-        }
+        TaskWorkspace::single(TaskRepository::new(
+            "source",
+            TaskRepositorySource::Local {
+                path: source.canonicalize().unwrap().display().to_string()
+            }
+        ))
     );
 
     let error = root
@@ -368,14 +376,17 @@ fn a_local_workspace_must_lie_inside_a_listed_root() {
     let launch = resolve_local(&root, vec![allowed.clone()]).expect("inside the root");
     assert_eq!(
         launch.spec.workspace,
-        TaskWorkspace::Local {
-            path: allowed
-                .join("project")
-                .canonicalize()
-                .unwrap()
-                .display()
-                .to_string()
-        }
+        TaskWorkspace::single(TaskRepository::new(
+            "project",
+            TaskRepositorySource::Local {
+                path: allowed
+                    .join("project")
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string()
+            }
+        ))
     );
 
     // The default — no roots — refuses every host directory.
@@ -635,7 +646,12 @@ fn a_local_backend_pins_an_unpinned_workspace_at_admission_not_creation() {
             ..intent("on-app")
         })
         .unwrap();
-    let TaskWorkspace::Git(git) = &launch.spec.workspace else {
+    let Some(TaskRepositorySource::Git(git)) = launch
+        .spec
+        .workspace
+        .primary()
+        .map(|repository| &repository.source)
+    else {
         panic!("git workspace expected");
     };
     assert!(!git.is_pinned(), "the commit is resolved at admission");
@@ -649,7 +665,12 @@ fn a_local_backend_pins_an_unpinned_workspace_at_admission_not_creation() {
             ..on_app()
         })
         .unwrap();
-    let TaskWorkspace::Git(git) = &pinned.spec.workspace else {
+    let Some(TaskRepositorySource::Git(git)) = pinned
+        .spec
+        .workspace
+        .primary()
+        .map(|repository| &repository.source)
+    else {
         panic!("git workspace expected");
     };
     assert!(git.is_pinned());
@@ -674,7 +695,11 @@ fn resolve_git_on_local(
             ..intent("on-app")
         })
         .unwrap();
-    let TaskWorkspace::Git(git) = launch.spec.workspace else {
+    let Some(TaskRepository {
+        source: TaskRepositorySource::Git(git),
+        ..
+    }) = launch.spec.workspace.repositories.into_iter().next()
+    else {
         panic!("git workspace expected");
     };
     git
@@ -810,7 +835,12 @@ fn a_git_workspace_needs_a_full_pinned_commit() {
     assert_eq!(short.code(), "invalid_commit");
 
     let launch = root.resolve(&on_app()).unwrap();
-    let TaskWorkspace::Git(git) = &launch.spec.workspace else {
+    let Some(TaskRepositorySource::Git(git)) = launch
+        .spec
+        .workspace
+        .primary()
+        .map(|repository| &repository.source)
+    else {
         panic!("git workspace expected");
     };
     let credential = git.credential.as_ref().expect("credential reference");
@@ -926,6 +956,104 @@ fn two_tasks_for_one_repository_share_one_environment_identity() {
     assert_eq!(
         one.spec.environment.base_image.unwrap().pinned,
         workflow_image()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Several repositories (U3)
+// ---------------------------------------------------------------------------
+
+const MULTI_REPOSITORY: &str = "schema: v2\nname: multi\nversion: 1\ninputs:\n  - { name: docs, \
+type: repository }\nglobals:\n  workspaces:\n    code: { primary: true, \
+base_branch: main, repository: app }\n    docs: { base_branch: trunk, repository: \"{{ inputs.docs }}\" }\n\
+states:\n  done:\n    description: done\nterminal_states: [done]\n";
+
+fn multi_repository_root() -> TempRoot {
+    let root = TempRoot::new();
+    root.registry()
+        .add(
+            RepositoryEntry::new("app", "https://example.com/app.git")
+                .with_default_branch("main")
+                .with_base_image(ImageSpec::pinned(pinned('d'))),
+        )
+        .unwrap();
+    root.registry()
+        .add(
+            RepositoryEntry::new("handbook", "https://example.com/handbook.git")
+                .with_default_branch("trunk"),
+        )
+        .unwrap();
+    root.write_workflow("multi", MULTI_REPOSITORY);
+    root
+}
+
+fn multi_intent(inputs: serde_json::Value) -> LaunchIntent {
+    LaunchIntent {
+        inputs,
+        commit: Some(COMMIT.to_string()),
+        ..intent("multi")
+    }
+}
+
+#[test]
+fn a_task_records_every_repository_with_its_resolved_branch() {
+    let root = multi_repository_root();
+    let spec = root
+        .resolve(&multi_intent(serde_json::json!({"docs": "handbook"})))
+        .unwrap()
+        .spec;
+
+    let names: Vec<_> = spec
+        .workspace
+        .repositories
+        .iter()
+        .map(|repository| (repository.name.as_str(), repository.branch.as_deref()))
+        .collect();
+    // The fixed repository takes the workflow's branch, the one chosen by an
+    // input takes the registry's default; the primary one goes first.
+    assert_eq!(names, [("code", Some("main")), ("docs", Some("trunk"))]);
+    let TaskRepositorySource::Git(docs) = &spec.workspace.repositories[1].source else {
+        panic!("a git repository");
+    };
+    assert_eq!(docs.repository.as_deref(), Some("handbook"));
+    assert!(
+        !docs.is_pinned(),
+        "only the primary takes the launch commit"
+    );
+    assert_eq!(docs.git_ref.as_deref(), Some("trunk"));
+}
+
+#[test]
+fn the_digest_changes_with_a_repository_branch() {
+    let root = multi_repository_root();
+    let inputs = serde_json::json!({"docs": "handbook"});
+    let spec = root.resolve(&multi_intent(inputs)).unwrap().spec;
+    let mut moved = spec.clone();
+    moved.workspace.repositories[1].branch = Some("other".to_string());
+    assert_ne!(moved.compute_digest(), spec.digest);
+}
+
+#[test]
+fn a_repository_chosen_by_an_unknown_input_is_refused() {
+    let root = multi_repository_root();
+    let error = root
+        .resolve(&multi_intent(serde_json::json!({"docs": "nonesuch"})))
+        .unwrap_err();
+    assert_eq!(error.code(), "unknown_repository", "{error}");
+}
+
+#[test]
+fn a_launch_spec_of_an_older_version_is_refused_naming_both_versions() {
+    let root = TempRoot::new();
+    let spec = root.resolve(&intent("wf")).unwrap().spec;
+    let mut value = serde_json::to_value(&spec).unwrap();
+    value["version"] = serde_json::json!(3);
+    let error = serde_json::from_value::<TaskLaunchSpec>(value).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("version 3"), "{message}");
+    assert!(
+        message.contains(&format!("expected {TASK_LAUNCH_SPEC_VERSION}")),
+        "{message}"
     );
 }
 

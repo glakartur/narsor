@@ -149,7 +149,16 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 
         // The variadic flags come first: each is followed by another flag,
         // never by the prompt, which they would swallow.
-        if !config.read_only_paths.is_empty() {
+        // Repositories of the step outside the working directory need
+        // `--add-dir` to be reachable at all. Claude Code cannot make one of
+        // them read-only, so the prompt block carries that (R14).
+        let step_dirs: Vec<String> = request
+            .outside_workspace(request.writable_dirs)
+            .into_iter()
+            .chain(request.outside_workspace(request.read_only_dirs))
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .collect();
+        if !config.read_only_paths.is_empty() || !step_dirs.is_empty() {
             args.push("--add-dir".to_string());
             // No option-like guard here: resolve_read_only_path joins a
             // relative entry onto the workspace and leaves an absolute one
@@ -159,6 +168,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             for path in &config.read_only_paths {
                 args.push(read_only_arg(request.workspace, path));
             }
+            args.extend(step_dirs);
         }
 
         if !config.permission_grants.is_empty() {

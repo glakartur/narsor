@@ -278,12 +278,25 @@ impl AgentExecutor {
 
         let mut session = new_session(config, harness, request.execution_id);
 
+        let mut scope = request.step_scope();
+        if config.workspace_access == Some(WorkspaceAccess::ReadOnly) {
+            scope = scope.read_only();
+        }
+        // A resumed session was told about the repositories when it began.
+        let repositories = if resume.is_none() {
+            scope.prompt_block()
+        } else {
+            String::new()
+        };
         let prompt = format!(
-            "{}{}",
+            "{}{}{}",
             config.prompt,
+            repositories,
             output_contract(&request.contract, adapter.contract_note())
         );
-        let workspace = Path::new(&request.workspace.path);
+        let workspace = scope.start_dir.as_path();
+        let writable_dirs = scope.write_dirs();
+        let read_only_dirs = scope.read_dirs();
 
         // Opened before `invocation` (Key Technical Decisions): even an
         // invocation that never runs (a bad parameter, a missing binary)
@@ -296,6 +309,8 @@ impl AgentExecutor {
             workspace_access: config.workspace_access,
             prompt: &prompt,
             workspace,
+            writable_dirs: &writable_dirs,
+            read_only_dirs: &read_only_dirs,
             resume_session: resume,
             output_schema: None,
         }) {
@@ -456,7 +471,7 @@ impl AgentExecutor {
                     harness_session_id: run.session_id.clone(),
                 },
             );
-            let cwd = request.workspace.path.clone();
+            let cwd = scope.start_dir.to_string_lossy().into_owned();
             return Ok(ActionOutcome::Suspended(
                 SuspendedAction::AwaitingAgentInput(HumanInputRequest {
                     action_execution_id: request.action_execution_id.to_string(),

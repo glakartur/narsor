@@ -5030,3 +5030,135 @@ async fn a_codex_step_keeps_every_stdout_line_and_reports_nothing() {
     let raw: Vec<String> = stdout.iter().map(entry_text).collect();
     assert_eq!(raw, lines);
 }
+
+// ---------------------------------------------------------------------------
+// Multi-repository scope (KTD5, KTD8)
+// ---------------------------------------------------------------------------
+
+/// A two-repository workspace, `code` (primary) and `docs`, under the root.
+fn two_repository_workspace(root: &TempRoot) -> Workspace {
+    use narsor_engine::domain::WorkspaceRepository;
+
+    let repository = |name: &str, primary: bool| WorkspaceRepository {
+        name: name.to_string(),
+        path: root.dir(name).to_string_lossy().into_owned(),
+        primary,
+        branch: None,
+        repository: None,
+        base_commit: None,
+    };
+    let mut workspace = Workspace::local_folder(root.path().join("code").to_string_lossy().into());
+    workspace.root = Some(root.path().to_string_lossy().into_owned());
+    workspace.repositories = vec![repository("code", true), repository("docs", false)];
+    workspace
+}
+
+/// Runs `config` with the scope of `section` and returns the fake harness.
+async fn run_scoped(
+    root: &TempRoot,
+    section: Option<&narsor_engine::domain::StepWorkspace>,
+    config: AgentActionConfig,
+) -> FakeHarness {
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+    let workspace = two_repository_workspace(root);
+    let scope = narsor_engine::engine::StepScope::resolve(section, &workspace);
+    let action = ActionConfig::Agent(config);
+    executor(&fake)
+        .execute(ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_scope(&scope))
+        .await
+        .expect("the action runs");
+    fake
+}
+
+/// F1/AE5: a docs step starts in `docs`, sees `code` read-only in the
+/// prompt, and the harness is given `code` to read.
+#[tokio::test]
+async fn a_docs_step_starts_in_docs_and_is_told_code_is_read_only() {
+    let root = TempRoot::new();
+    let section = narsor_engine::domain::StepWorkspace {
+        root: "docs".to_string(),
+        write: vec![],
+        read: vec!["code".to_string()],
+    };
+    let fake = run_scoped(&root, Some(&section), agent_action("document it")).await;
+
+    let docs = root.path().join("docs").to_string_lossy().into_owned();
+    let code = root.path().join("code").to_string_lossy().into_owned();
+    assert_eq!(
+        std::fs::canonicalize(fake.cwd(1)).unwrap(),
+        std::fs::canonicalize(&docs).unwrap()
+    );
+    let args = fake.args(1);
+    let prompt = args.last().unwrap();
+    assert!(
+        prompt.contains(&format!("- code ({code}): read-only")),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("- docs ({docs}): write")),
+        "{prompt}"
+    );
+    let add_dir = args.iter().position(|arg| arg == "--add-dir").unwrap();
+    assert_eq!(args[add_dir + 1], code);
+}
+
+/// AE4 and the contract retry: with no section the primary is writable and
+/// the other repository read-only; a forced read-only run lists both so.
+#[tokio::test]
+async fn a_forced_read_only_run_lists_every_repository_as_read_only() {
+    let root = TempRoot::new();
+    let fake = run_scoped(&root, None, agent_action("work")).await;
+    let prompt = fake.args(1).last().unwrap().clone();
+    assert!(prompt.contains("/code): write"), "{prompt}");
+    assert!(prompt.contains("/docs): read-only"), "{prompt}");
+
+    let root = TempRoot::new();
+    let mut config = agent_action("repair the answer");
+    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    let fake = run_scoped(&root, None, config).await;
+    let prompt = fake.args(1).last().unwrap().clone();
+    assert!(prompt.contains("/code): read-only"), "{prompt}");
+    assert!(prompt.contains("/docs): read-only"), "{prompt}");
+    assert!(!prompt.contains("): write"), "{prompt}");
+}
+
+/// Codex's sandbox protects what it is not given: only writable repositories
+/// outside the working directory are added. OpenCode cannot restrict, so it
+/// builds its command without error and the prompt carries the rule.
+#[test]
+fn adapters_map_scope_dirs_to_what_they_can_enforce() {
+    use narsor_engine::engine::HarnessRequest;
+    use std::path::PathBuf;
+
+    let config = agent_action("go");
+    let start = PathBuf::from("/task/workspace/docs");
+    let writable = [start.clone(), PathBuf::from("/task/workspace/notes")];
+    let read_only = [PathBuf::from("/task/workspace/code")];
+    let request = HarnessRequest {
+        config: &config,
+        workspace_access: Some(WorkspaceAccess::ReadWrite),
+        prompt: "go",
+        workspace: &start,
+        writable_dirs: &writable,
+        read_only_dirs: &read_only,
+        resume_session: None,
+        output_schema: None,
+    };
+
+    let codex = CodexAdapter::with_program("codex")
+        .invocation(&request)
+        .unwrap();
+    let add_dirs: Vec<_> = codex
+        .args
+        .windows(2)
+        .filter(|pair| pair[0] == "--add-dir")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    assert_eq!(add_dirs, ["/task/workspace/notes"]);
+
+    let opencode = OpenCodeAdapter::with_program("opencode")
+        .invocation(&request)
+        .unwrap();
+    assert!(!opencode.args.iter().any(|arg| arg == "--add-dir"));
+}

@@ -1461,7 +1461,7 @@ fn is_read_only_dir(_path: &Path) -> bool {
 }
 
 /// Rejects names that would escape `code/` or collide with path syntax.
-pub(crate) fn is_usable_directory_name(name: &str) -> bool {
+pub fn is_usable_directory_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."

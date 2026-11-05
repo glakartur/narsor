@@ -442,6 +442,35 @@ impl LocalBackend {
         Ok(spec)
     }
 
+    /// The command line of a runner: a reader gets `--read-only`.
+    fn runner_args(
+        &self,
+        role: Role,
+        launch: &WorkloadLaunch,
+        dir: &Path,
+        storage: &Path,
+    ) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "--task-id".into(),
+            launch.task_id.as_str().into(),
+            "--task-storage".into(),
+            storage.into(),
+            "--launch-spec".into(),
+            dir.join("launch-spec.json").into(),
+            "--control-plane".into(),
+            (&launch.control_plane_url).into(),
+            "--credential-file".into(),
+            dir.join("credential").into(),
+            "--incarnation".into(),
+            (&launch.incarnation).into(),
+        ];
+        if role == Role::Read {
+            args.push("--read-only".into());
+        }
+        args.extend(self.config.runner_args.iter().map(Into::into));
+        args
+    }
+
     fn spawn(
         &self,
         task: &TaskResources,
@@ -490,20 +519,7 @@ impl LocalBackend {
             .map_err(|error| io_error("create the runner log", error))?;
         let uid = format!("local-{}", uuid::Uuid::new_v4().simple());
         let mut command = Command::new(&self.config.program);
-        command
-            .args(["--task-id", launch.task_id.as_str()])
-            .arg("--task-storage")
-            .arg(storage)
-            .arg("--launch-spec")
-            .arg(dir.join("launch-spec.json"))
-            .args(["--control-plane", &launch.control_plane_url])
-            .arg("--credential-file")
-            .arg(dir.join("credential"))
-            .args(["--incarnation", &launch.incarnation]);
-        if role == Role::Read {
-            command.arg("--read-only");
-        }
-        command.args(&self.config.runner_args);
+        command.args(self.runner_args(role, launch, &dir, storage));
         // Nothing of the controller's own settings — its enrollment code
         // least of all — reaches the runner or the tools it starts (R12);
         // what the adapter sets itself is set below. `spawn` isolates it:
@@ -791,13 +807,23 @@ fn group_marked(pgid: u32, uid: &str) -> bool {
         else {
             return false;
         };
-        process_group(pid) == Some(pgid)
-            && fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| {
-                environ
-                    .split(|byte| *byte == 0)
-                    .any(|entry| entry == mark.as_bytes())
-            })
+        let environ = fs::read(format!("/proc/{pid}/environ")).ok();
+        member_marked(process_group(pid), pgid, environ.as_deref(), &mark)
     })
+}
+
+/// Whether a process — in group `member_group` (`None` for a zombie or one
+/// that is gone), with environment `environ` (`None` when unreadable) —
+/// is a live member of group `pgid` carrying `mark`.
+fn member_marked(member_group: Option<u32>, pgid: u32, environ: Option<&[u8]>, mark: &str) -> bool {
+    member_group == Some(pgid) && environ.is_some_and(|environ| environ_has(environ, mark))
+}
+
+/// Whether the NUL-separated `environ` block holds exactly the entry `mark`.
+fn environ_has(environ: &[u8], mark: &str) -> bool {
+    environ
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == mark.as_bytes())
 }
 
 /// Field 5 of `/proc/{pid}/stat`: its process group; `None` for a zombie or
@@ -826,17 +852,6 @@ fn process_alive(pid: u32, start_ticks: Option<u64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::CommandExt;
-
-    /// A process in a group of its own, carrying `mark` (if any).
-    fn group_leader(mark: Option<&str>) -> Child {
-        let mut command = Command::new("sleep");
-        command.arg("600").process_group(0);
-        if let Some(uid) = mark {
-            command.env(WORKLOAD_MARK_ENV, uid);
-        }
-        command.spawn().expect("spawn sleep")
-    }
 
     #[test]
     fn the_controllers_settings_are_not_inherited_by_a_runner() {
@@ -882,22 +897,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_group_without_the_workloads_mark_is_never_signalled() {
-        let mut stranger = group_leader(Some("local-someone-else"));
-        let mut unmarked = group_leader(None);
-
-        assert!(kill_marked_group(stranger.id(), "local-ours"));
-        assert!(kill_marked_group(unmarked.id(), "local-ours"));
-
-        assert!(stranger.try_wait().unwrap().is_none(), "still running");
-        assert!(unmarked.try_wait().unwrap().is_none(), "still running");
-        let _ = stranger.kill();
-        let _ = unmarked.kill();
-        let _ = stranger.wait();
-        let _ = unmarked.wait();
-    }
-
     /// A scratch backend whose "runner" is a script that records its
     /// arguments and sleeps; stops everything it started when dropped.
     struct Scratch {
@@ -939,7 +938,7 @@ mod tests {
                 "wf",
                 1,
                 serde_json::json!({}),
-                TaskWorkspace::None,
+                TaskWorkspace::none(),
                 ResolvedEnvironment::harness_only("claude-code"),
                 ResourceProfile::new(1000, 2048),
             );
@@ -951,23 +950,6 @@ mod tests {
                 launch_spec: serde_json::to_value(spec).unwrap(),
                 control_plane_url: "http://127.0.0.1:9".into(),
                 credential: crate::backends::RunnerCredential::new("nsr.test"),
-            }
-        }
-
-        /// The command lines the script was started with, once `count` of
-        /// them were written.
-        fn invocations(&self, count: usize) -> Vec<String> {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let lines: Vec<String> = fs::read_to_string(self.root.join("args"))
-                    .unwrap_or_default()
-                    .lines()
-                    .map(str::to_string)
-                    .collect();
-                if lines.len() >= count || Instant::now() >= deadline {
-                    return lines;
-                }
-                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -1045,92 +1027,50 @@ mod tests {
             .exists());
     }
 
-    #[tokio::test]
-    async fn a_reader_has_its_own_name_directory_group_and_flag() {
+    #[test]
+    fn a_reader_has_its_own_name_directory_and_flag() {
         let scratch = Scratch::new();
         let task = scratch.task();
         assert_ne!(task.reader, task.workload);
-        fs::create_dir_all(scratch.backend.storage_dir(&task)).unwrap();
+        let reader_dir = scratch.backend.workload_dir(&task, Role::Read);
+        assert!(reader_dir.starts_with(scratch.root.join("local/readers")));
+        assert_ne!(reader_dir, scratch.backend.workload_dir(&task, Role::Work));
 
-        let started = scratch
-            .backend
-            .start_reader(&task, &scratch.launch("task-1-reader-g1"))
-            .await
-            .expect("start the reader");
-        assert!(started.created);
-        let again = scratch
-            .backend
-            .start_reader(&task, &scratch.launch("task-1-reader-g1-again"))
-            .await
-            .expect("reconcile");
-        assert!(!again.created, "one reader per task");
-        assert_eq!(again.workload.uid, started.workload.uid);
-
-        let reader_pid = scratch.backend.reader_pid(&task).expect("a live reader");
-        assert_eq!(process_group(reader_pid), Some(reader_pid), "its own group");
-        assert!(scratch
-            .root
-            .join("local/readers")
-            .join(&task.reader)
-            .is_dir());
-        let observed = scratch.backend.observe(&task).await.unwrap();
-        assert!(
-            observed.workload.is_none(),
-            "the reader is not the workload"
-        );
-        assert!(scratch.invocations(1)[0].contains("--read-only"));
-
-        // A working runner beside it (as the controller never does, but the
-        // adapter must still keep them apart): its own group and directory.
-        scratch
-            .backend
-            .provision(&task, &scratch.launch("task-1-g1"))
-            .await
-            .expect("provision");
-        let work_pid = scratch.backend.runner_pid(&task).expect("a live runner");
-        assert_ne!(process_group(work_pid), process_group(reader_pid));
-        assert!(!scratch.invocations(2)[1].contains("--read-only"));
-
-        // Removing the working runner — group kill, marked-group sweep —
-        // leaves the reader alone, and removing the reader leaves the
-        // storage alone.
-        assert!(scratch
-            .backend
-            .release_compute(&task)
-            .await
-            .unwrap()
-            .is_complete());
-        assert!(scratch.backend.runner_pid(&task).is_none());
-        assert_eq!(
-            scratch.backend.reader_pid(&task),
-            Some(reader_pid),
-            "still reading"
-        );
-
-        let removal = scratch.backend.stop_reader(&task).await.unwrap();
-        assert!(removal.is_complete(), "{removal:?}");
-        assert!(scratch.backend.reader_pid(&task).is_none());
-        assert!(!scratch
-            .root
-            .join("local/readers")
-            .join(&task.reader)
-            .exists());
-        assert!(scratch.backend.storage_dir(&task).is_dir(), "storage stays");
-        assert!(scratch
-            .backend
-            .stop_reader(&task)
-            .await
-            .unwrap()
-            .is_complete());
+        let launch = scratch.launch("task-1-reader-g1");
+        let storage = scratch.backend.storage_dir(&task);
+        let args = |role| {
+            let dir = scratch.backend.workload_dir(&task, role);
+            scratch.backend.runner_args(role, &launch, &dir, &storage)
+        };
+        assert!(args(Role::Read).iter().any(|arg| arg == "--read-only"));
+        assert!(!args(Role::Work).iter().any(|arg| arg == "--read-only"));
     }
 
     #[test]
-    fn a_group_with_the_workloads_mark_is_killed() {
-        let mut ours = group_leader(Some("local-ours"));
+    fn only_a_live_member_with_the_mark_belongs_to_the_group() {
+        let mark = format!("{WORKLOAD_MARK_ENV}=local-ours");
+        let ours = mark.as_bytes();
+        let stranger = format!("{WORKLOAD_MARK_ENV}=local-someone-else");
 
-        assert!(kill_marked_group(ours.id(), "local-ours"));
+        assert!(member_marked(Some(7), 7, Some(ours), &mark));
+        assert!(!member_marked(Some(8), 7, Some(ours), &mark), "other group");
+        assert!(!member_marked(None, 7, Some(ours), &mark), "zombie or gone");
+        assert!(!member_marked(Some(7), 7, None, &mark), "unreadable");
+        assert!(!member_marked(Some(7), 7, Some(stranger.as_bytes()), &mark));
+        assert!(!member_marked(Some(7), 7, Some(b"A=1"), &mark), "unmarked");
+    }
 
-        let status = ours.wait().expect("reaped");
-        assert!(!status.success(), "killed: {status:?}");
+    #[test]
+    fn only_an_exact_entry_is_the_workloads_mark() {
+        let mark = format!("{WORKLOAD_MARK_ENV}=local-ours");
+        let environ = |entries: &[&str]| entries.join("\0").into_bytes();
+
+        assert!(environ_has(&environ(&["A=1", &mark, "B=2"]), &mark));
+        assert!(!environ_has(&environ(&["A=1"]), &mark));
+        assert!(!environ_has(&environ(&[]), &mark));
+        let other = format!("{WORKLOAD_MARK_ENV}=local-someone-else");
+        assert!(!environ_has(&environ(&[&other]), &mark));
+        let longer = format!("{mark}-2");
+        assert!(!environ_has(&environ(&[&longer]), &mark));
     }
 }

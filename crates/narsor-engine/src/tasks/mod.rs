@@ -336,9 +336,10 @@ pub fn workspace_request(
     definition: &WorkflowDefinition,
     inputs: &Map<String, Value>,
 ) -> Result<Option<WorkspaceRequest>> {
-    let Some(spec) = &definition.workspace else {
+    let Some(spec) = definition.primary_workspace_spec() else {
         return Ok(None);
     };
+    let spec = &spec;
 
     let context = Context::new();
     let scope = TemplateScope::new(inputs, &context);
@@ -685,8 +686,13 @@ pub fn takeover(
 
     let mut execution = store.load_execution(execution_id)?;
 
-    let bundle = store.paths().checkpoint_file(execution_id);
-    if !bundle.is_file() {
+    let repositories = execution.workspace.repository_entries();
+    if !repositories.iter().any(|repository| {
+        store
+            .paths()
+            .checkpoint_file(execution_id, &repository.name)
+            .is_file()
+    }) {
         return Err(TakeoverError::NoCheckpoint {
             execution_id: execution_id.to_string(),
         });
@@ -713,26 +719,56 @@ pub fn takeover(
         }
     };
 
-    let base = match &execution.workspace.base_commit {
-        Some(commit) => {
-            checkout_commit(&work_tree, commit)?;
-            Base::Commit(commit.clone())
+    // Every repository has its own base and its own bundle (KTD10). The
+    // provisioner above rebuilds the primary checkout; another repository is
+    // laid back only when its directory exists again.
+    for repository in repositories {
+        let path = if repository.primary {
+            work_tree.clone()
+        } else {
+            let path = PathBuf::from(&repository.path);
+            if !path.is_dir() {
+                continue;
+            }
+            path
+        };
+        let bundle = store
+            .paths()
+            .checkpoint_file(execution_id, &repository.name);
+        let scratch = store
+            .paths()
+            .checkpoint_scratch(execution_id, &repository.name);
+        if !bundle.is_file() {
+            continue;
         }
-        None => Base::None,
-    };
-
-    materialise(MaterialiseRequest {
-        work_tree: &work_tree,
-        base,
-        scratch: &store.paths().checkpoint_scratch(execution_id),
-        bundle: &bundle,
-    })?;
+        let base = match &repository.base_commit {
+            Some(commit) => {
+                checkout_commit(&path, commit)?;
+                Base::Commit(commit.clone())
+            }
+            None => Base::None,
+        };
+        materialise(MaterialiseRequest {
+            work_tree: &path,
+            base,
+            scratch: &scratch,
+            bundle: &bundle,
+        })?;
+    }
 
     // The record keeps its identity — id, repository, base commit — and only
     // learns where the work tree now lives.
     let path = work_tree.display().to_string();
     if let Some(info) = execution.context.workspace.as_mut() {
         info.path = path.clone();
+    }
+    for repository in execution
+        .workspace
+        .repositories
+        .iter_mut()
+        .filter(|repository| repository.primary)
+    {
+        repository.path = path.clone();
     }
     execution.workspace.path = path;
     store.save_execution(&execution)?;

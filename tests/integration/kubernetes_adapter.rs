@@ -35,7 +35,8 @@ use narsor_engine::backends::{
 };
 use narsor_engine::domain::{
     BackendId, GitIdentity, ImageDigest, ImageSource, ResolvedEnvironment, ResolvedImage,
-    ResourceProfile, SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskWorkspace,
+    ResourceProfile, SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskRepository,
+    TaskRepositorySource, TaskWorkspace,
 };
 use narsor_engine::orchestration::{Observation, OwnerCommand, RunnerState};
 use narsor_engine::runner::{HarnessHome, HomeMode};
@@ -84,7 +85,7 @@ fn spec_with(environment: ResolvedEnvironment, resources: ResourceProfile) -> Ta
         definition.id.clone(),
         definition.version,
         serde_json::json!({}),
-        TaskWorkspace::None,
+        TaskWorkspace::none(),
         environment,
         resources,
     )
@@ -867,24 +868,37 @@ fn tool_secrets_are_projected_files_never_values() {
     environment.secrets = vec![github_secret()];
     let environment = environment.sealed();
     let mut spec = spec_with(environment.clone(), ResourceProfile::new(1000, 2048));
+    let repository = |name: &str, credential: &str| {
+        TaskRepository::new(
+            name,
+            TaskRepositorySource::Git(GitIdentity {
+                repository: Some(name.into()),
+                remote_url: format!("https://git.example/{name}.git"),
+                commit: "a".repeat(40),
+                git_ref: None,
+                ref_origin: None,
+                credential: Some(SecretReference {
+                    name: credential.into(),
+                    tool: "git".into(),
+                    key: "narsor-git/credential".into(),
+                    delivery: SecretDelivery::File(".git-credential".into()),
+                    ..github_secret()
+                }),
+            }),
+        )
+    };
     spec = TaskLaunchSpec::new(
         spec.workflow_id.clone(),
         spec.workflow_version,
         spec.inputs.clone(),
-        TaskWorkspace::Git(GitIdentity {
-            repository: Some("acme".into()),
-            remote_url: "https://git.example/acme.git".into(),
-            commit: "a".repeat(40),
-            git_ref: None,
-            ref_origin: None,
-            credential: Some(SecretReference {
-                name: "git-credential".into(),
-                tool: "git".into(),
-                key: "narsor-git/credential".into(),
-                delivery: SecretDelivery::File(".git-credential".into()),
-                ..github_secret()
-            }),
-        }),
+        // The credential of every repository is projected, not only the
+        // primary one's.
+        TaskWorkspace {
+            repositories: vec![
+                repository("acme", "git-credential"),
+                repository("docs", "git-credential-docs"),
+            ],
+        },
         environment,
         spec.resources,
     );
@@ -934,6 +948,11 @@ fn tool_secrets_are_projected_files_never_values() {
                 "narsor-git".into(),
                 "credential".into(),
                 "git-credential".into()
+            ),
+            (
+                "narsor-git".into(),
+                "credential".into(),
+                "git-credential-docs".into()
             ),
             (
                 "narsor-github".into(),

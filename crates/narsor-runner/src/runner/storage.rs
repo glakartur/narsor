@@ -8,7 +8,10 @@
 //! {task storage}/
 //!     state/        Engine state root (`ExecutionStore`): the one execution,
 //!                   its event log, conversations, and the copied launch spec
-//!     workspace/    the clone of the pinned commit (R39), or an empty folder
+//!     workspace/    the parent of every repository of the task (R39):
+//!                   `workspace/<name>/` is the clone of the pinned commit
+//!                   (or the copy of a local folder) of the repository
+//!                   `<name>`; an empty folder for a workflow without any
 //!     home/         the task's private, persistent `$HOME` (R17, R42)
 //!     materials/    owner materials delivered by the control plane (U9),
 //!                   one verified, complete directory per material id
@@ -104,9 +107,15 @@ impl TaskStorage {
         self.root.join(STATE_DIR)
     }
 
-    /// `{root}/workspace`
+    /// `{root}/workspace`: the parent of every repository folder, i.e. what
+    /// `root: .` of a step means.
     pub fn workspace_dir(&self) -> PathBuf {
         self.root.join(WORKSPACE_DIR)
+    }
+
+    /// `{root}/workspace/{name}`: the directory of one repository.
+    pub fn repository_dir(&self, name: &str) -> PathBuf {
+        self.workspace_dir().join(name)
     }
 
     /// `{root}/home`

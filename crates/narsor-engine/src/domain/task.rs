@@ -123,7 +123,8 @@ pub struct TaskLaunchSpec {
     pub workflow_version: u32,
     /// Workflow inputs, exactly as validated at creation.
     pub inputs: serde_json::Value,
-    /// What the task clones into its empty storage (R39).
+    /// What the task clones into its empty storage (R39): every repository of
+    /// the workflow, with its name, branch and source.
     pub workspace: TaskWorkspace,
     /// The pinned runner environment (KTD5).
     pub environment: ResolvedEnvironment,
@@ -206,8 +207,8 @@ impl<'de> Deserialize<'de> for TaskLaunchSpec {
         if version != u64::from(TASK_LAUNCH_SPEC_VERSION) {
             return Err(serde::de::Error::custom(format!(
                 "task launch spec version {version} is not supported by this build (expected \
-                 {TASK_LAUNCH_SPEC_VERSION}); an older spec predates pinned environments or \
-                 the workflow definition snapshot and cannot be upgraded faithfully — archive \
+                 {TASK_LAUNCH_SPEC_VERSION}); an older spec predates pinned environments, the \
+                 workflow definition snapshot or the repository list and cannot be upgraded faithfully — archive \
                  the task and create it again"
             )));
         }

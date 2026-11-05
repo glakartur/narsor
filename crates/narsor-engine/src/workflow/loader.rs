@@ -9,8 +9,13 @@
 //!   together with the `terminal_status` the entry declares (§3.5),
 //! * `initial_state` is the state flagged `initial: true`, or — with no such
 //!   flag — the first state in file order,
-//! * `globals.workspace` becomes a single `WorkspaceSpec` on the definition,
-//!   because a workspace belongs to an execution, not to a state.
+//! * repositories belong to an execution, not to a state: `globals.workspaces`
+//!   (`schema: v2`) becomes the definition's repository list, and a `v1` file is
+//!   converted to the same shape — `globals.workspace` becomes one primary
+//!   repository, and an agent's `workspace_access` becomes the step's
+//!   `workspaces` section rooted in it (`read-only` lists the primary
+//!   repository in `read`; `read-write` leaves it writable). The file on disk
+//!   is never touched.
 //!
 //! No graph rules are checked here: an entry of `terminal_states` that names a
 //! state which does not exist is carried through without complaint, and
@@ -19,18 +24,21 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::workspace::provisioner::is_usable_directory_name;
+
 use crate::domain::{
     ActionConfig, AgentActionConfig, AgentDecisionConfig, ArtifactDefinition, ChoiceDefinition,
     DecisionConfig, DisplayLinkSpec, DisplaySpec, GlobalsConfig, HumanActionConfig,
-    HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter, ParamType, RetryPolicy,
-    ScriptActionConfig, State, TerminalStatus, VariableDefinition, WaitActionConfig,
-    WorkflowDefinition, WorkspaceSpec,
+    HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter, ParamType,
+    RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion, ScriptActionConfig, State,
+    StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig, WorkflowDefinition,
+    WorkspaceAccess,
 };
 
 use super::schema::{
     ActionSchema, ChoiceSchema, DecisionSchema, DisplaySchema, GlobalsSchema, HumanInputTypeSchema,
-    InputSchema, ParamTypeSchema, RetryPolicySchema, StateSchema, TerminalStatusSchema,
-    WorkflowFile, WorkspaceSchema,
+    InputSchema, ParamTypeSchema, RepositorySchema, RepositorySourceSchema, RetryPolicySchema,
+    StateSchema, StepWorkspaceSchema, TerminalStatusSchema, WorkflowFile, WorkspaceSchema,
 };
 
 /// Errors that can occur while loading a workflow definition from YAML.
@@ -89,7 +97,11 @@ pub fn compile(file: WorkflowFile) -> Result<WorkflowDefinition, LoadError> {
     let globals = file.globals.unwrap_or_default();
     let default_timeout_secs = globals.timeout.map(|d| d.as_secs());
     let default_retry_policy = globals.retry_policy.as_ref().map(compile_retry_policy);
-    let workspace = globals.workspace.as_ref().map(compile_workspace);
+    let repositories = compile_repositories(file.schema, &globals);
+    let primary_name = repositories
+        .iter()
+        .find(|repository| repository.primary)
+        .map(|repository| repository.name.as_str());
 
     let initial_state = file
         .states
@@ -112,6 +124,7 @@ pub fn compile(file: WorkflowFile) -> Result<WorkflowDefinition, LoadError> {
             terminal_status,
             default_timeout_secs,
             default_retry_policy.as_ref(),
+            primary_name,
         );
         states.insert(id, compiled);
     }
@@ -125,7 +138,8 @@ pub fn compile(file: WorkflowFile) -> Result<WorkflowDefinition, LoadError> {
         description: file.description,
         inputs: file.inputs.into_iter().map(compile_input).collect(),
         globals: compile_globals(&globals),
-        workspace,
+        source_schema: file.schema,
+        repositories,
         display: file.display.map(compile_display),
         states,
         initial_state,
@@ -155,18 +169,76 @@ fn compile_display(display: DisplaySchema) -> DisplaySpec {
     }
 }
 
-fn compile_workspace(workspace: &WorkspaceSchema) -> WorkspaceSpec {
+/// The repositories of a file: the declared list of a `v2` file, or the one
+/// primary repository a `v1` `globals.workspace` converts to.
+fn compile_repositories(
+    schema: SchemaVersion,
+    globals: &GlobalsSchema,
+) -> Vec<RepositoryDefinition> {
+    match schema {
+        SchemaVersion::V2 => globals
+            .workspaces
+            .iter()
+            .flatten()
+            .map(compile_repository)
+            .collect(),
+        SchemaVersion::V1 => globals.workspace.iter().map(convert_v1_workspace).collect(),
+    }
+}
+
+fn compile_repository(repository: &RepositorySchema) -> RepositoryDefinition {
+    RepositoryDefinition {
+        name: repository.name.clone(),
+        primary: repository.primary,
+        base_branch: repository.base_branch.clone(),
+        source: match &repository.source {
+            RepositorySourceSchema::Repository(repository) => RepositorySource::Git {
+                repository: repository.clone(),
+            },
+            RepositorySourceSchema::Path(path) => RepositorySource::Local { path: path.clone() },
+        },
+        preserve_paths: repository.preserve_paths.clone(),
+    }
+}
+
+/// Converts a `v1` `globals.workspace` into the primary repository. The
+/// folder name comes from the registry id or the last path segment; a
+/// templated or otherwise unusable value falls back to a fixed name, since the
+/// real repository is only known once the task starts.
+fn convert_v1_workspace(workspace: &WorkspaceSchema) -> RepositoryDefinition {
     match workspace {
-        WorkspaceSchema::Git(git) => WorkspaceSpec::Git {
-            repository: git.repository.clone(),
-            git_ref: git.git_ref.clone(),
+        WorkspaceSchema::Git(git) => RepositoryDefinition {
+            name: folder_name(&git.repository)
+                .unwrap_or("repository")
+                .to_string(),
+            primary: true,
+            base_branch: git.git_ref.clone(),
+            source: RepositorySource::Git {
+                repository: git.repository.clone(),
+            },
             preserve_paths: git.preserve_paths.clone(),
         },
-        WorkspaceSchema::Local(local) => WorkspaceSpec::Local {
-            path: local.path.clone(),
+        WorkspaceSchema::Local(local) => RepositoryDefinition {
+            name: local
+                .path
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+                .and_then(folder_name)
+                .unwrap_or("workspace")
+                .to_string(),
+            primary: true,
+            base_branch: None,
+            source: RepositorySource::Local {
+                path: local.path.clone(),
+            },
             preserve_paths: local.preserve_paths.clone(),
         },
     }
+}
+
+fn folder_name(candidate: &str) -> Option<&str> {
+    (is_usable_directory_name(candidate) && !candidate.contains("{{")).then_some(candidate)
 }
 
 fn compile_retry_policy(policy: &RetryPolicySchema) -> RetryPolicy {
@@ -209,6 +281,7 @@ fn compile_state(
     terminal_status: Option<TerminalStatus>,
     default_timeout_secs: Option<u64>,
     default_retry_policy: Option<&RetryPolicy>,
+    primary_repository: Option<&str>,
 ) -> State {
     let timeout_secs = state.timeout.map(|d| d.as_secs()).or(default_timeout_secs);
 
@@ -218,11 +291,37 @@ fn compile_state(
         .map(compile_retry_policy)
         .or_else(|| default_retry_policy.cloned());
 
+    // A `v1` step's `workspace_access` becomes a section on the primary
+    // repository; a `v2` step declares its own.
+    let workspace = match (&state.workspace, &state.action, primary_repository) {
+        (Some(section), _, _) => Some(compile_step_workspace(section)),
+        (None, Some(ActionSchema::Agent(agent)), Some(primary)) => {
+            agent.workspace_access.map(|access| match access {
+                WorkspaceAccess::ReadOnly => StepWorkspace {
+                    root: primary.to_string(),
+                    read: vec![primary.to_string()],
+                    ..StepWorkspace::default()
+                },
+                WorkspaceAccess::ReadWrite => StepWorkspace {
+                    root: primary.to_string(),
+                    ..StepWorkspace::default()
+                },
+            })
+        }
+        _ => None,
+    };
+
+    // A `v1` agent on a workflow with no repository has no section to carry
+    // its access, so the action keeps it.
+    let keeps_v1_access = workspace.is_none();
+
     State {
         id,
         max_entries: state.max_entries,
         description: state.description,
-        action: state.action.map(compile_action),
+        action: state
+            .action
+            .map(|action| compile_action(action, keeps_v1_access)),
         variables: state
             .variables
             .into_iter()
@@ -247,7 +346,16 @@ fn compile_state(
         terminal,
         terminal_status,
         allow_manual_override: state.allow_manual_override,
+        workspace,
         image: state.image,
+    }
+}
+
+fn compile_step_workspace(section: &StepWorkspaceSchema) -> StepWorkspace {
+    StepWorkspace {
+        root: section.root.clone(),
+        write: section.write.clone(),
+        read: section.read.clone(),
     }
 }
 
@@ -269,13 +377,17 @@ fn non_blank(text: Option<String>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn compile_action(action: ActionSchema) -> ActionConfig {
+fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
     match action {
         ActionSchema::Agent(agent) => ActionConfig::Agent(AgentActionConfig {
             harness: agent.harness,
             permission_grants: Vec::new(),
             model: agent.model,
-            workspace_access: agent.workspace_access,
+            workspace_access: if keep_v1_access {
+                agent.workspace_access
+            } else {
+                None
+            },
             prompt: agent.prompt,
             // The YAML contract has no per-action workspace (§6 lists it as a
             // future extension), so this stays unset.
@@ -330,5 +442,271 @@ fn compile_decision(decision: DecisionSchema) -> DecisionConfig {
         DecisionSchema::Human(human) => DecisionConfig::Human(HumanDecisionConfig {
             message: human.message,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{RepositorySource, SchemaVersion, WorkspaceAccess, WorkspaceSpec};
+
+    const STATES: &str = r#"
+states:
+  work:
+    action: { type: script, command: ./a.sh }
+    choices: [success]
+    transitions: { success: done }
+  done:
+    description: end
+terminal_states: [done]
+"#;
+
+    fn load(header: &str) -> Result<WorkflowDefinition, LoadError> {
+        load_from_str(&format!("{header}{STATES}"))
+    }
+
+    const V2_REPOSITORIES: &str = r#"
+schema: v2
+name: multi
+version: 3
+globals:
+  workspaces:
+    code: { primary: true, base_branch: main, repository: "{{ inputs.repo }}", preserve_paths: [Cargo.lock] }
+    docs: { base_branch: trunk, path: ../docs }
+inputs:
+  - { name: repo, type: repository }
+"#;
+
+    #[test]
+    fn a_v1_git_workspace_converts_to_one_primary_repository() {
+        let definition = load(
+            "name: legacy\nversion: 2\nglobals:\n  workspace:\n    type: git\n    repository: my-repo\n    ref: develop\n    preserve_paths: [Cargo.lock]\n",
+        )
+        .unwrap();
+
+        assert_eq!(definition.source_schema, SchemaVersion::V1);
+        assert_eq!(definition.version, 2);
+        assert_eq!(
+            definition.repositories,
+            vec![RepositoryDefinition {
+                name: "my-repo".to_string(),
+                primary: true,
+                base_branch: Some("develop".to_string()),
+                source: RepositorySource::Git {
+                    repository: "my-repo".to_string()
+                },
+                preserve_paths: vec!["Cargo.lock".to_string()],
+            }]
+        );
+        assert!(matches!(
+            definition.primary_workspace_spec(),
+            Some(WorkspaceSpec::Git { git_ref: Some(ref r), .. }) if r == "develop"
+        ));
+    }
+
+    #[test]
+    fn a_v1_local_workspace_converts_and_keeps_preserve_paths() {
+        let definition = load(
+            "name: legacy\nversion: 1\nglobals:\n  workspace:\n    type: local\n    path: ../apps/site/\n    preserve_paths: [\".env.example\"]\n",
+        )
+        .unwrap();
+
+        let [repository] = definition.repositories.as_slice() else {
+            panic!("expected one repository");
+        };
+        assert_eq!(repository.name, "site");
+        assert!(repository.primary);
+        assert_eq!(repository.base_branch, None);
+        assert_eq!(
+            repository.source,
+            RepositorySource::Local {
+                path: "../apps/site/".to_string()
+            }
+        );
+        assert_eq!(repository.preserve_paths, vec![".env.example".to_string()]);
+    }
+
+    #[test]
+    fn a_templated_v1_repository_gets_a_fixed_folder_name() {
+        let definition = load(
+            "name: legacy\nversion: 1\ninputs:\n  - { name: repo, type: repository }\nglobals:\n  workspace:\n    type: git\n    repository: \"{{ inputs.repo }}\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(definition.repositories[0].name, "repository");
+    }
+
+    #[test]
+    fn a_missing_schema_is_v1_and_a_v1_without_workspace_has_no_repositories() {
+        let definition = load("name: bare\nversion: 1\n").unwrap();
+        assert_eq!(definition.source_schema, SchemaVersion::V1);
+        assert!(definition.repositories.is_empty());
+
+        let explicit = load("schema: v1\nname: bare\nversion: 1\n").unwrap();
+        assert_eq!(explicit.source_schema, SchemaVersion::V1);
+    }
+
+    #[test]
+    fn v1_workspace_access_converts_to_a_step_workspace_section() {
+        let yaml = r#"
+name: legacy
+version: 1
+globals:
+  workspace: { type: git, repository: repo-a }
+states:
+  review:
+    action: { type: agent, prompt: look, workspace_access: read-only }
+    choices: [done]
+    transitions: { done: done }
+  done:
+    description: end
+terminal_states: [done]
+"#;
+        let definition = load_from_str(yaml).unwrap();
+        let review = &definition.states["review"];
+        assert_eq!(
+            review.workspace,
+            Some(StepWorkspace {
+                root: "repo-a".to_string(),
+                write: vec![],
+                read: vec!["repo-a".to_string()],
+            })
+        );
+        assert_eq!(review.workspace_access(), Some(WorkspaceAccess::ReadOnly));
+    }
+
+    #[test]
+    fn v1_read_only_access_survives_without_a_declared_repository() {
+        let yaml = r#"
+name: legacy
+version: 1
+states:
+  review:
+    action: { type: agent, prompt: look, workspace_access: read-only }
+    choices: [done]
+    transitions: { done: done }
+  done:
+    description: end
+terminal_states: [done]
+"#;
+        let definition = load_from_str(yaml).unwrap();
+        let Some(ActionConfig::Agent(agent)) = &definition.states["review"].action else {
+            panic!("an agent action");
+        };
+        assert_eq!(agent.workspace_access, Some(WorkspaceAccess::ReadOnly));
+    }
+
+    #[test]
+    fn a_v2_file_loads_repositories_and_step_workspaces() {
+        let yaml = format!(
+            "{V2_REPOSITORIES}{}",
+            r#"
+states:
+  work:
+    workspaces: { root: ".", write: [docs], read: [code] }
+    action: { type: agent, prompt: write the docs }
+    choices: [success]
+    transitions: { success: done }
+  done:
+    description: end
+terminal_states: [done]
+"#
+        );
+        let definition = load_from_str(&yaml).unwrap();
+
+        assert_eq!(definition.source_schema, SchemaVersion::V2);
+        assert_eq!(definition.version, 3);
+        assert_eq!(definition.repositories.len(), 2);
+        assert_eq!(definition.primary_repository().unwrap().name, "code");
+        assert_eq!(
+            definition.repositories[0].source,
+            RepositorySource::Git {
+                repository: "{{ inputs.repo }}".to_string()
+            }
+        );
+        assert_eq!(
+            definition.repositories[1].base_branch.as_deref(),
+            Some("trunk")
+        );
+        assert_eq!(
+            definition.states["work"].workspace,
+            Some(StepWorkspace {
+                root: ".".to_string(),
+                write: vec!["docs".to_string()],
+                read: vec!["code".to_string()],
+            })
+        );
+        assert_eq!(
+            definition.states["work"].workspace_access(),
+            Some(WorkspaceAccess::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn v2_rejects_v1_constructs() {
+        let with_workspace = load(
+            "schema: v2\nname: x\nversion: 1\nglobals:\n  workspace: { type: git, repository: r }\n",
+        )
+        .unwrap_err();
+        assert!(
+            with_workspace.to_string().contains("globals.workspace"),
+            "{with_workspace}"
+        );
+
+        let yaml = r#"
+schema: v2
+name: x
+version: 1
+states:
+  a:
+    action: { type: agent, prompt: p, workspace_access: read-only }
+    choices: [done]
+    transitions: { done: done }
+  done:
+    description: end
+terminal_states: [done]
+"#;
+        let error = load_from_str(yaml).unwrap_err();
+        assert!(error.to_string().contains("workspace_access"), "{error}");
+    }
+
+    #[test]
+    fn v1_rejects_v2_constructs() {
+        let error = load(
+            "name: x\nversion: 1\nglobals:\n  workspaces:\n    a: { primary: true, repository: r, base_branch: main }\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("schema: v2"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_schema_or_field_is_an_error() {
+        assert!(load("schema: v3\nname: x\nversion: 1\n").is_err());
+        assert!(load("schema: v2\nname: x\nversion: 1\nsurprise: true\n").is_err());
+        let error = load(
+            "schema: v2\nname: x\nversion: 1\nglobals:\n  workspaces:\n    a: { primary: true, repository: r, extra: 1 }\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("extra"), "{error}");
+    }
+
+    #[test]
+    fn a_workspace_name_used_twice_is_an_error() {
+        let error = load(
+            "schema: v2\nname: x\nversion: 1\nglobals:\n  workspaces:\n    a: { primary: true, path: p }\n    a: { path: q }\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn a_repository_names_exactly_one_source() {
+        for source in ["", ", repository: r, path: p"] {
+            let error = load(&format!(
+                "schema: v2\nname: x\nversion: 1\nglobals:\n  workspaces:\n    a: {{ primary: true{source} }}\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("exactly one"), "{error}");
+        }
     }
 }

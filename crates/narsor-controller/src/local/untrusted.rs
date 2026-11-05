@@ -30,7 +30,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use narsor_engine::domain::{GitIdentity, SecretDelivery, TaskLaunchSpec, TaskWorkspace};
+use narsor_engine::domain::{GitIdentity, SecretDelivery, TaskLaunchSpec, TaskRepositorySource};
 
 /// The variables a secret may be delivered as without `--allow-env`: the
 /// credentials of the harnesses and tools the runner supports.
@@ -66,10 +66,11 @@ impl UntrustedServer {
 
     /// Why `spec` is refused, if it is.
     pub fn check(&self, spec: &TaskLaunchSpec) -> Result<(), String> {
-        match &spec.workspace {
-            TaskWorkspace::None => {}
-            TaskWorkspace::Local { path } => self.check_directory(path)?,
-            TaskWorkspace::Git(identity) => check_remote(identity)?,
+        for repository in &spec.workspace.repositories {
+            match &repository.source {
+                TaskRepositorySource::Local { path } => self.check_directory(path)?,
+                TaskRepositorySource::Git(identity) => check_remote(identity)?,
+            }
         }
         for secret in &spec.environment.secrets {
             match &secret.delivery {
@@ -195,7 +196,10 @@ fn without_credentials(remote: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use narsor_engine::domain::{BackendId, ResolvedEnvironment, ResourceProfile, SecretReference};
+    use narsor_engine::domain::{
+        BackendId, ResolvedEnvironment, ResourceProfile, SecretReference, TaskRepository,
+        TaskWorkspace,
+    };
 
     struct Dir(PathBuf);
 
@@ -257,12 +261,7 @@ mod tests {
         std::fs::create_dir_all(&inside).unwrap();
         std::os::unix::fs::symlink("/etc", dir.0.join("storage/etc")).unwrap();
         assert!(server
-            .check(&spec(
-                TaskWorkspace::Local {
-                    path: inside.display().to_string()
-                },
-                vec![]
-            ))
+            .check(&spec(local(inside.display().to_string()), vec![]))
             .is_ok());
         for path in [
             dir.0.join("storage/../outside").display().to_string(),
@@ -272,25 +271,35 @@ mod tests {
             "relative".to_string(),
         ] {
             let error = server
-                .check(&spec(TaskWorkspace::Local { path: path.clone() }, vec![]))
+                .check(&spec(local(path.clone()), vec![]))
                 .expect_err(&path);
             assert!(
                 error.contains("storage") || error.contains("exist"),
                 "{error}"
             );
         }
-        assert!(server.check(&spec(TaskWorkspace::None, vec![])).is_ok());
+        assert!(server.check(&spec(TaskWorkspace::none(), vec![])).is_ok());
+    }
+
+    fn local(path: String) -> TaskWorkspace {
+        TaskWorkspace::single(TaskRepository::new(
+            "project",
+            TaskRepositorySource::Local { path },
+        ))
     }
 
     fn git(remote_url: &str) -> TaskWorkspace {
-        TaskWorkspace::Git(GitIdentity {
-            repository: None,
-            remote_url: remote_url.to_string(),
-            commit: String::new(),
-            git_ref: None,
-            ref_origin: None,
-            credential: None,
-        })
+        TaskWorkspace::single(TaskRepository::new(
+            "project",
+            TaskRepositorySource::Git(GitIdentity {
+                repository: None,
+                remote_url: remote_url.to_string(),
+                commit: String::new(),
+                git_ref: None,
+                ref_origin: None,
+                credential: None,
+            }),
+        ))
     }
 
     #[test]
@@ -317,6 +326,18 @@ mod tests {
             let error = server.check(&spec(git(remote), vec![])).expect_err(remote);
             assert!(error.contains("https://"), "{error}");
         }
+    }
+
+    #[test]
+    fn every_repository_of_a_workspace_is_checked() {
+        let dir = Dir::new();
+        let server = server(&dir, &[]);
+        let mut workspace = git("https://github.com/acme/app.git");
+        workspace
+            .repositories
+            .extend(git("/home/me/secret-repo").repositories);
+        let error = server.check(&spec(workspace, vec![])).unwrap_err();
+        assert!(error.contains("https://"), "{error}");
     }
 
     #[test]
@@ -368,7 +389,7 @@ mod tests {
         for name in ["LD_PRELOAD", "PATH", "NARSOR_X"] {
             let error = server(&dir, &[])
                 .check(&spec(
-                    TaskWorkspace::None,
+                    TaskWorkspace::none(),
                     vec![SecretDelivery::Env(name.into())],
                 ))
                 .expect_err(name);
@@ -377,14 +398,14 @@ mod tests {
         for name in ALLOWED_SECRET_ENVS {
             assert!(server(&dir, &[])
                 .check(&spec(
-                    TaskWorkspace::None,
+                    TaskWorkspace::none(),
                     vec![SecretDelivery::Env(name.into())]
                 ))
                 .is_ok());
         }
         assert!(server(&dir, &["MY_TOOL_TOKEN"])
             .check(&spec(
-                TaskWorkspace::None,
+                TaskWorkspace::none(),
                 vec![SecretDelivery::Env("MY_TOOL_TOKEN".into())]
             ))
             .is_ok());
@@ -400,7 +421,7 @@ mod tests {
             assert!(
                 server(&dir, &[])
                     .check(&spec(
-                        TaskWorkspace::None,
+                        TaskWorkspace::none(),
                         vec![SecretDelivery::File(path.into())]
                     ))
                     .is_err(),
@@ -409,7 +430,7 @@ mod tests {
         }
         assert!(server(&dir, &[])
             .check(&spec(
-                TaskWorkspace::None,
+                TaskWorkspace::none(),
                 vec![SecretDelivery::File(".config/gh/hosts.yml".into())]
             ))
             .is_ok());
@@ -418,7 +439,7 @@ mod tests {
     #[test]
     fn a_launch_spec_with_an_unknown_field_is_refused() {
         use narsor_protocol::launch::LaunchSpecEnvelope;
-        let mut value = serde_json::to_value(spec(TaskWorkspace::None, vec![])).unwrap();
+        let mut value = serde_json::to_value(spec(TaskWorkspace::none(), vec![])).unwrap();
         assert!(serde_json::from_value::<LaunchSpecEnvelope>(value.clone()).is_ok());
         value
             .as_object_mut()

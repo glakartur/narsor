@@ -120,7 +120,7 @@ use crate::controller_protocol::{
 };
 use crate::domain::{
     AnsweredBy, ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec,
-    TaskWorkspace, WorkflowDefinition, WorkflowExecution, Workspace,
+    TaskRepositorySource, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceRepository,
 };
 use crate::engine::{Engine, EngineError, HumanInputDelivery, Recovery, UsageReporter};
 use crate::orchestration::{
@@ -1749,37 +1749,69 @@ impl Session {
     }
 }
 
-/// The Engine workspace of a task: the cloned commit, or the empty folder.
+/// The Engine workspace of a task: every repository under `workspace/<name>`
+/// (the cloned commit, or the copied folder), or the empty `workspace/`.
+///
+/// `path` is the primary repository itself, so a single-repository task works
+/// where it always did; `root` is `workspace/` and `repositories` lists every
+/// folder (see [`Workspace`]).
 fn workspace(storage: &TaskStorage, spec: &TaskLaunchSpec) -> Workspace {
-    let path = storage.workspace_dir().display().to_string();
-    match &spec.workspace {
-        TaskWorkspace::None => Workspace::local_folder(path),
-        TaskWorkspace::Local { .. } => Workspace::local_folder(path),
-        TaskWorkspace::Git(identity) => {
-            let name = identity
-                .repository
-                .clone()
-                .unwrap_or_else(|| crate::tasks::repository_name(&identity.remote_url));
-            // A workspace pinned at admission is known only from its checkout.
-            let commit = if identity.is_pinned() {
-                Some(identity.commit.clone())
-            } else {
-                crate::workspace::checked_out_commit(&storage.workspace_dir())
-            };
-            let mut workspace = Workspace::git_checkout(
-                path,
-                RepositoryInfo {
-                    id: name.clone(),
-                    name,
-                    provider: "git".to_string(),
-                    remote: identity.remote_url.clone(),
-                },
-                commit.clone(),
-            );
-            workspace.base_commit = commit;
-            workspace
-        }
+    let root = storage.workspace_dir().display().to_string();
+    let mut entries = Vec::new();
+    for (index, repository) in spec.workspace.repositories.iter().enumerate() {
+        let dir = storage.repository_dir(&repository.name);
+        let (info, base_commit) = match &repository.source {
+            TaskRepositorySource::Local { .. } => (None, None),
+            TaskRepositorySource::Git(identity) => {
+                let name = identity
+                    .repository
+                    .clone()
+                    .unwrap_or_else(|| crate::tasks::repository_name(&identity.remote_url));
+                // A workspace pinned at admission is known only from its checkout.
+                let commit = if identity.is_pinned() {
+                    Some(identity.commit.clone())
+                } else {
+                    crate::workspace::checked_out_commit(&dir)
+                };
+                (
+                    Some(RepositoryInfo {
+                        id: name.clone(),
+                        name,
+                        provider: "git".to_string(),
+                        remote: identity.remote_url.clone(),
+                    }),
+                    commit,
+                )
+            }
+        };
+        entries.push(WorkspaceRepository {
+            name: repository.name.clone(),
+            path: dir.display().to_string(),
+            primary: index == 0,
+            branch: repository.branch.clone(),
+            repository: info,
+            base_commit,
+        });
     }
+
+    let mut workspace = match entries.first() {
+        None => Workspace::local_folder(root.clone()),
+        Some(primary) => match primary.repository.clone() {
+            Some(info) => {
+                let mut workspace = Workspace::git_checkout(
+                    primary.path.clone(),
+                    info,
+                    primary.base_commit.clone(),
+                );
+                workspace.base_commit = primary.base_commit.clone();
+                workspace
+            }
+            None => Workspace::local_folder(primary.path.clone()),
+        },
+    };
+    workspace.root = Some(root);
+    workspace.repositories = entries;
+    workspace
 }
 
 /// A long-poll under way, and the pending request it asked about.

@@ -731,17 +731,82 @@ impl GitIdentity {
     }
 }
 
-/// The workspace source of a launched task.
+/// The repositories a launched task works on, in the order of the workflow's
+/// declaration with the primary repository first.
+///
+/// Every entry is provisioned by the runner into `workspace/<name>/` of the
+/// task directory (see `crate::domain::Workspace` for the layout). An empty
+/// list is a workflow without repositories: the task gets an empty
+/// `workspace/`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskWorkspace {
+    /// One entry per repository of the workflow; the first one is primary.
+    pub repositories: Vec<TaskRepository>,
+}
+
+impl TaskWorkspace {
+    /// A workflow that declares no repository.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A workspace of a single repository, which is then the primary one.
+    pub fn single(repository: TaskRepository) -> Self {
+        Self {
+            repositories: vec![repository],
+        }
+    }
+
+    /// The primary repository, if any.
+    pub fn primary(&self) -> Option<&TaskRepository> {
+        self.repositories.first()
+    }
+
+    /// Every Git identity of the workspace, e.g. to look for credentials.
+    pub fn git_identities(&self) -> impl Iterator<Item = &GitIdentity> {
+        self.repositories
+            .iter()
+            .filter_map(|repository| match &repository.source {
+                TaskRepositorySource::Git(identity) => Some(identity),
+                TaskRepositorySource::Local { .. } => None,
+            })
+    }
+}
+
+/// One repository of a launched task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRepository {
+    /// Name of the repository and of its folder below `workspace/`.
+    pub name: String,
+    /// The branch the repository starts on, resolved at creation from the
+    /// workflow's `base_branch` or the registry. `None` leaves the choice
+    /// to the remote's `HEAD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Where the repository comes from.
+    pub source: TaskRepositorySource,
+}
+
+impl TaskRepository {
+    /// A repository without a recorded branch.
+    pub fn new(name: impl Into<String>, source: TaskRepositorySource) -> Self {
+        Self {
+            name: name.into(),
+            branch: None,
+            source,
+        }
+    }
+}
+
+/// The source identity of a [`TaskRepository`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum TaskWorkspace {
-    /// The workflow declares no workspace.
-    None,
+pub enum TaskRepositorySource {
     /// A host-local directory copied into a local backend's task storage at
     /// admitted runner initialization. It is never valid for an image-based
     /// backend, where a host path would not be portable.
     Local { path: String },
-    /// A pinned Git commit.
+    /// A Git repository, pinned to a commit once known.
     Git(GitIdentity),
 }
 

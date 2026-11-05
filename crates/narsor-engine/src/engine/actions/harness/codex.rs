@@ -74,6 +74,13 @@ impl HarnessAdapter for CodexAdapter {
         if let Some(sandbox) = sandbox {
             common.extend(["--sandbox".to_string(), sandbox]);
         }
+        // The sandbox makes only the working directory and these writable,
+        // so a read-only repository outside it is protected by the sandbox.
+        // A read-only repository that is the working directory (`root: "."`)
+        // is writable to the sandbox and is protected by the prompt only.
+        for dir in request.outside_workspace(request.writable_dirs) {
+            common.extend(["--add-dir".to_string(), dir.to_string_lossy().into_owned()]);
+        }
         common.extend([
             "--config".to_string(),
             format!("approval_policy={APPROVAL_POLICY}"),

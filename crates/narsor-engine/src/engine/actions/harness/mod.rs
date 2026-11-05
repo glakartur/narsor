@@ -60,6 +60,14 @@ pub struct HarnessRequest<'a> {
     /// The directory the harness runs in — the execution's workspace.
     pub workspace: &'a Path,
 
+    /// Repositories the step may change, by absolute path. Includes the
+    /// directory in `workspace` when it is one of them.
+    pub writable_dirs: &'a [PathBuf],
+
+    /// Repositories the step may only read, by absolute path. Adapters that
+    /// cannot enforce it rely on the prompt block (R14).
+    pub read_only_dirs: &'a [PathBuf],
+
     /// A harness session to continue instead of starting a fresh one (D18).
     pub resume_session: Option<&'a str>,
 
@@ -69,6 +77,17 @@ pub struct HarnessRequest<'a> {
     /// `claude-code` passes it as `--json-schema`, and every other adapter
     /// ignores it. The conductor sets it; the agent step does not.
     pub output_schema: Option<&'a Value>,
+}
+
+impl HarnessRequest<'_> {
+    /// Directories to hand the harness besides its working directory:
+    /// those of `dirs` that lie outside it.
+    pub(crate) fn outside_workspace<'d>(&self, dirs: &'d [PathBuf]) -> Vec<&'d Path> {
+        dirs.iter()
+            .map(PathBuf::as_path)
+            .filter(|dir| !dir.starts_with(self.workspace))
+            .collect()
+    }
 }
 
 /// The command line an adapter decided on.

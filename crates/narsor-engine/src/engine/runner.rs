@@ -89,7 +89,7 @@ use crate::domain::{
     Artifact, ArtifactReference, ChoiceDefinition, DecisionProviderType, Event, EventData,
     ExecutionId, ExecutionStatus, HumanInputField, HumanInputType, InputCloseReason, ProblemKind,
     RepromptedBy, State, StateId, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
-    WorkspaceSpec, LOCAL_VARIABLE_PREFIX,
+    LOCAL_VARIABLE_PREFIX,
 };
 use crate::engine::actions::agent::{
     self, DefaultHarnessSource, UsageReporter, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL,
@@ -104,7 +104,7 @@ use crate::engine::actions::human::{
 };
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
-    ScriptExecutor, StepContract, SuspendedAction,
+    ScriptExecutor, StepContract, StepScope, SuspendedAction,
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
@@ -2657,8 +2657,25 @@ impl Engine {
             ))
         })?;
 
+        // The access an agent runs with comes from the step's `workspace`
+        // section; a run that already carries one (a reprompt) keeps it.
+        let with_access;
+        let rendered = match rendered {
+            ActionConfig::Agent(config)
+                if config.workspace_access.is_none() && state.workspace_access().is_some() =>
+            {
+                let mut config = config.clone();
+                config.workspace_access = state.workspace_access();
+                with_access = ActionConfig::Agent(config);
+                &with_access
+            }
+            other => other,
+        };
+
         let conversation_store = self.store.conversation_store(&execution.id);
+        let scope = StepScope::resolve(state.workspace.as_ref(), &execution.workspace);
         let request = ActionRequest::new(rendered, &execution.workspace, action_execution_id)
+            .with_scope(&scope)
             .with_timeout(timeout)
             .with_execution_id(&execution.id)
             .with_conversation_store(&conversation_store)
@@ -3476,8 +3493,8 @@ impl Engine {
     /// made would turn a recoverable situation into a stopped workflow. The
     /// failure is logged, and the previous checkpoint is left intact (R25).
     ///
-    /// `preserve` comes from the workflow's own workspace declaration
-    /// (`globals.workspace.preserve_paths`) — the definition, not the
+    /// `preserve` comes from the workflow's own repository declaration
+    /// (`preserve_paths` of each repository) — the definition, not the
     /// provisioned `Workspace` record, because the latter does not carry it
     /// (it only exists to describe *where* the workspace lives, not how it was
     /// declared).
@@ -3486,32 +3503,41 @@ impl Engine {
             return;
         }
 
-        let base = match &execution.workspace.base_commit {
-            Some(commit) => crate::workspace::Base::Commit(commit.clone()),
-            None => crate::workspace::Base::None,
-        };
-
-        let preserve: &[String] = match &definition.workspace {
-            Some(WorkspaceSpec::Git { preserve_paths, .. }) => preserve_paths,
-            Some(WorkspaceSpec::Local { preserve_paths, .. }) => preserve_paths,
-            None => &[],
-        };
-
+        // One bundle per repository (KTD10): each has its own base commit and
+        // its own `preserve_paths`, and one failing does not stop the others.
         let paths = self.store.paths();
-        let request = crate::workspace::CaptureRequest {
-            work_tree: std::path::Path::new(&execution.workspace.path),
-            base,
-            scratch: &paths.checkpoint_scratch(&execution.id),
-            bundle: &paths.checkpoint_file(&execution.id),
-            preserve,
-        };
-
-        if let Err(error) = crate::workspace::capture(request) {
-            tracing::warn!(
-                execution_id = %execution.id,
-                %error,
-                "could not checkpoint the workspace; the previous checkpoint is kept"
-            );
+        for repository in execution.workspace.repository_entries() {
+            let base = match &repository.base_commit {
+                Some(commit) => crate::workspace::Base::Commit(commit.clone()),
+                None => crate::workspace::Base::None,
+            };
+            let preserve: &[String] = definition
+                .repositories
+                .iter()
+                .find(|declared| declared.name == repository.name)
+                .or_else(|| {
+                    definition
+                        .primary_repository()
+                        .filter(|_| repository.primary)
+                })
+                .map_or(&[], |declared| &declared.preserve_paths);
+            let scratch = paths.checkpoint_scratch(&execution.id, &repository.name);
+            let bundle = paths.checkpoint_file(&execution.id, &repository.name);
+            let request = crate::workspace::CaptureRequest {
+                work_tree: std::path::Path::new(&repository.path),
+                base,
+                scratch: &scratch,
+                bundle: &bundle,
+                preserve,
+            };
+            if let Err(error) = crate::workspace::capture(request) {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    repository = %repository.name,
+                    %error,
+                    "could not checkpoint the workspace; the previous checkpoint is kept"
+                );
+            }
         }
     }
 
@@ -4600,6 +4626,7 @@ mod tests {
             terminal: true,
             terminal_status: declared,
             allow_manual_override: false,
+            workspace: None,
             image: None,
         }
     }

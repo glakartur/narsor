@@ -26,9 +26,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::domain::{
-    ActionConfig, DecisionConfig, ImageSpec, OutputLabel, State, StateId, ValidationError,
-    WorkflowDefinition, WorkspaceSpec, LOCAL_VARIABLE_PREFIX,
+    ActionConfig, DecisionConfig, ImageSpec, OutputLabel, RepositorySource, SchemaVersion, State,
+    StateId, ValidationError, WorkflowDefinition, LOCAL_VARIABLE_PREFIX, WORKSPACE_ROOT,
 };
+use crate::workspace::provisioner::is_usable_directory_name;
 
 use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
@@ -54,8 +55,9 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_decision(state, &mut errors);
         validate_state_templates(definition, &declared, state, &mut errors);
         validate_state_image(state, &mut errors);
+        validate_step_workspace(definition, state, &mut errors);
     }
-    validate_workflow_templates(definition, &mut errors);
+    validate_repositories(definition, &mut errors);
     validate_display(definition, &mut errors);
     if let Some(image) = &definition.globals.image {
         validate_image("globals.image", image, &mut errors);
@@ -676,28 +678,127 @@ fn validate_state_templates(
     }
 }
 
-fn validate_workflow_templates(definition: &WorkflowDefinition, errors: &mut Vec<ValidationError>) {
-    let Some(workspace) = &definition.workspace else {
-        return;
-    };
+/// The name of a repository field as the author wrote it: a converted `v1`
+/// definition reports `globals.workspace.*`, a `v2` one
+/// `globals.workspaces.<name>.*` (R4).
+fn repository_field(definition: &WorkflowDefinition, name: &str, field: &str) -> String {
+    match definition.source_schema {
+        SchemaVersion::V1 => format!("globals.workspace.{field}"),
+        SchemaVersion::V2 => format!("globals.workspaces.{name}.{field}"),
+    }
+}
 
-    let (field, text) = match workspace {
-        WorkspaceSpec::Git { repository, .. } => {
-            ("globals.workspace.repository", repository.as_str())
+/// The rules of `globals.workspaces`: usable and distinct names, exactly one
+/// primary repository, a branch for every registered one, and templates that
+/// only name declared inputs.
+fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<ValidationError>) {
+    let invalid =
+        |field: String, reason: String| ValidationError::InvalidRepository { field, reason };
+
+    let mut names = HashSet::new();
+    for repository in &definition.repositories {
+        // A converted `v1` name is generated, never the author's.
+        if definition.source_schema == SchemaVersion::V2 {
+            let field = format!("globals.workspaces.{}", repository.name);
+            if !is_usable_directory_name(&repository.name) || repository.name.contains("{{") {
+                errors.push(invalid(
+                    field,
+                    format!("'{}' is not a usable folder name", repository.name),
+                ));
+            } else if !names.insert(repository.name.as_str()) {
+                errors.push(invalid(
+                    field,
+                    format!("the name '{}' is used more than once", repository.name),
+                ));
+            }
+            if matches!(repository.source, RepositorySource::Git { .. })
+                && repository.base_branch.as_deref().is_none_or(str::is_empty)
+            {
+                errors.push(invalid(
+                    repository_field(definition, &repository.name, "base_branch"),
+                    "a registered repository needs a base branch".to_string(),
+                ));
+            }
         }
-        WorkspaceSpec::Local { path, .. } => ("globals.workspace.path", path.as_str()),
-    };
 
-    for variable in extract_input_references(text) {
-        if !declares_input(definition, &variable) {
-            errors.push(ValidationError::UnknownInputReferenceInGlobals { field, variable });
+        let (field, text) = match &repository.source {
+            RepositorySource::Git { repository } => ("repository", repository.as_str()),
+            RepositorySource::Local { path } => ("path", path.as_str()),
+        };
+        let field = repository_field(definition, &repository.name, field);
+        for variable in extract_input_references(text) {
+            if !declares_input(definition, &variable) {
+                errors.push(ValidationError::UnknownInputReferenceInGlobals {
+                    field: field.clone(),
+                    variable,
+                });
+            }
+        }
+        if !step_reply_references(text).is_empty() || !step_stream_references(text).is_empty() {
+            errors.push(ValidationError::InvalidDisplay {
+                field,
+                reason: "step values are not supported in workspace fields".to_string(),
+            });
         }
     }
-    if !step_reply_references(text).is_empty() || !step_stream_references(text).is_empty() {
-        errors.push(ValidationError::InvalidDisplay {
-            field: field.to_string(),
-            reason: "step values are not supported in workspace fields".to_string(),
-        });
+
+    if definition.source_schema == SchemaVersion::V2 && !definition.repositories.is_empty() {
+        let primaries = definition
+            .repositories
+            .iter()
+            .filter(|repository| repository.primary)
+            .count();
+        if primaries != 1 {
+            errors.push(invalid(
+                "globals.workspaces".to_string(),
+                format!("exactly one repository must be primary, found {primaries}"),
+            ));
+        }
+    }
+}
+
+/// The rules of a step's `workspaces` section (KTD7).
+fn validate_step_workspace(
+    definition: &WorkflowDefinition,
+    state: &State,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(section) = &state.workspace else {
+        return;
+    };
+    let invalid = |field: &'static str, reason: String| ValidationError::InvalidStepWorkspace {
+        state: state.id.clone(),
+        field,
+        reason,
+    };
+    let declared = |name: &str| definition.repositories.iter().any(|r| r.name == name);
+
+    for (field, names) in [("write", &section.write), ("read", &section.read)] {
+        let mut seen = HashSet::new();
+        for name in names {
+            if !declared(name) {
+                errors.push(invalid(field, format!("unknown repository '{name}'")));
+            } else if !seen.insert(name.as_str()) {
+                errors.push(invalid(field, format!("'{name}' is listed more than once")));
+            }
+        }
+    }
+    for name in &section.write {
+        if section.read.contains(name) {
+            errors.push(invalid(
+                "read",
+                format!("'{name}' is listed in both 'write' and 'read'"),
+            ));
+        }
+    }
+    if section.root != WORKSPACE_ROOT && !declared(&section.root) {
+        errors.push(invalid(
+            "root",
+            format!(
+                "'{}' is neither '{WORKSPACE_ROOT}' nor a repository of the workflow",
+                section.root
+            ),
+        ));
     }
 }
 
@@ -843,5 +944,187 @@ mod tests {
     #[test]
     fn ignores_an_unterminated_expression() {
         assert!(extract_input_references("{{ inputs.feature").is_empty());
+    }
+
+    const TAIL: &str = r#"
+states:
+  work:
+    action: { type: script, command: ./a.sh }
+    choices: [success]
+    transitions: { success: done }
+  done:
+    description: end
+terminal_states: [done]
+"#;
+
+    fn errors_of(header: &str, step_workspace: &str) -> Vec<ValidationError> {
+        let tail = TAIL.replace("  work:\n", &format!("  work:\n{step_workspace}"));
+        validate_source(&format!("{header}{tail}")).expect("the file must parse")
+    }
+
+    const REPOS: &str = r#"
+schema: v2
+name: multi
+version: 1
+globals:
+  workspaces:
+    code: { primary: true, base_branch: main, repository: code-repo }
+    docs: { base_branch: main, repository: docs-repo }
+"#;
+
+    fn workspace_errors(section: &str) -> Vec<ValidationError> {
+        errors_of(REPOS, &format!("    workspaces: {section}\n"))
+    }
+
+    fn rejected_field(errors: &[ValidationError], expected: &str) -> bool {
+        errors.iter().any(|error| {
+            matches!(error, ValidationError::InvalidStepWorkspace { state, field, .. }
+                if state == "work" && *field == expected)
+        })
+    }
+
+    #[test]
+    fn a_valid_v2_definition_has_no_errors() {
+        assert!(workspace_errors("{ root: docs, write: [docs], read: [code] }").is_empty());
+        assert!(errors_of(REPOS, "").is_empty());
+    }
+
+    #[test]
+    fn unknown_names_in_root_write_and_read_name_the_step_and_field() {
+        assert!(rejected_field(
+            &workspace_errors("{ root: code, write: [nope] }"),
+            "write"
+        ));
+        assert!(rejected_field(
+            &workspace_errors("{ root: code, read: [nope] }"),
+            "read"
+        ));
+        assert!(rejected_field(
+            &workspace_errors("{ root: nope, read: [code] }"),
+            "root"
+        ));
+    }
+
+    #[test]
+    fn a_repository_cannot_be_both_written_and_read() {
+        assert!(rejected_field(
+            &workspace_errors("{ root: docs, write: [code], read: [code] }"),
+            "read"
+        ));
+    }
+
+    #[test]
+    fn root_is_required_and_need_not_be_listed() {
+        assert!(workspace_errors("{ root: docs }").is_empty());
+        assert!(workspace_errors("{ root: docs, write: [code] }").is_empty());
+        assert!(workspace_errors("{ root: \".\", write: [code] }").is_empty());
+        assert!(validate_source(&format!(
+            "{REPOS}{}",
+            TAIL.replace("  work:\n", "  work:\n    workspaces: { write: [code] }\n")
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn a_repository_is_listed_once_per_list() {
+        assert!(rejected_field(
+            &workspace_errors("{ root: docs, write: [code, code] }"),
+            "write"
+        ));
+        assert!(rejected_field(
+            &workspace_errors("{ root: docs, read: [code, code] }"),
+            "read"
+        ));
+    }
+
+    #[test]
+    fn root_dot_is_allowed_with_a_single_repository() {
+        let header = "schema: v2\nname: one\nversion: 1\nglobals:\n  workspaces:\n    only: { primary: true, base_branch: main, path: ../only }\n";
+        assert!(errors_of(header, "    workspaces: { root: \".\", write: [only] }\n").is_empty());
+    }
+
+    fn repository_errors(repositories: &str) -> Vec<String> {
+        let header = format!(
+            "schema: v2\nname: r\nversion: 1\ninputs:\n  - {{ name: repo, type: repository }}\nglobals:\n  workspaces:\n{repositories}"
+        );
+        errors_of(&header, "")
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn zero_or_two_primary_repositories_are_rejected() {
+        let none = repository_errors(
+            "    a: { base_branch: main, repository: r }\n    b: { base_branch: main, repository: r }\n",
+        );
+        assert!(
+            none.iter()
+                .any(|e| e.contains("exactly one repository must be primary, found 0")),
+            "{none:?}"
+        );
+        let two = repository_errors(
+            "    a: { primary: true, base_branch: main, repository: r }\n    b: { primary: true, base_branch: main, repository: r }\n",
+        );
+        assert!(two.iter().any(|e| e.contains("found 2")), "{two:?}");
+    }
+
+    #[test]
+    fn workspace_names_must_be_usable() {
+        let errors = repository_errors(
+            "    a: { primary: true, base_branch: main, repository: r }\n    \"x/y\": { base_branch: main, repository: r }\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("globals.workspaces.x/y") && e.contains("usable")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_registered_v2_repository_needs_a_base_branch() {
+        let errors = repository_errors("    a: { primary: true, repository: r }\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("globals.workspaces.a.base_branch")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_input_in_a_v2_source_names_the_v2_field() {
+        let errors = repository_errors(
+            "    a: { primary: true, base_branch: main, repository: \"{{ inputs.ghost }}\" }\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("globals.workspaces.a.repository") && e.contains("ghost")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_v1_error_names_the_original_field() {
+        let yaml = format!(
+            "name: legacy\nversion: 1\nglobals:\n  workspace:\n    type: git\n    repository: \"{{{{ inputs.ghost }}}}\"\n{TAIL}"
+        );
+        let errors: Vec<String> = validate_source(&yaml)
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("globals.workspace.repository") && e.contains("ghost")),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("globals.workspaces.")),
+            "{errors:?}"
+        );
     }
 }

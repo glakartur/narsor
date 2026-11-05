@@ -577,6 +577,7 @@ fn conversation_tails(
 /// The workflow's artifact files, read from the start up to `limit` bytes
 /// in all — a plan is read from its beginning.
 fn artifact_files(execution: &WorkflowExecution, limit: usize) -> Vec<ArtifactFile> {
+    // Artifacts live in the primary repository, which `path` is.
     let workspace = Path::new(&execution.workspace.path);
     let mut artifacts: Vec<_> = execution.context.artifacts.iter().collect();
     artifacts.sort_by(|a, b| a.0.cmp(b.0));
