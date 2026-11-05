@@ -50,10 +50,10 @@ globals:                    # Global settings for the whole workflow (optional)
     path: <string>          # Relative path in the task folder
     preserve_paths:         # Paths ignored by the repo that should nevertheless survive to the checkpoint (git and local); it must not be a file with secrets/credentials (the checkpoint is unencrypted)
       - <string>
-  repositories:             # schema v2: named repositories (replaces `workspace`, §3.2.1)
-    - name: <string>        # Label and folder name in the task directory
-      primary: <boolean>    # Exactly one repository is primary
-      default_branch: <string>
+  workspaces:               # schema v2: named workspaces, one repository each (replaces `workspace`, §3.2.1)
+    <name>:                 # Label and folder name in the task directory
+      primary: <boolean>    # Exactly one workspace is primary
+      base_branch: <string>
       repository: <string>  # Registry ID or {{ inputs.x }} (or `path:` instead)
       preserve_paths: [<string>]
   image: <image>            # Base image of the remote task, overrides the repository image (optional)
@@ -161,13 +161,16 @@ is not the `version` field, which stays the version of the workflow itself. Any 
 error. The file is checked against its own schema: a `v2` file cannot use `v1` constructs, and a
 `v1` file cannot use `v2` ones.
 
-**`globals.repositories` (v2).** A list of named repositories, replacing `globals.workspace`.
+**`globals.workspaces` (v2).** A mapping of named workspaces, each holding one repository, replacing
+`globals.workspace`. Steps refer to the same names in their own `workspaces` section.
 
-*   `name`: the label of the repository and the name of its folder, `workspace/<name>/`, in the
-    task directory. It must be a usable folder name, unique in the list, and cannot be a template.
+*   The key is the label of the workspace and the name of its folder, `workspace/<name>/`, in the
+    task directory. It must be a usable folder name, unique, and cannot be a template. The order
+    of the file is kept.
 *   `primary`: exactly one repository is primary. A step without a `workspaces` section starts there,
     and the conductor reads task artifacts from it.
-*   `default_branch`: the branch a new task starts on. It is required for a registered repository.
+*   `base_branch`: the branch a new task starts from, and the one a pull request targets. It is
+    required for a registered repository. Narsor does not create a working branch: a step does.
     The task keeps for each repository its name and branch.
 *   Exactly one source: `repository` (a registry ID or an `{{ inputs.x }}` template naming an input
     of type `repository`, as in `globals.workspace.repository`) or `path` (a local folder, as in
@@ -201,7 +204,7 @@ error. The file is checked against its own schema: a `v2` file cannot use `v1` c
 
 **Validation (v2).**
 
-*   `globals.workspace` and the agent's `workspace_access` are errors; `globals.repositories` and a
+*   `globals.workspace` and the agent's `workspace_access` are errors; `globals.workspaces` and a
     step `workspaces` in a `v1` file are errors too.
 *   Names are usable folder names and unique; exactly one repository is primary.
 *   `root` is required; it and the names in `write` and `read` refer only to declared repositories

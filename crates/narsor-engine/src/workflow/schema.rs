@@ -23,7 +23,7 @@ use crate::domain::SchemaVersion;
 ///
 /// Which schema the file is written in is read from `schema` and enforced
 /// while parsing: a `v2` file that still uses `globals.workspace` or an
-/// agent's `workspace_access`, and a `v1` file that uses `globals.repositories`
+/// agent's `workspace_access`, and a `v1` file that uses `globals.workspaces`
 /// or a step's `workspace`, is rejected with an error naming the field.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "RawWorkflowFile")]
@@ -88,8 +88,8 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
         let globals = raw.globals.as_ref();
         match raw.schema {
             SchemaVersion::V1 => {
-                if globals.is_some_and(|globals| globals.repositories.is_some()) {
-                    return Err("'globals.repositories' requires 'schema: v2'".to_string());
+                if globals.is_some_and(|globals| globals.workspaces.is_some()) {
+                    return Err("'globals.workspaces' requires 'schema: v2'".to_string());
                 }
                 if let Some((id, _)) = raw
                     .states
@@ -103,7 +103,7 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
                 if globals.is_some_and(|globals| globals.workspace.is_some()) {
                     return Err(
                         "'globals.workspace' is not allowed in 'schema: v2'; declare \
-                         'globals.repositories'"
+                         'globals.workspaces'"
                             .to_string(),
                     );
                 }
@@ -335,9 +335,10 @@ pub struct GlobalsSchema {
     #[serde(default)]
     pub workspace: Option<WorkspaceSchema>,
 
-    /// Repositories of the workflow (`schema: v2` only).
-    #[serde(default)]
-    pub repositories: Option<Vec<RepositorySchema>>,
+    /// Workspaces of the workflow, one repository each, in file order
+    /// (`schema: v2` only).
+    #[serde(default, deserialize_with = "deserialize_ordered_workspaces")]
+    pub workspaces: Option<Vec<RepositorySchema>>,
 
     /// Base image for every step of a remote task, overriding the
     /// repository's own (R15). A reference string, or a mapping with
@@ -421,19 +422,19 @@ pub struct LocalWorkspaceSchema {
     pub preserve_paths: Vec<String>,
 }
 
-/// One entry of `globals.repositories` (`schema: v2`).
+/// One entry of `globals.workspaces` (`schema: v2`).
 ///
 /// Exactly one of `repository` and `path` names the source.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(try_from = "RawRepositorySchema")]
+#[derive(Debug, Clone)]
 pub struct RepositorySchema {
-    /// Label of the repository and name of its folder in the task directory.
+    /// The key of the entry: the label of the repository and the name of its
+    /// folder in the task directory.
     pub name: String,
 
     /// Marks the primary repository; exactly one repository is primary.
     pub primary: bool,
 
-    /// Branch a new task starts on.
+    /// Branch a new task starts from (`base_branch`).
     pub default_branch: Option<String>,
 
     /// Where the repository comes from.
@@ -444,7 +445,7 @@ pub struct RepositorySchema {
     pub preserve_paths: Vec<String>,
 }
 
-/// The source of a `globals.repositories` entry.
+/// The source of a `globals.workspaces` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepositorySourceSchema {
     /// Repository id from the registry; may be a `{{ }}` template.
@@ -456,11 +457,10 @@ pub enum RepositorySourceSchema {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRepositorySchema {
-    name: String,
     #[serde(default)]
     primary: bool,
     #[serde(default)]
-    default_branch: Option<String>,
+    base_branch: Option<String>,
     #[serde(default)]
     repository: Option<String>,
     #[serde(default)]
@@ -469,24 +469,22 @@ struct RawRepositorySchema {
     preserve_paths: Vec<String>,
 }
 
-impl TryFrom<RawRepositorySchema> for RepositorySchema {
-    type Error = String;
-
-    fn try_from(raw: RawRepositorySchema) -> Result<Self, Self::Error> {
+impl RawRepositorySchema {
+    fn into_schema(self, name: String) -> Result<RepositorySchema, String> {
+        let raw = self;
         let source = match (raw.repository, raw.path) {
             (Some(repository), None) => RepositorySourceSchema::Repository(repository),
             (None, Some(path)) => RepositorySourceSchema::Path(path),
             _ => {
                 return Err(format!(
-                    "repository '{}' needs exactly one of 'repository' and 'path'",
-                    raw.name
+                    "workspace '{name}' needs exactly one of 'repository' and 'path'"
                 ))
             }
         };
-        Ok(Self {
-            name: raw.name,
+        Ok(RepositorySchema {
+            name,
             primary: raw.primary,
-            default_branch: raw.default_branch,
+            default_branch: raw.base_branch,
             source,
             preserve_paths: raw.preserve_paths,
         })
@@ -904,6 +902,46 @@ impl<'de> Deserialize<'de> for DurationSecs {
 // ---------------------------------------------------------------------------
 // Order-preserving state mapping
 // ---------------------------------------------------------------------------
+
+/// Deserializes `globals.workspaces`, a mapping of name to repository, keeping
+/// the order of the file.
+fn deserialize_ordered_workspaces<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<RepositorySchema>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct WorkspacesVisitor;
+
+    impl<'de> Visitor<'de> for WorkspacesVisitor {
+        type Value = Option<Vec<RepositorySchema>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a mapping of workspace name to repository definition")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut workspaces = Vec::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((name, raw)) = map.next_entry::<String, RawRepositorySchema>()? {
+                if workspaces
+                    .iter()
+                    .any(|entry: &RepositorySchema| entry.name == name)
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate workspace '{name}'"
+                    )));
+                }
+                workspaces.push(raw.into_schema(name).map_err(serde::de::Error::custom)?);
+            }
+            Ok(Some(workspaces))
+        }
+    }
+
+    deserializer.deserialize_map(WorkspacesVisitor)
+}
 
 /// Deserializes the `states` mapping while preserving the order of the file.
 ///

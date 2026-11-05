@@ -680,15 +680,15 @@ fn validate_state_templates(
 
 /// The name of a repository field as the author wrote it: a converted `v1`
 /// definition reports `globals.workspace.*`, a `v2` one
-/// `globals.repositories[i].*` (R4).
-fn repository_field(definition: &WorkflowDefinition, index: usize, field: &str) -> String {
+/// `globals.workspaces.<name>.*` (R4).
+fn repository_field(definition: &WorkflowDefinition, name: &str, field: &str) -> String {
     match definition.source_schema {
         SchemaVersion::V1 => format!("globals.workspace.{field}"),
-        SchemaVersion::V2 => format!("globals.repositories[{index}].{field}"),
+        SchemaVersion::V2 => format!("globals.workspaces.{name}.{field}"),
     }
 }
 
-/// The rules of `globals.repositories`: usable and distinct names, exactly one
+/// The rules of `globals.workspaces`: usable and distinct names, exactly one
 /// primary repository, a branch for every registered one, and templates that
 /// only name declared inputs.
 fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<ValidationError>) {
@@ -696,10 +696,10 @@ fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<Valid
         |field: String, reason: String| ValidationError::InvalidRepository { field, reason };
 
     let mut names = HashSet::new();
-    for (index, repository) in definition.repositories.iter().enumerate() {
+    for repository in &definition.repositories {
         // A converted `v1` name is generated, never the author's.
         if definition.source_schema == SchemaVersion::V2 {
-            let field = repository_field(definition, index, "name");
+            let field = format!("globals.workspaces.{}", repository.name);
             if !is_usable_directory_name(&repository.name) || repository.name.contains("{{") {
                 errors.push(invalid(
                     field,
@@ -718,8 +718,8 @@ fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<Valid
                     .is_none_or(str::is_empty)
             {
                 errors.push(invalid(
-                    repository_field(definition, index, "default_branch"),
-                    "a registered repository needs a default branch".to_string(),
+                    repository_field(definition, &repository.name, "base_branch"),
+                    "a registered repository needs a base branch".to_string(),
                 ));
             }
         }
@@ -728,7 +728,7 @@ fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<Valid
             RepositorySource::Git { repository } => ("repository", repository.as_str()),
             RepositorySource::Local { path } => ("path", path.as_str()),
         };
-        let field = repository_field(definition, index, field);
+        let field = repository_field(definition, &repository.name, field);
         for variable in extract_input_references(text) {
             if !declares_input(definition, &variable) {
                 errors.push(ValidationError::UnknownInputReferenceInGlobals {
@@ -753,7 +753,7 @@ fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<Valid
             .count();
         if primaries != 1 {
             errors.push(invalid(
-                "globals.repositories".to_string(),
+                "globals.workspaces".to_string(),
                 format!("exactly one repository must be primary, found {primaries}"),
             ));
         }
@@ -970,9 +970,9 @@ schema: v2
 name: multi
 version: 1
 globals:
-  repositories:
-    - { name: code, primary: true, default_branch: main, repository: code-repo }
-    - { name: docs, default_branch: main, repository: docs-repo }
+  workspaces:
+    code: { primary: true, base_branch: main, repository: code-repo }
+    docs: { base_branch: main, repository: docs-repo }
 "#;
 
     fn workspace_errors(section: &str) -> Vec<ValidationError> {
@@ -1042,13 +1042,13 @@ globals:
 
     #[test]
     fn root_dot_is_allowed_with_a_single_repository() {
-        let header = "schema: v2\nname: one\nversion: 1\nglobals:\n  repositories:\n    - { name: only, primary: true, default_branch: main, path: ../only }\n";
+        let header = "schema: v2\nname: one\nversion: 1\nglobals:\n  workspaces:\n    only: { primary: true, base_branch: main, path: ../only }\n";
         assert!(errors_of(header, "    workspaces: { root: \".\", write: [only] }\n").is_empty());
     }
 
     fn repository_errors(repositories: &str) -> Vec<String> {
         let header = format!(
-            "schema: v2\nname: r\nversion: 1\ninputs:\n  - {{ name: repo, type: repository }}\nglobals:\n  repositories:\n{repositories}"
+            "schema: v2\nname: r\nversion: 1\ninputs:\n  - {{ name: repo, type: repository }}\nglobals:\n  workspaces:\n{repositories}"
         );
         errors_of(&header, "")
             .iter()
@@ -1059,7 +1059,7 @@ globals:
     #[test]
     fn zero_or_two_primary_repositories_are_rejected() {
         let none = repository_errors(
-            "    - { name: a, default_branch: main, repository: r }\n    - { name: b, default_branch: main, repository: r }\n",
+            "    a: { base_branch: main, repository: r }\n    b: { base_branch: main, repository: r }\n",
         );
         assert!(
             none.iter()
@@ -1067,32 +1067,31 @@ globals:
             "{none:?}"
         );
         let two = repository_errors(
-            "    - { name: a, primary: true, default_branch: main, repository: r }\n    - { name: b, primary: true, default_branch: main, repository: r }\n",
+            "    a: { primary: true, base_branch: main, repository: r }\n    b: { primary: true, base_branch: main, repository: r }\n",
         );
         assert!(two.iter().any(|e| e.contains("found 2")), "{two:?}");
     }
 
     #[test]
-    fn repository_names_must_be_usable_and_unique() {
+    fn workspace_names_must_be_usable() {
         let errors = repository_errors(
-            "    - { name: a, primary: true, default_branch: main, repository: r }\n    - { name: a, default_branch: main, repository: r }\n    - { name: \"x/y\", default_branch: main, repository: r }\n",
+            "    a: { primary: true, base_branch: main, repository: r }\n    \"x/y\": { base_branch: main, repository: r }\n",
         );
-        assert!(errors.iter().any(|e| e.contains("globals.repositories[1].name") && e.contains("more than once")), "{errors:?}");
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("globals.repositories[2].name") && e.contains("usable")),
+                .any(|e| e.contains("globals.workspaces.x/y") && e.contains("usable")),
             "{errors:?}"
         );
     }
 
     #[test]
-    fn a_registered_v2_repository_needs_a_default_branch() {
-        let errors = repository_errors("    - { name: a, primary: true, repository: r }\n");
+    fn a_registered_v2_repository_needs_a_base_branch() {
+        let errors = repository_errors("    a: { primary: true, repository: r }\n");
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("globals.repositories[0].default_branch")),
+                .any(|e| e.contains("globals.workspaces.a.base_branch")),
             "{errors:?}"
         );
     }
@@ -1100,12 +1099,12 @@ globals:
     #[test]
     fn an_undeclared_input_in_a_v2_source_names_the_v2_field() {
         let errors = repository_errors(
-            "    - { name: a, primary: true, default_branch: main, repository: \"{{ inputs.ghost }}\" }\n",
+            "    a: { primary: true, base_branch: main, repository: \"{{ inputs.ghost }}\" }\n",
         );
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("globals.repositories[0].repository") && e.contains("ghost")),
+                .any(|e| e.contains("globals.workspaces.a.repository") && e.contains("ghost")),
             "{errors:?}"
         );
     }
@@ -1127,7 +1126,7 @@ globals:
             "{errors:?}"
         );
         assert!(
-            !errors.iter().any(|e| e.contains("repositories[")),
+            !errors.iter().any(|e| e.contains("globals.workspaces.")),
             "{errors:?}"
         );
     }

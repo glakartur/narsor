@@ -964,8 +964,8 @@ fn two_tasks_for_one_repository_share_one_environment_identity() {
 // ---------------------------------------------------------------------------
 
 const MULTI_REPOSITORY: &str = "schema: v2\nname: multi\nversion: 1\ninputs:\n  - { name: docs, \
-type: repository }\nglobals:\n  repositories:\n    - { name: code, primary: true, \
-default_branch: main, repository: app }\n    - { name: docs, default_branch: trunk, repository: \"{{ inputs.docs }}\" }\n\
+type: repository }\nglobals:\n  workspaces:\n    code: { primary: true, \
+base_branch: main, repository: app }\n    docs: { base_branch: trunk, repository: \"{{ inputs.docs }}\" }\n\
 states:\n  done:\n    description: done\nterminal_states: [done]\n";
 
 fn multi_repository_root() -> TempRoot {

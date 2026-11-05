@@ -9,7 +9,7 @@
 //!   together with the `terminal_status` the entry declares (§3.5),
 //! * `initial_state` is the state flagged `initial: true`, or — with no such
 //!   flag — the first state in file order,
-//! * repositories belong to an execution, not to a state: `globals.repositories`
+//! * repositories belong to an execution, not to a state: `globals.workspaces`
 //!   (`schema: v2`) becomes the definition's repository list, and a `v1` file is
 //!   converted to the same shape — `globals.workspace` becomes one primary
 //!   repository, and an agent's `workspace_access` becomes the step's
@@ -177,7 +177,7 @@ fn compile_repositories(
 ) -> Vec<RepositoryDefinition> {
     match schema {
         SchemaVersion::V2 => globals
-            .repositories
+            .workspaces
             .iter()
             .flatten()
             .map(compile_repository)
@@ -470,9 +470,9 @@ schema: v2
 name: multi
 version: 3
 globals:
-  repositories:
-    - { name: code, primary: true, default_branch: main, repository: "{{ inputs.repo }}", preserve_paths: [Cargo.lock] }
-    - { name: docs, default_branch: trunk, path: ../docs }
+  workspaces:
+    code: { primary: true, base_branch: main, repository: "{{ inputs.repo }}", preserve_paths: [Cargo.lock] }
+    docs: { base_branch: trunk, path: ../docs }
 inputs:
   - { name: repo, type: repository }
 "#;
@@ -673,7 +673,7 @@ terminal_states: [done]
     #[test]
     fn v1_rejects_v2_constructs() {
         let error = load(
-            "name: x\nversion: 1\nglobals:\n  repositories:\n    - { name: a, primary: true, repository: r, default_branch: main }\n",
+            "name: x\nversion: 1\nglobals:\n  workspaces:\n    a: { primary: true, repository: r, base_branch: main }\n",
         )
         .unwrap_err();
         assert!(error.to_string().contains("schema: v2"), "{error}");
@@ -684,17 +684,26 @@ terminal_states: [done]
         assert!(load("schema: v3\nname: x\nversion: 1\n").is_err());
         assert!(load("schema: v2\nname: x\nversion: 1\nsurprise: true\n").is_err());
         let error = load(
-            "schema: v2\nname: x\nversion: 1\nglobals:\n  repositories:\n    - { name: a, primary: true, repository: r, extra: 1 }\n",
+            "schema: v2\nname: x\nversion: 1\nglobals:\n  workspaces:\n    a: { primary: true, repository: r, extra: 1 }\n",
         )
         .unwrap_err();
         assert!(error.to_string().contains("extra"), "{error}");
     }
 
     #[test]
+    fn a_workspace_name_used_twice_is_an_error() {
+        let error = load(
+            "schema: v2\nname: x\nversion: 1\nglobals:\n  workspaces:\n    a: { primary: true, path: p }\n    a: { path: q }\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate"), "{error}");
+    }
+
+    #[test]
     fn a_repository_names_exactly_one_source() {
         for source in ["", ", repository: r, path: p"] {
             let error = load(&format!(
-                "schema: v2\nname: x\nversion: 1\nglobals:\n  repositories:\n    - {{ name: a, primary: true{source} }}\n"
+                "schema: v2\nname: x\nversion: 1\nglobals:\n  workspaces:\n    a: {{ primary: true{source} }}\n"
             ))
             .unwrap_err();
             assert!(error.to_string().contains("exactly one"), "{error}");

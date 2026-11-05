@@ -9,14 +9,14 @@ inputs:
     required: true
 
 globals:
-  repositories:
-    - name: code
+  workspaces:
+    code:
       primary: true
       repository: "{{ inputs.code_repo }}"
-      default_branch: main
-    - name: docs
+      base_branch: main
+    docs:
       repository: acme-docs
-      default_branch: main
+      base_branch: main
 
 states:
   implement:
