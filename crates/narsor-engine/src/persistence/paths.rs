@@ -539,6 +539,21 @@ impl StatePaths {
             .join(CHECKPOINT_SCRATCH_DIR)
     }
 
+    /// `{state}/executions/{id}/checkpoint.{name}.bundle`: the checkpoint of a
+    /// repository other than the primary one, which keeps
+    /// [`Self::checkpoint_file`].
+    pub fn checkpoint_repository_file(&self, execution_id: &str, repository: &str) -> PathBuf {
+        self.execution_dir(execution_id)
+            .join(format!("checkpoint.{repository}.bundle"))
+    }
+
+    /// `{state}/executions/{id}/checkpoint.{name}.git`: scratch of
+    /// [`Self::checkpoint_repository_file`].
+    pub fn checkpoint_repository_scratch(&self, execution_id: &str, repository: &str) -> PathBuf {
+        self.execution_dir(execution_id)
+            .join(format!("checkpoint.{repository}.git"))
+    }
+
     /// `{state}/executions/{id}/definition.yaml`.
     pub fn definition_file(&self, execution_id: &str) -> PathBuf {
         self.execution_dir(execution_id).join(DEFINITION_FILE)

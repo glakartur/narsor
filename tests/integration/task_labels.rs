@@ -10,7 +10,7 @@ fn spec() -> TaskLaunchSpec {
         "wf",
         1,
         serde_json::json!({}),
-        TaskWorkspace::None,
+        TaskWorkspace::none(),
         ResolvedEnvironment::harness_only("claude-code"),
         ResourceProfile::new(1000, 2048),
     )
@@ -105,7 +105,7 @@ fn another_version_is_refused_with_both_versions() {
     let error = serde_json::from_value::<TaskLaunchSpec>(json).unwrap_err();
     let text = error.to_string();
     assert!(
-        text.contains("version 2") && text.contains("expected 3"),
+        text.contains("version 2") && text.contains("expected 4"),
         "{text}"
     );
 }

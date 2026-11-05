@@ -939,7 +939,7 @@ mod tests {
                 "wf",
                 1,
                 serde_json::json!({}),
-                TaskWorkspace::None,
+                TaskWorkspace::none(),
                 ResolvedEnvironment::harness_only("claude-code"),
                 ResourceProfile::new(1000, 2048),
             );

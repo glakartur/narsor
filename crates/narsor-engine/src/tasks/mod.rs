@@ -714,26 +714,62 @@ pub fn takeover(
         }
     };
 
-    let base = match &execution.workspace.base_commit {
-        Some(commit) => {
-            checkout_commit(&work_tree, commit)?;
-            Base::Commit(commit.clone())
+    // Every repository has its own base and its own bundle (KTD10). The
+    // provisioner above rebuilds the primary one; another repository is laid
+    // back only when its directory exists again.
+    for repository in execution.workspace.repository_entries() {
+        let (path, bundle, scratch) = if repository.primary {
+            (
+                work_tree.clone(),
+                bundle.clone(),
+                store.paths().checkpoint_scratch(execution_id),
+            )
+        } else {
+            let path = PathBuf::from(&repository.path);
+            if !path.is_dir() {
+                continue;
+            }
+            (
+                path,
+                store
+                    .paths()
+                    .checkpoint_repository_file(execution_id, &repository.name),
+                store
+                    .paths()
+                    .checkpoint_repository_scratch(execution_id, &repository.name),
+            )
+        };
+        if !bundle.is_file() {
+            continue;
         }
-        None => Base::None,
-    };
-
-    materialise(MaterialiseRequest {
-        work_tree: &work_tree,
-        base,
-        scratch: &store.paths().checkpoint_scratch(execution_id),
-        bundle: &bundle,
-    })?;
+        let base = match &repository.base_commit {
+            Some(commit) => {
+                checkout_commit(&path, commit)?;
+                Base::Commit(commit.clone())
+            }
+            None => Base::None,
+        };
+        materialise(MaterialiseRequest {
+            work_tree: &path,
+            base,
+            scratch: &scratch,
+            bundle: &bundle,
+        })?;
+    }
 
     // The record keeps its identity — id, repository, base commit — and only
     // learns where the work tree now lives.
     let path = work_tree.display().to_string();
     if let Some(info) = execution.context.workspace.as_mut() {
         info.path = path.clone();
+    }
+    for repository in execution
+        .workspace
+        .repositories
+        .iter_mut()
+        .filter(|repository| repository.primary)
+    {
+        repository.path = path.clone();
     }
     execution.workspace.path = path;
     store.save_execution(&execution)?;

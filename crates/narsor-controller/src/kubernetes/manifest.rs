@@ -55,9 +55,7 @@ use serde_json::{json, Value};
 use super::names;
 use narsor_engine::backends::{BackendError, BackendResult, TaskResources, WorkloadLaunch};
 use narsor_engine::config::HarnessHome;
-use narsor_engine::domain::{
-    ImageReference, ResolvedImage, SecretReference, TaskLaunchSpec, TaskWorkspace,
-};
+use narsor_engine::domain::{ImageReference, ResolvedImage, SecretReference, TaskLaunchSpec};
 
 /// Component label of a read-only runner's Pod.
 pub const READER_COMPONENT: &str = "reader";
@@ -482,9 +480,13 @@ pub fn plan(
     }
 
     let mut references: Vec<&SecretReference> = environment.secrets.iter().collect();
-    if let TaskWorkspace::Git(git) = &spec.workspace {
-        references.extend(git.credential.as_ref());
-    }
+    // Every repository of the task is cloned by the same runner, each with
+    // its own credential.
+    references.extend(
+        spec.workspace
+            .git_identities()
+            .filter_map(|git| git.credential.as_ref()),
+    );
     let mut secrets: BTreeMap<String, SecretFile> = BTreeMap::new();
     for reference in references {
         if let Some(problem) = reference.delivery.problem() {

@@ -73,7 +73,7 @@ fn contract_launch_spec() -> TaskLaunchSpec {
         definition.id.clone(),
         definition.version,
         serde_json::json!({}),
-        TaskWorkspace::None,
+        TaskWorkspace::none(),
         ResolvedEnvironment::harness_only("claude-code"),
         ResourceProfile::new(1000, 2048),
     )

@@ -6,8 +6,9 @@
 //! 1. the launch spec is copied onto the storage
 //!    ([`ExecutionStore::initialize_task_launch_spec`]); a different spec for
 //!    the same task is refused for good;
-//! 2. the pinned commit is cloned — into `narsor/workspace.partial`, then
-//!    renamed to `workspace`, so a `workspace` directory only ever exists
+//! 2. every repository of the task is cloned (or copied) into
+//!    `workspace/<name>` — a clone goes into `narsor/workspace.partial` first
+//!    and is then renamed, so a repository directory only ever exists
 //!    complete;
 //! 3. the marker is written.
 //!
@@ -17,15 +18,16 @@
 //! marker never ran any work, so whatever an interrupted initialization left
 //! behind is its own debris: a partial clone is removed and redone, and a
 //! complete clone whose marker was never written is recognised by its
-//! commit and adopted. Anything that is neither ours nor the filesystem's
+//! commit and adopted, repository by repository. Anything that is neither ours nor the filesystem's
 //! means the storage was not empty, which is refused rather than cloned
 //! into.
 
 use std::fs;
 use std::path::Path;
 
-use crate::domain::{TaskId, TaskLaunchSpec, TaskWorkspace};
+use crate::domain::{GitIdentity, TaskId, TaskLaunchSpec, TaskRepositorySource};
 use crate::persistence::ExecutionStore;
+use crate::workspace::provisioner::is_usable_directory_name;
 use crate::workspace::{checked_out_commit, clone_pinned_commit, clone_resolving_ref, GitAccess};
 
 use super::secrets::MountedSecrets;
@@ -74,87 +76,111 @@ pub fn initialize(
     store.initialize_task_launch_spec(task_id, spec)?;
 
     let workspace = storage.workspace_dir();
-    let commit = match &spec.workspace {
-        TaskWorkspace::None => {
-            fs::create_dir_all(&workspace).map_err(|source| RunnerError::io(&workspace, source))?;
-            None
+    // The marker keeps the commit of the primary repository, the first one.
+    let mut commit = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, repository) in spec.workspace.repositories.iter().enumerate() {
+        if !is_usable_directory_name(&repository.name) || !seen.insert(repository.name.as_str()) {
+            return Err(RunnerError::ForeignStorage(format!(
+                "the launch spec names the repository '{}', which is not a usable and unique \
+                 folder name",
+                repository.name
+            )));
         }
-        TaskWorkspace::Local { path } => {
-            copy_local_directory(Path::new(path), &workspace)?;
-            None
-        }
-        TaskWorkspace::Git(identity) => {
-            let partial = storage.partial_clone_dir();
-            if partial.exists() {
-                fs::remove_dir_all(&partial).map_err(|source| RunnerError::io(&partial, source))?;
+        let target = storage.repository_dir(&repository.name);
+        let pinned = match &repository.source {
+            TaskRepositorySource::Local { path } => {
+                copy_local_directory(Path::new(path), &target)?;
+                None
             }
-            let pinned = if workspace.exists() {
-                // A clone that finished but whose marker was not written.
-                let found = checked_out_commit(&workspace);
-                let matches = if identity.is_pinned() {
-                    found.as_deref() == Some(identity.commit.as_str())
-                } else {
-                    // Pinned at admission by that earlier clone: adopt it.
-                    found.is_some()
-                };
-                if !matches {
-                    return Err(RunnerError::ForeignStorage(format!(
-                        "'{}' exists without an initialization marker and is not a checkout \
-                         of {}",
-                        workspace.display(),
-                        if identity.is_pinned() {
-                            identity.commit.as_str()
-                        } else {
-                            "a git repository"
-                        }
-                    )));
-                }
-                found.expect("a matching checkout has a commit")
-            } else {
-                let credential = identity
-                    .credential
-                    .as_ref()
-                    .map(|reference| secrets.file(reference))
-                    .transpose()?;
-                let repository = identity
-                    .repository
-                    .clone()
-                    .unwrap_or_else(|| crate::tasks::repository_name(&identity.remote_url));
-                let pinned = if identity.is_pinned() {
-                    clone_pinned_commit(
-                        &repository,
-                        &identity.remote_url,
-                        &identity.commit,
-                        &partial,
-                        credential.as_deref(),
-                        git,
-                    )?;
-                    identity.commit.clone()
-                } else {
-                    clone_resolving_ref(
-                        &repository,
-                        &identity.remote_url,
-                        identity.git_ref.as_deref(),
-                        identity.ref_origin,
-                        &partial,
-                        credential.as_deref(),
-                        git,
-                    )?
-                };
-                fs::rename(&partial, &workspace)
-                    .map_err(|source| RunnerError::io(&workspace, source))?;
-                pinned
-            };
-            Some(pinned)
+            TaskRepositorySource::Git(identity) => {
+                Some(provision_git(storage, identity, &target, secrets, git)?)
+            }
+        };
+        if index == 0 {
+            commit = pinned;
         }
-    };
+    }
 
+    // A workflow without repositories still works in `workspace/`.
+    fs::create_dir_all(&workspace).map_err(|source| RunnerError::io(&workspace, source))?;
     storage.write_marker(&InitializationMarker::new(
         task_id.as_str(),
         &spec.digest,
         commit,
     ))?;
     Ok(Initialization::Fresh)
+}
+
+/// Clones one Git repository of the task into `target`, resuming what an
+/// interrupted initialization left, and returns the commit it is at.
+fn provision_git(
+    storage: &TaskStorage,
+    identity: &GitIdentity,
+    target: &Path,
+    secrets: &MountedSecrets,
+    git: &GitAccess,
+) -> Result<String, RunnerError> {
+    let partial = storage.partial_clone_dir();
+    if partial.exists() {
+        fs::remove_dir_all(&partial).map_err(|source| RunnerError::io(&partial, source))?;
+    }
+    if target.exists() {
+        // A clone that finished but whose marker was not written.
+        let found = checked_out_commit(target);
+        let matches = if identity.is_pinned() {
+            found.as_deref() == Some(identity.commit.as_str())
+        } else {
+            // Pinned at admission by that earlier clone: adopt it.
+            found.is_some()
+        };
+        if !matches {
+            return Err(RunnerError::ForeignStorage(format!(
+                "'{}' exists without an initialization marker and is not a checkout of {}",
+                target.display(),
+                if identity.is_pinned() {
+                    identity.commit.as_str()
+                } else {
+                    "a git repository"
+                }
+            )));
+        }
+        return Ok(found.expect("a matching checkout has a commit"));
+    }
+    let credential = identity
+        .credential
+        .as_ref()
+        .map(|reference| secrets.file(reference))
+        .transpose()?;
+    let repository = identity
+        .repository
+        .clone()
+        .unwrap_or_else(|| crate::tasks::repository_name(&identity.remote_url));
+    let pinned = if identity.is_pinned() {
+        clone_pinned_commit(
+            &repository,
+            &identity.remote_url,
+            &identity.commit,
+            &partial,
+            credential.as_deref(),
+            git,
+        )?;
+        identity.commit.clone()
+    } else {
+        clone_resolving_ref(
+            &repository,
+            &identity.remote_url,
+            identity.git_ref.as_deref(),
+            identity.ref_origin,
+            &partial,
+            credential.as_deref(),
+            git,
+        )?
+    };
+    let parent = storage.workspace_dir();
+    fs::create_dir_all(&parent).map_err(|source| RunnerError::io(&parent, source))?;
+    fs::rename(&partial, target).map_err(|source| RunnerError::io(target, source))?;
+    Ok(pinned)
 }
 
 /// Copies a sealed host-local workspace only after admission.  This lives at
@@ -235,7 +261,9 @@ fn copy_tree(root: &Path, source: &Path, target: &Path) -> Result<(), RunnerErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{GitIdentity, RefOrigin, ResolvedEnvironment, ResourceProfile};
+    use crate::domain::{
+        GitIdentity, RefOrigin, ResolvedEnvironment, ResourceProfile, TaskRepository, TaskWorkspace,
+    };
 
     fn temp(name: &str) -> std::path::PathBuf {
         let path =
@@ -421,14 +449,17 @@ terminal_states: [completed]
         git_ref: Option<&str>,
         ref_origin: Option<RefOrigin>,
     ) -> TaskWorkspace {
-        TaskWorkspace::Git(GitIdentity {
-            repository: Some("demo".to_string()),
-            remote_url: bare.display().to_string(),
-            commit: String::new(),
-            git_ref: git_ref.map(str::to_string),
-            ref_origin,
-            credential: None,
-        })
+        TaskWorkspace::single(TaskRepository::new(
+            "demo",
+            TaskRepositorySource::Git(GitIdentity {
+                repository: Some("demo".to_string()),
+                remote_url: bare.display().to_string(),
+                commit: String::new(),
+                git_ref: git_ref.map(str::to_string),
+                ref_origin,
+                credential: None,
+            }),
+        ))
     }
 
     fn task() -> TaskId {
@@ -457,11 +488,23 @@ terminal_states: [completed]
         .unwrap();
 
         assert_eq!(initialized, Initialization::Fresh);
-        assert_eq!(git(&storage.workspace_dir(), &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            git(&storage.repository_dir("demo"), &["rev-parse", "HEAD"]),
+            head
+        );
         let marker = storage.marker().unwrap().expect("the marker");
         assert_eq!(marker.workspace_commit.as_deref(), Some(head.as_str()));
         let workspace = super::super::workspace(&storage, &spec);
         assert_eq!(workspace.base_commit.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            workspace.path,
+            storage.repository_dir("demo").display().to_string(),
+            "a single repository stays the directory the agent works in"
+        );
+        assert_eq!(
+            workspace.root_dir(),
+            storage.workspace_dir().display().to_string()
+        );
         assert!(!storage.partial_clone_dir().exists());
         let _ = fs::remove_dir_all(base);
     }
@@ -514,7 +557,7 @@ terminal_states: [completed]
         let storage = TaskStorage::new(base.join("storage"));
         fs::create_dir_all(storage.root()).unwrap();
         fs::write(storage.root().join("someone-elses-file"), "data").unwrap();
-        let spec = spec(TaskWorkspace::None);
+        let spec = spec(TaskWorkspace::none());
 
         let error = initialize(
             &storage,
@@ -535,6 +578,124 @@ terminal_states: [completed]
             .unwrap()
             .is_none());
         assert!(storage.store().list_execution_ids().unwrap().is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    fn named(name: &str, bare: &Path) -> TaskRepository {
+        let mut repository = TaskRepository::new(
+            name,
+            unpinned(bare, None, None).repositories.remove(0).source,
+        );
+        repository.branch = Some("main".to_string());
+        repository
+    }
+
+    #[test]
+    fn two_repositories_land_in_their_own_folders() {
+        let base = temp("two");
+        let (bare, head) = origin(&base);
+        let storage = TaskStorage::new(base.join("storage"));
+        fs::create_dir_all(storage.root()).unwrap();
+        let spec = spec(TaskWorkspace {
+            repositories: vec![named("code", &bare), named("docs", &bare)],
+        });
+
+        initialize(
+            &storage,
+            &storage.store(),
+            &task(),
+            &spec,
+            &MountedSecrets::new(None),
+            &GitAccess::User,
+        )
+        .unwrap();
+
+        for name in ["code", "docs"] {
+            assert_eq!(
+                git(&storage.repository_dir(name), &["rev-parse", "HEAD"]),
+                head
+            );
+        }
+        let workspace = super::super::workspace(&storage, &spec);
+        assert_eq!(
+            workspace.path,
+            storage.repository_dir("code").display().to_string()
+        );
+        let paths = workspace.repository_paths();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths["docs"], storage.repository_dir("docs"));
+        assert_eq!(workspace.repositories[1].branch.as_deref(), Some("main"));
+        assert!(!workspace.repositories[1].primary);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// The first clone finished, the runner died before the second: the
+    /// resumed initialization adopts the first and redoes the second, whose
+    /// partial clone is debris.
+    #[test]
+    fn an_interrupted_second_clone_is_recovered_with_the_first_adopted() {
+        let base = temp("recover");
+        let (bare, head) = origin(&base);
+        let storage = TaskStorage::new(base.join("storage"));
+        fs::create_dir_all(storage.root()).unwrap();
+        let spec = spec(TaskWorkspace {
+            repositories: vec![named("code", &bare), named("docs", &bare)],
+        });
+        git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                &bare.display().to_string(),
+                &storage.repository_dir("code").display().to_string(),
+            ],
+        );
+        fs::create_dir_all(storage.partial_clone_dir()).unwrap();
+        fs::write(storage.partial_clone_dir().join("half"), "x").unwrap();
+
+        initialize(
+            &storage,
+            &storage.store(),
+            &task(),
+            &spec,
+            &MountedSecrets::new(None),
+            &GitAccess::User,
+        )
+        .unwrap();
+
+        for name in ["code", "docs"] {
+            assert_eq!(
+                git(&storage.repository_dir(name), &["rev-parse", "HEAD"]),
+                head
+            );
+        }
+        assert!(!storage.partial_clone_dir().exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn an_unusable_or_repeated_repository_name_is_refused() {
+        let base = temp("names");
+        let (bare, _) = origin(&base);
+        for names in [vec!["../x"], vec!["a", "a"]] {
+            let storage = TaskStorage::new(
+                base.join(format!("storage-{}", names.join("-").replace('/', "_"))),
+            );
+            fs::create_dir_all(storage.root()).unwrap();
+            let spec = spec(TaskWorkspace {
+                repositories: names.iter().map(|name| named(name, &bare)).collect(),
+            });
+            let error = initialize(
+                &storage,
+                &storage.store(),
+                &task(),
+                &spec,
+                &MountedSecrets::new(None),
+                &GitAccess::User,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("folder name"), "{error}");
+        }
         let _ = fs::remove_dir_all(base);
     }
 }

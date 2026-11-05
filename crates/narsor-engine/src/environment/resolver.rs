@@ -40,9 +40,9 @@ pub use narsor_protocol::controller::TaskDefaultHarness;
 
 use crate::domain::{
     ActionConfig, BackendId, Context, DecisionConfig, GitIdentity, GitIdentityError, ImageError,
-    ImageSource, ImageSpec, InvalidIdentifier, RefOrigin, ResolvedEnvironment, ResolvedImage,
-    ResourceProfile, SecretReference, TaskLaunchSpec, TaskWorkspace, WorkflowDefinition,
-    WorkspaceSpec,
+    ImageSource, ImageSpec, InvalidIdentifier, RefOrigin, RepositoryDefinition, RepositorySource,
+    ResolvedEnvironment, ResolvedImage, ResourceProfile, SchemaVersion, SecretReference,
+    TaskLaunchSpec, TaskRepository, TaskRepositorySource, TaskWorkspace, WorkflowDefinition,
 };
 use crate::persistence::{DefaultHarnessSelector, HarnessSelectionSnapshot};
 use crate::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
@@ -663,7 +663,14 @@ impl CatalogLaunchResolver {
         })
     }
 
-    /// The repository the task works on and the workspace it clones.
+    /// The repositories the task works on and the workspace it clones: one
+    /// [`TaskRepository`] per repository of the definition, primary first.
+    ///
+    /// Returns the registry entry of the primary repository, which decides the
+    /// base image. `intent.repository` and `intent.commit` replace the primary
+    /// repository only; the others are resolved from the definition (a
+    /// registry id or an input of type `repository`, rendered from the inputs)
+    /// and start on their `default_branch`, else the registry's.
     fn workspace(
         &self,
         intent: &LaunchIntent,
@@ -680,62 +687,148 @@ impl CatalogLaunchResolver {
         let scope = TemplateScope::from_execution(&inputs, &context)
             .map_err(|error| LaunchError::InvalidInputs(error.to_string()))?
             .with_task_fields(intent.ticket.as_deref(), intent.title.as_deref());
+        // Errors name the field the author wrote: `globals.workspace` in a
+        // `v1` file, the repository's own entry in a `v2` one.
+        let field = |repository: &RepositoryDefinition, field: &str| match definition.source_schema
+        {
+            SchemaVersion::V1 => format!("globals.workspace.{field}"),
+            SchemaVersion::V2 => format!("globals.repositories[{}].{field}", repository.name),
+        };
         let render = |template: &str, field: &str| {
             scope
                 .render(template, field)
                 .map_err(|error| LaunchError::InvalidInputs(error.to_string()))
         };
 
-        let primary = definition.primary_workspace_spec();
-        let (repository, workflow_ref) = match (&intent.repository, &primary) {
-            (Some(repository), _) => (Some(repository.clone()), None),
-            (
-                None,
-                Some(WorkspaceSpec::Git {
-                    repository,
-                    git_ref,
-                    ..
-                }),
-            ) => {
-                let git_ref = match git_ref {
-                    Some(git_ref) => Some(render(git_ref, "globals.workspace.ref")?),
-                    None => None,
-                };
-                (
-                    Some(render(repository, "globals.workspace.repository")?),
-                    git_ref,
-                )
-            }
-            (None, Some(WorkspaceSpec::Local { path, .. })) => {
-                if backend.kind.runs_container_images() {
-                    return Err(LaunchError::UnsupportedWorkspace(format!(
-                        "workflow '{}' works on a local folder, which cannot travel to backend \
-                         '{backend_id}'",
-                        definition.id
-                    )));
+        let primary = definition.primary_repository();
+        let ordered = primary.into_iter().chain(
+            definition
+                .repositories
+                .iter()
+                .filter(|repository| !repository.primary),
+        );
+
+        let mut primary_entry = None;
+        let mut repositories = Vec::new();
+        for definition_repository in ordered {
+            let is_primary = definition_repository.primary;
+            let (source, repository, workflow_ref) = match (
+                intent.repository.as_ref().filter(|_| is_primary),
+                &definition_repository.source,
+            ) {
+                (Some(repository), _) => (None, Some(repository.clone()), None),
+                (None, RepositorySource::Git { repository }) => {
+                    let git_ref = match &definition_repository.default_branch {
+                        Some(branch) => Some(render(branch, &field(definition_repository, "ref"))?),
+                        None => None,
+                    };
+                    (
+                        None,
+                        Some(render(
+                            repository,
+                            &field(definition_repository, "repository"),
+                        )?),
+                        git_ref,
+                    )
                 }
-                let path =
-                    self.allowed_local_directory(&render(path, "globals.workspace.path")?)?;
-                return Ok((None, TaskWorkspace::Local { path }));
-            }
-            (None, None) => (None, None),
-        };
-
-        let Some(repository) = repository else {
-            if intent.commit.is_some() {
-                return Err(LaunchError::UnsupportedWorkspace(
-                    "a commit was given but no repository to clone it from".to_string(),
+                (None, RepositorySource::Local { path }) => {
+                    if backend.kind.runs_container_images() {
+                        return Err(LaunchError::UnsupportedWorkspace(format!(
+                            "workflow '{}' works on a local folder, which cannot travel to \
+                             backend '{backend_id}'",
+                            definition.id
+                        )));
+                    }
+                    let path = self.allowed_local_directory(&render(
+                        path,
+                        &field(definition_repository, "path"),
+                    )?)?;
+                    (Some(path), None, None)
+                }
+            };
+            if let Some(path) = source {
+                repositories.push(TaskRepository::new(
+                    &definition_repository.name,
+                    TaskRepositorySource::Local { path },
                 ));
+                continue;
             }
-            return Ok((None, TaskWorkspace::None));
-        };
+            let Some(repository) = repository else {
+                continue;
+            };
+            let commit = if is_primary {
+                intent.commit.as_deref()
+            } else {
+                None
+            };
+            let (entry, task_repository) = self.git_repository(
+                Some(&definition_repository.name),
+                &repository,
+                workflow_ref.as_deref(),
+                commit,
+                is_primary,
+                backend_id,
+                backend,
+                secrets,
+            )?;
+            if is_primary {
+                primary_entry = entry.clone();
+            }
+            repositories.push(task_repository);
+        }
 
-        let entry = match self.registry.get(&repository)? {
+        // A launch may name a repository for a workflow that declares none.
+        if definition.repositories.is_empty() {
+            match &intent.repository {
+                Some(repository) => {
+                    let (entry, task_repository) = self.git_repository(
+                        None,
+                        repository,
+                        None,
+                        intent.commit.as_deref(),
+                        true,
+                        backend_id,
+                        backend,
+                        secrets,
+                    )?;
+                    primary_entry = entry;
+                    repositories.push(task_repository);
+                }
+                None if intent.commit.is_some() => {
+                    return Err(LaunchError::UnsupportedWorkspace(
+                        "a commit was given but no repository to clone it from".to_string(),
+                    ));
+                }
+                None => {}
+            }
+        }
+        Ok((primary_entry, TaskWorkspace { repositories }))
+    }
+
+    /// Resolves one Git repository: a registry entry, or on a local backend a
+    /// local Git directory outside the registry.
+    ///
+    /// The primary repository of a backend that runs images must be pinned
+    /// now (`commit`); another repository is left to be pinned by the runner
+    /// at admission, since a launch names a commit for the primary only.
+    #[allow(clippy::too_many_arguments)]
+    fn git_repository(
+        &self,
+        name: Option<&str>,
+        repository: &str,
+        workflow_ref: Option<&str>,
+        commit: Option<&str>,
+        require_commit: bool,
+        backend_id: &BackendId,
+        backend: &BackendRecord,
+        secrets: &mut SecretSet,
+    ) -> Result<(Option<RepositoryEntry>, TaskRepository), LaunchError> {
+        let entry = match self.registry.get(repository)? {
             Some(entry) => entry,
             None if !backend.kind.runs_container_images()
-                && std::path::Path::new(&repository).is_dir() =>
+                && std::path::Path::new(repository).is_dir() =>
             {
-                let repository = self.allowed_local_directory(&repository)?;
+                let repository = self.allowed_local_directory(repository)?;
                 let output = std::process::Command::new("git")
                     .args(["-C", &repository, "rev-parse", "HEAD"])
                     .output()
@@ -751,19 +844,25 @@ impl CatalogLaunchResolver {
                 }
                 let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 GitIdentity::check_commit(&commit)?;
+                let name = name
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::tasks::repository_name(&repository));
                 return Ok((
                     None,
-                    TaskWorkspace::Git(GitIdentity {
-                        repository: None,
-                        remote_url: repository,
-                        commit,
-                        git_ref: None,
-                        ref_origin: None,
-                        credential: None,
-                    }),
+                    TaskRepository::new(
+                        name,
+                        TaskRepositorySource::Git(GitIdentity {
+                            repository: None,
+                            remote_url: repository,
+                            commit,
+                            git_ref: None,
+                            ref_origin: None,
+                            credential: None,
+                        }),
+                    ),
                 ));
             }
-            None => return Err(LaunchError::UnknownRepository(repository.clone())),
+            None => return Err(LaunchError::UnknownRepository(repository.to_string())),
         };
         // A commit — explicit, or a workflow `ref` that already is one —
         // pins the workspace now. Otherwise a backend that clones for itself
@@ -772,19 +871,22 @@ impl CatalogLaunchResolver {
         // images always needs the commit up front.
         // Without a workflow `ref`, the branch of the repository configuration
         // is used; with neither, the clone takes the remote's `HEAD`.
-        let named_ref = entry.named_ref(workflow_ref.as_deref());
-        let (commit, git_ref, ref_origin) = match (&intent.commit, named_ref) {
-            (Some(commit), _) => (commit.clone(), None, None),
+        let named_ref = entry.named_ref(workflow_ref);
+        let branch = named_ref.as_ref().map(|(git_ref, _)| git_ref.clone());
+        let (commit, git_ref, ref_origin) = match (commit, named_ref) {
+            (Some(commit), _) => (commit.to_string(), None, None),
             (None, Some((git_ref, RefOrigin::Workflow)))
                 if GitIdentity::check_commit(&git_ref).is_ok() =>
             {
                 (git_ref, None, None)
             }
-            (None, named) if !backend.kind.runs_container_images() => match named {
-                Some((git_ref, origin)) => (String::new(), Some(git_ref), Some(origin)),
-                None => (String::new(), None, None),
-            },
-            (None, _) => return Err(LaunchError::MissingCommit(repository)),
+            (None, named) if !backend.kind.runs_container_images() || !require_commit => {
+                match named {
+                    Some((git_ref, origin)) => (String::new(), Some(git_ref), Some(origin)),
+                    None => (String::new(), None, None),
+                }
+            }
+            (None, _) => return Err(LaunchError::MissingCommit(repository.to_string())),
         };
         if !commit.is_empty() {
             GitIdentity::check_commit(&commit)?;
@@ -798,15 +900,18 @@ impl CatalogLaunchResolver {
             )?),
             None => None,
         };
-        let workspace = TaskWorkspace::Git(GitIdentity {
+        let identity = GitIdentity {
             repository: Some(entry.id.clone()),
             remote_url: entry.remote.clone(),
             commit,
             git_ref,
             ref_origin,
             credential,
-        });
-        Ok((Some(entry), workspace))
+        };
+        let name = name.map(str::to_string).unwrap_or_else(|| entry.id.clone());
+        let mut task_repository = TaskRepository::new(name, TaskRepositorySource::Git(identity));
+        task_repository.branch = branch;
+        Ok((Some(entry), task_repository))
     }
 
     fn harness(

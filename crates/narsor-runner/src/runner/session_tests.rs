@@ -36,7 +36,7 @@ use crate::controller_protocol::{
 };
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, ConductorPurpose, EventData, ResolvedEnvironment,
-    ResourceProfile,
+    ResourceProfile, TaskWorkspace,
 };
 use crate::engine::{ActionExecutor, ActionKind, ActionOutcome, ActionRequest, UsageReporter};
 use crate::orchestration::{AttentionKind, OperatorCommand};
@@ -293,7 +293,7 @@ fn untitled(yaml: &str, harness: &str) -> TaskLaunchSpec {
         definition.id.clone(),
         definition.version,
         json!({}),
-        TaskWorkspace::None,
+        TaskWorkspace::none(),
         ResolvedEnvironment::harness_only(harness),
         ResourceProfile::new(1000, 2048),
     )
