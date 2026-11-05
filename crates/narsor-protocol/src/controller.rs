@@ -1,5 +1,7 @@
 //! Shared controller protocol values that do not depend on service internals.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -1501,6 +1503,10 @@ pub struct LaunchRequest {
     /// Repository and pinned commit to clone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceRequest>,
+    /// Branch to start from, by the name of the `repository` input it is
+    /// for. An input without an entry starts on its default branch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub branches: BTreeMap<String, String>,
     /// Environment profile; owner default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -2662,6 +2668,7 @@ mod tests {
                     repository: Some("repo".into()),
                     commit: Some("abc123".into()),
                 }),
+                branches: Default::default(),
                 profile: None,
                 harness: None,
                 resources: Some(ResourceProfileRequest {

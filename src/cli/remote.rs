@@ -918,6 +918,7 @@ pub async fn task(
                             commit: commit.clone(),
                         }
                     }),
+                    branches: Default::default(),
                     profile: profile.clone(),
                     harness: harness.clone(),
                     resources: None,

@@ -981,12 +981,21 @@ fn origin_note(origin: Option<RefOrigin>) -> String {
         .unwrap_or_default()
 }
 
-/// Rejects a reference `git` would read as an option rather than a revision.
-fn check_ref(repository: &str, git_ref: &str) -> Result<()> {
+/// Longest reference accepted: the name limit of a file on common systems,
+/// since git keeps a branch as a file.
+const MAX_REF_LEN: usize = 255;
+
+/// Rejects a reference `git` would read as an option rather than a revision,
+/// one with control characters, and one too long to be a branch.
+pub(crate) fn check_ref(repository: &str, git_ref: &str) -> Result<()> {
     let reason = if git_ref.trim().is_empty() {
         Some("it is empty")
     } else if git_ref.starts_with('-') {
         Some("a value starting with '-' is read by git as an option")
+    } else if git_ref.chars().any(char::is_control) {
+        Some("it contains a control character")
+    } else if git_ref.len() > MAX_REF_LEN {
+        Some("it is too long")
     } else {
         None
     };

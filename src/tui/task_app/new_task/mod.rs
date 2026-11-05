@@ -796,6 +796,7 @@ impl TaskApp {
                         workflow_version: version,
                         inputs: Value::Object(inputs.clone()),
                         workspace: None,
+                        branches: Default::default(),
                         profile: None,
                         harness: None,
                         resources: None,
