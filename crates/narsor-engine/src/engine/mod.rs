@@ -49,6 +49,6 @@ pub use actions::{
     HumanExecutor, HumanInputDelivery, HumanInputRequest, InputContinuation, LoggingEventSink,
     OpenCodeAdapter, OutputProblem, OutputRequirement, PendingHumanInput, PermissionDecision,
     PermissionDecisionKind, PermissionGrantScope, RejectedAnswer, ResumedHumanAction,
-    ScriptExecutor, StepContract, SuspendedAction, TimedOutAction, UsageReporter,
+    ScriptExecutor, StepContract, StepScope, SuspendedAction, TimedOutAction, UsageReporter,
     ACTION_ID_ENV_VAR,
 };

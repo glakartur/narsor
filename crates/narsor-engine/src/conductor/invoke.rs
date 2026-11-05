@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::conductor::actor::{ConductorAnswer, ConductorInvoker, Invocation, InvocationOutcome};
-use crate::conductor::prompt::{answer_schema, conductor_prompt};
+use crate::conductor::prompt::{answer_schema, conductor_prompt_for};
 use crate::conductor::response::ConductorResponse;
 use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
 use crate::conductor::store::ConductorStore;
@@ -240,7 +240,14 @@ impl HarnessInvoker {
             .load_execution(&invocation.execution_id)
             .map_err(|error| format!("the execution could not be read: {error}"))?;
 
-        let workspace = Path::new(&execution.workspace.path);
+        // Every repository of a multi-repository task, side by side; a single
+        // one is opened as before.
+        let repositories = execution.workspace.repository_entries();
+        let workspace = if repositories.len() > 1 {
+            Path::new(execution.workspace.root_dir())
+        } else {
+            Path::new(&execution.workspace.path)
+        };
         let access = match ConductorAccess::for_harness(&harness) {
             ConductorAccess::ReadOnlyWorkspace if workspace.is_dir() => {
                 ConductorAccess::ReadOnlyWorkspace
@@ -263,8 +270,17 @@ impl HarnessInvoker {
         input.request = Some(invocation.request.clone());
         input.chat_message = invocation.chat_message.clone();
         let snapshot = render(&input, &self.budget);
-        let prompt = conductor_prompt(invocation.request.purpose, access, &snapshot.text);
+        let prompt = conductor_prompt_for(
+            invocation.request.purpose,
+            access,
+            &snapshot.text,
+            &repositories,
+        );
 
+        let read_only_dirs: Vec<PathBuf> = repositories
+            .iter()
+            .map(|repository| PathBuf::from(&repository.path))
+            .collect();
         let config = conductor_config(&prompt);
         let schema = answer_schema(invocation.request.purpose);
         let mut command = adapter
@@ -273,6 +289,8 @@ impl HarnessInvoker {
                 workspace_access: Some(WorkspaceAccess::ReadOnly),
                 prompt: &prompt,
                 workspace: &working_dir,
+                writable_dirs: &[],
+                read_only_dirs: &read_only_dirs,
                 resume_session: None,
                 output_schema: Some(&schema),
             })

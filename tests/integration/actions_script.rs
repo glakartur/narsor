@@ -425,6 +425,52 @@ async fn a_relative_working_dir_is_resolved_against_the_workspace() {
     assert_eq!(PathBuf::from(result.stdout.trim()), expected);
 }
 
+/// KTD5: a multi-repository step starts in the directory its scope names,
+/// and a relative `working_dir` is resolved against it.
+#[tokio::test]
+async fn a_script_starts_in_the_step_scope_start_dir() {
+    use narsor_engine::domain::{StepWorkspace, WorkspaceRepository};
+    use narsor_engine::engine::StepScope;
+
+    let root = TempRoot::new();
+    let repository = |name: &str, primary: bool| {
+        let path = root.path().join(name);
+        fs::create_dir_all(path.join("sub")).expect("create repository");
+        WorkspaceRepository {
+            name: name.to_string(),
+            path: path.to_string_lossy().into_owned(),
+            primary,
+            branch: None,
+            repository: None,
+            base_commit: None,
+        }
+    };
+    let mut workspace = Workspace::local_folder(root.path().join("code").to_string_lossy().into());
+    workspace.root = Some(root.path().to_string_lossy().into_owned());
+    workspace.repositories = vec![repository("code", true), repository("docs", false)];
+
+    let section = StepWorkspace {
+        root: Some("docs".to_string()),
+        write: vec!["docs".to_string()],
+        read: vec!["code".to_string()],
+    };
+    let scope = StepScope::resolve(Some(&section), &workspace);
+    let mut config = script("print_cwd.sh", &[]);
+    config.working_dir = Some("sub".to_string());
+    let action = ActionConfig::Script(config);
+
+    let outcome = ScriptExecutor::new()
+        .execute(ActionRequest::new(&action, &workspace, "action-exec-1").with_scope(&scope))
+        .await
+        .expect("the script runs");
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action");
+    };
+
+    let expected = fs::canonicalize(root.path().join("docs/sub")).expect("canonical path");
+    assert_eq!(PathBuf::from(result.stdout.trim()), expected);
+}
+
 #[tokio::test]
 async fn a_script_writing_a_file_creates_it_inside_the_workspace() {
     let root = TempRoot::new();

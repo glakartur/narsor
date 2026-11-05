@@ -16,13 +16,24 @@ use serde_json::{json, Map, Value};
 
 use crate::conductor::invoke::ConductorAccess;
 use crate::conductor::response::{allowed_decisions, proposals_allowed, DecisionKind};
-use crate::domain::ConductorPurpose;
+use crate::domain::{ConductorPurpose, WorkspaceRepository};
 
 /// The whole prompt of one invocation for `purpose`, around `snapshot`.
 pub fn conductor_prompt(
     purpose: ConductorPurpose,
     access: ConductorAccess,
     snapshot: &str,
+) -> String {
+    conductor_prompt_for(purpose, access, snapshot, &[])
+}
+
+/// [`conductor_prompt`] for a task with `repositories`: more than one is
+/// listed, each read-only, in the working directory that holds them all.
+pub fn conductor_prompt_for(
+    purpose: ConductorPurpose,
+    access: ConductorAccess,
+    snapshot: &str,
+    repositories: &[WorkspaceRepository],
 ) -> String {
     let mut text = String::new();
 
@@ -39,6 +50,15 @@ JSON object you end it with.\n\
 choose the more cautious decision.\n",
     );
     match access {
+        ConductorAccess::ReadOnlyWorkspace if repositories.len() > 1 => {
+            text.push_str(
+                "- Your working directory holds every repository of the task, opened read-only. \
+You may read their files to check what the snapshot says. The repositories, all read-only:\n",
+            );
+            for repository in repositories {
+                let _ = writeln!(text, "  - {} ({})", repository.name, repository.path);
+            }
+        }
         ConductorAccess::ReadOnlyWorkspace => text.push_str(
             "- Your working directory is the task's workspace, opened read-only. You may read \
 its files to check what the snapshot says.\n",

@@ -104,7 +104,7 @@ use crate::engine::actions::human::{
 };
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
-    ScriptExecutor, StepContract, SuspendedAction,
+    ScriptExecutor, StepContract, StepScope, SuspendedAction,
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
@@ -2673,7 +2673,9 @@ impl Engine {
         };
 
         let conversation_store = self.store.conversation_store(&execution.id);
+        let scope = StepScope::resolve(state.workspace.as_ref(), &execution.workspace);
         let request = ActionRequest::new(rendered, &execution.workspace, action_execution_id)
+            .with_scope(&scope)
             .with_timeout(timeout)
             .with_execution_id(&execution.id)
             .with_conversation_store(&conversation_store)
