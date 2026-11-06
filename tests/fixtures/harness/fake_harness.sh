@@ -11,20 +11,13 @@
 #   exit, exit.<n>       the exit code (per call, then the fallback; default 0)
 #   sleep, sleep.<n>     seconds to sleep after answering (per call, then the
 #                        fallback; for timeout tests)
-#   background, background.<n>
-#                        seconds a background `sleep` lives, started before
-#                        the answer is printed and holding stdout open like a
-#                        task an agent left behind (per call, then the
-#                        fallback)
 #
 # and which it writes back, one set per call:
 #
 #   count                how many times it has been called
-#   pid.<n>              its process id
 #   cwd.<n>              its working directory
 #   action_id.<n>        the value of ORCHESTRATOR_ACTION_ID
 #   args.<n>             its arguments, each terminated by a --%ARG%-- line
-#   bg_pid.<n>           the process id of the background `sleep`
 set -u
 
 dir=$(dirname "$0")
@@ -34,9 +27,11 @@ if [ -f "$dir/count" ]; then
     count=$(cat "$dir/count")
 fi
 count=$((count + 1))
-printf '%s\n' "$count" > "$dir/count"
+# Written to a temporary name and moved into place: a reader that polls
+# `count` must never see the file truncated, only the old or the new value.
+printf '%s\n' "$count" > "$dir/count.tmp.$$"
+mv "$dir/count.tmp.$$" "$dir/count"
 
-printf '%s\n' "$$" > "$dir/pid.$count"
 pwd > "$dir/cwd.$count"
 printf '%s\n' "${ORCHESTRATOR_ACTION_ID-}" > "$dir/action_id.$count"
 
@@ -44,14 +39,6 @@ printf '%s\n' "${ORCHESTRATOR_ACTION_ID-}" > "$dir/action_id.$count"
 for arg in "$@"; do
     printf '%s\n--%%ARG%%--\n' "$arg" >> "$dir/args.$count"
 done
-
-if [ -f "$dir/background.$count" ]; then
-    sleep "$(cat "$dir/background.$count")" &
-    printf '%s\n' "$!" > "$dir/bg_pid.$count"
-elif [ -f "$dir/background" ]; then
-    sleep "$(cat "$dir/background")" &
-    printf '%s\n' "$!" > "$dir/bg_pid.$count"
-fi
 
 # Output is printed *before* the sleep, and flushed line-by-line (`cat` does
 # not buffer), so a streaming reader on the other end of the pipe really does
