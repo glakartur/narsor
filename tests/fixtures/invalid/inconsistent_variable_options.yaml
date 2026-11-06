@@ -1,0 +1,33 @@
+# The same variable declared with different options in two steps.
+schema: v2
+name: inconsistent-variable-options
+version: 1
+
+states:
+  first:
+    action:
+      type: agent
+      prompt: Zaimplementuj.
+    variables:
+      - name: autopilot
+        source: workflow
+        options: [off, on]
+    exit:
+      next: second
+
+  second:
+    action:
+      type: agent
+      prompt: Sprawdź.
+    variables:
+      - name: autopilot
+        source: workflow
+        options: [off, on, best-effort]
+    exit:
+      next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

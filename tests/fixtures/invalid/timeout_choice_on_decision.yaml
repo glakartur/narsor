@@ -1,0 +1,22 @@
+# Only an agent or script step can end with the engine's own `timeout`.
+schema: v2
+name: timeout-choice-on-decision
+version: 1
+
+states:
+  approval:
+    action:
+      type: decision
+      by: human
+      message: Zatwierdzasz?
+    choices:
+      approve:
+        next: done
+      timeout:
+        next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

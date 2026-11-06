@@ -1,0 +1,22 @@
+# A choice cannot require what only the workflow sets.
+schema: v2
+name: required-workflow-variable
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Zaimplementuj.
+    variables:
+      - name: autopilot
+        source: workflow
+    exit:
+      requires_variables: [autopilot]
+      next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

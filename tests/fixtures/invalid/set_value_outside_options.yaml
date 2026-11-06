@@ -1,0 +1,24 @@
+# A literal `set` value has to be one of the variable's `options`.
+schema: v2
+name: set-value-outside-options
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Zaimplementuj.
+    variables:
+      - name: autopilot
+        source: workflow
+        options: [off, on, best-effort]
+    exit:
+      set:
+        autopilot: always
+      next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

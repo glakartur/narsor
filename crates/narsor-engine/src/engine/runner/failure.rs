@@ -259,7 +259,7 @@ impl Engine {
                 // Unknown is not clean.
                 Err(_) => false,
             },
-            ActionKind::Human | ActionKind::Wait => false,
+            ActionKind::Human | ActionKind::Wait | ActionKind::Decision => false,
         }
     }
 }

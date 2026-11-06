@@ -112,7 +112,10 @@ fn step_definitions(contract: &StepContract<'_>) -> String {
     if !contract.variables.is_empty() {
         text.push_str("The step's variables (in `variables`, name → value):\n");
         for variable in contract.variables {
-            text.push_str(&described_item(&variable.name, Some(&variable.description)));
+            text.push_str(&described_item(
+                &variable.name,
+                variable.description.as_deref(),
+            ));
         }
     }
     if !contract.artifacts.is_empty() {

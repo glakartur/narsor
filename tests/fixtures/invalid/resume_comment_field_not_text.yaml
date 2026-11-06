@@ -1,0 +1,34 @@
+# `resume_comment_field` of a decision step names a `text` variable.
+schema: v2
+name: resume-comment-field-not-text
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Zaimplementuj.
+    exit:
+      next: approval
+
+  approval:
+    action:
+      type: decision
+      by: human
+      message: Zatwierdzasz?
+    variables:
+      - name: comment
+        type: select
+        options: [yes, no]
+    choices:
+      revise:
+        resume_comment_field: comment
+        next: work
+      approve:
+        next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

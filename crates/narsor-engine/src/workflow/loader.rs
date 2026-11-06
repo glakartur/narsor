@@ -17,6 +17,13 @@
 //!   repository in `read`; `read-write` leaves it writable). The file on disk
 //!   is never touched.
 //!
+//! * a `schema: v2` file written in the unified state shape (choices as a
+//!   mapping, `exit`, `decision` actions) is compiled into the same model as
+//!   the legacy shape: the `next` of each choice becomes a transition, and a
+//!   linear step's `exit` becomes its only choice, labelled [`EXIT_LABEL`].
+//!   A `schema: v2` file still in the legacy shape loads as before and is
+//!   reported as deprecated, see [`LoadDiagnostic`].
+//!
 //! No graph rules are checked here: an entry of `terminal_states` that names a
 //! state which does not exist is carried through without complaint, and
 //! reporting it is the validator's job.
@@ -28,17 +35,18 @@ use crate::workspace::provisioner::is_usable_directory_name;
 
 use crate::domain::{
     ActionConfig, AgentActionConfig, AgentDecisionConfig, ArtifactDefinition, ChoiceDefinition,
-    DecisionConfig, DisplayLinkSpec, DisplaySpec, GlobalsConfig, HumanActionConfig,
-    HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter, ParamType,
-    RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion, ScriptActionConfig, State,
-    StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig, WorkflowDefinition,
-    WorkspaceAccess,
+    DecisionActionConfig, DecisionConfig, DisplayLinkSpec, DisplaySpec, GlobalsConfig,
+    HumanActionConfig, HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter,
+    ParamType, RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion,
+    ScriptActionConfig, State, StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig,
+    WorkflowDefinition, WorkspaceAccess, EXIT_LABEL,
 };
 
 use super::schema::{
-    ActionSchema, ChoiceSchema, DecisionSchema, DisplaySchema, GlobalsSchema, HumanInputTypeSchema,
-    InputSchema, ParamTypeSchema, RepositorySchema, RepositorySourceSchema, RetryPolicySchema,
-    StateSchema, StepWorkspaceSchema, TerminalStatusSchema, WorkflowFile, WorkspaceSchema,
+    ActionSchema, ChoiceSchema, DecisionSchema, DisplaySchema, ExitSchema, GlobalsSchema,
+    HumanInputTypeSchema, InputSchema, ParamTypeSchema, RepositorySchema, RepositorySourceSchema,
+    RetryPolicySchema, StateSchema, StepWorkspaceSchema, TerminalStatusSchema, VariableSchema,
+    WorkflowFile, WorkspaceSchema,
 };
 
 /// Errors that can occur while loading a workflow definition from YAML.
@@ -65,6 +73,33 @@ pub enum LoadError {
     NoStates(String),
 }
 
+/// Something a loaded file does that still works but should change.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LoadDiagnostic {
+    /// `schema: v2` with states in the legacy shape (`choices` as a list and
+    /// a separate `transitions` map).
+    #[error(
+        "workflow '{workflow}' uses the legacy state shape under 'schema: v2' (choices as a \
+         list with separate 'transitions'); it still loads, but the shape is deprecated: write \
+         'choices' as a mapping with 'next' and use 'exit' for a linear step"
+    )]
+    DeprecatedStateShape { workflow: String },
+}
+
+/// A compiled definition with what its loading had to say.
+#[derive(Debug, Clone)]
+pub struct LoadedWorkflow {
+    pub definition: WorkflowDefinition,
+    pub diagnostics: Vec<LoadDiagnostic>,
+}
+
+/// Loads and compiles a workflow definition from a YAML string, returning the
+/// diagnostics too.
+pub fn load_from_str_with_diagnostics(yaml: &str) -> Result<LoadedWorkflow, LoadError> {
+    let file: WorkflowFile = serde_yaml::from_str(yaml).map_err(LoadError::ParseInline)?;
+    compile_with_diagnostics(file)
+}
+
 /// Loads and compiles a workflow definition from a YAML file.
 pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<WorkflowDefinition, LoadError> {
     let path = path.as_ref();
@@ -89,7 +124,33 @@ pub fn load_from_str(yaml: &str) -> Result<WorkflowDefinition, LoadError> {
 }
 
 /// Compiles an already deserialized workflow file into the domain model.
+///
+/// Diagnostics are logged; [`compile_with_diagnostics`] returns them.
 pub fn compile(file: WorkflowFile) -> Result<WorkflowDefinition, LoadError> {
+    let loaded = compile_with_diagnostics(file)?;
+    for diagnostic in &loaded.diagnostics {
+        tracing::warn!("{diagnostic}");
+    }
+    Ok(loaded.definition)
+}
+
+/// Compiles an already deserialized workflow file into the domain model and
+/// reports what is deprecated in it.
+pub fn compile_with_diagnostics(file: WorkflowFile) -> Result<LoadedWorkflow, LoadError> {
+    let mut diagnostics = Vec::new();
+    if file.uses_deprecated_state_shape() {
+        diagnostics.push(LoadDiagnostic::DeprecatedStateShape {
+            workflow: file.name.clone(),
+        });
+    }
+    let definition = compile_definition(file)?;
+    Ok(LoadedWorkflow {
+        definition,
+        diagnostics,
+    })
+}
+
+fn compile_definition(file: WorkflowFile) -> Result<WorkflowDefinition, LoadError> {
     if file.states.is_empty() {
         return Err(LoadError::NoStates(file.name));
     }
@@ -315,6 +376,8 @@ fn compile_state(
     // its access, so the action keeps it.
     let keeps_v1_access = workspace.is_none();
 
+    let (choices, transitions) = compile_exits(state.choices, state.exit, state.transitions);
+
     State {
         id,
         max_entries: state.max_entries,
@@ -322,14 +385,7 @@ fn compile_state(
         action: state
             .action
             .map(|action| compile_action(action, keeps_v1_access)),
-        variables: state
-            .variables
-            .into_iter()
-            .map(|variable| VariableDefinition {
-                name: variable.name,
-                description: variable.description,
-            })
-            .collect(),
+        variables: state.variables.into_iter().map(compile_variable).collect(),
         artifacts: state
             .artifacts
             .into_iter()
@@ -338,8 +394,8 @@ fn compile_state(
                 description: artifact.description,
             })
             .collect(),
-        choices: state.choices.into_iter().map(compile_choice).collect(),
-        transitions: state.transitions,
+        choices,
+        transitions,
         decision: state.decision.map(compile_decision),
         timeout_secs,
         retry_policy,
@@ -359,6 +415,32 @@ fn compile_step_workspace(section: &StepWorkspaceSchema) -> StepWorkspace {
     }
 }
 
+fn compile_variable(variable: VariableSchema) -> VariableDefinition {
+    VariableDefinition {
+        name: variable.name,
+        description: variable.description,
+        scope: variable.scope,
+        source: variable.source,
+        variable_type: variable.variable_type,
+        options: variable.options,
+    }
+}
+
+/// The choices and transitions of a state. A linear step's `exit` becomes its
+/// only choice, under [`EXIT_LABEL`], with its `next` as the one transition.
+fn compile_exits(
+    choices: Vec<ChoiceSchema>,
+    exit: Option<ExitSchema>,
+    mut transitions: HashMap<String, String>,
+) -> (Vec<ChoiceDefinition>, HashMap<String, String>) {
+    let mut compiled: Vec<ChoiceDefinition> = choices.into_iter().map(compile_choice).collect();
+    if let Some(exit) = exit {
+        transitions.insert(EXIT_LABEL.to_string(), exit.next);
+        compiled.push(compile_choice(exit.choice));
+    }
+    (compiled, transitions)
+}
+
 fn compile_choice(choice: ChoiceSchema) -> ChoiceDefinition {
     ChoiceDefinition {
         label: choice.label,
@@ -369,6 +451,7 @@ fn compile_choice(choice: ChoiceSchema) -> ChoiceDefinition {
         description: non_blank(choice.description),
         requires_human_approval: choice.requires_human_approval,
         resume_comment_field: non_blank(choice.resume_comment_field),
+        set: choice.set,
     }
 }
 
@@ -422,6 +505,10 @@ fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
                 })
                 .collect(),
             input_schema: None,
+        }),
+        ActionSchema::Decision(decision) => ActionConfig::Decision(DecisionActionConfig {
+            by: decision.by,
+            message: decision.message,
         }),
         ActionSchema::Wait(wait) => ActionConfig::Wait(WaitActionConfig {
             // Name drift: YAML says `event_type`, the domain says `event`.

@@ -1,0 +1,50 @@
+# A decision step decided by the operator: `variables` become the form, the
+# choices the menu, each with its own requirements.
+schema: v2
+name: human-decision
+version: 1
+
+states:
+  review:
+    action:
+      type: agent
+      prompt: Review the change.
+    variables:
+      - name: findings
+        description: Review remarks.
+    exit:
+      requires_variables: [findings]
+      next: approval
+
+  approval:
+    action:
+      type: decision
+      by: human
+      message: "Review finished: {{ steps.review.reply }}"
+    variables:
+      - name: comment
+        type: text
+        description: Remarks on the decision.
+      - name: severity
+        type: select
+        options: [low, high]
+    choices:
+      approve:
+        next: done
+      revise:
+        requires_variables: [comment]
+        resume_comment_field: comment
+        next: review
+      reject:
+        requires_variables: [comment, severity]
+        next: cancelled
+
+  done:
+    description: Finished.
+
+  cancelled:
+    description: Dropped.
+
+terminal_states:
+  done: completed
+  cancelled: cancelled

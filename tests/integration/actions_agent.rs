@@ -1549,6 +1549,7 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
             description: Some("The plan is written and nothing is unclear.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            set: Default::default(),
         },
         ChoiceDefinition::new("ambiguous"),
     ];
@@ -1569,10 +1570,7 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
 }
 
 fn variable(name: &str, description: &str) -> VariableDefinition {
-    VariableDefinition {
-        name: name.to_string(),
-        description: description.to_string(),
-    }
+    VariableDefinition::described(name, description)
 }
 
 /// R10: the step's variables and artifacts are described once, and every
@@ -1720,6 +1718,7 @@ fn a_contract_without_descriptions_lists_bare_labels_only() {
             description: Some("   ".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            set: Default::default(),
         },
     ];
     let contract = output_contract(

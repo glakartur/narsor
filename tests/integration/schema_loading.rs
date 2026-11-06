@@ -4,11 +4,14 @@
 //! verbatim from `docs/dev/workflow-schema.md` §4.
 
 use narsor_engine::domain::{
-    ActionConfig, ExecutionStatus, HumanInputType, ParamType, State, StepWorkspace, TerminalStatus,
-    WorkflowDefinition, WorkspaceAccess, WorkspaceSpec,
+    ActionConfig, DecisionMaker, ExecutionStatus, HumanInputType, ParamType, SchemaVersion, State,
+    StepWorkspace, TerminalStatus, VariableScope, VariableSource, VariableType, WorkflowDefinition,
+    WorkspaceAccess, WorkspaceSpec, EXIT_LABEL,
 };
 use narsor_engine::engine::terminal_status;
-use narsor_engine::workflow::{load_from_file, load_from_str};
+use narsor_engine::workflow::{
+    load_from_file, load_from_str, load_from_str_with_diagnostics, LoadDiagnostic,
+};
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -124,7 +127,12 @@ terminal_states: [done]
     let variables: Vec<(&str, &str)> = agent
         .variables
         .iter()
-        .map(|variable| (variable.name.as_str(), variable.description.as_str()))
+        .map(|variable| {
+            (
+                variable.name.as_str(),
+                variable.description.as_deref().expect("described"),
+            )
+        })
         .collect();
     assert_eq!(
         variables,
@@ -1375,5 +1383,384 @@ fn a_definition_without_display_has_none_and_serialises_without_the_key() {
     assert!(
         json.get("display").is_none(),
         "an absent display must not change the sealed snapshot or its digest"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The unified state shape of `schema: v2`
+// ---------------------------------------------------------------------------
+
+const UNIFIED_FIXTURES: [&str; 5] = [
+    "v2/exit.yaml",
+    "v2/set.yaml",
+    "v2/scope.yaml",
+    "v2/decision_human.yaml",
+    "v2/decision_conductor.yaml",
+];
+
+fn load_fixture(name: &str) -> WorkflowDefinition {
+    load_from_file(fixture_path(name)).unwrap_or_else(|error| panic!("{name} must load: {error}"))
+}
+
+fn load_error(yaml: &str) -> String {
+    load_from_str(yaml)
+        .expect_err("the file must not load")
+        .to_string()
+}
+
+/// Wraps `states` into a unified-shape file whose only terminal state is `done`.
+fn unified(states: &str) -> String {
+    format!(
+        "schema: v2\nname: unified\nversion: 1\nstates:\n{states}\n  done:\n    description: end\n\
+         terminal_states:\n  done: completed\n"
+    )
+}
+
+fn labels(state: &State) -> Vec<&str> {
+    state
+        .choices
+        .iter()
+        .map(|choice| choice.label.as_str())
+        .collect()
+}
+
+#[test]
+fn every_unified_fixture_loads_validates_and_is_not_deprecated() {
+    for name in UNIFIED_FIXTURES {
+        let yaml = std::fs::read_to_string(fixture_path(name)).unwrap();
+        let loaded = load_from_str_with_diagnostics(&yaml)
+            .unwrap_or_else(|error| panic!("{name} must load: {error}"));
+        assert_eq!(loaded.definition.source_schema, SchemaVersion::V2, "{name}");
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "{name}: {:?}",
+            loaded.diagnostics
+        );
+        if let Err(errors) = loaded.definition.validate() {
+            panic!("{name} must validate, got: {errors:?}");
+        }
+    }
+}
+
+#[test]
+fn choices_as_a_mapping_compile_to_choices_and_transitions_in_file_order() {
+    let definition = load_fixture("v2/exit.yaml");
+    let test = state(&definition, "test");
+
+    assert_eq!(labels(test), ["passed", "failed", "timeout"]);
+    assert_eq!(test.transitions["passed"], "done");
+    assert_eq!(test.transitions["failed"], "implement");
+    assert_eq!(test.transitions["timeout"], "gave_up");
+    assert_eq!(test.transitions.len(), 3);
+    assert_eq!(
+        test.choices[0].description.as_deref(),
+        Some("Tests are green.")
+    );
+}
+
+#[test]
+fn an_exit_compiles_to_one_reserved_choice_and_one_transition() {
+    let definition = load_fixture("v2/exit.yaml");
+    let implement = state(&definition, "implement");
+
+    assert_eq!(labels(implement), [EXIT_LABEL]);
+    assert!(implement.choices[0].is_exit());
+    assert_eq!(implement.choices[0].requires_variables, ["summary"]);
+    assert_eq!(
+        implement.choices[0].description.as_deref(),
+        Some("The change is written.")
+    );
+    assert_eq!(implement.transitions.len(), 1);
+    assert_eq!(implement.transitions[EXIT_LABEL], "test");
+}
+
+#[test]
+fn terminal_states_of_a_unified_file_carry_their_status() {
+    let definition = load_fixture("v2/exit.yaml");
+
+    assert_eq!(
+        state(&definition, "gave_up").terminal_status,
+        Some(TerminalStatus::Failed)
+    );
+    assert!(state(&definition, "implement")
+        .choices
+        .iter()
+        .all(|choice| !choice.label.is_empty()));
+}
+
+#[test]
+fn set_compiles_onto_the_choice_that_declares_it() {
+    let definition = load_fixture("v2/set.yaml");
+
+    let exit = &state(&definition, "implement").choices[0];
+    assert_eq!(exit.set.global["autopilot"], "best-effort");
+    assert_eq!(exit.set.local["notes"], "");
+
+    let review = state(&definition, "review");
+    assert_eq!(review.choices[0].set.global["autopilot"], "off");
+    assert!(review.choices[1].set.is_empty());
+}
+
+#[test]
+fn variables_carry_scope_source_type_and_options() {
+    let definition = load_fixture("v2/set.yaml");
+    let variables = &state(&definition, "implement").variables;
+
+    let summary = &variables[0];
+    assert_eq!(summary.scope, VariableScope::Global);
+    assert_eq!(summary.source, VariableSource::Step);
+    assert_eq!(summary.variable_type, None);
+
+    let autopilot = &variables[1];
+    assert_eq!(autopilot.source, VariableSource::Workflow);
+    assert_eq!(autopilot.description, None);
+    assert_eq!(autopilot.options, ["off", "on", "best-effort"]);
+
+    let notes = &variables[2];
+    assert_eq!(notes.scope, VariableScope::Local);
+    assert_eq!(notes.variable_type, Some(VariableType::Text));
+    assert!(notes.is_local());
+    assert!(!summary.is_local());
+}
+
+#[test]
+fn a_decision_step_names_who_decides() {
+    let definition = load_fixture("v2/decision_conductor.yaml");
+    let by = |id: &str| match &state(&definition, id).action {
+        Some(ActionConfig::Decision(decision)) => decision.by,
+        other => panic!("'{id}' must be a decision, got {other:?}"),
+    };
+
+    assert_eq!(by("triage"), DecisionMaker::Conductor);
+    assert_eq!(by("approval"), DecisionMaker::Human);
+    assert_eq!(
+        labels(state(&definition, "triage")),
+        ["fix", "flaky", "escalate"]
+    );
+}
+
+#[test]
+fn a_step_cannot_have_both_exit_and_choices() {
+    let yaml = unified(
+        "  work:\n    action: { type: script, command: ./a.sh }\n    exit: { next: done }\n    \
+         choices:\n      ok: { next: done }",
+    );
+    assert!(load_error(&yaml).contains("'exit' or 'choices'"));
+}
+
+#[test]
+fn a_terminal_state_cannot_have_an_exit_or_choices() {
+    for body in ["exit: { next: done }", "choices: { ok: { next: done } }"] {
+        let yaml = format!(
+            "schema: v2\nname: x\nversion: 1\nstates:\n  work:\n    action: {{ type: script, \
+             command: ./a.sh }}\n    exit: {{ next: done }}\n  done:\n    {body}\n\
+             terminal_states: {{ done: completed }}\n"
+        );
+        assert!(
+            load_error(&yaml).contains("terminal state 'done'"),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn the_label_reserved_for_exit_cannot_be_a_choice() {
+    let yaml = unified(
+        "  work:\n    action: { type: script, command: ./a.sh }\n    choices:\n      exit: { next: done }",
+    );
+    let error = load_error(&yaml);
+    assert!(
+        error.contains("reserved") && error.contains(EXIT_LABEL),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_choice_needs_a_target_and_knows_only_its_own_fields() {
+    let without_next = unified(
+        "  work:\n    action: { type: script, command: ./a.sh }\n    choices:\n      ok: { description: x }",
+    );
+    assert!(load_error(&without_next).contains("next"));
+
+    let stray_label = unified(
+        "  work:\n    action: { type: script, command: ./a.sh }\n    choices:\n      ok: { label: ok, next: done }",
+    );
+    assert!(load_error(&stray_label).contains("label"));
+}
+
+#[test]
+fn a_set_value_is_a_scalar_and_local_is_a_mapping() {
+    let state = |set: &str| {
+        unified(&format!(
+            "  work:\n    action: {{ type: script, command: ./a.sh }}\n    exit: {{ set: {set}, next: done }}"
+        ))
+    };
+    assert!(load_error(&state("{ a: [1] }")).contains("set.a"));
+    assert!(load_error(&state("{ local: 1 }")).contains("set.local"));
+    assert!(load_error(&state("{ local: { b: { c: 1 } } }")).contains("set.local.b"));
+    assert!(load_from_str(&state("{ a: 1, b: true, c: text, local: { d: 2 } }")).is_ok());
+}
+
+#[test]
+fn a_variable_of_a_unified_step_is_never_named_with_the_local_prefix() {
+    let yaml = unified(
+        "  work:\n    action: { type: agent, prompt: p }\n    variables:\n      - { name: local.x }\n    \
+         exit: { next: done }",
+    );
+    assert!(load_error(&yaml).contains("scope: local"));
+}
+
+#[test]
+fn the_unified_shape_has_no_human_gate_decision_block_or_transitions() {
+    let human = unified(
+        "  work:\n    action: { type: human, message: m }\n    choices:\n      ok: { next: done }",
+    );
+    assert!(load_error(&human).contains("'by: human'"));
+
+    // These keys mark the legacy shape, so with them the file is read as such
+    // and the unified-only parts fail there.
+    let transitions = unified(
+        "  work:\n    action: { type: script, command: ./a.sh }\n    exit: { next: done }\n    \
+         transitions: { ok: done }",
+    );
+    let error = load_error(&transitions);
+    assert!(
+        error.contains("legacy state shape") && error.contains("transitions"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_decision_action_needs_the_unified_shape() {
+    let yaml = "name: x\nversion: 1\nstates:\n  ask:\n    action: { type: decision, by: human, \
+                message: m }\n    choices: [ok]\n    transitions: { ok: end }\n  end: {}\n\
+                terminal_states: [end]\n";
+    assert!(load_error(yaml).contains("decision"));
+}
+
+// ---------------------------------------------------------------------------
+// Files written before the unified shape keep loading
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_v2_file_in_the_legacy_shape_loads_and_is_reported_as_deprecated() {
+    let yaml = std::fs::read_to_string(fixture_path("multirepo/code_and_docs.yaml")).unwrap();
+    let loaded = load_from_str_with_diagnostics(&yaml).expect("the legacy v2 shape must load");
+
+    assert_eq!(loaded.definition.source_schema, SchemaVersion::V2);
+    assert_eq!(
+        loaded.diagnostics,
+        [LoadDiagnostic::DeprecatedStateShape {
+            workflow: "code-and-docs".to_string()
+        }]
+    );
+    let implement = state(&loaded.definition, "implement");
+    assert_eq!(labels(implement), ["done"]);
+    assert_eq!(implement.transitions["done"], "document");
+}
+
+#[test]
+fn a_legacy_v2_file_without_any_transitions_is_still_legacy_through_its_list_forms() {
+    // Only terminal states, listed the old way: no state carries a legacy key,
+    // the list form of `terminal_states` is what gives the shape away.
+    let yaml = "schema: v2\nname: x\nversion: 1\nstates:\n  done:\n    description: d\n\
+                terminal_states: [done]\n";
+    let loaded = load_from_str_with_diagnostics(yaml).expect("loads");
+    assert_eq!(loaded.diagnostics.len(), 1);
+}
+
+#[test]
+fn v1_files_and_unified_files_raise_no_diagnostics() {
+    let v1 = std::fs::read_to_string(fixture_path("implement_feature.yaml")).unwrap();
+    assert!(load_from_str_with_diagnostics(&v1)
+        .unwrap()
+        .diagnostics
+        .is_empty());
+
+    let unified = std::fs::read_to_string(fixture_path("v2/exit.yaml")).unwrap();
+    assert!(load_from_str_with_diagnostics(&unified)
+        .unwrap()
+        .diagnostics
+        .is_empty());
+}
+
+#[test]
+fn a_definition_serialized_before_the_unified_shape_still_deserializes() {
+    // What a pinned definition looked like: no scope, source, type, options,
+    // `set` or decision action anywhere.
+    let stored = serde_json::json!({
+        "id": "wf", "name": "wf", "version": 1, "initial_state": "work",
+        "states": {
+            "work": {
+                "id": "work",
+                "action": {"type": "agent", "prompt": "p", "history": true},
+                "variables": [{"name": "summary", "description": "What was done"}],
+                "choices": [{"label": "done", "requires_variables": ["summary"]}],
+                "transitions": {"done": "end"}
+            },
+            "end": {"id": "end", "terminal": true}
+        }
+    });
+    let definition: WorkflowDefinition = serde_json::from_value(stored).expect("old record loads");
+
+    let work = state(&definition, "work");
+    assert_eq!(work.variables[0].scope, VariableScope::Global);
+    assert_eq!(work.variables[0].source, VariableSource::Step);
+    assert!(work.variables[0].options.is_empty());
+    assert!(work.choices[0].set.is_empty());
+}
+
+#[test]
+fn a_definition_round_trips_through_json_with_its_new_fields() {
+    let definition = load_fixture("v2/set.yaml");
+    let json = serde_json::to_value(&definition).unwrap();
+    let back: WorkflowDefinition = serde_json::from_value(json).unwrap();
+
+    let implement = state(&back, "implement");
+    assert_eq!(
+        implement.choices[0].set,
+        state(&definition, "implement").choices[0].set
+    );
+    assert_eq!(
+        implement.variables,
+        state(&definition, "implement").variables
+    );
+    assert_eq!(implement.variables[2].scope, VariableScope::Local);
+
+    let conductor = load_fixture("v2/decision_conductor.yaml");
+    let json = serde_json::to_value(&conductor).unwrap();
+    let back: WorkflowDefinition = serde_json::from_value(json).unwrap();
+    assert!(matches!(
+        &state(&back, "triage").action,
+        Some(ActionConfig::Decision(decision)) if decision.by == DecisionMaker::Conductor
+    ));
+}
+
+#[test]
+fn a_legacy_definition_serializes_without_the_new_fields() {
+    let json = serde_json::to_value(load_reference()).unwrap();
+    let mut variables_seen = 0;
+
+    for state in json["states"].as_object().unwrap().values() {
+        for variable in state["variables"].as_array().into_iter().flatten() {
+            variables_seen += 1;
+            let keys: Vec<&str> = variable
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert!(
+                keys.iter().all(|key| ["name", "description"].contains(key)),
+                "{keys:?}"
+            );
+        }
+        for choice in state["choices"].as_array().into_iter().flatten() {
+            assert!(choice.get("set").is_none(), "{choice}");
+        }
+    }
+    assert!(
+        variables_seen > 0,
+        "the reference example defines variables"
     );
 }

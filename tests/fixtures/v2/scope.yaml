@@ -1,0 +1,61 @@
+# `scope: local` keeps a variable private to its step, on agent, script and
+# decision steps alike.
+schema: v2
+name: local-scope
+version: 1
+
+states:
+  review:
+    action:
+      type: agent
+      prompt: Review the change.
+    variables:
+      - name: findings
+        description: Review remarks.
+      - name: notes
+        scope: local
+        description: Notes for the next entry into this step.
+    choices:
+      approved:
+        next: check
+      changes_requested:
+        requires_variables: [findings, notes]
+        next: review
+
+  check:
+    action:
+      type: script
+      command: ./check.sh
+    variables:
+      - name: cursor
+        scope: local
+        type: integer
+    choices:
+      success:
+        set:
+          local:
+            cursor: 0
+        next: decide
+      failure:
+        next: review
+
+  decide:
+    action:
+      type: decision
+      by: human
+      message: "Ship it? Local note: {{ local.remark }}"
+    variables:
+      - name: remark
+        scope: local
+        type: text
+    choices:
+      ship:
+        next: done
+      hold:
+        next: review
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

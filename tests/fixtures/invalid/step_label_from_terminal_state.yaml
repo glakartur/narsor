@@ -1,0 +1,20 @@
+# `steps.<id>.label` names a step that has an action.
+schema: v2
+name: step-label-from-terminal-state
+version: 1
+
+states:
+  approval:
+    action:
+      type: decision
+      by: conductor
+      message: "Poprzednio: {{ steps.done.label }}"
+    choices:
+      approve:
+        next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

@@ -234,6 +234,8 @@ pub enum ActionKind {
     Human,
     /// `WaitAction` — no executor in this version.
     Wait,
+    /// `DecisionAction` — no executor in this version.
+    Decision,
 }
 
 impl ActionKind {
@@ -244,6 +246,7 @@ impl ActionKind {
             ActionConfig::Script(_) => Self::Script,
             ActionConfig::Human(_) => Self::Human,
             ActionConfig::Wait(_) => Self::Wait,
+            ActionConfig::Decision(_) => Self::Decision,
         }
     }
 
@@ -254,6 +257,7 @@ impl ActionKind {
             Self::Script => "script",
             Self::Human => "human",
             Self::Wait => "wait",
+            Self::Decision => "decision",
         }
     }
 }
@@ -2263,7 +2267,9 @@ impl Engine {
             // Unchanged, bit for bit: a script or human state that declares no
             // limit still has none. Spelled out rather than caught by `_`, so
             // that a fifth action kind has to decide rather than inherit.
-            ActionKind::Script | ActionKind::Human | ActionKind::Wait => declared,
+            ActionKind::Script | ActionKind::Human | ActionKind::Wait | ActionKind::Decision => {
+                declared
+            }
         }
     }
 

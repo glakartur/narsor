@@ -35,9 +35,10 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value};
 
 use crate::domain::{
-    safe_link_url, ActionConfig, AgentActionConfig, ArtifactReference, Context, DisplayLink,
-    DisplaySpec, HumanActionConfig, ScriptActionConfig, TaskDisplay, VariableDefinition,
-    WaitActionConfig, WorkflowDefinition, EMPTY_LINK_TEXT, LOCAL_VARIABLE_PREFIX,
+    safe_link_url, ActionConfig, AgentActionConfig, ArtifactReference, Context,
+    DecisionActionConfig, DisplayLink, DisplaySpec, HumanActionConfig, ScriptActionConfig,
+    TaskDisplay, VariableDefinition, WaitActionConfig, WorkflowDefinition, EMPTY_LINK_TEXT,
+    LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -433,6 +434,11 @@ impl<'a> TemplateScope<'a> {
                 ..config.clone()
             })),
 
+            ActionConfig::Decision(config) => Ok(ActionConfig::Decision(DecisionActionConfig {
+                message: self.render(&config.message, &format!("{location}, message"))?,
+                ..config.clone()
+            })),
+
             ActionConfig::Wait(config) => {
                 let filter = match &config.filter {
                     Some(filter) => {
@@ -677,6 +683,19 @@ pub fn step_reply_references(template: &str) -> Vec<String> {
     ids
 }
 
+/// Workflow step ids referenced through `steps.<id>.label`, in first-use order.
+pub fn step_label_references(template: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for path in step_paths(template) {
+        if let Some((id, "label")) = path.split_once('.') {
+            if plain_name(id).is_some() && !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
 /// Script stream references in first-use order, without repeats.
 pub fn step_stream_references(template: &str) -> Vec<(String, String)> {
     let mut references = Vec::new();
@@ -700,7 +719,7 @@ pub fn unsupported_step_references(template: &str) -> Vec<String> {
     step_paths(template)
         .into_iter()
         .filter(
-            |path| !matches!(path.split_once('.'), Some((id, "reply" | "stdout" | "stderr")) if plain_name(id).is_some()),
+            |path| !matches!(path.split_once('.'), Some((id, "reply" | "stdout" | "stderr" | "label")) if plain_name(id).is_some()),
         )
         .map(|path| format!("steps.{path}"))
         .collect()
@@ -752,6 +771,7 @@ pub fn action_context_references(action: &ActionConfig) -> Vec<String> {
             }
         }
         ActionConfig::Human(config) => collect_context_references(&config.instruction, &mut names),
+        ActionConfig::Decision(config) => collect_context_references(&config.message, &mut names),
         ActionConfig::Wait(config) => {
             if let Some(filter) = &config.filter {
                 collect_value_references(filter, &mut names);

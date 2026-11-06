@@ -206,6 +206,7 @@ mod tests {
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,
+                    set: Default::default(),
                 },
                 ChoiceDefinition {
                     label: "orphan".to_string(),
@@ -214,6 +215,7 @@ mod tests {
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,
+                    set: Default::default(),
                 },
             ],
             transitions,
