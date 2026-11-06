@@ -1614,6 +1614,13 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::AgentConversation,
+        Key::char('f'),
+        Action::Follow,
+        "śledź",
+        "włącz albo wyłącz śledzenie najnowszego kroku i jego najnowszego wpisu",
+    ),
+    bind(
+        Context::AgentConversation,
         Key::code(KeyCode::Left),
         Action::NewerStep,
         "kroki",

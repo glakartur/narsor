@@ -6794,7 +6794,7 @@ mod stacked_form {
     }
 
     #[test]
-    fn the_branch_box_is_filled_from_its_label_to_one_cell_before_the_edge() {
+    fn the_branch_box_is_filled_from_its_label_to_one_cell_before_the_edge_only_with_the_focus() {
         let styles = Styles::new(false);
         for focus_steps in [0, 1, 2] {
             let mut chooser = entered(repository_and_branch("main"));
@@ -6808,13 +6808,21 @@ mod stacked_form {
             let box_start = rows[value][..start].chars().count() + "gałąź: ".chars().count();
             let cells = filled(&buffer, value, &styles);
             let width = usize::from(WIDTH);
-            assert!(
-                cells[box_start..width - 1].iter().all(|&on| on),
-                "focus {focus_steps}: {cells:?}\n{}",
-                screen(&buffer)
-            );
-            assert!(!cells[width - 1], "a gap at the edge");
-            assert!(!cells[box_start - 1], "the label has no fill");
+            if focus_steps == 2 {
+                assert!(
+                    cells[box_start..width - 1].iter().all(|&on| on),
+                    "{cells:?}\n{}",
+                    screen(&buffer)
+                );
+                assert!(!cells[width - 1], "a gap at the edge");
+                assert!(!cells[box_start - 1], "the label has no fill");
+            } else {
+                assert!(
+                    !cells[box_start..].iter().any(|&on| on),
+                    "no fill without the focus (focus {focus_steps}):\n{}",
+                    screen(&buffer)
+                );
+            }
         }
     }
 
@@ -6896,15 +6904,18 @@ mod stacked_form {
     }
 
     #[test]
-    fn without_colour_the_branch_box_is_underlined() {
+    fn without_colour_the_branch_box_has_no_fill_and_no_underline() {
         let styles = Styles::new(true);
         let mut chooser = entered(repository_and_branch("main"));
+        press(&mut chooser, KeyCode::Down);
+        press(&mut chooser, KeyCode::Down);
         let buffer = draw_chooser(WIDTH, 20, &mut chooser, &styles);
-        let (y, x) = spot(&buffer, "gałąź: main");
-        let box_x = x + "gałąź: ".chars().count() as u16;
-        let cell = &buffer[(box_x, y)];
-        assert!(cell.modifier.contains(Modifier::UNDERLINED));
         assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
+        assert!(!buffer
+            .content()
+            .iter()
+            .any(|cell| cell.modifier.contains(Modifier::UNDERLINED)));
+        assert!(screen(&buffer).contains("gałąź: main"));
     }
 
     #[test]

@@ -201,17 +201,19 @@ impl TaskDetail {
         }
     }
 
-    /// In *Rozmowa* `←` / `→` pick the step and the other keys read it.
+    /// In *Rozmowa* `←` / `→` pick the step, `f` follows the newest one and
+    /// the other keys read it.
     fn on_conversation_action(&mut self, action: Action) {
-        let moved = match action {
+        let rebuild = match action {
             Action::NewerStep => self.conversation.select_newer(),
             Action::OlderStep => self.conversation.select_older(),
+            Action::Follow => self.conversation.toggle_follow(),
             _ => {
-                transcript_action(self.conversation.transcript_mut(), action);
+                self.conversation.read(action);
                 false
             }
         };
-        if moved {
+        if rebuild {
             rebuild_conversation(self);
         }
     }
@@ -1210,7 +1212,7 @@ pub(super) fn render_view(
         Paragraph::new(tab_bar(
             view.tab,
             &view.detail.progress,
-            view.detail.conversation.transcript().is_following_end(),
+            view.detail.conversation.follows(),
             focused,
             styles,
             tabs_content.width,

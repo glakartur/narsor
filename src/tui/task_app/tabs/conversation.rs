@@ -496,8 +496,9 @@ pub struct StepChip {
 }
 
 /// *Rozmowa*: the conversation of one step entry at a time, picked on the
-/// strip of steps above it, newest first. The strip follows the newest step
-/// while it is the one selected; a step picked further back stays. Each step
+/// strip of steps above it, newest first. Following (`f`) keeps the newest
+/// step and its newest entry in view; picking a step by hand or scrolling up
+/// in its conversation ends it. Each step
 /// keeps its own reader (cursor, expanded entries, following the end).
 #[derive(Debug, Clone)]
 pub struct Conversation {
@@ -565,9 +566,32 @@ impl Conversation {
         self.selected.as_deref()
     }
 
-    /// Whether the selection follows the newest step.
-    pub fn follows_newest(&self) -> bool {
+    /// Whether it follows: the newest step, at its newest entry.
+    pub fn follows(&self) -> bool {
         self.follow
+    }
+
+    /// `f`: follow the newest step at its newest entry, or stop following
+    /// and leave the reader where it is. Returns whether the conversation
+    /// must be put together again, as the selection moves to the newest step.
+    pub fn toggle_follow(&mut self) -> bool {
+        self.follow = !self.follow;
+        if !self.follow {
+            let reader = self.transcript_mut();
+            if reader.is_following_end() {
+                reader.toggle_follow();
+            }
+        }
+        self.follow
+    }
+
+    /// A reading key on the selected step's reader. Leaving the end of the
+    /// conversation ends the following.
+    pub fn read(&mut self, action: Action) {
+        transcript_action(self.transcript_mut(), action);
+        if !self.transcript().is_following_end() {
+            self.follow = false;
+        }
     }
 
     /// Whether the conversation was put together at least once.
@@ -612,7 +636,7 @@ impl Conversation {
             return false;
         }
         self.selected = Some(self.steps[to as usize].label.clone());
-        self.follow = to == 0;
+        self.follow = false;
         true
     }
 
@@ -648,7 +672,6 @@ impl Conversation {
             .collect();
         if self.follow || self.selected_index().is_none() {
             self.selected = self.steps.first().map(|step| step.label.clone());
-            self.follow = true;
         }
         let selected = self
             .selected
@@ -671,6 +694,9 @@ impl Conversation {
                 .entry(position.label.clone())
                 .or_insert_with(|| TranscriptState::new(id))
                 .replace_entries(built.entries);
+        }
+        if self.follow && !self.transcript().is_following_end() {
+            self.transcript_mut().toggle_follow();
         }
         self.loading = built.loading;
         self.failure = built.failure;

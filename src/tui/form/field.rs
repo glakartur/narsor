@@ -205,9 +205,10 @@ const MIN_BRANCH_BOX: usize = 12;
 /// One row for a repository and its branch:
 /// `> ‹ repo ›   gałąź: [branch      ]`. The repository is drawn as a select
 /// (the editing fill under `‹ … ›` while it has the focus); the branch is a
-/// box with [`Styles::inline_field`] from its label to one cell before the
-/// edge, which scrolls sideways to keep the cursor in view. Remembers the
-/// box's width in the branch field, so that its cursor keys walk what is drawn.
+/// box from its label to one cell before the edge, filled while it has the
+/// focus like every field being edited, and scrolled sideways to keep the
+/// cursor in view. Remembers the box's width in the branch field, so that
+/// its cursor keys walk what is drawn.
 pub fn repository_branch_line(
     repository: &ChooserField,
     branch: &ChooserField,
@@ -249,8 +250,9 @@ pub fn repository_branch_line(
     Line::from(spans)
 }
 
-/// The branch's box, `width` cells: the part of its text around the cursor,
-/// the cursor reversed while `focused`, the fill to the end of the box.
+/// The branch's box, `width` cells: its text, and while `focused` the part
+/// around the cursor, the cursor reversed and the editing fill to the end of
+/// the box.
 fn branch_box(
     branch: &ChooserField,
     width: usize,
@@ -258,26 +260,17 @@ fn branch_box(
     styles: &Styles,
 ) -> Vec<Span<'static>> {
     branch.wrap_width().set(width);
-    let fill = styles.inline_field();
     let text: Vec<char> = sanitize(branch.value()).chars().collect();
+    if !focused {
+        return vec![Span::raw(text.iter().take(width).collect::<String>())];
+    }
     let cursor = branch.cursor().min(text.len());
     // The cursor at the end of the text takes a cell of its own.
-    let first = if focused {
-        (cursor + 1).saturating_sub(width)
-    } else {
-        0
-    };
+    let first = (cursor + 1).saturating_sub(width);
     let visible: String = text.iter().skip(first).take(width).collect();
-    let used = if focused {
-        cells(&visible).max(cursor - first + 1)
-    } else {
-        cells(&visible)
-    };
-    let mut spans = if focused {
-        cursor_spans(&visible, cursor - first, fill, styles.cursor())
-    } else {
-        vec![Span::styled(visible, fill)]
-    };
+    let used = cells(&visible).max(cursor - first + 1);
+    let fill = styles.field_editing();
+    let mut spans = cursor_spans(&visible, cursor - first, fill, styles.cursor());
     spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), fill));
     spans
 }

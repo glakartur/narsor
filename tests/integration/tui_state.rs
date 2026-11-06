@@ -4545,7 +4545,7 @@ mod task_app_detail {
             assert!(conversation.select_older());
             assert!(!conversation.select_older(), "the oldest is selected");
             assert_eq!(conversation.selected_step(), Some("plan #1"));
-            assert!(!conversation.follows_newest());
+            assert!(!conversation.follows());
             conversation.rebuild(&positions, &attempts);
             let lines = texts(&conversation);
             assert!(
@@ -4625,7 +4625,7 @@ mod task_app_detail {
             positions.remove(0);
             conversation.rebuild(&positions, &attempts);
             assert_eq!(conversation.selected_step(), Some("edit #1"));
-            assert!(conversation.follows_newest());
+            assert!(!conversation.follows(), "following stays off");
 
             conversation.rebuild(&[], &attempts);
             assert_eq!(conversation.selected_step(), None);
@@ -4633,30 +4633,65 @@ mod task_app_detail {
         }
 
         #[test]
-        fn a_new_step_is_followed_only_while_the_newest_is_selected() {
+        fn following_keeps_the_newest_step_until_a_step_is_picked_by_hand() {
             let mut positions = three_steps();
             let attempts = Attempts::default();
             let mut conversation = Conversation::new("a");
             conversation.rebuild(&positions, &attempts);
+            assert!(conversation.follows(), "a new tab follows");
             positions.push(position("review", PositionStatus::InProgress));
             conversation.rebuild(&positions, &attempts);
             assert_eq!(conversation.selected_step(), Some("review #1"));
 
             conversation.select_older();
+            conversation.select_newer();
+            assert!(
+                !conversation.follows(),
+                "back on the newest by hand is not following"
+            );
             positions.push(position("merge", PositionStatus::InProgress));
             conversation.rebuild(&positions, &attempts);
             assert_eq!(
                 conversation.selected_step(),
-                Some("edit #1"),
+                Some("review #1"),
                 "a picked step stays"
             );
 
-            conversation.select_newer();
-            conversation.select_newer();
-            assert!(conversation.follows_newest(), "back on the newest");
+            assert!(conversation.toggle_follow());
+            conversation.rebuild(&positions, &attempts);
+            assert_eq!(conversation.selected_step(), Some("merge #1"));
+            assert!(conversation.transcript().is_following_end());
             positions.push(position("deploy", PositionStatus::InProgress));
             conversation.rebuild(&positions, &attempts);
             assert_eq!(conversation.selected_step(), Some("deploy #1"));
+
+            assert!(!conversation.toggle_follow());
+            assert!(!conversation.follows());
+        }
+
+        #[test]
+        fn scrolling_up_in_the_conversation_ends_the_following() {
+            let positions = three_steps();
+            let mut attempts = Attempts::default();
+            attempts.apply(
+                "act-edit",
+                1,
+                0,
+                Ok(read(vec![entry("1", "edit one"), entry("2", "edit two")])),
+            );
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild(&positions, &attempts);
+            assert!(conversation.follows());
+            conversation.read(narsor::tui::keymap::Action::Top);
+            assert!(!conversation.follows());
+
+            conversation.toggle_follow();
+            conversation.rebuild(&positions, &attempts);
+            assert!(conversation.follows());
+            assert!(
+                conversation.transcript().is_following_end(),
+                "back at the newest entry"
+            );
         }
 
         #[test]
