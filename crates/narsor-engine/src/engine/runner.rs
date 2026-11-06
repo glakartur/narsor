@@ -125,7 +125,9 @@ mod rescue;
 mod step_memory;
 mod variable_rules;
 
-use gate_context::{decision_fields, has_step_contract, local_values, GateContext};
+use gate_context::{
+    decision_fields, has_step_contract, holds_variables_to_declarations, local_values, GateContext,
+};
 use variable_rules::Assignment;
 
 pub use failure::{
@@ -543,7 +545,7 @@ fn write_assignments(
     step_memory::write_locals(execution, state_id, local_values)
 }
 
-/// Moves the variables of an agent or script `result` that its step does not
+/// Moves the variables of an agent, script or decision `result` that its step does not
 /// let it write into its `additional_data` (KTD5): kept, but never written
 /// to the context. That is a variable the step does not define, and one
 /// only the workflow sets (`source: workflow`). Returns a warning for each
@@ -553,7 +555,7 @@ fn write_assignments(
 /// does whatever a gate or a person gave: only a step that can define
 /// variables is held to its definitions.
 fn set_aside_undeclared_variables(state: &State, result: &mut ActionResult) -> Vec<String> {
-    if !has_step_contract(state) {
+    if !holds_variables_to_declarations(state) {
         return Vec::new();
     }
     let is_kept = |name: &String| {
@@ -3232,7 +3234,7 @@ impl Engine {
         let warnings = set_aside_undeclared_variables(state, &mut result);
         // A script cannot be asked again, so a value outside the declared
         // `options` ends its step; an agent was asked again before this.
-        if has_step_contract(state) && !is_agent(state) {
+        if holds_variables_to_declarations(state) && !is_agent(state) {
             if let Some(problem) = variable_rules::value_outside_options(state, &result.variables) {
                 self.fail_action(execution, &action_execution_id, problem)?;
                 return Ok(None);

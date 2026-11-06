@@ -1016,6 +1016,7 @@ async fn output_descriptions_survive_in_the_pending_record() {
             description: Some("The failures are known and harmless.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
             set: Default::default(),
         },
         ChoiceDefinition::new("fix_it"),

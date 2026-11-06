@@ -808,9 +808,18 @@ pub struct ChoiceDefinition {
     /// prior session after this human choice is made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_comment_field: Option<String>,
+    /// Whether this is the `exit` of a unified linear step. Set by the
+    /// loader only: a label called `exit` in an old-shape workflow is an
+    /// ordinary choice.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exit: bool,
     /// Variables the workflow sets when this choice is taken (`set` in YAML).
     #[serde(default, skip_serializing_if = "SetDefinition::is_empty")]
     pub set: SetDefinition,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// The label a linear step's `exit` compiles to: the step's only choice.
@@ -872,13 +881,14 @@ impl ChoiceDefinition {
             description: None,
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
             set: SetDefinition::default(),
         }
     }
 
     /// Whether this is the single exit of a linear step.
     pub fn is_exit(&self) -> bool {
-        self.label == EXIT_LABEL
+        self.exit
     }
 }
 

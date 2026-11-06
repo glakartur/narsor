@@ -143,7 +143,10 @@ async fn unmapped_non_zero_exit_code_falls_back_to_failure() {
 
 /// Runs `config` as a step that has an `exit`, and returns its result.
 async fn complete_with_exit(config: ScriptActionConfig, workspace: &Workspace) -> ActionResult {
-    let choices = [ChoiceDefinition::new(EXIT_LABEL)];
+    let choices = [ChoiceDefinition {
+        exit: true,
+        ..ChoiceDefinition::new(EXIT_LABEL)
+    }];
     let action = ActionConfig::Script(config);
     let request =
         ActionRequest::new(&action, workspace, "action-exec-1").with_contract(StepContract {

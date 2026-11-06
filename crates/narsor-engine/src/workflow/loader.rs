@@ -440,7 +440,10 @@ fn compile_exits(
     let mut compiled: Vec<ChoiceDefinition> = choices.into_iter().map(compile_choice).collect();
     if let Some(exit) = exit {
         transitions.insert(EXIT_LABEL.to_string(), exit.next);
-        compiled.push(compile_choice(exit.choice));
+        compiled.push(ChoiceDefinition {
+            exit: true,
+            ..compile_choice(exit.choice)
+        });
     }
     (compiled, transitions)
 }
@@ -455,6 +458,7 @@ fn compile_choice(choice: ChoiceSchema) -> ChoiceDefinition {
         description: non_blank(choice.description),
         requires_human_approval: choice.requires_human_approval,
         resume_comment_field: non_blank(choice.resume_comment_field),
+        exit: false,
         set: choice.set,
     }
 }

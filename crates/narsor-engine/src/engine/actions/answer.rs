@@ -57,9 +57,10 @@ impl ChoiceAnswer {
 }
 
 /// What makes an object the answer of a step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AnswerShape {
     /// The step has choices: the answer carries a string `choice`.
+    #[default]
     Choice,
     /// The step has one `exit`: any object is the answer, and it needs no
     /// `choice` — the step's only label is [`EXIT_LABEL`].

@@ -3115,7 +3115,8 @@ mod task_app_detail_render {
             .join("tests/fixtures/claude-code")
             .join(name);
         let text = std::fs::read_to_string(&path).expect("a recording");
-        let mut parser = ClaudeCodeAdapter::new().stream_parser();
+        let mut parser = ClaudeCodeAdapter::new()
+            .stream_parser(narsor_engine::engine::actions::answer::AnswerShape::Choice);
         text.lines()
             .enumerate()
             .flat_map(|(index, line)| {

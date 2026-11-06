@@ -1225,6 +1225,13 @@ fn exit_codes_beside_an_exit_are_rejected() {
 }
 
 #[test]
+fn an_old_shape_choice_labelled_exit_is_an_ordinary_choice() {
+    let errors = validate_path(fixture_path("legacy_exit_label.yaml")).expect("must load");
+
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
 fn set_of_a_variable_the_step_does_not_declare_is_rejected() {
     let errors = errors_of("set_unknown_variable.yaml");
     assert!(

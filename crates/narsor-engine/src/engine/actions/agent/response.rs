@@ -99,8 +99,8 @@ pub(super) fn read_response(
 /// What kind of final answer `value` is, by the same rule [`read_response`]
 /// uses: `None` for anything that is not an answer. A label the state does
 /// not declare is still a final answer; the engine rejects it later.
-pub(crate) fn final_answer_kind(value: &Value) -> Option<FinalAnswer> {
-    match structured_response(value, AnswerShape::Choice) {
+pub(crate) fn final_answer_kind(value: &Value, shape: AnswerShape) -> Option<FinalAnswer> {
+    match structured_response(value, shape) {
         Ok(AgentResponse::Completed(_)) => Some(FinalAnswer::Choice),
         Ok(AgentResponse::AwaitingInput { .. }) => Some(FinalAnswer::AwaitingInput),
         Err(_) => None,
@@ -113,10 +113,10 @@ pub(crate) fn final_answer_kind(value: &Value) -> Option<FinalAnswer> {
 ///
 /// Stricter than [`extract_response`] on purpose: a harness ends the step on
 /// this, so an example object quoted in the middle of a message must not.
-pub(crate) fn closing_answer(text: &str) -> Option<(Value, FinalAnswer)> {
-    let (_, object) = final_contract(text)?;
+pub(crate) fn closing_answer(text: &str, shape: AnswerShape) -> Option<(Value, FinalAnswer)> {
+    let (_, object) = final_contract(text, shape)?;
     let value = serde_json::from_str::<Value>(object).ok()?;
-    let kind = final_answer_kind(&value)?;
+    let kind = final_answer_kind(&value, shape)?;
     Some((value, kind))
 }
 
@@ -334,8 +334,10 @@ pub(super) fn build_result(
     session: &AgentSession,
     run: &HarnessRun,
     finished: &FinishedRun,
+    shape: AnswerShape,
 ) -> ActionResult {
-    let reply = run_reply(run).or_else(|| contract_reply(&answer.reason, &answer.additional_data));
+    let reply =
+        run_reply(run, shape).or_else(|| contract_reply(&answer.reason, &answer.additional_data));
     let session_record = serde_json::to_value(session).unwrap_or(Value::Null);
 
     let mut result = answer.into_result();
@@ -379,8 +381,12 @@ fn contract_reply(reason: &str, additional_data: &Map<String, Value>) -> Option<
 
 /// Adds the attempt's reply to the details of an extraction failure, so a
 /// format reprompt can keep it instead of its own text (R3).
-pub(super) fn record_reply_in_details(error: &mut ActionError, run: &HarnessRun) {
-    let Some(reply) = run_reply(run) else {
+pub(super) fn record_reply_in_details(
+    error: &mut ActionError,
+    run: &HarnessRun,
+    shape: AnswerShape,
+) {
+    let Some(reply) = run_reply(run, shape) else {
         return;
     };
     if let Some(Value::Object(details)) = error.details.as_mut() {
@@ -390,15 +396,15 @@ pub(super) fn record_reply_in_details(error: &mut ActionError, run: &HarnessRun)
 
 /// The step's reply of `run`: the reply its harness read, or else its final
 /// text, without the output-contract object (R3).
-pub(crate) fn run_reply(run: &HarnessRun) -> Option<String> {
-    clean_reply(run.reply.as_deref().unwrap_or(&run.text))
+pub(crate) fn run_reply(run: &HarnessRun, shape: AnswerShape) -> Option<String> {
+    clean_reply(run.reply.as_deref().unwrap_or(&run.text), shape)
 }
 
 /// The agent's reply: its text without the output-contract object, and
 /// without the code fence around that object (R3). `None` when nothing else
 /// is left.
-fn clean_reply(text: &str) -> Option<String> {
-    let reply = match final_contract_start(text) {
+fn clean_reply(text: &str, shape: AnswerShape) -> Option<String> {
+    let reply = match final_contract_start(text, shape) {
         Some(cut) => text[..cut].to_string(),
         None => {
             let mut reply = text.to_string();
@@ -423,12 +429,12 @@ fn clean_reply(text: &str) -> Option<String> {
 /// and a closing fence), found from the right, so a brace in the prose
 /// before it never hides it. At most [`MAX_BRACE_CANDIDATES`] braces are
 /// tried.
-fn final_contract_start(text: &str) -> Option<usize> {
-    final_contract(text).map(|(cut, _)| cut)
+fn final_contract_start(text: &str, shape: AnswerShape) -> Option<usize> {
+    final_contract(text, shape).map(|(cut, _)| cut)
 }
 
 /// [`final_contract_start`], with the text of the closing object as well.
-fn final_contract(text: &str) -> Option<(usize, &str)> {
+fn final_contract(text: &str, shape: AnswerShape) -> Option<(usize, &str)> {
     let trimmed = text.trim_end();
     let (body, fenced) = match trimmed.strip_suffix("```") {
         Some(rest) => (rest.trim_end(), true),
@@ -442,7 +448,7 @@ fn final_contract(text: &str) -> Option<(usize, &str)> {
             return None;
         }
         candidates = &body[..start];
-        if object_end(body, start) != Some(body.len()) || !is_contract(&body[start..]) {
+        if object_end(body, start) != Some(body.len()) || !is_contract(&body[start..], shape) {
             continue;
         }
         if !fenced {
@@ -494,13 +500,13 @@ fn object_end(text: &str, start: usize) -> Option<usize> {
 }
 
 /// Whether `object` is an output-contract object: an answer or a question.
-fn is_contract(object: &str) -> bool {
+fn is_contract(object: &str, shape: AnswerShape) -> bool {
     serde_json::from_str::<Value>(object)
         .ok()
         .and_then(|value| {
             value
                 .as_object()
-                .map(|object| is_answer_object(object, AnswerShape::Choice))
+                .map(|object| is_answer_object(object, shape))
         })
         .unwrap_or(false)
 }
@@ -511,7 +517,7 @@ fn last_contract_span(text: &str) -> Option<(usize, usize)> {
     top_level_objects(text)
         .into_iter()
         .rev()
-        .find(|&(start, end)| is_contract(&text[start..end]))
+        .find(|&(start, end)| is_contract(&text[start..end], AnswerShape::Choice))
 }
 
 #[cfg(test)]
@@ -554,7 +560,7 @@ mod json_object_tests {
         let text = format!("{}\n{{\"choice\":\"findings\"}}", "{".repeat(200_000));
         let started = std::time::Instant::now();
         let _ = json_objects(&text);
-        let _ = super::clean_reply(&text);
+        let _ = super::clean_reply(&text, super::AnswerShape::Choice);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "stray braces must not make the scan quadratic: {:?}",
@@ -573,8 +579,35 @@ mod json_object_tests {
 
 #[cfg(test)]
 mod reply_tests {
-    use super::{clean_reply, contract_reply};
+    use super::{contract_reply, AnswerShape};
     use crate::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
+
+    fn clean_reply(text: &str) -> Option<String> {
+        super::clean_reply(text, AnswerShape::Choice)
+    }
+
+    #[test]
+    fn an_exit_answer_closing_the_text_is_cut_from_the_reply() {
+        let text = "done\n{\"reason\":\"x\",\"variables\":{}}";
+
+        assert_eq!(
+            super::clean_reply(text, AnswerShape::Exit),
+            Some("done".to_string())
+        );
+        assert_eq!(
+            clean_reply(text),
+            Some(text.to_string()),
+            "in a step with choices that object is no answer"
+        );
+    }
+
+    #[test]
+    fn an_exit_answer_closing_the_text_is_the_final_answer() {
+        let text = "done\n{\"reason\":\"x\",\"variables\":{}}";
+
+        assert!(super::closing_answer(text, AnswerShape::Exit).is_some());
+        assert!(super::closing_answer(text, AnswerShape::Choice).is_none());
+    }
 
     #[test]
     fn a_long_reply_keeps_its_beginning_and_is_marked_cut() {

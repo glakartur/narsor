@@ -77,6 +77,7 @@ use super::{
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
 use crate::engine::actions::agent;
+use crate::engine::actions::answer::AnswerShape;
 use narsor_protocol::chat::ChatElement;
 use narsor_protocol::controller::UsageLimit;
 
@@ -229,8 +230,8 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         })
     }
 
-    fn stream_parser(&self) -> Box<dyn HarnessStreamParser> {
-        Box::new(ClaudeCodeStreamParser::default())
+    fn stream_parser(&self, shape: AnswerShape) -> Box<dyn HarnessStreamParser> {
+        Box::new(ClaudeCodeStreamParser::new(shape))
     }
 }
 
@@ -251,6 +252,8 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 ///   a failure.
 #[derive(Debug, Default)]
 struct ClaudeCodeStreamParser {
+    /// What the step's final answer looks like.
+    answer_shape: AnswerShape,
     /// Turns lines into chat elements; remembers tool calls by id.
     classifier: classify::Classifier,
     /// The earliest session id seen, from `system`/`init` or `result`.
@@ -279,6 +282,13 @@ struct ClaudeCodeStreamParser {
 }
 
 impl ClaudeCodeStreamParser {
+    fn new(answer_shape: AnswerShape) -> Self {
+        Self {
+            answer_shape,
+            ..Self::default()
+        }
+    }
+
     /// Folds one parsed stdout line into what
     /// [`HarnessStreamParser::finish`] needs; lines that carry none of it
     /// are ignored. `result` is what [`classify::ResultLine::take`] read
@@ -348,12 +358,15 @@ impl ClaudeCodeStreamParser {
         let answered = if result.is_error {
             None
         } else if let Some(value) = &result.structured_output {
-            Some((value.clone(), agent::final_answer_kind(value)))
+            Some((
+                value.clone(),
+                agent::final_answer_kind(value, self.answer_shape),
+            ))
         } else {
             result
                 .text
                 .as_deref()
-                .and_then(agent::closing_answer)
+                .and_then(|text| agent::closing_answer(text, self.answer_shape))
                 .map(|(value, kind)| (value, Some(kind)))
         };
         self.permission_denials = result.permission_denials.clone();

@@ -62,6 +62,7 @@ use crate::engine::actions::agent::conversation::ReadingTap;
 use crate::engine::actions::agent::{
     run_harness_process, DefaultHarnessSource, SpawnEnding, BUILT_IN_HARNESS,
 };
+use crate::engine::actions::answer::AnswerShape;
 use crate::engine::actions::harness::{
     apply_extra_args, HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX,
 };
@@ -335,7 +336,7 @@ impl HarnessInvoker {
             &command.args,
             &working_dir,
             Some(self.timeout),
-            adapter.stream_parser(),
+            adapter.stream_parser(AnswerShape::Choice),
             self.reading_tap(invocation, &harness),
         )
         .await

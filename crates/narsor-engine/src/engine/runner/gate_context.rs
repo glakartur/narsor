@@ -60,6 +60,14 @@ pub(super) fn has_step_contract(state: &State) -> bool {
     )
 }
 
+/// Whether the variables a result gives for `state` are held to its
+/// declarations: an agent or script step, and a decision, whose answer the
+/// conductor may give with variables. Not the same as [`has_step_contract`]:
+/// a decision is no step whose result a gate shows.
+pub(super) fn holds_variables_to_declarations(state: &State) -> bool {
+    has_step_contract(state) || matches!(state.action, Some(ActionConfig::Decision(_)))
+}
+
 /// The form of a decision: a field for each variable of the step that the
 /// operator may give, which is every one but those the workflow alone sets.
 /// A variable with `options` is a `select`; no field is required here, since

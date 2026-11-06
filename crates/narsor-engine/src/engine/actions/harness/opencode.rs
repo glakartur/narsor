@@ -44,6 +44,7 @@ use super::{
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
+use crate::engine::actions::answer::AnswerShape;
 use narsor_protocol::chat::ChatElement;
 use serde_json::Value;
 
@@ -145,7 +146,7 @@ impl HarnessAdapter for OpenCodeAdapter {
         })
     }
 
-    fn stream_parser(&self) -> Box<dyn HarnessStreamParser> {
+    fn stream_parser(&self, _shape: AnswerShape) -> Box<dyn HarnessStreamParser> {
         Box::new(OpenCodeStreamParser::default())
     }
 }
@@ -326,6 +327,7 @@ fn extract_session_id(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::engine::actions::agent::run_reply;
+    use crate::engine::actions::answer::AnswerShape;
 
     #[test]
     fn the_reply_is_the_final_text_without_the_contract() {
@@ -344,7 +346,7 @@ mod tests {
 
         assert_eq!(run.failure, None);
         assert_eq!(
-            run_reply(&run).as_deref(),
+            run_reply(&run, AnswerShape::Choice).as_deref(),
             Some("P1: validate the request body.")
         );
     }

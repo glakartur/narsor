@@ -706,9 +706,8 @@ fn validate_exit_and_timeout(
     state: &State,
     errors: &mut Vec<ValidationError>,
 ) {
-    let has_exit = state.has_exit();
     if let Some(ActionConfig::Script(script)) = &state.action {
-        if has_exit && !script.exit_codes.is_empty() {
+        if state.has_exit() && !script.exit_codes.is_empty() {
             errors.push(ValidationError::ExitCodesWithExit {
                 state: state.id.clone(),
                 action_type: "script",

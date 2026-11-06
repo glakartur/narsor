@@ -621,6 +621,13 @@ pub(super) fn check_choice(
         ));
     }
 
+    if let Some(problem) = variable_rules::value_outside_options(state, &choice.variables) {
+        return Err(format!(
+            "the conductor chose the output '{label}' with a value its step does not allow: \
+             {problem}"
+        ));
+    }
+
     let requirements = output_requirements(definition, execution, state);
     let Some(requirement) = requirements
         .iter()

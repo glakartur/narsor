@@ -1456,6 +1456,17 @@ fn choices_as_a_mapping_compile_to_choices_and_transitions_in_file_order() {
 }
 
 #[test]
+fn an_old_shape_choice_labelled_exit_does_not_make_a_linear_exit_step() {
+    let definition = load_fixture("legacy_exit_label.yaml");
+
+    for id in ["work", "check"] {
+        let step = state(&definition, id);
+        assert_eq!(labels(step), [EXIT_LABEL, "retry"], "{id}");
+        assert!(!step.has_exit(), "{id}");
+    }
+}
+
+#[test]
 fn an_exit_compiles_to_one_reserved_choice_and_one_transition() {
     let definition = load_fixture("v2/exit.yaml");
     let implement = state(&definition, "implement");

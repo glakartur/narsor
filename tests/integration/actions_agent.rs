@@ -375,7 +375,8 @@ fn process_summary(entry: &ConversationEntry) -> String {
 /// What a fresh parser of `adapter` returns for each of `lines`, in order —
 /// the elements the executor is expected to store with them.
 fn parsed_elements(adapter: &dyn HarnessAdapter, lines: &[String]) -> Vec<Vec<ChatElement>> {
-    let mut parser = adapter.stream_parser();
+    let mut parser =
+        adapter.stream_parser(narsor_engine::engine::actions::answer::AnswerShape::Choice);
     lines
         .iter()
         .map(|line| parser.on_stdout_line(line.as_bytes()))
@@ -757,6 +758,7 @@ async fn run_with_contract(
 fn exit_choices() -> [ChoiceDefinition; 1] {
     [ChoiceDefinition {
         requires_variables: vec!["summary".to_string()],
+        exit: true,
         ..ChoiceDefinition::new(narsor_engine::domain::EXIT_LABEL)
     }]
 }
@@ -1674,6 +1676,7 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
             description: Some("The plan is written and nothing is unclear.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
             set: Default::default(),
         },
         ChoiceDefinition::new("ambiguous"),
@@ -1843,6 +1846,7 @@ fn a_contract_without_descriptions_lists_bare_labels_only() {
             description: Some("   ".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
             set: Default::default(),
         },
     ];
@@ -1857,6 +1861,27 @@ fn a_contract_without_descriptions_lists_bare_labels_only() {
     assert!(contract.contains("- `approved`\n"), "{contract}");
     assert!(contract.contains("- `rejected`\n"), "{contract}");
     assert!(!contract.contains(" — "), "{contract}");
+}
+
+/// A label called `exit` in an old-shape workflow is an ordinary choice: the
+/// agent still gives a `choice` and still sees the other labels.
+#[test]
+fn an_ordinary_choice_labelled_exit_keeps_the_choice_contract() {
+    let choices = [
+        ChoiceDefinition::new("exit"),
+        ChoiceDefinition::new("retry"),
+    ];
+    let contract = StepContract {
+        choices: &choices,
+        ..StepContract::default()
+    };
+
+    let text = output_contract(&contract, None);
+
+    assert!(!contract.has_exit());
+    assert!(text.contains("- `exit`\n"), "{text}");
+    assert!(text.contains("- `retry`\n"), "{text}");
+    assert!(text.contains("`choice` is required"), "{text}");
 }
 
 /// With no choices to list, the agent is pointed at the label the task names.

@@ -259,6 +259,7 @@ impl AgentExecutor {
     /// One agent run, from the session record to the output label.
     async fn run(&self, request: ActionRequest<'_>) -> Result<ActionOutcome, ActionError> {
         let config = agent_config(request.action)?;
+        let answer_shape = AnswerShape::of_step(request.contract.has_exit());
         let resume = resume_session(config)?;
         if resume.is_some() && config.harness.is_none() {
             return Err(ActionError {
@@ -359,7 +360,7 @@ impl AgentExecutor {
             Some(request.action_execution_id),
             request.timeout,
             self.final_answer_grace,
-            adapter.stream_parser(),
+            adapter.stream_parser(answer_shape),
             &conversation,
             usage,
         )
@@ -522,7 +523,7 @@ impl AgentExecutor {
             ));
         }
 
-        let output = match read_response(&run, AnswerShape::of_step(request.contract.has_exit())) {
+        let output = match read_response(&run, answer_shape) {
             Ok(output) => {
                 record_question(&conversation, &output);
                 conversation.finish();
@@ -533,7 +534,7 @@ impl AgentExecutor {
                 // What the engine needs to ask this same session again
                 // (KTD7): the harness it ran on and the session it left.
                 record_session_in_details(&mut error, harness, run.session_id.as_deref());
-                record_reply_in_details(&mut error, &run);
+                record_reply_in_details(&mut error, &run, answer_shape);
                 self.fail_session(
                     request.execution_id,
                     request.action_execution_id,
@@ -558,7 +559,11 @@ impl AgentExecutor {
 
         match output {
             AgentResponse::Completed(output) => Ok(ActionOutcome::Completed(build_result(
-                output, &session, &run, &finished,
+                output,
+                &session,
+                &run,
+                &finished,
+                answer_shape,
             ))),
             AgentResponse::AwaitingInput { question, options } => Ok(ActionOutcome::Suspended(
                 SuspendedAction::AwaitingAgentInput(HumanInputRequest {

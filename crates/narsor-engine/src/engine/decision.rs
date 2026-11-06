@@ -206,6 +206,7 @@ mod tests {
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,
+                    exit: false,
                     set: Default::default(),
                 },
                 ChoiceDefinition {
@@ -215,6 +216,7 @@ mod tests {
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,
+                    exit: false,
                     set: Default::default(),
                 },
             ],

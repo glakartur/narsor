@@ -251,6 +251,74 @@ async fn a_label_with_requirements_is_taken_when_they_are_met() {
     );
 }
 
+/// The conductor writes variables under the same declarations as an agent: a
+/// name the step does not declare is kept as additional data, not written.
+#[tokio::test]
+async fn a_variable_the_step_does_not_declare_is_set_aside() {
+    let fixture = Fixture::new(vec![choose("approve", "high", json!({ "invented": "x" }))]);
+    let execution = fixture.run(json!({})).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(execution.context.variables.get("invented"), None);
+    assert_set_aside(&fixture.events(&execution.id), "invented");
+}
+
+/// A variable only the workflow sets is no more the conductor's to write
+/// than an agent's.
+#[tokio::test]
+async fn a_variable_the_workflow_alone_sets_is_set_aside() {
+    let fixture = Fixture::new(vec![choose(
+        "reject",
+        "high",
+        json!({ "severity": "high", "stage": "open" }),
+    )]);
+    let execution = fixture.run(json!({})).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Cancelled);
+    assert_eq!(execution.context.variables.get("stage"), None);
+    assert_set_aside(&fixture.events(&execution.id), "stage");
+}
+
+/// A value outside the declared `options` is no choice the conductor can
+/// settle: the operator decides, with the label still proposed.
+#[tokio::test]
+async fn a_value_outside_the_declared_options_waits_for_the_operator() {
+    let fixture = Fixture::new(vec![choose(
+        "reject",
+        "high",
+        json!({ "severity": "urgent" }),
+    )]);
+    let execution = fixture.run(json!({})).await;
+
+    let (_, problem) = fixture.problem(&execution);
+    let analysis = problem.analysis.expect("the conductor's proposal");
+    assert_eq!(analysis.label.as_deref(), Some("reject"));
+    assert!(made_by_the_conductor(&fixture.events(&execution.id)).is_empty());
+    assert_eq!(execution.context.variables.get("severity"), None);
+}
+
+/// Asserts that the last step to complete kept `name` kept as additional data and a
+/// warning for it.
+fn assert_set_aside(events: &[EventData], name: &str) {
+    let (additional_data, warnings) = events
+        .iter()
+        .rev()
+        .find_map(|data| match data {
+            EventData::ActionCompleted {
+                additional_data,
+                warnings,
+                ..
+            } => Some((additional_data, warnings)),
+            _ => None,
+        })
+        .expect("the step completed");
+    assert!(additional_data.contains_key(name), "{additional_data:?}");
+    assert!(
+        warnings.iter().any(|warning| warning.contains(name)),
+        "{warnings:?}"
+    );
+}
+
 /// An unsure conductor leaves the step to the operator, who gets what the
 /// conductor would have chosen.
 #[tokio::test]

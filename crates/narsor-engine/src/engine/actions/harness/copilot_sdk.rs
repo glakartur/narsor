@@ -491,6 +491,7 @@ mod copilot_sdk_dispatch_tests {
     use crate::engine::actions::agent::process::{
         run_harness_invocation, run_harness_invocation_with_sdk, SpawnEnding, FINAL_ANSWER_GRACE,
     };
+    use crate::engine::actions::answer::AnswerShape;
     use crate::engine::actions::harness::{GitHubCopilotAdapter, HarnessAdapter};
     use base64::Engine;
     use chrono::Utc;
@@ -619,7 +620,7 @@ mod copilot_sdk_dispatch_tests {
             None,
             None,
             FINAL_ANSWER_GRACE,
-            adapter.stream_parser(),
+            adapter.stream_parser(AnswerShape::Choice),
             &ConversationSink::none(),
             None,
         )
@@ -654,7 +655,7 @@ mod copilot_sdk_dispatch_tests {
             Some("action-123"),
             None,
             FINAL_ANSWER_GRACE,
-            adapter.stream_parser(),
+            adapter.stream_parser(AnswerShape::Choice),
             &ConversationSink::none(),
             None,
             &sdk,

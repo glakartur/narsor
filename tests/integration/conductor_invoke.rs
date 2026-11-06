@@ -1207,6 +1207,7 @@ fn a_long_tasks_snapshot_fits_its_budget_with_the_definition_and_pending_input_w
             description: Some("The work is done.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
             set: Default::default(),
         }],
         definition: Ok(definition.clone()),
