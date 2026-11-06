@@ -6,10 +6,12 @@
 //! declares, with every value the label requires — is saved and applied as
 //! the `conductor` provider's decision, so `set` and an undo work as for any
 //! other. Anything else hands the step to the operator, with the
-//! conductor's proposal prefilled in the form.
+//! conductor's proposal prefilled in the form. So does an entry after
+//! [`CONDUCTOR_DECISION_LIMIT`] decisions of the conductor's in a row.
 
 use super::rescue::{check_choice, chosen_output_decision, unsaved_decision, Choice, Settled};
 use super::*;
+use crate::conductor::autopilot::CONDUCTOR_DECISION_LIMIT;
 use crate::conductor::{
     ConductorResponse, Decision, InvocationOutcome, QueuedRequest, SavedDecision,
 };
@@ -38,6 +40,17 @@ impl Engine {
                 None,
             );
         };
+        let in_a_row = step_memory::conductor_decisions(execution, &state.id)?;
+        if in_a_row >= CONDUCTOR_DECISION_LIMIT {
+            return self.hand_decision_to_operator(
+                definition,
+                execution,
+                state,
+                action_execution_id,
+                format!("it took the last {in_a_row} decisions of this step in a row"),
+                None,
+            );
+        }
 
         let request =
             QueuedRequest::new(ConductorTrigger::DecisionStep, ConductorPurpose::DecideFork)

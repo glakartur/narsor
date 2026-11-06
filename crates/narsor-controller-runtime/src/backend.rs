@@ -5,7 +5,7 @@ use std::future::Future;
 use std::fmt;
 
 use narsor_protocol::identifier::TaskId;
-use narsor_protocol::launch::{LaunchSpecEnvelope, TASK_LAUNCH_SPEC_VERSION};
+use narsor_protocol::launch::{unsupported_launch_spec_version, LaunchSpecEnvelope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -168,11 +168,8 @@ pub struct WorkloadLaunch {
 pub fn validate_launch_input(value: &Value) -> Result<(), String> {
     let input: LaunchSpecEnvelope = serde_json::from_value(value.clone())
         .map_err(|error| format!("control plane returned an invalid launch spec: {error}"))?;
-    if input.version != TASK_LAUNCH_SPEC_VERSION {
-        return Err(format!(
-            "task launch spec version {} is not supported by this build (expected {})",
-            input.version, TASK_LAUNCH_SPEC_VERSION
-        ));
+    if let Some(problem) = unsupported_launch_spec_version(u64::from(input.version)) {
+        return Err(problem);
     }
     if input.workflow_id.is_empty() || input.workflow_version == 0 || input.digest.is_empty() {
         return Err("task launch spec has an invalid workflow identity or digest".into());
@@ -460,7 +457,7 @@ mod tests {
         let mut value = spec();
         value["version"] = json!(TASK_LAUNCH_SPEC_VERSION + 1);
         let error = validate_launch_input(&value).unwrap_err();
-        assert!(error.contains("not supported"), "{error}");
+        assert!(error.contains("newer Narsor build"), "{error}");
     }
 
     #[test]

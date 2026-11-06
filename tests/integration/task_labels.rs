@@ -105,7 +105,7 @@ fn another_version_is_refused_with_both_versions() {
     let error = serde_json::from_value::<TaskLaunchSpec>(json).unwrap_err();
     let text = error.to_string();
     assert!(
-        text.contains("version 2") && text.contains("expected 4"),
+        text.contains("version 2") && text.contains("reads 4 to 5"),
         "{text}"
     );
 }

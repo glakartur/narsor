@@ -3411,6 +3411,10 @@ impl Engine {
             .update_variables(shared_variables(state, &pending.result.variables));
         step_memory::keep_locals(execution, state, &pending.result.variables)?;
         step_memory::record_choice(execution, &state.id, &outcome.label, &pending.result.reason)?;
+        if matches!(state.action, Some(ActionConfig::Decision(_))) {
+            let by_conductor = outcome.provider == DecisionProviderType::Conductor;
+            step_memory::count_decision(execution, &state.id, by_conductor)?;
+        }
         // After the step's own result, so what `set` assigns wins over it.
         write_assignments(execution, &state.id, &assignments)?;
         if pending
@@ -3486,8 +3490,12 @@ impl Engine {
         // is the conductor's retry of a failed one (F3).
         clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
         clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);
-        self.store.save_execution(execution)?;
 
+        // No save until the target is set: a `state.json` without the pending
+        // step but still at this state would run its action again after a
+        // crash, over the result and the `set` already applied. A crash
+        // before the one save below leaves the pending step, and the step
+        // resumes at its decision.
         for assignment in assignments {
             self.emit(
                 &execution.id,

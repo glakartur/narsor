@@ -523,3 +523,26 @@ async fn the_count_of_answers_starts_over_when_the_step_is_entered_again() {
     assert_eq!(attempts["entries"], json!(2));
     assert_eq!(attempts["conductor_answers"], json!(0));
 }
+
+/// A loop only the conductor drives is bounded: after five decisions of the
+/// step in a row, the next entry goes to the operator without asking it.
+#[tokio::test]
+async fn the_operator_decides_after_five_decisions_of_the_conductor_in_a_row() {
+    let fixture = Fixture::with_agent(
+        vec![finished_work(); 6],
+        (0..5)
+            .map(|_| choose("revise", "high", json!({})))
+            .collect(),
+    );
+    let execution = fixture.run(json!({})).await;
+
+    let (_, problem) = fixture.problem(&execution);
+    assert_eq!(problem.analysis, None);
+    assert_eq!(fixture.conductor.calls().len(), 5);
+    assert_eq!(
+        made_by_the_conductor(&fixture.events(&execution.id)).len(),
+        5
+    );
+    let attempts = &execution.metadata[METADATA_ENGINE_KEY]["step_attempts"]["pick"];
+    assert_eq!(attempts["conductor_decisions"], json!(5));
+}

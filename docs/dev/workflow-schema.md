@@ -924,6 +924,9 @@ approval:
     operator can undo the choice. The operator decides instead when the conductor is not sure, when it
     fails, when no conductor is attached, or when its choice is not valid. The form then shows the
     conductor's proposal prefilled. Every decision is an event with confidence and rationale.
+*   The conductor decides one step at most 5 times in a row. On the next entry the engine does not
+    ask the conductor, and the operator decides. A decision of the operator starts the count again.
+    This stops a loop that only the conductor drives.
 *   The tokens and the cost of the conductor run are written to the timeline entry of the step it
     decided in. They are shown apart from the numbers of the agents (the usage line of a task shows
     `dyrygent` and `razem`, the step list a `dyr.` column).
@@ -1037,6 +1040,11 @@ it. Picking one of the declared exits of the current state never needs the field
     warning that the shape is deprecated and what to write instead. The definition keeps the legacy
     rules, for example `allow_manual_override`.
 *   A definition that was saved before the shape was recorded reads as legacy.
+*   A task whose definition is in the unified shape is saved with task launch spec version 5. A task
+    in the legacy shape keeps version 4. A runner or controller older than the unified shape refuses
+    version 5 with a message that names both versions, and still runs version 4. This build reads
+    both. A version newer than it reads gets a message that asks to update the runner and the
+    controller.
 *   Two behaviours changed for every shape. `autopilot` has three values and `true` no longer means
     `on` (§3.3). In the unified shape, a step can declare a `timeout` choice only when it is an agent or a script step.
 *   There is no tool that converts a file. To convert a state, write `choices` as a map with `next`,

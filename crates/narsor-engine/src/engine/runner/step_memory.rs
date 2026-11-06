@@ -63,6 +63,11 @@ pub struct StepAttempts {
     /// latest entry.
     #[serde(default)]
     pub conductor_answers: u32,
+
+    /// How many decisions of the step the conductor took since the
+    /// operator last took one.
+    #[serde(default)]
+    pub conductor_decisions: u32,
 }
 
 /// What one attempt at a step ended with.
@@ -106,6 +111,32 @@ pub(super) fn conductor_answers(
     Ok(read_attempts(execution)?
         .get(state_id)
         .map_or(0, |record| record.conductor_answers))
+}
+
+/// How many decisions of `state_id` the conductor took in a row.
+pub(super) fn conductor_decisions(
+    execution: &WorkflowExecution,
+    state_id: &str,
+) -> Result<u32, EngineError> {
+    Ok(read_attempts(execution)?
+        .get(state_id)
+        .map_or(0, |record| record.conductor_decisions))
+}
+
+/// Counts a decision of `state_id`: one more in a row when the conductor
+/// took it, none when anyone else did.
+pub(super) fn count_decision(
+    execution: &mut WorkflowExecution,
+    state_id: &str,
+    by_conductor: bool,
+) -> Result<(), EngineError> {
+    update_attempts(execution, state_id, |record| {
+        record.conductor_decisions = if by_conductor {
+            record.conductor_decisions.saturating_add(1)
+        } else {
+            0
+        };
+    })
 }
 
 /// Counts one more answer of the conductor's in `state_id`.

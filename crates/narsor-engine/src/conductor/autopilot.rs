@@ -9,6 +9,11 @@ use serde_json::Value;
 /// next one goes to the operator.
 pub const CONDUCTOR_ANSWER_LIMIT: u32 = 5;
 
+/// How many times in a row the conductor decides one `decision` step; the
+/// next entry goes to the operator, whose decision starts the count over.
+/// Bounds a loop that only the conductor would otherwise drive.
+pub const CONDUCTOR_DECISION_LIMIT: u32 = 5;
+
 /// What the variable `autopilot` says about the questions of agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Autopilot {
