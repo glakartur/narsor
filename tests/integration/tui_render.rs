@@ -2241,6 +2241,7 @@ mod task_app_detail_render {
             subagent_count: Some(1),
             subagent_stats: None,
             cost_usd: Some(cost),
+            ..PositionUsage::default()
         })
     }
 

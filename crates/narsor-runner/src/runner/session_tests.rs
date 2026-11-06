@@ -1291,6 +1291,92 @@ async fn an_override_transition_is_taken_under_the_claim_and_audited_with_its_re
     )));
 }
 
+/// The same step in the unified shape, which has no `allow_manual_override`.
+const UNIFIED_AGENT: &str = r#"
+schema: v2
+name: unified-agent
+version: 1
+states:
+  think:
+    action:
+      type: agent
+      prompt: Think about it.
+    exit: { next: completed }
+  completed: {}
+terminal_states: { completed: completed }
+"#;
+
+fn forced_into_completed(reason: Option<&str>) -> OperatorCommand {
+    OperatorCommand::Transition {
+        target: "completed".to_string(),
+        forced: true,
+        reason: reason.map(str::to_string),
+    }
+}
+
+#[tokio::test]
+async fn a_unified_workflow_allows_a_forced_transition_with_a_reason() {
+    let root = TempRoot::new();
+    let mut fixture = hanging(&root, UNIFIED_AGENT).await;
+    fixture
+        .applied("interrupt-1", OperatorCommand::Interrupt)
+        .await;
+
+    fixture
+        .applied(
+            "transition-1",
+            forced_into_completed(Some("the work moved elsewhere")),
+        )
+        .await;
+
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    assert!(fixture.events().iter().any(|data| matches!(
+        data,
+        EventData::DecisionMade { provider, reasoning: Some(reasoning), .. }
+            if provider == "human_override"
+                && reasoning.contains("the work moved elsewhere")
+                && reasoning.contains(OWNER)
+    )));
+}
+
+#[tokio::test]
+async fn a_forced_transition_without_a_reason_is_refused_in_every_shape() {
+    for yaml in [UNIFIED_AGENT, OVERRIDABLE] {
+        let root = TempRoot::new();
+        let mut fixture = hanging(&root, yaml).await;
+        fixture
+            .applied("interrupt-1", OperatorCommand::Interrupt)
+            .await;
+
+        fixture
+            .rejected("transition-1", forced_into_completed(None))
+            .await;
+
+        assert_eq!(fixture.status(), ExecutionStatus::Unknown);
+    }
+}
+
+#[tokio::test]
+async fn a_legacy_workflow_without_the_field_or_with_it_off_refuses_a_forced_transition() {
+    let switched_off = OVERRIDABLE.replace(
+        "allow_manual_override: true",
+        "allow_manual_override: false",
+    );
+    for yaml in [AGENT_THEN_AGENT, switched_off.as_str()] {
+        let root = TempRoot::new();
+        let mut fixture = hanging(&root, yaml).await;
+        fixture
+            .applied("interrupt-1", OperatorCommand::Interrupt)
+            .await;
+
+        fixture
+            .rejected("transition-1", forced_into_completed(Some("a reason")))
+            .await;
+
+        assert_eq!(fixture.status(), ExecutionStatus::Unknown);
+    }
+}
+
 const AGENT_THEN_AGENT: &str = r#"
 name: agent-then-agent
 version: 1

@@ -19,7 +19,7 @@
 //! the operation says so in its warning.
 
 use super::*;
-use crate::domain::Context;
+use crate::domain::{Context, DefinitionShape};
 use narsor_protocol::chat::PromptAuthor;
 
 /// Where an execution stands, as a key (KTD9): what a proposal of the
@@ -131,11 +131,25 @@ pub struct TransitionPlan {
     pub target: String,
 }
 
+/// Whether the operator may force a transition out of `state`.
+///
+/// The one place that decides it, for the offer a control plane shows and
+/// for the verdict of the runner alike. A definition in the unified shape
+/// has no `allow_manual_override`: every state it can leave allows the
+/// jump, and the operator's reason is what it takes. A definition in the
+/// legacy shape keeps what the state declares.
+pub fn manual_override_allowed(definition: &WorkflowDefinition, state: &State) -> bool {
+    match definition.shape {
+        DefinitionShape::Unified => !state.terminal,
+        DefinitionShape::Legacy => state.allow_manual_override,
+    }
+}
+
 /// Works out how a transition into `target` leaves `from_state`.
 ///
 /// Not forced: `target` must be where a declared transition of the state
-/// leads (the lowest label wins when several do). Forced: the state must
-/// declare `allow_manual_override` (D30) and `target` must exist in the
+/// leads (the lowest label wins when several do). Forced:
+/// [`manual_override_allowed`] must say so and `target` must exist in the
 /// workflow. The same rules whoever asks, so a control plane can refuse
 /// early on what the runner would refuse later.
 pub fn plan_operator_transition(
@@ -146,9 +160,9 @@ pub fn plan_operator_transition(
 ) -> Result<TransitionPlan, EngineError> {
     let invalid = |message: String| EngineError::InvalidTransition { message };
     if forced {
-        if !from_state.allow_manual_override {
+        if !manual_override_allowed(definition, from_state) {
             return Err(invalid(format!(
-                "state '{}' does not allow a forced transition (allow_manual_override)",
+                "state '{}' does not allow a forced transition",
                 from_state.id
             )));
         }

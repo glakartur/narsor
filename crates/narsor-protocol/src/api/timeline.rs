@@ -163,6 +163,13 @@ pub struct PositionUsage {
     /// The cost the harness reported, in US dollars.
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// What the conductor used when it decided in this entry's scope. Kept
+    /// apart from the agent's use above, which it never changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_total: Option<TokenCounts>,
+    /// The cost of those conductor runs, in US dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_cost_usd: Option<f64>,
 }
 
 /// Outcome of one timeline position.

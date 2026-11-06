@@ -323,9 +323,10 @@ pub enum TaskCommand {
         /// The state to go to.
         #[arg(value_name = "TARGET")]
         target: String,
-        /// Override the declared transitions. Needs a state that allows it
-        /// (`allow_manual_override`) and a `--reason`, which is recorded in
-        /// the task's audit trail.
+        /// Override the declared transitions. Needs a `--reason`, which is
+        /// recorded in the task's audit trail, and a workflow that allows it:
+        /// one in the unified state shape always does, one in the legacy
+        /// shape only from a state with `allow_manual_override`.
         #[arg(long = "override")]
         forced: bool,
         /// Why the transition is overridden.

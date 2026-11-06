@@ -58,12 +58,14 @@ use crate::config::{agent_args_for, AgentArgs};
 use crate::domain::{
     AgentActionConfig, ChoiceDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
 };
+use crate::engine::actions::agent::conversation::ReadingTap;
 use crate::engine::actions::agent::{
     run_harness_process, DefaultHarnessSource, SpawnEnding, BUILT_IN_HARNESS,
 };
 use crate::engine::actions::harness::{
     apply_extra_args, HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX,
 };
+use crate::engine::timeline_file::{ReadingSink, UsageReading};
 use crate::persistence::{ExecutionStore, WorkPaths};
 
 /// The time limit of an invocation when no `agent_timeout` is configured.
@@ -140,6 +142,22 @@ pub struct HarnessInvoker {
     timeout: Duration,
     budget: SnapshotBudget,
     extra_args: AgentArgs,
+    readings: Option<Arc<dyn ReadingSink>>,
+}
+
+/// Hands what the conductor's harness run reports on to the sink, as the
+/// use of the conductor and not of an agent.
+#[derive(Debug)]
+struct ConductorReadings(Arc<dyn ReadingSink>);
+
+impl ReadingSink for ConductorReadings {
+    fn record(&self, execution_id: &str, attempt_id: &str, reading: UsageReading) {
+        self.0.record(
+            execution_id,
+            attempt_id,
+            UsageReading::of_conductor(reading),
+        );
+    }
 }
 
 impl HarnessInvoker {
@@ -162,7 +180,16 @@ impl HarnessInvoker {
             timeout: DEFAULT_CONDUCTOR_TIMEOUT,
             budget: SnapshotBudget::default(),
             extra_args: AgentArgs::new(),
+            readings: None,
         }
+    }
+
+    /// Returns the invoker writing the tokens and cost of its runs to
+    /// `sink`, on the step the conductor decided in: the episode of the
+    /// invocation. A request without an episode has no step to count on.
+    pub fn with_reading_sink(mut self, sink: Arc<dyn ReadingSink>) -> Self {
+        self.readings = Some(sink);
+        self
     }
 
     /// Returns the invoker adding `args` to every harness run; on a conflict
@@ -309,6 +336,7 @@ impl HarnessInvoker {
             &working_dir,
             Some(self.timeout),
             adapter.stream_parser(),
+            self.reading_tap(invocation, &harness),
         )
         .await
         .map_err(|error| error.message)?;
@@ -338,6 +366,18 @@ impl HarnessInvoker {
         Ok(ConductorAnswer {
             message: response.message.clone(),
             response: response.to_value(),
+        })
+    }
+
+    /// Where the use the harness reports goes: the timeline entry of the
+    /// invocation's episode.
+    fn reading_tap(&self, invocation: &Invocation, harness: &str) -> Option<ReadingTap> {
+        let sink = self.readings.as_ref()?;
+        Some(ReadingTap {
+            sink: Arc::new(ConductorReadings(Arc::clone(sink))),
+            execution_id: invocation.execution_id.clone(),
+            attempt_id: invocation.request.episode.clone()?,
+            harness: harness.to_string(),
         })
     }
 

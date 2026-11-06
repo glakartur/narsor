@@ -4,6 +4,10 @@
 //! The numbers are those the harness reported on each timeline position, added
 //! up as they are: `in` and `out` are the `input` and `output` of
 //! [`TokenCounts`], and the cache counts are neither added to them nor read.
+//!
+//! What the conductor used is reported apart from what the agents used, and
+//! stays apart: the agent's numbers never include it, and the combined
+//! numbers are the sum of the two, made here.
 
 use narsor_protocol::api::{Position, PositionUsage, TokenCounts};
 
@@ -21,6 +25,28 @@ pub struct TaskUsage {
     pub subagents: Option<TokenCounts>,
     pub subagent_count: Option<u32>,
     pub cost_usd: Option<f64>,
+    /// What the conductor used when it decided, apart from the above.
+    pub conductor_total: Option<TokenCounts>,
+    pub conductor_cost_usd: Option<f64>,
+}
+
+impl TaskUsage {
+    /// Whether the conductor reported anything.
+    pub fn has_conductor(&self) -> bool {
+        self.conductor_total.is_some() || self.conductor_cost_usd.is_some()
+    }
+
+    /// The cost of the agents and the conductor together; `None` when
+    /// neither reported one.
+    pub fn combined_cost_usd(&self) -> Option<f64> {
+        add(self.cost_usd, self.conductor_cost_usd, |a, b| a + b)
+    }
+
+    /// The tokens of the agents and the conductor together; `None` when
+    /// neither reported any.
+    pub fn combined_total(&self) -> Option<TokenCounts> {
+        add(self.total, self.conductor_total, TokenCounts::plus)
+    }
 }
 
 /// The sum of the usage of `positions`; `None` when no position reported any.
@@ -37,10 +63,23 @@ pub fn sum(positions: &[Position]) -> Option<TaskUsage> {
                 u32::saturating_add,
             ),
             cost_usd: add(so_far.cost_usd, usage.cost_usd, |a, b| a + b),
+            conductor_total: add(
+                so_far.conductor_total,
+                usage.conductor_total,
+                TokenCounts::plus,
+            ),
+            conductor_cost_usd: add(
+                so_far.conductor_cost_usd,
+                usage.conductor_cost_usd,
+                |a, b| a + b,
+            ),
         });
     }
     sum.filter(|usage| {
-        usage.total.is_some() || usage.subagents.is_some() || usage.cost_usd.is_some()
+        usage.total.is_some()
+            || usage.subagents.is_some()
+            || usage.cost_usd.is_some()
+            || usage.has_conductor()
     })
 }
 
@@ -53,12 +92,10 @@ fn add<T: Copy>(a: Option<T>, b: Option<T>, plus: impl Fn(T, T) -> T) -> Option<
 
 /// `$1.20 · in 120k out 8k`, with `· w tym subagenci in 40k out 3k (2)` when
 /// `with_subagents` and the subagents used anything. A part that is unknown
-/// reads `—`.
+/// reads `—`. When the conductor reported use, `· dyrygent $0.05 · razem
+/// $1.25` ends the line: the first numbers stay the agents' alone.
 pub fn line(usage: &TaskUsage, with_subagents: bool) -> String {
-    let cost = usage
-        .cost_usd
-        .map_or_else(|| UNKNOWN.to_string(), |cost| format!("${cost:.2}"));
-    let mut text = format!("{cost} · {}", tokens(usage.total));
+    let mut text = format!("{} · {}", money(usage.cost_usd), tokens(usage.total));
     let subagents = usage
         .subagents
         .filter(|counts| counts.input + counts.output > 0);
@@ -68,7 +105,18 @@ pub fn line(usage: &TaskUsage, with_subagents: bool) -> String {
             text.push_str(&format!(" ({count})"));
         }
     }
+    if usage.has_conductor() {
+        text.push_str(&format!(
+            " · dyrygent {} · razem {}",
+            money(usage.conductor_cost_usd),
+            money(usage.combined_cost_usd())
+        ));
+    }
     text
+}
+
+fn money(cost: Option<f64>) -> String {
+    cost.map_or_else(|| UNKNOWN.to_string(), |cost| format!("${cost:.2}"))
 }
 
 /// What one step used, as the cells of a table row: each one is empty when
@@ -76,6 +124,8 @@ pub fn line(usage: &TaskUsage, with_subagents: bool) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StepCells {
     pub cost: String,
+    /// What the conductor cost in this step, apart from `cost`.
+    pub conductor_cost: String,
     pub input: String,
     pub output: String,
     pub subagent_count: String,
@@ -88,7 +138,7 @@ pub struct StepCells {
 impl StepCells {
     /// Whether the step has anything to show on the main part of its row.
     pub fn has_main(&self) -> bool {
-        !(self.cost.is_empty() && self.input.is_empty())
+        !(self.cost.is_empty() && self.conductor_cost.is_empty() && self.input.is_empty())
     }
 
     /// Whether the step has subagents to show.
@@ -111,6 +161,9 @@ pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
         cost: usage
             .cost_usd
             .map_or_else(String::new, |cost| format!("${cost:.2}")),
+        conductor_cost: usage
+            .conductor_cost_usd
+            .map_or_else(String::new, |cost| format!("dyr. ${cost:.2}")),
         ..StepCells::default()
     };
     if let Some(counts) = usage.total {
@@ -213,6 +266,7 @@ mod tests {
             subagent_count: subagents.map(|_| 1),
             subagent_stats: None,
             cost_usd: Some(cost),
+            ..PositionUsage::default()
         }
     }
 
@@ -421,6 +475,83 @@ mod tests {
         assert_eq!(
             (cells.input.as_str(), cells.output.as_str()),
             ("↓2k", "↑100")
+        );
+    }
+
+    #[test]
+    fn conductor_use_is_summed_apart_and_combined_with_the_agents() {
+        let mut first = used((80_000, 5_000), None, 0.8);
+        first.conductor_cost_usd = Some(0.05);
+        first.conductor_total = Some(counts(1_000, 100));
+        let mut second = used((20_000, 1_000), None, 0.2);
+        second.conductor_cost_usd = Some(0.25);
+        second.conductor_total = Some(counts(500, 50));
+
+        let task = sum(&[position(Some(first)), position(Some(second))]).unwrap();
+
+        assert_eq!(task.cost_usd, Some(1.0));
+        assert_eq!(task.total, Some(counts(100_000, 6_000)));
+        assert_eq!(task.conductor_cost_usd, Some(0.3));
+        assert_eq!(task.conductor_total, Some(counts(1_500, 150)));
+        assert_eq!(task.combined_cost_usd(), Some(1.3));
+        assert_eq!(task.combined_total(), Some(counts(101_500, 6_150)));
+    }
+
+    #[test]
+    fn a_task_with_only_conductor_use_still_has_a_sum() {
+        let only_conductor = PositionUsage {
+            conductor_cost_usd: Some(0.1),
+            ..PositionUsage::default()
+        };
+
+        let task = sum(&[position(Some(only_conductor))]).unwrap();
+
+        assert_eq!(task.cost_usd, None);
+        assert_eq!(task.combined_cost_usd(), Some(0.1));
+    }
+
+    #[test]
+    fn the_line_names_the_conductor_and_the_total_only_when_it_reported() {
+        let mut usage = TaskUsage {
+            cost_usd: Some(1.0),
+            total: Some(counts(1_000, 100)),
+            ..TaskUsage::default()
+        };
+        let without = line(&usage, true);
+        assert!(!without.contains("dyrygent"));
+
+        usage.conductor_cost_usd = Some(0.25);
+        let with = line(&usage, true);
+        assert!(with.starts_with(&without));
+        assert!(with.ends_with(" · dyrygent $0.25 · razem $1.25"));
+    }
+
+    #[test]
+    fn the_conductors_cost_has_a_cell_of_its_own() {
+        let usage = PositionUsage {
+            cost_usd: Some(0.5),
+            conductor_cost_usd: Some(0.05),
+            ..PositionUsage::default()
+        };
+
+        let cells = step_cells(Some(&usage));
+
+        assert_eq!(cells.cost, "$0.50");
+        assert_eq!(cells.conductor_cost, "dyr. $0.05");
+        assert!(step_cells(Some(&used((1, 1), None, 0.5)))
+            .conductor_cost
+            .is_empty());
+    }
+
+    #[test]
+    fn a_position_usage_without_conductor_fields_reads_back() {
+        let usage: PositionUsage =
+            serde_json::from_str(r#"{"cost_usd":0.5,"total":{"input":1}}"#).unwrap();
+
+        assert_eq!(usage.cost_usd, Some(0.5));
+        assert_eq!(
+            (usage.conductor_total, usage.conductor_cost_usd),
+            (None, None)
         );
     }
 }

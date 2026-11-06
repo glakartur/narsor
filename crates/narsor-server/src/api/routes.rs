@@ -1511,9 +1511,10 @@ async fn post_permission_decision(
 ///
 /// * ordinary (`force: false`): `label` must be one of the current state's
 ///   declared `transitions`; anything else is `400`.
-/// * forced (`force: true`, D30): the current state must declare
-///   `allow_manual_override: true`, and `target` must name a state the
-///   workflow actually has; either failing is `400`.
+/// * forced (`force: true`, D30): the workflow must allow the jump from the
+///   current state — always, in a definition in the unified state shape; as
+///   its `allow_manual_override` says, in the legacy shape — and `target`
+///   must name a state the workflow actually has; either failing is `400`.
 ///
 /// Once validated, the event sequence and status update are byte-for-byte
 /// the ones `write_transition` writes, in the same order.

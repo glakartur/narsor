@@ -30,7 +30,7 @@ use narsor_engine::domain::{
 use narsor_engine::engine::actions::harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessRegistry, OpenCodeAdapter,
 };
-use narsor_engine::engine::{DefaultHarnessSource, Engine};
+use narsor_engine::engine::{DefaultHarnessSource, Engine, ReadingSink, UsageReading};
 use narsor_engine::persistence::DefaultHarnessSelector;
 use serde_json::{json, Value};
 
@@ -1011,6 +1011,69 @@ async fn an_opencode_conductor_gets_no_schema() {
 // ---------------------------------------------------------------------------
 // The response
 // ---------------------------------------------------------------------------
+
+/// A reading sink that keeps what it is given.
+#[derive(Debug, Default)]
+struct RecordedReadings(std::sync::Mutex<Vec<(String, String, UsageReading)>>);
+
+impl ReadingSink for RecordedReadings {
+    fn record(&self, execution_id: &str, attempt_id: &str, reading: UsageReading) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((execution_id.to_string(), attempt_id.to_string(), reading));
+    }
+}
+
+#[tokio::test]
+async fn the_use_a_conductor_reports_goes_to_the_sink_as_the_conductors_own() {
+    let fixture = Fixture::new();
+    let line = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "conductor-session",
+        "result": CHOOSE_DONE,
+        "total_cost_usd": 0.05,
+        "usage": { "input_tokens": 300, "output_tokens": 40 },
+    });
+    fixture.claude.answers(&format!("{line}\n"));
+    let sink = Arc::new(RecordedReadings::default());
+
+    let outcome = fixture
+        .invoker("claude-code")
+        .with_reading_sink(sink.clone())
+        .invoke_once(&fixture.rescue())
+        .await;
+    answered(outcome, ConductorPurpose::ChooseOutput);
+
+    let readings = sink.0.lock().unwrap();
+    let [(execution_id, episode, reading)] = readings.as_slice() else {
+        panic!("expected one reading, got {readings:?}");
+    };
+    assert_eq!(execution_id, &fixture.execution_id);
+    assert_eq!(episode, "episode-1");
+    assert_eq!(reading.conductor_cost_usd, Some(0.05));
+    assert_eq!(reading.conductor_total.map(|total| total.input), Some(300));
+    assert_eq!(reading.cost_usd, None);
+    assert_eq!(reading.total, None);
+}
+
+#[tokio::test]
+async fn an_answer_without_a_use_report_is_still_an_answer_and_records_nothing() {
+    let fixture = Fixture::new();
+    fixture.claude.answers(&claude_answer(CHOOSE_DONE));
+    let sink = Arc::new(RecordedReadings::default());
+
+    let outcome = fixture
+        .invoker("claude-code")
+        .with_reading_sink(sink.clone())
+        .invoke_once(&fixture.rescue())
+        .await;
+
+    answered(outcome, ConductorPurpose::ChooseOutput);
+    assert!(sink.0.lock().unwrap().is_empty());
+}
 
 #[test]
 fn a_response_without_confidence_is_low() {

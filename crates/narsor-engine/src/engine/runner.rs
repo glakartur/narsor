@@ -108,7 +108,7 @@ use crate::engine::actions::{
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
-use crate::engine::timeline_file::FileReadingSink;
+use crate::engine::timeline_file::{FileReadingSink, ReadingSink};
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
 use crate::workflow::template::{
     embeds_user_content, step_reply_references, step_stream_references,
@@ -132,8 +132,8 @@ pub use failure::{
     step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
 };
 pub use operations::{
-    execution_episode, plan_operator_transition, ManualTransition, OperatorTransition,
-    OutputDecisionUndo, TransitionPlan, UndoneOutputDecision,
+    execution_episode, manual_override_allowed, plan_operator_transition, ManualTransition,
+    OperatorTransition, OutputDecisionUndo, TransitionPlan, UndoneOutputDecision,
 };
 pub use step_memory::{
     StepAttempt, StepAttempts, METADATA_STEP_ATTEMPTS_KEY, METADATA_STEP_LOCALS_KEY,
@@ -1335,6 +1335,15 @@ impl Engine {
     /// The store this engine persists to.
     pub fn store(&self) -> &ExecutionStore {
         &self.store
+    }
+
+    /// Where the tokens and cost that harnesses report go: the timeline
+    /// file, announced to the reading notifier like an agent's.
+    pub fn reading_sink(&self) -> Arc<dyn ReadingSink> {
+        Arc::new(FileReadingSink::new(
+            self.store.clone(),
+            self.reading_notifier.clone(),
+        ))
     }
 
     /// Subscribes to the live event stream.

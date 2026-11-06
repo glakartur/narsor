@@ -35,9 +35,9 @@ use crate::workspace::provisioner::is_usable_directory_name;
 
 use crate::domain::{
     ActionConfig, AgentActionConfig, AgentDecisionConfig, ArtifactDefinition, ChoiceDefinition,
-    DecisionActionConfig, DecisionConfig, DisplayLinkSpec, DisplaySpec, GlobalsConfig,
-    HumanActionConfig, HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter,
-    ParamType, RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion,
+    DecisionActionConfig, DecisionConfig, DefinitionShape, DisplayLinkSpec, DisplaySpec,
+    GlobalsConfig, HumanActionConfig, HumanDecisionConfig, HumanInputField, HumanInputType,
+    InputParameter, ParamType, RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion,
     ScriptActionConfig, State, StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig,
     WorkflowDefinition, WorkspaceAccess, EXIT_LABEL,
 };
@@ -45,8 +45,8 @@ use crate::domain::{
 use super::schema::{
     ActionSchema, ChoiceSchema, DecisionSchema, DisplaySchema, ExitSchema, GlobalsSchema,
     HumanInputTypeSchema, InputSchema, ParamTypeSchema, RepositorySchema, RepositorySourceSchema,
-    RetryPolicySchema, StateSchema, StepWorkspaceSchema, TerminalStatusSchema, VariableSchema,
-    WorkflowFile, WorkspaceSchema,
+    RetryPolicySchema, StateSchema, StateShape, StepWorkspaceSchema, TerminalStatusSchema,
+    VariableSchema, WorkflowFile, WorkspaceSchema,
 };
 
 /// Errors that can occur while loading a workflow definition from YAML.
@@ -200,6 +200,10 @@ fn compile_definition(file: WorkflowFile) -> Result<WorkflowDefinition, LoadErro
         inputs: file.inputs.into_iter().map(compile_input).collect(),
         globals: compile_globals(&globals),
         source_schema: file.schema,
+        shape: match file.shape {
+            StateShape::Legacy => DefinitionShape::Legacy,
+            StateShape::Unified => DefinitionShape::Unified,
+        },
         repositories,
         display: file.display.map(compile_display),
         states,

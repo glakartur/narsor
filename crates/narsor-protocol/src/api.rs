@@ -717,6 +717,7 @@ mod tests {
                     subagent_count: Some(2),
                     subagent_stats: None,
                     cost_usd: Some(0.5),
+                    ..Default::default()
                 }),
             }],
             links: BTreeMap::from([(7, EventLink::Position("review #1".into()))]),

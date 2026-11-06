@@ -52,6 +52,12 @@ pub struct WorkflowDefinition {
     #[serde(default, skip_serializing_if = "SchemaVersion::is_v2")]
     pub source_schema: SchemaVersion,
 
+    /// The state shape the definition was written in. A definition saved
+    /// before this field existed reads as `legacy`, which keeps what its
+    /// states declare (`allow_manual_override`).
+    #[serde(default, skip_serializing_if = "DefinitionShape::is_legacy")]
+    pub shape: DefinitionShape,
+
     /// Repositories the workflow works on (`globals.repositories` in YAML,
     /// or the converted `globals.workspace` of a `v1` file). Repositories are
     /// per execution, never per state. Empty for a workflow without any.
@@ -100,6 +106,23 @@ pub enum SchemaVersion {
 impl SchemaVersion {
     fn is_v2(&self) -> bool {
         *self == SchemaVersion::V2
+    }
+}
+
+/// The state shape a definition was written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionShape {
+    /// `v1`, or `v2` with `transitions`, a `decision` block and the like.
+    #[default]
+    Legacy,
+    /// `v2` with `choices` as a mapping and `exit`.
+    Unified,
+}
+
+impl DefinitionShape {
+    fn is_legacy(&self) -> bool {
+        *self == DefinitionShape::Legacy
     }
 }
 

@@ -310,6 +310,7 @@ fn initial_state_that_does_not_exist_is_rejected() {
         inputs: Vec::new(),
         globals: Default::default(),
         source_schema: Default::default(),
+        shape: Default::default(),
         repositories: Vec::new(),
         display: None,
         states,

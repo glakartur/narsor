@@ -613,6 +613,7 @@ impl AxisLayout {
         );
         let main = [
             column(true, |cells| &cells.cost),
+            column(true, |cells| &cells.conductor_cost),
             column(true, |cells| &cells.input),
             column(true, |cells| &cells.output),
         ];
@@ -975,6 +976,7 @@ mod tests {
             subagent_count: subagents.map(|_| 2),
             subagent_stats: None,
             cost_usd: Some(cost),
+            ..PositionUsage::default()
         })
     }
 

@@ -210,6 +210,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     )
     .with_default_harness_source(selector.clone())
     .with_extra_args(defaults.args.clone())
+    .with_reading_sink(engine.reading_sink())
     .with_agent_timeout(agent_timeout_secs);
     // Held here for the daemon's whole life: the engine only holds it
     // weakly, and hands a step without a usable output label to it (F1).
