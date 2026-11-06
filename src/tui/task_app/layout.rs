@@ -239,9 +239,14 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
         View::Tasks => detail::render(frame, area, app, styles, stale),
         View::NewTask(form) => new_task::render(frame, area, form, place, styles, focused),
         View::History(open) => {
-            history::render_details(
-                frame, area, open, styles, focused, stale, hyperlinks, glyph, loading,
-            );
+            let look = history::DetailsLook {
+                focused,
+                stale,
+                hyperlinks,
+                glyph,
+                loading,
+            };
+            history::render_details(frame, area, open, styles, look);
         }
         View::Repositories(open) => repositories::render(frame, area, open, styles, focused),
     }

@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use super::conductor::{ConductorHost, HarnessProbe};
-use super::storage::{CommandVerdict, StorageLock};
+use super::storage::CommandVerdict;
 use super::*;
 use crate::conductor::{
     ChatAuthor, ConductorAnswer, ConductorInvoker, ConductorView, Invocation, InvocationOutcome,
@@ -330,13 +330,12 @@ fn offline_config(root: &TempRoot, storage: &Path, incarnation: &str) -> RunnerC
     }
 }
 
-/// One incarnation of a runner on a task storage, holding its lock.
+/// One incarnation of a runner on a task storage.
 struct Fixture {
     session: Session,
     agent: Arc<Agent>,
     conductor: Arc<Conductor>,
     spec: TaskLaunchSpec,
-    _lock: StorageLock,
 }
 
 impl Fixture {
@@ -353,7 +352,6 @@ impl Fixture {
     ) -> Self {
         let config = offline_config(root, storage, incarnation);
         let storage = TaskStorage::new(storage);
-        let lock = storage.lock().expect("lock the storage");
         storage.prepare().expect("prepare the storage");
         initialize(
             &storage,
@@ -391,7 +389,6 @@ impl Fixture {
             agent,
             conductor,
             spec: spec.clone(),
-            _lock: lock,
         }
     }
 

@@ -215,14 +215,14 @@ mod tests {
     fn git(remote_url: &str) -> TaskWorkspace {
         TaskWorkspace::single(TaskRepository::new(
             "project",
-            TaskRepositorySource::Git(GitIdentity {
+            TaskRepositorySource::Git(Box::new(GitIdentity {
                 repository: None,
                 remote_url: remote_url.to_string(),
                 commit: String::new(),
                 git_ref: None,
                 ref_origin: None,
                 credential: None,
-            }),
+            })),
         ))
     }
 

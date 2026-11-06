@@ -294,7 +294,7 @@ impl GitHubCopilotStreamParser {
                 }]
             }
             "error" => {
-                self.terminal_failure = Some(error_text(&value));
+                self.terminal_failure = Some(error_text(value));
                 vec![technical_event(kind, data)]
             }
             "usage" => {

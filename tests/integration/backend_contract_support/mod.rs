@@ -192,7 +192,26 @@ pub struct Harness<T: ContractTarget> {
     controllers: Vec<ControllerHandle>,
     server: tokio::task::JoinHandle<()>,
     policy: Option<tokio::task::JoinHandle<()>>,
+    clock: Arc<ShiftedClock>,
     root: TempRoot,
+}
+
+/// The wall clock plus a shift the test moves by hand. Time still passes on
+/// its own, so leases and timestamps behave as usual; a test only adds to the
+/// shift to end a lease at once instead of waiting for it.
+#[derive(Debug, Default)]
+struct ShiftedClock(std::sync::Mutex<chrono::Duration>);
+
+impl ShiftedClock {
+    fn advance(&self, by: chrono::Duration) {
+        *self.0.lock().expect("the shift") += by;
+    }
+}
+
+impl narsor_engine::orchestration::Clock for ShiftedClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + *self.0.lock().expect("the shift")
+    }
 }
 
 impl<T: ContractTarget> Harness<T> {
@@ -217,6 +236,7 @@ impl<T: ContractTarget> Harness<T> {
         let state = root.0.join("control");
         fs::create_dir_all(&state).expect("state root");
         let launch = crate::environment_support::seeded_resolver(&state);
+        let clock = Arc::new(ShiftedClock::default());
         // The scheduler admits a task only on a registered backend, with
         // its limit read from the catalogue (U10).
         narsor_engine::environment::EnvironmentCatalog::new(&state)
@@ -224,7 +244,10 @@ impl<T: ContractTarget> Harness<T> {
             .expect("register the contract backend");
         let service = Arc::new(
             ProtocolService::with_config(
-                narsor_engine::orchestration::ControlPlane::new(StatePaths::new(&state)),
+                narsor_engine::orchestration::ControlPlane::with_clock(
+                    StatePaths::new(&state),
+                    Arc::clone(&clock) as Arc<dyn narsor_engine::orchestration::Clock>,
+                ),
                 launch,
                 ProtocolConfig {
                     resume: test_resume_policy(),
@@ -257,6 +280,7 @@ impl<T: ContractTarget> Harness<T> {
             controllers: Vec::new(),
             server,
             policy,
+            clock,
             root,
         })
     }
@@ -623,6 +647,12 @@ impl<T: ContractTarget> Harness<T> {
             h.counters().observe_calls >= target
         })
         .await;
+    }
+
+    /// Moves the control plane's clock forward, so a lease ends without the
+    /// test waiting for it, then wakes the controllers to notice.
+    pub fn advance_clock(&self, by: chrono::Duration) {
+        self.clock.advance(by);
     }
 
     /// Lets controllers run a few rounds, for "nothing happens" checks.
@@ -1441,7 +1471,9 @@ pub async fn a_reader_reads_a_stopped_task_and_leaves_with_its_lease<T: Contract
     let before = h.storage_digest("task-1");
     let created = h.counters().workloads_created;
 
-    h.lease_reader("task-1", 3);
+    // A long lease: the reader is seen running however slow the machine is.
+    // The test ends it by moving the clock, not by waiting for it.
+    h.lease_reader("task-1", 600);
     let reader = h.running_reader("task-1").await;
     assert_eq!(reader.launch_generation, h.record("task-1").generation);
     let observed = h.observe("task-1").await;
@@ -1460,6 +1492,8 @@ pub async fn a_reader_reads_a_stopped_task_and_leaves_with_its_lease<T: Contract
         .await
         .is_some_and(|r| r.uid == reader.uid));
 
+    h.advance_clock(chrono::Duration::seconds(601));
+    h.service.notify(&TaskId::parse("task-1").unwrap());
     h.wait_reader("task-1", "the lease to end the reader", |r| r.is_none())
         .await;
     assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);

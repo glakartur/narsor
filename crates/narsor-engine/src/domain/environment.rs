@@ -770,7 +770,7 @@ impl TaskWorkspace {
         self.repositories
             .iter()
             .filter_map(|repository| match &repository.source {
-                TaskRepositorySource::Git(identity) => Some(identity),
+                TaskRepositorySource::Git(identity) => Some(identity.as_ref()),
                 TaskRepositorySource::Local { .. } => None,
             })
     }
@@ -810,7 +810,7 @@ pub enum TaskRepositorySource {
     /// backend, where a host path would not be portable.
     Local { path: String },
     /// A Git repository, pinned to a commit once known.
-    Git(GitIdentity),
+    Git(Box<GitIdentity>),
 }
 
 // ---------------------------------------------------------------------------

@@ -871,7 +871,7 @@ fn tool_secrets_are_projected_files_never_values() {
     let repository = |name: &str, credential: &str| {
         TaskRepository::new(
             name,
-            TaskRepositorySource::Git(GitIdentity {
+            TaskRepositorySource::Git(Box::new(GitIdentity {
                 repository: Some(name.into()),
                 remote_url: format!("https://git.example/{name}.git"),
                 commit: "a".repeat(40),
@@ -884,7 +884,7 @@ fn tool_secrets_are_projected_files_never_values() {
                     delivery: SecretDelivery::File(".git-credential".into()),
                     ..github_secret()
                 }),
-            }),
+            })),
         )
     };
     spec = TaskLaunchSpec::new(
