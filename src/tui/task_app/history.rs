@@ -1003,6 +1003,16 @@ pub fn render_list(
     }
 }
 
+/// How the details of a history entry are drawn.
+#[derive(Clone, Copy)]
+pub struct DetailsLook {
+    pub focused: bool,
+    pub stale: bool,
+    pub hyperlinks: bool,
+    pub glyph: &'static str,
+    pub loading: bool,
+}
+
 /// Draws the details of the selected entry into `area`: the header and the
 /// tabs of a task, with nothing to answer.
 pub fn render_details(
@@ -1010,12 +1020,15 @@ pub fn render_details(
     area: Rect,
     history: &mut History,
     styles: &Styles,
-    focused: bool,
-    stale: bool,
-    hyperlinks: bool,
-    glyph: &'static str,
-    loading: bool,
+    look: DetailsLook,
 ) {
+    let DetailsLook {
+        focused,
+        stale,
+        hyperlinks,
+        glyph,
+        loading,
+    } = look;
     let tab = history.tab;
     let keys = if focused {
         KeysAt::Content(history.step_focus())

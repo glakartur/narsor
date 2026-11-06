@@ -151,7 +151,7 @@ impl ControlPlane {
         for task in waiting {
             match (&policy.backend, policy.max_concurrent_tasks) {
                 (BackendAvailability::Available, limit)
-                    if online && limit.map_or(true, |limit| in_use < limit) =>
+                    if online && limit.is_none_or(|limit| in_use < limit) =>
                 {
                     in_use += 1;
                     verdicts.push((task.task_id.clone(), Verdict::Admit));

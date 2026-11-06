@@ -865,14 +865,14 @@ impl CatalogLaunchResolver {
                     None,
                     TaskRepository::new(
                         name,
-                        TaskRepositorySource::Git(GitIdentity {
+                        TaskRepositorySource::Git(Box::new(GitIdentity {
                             repository: None,
                             remote_url: repository,
                             commit,
                             git_ref: None,
                             ref_origin: None,
                             credential: None,
-                        }),
+                        })),
                     ),
                 ));
             }
@@ -923,7 +923,8 @@ impl CatalogLaunchResolver {
             credential,
         };
         let name = name.map(str::to_string).unwrap_or_else(|| entry.id.clone());
-        let mut task_repository = TaskRepository::new(name, TaskRepositorySource::Git(identity));
+        let mut task_repository =
+            TaskRepository::new(name, TaskRepositorySource::Git(Box::new(identity)));
         task_repository.branch = branch;
         Ok((Some(entry), task_repository))
     }

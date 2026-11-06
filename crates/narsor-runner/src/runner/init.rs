@@ -451,14 +451,14 @@ terminal_states: [completed]
     ) -> TaskWorkspace {
         TaskWorkspace::single(TaskRepository::new(
             "demo",
-            TaskRepositorySource::Git(GitIdentity {
+            TaskRepositorySource::Git(Box::new(GitIdentity {
                 repository: Some("demo".to_string()),
                 remote_url: bare.display().to_string(),
                 commit: String::new(),
                 git_ref: git_ref.map(str::to_string),
                 ref_origin,
                 credential: None,
-            }),
+            })),
         ))
     }
 

@@ -702,7 +702,7 @@ fn resolve_git_on_local(
     else {
         panic!("git workspace expected");
     };
-    git
+    *git
 }
 
 fn app_entry() -> RepositoryEntry {

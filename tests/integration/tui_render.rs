@@ -3767,7 +3767,7 @@ mod task_app_detail_render {
             .iter()
             .map(|text| ratatui::text::Span::raw(text.as_str()).width() + 4)
             .sum();
-        assert!(cells + 2 + 12 + 1 <= 30, "{edge:?}");
+        assert!(cells + 2 + 12 < 30, "{edge:?}");
     }
 
     #[test]

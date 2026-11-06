@@ -106,13 +106,16 @@ pub fn render_bracketed_list(
     focused: bool,
     top: &mut usize,
 ) {
+    let list = List {
+        items,
+        selected,
+        focused,
+    };
     render_list(
         frame,
         area,
         styles,
-        items,
-        selected,
-        focused,
+        list,
         top,
         SelectionDecoration::Bracketed,
     );
@@ -130,28 +133,41 @@ pub fn render_barred_list(
     focused: bool,
     top: &mut usize,
 ) {
-    render_list(
-        frame,
-        area,
-        styles,
+    let list = List {
         items,
         selected,
         focused,
-        top,
-        SelectionDecoration::Barred,
-    );
+    };
+    render_list(frame, area, styles, list, top, SelectionDecoration::Barred);
+}
+
+/// What a list shows: its items, the selected one, and whether it has focus.
+struct List<'a> {
+    items: &'a [Vec<Line<'a>>],
+    selected: Option<usize>,
+    focused: bool,
+}
+
+/// How one line is marked: selected or not, and whether its list has focus.
+#[derive(Clone, Copy)]
+struct LineMark {
+    selected: bool,
+    focused: bool,
 }
 
 fn render_list(
     frame: &mut Frame,
     area: Rect,
     styles: &Styles,
-    items: &[Vec<Line<'_>>],
-    selected: Option<usize>,
-    focused: bool,
+    list: List<'_>,
     top: &mut usize,
     decoration: SelectionDecoration,
 ) {
+    let List {
+        items,
+        selected,
+        focused,
+    } = list;
     let selected = selected.filter(|&index| index < items.len());
     let height = usize::from(area.height);
     let heights: Vec<usize> = items.iter().map(Vec::len).collect();
@@ -165,7 +181,11 @@ fn render_list(
         let rules = if decoration.has_rules() { 2 } else { 0 };
         if heights[index] + rules > height {
             for (row, line) in items[index].iter().take(height).enumerate() {
-                draw_line(frame, area, row, styles, line, true, focused, decoration);
+                let mark = LineMark {
+                    selected: true,
+                    focused,
+                };
+                draw_line(frame, area, row, styles, line, mark, decoration);
             }
             return;
         }
@@ -185,16 +205,11 @@ fn render_list(
             if row >= height {
                 break;
             }
-            draw_line(
-                frame,
-                area,
-                row,
-                styles,
-                line,
-                is_selected,
+            let mark = LineMark {
+                selected: is_selected,
                 focused,
-                decoration,
-            );
+            };
+            draw_line(frame, area, row, styles, line, mark, decoration);
             row += 1;
         }
         if is_selected && decoration.has_rules() && row < height {
@@ -266,10 +281,10 @@ fn draw_line(
     row: usize,
     styles: &Styles,
     line: &Line<'_>,
-    selected: bool,
-    focused: bool,
+    mark: LineMark,
     decoration: SelectionDecoration,
 ) {
+    let LineMark { selected, focused } = mark;
     let y = area.y + row as u16;
     let prefix_width = area.width.min(PREFIX_WIDTH);
     frame.render_widget(

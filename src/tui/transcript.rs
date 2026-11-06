@@ -1198,70 +1198,69 @@ impl TranscriptState {
         // Raw views show source bytes, not the choice card, so only the
         // rendered card carries the highlight.
         let card = self.mode != DisplayMode::Raw && !self.is_raw(&entry.id);
-        let lines = match self.mode {
-            DisplayMode::Raw => {
-                vec![(
-                    raw_display(&entry.raw),
-                    TranscriptPresentation::Neutral,
-                    false,
-                    false,
-                )]
-            }
-            DisplayMode::Rendered | DisplayMode::Chronology => {
-                if self.is_raw(&entry.id) {
+        let lines =
+            match self.mode {
+                DisplayMode::Raw => {
                     vec![(
                         raw_display(&entry.raw),
                         TranscriptPresentation::Neutral,
                         false,
                         false,
                     )]
-                } else {
-                    let mut lines = entry
-                        .rendered_lines
-                        .iter()
-                        .cloned()
-                        .map(|text| (text, entry.presentation, false, true))
-                        .collect::<Vec<_>>();
-                    let expanded = self.is_expanded(&entry.id);
-                    let has_details = !entry.detail_lines.is_empty()
-                        && !entry
-                            .detail_lines
+                }
+                DisplayMode::Rendered | DisplayMode::Chronology => {
+                    if self.is_raw(&entry.id) {
+                        vec![(
+                            raw_display(&entry.raw),
+                            TranscriptPresentation::Neutral,
+                            false,
+                            false,
+                        )]
+                    } else {
+                        let mut lines = entry
+                            .rendered_lines
                             .iter()
-                            .map(|detail| detail.text.as_str())
-                            .eq(entry.rendered_lines.iter().map(String::as_str));
-                    if expanded {
-                        if has_details {
+                            .cloned()
+                            .map(|text| (text, entry.presentation, false, true))
+                            .collect::<Vec<_>>();
+                        let expanded = self.is_expanded(&entry.id);
+                        let has_details = !entry.detail_lines.is_empty()
+                            && !entry
+                                .detail_lines
+                                .iter()
+                                .map(|detail| detail.text.as_str())
+                                .eq(entry.rendered_lines.iter().map(String::as_str));
+                        if expanded && has_details {
                             lines.extend(entry.detail_lines.iter().map(|detail| {
                                 (detail.text.clone(), detail.presentation, false, true)
                             }));
                         }
-                    }
-                    // Conversation and Chronology intentionally share the
-                    // same card header. The source timestamp is already
-                    // shown as date, hour, minute and second; switching a
-                    // projection must not turn into a formatting change.
-                    let marker = if has_details {
-                        if expanded {
-                            "⌄"
+                        // Conversation and Chronology intentionally share the
+                        // same card header. The source timestamp is already
+                        // shown as date, hour, minute and second; switching a
+                        // projection must not turn into a formatting change.
+                        let marker = if has_details {
+                            if expanded {
+                                "⌄"
+                            } else {
+                                "›"
+                            }
                         } else {
-                            "›"
-                        }
-                    } else {
-                        "·"
-                    };
-                    lines.insert(
-                        0,
-                        (
-                            format!("{marker} {}", entry.header),
-                            entry.presentation,
-                            true,
-                            false,
-                        ),
-                    );
-                    lines
+                            "·"
+                        };
+                        lines.insert(
+                            0,
+                            (
+                                format!("{marker} {}", entry.header),
+                                entry.presentation,
+                                true,
+                                false,
+                            ),
+                        );
+                        lines
+                    }
                 }
-            }
-        };
+            };
         lines
             .into_iter()
             .enumerate()

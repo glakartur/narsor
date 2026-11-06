@@ -586,8 +586,7 @@ impl ProtocolService {
         let comment_taken = |record: &TaskRecord| {
             record
                 .resume_message_taken
-                .iter()
-                .any(|taken| *taken == request.idempotency_key)
+                .contains(&request.idempotency_key)
         };
         let key_taken = |record: &TaskRecord| {
             record
