@@ -373,7 +373,7 @@ impl Progress {
 
 /// The glyph, the role and the word of a step's status: colour is never the
 /// only thing that says it.
-fn status_look(status: PositionStatus) -> (&'static str, Role, &'static str) {
+pub(super) fn status_look(status: PositionStatus) -> (&'static str, Role, &'static str) {
     match status {
         PositionStatus::Succeeded => ("✓", Role::Done, "ok"),
         PositionStatus::Failed => ("✗", Role::Problem, "błąd"),

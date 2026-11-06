@@ -1,5 +1,6 @@
-//! *Rozmowa*: the whole conversation of the task, and the per-attempt cache
-//! that *Przebieg* shows a step from.
+//! *Rozmowa*: the conversation of one step of the task, picked on a strip of
+//! steps (newest first, `←` / `→`), and the per-attempt cache that it and
+//! *Przebieg* show a step from.
 //!
 //! Pages come through the control plane's relay
 //! (`GET /control/v1/tasks/:id/attempts/:attempt/conversation`), which waits
@@ -38,7 +39,7 @@ use crate::controller_protocol::{
     CONVERSATION_UNAVAILABLE,
 };
 use crate::domain::{Event, EventData};
-use narsor_protocol::api::{ConversationState, Position};
+use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{bar_prefix, PREFIX_WIDTH};
@@ -486,10 +487,28 @@ pub fn transcript_action(transcript: &mut TranscriptState, action: Action) {
     }
 }
 
-/// *Rozmowa*: every attempt's entries, oldest attempt first, one transcript.
+/// A step entry as the strip of *Rozmowa* names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepChip {
+    /// The label of the entry, unique within the timeline.
+    pub label: String,
+    pub status: PositionStatus,
+}
+
+/// *Rozmowa*: the conversation of one step entry at a time, picked on the
+/// strip of steps above it, newest first. The strip follows the newest step
+/// while it is the one selected; a step picked further back stays. Each step
+/// keeps its own reader (cursor, expanded entries, following the end).
 #[derive(Debug, Clone)]
 pub struct Conversation {
-    full: TranscriptState,
+    task_id: String,
+    /// The step entries, newest first.
+    steps: Vec<StepChip>,
+    selected: Option<String>,
+    follow: bool,
+    readers: BTreeMap<String, TranscriptState>,
+    /// The reader shown while no step is selected.
+    empty: TranscriptState,
     built: bool,
     loading: bool,
     /// The first failed read, and the step it was of.
@@ -503,7 +522,12 @@ impl Conversation {
     /// An empty conversation of `task_id`.
     pub fn new(task_id: &str) -> Self {
         Self {
-            full: TranscriptState::new(TranscriptId::from(task_id)),
+            task_id: task_id.to_string(),
+            steps: Vec::new(),
+            selected: None,
+            follow: true,
+            readers: BTreeMap::new(),
+            empty: TranscriptState::new(TranscriptId::from(task_id)),
             built: false,
             loading: false,
             failure: None,
@@ -511,14 +535,39 @@ impl Conversation {
         }
     }
 
-    /// The reader of the whole conversation.
+    /// The reader of the selected step.
     pub fn transcript(&self) -> &TranscriptState {
-        &self.full
+        self.selected
+            .as_ref()
+            .and_then(|label| self.readers.get(label))
+            .unwrap_or(&self.empty)
     }
 
-    /// The reader, to scroll it.
+    /// The reader of the selected step, to scroll it.
     pub fn transcript_mut(&mut self) -> &mut TranscriptState {
-        &mut self.full
+        match self
+            .selected
+            .as_ref()
+            .and_then(|label| self.readers.get_mut(label))
+        {
+            Some(reader) => reader,
+            None => &mut self.empty,
+        }
+    }
+
+    /// The step entries, newest first.
+    pub fn steps(&self) -> &[StepChip] {
+        &self.steps
+    }
+
+    /// The label of the selected step.
+    pub fn selected_step(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
+    /// Whether the selection follows the newest step.
+    pub fn follows_newest(&self) -> bool {
+        self.follow
     }
 
     /// Whether the conversation was put together at least once.
@@ -526,7 +575,7 @@ impl Conversation {
         self.built
     }
 
-    /// Whether some attempt has not been read yet.
+    /// Whether some attempt of the selected step has not been read yet.
     pub fn is_loading(&self) -> bool {
         self.loading
     }
@@ -542,27 +591,90 @@ impl Conversation {
         self.record
     }
 
-    /// Puts the whole conversation together from the attempts read, in the
-    /// order of the `positions`. The cursor and the expanded entries stay
-    /// where they were; a reader at the end stays at the end.
+    /// `←`: the step after the selected one (to the left on the strip).
+    /// Returns whether the selection moved.
+    pub fn select_newer(&mut self) -> bool {
+        self.select_by(-1)
+    }
+
+    /// `→`: the step before the selected one (to the right on the strip).
+    /// Returns whether the selection moved.
+    pub fn select_older(&mut self) -> bool {
+        self.select_by(1)
+    }
+
+    fn select_by(&mut self, by: isize) -> bool {
+        let Some(at) = self.selected_index() else {
+            return false;
+        };
+        let to = at as isize + by;
+        if to < 0 || to as usize >= self.steps.len() {
+            return false;
+        }
+        self.selected = Some(self.steps[to as usize].label.clone());
+        self.follow = to == 0;
+        true
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let label = self.selected.as_deref()?;
+        self.steps.iter().position(|step| step.label == label)
+    }
+
+    /// Puts the selected step's conversation together from the attempts
+    /// read. The cursor and the expanded entries stay where they were; a
+    /// reader at the end stays at the end.
     pub fn rebuild(&mut self, positions: &[Position], attempts: &Attempts) {
         self.rebuild_with_events(positions, attempts, &[]);
     }
 
-    /// Rebuilds the transcript and includes workflow output choices made by
-    /// the agent, conductor, or operator: [`build_conversation`] over the
-    /// whole conversation.
+    /// Takes the step entries of `positions` in, moves the selection to the
+    /// newest one while following (or when the selected one is gone), and
+    /// puts the selected step's conversation together with the workflow
+    /// choices made in it: [`build_conversation`] over [`Scope::Step`].
     pub fn rebuild_with_events(
         &mut self,
         positions: &[Position],
         attempts: &Attempts,
         events: &[Event],
     ) {
-        let built = build_conversation(Scope::Whole, positions, attempts, events);
+        self.steps = positions
+            .iter()
+            .rev()
+            .map(|position| StepChip {
+                label: position.label.clone(),
+                status: position.status,
+            })
+            .collect();
+        if self.follow || self.selected_index().is_none() {
+            self.selected = self.steps.first().map(|step| step.label.clone());
+            self.follow = true;
+        }
+        let selected = self
+            .selected
+            .as_deref()
+            .and_then(|label| positions.iter().find(|position| position.label == label));
+        let built = selected.map_or_else(Built::default, |position| {
+            build_conversation(
+                Scope::Step {
+                    state_id: &position.state_id,
+                    visit: position.visit,
+                },
+                positions,
+                attempts,
+                events,
+            )
+        });
+        if let Some(position) = selected {
+            let id = TranscriptId::from(format!("{}/{}", self.task_id, position.label));
+            self.readers
+                .entry(position.label.clone())
+                .or_insert_with(|| TranscriptState::new(id))
+                .replace_entries(built.entries);
+        }
         self.loading = built.loading;
         self.failure = built.failure;
         self.record = built.record;
-        self.full.replace_entries(built.entries);
         self.built = true;
     }
 }
@@ -1135,6 +1247,127 @@ pub fn render_notes(frame: &mut Frame, area: Rect, notes: Vec<Line<'static>>) ->
     Rect::new(area.x, area.y + rows, area.width, area.height - rows)
 }
 
+/// The rows the strip of steps takes: a rule, the steps, a rule.
+pub const STEP_STRIP_ROWS: u16 = 3;
+
+/// Between two steps on the strip.
+const STEP_SEPARATOR: &str = " · ";
+
+/// Where steps are cut off the strip.
+const STEP_MORE: &str = "…";
+
+/// Draws the strip of steps over the whole of `area` (its first
+/// [`STEP_STRIP_ROWS`] rows): a rule across the full width, the steps newest
+/// first indented like the tab's content, and a rule again. The selected step
+/// is bold and underlined, in the focus role while the keys are in the tab.
+/// A strip wider than the area keeps the selected step in view, `…` where
+/// steps are cut.
+pub fn render_step_strip(
+    frame: &mut Frame,
+    area: Rect,
+    styles: &Styles,
+    conversation: &Conversation,
+    focused: bool,
+) {
+    let rule = Line::styled("─".repeat(usize::from(area.width)), styles.of(Role::Done));
+    let rows = [rule.clone(), Line::default(), rule];
+    for (offset, line) in (0..area.height.min(STEP_STRIP_ROWS)).zip(rows) {
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(area.x, area.y + offset, area.width, 1),
+        );
+    }
+    if area.height < 2 {
+        return;
+    }
+    let steps = Rect::new(
+        area.x.saturating_add(2),
+        area.y + 1,
+        area.width.saturating_sub(3),
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(step_strip_line(
+            conversation,
+            usize::from(steps.width),
+            focused,
+            styles,
+        )),
+        steps,
+    );
+}
+
+/// The steps of the strip that fit in `width`, with the selected one in view.
+fn step_strip_line(
+    conversation: &Conversation,
+    width: usize,
+    focused: bool,
+    styles: &Styles,
+) -> Line<'static> {
+    let steps = conversation.steps();
+    if steps.is_empty() {
+        return Line::styled("brak kroków", styles.of(Role::Done));
+    }
+    let chip_width = |step: &StepChip| 2 + one_line(&step.label).chars().count();
+    let separator = STEP_SEPARATOR.chars().count();
+    let more = STEP_MORE.chars().count() + 1;
+    let span_width = |from: usize, to: usize| -> usize {
+        steps[from..=to].iter().map(chip_width).sum::<usize>() + separator * (to - from)
+    };
+    let selected = conversation
+        .selected_step()
+        .and_then(|label| steps.iter().position(|step| step.label == label))
+        .unwrap_or(0);
+    let mut first = 0;
+    while first < selected && span_width(first, selected) + more * usize::from(first > 0) > width {
+        first += 1;
+    }
+    let mut spans = Vec::new();
+    let mut used = 0;
+    if first > 0 {
+        spans.push(Span::styled(format!("{STEP_MORE} "), styles.of(Role::Done)));
+        used += more;
+    }
+    for (index, step) in steps.iter().enumerate().skip(first) {
+        let gap = if index > first { separator } else { 0 };
+        let last = index + 1 == steps.len();
+        let room = width.saturating_sub(if last { 0 } else { more });
+        if index > selected && used + gap + chip_width(step) > room {
+            spans.push(Span::styled(format!(" {STEP_MORE}"), styles.of(Role::Done)));
+            break;
+        }
+        if gap > 0 {
+            spans.push(Span::styled(STEP_SEPARATOR, styles.of(Role::Done)));
+        }
+        spans.extend(step_chip(step, index == selected, focused, styles));
+        used += gap + chip_width(step);
+    }
+    Line::from(spans)
+}
+
+/// A step on the strip: its status glyph and its label.
+fn step_chip(
+    step: &StepChip,
+    selected: bool,
+    focused: bool,
+    styles: &Styles,
+) -> [Span<'static>; 2] {
+    let (glyph, role, _) = super::progress::status_look(step.status);
+    let label = one_line(&step.label);
+    let label_style = if selected {
+        let role = if focused { Role::Focus } else { Role::Calm };
+        styles
+            .selected_tab(role)
+            .add_modifier(ratatui::style::Modifier::UNDERLINED)
+    } else {
+        styles.of(Role::Done)
+    };
+    [
+        Span::styled(format!("{glyph} "), styles.of(role)),
+        Span::styled(label, label_style),
+    ]
+}
+
 /// Draws the tab. `focused` says the keys are in it.
 pub fn render(
     frame: &mut Frame,
@@ -1159,11 +1392,13 @@ pub fn render(
     let body = render_notes(frame, area, notes);
     if conversation.transcript().entries().is_empty() {
         let text = if conversation.is_loading() {
-            format!("{glyph} wczytuję rozmowę…")
+            format!("{glyph} wczytuję rozmowę kroku…")
         } else if conversation.record().is_some() {
             "brak zapisanej rozmowy".to_string()
-        } else {
+        } else if conversation.steps().is_empty() {
             "brak rozmowy — żaden krok nie zapisał jej jeszcze".to_string()
+        } else {
+            "brak rozmowy w tym kroku".to_string()
         };
         frame.render_widget(
             Paragraph::new(Line::styled(text, styles.of(Role::Done))),

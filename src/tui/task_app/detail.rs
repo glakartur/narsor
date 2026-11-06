@@ -194,12 +194,25 @@ impl TaskDetail {
     pub fn on_action(&mut self, tab: DetailTab, step: StepFocus, action: Action) {
         match tab {
             DetailTab::Progress => self.on_progress_action(step, action),
-            DetailTab::Conversation => {
-                transcript_action(self.conversation.transcript_mut(), action);
-            }
+            DetailTab::Conversation => self.on_conversation_action(action),
             DetailTab::Events => self.events.on_action(action),
             DetailTab::Info => self.info.on_action(action),
             DetailTab::Conductor => self.conductor.on_action(action),
+        }
+    }
+
+    /// In *Rozmowa* `←` / `→` pick the step and the other keys read it.
+    fn on_conversation_action(&mut self, action: Action) {
+        let moved = match action {
+            Action::NewerStep => self.conversation.select_newer(),
+            Action::OlderStep => self.conversation.select_older(),
+            _ => {
+                transcript_action(self.conversation.transcript_mut(), action);
+                false
+            }
+        };
+        if moved {
+            rebuild_conversation(self);
         }
     }
 
@@ -825,7 +838,7 @@ impl TaskApp {
 
     /// Takes the answers of one job of `task_id`'s details in, in the order
     /// they were read. A task that left the list has no details to put them in.
-    fn on_detail_reads(&mut self, task_id: &str, revision: u64, reads: Vec<DetailRead>) {
+    pub fn on_detail_reads(&mut self, task_id: &str, revision: u64, reads: Vec<DetailRead>) {
         if !self
             .list
             .tasks()
@@ -1254,6 +1267,27 @@ pub(super) fn render_view(
             )
         }
         (DetailTab::Conversation, None) => {
+            // The strip spans the whole pane, from right under the tabs.
+            let strip = Rect::new(
+                parts.content.x,
+                parts.content.y,
+                parts.content.width,
+                conversation::STEP_STRIP_ROWS.min(parts.content.height),
+            );
+            conversation::render_step_strip(
+                frame,
+                strip,
+                styles,
+                &view.detail.conversation,
+                focused,
+            );
+            let below = strip.bottom().saturating_sub(content.y);
+            let content = Rect::new(
+                content.x,
+                content.y + below.min(content.height),
+                content.width,
+                content.height.saturating_sub(below),
+            );
             conversation::render(
                 frame,
                 content,

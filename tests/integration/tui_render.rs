@@ -2740,6 +2740,156 @@ mod task_app_detail_render {
         assert!(screen.contains("brak rozmowy"), "{screen}");
     }
 
+    /// `NAR-12` on *Rozmowa*, the keys in the details: `plan` done and
+    /// `review` running, each with one line of its own conversation.
+    fn conversation_of_two_steps() -> TaskApp {
+        let mut app = running_app();
+        press(&mut app, KeyCode::Enter);
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Conversation);
+        let mut plan = position("plan", PositionStatus::Succeeded);
+        plan.conversation = ConversationState::Recorded;
+        let mut review = position("review", PositionStatus::InProgress);
+        review.conversation = ConversationState::Recorded;
+        let read = |text: &str| AttemptRead {
+            entries: vec![entry("1", &[text])],
+            next_entry: 1,
+            closed: false,
+            truncated_tail: false,
+            complete: true,
+            no_record: false,
+            source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
+            recorded_at: None,
+        };
+        app.on_detail_reads(
+            "a",
+            1,
+            vec![
+                DetailRead::Timeline(Ok(timeline("a", vec![plan, review], Some("review #1")))),
+                DetailRead::Attempt {
+                    attempt_id: "act-plan".into(),
+                    from: 0,
+                    result: Ok(read("what the plan said")),
+                },
+                DetailRead::Attempt {
+                    attempt_id: "act-review".into(),
+                    from: 0,
+                    result: Ok(read("what the review said")),
+                },
+            ],
+        );
+        app
+    }
+
+    #[test]
+    fn the_conversation_tab_has_the_steps_newest_first_between_two_rules() {
+        let styles = Styles::new(false);
+        let mut app = conversation_of_two_steps();
+        let buffer = render(&mut app, &styles);
+        let rows = rows(&buffer);
+        let strip = TAB_MARKER_ROW + 2;
+        let text = &rows[strip];
+        let (review, plan) = (text.find("● review #1"), text.find("✓ plan #1"));
+        assert!(review.is_some() && plan.is_some(), "{}", screen(&buffer));
+        assert!(review < plan, "newest first: {text}");
+        assert!(text.contains("review #1 · ✓ plan #1"), "{text}");
+        for rule in [strip - 1, strip + 1] {
+            let details = &rows[rule][rows[rule].find('─').unwrap()..];
+            assert!(
+                details
+                    .trim_end_matches('│')
+                    .trim_end()
+                    .chars()
+                    .all(|c| c == '─')
+                    && details.chars().filter(|&c| c == '─').count() > 60,
+                "a full rule at {rule}:\n{}",
+                screen(&buffer)
+            );
+        }
+        let screen_text = screen(&buffer);
+        assert!(
+            screen_text.contains("what the review said"),
+            "{screen_text}"
+        );
+        assert!(!screen_text.contains("what the plan said"), "{screen_text}");
+        let (y, x) = spot(&buffer, "review #1 ·");
+        let selected = &buffer[(x, y)];
+        assert!(
+            selected.modifier.contains(Modifier::BOLD)
+                && selected.modifier.contains(Modifier::UNDERLINED),
+            "the selected step is marked"
+        );
+        let (y, x) = spot(&buffer, "plan #1");
+        assert!(!buffer[(x, y)].modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn right_shows_the_older_step_and_left_the_newer_one() {
+        let styles = Styles::new(false);
+        let mut app = conversation_of_two_steps();
+        press(&mut app, KeyCode::Right);
+        let buffer = render(&mut app, &styles);
+        let screen_text = screen(&buffer);
+        assert!(screen_text.contains("what the plan said"), "{screen_text}");
+        assert!(
+            !screen_text.contains("what the review said"),
+            "{screen_text}"
+        );
+        let (y, x) = spot(&buffer, "plan #1");
+        assert!(buffer[(x, y)].modifier.contains(Modifier::UNDERLINED));
+
+        press(&mut app, KeyCode::Left);
+        let screen_text = screen(&render(&mut app, &styles));
+        assert!(
+            screen_text.contains("what the review said"),
+            "{screen_text}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_strip_keeps_the_selected_step_in_view() {
+        use narsor::tui::task_app::tabs::conversation::{render_step_strip, Conversation};
+        let positions: Vec<_> = (0..12)
+            .map(|index| position(&format!("step{index}"), PositionStatus::Succeeded))
+            .collect();
+        let mut conversation = Conversation::new("a");
+        conversation.rebuild(&positions, &Attempts::default());
+        let styles = Styles::new(false);
+        let strip = |conversation: &Conversation| {
+            let buffer = draw(40, 3, |frame| {
+                render_step_strip(frame, Rect::new(0, 0, 40, 3), &styles, conversation, true)
+            });
+            rows(&buffer)[1].clone()
+        };
+        let newest = strip(&conversation);
+        assert!(newest.contains("step11 #1"), "{newest}");
+        assert!(
+            newest.trim_end().ends_with('…'),
+            "more to the right: {newest}"
+        );
+        for _ in 0..11 {
+            conversation.select_older();
+        }
+        let oldest = strip(&conversation);
+        assert!(oldest.contains("step0 #1"), "{oldest}");
+        assert!(
+            oldest.trim_start().starts_with('…'),
+            "more to the left: {oldest}"
+        );
+        assert!(!oldest.contains("step11"), "{oldest}");
+        for width in 0..6 {
+            draw(width, 3, |frame| {
+                render_step_strip(
+                    frame,
+                    Rect::new(0, 0, width, 3),
+                    &styles,
+                    &conversation,
+                    true,
+                )
+            });
+        }
+    }
+
     #[test]
     fn text_from_the_workflow_and_the_runner_never_carries_terminal_controls() {
         let mut app = app();

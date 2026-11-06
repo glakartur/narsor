@@ -3690,15 +3690,12 @@ mod task_app_detail {
         /// The transcript as a list of tags: a heading is `step:<attempt>`, a
         /// choice `choice:<sequence>`, an entry its own id.
         fn order(positions: &[Position], attempts: &Attempts, events: &[Event]) -> Vec<String> {
-            let mut conversation = Conversation::new("a");
-            conversation.rebuild_with_events(positions, attempts, events);
-            tags(&conversation)
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            tags(&build_conversation(Scope::Whole, positions, attempts, events).entries)
         }
 
-        fn tags(conversation: &Conversation) -> Vec<String> {
-            conversation
-                .transcript()
-                .entries()
+        fn tags(entries: &[TranscriptEntry]) -> Vec<String> {
+            entries
                 .iter()
                 .map(|entry| {
                     let id = entry.id.as_str();
@@ -4062,9 +4059,9 @@ mod task_app_detail {
             // Rebuilding on the same data gives the same entries.
             let mut conversation = Conversation::new("a");
             conversation.rebuild_with_events(&positions, &attempts(&["p", "c"]), &events);
-            let first = tags(&conversation);
+            let first = tags(conversation.transcript().entries());
             conversation.rebuild_with_events(&positions, &attempts(&["p", "c"]), &events);
-            assert_eq!(tags(&conversation), first);
+            assert_eq!(tags(conversation.transcript().entries()), first);
         }
 
         #[test]
@@ -4164,12 +4161,18 @@ mod task_app_detail {
             let mut conversation = Conversation::new("a");
             conversation.transcript_mut().set_viewport(2);
             conversation.rebuild_with_events(&positions, &attempts, &events);
-            assert_eq!(tags(&conversation).last().unwrap(), "choice:2");
+            assert_eq!(
+                tags(conversation.transcript().entries()).last().unwrap(),
+                "choice:2"
+            );
             assert!(conversation.transcript().is_following_end());
 
             events.push(conductor_chose(3, "again"));
             conversation.rebuild_with_events(&positions, &attempts, &events);
-            assert_eq!(tags(&conversation).last().unwrap(), "choice:3");
+            assert_eq!(
+                tags(conversation.transcript().entries()).last().unwrap(),
+                "choice:3"
+            );
             assert!(conversation.transcript().is_following_end());
         }
 
@@ -4293,10 +4296,10 @@ mod task_app_detail {
                 agent_chose(2, "revise", None),
                 entered(3, "fix"),
             ];
-            let mut conversation = Conversation::new("a");
-            conversation.rebuild_with_events(&positions, &attempts(&["p"]), &events);
-            assert!(conversation.is_loading());
-            assert_eq!(tags(&conversation), ["step:p", "p/m", "choice:2"]);
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            let built = build_conversation(Scope::Whole, &positions, &attempts(&["p"]), &events);
+            assert!(built.loading);
+            assert_eq!(tags(&built.entries), ["step:p", "p/m", "choice:2"]);
         }
     }
 
@@ -4468,18 +4471,31 @@ mod task_app_detail {
             }
         }
 
-        #[test]
-        fn the_conversation_is_every_attempt_in_the_order_of_the_steps() {
+        fn three_steps() -> Vec<narsor_protocol::api::Position> {
             let recorded = |state: &str| {
                 let mut step = position(state, PositionStatus::Succeeded);
                 step.conversation = ConversationState::Recorded;
                 step
             };
-            let positions = vec![
+            vec![
                 recorded("plan"),
                 position("script", PositionStatus::Succeeded),
                 recorded("edit"),
-            ];
+            ]
+        }
+
+        fn texts(conversation: &Conversation) -> Vec<String> {
+            conversation
+                .transcript()
+                .logical_lines()
+                .into_iter()
+                .map(|line| line.text)
+                .collect()
+        }
+
+        #[test]
+        fn the_conversation_is_the_newest_step_and_the_strip_lists_the_steps_newest_first() {
+            let positions = three_steps();
             let mut attempts = Attempts::default();
             attempts.apply(
                 "act-plan",
@@ -4489,48 +4505,134 @@ mod task_app_detail {
             );
             let mut conversation = Conversation::new("a");
             conversation.rebuild(&positions, &attempts);
+            let labels: Vec<&str> = conversation
+                .steps()
+                .iter()
+                .map(|step| step.label.as_str())
+                .collect();
+            assert_eq!(labels, ["edit #1", "script #1", "plan #1"]);
+            assert_eq!(conversation.selected_step(), Some("edit #1"));
             assert!(conversation.is_loading(), "act-edit was not read yet");
-            assert_eq!(
-                conversation.transcript().entries().len(),
-                3,
-                "a heading and two entries"
-            );
+            assert!(conversation.transcript().entries().is_empty());
 
             attempts.apply("act-edit", 1, 0, Ok(read(vec![entry("1", "edit one")])));
             conversation.rebuild(&positions, &attempts);
             assert!(!conversation.is_loading());
-            let lines: Vec<String> = conversation
-                .transcript()
-                .logical_lines()
-                .into_iter()
-                .map(|line| line.text)
-                .collect();
-            let at = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap();
+            let lines = texts(&conversation);
             assert!(
-                at("plan #1") < at("plan one")
-                    && at("plan two") < at("edit #1")
-                    && at("edit #1") < at("edit one"),
+                lines.iter().any(|line| line.contains("edit one")),
+                "{lines:?}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("plan one") || line.contains("#1")),
+                "only the step, with no heading: {lines:?}"
+            );
+        }
+
+        #[test]
+        fn left_and_right_walk_the_strip_and_show_only_the_selected_step() {
+            let positions = three_steps();
+            let mut attempts = Attempts::default();
+            attempts.apply("act-plan", 1, 0, Ok(read(vec![entry("1", "plan one")])));
+            attempts.apply("act-edit", 1, 0, Ok(read(vec![entry("1", "edit one")])));
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild(&positions, &attempts);
+
+            assert!(!conversation.select_newer(), "the newest is selected");
+            assert!(conversation.select_older());
+            assert!(conversation.select_older());
+            assert!(!conversation.select_older(), "the oldest is selected");
+            assert_eq!(conversation.selected_step(), Some("plan #1"));
+            assert!(!conversation.follows_newest());
+            conversation.rebuild(&positions, &attempts);
+            let lines = texts(&conversation);
+            assert!(
+                lines.iter().any(|line| line.contains("plan one")),
+                "{lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|line| line.contains("edit one")),
                 "{lines:?}"
             );
 
             attempts.apply(
                 "act-plan",
                 2,
-                3,
+                1,
                 Err(ReadFailure::Failed("the runner did not answer".into())),
             );
             conversation.rebuild(&positions, &attempts);
-            let failure = conversation.failure().expect("the failure");
-            assert_eq!(failure.detail(), "the runner did not answer");
             assert_eq!(
-                failure.note(Some("plan #1")).0,
-                "✗ nie udało się wczytać rozmowy (plan #1: the runner did not answer)"
+                conversation.failure().expect("the failure").detail(),
+                "the runner did not answer"
             );
             assert_eq!(
                 conversation.transcript().entries().len(),
-                5,
+                1,
                 "what was read stays"
             );
+        }
+
+        #[test]
+        fn a_new_step_is_followed_only_while_the_newest_is_selected() {
+            let mut positions = three_steps();
+            let attempts = Attempts::default();
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild(&positions, &attempts);
+            positions.push(position("review", PositionStatus::InProgress));
+            conversation.rebuild(&positions, &attempts);
+            assert_eq!(conversation.selected_step(), Some("review #1"));
+
+            conversation.select_older();
+            positions.push(position("merge", PositionStatus::InProgress));
+            conversation.rebuild(&positions, &attempts);
+            assert_eq!(
+                conversation.selected_step(),
+                Some("edit #1"),
+                "a picked step stays"
+            );
+
+            conversation.select_newer();
+            conversation.select_newer();
+            assert!(conversation.follows_newest(), "back on the newest");
+            positions.push(position("deploy", PositionStatus::InProgress));
+            conversation.rebuild(&positions, &attempts);
+            assert_eq!(conversation.selected_step(), Some("deploy #1"));
+        }
+
+        #[test]
+        fn the_arrows_in_the_conversation_tab_change_the_step() {
+            let mut app = details_app();
+            open_tab(&mut app, DetailTab::Conversation);
+            let selected = |app: &TaskApp| {
+                app.detail()
+                    .view("a")
+                    .unwrap()
+                    .conversation()
+                    .selected_step()
+                    .map(str::to_string)
+            };
+            let positions = ["plan", "edit"]
+                .iter()
+                .map(|state| position(state, PositionStatus::Succeeded))
+                .collect();
+            app.on_detail_reads(
+                "a",
+                1,
+                vec![DetailRead::Timeline(Ok(timeline(
+                    "a",
+                    positions,
+                    Some("edit #1"),
+                )))],
+            );
+            assert_eq!(selected(&app).as_deref(), Some("edit #1"));
+            press(&mut app, KeyCode::Right);
+            assert_eq!(selected(&app).as_deref(), Some("plan #1"));
+            press(&mut app, KeyCode::Left);
+            assert_eq!(selected(&app).as_deref(), Some("edit #1"));
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
         }
 
         #[test]
