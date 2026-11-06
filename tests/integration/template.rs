@@ -768,10 +768,6 @@ states:
     narsor_engine::workflow::load_from_str(yaml).expect("task.* passes validation");
 }
 
-// ---------------------------------------------------------------------------
-// Prompt parts with a `when` condition
-// ---------------------------------------------------------------------------
-
 use narsor_engine::domain::{PromptPart, PromptText};
 
 const PROMPT: &str = "state 'work', prompt";
@@ -834,7 +830,6 @@ fn a_part_whose_condition_names_an_empty_variable_is_left_out() {
         ]
     };
 
-    // Not set, null, empty and white space only all count as empty.
     for empty in [
         None,
         Some(Value::Null),

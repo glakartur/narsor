@@ -31,10 +31,6 @@ use serde_json::{json, Value};
 
 const FIXTURE: &str = "v2/engine_decision_conductor.yaml";
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
 /// One outcome of the scripted conductor.
 enum Script {
     Answer(Value),
@@ -202,10 +198,6 @@ fn made_by_the_conductor(events: &[EventData]) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// The conductor settles the step
-// ---------------------------------------------------------------------------
-
 /// A sure choice of a declared label takes the transition, runs the label's
 /// `set` and is recorded as the conductor's decision. The conductor is asked
 /// although `autopilot` is off, and what it is asked is rendered.
@@ -258,10 +250,6 @@ async fn a_label_with_requirements_is_taken_when_they_are_met() {
         ["reject"]
     );
 }
-
-// ---------------------------------------------------------------------------
-// The conductor hands the step to the operator
-// ---------------------------------------------------------------------------
 
 /// An unsure conductor leaves the step to the operator, who gets what the
 /// conductor would have chosen.
@@ -350,10 +338,6 @@ async fn without_a_conductor_the_step_waits_for_the_operator() {
     assert_eq!(problem.analysis, None);
     assert!(fixture.conductor.calls().is_empty());
 }
-
-// ---------------------------------------------------------------------------
-// What the conductor sees, and undo
-// ---------------------------------------------------------------------------
 
 /// The snapshot carries the values the current step keeps for itself, and
 /// no other step's.

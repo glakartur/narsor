@@ -1356,8 +1356,6 @@ fn resume_inner(
             let label = resolve_label(&pending, delivery, &values)?;
             require_resume_comment(&pending, &label, &values)?;
             let answered = if pending.label_from_menu {
-                // A blank field gives no value: what an earlier entry left in
-                // the context or the step's memory stays.
                 require_label_variables(&pending, &label, &values)?;
                 values.clone()
             } else {

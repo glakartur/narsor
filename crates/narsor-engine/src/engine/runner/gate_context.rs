@@ -9,6 +9,7 @@ use crate::domain::{
     HumanInputField, HumanInputType, VariableSource, VariableType, LOCAL_VARIABLE_PREFIX,
 };
 use crate::engine::actions::human::{LocalValue, RequiredValue, RequiredValueKind};
+use crate::workflow::template::render_scalar;
 use narsor_protocol::display::{without_unsafe_chars, without_unsafe_chars_multiline, NO_REASON};
 
 /// The longest reason or required value a gate shows, in bytes.
@@ -95,7 +96,7 @@ pub(super) fn local_values(state: &State, kept_locals: &Map<String, Value>) -> V
         .iter()
         .filter(|variable| variable.is_local())
         .filter_map(|variable| {
-            let value = text_of(kept_locals.get(&variable.name)?);
+            let value = render_scalar(kept_locals.get(&variable.name)?);
             if value.trim().is_empty() {
                 return None;
             }
@@ -149,7 +150,11 @@ fn required_values(
             .variables
             .get(name)
             .or_else(|| kept_locals.get(name))?;
-        Some(shown(name, RequiredValueKind::Variable, &text_of(value)))
+        Some(shown(
+            name,
+            RequiredValueKind::Variable,
+            &render_scalar(value),
+        ))
     });
     let artifacts = choice.requires_artifacts.iter().filter_map(|name| {
         let path = result.artifacts.get(name)?;
@@ -164,14 +169,6 @@ fn shown(name: &str, kind: RequiredValueKind, value: &str) -> RequiredValue {
         name: without_unsafe_chars(name),
         kind,
         value: head(&without_unsafe_chars_multiline(value), MAX_SHOWN_BYTES),
-    }
-}
-
-/// A variable's value as text: a string as it is, anything else as JSON.
-fn text_of(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
     }
 }
 

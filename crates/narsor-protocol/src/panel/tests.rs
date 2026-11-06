@@ -438,7 +438,6 @@ fn a_decision_requires_the_fields_its_label_names_and_no_others() {
 
 #[test]
 fn a_single_select_of_a_decision_does_not_stand_for_the_label() {
-    // `severity` is the only select, and its options are not the labels.
     let definition = definition_of(decision_form());
     assert_eq!(definition.entries.len(), 3);
 
@@ -502,7 +501,6 @@ fn a_gate_of_the_old_shape_keeps_inferring_its_label_from_a_lone_select() {
 
     let definition = definition_of(form);
 
-    // The select stands for the label, so it is no field of an entry.
     assert_eq!(labels(&definition), ["approved", "rejected"]);
     assert!(definition.entries[0]
         .fields

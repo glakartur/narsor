@@ -5,9 +5,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// What separates two parts of a text once they are joined.
-const PART_SEPARATOR: &str = "\n\n";
-
 /// A prompt or message: one or more parts, joined by an empty line when the
 /// text is used.
 ///
@@ -31,6 +28,11 @@ pub struct PromptPart {
 }
 
 impl PromptPart {
+    /// A `when` reference as the placeholder a template scan sees.
+    pub(crate) fn placeholder(reference: &str) -> String {
+        format!("{{{{ {reference} }}}}")
+    }
+
     /// A part that always applies.
     pub fn always(text: impl Into<String>) -> Self {
         Self {
@@ -49,6 +51,9 @@ impl PromptPart {
 }
 
 impl PromptText {
+    /// What separates two parts of a text once they are joined.
+    pub(crate) const PART_SEPARATOR: &'static str = "\n\n";
+
     /// A text of one part that always applies.
     pub fn plain(text: impl Into<String>) -> Self {
         Self::from_parts(vec![PromptPart::always(text)])
@@ -85,7 +90,7 @@ impl PromptText {
             pieces.extend(
                 part.when
                     .iter()
-                    .map(|reference| format!("{{{{ {reference} }}}}")),
+                    .map(|reference| PromptPart::placeholder(reference)),
             );
         }
         pieces
@@ -100,7 +105,7 @@ impl PromptText {
     /// The text of every part, joined, whatever the conditions say. For a
     /// text already rendered this is the text itself.
     pub fn joined(&self) -> String {
-        self.texts().collect::<Vec<_>>().join(PART_SEPARATOR)
+        self.texts().collect::<Vec<_>>().join(Self::PART_SEPARATOR)
     }
 
     /// Adds `text` to the end of the last part. For a text already

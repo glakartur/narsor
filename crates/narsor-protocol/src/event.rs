@@ -380,9 +380,7 @@ pub enum EventData {
         variable: String,
         /// The value written: a literal or a rendered template.
         value: serde_json::Value,
-        /// The step that was left.
         state_id: String,
-        /// The label that was taken.
         output_label: String,
         /// Whether the variable is the step's own (`scope: local`) rather
         /// than a shared one.

@@ -1183,10 +1183,6 @@ fn an_unknown_field_in_display_is_rejected_at_load() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The unified state shape of `schema: v2`
-// ---------------------------------------------------------------------------
-
 /// Validates a unified-shape file whose `states` section is `states`; `done`
 /// is its terminal state.
 fn unified_errors(states: &str) -> Vec<ValidationError> {

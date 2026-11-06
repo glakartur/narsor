@@ -52,9 +52,7 @@ pub struct WorkflowDefinition {
     #[serde(default, skip_serializing_if = "SchemaVersion::is_v2")]
     pub source_schema: SchemaVersion,
 
-    /// The state shape the definition was written in. A definition saved
-    /// before this field existed reads as `legacy`, which keeps what its
-    /// states declare (`allow_manual_override`).
+    /// The state shape the definition was written in.
     #[serde(default, skip_serializing_if = "DefinitionShape::is_legacy")]
     pub shape: DefinitionShape,
 
@@ -817,6 +815,9 @@ pub struct ChoiceDefinition {
 
 /// The label a linear step's `exit` compiles to: the step's only choice.
 pub const EXIT_LABEL: &str = "exit";
+
+/// The output label a timed-out action asks for, when the state allows it.
+pub const TIMEOUT_LABEL: &str = "timeout";
 
 /// What a choice sets when it is taken: literal values or templates, for
 /// declared variables of the step being left.

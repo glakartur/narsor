@@ -26,10 +26,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::domain::{
-    ActionConfig, ChoiceDefinition, DecisionConfig, ImageSpec, OutputLabel, PromptText,
+    ActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel, PromptPart, PromptText,
     RepositorySource, SchemaVersion, State, StateId, ValidationError, VariableDefinition,
     VariableScope, VariableSource, VariableType, WorkflowDefinition, LOCAL_VARIABLE_PREFIX,
-    WORKSPACE_ROOT,
+    TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
 use crate::workspace::provisioner::is_usable_directory_name;
 
@@ -127,7 +127,6 @@ fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
     let defines_anything = defines_artifacts || !state.variables.is_empty();
     match &state.action {
         Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_)) => {}
-        // A decision step has a form or a contract of variables, never files.
         Some(ActionConfig::Decision(_)) if !defines_artifacts => {}
         _ if !defines_anything => {}
         other => errors.push(ValidationError::DefinitionsNotAllowed {
@@ -163,11 +162,7 @@ fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
 
     for choice in &state.choices {
         for name in &choice.requires_variables {
-            match state
-                .variables
-                .iter()
-                .find(|variable| &variable.name == name)
-            {
+            match state.variable(name) {
                 None => errors.push(ValidationError::UndefinedRequiredVariable {
                     state: state.id.clone(),
                     label: choice.label.clone(),
@@ -530,10 +525,6 @@ fn missing_field(state: &State, action_type: &'static str, field: &'static str) 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Variables: declarations, `set`, and the step's way out
-// ---------------------------------------------------------------------------
-
 /// The declarations of one step: unique names, and `type` and `options` that
 /// agree with each other.
 fn validate_variable_declarations(state: &State, errors: &mut Vec<ValidationError>) {
@@ -643,11 +634,7 @@ fn validate_set_assignments(state: &State, errors: &mut Vec<ValidationError>) {
         ];
         for (assignments, scope) in places {
             for (name, value) in assignments {
-                let declared = state
-                    .variables
-                    .iter()
-                    .find(|variable| variable.name == *name);
-                let Some(declared) = declared else {
+                let Some(declared) = state.variable(name) else {
                     errors.push(ValidationError::SetUnknownVariable {
                         state: state.id.clone(),
                         label: choice.label.clone(),
@@ -719,7 +706,7 @@ fn validate_exit_and_timeout(
     state: &State,
     errors: &mut Vec<ValidationError>,
 ) {
-    let has_exit = state.choices.iter().any(ChoiceDefinition::is_exit);
+    let has_exit = state.has_exit();
     if let Some(ActionConfig::Script(script)) = &state.action {
         if has_exit && !script.exit_codes.is_empty() {
             errors.push(ValidationError::ExitCodesWithExit {
@@ -735,10 +722,10 @@ fn validate_exit_and_timeout(
     let declares_timeout = state
         .choices
         .iter()
-        .any(|choice| choice.label == crate::engine::actions::TIMEOUT_LABEL);
+        .any(|choice| choice.label == TIMEOUT_LABEL);
     // Old-shape workflows may use `timeout` as an ordinary label of a human
     // gate, so the rule applies to the unified shape only.
-    let unified = definition.shape == crate::domain::DefinitionShape::Unified;
+    let unified = definition.shape == DefinitionShape::Unified;
     if unified && declares_timeout && !can_time_out && state.action.is_some() {
         errors.push(ValidationError::TimeoutChoiceNotAllowed {
             state: state.id.clone(),
@@ -992,7 +979,7 @@ fn prompt_templates(
                     field: when,
                     reason,
                 }),
-                None => templates.push((when, format!("{{{{ {reference} }}}}"))),
+                None => templates.push((when, PromptPart::placeholder(reference))),
             }
         }
     }

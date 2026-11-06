@@ -19,10 +19,6 @@ use serde_json::{json, Map, Value};
 
 const FIXTURE: &str = "v2/engine_decision_human.yaml";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 struct Run {
     harness: Harness,
     agent: Arc<ScriptedAgentExecutor>,
@@ -120,10 +116,6 @@ fn invalid_delivery(error: EngineError) -> HumanActionError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The form
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn the_form_is_the_variables_of_the_step_and_the_menu_is_its_choices() {
     let run = Run::until_the_decision(vec![work_done()]).await;
@@ -136,7 +128,6 @@ async fn the_form_is_the_variables_of_the_step_and_the_menu_is_its_choices() {
         .iter()
         .map(|field| field.name.as_str())
         .collect();
-    // `stage` is the workflow's own: it is not the operator's to fill in.
     assert_eq!(fields, ["comment", "severity", "notes"]);
     let labels: Vec<&str> = pending
         .outputs
@@ -159,10 +150,6 @@ async fn the_message_is_rendered_with_the_reply_of_the_step_before() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// What a delivery must hold
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn a_choice_without_requirements_takes_an_empty_answer() {
     let mut run = Run::until_the_decision(vec![work_done()]).await;
@@ -172,7 +159,6 @@ async fn a_choice_without_requirements_takes_an_empty_answer() {
         .expect("approve");
 
     assert_eq!(run.execution.status, ExecutionStatus::Completed);
-    // The `set` of the choice ran, as on any other step.
     assert_eq!(
         run.execution.context.variables.get("stage"),
         Some(&json!("closed"))
@@ -237,7 +223,6 @@ async fn a_value_outside_the_options_of_a_variable_is_refused() {
 async fn a_single_select_variable_does_not_choose_the_label() {
     let mut run = Run::until_the_decision(vec![work_done()]).await;
 
-    // `severity` is the only select of the form, and its value is no label.
     let error = run
         .deliver(HumanInputDelivery::with_values(values(&[(
             "severity",
@@ -267,14 +252,9 @@ async fn a_label_the_step_does_not_declare_is_refused() {
     ));
 }
 
-// ---------------------------------------------------------------------------
-// Where the answer leads
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn the_comment_of_a_returning_choice_goes_to_the_session_of_the_target_step() {
     let mut run = Run::until_the_decision(vec![work_done(), work_done()]).await;
-    // The step the choice returns to has a session to continue.
     assert!(run.pending().resume_targets.contains_key("revise"));
 
     run.deliver(pick("revise", &[("comment", json!("cover the edge case"))]))
@@ -308,10 +288,6 @@ async fn the_answer_of_the_operator_is_recorded_with_the_label() {
     )));
 }
 
-// ---------------------------------------------------------------------------
-// The step's own values
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn a_local_variable_of_the_decision_is_kept_and_shown_the_next_time() {
     let mut run = Run::until_the_decision(vec![work_done(), work_done()]).await;
@@ -328,7 +304,6 @@ async fn a_local_variable_of_the_decision_is_kept_and_shown_the_next_time() {
     .expect("revise");
 
     assert_eq!(run.execution.status, ExecutionStatus::InputNeeded);
-    // Kept by the step, not shared.
     assert_eq!(run.execution.context.variables.get("notes"), None);
     let shown: Vec<(String, String)> = run
         .pending()
@@ -337,7 +312,6 @@ async fn a_local_variable_of_the_decision_is_kept_and_shown_the_next_time() {
         .map(|local| (local.name.clone(), local.value.clone()))
         .collect();
     assert_eq!(shown, [("notes".to_string(), "first pass".to_string())]);
-    // And the message part that waits for it is there now.
     assert!(run.pending().instruction().contains("first pass"));
 }
 

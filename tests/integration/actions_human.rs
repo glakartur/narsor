@@ -969,8 +969,7 @@ async fn a_pending_request_survives_a_restart_and_can_still_be_satisfied() {
     assert!(received_input(&log).is_some());
 }
 
-/// Output descriptions are part of the durable record, so a form rebuilt
-/// after a restart can still say what each label means.
+/// A record written before `set` existed still loads, and an empty `set` is not written.
 #[tokio::test]
 async fn a_pending_record_written_before_set_existed_still_loads() {
     let SuspendedAction::AwaitingHumanInput(request) =
@@ -997,6 +996,8 @@ async fn a_pending_record_written_before_set_existed_still_loads() {
     assert_eq!(reread.outputs[0].requires_variables, ["note"]);
 }
 
+/// Output descriptions are part of the durable record, so a form rebuilt
+/// after a restart can still say what each label means.
 #[tokio::test]
 async fn output_descriptions_survive_in_the_pending_record() {
     let root = TempRoot::new();

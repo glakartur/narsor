@@ -41,12 +41,6 @@ impl TaskUsage {
     pub fn combined_cost_usd(&self) -> Option<f64> {
         add(self.cost_usd, self.conductor_cost_usd, |a, b| a + b)
     }
-
-    /// The tokens of the agents and the conductor together; `None` when
-    /// neither reported any.
-    pub fn combined_total(&self) -> Option<TokenCounts> {
-        add(self.total, self.conductor_total, TokenCounts::plus)
-    }
 }
 
 /// The sum of the usage of `positions`; `None` when no position reported any.
@@ -494,7 +488,6 @@ mod tests {
         assert_eq!(task.conductor_cost_usd, Some(0.3));
         assert_eq!(task.conductor_total, Some(counts(1_500, 150)));
         assert_eq!(task.combined_cost_usd(), Some(1.3));
-        assert_eq!(task.combined_total(), Some(counts(101_500, 6_150)));
     }
 
     #[test]

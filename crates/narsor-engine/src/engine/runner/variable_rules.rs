@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::domain::{VariableDefinition, VariableSource, VariableType};
+use crate::workflow::template::render_scalar;
 
 /// One variable a label's `set` assigns, with its value rendered.
 #[derive(Debug, Clone, PartialEq)]
@@ -111,13 +112,13 @@ fn scope_name(local: bool) -> &'static str {
 }
 
 fn options_problem(declared: &VariableDefinition, value: &Value) -> Option<String> {
-    if declared.options.is_empty() || declared.options.contains(&text_of(value)) {
+    if declared.options.is_empty() || declared.options.contains(&render_scalar(value)) {
         return None;
     }
     Some(format!(
         "variable '{}' has the value '{}', which is not one of: {}",
         declared.name,
-        text_of(value),
+        render_scalar(value),
         declared.options.join(", ")
     ))
 }
@@ -139,14 +140,6 @@ fn type_problem(declared: &VariableDefinition, value: &Value) -> Option<String> 
     Some(format!(
         "variable '{}' has the value '{}', which does not fit its type",
         declared.name,
-        text_of(value)
+        render_scalar(value)
     ))
-}
-
-/// A value as text: a string as it is, anything else as JSON.
-fn text_of(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
 }

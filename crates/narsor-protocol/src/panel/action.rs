@@ -31,7 +31,6 @@ impl Builder {
     ) {
         let fields = pending.fields();
         let outputs = &pending.outputs;
-        // Where only the menu chooses the label, no field stands for it.
         let from_menu = pending.label_from_menu;
         let label_field = fields
             .iter()

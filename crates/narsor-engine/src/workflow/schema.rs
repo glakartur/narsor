@@ -80,7 +80,7 @@ impl WorkflowFile {
 ///
 /// * `Legacy`: `choices` is a list and `transitions` a separate map; gates
 ///   use `inputs`, forks may use a `decision` block. Every `v1` file, and
-///   every `v2` file written before the unified shape.
+///   any `v2` file that keeps this form.
 /// * `Unified`: `choices` is a mapping from label to exit object with its own
 ///   `next`, a linear step has `exit`, and a fork decided by someone else is a
 ///   `decision` action. Only in `schema: v2`.

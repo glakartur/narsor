@@ -111,10 +111,7 @@ impl UsageReading {
     /// Puts a later reading of the same attempt on this one.
     fn absorb(&mut self, later: UsageReading) {
         self.conductor_total = plus(self.conductor_total, later.conductor_total);
-        self.conductor_cost_usd = match (self.conductor_cost_usd, later.conductor_cost_usd) {
-            (Some(a), Some(b)) => Some(a + b),
-            (a, b) => a.or(b),
-        };
+        self.conductor_cost_usd = plus_cost(self.conductor_cost_usd, later.conductor_cost_usd);
         // A reading of the conductor alone says nothing about the agent: it
         // must not change the basis or the harness of what the agent used.
         if !later.has_agent_use() {
@@ -150,6 +147,13 @@ impl UsageReading {
 fn plus(a: Option<TokenCounts>, b: Option<TokenCounts>) -> Option<TokenCounts> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.plus(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn plus_cost(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
         (a, b) => a.or(b),
     }
 }
@@ -338,10 +342,7 @@ pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageRea
                 continue;
             };
             conductor_total = plus(conductor_total, reading.conductor_total);
-            conductor_cost = match (conductor_cost, reading.conductor_cost_usd) {
-                (Some(x), Some(y)) => Some(x + y),
-                (x, y) => x.or(y),
-            };
+            conductor_cost = plus_cost(conductor_cost, reading.conductor_cost_usd);
             if let Some(model) = &reading.model {
                 position.model = Some(model.clone());
             }

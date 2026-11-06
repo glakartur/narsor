@@ -14,10 +14,6 @@ use narsor_engine::domain::{EventData, ExecutionStatus, WorkflowExecution};
 use narsor_engine::engine::{ActionKind, Engine, ManualTransition};
 use serde_json::{json, Value};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn engine_with(harness: &Harness, agent: &Arc<ScriptedAgentExecutor>) -> Engine {
     harness
         .engine()
@@ -100,10 +96,6 @@ fn variables_set(harness: &Harness, execution_id: &str) -> Vec<(String, Value, S
 fn ideas() -> AgentTurn {
     AgentTurn::with_variables("exit", json!({ "ideas": "a few" }))
 }
-
-// ---------------------------------------------------------------------------
-// Scope by declaration
-// ---------------------------------------------------------------------------
 
 /// A local variable kept by one entry is still there when a later entry
 /// does not give it, and never reaches the context.
@@ -199,10 +191,6 @@ async fn a_required_local_nobody_gave_is_asked_for_again() {
     assert_eq!(agent.calls().len(), 4);
     assert_eq!(local_values(&execution, "plan")["note"], json!("n"));
 }
-
-// ---------------------------------------------------------------------------
-// options and source: workflow
-// ---------------------------------------------------------------------------
 
 /// A value outside `options` is rejected like a missing variable: the agent
 /// is asked again, with the allowed values in the request.
@@ -300,10 +288,6 @@ async fn a_script_value_outside_options_fails_the_action() {
     assert!(transitions(&harness, &execution.id).is_empty());
 }
 
-// ---------------------------------------------------------------------------
-// exit steps
-// ---------------------------------------------------------------------------
-
 /// A script step with `exit` goes on when it exits with code 0.
 #[tokio::test]
 async fn a_script_with_exit_goes_on_after_exit_code_zero() {
@@ -383,10 +367,6 @@ async fn a_choices_step_does_not_accept_the_exit_label() {
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(agent.calls().len(), 2);
 }
-
-// ---------------------------------------------------------------------------
-// set
-// ---------------------------------------------------------------------------
 
 /// `set` assigns the variables of the choice taken, and nothing for another.
 #[tokio::test]
@@ -548,10 +528,6 @@ async fn a_forced_jump_does_not_run_set() {
     assert!(variables_set(&harness, &failed.id).is_empty());
 }
 
-// ---------------------------------------------------------------------------
-// steps.X.label
-// ---------------------------------------------------------------------------
-
 /// A later step reads the label chosen in an earlier one.
 #[tokio::test]
 async fn a_step_label_is_readable_by_a_later_prompt() {
@@ -593,10 +569,6 @@ async fn the_next_prompt_sees_what_set_wrote() {
     assert!(prompt.contains("Last: approved."), "{prompt}");
     assert!(prompt.contains("Stage: [reviewed]."), "{prompt}");
 }
-
-// ---------------------------------------------------------------------------
-// Prompt parts
-// ---------------------------------------------------------------------------
 
 /// A part waits for its condition: the first entry has no memory and so no
 /// part for it, the next one has, and the reply of the review joins in once

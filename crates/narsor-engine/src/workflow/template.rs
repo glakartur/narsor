@@ -430,7 +430,7 @@ impl<'a> TemplateScope<'a> {
             }
             rendered.push(self.render(&part.text, &place)?);
         }
-        Ok(PromptText::plain(rendered.join("\n\n")))
+        Ok(PromptText::plain(rendered.join(PromptText::PART_SEPARATOR)))
     }
 
     /// Whether every reference of the part's `when` has a value.
@@ -937,7 +937,7 @@ fn plain_name(candidate: &str) -> Option<&str> {
 ///
 /// A string is inserted as-is (no surrounding quotes, no escaping), numbers
 /// and booleans as bare JSON scalars, and arrays and objects as compact JSON.
-fn render_scalar(value: &Value) -> String {
+pub(crate) fn render_scalar(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => other.to_string(),

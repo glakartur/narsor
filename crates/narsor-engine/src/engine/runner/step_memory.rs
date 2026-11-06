@@ -192,17 +192,17 @@ pub(super) fn last_choice_labels(
     execution: &WorkflowExecution,
 ) -> Result<HashMap<String, Value>, EngineError> {
     let labels = read_attempts(execution)?
-        .into_iter()
+        .iter()
         .filter_map(|(state_id, record)| {
             let label = record
                 .attempts
-                .into_iter()
+                .iter()
                 .rev()
                 .find_map(|attempt| match attempt {
                     StepAttempt::Choice { choice, .. } => Some(choice),
                     StepAttempt::Failure { .. } => None,
                 })?;
-            Some((state_id, Value::String(label)))
+            Some((state_id.clone(), Value::String(label.clone())))
         })
         .collect();
     Ok(labels)

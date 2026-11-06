@@ -1386,10 +1386,6 @@ fn a_definition_without_display_has_none_and_serialises_without_the_key() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The unified state shape of `schema: v2`
-// ---------------------------------------------------------------------------
-
 const UNIFIED_FIXTURES: [&str; 6] = [
     "v2/prompt_parts.yaml",
     "v2/exit.yaml",
@@ -1638,10 +1634,6 @@ fn a_decision_action_needs_the_unified_shape() {
                 terminal_states: [end]\n";
     assert!(load_error(yaml).contains("decision"));
 }
-
-// ---------------------------------------------------------------------------
-// Files written before the unified shape keep loading
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_v2_file_in_the_legacy_shape_loads_and_is_reported_as_deprecated() {

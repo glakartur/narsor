@@ -1516,10 +1516,6 @@ async fn with_autopilot_on_an_unsure_conductor_forwards_the_question() {
     assert_eq!(fixture.conductor.calls().len(), 1);
 }
 
-// ---------------------------------------------------------------------------
-// Autopilot: who receives the agent's questions
-// ---------------------------------------------------------------------------
-
 /// A sure answer of the conductor to a question.
 fn sure_reply(message: &str) -> Script {
     Script::Answer(json!({

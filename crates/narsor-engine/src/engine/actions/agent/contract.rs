@@ -125,7 +125,6 @@ not omit the JSON object: without it the workflow cannot continue.\
 /// The step's variables and artifacts, each with what it is.
 fn step_definitions(contract: &StepContract<'_>) -> String {
     let mut text = String::new();
-    // A variable only the workflow sets is not the agent's to give.
     let given_by_step: Vec<&VariableDefinition> = contract
         .variables
         .iter()
@@ -157,8 +156,7 @@ fn choice_list(contract: &StepContract<'_>) -> String {
             ("variables", &exit.requires_variables),
             ("artifacts", &exit.requires_artifacts),
         ] {
-            let required = required_names(kind, names);
-            text.push_str(required.trim_start_matches("  - "));
+            text.extend(required_clause(kind, names));
         }
         return text;
     }
@@ -180,39 +178,48 @@ fn choice_list(contract: &StepContract<'_>) -> String {
 /// A variable of the step: [`described_item`], with the values it may take
 /// when it declares `options`.
 fn variable_item(variable: &VariableDefinition) -> String {
-    let item = described_item(&variable.name, variable.description.as_deref());
-    if variable.options.is_empty() {
-        return item;
+    let mut item = item_line(&variable.name, variable.description.as_deref());
+    if !variable.options.is_empty() {
+        let options: Vec<String> = variable
+            .options
+            .iter()
+            .map(|option| format!("`{option}`"))
+            .collect();
+        item.push_str(&format!("  - Allowed values: {}", options.join(", ")));
     }
-    let options: Vec<String> = variable
-        .options
-        .iter()
-        .map(|option| format!("`{option}`"))
-        .collect();
-    format!(
-        "{}  - Allowed values: {}\n",
-        item.trim_end_matches('\n'),
-        options.join(", ")
-    )
+    item.push('\n');
+    item
 }
 
 /// `- `name` — description`, or the bare name when the description is blank.
 fn described_item(name: &str, description: Option<&str>) -> String {
+    format!("{}\n", item_line(name, description))
+}
+
+/// [`described_item`] without its line break.
+fn item_line(name: &str, description: Option<&str>) -> String {
     match description.map(str::trim) {
         Some(description) if !description.is_empty() => {
-            format!("- `{name}` — {description}\n")
+            format!("- `{name}` — {description}")
         }
-        _ => format!("- `{name}`\n"),
+        _ => format!("- `{name}`"),
     }
 }
 
 /// The line naming what a choice requires of one kind, empty for none.
 fn required_names(kind: &str, names: &[String]) -> String {
+    required_clause(kind, names)
+        .map(|clause| format!("  - {clause}"))
+        .unwrap_or_default()
+}
+
+/// `Required kind: `a`, `b``, as a line, or nothing when `names` is empty.
+fn required_clause(kind: &str, names: &[String]) -> Option<String> {
     if names.is_empty() {
-        return String::new();
+        return None;
     }
     let names: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
-    format!("  - Required {kind}: {}\n", names.join(", "))
+    Some(format!("Required {kind}: {}\n", names.join(", ")))
 }
 
 /// The `status` of an answer that asks a person before the task continues.
