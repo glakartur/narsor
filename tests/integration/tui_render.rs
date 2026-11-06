@@ -6445,31 +6445,20 @@ mod active_field_fill {
     }
 
     #[test]
-    fn a_field_with_suggestions_is_filled_like_text_and_lists_what_fits_below() {
+    fn a_field_with_suggestions_is_filled_like_text_and_lists_nothing() {
         let styles = Styles::new(false);
-        let suggest = || {
-            ChooserField::suggest(
-                "branch",
-                vec!["main".into(), "develop".into(), "feature/x".into()],
-            )
-        };
-        let mut chooser = form(suggest());
+        let mut chooser = form(ChooserField::suggest(
+            "branch",
+            vec!["main".into(), "develop".into(), "feature/x".into()],
+        ));
         let rows = drawn(&mut chooser, &styles);
         assert_eq!(rows.len(), 1, "only the field itself carries the fill");
         assert_filled(&rows[0], &styles);
         let drawn_screen = screen(&draw_chooser(WIDTH, 12, &mut chooser, &styles));
         assert!(
-            drawn_screen.contains("main") && drawn_screen.contains("feature/x"),
+            !drawn_screen.contains("develop") && !drawn_screen.contains("feature/x"),
             "{drawn_screen}"
         );
-
-        type_text(&mut chooser, "dev");
-        let rows = drawn(&mut chooser, &styles);
-        assert_eq!(rows.len(), 1);
-        assert_filled(&rows[0], &styles);
-        let drawn_screen = screen(&draw_chooser(WIDTH, 12, &mut chooser, &styles));
-        assert!(drawn_screen.contains("develop"), "{drawn_screen}");
-        assert!(!drawn_screen.contains("feature/x"), "{drawn_screen}");
     }
 
     #[test]
@@ -6547,6 +6536,7 @@ mod active_field_fill {
 mod stacked_form {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::tui::input_form::branch_field_name;
 
     const WIDTH: u16 = 40;
 
@@ -6604,30 +6594,140 @@ mod stacked_form {
             .collect()
     }
 
-    #[test]
-    fn a_branch_field_in_the_form_is_filled_and_lists_the_suggestions_under_its_value() {
-        let styles = Styles::new(false);
-        let mut chooser = entered(vec![
+    fn spot(buffer: &Buffer, needle: &str) -> (u16, u16) {
+        let rows = rows(buffer);
+        let row = row_of(&rows, needle, buffer);
+        let column = rows[row][..rows[row].find(needle).unwrap()].chars().count();
+        (row as u16, u16::try_from(column).unwrap())
+    }
+
+    fn type_text(chooser: &mut Chooser, text: &str) {
+        for character in text.chars() {
+            press(chooser, KeyCode::Char(character));
+        }
+    }
+
+    /// A repository and the branch field that follows it.
+    fn repository_and_branch(branch: &str) -> Vec<ChooserField> {
+        vec![
             ChooserField::text("Ticket"),
-            ChooserField::suggest("branch", vec!["main".into(), "develop".into()])
-                .starting_from("main"),
-        ]);
-        press(&mut chooser, KeyCode::Down);
-        let buffer = draw_chooser(WIDTH, 12, &mut chooser, &styles);
+            ChooserField::select("repo", vec!["acme/web".into(), "acme/api".into()])
+                .labelled("Repozytorium"),
+            ChooserField::suggest(branch_field_name("repo"), vec!["main".into()])
+                .starting_from(branch),
+            ChooserField::multiline("Opis"),
+        ]
+    }
+
+    fn row_of(rows: &[String], needle: &str, buffer: &Buffer) -> usize {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle}:\n{}", screen(buffer)))
+    }
+
+    #[test]
+    fn a_repository_and_its_branch_share_one_row_under_one_header() {
+        let styles = Styles::new(false);
+        let mut chooser = entered(repository_and_branch("main"));
+        let buffer = draw_chooser(WIDTH, 20, &mut chooser, &styles);
         let rows = rows(&buffer);
-        let value = rows
-            .iter()
-            .position(|row| row.starts_with("> main"))
-            .unwrap();
-        let cells = filled(&buffer, value, &styles);
-        assert!(cells[2..usize::from(WIDTH) - 2].iter().all(|&on| on));
-        assert!(!cells[0] && !cells[1], "the prompt has no fill");
+        let header = row_of(&rows, "Repozytorium", &buffer);
+        let value = row_of(&rows, "‹ acme/web ›", &buffer);
+        assert_eq!(value, header + 1, "{}", screen(&buffer));
+        assert!(rows[value].contains("gałąź: main"), "{}", screen(&buffer));
         assert!(
-            rows[value + 1].contains("main") && rows[value + 1].contains("develop"),
-            "{}",
+            rows[value + 1].trim().is_empty() || rows[value + 1].starts_with("Opis"),
+            "no suggestion row under it:\n{}",
             screen(&buffer)
         );
-        assert!(!filled(&buffer, value + 1, &styles).iter().any(|&on| on));
+        assert!(!screen(&buffer).contains(&branch_field_name("repo")));
+    }
+
+    #[test]
+    fn the_branch_box_is_filled_from_its_label_to_one_cell_before_the_edge() {
+        let styles = Styles::new(false);
+        for focus_steps in [0, 1, 2] {
+            let mut chooser = entered(repository_and_branch("main"));
+            for _ in 0..focus_steps {
+                press(&mut chooser, KeyCode::Down);
+            }
+            let buffer = draw_chooser(WIDTH, 20, &mut chooser, &styles);
+            let rows = rows(&buffer);
+            let value = row_of(&rows, "gałąź: ", &buffer);
+            let start = rows[value].find("gałąź: ").unwrap();
+            let box_start = rows[value][..start].chars().count() + "gałąź: ".chars().count();
+            let cells = filled(&buffer, value, &styles);
+            let width = usize::from(WIDTH);
+            assert!(
+                cells[box_start..width - 1].iter().all(|&on| on),
+                "focus {focus_steps}: {cells:?}\n{}",
+                screen(&buffer)
+            );
+            assert!(!cells[width - 1], "a gap at the edge");
+            assert!(!cells[box_start - 1], "the label has no fill");
+        }
+    }
+
+    #[test]
+    fn the_branch_takes_the_focus_after_the_repository_with_its_cursor_and_label() {
+        let styles = Styles::new(false);
+        let mut chooser = entered(repository_and_branch("main"));
+        press(&mut chooser, KeyCode::Down);
+        let repository = draw_chooser(WIDTH, 20, &mut chooser, &styles);
+        let reversed = |buffer: &Buffer| {
+            buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+                .count()
+        };
+        assert_eq!(reversed(&repository), 0, "a select has no cursor");
+        let (y, x) = spot(&repository, "‹ acme/web ›");
+        assert_eq!(Some(repository[(x, y)].bg), styles.field_editing().bg);
+
+        press(&mut chooser, KeyCode::Down);
+        let branch = draw_chooser(WIDTH, 20, &mut chooser, &styles);
+        assert_eq!(reversed(&branch), 1, "{}", screen(&branch));
+        let (y, x) = spot(&branch, "gałąź:");
+        assert_eq!(
+            cell_at(&branch, x, y).1,
+            Color::Cyan,
+            "the label is focused"
+        );
+        type_text(&mut chooser, "-x");
+        let typed = screen(&draw_chooser(WIDTH, 20, &mut chooser, &styles));
+        assert!(typed.contains("gałąź: main-x"), "{typed}");
+    }
+
+    #[test]
+    fn a_long_branch_scrolls_to_keep_the_cursor_in_its_box() {
+        let styles = Styles::new(false);
+        let long = format!("feature/{}end", "x".repeat(60));
+        let mut chooser = entered(repository_and_branch(&long));
+        press(&mut chooser, KeyCode::Down);
+        press(&mut chooser, KeyCode::Down);
+        press(&mut chooser, KeyCode::End);
+        let buffer = draw_chooser(WIDTH, 20, &mut chooser, &styles);
+        let rows = rows(&buffer);
+        let value = row_of(&rows, "gałąź: ", &buffer);
+        assert!(rows[value].contains("xend"), "{}", screen(&buffer));
+        assert!(!rows[value].contains("feature/"), "{}", screen(&buffer));
+        let cursor = buffer.content()[value * usize::from(WIDTH)..(value + 1) * usize::from(WIDTH)]
+            .iter()
+            .position(|cell| cell.modifier.contains(Modifier::REVERSED));
+        assert_eq!(cursor, Some(usize::from(WIDTH) - 2), "{}", screen(&buffer));
+    }
+
+    #[test]
+    fn without_colour_the_branch_box_is_underlined() {
+        let styles = Styles::new(true);
+        let mut chooser = entered(repository_and_branch("main"));
+        let buffer = draw_chooser(WIDTH, 20, &mut chooser, &styles);
+        let (y, x) = spot(&buffer, "gałąź: main");
+        let box_x = x + "gałąź: ".chars().count() as u16;
+        let cell = &buffer[(box_x, y)];
+        assert!(cell.modifier.contains(Modifier::UNDERLINED));
+        assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
     }
 
     #[test]

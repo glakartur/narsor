@@ -1,17 +1,21 @@
 //! The layout of the new task form: a strip with the entry's name and the
 //! fields in one column in the order they are declared. Every field is drawn
 //! as in the other forms: its header, its value under it, its complaint under
-//! the value. The main multi-line field fills the rest of the screen; the
-//! other multi-line fields fold to what they hold.
+//! the value. A repository and its branch share one row under the
+//! repository's header. The main multi-line field fills the rest of the
+//! screen; the other multi-line fields fold to what they hold.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::chooser::{Chooser, ChooserField, ChooserItem};
-use crate::tui::form::field::{clip, fill_padding, header_line, value_lines, value_rows};
+use crate::tui::chooser::{Chooser, ChooserField, ChooserItem, FieldKind};
+use crate::tui::form::field::{
+    clip, fill_padding, header_line, repository_branch_line, value_lines, value_rows, RowFocus,
+};
 use crate::tui::form::layout::{text_width, window_start, wrap};
+use crate::tui::input_form::branch_field_name;
 use crate::tui::scroll::{one_line, sanitize};
 use crate::tui::style::{Role, Styles};
 
@@ -108,7 +112,11 @@ fn render_column(
     let header_rows = |index: usize| 1 + complaint_rows(index);
     let rows_of = |index: usize, with_text: bool| {
         let field = &item.fields[index];
-        if !field.is_long() {
+        if is_branch_of_previous(&item.fields, index) {
+            0
+        } else if has_branch_after(&item.fields, index) {
+            header_rows(index) + 1 + complaint_rows(index + 1)
+        } else if !field.is_long() {
             header_rows(index) + value_rows(field, width, focused == Some(index))
         } else if with_text {
             header_rows(index) + folded_rows(field, folded_width).len()
@@ -138,6 +146,31 @@ fn render_column(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut focus_line = 0;
     for index in order {
+        if is_branch_of_previous(&item.fields, index) {
+            continue;
+        }
+        if has_branch_after(&item.fields, index) {
+            let focus = row_focus(focused, index);
+            let (repository, branch) = (&item.fields[index], &item.fields[index + 1]);
+            lines.push(header_line(
+                repository,
+                width,
+                focus != RowFocus::None,
+                styles,
+            ));
+            if focus != RowFocus::None {
+                focus_line = lines.len();
+            }
+            lines.push(repository_branch_line(
+                repository, branch, width, focus, styles,
+            ));
+            for field in [repository, branch] {
+                if let Some(error) = field.error() {
+                    lines.push(complaint_line(error, styles));
+                }
+            }
+            continue;
+        }
         let field = &item.fields[index];
         let is_focused = focused == Some(index);
         lines.push(header_line(field, width, is_focused, styles));
@@ -161,10 +194,7 @@ fn render_column(
             focus_line = value_start + cursor_row;
         }
         if let Some(error) = field.error() {
-            lines.push(Line::styled(
-                format!("✗ {}", one_line(error)),
-                styles.of(Role::Problem),
-            ));
+            lines.push(complaint_line(error, styles));
         }
     }
     if !has_long {
@@ -175,6 +205,34 @@ fn render_column(
         Paragraph::new(lines).scroll((offset.min(usize::from(u16::MAX)) as u16, 0)),
         area,
     );
+}
+
+/// Whether field `index` is a repository whose branch stands right after it:
+/// the two are drawn as one row.
+fn has_branch_after(fields: &[ChooserField], index: usize) -> bool {
+    let field = &fields[index];
+    matches!(field.kind, FieldKind::Select(_))
+        && fields
+            .get(index + 1)
+            .is_some_and(|next| next.name == branch_field_name(&field.name))
+}
+
+/// Whether field `index` is the branch drawn on its repository's row.
+fn is_branch_of_previous(fields: &[ChooserField], index: usize) -> bool {
+    index > 0 && has_branch_after(fields, index - 1)
+}
+
+/// Which half of the row of the repository `index` has the focus.
+fn row_focus(focused: Option<usize>, index: usize) -> RowFocus {
+    match focused {
+        Some(at) if at == index => RowFocus::Repository,
+        Some(at) if at == index + 1 => RowFocus::Branch,
+        _ => RowFocus::None,
+    }
+}
+
+fn complaint_line(error: &str, styles: &Styles) -> Line<'static> {
+    Line::styled(format!("✗ {}", one_line(error)), styles.of(Role::Problem))
 }
 
 /// A row of the main field with no text: the fill, when the field is edited.

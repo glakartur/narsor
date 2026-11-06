@@ -214,17 +214,6 @@ impl ChooserField {
             .collect()
     }
 
-    /// Whether any suggestion fits what is typed.
-    pub fn has_matching_suggestions(&self) -> bool {
-        let FieldKind::Suggest(suggestions) = &self.kind else {
-            return false;
-        };
-        let typed = self.narrowing_text().trim().to_lowercase();
-        suggestions
-            .iter()
-            .any(|suggestion| suggestion.to_lowercase().contains(&typed))
-    }
-
     /// What the operator typed: nothing while the value is the one the form
     /// put there.
     fn typed(&self) -> &str {

@@ -260,8 +260,8 @@ pub fn branch_field_name(input: &str) -> String {
 /// * `string` is a free line.
 ///
 /// Right after every `repository` input stands the field of its branch
-/// ([`branch_field_name`]): a free line that suggests, and starts from the
-/// repository's default branch.
+/// ([`branch_field_name`]): a free line that starts from the repository's
+/// default branch. The new-task form draws the two on one row.
 ///
 /// An input is required when the workflow says so and gives no default; a
 /// default is shown as the value the field starts with.
@@ -326,7 +326,6 @@ fn branch_field(
     ChooserField::suggest(branch_field_name(&input.name), Vec::new())
         .labelled(format!("{}{BRANCH_SUFFIX}", field.label()))
         .starting_from(default_branch_of(repositories, field.value()))
-        .described("z niej startuje zadanie; → bierze podpowiedź, własną można wpisać")
 }
 
 pub fn default_branch_of(repositories: &[RepositoryView], id: &str) -> String {

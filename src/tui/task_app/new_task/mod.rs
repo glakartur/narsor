@@ -24,8 +24,10 @@
 //! # The branch of a repository
 //!
 //! Every `repository` input of a workflow is followed by the field of its
-//! branch: a free line that starts from the repository's default branch and
-//! suggests the branches the server lists for it ([`Request::ReadBranches`]).
+//! branch, drawn on the same row: `> ‹ repo ›   gałąź: [main        ]`. The
+//! branch is a free line that starts from the repository's default branch;
+//! `→` at its end completes from the branches the server lists for it
+//! ([`Request::ReadBranches`]), which are not drawn.
 //! Choosing another repository puts that repository's default in the field and
 //! reads its list again; a list that cannot be read leaves a plain line and
 //! says why. What is typed is never checked against the list. Only a branch

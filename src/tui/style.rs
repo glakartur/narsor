@@ -274,6 +274,17 @@ impl Styles {
         }
     }
 
+    /// The box of a short field that stands inside a row (the branch beside
+    /// its repository): the editing fill, always, so the box reads as a
+    /// place to type even without the focus. Without colour it is underlined.
+    pub fn inline_field(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::UNDERLINED)
+        } else {
+            self.field_editing()
+        }
+    }
+
     /// The cursor: the cell it stands on, reversed. Nothing is inserted
     /// into the text.
     pub fn cursor(&self) -> Style {

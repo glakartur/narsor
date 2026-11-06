@@ -14,8 +14,6 @@ use crate::tui::style::{Role, Styles};
 const PROMPT: &str = "> ";
 const CONTINUATION: &str = "  ";
 
-const SUGGESTION_SEPARATOR: &str = " · ";
-
 /// `text` as spans with the cell at `cursor` reversed. At the end of the text
 /// the cursor is one reversed space after it.
 pub fn cursor_spans(
@@ -100,7 +98,7 @@ pub fn value_lines(
         return (vec![Line::from(spans)], 0);
     }
     let wrapped = layout_of(field, width, focused);
-    let mut lines: Vec<Line<'static>> = wrapped
+    let lines: Vec<Line<'static>> = wrapped
         .rows
         .iter()
         .enumerate()
@@ -128,44 +126,7 @@ pub fn value_lines(
             Line::from(spans)
         })
         .collect();
-    if let Some(line) = suggestion_line(field, width, focused, styles) {
-        lines.push(line);
-    }
     (lines, wrapped.cursor_row)
-}
-
-/// The row under a suggesting field being edited: what fits what is typed,
-/// the one the value stands on in brackets, cut with `…` at the edge. `None`
-/// when the field does not suggest, has no focus, or nothing fits.
-fn suggestion_line(
-    field: &ChooserField,
-    width: usize,
-    focused: bool,
-    styles: &Styles,
-) -> Option<Line<'static>> {
-    if !focused {
-        return None;
-    }
-    let matching = field.matching_suggestions();
-    if matching.is_empty() {
-        return None;
-    }
-    let listed: Vec<String> = matching
-        .iter()
-        .map(|suggestion| {
-            let text = sanitize(suggestion);
-            if *suggestion == field.value() {
-                format!("[{text}]")
-            } else {
-                text
-            }
-        })
-        .collect();
-    let text = clip(&listed.join(SUGGESTION_SEPARATOR), text_width(width));
-    Some(Line::from(vec![
-        Span::styled(CONTINUATION, styles.of(Role::Done)),
-        Span::styled(text, styles.of(Role::Done)),
-    ]))
 }
 
 /// How many rows the value of a field takes in `width` columns.
@@ -174,12 +135,10 @@ pub fn value_rows(field: &ChooserField, width: usize, focused: bool) -> usize {
         return 1;
     }
     let text = text_width(width);
-    let text_rows = wrap(field.value(), focused.then(|| field.cursor()), text)
+    wrap(field.value(), focused.then(|| field.cursor()), text)
         .rows
         .len()
-        .max(1);
-    let suggestion_rows = usize::from(focused && field.has_matching_suggestions());
-    text_rows + suggestion_rows
+        .max(1)
 }
 
 /// The row above a field's value: its label, `(wymagane)`, `◆` and ` · description`.
@@ -221,4 +180,97 @@ pub fn clip(text: &str, width: usize) -> String {
     }
     let kept: String = text.chars().take(width.saturating_sub(1)).collect();
     format!("{kept}…")
+}
+
+/// What has the focus on a row that holds a repository and its branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowFocus {
+    None,
+    Repository,
+    Branch,
+}
+
+/// The cells between the repository's `›` and the branch's label.
+const BRANCH_GAP: &str = "   ";
+
+/// The words before the branch's box.
+const BRANCH_LABEL: &str = "gałąź: ";
+
+/// The cells left free after the branch's box, at the right edge.
+const BRANCH_RIGHT_GAP: usize = 1;
+
+/// One row for a repository and its branch:
+/// `> ‹ repo ›   gałąź: [branch      ]`. The repository is drawn as a select
+/// (the editing fill under `‹ … ›` while it has the focus); the branch is a
+/// box with [`Styles::inline_field`] from its label to one cell before the
+/// edge, which scrolls sideways to keep the cursor in view. Remembers the
+/// box's width in the branch field, so that its cursor keys walk what is drawn.
+pub fn repository_branch_line(
+    repository: &ChooserField,
+    branch: &ChooserField,
+    width: usize,
+    focus: RowFocus,
+    styles: &Styles,
+) -> Line<'static> {
+    let any_focus = focus != RowFocus::None;
+    let prompt_role = if any_focus { Role::Focus } else { Role::Done };
+    let repository_fill = if focus == RowFocus::Repository {
+        styles.field_editing()
+    } else {
+        Style::default()
+    };
+    let label_style = if focus == RowFocus::Branch {
+        styles.of(Role::Focus)
+    } else {
+        styles.of(Role::Done)
+    };
+    let shown = format!("‹ {} ›", sanitize(repository.value()));
+    let used = PROMPT.len() + cells(&shown) + BRANCH_GAP.len() + cells(BRANCH_LABEL);
+    let box_width = width.saturating_sub(used + BRANCH_RIGHT_GAP).max(1);
+    let mut spans = vec![
+        Span::styled(PROMPT, styles.of(prompt_role)),
+        Span::styled(shown, repository_fill),
+        Span::raw(BRANCH_GAP),
+        Span::styled(BRANCH_LABEL, label_style),
+    ];
+    spans.extend(branch_box(
+        branch,
+        box_width,
+        focus == RowFocus::Branch,
+        styles,
+    ));
+    Line::from(spans)
+}
+
+/// The branch's box, `width` cells: the part of its text around the cursor,
+/// the cursor reversed while `focused`, the fill to the end of the box.
+fn branch_box(
+    branch: &ChooserField,
+    width: usize,
+    focused: bool,
+    styles: &Styles,
+) -> Vec<Span<'static>> {
+    branch.wrap_width().set(width);
+    let fill = styles.inline_field();
+    let text: Vec<char> = sanitize(branch.value()).chars().collect();
+    let cursor = branch.cursor().min(text.len());
+    // The cursor at the end of the text takes a cell of its own.
+    let first = if focused {
+        (cursor + 1).saturating_sub(width)
+    } else {
+        0
+    };
+    let visible: String = text.iter().skip(first).take(width).collect();
+    let mut spans = if focused {
+        cursor_spans(&visible, cursor - first, fill, styles.cursor())
+    } else {
+        vec![Span::styled(visible.clone(), fill)]
+    };
+    let used = if focused {
+        cells(&visible).max(cursor - first + 1)
+    } else {
+        cells(&visible)
+    };
+    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), fill));
+    spans
 }
