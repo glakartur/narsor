@@ -7,8 +7,9 @@
 //!    agent gives (KTD3, [`super::answer`]): that label wins, and brings its
 //!    `reason`, `variables`, `artifacts`, `additional_data` and
 //!    `additional_artifacts` along;
-//! 2. otherwise the exit code is looked up in `exit_codes`;
-//! 3. otherwise the documented default applies: `0` → `success`, anything
+//! 2. otherwise, for a step with `exit`, exit code 0 is the step's one exit;
+//! 3. otherwise the exit code is looked up in `exit_codes`;
+//! 4. otherwise the documented default applies: `0` → `success`, anything
 //!    else → `failure`.
 //!
 //! A process that never returned an exit code — killed by a signal — is an
@@ -28,7 +29,7 @@ use tokio::process::Command;
 
 use super::answer::{read_choice_answer, ChoiceAnswer};
 use super::{ActionExecutor, ActionOutcome, ActionRequest, TimedOutAction, ACTION_ID_ENV_VAR};
-use crate::domain::{ActionConfig, ActionError, ActionResult, ScriptActionConfig};
+use crate::domain::{ActionConfig, ActionError, ActionResult, ScriptActionConfig, EXIT_LABEL};
 
 /// How much of stdout and of stderr is kept in the [`ActionResult`], in bytes.
 ///
@@ -82,7 +83,14 @@ impl ActionExecutor for ScriptExecutor {
                 .timeout
                 .or_else(|| config.timeout_secs.map(Duration::from_secs));
 
-            run(config, &working_dir, request.action_execution_id, limit).await
+            run(
+                config,
+                &working_dir,
+                request.action_execution_id,
+                limit,
+                request.contract.has_exit(),
+            )
+            .await
         })
     }
 }
@@ -138,6 +146,7 @@ async fn run(
     working_dir: &Path,
     action_execution_id: &str,
     limit: Option<Duration>,
+    has_exit: bool,
 ) -> Result<ActionOutcome, ActionError> {
     let mut command = Command::new(&config.command);
     command
@@ -202,6 +211,7 @@ async fn run(
         Some(answer) => answer
             .map_err(|reason| invalid_output_error(config, reason))?
             .into_result(),
+        None if has_exit && exit_code == 0 => ActionResult::new(EXIT_LABEL),
         None => ActionResult::new(label_from_exit_code(exit_code, &config.exit_codes)),
     };
     result.exit_code = Some(exit_code);

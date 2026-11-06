@@ -389,6 +389,28 @@ impl State {
     pub fn workspace_access(&self) -> Option<WorkspaceAccess> {
         self.workspace.as_ref().map(StepWorkspace::access)
     }
+
+    /// The declaration of the variable `name` on this step.
+    pub fn variable(&self, name: &str) -> Option<&VariableDefinition> {
+        self.variables.iter().find(|variable| variable.name == name)
+    }
+
+    /// Whether `name` is the step's own memory rather than a shared
+    /// variable: the declaration decides, and a name this step does not
+    /// declare is local only by the `local.` prefix of the older shape.
+    ///
+    /// The one place that tells the two scopes apart.
+    pub fn is_local_variable(&self, name: &str) -> bool {
+        match self.variable(name) {
+            Some(variable) => variable.is_local(),
+            None => name.starts_with(LOCAL_VARIABLE_PREFIX),
+        }
+    }
+
+    /// Whether the step has a single `exit` instead of a choice to make.
+    pub fn has_exit(&self) -> bool {
+        self.choices.iter().any(ChoiceDefinition::is_exit)
+    }
 }
 
 /// Configuration for an action

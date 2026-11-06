@@ -64,7 +64,7 @@ use uuid::Uuid;
 use crate::config::{agent_args_for, AgentArgs};
 use crate::engine::timeline_file::ReadingSink;
 
-use super::answer::{self, ChoiceAnswer};
+use super::answer::{self, AnswerShape, ChoiceAnswer};
 use super::harness::{
     apply_extra_args, FinalAnswer, HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun,
     HarnessStreamParser,
@@ -78,7 +78,7 @@ use super::{
 };
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, AgentSessionStatus,
-    ChoiceDefinition, Event, EventData, WorkspaceAccess,
+    Event, EventData, WorkspaceAccess,
 };
 use crate::persistence::{
     ConversationSource, ConversationStore, ConversationWriter, ExecutionStore,
@@ -522,7 +522,7 @@ impl AgentExecutor {
             ));
         }
 
-        let output = match read_response(&run) {
+        let output = match read_response(&run, AnswerShape::of_step(request.contract.has_exit())) {
             Ok(output) => {
                 record_question(&conversation, &output);
                 conversation.finish();

@@ -43,6 +43,7 @@ mod conversation_store;
 mod docs_links;
 mod engine_recovery;
 mod engine_step_context;
+mod engine_unified_schema;
 mod environment;
 mod kubernetes_adapter;
 mod launch_spec_contract;

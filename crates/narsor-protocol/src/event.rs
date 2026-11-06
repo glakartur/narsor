@@ -373,6 +373,22 @@ pub enum EventData {
     },
 
     // Transition events
+    /// The workflow itself set a variable of the step it was leaving, as
+    /// the `set` of the label taken (never the step's own result).
+    VariableSetByWorkflow {
+        /// The variable, by its declared name.
+        variable: String,
+        /// The value written: a literal or a rendered template.
+        value: serde_json::Value,
+        /// The step that was left.
+        state_id: String,
+        /// The label that was taken.
+        output_label: String,
+        /// Whether the variable is the step's own (`scope: local`) rather
+        /// than a shared one.
+        #[serde(default)]
+        local: bool,
+    },
     TransitionTaken {
         from_state: String,
         to_state: String,
@@ -856,6 +872,14 @@ impl Event {
                 format!("External event '{event_type}' from '{source}'")
             }
 
+            EventData::VariableSetByWorkflow {
+                variable,
+                state_id,
+                output_label,
+                ..
+            } => {
+                format!("Workflow set '{variable}' leaving '{state_id}' on '{output_label}'")
+            }
             EventData::TransitionTaken {
                 from_state,
                 to_state,

@@ -125,34 +125,49 @@ pub struct TemplateScope<'a> {
     declared: Option<&'a DeclaredNames>,
     step_replies: Option<&'a HashMap<String, Value>>,
     step_streams: Option<&'a HashMap<String, Value>>,
+    step_labels: Option<&'a HashMap<String, Value>>,
     step_memory: Option<StepMemory<'a>>,
     task_ticket: &'a str,
     task_title: &'a str,
 }
 
-/// What the step being rendered keeps for itself: its `local.*` values, the
-/// `local.*` names it defines, and the history of its earlier attempts.
+/// What the step being rendered keeps for itself: its local values, the
+/// local variables it defines, and the history of its earlier attempts.
 #[derive(Debug, Clone, Copy)]
 pub struct StepMemory<'a> {
-    /// The values kept from earlier attempts, keyed by the full name
-    /// (`local.memory`).
+    /// The values kept from earlier attempts, keyed by the declared name
+    /// (`memory`, or `local.memory` in the older shape).
     pub locals: &'a Map<String, Value>,
-    /// The step's variable definitions: a `local.*` one without a value
-    /// renders as empty text (R14).
+    /// The step's variable definitions: a local one without a value renders
+    /// as empty text (R14).
     pub definitions: &'a [VariableDefinition],
     /// The history block, empty when the step gets none (R17, R19).
     pub history: &'a str,
 }
 
 impl StepMemory<'_> {
+    /// The local variable `{{ local.NAME }}` reads: declared with
+    /// `scope: local` as `NAME`, or as `local.NAME` in the older shape.
+    fn declared_local(&self, name: &str) -> Option<&VariableDefinition> {
+        self.definitions.iter().find(|variable| {
+            variable.is_local()
+                && variable
+                    .name
+                    .strip_prefix(LOCAL_VARIABLE_PREFIX)
+                    .unwrap_or(&variable.name)
+                    == name
+        })
+    }
+
     fn local(&self, name: &str) -> Option<&Value> {
-        self.locals.get(&format!("{LOCAL_VARIABLE_PREFIX}{name}"))
+        match self.declared_local(name) {
+            Some(variable) => self.locals.get(&variable.name),
+            None => self.locals.get(&format!("{LOCAL_VARIABLE_PREFIX}{name}")),
+        }
     }
 
     fn defines_local(&self, name: &str) -> bool {
-        self.definitions
-            .iter()
-            .any(|variable| variable.name.strip_prefix(LOCAL_VARIABLE_PREFIX) == Some(name))
+        self.declared_local(name).is_some()
     }
 }
 
@@ -213,6 +228,7 @@ impl<'a> TemplateScope<'a> {
             declared: None,
             step_replies: None,
             step_streams: None,
+            step_labels: None,
             step_memory: None,
             task_ticket: "",
             task_title: "",
@@ -232,6 +248,7 @@ impl<'a> TemplateScope<'a> {
             declared: None,
             step_replies: None,
             step_streams: None,
+            step_labels: None,
             step_memory: None,
             task_ticket: "",
             task_title: "",
@@ -254,6 +271,13 @@ impl<'a> TemplateScope<'a> {
     /// Adds captured script streams keyed by `step.field`.
     pub fn with_step_streams(mut self, streams: &'a HashMap<String, Value>) -> Self {
         self.step_streams = Some(streams);
+        self
+    }
+
+    /// Adds the label each step last chose, keyed by workflow step id:
+    /// `{{ steps.ID.label }}`.
+    pub fn with_step_labels(mut self, labels: &'a HashMap<String, Value>) -> Self {
+        self.step_labels = Some(labels);
         self
     }
 
@@ -547,6 +571,7 @@ impl<'a> TemplateScope<'a> {
                 }
                 match field {
                     "reply" => self.step_replies.and_then(|replies| replies.get(step)),
+                    "label" => self.step_labels.and_then(|labels| labels.get(step)),
                     "stdout" | "stderr" => self
                         .step_streams
                         .and_then(|streams| streams.get(&format!("{step}.{field}"))),
@@ -616,9 +641,14 @@ pub fn check_syntax(template: &str, location: &str) -> Result<(), TemplateError>
         .into_iter()
         .map(|(id, field)| (format!("{id}.{field}"), Value::String(String::new())))
         .collect();
+    let labels = step_label_references(template)
+        .into_iter()
+        .map(|id| (id, Value::String(String::new())))
+        .collect();
     TemplateScope::from_parts(&inputs, &variables)
         .with_step_replies(&replies)
         .with_step_streams(&streams)
+        .with_step_labels(&labels)
         .render_with(template, location, Unknown::Blank)
         .map(|_| ())
 }

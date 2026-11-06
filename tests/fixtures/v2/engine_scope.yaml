@@ -1,0 +1,54 @@
+# An agent step with a private `scope: local` memory, a variable limited to
+# `options`, and a `source: workflow` variable. Its sibling step has an
+# `exit` and no label to choose.
+schema: v2
+name: engine-scope
+version: 1
+
+states:
+  plan:
+    action:
+      type: agent
+      prompt: "Plan. Memory: [{{ local.memory }}]."
+    variables:
+      - name: memory
+        scope: local
+        description: What the plan step keeps for its next entry.
+      - name: note
+        scope: local
+        description: A note the plan step keeps.
+      - name: verdict
+        type: select
+        options: [fine, poor]
+        description: How the plan went.
+      - name: autopilot
+        source: workflow
+        options: [off, on]
+    choices:
+      revise:
+        next: brainstorm
+      noted:
+        requires_variables: [note]
+        next: brainstorm
+      judged:
+        requires_variables: [verdict]
+        next: done
+      ready:
+        next: done
+
+  brainstorm:
+    action:
+      type: agent
+      prompt: Brainstorm.
+    variables:
+      - name: ideas
+        description: What came up.
+    exit:
+      requires_variables: [ideas]
+      next: plan
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

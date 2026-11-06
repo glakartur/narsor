@@ -62,7 +62,7 @@ pub(super) fn agent_input_fields(options: Vec<String>) -> Vec<crate::domain::Hum
 /// * nothing in the answer parses as a JSON object;
 /// * objects are there, but none carries a string `choice`.
 pub fn extract_output(text: &str) -> Result<ChoiceAnswer, ActionError> {
-    match extract_response(text)? {
+    match extract_response(text, AnswerShape::Choice)? {
         AgentResponse::Completed(output) => Ok(output),
         AgentResponse::AwaitingInput { .. } => Err(no_label_error(
             "the agent requested human input instead of producing an output label",
@@ -80,9 +80,12 @@ pub fn extract_output(text: &str) -> Result<ChoiceAnswer, ActionError> {
 /// is read instead, and only its failure is reported. A label the state does
 /// not declare is not unusable here; like a label read from text, it is the
 /// engine's to reject.
-pub(super) fn read_response(run: &HarnessRun) -> Result<AgentResponse, ActionError> {
+pub(super) fn read_response(
+    run: &HarnessRun,
+    shape: AnswerShape,
+) -> Result<AgentResponse, ActionError> {
     if let Some(structured) = &run.structured_output {
-        match structured_response(structured) {
+        match structured_response(structured, shape) {
             Ok(response) => return Ok(response),
             Err(error) => tracing::warn!(
                 reason = %error.message,
@@ -90,14 +93,14 @@ pub(super) fn read_response(run: &HarnessRun) -> Result<AgentResponse, ActionErr
             ),
         }
     }
-    extract_response(&run.text)
+    extract_response(&run.text, shape)
 }
 
 /// What kind of final answer `value` is, by the same rule [`read_response`]
 /// uses: `None` for anything that is not an answer. A label the state does
 /// not declare is still a final answer; the engine rejects it later.
 pub(crate) fn final_answer_kind(value: &Value) -> Option<FinalAnswer> {
-    match structured_response(value) {
+    match structured_response(value, AnswerShape::Choice) {
         Ok(AgentResponse::Completed(_)) => Some(FinalAnswer::Choice),
         Ok(AgentResponse::AwaitingInput { .. }) => Some(FinalAnswer::AwaitingInput),
         Err(_) => None,
@@ -119,17 +122,17 @@ pub(crate) fn closing_answer(text: &str) -> Option<(Value, FinalAnswer)> {
 
 /// Reads an answer from a harness's `structured_output` value, by the same
 /// rules as an object found in the text.
-fn structured_response(value: &Value) -> Result<AgentResponse, ActionError> {
+fn structured_response(value: &Value, shape: AnswerShape) -> Result<AgentResponse, ActionError> {
     let object = value
         .as_object()
-        .filter(|object| is_answer_object(object))
+        .filter(|object| is_answer_object(object, shape))
         .ok_or_else(|| {
             no_label_error(
                 "the structured output has neither a string 'choice' nor an 'awaiting_input' status",
                 &value.to_string(),
             )
         })?;
-    response_from_object(object).map_err(|reason| no_label_error(reason, &value.to_string()))
+    response_from_object(object, shape).map_err(|reason| no_label_error(reason, &value.to_string()))
 }
 
 /// Writes the agent's question to the conversation as a narsor entry, when
@@ -161,7 +164,7 @@ pub(super) fn record_question(conversation: &ConversationSink, response: &AgentR
 
 /// Extracts either a normal label or a request that pauses the same agent
 /// action. The last matching object wins, following the normal output rule.
-fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
+fn extract_response(text: &str, shape: AnswerShape) -> Result<AgentResponse, ActionError> {
     let objects = json_objects(text);
 
     if objects.is_empty() {
@@ -171,23 +174,24 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         ));
     }
 
-    let Some(object) = objects
-        .iter()
-        .rev()
-        .find_map(|value| value.as_object().filter(|object| is_answer_object(object)))
-    else {
+    let Some(object) = objects.iter().rev().find_map(|value| {
+        value
+            .as_object()
+            .filter(|object| is_answer_object(object, shape))
+    }) else {
         return Err(no_label_error(
             "the agent's answer contains JSON, but no object with a string 'choice' key",
             text,
         ));
     };
 
-    response_from_object(object).map_err(|reason| no_label_error(reason, text))
+    response_from_object(object, shape).map_err(|reason| no_label_error(reason, text))
 }
 
-/// Whether `object` is an answer at all: a question, or a string `choice`.
-fn is_answer_object(object: &Map<String, Value>) -> bool {
-    is_question(object) || answer::has_choice(object)
+/// Whether `object` is an answer at all: a question, a string `choice`, or
+/// for a step with an `exit` any object.
+fn is_answer_object(object: &Map<String, Value>, shape: AnswerShape) -> bool {
+    is_question(object) || shape == AnswerShape::Exit || answer::has_choice(object)
 }
 
 /// Whether `object` asks a person before the task continues.
@@ -198,12 +202,15 @@ fn is_question(object: &Map<String, Value>) -> bool {
 /// Turns an answer object into the response it stands for. An error is the
 /// reason the object is unusable; the caller quotes the answer it came
 /// from (the agent's text, or the structured output) with it.
-fn response_from_object(object: &Map<String, Value>) -> Result<AgentResponse, &'static str> {
+fn response_from_object(
+    object: &Map<String, Value>,
+    shape: AnswerShape,
+) -> Result<AgentResponse, &'static str> {
     if is_question(object) {
         return question_from_object(object);
     }
-    answer::read_choice_answer(object)
-        .expect("the object was selected for having a choice")
+    answer::read_answer(object, shape)
+        .expect("the object was selected as an answer of this shape")
         .map(AgentResponse::Completed)
 }
 
@@ -490,7 +497,11 @@ fn object_end(text: &str, start: usize) -> Option<usize> {
 fn is_contract(object: &str) -> bool {
     serde_json::from_str::<Value>(object)
         .ok()
-        .and_then(|value| value.as_object().map(is_answer_object))
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|object| is_answer_object(object, AnswerShape::Choice))
+        })
         .unwrap_or(false)
 }
 
@@ -509,7 +520,7 @@ mod json_object_tests {
     use serde_json::json;
 
     fn label_of(text: &str) -> String {
-        match extract_response(text).expect("a response") {
+        match extract_response(text, super::AnswerShape::Choice).expect("a response") {
             AgentResponse::Completed(answer) => answer.choice,
             AgentResponse::AwaitingInput { .. } => panic!("not an output"),
         }

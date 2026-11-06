@@ -88,8 +88,8 @@ use crate::domain::{
     effective_title, ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy,
     Artifact, ArtifactReference, ChoiceDefinition, DecisionProviderType, Event, EventData,
     ExecutionId, ExecutionStatus, HumanInputField, HumanInputType, InputCloseReason, ProblemKind,
-    RepromptedBy, State, StateId, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
-    LOCAL_VARIABLE_PREFIX,
+    RepromptedBy, State, StateId, VariableSource, WorkflowDefinition, WorkflowExecution, Workspace,
+    WorkspaceInfo,
 };
 use crate::engine::actions::agent::{
     self, DefaultHarnessSource, UsageReporter, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL,
@@ -122,8 +122,10 @@ mod gate_context;
 mod operations;
 mod rescue;
 mod step_memory;
+mod variable_rules;
 
 use gate_context::{has_step_contract, GateContext};
+use variable_rules::Assignment;
 
 pub use failure::{
     step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
@@ -420,7 +422,8 @@ impl OutputRejection {
                     .choices
                     .iter()
                     .find(|choice| choice.label == result.output_label)?;
-                unmet_requirements(choice, result, kept_locals)?
+                unmet_requirements(choice, result, kept_locals)
+                    .or_else(|| variable_rules::value_outside_options(state, &result.variables))?
             }
             Err(_) => return None,
         };
@@ -517,9 +520,33 @@ fn unmet_requirements(
     ))
 }
 
+/// Writes what `set` assigned: shared variables into the context, local
+/// ones into the memory of `state_id`.
+fn write_assignments(
+    execution: &mut WorkflowExecution,
+    state_id: &str,
+    assignments: &[Assignment],
+) -> Result<(), EngineError> {
+    let (local, global): (Vec<&Assignment>, Vec<&Assignment>) =
+        assignments.iter().partition(|assignment| assignment.local);
+    for assignment in global {
+        execution
+            .context
+            .variables
+            .insert(assignment.name.clone(), assignment.value.clone());
+    }
+    let local_values = local
+        .into_iter()
+        .map(|assignment| (assignment.name.clone(), assignment.value.clone()))
+        .collect();
+    step_memory::write_locals(execution, state_id, local_values)
+}
+
 /// Moves the variables of an agent or script `result` that its step does not
-/// define into its `additional_data` (KTD5): kept, but never written to the
-/// context. Returns a warning for each one moved.
+/// let it write into its `additional_data` (KTD5): kept, but never written
+/// to the context. That is a variable the step does not define, and one
+/// only the workflow sets (`source: workflow`). Returns a warning for each
+/// one moved.
 ///
 /// The engine's own [`agent::SESSION_ID_VARIABLE`] stays where it is, and so
 /// does whatever a gate or a person gave: only a step that can define
@@ -531,23 +558,30 @@ fn set_aside_undeclared_variables(state: &State, result: &mut ActionResult) -> V
     let is_kept = |name: &String| {
         name == agent::SESSION_ID_VARIABLE
             || state
-                .variables
-                .iter()
-                .any(|variable| &variable.name == name)
+                .variable(name)
+                .is_some_and(|variable| variable.source == VariableSource::Step)
     };
-    let (kept, undeclared): (Map<String, Value>, Map<String, Value>) =
+    let (kept, set_aside): (Map<String, Value>, Map<String, Value>) =
         std::mem::take(&mut result.variables)
             .into_iter()
             .partition(|(name, _)| is_kept(name));
     result.variables = kept;
-    undeclared
+    set_aside
         .into_iter()
         .map(|(name, value)| {
-            let warning = format!(
-                "variable '{name}' is not defined on step '{}'; it was kept as additional \
-                 data and not written to the context",
-                state.id
-            );
+            let warning = if state.variable(&name).is_some() {
+                format!(
+                    "variable '{name}' is set by the workflow alone on step '{}'; it was kept \
+                     as additional data and not written to the context",
+                    state.id
+                )
+            } else {
+                format!(
+                    "variable '{name}' is not defined on step '{}'; it was kept as additional \
+                     data and not written to the context",
+                    state.id
+                )
+            };
             result.additional_data.entry(name).or_insert(value);
             warning
         })
@@ -555,11 +589,11 @@ fn set_aside_undeclared_variables(state: &State, result: &mut ActionResult) -> V
 }
 
 /// The variables of a result that belong in the shared context: all but the
-/// step's own `local.*` memory, which never leaves its step (R12).
-fn shared_variables(variables: &Map<String, Value>) -> Map<String, Value> {
+/// step's own local memory, which never leaves its step (R12).
+fn shared_variables(state: &State, variables: &Map<String, Value>) -> Map<String, Value> {
     variables
         .iter()
-        .filter(|(name, _)| !name.starts_with(LOCAL_VARIABLE_PREFIX))
+        .filter(|(name, _)| !state.is_local_variable(name))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
@@ -2473,6 +2507,7 @@ impl Engine {
             }
             _ => String::new(),
         };
+        let step_labels = step_memory::last_choice_labels(execution).map_err(unreadable_memory)?;
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
         let task_title = self.task_labels.effective_title();
@@ -2481,6 +2516,7 @@ impl Engine {
             .with_declared(declared)
             .with_step_replies(&step_replies)
             .with_step_streams(&step_streams)
+            .with_step_labels(&step_labels)
             .with_step_memory(StepMemory {
                 locals: &kept_locals,
                 definitions: &state.variables,
@@ -3150,6 +3186,14 @@ impl Engine {
         }
 
         let warnings = set_aside_undeclared_variables(state, &mut result);
+        // A script cannot be asked again, so a value outside the declared
+        // `options` ends its step; an agent was asked again before this.
+        if has_step_contract(state) && !is_agent(state) {
+            if let Some(problem) = variable_rules::value_outside_options(state, &result.variables) {
+                self.fail_action(execution, &action_execution_id, problem)?;
+                return Ok(None);
+            }
+        }
         self.emit(
             &execution.id,
             EventData::ActionCompleted {
@@ -3293,6 +3337,16 @@ impl Engine {
             .choices
             .iter()
             .any(|output| output.label == outcome.label && output.resume_comment_field.is_some());
+        // Rendered and checked before anything is written: a `set` that
+        // cannot be applied whole is not applied at all.
+        let assignments =
+            match self.render_assignments(definition, execution, state, &pending, &outcome.label) {
+                Ok(assignments) => assignments,
+                Err(message) => {
+                    self.fail_action(execution, &pending.action_execution_id, message)?;
+                    return Ok(Flow::Stop);
+                }
+            };
 
         self.emit(
             &execution.id,
@@ -3308,9 +3362,11 @@ impl Engine {
         // authority; writing `context.json` alone would leave a stale copy.
         execution
             .context
-            .update_variables(shared_variables(&pending.result.variables));
-        step_memory::keep_locals(execution, &state.id, &pending.result.variables)?;
+            .update_variables(shared_variables(state, &pending.result.variables));
+        step_memory::keep_locals(execution, state, &pending.result.variables)?;
         step_memory::record_choice(execution, &state.id, &outcome.label, &pending.result.reason)?;
+        // After the step's own result, so what `set` assigns wins over it.
+        write_assignments(execution, &state.id, &assignments)?;
         if pending
             .result
             .reply
@@ -3386,6 +3442,18 @@ impl Engine {
         clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);
         self.store.save_execution(execution)?;
 
+        for assignment in assignments {
+            self.emit(
+                &execution.id,
+                EventData::VariableSetByWorkflow {
+                    variable: assignment.name,
+                    value: assignment.value,
+                    state_id: state.id.clone(),
+                    output_label: outcome.label.clone(),
+                    local: assignment.local,
+                },
+            )?;
+        }
         self.emit(
             &execution.id,
             EventData::TransitionTaken {
@@ -3426,6 +3494,54 @@ impl Engine {
         self.write_checkpoint(definition, execution);
 
         Ok(Flow::Continue)
+    }
+
+    /// What the `set` of `label` assigns on leaving `state`, rendered in the
+    /// scope of that step: the context as the step's own result leaves it,
+    /// its local memory, and the label each step last chose (this one's
+    /// included). Reads only; nothing is written.
+    fn render_assignments(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &WorkflowExecution,
+        state: &State,
+        pending: &PendingStep,
+        label: &str,
+    ) -> Result<Vec<Assignment>, String> {
+        let sets_nothing = state
+            .choices
+            .iter()
+            .all(|choice| choice.label != label || choice.set.is_empty());
+        if sets_nothing {
+            return Ok(Vec::new());
+        }
+        let unreadable = |error: EngineError| error.to_string();
+        let mut context = execution.context.clone();
+        context.update_variables(shared_variables(state, &pending.result.variables));
+        let mut locals = step_memory::step_locals(execution, &state.id).map_err(unreadable)?;
+        locals.extend(
+            pending
+                .result
+                .variables
+                .iter()
+                .filter(|(name, _)| state.is_local_variable(name))
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        let mut labels = step_memory::last_choice_labels(execution).map_err(unreadable)?;
+        labels.insert(state.id.clone(), Value::String(label.to_string()));
+        let declared = DeclaredNames::of(definition);
+        let task_title = self.task_labels.effective_title();
+        let scope = TemplateScope::from_execution(&execution.inputs, &context)
+            .map_err(|error| error.to_string())?
+            .with_task_fields(self.task_labels.ticket.as_deref(), task_title.as_deref())
+            .with_declared(&declared)
+            .with_step_labels(&labels)
+            .with_step_memory(StepMemory {
+                locals: &locals,
+                definitions: &state.variables,
+                history: "",
+            });
+        variable_rules::render_assignments(state, label, &scope)
     }
 
     fn wait_on_entry_limit(

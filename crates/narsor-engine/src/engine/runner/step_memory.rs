@@ -15,8 +15,9 @@
 //!
 //! # Local values (R12–R15)
 //!
-//! A step's `local.*` variables are kept in `metadata.engine.step_locals`,
-//! never in the context. A value given replaces the earlier one whole; a
+//! A step's local variables (`scope: local`, or named `local.*` in the older
+//! shape) are kept in `metadata.engine.step_locals` under their declared
+//! name, never in the context. A value given replaces the earlier one whole; a
 //! value not given leaves the earlier one in place.
 //!
 //! Both records are written by the save that writes the context (or that
@@ -115,35 +116,68 @@ pub(super) fn record_failure(
     update_attempts(execution, state_id, |record| record.attempts.push(attempt))
 }
 
-/// Keeps the `local.*` values among `variables` as the memory of
-/// `state_id`, each replacing the one kept before (R15).
+/// Keeps the local values among `variables` as the memory of `state`, each
+/// replacing the one kept before (R15). Which names are local is the
+/// step's declaration ([`State::is_local_variable`]).
 pub(super) fn keep_locals(
     execution: &mut WorkflowExecution,
-    state_id: &str,
+    state: &State,
     variables: &Map<String, Value>,
 ) -> Result<(), EngineError> {
-    let given: Vec<(&String, &Value)> = variables
+    let given: Vec<(String, Value)> = variables
         .iter()
-        .filter(|(name, _)| name.starts_with(LOCAL_VARIABLE_PREFIX))
+        .filter(|(name, _)| state.is_local_variable(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
-    if given.is_empty() {
+    write_locals(execution, &state.id, given)
+}
+
+/// Keeps `values` as local memory of `state_id`, each replacing the one
+/// kept before.
+pub(super) fn write_locals(
+    execution: &mut WorkflowExecution,
+    state_id: &str,
+    values: Vec<(String, Value)>,
+) -> Result<(), EngineError> {
+    if values.is_empty() {
         return Ok(());
     }
     let mut locals = read_locals(execution)?;
     let kept = locals.entry(state_id.to_string()).or_default();
-    for (name, value) in given {
-        kept.insert(name.clone(), value.clone());
+    for (name, value) in values {
+        kept.insert(name, value);
     }
     write_engine_record(execution, METADATA_STEP_LOCALS_KEY, &locals)
 }
 
-/// The `local.*` values `state_id` kept, keyed by the full name.
+/// The local values `state_id` kept, keyed by the declared name.
 pub(super) fn step_locals(
     execution: &WorkflowExecution,
     state_id: &str,
 ) -> Result<Map<String, Value>, EngineError> {
     let mut locals = read_locals(execution)?;
     Ok(locals.remove(state_id).unwrap_or_default())
+}
+
+/// The label each step last chose, by step id: what `steps.ID.label` reads.
+pub(super) fn last_choice_labels(
+    execution: &WorkflowExecution,
+) -> Result<HashMap<String, Value>, EngineError> {
+    let labels = read_attempts(execution)?
+        .into_iter()
+        .filter_map(|(state_id, record)| {
+            let label = record
+                .attempts
+                .into_iter()
+                .rev()
+                .find_map(|attempt| match attempt {
+                    StepAttempt::Choice { choice, .. } => Some(choice),
+                    StepAttempt::Failure { .. } => None,
+                })?;
+            Some((state_id, Value::String(label)))
+        })
+        .collect();
+    Ok(labels)
 }
 
 /// The history block of `state_id`: empty on its first entry (R17).

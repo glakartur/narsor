@@ -1,0 +1,56 @@
+# `set` runs when a choice or `exit` is taken, before the next step starts.
+schema: v2
+name: engine-set
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Work.
+    variables:
+      - name: mode
+        type: select
+        options: [fast, careful]
+      - name: summary
+      - name: stage
+      - name: count
+        type: integer
+      - name: memo
+        scope: local
+      - name: autopilot
+        source: workflow
+        options: [off, on]
+    choices:
+      approved:
+        set:
+          stage: reviewed
+          autopilot: "on"
+          count: 3
+          local:
+            memo: "approved after {{ context.variables.summary }}"
+        next: report
+      overwritten:
+        set:
+          summary: forced
+        next: report
+      rendered:
+        set:
+          mode: "{{ context.variables.summary }}"
+          stage: never-written
+        next: report
+      plain:
+        next: report
+
+  report:
+    action:
+      type: agent
+      prompt: "Report. Last: {{ steps.work.label }}. Stage: [{{ context.variables.stage }}]."
+    exit:
+      next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

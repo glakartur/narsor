@@ -6,7 +6,8 @@
 //!  "additional_artifacts": ["<path>"]}
 //! ```
 //!
-//! Only `choice` is needed for the object to be an answer. `reason` is asked
+//! Only `choice` is needed for the object to be an answer (a step with an
+//! `exit` needs no `choice` at all). `reason` is asked
 //! for by the contract, but an answer without one is accepted with an empty
 //! reason (R3). A field of the wrong shape makes the answer unusable rather
 //! than being dropped: a value the step requires would otherwise go missing
@@ -16,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::domain::ActionResult;
+use crate::domain::{ActionResult, EXIT_LABEL};
 
 /// The key that makes an object an answer, and carries its label.
 pub const CHOICE_KEY: &str = "choice";
@@ -55,6 +56,27 @@ impl ChoiceAnswer {
     }
 }
 
+/// What makes an object the answer of a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerShape {
+    /// The step has choices: the answer carries a string `choice`.
+    Choice,
+    /// The step has one `exit`: any object is the answer, and it needs no
+    /// `choice` — the step's only label is [`EXIT_LABEL`].
+    Exit,
+}
+
+impl AnswerShape {
+    /// The shape of the answer of a step that has an `exit` or not.
+    pub fn of_step(has_exit: bool) -> Self {
+        if has_exit {
+            Self::Exit
+        } else {
+            Self::Choice
+        }
+    }
+}
+
 /// Whether `object` carries a string `choice`, which makes it an answer.
 pub fn has_choice(object: &Map<String, Value>) -> bool {
     object.get(CHOICE_KEY).and_then(Value::as_str).is_some()
@@ -67,6 +89,26 @@ pub fn read_choice_answer(
 ) -> Option<Result<ChoiceAnswer, &'static str>> {
     let choice = object.get(CHOICE_KEY)?.as_str()?.to_string();
     Some(answer_with(choice, object))
+}
+
+/// Reads the answer `object` stands for in a step of this `shape`. In an
+/// `exit` step a missing `choice` is the exit label; one given is kept, so
+/// the engine can turn down a label the step does not declare.
+pub fn read_answer(
+    object: &Map<String, Value>,
+    shape: AnswerShape,
+) -> Option<Result<ChoiceAnswer, &'static str>> {
+    match shape {
+        AnswerShape::Choice => read_choice_answer(object),
+        AnswerShape::Exit => {
+            let choice = object
+                .get(CHOICE_KEY)
+                .and_then(Value::as_str)
+                .unwrap_or(EXIT_LABEL)
+                .to_string();
+            Some(answer_with(choice, object))
+        }
+    }
 }
 
 fn answer_with(choice: String, object: &Map<String, Value>) -> Result<ChoiceAnswer, &'static str> {

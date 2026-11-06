@@ -233,6 +233,12 @@ impl<'a> StepContract<'a> {
             choices: &state.choices,
         }
     }
+
+    /// Whether the step has one `exit` and no label for the action to
+    /// choose.
+    pub fn has_exit(&self) -> bool {
+        self.choices.iter().any(ChoiceDefinition::is_exit)
+    }
 }
 
 /// How an attempt ended, short of failing outright.

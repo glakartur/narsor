@@ -734,6 +734,131 @@ async fn json_without_a_choice_key_is_an_error() {
     assert_eq!(details["harness_session_id"], json!("fake-session-1"));
 }
 
+/// Runs the fake harness with `contract` and returns what the agent made of
+/// its answer.
+async fn run_with_contract(
+    answer: &str,
+    contract: StepContract<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(answer));
+    let action = ActionConfig::Agent(agent_action("do the thing"));
+    let workspace = root.workspace();
+    executor(&fake)
+        .execute(
+            ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_contract(contract),
+        )
+        .await
+}
+
+/// The choices of a step with an `exit`: the one choice the loader compiles
+/// it to, requiring a summary.
+fn exit_choices() -> [ChoiceDefinition; 1] {
+    [ChoiceDefinition {
+        requires_variables: vec!["summary".to_string()],
+        ..ChoiceDefinition::new(narsor_engine::domain::EXIT_LABEL)
+    }]
+}
+
+#[tokio::test]
+async fn an_answer_without_a_choice_ends_a_step_with_an_exit() {
+    let choices = exit_choices();
+    let outcome = run_with_contract(
+        r#"{"reason":"all done","variables":{"summary":"s"}}"#,
+        StepContract {
+            choices: &choices,
+            ..StepContract::default()
+        },
+    )
+    .await
+    .expect("the answer is accepted");
+
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action, got {outcome:?}");
+    };
+    assert_eq!(result.output_label, narsor_engine::domain::EXIT_LABEL);
+    assert_eq!(result.reason, "all done");
+    assert_eq!(result.variables.get("summary"), Some(&json!("s")));
+}
+
+#[tokio::test]
+async fn a_step_with_choices_still_needs_a_choice() {
+    let choices = [ChoiceDefinition::new("ready")];
+    let error = run_with_contract(
+        r#"{"reason":"all done","variables":{"summary":"s"}}"#,
+        StepContract {
+            choices: &choices,
+            ..StepContract::default()
+        },
+    )
+    .await
+    .expect_err("an answer without a choice is no answer");
+
+    assert_eq!(error.error_type.as_deref(), Some("missing_output_label"));
+}
+
+#[tokio::test]
+async fn the_contract_of_an_exit_step_asks_for_no_choice() {
+    let choices = exit_choices();
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"reason":"r"}"#));
+    let action = ActionConfig::Agent(agent_action("do the thing"));
+    let workspace = root.workspace();
+    executor(&fake)
+        .execute(
+            ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_contract(
+                StepContract {
+                    choices: &choices,
+                    ..StepContract::default()
+                },
+            ),
+        )
+        .await
+        .expect("the action runs");
+    let prompt = fake.args(1).last().expect("a prompt").clone();
+
+    assert!(!prompt.contains("\"choice\""), "{prompt}");
+    assert!(
+        prompt.contains("`summary`"),
+        "the requirement is named: {prompt}"
+    );
+}
+
+/// The contract lists the values a variable may take, and leaves out a
+/// variable only the workflow sets.
+#[tokio::test]
+async fn the_contract_lists_the_options_and_hides_workflow_variables() {
+    use narsor_engine::domain::{VariableSource, VariableType};
+    let variables = [
+        VariableDefinition {
+            options: vec!["fine".to_string(), "poor".to_string()],
+            variable_type: Some(VariableType::Select),
+            ..variable("verdict", "How it went.")
+        },
+        VariableDefinition {
+            source: VariableSource::Workflow,
+            ..variable("autopilot", "Set by the workflow.")
+        },
+    ];
+    let choices = [ChoiceDefinition::new("ready")];
+
+    let prompt = prompt_sent_with_contract(StepContract {
+        variables: &variables,
+        choices: &choices,
+        ..StepContract::default()
+    })
+    .await;
+
+    assert!(prompt.contains("`verdict`"), "{prompt}");
+    assert!(
+        prompt.contains("`fine`") && prompt.contains("`poor`"),
+        "the allowed values are listed: {prompt}"
+    );
+    assert!(!prompt.contains("autopilot"), "{prompt}");
+}
+
 #[tokio::test]
 async fn a_choice_brings_its_reason_and_its_named_artifacts() {
     let root = TempRoot::new();
