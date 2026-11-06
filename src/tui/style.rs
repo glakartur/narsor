@@ -185,6 +185,12 @@ impl Styles {
         self.strong(role)
     }
 
+    /// The step picked on the strip of *Rozmowa*: the open tab's look,
+    /// underlined, as the strip has no marker row of its own.
+    pub fn selected_step(&self, role: Role) -> Style {
+        self.selected_tab(role).add_modifier(Modifier::UNDERLINED)
+    }
+
     /// The frame of every panel: rounded corners, one line type for all.
     pub const FRAME: BorderType = BorderType::Rounded;
 

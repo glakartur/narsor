@@ -8,8 +8,8 @@
 //! the relay would have produced without starting a server.
 //!
 //! * [`progress`] — the step timeline and the selected step;
-//! * [`conversation`] — the whole conversation, and the per-attempt cache the
-//!   progress tab shares;
+//! * [`conversation`] — the conversation of one step, picked on a strip of
+//!   steps, and the per-attempt cache the progress tab shares;
 //! * [`events`] — the raw event log with the detail of one event;
 //! * [`conductor`] — the chat with the conductor, its decisions and harness;
 //! * [`info`] — what the control plane knows about the task.

@@ -4576,6 +4576,63 @@ mod task_app_detail {
         }
 
         #[test]
+        fn each_step_keeps_its_own_reader_across_switches() {
+            let positions = three_steps();
+            let mut attempts = Attempts::default();
+            attempts.apply(
+                "act-plan",
+                1,
+                0,
+                Ok(read(vec![entry("1", "plan one"), entry("2", "plan two")])),
+            );
+            attempts.apply("act-edit", 1, 0, Ok(read(vec![entry("1", "edit one")])));
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild(&positions, &attempts);
+            conversation.select_older();
+            conversation.select_older();
+            conversation.rebuild(&positions, &attempts);
+            narsor::tui::task_app::tabs::conversation::transcript_action(
+                conversation.transcript_mut(),
+                narsor::tui::keymap::Action::Top,
+            );
+            let picked = conversation.transcript().selected_entry().cloned();
+            conversation
+                .transcript_mut()
+                .toggle_expanded(picked.as_ref().unwrap());
+
+            conversation.select_newer();
+            conversation.select_newer();
+            conversation.rebuild(&positions, &attempts);
+            assert_eq!(conversation.selected_step(), Some("edit #1"));
+            conversation.select_older();
+            conversation.select_older();
+            conversation.rebuild(&positions, &attempts);
+            assert_eq!(conversation.transcript().selected_entry().cloned(), picked);
+            assert!(conversation
+                .transcript()
+                .is_expanded(picked.as_ref().unwrap()));
+        }
+
+        #[test]
+        fn a_selected_step_that_is_gone_gives_way_to_the_newest() {
+            let mut positions = three_steps();
+            let attempts = Attempts::default();
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild(&positions, &attempts);
+            conversation.select_older();
+            conversation.select_older();
+            assert_eq!(conversation.selected_step(), Some("plan #1"));
+            positions.remove(0);
+            conversation.rebuild(&positions, &attempts);
+            assert_eq!(conversation.selected_step(), Some("edit #1"));
+            assert!(conversation.follows_newest());
+
+            conversation.rebuild(&[], &attempts);
+            assert_eq!(conversation.selected_step(), None);
+            assert!(conversation.transcript().entries().is_empty());
+        }
+
+        #[test]
         fn a_new_step_is_followed_only_while_the_newest_is_selected() {
             let mut positions = three_steps();
             let attempts = Attempts::default();

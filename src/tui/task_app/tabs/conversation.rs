@@ -682,7 +682,8 @@ impl Conversation {
 /// What a conversation is put together for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope<'a> {
-    /// Every step, each under its heading (*Rozmowa*).
+    /// Every step, each under its heading: the order of steps and choices
+    /// over the whole task, which *Rozmowa* once showed in one piece.
     Whole,
     /// One entry into a step: its attempts and the choices made in it, no
     /// heading (*Przebieg*).
@@ -1308,11 +1309,14 @@ fn step_strip_line(
     if steps.is_empty() {
         return Line::styled("brak kroków", styles.of(Role::Done));
     }
-    let chip_width = |step: &StepChip| 2 + one_line(&step.label).chars().count();
-    let separator = STEP_SEPARATOR.chars().count();
-    let more = STEP_MORE.chars().count() + 1;
+    let chip_widths: Vec<usize> = steps
+        .iter()
+        .map(|step| 2 + Span::raw(one_line(&step.label)).width())
+        .collect();
+    let separator = Span::raw(STEP_SEPARATOR).width();
+    let more = Span::raw(STEP_MORE).width() + 1;
     let span_width = |from: usize, to: usize| -> usize {
-        steps[from..=to].iter().map(chip_width).sum::<usize>() + separator * (to - from)
+        chip_widths[from..=to].iter().sum::<usize>() + separator * (to - from)
     };
     let selected = conversation
         .selected_step()
@@ -1332,7 +1336,7 @@ fn step_strip_line(
         let gap = if index > first { separator } else { 0 };
         let last = index + 1 == steps.len();
         let room = width.saturating_sub(if last { 0 } else { more });
-        if index > selected && used + gap + chip_width(step) > room {
+        if index > selected && used + gap + chip_widths[index] > room {
             spans.push(Span::styled(format!(" {STEP_MORE}"), styles.of(Role::Done)));
             break;
         }
@@ -1340,7 +1344,7 @@ fn step_strip_line(
             spans.push(Span::styled(STEP_SEPARATOR, styles.of(Role::Done)));
         }
         spans.extend(step_chip(step, index == selected, focused, styles));
-        used += gap + chip_width(step);
+        used += gap + chip_widths[index];
     }
     Line::from(spans)
 }
@@ -1356,9 +1360,7 @@ fn step_chip(
     let label = one_line(&step.label);
     let label_style = if selected {
         let role = if focused { Role::Focus } else { Role::Calm };
-        styles
-            .selected_tab(role)
-            .add_modifier(ratatui::style::Modifier::UNDERLINED)
+        styles.selected_step(role)
     } else {
         styles.of(Role::Done)
     };

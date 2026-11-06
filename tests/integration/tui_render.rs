@@ -6869,6 +6869,33 @@ mod stacked_form {
     }
 
     #[test]
+    fn a_long_repository_id_is_cut_and_the_branch_stays_in_view() {
+        let styles = Styles::new(false);
+        let long = format!("acme/{}", "x".repeat(60));
+        let mut chooser = entered(vec![
+            ChooserField::select("repo", vec![long.clone()]).labelled("Repozytorium"),
+            ChooserField::suggest(branch_field_name("repo"), Vec::new()).starting_from("main"),
+        ]);
+        press(&mut chooser, KeyCode::Down);
+        type_text(&mut chooser, "-x");
+        let buffer = draw_chooser(WIDTH, 12, &mut chooser, &styles);
+        let rows = rows(&buffer);
+        let value = row_of(&rows, "gałąź: main-x", &buffer);
+        assert!(
+            rows[value].contains("…"),
+            "the id is cut: {}",
+            screen(&buffer)
+        );
+        assert!(!rows[value].contains(&long), "{}", screen(&buffer));
+        let reversed = buffer.content()
+            [value * usize::from(WIDTH)..(value + 1) * usize::from(WIDTH)]
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .count();
+        assert_eq!(reversed, 1, "the cursor is in view:\n{}", screen(&buffer));
+    }
+
+    #[test]
     fn without_colour_the_branch_box_is_underlined() {
         let styles = Styles::new(true);
         let mut chooser = entered(repository_and_branch("main"));

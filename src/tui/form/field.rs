@@ -199,6 +199,9 @@ const BRANCH_LABEL: &str = "gałąź: ";
 /// The cells left free after the branch's box, at the right edge.
 const BRANCH_RIGHT_GAP: usize = 1;
 
+/// The fewest cells the branch's box keeps; a longer repository id is cut.
+const MIN_BRANCH_BOX: usize = 12;
+
 /// One row for a repository and its branch:
 /// `> ‹ repo ›   gałąź: [branch      ]`. The repository is drawn as a select
 /// (the editing fill under `‹ … ›` while it has the focus); the branch is a
@@ -224,7 +227,11 @@ pub fn repository_branch_line(
     } else {
         styles.of(Role::Done)
     };
-    let shown = format!("‹ {} ›", sanitize(repository.value()));
+    // A long repository id is cut so that the branch box keeps its room.
+    let around =
+        PROMPT.len() + cells("‹  ›") + BRANCH_GAP.len() + cells(BRANCH_LABEL) + BRANCH_RIGHT_GAP;
+    let name_room = width.saturating_sub(around + MIN_BRANCH_BOX).max(1);
+    let shown = format!("‹ {} ›", clip(&sanitize(repository.value()), name_room));
     let used = PROMPT.len() + cells(&shown) + BRANCH_GAP.len() + cells(BRANCH_LABEL);
     let box_width = width.saturating_sub(used + BRANCH_RIGHT_GAP).max(1);
     let mut spans = vec![
@@ -261,15 +268,15 @@ fn branch_box(
         0
     };
     let visible: String = text.iter().skip(first).take(width).collect();
-    let mut spans = if focused {
-        cursor_spans(&visible, cursor - first, fill, styles.cursor())
-    } else {
-        vec![Span::styled(visible.clone(), fill)]
-    };
     let used = if focused {
         cells(&visible).max(cursor - first + 1)
     } else {
         cells(&visible)
+    };
+    let mut spans = if focused {
+        cursor_spans(&visible, cursor - first, fill, styles.cursor())
+    } else {
+        vec![Span::styled(visible, fill)]
     };
     spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), fill));
     spans
