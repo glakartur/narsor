@@ -29,6 +29,7 @@
 //! plane once for the reads waiting for it, fails each with the reason
 //! ([`fail_read`]) and exits with a [`RunnerProblem`].
 
+use std::any::Any;
 use std::time::Duration;
 
 use crate::api::ClientError;
@@ -39,7 +40,7 @@ use crate::controller_protocol::{
 use crate::orchestration::RunnerProblem;
 use crate::persistence::ExecutionStore;
 
-use super::storage::StorageLock;
+use super::storage::InitializationMarker;
 use super::{
     Link, RunnerConfig, RunnerError, RunnerExit, RunnerTiming, TaskStorage,
     PROBLEM_READER_UNAVAILABLE,
@@ -49,19 +50,51 @@ use super::{
 /// runs one.
 const NO_CONDUCTOR: &str = "the task is not running; this is its stored chat";
 
+/// What a reader asks of a storage before it reads: the runner lock, the
+/// initialization marker and the store. A trait so the decision to refuse a
+/// storage can be checked by the calls it makes, without a lock file.
+pub(super) trait ReaderStorage {
+    /// Takes the runner lock for reading; the guard is held until the reader
+    /// exits.
+    fn lock_for_reading(&self) -> Result<Box<dyn Any + Send>, RunnerError>;
+    fn marker(&self) -> Result<Option<InitializationMarker>, RunnerError>;
+    fn store(&self) -> ExecutionStore;
+}
+
+impl ReaderStorage for TaskStorage {
+    fn lock_for_reading(&self) -> Result<Box<dyn Any + Send>, RunnerError> {
+        TaskStorage::lock_for_reading(self).map(|lock| Box::new(lock) as Box<dyn Any + Send>)
+    }
+
+    fn marker(&self) -> Result<Option<InitializationMarker>, RunnerError> {
+        TaskStorage::marker(self)
+    }
+
+    fn store(&self) -> ExecutionStore {
+        TaskStorage::store(self)
+    }
+}
+
 /// What a reader holds once its storage is open.
 struct Opened {
     /// Held until the reader exits.
-    _lock: StorageLock,
+    _lock: Box<dyn Any + Send>,
     store: ExecutionStore,
     execution_id: Option<String>,
 }
 
 /// Runs a read-only runner to its end.
 pub(super) async fn run(config: RunnerConfig) -> Result<RunnerExit, RunnerError> {
-    let storage = TaskStorage::new(&config.storage);
+    run_on(&TaskStorage::new(&config.storage), config).await
+}
+
+/// Runs a read-only runner on the storage it is given.
+async fn run_on(
+    storage: &impl ReaderStorage,
+    config: RunnerConfig,
+) -> Result<RunnerExit, RunnerError> {
     let mut link = Link::new(&config);
-    let opened = match open(&storage, &config) {
+    let opened = match open(storage, &config) {
         Ok(opened) => opened,
         Err(error) => return Ok(refuse_reads(&mut link, &config.timing, error).await),
     };
@@ -69,7 +102,7 @@ pub(super) async fn run(config: RunnerConfig) -> Result<RunnerExit, RunnerError>
 }
 
 /// Locks the storage and checks it is one a runner worked on.
-fn open(storage: &TaskStorage, config: &RunnerConfig) -> Result<Opened, RunnerError> {
+fn open(storage: &impl ReaderStorage, config: &RunnerConfig) -> Result<Opened, RunnerError> {
     let lock = storage.lock_for_reading()?;
     let marker = storage
         .marker()?
@@ -362,15 +395,13 @@ pub(super) async fn fail_read(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
 
     use super::*;
-    use crate::domain::{
-        EventData, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec, TaskWorkspace,
-    };
-    use crate::runner::{initialize, HarnessHome, MountedSecrets};
+    use crate::domain::{EventData, TaskId};
+    use crate::runner::HarnessHome;
 
     /// A directory that deletes itself.
     struct TempRoot(PathBuf);
@@ -389,62 +420,19 @@ mod tests {
         }
     }
 
-    const WORKFLOW: &str = r#"
-name: one-step
-version: 1
-states:
-  work:
-    action:
-      type: agent
-      prompt: Do the work.
-    choices: [done]
-    transitions:
-      done: completed
-  completed:
-    description: Done.
-terminal_states: [completed]
-"#;
-
     fn task() -> TaskId {
         TaskId::parse("task-1").unwrap()
     }
 
-    /// A storage a working runner initialized, and the lock it holds.
-    fn worked_on(root: &TempRoot) -> (TaskStorage, StorageLock) {
-        let storage = TaskStorage::new(root.0.join("storage"));
-        let lock = storage.lock().unwrap();
-        let definition = crate::workflow::load_from_str(WORKFLOW).unwrap();
-        let spec = TaskLaunchSpec::new(
-            definition.id.clone(),
-            definition.version,
-            serde_json::json!({}),
-            TaskWorkspace::none(),
-            ResolvedEnvironment::harness_only("claude-code"),
-            ResourceProfile::new(1000, 2048),
-        )
-        .with_definition(&definition)
-        .unwrap();
-        initialize(
-            &storage,
-            &storage.store(),
-            &task(),
-            &spec,
-            &MountedSecrets::new(None),
-            &crate::workspace::GitAccess::User,
-        )
-        .unwrap();
-        (storage, lock)
-    }
-
-    /// A reader's configuration; its credential file does not exist, so it
-    /// never reaches a control plane.
-    fn reader_config(root: &TempRoot, storage: &TaskStorage) -> RunnerConfig {
+    /// A reader's configuration; its credential file is not there, so the
+    /// control plane is never reached.
+    fn reader_config() -> RunnerConfig {
         RunnerConfig {
             task_id: task(),
-            storage: storage.root().to_path_buf(),
+            storage: PathBuf::from("/storage"),
             launch_spec: None,
             control_plane: "http://control-plane.invalid".to_string(),
-            credential_file: root.0.join("no-credential"),
+            credential_file: PathBuf::from("/no-credential"),
             secrets_dir: None,
             harness_home: HarnessHome::default(),
             agent_args: Default::default(),
@@ -456,34 +444,52 @@ terminal_states: [completed]
         }
     }
 
-    type TreeEntry = (bool, u64, std::time::SystemTime);
-
-    /// Kind, size and modification time of every entry under `root`, `root`
-    /// itself and the directories included: a file created and removed again
-    /// still moves its directory's time.
-    fn tree(root: &Path) -> BTreeMap<String, TreeEntry> {
-        fn walk(root: &Path, dir: &Path, tree: &mut BTreeMap<String, TreeEntry>) {
-            let meta = fs::symlink_metadata(dir).unwrap();
-            let key = dir.strip_prefix(root).unwrap().display().to_string();
-            let size = if meta.is_dir() { 0 } else { meta.len() };
-            tree.insert(key, (meta.is_dir(), size, meta.modified().unwrap()));
-            if meta.is_dir() {
-                for entry in fs::read_dir(dir).unwrap() {
-                    walk(root, &entry.unwrap().path(), tree);
-                }
-            }
-        }
-        let mut tree = BTreeMap::new();
-        walk(root, root, &mut tree);
-        tree
+    /// A storage that answers each call with what the test sets and records
+    /// the calls it gets, in order.
+    struct FakeStorage {
+        lock: fn() -> Result<(), RunnerError>,
+        marker: fn() -> Result<Option<InitializationMarker>, RunnerError>,
+        calls: Mutex<Vec<&'static str>>,
     }
 
-    /// Runs a reader on the storage as it is; checks that it ends with the
-    /// reason at once and leaves the storage alone, and returns the reason.
-    async fn unavailable_reader(root: &TempRoot, storage: &TaskStorage) -> String {
-        let before = tree(storage.root());
-        let exit = run(reader_config(root, storage)).await.unwrap();
-        assert_eq!(tree(storage.root()), before, "nothing changed");
+    impl FakeStorage {
+        fn new(
+            lock: fn() -> Result<(), RunnerError>,
+            marker: fn() -> Result<Option<InitializationMarker>, RunnerError>,
+        ) -> Self {
+            Self {
+                lock,
+                marker,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ReaderStorage for FakeStorage {
+        fn lock_for_reading(&self) -> Result<Box<dyn Any + Send>, RunnerError> {
+            self.calls.lock().unwrap().push("lock_for_reading");
+            (self.lock)().map(|()| Box::new(()) as Box<dyn Any + Send>)
+        }
+
+        fn marker(&self) -> Result<Option<InitializationMarker>, RunnerError> {
+            self.calls.lock().unwrap().push("marker");
+            (self.marker)()
+        }
+
+        fn store(&self) -> ExecutionStore {
+            self.calls.lock().unwrap().push("store");
+            panic!("a reader that cannot read never opens the store");
+        }
+    }
+
+    /// Runs a reader on the storage; checks that it ends with the problem
+    /// code of a reader that cannot read, and returns the reason.
+    async fn unavailable_reader(storage: &FakeStorage) -> String {
+        let exit = run_on(storage, reader_config()).await.unwrap();
         let RunnerExit::Problem(problem) = exit else {
             panic!("a problem: {exit:?}");
         };
@@ -491,41 +497,49 @@ terminal_states: [completed]
         problem.message
     }
 
+    fn busy() -> Result<(), RunnerError> {
+        Err(RunnerError::StorageBusy(PathBuf::from("/storage")))
+    }
+
+    fn never_used() -> Result<(), RunnerError> {
+        Err(RunnerError::StorageNotInitialized(PathBuf::from(
+            "/storage",
+        )))
+    }
+
+    fn locked() -> Result<(), RunnerError> {
+        Ok(())
+    }
+
+    fn no_marker() -> Result<Option<InitializationMarker>, RunnerError> {
+        Ok(None)
+    }
+
     /// A storage another runner holds is not waited for: the reader says it
-    /// cannot read and changes nothing; the working runner keeps its lock.
+    /// cannot read and asks the storage for nothing more than the lock.
     #[tokio::test]
     async fn a_read_only_runner_on_a_busy_storage_says_so_and_exits() {
-        let root = TempRoot::new();
-        let (storage, _working) = worked_on(&root);
+        let storage = FakeStorage::new(busy, no_marker);
 
-        let reason = unavailable_reader(&root, &storage).await;
+        let reason = unavailable_reader(&storage).await;
 
         assert!(reason.contains("in use by another runner"), "{reason}");
-        assert!(
-            matches!(storage.lock(), Err(RunnerError::StorageBusy(_))),
-            "the working runner still holds the lock"
-        );
+        assert_eq!(storage.calls(), vec!["lock_for_reading"]);
     }
 
     /// A storage no runner ever finished initializing is not made into one
-    /// by a read, whether its marker or its lock file is what is missing.
+    /// by a read, whether its lock file or its marker is what is missing.
     #[tokio::test]
-    async fn a_read_only_runner_on_an_uninitialized_storage_says_so_and_creates_nothing() {
-        let root = TempRoot::new();
-        let (storage, working) = worked_on(&root);
-        drop(working);
-
-        fs::remove_file(storage.bookkeeping_dir().join("initialized.json")).unwrap();
-        let reason = unavailable_reader(&root, &storage).await;
+    async fn a_read_only_runner_on_an_uninitialized_storage_says_so() {
+        let without_lock_file = FakeStorage::new(never_used, no_marker);
+        let reason = unavailable_reader(&without_lock_file).await;
         assert!(reason.contains("never initialized"), "{reason}");
+        assert_eq!(without_lock_file.calls(), vec!["lock_for_reading"]);
 
-        fs::remove_dir_all(storage.bookkeeping_dir()).unwrap();
-        let reason = unavailable_reader(&root, &storage).await;
+        let without_marker = FakeStorage::new(locked, no_marker);
+        let reason = unavailable_reader(&without_marker).await;
         assert!(reason.contains("never initialized"), "{reason}");
-        assert!(
-            !storage.bookkeeping_dir().exists(),
-            "not even the bookkeeping directory was created"
-        );
+        assert_eq!(without_marker.calls(), vec!["lock_for_reading", "marker"]);
     }
 
     /// An events read is answered with the events after the asked sequence,
