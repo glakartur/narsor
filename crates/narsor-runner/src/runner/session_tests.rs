@@ -252,6 +252,7 @@ fn answer_key(purpose: ConductorPurpose) -> &'static str {
         ConductorPurpose::ChooseOutput
         | ConductorPurpose::ChooseOutputAfterReprompt
         | ConductorPurpose::DecideFork => "choose",
+        ConductorPurpose::Unrecognized => "escalate",
     }
 }
 

@@ -535,6 +535,9 @@ pub enum ConductorTrigger {
     Title,
     /// A `decision` step declared `by: conductor` was entered.
     DecisionStep,
+    /// A value this build does not know, written by a newer one.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl ConductorTrigger {
@@ -547,6 +550,7 @@ impl ConductorTrigger {
             Self::Annotation => "annotation",
             Self::Title => "title",
             Self::DecisionStep => "decision_step",
+            Self::Unrecognized => "unrecognized",
         }
     }
 
@@ -598,6 +602,9 @@ pub enum ConductorPurpose {
     GenerateTitle,
     /// Pick the label of a `decision` step declared `by: conductor`.
     DecideFork,
+    /// A value this build does not know, written by a newer one.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl ConductorPurpose {
@@ -612,6 +619,7 @@ impl ConductorPurpose {
             Self::SummarizeGate => "summarize_gate",
             Self::GenerateTitle => "generate_title",
             Self::DecideFork => "decide_fork",
+            Self::Unrecognized => "unrecognized",
         }
     }
 }
@@ -657,6 +665,9 @@ pub enum ConductorDecisionKind {
     /// The conductor answered a question the agent asked, in the
     /// operator's place (`autopilot`).
     AnswerQuestion,
+    /// A value this build does not know, written by a newer one.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl ConductorDecisionKind {
@@ -669,6 +680,7 @@ impl ConductorDecisionKind {
             Self::Retry => "retry",
             Self::ExecuteProposal => "execute_proposal",
             Self::AnswerQuestion => "answer_question",
+            Self::Unrecognized => "unrecognized",
         }
     }
 }
@@ -955,6 +967,7 @@ impl From<ConductorPurpose> for ConductorPurposeDto {
             ConductorPurpose::SummarizeGate => Self::SummarizeGate,
             ConductorPurpose::GenerateTitle => Self::GenerateTitle,
             ConductorPurpose::DecideFork => Self::DecideFork,
+            ConductorPurpose::Unrecognized => Self::Unrecognized,
         }
     }
 }
@@ -968,6 +981,7 @@ impl From<ConductorTrigger> for ConductorTriggerDto {
             ConductorTrigger::Annotation => Self::Annotation,
             ConductorTrigger::Title => Self::Title,
             ConductorTrigger::DecisionStep => Self::DecisionStep,
+            ConductorTrigger::Unrecognized => Self::Unrecognized,
         }
     }
 }
@@ -1000,7 +1014,8 @@ fn summarize_input(input: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, EventData};
+    use super::{ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Event, EventData};
+    use crate::api::{ConductorPurposeDto, ConductorTriggerDto};
 
     #[test]
     fn event_keeps_the_existing_persisted_wire_shape() {
@@ -1017,6 +1032,38 @@ mod tests {
         let data: EventData =
             serde_json::from_value(serde_json::json!({"type":"future_event","value":1})).unwrap();
         assert!(matches!(data, EventData::Unrecognized));
+    }
+
+    #[test]
+    fn an_unknown_conductor_value_decodes_to_its_fallback_variant() {
+        let future = serde_json::json!("future_value");
+
+        assert_eq!(
+            serde_json::from_value::<ConductorTrigger>(future.clone()).unwrap(),
+            ConductorTrigger::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorPurpose>(future.clone()).unwrap(),
+            ConductorPurpose::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorDecisionKind>(future.clone()).unwrap(),
+            ConductorDecisionKind::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorTriggerDto>(future.clone()).unwrap(),
+            ConductorTriggerDto::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorPurposeDto>(future).unwrap(),
+            ConductorPurposeDto::Unrecognized
+        );
+    }
+
+    #[test]
+    fn an_unknown_conductor_trigger_is_neither_automatic_nor_inline() {
+        assert!(!ConductorTrigger::Unrecognized.is_automatic());
+        assert!(!ConductorTrigger::Unrecognized.is_inline());
     }
 
     #[test]

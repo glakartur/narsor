@@ -104,8 +104,10 @@ fn the_template_is_the_only_builtin_and_demonstrates_engine_features_safely() {
         vec!["example_file"]
     );
 
+    assert!(demonstrate.has_exit());
+
     let review = &definition.states["review"];
-    assert!(matches!(review.action, Some(ActionConfig::Human(_))));
+    assert!(matches!(review.action, Some(ActionConfig::Decision(_))));
     assert!(review.choices.iter().any(|choice| choice.label == "finish"));
 
     assert!(

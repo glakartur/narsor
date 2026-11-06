@@ -421,6 +421,7 @@ fn purpose_word(purpose: ConductorPurpose) -> &'static str {
         ConductorPurpose::SummarizeGate => "streszcza bramkę",
         ConductorPurpose::GenerateTitle => "nadaje tytuł zadaniu",
         ConductorPurpose::DecideFork => "rozstrzyga rozwidlenie",
+        ConductorPurpose::Unrecognized => "pracuje",
     }
 }
 

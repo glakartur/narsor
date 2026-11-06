@@ -109,6 +109,7 @@ pub fn allowed_decisions(purpose: ConductorPurpose) -> &'static [DecisionKind] {
         ConductorPurpose::SummarizeGate => &[DecisionKind::Annotate],
         ConductorPurpose::GenerateTitle => &[DecisionKind::Title],
         ConductorPurpose::DecideFork => &[DecisionKind::ChooseOutput, DecisionKind::Escalate],
+        ConductorPurpose::Unrecognized => &[DecisionKind::Escalate],
     }
 }
 

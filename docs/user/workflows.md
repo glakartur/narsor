@@ -169,9 +169,10 @@ there, so executions created before this existed keep resolving unchanged;
 ## Built-in workflow template
 
 `workflows/template.yaml` is the only workflow shipped in the binary. It
-demonstrates typed inputs, task display links, script output contracts,
-variables, artifact-path metadata, a human choice, terminal statuses, timeouts
-and retry policy. Its `printf` step has no side effects; the artifact path is a
+is written in the unified `schema: v2` shape and demonstrates typed inputs,
+task display links, a script step with one `exit`, variables, artifact-path
+metadata, a human `decision` step that writes a variable with `set`, terminal
+statuses, timeouts and retry policy. Its `printf` step has no side effects; the artifact path is a
 placeholder and no file is created. The workflow does not invoke an agent or
 external service.
 
@@ -179,9 +180,9 @@ external service.
 narsor-cli validate template
 narsor-cli run template --input example_text="Hello, engine"
 narsor-cli show <execution-id>
-narsor-cli input <execution-id> --field decision=finish
+narsor-cli input <execution-id> --label finish --field comment="looks good"
 ```
 
-The run pauses at its human gate. Choose `finish` or `cancel`; project-specific
+The run pauses at its human decision step. Choose `finish` or `cancel`; project-specific
 workflow definitions can live in the project's or user's workflow directory.
 [`workflows/README.md`](../../workflows/README.md) describes the example.
