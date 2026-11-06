@@ -1363,7 +1363,7 @@ async fn the_history_goes_where_the_prompt_places_it_once() {
     turns.push(choice("plan_ready", "planned", json!({})));
     let (agent, _execution) = run_history(
         &harness,
-        |config| config.prompt = "Plan.\n{{ step.history }}\nEnd of plan.".to_string(),
+        |config| config.prompt = "Plan.\n{{ step.history }}\nEnd of plan.".into(),
         turns,
     )
     .await;

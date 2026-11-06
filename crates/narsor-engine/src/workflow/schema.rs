@@ -18,8 +18,8 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use crate::domain::{
-    DecisionMaker, SchemaVersion, SetDefinition, VariableScope, VariableSource, VariableType,
-    EXIT_LABEL, LOCAL_VARIABLE_PREFIX,
+    DecisionMaker, PromptText, SchemaVersion, SetDefinition, VariableScope, VariableSource,
+    VariableType, EXIT_LABEL, LOCAL_VARIABLE_PREFIX,
 };
 
 /// The whole workflow file (`docs/dev/workflow-schema.md` §2).
@@ -1126,7 +1126,7 @@ pub struct DecisionActionSchema {
     pub by: DecisionMaker,
 
     /// What the decider is asked; templated like an agent prompt.
-    pub message: String,
+    pub message: PromptText,
 }
 
 /// `type: agent` (§3.3.A).
@@ -1149,7 +1149,7 @@ pub struct AgentActionSchema {
     #[serde(default)]
     pub workspace_access: Option<crate::domain::WorkspaceAccess>,
 
-    pub prompt: String,
+    pub prompt: PromptText,
 
     #[serde(default)]
     pub parameters: HashMap<String, serde_json::Value>,

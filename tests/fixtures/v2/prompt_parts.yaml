@@ -1,0 +1,43 @@
+# A prompt as a list of parts: a string is always there, `{text, when}` only
+# while every referenced value is non-empty. The parts are joined by an empty
+# line.
+schema: v2
+name: prompt-parts
+version: 1
+
+states:
+  draft:
+    action:
+      type: agent
+      prompt:
+        - Draft the change.
+        - when: local.memory
+          text: "MEMORY[{{ local.memory }}]"
+        - when: [local.memory, steps.review.reply]
+          text: "REVIEW[{{ steps.review.reply }}]"
+    variables:
+      - name: memory
+        scope: local
+        description: What the draft step keeps for its next entry.
+    choices:
+      remember:
+        requires_variables: [memory]
+        next: review
+      finish:
+        next: done
+
+  review:
+    action:
+      type: agent
+      prompt: Review the draft.
+    variables:
+      - name: remarks
+    exit:
+      requires_variables: [remarks]
+      next: draft
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

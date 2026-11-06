@@ -252,7 +252,7 @@ pub fn reprompt_config(
     let mut config = original.clone();
     config.harness = Some(harness.to_string());
     config.workspace_access = Some(WorkspaceAccess::ReadOnly);
-    config.prompt = format!("{OUTPUT_REPROMPT}\n\nWhy it was rejected: {reason}");
+    config.prompt = format!("{OUTPUT_REPROMPT}\n\nWhy it was rejected: {reason}").into();
     config.parameters.insert(
         RESUME_SESSION_PARAMETER.to_string(),
         Value::String(harness_session.to_string()),
@@ -276,7 +276,7 @@ pub fn conductor_reprompt_config(
     prompt: &str,
 ) -> AgentActionConfig {
     let mut config = reprompt_config(original, harness, harness_session, "");
-    config.prompt = format!("{}\n\n{CONDUCTOR_REPROMPT_GUARD}", prompt.trim());
+    config.prompt = format!("{}\n\n{CONDUCTOR_REPROMPT_GUARD}", prompt.trim()).into();
     config
 }
 
@@ -310,7 +310,7 @@ pub fn continuation_config(
         RESUME_SESSION_PARAMETER.to_string(),
         Value::String(harness_session.to_string()),
     );
-    config.prompt = message.to_string();
+    config.prompt = message.into();
     config
 }
 

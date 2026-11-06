@@ -17,6 +17,7 @@ impl Builder {
             &fields,
             &[],
             None,
+            &[],
         );
         if let Some(answer) = pending.prefilled_answer.as_deref() {
             // The text of an answer a refused resume gave back (2a9c6f2).

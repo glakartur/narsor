@@ -423,7 +423,7 @@ fn conductor_config(prompt: &str) -> AgentActionConfig {
         permission_grants: Vec::new(),
         model: None,
         workspace_access: Some(WorkspaceAccess::ReadOnly),
-        prompt: prompt.to_string(),
+        prompt: prompt.into(),
         workspace: None,
         parameters: Default::default(),
         read_only_paths: Vec::new(),

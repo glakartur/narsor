@@ -36,9 +36,9 @@ use serde_json::{Map, Value};
 
 use crate::domain::{
     safe_link_url, ActionConfig, AgentActionConfig, ArtifactReference, Context,
-    DecisionActionConfig, DisplayLink, DisplaySpec, HumanActionConfig, ScriptActionConfig,
-    TaskDisplay, VariableDefinition, WaitActionConfig, WorkflowDefinition, EMPTY_LINK_TEXT,
-    LOCAL_VARIABLE_PREFIX,
+    DecisionActionConfig, DisplayLink, DisplaySpec, HumanActionConfig, PromptPart, PromptText,
+    ScriptActionConfig, TaskDisplay, VariableDefinition, WaitActionConfig, WorkflowDefinition,
+    EMPTY_LINK_TEXT, LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -407,6 +407,59 @@ impl<'a> TemplateScope<'a> {
         Ok(complete.then_some(rendered))
     }
 
+    /// Renders a prompt or message: each part on its own, a part whose
+    /// `when` has an empty reference dropped, the rest joined by an empty
+    /// line into a text of one part.
+    ///
+    /// A text of several parts names the part in an error: `location, part 2`.
+    pub fn render_text(
+        &self,
+        text: &PromptText,
+        location: &str,
+    ) -> Result<PromptText, TemplateError> {
+        let numbered = text.parts().len() > 1;
+        let mut rendered = Vec::new();
+        for (index, part) in text.parts().iter().enumerate() {
+            let place = if numbered {
+                format!("{location}, part {}", index + 1)
+            } else {
+                location.to_string()
+            };
+            if !self.part_applies(part, &place)? {
+                continue;
+            }
+            rendered.push(self.render(&part.text, &place)?);
+        }
+        Ok(PromptText::plain(rendered.join("\n\n")))
+    }
+
+    /// Whether every reference of the part's `when` has a value.
+    fn part_applies(&self, part: &PromptPart, location: &str) -> Result<bool, TemplateError> {
+        let place = format!("{location}, when");
+        for reference in &part.when {
+            if self.is_empty_reference(reference, &place)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether `reference` names no value: missing, `null`, or text of
+    /// nothing but white space. `false` and `0` are values. The result of a
+    /// step that has not run is missing, not an error.
+    fn is_empty_reference(&self, reference: &str, location: &str) -> Result<bool, TemplateError> {
+        let reference = reference.trim();
+        match self.resolve_value(reference, location) {
+            Ok(Value::Null) => Ok(true),
+            Ok(Value::String(text)) => Ok(text.trim().is_empty()),
+            Ok(_) => Ok(false),
+            Err(TemplateError::UnknownVariable { .. }) if reference.starts_with("steps.") => {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Renders every templated field of an action configuration, returning a
     /// new configuration with the placeholders replaced.
     ///
@@ -421,7 +474,7 @@ impl<'a> TemplateScope<'a> {
     ) -> Result<ActionConfig, TemplateError> {
         match action {
             ActionConfig::Agent(config) => Ok(ActionConfig::Agent(AgentActionConfig {
-                prompt: self.render(&config.prompt, &format!("{location}, prompt"))?,
+                prompt: self.render_text(&config.prompt, &format!("{location}, prompt"))?,
                 ..config.clone()
             })),
 
@@ -459,7 +512,7 @@ impl<'a> TemplateScope<'a> {
             })),
 
             ActionConfig::Decision(config) => Ok(ActionConfig::Decision(DecisionActionConfig {
-                message: self.render(&config.message, &format!("{location}, message"))?,
+                message: self.render_text(&config.message, &format!("{location}, message"))?,
                 ..config.clone()
             })),
 
@@ -510,6 +563,12 @@ impl<'a> TemplateScope<'a> {
 
     /// Resolves the contents of a single `{{ ... }}` placeholder.
     fn resolve(&self, expression: &str, location: &str) -> Result<String, TemplateError> {
+        self.resolve_value(expression, location)
+            .map(|value| render_scalar(&value))
+    }
+
+    /// [`Self::resolve`] without turning the value into text.
+    fn resolve_value(&self, expression: &str, location: &str) -> Result<Value, TemplateError> {
         let reference = expression.trim();
 
         if reference.contains('|') {
@@ -525,7 +584,7 @@ impl<'a> TemplateScope<'a> {
     /// Looks a reference up in the scope and renders its value, distinguishing
     /// "path I do not understand" from "path I understand but no such
     /// variable".
-    fn lookup(&self, reference: &str, location: &str) -> Result<String, TemplateError> {
+    fn lookup(&self, reference: &str, location: &str) -> Result<Value, TemplateError> {
         let unknown = || TemplateError::UnknownVariable {
             reference: reference.to_string(),
             location: location.to_string(),
@@ -540,7 +599,7 @@ impl<'a> TemplateScope<'a> {
         match root {
             "inputs" => {
                 let name = plain_name(path).ok_or_else(unsupported)?;
-                self.inputs.get(name).map(render_scalar).ok_or_else(unknown)
+                self.inputs.get(name).cloned().ok_or_else(unknown)
             }
 
             "context" => {
@@ -549,8 +608,8 @@ impl<'a> TemplateScope<'a> {
                 let name = path.strip_prefix("variables.").unwrap_or(path);
                 let name = plain_name(name).ok_or_else(unsupported)?;
                 match self.variables.get(name) {
-                    Some(value) => Ok(render_scalar(value)),
-                    None if self.declares_variable(name) => Ok(String::new()),
+                    Some(value) => Ok(value.clone()),
+                    None if self.declares_variable(name) => Ok(Value::String(String::new())),
                     None => Err(unknown()),
                 }
             }
@@ -558,8 +617,8 @@ impl<'a> TemplateScope<'a> {
             "artifacts" => {
                 let name = plain_name(path).ok_or_else(unsupported)?;
                 match self.artifact_location(name) {
-                    Some(location) => Ok(location.to_string()),
-                    None if self.declares_artifact(name) => Ok(String::new()),
+                    Some(location) => Ok(Value::String(location.to_string())),
+                    None if self.declares_artifact(name) => Ok(Value::String(String::new())),
                     None => Err(unknown()),
                 }
             }
@@ -577,7 +636,7 @@ impl<'a> TemplateScope<'a> {
                         .and_then(|streams| streams.get(&format!("{step}.{field}"))),
                     _ => return Err(unsupported()),
                 }
-                .map(render_scalar)
+                .cloned()
                 .ok_or_else(unknown)
             }
 
@@ -585,22 +644,23 @@ impl<'a> TemplateScope<'a> {
                 let name = plain_name(path).ok_or_else(unsupported)?;
                 let memory = self.step_memory.ok_or_else(unknown)?;
                 match memory.local(name) {
-                    Some(value) => Ok(render_scalar(value)),
-                    None if memory.defines_local(name) => Ok(String::new()),
+                    Some(value) => Ok(value.clone()),
+                    None if memory.defines_local(name) => Ok(Value::String(String::new())),
                     None => Err(unknown()),
                 }
             }
 
             "task" => match path {
-                "ticket" => Ok(self.task_ticket.to_string()),
-                "title" => Ok(self.task_title.to_string()),
+                "ticket" => Ok(Value::String(self.task_ticket.to_string())),
+                "title" => Ok(Value::String(self.task_title.to_string())),
                 _ => Err(unknown()),
             },
 
-            "step" if path == "history" => Ok(self
-                .step_memory
-                .map(|memory| memory.history.to_string())
-                .unwrap_or_default()),
+            "step" if path == "history" => Ok(Value::String(
+                self.step_memory
+                    .map(|memory| memory.history.to_string())
+                    .unwrap_or_default(),
+            )),
 
             _ => Err(unsupported()),
         }
@@ -784,7 +844,11 @@ fn expressions(template: &str) -> Vec<&str> {
 pub fn action_context_references(action: &ActionConfig) -> Vec<String> {
     let mut names = Vec::new();
     match action {
-        ActionConfig::Agent(config) => collect_context_references(&config.prompt, &mut names),
+        ActionConfig::Agent(config) => {
+            for piece in config.prompt.template_pieces() {
+                collect_context_references(&piece, &mut names);
+            }
+        }
         ActionConfig::Script(config) => {
             collect_context_references(&config.command, &mut names);
             for arg in &config.args {
@@ -801,7 +865,11 @@ pub fn action_context_references(action: &ActionConfig) -> Vec<String> {
             }
         }
         ActionConfig::Human(config) => collect_context_references(&config.instruction, &mut names),
-        ActionConfig::Decision(config) => collect_context_references(&config.message, &mut names),
+        ActionConfig::Decision(config) => {
+            for piece in config.message.template_pieces() {
+                collect_context_references(&piece, &mut names);
+            }
+        }
         ActionConfig::Wait(config) => {
             if let Some(filter) = &config.filter {
                 collect_value_references(filter, &mut names);

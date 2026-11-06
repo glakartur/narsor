@@ -1,0 +1,31 @@
+# `steps.X.reply` is the reply of an agent step; a condition on it follows
+# the same rule as the placeholder.
+schema: v2
+name: when-step-result-from-script
+version: 1
+
+states:
+  build:
+    action:
+      type: script
+      command: ./build.sh
+    exit:
+      next: work
+
+  work:
+    action:
+      type: agent
+      prompt:
+        - Do it.
+        - when: steps.build.reply
+          text: More.
+    variables:
+      - name: summary
+    exit:
+      next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

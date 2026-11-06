@@ -24,7 +24,7 @@
 //! fails the execution), so they cannot disagree with it after a crash.
 
 use super::*;
-use crate::domain::OutputLabel;
+use crate::domain::{OutputLabel, PromptText};
 use narsor_protocol::display::without_unsafe_chars;
 
 /// Key of the entries and attempts of each step, inside the engine's scratch
@@ -195,8 +195,8 @@ pub(super) fn history_block(
 
 /// Adds `history` to a rendered agent `config` after the author's prompt,
 /// unless the prompt `template` placed it itself (R18).
-pub(super) fn add_history(config: &mut AgentActionConfig, template: &str, history: &str) {
-    if history.is_empty() || places_step_history(template) {
+pub(super) fn add_history(config: &mut AgentActionConfig, template: &PromptText, history: &str) {
+    if history.is_empty() || template.texts().any(places_step_history) {
         return;
     }
     config.prompt.push_str("\n\n---\n");

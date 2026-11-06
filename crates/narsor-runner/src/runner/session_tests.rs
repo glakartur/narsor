@@ -157,7 +157,7 @@ impl ActionExecutor for Agent {
             panic!("only agent actions run here");
         };
         self.calls.lock().unwrap().push(Call {
-            prompt: config.prompt.clone(),
+            prompt: config.prompt.to_string(),
             harness: config.harness.clone(),
         });
         let reply = self

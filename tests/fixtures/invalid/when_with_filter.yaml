@@ -1,0 +1,24 @@
+# A condition is one plain reference: no filter, no expression.
+schema: v2
+name: when-with-filter
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt:
+        - Do it.
+        - when: "local.notes | upper"
+          text: More.
+    variables:
+      - name: notes
+        scope: local
+    exit:
+      next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

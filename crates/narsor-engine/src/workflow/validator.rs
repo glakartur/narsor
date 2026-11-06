@@ -26,9 +26,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::domain::{
-    ActionConfig, ChoiceDefinition, DecisionConfig, ImageSpec, OutputLabel, RepositorySource,
-    SchemaVersion, State, StateId, ValidationError, VariableDefinition, VariableScope,
-    VariableSource, VariableType, WorkflowDefinition, LOCAL_VARIABLE_PREFIX, WORKSPACE_ROOT,
+    ActionConfig, ChoiceDefinition, DecisionConfig, ImageSpec, OutputLabel, PromptText,
+    RepositorySource, SchemaVersion, State, StateId, ValidationError, VariableDefinition,
+    VariableScope, VariableSource, VariableType, WorkflowDefinition, LOCAL_VARIABLE_PREFIX,
+    WORKSPACE_ROOT,
 };
 use crate::workspace::provisioner::is_usable_directory_name;
 
@@ -476,7 +477,7 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             {
                 errors.push(missing_field(state, "agent", "harness"));
             }
-            if agent.prompt.trim().is_empty() {
+            if agent.prompt.is_blank() {
                 errors.push(missing_field(state, "agent", "prompt"));
             }
             if state.choices.is_empty() {
@@ -508,7 +509,7 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             }
         }
         ActionConfig::Decision(decision) => {
-            if decision.message.trim().is_empty() {
+            if decision.message.is_blank() {
                 errors.push(missing_field(state, "decision", "message"));
             }
             if state.choices.is_empty() {
@@ -806,39 +807,49 @@ fn validate_state_templates(
     state: &State,
     errors: &mut Vec<ValidationError>,
 ) {
-    let mut templated: Vec<(String, &str)> = Vec::new();
+    let mut templated: Vec<(String, String)> = Vec::new();
 
     match &state.action {
         Some(ActionConfig::Agent(agent)) => {
             // The same shape the decision branch below already has.
             if let Some(harness) = &agent.harness {
-                templated.push(("action.harness".to_string(), harness.as_str()));
+                templated.push(("action.harness".to_string(), harness.clone()));
             }
-            templated.push(("action.prompt".to_string(), agent.prompt.as_str()));
+            templated.extend(prompt_templates(
+                state,
+                "action.prompt",
+                &agent.prompt,
+                errors,
+            ));
             if let Some(model) = &agent.model {
-                templated.push(("action.model".to_string(), model.as_str()));
+                templated.push(("action.model".to_string(), model.clone()));
             }
         }
         Some(ActionConfig::Script(script)) => {
-            templated.push(("action.command".to_string(), script.command.as_str()));
+            templated.push(("action.command".to_string(), script.command.clone()));
             for (index, arg) in script.args.iter().enumerate() {
-                templated.push((format!("action.args[{index}]"), arg.as_str()));
+                templated.push((format!("action.args[{index}]"), arg.clone()));
             }
             if let Some(working_dir) = &script.working_dir {
-                templated.push(("action.working_dir".to_string(), working_dir.as_str()));
+                templated.push(("action.working_dir".to_string(), working_dir.clone()));
             }
             for (key, value) in &script.env {
-                templated.push((format!("action.env.{key}"), value.as_str()));
+                templated.push((format!("action.env.{key}"), value.clone()));
             }
         }
         Some(ActionConfig::Human(human)) => {
-            templated.push(("action.message".to_string(), human.instruction.as_str()));
+            templated.push(("action.message".to_string(), human.instruction.clone()));
         }
         Some(ActionConfig::Decision(decision)) => {
-            templated.push(("action.message".to_string(), decision.message.as_str()));
+            templated.extend(prompt_templates(
+                state,
+                "action.message",
+                &decision.message,
+                errors,
+            ));
         }
         Some(ActionConfig::Wait(wait)) => {
-            templated.push(("action.event_type".to_string(), wait.event.as_str()));
+            templated.push(("action.event_type".to_string(), wait.event.clone()));
         }
         None => {}
     }
@@ -846,15 +857,15 @@ fn validate_state_templates(
     match &state.decision {
         Some(DecisionConfig::Agent(agent)) => {
             if let Some(harness) = &agent.harness {
-                templated.push(("decision.harness".to_string(), harness.as_str()));
+                templated.push(("decision.harness".to_string(), harness.clone()));
             }
             if let Some(prompt) = &agent.prompt {
-                templated.push(("decision.prompt".to_string(), prompt.as_str()));
+                templated.push(("decision.prompt".to_string(), prompt.clone()));
             }
         }
         Some(DecisionConfig::Human(human)) => {
             if let Some(message) = &human.message {
-                templated.push(("decision.message".to_string(), message.as_str()));
+                templated.push(("decision.message".to_string(), message.clone()));
             }
         }
         Some(DecisionConfig::Rules) | None => {}
@@ -864,7 +875,8 @@ fn validate_state_templates(
     templated.sort_by(|left, right| left.0.cmp(&right.0));
 
     for (field, text) in templated {
-        let allowed = field == "action.prompt" || field == "action.message";
+        let text = text.as_str();
+        let allowed = field.starts_with("action.prompt") || field.starts_with("action.message");
         for source in step_reply_references(text) {
             if !allowed {
                 errors.push(ValidationError::StepReplyNotAllowed {
@@ -942,6 +954,63 @@ fn validate_state_templates(
             }
         }
     }
+}
+
+/// The templates of a prompt or message, named for the report: the field
+/// itself for a plain text, `field[N]` for part N of a list, and
+/// `field[N].when` for a reference of its condition, which is checked like
+/// the placeholder it stands for. A condition that is no plain reference is
+/// reported here.
+fn prompt_templates(
+    state: &State,
+    field: &str,
+    text: &PromptText,
+    errors: &mut Vec<ValidationError>,
+) -> Vec<(String, String)> {
+    if text.is_plain() {
+        return text
+            .texts()
+            .map(|part| (field.to_string(), part.to_string()))
+            .collect();
+    }
+    let mut templates = Vec::new();
+    for (index, part) in text.parts().iter().enumerate() {
+        let place = format!("{field}[{}]", index + 1);
+        templates.push((place.clone(), part.text.clone()));
+        for reference in &part.when {
+            let when = format!("{place}.when");
+            match when_problem(reference) {
+                Some(reason) => errors.push(ValidationError::InvalidWhen {
+                    state: state.id.clone(),
+                    field: when,
+                    reason,
+                }),
+                None => templates.push((when, format!("{{{{ {reference} }}}}"))),
+            }
+        }
+    }
+    templates
+}
+
+/// Why `reference` cannot be the condition of a part, if it cannot: it must
+/// be one plain reference such as `local.notes`, with no braces, filter or
+/// white space inside.
+fn when_problem(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Some("a condition must name a value".to_string());
+    }
+    if reference.contains("{{") || reference.contains("}}") {
+        return Some(format!(
+            "'{reference}' is a template; write the reference without braces"
+        ));
+    }
+    if reference.contains('|') || reference.contains(char::is_whitespace) {
+        return Some(format!(
+            "'{reference}' is not a plain reference; filters and expressions are not supported"
+        ));
+    }
+    None
 }
 
 /// The name of a repository field as the author wrote it: a converted `v1`

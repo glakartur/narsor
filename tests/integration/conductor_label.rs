@@ -88,7 +88,7 @@ impl ActionExecutor for ScriptedAgent {
             panic!("the scripted agent only runs agent actions");
         };
         self.calls.lock().unwrap().push(AgentCall {
-            prompt: config.prompt.clone(),
+            prompt: config.prompt.to_string(),
             resume_session: config
                 .parameters
                 .get("resume_session")

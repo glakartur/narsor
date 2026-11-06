@@ -86,10 +86,10 @@ use crate::conductor::ConductorRegistry;
 use crate::config::{AgentArgs, AgentDefaults};
 use crate::domain::{
     effective_title, ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy,
-    Artifact, ArtifactReference, ChoiceDefinition, DecisionProviderType, Event, EventData,
-    ExecutionId, ExecutionStatus, HumanInputField, HumanInputType, InputCloseReason, ProblemKind,
-    RepromptedBy, State, StateId, VariableSource, WorkflowDefinition, WorkflowExecution, Workspace,
-    WorkspaceInfo,
+    Artifact, ArtifactReference, ChoiceDefinition, DecisionMaker, DecisionProviderType, Event,
+    EventData, ExecutionId, ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType,
+    InputCloseReason, ProblemKind, RepromptedBy, State, StateId, VariableSource,
+    WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
 };
 use crate::engine::actions::agent::{
     self, DefaultHarnessSource, UsageReporter, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL,
@@ -124,7 +124,7 @@ mod rescue;
 mod step_memory;
 mod variable_rules;
 
-use gate_context::{has_step_contract, GateContext};
+use gate_context::{decision_fields, has_step_contract, local_values, GateContext};
 use variable_rules::Assignment;
 
 pub use failure::{
@@ -2525,13 +2525,24 @@ impl Engine {
         let mut rendered = scope
             .render_action(action, &location)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+        // A decision for the operator is asked as a form: the step's
+        // variables are its fields.
+        if let ActionConfig::Decision(decision) = &rendered {
+            if decision.by == DecisionMaker::Human {
+                rendered = ActionConfig::Human(HumanActionConfig {
+                    instruction: decision.message.to_string(),
+                    inputs: decision_fields(state),
+                    input_schema: None,
+                });
+            }
+        }
 
         // A comment is consumed only by the first agent attempt following an
         // explicit recovery. It remains durable until this point, so a daemon
         // restart before the attempt begins cannot silently discard it.
         let mut resumed_input = None;
         let mut author = match action {
-            ActionConfig::Agent(template) if embeds_user_content(&template.prompt) => {
+            ActionConfig::Agent(template) if template.prompt.texts().any(embeds_user_content) => {
                 PromptAuthor::EngineUser
             }
             _ => PromptAuthor::Engine,
@@ -3826,6 +3837,10 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let mut pending =
             PendingHumanInput::new(execution.id.clone(), state.id.clone(), request, outputs);
+        if matches!(state.action, Some(ActionConfig::Decision(_))) {
+            let kept_locals = step_memory::step_locals(execution, &state.id)?;
+            pending = pending.deciding(local_values(state, &kept_locals));
+        }
         let sessions: BTreeMap<String, AgentSessionProvenance> =
             read_engine_record(execution, METADATA_AGENT_SESSIONS_KEY)?.unwrap_or_default();
         for output in &pending.outputs {
@@ -4673,15 +4688,21 @@ fn step_reply_attempt<'a>(execution: &'a WorkflowExecution, state_id: &str) -> O
         .as_str()
 }
 
+/// The templates of an action that may use the result of an earlier step: a
+/// prompt or message with the references of its parts' `when`.
+fn step_templates(action: &ActionConfig) -> Vec<String> {
+    match action {
+        ActionConfig::Agent(config) => config.prompt.template_pieces(),
+        ActionConfig::Human(config) => vec![config.instruction.clone()],
+        ActionConfig::Decision(config) => config.message.template_pieces(),
+        _ => Vec::new(),
+    }
+}
+
 fn action_step_reply_sources(action: &ActionConfig) -> Vec<String> {
     let mut sources = Vec::new();
-    let templates: Vec<&str> = match action {
-        ActionConfig::Agent(config) => vec![config.prompt.as_str()],
-        ActionConfig::Human(config) => vec![config.instruction.as_str()],
-        _ => Vec::new(),
-    };
-    for template in templates {
-        for source in step_reply_references(template) {
+    for template in step_templates(action) {
+        for source in step_reply_references(&template) {
             if !sources.contains(&source) {
                 sources.push(source);
             }
@@ -4691,14 +4712,9 @@ fn action_step_reply_sources(action: &ActionConfig) -> Vec<String> {
 }
 
 fn action_step_stream_sources(action: &ActionConfig) -> Vec<(String, String)> {
-    let templates: Vec<&str> = match action {
-        ActionConfig::Agent(config) => vec![config.prompt.as_str()],
-        ActionConfig::Human(config) => vec![config.instruction.as_str()],
-        _ => Vec::new(),
-    };
     let mut sources = Vec::new();
-    for template in templates {
-        for source in step_stream_references(template) {
+    for template in step_templates(action) {
+        for source in step_stream_references(&template) {
             if !sources.contains(&source) {
                 sources.push(source);
             }

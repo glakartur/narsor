@@ -69,7 +69,7 @@ use crate::domain::{
 use crate::persistence::{ExecutionStore, PersistenceError};
 
 pub use narsor_protocol::api::HumanInputActionDto as HumanInputAction;
-pub use narsor_protocol::api::{RequiredValue, RequiredValueKind};
+pub use narsor_protocol::api::{LocalValue, RequiredValue, RequiredValueKind};
 
 /// Executes `HumanAction` states.
 ///
@@ -391,6 +391,19 @@ pub struct PendingHumanInput {
     #[serde(default)]
     pub resume_targets: BTreeMap<String, AgentSessionProvenance>,
 
+    /// The step's own `scope: local` values from earlier entries, cleaned
+    /// and bounded, shown beside the form of a decision.
+    #[serde(default)]
+    pub local_values: Vec<LocalValue>,
+
+    /// Whether only the menu chooses the label, as in a `decision` step: no
+    /// field stands for the label, and the label's `requires_variables` must
+    /// be among the delivered values. Records written before decisions had
+    /// forms are all `false`, which keeps the label inferred from a lone
+    /// `select` field.
+    #[serde(default)]
+    pub label_from_menu: bool,
+
     /// When the request was raised.
     pub requested_at: DateTime<Utc>,
 }
@@ -557,8 +570,18 @@ impl PendingHumanInput {
             entry_limit: None,
             approval: None,
             resume_targets: BTreeMap::new(),
+            local_values: Vec::new(),
+            label_from_menu: false,
             requested_at: Utc::now(),
         }
+    }
+
+    /// The same request as the form of a `decision` step: only the menu
+    /// chooses the label, and `local_values` are what the step keeps.
+    pub fn deciding(mut self, local_values: Vec<LocalValue>) -> Self {
+        self.label_from_menu = true;
+        self.local_values = local_values;
+        self
     }
 
     /// Builds a question raised by an agent that must be resumed in-place.
@@ -578,6 +601,8 @@ impl PendingHumanInput {
             entry_limit: None,
             approval: None,
             resume_targets: BTreeMap::new(),
+            local_values: Vec::new(),
+            label_from_menu: false,
             requested_at: Utc::now(),
         }
     }
@@ -600,6 +625,8 @@ impl PendingHumanInput {
             entry_limit: None,
             approval: None,
             resume_targets: BTreeMap::new(),
+            local_values: Vec::new(),
+            label_from_menu: false,
             requested_at: Utc::now(),
         }
     }
@@ -624,6 +651,8 @@ impl PendingHumanInput {
             entry_limit: None,
             approval: None,
             resume_targets: BTreeMap::new(),
+            local_values: Vec::new(),
+            label_from_menu: false,
             requested_at: Utc::now(),
         }
     }
@@ -645,6 +674,8 @@ impl PendingHumanInput {
             entry_limit: None,
             approval: Some(candidate),
             resume_targets: BTreeMap::new(),
+            local_values: Vec::new(),
+            label_from_menu: false,
             requested_at: Utc::now(),
         }
     }
@@ -1324,7 +1355,14 @@ fn resume_inner(
             reject_step_values(delivery)?;
             let label = resolve_label(&pending, delivery, &values)?;
             require_resume_comment(&pending, &label, &values)?;
-            let answered = with_blank_optional_text(pending.fields(), &values);
+            let answered = if pending.label_from_menu {
+                // A blank field gives no value: what an earlier entry left in
+                // the context or the step's memory stays.
+                require_label_variables(&pending, &label, &values)?;
+                values.clone()
+            } else {
+                with_blank_optional_text(pending.fields(), &values)
+            };
             (label, Value::Object(answered.clone()), answered)
         }
         // This label is internal only. The engine observes `continuation` and
@@ -1680,6 +1718,31 @@ fn require_resume_comment(
     }
 }
 
+/// Refuses the choice of a label whose `requires_variables` the delivered
+/// values do not all hold (only where the menu chooses the label). A blank
+/// value is none.
+fn require_label_variables(
+    pending: &PendingHumanInput,
+    label: &str,
+    values: &Map<String, Value>,
+) -> Result<(), HumanActionError> {
+    let required = pending
+        .outputs
+        .iter()
+        .find(|output| output.label == label)
+        .map(|output| output.requires_variables.as_slice())
+        .unwrap_or_default();
+    match required
+        .iter()
+        .find(|name| values.get(name.as_str()).is_none_or(is_blank))
+    {
+        Some(name) => Err(HumanActionError::MissingRequiredField {
+            field: name.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// `artifacts` as a JSON object, for the event log.
 fn json_object(artifacts: &BTreeMap<String, String>) -> Value {
     Value::Object(
@@ -1833,6 +1896,9 @@ fn intended_label<'a>(
     if let Some(label) = delivery.chosen_label.as_deref() {
         return Some(label);
     }
+    if pending.label_from_menu {
+        return None;
+    }
     let mut selects = pending
         .fields()
         .iter()
@@ -1866,7 +1932,8 @@ fn resolve_label(
         .filter(|field| field.field_type == HumanInputType::Select)
         .collect();
 
-    if let [field] = selects[..] {
+    // Where only the menu chooses, no field stands for the label.
+    if let (false, [field]) = (pending.label_from_menu, &selects[..]) {
         if let Some(Value::String(value)) = values.get(&field.name) {
             return Ok(value.clone());
         }

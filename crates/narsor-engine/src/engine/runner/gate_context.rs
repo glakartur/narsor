@@ -5,7 +5,10 @@
 //! handed and bounded before any record or event holds them.
 
 use super::*;
-use crate::engine::actions::human::{RequiredValue, RequiredValueKind};
+use crate::domain::{
+    HumanInputField, HumanInputType, VariableSource, VariableType, LOCAL_VARIABLE_PREFIX,
+};
+use crate::engine::actions::human::{LocalValue, RequiredValue, RequiredValueKind};
 use narsor_protocol::display::{without_unsafe_chars, without_unsafe_chars_multiline, NO_REASON};
 
 /// The longest reason or required value a gate shows, in bytes.
@@ -54,6 +57,58 @@ pub(super) fn has_step_contract(state: &State) -> bool {
         state.action,
         Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_))
     )
+}
+
+/// The form of a decision: a field for each variable of the step that the
+/// operator may give, which is every one but those the workflow alone sets.
+/// A variable with `options` is a `select`; no field is required here, since
+/// what a choice needs is said by the choice.
+pub(super) fn decision_fields(state: &State) -> Vec<HumanInputField> {
+    state
+        .variables
+        .iter()
+        .filter(|variable| variable.source == VariableSource::Step)
+        .map(|variable| {
+            let is_select = variable.variable_type == Some(VariableType::Select)
+                || !variable.options.is_empty();
+            HumanInputField {
+                name: variable.name.clone(),
+                field_type: if is_select {
+                    HumanInputType::Select
+                } else {
+                    HumanInputType::Text
+                },
+                options: variable.options.clone(),
+                required: false,
+                description: variable.description.clone(),
+            }
+        })
+        .collect()
+}
+
+/// What `state` keeps for itself, as a decision shows it beside its form:
+/// each `scope: local` variable that holds a value, in declaration order,
+/// cleaned and bounded.
+pub(super) fn local_values(state: &State, kept_locals: &Map<String, Value>) -> Vec<LocalValue> {
+    state
+        .variables
+        .iter()
+        .filter(|variable| variable.is_local())
+        .filter_map(|variable| {
+            let value = text_of(kept_locals.get(&variable.name)?);
+            if value.trim().is_empty() {
+                return None;
+            }
+            let name = variable
+                .name
+                .strip_prefix(LOCAL_VARIABLE_PREFIX)
+                .unwrap_or(&variable.name);
+            Some(LocalValue {
+                name: without_unsafe_chars(name),
+                value: head(&without_unsafe_chars_multiline(&value), MAX_SHOWN_BYTES),
+            })
+        })
+        .collect()
 }
 
 /// `reason` as a gate shows it: cleaned and bounded, or the placeholder

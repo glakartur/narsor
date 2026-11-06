@@ -593,3 +593,47 @@ async fn the_next_prompt_sees_what_set_wrote() {
     assert!(prompt.contains("Last: approved."), "{prompt}");
     assert!(prompt.contains("Stage: [reviewed]."), "{prompt}");
 }
+
+// ---------------------------------------------------------------------------
+// Prompt parts
+// ---------------------------------------------------------------------------
+
+/// A part waits for its condition: the first entry has no memory and so no
+/// part for it, the next one has, and the reply of the review joins in once
+/// the review has answered.
+#[tokio::test]
+async fn parts_of_a_prompt_appear_when_their_values_do() {
+    let harness = Harness::new();
+    let (agent, execution) = run(
+        &harness,
+        "v2/prompt_parts.yaml",
+        vec![
+            AgentTurn::with_variables("remember", json!({ "memory": "M" })),
+            AgentTurn::Label {
+                label: "exit",
+                reason: "",
+                variables: json!({ "remarks": "R" }),
+                artifacts: json!({}),
+                reply: Some("the review reply"),
+                session: true,
+            },
+            AgentTurn::label("finish", "done"),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let drafts: Vec<String> = agent
+        .prompts()
+        .into_iter()
+        .filter(|prompt| prompt.starts_with("Draft"))
+        .collect();
+    assert_eq!(drafts.len(), 2);
+    assert!(!drafts[0].contains("MEMORY"), "{}", drafts[0]);
+    assert!(!drafts[0].contains("REVIEW"), "{}", drafts[0]);
+    assert!(
+        drafts[1].contains("\n\nMEMORY[M]\n\nREVIEW[the review reply]"),
+        "the parts must follow each other, separated by an empty line: {}",
+        drafts[1]
+    );
+}

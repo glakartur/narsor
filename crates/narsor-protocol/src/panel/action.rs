@@ -31,9 +31,11 @@ impl Builder {
     ) {
         let fields = pending.fields();
         let outputs = &pending.outputs;
+        // Where only the menu chooses the label, no field stands for it.
+        let from_menu = pending.label_from_menu;
         let label_field = fields
             .iter()
-            .find(|field| offers_exactly(field, outputs))
+            .find(|field| !from_menu && offers_exactly(field, outputs))
             .map(|field| field.name.clone());
         let others: Vec<&HumanInputFieldView> = fields
             .iter()
@@ -46,6 +48,7 @@ impl Builder {
                 &others,
                 outputs,
                 None,
+                &[],
             );
             self.push(
                 entry,
@@ -56,7 +59,7 @@ impl Builder {
             );
             return;
         }
-        if label_field.is_none() && infers_label(fields) {
+        if label_field.is_none() && !from_menu && infers_label(fields) {
             let entry = declared_fields(
                 PanelEntry::new(
                     "wg wartości pola",
@@ -65,6 +68,7 @@ impl Builder {
                 &others,
                 outputs,
                 None,
+                &[],
             );
             self.push(
                 entry,
@@ -91,7 +95,13 @@ impl Builder {
                 entry = entry.resuming(state);
                 entry.resumes_attempt = attempt;
             }
-            let entry = declared_fields(entry, &others, outputs, Some(&output.label));
+            // A decision's label names the fields it needs a value in.
+            let needed: &[String] = if from_menu {
+                &output.requires_variables
+            } else {
+                &[]
+            };
+            let entry = declared_fields(entry, &others, outputs, Some(&output.label), needed);
             self.push(
                 entry,
                 PanelPlan::Complete {

@@ -1390,7 +1390,8 @@ fn a_definition_without_display_has_none_and_serialises_without_the_key() {
 // The unified state shape of `schema: v2`
 // ---------------------------------------------------------------------------
 
-const UNIFIED_FIXTURES: [&str; 5] = [
+const UNIFIED_FIXTURES: [&str; 6] = [
+    "v2/prompt_parts.yaml",
     "v2/exit.yaml",
     "v2/set.yaml",
     "v2/scope.yaml",

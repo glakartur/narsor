@@ -728,6 +728,48 @@ fn unknown_input_in_a_prompt_is_rejected() {
 }
 
 #[test]
+fn a_condition_on_an_undeclared_input_is_rejected_and_names_the_part() {
+    let errors = errors_of("when_unknown_input.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::UnknownInputReference { state, field, variable }
+                if state == "work" && field == "action.prompt[2].when" && variable == "nonexistent"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_condition_with_a_filter_is_rejected() {
+    let errors = errors_of("when_with_filter.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidWhen { state, field, .. }
+                if state == "work" && field == "action.prompt[2].when"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_condition_on_the_reply_of_a_script_step_is_rejected() {
+    let errors = errors_of("when_step_result_from_script.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidStepReplySource { state, step_id, field }
+                if state == "work" && step_id == "build" && field == "action.prompt[2].when"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
 fn context_references_and_filter_expressions_are_left_to_the_runtime() {
     let yaml = r#"
 name: runtime-references

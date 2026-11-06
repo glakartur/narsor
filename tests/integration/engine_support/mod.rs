@@ -266,7 +266,7 @@ impl ActionExecutor for StubAgentExecutor {
             self.prompts
                 .lock()
                 .expect("prompts")
-                .push(config.prompt.clone());
+                .push(config.prompt.to_string());
 
             let label = self
                 .labels
@@ -347,7 +347,7 @@ impl ActionExecutor for AnsweringAgentExecutor {
                 self.prompts
                     .lock()
                     .expect("prompts")
-                    .push(config.prompt.clone());
+                    .push(config.prompt.to_string());
                 self.resumed_sessions.lock().expect("sessions").push(
                     config
                         .parameters
@@ -455,7 +455,7 @@ impl ActionExecutor for QuestioningAgentExecutor {
         request: ActionRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
         let prompt = match request.action {
-            ActionConfig::Agent(config) => config.prompt.clone(),
+            ActionConfig::Agent(config) => config.prompt.to_string(),
             _ => {
                 return Box::pin(async {
                     Err(ActionError {
@@ -745,7 +745,7 @@ impl ActionExecutor for ScriptedAgentExecutor {
         };
         let action_execution_id = request.action_execution_id.to_string();
         self.calls.lock().expect("calls").push(AgentCall {
-            prompt: config.prompt.clone(),
+            prompt: config.prompt.to_string(),
             resume_session: config
                 .parameters
                 .get("resume_session")

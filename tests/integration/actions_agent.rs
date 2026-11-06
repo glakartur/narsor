@@ -412,7 +412,7 @@ fn agent_action(prompt: &str) -> AgentActionConfig {
         permission_grants: Vec::new(),
         model: None,
         workspace_access: Some(WorkspaceAccess::ReadWrite),
-        prompt: prompt.to_string(),
+        prompt: prompt.into(),
         workspace: None,
         parameters: HashMap::new(),
         read_only_paths: Vec::new(),

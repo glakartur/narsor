@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-use crate::domain::{DisplaySpec, ExecutionStatus, ImageSpec};
+use crate::domain::{DisplaySpec, ExecutionStatus, ImageSpec, PromptText};
 
 /// Unique identifier for a workflow definition
 pub type WorkflowDefinitionId = String;
@@ -432,7 +432,7 @@ pub struct DecisionActionConfig {
     pub by: DecisionMaker,
 
     /// What the decider is asked, still templated.
-    pub message: String,
+    pub message: PromptText,
 }
 
 /// Who decides a [`DecisionActionConfig`] fork.
@@ -481,7 +481,7 @@ pub struct AgentActionConfig {
     pub workspace_access: Option<WorkspaceAccess>,
 
     /// Prompt to send to the agent
-    pub prompt: String,
+    pub prompt: PromptText,
 
     /// Workspace configuration (optional, defaults to current)
     #[serde(default)]
@@ -1057,6 +1057,13 @@ pub enum ValidationError {
         state: StateId,
         step_id: String,
         field: String,
+    },
+
+    #[error("State '{state}' field '{field}' has an unusable condition: {reason}")]
+    InvalidWhen {
+        state: StateId,
+        field: String,
+        reason: String,
     },
 
     #[error("State '{state}' declares variable '{name}' more than once")]

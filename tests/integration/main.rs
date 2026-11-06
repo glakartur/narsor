@@ -41,6 +41,7 @@ mod config_resolve;
 mod controller_supervision;
 mod conversation_store;
 mod docs_links;
+mod engine_decision_human;
 mod engine_recovery;
 mod engine_step_context;
 mod engine_unified_schema;
