@@ -45,7 +45,8 @@
 
 use super::*;
 use crate::conductor::{
-    ConductorResponse, Decision, InvocationOutcome, QueuedRequest, SavedDecision,
+    Autopilot, ConductorResponse, Decision, InvocationOutcome, QueuedRequest, SavedDecision,
+    CONDUCTOR_ANSWER_LIMIT,
 };
 use crate::domain::{ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence};
 
@@ -89,8 +90,13 @@ impl Engine {
                 if let Some(decision) =
                     conductor.unapplied_decision(&execution.id, rescue.episode())?
                 {
-                    return self
-                        .apply_conductor_output(definition, execution, state, &rescue, decision);
+                    return self.apply_conductor_output(
+                        definition,
+                        execution,
+                        state,
+                        rescue.settled(),
+                        decision,
+                    );
                 }
             }
             if let Some(pending) = self.pending_step(execution, &state.id)? {
@@ -166,23 +172,16 @@ impl Engine {
                     return match check_choice(definition, execution, state, &response, &choice) {
                         Ok(()) => {
                             let decision = SavedDecision {
-                                decision_id: Uuid::new_v4().to_string(),
-                                kind: ConductorDecisionKind::ChooseOutput,
-                                episode: Some(rescue.episode().to_string()),
-                                state_id: Some(state.id.clone()),
-                                output_label: Some(choice.label),
-                                artifacts: choice.artifacts,
-                                variables: Value::Object(choice.variables),
-                                confidence: response.confidence,
-                                rationale: response.rationale.clone(),
-                                context_before: serde_json::to_value(&execution.context)
-                                    .unwrap_or(Value::Null),
                                 answers: rescue.answers.clone(),
                                 reason: Some(rescue.reason.clone()),
                                 reply: rescue.reply.clone(),
-                                state_entries_before: state_entries_value(execution)?,
-                                step_memory_before: step_memory::step_memory_value(execution)?,
-                                saved_at: Utc::now(),
+                                ..chosen_output_decision(
+                                    execution,
+                                    state,
+                                    rescue.episode(),
+                                    &response,
+                                    choice,
+                                )?
                             };
                             conductor.save_decision(
                                 &execution.id,
@@ -190,7 +189,11 @@ impl Engine {
                                 response.message.as_deref(),
                             )?;
                             self.apply_conductor_output(
-                                definition, execution, state, &rescue, decision,
+                                definition,
+                                execution,
+                                state,
+                                rescue.settled(),
+                                decision,
                             )
                         }
                         Err(why) => {
@@ -242,7 +245,7 @@ impl Engine {
                     let decision = unsaved_decision(
                         ConductorDecisionKind::Reprompt,
                         state,
-                        &rescue,
+                        rescue.episode(),
                         &response,
                         Choice::default(),
                         response.rationale.clone(),
@@ -338,11 +341,12 @@ impl Engine {
         }
     }
 
-    /// Routes a question the agent asked in reply to a reprompt: to the
-    /// operator, or — when the context variable `autopilot` is on and a
-    /// conductor is attached — first to the conductor, which answers only
-    /// when it is sure. The step then waits on the agent's own question
-    /// (`ResumeAgent`) or goes on with the conductor's answer.
+    /// Routes a question an agent asked: to the operator, or — when the
+    /// context variable `autopilot` is on, a conductor is attached and its
+    /// answers for this entry into the step are not used up — first to the
+    /// conductor, which answers only when it is sure. The step then waits
+    /// on the agent's own question (`ResumeAgent`) or goes on with the
+    /// conductor's answer.
     pub(super) async fn route_agent_question(
         &self,
         execution: &mut WorkflowExecution,
@@ -352,53 +356,91 @@ impl Engine {
         clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
         clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
 
-        let conductor = self.conductor().filter(|_| {
-            request.permission.is_none() && autopilot_is_on(&execution.context.variables)
-        });
-        if let Some(conductor) = conductor {
-            let asked = QueuedRequest::new(
-                ConductorTrigger::OutputRescue,
-                ConductorPurpose::AnswerAgentQuestion,
-            )
-            .with_episode(&request.action_execution_id)
-            .with_payload(json!({
-                "state_id": state.id,
-                "question": request.instruction,
-                "options": request.fields,
-            }));
-            let outcome = conductor.choose_output(&execution.id, asked).await?;
-            let answer = match outcome {
-                InvocationOutcome::Answered(answer) => ConductorResponse::from_value(
-                    answer.response,
-                    ConductorPurpose::AnswerAgentQuestion,
-                )
-                .ok(),
-                _ => None,
-            };
-            let answer = answer
-                .filter(|response| {
-                    matches!(response.decision, Decision::Reply)
-                        && response.confidence == Confidence::High
-                })
-                .and_then(|response| response.message)
-                .map(|message| message.trim().to_string())
-                .filter(|message| !message.is_empty());
-            if let Some(answer) = answer {
-                self.store_agent_input(
-                    execution,
-                    &state.id,
-                    &answer,
-                    request.agent_harness.as_deref(),
-                    request.agent_session_id.as_deref(),
-                    Vec::new(),
-                    PromptAuthor::Conductor,
-                )?;
-                return Ok(Flow::Continue);
-            }
+        if let Some(answer) = self.answer_by_conductor(execution, state, &request).await? {
+            step_memory::count_conductor_answer(execution, &state.id)?;
+            self.store_agent_input(
+                execution,
+                &state.id,
+                &answer,
+                request.agent_harness.as_deref(),
+                request.agent_session_id.as_deref(),
+                Vec::new(),
+                PromptAuthor::Conductor,
+            )?;
+            return Ok(Flow::Continue);
         }
 
         self.suspend_for_agent_input(execution, state, request)?;
         Ok(Flow::Stop)
+    }
+
+    /// The answer the conductor gives to `question`, with its rationale on
+    /// record, or `None` when the operator is to be asked: `autopilot` is
+    /// off, the question is a request for a permission or a notice of the
+    /// engine's, no conductor is attached, its answers for this entry are
+    /// used up, or it is not sure.
+    async fn answer_by_conductor(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        question: &HumanInputRequest,
+    ) -> Result<Option<String>, EngineError> {
+        let autopilot = Autopilot::of(&execution.context.variables);
+        let is_agents_question =
+            question.permission.is_none() && question.prefilled_answer.is_none();
+        if autopilot == Autopilot::Off || !is_agents_question {
+            return Ok(None);
+        }
+        let Some(conductor) = self.conductor() else {
+            return Ok(None);
+        };
+        if step_memory::conductor_answers(execution, &state.id)? >= CONDUCTOR_ANSWER_LIMIT {
+            return Ok(None);
+        }
+
+        let asked = QueuedRequest::new(
+            ConductorTrigger::OutputRescue,
+            ConductorPurpose::AnswerAgentQuestion,
+        )
+        .with_episode(&question.action_execution_id)
+        .with_payload(json!({
+            "state_id": state.id,
+            "question": question.instruction,
+            "options": question.fields,
+            "autopilot": autopilot.name(),
+        }));
+        let outcome = conductor.choose_output(&execution.id, asked).await?;
+        let InvocationOutcome::Answered(answer) = outcome else {
+            return Ok(None);
+        };
+        let Ok(response) =
+            ConductorResponse::from_value(answer.response, ConductorPurpose::AnswerAgentQuestion)
+        else {
+            return Ok(None);
+        };
+        if !matches!(response.decision, Decision::Reply) || response.confidence != Confidence::High
+        {
+            return Ok(None);
+        }
+        let Some(text) = response
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let decision = unsaved_decision(
+            ConductorDecisionKind::AnswerQuestion,
+            state,
+            &question.action_execution_id,
+            &response,
+            Choice::default(),
+            response.rationale.clone(),
+        );
+        self.note_decision(&conductor, execution, &decision, &response);
+        Ok(Some(text.to_string()))
     }
 
     /// Applies the conductor's saved choice (a): `ConductorDecision`, then
@@ -407,12 +449,12 @@ impl Engine {
     /// and drops the rescue — and last the saved decision.
     ///
     /// A result already recorded before a restart is not recorded again.
-    fn apply_conductor_output(
+    pub(super) fn apply_conductor_output(
         &self,
         definition: &WorkflowDefinition,
         execution: &mut WorkflowExecution,
         state: &State,
-        rescue: &OutputRescue,
+        settled: Settled<'_>,
         decision: SavedDecision,
     ) -> Result<Flow, EngineError> {
         let label = decision.output_label.clone().unwrap_or_default();
@@ -436,19 +478,14 @@ impl Engine {
                     exit_code: None,
                     // What the agent last said: a gate the label leads to
                     // shows it (KTD8).
-                    stdout: rescue
-                        .answers
-                        .iter()
-                        .rev()
-                        .find_map(|answer| answer.answer_tail.clone())
-                        .unwrap_or_default(),
+                    stdout: settled.stdout,
                     stderr: String::new(),
                     // The conductor settles the label, not what the agent
                     // said (R3).
-                    reply: rescue.reply.clone(),
+                    reply: settled.reply,
                     ..ActionResult::default()
                 };
-                match self.record_result(execution, state, rescue.episode().to_string(), result)? {
+                match self.record_result(execution, state, settled.episode.to_string(), result)? {
                     Some(pending) => {
                         self.apply_decision(definition, execution, state, pending, outcome)?
                     }
@@ -498,7 +535,7 @@ impl Engine {
             let decision = unsaved_decision(
                 ConductorDecisionKind::Escalate,
                 state,
-                &rescue,
+                rescue.episode(),
                 response,
                 choice,
                 Some(rationale),
@@ -524,7 +561,7 @@ impl Engine {
     /// Records a decision carried out right away ((b), (c)): in the chat and
     /// as `ConductorDecision`. Best-effort — the decision is carried out
     /// whether or not its record could be written.
-    fn note_decision(
+    pub(super) fn note_decision(
         &self,
         conductor: &ConductorRegistry,
         execution: &WorkflowExecution,
@@ -550,31 +587,21 @@ impl Engine {
     }
 }
 
-/// Whether the context variable `autopilot` is switched on. Unset, or any
-/// other value, is off.
-fn autopilot_is_on(variables: &HashMap<String, Value>) -> bool {
-    match variables.get("autopilot") {
-        Some(Value::Bool(on)) => *on,
-        Some(Value::String(text)) => matches!(text.trim().to_lowercase().as_str(), "on" | "true"),
-        _ => false,
-    }
-}
-
 /// A label and the values that go with it, as the conductor gave them.
 #[derive(Debug, Default)]
-struct Choice {
+pub(super) struct Choice {
     /// The label; empty for none.
-    label: String,
+    pub(super) label: String,
     /// The step's artifacts, name → path.
-    artifacts: BTreeMap<String, String>,
+    pub(super) artifacts: BTreeMap<String, String>,
     /// The step's `variables`.
-    variables: Map<String, Value>,
+    pub(super) variables: Map<String, Value>,
 }
 
 /// Whether the conductor's choice (a) can be taken as it is (R18, KTD15):
 /// a sure choice of a label the state declares, with every value the state
 /// it leads to needs. The reason it cannot, otherwise.
-fn check_choice(
+pub(super) fn check_choice(
     definition: &WorkflowDefinition,
     execution: &WorkflowExecution,
     state: &State,
@@ -591,6 +618,13 @@ fn check_choice(
     if response.confidence != Confidence::High {
         return Err(format!(
             "the conductor chose the output '{label}' without being sure of it (low confidence)"
+        ));
+    }
+
+    if let Some(problem) = variable_rules::value_outside_options(state, &choice.variables) {
+        return Err(format!(
+            "the conductor chose the output '{label}' with a value its step does not allow: \
+             {problem}"
         ));
     }
 
@@ -631,11 +665,66 @@ fn check_choice(
     Ok(())
 }
 
+/// What a step is completed with besides the conductor's choice.
+pub(super) struct Settled<'a> {
+    /// The attempt the step completes under.
+    pub(super) episode: &'a str,
+    /// What the agent last said, for a gate the label leads to.
+    pub(super) stdout: String,
+    /// The step's reply.
+    pub(super) reply: Option<String>,
+}
+
+impl OutputRescue {
+    /// What the rescue's step completes with.
+    fn settled(&self) -> Settled<'_> {
+        Settled {
+            episode: self.episode(),
+            stdout: self
+                .answers
+                .iter()
+                .rev()
+                .find_map(|answer| answer.answer_tail.clone())
+                .unwrap_or_default(),
+            reply: self.reply.clone(),
+        }
+    }
+}
+
+/// The record of the conductor's choice of an output, with the context it
+/// is made in so an undo can take it back.
+pub(super) fn chosen_output_decision(
+    execution: &WorkflowExecution,
+    state: &State,
+    episode: &str,
+    response: &ConductorResponse,
+    choice: Choice,
+) -> Result<SavedDecision, EngineError> {
+    Ok(SavedDecision {
+        decision_id: Uuid::new_v4().to_string(),
+        kind: ConductorDecisionKind::ChooseOutput,
+        episode: Some(episode.to_string()),
+        state_id: Some(state.id.clone()),
+        output_label: Some(choice.label),
+        artifacts: choice.artifacts,
+        variables: Value::Object(choice.variables),
+        confidence: response.confidence,
+        rationale: response.rationale.clone(),
+        context_before: serde_json::to_value(&execution.context).unwrap_or(Value::Null),
+        answers: Vec::new(),
+        reason: None,
+        reply: None,
+        state_entries_before: state_entries_value(execution)?,
+        step_memory_before: step_memory::step_memory_value(execution)?,
+        saved_at: Utc::now(),
+    })
+}
+
 /// The record of a decision that is carried out rather than saved.
-fn unsaved_decision(
+pub(super) fn unsaved_decision(
     kind: ConductorDecisionKind,
     state: &State,
-    rescue: &OutputRescue,
+    episode: &str,
     response: &ConductorResponse,
     choice: Choice,
     rationale: Option<String>,
@@ -643,7 +732,7 @@ fn unsaved_decision(
     SavedDecision {
         decision_id: Uuid::new_v4().to_string(),
         kind,
-        episode: Some(rescue.episode().to_string()),
+        episode: Some(episode.to_string()),
         state_id: Some(state.id.clone()),
         output_label: (!choice.label.is_empty()).then_some(choice.label),
         artifacts: choice.artifacts,
@@ -661,7 +750,7 @@ fn unsaved_decision(
 }
 
 /// The `ConductorDecision` event of `decision`.
-fn decision_event(decision: &SavedDecision) -> EventData {
+pub(super) fn decision_event(decision: &SavedDecision) -> EventData {
     EventData::ConductorDecision {
         decision_id: decision.decision_id.clone(),
         kind: decision.kind,
@@ -698,20 +787,4 @@ fn set_output_rescue(
     rescue: &OutputRescue,
 ) -> Result<(), EngineError> {
     write_engine_record(execution, METADATA_OUTPUT_RESCUE_KEY, rescue)
-}
-
-#[cfg(test)]
-mod autopilot_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn autopilot_is_off_unless_switched_on() {
-        let with = |value: Value| HashMap::from([("autopilot".to_string(), value)]);
-        assert!(!autopilot_is_on(&HashMap::new()));
-        assert!(!autopilot_is_on(&with(json!("off"))));
-        assert!(!autopilot_is_on(&with(json!("maybe"))));
-        assert!(autopilot_is_on(&with(json!("On"))));
-        assert!(autopilot_is_on(&with(json!(true))));
-    }
 }

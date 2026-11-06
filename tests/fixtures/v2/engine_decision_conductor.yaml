@@ -1,0 +1,55 @@
+# A decision the conductor takes: its choice runs the label's `set`, and
+# `revise` goes back to the agent step.
+schema: v2
+name: engine-decision-conductor
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Work on it.
+    exit:
+      next: pick
+
+  pick:
+    action:
+      type: decision
+      by: conductor
+      message:
+        - "Work done: {{ steps.work.reply }}"
+        - when: local.notes
+          text: "Notes so far: {{ local.notes }}"
+    variables:
+      - name: notes
+        type: text
+        scope: local
+      - name: severity
+        type: select
+        options: [low, high]
+      - name: stage
+        source: workflow
+        options: [open, closed]
+    choices:
+      approve:
+        description: Accept the work.
+        set:
+          stage: closed
+        next: done
+      revise:
+        description: Send it back.
+        next: work
+      reject:
+        description: Drop it.
+        requires_variables: [severity]
+        next: cancelled
+
+  done:
+    description: Finished.
+
+  cancelled:
+    description: Dropped.
+
+terminal_states:
+  done: completed
+  cancelled: cancelled

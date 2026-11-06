@@ -1,0 +1,38 @@
+# Old shape: `exit` is an ordinary label here, not a linear step's exit.
+name: legacy-exit-label
+version: 1
+
+states:
+  work:
+    description: Agent step that may stop or try again.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Do the work.
+    choices:
+      - exit
+      - retry
+    transitions:
+      exit: check
+      retry: work
+
+  check:
+    description: Script step with exit codes and an `exit` label.
+    action:
+      type: script
+      command: ./check.sh
+      exit_codes:
+        0: exit
+        1: retry
+    choices:
+      - exit
+      - retry
+    transitions:
+      exit: done
+      retry: work
+
+  done:
+    description: End.
+
+terminal_states:
+  done: completed

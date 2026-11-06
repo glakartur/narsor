@@ -1,0 +1,23 @@
+# `set.local` reaches only `scope: local` variables.
+schema: v2
+name: set-local-on-global-variable
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Zaimplementuj.
+    variables:
+      - name: summary
+    exit:
+      set:
+        local:
+          summary: x
+      next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

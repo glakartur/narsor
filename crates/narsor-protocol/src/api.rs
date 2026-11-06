@@ -427,6 +427,10 @@ pub enum ConductorTriggerDto {
     Chat,
     Annotation,
     Title,
+    DecisionStep,
+    /// A value this build does not know, written by a newer one.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl ConductorTriggerDto {
@@ -437,6 +441,8 @@ impl ConductorTriggerDto {
             Self::Chat => "chat",
             Self::Annotation => "annotation",
             Self::Title => "title",
+            Self::DecisionStep => "decision_step",
+            Self::Unrecognized => "unrecognized",
         }
     }
 }
@@ -452,6 +458,10 @@ pub enum ConductorPurposeDto {
     ReplyToChat,
     SummarizeGate,
     GenerateTitle,
+    DecideFork,
+    /// A value this build does not know, written by a newer one.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl ConductorPurposeDto {
@@ -464,6 +474,8 @@ impl ConductorPurposeDto {
             Self::ReplyToChat => "reply_to_chat",
             Self::SummarizeGate => "summarize_gate",
             Self::GenerateTitle => "generate_title",
+            Self::DecideFork => "decide_fork",
+            Self::Unrecognized => "unrecognized",
         }
     }
 }
@@ -713,6 +725,7 @@ mod tests {
                     subagent_count: Some(2),
                     subagent_stats: None,
                     cost_usd: Some(0.5),
+                    ..Default::default()
                 }),
             }],
             links: BTreeMap::from([(7, EventLink::Position("review #1".into()))]),

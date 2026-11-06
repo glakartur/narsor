@@ -1,0 +1,52 @@
+# `set` assigns declared variables when a choice or `exit` is taken.
+# `source: workflow` keeps a variable out of the agent's contract.
+schema: v2
+name: set-on-exit
+version: 1
+
+states:
+  implement:
+    action:
+      type: agent
+      prompt: Implement the change.
+    variables:
+      - name: summary
+        description: What was done.
+      - name: autopilot
+        source: workflow
+        options: [off, on, best-effort]
+      - name: notes
+        scope: local
+        type: text
+    exit:
+      requires_variables: [summary]
+      set:
+        autopilot: best-effort
+        local:
+          notes: ""
+      next: review
+
+  review:
+    action:
+      type: agent
+      prompt: Review the change.
+    variables:
+      - name: autopilot
+        source: workflow
+        options: [off, on, best-effort]
+      - name: findings
+        description: Review remarks.
+    choices:
+      approved:
+        set:
+          autopilot: "off"
+        next: done
+      changes_requested:
+        requires_variables: [findings]
+        next: implement
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

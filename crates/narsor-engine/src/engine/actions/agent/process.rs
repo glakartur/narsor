@@ -1,4 +1,4 @@
-use super::conversation::record_stdout_line;
+use super::conversation::{record_stdout_line, ReadingTap};
 use super::*;
 use crate::engine::actions::harness::copilot_sdk::{
     run_copilot_sdk, CopilotSdkBackend, GitHubCopilotSdkRuntime,
@@ -45,14 +45,20 @@ pub(crate) enum SpawnEnding {
 /// the spawning (through [`spawn_retrying_text_busy`]), the pipe draining and
 /// the stream parsing of an agent step without being one. The elements the
 /// parser returns are discarded with the lines: there is nowhere to record
-/// them. So are the usage limits: the conductor has no reporter.
+/// them. So are the usage limits: the conductor has no reporter. The tokens
+/// and cost a run reports are handed to `readings`, when there is a tap.
 pub(crate) async fn run_harness_process(
     program: &str,
     args: &[String],
     working_dir: &Path,
     limit: Option<Duration>,
     parser: Box<dyn HarnessStreamParser>,
+    readings: Option<ReadingTap>,
 ) -> Result<SpawnEnding, ActionError> {
+    let conversation = match readings {
+        Some(tap) => ConversationSink::none().with_readings(tap),
+        None => ConversationSink::none(),
+    };
     run_harness_invocation(
         program,
         args,
@@ -62,7 +68,7 @@ pub(crate) async fn run_harness_process(
         limit,
         FINAL_ANSWER_GRACE,
         parser,
-        &ConversationSink::none(),
+        &conversation,
         None,
     )
     .await

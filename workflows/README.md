@@ -4,10 +4,11 @@
 runnable tour of the workflow engine rather than a project automation pipeline:
 
 - a typed input and a display link;
-- a no-op `printf` script returning a choice, a variable and artifact-path
-  metadata;
-- a human form with a choice and optional comment;
-- deterministic transitions, terminal statuses, a timeout and retry policy.
+- a no-op `printf` script step with one `exit`, returning a variable and
+  artifact-path metadata;
+- a human `decision` step with an optional comment, whose choices write the
+  `outcome` variable with `set`;
+- the unified `schema: v2` shape, terminal statuses, a timeout and retry policy.
 
 The script writes no files and calls no external services. Its artifact path is
 illustrative metadata only; no file is created. The workflow does not invoke an

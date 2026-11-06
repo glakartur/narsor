@@ -84,6 +84,7 @@ impl ConductorHost {
         )
         .with_default_harness_source(harness.clone())
         .with_extra_args(extra_args)
+        .with_reading_sink(engine.reading_sink())
         .with_pinned_definition(Arc::clone(definition));
         Self::assemble_with(
             engine,

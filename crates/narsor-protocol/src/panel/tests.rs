@@ -371,3 +371,169 @@ fn an_entry_that_does_not_exist_is_refused() {
         "Ta akcja nie istnieje."
     );
 }
+
+/// A `decision` step's form: two variables, three labels, each with its own
+/// requirements, and a value the step keeps for itself.
+fn decision_form() -> Value {
+    json!({
+        "execution_id": "exec-1",
+        "state_id": "approval",
+        "action_execution_id": "act-d",
+        "instruction": "Zdecyduj.",
+        "fields": [
+            { "name": "comment", "type": "text", "description": "Uwagi." },
+            { "name": "severity", "type": "select", "options": ["low", "high"] }
+        ],
+        "outputs": [
+            { "label": "approve" },
+            { "label": "revise", "requires_variables": ["comment"], "resume_comment_field": "comment" },
+            { "label": "reject", "requires_variables": ["comment", "severity"] }
+        ],
+        "label_from_menu": true,
+        "local_values": [{ "name": "notes", "value": "pierwsze podejście" }],
+        "episode": "ep-d",
+        "requested_at": "2026-10-09T11:54:00Z"
+    })
+}
+
+fn field_named<'a>(entry: &'a PanelEntry, name: &str) -> &'a PanelField {
+    entry
+        .fields
+        .iter()
+        .find(|field| field.name == name)
+        .unwrap_or_else(|| panic!("the entry has no field '{name}'"))
+}
+
+#[test]
+fn a_decision_form_has_the_fields_of_the_variables_and_an_entry_for_each_label() {
+    let definition = definition_of(decision_form());
+
+    assert_eq!(labels(&definition), ["approve", "revise", "reject"]);
+    for entry in &definition.entries {
+        let names: Vec<&str> = entry
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(names, ["comment", "severity"], "{}", entry.label);
+    }
+}
+
+#[test]
+fn a_decision_requires_the_fields_its_label_names_and_no_others() {
+    let definition = definition_of(decision_form());
+    let required = |entry: usize| -> Vec<&str> {
+        definition.entries[entry]
+            .fields
+            .iter()
+            .filter(|field| field.required)
+            .map(|field| field.name.as_str())
+            .collect()
+    };
+
+    assert!(required(0).is_empty());
+    assert_eq!(required(1), ["comment"]);
+    assert_eq!(required(2), ["comment", "severity"]);
+}
+
+#[test]
+fn a_single_select_of_a_decision_does_not_stand_for_the_label() {
+    let definition = definition_of(decision_form());
+    assert_eq!(definition.entries.len(), 3);
+
+    let delivery = choose(&definition, 2, &[("severity", "high"), ("comment", "źle")]);
+
+    assert_eq!(delivery.chosen_label.as_deref(), Some("reject"));
+    assert_eq!(delivery.values.get("severity"), Some(&json!("high")));
+}
+
+#[test]
+fn a_select_offering_exactly_the_labels_is_still_a_field_of_a_decision() {
+    let mut form = decision_form();
+    form["fields"] = json!([{
+        "name": "verdict",
+        "type": "select",
+        "options": ["approve", "revise", "reject"]
+    }]);
+
+    let definition = definition_of(form);
+
+    assert_eq!(labels(&definition), ["approve", "revise", "reject"]);
+    assert!(definition
+        .entries
+        .iter()
+        .all(|entry| entry.fields.iter().any(|field| field.name == "verdict")));
+    let PanelPlan::Complete { label_field, .. } = &definition.entries[0].plan else {
+        panic!("a decision completes the step");
+    };
+    assert_eq!(*label_field, None);
+}
+
+#[test]
+fn the_values_a_step_keeps_for_itself_are_lines_of_the_context() {
+    let definition = definition_of(decision_form());
+
+    assert!(
+        definition
+            .context
+            .iter()
+            .any(|line| line.text.contains("notes") && line.text.contains("pierwsze podejście")),
+        "{:?}",
+        definition.context
+    );
+}
+
+#[test]
+fn a_gate_of_the_old_shape_keeps_inferring_its_label_from_a_lone_select() {
+    let form = json!({
+        "execution_id": "exec-1",
+        "state_id": "review",
+        "action_execution_id": "act-g",
+        "instruction": "Przejrzyj.",
+        "fields": [
+            { "name": "status", "type": "select", "options": ["approved", "rejected"], "required": true },
+            { "name": "comments", "type": "text" }
+        ],
+        "outputs": [{ "label": "approved" }, { "label": "rejected" }],
+        "episode": "ep-v1",
+        "requested_at": "2026-10-09T11:54:00Z"
+    });
+
+    let definition = definition_of(form);
+
+    assert_eq!(labels(&definition), ["approved", "rejected"]);
+    assert!(definition.entries[0]
+        .fields
+        .iter()
+        .all(|field| field.name != "status"));
+    let PanelPlan::Complete { label_field, .. } = &definition.entries[0].plan else {
+        panic!("a gate completes the step");
+    };
+    assert_eq!(label_field.as_deref(), Some("status"));
+}
+
+#[test]
+fn requirements_of_an_old_shape_gate_do_not_make_its_fields_required() {
+    let mut form = gate();
+    form["fields"] = json!([{ "name": "comment", "type": "text" }]);
+    form["outputs"] = json!([
+        { "label": "approve" },
+        { "label": "reject", "requires_variables": ["comment"] }
+    ]);
+
+    let definition = definition_of(form);
+
+    assert!(!field_named(&definition.entries[1], "comment").required);
+}
+
+#[test]
+fn a_stored_form_without_the_new_fields_still_reads() {
+    let pending: PendingHumanInputView = serde_json::from_value(gate()).unwrap();
+
+    assert!(pending.local_values.is_empty());
+    assert!(!pending.label_from_menu);
+    assert!(pending
+        .outputs
+        .iter()
+        .all(|output| output.requires_variables.is_empty()));
+}

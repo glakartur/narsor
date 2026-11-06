@@ -31,7 +31,8 @@ fn recording(name: &str) -> Vec<String> {
 }
 
 fn parser() -> Box<dyn HarnessStreamParser> {
-    ClaudeCodeAdapter::new().stream_parser()
+    ClaudeCodeAdapter::new()
+        .stream_parser(narsor_engine::engine::actions::answer::AnswerShape::Choice)
 }
 
 /// The elements of each line, from one fresh parser fed the lines in order.
@@ -545,7 +546,8 @@ fn usage_is_taken_once_and_only_for_its_line() {
 
 #[test]
 fn other_harnesses_report_no_usage() {
-    let mut parser = CodexAdapter::new().stream_parser();
+    let mut parser = CodexAdapter::new()
+        .stream_parser(narsor_engine::engine::actions::answer::AnswerShape::Choice);
     parser.on_stdout_line(recorded_rate_limit_event("tools.ndjson").as_bytes());
     assert_eq!(parser.take_usage(), None);
 }

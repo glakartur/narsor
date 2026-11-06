@@ -310,6 +310,7 @@ fn initial_state_that_does_not_exist_is_rejected() {
         inputs: Vec::new(),
         globals: Default::default(),
         source_schema: Default::default(),
+        shape: Default::default(),
         repositories: Vec::new(),
         display: None,
         states,
@@ -728,6 +729,48 @@ fn unknown_input_in_a_prompt_is_rejected() {
 }
 
 #[test]
+fn a_condition_on_an_undeclared_input_is_rejected_and_names_the_part() {
+    let errors = errors_of("when_unknown_input.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::UnknownInputReference { state, field, variable }
+                if state == "work" && field == "action.prompt[2].when" && variable == "nonexistent"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_condition_with_a_filter_is_rejected() {
+    let errors = errors_of("when_with_filter.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidWhen { state, field, .. }
+                if state == "work" && field == "action.prompt[2].when"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_condition_on_the_reply_of_a_script_step_is_rejected() {
+    let errors = errors_of("when_step_result_from_script.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidStepReplySource { state, step_id, field }
+                if state == "work" && step_id == "build" && field == "action.prompt[2].when"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
 fn context_references_and_filter_expressions_are_left_to_the_runtime() {
     let yaml = r#"
 name: runtime-references
@@ -1138,4 +1181,369 @@ fn an_unknown_field_in_display_is_rejected_at_load() {
         let result = narsor_engine::workflow::validate_source(&with_display(display, ""));
         assert!(result.is_err(), "{display:?} must not load");
     }
+}
+
+/// Validates a unified-shape file whose `states` section is `states`; `done`
+/// is its terminal state.
+fn unified_errors(states: &str) -> Vec<ValidationError> {
+    let yaml = format!(
+        "schema: v2\nname: unified\nversion: 1\nstates:\n{states}\n  done:\n    description: end\n\
+         terminal_states:\n  done: completed\n"
+    );
+    narsor_engine::workflow::validate_source(&yaml).expect("the file must load")
+}
+
+fn valid_fixture(name: &str) {
+    let errors = validate_path(fixture_path(name)).unwrap_or_else(|err| panic!("{name}: {err}"));
+    assert!(errors.is_empty(), "{name}: {}", describe(&errors));
+}
+
+#[test]
+fn every_unified_fixture_passes_validation() {
+    for name in [
+        "v2/exit.yaml",
+        "v2/set.yaml",
+        "v2/scope.yaml",
+        "v2/decision_human.yaml",
+        "v2/decision_conductor.yaml",
+    ] {
+        valid_fixture(name);
+    }
+}
+
+#[test]
+fn exit_codes_beside_an_exit_are_rejected() {
+    let errors = errors_of("exit_codes_with_exit.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::ExitCodesWithExit { state, .. } if state == "check"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn an_old_shape_choice_labelled_exit_is_an_ordinary_choice() {
+    let errors = validate_path(fixture_path("legacy_exit_label.yaml")).expect("must load");
+
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
+fn set_of_a_variable_the_step_does_not_declare_is_rejected() {
+    let errors = errors_of("set_unknown_variable.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::SetUnknownVariable { state, label, name }
+                if state == "work" && label == "exit" && name == "sumary"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn set_local_of_a_global_variable_is_rejected() {
+    let errors = errors_of("set_local_on_global_variable.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::SetScopeMismatch { state, name, .. }
+                if state == "work" && name == "summary"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_local_variable_set_without_local_is_rejected() {
+    let errors = unified_errors(
+        "  work:\n    action: { type: agent, prompt: p }\n    variables:\n      \
+         - { name: notes, scope: local }\n    exit: { set: { notes: x }, next: done }",
+    );
+    assert!(
+        errors.iter().any(
+            |err| matches!(err, ValidationError::SetScopeMismatch { name, .. } if name == "notes")
+        ),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn set_of_a_value_outside_the_options_is_rejected() {
+    let errors = errors_of("set_value_outside_options.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::SetValueRejected { name, .. } if name == "autopilot"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn set_of_a_value_of_the_wrong_type_is_rejected_but_a_template_is_not() {
+    let work = |value: &str| {
+        unified_errors(&format!(
+            "  work:\n    action: {{ type: agent, prompt: p }}\n    variables:\n      \
+             - {{ name: attempts, type: integer }}\n    exit: {{ set: {{ attempts: {value} }}, next: done }}"
+        ))
+    };
+    assert!(work("\"many\"")
+        .iter()
+        .any(|err| matches!(err, ValidationError::SetValueRejected { .. })));
+    assert!(work("3").is_empty());
+    // Whether a rendered template fits is known only when it is rendered.
+    let templated = unified_errors(
+        "  work:\n    action: { type: agent, prompt: p }\n    variables:\n      \
+         - { name: mode, options: [a, b] }\n    exit: { set: { mode: \"{{ inputs.x }}\" }, next: done }",
+    );
+    assert!(
+        !templated
+            .iter()
+            .any(|err| matches!(err, ValidationError::SetValueRejected { .. })),
+        "got: {}",
+        describe(&templated)
+    );
+}
+
+#[test]
+fn one_variable_with_different_options_in_two_steps_is_rejected() {
+    let errors = errors_of("inconsistent_variable_options.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InconsistentVariable { name, state, other_state, .. }
+                if name == "autopilot" && state == "first" && other_state == "second"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_local_variable_may_differ_between_steps() {
+    let errors = unified_errors(
+        "  first:\n    action: { type: agent, prompt: p }\n    variables:\n      \
+         - { name: notes, scope: local, type: text }\n    exit: { next: second }\n  \
+         second:\n    action: { type: agent, prompt: p }\n    variables:\n      \
+         - { name: notes, scope: local, type: integer }\n    exit: { next: done }",
+    );
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
+fn a_variable_declared_twice_in_a_step_is_rejected() {
+    let errors = errors_of("duplicate_variable.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::DuplicateVariable { state, name }
+                if state == "work" && name == "summary"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn type_and_options_of_a_declaration_have_to_agree() {
+    for variable in [
+        "{ name: v, type: select }",
+        "{ name: v, type: integer, options: [a] }",
+        "{ name: v, options: [a, a] }",
+        "{ name: v, scope: local, source: workflow }",
+    ] {
+        let errors = unified_errors(&format!(
+            "  work:\n    action: {{ type: agent, prompt: p }}\n    variables:\n      - {variable}\n    \
+             exit: {{ next: done }}"
+        ));
+        assert!(
+            errors
+                .iter()
+                .any(|err| matches!(err, ValidationError::InvalidVariableDeclaration { .. })),
+            "{variable}: {}",
+            describe(&errors)
+        );
+    }
+}
+
+#[test]
+fn a_choice_cannot_require_a_variable_only_the_workflow_sets() {
+    let errors = errors_of("required_workflow_variable.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::RequiredWorkflowVariable { state, name, .. }
+                if state == "work" && name == "autopilot"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn resume_comment_field_has_to_be_a_text_variable_of_the_decision() {
+    let errors = errors_of("resume_comment_field_not_text.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidChoiceBehavior { state, label, .. }
+                if state == "approval" && label == "revise"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn an_old_shape_gate_may_still_have_a_label_named_timeout() {
+    let yaml = r#"
+schema: v2
+name: old-shape-timeout-label
+version: 1
+
+states:
+  gate:
+    action:
+      type: human
+      message: Pick one.
+    choices:
+      - timeout
+      - done
+    transitions:
+      timeout: done
+      done: done
+  done:
+    description: End.
+
+terminal_states:
+  done: completed
+"#;
+
+    let errors = narsor_engine::workflow::validate_source(yaml).expect("the file must compile");
+    assert!(
+        !errors
+            .iter()
+            .any(|err| matches!(err, ValidationError::TimeoutChoiceNotAllowed { .. })),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_timeout_choice_is_only_for_agent_and_script_steps() {
+    let errors = errors_of("timeout_choice_on_decision.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::TimeoutChoiceNotAllowed { state } if state == "approval"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn the_label_of_a_terminal_state_cannot_be_referenced() {
+    let errors = errors_of("step_label_from_terminal_state.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidStepLabelSource { state, step_id, .. }
+                if state == "approval" && step_id == "done"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_decision_message_may_read_a_script_stream_and_a_step_label() {
+    let errors = unified_errors(
+        "  test:\n    action: { type: script, command: ./t.sh }\n    exit: { next: ask }\n  ask:\n    \
+         action:\n      type: decision\n      by: conductor\n      message: \"{{ steps.test.stdout }} \
+         {{ steps.test.label }}\"\n    choices:\n      go: { next: done }",
+    );
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
+fn a_decision_needs_a_message_and_choices() {
+    let errors =
+        unified_errors("  ask:\n    action: { type: decision, by: human, message: \"  \" }");
+    assert!(errors.iter().any(|err| matches!(
+        err,
+        ValidationError::MissingActionField {
+            action_type: "decision",
+            field: "message",
+            ..
+        }
+    )));
+    assert!(errors.iter().any(|err| matches!(
+        err,
+        ValidationError::EmptyChoices {
+            action_type: "decision",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_decision_defines_variables_but_no_artifacts() {
+    let with_variables = unified_errors(
+        "  ask:\n    action: { type: decision, by: human, message: m }\n    variables:\n      \
+         - { name: comment, type: text }\n    choices:\n      go: { next: done }",
+    );
+    assert!(
+        with_variables.is_empty(),
+        "got: {}",
+        describe(&with_variables)
+    );
+
+    let with_artifacts = unified_errors(
+        "  ask:\n    action: { type: decision, by: human, message: m }\n    artifacts:\n      \
+         - { name: doc, description: d }\n    choices:\n      go: { next: done }",
+    );
+    assert!(with_artifacts
+        .iter()
+        .any(|err| matches!(err, ValidationError::DefinitionsNotAllowed { .. })));
+}
+
+#[test]
+fn a_local_variable_may_be_declared_on_a_script_step_through_its_scope() {
+    let errors = unified_errors(
+        "  check:\n    action: { type: script, command: ./c.sh }\n    variables:\n      \
+         - { name: cursor, scope: local }\n    exit: { next: done }",
+    );
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
+fn an_exit_to_an_unknown_state_is_rejected() {
+    let errors = unified_errors(
+        "  work:\n    action: { type: script, command: ./a.sh }\n    exit: { next: nowhere }",
+    );
+    assert!(errors.iter().any(|err| matches!(
+        err,
+        ValidationError::TransitionToUnknownState(state, label, target)
+            if state == "work" && label == "exit" && target == "nowhere"
+    )));
+}
+
+#[test]
+fn a_loop_of_exits_without_a_way_out_is_a_deadlock() {
+    let errors = unified_errors(
+        "  first:\n    action: { type: script, command: ./a.sh }\n    exit: { next: second }\n  \
+         second:\n    action: { type: script, command: ./a.sh }\n    exit: { next: first }",
+    );
+    assert!(errors
+        .iter()
+        .any(|err| matches!(err, ValidationError::NoPathToTerminal(state) if state == "first")));
 }

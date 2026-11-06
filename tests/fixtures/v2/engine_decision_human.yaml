@@ -1,0 +1,64 @@
+# A decision the operator takes: the variables of the step are the form, the
+# choices the menu, and each choice has its own requirements.
+schema: v2
+name: engine-decision-human
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Work on it.
+    variables:
+      - name: summary
+    exit:
+      requires_variables: [summary]
+      next: approval
+
+  approval:
+    action:
+      type: decision
+      by: human
+      message:
+        - "Work done: {{ steps.work.reply }}"
+        - when: local.notes
+          text: "Notes so far: {{ local.notes }}"
+    variables:
+      - name: comment
+        type: text
+        description: Remarks on the decision.
+      - name: severity
+        type: select
+        options: [low, high]
+      - name: notes
+        type: text
+        scope: local
+        description: Kept for the next time the decision is asked.
+      - name: stage
+        source: workflow
+        options: [open, closed]
+    choices:
+      approve:
+        description: Accept the work.
+        set:
+          stage: closed
+        next: done
+      revise:
+        description: Send it back with a comment.
+        requires_variables: [comment]
+        resume_comment_field: comment
+        next: work
+      reject:
+        description: Drop it.
+        requires_variables: [comment, severity]
+        next: cancelled
+
+  done:
+    description: Finished.
+
+  cancelled:
+    description: Dropped.
+
+terminal_states:
+  done: completed
+  cancelled: cancelled

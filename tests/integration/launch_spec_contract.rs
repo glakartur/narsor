@@ -3,8 +3,11 @@
 
 use narsor_controller_runtime::backend::validate_launch_input;
 use narsor_engine::domain::{ResolvedEnvironment, ResourceProfile, TaskLaunchSpec, TaskWorkspace};
+use narsor_engine::workflow::load_from_str;
 use narsor_protocol::controller::LaunchRequest;
-use narsor_protocol::launch::LaunchSpecEnvelope;
+use narsor_protocol::launch::{
+    LaunchSpecEnvelope, LEGACY_SHAPE_LAUNCH_SPEC_VERSION, TASK_LAUNCH_SPEC_VERSION,
+};
 
 fn plain() -> TaskLaunchSpec {
     TaskLaunchSpec::new(
@@ -86,4 +89,40 @@ fn a_launch_request_carries_a_branch_per_input() {
     let request: LaunchRequest = serde_json::from_value(with.clone()).unwrap();
     assert_eq!(request.branches["code"], "develop");
     assert_eq!(serde_json::to_value(&request).unwrap(), with);
+}
+
+fn sealed_with(definition_yaml: &str) -> TaskLaunchSpec {
+    let definition = load_from_str(definition_yaml).expect("the definition loads");
+    TaskLaunchSpec::new(
+        definition.id.clone(),
+        definition.version,
+        serde_json::json!({}),
+        TaskWorkspace::none(),
+        ResolvedEnvironment::harness_only("claude-code"),
+        ResourceProfile::new(1000, 2048),
+    )
+    .with_definition(&definition)
+    .expect("the definition serializes")
+}
+
+/// A runner from before the unified shape reads only version 4, so it
+/// refuses a unified snapshot by its version, and still runs a legacy one.
+#[test]
+fn only_a_unified_definition_raises_the_spec_version() {
+    let unified = sealed_with(include_str!("../fixtures/v2/exit.yaml"));
+    let legacy = sealed_with(include_str!("../fixtures/implement_feature.yaml"));
+
+    assert_eq!(unified.version, TASK_LAUNCH_SPEC_VERSION);
+    assert_eq!(legacy.version, LEGACY_SHAPE_LAUNCH_SPEC_VERSION);
+    accepted(&unified);
+    accepted(&legacy);
+    for spec in [unified, legacy] {
+        let value = serde_json::to_value(&spec).unwrap();
+        let read: TaskLaunchSpec = serde_json::from_value(value).expect("this build reads it");
+        assert_eq!(read, spec);
+        assert!(
+            read.digest_is_valid(),
+            "the version is sealed in the digest"
+        );
+    }
 }

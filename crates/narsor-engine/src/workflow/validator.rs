@@ -26,16 +26,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::domain::{
-    ActionConfig, DecisionConfig, ImageSpec, OutputLabel, RepositorySource, SchemaVersion, State,
-    StateId, ValidationError, WorkflowDefinition, LOCAL_VARIABLE_PREFIX, WORKSPACE_ROOT,
+    ActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel, PromptPart, PromptText,
+    RepositorySource, SchemaVersion, State, StateId, ValidationError, VariableDefinition,
+    VariableScope, VariableSource, VariableType, WorkflowDefinition, LOCAL_VARIABLE_PREFIX,
+    TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
 use crate::workspace::provisioner::is_usable_directory_name;
 
 use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
 use super::template::{
-    artifact_references, check_syntax, step_reply_references, step_stream_references,
-    unsupported_step_references, DeclaredNames,
+    artifact_references, check_syntax, step_label_references, step_reply_references,
+    step_stream_references, unsupported_step_references, DeclaredNames,
 };
 
 /// Validates a compiled workflow definition.
@@ -52,11 +54,15 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_action(state, &mut errors);
         validate_choice_behavior(definition, state, &mut errors);
         validate_step_contract(state, &mut errors);
+        validate_variable_declarations(state, &mut errors);
+        validate_set_assignments(state, &mut errors);
+        validate_exit_and_timeout(definition, state, &mut errors);
         validate_decision(state, &mut errors);
         validate_state_templates(definition, &declared, state, &mut errors);
         validate_state_image(state, &mut errors);
         validate_step_workspace(definition, state, &mut errors);
     }
+    validate_variable_consistency(definition, &mut errors);
     validate_repositories(definition, &mut errors);
     validate_display(definition, &mut errors);
     if let Some(image) = &definition.globals.image {
@@ -92,6 +98,9 @@ fn validate_choice_behavior(
             Some(ActionConfig::Human(human)) => human.inputs.iter().any(|field| {
                 field.name == field_name && field.field_type == crate::domain::HumanInputType::Text
             }),
+            Some(ActionConfig::Decision(_)) => state.variables.iter().any(|variable| {
+                variable.name == field_name && variable.variable_type == Some(VariableType::Text)
+            }),
             _ => false,
         };
         let valid_target = state.transitions.get(&choice.label).is_some_and(|target| {
@@ -103,7 +112,8 @@ fn validate_choice_behavior(
             errors.push(ValidationError::InvalidChoiceBehavior {
                 state: state.id.clone(),
                 label: choice.label.clone(),
-                reason: "resume_comment_field requires a text input and an agent transition target"
+                reason: "resume_comment_field requires a text input (a variable of type 'text' \
+                         on a decision step) and an agent transition target"
                     .to_string(),
             });
         }
@@ -113,9 +123,11 @@ fn validate_choice_behavior(
 /// The step contract: what a step defines, and that each choice requires
 /// only what its step defines (R9, R11, R21).
 fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
-    let defines_anything = !state.variables.is_empty() || !state.artifacts.is_empty();
+    let defines_artifacts = !state.artifacts.is_empty();
+    let defines_anything = defines_artifacts || !state.variables.is_empty();
     match &state.action {
         Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_)) => {}
+        Some(ActionConfig::Decision(_)) if !defines_artifacts => {}
         _ if !defines_anything => {}
         other => errors.push(ValidationError::DefinitionsNotAllowed {
             state: state.id.clone(),
@@ -132,7 +144,10 @@ fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
         if !is_plain_name(bare_name) {
             errors.push(invalid_name(state, "variable", &variable.name));
         }
-        if variable.is_local() && !is_agent {
+        // A variable declared with `scope: local` is kept by any step that
+        // may define variables; only the `local.*` naming of the legacy shape
+        // stays an agent-only feature.
+        if variable.name.starts_with(LOCAL_VARIABLE_PREFIX) && !is_agent {
             errors.push(ValidationError::LocalVariableOutsideAgent {
                 state: state.id.clone(),
                 name: variable.name.clone(),
@@ -147,16 +162,20 @@ fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
 
     for choice in &state.choices {
         for name in &choice.requires_variables {
-            if !state
-                .variables
-                .iter()
-                .any(|variable| &variable.name == name)
-            {
-                errors.push(ValidationError::UndefinedRequiredVariable {
+            match state.variable(name) {
+                None => errors.push(ValidationError::UndefinedRequiredVariable {
                     state: state.id.clone(),
                     label: choice.label.clone(),
                     name: name.clone(),
-                });
+                }),
+                Some(variable) if variable.source == VariableSource::Workflow => {
+                    errors.push(ValidationError::RequiredWorkflowVariable {
+                        state: state.id.clone(),
+                        label: choice.label.clone(),
+                        name: name.clone(),
+                    })
+                }
+                Some(_) => {}
             }
         }
         for name in &choice.requires_artifacts {
@@ -196,6 +215,7 @@ fn action_type_name(action: &ActionConfig) -> &'static str {
         ActionConfig::Script(_) => "script",
         ActionConfig::Human(_) => "human",
         ActionConfig::Wait(_) => "wait",
+        ActionConfig::Decision(_) => "decision",
     }
 }
 
@@ -452,7 +472,7 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             {
                 errors.push(missing_field(state, "agent", "harness"));
             }
-            if agent.prompt.trim().is_empty() {
+            if agent.prompt.is_blank() {
                 errors.push(missing_field(state, "agent", "prompt"));
             }
             if state.choices.is_empty() {
@@ -483,6 +503,17 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
                 errors.push(missing_field(state, "wait", "event_type"));
             }
         }
+        ActionConfig::Decision(decision) => {
+            if decision.message.is_blank() {
+                errors.push(missing_field(state, "decision", "message"));
+            }
+            if state.choices.is_empty() {
+                errors.push(ValidationError::EmptyChoices {
+                    state: state.id.clone(),
+                    action_type: "decision",
+                });
+            }
+        }
     }
 }
 
@@ -491,6 +522,213 @@ fn missing_field(state: &State, action_type: &'static str, field: &'static str) 
         state: state.id.clone(),
         action_type,
         field,
+    }
+}
+
+/// The declarations of one step: unique names, and `type` and `options` that
+/// agree with each other.
+fn validate_variable_declarations(state: &State, errors: &mut Vec<ValidationError>) {
+    let mut seen = HashSet::new();
+    let mut reported = HashSet::new();
+    for variable in &state.variables {
+        if !seen.insert(variable.name.as_str()) && reported.insert(variable.name.as_str()) {
+            errors.push(ValidationError::DuplicateVariable {
+                state: state.id.clone(),
+                name: variable.name.clone(),
+            });
+        }
+        if let Some(reason) = declaration_problem(variable) {
+            errors.push(ValidationError::InvalidVariableDeclaration {
+                state: state.id.clone(),
+                name: variable.name.clone(),
+                reason,
+            });
+        }
+    }
+}
+
+/// What is wrong with the `type` and `options` of a declaration, if anything.
+fn declaration_problem(variable: &VariableDefinition) -> Option<String> {
+    let takes_options = matches!(
+        variable.variable_type,
+        None | Some(VariableType::String) | Some(VariableType::Select)
+    );
+    if variable.variable_type == Some(VariableType::Select) && variable.options.is_empty() {
+        return Some("a 'select' variable needs 'options'".to_string());
+    }
+    if !variable.options.is_empty() && !takes_options {
+        return Some("'options' only apply to a 'string' or 'select' variable".to_string());
+    }
+    let mut options = HashSet::new();
+    for option in &variable.options {
+        if option.trim().is_empty() {
+            return Some("'options' must not contain an empty value".to_string());
+        }
+        if !options.insert(option.as_str()) {
+            return Some(format!("'options' lists '{option}' more than once"));
+        }
+    }
+    if variable.source == VariableSource::Workflow && variable.scope == VariableScope::Local {
+        return Some(
+            "a 'scope: local' variable is filled by its step, not by 'source: workflow'"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// A variable of the same name has to mean the same thing in every step that
+/// declares it: the same `type` and the same `options`. Step-private
+/// variables are exempt, as no other step can see them.
+fn validate_variable_consistency(
+    definition: &WorkflowDefinition,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut first_declared: HashMap<&str, (&StateId, &VariableDefinition)> = HashMap::new();
+    for state_id in sorted_state_ids(definition) {
+        for variable in definition.states[state_id]
+            .variables
+            .iter()
+            .filter(|variable| !variable.is_local())
+        {
+            let Some((first_state, first)) = first_declared.get(variable.name.as_str()) else {
+                first_declared.insert(variable.name.as_str(), (state_id, variable));
+                continue;
+            };
+            if let Some(reason) = disagreement(first, variable) {
+                errors.push(ValidationError::InconsistentVariable {
+                    name: variable.name.clone(),
+                    state: (*first_state).clone(),
+                    other_state: state_id.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+}
+
+fn disagreement(first: &VariableDefinition, other: &VariableDefinition) -> Option<String> {
+    if first.variable_type != other.variable_type {
+        return Some(format!(
+            "type {:?} against {:?}",
+            first.variable_type, other.variable_type
+        ));
+    }
+    let sorted = |variable: &VariableDefinition| {
+        let mut options = variable.options.clone();
+        options.sort();
+        options
+    };
+    (sorted(first) != sorted(other))
+        .then(|| format!("options {:?} against {:?}", first.options, other.options))
+}
+
+/// The `set` of each choice: only variables the step declares, shared ones
+/// by name and `scope: local` ones under `local`, and values the declaration
+/// accepts. A templated value is checked when it is rendered.
+fn validate_set_assignments(state: &State, errors: &mut Vec<ValidationError>) {
+    for choice in &state.choices {
+        let places = [
+            (&choice.set.global, VariableScope::Global),
+            (&choice.set.local, VariableScope::Local),
+        ];
+        for (assignments, scope) in places {
+            for (name, value) in assignments {
+                let Some(declared) = state.variable(name) else {
+                    errors.push(ValidationError::SetUnknownVariable {
+                        state: state.id.clone(),
+                        label: choice.label.clone(),
+                        name: name.clone(),
+                    });
+                    continue;
+                };
+                let scope_problem = match (scope, declared.scope) {
+                    (VariableScope::Local, VariableScope::Global) => {
+                        Some("'set.local' only reaches 'scope: local' variables")
+                    }
+                    (VariableScope::Global, VariableScope::Local) => {
+                        Some("a 'scope: local' variable is set under 'set.local'")
+                    }
+                    _ => None,
+                };
+                if let Some(reason) = scope_problem {
+                    errors.push(ValidationError::SetScopeMismatch {
+                        state: state.id.clone(),
+                        label: choice.label.clone(),
+                        name: name.clone(),
+                        reason: reason.to_string(),
+                    });
+                } else if let Some(reason) = rejected_value(declared, value) {
+                    errors.push(ValidationError::SetValueRejected {
+                        state: state.id.clone(),
+                        label: choice.label.clone(),
+                        name: name.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Why `variable` does not accept the literal `value`, if it does not.
+fn rejected_value(variable: &VariableDefinition, value: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    if matches!(value, Value::String(text) if text.contains("{{")) {
+        return None;
+    }
+    let type_matches = match (variable.variable_type, value) {
+        (Some(VariableType::Integer), value) => value.is_i64() || value.is_u64(),
+        (Some(VariableType::Boolean), value) => value.is_boolean(),
+        (Some(VariableType::String | VariableType::Text | VariableType::Select), value) => {
+            value.is_string()
+        }
+        (None, _) => true,
+    };
+    if !type_matches {
+        return Some(format!(
+            "{value} is not a value of type {:?}",
+            variable.variable_type
+        ));
+    }
+    if variable.options.is_empty() {
+        return None;
+    }
+    let allowed = matches!(value, Value::String(text) if variable.options.contains(text));
+    (!allowed).then(|| format!("{value} is not one of {:?}", variable.options))
+}
+
+/// `exit_codes` and `exit` both say where a script's result goes, so a linear
+/// script step cannot have the first; and only an agent or script step can
+/// finish with the engine's own `timeout`.
+fn validate_exit_and_timeout(
+    definition: &WorkflowDefinition,
+    state: &State,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(ActionConfig::Script(script)) = &state.action {
+        if state.has_exit() && !script.exit_codes.is_empty() {
+            errors.push(ValidationError::ExitCodesWithExit {
+                state: state.id.clone(),
+                action_type: "script",
+            });
+        }
+    }
+    let can_time_out = matches!(
+        state.action,
+        Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_))
+    );
+    let declares_timeout = state
+        .choices
+        .iter()
+        .any(|choice| choice.label == TIMEOUT_LABEL);
+    // Old-shape workflows may use `timeout` as an ordinary label of a human
+    // gate, so the rule applies to the unified shape only.
+    let unified = definition.shape == DefinitionShape::Unified;
+    if unified && declares_timeout && !can_time_out && state.action.is_some() {
+        errors.push(ValidationError::TimeoutChoiceNotAllowed {
+            state: state.id.clone(),
+        });
     }
 }
 
@@ -562,36 +800,49 @@ fn validate_state_templates(
     state: &State,
     errors: &mut Vec<ValidationError>,
 ) {
-    let mut templated: Vec<(String, &str)> = Vec::new();
+    let mut templated: Vec<(String, String)> = Vec::new();
 
     match &state.action {
         Some(ActionConfig::Agent(agent)) => {
             // The same shape the decision branch below already has.
             if let Some(harness) = &agent.harness {
-                templated.push(("action.harness".to_string(), harness.as_str()));
+                templated.push(("action.harness".to_string(), harness.clone()));
             }
-            templated.push(("action.prompt".to_string(), agent.prompt.as_str()));
+            templated.extend(prompt_templates(
+                state,
+                "action.prompt",
+                &agent.prompt,
+                errors,
+            ));
             if let Some(model) = &agent.model {
-                templated.push(("action.model".to_string(), model.as_str()));
+                templated.push(("action.model".to_string(), model.clone()));
             }
         }
         Some(ActionConfig::Script(script)) => {
-            templated.push(("action.command".to_string(), script.command.as_str()));
+            templated.push(("action.command".to_string(), script.command.clone()));
             for (index, arg) in script.args.iter().enumerate() {
-                templated.push((format!("action.args[{index}]"), arg.as_str()));
+                templated.push((format!("action.args[{index}]"), arg.clone()));
             }
             if let Some(working_dir) = &script.working_dir {
-                templated.push(("action.working_dir".to_string(), working_dir.as_str()));
+                templated.push(("action.working_dir".to_string(), working_dir.clone()));
             }
             for (key, value) in &script.env {
-                templated.push((format!("action.env.{key}"), value.as_str()));
+                templated.push((format!("action.env.{key}"), value.clone()));
             }
         }
         Some(ActionConfig::Human(human)) => {
-            templated.push(("action.message".to_string(), human.instruction.as_str()));
+            templated.push(("action.message".to_string(), human.instruction.clone()));
+        }
+        Some(ActionConfig::Decision(decision)) => {
+            templated.extend(prompt_templates(
+                state,
+                "action.message",
+                &decision.message,
+                errors,
+            ));
         }
         Some(ActionConfig::Wait(wait)) => {
-            templated.push(("action.event_type".to_string(), wait.event.as_str()));
+            templated.push(("action.event_type".to_string(), wait.event.clone()));
         }
         None => {}
     }
@@ -599,15 +850,15 @@ fn validate_state_templates(
     match &state.decision {
         Some(DecisionConfig::Agent(agent)) => {
             if let Some(harness) = &agent.harness {
-                templated.push(("decision.harness".to_string(), harness.as_str()));
+                templated.push(("decision.harness".to_string(), harness.clone()));
             }
             if let Some(prompt) = &agent.prompt {
-                templated.push(("decision.prompt".to_string(), prompt.as_str()));
+                templated.push(("decision.prompt".to_string(), prompt.clone()));
             }
         }
         Some(DecisionConfig::Human(human)) => {
             if let Some(message) = &human.message {
-                templated.push(("decision.message".to_string(), message.as_str()));
+                templated.push(("decision.message".to_string(), message.clone()));
             }
         }
         Some(DecisionConfig::Rules) | None => {}
@@ -617,7 +868,8 @@ fn validate_state_templates(
     templated.sort_by(|left, right| left.0.cmp(&right.0));
 
     for (field, text) in templated {
-        let allowed = field == "action.prompt" || field == "action.message";
+        let text = text.as_str();
+        let allowed = field.starts_with("action.prompt") || field.starts_with("action.message");
         for source in step_reply_references(text) {
             if !allowed {
                 errors.push(ValidationError::StepReplyNotAllowed {
@@ -650,6 +902,25 @@ fn validate_state_templates(
                 });
             }
         }
+        for source in step_label_references(text) {
+            if !allowed {
+                errors.push(ValidationError::InvalidStepLabelSource {
+                    state: state.id.clone(),
+                    step_id: source,
+                    field: field.clone(),
+                });
+            } else if !definition
+                .states
+                .get(&source)
+                .is_some_and(|source_state| !source_state.terminal && source_state.action.is_some())
+            {
+                errors.push(ValidationError::InvalidStepLabelSource {
+                    state: state.id.clone(),
+                    step_id: source,
+                    field: field.clone(),
+                });
+            }
+        }
         for reference in unsupported_step_references(text) {
             errors.push(ValidationError::UnsupportedStepReference {
                 state: state.id.clone(),
@@ -676,6 +947,63 @@ fn validate_state_templates(
             }
         }
     }
+}
+
+/// The templates of a prompt or message, named for the report: the field
+/// itself for a plain text, `field[N]` for part N of a list, and
+/// `field[N].when` for a reference of its condition, which is checked like
+/// the placeholder it stands for. A condition that is no plain reference is
+/// reported here.
+fn prompt_templates(
+    state: &State,
+    field: &str,
+    text: &PromptText,
+    errors: &mut Vec<ValidationError>,
+) -> Vec<(String, String)> {
+    if text.is_plain() {
+        return text
+            .texts()
+            .map(|part| (field.to_string(), part.to_string()))
+            .collect();
+    }
+    let mut templates = Vec::new();
+    for (index, part) in text.parts().iter().enumerate() {
+        let place = format!("{field}[{}]", index + 1);
+        templates.push((place.clone(), part.text.clone()));
+        for reference in &part.when {
+            let when = format!("{place}.when");
+            match when_problem(reference) {
+                Some(reason) => errors.push(ValidationError::InvalidWhen {
+                    state: state.id.clone(),
+                    field: when,
+                    reason,
+                }),
+                None => templates.push((when, PromptPart::placeholder(reference))),
+            }
+        }
+    }
+    templates
+}
+
+/// Why `reference` cannot be the condition of a part, if it cannot: it must
+/// be one plain reference such as `local.notes`, with no braces, filter or
+/// white space inside.
+fn when_problem(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Some("a condition must name a value".to_string());
+    }
+    if reference.contains("{{") || reference.contains("}}") {
+        return Some(format!(
+            "'{reference}' is a template; write the reference without braces"
+        ));
+    }
+    if reference.contains('|') || reference.contains(char::is_whitespace) {
+        return Some(format!(
+            "'{reference}' is not a plain reference; filters and expressions are not supported"
+        ));
+    }
+    None
 }
 
 /// The name of a repository field as the author wrote it: a converted `v1`

@@ -77,19 +77,46 @@ pub struct UsageReading {
     pub subagent_stats: Option<SubagentStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// What the conductor used when it decided in the scope of this
+    /// attempt. Always the use of single runs, and never part of `total`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_total: Option<TokenCounts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_cost_usd: Option<f64>,
 }
 
 impl UsageReading {
+    /// What the conductor's own harness run reported, as the use of the
+    /// conductor: tokens and cost only, kept apart from the agent's.
+    pub fn of_conductor(run: UsageReading) -> UsageReading {
+        UsageReading {
+            conductor_total: run.total,
+            conductor_cost_usd: run.cost_usd,
+            ..UsageReading::default()
+        }
+    }
+
+    fn has_agent_use(&self) -> bool {
+        self.model.is_some()
+            || self.total.is_some()
+            || self.subagents.is_some()
+            || self.subagent_stats.is_some()
+            || self.cost_usd.is_some()
+    }
+
     fn is_empty(&self) -> bool {
-        self.model.is_none()
-            && self.total.is_none()
-            && self.subagents.is_none()
-            && self.subagent_stats.is_none()
-            && self.cost_usd.is_none()
+        !self.has_agent_use() && self.conductor_total.is_none() && self.conductor_cost_usd.is_none()
     }
 
     /// Puts a later reading of the same attempt on this one.
     fn absorb(&mut self, later: UsageReading) {
+        self.conductor_total = plus(self.conductor_total, later.conductor_total);
+        self.conductor_cost_usd = plus_cost(self.conductor_cost_usd, later.conductor_cost_usd);
+        // A reading of the conductor alone says nothing about the agent: it
+        // must not change the basis or the harness of what the agent used.
+        if !later.has_agent_use() {
+            return;
+        }
         let counts = |a: Option<TokenCounts>, b: Option<TokenCounts>| match later.basis {
             ReadingBasis::Increment => plus(a, b),
             ReadingBasis::SessionTotal => b.or(a),
@@ -120,6 +147,13 @@ impl UsageReading {
 fn plus(a: Option<TokenCounts>, b: Option<TokenCounts>) -> Option<TokenCounts> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.plus(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn plus_cost(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
         (a, b) => a.or(b),
     }
 }
@@ -301,10 +335,14 @@ pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageRea
         let mut count: Option<u32> = None;
         let mut stats: Option<SubagentStats> = None;
         let mut cost: Option<f64> = None;
+        let mut conductor_total: Option<TokenCounts> = None;
+        let mut conductor_cost: Option<f64> = None;
         for attempt in attempts {
             let Some(reading) = readings.get(&attempt) else {
                 continue;
             };
+            conductor_total = plus(conductor_total, reading.conductor_total);
+            conductor_cost = plus_cost(conductor_cost, reading.conductor_cost_usd);
             if let Some(model) = &reading.model {
                 position.model = Some(model.clone());
             }
@@ -355,13 +393,17 @@ pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageRea
             || subagents.is_some()
             || count.is_some()
             || stats.is_some()
-            || cost.is_some())
+            || cost.is_some()
+            || conductor_total.is_some()
+            || conductor_cost.is_some())
         .then_some(PositionUsage {
             total,
             subagents,
             subagent_count: count,
             subagent_stats: stats,
             cost_usd: cost,
+            conductor_total,
+            conductor_cost_usd: conductor_cost,
         });
     }
 }
@@ -599,5 +641,37 @@ mod tests {
             })
         );
         assert_eq!(reading.basis, ReadingBasis::Increment);
+    }
+
+    #[test]
+    fn a_conductor_reading_keeps_the_basis_and_harness_of_the_agents_reading() {
+        let mut agent = reading(ReadingBasis::SessionTotal, 10, 4, 1.0);
+        agent.harness = Some("claude-code".into());
+
+        agent.absorb(UsageReading::of_conductor(reading(
+            ReadingBasis::Increment,
+            3,
+            1,
+            0.1,
+        )));
+
+        assert_eq!(agent.basis, ReadingBasis::SessionTotal);
+        assert_eq!(agent.harness.as_deref(), Some("claude-code"));
+        assert_eq!(agent.total, tokens(10, 4));
+        assert_eq!(agent.cost_usd, Some(1.0));
+        assert_eq!(agent.conductor_total, tokens(3, 1));
+        assert_eq!(agent.conductor_cost_usd, Some(0.1));
+    }
+
+    #[test]
+    fn a_conductor_reading_leaves_out_what_is_not_its_use() {
+        let mut run = reading(ReadingBasis::Increment, 3, 1, 0.1);
+        run.model = Some("m".into());
+        run.subagent_stats = Some(SubagentStats::default());
+
+        let conductor = UsageReading::of_conductor(run);
+
+        assert!(!conductor.has_agent_use());
+        assert!(!conductor.is_empty());
     }
 }

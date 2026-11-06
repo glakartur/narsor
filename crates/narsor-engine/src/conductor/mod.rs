@@ -53,6 +53,7 @@
 
 pub mod actor;
 pub mod assembly;
+pub mod autopilot;
 pub mod chat;
 pub mod failure;
 pub mod invoke;
@@ -73,6 +74,7 @@ pub use actor::{
     AdvisoryInterrupts, ConductorActor, ConductorAnswer, ConductorInvoker, Invocation,
     InvocationOutcome, InvocationQueue, MAX_AUTOMATIC_ATTEMPTS,
 };
+pub use autopilot::{Autopilot, CONDUCTOR_ANSWER_LIMIT};
 pub use chat::{annotation_of, ProposalContext, ProposalRecord};
 pub use failure::{active_failure_problem, agent_attempt_left_traces, PassLauncher};
 pub use invoke::{ConductorAccess, HarnessInvoker, LiveHarness, DEFAULT_CONDUCTOR_TIMEOUT};

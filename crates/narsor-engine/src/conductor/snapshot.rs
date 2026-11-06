@@ -36,6 +36,7 @@ use serde_json::Value;
 use crate::conductor::store::{Annotation, ChatEntry, ConductorStore, QueuedRequest};
 use crate::domain::{ChoiceDefinition, Event, EventData, WorkflowExecution};
 use crate::engine::actions::human::PendingHumanInput;
+use crate::engine::{METADATA_ENGINE_KEY, METADATA_STEP_LOCALS_KEY};
 use crate::persistence::{ConversationSource, ConversationStore, ExecutionStore};
 
 /// The limits of one snapshot. The numbers are the starting point, not a
@@ -107,6 +108,9 @@ impl SnapshotBudget {
     }
 }
 
+/// The most of the current step's local values the snapshot shows.
+const STEP_LOCALS_BYTES: usize = 2048;
+
 /// How many times the shortened limits are halved before they are left out.
 const MAX_LEVEL: u32 = 8;
 
@@ -159,6 +163,8 @@ pub struct SnapshotInput {
     pub annotations: Vec<Annotation>,
     /// The context's variables.
     pub variables: Value,
+    /// The `scope: local` values the current step keeps, name → value.
+    pub step_locals: Value,
     /// The execution's events, oldest first.
     pub events: Vec<Event>,
     /// The conversations, the current state's first, latest first within.
@@ -184,6 +190,7 @@ impl Default for SnapshotInput {
             pending_input: None,
             annotations: Vec::new(),
             variables: Value::Null,
+            step_locals: Value::Null,
             events: Vec::new(),
             conversations: Vec::new(),
             chat: Vec::new(),
@@ -274,12 +281,27 @@ impl SnapshotInput {
             pending_input: pending.and_then(|pending| serde_json::to_value(pending).ok()),
             annotations,
             variables: serde_json::to_value(&execution.context.variables).unwrap_or(Value::Null),
+            step_locals: current_step_locals(execution),
             events,
             conversations,
             chat,
             artifacts,
         }
     }
+}
+
+/// The `scope: local` values the current state of `execution` keeps.
+fn current_step_locals(execution: &WorkflowExecution) -> Value {
+    let Some(state_id) = execution.current_state.as_deref() else {
+        return Value::Null;
+    };
+    execution
+        .metadata
+        .get(METADATA_ENGINE_KEY)
+        .and_then(|engine| engine.get(METADATA_STEP_LOCALS_KEY))
+        .and_then(|locals| locals.get(state_id))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 /// Renders `input` within `budget` (see the module documentation).
@@ -352,6 +374,15 @@ fn render_whole(input: &SnapshotInput) -> String {
             text,
             "\n## The operator's message you answer\n\n{}",
             message.text
+        );
+    }
+
+    if !is_empty_json(&input.step_locals) {
+        let _ = writeln!(text, "\n## Local values of the current step\n");
+        let _ = writeln!(
+            text,
+            "```json\n{}\n```",
+            head(&pretty(&input.step_locals), STEP_LOCALS_BYTES)
         );
     }
 

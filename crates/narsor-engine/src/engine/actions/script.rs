@@ -7,8 +7,9 @@
 //!    agent gives (KTD3, [`super::answer`]): that label wins, and brings its
 //!    `reason`, `variables`, `artifacts`, `additional_data` and
 //!    `additional_artifacts` along;
-//! 2. otherwise the exit code is looked up in `exit_codes`;
-//! 3. otherwise the documented default applies: `0` → `success`, anything
+//! 2. otherwise, for a step with `exit`, exit code 0 is the step's one exit;
+//! 3. otherwise the exit code is looked up in `exit_codes`;
+//! 4. otherwise the documented default applies: `0` → `success`, anything
 //!    else → `failure`.
 //!
 //! A process that never returned an exit code — killed by a signal — is an
@@ -26,9 +27,9 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use super::answer::{read_choice_answer, ChoiceAnswer};
+use super::answer::{read_answer, AnswerShape, ChoiceAnswer};
 use super::{ActionExecutor, ActionOutcome, ActionRequest, TimedOutAction, ACTION_ID_ENV_VAR};
-use crate::domain::{ActionConfig, ActionError, ActionResult, ScriptActionConfig};
+use crate::domain::{ActionConfig, ActionError, ActionResult, ScriptActionConfig, EXIT_LABEL};
 
 /// How much of stdout and of stderr is kept in the [`ActionResult`], in bytes.
 ///
@@ -82,7 +83,14 @@ impl ActionExecutor for ScriptExecutor {
                 .timeout
                 .or_else(|| config.timeout_secs.map(Duration::from_secs));
 
-            run(config, &working_dir, request.action_execution_id, limit).await
+            run(
+                config,
+                &working_dir,
+                request.action_execution_id,
+                limit,
+                request.contract.has_exit(),
+            )
+            .await
         })
     }
 }
@@ -109,6 +117,7 @@ fn action_type_name(action: &ActionConfig) -> &'static str {
         ActionConfig::Script(_) => "script",
         ActionConfig::Human(_) => "human",
         ActionConfig::Wait(_) => "wait",
+        ActionConfig::Decision(_) => "decision",
     }
 }
 
@@ -137,6 +146,7 @@ async fn run(
     working_dir: &Path,
     action_execution_id: &str,
     limit: Option<Duration>,
+    has_exit: bool,
 ) -> Result<ActionOutcome, ActionError> {
     let mut command = Command::new(&config.command);
     command
@@ -197,17 +207,31 @@ async fn run(
         return Err(signal_error(config, &status, &stderr));
     };
 
-    let mut result = match parse_json_output(&stdout) {
-        Some(answer) => answer
-            .map_err(|reason| invalid_output_error(config, reason))?
-            .into_result(),
-        None => ActionResult::new(label_from_exit_code(exit_code, &config.exit_codes)),
-    };
+    let mut result = result_of_output(&stdout, exit_code, has_exit, &config.exit_codes)
+        .map_err(|reason| invalid_output_error(config, reason))?;
     result.exit_code = Some(exit_code);
     result.stdout = truncate(&stdout);
     result.stderr = truncate(&stderr);
 
     Ok(ActionOutcome::Completed(result))
+}
+
+/// The result a finished script stands for: its stdout answer when it
+/// printed one, else its exit code. A step's `exit` is taken only on code `0`.
+fn result_of_output(
+    stdout: &str,
+    exit_code: i32,
+    has_exit: bool,
+    exit_codes: &HashMap<i32, String>,
+) -> Result<ActionResult, &'static str> {
+    let exits = has_exit && exit_code == 0;
+    match parse_json_output(stdout, AnswerShape::of_step(exits)) {
+        Some(answer) => Ok(answer?.into_result()),
+        None if exits => Ok(ActionResult::new(EXIT_LABEL)),
+        None => Ok(ActionResult::new(label_from_exit_code(
+            exit_code, exit_codes,
+        ))),
+    }
 }
 
 /// Drains `pipe` to its end, retaining at most the latest [`MAX_BUFFERED_OUTPUT_BYTES`].
@@ -252,13 +276,17 @@ fn label_from_exit_code(exit_code: i32, exit_codes: &HashMap<i32, String>) -> St
 /// Reads the answer object (KTD3) from stdout.
 ///
 /// Returns `None` — never an error — when stdout is not JSON at all (an
-/// ordinary log line) or is JSON without a string `choice`. Scripts are
-/// explicitly allowed to print whatever they like and let the exit code
-/// decide. An answer with a `choice` but a field of the wrong shape is an
-/// error: it was meant as an answer, and part of it would be lost.
-fn parse_json_output(stdout: &str) -> Option<Result<ChoiceAnswer, &'static str>> {
+/// ordinary log line) or, in a step with choices, is JSON without a string
+/// `choice`. Scripts are explicitly allowed to print whatever they like and
+/// let the exit code decide. When the script takes its step's `exit`, any
+/// JSON object is the answer, as for an agent. An answer of the wrong shape
+/// is an error: it was meant as an answer, and part of it would be lost.
+fn parse_json_output(
+    stdout: &str,
+    shape: AnswerShape,
+) -> Option<Result<ChoiceAnswer, &'static str>> {
     let payload: Value = serde_json::from_str(stdout.trim()).ok()?;
-    read_choice_answer(payload.as_object()?)
+    read_answer(payload.as_object()?, shape)
 }
 
 /// Keeps the tail of captured output within [`MAX_CAPTURED_OUTPUT_BYTES`].
@@ -361,5 +389,43 @@ fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
     {
         let _ = status;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::result_of_output;
+    use crate::domain::EXIT_LABEL;
+
+    const ANSWER_WITHOUT_CHOICE: &str = r#"{"variables":{"pr_number":123}}"#;
+
+    #[test]
+    fn json_without_a_choice_supplies_the_variables_of_an_exit() {
+        let result = result_of_output(ANSWER_WITHOUT_CHOICE, 0, true, &HashMap::new()).unwrap();
+
+        assert_eq!(result.output_label, EXIT_LABEL);
+        assert_eq!(result.variables.get("pr_number"), Some(&json!(123)));
+    }
+
+    #[test]
+    fn json_without_a_choice_is_no_exit_after_a_non_zero_exit_code() {
+        let result = result_of_output(ANSWER_WITHOUT_CHOICE, 3, true, &HashMap::new()).unwrap();
+
+        assert_ne!(result.output_label, EXIT_LABEL);
+        assert!(result.variables.is_empty());
+    }
+
+    #[test]
+    fn json_without_a_choice_is_only_a_log_line_in_a_step_with_choices() {
+        let exit_codes = HashMap::from([(0, "success".to_string())]);
+
+        let result = result_of_output(ANSWER_WITHOUT_CHOICE, 0, false, &exit_codes).unwrap();
+
+        assert_eq!(result.output_label, "success");
+        assert!(result.variables.is_empty());
     }
 }

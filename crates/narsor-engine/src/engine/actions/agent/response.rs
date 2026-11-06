@@ -62,7 +62,7 @@ pub(super) fn agent_input_fields(options: Vec<String>) -> Vec<crate::domain::Hum
 /// * nothing in the answer parses as a JSON object;
 /// * objects are there, but none carries a string `choice`.
 pub fn extract_output(text: &str) -> Result<ChoiceAnswer, ActionError> {
-    match extract_response(text)? {
+    match extract_response(text, AnswerShape::Choice)? {
         AgentResponse::Completed(output) => Ok(output),
         AgentResponse::AwaitingInput { .. } => Err(no_label_error(
             "the agent requested human input instead of producing an output label",
@@ -80,9 +80,12 @@ pub fn extract_output(text: &str) -> Result<ChoiceAnswer, ActionError> {
 /// is read instead, and only its failure is reported. A label the state does
 /// not declare is not unusable here; like a label read from text, it is the
 /// engine's to reject.
-pub(super) fn read_response(run: &HarnessRun) -> Result<AgentResponse, ActionError> {
+pub(super) fn read_response(
+    run: &HarnessRun,
+    shape: AnswerShape,
+) -> Result<AgentResponse, ActionError> {
     if let Some(structured) = &run.structured_output {
-        match structured_response(structured) {
+        match structured_response(structured, shape) {
             Ok(response) => return Ok(response),
             Err(error) => tracing::warn!(
                 reason = %error.message,
@@ -90,14 +93,14 @@ pub(super) fn read_response(run: &HarnessRun) -> Result<AgentResponse, ActionErr
             ),
         }
     }
-    extract_response(&run.text)
+    extract_response(&run.text, shape)
 }
 
 /// What kind of final answer `value` is, by the same rule [`read_response`]
 /// uses: `None` for anything that is not an answer. A label the state does
 /// not declare is still a final answer; the engine rejects it later.
-pub(crate) fn final_answer_kind(value: &Value) -> Option<FinalAnswer> {
-    match structured_response(value) {
+pub(crate) fn final_answer_kind(value: &Value, shape: AnswerShape) -> Option<FinalAnswer> {
+    match structured_response(value, shape) {
         Ok(AgentResponse::Completed(_)) => Some(FinalAnswer::Choice),
         Ok(AgentResponse::AwaitingInput { .. }) => Some(FinalAnswer::AwaitingInput),
         Err(_) => None,
@@ -110,26 +113,26 @@ pub(crate) fn final_answer_kind(value: &Value) -> Option<FinalAnswer> {
 ///
 /// Stricter than [`extract_response`] on purpose: a harness ends the step on
 /// this, so an example object quoted in the middle of a message must not.
-pub(crate) fn closing_answer(text: &str) -> Option<(Value, FinalAnswer)> {
-    let (_, object) = final_contract(text)?;
+pub(crate) fn closing_answer(text: &str, shape: AnswerShape) -> Option<(Value, FinalAnswer)> {
+    let (_, object) = final_contract(text, shape)?;
     let value = serde_json::from_str::<Value>(object).ok()?;
-    let kind = final_answer_kind(&value)?;
+    let kind = final_answer_kind(&value, shape)?;
     Some((value, kind))
 }
 
 /// Reads an answer from a harness's `structured_output` value, by the same
 /// rules as an object found in the text.
-fn structured_response(value: &Value) -> Result<AgentResponse, ActionError> {
+fn structured_response(value: &Value, shape: AnswerShape) -> Result<AgentResponse, ActionError> {
     let object = value
         .as_object()
-        .filter(|object| is_answer_object(object))
+        .filter(|object| is_answer_object(object, shape))
         .ok_or_else(|| {
             no_label_error(
                 "the structured output has neither a string 'choice' nor an 'awaiting_input' status",
                 &value.to_string(),
             )
         })?;
-    response_from_object(object).map_err(|reason| no_label_error(reason, &value.to_string()))
+    response_from_object(object, shape).map_err(|reason| no_label_error(reason, &value.to_string()))
 }
 
 /// Writes the agent's question to the conversation as a narsor entry, when
@@ -161,7 +164,7 @@ pub(super) fn record_question(conversation: &ConversationSink, response: &AgentR
 
 /// Extracts either a normal label or a request that pauses the same agent
 /// action. The last matching object wins, following the normal output rule.
-fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
+fn extract_response(text: &str, shape: AnswerShape) -> Result<AgentResponse, ActionError> {
     let objects = json_objects(text);
 
     if objects.is_empty() {
@@ -171,23 +174,24 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         ));
     }
 
-    let Some(object) = objects
-        .iter()
-        .rev()
-        .find_map(|value| value.as_object().filter(|object| is_answer_object(object)))
-    else {
+    let Some(object) = objects.iter().rev().find_map(|value| {
+        value
+            .as_object()
+            .filter(|object| is_answer_object(object, shape))
+    }) else {
         return Err(no_label_error(
             "the agent's answer contains JSON, but no object with a string 'choice' key",
             text,
         ));
     };
 
-    response_from_object(object).map_err(|reason| no_label_error(reason, text))
+    response_from_object(object, shape).map_err(|reason| no_label_error(reason, text))
 }
 
-/// Whether `object` is an answer at all: a question, or a string `choice`.
-fn is_answer_object(object: &Map<String, Value>) -> bool {
-    is_question(object) || answer::has_choice(object)
+/// Whether `object` is an answer at all: a question, a string `choice`, or
+/// for a step with an `exit` any object.
+fn is_answer_object(object: &Map<String, Value>, shape: AnswerShape) -> bool {
+    is_question(object) || shape == AnswerShape::Exit || answer::has_choice(object)
 }
 
 /// Whether `object` asks a person before the task continues.
@@ -198,12 +202,15 @@ fn is_question(object: &Map<String, Value>) -> bool {
 /// Turns an answer object into the response it stands for. An error is the
 /// reason the object is unusable; the caller quotes the answer it came
 /// from (the agent's text, or the structured output) with it.
-fn response_from_object(object: &Map<String, Value>) -> Result<AgentResponse, &'static str> {
+fn response_from_object(
+    object: &Map<String, Value>,
+    shape: AnswerShape,
+) -> Result<AgentResponse, &'static str> {
     if is_question(object) {
         return question_from_object(object);
     }
-    answer::read_choice_answer(object)
-        .expect("the object was selected for having a choice")
+    answer::read_answer(object, shape)
+        .expect("the object was selected as an answer of this shape")
         .map(AgentResponse::Completed)
 }
 
@@ -327,8 +334,10 @@ pub(super) fn build_result(
     session: &AgentSession,
     run: &HarnessRun,
     finished: &FinishedRun,
+    shape: AnswerShape,
 ) -> ActionResult {
-    let reply = run_reply(run).or_else(|| contract_reply(&answer.reason, &answer.additional_data));
+    let reply =
+        run_reply(run, shape).or_else(|| contract_reply(&answer.reason, &answer.additional_data));
     let session_record = serde_json::to_value(session).unwrap_or(Value::Null);
 
     let mut result = answer.into_result();
@@ -372,8 +381,12 @@ fn contract_reply(reason: &str, additional_data: &Map<String, Value>) -> Option<
 
 /// Adds the attempt's reply to the details of an extraction failure, so a
 /// format reprompt can keep it instead of its own text (R3).
-pub(super) fn record_reply_in_details(error: &mut ActionError, run: &HarnessRun) {
-    let Some(reply) = run_reply(run) else {
+pub(super) fn record_reply_in_details(
+    error: &mut ActionError,
+    run: &HarnessRun,
+    shape: AnswerShape,
+) {
+    let Some(reply) = run_reply(run, shape) else {
         return;
     };
     if let Some(Value::Object(details)) = error.details.as_mut() {
@@ -383,15 +396,15 @@ pub(super) fn record_reply_in_details(error: &mut ActionError, run: &HarnessRun)
 
 /// The step's reply of `run`: the reply its harness read, or else its final
 /// text, without the output-contract object (R3).
-pub(crate) fn run_reply(run: &HarnessRun) -> Option<String> {
-    clean_reply(run.reply.as_deref().unwrap_or(&run.text))
+pub(crate) fn run_reply(run: &HarnessRun, shape: AnswerShape) -> Option<String> {
+    clean_reply(run.reply.as_deref().unwrap_or(&run.text), shape)
 }
 
 /// The agent's reply: its text without the output-contract object, and
 /// without the code fence around that object (R3). `None` when nothing else
 /// is left.
-fn clean_reply(text: &str) -> Option<String> {
-    let reply = match final_contract_start(text) {
+fn clean_reply(text: &str, shape: AnswerShape) -> Option<String> {
+    let reply = match final_contract_start(text, shape) {
         Some(cut) => text[..cut].to_string(),
         None => {
             let mut reply = text.to_string();
@@ -416,12 +429,12 @@ fn clean_reply(text: &str) -> Option<String> {
 /// and a closing fence), found from the right, so a brace in the prose
 /// before it never hides it. At most [`MAX_BRACE_CANDIDATES`] braces are
 /// tried.
-fn final_contract_start(text: &str) -> Option<usize> {
-    final_contract(text).map(|(cut, _)| cut)
+fn final_contract_start(text: &str, shape: AnswerShape) -> Option<usize> {
+    final_contract(text, shape).map(|(cut, _)| cut)
 }
 
 /// [`final_contract_start`], with the text of the closing object as well.
-fn final_contract(text: &str) -> Option<(usize, &str)> {
+fn final_contract(text: &str, shape: AnswerShape) -> Option<(usize, &str)> {
     let trimmed = text.trim_end();
     let (body, fenced) = match trimmed.strip_suffix("```") {
         Some(rest) => (rest.trim_end(), true),
@@ -435,7 +448,7 @@ fn final_contract(text: &str) -> Option<(usize, &str)> {
             return None;
         }
         candidates = &body[..start];
-        if object_end(body, start) != Some(body.len()) || !is_contract(&body[start..]) {
+        if object_end(body, start) != Some(body.len()) || !is_contract(&body[start..], shape) {
             continue;
         }
         if !fenced {
@@ -487,10 +500,14 @@ fn object_end(text: &str, start: usize) -> Option<usize> {
 }
 
 /// Whether `object` is an output-contract object: an answer or a question.
-fn is_contract(object: &str) -> bool {
+fn is_contract(object: &str, shape: AnswerShape) -> bool {
     serde_json::from_str::<Value>(object)
         .ok()
-        .and_then(|value| value.as_object().map(is_answer_object))
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|object| is_answer_object(object, shape))
+        })
         .unwrap_or(false)
 }
 
@@ -500,7 +517,7 @@ fn last_contract_span(text: &str) -> Option<(usize, usize)> {
     top_level_objects(text)
         .into_iter()
         .rev()
-        .find(|&(start, end)| is_contract(&text[start..end]))
+        .find(|&(start, end)| is_contract(&text[start..end], AnswerShape::Choice))
 }
 
 #[cfg(test)]
@@ -509,7 +526,7 @@ mod json_object_tests {
     use serde_json::json;
 
     fn label_of(text: &str) -> String {
-        match extract_response(text).expect("a response") {
+        match extract_response(text, super::AnswerShape::Choice).expect("a response") {
             AgentResponse::Completed(answer) => answer.choice,
             AgentResponse::AwaitingInput { .. } => panic!("not an output"),
         }
@@ -543,7 +560,7 @@ mod json_object_tests {
         let text = format!("{}\n{{\"choice\":\"findings\"}}", "{".repeat(200_000));
         let started = std::time::Instant::now();
         let _ = json_objects(&text);
-        let _ = super::clean_reply(&text);
+        let _ = super::clean_reply(&text, super::AnswerShape::Choice);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "stray braces must not make the scan quadratic: {:?}",
@@ -562,8 +579,35 @@ mod json_object_tests {
 
 #[cfg(test)]
 mod reply_tests {
-    use super::{clean_reply, contract_reply};
+    use super::{contract_reply, AnswerShape};
     use crate::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
+
+    fn clean_reply(text: &str) -> Option<String> {
+        super::clean_reply(text, AnswerShape::Choice)
+    }
+
+    #[test]
+    fn an_exit_answer_closing_the_text_is_cut_from_the_reply() {
+        let text = "done\n{\"reason\":\"x\",\"variables\":{}}";
+
+        assert_eq!(
+            super::clean_reply(text, AnswerShape::Exit),
+            Some("done".to_string())
+        );
+        assert_eq!(
+            clean_reply(text),
+            Some(text.to_string()),
+            "in a step with choices that object is no answer"
+        );
+    }
+
+    #[test]
+    fn an_exit_answer_closing_the_text_is_the_final_answer() {
+        let text = "done\n{\"reason\":\"x\",\"variables\":{}}";
+
+        assert!(super::closing_answer(text, AnswerShape::Exit).is_some());
+        assert!(super::closing_answer(text, AnswerShape::Choice).is_none());
+    }
 
     #[test]
     fn a_long_reply_keeps_its_beginning_and_is_marked_cut() {

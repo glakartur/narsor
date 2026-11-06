@@ -13,7 +13,7 @@ next invocation; the *Dyrygent* tab names the harness it runs on. It has one his
 execution, with its chat, kept under the daemon's data directory, so it
 survives a restart of the daemon and of the interface.
 
-It steps in on its own in three places, each with fixed limits:
+It steps in on its own in five places, each with fixed limits:
 
 * **A step without a usable output label.** The engine first asks the agent
   once more in the same session. If that does not help either, the conductor
@@ -28,9 +28,32 @@ It steps in on its own in three places, each with fixed limits:
   failure — that can only be proposed.
 * **A `human` gate.** It may add a summary and a recommendation to the form.
   The gate always waits for the operator.
+* **A `decision` step with `by: conductor`.** The conductor always decides this
+  step, whatever `autopilot` says. It gets the message of the step, the choices
+  and what each choice requires. When it is sure, it picks a label and gives the
+  values that label requires. The workflow then takes the transition, and `set`
+  of the label applies. You can undo that choice. When the conductor is not sure,
+  when it fails, or when no conductor is attached, the operator decides. The form
+  shows the conductor's proposal, already filled in. A `by: human` decision
+  always waits for the operator.
+* **A question of an agent, when `autopilot` is on.** With `autopilot` set to
+  `on` the conductor answers a question of an agent when it is sure. With
+  `best-effort` it also takes a reasonable default and lists its assumptions in
+  the rationale. With `off`, or when the variable is not set, the operator gets
+  every question. The conductor answers at most 5 questions for one entry into a
+  step. The next question goes to the operator. See
+  [`AgentAction`](agents.md#agentaction--running-an-ai-agent).
 
 Every decision it takes is an event with its confidence and rationale
-(`narsor events`). If the conductor itself cannot answer, its invocation is
+(`narsor events`). For an answer to an agent, the rationale is also in the
+conversation of the step, under *ODPOWIEDŹ DYRYGENTA*.
+
+**Cost.** What the conductor uses is counted apart from the agents. The tokens
+and the cost of a conductor run go to the step it decided in. The agent numbers
+never include them. The usage line of a task ends with `· dyrygent $0.05 · razem
+$1.25` when the conductor reported any use: the first numbers are the agents'
+alone, and `razem` is the sum. In the step list of *Przebieg*, a `dyr.` value
+shows the conductor's part of a step. If the conductor itself cannot answer, its invocation is
 repeated once — also across a daemon restart — and then the operator gets a
 problem with the raw error; a failure of the conductor never triggers the
 conductor again.

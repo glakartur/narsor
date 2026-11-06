@@ -434,6 +434,7 @@ pub fn build_timeline(
             // The conductor's work is not an attempt of its own (D55): it is
             // pinned to the visit it happened in, like a decision.
             EventData::DecisionMade { .. }
+            | EventData::VariableSetByWorkflow { .. }
             | EventData::ArtifactCreated { .. }
             | EventData::ProblemRaised { .. }
             | EventData::ConductorStarted { .. }

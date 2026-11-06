@@ -86,10 +86,10 @@ use crate::conductor::ConductorRegistry;
 use crate::config::{AgentArgs, AgentDefaults};
 use crate::domain::{
     effective_title, ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy,
-    Artifact, ArtifactReference, ChoiceDefinition, DecisionProviderType, Event, EventData,
-    ExecutionId, ExecutionStatus, HumanInputField, HumanInputType, InputCloseReason, ProblemKind,
-    RepromptedBy, State, StateId, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
-    LOCAL_VARIABLE_PREFIX,
+    Artifact, ArtifactReference, ChoiceDefinition, DecisionMaker, DecisionProviderType, Event,
+    EventData, ExecutionId, ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType,
+    InputCloseReason, ProblemKind, RepromptedBy, State, StateId, VariableSource,
+    WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
 };
 use crate::engine::actions::agent::{
     self, DefaultHarnessSource, UsageReporter, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL,
@@ -108,7 +108,7 @@ use crate::engine::actions::{
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
-use crate::engine::timeline_file::FileReadingSink;
+use crate::engine::timeline_file::{FileReadingSink, ReadingSink};
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
 use crate::workflow::template::{
     embeds_user_content, step_reply_references, step_stream_references,
@@ -117,20 +117,25 @@ use crate::workflow::{
     action_context_references, places_step_history, DeclaredNames, StepMemory, TemplateScope,
 };
 
+mod conductor_decision;
 mod failure;
 mod gate_context;
 mod operations;
 mod rescue;
 mod step_memory;
+mod variable_rules;
 
-use gate_context::{has_step_contract, GateContext};
+use gate_context::{
+    decision_fields, has_step_contract, holds_variables_to_declarations, local_values, GateContext,
+};
+use variable_rules::Assignment;
 
 pub use failure::{
     step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
 };
 pub use operations::{
-    execution_episode, plan_operator_transition, ManualTransition, OperatorTransition,
-    OutputDecisionUndo, TransitionPlan, UndoneOutputDecision,
+    execution_episode, manual_override_allowed, plan_operator_transition, ManualTransition,
+    OperatorTransition, OutputDecisionUndo, TransitionPlan, UndoneOutputDecision,
 };
 pub use step_memory::{
     StepAttempt, StepAttempts, METADATA_STEP_ATTEMPTS_KEY, METADATA_STEP_LOCALS_KEY,
@@ -234,6 +239,8 @@ pub enum ActionKind {
     Human,
     /// `WaitAction` — no executor in this version.
     Wait,
+    /// `DecisionAction` — no executor in this version.
+    Decision,
 }
 
 impl ActionKind {
@@ -244,6 +251,7 @@ impl ActionKind {
             ActionConfig::Script(_) => Self::Script,
             ActionConfig::Human(_) => Self::Human,
             ActionConfig::Wait(_) => Self::Wait,
+            ActionConfig::Decision(_) => Self::Decision,
         }
     }
 
@@ -254,6 +262,7 @@ impl ActionKind {
             Self::Script => "script",
             Self::Human => "human",
             Self::Wait => "wait",
+            Self::Decision => "decision",
         }
     }
 }
@@ -416,7 +425,8 @@ impl OutputRejection {
                     .choices
                     .iter()
                     .find(|choice| choice.label == result.output_label)?;
-                unmet_requirements(choice, result, kept_locals)?
+                unmet_requirements(choice, result, kept_locals)
+                    .or_else(|| variable_rules::value_outside_options(state, &result.variables))?
             }
             Err(_) => return None,
         };
@@ -513,37 +523,68 @@ fn unmet_requirements(
     ))
 }
 
-/// Moves the variables of an agent or script `result` that its step does not
-/// define into its `additional_data` (KTD5): kept, but never written to the
-/// context. Returns a warning for each one moved.
+/// Writes what `set` assigned: shared variables into the context, local
+/// ones into the memory of `state_id`.
+fn write_assignments(
+    execution: &mut WorkflowExecution,
+    state_id: &str,
+    assignments: &[Assignment],
+) -> Result<(), EngineError> {
+    let (local, global): (Vec<&Assignment>, Vec<&Assignment>) =
+        assignments.iter().partition(|assignment| assignment.local);
+    for assignment in global {
+        execution
+            .context
+            .variables
+            .insert(assignment.name.clone(), assignment.value.clone());
+    }
+    let local_values = local
+        .into_iter()
+        .map(|assignment| (assignment.name.clone(), assignment.value.clone()))
+        .collect();
+    step_memory::write_locals(execution, state_id, local_values)
+}
+
+/// Moves the variables of an agent, script or decision `result` that its step does not
+/// let it write into its `additional_data` (KTD5): kept, but never written
+/// to the context. That is a variable the step does not define, and one
+/// only the workflow sets (`source: workflow`). Returns a warning for each
+/// one moved.
 ///
 /// The engine's own [`agent::SESSION_ID_VARIABLE`] stays where it is, and so
 /// does whatever a gate or a person gave: only a step that can define
 /// variables is held to its definitions.
 fn set_aside_undeclared_variables(state: &State, result: &mut ActionResult) -> Vec<String> {
-    if !has_step_contract(state) {
+    if !holds_variables_to_declarations(state) {
         return Vec::new();
     }
     let is_kept = |name: &String| {
         name == agent::SESSION_ID_VARIABLE
             || state
-                .variables
-                .iter()
-                .any(|variable| &variable.name == name)
+                .variable(name)
+                .is_some_and(|variable| variable.source == VariableSource::Step)
     };
-    let (kept, undeclared): (Map<String, Value>, Map<String, Value>) =
+    let (kept, set_aside): (Map<String, Value>, Map<String, Value>) =
         std::mem::take(&mut result.variables)
             .into_iter()
             .partition(|(name, _)| is_kept(name));
     result.variables = kept;
-    undeclared
+    set_aside
         .into_iter()
         .map(|(name, value)| {
-            let warning = format!(
-                "variable '{name}' is not defined on step '{}'; it was kept as additional \
-                 data and not written to the context",
-                state.id
-            );
+            let warning = if state.variable(&name).is_some() {
+                format!(
+                    "variable '{name}' is set by the workflow alone on step '{}'; it was kept \
+                     as additional data and not written to the context",
+                    state.id
+                )
+            } else {
+                format!(
+                    "variable '{name}' is not defined on step '{}'; it was kept as additional \
+                     data and not written to the context",
+                    state.id
+                )
+            };
             result.additional_data.entry(name).or_insert(value);
             warning
         })
@@ -551,11 +592,11 @@ fn set_aside_undeclared_variables(state: &State, result: &mut ActionResult) -> V
 }
 
 /// The variables of a result that belong in the shared context: all but the
-/// step's own `local.*` memory, which never leaves its step (R12).
-fn shared_variables(variables: &Map<String, Value>) -> Map<String, Value> {
+/// step's own local memory, which never leaves its step (R12).
+fn shared_variables(state: &State, variables: &Map<String, Value>) -> Map<String, Value> {
     variables
         .iter()
-        .filter(|(name, _)| !name.starts_with(LOCAL_VARIABLE_PREFIX))
+        .filter(|(name, _)| !state.is_local_variable(name))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
@@ -815,6 +856,9 @@ enum AttemptOutcome {
     /// An agent answered without an output label the state accepts: a format
     /// error, answered with a reprompt rather than a retry (KTD7).
     OutputRejected(OutputRejection),
+    /// A `decision` declared `by: conductor`: the conductor is asked, with
+    /// the message as the step rendered it.
+    AwaitingConductor(String),
 }
 
 /// How the whole action of a state ended, retries included.
@@ -1293,6 +1337,15 @@ impl Engine {
     /// The store this engine persists to.
     pub fn store(&self) -> &ExecutionStore {
         &self.store
+    }
+
+    /// Where the tokens and cost that harnesses report go: the timeline
+    /// file, announced to the reading notifier like an agent's.
+    pub fn reading_sink(&self) -> Arc<dyn ReadingSink> {
+        Arc::new(FileReadingSink::new(
+            self.store.clone(),
+            self.reading_notifier.clone(),
+        ))
     }
 
     /// Subscribes to the live event stream.
@@ -2263,7 +2316,9 @@ impl Engine {
             // Unchanged, bit for bit: a script or human state that declares no
             // limit still has none. Spelled out rather than caught by `_`, so
             // that a fifth action kind has to decide rather than inherit.
-            ActionKind::Script | ActionKind::Human | ActionKind::Wait => declared,
+            ActionKind::Script | ActionKind::Human | ActionKind::Wait | ActionKind::Decision => {
+                declared
+            }
         }
     }
 
@@ -2336,8 +2391,20 @@ impl Engine {
                     return Ok(ActionUpshot::Stopped);
                 }
                 Ok(AttemptOutcome::AwaitingAgentInput(request)) => {
-                    self.suspend_for_agent_input(execution, state, request)?;
-                    return Ok(ActionUpshot::Stopped);
+                    let flow = self.route_agent_question(execution, state, request).await?;
+                    return Ok(ActionUpshot::settled(flow));
+                }
+                Ok(AttemptOutcome::AwaitingConductor(message)) => {
+                    let flow = self
+                        .decide_by_conductor(
+                            definition,
+                            execution,
+                            state,
+                            &action_execution_id,
+                            message,
+                        )
+                        .await?;
+                    return Ok(ActionUpshot::settled(flow));
                 }
                 Ok(AttemptOutcome::OutputRejected(rejection)) => {
                     // Outside the retry schedule on purpose (R15): a format
@@ -2467,6 +2534,7 @@ impl Engine {
             }
             _ => String::new(),
         };
+        let step_labels = step_memory::last_choice_labels(execution).map_err(unreadable_memory)?;
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
         let task_title = self.task_labels.effective_title();
@@ -2475,6 +2543,7 @@ impl Engine {
             .with_declared(declared)
             .with_step_replies(&step_replies)
             .with_step_streams(&step_streams)
+            .with_step_labels(&step_labels)
             .with_step_memory(StepMemory {
                 locals: &kept_locals,
                 definitions: &state.variables,
@@ -2483,13 +2552,32 @@ impl Engine {
         let mut rendered = scope
             .render_action(action, &location)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+        // A decision for the operator is asked as a form: the step's
+        // variables are its fields. One for the conductor is no action to
+        // run: the caller asks the conductor.
+        if let ActionConfig::Decision(decision) = &rendered {
+            match decision.by {
+                DecisionMaker::Human => {
+                    rendered = ActionConfig::Human(HumanActionConfig {
+                        instruction: decision.message.to_string(),
+                        inputs: decision_fields(state),
+                        input_schema: None,
+                    });
+                }
+                DecisionMaker::Conductor => {
+                    return Ok(AttemptOutcome::AwaitingConductor(
+                        decision.message.to_string(),
+                    ));
+                }
+            }
+        }
 
         // A comment is consumed only by the first agent attempt following an
         // explicit recovery. It remains durable until this point, so a daemon
         // restart before the attempt begins cannot silently discard it.
         let mut resumed_input = None;
         let mut author = match action {
-            ActionConfig::Agent(template) if embeds_user_content(&template.prompt) => {
+            ActionConfig::Agent(template) if template.prompt.texts().any(embeds_user_content) => {
                 PromptAuthor::EngineUser
             }
             _ => PromptAuthor::Engine,
@@ -3071,11 +3159,7 @@ impl Engine {
         };
         let request = HumanInputRequest {
             action_execution_id: action_execution_id.clone(),
-            instruction: format!(
-                "The agent of state '{}' did not give a usable output label. Choose the \
-                 label its step ends with, and the data and variables it would have given.",
-                state.id
-            ),
+            instruction: output_problem_instruction(state),
             fields: Vec::new(),
             reason: None,
             required_values: Vec::new(),
@@ -3085,13 +3169,17 @@ impl Engine {
             prefilled_answer: None,
             permission: None,
         };
-        let pending = PendingHumanInput::for_problem(
+        let mut pending = PendingHumanInput::for_problem(
             execution.id.clone(),
             state.id.clone(),
             request,
             decision::permitted_outputs(state),
             problem,
         );
+        if matches!(state.action, Some(ActionConfig::Decision(_))) {
+            let kept_locals = step_memory::step_locals(execution, &state.id)?;
+            pending.local_values = local_values(state, &kept_locals);
+        }
 
         let from = self.store.event_log(&execution.id).next_sequence()?;
         human::suspend(&self.store, execution, &pending)?;
@@ -3144,6 +3232,14 @@ impl Engine {
         }
 
         let warnings = set_aside_undeclared_variables(state, &mut result);
+        // A script cannot be asked again, so a value outside the declared
+        // `options` ends its step; an agent was asked again before this.
+        if holds_variables_to_declarations(state) && !is_agent(state) {
+            if let Some(problem) = variable_rules::value_outside_options(state, &result.variables) {
+                self.fail_action(execution, &action_execution_id, problem)?;
+                return Ok(None);
+            }
+        }
         self.emit(
             &execution.id,
             EventData::ActionCompleted {
@@ -3287,6 +3383,16 @@ impl Engine {
             .choices
             .iter()
             .any(|output| output.label == outcome.label && output.resume_comment_field.is_some());
+        // Rendered and checked before anything is written: a `set` that
+        // cannot be applied whole is not applied at all.
+        let assignments =
+            match self.render_assignments(definition, execution, state, &pending, &outcome.label) {
+                Ok(assignments) => assignments,
+                Err(message) => {
+                    self.fail_action(execution, &pending.action_execution_id, message)?;
+                    return Ok(Flow::Stop);
+                }
+            };
 
         self.emit(
             &execution.id,
@@ -3302,9 +3408,15 @@ impl Engine {
         // authority; writing `context.json` alone would leave a stale copy.
         execution
             .context
-            .update_variables(shared_variables(&pending.result.variables));
-        step_memory::keep_locals(execution, &state.id, &pending.result.variables)?;
+            .update_variables(shared_variables(state, &pending.result.variables));
+        step_memory::keep_locals(execution, state, &pending.result.variables)?;
         step_memory::record_choice(execution, &state.id, &outcome.label, &pending.result.reason)?;
+        if matches!(state.action, Some(ActionConfig::Decision(_))) {
+            let by_conductor = outcome.provider == DecisionProviderType::Conductor;
+            step_memory::count_decision(execution, &state.id, by_conductor)?;
+        }
+        // After the step's own result, so what `set` assigns wins over it.
+        write_assignments(execution, &state.id, &assignments)?;
         if pending
             .result
             .reply
@@ -3378,8 +3490,24 @@ impl Engine {
         // is the conductor's retry of a failed one (F3).
         clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
         clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);
-        self.store.save_execution(execution)?;
 
+        // No save until the target is set: a `state.json` without the pending
+        // step but still at this state would run its action again after a
+        // crash, over the result and the `set` already applied. A crash
+        // before the one save below leaves the pending step, and the step
+        // resumes at its decision.
+        for assignment in assignments {
+            self.emit(
+                &execution.id,
+                EventData::VariableSetByWorkflow {
+                    variable: assignment.name,
+                    value: assignment.value,
+                    state_id: state.id.clone(),
+                    output_label: outcome.label.clone(),
+                    local: assignment.local,
+                },
+            )?;
+        }
         self.emit(
             &execution.id,
             EventData::TransitionTaken {
@@ -3420,6 +3548,54 @@ impl Engine {
         self.write_checkpoint(definition, execution);
 
         Ok(Flow::Continue)
+    }
+
+    /// What the `set` of `label` assigns on leaving `state`, rendered in the
+    /// scope of that step: the context as the step's own result leaves it,
+    /// its local memory, and the label each step last chose (this one's
+    /// included). Reads only; nothing is written.
+    fn render_assignments(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &WorkflowExecution,
+        state: &State,
+        pending: &PendingStep,
+        label: &str,
+    ) -> Result<Vec<Assignment>, String> {
+        let sets_nothing = state
+            .choices
+            .iter()
+            .all(|choice| choice.label != label || choice.set.is_empty());
+        if sets_nothing {
+            return Ok(Vec::new());
+        }
+        let unreadable = |error: EngineError| error.to_string();
+        let mut context = execution.context.clone();
+        context.update_variables(shared_variables(state, &pending.result.variables));
+        let mut locals = step_memory::step_locals(execution, &state.id).map_err(unreadable)?;
+        locals.extend(
+            pending
+                .result
+                .variables
+                .iter()
+                .filter(|(name, _)| state.is_local_variable(name))
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        let mut labels = step_memory::last_choice_labels(execution).map_err(unreadable)?;
+        labels.insert(state.id.clone(), Value::String(label.to_string()));
+        let declared = DeclaredNames::of(definition);
+        let task_title = self.task_labels.effective_title();
+        let scope = TemplateScope::from_execution(&execution.inputs, &context)
+            .map_err(|error| error.to_string())?
+            .with_task_fields(self.task_labels.ticket.as_deref(), task_title.as_deref())
+            .with_declared(&declared)
+            .with_step_labels(&labels)
+            .with_step_memory(StepMemory {
+                locals: &locals,
+                definitions: &state.variables,
+                history: "",
+            });
+        variable_rules::render_assignments(state, label, &scope)
     }
 
     fn wait_on_entry_limit(
@@ -3704,6 +3880,10 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let mut pending =
             PendingHumanInput::new(execution.id.clone(), state.id.clone(), request, outputs);
+        if matches!(state.action, Some(ActionConfig::Decision(_))) {
+            let kept_locals = step_memory::step_locals(execution, &state.id)?;
+            pending = pending.deciding(local_values(state, &kept_locals));
+        }
         let sessions: BTreeMap<String, AgentSessionProvenance> =
             read_engine_record(execution, METADATA_AGENT_SESSIONS_KEY)?.unwrap_or_default();
         for output in &pending.outputs {
@@ -4212,6 +4392,23 @@ fn keep_previous_reply(mut result: ActionResult, previous_reply: Option<&str>) -
     result
 }
 
+/// What the operator is asked when the step `state` has no output label of
+/// its own to go on with.
+fn output_problem_instruction(state: &State) -> String {
+    match state.action {
+        Some(ActionConfig::Decision(_)) => format!(
+            "The conductor did not settle the decision of state '{}'. Choose the label its step \
+             ends with, and the variables it needs.",
+            state.id
+        ),
+        _ => format!(
+            "The agent of state '{}' did not give a usable output label. Choose the \
+             label its step ends with, and the data and variables it would have given.",
+            state.id
+        ),
+    }
+}
+
 /// The rescue of `execution`'s output label under way, when it belongs to
 /// `state_id`.
 fn stored_output_rescue(
@@ -4551,15 +4748,21 @@ fn step_reply_attempt<'a>(execution: &'a WorkflowExecution, state_id: &str) -> O
         .as_str()
 }
 
+/// The templates of an action that may use the result of an earlier step: a
+/// prompt or message with the references of its parts' `when`.
+fn step_templates(action: &ActionConfig) -> Vec<String> {
+    match action {
+        ActionConfig::Agent(config) => config.prompt.template_pieces(),
+        ActionConfig::Human(config) => vec![config.instruction.clone()],
+        ActionConfig::Decision(config) => config.message.template_pieces(),
+        _ => Vec::new(),
+    }
+}
+
 fn action_step_reply_sources(action: &ActionConfig) -> Vec<String> {
     let mut sources = Vec::new();
-    let templates: Vec<&str> = match action {
-        ActionConfig::Agent(config) => vec![config.prompt.as_str()],
-        ActionConfig::Human(config) => vec![config.instruction.as_str()],
-        _ => Vec::new(),
-    };
-    for template in templates {
-        for source in step_reply_references(template) {
+    for template in step_templates(action) {
+        for source in step_reply_references(&template) {
             if !sources.contains(&source) {
                 sources.push(source);
             }
@@ -4569,14 +4772,9 @@ fn action_step_reply_sources(action: &ActionConfig) -> Vec<String> {
 }
 
 fn action_step_stream_sources(action: &ActionConfig) -> Vec<(String, String)> {
-    let templates: Vec<&str> = match action {
-        ActionConfig::Agent(config) => vec![config.prompt.as_str()],
-        ActionConfig::Human(config) => vec![config.instruction.as_str()],
-        _ => Vec::new(),
-    };
     let mut sources = Vec::new();
-    for template in templates {
-        for source in step_stream_references(template) {
+    for template in step_templates(action) {
+        for source in step_stream_references(&template) {
             if !sources.contains(&source) {
                 sources.push(source);
             }

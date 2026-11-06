@@ -28,6 +28,23 @@ analyze:
     ambiguous: human_clarification
 ```
 
+This is the legacy shape, as a `v1` file writes it. In a `schema: v2` file the
+labels and their targets sit together:
+
+```yaml
+analyze:
+  action:
+    type: agent
+    prompt: |
+      Analyse the repository for: {{ inputs.description }}.
+      Write the plan to plan.md.
+  choices:
+    ready:
+      next: implement
+    ambiguous:
+      next: human_clarification
+```
+
 `harness` is **optional**. An action that names none uses the installation's
 default harness: the operator's choice (`narsor-cli harness default set <harness>`,
 or `h` in the TUI) when there is one, otherwise the configured
@@ -73,12 +90,42 @@ and no workflow transition is taken.
 The same question is allowed as an answer to a reprompt. When an agent's answer
 has no valid JSON, narsor reprompts it once; if the agent replies to the
 reprompt with `awaiting_input`, that is a normal question, not a format error.
-Who gets it depends on the context variable `autopilot`. Unset or any value
-other than `on`/`true`, the operator gets the question at once. With `autopilot`
-set to `on`, the conductor tries to answer first and forwards the question to
-the operator when it is not sure. The answer resumes the same agent session
-with the state's normal permissions. `autopilot` does not change the rescue of a
-missing JSON answer. The conversation shows who wrote each prompt: Narsor,
+Who gets it depends on the context variable `autopilot`. It has three values:
+
+* `off` — the operator gets every question at once. This is also the value when
+  the variable is unset, and any other word, `true` and `false` count as `off`.
+* `on` — the conductor tries to answer first. It answers only what the task,
+  the context or the repository settle.
+* `best-effort` — the conductor also answers with a reasonable default. It
+  writes each assumption it made into its rationale.
+
+The operator gets the question when the conductor is not sure. The conductor must
+answer with high confidence. The operator also gets a permission request, a
+notice of the engine, and any question when no conductor is attached. The
+conductor answers at most 5 questions for one entry into a step. The sixth goes
+to the operator. A new entry into the step counts from zero again. Each answer
+of the conductor is an event with its rationale, and the conversation shows it
+as *ODPOWIEDŹ DYRYGENTA* with the reason. The answer resumes the same agent
+session with the state's normal permissions. `autopilot` does not change the
+rescue of a missing JSON answer. A workflow sets `autopilot` like any variable,
+for example with `set` on a choice. The value `true` no longer turns it on: use
+`on`.
+
+An agent step of the unified shape may have `exit` instead of `choices`. The
+agent then gives no `choice`. It answers with `reason`, `variables` and
+`artifacts`, and the step goes on to the `next` of the `exit`.
+
+The `prompt` is a string, or a list of parts. A part may have a `when`: the
+engine adds that part only when every value named in `when` is not empty.
+
+```yaml
+prompt:
+  - Draft the change.
+  - when: local.memory
+    text: "Your notes from the last attempt: {{ local.memory }}"
+```
+
+The schema is in [the workflow schema](../dev/workflow-schema.md). The conversation shows who wrote each prompt: Narsor,
 Narsor + user (a template that embeds `inputs` or `task` content), Conductor or
 User. A human answer pasted into a template is not detected and shows as Narsor.
 

@@ -80,8 +80,10 @@ and only an explicit queue move reorders them. `Esc` cancels filter editing.
 **The details** show the header (title and links from `display`, lifecycle,
 step, duration; under the links, once a harness reported any, a row with the
 usage it reported for the whole task: cost, tokens `in` / `out` and the
-subagents' part) and five tabs: *Przebieg* (the steps and the selected one; once a harness reported usage,
-each step's row also shows its cost and its tokens `↓in ↑out`, with the
+subagents' part; when the conductor used a harness, `· dyrygent $… · razem $…`
+ends the row, and the first numbers stay the agents' alone) and five tabs: *Przebieg* (the steps and the selected one; once a harness reported usage,
+each step's row also shows its cost (and, when the conductor decided in it, its own
+cost as `dyr. $…`) and its tokens `↓in ↑out`, with the
 subagents' count and tokens after them (`3× ↓40k ↑3k`, or `3× ↕45k` when the
 harness gave only their sum), in columns aligned across the steps; a second row
 under each step gives its start time and duration, then its model, effort and
@@ -161,7 +163,7 @@ danych". An action marked `!` asks `y` / `n` first.
 | `K` / `J` / `m` | move in the queue (a place preview, `Enter` confirms) | `narsor-cli task move` |
 | `p` | pause or resume | `narsor-cli task pause` / `resume` |
 | `x` | interrupt the running step (`!`) | `narsor-cli task interrupt` |
-| `t` | manual transition; with a reason, an override where the state allows it | `narsor-cli task transition [--override --reason]` |
+| `t` | manual transition; with a reason, a forced jump (override) where the workflow allows it. A `schema: v2` workflow in the unified shape allows it from every state that is not terminal. A workflow in the older shape allows it only from a state with `allow_manual_override: true` | `narsor-cli task transition [--override --reason]` |
 | `s` | start again an interrupted task or a failed provisioning | `narsor-cli task start` |
 | `a` | archive (`!`) | `narsor-cli task archive` |
 | `o` | open a link of the task (`display.links`) in the browser | — |
@@ -177,6 +179,14 @@ danych". An action marked `!` asks `y` / `n` first.
 | `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor-cli harness default set <harness>` / `reset` (`narsor-cli harness default` shows it) |
 | `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `max_concurrent_tasks` applies again) | `max_concurrent_tasks` in the configuration |
 | the header | what the connection offers | `narsor-cli task capabilities` |
+
+**A forced jump** (`t`, with a reason) leaves the declared exits of the step and goes
+to any other state. It always needs a reason, and the reason is saved in the audit
+trail. A workflow in the unified shape (`schema: v2` with `choices` as a map) allows
+it from every state that is not terminal. A workflow in the older shape honors the
+field `allow_manual_override` of the state: without it the jump is refused, and the
+message says that the older shape needs that field. Choosing one of the declared
+exits never needs the field. A forced jump does not apply the `set` of a choice.
 
 The CLI of the remote-aware commands has a machine form too: `narsor-cli task list
 --json` and `narsor-cli task show <task> --json` print the task summaries of the

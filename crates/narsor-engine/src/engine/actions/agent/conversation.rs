@@ -125,11 +125,11 @@ pub(crate) struct ConversationSink(Option<Arc<Mutex<ConversationWriter>>>, Optio
 /// Where the use a harness reports in its output is handed on, and what it
 /// is a reading of.
 #[derive(Clone)]
-pub(super) struct ReadingTap {
-    pub(super) sink: Arc<dyn ReadingSink>,
-    pub(super) execution_id: String,
-    pub(super) attempt_id: String,
-    pub(super) harness: String,
+pub(crate) struct ReadingTap {
+    pub(crate) sink: Arc<dyn ReadingSink>,
+    pub(crate) execution_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) harness: String,
 }
 
 /// The elements as the conversation file keeps them. What an agent used lives

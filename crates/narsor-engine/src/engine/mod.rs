@@ -27,13 +27,13 @@ pub use decision::{
 };
 pub use retry::RetrySchedule;
 pub use runner::{
-    execution_episode, owed_output_rescue, owed_reprompt, plan_operator_transition,
-    record_manual_transition, step_failure, terminal_status, ActionKind, Engine, EngineError,
-    LastAgentStep, ManualTransition, OperatorTransition, OutputDecisionUndo, OutputRejection,
-    OutputRescue, PendingStep, Recovery, RunHandle, StepFailure, TransitionPlan,
+    execution_episode, manual_override_allowed, owed_output_rescue, owed_reprompt,
+    plan_operator_transition, record_manual_transition, step_failure, terminal_status, ActionKind,
+    Engine, EngineError, LastAgentStep, ManualTransition, OperatorTransition, OutputDecisionUndo,
+    OutputRejection, OutputRescue, PendingStep, Recovery, RunHandle, StepFailure, TransitionPlan,
     UndoneOutputDecision, EVENT_CHANNEL_CAPACITY, METADATA_CONDUCTOR_RETRY_KEY,
     METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY, METADATA_OUTPUT_RESCUE_KEY,
-    METADATA_STEP_FAILURE_KEY,
+    METADATA_STEP_FAILURE_KEY, METADATA_STEP_LOCALS_KEY,
 };
 pub use timeline::{
     build_timeline, ConversationState, EventLink, Position, PositionStatus, Timeline,

@@ -10,12 +10,14 @@ use thiserror::Error;
 
 pub use narsor_protocol::display::GENERATED_TITLE_MAX_CHARS;
 pub use narsor_protocol::identifier::{BackendId, InvalidIdentifier, TaskId, MAX_IDENTIFIER_LEN};
-pub use narsor_protocol::launch::TASK_LAUNCH_SPEC_VERSION;
+pub use narsor_protocol::launch::{
+    unsupported_launch_spec_version, LEGACY_SHAPE_LAUNCH_SPEC_VERSION, TASK_LAUNCH_SPEC_VERSION,
+};
 
 use narsor_protocol::launch::LaunchSpecEnvelope;
 
 use super::environment::{canonical_sha256, ResolvedEnvironment, ResourceProfile, TaskWorkspace};
-use super::{DisplaySpec, WorkflowDefinition};
+use super::{DefinitionShape, DisplaySpec, WorkflowDefinition};
 
 /// Longest ticket, in characters.
 pub const TICKET_MAX_CHARS: usize = 64;
@@ -204,13 +206,8 @@ impl<'de> Deserialize<'de> for TaskLaunchSpec {
             .get("version")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| serde::de::Error::custom("task launch spec has no version"))?;
-        if version != u64::from(TASK_LAUNCH_SPEC_VERSION) {
-            return Err(serde::de::Error::custom(format!(
-                "task launch spec version {version} is not supported by this build (expected \
-                 {TASK_LAUNCH_SPEC_VERSION}); an older spec predates pinned environments, the \
-                 workflow definition snapshot or the repository list and cannot be upgraded faithfully — archive \
-                 the task and create it again"
-            )));
+        if let Some(problem) = unsupported_launch_spec_version(version) {
+            return Err(serde::de::Error::custom(problem));
         }
         let envelope: LaunchSpecEnvelope =
             serde_json::from_value(value).map_err(serde::de::Error::custom)?;
@@ -266,7 +263,7 @@ impl TaskLaunchSpec {
         resources: ResourceProfile,
     ) -> Self {
         let mut spec = Self {
-            version: TASK_LAUNCH_SPEC_VERSION,
+            version: LEGACY_SHAPE_LAUNCH_SPEC_VERSION,
             workflow_id: workflow_id.into(),
             workflow_version,
             inputs,
@@ -291,6 +288,10 @@ impl TaskLaunchSpec {
         definition: &WorkflowDefinition,
     ) -> Result<Self, serde_json::Error> {
         self.definition = Some(serde_json::to_value(definition)?);
+        self.version = match definition.shape {
+            DefinitionShape::Unified => TASK_LAUNCH_SPEC_VERSION,
+            DefinitionShape::Legacy => LEGACY_SHAPE_LAUNCH_SPEC_VERSION,
+        };
         self.digest = self.compute_digest();
         Ok(self)
     }

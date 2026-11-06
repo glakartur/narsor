@@ -36,6 +36,7 @@ use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
 use narsor_protocol::controller::UsageLimit;
 use serde_json::Value;
 
+use super::answer::AnswerShape;
 use crate::domain::{ActionError, AgentActionConfig, WorkspaceAccess};
 
 pub use claude_code::{ClaudeCodeAdapter, CLAUDE_CODE};
@@ -301,8 +302,9 @@ pub trait HarnessAdapter: Send + Sync + std::fmt::Debug {
     ///
     /// A new one per run: the parser accumulates state (a session id seen so
     /// far, whether a `result` line has appeared) that must never leak
-    /// between two attempts.
-    fn stream_parser(&self) -> Box<dyn HarnessStreamParser>;
+    /// between two attempts. `shape` is what the step's final answer looks
+    /// like, for a harness that ends the step on it.
+    fn stream_parser(&self, shape: AnswerShape) -> Box<dyn HarnessStreamParser>;
 
     /// How this harness wants the answer and any `awaiting_input` question
     /// delivered, appended to the output contract; `None` when the contract

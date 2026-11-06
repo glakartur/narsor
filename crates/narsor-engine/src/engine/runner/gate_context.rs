@@ -5,7 +5,11 @@
 //! handed and bounded before any record or event holds them.
 
 use super::*;
-use crate::engine::actions::human::{RequiredValue, RequiredValueKind};
+use crate::domain::{
+    HumanInputField, HumanInputType, VariableSource, VariableType, LOCAL_VARIABLE_PREFIX,
+};
+use crate::engine::actions::human::{LocalValue, RequiredValue, RequiredValueKind};
+use crate::workflow::template::render_scalar;
 use narsor_protocol::display::{without_unsafe_chars, without_unsafe_chars_multiline, NO_REASON};
 
 /// The longest reason or required value a gate shows, in bytes.
@@ -56,6 +60,66 @@ pub(super) fn has_step_contract(state: &State) -> bool {
     )
 }
 
+/// Whether the variables a result gives for `state` are held to its
+/// declarations: an agent or script step, and a decision, whose answer the
+/// conductor may give with variables. Not the same as [`has_step_contract`]:
+/// a decision is no step whose result a gate shows.
+pub(super) fn holds_variables_to_declarations(state: &State) -> bool {
+    has_step_contract(state) || matches!(state.action, Some(ActionConfig::Decision(_)))
+}
+
+/// The form of a decision: a field for each variable of the step that the
+/// operator may give, which is every one but those the workflow alone sets.
+/// A variable with `options` is a `select`; no field is required here, since
+/// what a choice needs is said by the choice.
+pub(super) fn decision_fields(state: &State) -> Vec<HumanInputField> {
+    state
+        .variables
+        .iter()
+        .filter(|variable| variable.source == VariableSource::Step)
+        .map(|variable| {
+            let is_select = variable.variable_type == Some(VariableType::Select)
+                || !variable.options.is_empty();
+            HumanInputField {
+                name: variable.name.clone(),
+                field_type: if is_select {
+                    HumanInputType::Select
+                } else {
+                    HumanInputType::Text
+                },
+                options: variable.options.clone(),
+                required: false,
+                description: variable.description.clone(),
+            }
+        })
+        .collect()
+}
+
+/// What `state` keeps for itself, as a decision shows it beside its form:
+/// each `scope: local` variable that holds a value, in declaration order,
+/// cleaned and bounded.
+pub(super) fn local_values(state: &State, kept_locals: &Map<String, Value>) -> Vec<LocalValue> {
+    state
+        .variables
+        .iter()
+        .filter(|variable| variable.is_local())
+        .filter_map(|variable| {
+            let value = render_scalar(kept_locals.get(&variable.name)?);
+            if value.trim().is_empty() {
+                return None;
+            }
+            let name = variable
+                .name
+                .strip_prefix(LOCAL_VARIABLE_PREFIX)
+                .unwrap_or(&variable.name);
+            Some(LocalValue {
+                name: without_unsafe_chars(name),
+                value: head(&without_unsafe_chars_multiline(&value), MAX_SHOWN_BYTES),
+            })
+        })
+        .collect()
+}
+
 /// `reason` as a gate shows it: cleaned and bounded, or the placeholder
 /// when there is none.
 pub(super) fn gate_reason(reason: &str) -> String {
@@ -94,7 +158,11 @@ fn required_values(
             .variables
             .get(name)
             .or_else(|| kept_locals.get(name))?;
-        Some(shown(name, RequiredValueKind::Variable, &text_of(value)))
+        Some(shown(
+            name,
+            RequiredValueKind::Variable,
+            &render_scalar(value),
+        ))
     });
     let artifacts = choice.requires_artifacts.iter().filter_map(|name| {
         let path = result.artifacts.get(name)?;
@@ -109,14 +177,6 @@ fn shown(name: &str, kind: RequiredValueKind, value: &str) -> RequiredValue {
         name: without_unsafe_chars(name),
         kind,
         value: head(&without_unsafe_chars_multiline(value), MAX_SHOWN_BYTES),
-    }
-}
-
-/// A variable's value as text: a string as it is, anything else as JSON.
-fn text_of(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
     }
 }
 

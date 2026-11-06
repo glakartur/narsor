@@ -12,7 +12,7 @@
 //! | `K` `J` `m` | move in the queue | queued |
 //! | `p` | pause / resume | running, paused |
 //! | `x` | interrupt the step `!` | running |
-//! | `t` | manual transition; override `!` | the state has exits (override: `allow_manual_override`) |
+//! | `t` | manual transition; override `!` | the state has exits (override: always, or `allow_manual_override` in the legacy shape) |
 //! | `s` | start again | interrupted, failed provisioning |
 //! | `a` | archive `!` | finished, interrupted |
 //! | `o` | open a link | `display.links` has a value |
@@ -1470,7 +1470,9 @@ pub fn refusal_reason(error: &ClientError) -> String {
     let known = match code.as_str() {
         "operator_command_refused" => return said,
         "override_reason_required" => "override wymaga powodu",
-        "override_not_allowed" => "ten stan nie dopuszcza override (allow_manual_override)",
+        "override_not_allowed" => {
+            "ten stan nie dopuszcza override (w starym kształcie workflow: allow_manual_override)"
+        }
         "illegal_transition" => "to przejście nie jest dozwolone z bieżącego stanu",
         "missing_target" => "brak stanu docelowego przejścia",
         "stale_generation" => "zadanie zmieniło się w międzyczasie",

@@ -136,6 +136,16 @@ pub fn event_line(event: &Event) -> String {
             from_state,
             to_state,
         } => format!("human_transition_selected  {from_state} → {to_state}"),
+        EventData::VariableSetByWorkflow {
+            variable,
+            value,
+            state_id,
+            output_label,
+            ..
+        } => format!(
+            "variable_set  {variable} = {} ({state_id}, {output_label})",
+            shown_value(value)
+        ),
         EventData::TransitionTaken {
             from_state,
             to_state,
@@ -223,6 +233,15 @@ fn first_line(text: &str) -> String {
     }
     let cut: String = line.chars().take(LIMIT).collect();
     format!("{cut}…")
+}
+
+/// A value set by the workflow, on one short line: a string as it is,
+/// anything else as JSON.
+fn shown_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => first_line(text),
+        other => first_line(&other.to_string()),
+    }
 }
 
 /// A short fragment of an id, for a one-line summary where the full UUID

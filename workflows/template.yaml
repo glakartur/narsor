@@ -1,3 +1,4 @@
+schema: v2
 name: template
 version: 1
 description: A safe, runnable tour of Narsor workflow features.
@@ -29,46 +30,45 @@ states:
       type: script
       command: /usr/bin/printf
       args:
-        - '{"choice":"ready","reason":"The no-op script completed.","variables":{"example_value":"sample"},"artifacts":{"example_file":"template-example.txt"}}\n'
+        - '{"reason":"The no-op script completed.","variables":{"example_value":"sample"},"artifacts":{"example_file":"template-example.txt"}}\n'
     variables:
       - name: example_value
         description: A sample value carried into the next state.
     artifacts:
       - name: example_file
         description: A sample artifact path; this workflow does not create the file.
-    choices:
-      - label: ready
-        description: The sample result and artifact reference are available.
-        requires_variables: [example_value]
-        requires_artifacts: [example_file]
-    transitions:
-      ready: review
+    exit:
+      description: The sample result and artifact reference are available.
+      requires_variables: [example_value]
+      requires_artifacts: [example_file]
+      next: review
 
   review:
     description: Shows workflow inputs and script outputs, then waits for a person to choose a route.
     action:
-      type: human
+      type: decision
+      by: human
       message: |
         Example input: {{ inputs.example_text }}
         Script variable: {{ context.example_value }}
         Artifact path metadata: {{ artifacts.example_file }}
-      inputs:
-        - name: decision
-          type: select
-          required: true
-          options: [finish, cancel]
-        - name: comment
-          type: text
-          required: false
-          description: Optional note; it is recorded with this decision.
+    variables:
+      - name: comment
+        type: text
+        description: Optional note; it is recorded with this decision.
+      - name: outcome
+        source: workflow
+        options: [finished, cancelled]
+        description: How the demonstration ended; only the chosen route writes it.
     choices:
-      - label: finish
+      finish:
         description: Finish the demonstration successfully.
-      - label: cancel
+        set: { outcome: finished }
+        next: completed
+      cancel:
         description: End the demonstration as cancelled.
-    transitions:
-      finish: completed
-      cancel: cancelled
+        set: { outcome: cancelled }
+        next: cancelled
 
   completed:
     description: The demonstration completed.

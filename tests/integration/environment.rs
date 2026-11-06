@@ -18,7 +18,7 @@ use environment_support::{
 use narsor_engine::domain::{
     ImageDigest, ImageSource, ImageSpec, LaunchDefinitionError, RefOrigin, ResolvedEnvironment,
     ResourceProfile, SecretDelivery, TaskLaunchSpec, TaskRepository, TaskRepositorySource,
-    TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
+    TaskWorkspace, LEGACY_SHAPE_LAUNCH_SPEC_VERSION, TASK_LAUNCH_SPEC_VERSION,
 };
 use narsor_engine::environment::{
     BackendKind, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent, LaunchResolver,
@@ -1303,7 +1303,7 @@ fn a_launch_spec_of_an_older_version_is_refused_naming_both_versions() {
     let message = error.to_string();
     assert!(message.contains("version 3"), "{message}");
     assert!(
-        message.contains(&format!("expected {TASK_LAUNCH_SPEC_VERSION}")),
+        message.contains(&format!("to {TASK_LAUNCH_SPEC_VERSION}")),
         "{message}"
     );
 }
@@ -1316,7 +1316,7 @@ fn a_launch_spec_of_an_older_version_is_refused_naming_both_versions() {
 fn a_launch_spec_round_trips_and_detects_a_tampered_environment() {
     let root = TempRoot::new();
     let spec = root.resolve(&intent("wf")).unwrap().spec;
-    assert_eq!(spec.version, TASK_LAUNCH_SPEC_VERSION);
+    assert_eq!(spec.version, LEGACY_SHAPE_LAUNCH_SPEC_VERSION);
     let text = serde_json::to_string(&spec).unwrap();
     let back: TaskLaunchSpec = serde_json::from_str(&text).unwrap();
     assert_eq!(back, spec);

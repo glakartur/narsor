@@ -119,6 +119,15 @@ pub struct PendingHumanInputView {
     pub approval: Option<ApprovalCandidateView>,
     #[serde(default)]
     pub resume_targets: BTreeMap<String, AgentSessionProvenanceView>,
+    /// The step's own `scope: local` values kept from earlier entries, for
+    /// the operator to read beside the form.
+    #[serde(default)]
+    pub local_values: Vec<LocalValue>,
+    /// Whether only the menu chooses the label: a `decision` step's form
+    /// never takes it from a field, and each label's `requires_variables`
+    /// holds.
+    #[serde(default)]
+    pub label_from_menu: bool,
     pub requested_at: DateTime<Utc>,
 }
 
@@ -164,6 +173,14 @@ pub struct RequiredValue {
     pub value: String,
 }
 
+/// A value a step keeps for itself, as the operator is shown it: text,
+/// already cleaned and bounded by the engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalValue {
+    pub name: String,
+    pub value: String,
+}
+
 /// A field in a pending operator form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -196,6 +213,10 @@ pub struct OutputDefinitionView {
     pub requires_human_approval: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_comment_field: Option<String>,
+    /// The form fields this output needs a value in, when only the menu
+    /// chooses the label ([`PendingHumanInputView::label_from_menu`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_variables: Vec<String>,
 }
 
 fn deserialize_output_views<'de, D>(deserializer: D) -> Result<Vec<OutputDefinitionView>, D::Error>
@@ -218,6 +239,7 @@ where
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,
+                    requires_variables: Vec::new(),
                 },
                 StoredOutput::Defined(output) => output,
             })

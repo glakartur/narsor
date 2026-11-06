@@ -1,0 +1,26 @@
+# A script that prints a value outside the `options` of its variable.
+schema: v2
+name: engine-script-options
+version: 1
+
+states:
+  check:
+    action:
+      type: script
+      command: /bin/sh
+      args:
+        - -c
+        - "echo '{\"choice\": \"passed\", \"variables\": {\"verdict\": \"bogus\"}}'"
+    variables:
+      - name: verdict
+        type: select
+        options: [fine, poor]
+    choices:
+      passed:
+        next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

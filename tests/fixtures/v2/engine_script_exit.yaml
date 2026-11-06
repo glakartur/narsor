@@ -1,0 +1,19 @@
+# A script step with `exit`: exit code 0 is the only way on.
+schema: v2
+name: engine-script-exit
+version: 1
+
+states:
+  build:
+    action:
+      type: script
+      command: /bin/sh
+      args: [-c, "exit 0"]
+    exit:
+      next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

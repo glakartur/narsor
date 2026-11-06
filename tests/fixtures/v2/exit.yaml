@@ -1,0 +1,42 @@
+# A linear step has `exit` instead of `choices`; a fork has `choices` as a
+# mapping, each label with its own `next`.
+schema: v2
+name: linear-exit
+version: 1
+
+states:
+  implement:
+    action:
+      type: agent
+      prompt: Implement the change.
+    variables:
+      - name: summary
+        description: What was done.
+    exit:
+      description: The change is written.
+      requires_variables: [summary]
+      next: test
+
+  test:
+    action:
+      type: script
+      command: ./test.sh
+    choices:
+      passed:
+        description: Tests are green.
+        next: done
+      failed:
+        description: Tests are red.
+        next: implement
+      timeout:
+        next: gave_up
+
+  done:
+    description: Finished.
+
+  gave_up:
+    description: The tests never finished.
+
+terminal_states:
+  done: completed
+  gave_up: failed

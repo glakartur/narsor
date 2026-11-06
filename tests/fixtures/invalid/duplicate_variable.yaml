@@ -1,0 +1,21 @@
+# A variable name is unique within a step.
+schema: v2
+name: duplicate-variable
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Zaimplementuj.
+    variables:
+      - name: summary
+      - name: summary
+    exit:
+      next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

@@ -1,0 +1,59 @@
+# A decision step decided by the conductor, reading earlier steps through
+# `steps.<id>` (the stream of a script, the label of any step).
+schema: v2
+name: conductor-decision
+version: 1
+
+states:
+  test:
+    action:
+      type: script
+      command: ./test.sh
+    choices:
+      passed:
+        next: done
+      failed:
+        next: triage
+
+  triage:
+    action:
+      type: decision
+      by: conductor
+      message: "Judge the test result ({{ steps.test.label }}): {{ steps.test.stdout }}"
+    variables:
+      - name: diagnosis
+        description: Short diagnosis.
+    choices:
+      fix:
+        requires_variables: [diagnosis]
+        next: work
+      flaky:
+        next: test
+      escalate:
+        next: approval
+
+  work:
+    action:
+      type: agent
+      prompt: "Fix the failure. Diagnosis: {{ context.variables.diagnosis }}"
+    exit:
+      next: test
+
+  approval:
+    action:
+      type: decision
+      by: human
+      message: The conductor could not decide.
+    choices:
+      stop:
+        next: cancelled
+
+  done:
+    description: Finished.
+
+  cancelled:
+    description: Dropped.
+
+terminal_states:
+  done: completed
+  cancelled: cancelled

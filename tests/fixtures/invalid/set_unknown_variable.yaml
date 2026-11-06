@@ -1,0 +1,22 @@
+# `set` reaches only variables the step it leaves declares.
+schema: v2
+name: set-unknown-variable
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Zaimplementuj.
+    variables:
+      - name: summary
+    exit:
+      set:
+        sumary: x
+      next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

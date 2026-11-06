@@ -15,15 +15,16 @@
 //!
 //! # Local values (R12–R15)
 //!
-//! A step's `local.*` variables are kept in `metadata.engine.step_locals`,
-//! never in the context. A value given replaces the earlier one whole; a
+//! A step's local variables (`scope: local`, or named `local.*` in the older
+//! shape) are kept in `metadata.engine.step_locals` under their declared
+//! name, never in the context. A value given replaces the earlier one whole; a
 //! value not given leaves the earlier one in place.
 //!
 //! Both records are written by the save that writes the context (or that
 //! fails the execution), so they cannot disagree with it after a crash.
 
 use super::*;
-use crate::domain::OutputLabel;
+use crate::domain::{OutputLabel, PromptText};
 use narsor_protocol::display::without_unsafe_chars;
 
 /// Key of the entries and attempts of each step, inside the engine's scratch
@@ -57,6 +58,16 @@ pub struct StepAttempts {
     /// What its entries ended with, oldest first.
     #[serde(default)]
     pub attempts: Vec<StepAttempt>,
+
+    /// How many questions of its agent the conductor answered since the
+    /// latest entry.
+    #[serde(default)]
+    pub conductor_answers: u32,
+
+    /// How many decisions of the step the conductor took since the
+    /// operator last took one.
+    #[serde(default)]
+    pub conductor_decisions: u32,
 }
 
 /// What one attempt at a step ended with.
@@ -79,13 +90,62 @@ pub enum StepAttempt {
 type AttemptsByStep = BTreeMap<StateId, StepAttempts>;
 type LocalsByStep = BTreeMap<StateId, Map<String, Value>>;
 
-/// Counts one more entry into `state_id`.
+/// Counts one more entry into `state_id`, which starts its count of the
+/// conductor's answers over.
 pub(super) fn count_step_entry(
     execution: &mut WorkflowExecution,
     state_id: &str,
 ) -> Result<(), EngineError> {
     update_attempts(execution, state_id, |record| {
         record.entries = record.entries.saturating_add(1);
+        record.conductor_answers = 0;
+    })
+}
+
+/// How many questions of the agent of `state_id` the conductor answered
+/// since the step was last entered.
+pub(super) fn conductor_answers(
+    execution: &WorkflowExecution,
+    state_id: &str,
+) -> Result<u32, EngineError> {
+    Ok(read_attempts(execution)?
+        .get(state_id)
+        .map_or(0, |record| record.conductor_answers))
+}
+
+/// How many decisions of `state_id` the conductor took in a row.
+pub(super) fn conductor_decisions(
+    execution: &WorkflowExecution,
+    state_id: &str,
+) -> Result<u32, EngineError> {
+    Ok(read_attempts(execution)?
+        .get(state_id)
+        .map_or(0, |record| record.conductor_decisions))
+}
+
+/// Counts a decision of `state_id`: one more in a row when the conductor
+/// took it, none when anyone else did.
+pub(super) fn count_decision(
+    execution: &mut WorkflowExecution,
+    state_id: &str,
+    by_conductor: bool,
+) -> Result<(), EngineError> {
+    update_attempts(execution, state_id, |record| {
+        record.conductor_decisions = if by_conductor {
+            record.conductor_decisions.saturating_add(1)
+        } else {
+            0
+        };
+    })
+}
+
+/// Counts one more answer of the conductor's in `state_id`.
+pub(super) fn count_conductor_answer(
+    execution: &mut WorkflowExecution,
+    state_id: &str,
+) -> Result<(), EngineError> {
+    update_attempts(execution, state_id, |record| {
+        record.conductor_answers = record.conductor_answers.saturating_add(1);
     })
 }
 
@@ -115,35 +175,68 @@ pub(super) fn record_failure(
     update_attempts(execution, state_id, |record| record.attempts.push(attempt))
 }
 
-/// Keeps the `local.*` values among `variables` as the memory of
-/// `state_id`, each replacing the one kept before (R15).
+/// Keeps the local values among `variables` as the memory of `state`, each
+/// replacing the one kept before (R15). Which names are local is the
+/// step's declaration ([`State::is_local_variable`]).
 pub(super) fn keep_locals(
     execution: &mut WorkflowExecution,
-    state_id: &str,
+    state: &State,
     variables: &Map<String, Value>,
 ) -> Result<(), EngineError> {
-    let given: Vec<(&String, &Value)> = variables
+    let given: Vec<(String, Value)> = variables
         .iter()
-        .filter(|(name, _)| name.starts_with(LOCAL_VARIABLE_PREFIX))
+        .filter(|(name, _)| state.is_local_variable(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
-    if given.is_empty() {
+    write_locals(execution, &state.id, given)
+}
+
+/// Keeps `values` as local memory of `state_id`, each replacing the one
+/// kept before.
+pub(super) fn write_locals(
+    execution: &mut WorkflowExecution,
+    state_id: &str,
+    values: Vec<(String, Value)>,
+) -> Result<(), EngineError> {
+    if values.is_empty() {
         return Ok(());
     }
     let mut locals = read_locals(execution)?;
     let kept = locals.entry(state_id.to_string()).or_default();
-    for (name, value) in given {
-        kept.insert(name.clone(), value.clone());
+    for (name, value) in values {
+        kept.insert(name, value);
     }
     write_engine_record(execution, METADATA_STEP_LOCALS_KEY, &locals)
 }
 
-/// The `local.*` values `state_id` kept, keyed by the full name.
+/// The local values `state_id` kept, keyed by the declared name.
 pub(super) fn step_locals(
     execution: &WorkflowExecution,
     state_id: &str,
 ) -> Result<Map<String, Value>, EngineError> {
     let mut locals = read_locals(execution)?;
     Ok(locals.remove(state_id).unwrap_or_default())
+}
+
+/// The label each step last chose, by step id: what `steps.ID.label` reads.
+pub(super) fn last_choice_labels(
+    execution: &WorkflowExecution,
+) -> Result<HashMap<String, Value>, EngineError> {
+    let labels = read_attempts(execution)?
+        .iter()
+        .filter_map(|(state_id, record)| {
+            let label = record
+                .attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| match attempt {
+                    StepAttempt::Choice { choice, .. } => Some(choice),
+                    StepAttempt::Failure { .. } => None,
+                })?;
+            Some((state_id.clone(), Value::String(label.clone())))
+        })
+        .collect();
+    Ok(labels)
 }
 
 /// The history block of `state_id`: empty on its first entry (R17).
@@ -161,8 +254,8 @@ pub(super) fn history_block(
 
 /// Adds `history` to a rendered agent `config` after the author's prompt,
 /// unless the prompt `template` placed it itself (R18).
-pub(super) fn add_history(config: &mut AgentActionConfig, template: &str, history: &str) {
-    if history.is_empty() || places_step_history(template) {
+pub(super) fn add_history(config: &mut AgentActionConfig, template: &PromptText, history: &str) {
+    if history.is_empty() || template.texts().any(places_step_history) {
         return;
     }
     config.prompt.push_str("\n\n---\n");

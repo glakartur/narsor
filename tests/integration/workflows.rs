@@ -66,10 +66,10 @@ async fn template_runs_a_no_op_script_then_waits_for_a_human_choice() {
         .deliver_human_input(
             &definition,
             &waiting.id,
-            &HumanInputDelivery::with_values(Map::from_iter([
-                ("decision".to_string(), json!("finish")),
-                ("comment".to_string(), json!("looks good")),
-            ]))
+            &HumanInputDelivery::with_values(Map::from_iter([(
+                "comment".to_string(),
+                json!("looks good"),
+            )]))
             .choosing("finish"),
         )
         .await
@@ -77,5 +77,9 @@ async fn template_runs_a_no_op_script_then_waits_for_a_human_choice() {
 
     assert_eq!(completed.status, ExecutionStatus::Completed);
     assert_eq!(completed.current_state.as_deref(), Some("completed"));
+    assert_eq!(
+        completed.context.variables.get("outcome"),
+        Some(&json!("finished"))
+    );
     assert!(!workspace.join("template-example.txt").exists());
 }

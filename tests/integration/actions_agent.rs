@@ -375,7 +375,8 @@ fn process_summary(entry: &ConversationEntry) -> String {
 /// What a fresh parser of `adapter` returns for each of `lines`, in order —
 /// the elements the executor is expected to store with them.
 fn parsed_elements(adapter: &dyn HarnessAdapter, lines: &[String]) -> Vec<Vec<ChatElement>> {
-    let mut parser = adapter.stream_parser();
+    let mut parser =
+        adapter.stream_parser(narsor_engine::engine::actions::answer::AnswerShape::Choice);
     lines
         .iter()
         .map(|line| parser.on_stdout_line(line.as_bytes()))
@@ -412,7 +413,7 @@ fn agent_action(prompt: &str) -> AgentActionConfig {
         permission_grants: Vec::new(),
         model: None,
         workspace_access: Some(WorkspaceAccess::ReadWrite),
-        prompt: prompt.to_string(),
+        prompt: prompt.into(),
         workspace: None,
         parameters: HashMap::new(),
         read_only_paths: Vec::new(),
@@ -732,6 +733,132 @@ async fn json_without_a_choice_key_is_an_error() {
     let details = error.details.expect("details");
     assert_eq!(details["harness"], json!("claude-code"));
     assert_eq!(details["harness_session_id"], json!("fake-session-1"));
+}
+
+/// Runs the fake harness with `contract` and returns what the agent made of
+/// its answer.
+async fn run_with_contract(
+    answer: &str,
+    contract: StepContract<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(answer));
+    let action = ActionConfig::Agent(agent_action("do the thing"));
+    let workspace = root.workspace();
+    executor(&fake)
+        .execute(
+            ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_contract(contract),
+        )
+        .await
+}
+
+/// The choices of a step with an `exit`: the one choice the loader compiles
+/// it to, requiring a summary.
+fn exit_choices() -> [ChoiceDefinition; 1] {
+    [ChoiceDefinition {
+        requires_variables: vec!["summary".to_string()],
+        exit: true,
+        ..ChoiceDefinition::new(narsor_engine::domain::EXIT_LABEL)
+    }]
+}
+
+#[tokio::test]
+async fn an_answer_without_a_choice_ends_a_step_with_an_exit() {
+    let choices = exit_choices();
+    let outcome = run_with_contract(
+        r#"{"reason":"all done","variables":{"summary":"s"}}"#,
+        StepContract {
+            choices: &choices,
+            ..StepContract::default()
+        },
+    )
+    .await
+    .expect("the answer is accepted");
+
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action, got {outcome:?}");
+    };
+    assert_eq!(result.output_label, narsor_engine::domain::EXIT_LABEL);
+    assert_eq!(result.reason, "all done");
+    assert_eq!(result.variables.get("summary"), Some(&json!("s")));
+}
+
+#[tokio::test]
+async fn a_step_with_choices_still_needs_a_choice() {
+    let choices = [ChoiceDefinition::new("ready")];
+    let error = run_with_contract(
+        r#"{"reason":"all done","variables":{"summary":"s"}}"#,
+        StepContract {
+            choices: &choices,
+            ..StepContract::default()
+        },
+    )
+    .await
+    .expect_err("an answer without a choice is no answer");
+
+    assert_eq!(error.error_type.as_deref(), Some("missing_output_label"));
+}
+
+#[tokio::test]
+async fn the_contract_of_an_exit_step_asks_for_no_choice() {
+    let choices = exit_choices();
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"reason":"r"}"#));
+    let action = ActionConfig::Agent(agent_action("do the thing"));
+    let workspace = root.workspace();
+    executor(&fake)
+        .execute(
+            ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_contract(
+                StepContract {
+                    choices: &choices,
+                    ..StepContract::default()
+                },
+            ),
+        )
+        .await
+        .expect("the action runs");
+    let prompt = fake.args(1).last().expect("a prompt").clone();
+
+    assert!(!prompt.contains("\"choice\""), "{prompt}");
+    assert!(
+        prompt.contains("`summary`"),
+        "the requirement is named: {prompt}"
+    );
+}
+
+/// The contract lists the values a variable may take, and leaves out a
+/// variable only the workflow sets.
+#[tokio::test]
+async fn the_contract_lists_the_options_and_hides_workflow_variables() {
+    use narsor_engine::domain::{VariableSource, VariableType};
+    let variables = [
+        VariableDefinition {
+            options: vec!["fine".to_string(), "poor".to_string()],
+            variable_type: Some(VariableType::Select),
+            ..variable("verdict", "How it went.")
+        },
+        VariableDefinition {
+            source: VariableSource::Workflow,
+            ..variable("autopilot", "Set by the workflow.")
+        },
+    ];
+    let choices = [ChoiceDefinition::new("ready")];
+
+    let prompt = prompt_sent_with_contract(StepContract {
+        variables: &variables,
+        choices: &choices,
+        ..StepContract::default()
+    })
+    .await;
+
+    assert!(prompt.contains("`verdict`"), "{prompt}");
+    assert!(
+        prompt.contains("`fine`") && prompt.contains("`poor`"),
+        "the allowed values are listed: {prompt}"
+    );
+    assert!(!prompt.contains("autopilot"), "{prompt}");
 }
 
 #[tokio::test]
@@ -1549,6 +1676,8 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
             description: Some("The plan is written and nothing is unclear.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
+            set: Default::default(),
         },
         ChoiceDefinition::new("ambiguous"),
     ];
@@ -1569,10 +1698,7 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
 }
 
 fn variable(name: &str, description: &str) -> VariableDefinition {
-    VariableDefinition {
-        name: name.to_string(),
-        description: description.to_string(),
-    }
+    VariableDefinition::described(name, description)
 }
 
 /// R10: the step's variables and artifacts are described once, and every
@@ -1720,6 +1846,8 @@ fn a_contract_without_descriptions_lists_bare_labels_only() {
             description: Some("   ".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
+            set: Default::default(),
         },
     ];
     let contract = output_contract(
@@ -1733,6 +1861,27 @@ fn a_contract_without_descriptions_lists_bare_labels_only() {
     assert!(contract.contains("- `approved`\n"), "{contract}");
     assert!(contract.contains("- `rejected`\n"), "{contract}");
     assert!(!contract.contains(" — "), "{contract}");
+}
+
+/// A label called `exit` in an old-shape workflow is an ordinary choice: the
+/// agent still gives a `choice` and still sees the other labels.
+#[test]
+fn an_ordinary_choice_labelled_exit_keeps_the_choice_contract() {
+    let choices = [
+        ChoiceDefinition::new("exit"),
+        ChoiceDefinition::new("retry"),
+    ];
+    let contract = StepContract {
+        choices: &choices,
+        ..StepContract::default()
+    };
+
+    let text = output_contract(&contract, None);
+
+    assert!(!contract.has_exit());
+    assert!(text.contains("- `exit`\n"), "{text}");
+    assert!(text.contains("- `retry`\n"), "{text}");
+    assert!(text.contains("`choice` is required"), "{text}");
 }
 
 /// With no choices to list, the agent is pointed at the label the task names.

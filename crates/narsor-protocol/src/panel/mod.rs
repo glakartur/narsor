@@ -299,6 +299,9 @@ pub fn define(
     for required in &pending.required_values {
         builder.push_named_value(&required.name, &required.value);
     }
+    for local in &pending.local_values {
+        builder.push_local_value(&local.name, &local.value);
+    }
     if let Some(tail) = &pending.answer_tail {
         builder
             .context
@@ -538,6 +541,15 @@ impl Builder {
         )));
     }
 
+    /// A value the step keeps for itself, `name (lokalna): value`.
+    fn push_local_value(&mut self, name: &str, value: &str) {
+        self.context.push(PanelContextLine::plain(format!(
+            "{} (lokalna): {}",
+            without_unsafe_chars(name),
+            without_unsafe_chars_multiline(value)
+        )));
+    }
+
     fn finish(mut self, pending: &PendingHumanInputView) -> PanelDefinition {
         for entry in &mut self.entries {
             entry.summary = summary(entry, self.approval_label.as_deref());
@@ -626,12 +638,14 @@ fn summary(entry: &PanelEntry, approval_label: Option<&str>) -> String {
 /// `entry` with a field for each of `fields`. A field is required when the
 /// workflow says so — except a resume comment, which only the output that
 /// resumes an agent needs (3f3dab2), and that output always needs, even when
-/// the field itself is optional (KTD12).
+/// the field itself is optional (KTD12) — or when the entry's own label
+/// names it in `needed`.
 fn declared_fields(
     mut entry: PanelEntry,
     fields: &[&HumanInputFieldView],
     outputs: &[OutputDefinitionView],
     label: Option<&str>,
+    needed: &[String],
 ) -> PanelEntry {
     for field in fields {
         // Whether this output, or another one, takes the field as the comment
@@ -647,7 +661,8 @@ fn declared_fields(
                 claimed_by_other = true;
             }
         }
-        let required = (field.required && !claimed_by_other) || claimed_by_own;
+        let required =
+            (field.required && !claimed_by_other) || claimed_by_own || needed.contains(&field.name);
         let mut built = match field.field_type {
             HumanInputTypeView::Text => PanelField::multiline(field.name.clone()),
             HumanInputTypeView::Select => {

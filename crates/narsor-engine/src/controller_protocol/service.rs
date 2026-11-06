@@ -37,11 +37,12 @@ use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{
     effective_title, normalize_label, one_line_label, AnsweredBy, BackendId, LabelError,
-    LaunchDefinitionError, ResourceProfile, TaskDisplay, TaskId, GENERATED_TITLE_MAX_CHARS,
-    TICKET_MAX_CHARS, TITLE_MAX_CHARS,
+    LaunchDefinitionError, ResourceProfile, TaskDisplay, TaskId, WorkflowDefinition,
+    GENERATED_TITLE_MAX_CHARS, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use crate::engine::{
-    plan_operator_transition, EngineError, HumanInputDelivery, PositionStatus, Timeline,
+    manual_override_allowed, plan_operator_transition, EngineError, HumanInputDelivery,
+    PositionStatus, Timeline,
 };
 use crate::environment::{BackendKind, LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
@@ -1040,8 +1041,8 @@ impl ProtocolService {
     /// Refused at once, with the reason and nothing written, when the task
     /// is not running, its runner is gone or silent, the generation moved
     /// on, or the command can be seen to be illegal from the runner's last
-    /// snapshot (an override without a reason or without
-    /// `allow_manual_override`, a target no declared transition leads to).
+    /// snapshot (an override without a reason or out of a state that does
+    /// not allow one, a target no declared transition leads to).
     /// The runner checks the same again under the Engine's own claim, on
     /// what it then finds: this early refusal only spares the owner a
     /// round trip.
@@ -2515,6 +2516,11 @@ fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
         .current_state
         .as_deref()?;
     let definition = record.launch_spec.definition().ok()?;
+    transition_offer(&definition, current)
+}
+
+/// What an owner can ask for out of `current` in `definition`.
+fn transition_offer(definition: &WorkflowDefinition, current: &str) -> Option<TransitionOffer> {
     let state = definition.states.get(current)?;
     let mut exits: Vec<TransitionExit> = Vec::new();
     let mut labels: Vec<(&String, &String)> = state.transitions.iter().collect();
@@ -2533,7 +2539,8 @@ fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
                 .and_then(|output| output.description.clone()),
         });
     }
-    let mut override_targets: Vec<String> = if state.allow_manual_override {
+    let override_allowed = manual_override_allowed(definition, state);
+    let mut override_targets: Vec<String> = if override_allowed {
         definition
             .states
             .keys()
@@ -2547,7 +2554,7 @@ fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
     Some(TransitionOffer {
         from_state: current.to_string(),
         exits,
-        override_allowed: state.allow_manual_override,
+        override_allowed,
         override_targets,
     })
 }
@@ -2728,4 +2735,145 @@ fn request_digest(request: &CreateTaskRequest) -> ProtocolResult<String> {
 
 fn parse_identifier<T>(parsed: Result<T, crate::domain::InvalidIdentifier>) -> ProtocolResult<T> {
     parsed.map_err(|error| ProtocolError::bad_request("invalid_identifier", error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::load_from_str;
+
+    const UNIFIED: &str = r#"
+schema: v2
+name: unified
+version: 1
+states:
+  work:
+    action:
+      type: script
+      command: "true"
+    exit: { next: completed }
+  completed: {}
+terminal_states: { completed: completed }
+"#;
+
+    const LEGACY_WITH_FIELD: &str = r#"
+name: legacy
+version: 1
+states:
+  work:
+    allow_manual_override: true
+    action:
+      type: script
+      command: "true"
+    choices: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+    const LEGACY_WITHOUT_FIELD: &str = r#"
+name: legacy
+version: 1
+states:
+  work:
+    action:
+      type: script
+      command: "true"
+    choices: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+    const LEGACY_FIELD_OFF: &str = r#"
+name: legacy
+version: 1
+states:
+  work:
+    allow_manual_override: false
+    action:
+      type: script
+      command: "true"
+    choices: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+    /// Every shape the consent can depend on, with what it must be.
+    fn cases() -> [(&'static str, &'static str, bool); 4] {
+        [
+            ("unified", UNIFIED, true),
+            ("legacy, field on", LEGACY_WITH_FIELD, true),
+            ("legacy, field off", LEGACY_FIELD_OFF, false),
+            ("legacy, no field", LEGACY_WITHOUT_FIELD, false),
+        ]
+    }
+
+    #[test]
+    fn the_offer_and_the_runners_verdict_come_from_the_same_consent() {
+        for (name, yaml, allowed) in cases() {
+            let definition = load_from_str(yaml).expect(name);
+            let state = &definition.states["work"];
+
+            let offer = transition_offer(&definition, "work").expect(name);
+            let verdict = plan_operator_transition(&definition, state, "completed", true);
+
+            assert_eq!(offer.override_allowed, allowed, "{name}");
+            assert_eq!(
+                offer.override_allowed,
+                manual_override_allowed(&definition, state)
+            );
+            assert_eq!(verdict.is_ok(), offer.override_allowed, "{name}");
+            assert_eq!(!offer.override_targets.is_empty(), allowed, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_terminal_state_of_a_unified_definition_offers_no_override() {
+        let definition = load_from_str(UNIFIED).unwrap();
+
+        let offer = transition_offer(&definition, "completed").unwrap();
+
+        assert!(!offer.override_allowed);
+    }
+
+    #[test]
+    fn a_saved_definition_without_a_shape_reads_as_legacy_and_keeps_its_field() {
+        let saved = serde_json::to_value(load_from_str(LEGACY_WITH_FIELD).unwrap()).unwrap();
+        assert!(
+            saved.get("shape").is_none(),
+            "a legacy definition adds nothing"
+        );
+
+        let definition: WorkflowDefinition = serde_json::from_value(saved).unwrap();
+
+        assert!(manual_override_allowed(
+            &definition,
+            &definition.states["work"]
+        ));
+        let off: WorkflowDefinition = serde_json::from_value(
+            serde_json::to_value(load_from_str(LEGACY_FIELD_OFF).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(!manual_override_allowed(&off, &off.states["work"]));
+    }
+
+    #[test]
+    fn the_unified_shape_survives_being_saved() {
+        let saved = serde_json::to_value(load_from_str(UNIFIED).unwrap()).unwrap();
+
+        let definition: WorkflowDefinition = serde_json::from_value(saved).unwrap();
+
+        assert!(manual_override_allowed(
+            &definition,
+            &definition.states["work"]
+        ));
+    }
 }

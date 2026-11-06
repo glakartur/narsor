@@ -373,6 +373,20 @@ pub enum EventData {
     },
 
     // Transition events
+    /// The workflow itself set a variable of the step it was leaving, as
+    /// the `set` of the label taken (never the step's own result).
+    VariableSetByWorkflow {
+        /// The variable, by its declared name.
+        variable: String,
+        /// The value written: a literal or a rendered template.
+        value: serde_json::Value,
+        state_id: String,
+        output_label: String,
+        /// Whether the variable is the step's own (`scope: local`) rather
+        /// than a shared one.
+        #[serde(default)]
+        local: bool,
+    },
     TransitionTaken {
         from_state: String,
         to_state: String,
@@ -519,6 +533,11 @@ pub enum ConductorTrigger {
     Annotation,
     /// The task has no title and the runner asks for one.
     Title,
+    /// A `decision` step declared `by: conductor` was entered.
+    DecisionStep,
+    /// A value this build does not know, written by a newer one.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl ConductorTrigger {
@@ -530,6 +549,8 @@ impl ConductorTrigger {
             Self::Chat => "chat",
             Self::Annotation => "annotation",
             Self::Title => "title",
+            Self::DecisionStep => "decision_step",
+            Self::Unrecognized => "unrecognized",
         }
     }
 
@@ -537,15 +558,24 @@ impl ConductorTrigger {
     /// than an operator — which is what puts it first in the queue and
     /// makes a failed invocation a problem (KTD11, KTD12).
     pub fn is_automatic(&self) -> bool {
-        matches!(self, Self::OutputRescue | Self::StepFailure)
+        matches!(
+            self,
+            Self::OutputRescue | Self::StepFailure | Self::DecisionStep
+        )
+    }
+
+    /// Whether the pass that waits for the answer runs the invocation
+    /// inline, under its own claim: the label rescue (F1) and a decision
+    /// step of the conductor's.
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::OutputRescue | Self::DecisionStep)
     }
 
     /// Whether an invocation for this trigger works beside the execution,
     /// without its claim, and is stopped through the registry of advisory
-    /// interrupts (KTD10): everything but the label rescue (F1), which runs
-    /// inline under the claim of the pass that waits for it.
+    /// interrupts (KTD10): everything but the inline ones.
     pub fn is_advisory(&self) -> bool {
-        !matches!(self, Self::OutputRescue)
+        !self.is_inline()
     }
 }
 
@@ -570,6 +600,11 @@ pub enum ConductorPurpose {
     SummarizeGate,
     /// Give a task the operator named no title a short one.
     GenerateTitle,
+    /// Pick the label of a `decision` step declared `by: conductor`.
+    DecideFork,
+    /// A value this build does not know, written by a newer one.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl ConductorPurpose {
@@ -583,6 +618,8 @@ impl ConductorPurpose {
             Self::ReplyToChat => "reply_to_chat",
             Self::SummarizeGate => "summarize_gate",
             Self::GenerateTitle => "generate_title",
+            Self::DecideFork => "decide_fork",
+            Self::Unrecognized => "unrecognized",
         }
     }
 }
@@ -625,6 +662,12 @@ pub enum ConductorDecisionKind {
     Retry,
     /// A proposal the operator confirmed was carried out (R28).
     ExecuteProposal,
+    /// The conductor answered a question the agent asked, in the
+    /// operator's place (`autopilot`).
+    AnswerQuestion,
+    /// A value this build does not know, written by a newer one.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl ConductorDecisionKind {
@@ -636,6 +679,8 @@ impl ConductorDecisionKind {
             Self::Escalate => "escalate",
             Self::Retry => "retry",
             Self::ExecuteProposal => "execute_proposal",
+            Self::AnswerQuestion => "answer_question",
+            Self::Unrecognized => "unrecognized",
         }
     }
 }
@@ -856,6 +901,14 @@ impl Event {
                 format!("External event '{event_type}' from '{source}'")
             }
 
+            EventData::VariableSetByWorkflow {
+                variable,
+                state_id,
+                output_label,
+                ..
+            } => {
+                format!("Workflow set '{variable}' leaving '{state_id}' on '{output_label}'")
+            }
             EventData::TransitionTaken {
                 from_state,
                 to_state,
@@ -913,6 +966,8 @@ impl From<ConductorPurpose> for ConductorPurposeDto {
             ConductorPurpose::ReplyToChat => Self::ReplyToChat,
             ConductorPurpose::SummarizeGate => Self::SummarizeGate,
             ConductorPurpose::GenerateTitle => Self::GenerateTitle,
+            ConductorPurpose::DecideFork => Self::DecideFork,
+            ConductorPurpose::Unrecognized => Self::Unrecognized,
         }
     }
 }
@@ -925,6 +980,8 @@ impl From<ConductorTrigger> for ConductorTriggerDto {
             ConductorTrigger::Chat => Self::Chat,
             ConductorTrigger::Annotation => Self::Annotation,
             ConductorTrigger::Title => Self::Title,
+            ConductorTrigger::DecisionStep => Self::DecisionStep,
+            ConductorTrigger::Unrecognized => Self::Unrecognized,
         }
     }
 }
@@ -957,7 +1014,8 @@ fn summarize_input(input: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, EventData};
+    use super::{ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Event, EventData};
+    use crate::api::{ConductorPurposeDto, ConductorTriggerDto};
 
     #[test]
     fn event_keeps_the_existing_persisted_wire_shape() {
@@ -974,6 +1032,38 @@ mod tests {
         let data: EventData =
             serde_json::from_value(serde_json::json!({"type":"future_event","value":1})).unwrap();
         assert!(matches!(data, EventData::Unrecognized));
+    }
+
+    #[test]
+    fn an_unknown_conductor_value_decodes_to_its_fallback_variant() {
+        let future = serde_json::json!("future_value");
+
+        assert_eq!(
+            serde_json::from_value::<ConductorTrigger>(future.clone()).unwrap(),
+            ConductorTrigger::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorPurpose>(future.clone()).unwrap(),
+            ConductorPurpose::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorDecisionKind>(future.clone()).unwrap(),
+            ConductorDecisionKind::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorTriggerDto>(future.clone()).unwrap(),
+            ConductorTriggerDto::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorPurposeDto>(future).unwrap(),
+            ConductorPurposeDto::Unrecognized
+        );
+    }
+
+    #[test]
+    fn an_unknown_conductor_trigger_is_neither_automatic_nor_inline() {
+        assert!(!ConductorTrigger::Unrecognized.is_automatic());
+        assert!(!ConductorTrigger::Unrecognized.is_inline());
     }
 
     #[test]

@@ -7,9 +7,9 @@
 //! by `crate::workflow::loader`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::domain::{DisplaySpec, ExecutionStatus, ImageSpec};
+use crate::domain::{DisplaySpec, ExecutionStatus, ImageSpec, PromptText};
 
 /// Unique identifier for a workflow definition
 pub type WorkflowDefinitionId = String;
@@ -51,6 +51,10 @@ pub struct WorkflowDefinition {
     /// `globals.workspace`, not `globals.repositories[0]`).
     #[serde(default, skip_serializing_if = "SchemaVersion::is_v2")]
     pub source_schema: SchemaVersion,
+
+    /// The state shape the definition was written in.
+    #[serde(default, skip_serializing_if = "DefinitionShape::is_legacy")]
+    pub shape: DefinitionShape,
 
     /// Repositories the workflow works on (`globals.repositories` in YAML,
     /// or the converted `globals.workspace` of a `v1` file). Repositories are
@@ -100,6 +104,23 @@ pub enum SchemaVersion {
 impl SchemaVersion {
     fn is_v2(&self) -> bool {
         *self == SchemaVersion::V2
+    }
+}
+
+/// The state shape a definition was written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionShape {
+    /// `v1`, or `v2` with `transitions`, a `decision` block and the like.
+    #[default]
+    Legacy,
+    /// `v2` with `choices` as a mapping and `exit`.
+    Unified,
+}
+
+impl DefinitionShape {
+    fn is_legacy(&self) -> bool {
+        *self == DefinitionShape::Legacy
     }
 }
 
@@ -389,6 +410,28 @@ impl State {
     pub fn workspace_access(&self) -> Option<WorkspaceAccess> {
         self.workspace.as_ref().map(StepWorkspace::access)
     }
+
+    /// The declaration of the variable `name` on this step.
+    pub fn variable(&self, name: &str) -> Option<&VariableDefinition> {
+        self.variables.iter().find(|variable| variable.name == name)
+    }
+
+    /// Whether `name` is the step's own memory rather than a shared
+    /// variable: the declaration decides, and a name this step does not
+    /// declare is local only by the `local.` prefix of the older shape.
+    ///
+    /// The one place that tells the two scopes apart.
+    pub fn is_local_variable(&self, name: &str) -> bool {
+        match self.variable(name) {
+            Some(variable) => variable.is_local(),
+            None => name.starts_with(LOCAL_VARIABLE_PREFIX),
+        }
+    }
+
+    /// Whether the step has a single `exit` instead of a choice to make.
+    pub fn has_exit(&self) -> bool {
+        self.choices.iter().any(ChoiceDefinition::is_exit)
+    }
 }
 
 /// Configuration for an action
@@ -399,6 +442,29 @@ pub enum ActionConfig {
     Script(ScriptActionConfig),
     Human(HumanActionConfig),
     Wait(WaitActionConfig),
+    Decision(DecisionActionConfig),
+}
+
+/// Decision action configuration: a fork decided by someone other than the
+/// step itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionActionConfig {
+    /// Who picks the label.
+    pub by: DecisionMaker,
+
+    /// What the decider is asked, still templated.
+    pub message: PromptText,
+}
+
+/// Who decides a [`DecisionActionConfig`] fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionMaker {
+    /// The conductor always decides; an unsure conductor hands the step to
+    /// the operator.
+    Conductor,
+    /// The operator is asked through a form with the step's variables.
+    Human,
 }
 
 /// Agent action configuration
@@ -436,7 +502,7 @@ pub struct AgentActionConfig {
     pub workspace_access: Option<WorkspaceAccess>,
 
     /// Prompt to send to the agent
-    pub prompt: String,
+    pub prompt: PromptText,
 
     /// Workspace configuration (optional, defaults to current)
     #[serde(default)]
@@ -603,25 +669,110 @@ pub enum WorkspaceRef {
     Path(String),
 }
 
-/// A variable a step defines: its name and what its value means.
+/// A variable a step defines: its name, what its value means and how the
+/// engine treats it.
 ///
 /// A name with the [`LOCAL_VARIABLE_PREFIX`] is the step's own memory and
-/// never reaches the shared context.
+/// never reaches the shared context; a variable declared with
+/// `scope: local` is the same, under its plain name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VariableDefinition {
     pub name: String,
-    pub description: String,
+
+    /// What the value means. Optional: a variable the workflow sets on its
+    /// own may need no explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Whether the value is shared or private to the step.
+    #[serde(default, skip_serializing_if = "VariableScope::is_global")]
+    pub scope: VariableScope,
+
+    /// Who supplies the value.
+    #[serde(default, skip_serializing_if = "VariableSource::is_step")]
+    pub source: VariableSource,
+
+    /// Declared type of the value (`type` in YAML).
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub variable_type: Option<VariableType>,
+
+    /// The only values the variable may take; empty means any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 impl VariableDefinition {
-    /// Whether this variable is the step's own memory (`local.*`).
+    /// A shared variable the step supplies, with a description and nothing
+    /// else declared.
+    pub fn described(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: Some(description.into()),
+            scope: VariableScope::Global,
+            source: VariableSource::Step,
+            variable_type: None,
+            options: Vec::new(),
+        }
+    }
+
+    /// Whether this variable is the step's own memory: declared with
+    /// `scope: local`, or named `local.*`.
     pub fn is_local(&self) -> bool {
-        self.name.starts_with(LOCAL_VARIABLE_PREFIX)
+        self.scope == VariableScope::Local || self.name.starts_with(LOCAL_VARIABLE_PREFIX)
     }
 }
 
 /// The prefix of a variable that stays with its step (`local.memory`).
 pub const LOCAL_VARIABLE_PREFIX: &str = "local.";
+
+/// Where a variable's value lives (`scope` in YAML).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VariableScope {
+    /// Shared with the whole execution.
+    #[default]
+    Global,
+    /// Private to the step, kept between its entries.
+    Local,
+}
+
+impl VariableScope {
+    fn is_global(&self) -> bool {
+        *self == VariableScope::Global
+    }
+}
+
+/// Who supplies a variable's value in a step (`source` in YAML).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VariableSource {
+    /// The step's agent, script or form fills it in.
+    #[default]
+    Step,
+    /// Only the workflow sets it, through `set`; it stays out of the step's
+    /// contract and form.
+    Workflow,
+}
+
+impl VariableSource {
+    fn is_step(&self) -> bool {
+        *self == VariableSource::Step
+    }
+}
+
+/// Declared type of a step variable: the types of a form field and of a
+/// workflow input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VariableType {
+    String,
+    /// Multi-line text.
+    Text,
+    /// One value out of `options`.
+    Select,
+    Integer,
+    Boolean,
+}
 
 /// An artifact a step defines: its name and what the file is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,6 +808,43 @@ pub struct ChoiceDefinition {
     /// prior session after this human choice is made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_comment_field: Option<String>,
+    /// Whether this is the `exit` of a unified linear step. Set by the
+    /// loader only: a label called `exit` in an old-shape workflow is an
+    /// ordinary choice.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exit: bool,
+    /// Variables the workflow sets when this choice is taken (`set` in YAML).
+    #[serde(default, skip_serializing_if = "SetDefinition::is_empty")]
+    pub set: SetDefinition,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// The label a linear step's `exit` compiles to: the step's only choice.
+pub const EXIT_LABEL: &str = "exit";
+
+/// The output label a timed-out action asks for, when the state allows it.
+pub const TIMEOUT_LABEL: &str = "timeout";
+
+/// What a choice sets when it is taken: literal values or templates, for
+/// declared variables of the step being left.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetDefinition {
+    /// Shared variables, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub global: BTreeMap<String, serde_json::Value>,
+    /// The step's own `scope: local` variables, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub local: BTreeMap<String, serde_json::Value>,
+}
+
+impl SetDefinition {
+    /// Whether nothing is set.
+    pub fn is_empty(&self) -> bool {
+        self.global.is_empty() && self.local.is_empty()
+    }
 }
 
 /// Reads `requires_variables` of a stored record (`pending_input.json`) in
@@ -693,7 +881,14 @@ impl ChoiceDefinition {
             description: None,
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
+            set: SetDefinition::default(),
         }
+    }
+
+    /// Whether this is the single exit of a linear step.
+    pub fn is_exit(&self) -> bool {
+        self.exit
     }
 }
 
@@ -856,7 +1051,7 @@ pub enum ValidationError {
     #[error("State '{state}' defines local variable '{name}', but only an agent step keeps local variables")]
     LocalVariableOutsideAgent { state: StateId, name: String },
 
-    #[error("State '{state}' is a {action_type} step and cannot define variables or artifacts; only agent and script steps can")]
+    #[error("State '{state}' is a {action_type} step and cannot define variables or artifacts; only agent and script steps can, and decision steps may define variables")]
     DefinitionsNotAllowed {
         state: StateId,
         action_type: &'static str,
@@ -883,13 +1078,86 @@ pub enum ValidationError {
     },
 
     #[error(
-        "State '{state}' field '{field}' references '{reference}'; supported fields are steps.<id>.reply, steps.<id>.stdout and steps.<id>.stderr"
+        "State '{state}' field '{field}' references '{reference}'; supported fields are steps.<id>.reply, steps.<id>.stdout, steps.<id>.stderr and steps.<id>.label"
     )]
     UnsupportedStepReference {
         state: StateId,
         field: String,
         reference: String,
     },
+
+    #[error("State '{state}' field '{field}' references the label of unknown or terminal step '{step_id}'")]
+    InvalidStepLabelSource {
+        state: StateId,
+        step_id: String,
+        field: String,
+    },
+
+    #[error("State '{state}' field '{field}' has an unusable condition: {reason}")]
+    InvalidWhen {
+        state: StateId,
+        field: String,
+        reason: String,
+    },
+
+    #[error("State '{state}' declares variable '{name}' more than once")]
+    DuplicateVariable { state: StateId, name: String },
+
+    #[error("State '{state}' declares variable '{name}' incorrectly: {reason}")]
+    InvalidVariableDeclaration {
+        state: StateId,
+        name: String,
+        reason: String,
+    },
+
+    #[error("Variable '{name}' is declared differently in states '{state}' and '{other_state}': {reason}")]
+    InconsistentVariable {
+        name: String,
+        state: StateId,
+        other_state: StateId,
+        reason: String,
+    },
+
+    #[error("Choice '{label}' in state '{state}' requires variable '{name}', which only the workflow sets ('source: workflow')")]
+    RequiredWorkflowVariable {
+        state: StateId,
+        label: OutputLabel,
+        name: String,
+    },
+
+    #[error("Choice '{label}' in state '{state}' sets variable '{name}', which the state does not declare")]
+    SetUnknownVariable {
+        state: StateId,
+        label: OutputLabel,
+        name: String,
+    },
+
+    #[error(
+        "Choice '{label}' in state '{state}' sets variable '{name}' in the wrong place: {reason}"
+    )]
+    SetScopeMismatch {
+        state: StateId,
+        label: OutputLabel,
+        name: String,
+        reason: String,
+    },
+
+    #[error("Choice '{label}' in state '{state}' sets variable '{name}' to a value it does not accept: {reason}")]
+    SetValueRejected {
+        state: StateId,
+        label: OutputLabel,
+        name: String,
+        reason: String,
+    },
+
+    #[error("State '{state}' is a {action_type} step with an 'exit' and cannot map 'exit_codes'; give it 'choices' instead")]
+    ExitCodesWithExit {
+        state: StateId,
+        action_type: &'static str,
+    },
+
+    #[error("State '{state}' declares a 'timeout' choice, which only agent and script steps can produce")]
+    TimeoutChoiceNotAllowed { state: StateId },
 
     #[error("Choice '{label}' in state '{state}' has invalid approval/resume behavior: {reason}")]
     InvalidChoiceBehavior {

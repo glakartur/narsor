@@ -76,8 +76,7 @@ pub use script::ScriptExecutor;
 /// work it has already done.
 pub const ACTION_ID_ENV_VAR: &str = "ORCHESTRATOR_ACTION_ID";
 
-/// The output label a timed-out action asks for, when the state allows it.
-pub const TIMEOUT_LABEL: &str = "timeout";
+pub use crate::domain::TIMEOUT_LABEL;
 
 /// Everything an executor needs for one attempt at one action.
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +231,12 @@ impl<'a> StepContract<'a> {
             artifacts: &state.artifacts,
             choices: &state.choices,
         }
+    }
+
+    /// Whether the step has one `exit` and no label for the action to
+    /// choose.
+    pub fn has_exit(&self) -> bool {
+        self.choices.iter().any(ChoiceDefinition::is_exit)
     }
 }
 

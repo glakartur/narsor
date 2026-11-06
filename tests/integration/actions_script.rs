@@ -12,11 +12,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use narsor_engine::domain::{
-    ActionConfig, ActionError, ActionResult, Context, ScriptActionConfig, Workspace,
+    ActionConfig, ActionError, ActionResult, ChoiceDefinition, Context, ScriptActionConfig,
+    Workspace, EXIT_LABEL,
 };
 use narsor_engine::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
 use narsor_engine::engine::actions::TIMEOUT_LABEL;
-use narsor_engine::engine::{ActionExecutor, ActionOutcome, ActionRequest, ScriptExecutor};
+use narsor_engine::engine::{
+    ActionExecutor, ActionOutcome, ActionRequest, ScriptExecutor, StepContract,
+};
 use narsor_engine::workflow::TemplateScope;
 use serde_json::{json, Map};
 
@@ -136,6 +139,42 @@ async fn unmapped_non_zero_exit_code_falls_back_to_failure() {
 
     assert_eq!(result.output_label, "failure");
     assert_eq!(result.exit_code, Some(7));
+}
+
+/// Runs `config` as a step that has an `exit`, and returns its result.
+async fn complete_with_exit(config: ScriptActionConfig, workspace: &Workspace) -> ActionResult {
+    let choices = [ChoiceDefinition {
+        exit: true,
+        ..ChoiceDefinition::new(EXIT_LABEL)
+    }];
+    let action = ActionConfig::Script(config);
+    let request =
+        ActionRequest::new(&action, workspace, "action-exec-1").with_contract(StepContract {
+            choices: &choices,
+            ..StepContract::default()
+        });
+    match ScriptExecutor::new().execute(request).await {
+        Ok(ActionOutcome::Completed(result)) => result,
+        other => panic!("expected a completed action, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn exit_code_zero_is_the_exit_of_a_step_with_an_exit() {
+    let root = TempRoot::new();
+
+    let result = complete_with_exit(script("exit_with.sh", &["0"]), &root.workspace()).await;
+
+    assert_eq!(result.output_label, EXIT_LABEL);
+}
+
+#[tokio::test]
+async fn a_non_zero_exit_code_is_no_exit_of_a_step_with_an_exit() {
+    let root = TempRoot::new();
+
+    let result = complete_with_exit(script("exit_with.sh", &["3"]), &root.workspace()).await;
+
+    assert_ne!(result.output_label, EXIT_LABEL);
 }
 
 #[tokio::test]

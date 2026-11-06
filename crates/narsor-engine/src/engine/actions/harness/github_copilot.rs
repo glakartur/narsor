@@ -43,6 +43,7 @@ use super::{
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
+use crate::engine::actions::answer::AnswerShape;
 use narsor_protocol::api::SubagentStats;
 use narsor_protocol::chat::{
     summary_line, ChatElement, TechnicalCategory, ToolResultStatus, UnclassifiedReason,
@@ -130,7 +131,7 @@ impl HarnessAdapter for GitHubCopilotAdapter {
         })
     }
 
-    fn stream_parser(&self) -> Box<dyn HarnessStreamParser> {
+    fn stream_parser(&self, _shape: AnswerShape) -> Box<dyn HarnessStreamParser> {
         Box::new(GitHubCopilotStreamParser::default())
     }
 }

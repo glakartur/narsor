@@ -969,6 +969,33 @@ async fn a_pending_request_survives_a_restart_and_can_still_be_satisfied() {
     assert!(received_input(&log).is_some());
 }
 
+/// A record written before `set` existed still loads, and an empty `set` is not written.
+#[tokio::test]
+async fn a_pending_record_written_before_set_existed_still_loads() {
+    let SuspendedAction::AwaitingHumanInput(request) =
+        request_for(&no_fields_action(), "action-1").await
+    else {
+        panic!("a human action must request human input");
+    };
+    let pending = PendingHumanInput::new(
+        "exec-1".to_string(),
+        "review",
+        request,
+        vec![ChoiceDefinition::new("approve")],
+    );
+
+    let mut stored = serde_json::to_value(&pending).expect("serialize");
+    assert!(
+        stored["outputs"][0].get("set").is_none(),
+        "an empty set is not written, so the record reads the same to an older engine"
+    );
+    stored["outputs"] = serde_json::json!([{"label": "approve", "requires_variables": ["note"]}]);
+
+    let reread: PendingHumanInput = serde_json::from_value(stored).expect("an old record loads");
+    assert!(reread.outputs[0].set.is_empty());
+    assert_eq!(reread.outputs[0].requires_variables, ["note"]);
+}
+
 /// Output descriptions are part of the durable record, so a form rebuilt
 /// after a restart can still say what each label means.
 #[tokio::test]
@@ -989,6 +1016,8 @@ async fn output_descriptions_survive_in_the_pending_record() {
             description: Some("The failures are known and harmless.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
+            set: Default::default(),
         },
         ChoiceDefinition::new("fix_it"),
     ];

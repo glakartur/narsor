@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::{VariableDefinition, VariableSource};
 use crate::persistence::DefaultHarnessSelector;
 
 /// Where the harness of an agent action that names none comes from.
@@ -59,6 +60,14 @@ pub(super) fn resume_session(config: &AgentActionConfig) -> Result<Option<&str>,
     }
 }
 
+/// The answer object of a step that chooses a label.
+const CHOICE_ANSWER_SHAPE: &str = "{\"choice\": \"<label>\", \"reason\": \"<one line>\", \
+\"variables\": {}, \"artifacts\": {}, \"additional_data\": {}, \"additional_artifacts\": []}";
+
+/// The answer object of a step with an `exit`: there is no label to give.
+const EXIT_ANSWER_SHAPE: &str = "{\"reason\": \"<one line>\", \"variables\": {}, \
+\"artifacts\": {}, \"additional_data\": {}, \"additional_artifacts\": []}";
+
 /// Builds the output contract appended to every prompt, so the agent is told
 /// the contract it has to meet.
 ///
@@ -76,13 +85,20 @@ pub(super) fn resume_session(config: &AgentActionConfig) -> Result<Option<&str>,
 /// `harness_note` is how the harness wants the answer delivered
 /// ([`HarnessAdapter::contract_note`]); it closes the contract.
 pub fn output_contract(contract: &StepContract<'_>, harness_note: Option<&str>) -> String {
+    let (answer_shape, send_rule) = if contract.has_exit() {
+        (EXIT_ANSWER_SHAPE, "Send the answer exactly once")
+    } else {
+        (
+            CHOICE_ANSWER_SHAPE,
+            "Send the answer with `choice` exactly once",
+        )
+    };
     format!(
         "\n\n\
 ---\n\
 When you are done, end your reply with a single JSON object on its own, and \
 nothing after it:\n\
-{{\"choice\": \"<label>\", \"reason\": \"<one line>\", \"variables\": {{}}, \
-\"artifacts\": {{}}, \"additional_data\": {{}}, \"additional_artifacts\": []}}\n\
+{answer_shape}\n\
 {definitions}\
 {choices}\
 `reason` is required: one line saying why you made this choice.\n\
@@ -92,14 +108,14 @@ fields are optional unless your choice requires them. If, and only if, you need 
 person to answer a question before continuing this same task, return instead:\n\
 {{\"status\":\"awaiting_input\",\"question\":\"<question>\",\"options\":[\"<optional choice>\"]}}\n\
 Do not use `awaiting_input` for a harness, sandbox, permission, or tool error; \
-those are action failures. Send the answer with `choice` exactly once, when all \
+those are action failures. {send_rule}, when all \
 your subagents have returned their results. A decision you cannot make yourself (a trade-off, a \
 change of behaviour, or a question a skill would put to the user) is a question \
 for the person: ask it with `awaiting_input`, and do not use a question tool. Do \
 not omit the JSON object: without it the workflow cannot continue.\
 {note}",
         definitions = step_definitions(contract),
-        choices = choice_list(contract.choices),
+        choices = choice_list(contract),
         note = harness_note
             .map(|note| format!("\n{note}"))
             .unwrap_or_default(),
@@ -109,10 +125,15 @@ not omit the JSON object: without it the workflow cannot continue.\
 /// The step's variables and artifacts, each with what it is.
 fn step_definitions(contract: &StepContract<'_>) -> String {
     let mut text = String::new();
-    if !contract.variables.is_empty() {
+    let given_by_step: Vec<&VariableDefinition> = contract
+        .variables
+        .iter()
+        .filter(|variable| variable.source == VariableSource::Step)
+        .collect();
+    if !given_by_step.is_empty() {
         text.push_str("The step's variables (in `variables`, name → value):\n");
-        for variable in contract.variables {
-            text.push_str(&described_item(&variable.name, Some(&variable.description)));
+        for variable in given_by_step {
+            text.push_str(&variable_item(variable));
         }
     }
     if !contract.artifacts.is_empty() {
@@ -124,8 +145,21 @@ fn step_definitions(contract: &StepContract<'_>) -> String {
     text
 }
 
-/// The labels `choice` may take, each with what it requires.
-fn choice_list(choices: &[ChoiceDefinition]) -> String {
+/// What the agent may answer with: the labels `choice` may take, each with
+/// what it requires, or for a step with an `exit` what that one way out
+/// requires.
+fn choice_list(contract: &StepContract<'_>) -> String {
+    let choices = contract.choices;
+    if let Some(exit) = choices.iter().find(|choice| choice.is_exit()) {
+        let mut text = "This step has one way out: do not give a `choice`.\n".to_string();
+        for (kind, names) in [
+            ("variables", &exit.requires_variables),
+            ("artifacts", &exit.requires_artifacts),
+        ] {
+            text.extend(required_clause(kind, names));
+        }
+        return text;
+    }
     if choices.is_empty() {
         return "`choice` is required and must be the label the task asks for.\n".to_string();
     }
@@ -141,23 +175,51 @@ fn choice_list(choices: &[ChoiceDefinition]) -> String {
     text
 }
 
+/// A variable of the step: [`described_item`], with the values it may take
+/// when it declares `options`.
+fn variable_item(variable: &VariableDefinition) -> String {
+    let mut item = item_line(&variable.name, variable.description.as_deref());
+    if !variable.options.is_empty() {
+        let options: Vec<String> = variable
+            .options
+            .iter()
+            .map(|option| format!("`{option}`"))
+            .collect();
+        item.push_str(&format!("  - Allowed values: {}", options.join(", ")));
+    }
+    item.push('\n');
+    item
+}
+
 /// `- `name` — description`, or the bare name when the description is blank.
 fn described_item(name: &str, description: Option<&str>) -> String {
+    format!("{}\n", item_line(name, description))
+}
+
+/// [`described_item`] without its line break.
+fn item_line(name: &str, description: Option<&str>) -> String {
     match description.map(str::trim) {
         Some(description) if !description.is_empty() => {
-            format!("- `{name}` — {description}\n")
+            format!("- `{name}` — {description}")
         }
-        _ => format!("- `{name}`\n"),
+        _ => format!("- `{name}`"),
     }
 }
 
 /// The line naming what a choice requires of one kind, empty for none.
 fn required_names(kind: &str, names: &[String]) -> String {
+    required_clause(kind, names)
+        .map(|clause| format!("  - {clause}"))
+        .unwrap_or_default()
+}
+
+/// `Required kind: `a`, `b``, as a line, or nothing when `names` is empty.
+fn required_clause(kind: &str, names: &[String]) -> Option<String> {
     if names.is_empty() {
-        return String::new();
+        return None;
     }
     let names: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
-    format!("  - Required {kind}: {}\n", names.join(", "))
+    Some(format!("Required {kind}: {}\n", names.join(", ")))
 }
 
 /// The `status` of an answer that asks a person before the task continues.
@@ -197,7 +259,7 @@ pub fn reprompt_config(
     let mut config = original.clone();
     config.harness = Some(harness.to_string());
     config.workspace_access = Some(WorkspaceAccess::ReadOnly);
-    config.prompt = format!("{OUTPUT_REPROMPT}\n\nWhy it was rejected: {reason}");
+    config.prompt = format!("{OUTPUT_REPROMPT}\n\nWhy it was rejected: {reason}").into();
     config.parameters.insert(
         RESUME_SESSION_PARAMETER.to_string(),
         Value::String(harness_session.to_string()),
@@ -221,7 +283,7 @@ pub fn conductor_reprompt_config(
     prompt: &str,
 ) -> AgentActionConfig {
     let mut config = reprompt_config(original, harness, harness_session, "");
-    config.prompt = format!("{}\n\n{CONDUCTOR_REPROMPT_GUARD}", prompt.trim());
+    config.prompt = format!("{}\n\n{CONDUCTOR_REPROMPT_GUARD}", prompt.trim()).into();
     config
 }
 
@@ -255,7 +317,7 @@ pub fn continuation_config(
         RESUME_SESSION_PARAMETER.to_string(),
         Value::String(harness_session.to_string()),
     );
-    config.prompt = message.to_string();
+    config.prompt = message.into();
     config
 }
 

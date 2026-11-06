@@ -303,7 +303,7 @@ fn implement_prompt_from_the_reference_fixture_expands_fully() {
         .expect("the corrected §4 prompt must render");
 
     let prompt = match rendered {
-        ActionConfig::Agent(config) => config.prompt,
+        ActionConfig::Agent(config) => config.prompt.to_string(),
         other => panic!("expected an agent action, got {other:?}"),
     };
 
@@ -766,4 +766,273 @@ states:
       done: completed
 "#;
     narsor_engine::workflow::load_from_str(yaml).expect("task.* passes validation");
+}
+
+use narsor_engine::domain::{PromptPart, PromptText};
+
+const PROMPT: &str = "state 'work', prompt";
+
+fn conditional(text: &str, when: &[&str]) -> PromptPart {
+    PromptPart::when(text, when.iter().map(|name| (*name).to_string()).collect())
+}
+
+/// Renders `parts` on `context` with the names in `declared` known to the
+/// workflow, and returns the joined text.
+fn render_parts(parts: Vec<PromptPart>, context: &Context) -> String {
+    try_render_parts(parts, context, &HashMap::new())
+        .expect("the parts must render")
+        .to_string()
+}
+
+fn try_render_parts(
+    parts: Vec<PromptPart>,
+    context: &Context,
+    replies: &HashMap<String, Value>,
+) -> Result<PromptText, TemplateError> {
+    let inputs = inputs(&[]);
+    let declared =
+        DeclaredNames::of(&narsor_engine::workflow::load_from_str(PARTS_WORKFLOW).unwrap());
+    TemplateScope::new(&inputs, context)
+        .with_declared(&declared)
+        .with_step_replies(replies)
+        .render_text(&PromptText::from_parts(parts), PROMPT)
+}
+
+/// A workflow that declares the variables the parts below refer to.
+const PARTS_WORKFLOW: &str = r#"
+schema: v2
+name: parts
+version: 1
+states:
+  work:
+    action:
+      type: agent
+      prompt: x
+    variables:
+      - name: notes
+      - name: flag
+      - name: count
+    exit:
+      next: done
+  done:
+    description: end
+terminal_states:
+  done: completed
+"#;
+
+#[test]
+fn a_part_whose_condition_names_an_empty_variable_is_left_out() {
+    let parts = || {
+        vec![
+            PromptPart::always("first"),
+            conditional("second {{ context.notes }}", &["context.notes"]),
+            PromptPart::always("third"),
+        ]
+    };
+
+    for empty in [
+        None,
+        Some(Value::Null),
+        Some(json!("")),
+        Some(json!(" \n\t")),
+    ] {
+        let pairs: Vec<(&str, Value)> = empty.into_iter().map(|value| ("notes", value)).collect();
+        assert_eq!(render_parts(parts(), &context(&pairs)), "first\n\nthird");
+    }
+}
+
+#[test]
+fn false_and_zero_are_values_so_their_part_stays() {
+    for value in [json!(false), json!(0)] {
+        let rendered = render_parts(
+            vec![conditional("kept", &["context.flag"])],
+            &context(&[("flag", value)]),
+        );
+        assert_eq!(rendered, "kept");
+    }
+}
+
+#[test]
+fn every_reference_of_a_condition_must_have_a_value() {
+    let parts = || vec![conditional("both", &["context.notes", "context.flag"])];
+
+    let one = context(&[("notes", json!("n"))]);
+    let both = context(&[("notes", json!("n")), ("flag", json!(false))]);
+
+    assert_eq!(render_parts(parts(), &one), "");
+    assert_eq!(render_parts(parts(), &both), "both");
+}
+
+#[test]
+fn the_parts_that_apply_are_joined_by_an_empty_line() {
+    let rendered = render_parts(
+        vec![
+            PromptPart::always("one"),
+            PromptPart::always("two"),
+            conditional("three", &["context.notes"]),
+        ],
+        &context(&[("notes", json!("x"))]),
+    );
+
+    assert_eq!(rendered, "one\n\ntwo\n\nthree");
+}
+
+#[test]
+fn an_error_in_a_part_names_the_part() {
+    let error = try_render_parts(
+        vec![
+            PromptPart::always("fine"),
+            PromptPart::always("{{ context.undeclared }}"),
+        ],
+        &Context::new(),
+        &HashMap::new(),
+    )
+    .expect_err("the second part refers to an unknown variable");
+
+    let TemplateError::UnknownVariable { location, .. } = error else {
+        panic!("expected an unknown variable, got {error:?}");
+    };
+    assert_eq!(location, format!("{PROMPT}, part 2"));
+}
+
+#[test]
+fn an_error_in_a_condition_names_the_part_and_the_condition() {
+    let error = try_render_parts(
+        vec![
+            PromptPart::always("fine"),
+            conditional("x", &["context.undeclared"]),
+        ],
+        &Context::new(),
+        &HashMap::new(),
+    )
+    .expect_err("the condition refers to an unknown variable");
+
+    let TemplateError::UnknownVariable { location, .. } = error else {
+        panic!("expected an unknown variable, got {error:?}");
+    };
+    assert_eq!(location, format!("{PROMPT}, part 2, when"));
+}
+
+#[test]
+fn a_condition_on_a_step_that_has_not_answered_leaves_the_part_out() {
+    let parts = || {
+        vec![
+            PromptPart::always("always"),
+            conditional("reply: {{ steps.review.reply }}", &["steps.review.reply"]),
+        ]
+    };
+
+    let without = try_render_parts(parts(), &Context::new(), &HashMap::new()).unwrap();
+    let with = try_render_parts(
+        parts(),
+        &Context::new(),
+        &HashMap::from([("review".to_string(), json!("looks fine"))]),
+    )
+    .unwrap();
+
+    assert_eq!(without.to_string(), "always");
+    assert_eq!(with.to_string(), "always\n\nreply: looks fine");
+}
+
+#[test]
+fn a_reference_to_a_missing_step_result_in_the_text_stays_an_error() {
+    let error = try_render_parts(
+        vec![PromptPart::always("reply: {{ steps.review.reply }}")],
+        &Context::new(),
+        &HashMap::new(),
+    )
+    .expect_err("the text needs the result");
+
+    assert!(matches!(error, TemplateError::UnknownVariable { .. }));
+}
+
+#[test]
+fn a_filter_in_a_condition_is_refused() {
+    let error = try_render_parts(
+        vec![conditional("x", &["context.notes | upper"])],
+        &Context::new(),
+        &HashMap::new(),
+    )
+    .expect_err("filters stay unsupported");
+
+    assert!(matches!(error, TemplateError::FilterUnsupported { .. }));
+}
+
+#[test]
+fn a_plain_string_prompt_renders_as_before() {
+    let inputs = inputs(&[("description", json!("login"))]);
+    let context = Context::new();
+
+    let rendered = TemplateScope::new(&inputs, &context)
+        .render_text(&"Do {{ inputs.description }}".into(), PROMPT)
+        .unwrap();
+
+    assert_eq!(rendered.to_string(), "Do login");
+    assert!(rendered.is_plain());
+}
+
+#[test]
+fn an_error_in_a_plain_prompt_does_not_name_a_part() {
+    let inputs = inputs(&[]);
+    let context = Context::new();
+
+    let error = TemplateScope::new(&inputs, &context)
+        .render_text(&"{{ inputs.missing }}".into(), PROMPT)
+        .expect_err("the input is not there");
+
+    let TemplateError::UnknownVariable { location, .. } = error else {
+        panic!("expected an unknown variable, got {error:?}");
+    };
+    assert_eq!(location, PROMPT);
+}
+
+#[test]
+fn a_stored_definition_with_a_string_prompt_still_loads() {
+    let definition = narsor_engine::workflow::load_from_str(PARTS_WORKFLOW).unwrap();
+    let mut stored = serde_json::to_value(&definition).unwrap();
+    // The shape every definition stored before parts existed has.
+    assert_eq!(stored["states"]["work"]["action"]["prompt"], json!("x"));
+    stored["states"]["work"]["action"]["prompt"] = json!("written long ago");
+
+    let loaded: narsor_engine::domain::WorkflowDefinition =
+        serde_json::from_value(stored).expect("a string prompt must load");
+
+    let Some(ActionConfig::Agent(agent)) = &loaded.states["work"].action else {
+        panic!("expected an agent action");
+    };
+    assert!(agent.prompt.is_plain());
+    assert_eq!(agent.prompt.to_string(), "written long ago");
+}
+
+#[test]
+fn a_list_of_parts_survives_storing_and_loading() {
+    let yaml = PARTS_WORKFLOW.replace(
+        "prompt: x",
+        "prompt:\n        - first\n        - when: [context.notes, context.flag]\n          text: second",
+    );
+    let definition = narsor_engine::workflow::load_from_str(&yaml).unwrap();
+
+    let stored = serde_json::to_string(&definition).unwrap();
+    let loaded: narsor_engine::domain::WorkflowDefinition = serde_json::from_str(&stored).unwrap();
+
+    let Some(ActionConfig::Agent(agent)) = &loaded.states["work"].action else {
+        panic!("expected an agent action");
+    };
+    assert_eq!(
+        agent.prompt.parts(),
+        [
+            PromptPart::always("first"),
+            conditional("second", &["context.notes", "context.flag"]),
+        ]
+    );
+}
+
+#[test]
+fn a_condition_without_references_does_not_load() {
+    let yaml = PARTS_WORKFLOW.replace(
+        "prompt: x",
+        "prompt:\n        - when: []\n          text: second",
+    );
+
+    assert!(narsor_engine::workflow::load_from_str(&yaml).is_err());
 }

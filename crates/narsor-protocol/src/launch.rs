@@ -18,7 +18,39 @@ use serde_json::Value;
 /// even see) since the task was created.
 /// Version 4 replaced the single `workspace` source with a list of named
 /// repositories, each with its branch, for workflows of several repositories.
-pub const TASK_LAUNCH_SPEC_VERSION: u32 = 4;
+/// Version 5 is a version 4 spec whose definition snapshot is in the unified
+/// state shape (`schema: v2` without legacy markers). Only such a spec is
+/// written as version 5, so a runner older than the shape refuses it by its
+/// version instead of failing on the snapshot, and still runs the rest.
+pub const TASK_LAUNCH_SPEC_VERSION: u32 = 5;
+
+/// The version of a spec whose definition is in the legacy state shape, or
+/// that has none. Still written, and read, beside [`TASK_LAUNCH_SPEC_VERSION`].
+pub const LEGACY_SHAPE_LAUNCH_SPEC_VERSION: u32 = 4;
+
+/// Why this build cannot read a spec of `version`, or `None` when it can.
+pub fn unsupported_launch_spec_version(version: u64) -> Option<String> {
+    let readable =
+        u64::from(LEGACY_SHAPE_LAUNCH_SPEC_VERSION)..=u64::from(TASK_LAUNCH_SPEC_VERSION);
+    if readable.contains(&version) {
+        return None;
+    }
+    let reads = format!(
+        "this build reads {LEGACY_SHAPE_LAUNCH_SPEC_VERSION} to {TASK_LAUNCH_SPEC_VERSION}"
+    );
+    Some(if version > u64::from(TASK_LAUNCH_SPEC_VERSION) {
+        format!(
+            "task launch spec version {version} was written by a newer Narsor build ({reads}); \
+             update this runner and controller to the server's build"
+        )
+    } else {
+        format!(
+            "task launch spec version {version} is not supported ({reads}); an older spec \
+             predates pinned environments, the workflow definition snapshot or the repository \
+             list and cannot be upgraded faithfully — archive the task and create it again"
+        )
+    })
+}
 
 /// Every top-level field of a current-version launch spec.
 ///
@@ -73,6 +105,25 @@ mod tests {
     }
 
     #[test]
+    fn both_written_versions_are_readable() {
+        assert_eq!(unsupported_launch_spec_version(4), None);
+        assert_eq!(unsupported_launch_spec_version(5), None);
+    }
+
+    #[test]
+    fn a_newer_version_asks_for_an_update() {
+        let message = unsupported_launch_spec_version(6).expect("refused");
+        assert!(message.contains("newer Narsor build"), "{message}");
+        assert!(message.contains("update"), "{message}");
+    }
+
+    #[test]
+    fn an_older_version_asks_to_create_the_task_again() {
+        let message = unsupported_launch_spec_version(3).expect("refused");
+        assert!(message.contains("create it again"), "{message}");
+    }
+
+    #[test]
     fn full_envelope_parses_with_ticket_and_title() {
         let mut value = base();
         value["definition"] = json!({"id": "wf"});
@@ -81,7 +132,7 @@ mod tests {
 
         let envelope: LaunchSpecEnvelope = serde_json::from_value(value).unwrap();
 
-        assert_eq!(envelope.version, TASK_LAUNCH_SPEC_VERSION);
+        assert_eq!(envelope.version, LEGACY_SHAPE_LAUNCH_SPEC_VERSION);
         assert_eq!(envelope.ticket.as_deref(), Some("NAR-001"));
         assert_eq!(envelope.title.as_deref(), Some("Poprawa formularza"));
         assert_eq!(envelope.definition, Some(json!({"id": "wf"})));

@@ -742,6 +742,79 @@ fn readings_reach_the_timeline_through_the_file_without_an_event() {
     assert_eq!(later.positions[0].usage.unwrap().cost_usd, Some(0.75));
 }
 
+fn conductor_use(input: u64, output: u64, cost: f64) -> UsageReading {
+    UsageReading::of_conductor(increment(input, output, cost))
+}
+
+#[test]
+fn the_conductors_use_lands_on_the_decision_step_it_decided() {
+    let store = scratch("conductor-decision");
+    let mut log = Log::new();
+    log.push(state_entered("gate"));
+    log.push(action_started("d1", "gate", "decision"));
+    let none = HashSet::new();
+    let record = narsor_engine::engine::timeline_file::record_reading;
+
+    record(&store, EXEC, "d1", conductor_use(300, 40, 0.05)).unwrap();
+    record(&store, EXEC, "d1", conductor_use(100, 10, 0.02)).unwrap();
+
+    let timeline = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Running, &none);
+    let [position] = timeline.positions.as_slice() else {
+        panic!("a decision step has a position");
+    };
+    let usage = position.usage.expect("usage");
+    assert_eq!(usage.conductor_total.map(|total| total.input), Some(400));
+    assert_eq!(usage.conductor_cost_usd, Some(0.07));
+    assert_eq!((usage.total, usage.cost_usd), (None, None));
+}
+
+#[test]
+fn the_conductors_cost_never_changes_the_cost_of_the_agent_of_the_step() {
+    let store = scratch("conductor-agent");
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a1", "plan", None, "hs-A");
+    let none = HashSet::new();
+    let record = narsor_engine::engine::timeline_file::record_reading;
+
+    record(&store, EXEC, "a1", increment(10, 4, 0.5)).unwrap();
+    record(&store, EXEC, "a1", conductor_use(300, 40, 0.05)).unwrap();
+    record(&store, EXEC, "a1", increment(1, 1, 0.25)).unwrap();
+
+    let timeline = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
+    let usage = timeline.positions[0].usage.expect("usage");
+    assert_eq!(usage.cost_usd, Some(0.75));
+    assert_eq!(usage.total.map(|total| total.input), Some(11));
+    assert_eq!(usage.conductor_cost_usd, Some(0.05));
+}
+
+#[test]
+fn a_timeline_file_without_conductor_fields_still_loads() {
+    let store = scratch("conductor-old-file");
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a1", "plan", None, "hs-A");
+    let none = HashSet::new();
+    narsor_engine::engine::timeline_file::record_reading(&store, EXEC, "a1", increment(10, 4, 0.5))
+        .unwrap();
+    current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
+    let path = store.execution_dir(EXEC).join("timeline.json");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !written.contains("conductor"),
+        "an old file has no such field"
+    );
+
+    let timeline = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Completed, &none);
+
+    let usage = timeline.positions[0].usage.expect("usage");
+    assert_eq!(usage.cost_usd, Some(0.5));
+    assert_eq!(
+        (usage.conductor_total, usage.conductor_cost_usd),
+        (None, None)
+    );
+}
+
 #[test]
 fn a_timeline_file_in_the_wrong_state_is_made_again() {
     let store = scratch("rebuild");

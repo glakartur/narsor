@@ -1,0 +1,20 @@
+# `exit` and `exit_codes` both say where a script's result goes.
+schema: v2
+name: exit-codes-with-exit
+version: 1
+
+states:
+  check:
+    action:
+      type: script
+      command: ./check.sh
+      exit_codes:
+        0: ok
+    exit:
+      next: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed

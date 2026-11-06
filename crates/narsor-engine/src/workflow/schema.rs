@@ -10,16 +10,22 @@
 //! job of [`crate::workflow::loader`], validating the result is the job of the
 //! validator.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 pub use crate::config::duration::{parse_duration, DurationParseError};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use crate::domain::SchemaVersion;
+use crate::domain::{
+    DecisionMaker, PromptText, SchemaVersion, SetDefinition, VariableScope, VariableSource,
+    VariableType, EXIT_LABEL, LOCAL_VARIABLE_PREFIX,
+};
 
 /// The whole workflow file (`docs/dev/workflow-schema.md` §2).
+///
+/// Two shapes of state exist, see [`StateShape`]. Both are read into the same
+/// [`StateSchema`], so everything past parsing is shape-agnostic.
 ///
 /// Which schema the file is written in is read from `schema` and enforced
 /// while parsing: a `v2` file that still uses `globals.workspace` or an
@@ -57,6 +63,34 @@ pub struct WorkflowFile {
     /// States whose entry ends the execution, with the status each one
     /// produces. Accepts both forms of §3.5 — see [`TerminalStatesSchema`].
     pub terminal_states: TerminalStatesSchema,
+
+    /// The shape the states were written in.
+    pub shape: StateShape,
+}
+
+impl WorkflowFile {
+    /// Whether the file is `schema: v2` but still written in the legacy
+    /// state shape, which only exists so that earlier files keep loading.
+    pub fn uses_deprecated_state_shape(&self) -> bool {
+        self.schema == SchemaVersion::V2 && self.shape == StateShape::Legacy
+    }
+}
+
+/// How the states of a file are written.
+///
+/// * `Legacy`: `choices` is a list and `transitions` a separate map; gates
+///   use `inputs`, forks may use a `decision` block. Every `v1` file, and
+///   any `v2` file that keeps this form.
+/// * `Unified`: `choices` is a mapping from label to exit object with its own
+///   `next`, a linear step has `exit`, and a fork decided by someone else is a
+///   `decision` action. Only in `schema: v2`.
+///
+/// The shape is read from the content, not declared: a `v2` file whose states
+/// carry a legacy marker (see [`legacy_marker`]) is `Legacy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateShape {
+    Legacy,
+    Unified,
 }
 
 /// The file as it is written, before the schema rules are applied.
@@ -76,7 +110,7 @@ struct RawWorkflowFile {
     #[serde(default)]
     display: Option<DisplaySchema>,
     #[serde(deserialize_with = "deserialize_ordered_states")]
-    states: Vec<(String, StateSchema)>,
+    states: Vec<(String, serde_yaml::Value)>,
     #[serde(default)]
     terminal_states: TerminalStatesSchema,
 }
@@ -85,17 +119,38 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
     type Error = String;
 
     fn try_from(raw: RawWorkflowFile) -> Result<Self, Self::Error> {
+        let marker = match raw.schema {
+            SchemaVersion::V1 => None,
+            SchemaVersion::V2 => legacy_marker(&raw.states, &raw.terminal_states),
+        };
+        let shape = if raw.schema == SchemaVersion::V2 && marker.is_none() {
+            StateShape::Unified
+        } else {
+            StateShape::Legacy
+        };
+        let states = raw
+            .states
+            .into_iter()
+            .map(|(id, value)| {
+                parse_state(shape, &id, value)
+                    .map(|state| (id, state))
+                    .map_err(|error| match &marker {
+                        Some(reason) => format!(
+                            "{error} (the file is read in the legacy state shape because \
+                             {reason})"
+                        ),
+                        None => error,
+                    })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
         let globals = raw.globals.as_ref();
         match raw.schema {
             SchemaVersion::V1 => {
                 if globals.is_some_and(|globals| globals.workspaces.is_some()) {
                     return Err("'globals.workspaces' requires 'schema: v2'".to_string());
                 }
-                if let Some((id, _)) = raw
-                    .states
-                    .iter()
-                    .find(|(_, state)| state.workspace.is_some())
-                {
+                if let Some((id, _)) = states.iter().find(|(_, state)| state.workspace.is_some()) {
                     return Err(format!("'states.{id}.workspaces' requires 'schema: v2'"));
                 }
             }
@@ -107,7 +162,7 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
                             .to_string(),
                     );
                 }
-                let with_access = raw.states.iter().find(|(_, state)| {
+                let with_access = states.iter().find(|(_, state)| {
                     matches!(
                         &state.action,
                         Some(ActionSchema::Agent(agent)) if agent.workspace_access.is_some()
@@ -121,6 +176,17 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
                 }
             }
         }
+        if shape == StateShape::Unified {
+            check_unified_file(&states, &raw.terminal_states)?;
+        } else if let Some((id, _)) = states
+            .iter()
+            .find(|(_, state)| matches!(state.action, Some(ActionSchema::Decision(_))))
+        {
+            return Err(format!(
+                "'states.{id}.action.type' is 'decision', which needs a 'schema: v2' file \
+                 in the unified state shape"
+            ));
+        }
         Ok(Self {
             schema: raw.schema,
             name: raw.name,
@@ -129,10 +195,97 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
             inputs: raw.inputs,
             globals: raw.globals,
             display: raw.display,
-            states: raw.states,
+            states,
             terminal_states: raw.terminal_states,
+            shape,
         })
     }
+}
+
+/// Why a `v2` file is in the legacy shape, if it is: the first thing in it
+/// that only that shape has.
+///
+/// `transitions` and a `decision` block are the legacy shape's own; so is a
+/// `choices` written as a list, `allow_manual_override` and `terminal_states`
+/// written as a list. A `v2` file with none of them is read in the unified
+/// shape.
+fn legacy_marker(
+    states: &[(String, serde_yaml::Value)],
+    terminal_states: &TerminalStatesSchema,
+) -> Option<String> {
+    let in_a_state = states.iter().find_map(|(id, value)| {
+        let state = value.as_mapping()?;
+        let has = |key: &str| state.contains_key(key);
+        let marker = if has("transitions") {
+            "transitions"
+        } else if has("decision") {
+            "decision"
+        } else if has("allow_manual_override") {
+            "allow_manual_override"
+        } else if state
+            .get("choices")
+            .is_some_and(serde_yaml::Value::is_sequence)
+        {
+            "choices as a list"
+        } else {
+            return None;
+        };
+        Some(format!("'states.{id}' has '{marker}'"))
+    });
+    in_a_state.or_else(|| {
+        terminal_states
+            .is_list_form()
+            .then(|| "'terminal_states' is a list".to_string())
+    })
+}
+
+fn parse_state(
+    shape: StateShape,
+    id: &str,
+    value: serde_yaml::Value,
+) -> Result<StateSchema, String> {
+    let failed = |error: serde_yaml::Error| format!("states.{id}: {error}");
+    match shape {
+        StateShape::Legacy => serde_yaml::from_value::<LegacyStateSchema>(value)
+            .map(StateSchema::from)
+            .map_err(failed),
+        StateShape::Unified => serde_yaml::from_value::<UnifiedStateSchema>(value)
+            .map_err(failed)
+            .and_then(|state| {
+                state
+                    .into_schema()
+                    .map_err(|error| format!("states.{id}: {error}"))
+            }),
+    }
+}
+
+/// The rules of the unified shape that need more than one state: one form of
+/// `terminal_states`, no gate with `inputs`, and no exit on a terminal state.
+fn check_unified_file(
+    states: &[(String, StateSchema)],
+    terminal_states: &TerminalStatesSchema,
+) -> Result<(), String> {
+    if terminal_states.is_list_form() {
+        return Err(
+            "'terminal_states' must be a mapping from state id to status in the unified \
+                    state shape"
+                .to_string(),
+        );
+    }
+    for (id, state) in states {
+        if matches!(state.action, Some(ActionSchema::Human(_))) {
+            return Err(format!(
+                "'states.{id}.action.type' is 'human', which the unified state shape does not \
+                 have; use 'type: decision' with 'by: human'"
+            ));
+        }
+        if terminal_states.contains(id) && (state.exit.is_some() || !state.choices.is_empty()) {
+            return Err(format!(
+                "terminal state '{id}' cannot have 'exit' or 'choices'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The `display` section (§3.6): templates for a task's title and links.
@@ -191,6 +344,11 @@ impl TerminalStatesSchema {
     /// Builds the section from already-parsed entries.
     pub fn new(entries: Vec<(String, Option<TerminalStatusSchema>)>) -> Self {
         Self { entries }
+    }
+
+    /// Whether the list form was used, which declares no status.
+    pub fn is_list_form(&self) -> bool {
+        self.entries.iter().any(|(_, status)| status.is_none())
     }
 
     /// The declared state ids, in file order.
@@ -509,66 +667,323 @@ pub struct StepWorkspaceSchema {
     pub read: Vec<String>,
 }
 
-/// A single state of the graph (§3.3).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A single state of the graph (§3.3), whichever shape it was written in.
+///
+/// Built from a [`LegacyStateSchema`] or an [`UnifiedStateSchema`]; the
+/// loader compiles this one. A unified state has no `transitions` of its own:
+/// the `next` of each choice is carried over into `transitions`, and `exit`
+/// stays separate until the loader turns it into the reserved choice.
+#[derive(Debug, Clone)]
 pub struct StateSchema {
     /// Maximum number of entries before operator intervention.
-    #[serde(default)]
     pub max_entries: Option<u32>,
-    #[serde(default)]
     pub description: Option<String>,
 
     /// Action executed on entry. Terminal states have none (§4).
-    #[serde(default)]
     pub action: Option<ActionSchema>,
 
-    /// Variables the step's action may set (agent and script steps only).
-    #[serde(default)]
-    pub variables: Vec<DefinitionSchema>,
+    /// Variables the step's action may set.
+    pub variables: Vec<VariableSchema>,
 
     /// Artifacts the step's action may produce (agent and script steps
     /// only).
-    #[serde(default)]
     pub artifacts: Vec<DefinitionSchema>,
 
     /// Possible choices, each optionally described — see [`ChoiceSchema`].
-    #[serde(default)]
     pub choices: Vec<ChoiceSchema>,
 
+    /// The only way out of a linear step (unified shape only).
+    pub exit: Option<ExitSchema>,
+
     /// Mapping from output label to target state.
-    #[serde(default)]
     pub transitions: HashMap<String, String>,
 
-    /// Decision provider; defaults to `rules`.
-    #[serde(default)]
+    /// Decision provider; defaults to `rules` (legacy shape only).
     pub decision: Option<DecisionSchema>,
 
     /// Overrides `globals.timeout`.
-    #[serde(default)]
     pub timeout: Option<DurationSecs>,
 
     /// Overrides `globals.retry_policy`.
-    #[serde(default)]
     pub retry_policy: Option<RetryPolicySchema>,
 
     /// Marks the entry point explicitly, overriding file order (§5.1).
-    #[serde(default)]
     pub initial: bool,
 
-    /// Allows the operator to force an arbitrary transition out of this state.
-    #[serde(default)]
+    /// Allows the operator to force an arbitrary transition out of this state
+    /// (legacy shape only).
     pub allow_manual_override: bool,
 
     /// Base image for this step only, overriding `globals.image` and the
     /// repository's (R15).
-    #[serde(default)]
     pub image: Option<crate::domain::ImageSpec>,
 
     /// Repositories the step gets (`schema: v2` only). Without it the step
     /// gets all of them, the primary one writable.
-    #[serde(default, rename = "workspaces")]
     pub workspace: Option<StepWorkspaceSchema>,
+}
+
+/// A state in the legacy shape, as it is written (§3.3).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyStateSchema {
+    #[serde(default)]
+    max_entries: Option<u32>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    action: Option<ActionSchema>,
+    #[serde(default)]
+    variables: Vec<DefinitionSchema>,
+    #[serde(default)]
+    artifacts: Vec<DefinitionSchema>,
+    #[serde(default)]
+    choices: Vec<ChoiceSchema>,
+    #[serde(default)]
+    transitions: HashMap<String, String>,
+    #[serde(default)]
+    decision: Option<DecisionSchema>,
+    #[serde(default)]
+    timeout: Option<DurationSecs>,
+    #[serde(default)]
+    retry_policy: Option<RetryPolicySchema>,
+    #[serde(default)]
+    initial: bool,
+    #[serde(default)]
+    allow_manual_override: bool,
+    #[serde(default)]
+    image: Option<crate::domain::ImageSpec>,
+    #[serde(default, rename = "workspaces")]
+    workspace: Option<StepWorkspaceSchema>,
+}
+
+impl From<LegacyStateSchema> for StateSchema {
+    fn from(state: LegacyStateSchema) -> Self {
+        StateSchema {
+            max_entries: state.max_entries,
+            description: state.description,
+            action: state.action,
+            variables: state
+                .variables
+                .into_iter()
+                .map(VariableSchema::from)
+                .collect(),
+            artifacts: state.artifacts,
+            choices: state.choices,
+            exit: None,
+            transitions: state.transitions,
+            decision: state.decision,
+            timeout: state.timeout,
+            retry_policy: state.retry_policy,
+            initial: state.initial,
+            allow_manual_override: state.allow_manual_override,
+            image: state.image,
+            workspace: state.workspace,
+        }
+    }
+}
+
+/// A state in the unified shape, as it is written.
+///
+/// `choices` is a mapping from label to exit object, `exit` the single exit
+/// of a linear step; a step has one of them. There is no `transitions`, no
+/// `decision` block and no `allow_manual_override`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnifiedStateSchema {
+    #[serde(default)]
+    max_entries: Option<u32>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    action: Option<ActionSchema>,
+    #[serde(default)]
+    variables: Vec<VariableSchema>,
+    #[serde(default)]
+    artifacts: Vec<DefinitionSchema>,
+    #[serde(default, deserialize_with = "deserialize_ordered_choices")]
+    choices: Vec<(String, ExitObjectSchema)>,
+    #[serde(default)]
+    exit: Option<ExitObjectSchema>,
+    #[serde(default)]
+    timeout: Option<DurationSecs>,
+    #[serde(default)]
+    retry_policy: Option<RetryPolicySchema>,
+    #[serde(default)]
+    initial: bool,
+    #[serde(default)]
+    image: Option<crate::domain::ImageSpec>,
+    #[serde(default, rename = "workspaces")]
+    workspace: Option<StepWorkspaceSchema>,
+}
+
+impl UnifiedStateSchema {
+    /// Applies the rules of a single unified state and converts it.
+    fn into_schema(self) -> Result<StateSchema, String> {
+        if self.exit.is_some() && !self.choices.is_empty() {
+            return Err("a step has 'exit' or 'choices', never both".to_string());
+        }
+        if let Some(variable) = self
+            .variables
+            .iter()
+            .find(|variable| variable.name.starts_with(LOCAL_VARIABLE_PREFIX))
+        {
+            return Err(format!(
+                "variable '{}' cannot be named with '{LOCAL_VARIABLE_PREFIX}'; declare it with \
+                 'scope: local'",
+                variable.name
+            ));
+        }
+
+        let mut choices = Vec::with_capacity(self.choices.len());
+        let mut transitions = HashMap::with_capacity(self.choices.len());
+        for (label, object) in self.choices {
+            if label == EXIT_LABEL {
+                return Err(format!(
+                    "'{EXIT_LABEL}' is reserved for the step's 'exit' and cannot be a choice label"
+                ));
+            }
+            let (choice, next) = object.into_choice(label.clone())?;
+            transitions.insert(label, next);
+            choices.push(choice);
+        }
+        let exit = self
+            .exit
+            .map(|object| {
+                object
+                    .into_choice(EXIT_LABEL.to_string())
+                    .map(|(choice, next)| ExitSchema { choice, next })
+            })
+            .transpose()?;
+
+        Ok(StateSchema {
+            max_entries: self.max_entries,
+            description: self.description,
+            action: self.action,
+            variables: self.variables,
+            artifacts: self.artifacts,
+            choices,
+            exit,
+            transitions,
+            decision: None,
+            timeout: self.timeout,
+            retry_policy: self.retry_policy,
+            initial: self.initial,
+            allow_manual_override: false,
+            image: self.image,
+            workspace: self.workspace,
+        })
+    }
+}
+
+/// The `exit` of a unified linear step: its only choice and where it leads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitSchema {
+    /// The choice, labelled [`EXIT_LABEL`].
+    pub choice: ChoiceSchema,
+    /// The state the step leads to.
+    pub next: String,
+}
+
+/// An exit object as written under `choices.<label>` or `exit`: what the
+/// choice requires, what it sets, and where it leads.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExitObjectSchema {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    requires_variables: Vec<String>,
+    #[serde(default)]
+    requires_artifacts: Vec<String>,
+    #[serde(default)]
+    requires_human_approval: bool,
+    #[serde(default)]
+    resume_comment_field: Option<String>,
+    #[serde(default)]
+    set: BTreeMap<String, serde_json::Value>,
+    next: String,
+}
+
+impl ExitObjectSchema {
+    fn into_choice(self, label: String) -> Result<(ChoiceSchema, String), String> {
+        let set = parse_set(self.set).map_err(|error| format!("choice '{label}': {error}"))?;
+        let choice = ChoiceSchema {
+            label,
+            description: self.description,
+            requires_variables: self.requires_variables,
+            requires_artifacts: self.requires_artifacts,
+            requires_human_approval: self.requires_human_approval,
+            resume_comment_field: self.resume_comment_field,
+            set,
+        };
+        Ok((choice, self.next))
+    }
+}
+
+/// Reads a `set` mapping: a name per shared variable, and the reserved key
+/// `local` holding a mapping of the step's own variables. Every value is
+/// text, a number or a boolean.
+fn parse_set(raw: BTreeMap<String, serde_json::Value>) -> Result<SetDefinition, String> {
+    let mut set = SetDefinition::default();
+    for (name, value) in raw {
+        if name == "local" {
+            let serde_json::Value::Object(locals) = value else {
+                return Err("'set.local' must be a mapping of variable name to value".to_string());
+            };
+            for (local_name, local_value) in locals {
+                check_set_value(&format!("set.local.{local_name}"), &local_value)?;
+                set.local.insert(local_name, local_value);
+            }
+        } else {
+            check_set_value(&format!("set.{name}"), &value)?;
+            set.global.insert(name, value);
+        }
+    }
+    Ok(set)
+}
+
+fn check_set_value(field: &str, value: &serde_json::Value) -> Result<(), String> {
+    match value {
+        serde_json::Value::String(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Bool(_) => Ok(()),
+        _ => Err(format!("'{field}' must be text, a number or true/false")),
+    }
+}
+
+/// One entry of a state's `variables` list.
+///
+/// A legacy entry has a name and a description; a unified one may also say
+/// where the value lives (`scope`), who supplies it (`source`), what type it
+/// has and which values it accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VariableSchema {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub scope: VariableScope,
+    #[serde(default)]
+    pub source: VariableSource,
+    #[serde(default, rename = "type")]
+    pub variable_type: Option<VariableType>,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+impl From<DefinitionSchema> for VariableSchema {
+    fn from(definition: DefinitionSchema) -> Self {
+        VariableSchema {
+            name: definition.name,
+            description: Some(definition.description),
+            scope: VariableScope::Global,
+            source: VariableSource::Step,
+            variable_type: None,
+            options: Vec::new(),
+        }
+    }
 }
 
 /// One entry of a state's `variables` or `artifacts` list: a name and what
@@ -605,6 +1020,8 @@ pub struct ChoiceSchema {
     pub requires_artifacts: Vec<String>,
     pub requires_human_approval: bool,
     pub resume_comment_field: Option<String>,
+    /// What taking the choice sets (unified shape only).
+    pub set: SetDefinition,
 }
 
 /// The object form of a [`ChoiceSchema`]. `deny_unknown_fields` keeps a
@@ -634,6 +1051,7 @@ impl ChoiceSchema {
             requires_artifacts: Vec::new(),
             requires_human_approval: false,
             resume_comment_field: None,
+            set: SetDefinition::default(),
         }
     }
 }
@@ -647,6 +1065,7 @@ impl From<ChoiceObjectSchema> for ChoiceSchema {
             requires_artifacts: object.requires_artifacts,
             requires_human_approval: object.requires_human_approval,
             resume_comment_field: object.resume_comment_field,
+            set: SetDefinition::default(),
         }
     }
 }
@@ -695,6 +1114,19 @@ pub enum ActionSchema {
     Script(ScriptActionSchema),
     Human(HumanActionSchema),
     Wait(WaitActionSchema),
+    /// Unified shape only.
+    Decision(DecisionActionSchema),
+}
+
+/// `type: decision`: a fork someone other than the step decides.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionActionSchema {
+    /// `conductor` or `human`.
+    pub by: DecisionMaker,
+
+    /// What the decider is asked; templated like an agent prompt.
+    pub message: PromptText,
 }
 
 /// `type: agent` (§3.3.A).
@@ -717,7 +1149,7 @@ pub struct AgentActionSchema {
     #[serde(default)]
     pub workspace_access: Option<crate::domain::WorkspaceAccess>,
 
-    pub prompt: String,
+    pub prompt: PromptText,
 
     #[serde(default)]
     pub parameters: HashMap<String, serde_json::Value>,
@@ -946,35 +1378,72 @@ where
 /// Deserializes the `states` mapping while preserving the order of the file.
 ///
 /// `HashMap` would lose that order, and the order decides which state is the
-/// entry point when no state is flagged `initial: true`.
+/// entry point when no state is flagged `initial: true`. Each state is kept
+/// as raw YAML here, because which shape it is parsed as depends on the whole
+/// file (see [`StateShape`]).
 fn deserialize_ordered_states<'de, D>(
     deserializer: D,
-) -> Result<Vec<(String, StateSchema)>, D::Error>
+) -> Result<Vec<(String, serde_yaml::Value)>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    struct StatesVisitor;
+    deserialize_ordered_map(deserializer, "a mapping of state id to state definition")
+}
 
-    impl<'de> Visitor<'de> for StatesVisitor {
-        type Value = Vec<(String, StateSchema)>;
+/// Deserializes the `choices` mapping of a unified state, keeping the order
+/// of the file: the order is how choices are listed to the agent and the
+/// operator.
+fn deserialize_ordered_choices<'de, D>(
+    deserializer: D,
+) -> Result<Vec<(String, ExitObjectSchema)>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_ordered_map(
+        deserializer,
+        "a mapping of choice label to exit object (a legacy list of labels is not allowed here)",
+    )
+}
+
+fn deserialize_ordered_map<'de, D, V>(
+    deserializer: D,
+    expecting: &'static str,
+) -> Result<Vec<(String, V)>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct OrderedMapVisitor<V> {
+        expecting: &'static str,
+        value: std::marker::PhantomData<V>,
+    }
+
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for OrderedMapVisitor<V> {
+        type Value = Vec<(String, V)>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a mapping of state id to state definition")
+            formatter.write_str(self.expecting)
         }
 
         fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
         where
             A: MapAccess<'de>,
         {
-            let mut states = Vec::with_capacity(map.size_hint().unwrap_or(0));
-            while let Some((id, state)) = map.next_entry::<String, StateSchema>()? {
-                states.push((id, state));
+            let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((key, value)) = map.next_entry::<String, V>()? {
+                if entries.iter().any(|(existing, _)| existing == &key) {
+                    return Err(de::Error::custom(format!("duplicate entry '{key}'")));
+                }
+                entries.push((key, value));
             }
-            Ok(states)
+            Ok(entries)
         }
     }
 
-    deserializer.deserialize_map(StatesVisitor)
+    deserializer.deserialize_map(OrderedMapVisitor {
+        expecting,
+        value: std::marker::PhantomData,
+    })
 }
 
 #[cfg(test)]

@@ -18,9 +18,10 @@ use chrono::Utc;
 use engine_support::{fixtures, workflow, Harness};
 use narsor_engine::conductor::snapshot::{render, ConversationTail, SnapshotBudget, SnapshotInput};
 use narsor_engine::conductor::{
-    prompt::conductor_prompt, ChatAuthor, ChatEntry, ChatEntryKind, ConductorAccess,
-    ConductorRegistry, ConductorResponse, ConductorStore, Decision, DecisionKind, HarnessInvoker,
-    Invocation, InvocationOutcome, LiveHarness, QueuedRequest, ResponseError,
+    prompt::{conductor_prompt, conductor_prompt_for},
+    Autopilot, ChatAuthor, ChatEntry, ChatEntryKind, ConductorAccess, ConductorRegistry,
+    ConductorResponse, ConductorStore, Decision, DecisionKind, HarnessInvoker, Invocation,
+    InvocationOutcome, LiveHarness, QueuedRequest, ResponseError,
 };
 use narsor_engine::domain::{
     ArtifactReference, ChoiceDefinition, ConductorOutcome, ConductorPurpose, ConductorTrigger,
@@ -29,7 +30,7 @@ use narsor_engine::domain::{
 use narsor_engine::engine::actions::harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessRegistry, OpenCodeAdapter,
 };
-use narsor_engine::engine::{DefaultHarnessSource, Engine};
+use narsor_engine::engine::{DefaultHarnessSource, Engine, ReadingSink, UsageReading};
 use narsor_engine::persistence::DefaultHarnessSelector;
 use serde_json::{json, Value};
 
@@ -1011,6 +1012,69 @@ async fn an_opencode_conductor_gets_no_schema() {
 // The response
 // ---------------------------------------------------------------------------
 
+/// A reading sink that keeps what it is given.
+#[derive(Debug, Default)]
+struct RecordedReadings(std::sync::Mutex<Vec<(String, String, UsageReading)>>);
+
+impl ReadingSink for RecordedReadings {
+    fn record(&self, execution_id: &str, attempt_id: &str, reading: UsageReading) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((execution_id.to_string(), attempt_id.to_string(), reading));
+    }
+}
+
+#[tokio::test]
+async fn the_use_a_conductor_reports_goes_to_the_sink_as_the_conductors_own() {
+    let fixture = Fixture::new();
+    let line = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "conductor-session",
+        "result": CHOOSE_DONE,
+        "total_cost_usd": 0.05,
+        "usage": { "input_tokens": 300, "output_tokens": 40 },
+    });
+    fixture.claude.answers(&format!("{line}\n"));
+    let sink = Arc::new(RecordedReadings::default());
+
+    let outcome = fixture
+        .invoker("claude-code")
+        .with_reading_sink(sink.clone())
+        .invoke_once(&fixture.rescue())
+        .await;
+    answered(outcome, ConductorPurpose::ChooseOutput);
+
+    let readings = sink.0.lock().unwrap();
+    let [(execution_id, episode, reading)] = readings.as_slice() else {
+        panic!("expected one reading, got {readings:?}");
+    };
+    assert_eq!(execution_id, &fixture.execution_id);
+    assert_eq!(episode, "episode-1");
+    assert_eq!(reading.conductor_cost_usd, Some(0.05));
+    assert_eq!(reading.conductor_total.map(|total| total.input), Some(300));
+    assert_eq!(reading.cost_usd, None);
+    assert_eq!(reading.total, None);
+}
+
+#[tokio::test]
+async fn an_answer_without_a_use_report_is_still_an_answer_and_records_nothing() {
+    let fixture = Fixture::new();
+    fixture.claude.answers(&claude_answer(CHOOSE_DONE));
+    let sink = Arc::new(RecordedReadings::default());
+
+    let outcome = fixture
+        .invoker("claude-code")
+        .with_reading_sink(sink.clone())
+        .invoke_once(&fixture.rescue())
+        .await;
+
+    answered(outcome, ConductorPurpose::ChooseOutput);
+    assert!(sink.0.lock().unwrap().is_empty());
+}
+
 #[test]
 fn a_response_without_confidence_is_low() {
     let response = ConductorResponse::parse(
@@ -1143,6 +1207,8 @@ fn a_long_tasks_snapshot_fits_its_budget_with_the_definition_and_pending_input_w
             description: Some("The work is done.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
+            exit: false,
+            set: Default::default(),
         }],
         definition: Ok(definition.clone()),
         pending_input: Some(pending.clone()),
@@ -1255,6 +1321,7 @@ fn every_purpose_offers_exactly_the_decisions_it_allows() {
         ConductorPurpose::DiagnoseFailure,
         ConductorPurpose::ReplyToChat,
         ConductorPurpose::SummarizeGate,
+        ConductorPurpose::DecideFork,
     ];
     let all = [
         DecisionKind::ChooseOutput,
@@ -1286,4 +1353,35 @@ fn every_purpose_offers_exactly_the_decisions_it_allows() {
         }
     }
     assert!(!offered[&("diagnose_failure", "choose_output")]);
+}
+
+/// The task and the answer contract of `prompt`, split where the contract
+/// lists the decisions.
+fn task_and_contract(prompt: &str) -> (String, String) {
+    let (task, contract) = prompt
+        .split_once("`decision` must be exactly one of:")
+        .expect("the answer contract");
+    (task.to_string(), contract.to_string())
+}
+
+/// The modes of the autopilot differ in what the conductor is told, never in
+/// what it may answer with.
+#[test]
+fn the_autopilot_modes_change_the_task_and_not_the_answer_contract() {
+    let prompt_in = |mode| {
+        conductor_prompt_for(
+            ConductorPurpose::AnswerAgentQuestion,
+            ConductorAccess::Isolated,
+            "",
+            &[],
+            mode,
+        )
+    };
+    let (task, contract) = task_and_contract(&prompt_in(Some(Autopilot::On)));
+    let (best_effort_task, best_effort_contract) =
+        task_and_contract(&prompt_in(Some(Autopilot::BestEffort)));
+
+    assert_ne!(task, best_effort_task);
+    assert_eq!(contract, best_effort_contract);
+    assert_eq!(prompt_in(None), prompt_in(Some(Autopilot::On)));
 }
