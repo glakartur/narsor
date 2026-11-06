@@ -1400,6 +1400,41 @@ fn resume_comment_field_has_to_be_a_text_variable_of_the_decision() {
 }
 
 #[test]
+fn an_old_shape_gate_may_still_have_a_label_named_timeout() {
+    let yaml = r#"
+schema: v2
+name: old-shape-timeout-label
+version: 1
+
+states:
+  gate:
+    action:
+      type: human
+      message: Pick one.
+    choices:
+      - timeout
+      - done
+    transitions:
+      timeout: done
+      done: done
+  done:
+    description: End.
+
+terminal_states:
+  done: completed
+"#;
+
+    let errors = narsor_engine::workflow::validate_source(yaml).expect("the file must compile");
+    assert!(
+        !errors
+            .iter()
+            .any(|err| matches!(err, ValidationError::TimeoutChoiceNotAllowed { .. })),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
 fn a_timeout_choice_is_only_for_agent_and_script_steps() {
     let errors = errors_of("timeout_choice_on_decision.yaml");
     assert!(

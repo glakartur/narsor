@@ -26,6 +26,64 @@ finishes the execution as `completed`, because the list declares only *which*
 states are terminal and not what they mean. Reach for the mapping form when a
 state is supposed to end the run as a failure or a cancellation.
 
+## Two shapes of a state
+
+A workflow file can write its states in two shapes. Both load.
+
+* **The unified shape** is for `schema: v2` files. `choices` is a map. Each label
+  has its own `next`, and a step with one way out has `exit` instead of `choices`.
+  A fork that is not decided by an agent or a script is a step with
+  `type: decision` and `by: human` or `by: conductor`. This shape also has richer
+  variables (`scope`, `source`, `type`, `options`), `set` on a choice, prompts as
+  lists of parts with `when`, and `{{ steps.ID.label }}`.
+* **The older shape** has `choices` as a list and a separate `transitions` map.
+  Every `v1` file uses it. A `schema: v2` file that has `transitions`, a
+  `decision` block, `allow_manual_override`, `choices` as a list or
+  `terminal_states` as a list is read in this shape too. Under `schema: v2` it is
+  deprecated: the file still loads, and Narsor logs a warning.
+
+```yaml
+schema: v2
+name: example
+version: 1
+
+states:
+  build:
+    action:
+      type: script
+      command: ./build.sh
+    exit:                 # one way out, no label to pick
+      next: test
+
+  test:
+    action:
+      type: script
+      command: ./test.sh
+    choices:              # a fork: each label has its own next
+      passed:
+        next: done
+      failed:
+        next: build
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed
+```
+
+What changed for old files:
+
+* `v1` files and `schema: v2` files in the older shape keep working.
+* `autopilot` has three values now: `off`, `on` and `best-effort`. The value
+  `true` no longer turns it on. Use `on`.
+* Only an agent or a script step can declare a `timeout` choice.
+* The unified shape has no `allow_manual_override`. The operator can force a jump
+  from every state that is not terminal, with a reason. See [the terminal
+  interface](tui.md#terminal-interface-tui).
+
+The full rules are in [the workflow schema](../dev/workflow-schema.md).
+
 ## Workflows: built in, by name, overridable
 
 The `template` workflow is compiled into `narsor-cli`; install the workspace

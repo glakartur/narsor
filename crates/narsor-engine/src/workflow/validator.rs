@@ -56,7 +56,7 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_step_contract(state, &mut errors);
         validate_variable_declarations(state, &mut errors);
         validate_set_assignments(state, &mut errors);
-        validate_exit_and_timeout(state, &mut errors);
+        validate_exit_and_timeout(definition, state, &mut errors);
         validate_decision(state, &mut errors);
         validate_state_templates(definition, &declared, state, &mut errors);
         validate_state_image(state, &mut errors);
@@ -714,7 +714,11 @@ fn rejected_value(variable: &VariableDefinition, value: &serde_json::Value) -> O
 /// `exit_codes` and `exit` both say where a script's result goes, so a linear
 /// script step cannot have the first; and only an agent or script step can
 /// finish with the engine's own `timeout`.
-fn validate_exit_and_timeout(state: &State, errors: &mut Vec<ValidationError>) {
+fn validate_exit_and_timeout(
+    definition: &WorkflowDefinition,
+    state: &State,
+    errors: &mut Vec<ValidationError>,
+) {
     let has_exit = state.choices.iter().any(ChoiceDefinition::is_exit);
     if let Some(ActionConfig::Script(script)) = &state.action {
         if has_exit && !script.exit_codes.is_empty() {
@@ -732,7 +736,10 @@ fn validate_exit_and_timeout(state: &State, errors: &mut Vec<ValidationError>) {
         .choices
         .iter()
         .any(|choice| choice.label == crate::engine::actions::TIMEOUT_LABEL);
-    if declares_timeout && !can_time_out && state.action.is_some() {
+    // Old-shape workflows may use `timeout` as an ordinary label of a human
+    // gate, so the rule applies to the unified shape only.
+    let unified = definition.shape == crate::domain::DefinitionShape::Unified;
+    if unified && declares_timeout && !can_time_out && state.action.is_some() {
         errors.push(ValidationError::TimeoutChoiceNotAllowed {
             state: state.id.clone(),
         });

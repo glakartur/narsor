@@ -8,7 +8,8 @@ This document defines the declarative format of the YAML files used to describe 
 
 *   **Static Graph:** The workflow definition is immutable during execution. States or transitions cannot be added dynamically.
 *   **One State = One Action:** Each state executes exactly one action (`AgentAction`, `ScriptAction`, `HumanAction`, `WaitAction`).
-*   **Deterministic Transitions:** Transitions between states are determined by a static mapping of choice labels (`choices`) to target states. There are no dynamic conditional expressions (e.g. `when: x > 5`).
+*   **Deterministic Transitions:** Transitions between states are determined by a static mapping of choice labels (`choices`) to target states. There are no dynamic conditional expressions (e.g. `when: x > 5`). The `when` of a prompt part (§3.7.6) only decides whether a piece of prompt text is sent. It never picks a transition.
+*   **Two State Shapes:** A `schema: v2` file is written in the unified state shape (§3.7). The older shape, with `choices` as a list and a separate `transitions` map, still loads. It is deprecated under `schema: v2` (§3.7.9).
 *   **One Step Contract:** An agent step and a script step define their variables and artifacts once, each with a name and a description. Each choice gives only the names of the variables and artifacts it requires (§3.3).
 *   **Structured Response:** The agent and script finish a step with a single JSON object: `choice` (the choice label), `reason` (a single line of rationale), `variables` (step variables), `artifacts` (artifact name → path), `additional_data` and `additional_artifacts` (content outside the step definition). There is no `data` field in the response (§3.3.A).
 *   **Security through Isolation:** The workspace is defined at the execution or task level, and is not changed dynamically within the workflow. File access is controlled by filesystem permissions and mounts.
@@ -20,7 +21,9 @@ This document defines the declarative format of the YAML files used to describe 
 A workflow file consists of the following sections:
 
 ```yaml
-schema: <v1|v2>             # Schema of this file (optional, v1 when missing; §3.2.1)
+schema: <v1|v2>             # Schema of this file (optional, v1 when missing; §3.2.1).
+                            # A v2 file is read in the unified state shape (§3.7) unless it
+                            # uses a legacy marker (§3.7.1).
 name: <string>              # Unique workflow name (e.g. "code-review")
 version: <integer>          # Definition version (e.g. 1)
 description: <string>       # Description of the workflow's purpose (optional)
@@ -85,11 +88,18 @@ states:                     # State graph (required)
       write: [<name>]
     timeout: <duration>     # Timeout for this state (overrides the global one)
     retry_policy:           # Retry policy for this action (overrides the global one)
+    allow_manual_override: <boolean>  # Legacy shape only: may the operator force a jump (§3.7.8)
 
 terminal_states:            # Terminal states (ending the workflow) and their status
   <state_id_1>: completed   # completed | failed | cancelled
   <state_id_2>: failed      # The list form also works — every entry = completed
 ```
+
+The `states` block above is the **legacy state shape**: `choices` is a list and `transitions` is a
+separate map. It is what every `v1` file uses. The **unified state shape** of `schema: v2` writes
+`choices` as a map from label to an exit object that has its own `next`, and it adds `exit`, the
+`decision` action and richer variables. It is described in §3.7. The rest of §3 describes what both
+shapes share, and marks what belongs to the legacy shape only.
 
 ---
 
@@ -237,6 +247,10 @@ For a complete example see `tests/fixtures/multirepo/code_and_docs.yaml`.
 
 The heart of the workflow definition. Each key in the `states` section is a unique state identifier.
 
+The structure below is the **legacy shape** (`choices` as a list, a separate `transitions` map). The
+unified shape of `schema: v2` is in §3.7. Where the text says "legacy shape only", the unified shape
+has a different form for the same job.
+
 #### State Structure:
 
 ```yaml
@@ -274,6 +288,7 @@ The heart of the workflow definition. Each key in the `states` section is a uniq
     backoff: 5s
   max_entries: 5                     # entry limit; waiting for an operator decision
   image: <image>                      # Override of the base image for this step (§3.2)
+  allow_manual_override: false        # Legacy shape only (§3.7.8)
 ```
 
 #### Choices (`choices`)
@@ -320,7 +335,8 @@ A choice object can also express two optional control behaviors:
 An `agent` and `script` step may define its variables and artifacts. Each entry
 has two required fields: `name` and `description`. Any other field is a load error.
 A `human` gate, a `wait` step and a terminal state cannot define variables or
-artifacts (§5).
+artifacts (§5). In the unified shape a `decision` step may define variables, but not artifacts
+(§3.7.3). The unified shape also has richer variable declarations (§3.7.4).
 
 *   A **global variable** (e.g. `blocker`) goes into the execution context
     (`context.variables`) after the transition. Subsequent steps read it through
@@ -560,7 +576,9 @@ An example script response:
 *   The engine does not ask the script again. When a script does not provide a required value,
     the transition happens, and the gate after the step shows only the provided values.
 *   When a step exceeds the time limit and has a `timeout` choice, the engine itself creates a
-    `timeout` result with a `reason` of the form "the step exceeded the time limit of Ns".
+    `timeout` result with a `reason` of the form "the step exceeded the time limit of Ns". The
+    engine matches the choice by its name, `timeout`, in both shapes. Only an agent or a script
+    step can declare it (§5).
 
 A script without a JSON object on stdout still works. The engine then decides only
 on the basis of the exit code.
@@ -615,7 +633,9 @@ action:
   timeout: 24h                              # Maximum wait time
 ```
 
-**Outputs:** Typically `received` (when the event occurred) or `timeout` (when the time elapsed).
+**Choices:** the labels the state declares, typically `received` (when the event occurred). The
+engine creates a `timeout` result only for an agent or script step. In the unified shape, a
+`timeout` choice on a `wait` step is a validation error (§5).
 
 #### Scope of `{{ }}` templates
 
@@ -650,7 +670,15 @@ Whitespace inside `{{ }}` is ignored. There are no filters (`| default(...)`), e
 
 Thanks to this a step can refer to its own document or to a variable that is set only by a later step. On the first entry the render is empty. On the next entry the template yields the value.
 
-**Reserved variable `autopilot`.** It decides who gets an agent's question (`awaiting_input`) asked in reply to a reprompt: unset, `off` or any other value — the operator; `on` or `true` — the conductor first, then the operator if the conductor does not answer with high confidence. A step can set it like any variable, or the workflow can declare it with a `default`.
+**Reserved variable `autopilot`.** It decides who gets the question of an agent (`awaiting_input`), including one asked in reply to a reprompt. It has three values:
+
+- `off`: the operator gets every question. This is the value when the variable is unset. Any other word, and a boolean (`true`, `false`), also mean `off`.
+- `on`: the conductor tries first. It answers only when the task, the context or the repository settle the question.
+- `best-effort`: the conductor also answers with a reasonable default. It writes every assumption into its rationale.
+
+The operator gets the question when the conductor is not sure (it must answer with high confidence), when no conductor is attached, and when the question is a permission request or a notice of the engine. The conductor answers at most 5 questions per entry into a step. The sixth goes to the operator. A new entry into the step counts from zero. The conductor answer is recorded as an event with its rationale. `autopilot` never changes the rescue of a missing answer, and it never changes who decides a `decision` step.
+
+A step sets `autopilot` like any variable: a step variable, a gate field, or `set` on a choice (§3.7.5). There is no `default` for step variables. The value `true` no longer turns `autopilot` on. Use `on`.
 
 Non-string values render as JSON: a number and a boolean without quotes (`123`, `true`), a list and an object in compact form (`["a","b"]`).
 
@@ -659,6 +687,8 @@ Non-string values render as JSON: a number and a boolean without quotes (`123`, 
 ### 3.4. Decision Providers
 
 Specifies the mechanism for choosing a transition based on an action's result. `rules` by default.
+
+The `decision` block belongs to the legacy shape. In the unified shape a fork that someone else decides is a step with `type: decision` (§3.7.3). A file with a `decision` block is read in the legacy shape.
 
 #### A. Rules (Static Rules)
 
@@ -753,11 +783,272 @@ display:
 *   **Two rendering places.** The control plane renders the section from the sealed `inputs` when the task is created (the variables are then empty). The runner renders it again from `context.variables` and reports it in the snapshot; the last report wins.
 *   `label` is non-empty and unique within the section; an unknown field in `display` or in a link is a load error.
 
+### 3.7. Unified State Shape (`schema: v2`)
+
+The unified shape is for `schema: v2` files. A step names its exits in one place. The target of each
+exit is written next to it. The loader compiles this shape into the same model as the legacy shape, so
+the engine, the TUI and the CLI treat both alike.
+
+#### 3.7.1. Which shape a file has
+
+The shape is read from the content. It is not declared.
+
+*   A `v1` file is always in the legacy shape.
+*   A `v2` file is in the legacy shape when any of these legacy markers occurs: a state has
+    `transitions`, `decision` or `allow_manual_override`; a state has `choices` written as a list;
+    `terminal_states` is a list.
+*   A `v2` file without a marker is in the unified shape.
+
+One marker puts the whole file, every state, in the legacy shape. A parse error in that file names the
+marker, so a state written in the new form by mistake is easy to find.
+
+The unified shape has no `human` action (use a decision step, §3.7.3). The legacy shape has no
+`decision` action. `terminal_states` must be a mapping.
+
+#### 3.7.2. State structure, choices and `exit`
+
+```yaml
+<state_id>:
+  description: <string>
+  action:
+    type: <agent|script|decision|wait>
+    # ... configuration specific to the action type
+  variables: [...]              # §3.7.4 (agent, script and decision steps)
+  artifacts: [...]              # agent and script steps only
+  choices:                      # a fork: a map, in the order written
+    <label>:
+      description: <string>             # optional
+      requires_variables: [<name>]      # optional, names from this step's `variables`
+      requires_artifacts: [<name>]      # optional, names from this step's `artifacts`
+      requires_human_approval: <bool>   # agent steps only
+      resume_comment_field: <name>      # decision steps only (§3.7.3)
+      set: { <name>: <value> }          # optional (§3.7.5)
+      next: <state_id>                  # required
+  exit:                         # a linear step: instead of `choices`, never both
+    # the same keys as a choice object, with `next` required
+  timeout: <duration>
+  retry_policy: { ... }
+  max_entries: <int>
+  image: <image>
+  workspaces: { ... }           # §3.2.1
+  initial: <boolean>
+```
+
+*   `choices` is a map from a label to an **exit object**. The key is the label. The order of the file
+    is kept. It is the order in which the engine lists the labels to the agent and to the operator.
+    `next` is the state the label leads to. The unified shape has no `transitions` map.
+*   `exit` is for a step that has one way out. There is no label to pick. An agent gives no `choice`.
+    A script goes on when it exits with code `0`. Any other code is not the exit, and the step does not
+    go on. A step has `exit` or `choices`, never both. Internally `exit` is the single choice with the
+    reserved label `exit`, so `exit` cannot be a key in `choices`. A step with `exit` cannot declare a
+    `timeout` choice, so a timeout fails that step. A step that must handle a timeout uses `choices`.
+*   A terminal state has neither `exit` nor `choices`.
+*   An unknown key in an exit object (for example a typo) is a load error. So is a missing `next`.
+*   Every other key behaves as in the legacy shape. `requires_variables`, `requires_artifacts`,
+    `requires_human_approval` and `resume_comment_field` keep their meaning (§3.3).
+
+A step with `exit` does not offer a choice. The agent contract says: "This step has one way out: do not
+give a `choice`." The answer is the same object as before, without `choice` (§3.3.A).
+
+A short example:
+
+```yaml
+implement:
+  action:
+    type: agent
+    prompt: Implement the change.
+  variables:
+    - name: summary
+      description: What was done.
+  exit:
+    requires_variables: [summary]
+    next: test
+
+test:
+  action:
+    type: script
+    command: ./test.sh
+  choices:
+    passed:
+      next: done
+    failed:
+      description: The tests are red.
+      next: implement
+    timeout:
+      next: gave_up
+```
+
+#### 3.7.3. Decision steps (`type: decision`)
+
+A decision step is a fork that is not decided by an agent or a script. Someone else picks the label.
+It replaces the `human` action and the `decision` block of the legacy shape.
+
+```yaml
+approval:
+  action:
+    type: decision
+    by: human                  # human | conductor
+    message: "Review finished: {{ steps.review.reply }}"   # required, a prompt text (§3.7.6)
+  variables:
+    - name: comment
+      type: text
+      description: Remarks on the decision.
+    - name: severity
+      type: select
+      options: [low, high]
+  choices:
+    approve:
+      next: done
+    revise:
+      requires_variables: [comment]
+      resume_comment_field: comment
+      next: review
+    reject:
+      requires_variables: [comment, severity]
+      next: cancelled
+```
+
+*   `by` is `human` or `conductor`. `message` is required and must not be blank. The step needs at
+    least one choice. A decision step may define `variables`. It may not define `artifacts`.
+*   **`by: human`.** The engine asks the operator with a form. The step's `variables` are the fields,
+    except those with `source: workflow`. A variable with `options` (or `type: select`) is a `select`
+    field. Any other variable is a text field. No field is required by the form. The label is chosen
+    from the menu of `choices`, and the engine refuses a label when one of its `requires_variables`
+    has no value (a blank value is no value). The form also shows the values that the step keeps in
+    its `scope: local` variables. `resume_comment_field` names a variable of `type: text` on the
+    step. The comment is then required, and the target of that label must be an agent step.
+*   **`by: conductor`.** The conductor decides, always. `autopilot` does not matter here. The engine
+    gives the conductor the rendered message, the choices and what each choice requires. The conductor
+    picks a label when it is sure and gives every value the label requires. The engine saves the
+    choice as a decision of the `conductor` provider, applies `set` and takes the transition. The
+    operator can undo the choice. The operator decides instead when the conductor is not sure, when it
+    fails, when no conductor is attached, or when its choice is not valid. The form then shows the
+    conductor's proposal prefilled. Every decision is an event with confidence and rationale.
+*   The tokens and the cost of the conductor run are written to the timeline entry of the step it
+    decided in. They are shown apart from the numbers of the agents (the usage line of a task shows
+    `dyrygent` and `razem`, the step list a `dyr.` column).
+*   A decision step cannot declare a `timeout` choice (§5).
+
+#### 3.7.4. Variables
+
+An entry of `variables` has these keys:
+
+| Key | Meaning |
+|---|---|
+| `name` | Required. Letters, digits and `_`, not starting with a digit. In the unified shape the name has no `local.` prefix. |
+| `description` | Optional. Shown in the agent contract and in the decision form. |
+| `scope` | `global` (default) or `local`. A global variable goes into the context. A local variable stays in the step memory and is read as `{{ local.NAME }}`. |
+| `source` | `step` (default) or `workflow`. `workflow` means that only `set` writes the variable. It is not part of the agent contract or of the form. |
+| `type` | `string`, `text`, `select`, `integer` or `boolean`. |
+| `options` | The only values the variable accepts. Only for `string`, `select` or no `type`. |
+
+*   A step can define variables when it is an agent, a script or a decision step. A local variable is
+    allowed on all three. A `wait` step and a terminal state cannot define variables.
+*   `options` restrict what a step returns. An agent that returns another value is asked again, in the
+    same session. A script that returns another value fails the step. The agent contract lists the
+    allowed values. A value that is blank counts as not given.
+*   `type` is checked for the values of `set` (§3.7.5). For the values a step returns, the engine
+    checks only `options`. `type: select` needs `options`. `type: text` also marks the comment field
+    of `resume_comment_field`.
+*   A variable with `source: workflow` is never required by a choice. If a step returns a value for it
+    anyway, the engine moves the value to `additional_data` and records a warning.
+*   A `scope: local` variable cannot have `source: workflow`.
+*   A global variable of the same name in several steps must have the same `type` and the same
+    `options` in each of them. Local variables are exempt.
+*   A name is declared once per step.
+*   The legacy form of an entry (`name` and `description`, and a `local.` prefix for a local variable)
+    is still accepted in the legacy shape. A `local.` prefix in the unified shape is an error.
+
+#### 3.7.5. `set` on a choice
+
+`set` writes variables when the step leaves with that choice (or `exit`). It is the way to give a
+variable a value that no agent or script returned.
+
+```yaml
+choices:
+  approved:
+    set:
+      autopilot: "off"          # a global variable
+      local:
+        notes: ""               # a `scope: local` variable of this step
+    next: done
+```
+
+*   The keys are names of variables that this same step declares. Global variables go directly under
+    `set`. Local variables go under `set.local`. The key `local` is reserved for that map.
+*   A value is text, a number or `true`/`false`. Text may contain templates (`{{ ... }}`). The engine
+    renders them when the choice is taken. The scope has the context after the step result, the
+    local values of the step, and the label that each step last chose, this step included.
+*   The validator checks literal values against `type` and `options`. A value with a template is
+    checked by the engine when it applies the value.
+*   The engine renders and checks every assignment first. If one fails, the step fails and nothing is
+    written. Otherwise it writes the assignments after the result of the step, so `set` wins over a
+    value that the step returned.
+*   Each assignment is an event: `VariableSetByWorkflow` (shown as `variable_set`).
+*   A manual jump of the operator (§3.7.8) does not apply `set`.
+
+#### 3.7.6. Prompt and message parts (`when`)
+
+The `prompt` of an agent and the `message` of a decision step are a string or a list of parts.
+
+```yaml
+prompt:
+  - Draft the change.
+  - when: local.memory
+    text: "Your notes from the last attempt: {{ local.memory }}"
+  - when: [local.memory, steps.review.reply]
+    text: "The review said: {{ steps.review.reply }}"
+```
+
+*   A part is a string (it always applies) or an object with `text` and `when`. Unknown keys in the
+    object are an error.
+*   `when` is one reference or a list of references. A part applies only when every reference has a
+    value. The engine joins the parts that apply with an empty line.
+*   A reference has no value when it is missing, `null`, or text with only white space. `false` and `0`
+    are values. A `steps.ID.*` reference to a step that has not run yet has no value. It is not an
+    error here.
+*   A reference is written plainly (`local.memory`, `context.pr_number`, `inputs.x`, `artifacts.x`,
+    `steps.ID.reply`). No braces, no filter, no white space, and the list must not be empty. The
+    loader checks a reference like a `{{ }}` placeholder in the same text. An undeclared input, and a
+    `steps.ID.reply` of a script step, are errors.
+*   An error message about a text with several parts names the part (for example `prompt[2].when`).
+*   A text that is one plain string works as before.
+
+#### 3.7.7. The label of an earlier step (`steps.ID.label`)
+
+`{{ steps.ID.label }}` is the label that step `ID` last chose. For a step with `exit` the label is
+`exit`. A decision step has a label too. It is allowed in an agent `prompt`, in a decision `message`
+and in the `when` of their parts. The step `ID` must exist, and it must not be a terminal state.
+A placeholder for a step that has not chosen yet is an error. In a `when` the same reference has no
+value.
+
+#### 3.7.8. Manual transitions
+
+The unified shape has no `allow_manual_override`. The operator may force a jump out of any state
+that is not terminal. A forced jump needs a reason. The reason is audited as `human_override`. The
+offer of the control plane and the check of the runner use the same rule. In the legacy shape the
+state decides: `allow_manual_override: true` allows the jump, and a state without the field forbids
+it. Picking one of the declared exits of the current state never needs the field.
+
+#### 3.7.9. Compatibility and the deprecated shape
+
+*   A `v1` file loads as before. The loader converts it in memory (§3.2.1).
+*   A `v2` file in the legacy shape also loads, with the same behaviour as before. The loader logs a
+    warning that the shape is deprecated and what to write instead. The definition keeps the legacy
+    rules, for example `allow_manual_override`.
+*   A definition that was saved before the shape was recorded reads as legacy.
+*   Two behaviours changed for every shape. `autopilot` has three values and `true` no longer means
+    `on` (§3.3). In the unified shape, a step can declare a `timeout` choice only when it is an agent or a script step.
+*   There is no tool that converts a file. To convert a state, write `choices` as a map with `next`,
+    move each `transitions` entry into its choice, and use `exit` for a step with one label. Replace
+    a `human` action with `type: decision` and `by: human`, and its `inputs` with `variables`. Write
+    `terminal_states` as a mapping.
+
 ---
 
 ## 4. Example Workflow
 
-Below is a complete example of a workflow implementing a simple process of implementing a feature, testing it and creating a PR.
+Below is a complete example of a workflow implementing a simple process of implementing a feature, testing it and creating a PR. It is written in the **legacy shape** (no `schema` field, so `v1`). The test fixture `tests/fixtures/implement_feature.yaml` is the reference file for this shape. Its descriptions are in Polish. The example in §4.1 is the same process in the unified shape.
 
 ```yaml
 name: implement-feature
@@ -909,6 +1200,152 @@ terminal_states:
   failed: failed
 ```
 
+### 4.1. The same workflow in the unified shape
+
+This file is `schema: v2` in the unified shape. It uses `exit` for the linear steps, `choices` as a
+map with `next`, a `decision` step for the human gates, a prompt part with `when`, and
+`{{ steps.test.label }}`.
+
+```yaml
+schema: v2
+name: implement-feature
+version: 1
+description: Implements a feature, tests it and creates a Pull Request.
+
+inputs:
+  - name: description
+    type: string
+    required: true
+  - name: target_repo
+    type: repository
+    required: true
+
+globals:
+  timeout: 2h
+  retry_policy:
+    max_attempts: 2
+    backoff: 10s
+  workspaces:
+    repo:
+      primary: true
+      base_branch: main
+      repository: "{{ inputs.target_repo }}"
+
+states:
+  analyze:
+    description: Analysis of the existing code and requirements.
+    action:
+      type: agent
+      harness: claude-code
+      prompt:
+        - |
+          Analyze the repository with a view to implementing: {{ inputs.description }}.
+          Identify the files that need to be modified.
+          Write the plan to the file plan.md.
+        - when: context.clarification_text
+          text: "Human clarifications: {{ context.clarification_text }}"
+    artifacts:
+      - name: plan_doc
+        description: An implementation plan with a list of files to change.
+    variables:
+      - name: open_questions
+        description: Questions for a human without which work cannot begin.
+    choices:
+      ready:
+        requires_artifacts: [plan_doc]
+        next: implement
+      ambiguous:
+        description: The requirements are unclear and a human decision is needed.
+        requires_variables: [open_questions]
+        next: human_clarification
+
+  human_clarification:
+    description: A human clarifies the ambiguities.
+    action:
+      type: decision
+      by: human
+      message: "The agent has doubts: {{ context.open_questions }}"
+    variables:
+      - name: clarification_text
+        type: text
+        description: The clarified requirements.
+    choices:
+      clarified:
+        requires_variables: [clarification_text]
+        next: analyze
+      abort:
+        next: failed
+
+  implement:
+    description: Implementing the feature.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Implement the feature according to the plan in {{ artifacts.plan_doc }}
+        and the requirement: {{ inputs.description }}.
+        Make sure the code compiles.
+    exit:
+      next: test
+
+  test:
+    description: Running unit tests.
+    action:
+      type: script
+      command: ./run_tests.sh
+    choices:
+      success:
+        next: create_pr
+      failure:
+        next: fix_code
+      partial_failure:
+        next: human_review_tests
+
+  fix_code:
+    description: Fixing errors detected by the tests.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        The tests did not pass ({{ steps.test.label }}). Analyze the logs and fix the code.
+        {{ steps.test.stdout }}
+    exit:
+      next: test
+
+  human_review_tests:
+    description: A human assesses the partial test failure.
+    action:
+      type: decision
+      by: human
+      message: "Some tests did not pass. Should they be ignored?"
+    choices:
+      ignore:
+        next: create_pr
+      fix_it:
+        next: fix_code
+
+  create_pr:
+    description: Creating a Pull Request.
+    action:
+      type: script
+      command: ./create_pr.sh
+      args:
+        - "--title"
+        - "Feature: {{ inputs.description }}"
+    exit:
+      next: completed
+
+  completed:
+    description: Success.
+
+  failed:
+    description: Failure.
+
+terminal_states:
+  completed: completed
+  failed: failed
+```
+
 ---
 
 ## 5. Schema Validation
@@ -916,8 +1353,8 @@ terminal_states:
 Before a workflow is run, the definition must pass validation:
 
 1.  **Graph Consistency:**
-    *   All states indicated in `transitions` must exist in the `states` section.
-    *   Every label in `choices` must have a corresponding transition in `transitions` (unless the state is terminal).
+    *   All states indicated in `transitions` (legacy shape) or in `next` (unified shape) must exist in the `states` section.
+    *   Every label in `choices` must have a corresponding transition in `transitions` (unless the state is terminal). In the unified shape `next` is required, so this holds by construction.
     *   A label in `choices` must not repeat, including between the bare form and the object (§3.3).
     *   A state must not have an `outputs` key. It is an unknown field and the file does not load.
     *   There must be at least one initial state (the first defined or marked with the flag `initial: true`).
@@ -931,8 +1368,8 @@ Before a workflow is run, the definition must pass validation:
         remains a function of the source alone.
     *   For `AgentAction` and `ScriptAction` the `choices` list must not be empty.
     *   `max_entries` is allowed only for `agent` actions and must be >= 1.
-    *   `variables` and `artifacts` are allowed only on `agent` and `script` steps. A `human` gate, a `wait` step and a terminal state must not have them.
-    *   A `local.*` variable is allowed only on an `agent` step.
+    *   `variables` and `artifacts` are allowed only on `agent` and `script` steps. A `human` gate, a `wait` step and a terminal state must not have them. A `decision` step may have `variables`, not `artifacts`.
+    *   A variable named with the `local.` prefix is allowed only on an `agent` step. A variable declared with `scope: local` (unified shape) is allowed on an agent, script or decision step.
     *   A variable name (without the `local.` prefix) and an artifact name contain only letters, digits and `_` and do not start with a digit.
     *   Every name in `requires_variables` must be defined in that step's `variables`, and every name in `requires_artifacts` in that step's `artifacts`.
     *   `requires_human_approval` is allowed only on a choice of an `agent` step.
@@ -956,6 +1393,30 @@ Before a workflow is run, the definition must pass validation:
 6.  **Images:**
     *   `globals.image` and a step's `image` must be a valid OCI reference with an explicit tag or digest; under the `pinned` policy a digest is mandatory.
     *   A terminal state must not override the image — it runs nothing.
+
+7.  **Unified shape (§3.7):**
+    *   A step has `exit` or `choices`, never both. A terminal state has neither.
+    *   `exit` is a reserved label and cannot be a key in `choices`. Every exit object has `next`.
+    *   `terminal_states` is a mapping. There is no `human` action. A `decision` action is not allowed in a legacy file.
+    *   A `decision` step has a non-blank `message` and at least one choice. It may define `variables`, not `artifacts`.
+    *   A script step with `exit` cannot have `exit_codes`.
+    *   In the unified shape only an agent or a script step can declare a `timeout` choice; a `decision` or `wait` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
+    *   `resume_comment_field` on a decision step names a variable of `type: text`.
+
+8.  **Variable declarations (§3.7.4):**
+    *   A variable is declared once per step.
+    *   A `select` variable has `options`. `options` only go with `string`, `select` or no `type`. An option is not empty and appears once.
+    *   A `scope: local` variable cannot have `source: workflow`. A name with the `local.` prefix is an error in the unified shape.
+    *   A global variable has the same `type` and `options` in every step that declares it.
+    *   A choice cannot require a variable with `source: workflow`.
+
+9.  **`set` (§3.7.5):**
+    *   A key names a variable of the same step. Global variables are set directly and local variables under `set.local`.
+    *   A literal value is text, a number or a boolean, and it fits the `type` and the `options` of the variable. A value with a template is checked when the engine applies it.
+
+10. **Prompt parts and step labels (§3.7.6, §3.7.7):**
+    *   `when` is a plain reference, with no braces, filter or white space. The list is not empty. The reference follows the same rules as a `{{ }}` placeholder in that text.
+    *   `steps.ID.label` is allowed only in an agent prompt and a decision message (and in the `when` of their parts). `ID` is an existing step with an action.
 
 Validation takes place statically before a `WorkflowExecution` is created. Validation errors prevent the workflow from starting.
 

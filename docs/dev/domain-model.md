@@ -36,17 +36,37 @@ Represents a business process template. It is immutable after creation (versione
 - `description`: Description of the workflow's purpose.
 - `inputs`: Schema of expected input data.
 - `states`: Map of states (key -> state definition).
+- `shape`: The state shape the definition was written in: `legacy` or `unified`. `unified` is a `schema: v2` file without a legacy marker (`workflow-schema.md` §3.7.1). A definition stored before the field existed reads as `legacy`. The engine uses it for one rule: whether a manual jump is allowed (below).
 - `created_at`: Creation timestamp.
 
 **State structure (in the definition):**
 - `id`: State identifier.
 - `action`: Definition of the action to execute (type, configuration).
-- `variables`: Step variables (`name`, `description`). A name with the `local.` prefix denotes a step-local variable. Only `agent` and `script` steps; `local.*` only for `agent`.
+- `variables`: Step variables, each a `Variable` (below). Agent, script and `decision` steps. The older name form still works: a name with the `local.` prefix is a step-local variable, and that form is only for `agent` steps.
 - `artifacts`: Named step artifacts (`name`, `description`). Only `agent` and `script` steps.
-- `choices`: List of possible choices. Each has a `label`, an optional `description`, a `requires_variables` list and a `requires_artifacts` list (names from the step definition), and the optional `requires_human_approval` and `resume_comment_field`.
-- `transitions`: Map of label -> ID of the next state.
+- `choices`: List of possible choices. Each is a `Choice` (below).
+- `transitions`: Map of label -> ID of the next state. The loader fills it from the `next` of each choice in the unified shape.
 - `decision_provider`: Type of decision provider (`rule`, `human`, `agent`).
-- `allow_manual_override`: Whether the user can force a manual transition.
+- `allow_manual_override`: Whether the user can force a manual transition. Only the legacy shape reads it (below).
+
+**Choice:**
+- `label`: The label. A step with an `exit` has one choice with the reserved label `exit` (`EXIT_LABEL`). A script step with `exit` goes on when its exit code is `0`.
+- `description`: Optional.
+- `requires_variables`, `requires_artifacts`: Names from the step definition.
+- `requires_human_approval`, `resume_comment_field`: Optional control behaviours.
+- `set`: What the workflow writes when the choice is taken (`SetDefinition`). It has `global` (variable name -> value) and `local` (name -> value, for the step's own variables). Values are text, numbers or booleans. Text may hold templates, which the engine renders when it applies the choice. Empty by default.
+
+**Variable:**
+- `name`: The declared name. In the unified shape it has no `local.` prefix.
+- `description`: Optional.
+- `scope`: `global` (default, goes into the context) or `local` (stays in the step memory).
+- `source`: `step` (default) or `workflow`. A `workflow` variable is written only by `set`. It is not in the agent contract or the form, and no choice can require it.
+- `type`: Optional: `string`, `text`, `select`, `integer`, `boolean`.
+- `options`: Optional list of the only accepted values.
+
+**Decision action (`DecisionActionConfig`):** `by` (`human` or `conductor`) and `message` (a `PromptText`). The `message` of a decision and the `prompt` of an agent are a `PromptText`: a list of parts, each with a text and a list of `when` references. A string is one part that always applies. The engine renders the parts that apply and joins them with an empty line. A plain string is stored as a plain string.
+
+**Manual override rule:** one function (`manual_override_allowed`) answers whether the operator may force a jump out of a state. For a `unified` definition the answer is yes for every state that is not terminal. For a `legacy` definition it is the value of `allow_manual_override`. The offer to a client (`TransitionOffer.override_allowed`) and the check of the runner both call it. A forced jump always needs a reason, and it is audited as a decision of the provider `human_override`.
 
 ### 2.2 WorkflowExecution
 
@@ -84,7 +104,8 @@ An abstraction of an operation to execute. In the domain model, an Action is par
 **Action types (MVP):**
 - `AgentAction`: Launching an AI harness (Claude Code/OpenCode).
 - `ScriptAction`: Executing a shell command/script.
-- `HumanAction`: Waiting for human intervention.
+- `HumanAction`: Waiting for human intervention. Legacy shape only.
+- `DecisionAction`: A fork that someone other than the step decides, `by: human` or `by: conductor` (unified shape only). A `by: human` decision is shown to the operator as a form built from the step's variables. A `by: conductor` decision is put to the conductor, and the operator decides only when the conductor is not sure.
 - `WaitAction`: Waiting for an external event.
 
 **Action configuration:**
@@ -109,7 +130,7 @@ Represents a single execution of an action within a state.
 - `result`: Structured result (`ActionResult`, the D64 contract).
   - `output_label`: Transition label. The agent and script provide it in the `choice` field of the response.
   - `reason`: A single line of rationale for the choice. Empty text when the action did not provide it. A `timeout` result gets `reason` from the engine.
-  - `variables`: Variables defined on the step (global and `local.*`). The engine removes from them variables outside the step definition before saving the result (exception: `agent_session_id`).
+  - `variables`: Variables defined on the step (global and local). The engine removes from them variables outside the step definition, and variables with `source: workflow`, before saving the result (exception: `agent_session_id`).
   - `artifacts`: Named step artifacts, a name → path map.
   - `additional_data`: Any object outside the step definition. The engine does not interpret it. Variables outside the step definition also end up here.
   - `additional_artifacts`: A list of file paths outside the step definition.
@@ -125,13 +146,13 @@ A data store shared by all workflow steps. Stored as `context.json`.
 **Structure:**
 - `variables`: A flat map of keys and values of simple types (string, int, bool, list).
   - Example: `{ "branch_name": "feature/login", "pr_number": 123 }`.
-  - Does not contain `local.*` variables (see below).
+  - Does not contain local variables (`scope: local`, or `local.*` in the older form; see below).
 - `artifacts_index`: A map of artifact names to their locations/metadata. A named step artifact is available in a template as `{{ artifacts.NAME }}` (the path of the last write).
 - `workspace_info`: Information about the active workspace (paths to repos).
 
 **Rules:**
-- Updated exclusively by the Workflow Engine based on the `variables` field of the Action result. The engine writes only the global variables defined on the step and the values of `human` gate fields.
-- `local.*` variables do not go into the context. The engine keeps them in the execution's `metadata.engine.step_locals` (`state.json`), separately for each step (`state_id → { "local.NAME": value }`). The value lives within a single execution. A new value replaces the old one entirely. When an attempt does not provide a value, the previous one stays. The template `{{ local.NAME }}` reads it only in the same step.
+- Updated exclusively by the Workflow Engine based on the `variables` field of the Action result, the values of `human` gate and `decision` form fields, and the `set` of the choice taken. The engine writes only the global variables defined on the step. `set` is written after the result of the step, so it wins. Each assignment of `set` is an event, `VariableSetByWorkflow`.
+- Local variables do not go into the context. The engine keeps them in the execution's `metadata.engine.step_locals` (`state.json`), separately for each step (`state_id → { NAME: value }`, under the declared name: `NAME` for `scope: local`, `local.NAME` in the older form). The value lives within a single execution. A new value replaces the old one entirely. When an attempt does not provide a value, the previous one stays. The template `{{ local.NAME }}` reads it only in the same step.
 - Does not store large data blobs (only references to Artifact).
 - Does not store agent conversation history.
 
@@ -226,7 +247,7 @@ Represents the act of choosing a transition path. It can be made by rules, an ag
 
 **Attributes:**
 - `id`: Unique ID.
-- `provider_type`: `rule`, `agent`, `human`.
+- `provider_type`: `rule`, `agent`, `human`. A label chosen by the conductor (also for a `by: conductor` decision step) has the provider `conductor`. A forced manual jump has the provider `human_override`.
 - `input_result`: The action result on the basis of which the decision was made.
 - `selected_transition`: The chosen transition label.
 - `reason`: Rationale (optional). For a rule decision after an `agent` or `script` step, this is the `reason` from the step's response (the `DecisionMade.reasoning` field). For a human decision, it is their comment.
@@ -420,8 +441,8 @@ resumption after an agent question, return from an approval, a reprompt, a retry
 (`ended: failure`). The engine records entries and attempts for every step, but renders the history
 block only in the prompt of an `agent` step (`workflow-schema.md` §3.3).
 
-`metadata.engine.step_locals` stores the `local.*` values of each step
-(§2.6).
+`metadata.engine.step_locals` stores the local values of each step
+(§2.6). The record of each step also has `conductor_answers`: how many questions of its agent the conductor answered since the latest entry (`autopilot`, at most 5). A new entry resets it. The label that a step last chose, which `{{ steps.ID.label }}` reads, comes from the latest `choice` attempt of that step.
 
 Both records are made in the same `state.json` write as the context (or as
 marking the execution as failed), so after a crash they do not differ from the
