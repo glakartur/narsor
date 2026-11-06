@@ -91,7 +91,8 @@ impl DecisionKind {
 /// * a chat reply: a message, with proposals;
 /// * a gate annotation: a summary and a recommendation, never an answer
 ///   (R30);
-/// * a title: one line of text, nothing else.
+/// * a title: one line of text, nothing else;
+/// * a fork of a `decision` step: a label, or the operator.
 pub fn allowed_decisions(purpose: ConductorPurpose) -> &'static [DecisionKind] {
     match purpose {
         ConductorPurpose::ChooseOutput => &[
@@ -107,6 +108,7 @@ pub fn allowed_decisions(purpose: ConductorPurpose) -> &'static [DecisionKind] {
         ConductorPurpose::ReplyToChat => &[DecisionKind::Reply],
         ConductorPurpose::SummarizeGate => &[DecisionKind::Annotate],
         ConductorPurpose::GenerateTitle => &[DecisionKind::Title],
+        ConductorPurpose::DecideFork => &[DecisionKind::ChooseOutput, DecisionKind::Escalate],
     }
 }
 

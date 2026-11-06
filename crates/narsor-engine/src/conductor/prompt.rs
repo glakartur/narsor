@@ -14,6 +14,7 @@ use std::fmt::Write as _;
 
 use serde_json::{json, Map, Value};
 
+use crate::conductor::autopilot::Autopilot;
 use crate::conductor::invoke::ConductorAccess;
 use crate::conductor::response::{allowed_decisions, proposals_allowed, DecisionKind};
 use crate::domain::{ConductorPurpose, WorkspaceRepository};
@@ -24,16 +25,19 @@ pub fn conductor_prompt(
     access: ConductorAccess,
     snapshot: &str,
 ) -> String {
-    conductor_prompt_for(purpose, access, snapshot, &[])
+    conductor_prompt_for(purpose, access, snapshot, &[], None)
 }
 
 /// [`conductor_prompt`] for a task with `repositories`: more than one is
 /// listed, each read-only, in the working directory that holds them all.
+/// `autopilot` is the mode the question of an agent is answered in; it only
+/// changes how the conductor is told to answer, never what it may decide.
 pub fn conductor_prompt_for(
     purpose: ConductorPurpose,
     access: ConductorAccess,
     snapshot: &str,
     repositories: &[WorkspaceRepository],
+    autopilot: Option<Autopilot>,
 ) -> String {
     let mut text = String::new();
 
@@ -72,14 +76,14 @@ scratch directory. Everything you know about the task is in the snapshot below.\
     text.push_str("\n# Snapshot of the execution\n\n");
     text.push_str(snapshot.trim_end());
     text.push_str("\n\n# Your task\n\n");
-    text.push_str(task(purpose));
+    text.push_str(task(purpose, autopilot));
     text.push_str("\n\n");
     text.push_str(&answer_contract(purpose));
     text
 }
 
 /// What the invocation is for, in the conductor's terms.
-fn task(purpose: ConductorPurpose) -> &'static str {
+fn task(purpose: ConductorPurpose, autopilot: Option<Autopilot>) -> &'static str {
     match purpose {
         ConductorPurpose::ChooseOutput => {
             "The agent of the current state finished without a usable output label, and the \
@@ -96,12 +100,26 @@ step with the output label that describes the work the agent actually did (`choo
 hand the step to the operator as a problem (`escalate`). Choose an output only when the \
 conversation shows it, with every value the label needs; otherwise escalate."
         }
+        ConductorPurpose::AnswerAgentQuestion if autopilot == Some(Autopilot::BestEffort) => {
+            "The agent of the current state asked a question (`question` in the request). Answer \
+it yourself in `message` (`reply`) when the snapshot and the task give you a sure answer, or when \
+the question has a reasonable default you can choose with confidence; the agent then continues \
+its work with your answer. Write every assumption you made into `rationale`. When you would have \
+to guess, hand the question to the operator (`escalate`), who is asked exactly what the agent \
+asked."
+        }
         ConductorPurpose::AnswerAgentQuestion => {
-            "The agent of the current state did not give an output label and asked a question \
-instead (`question` in the request). Answer it yourself in `message` (`reply`) only when the \
-snapshot and the task give you a sure answer; the agent then continues its work with your \
-answer. Otherwise hand the question to the operator (`escalate`), who is asked exactly what the \
-agent asked. When in doubt, escalate: a wrong answer costs more than a question."
+            "The agent of the current state asked a question (`question` in the request). Answer \
+it yourself in `message` (`reply`) only when the snapshot and the task give you a sure answer; \
+the agent then continues its work with your answer. Otherwise hand the question to the operator \
+(`escalate`), who is asked exactly what the agent asked. When in doubt, escalate: a wrong answer \
+costs more than a question."
+        }
+        ConductorPurpose::DecideFork => {
+            "The current state is a decision declared to be yours. Read its message and its \
+variables in the snapshot, then choose the output label that fits (`choose_output`) with the \
+values the label needs. When the snapshot does not settle the choice, hand the decision to the \
+operator (`escalate`), with the label you would propose if you have one."
         }
         ConductorPurpose::DiagnoseFailure => {
             "A step of the execution failed and its retry policy is exhausted. Diagnose why \

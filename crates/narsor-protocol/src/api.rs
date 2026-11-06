@@ -427,6 +427,7 @@ pub enum ConductorTriggerDto {
     Chat,
     Annotation,
     Title,
+    DecisionStep,
 }
 
 impl ConductorTriggerDto {
@@ -437,6 +438,7 @@ impl ConductorTriggerDto {
             Self::Chat => "chat",
             Self::Annotation => "annotation",
             Self::Title => "title",
+            Self::DecisionStep => "decision_step",
         }
     }
 }
@@ -452,6 +454,7 @@ pub enum ConductorPurposeDto {
     ReplyToChat,
     SummarizeGate,
     GenerateTitle,
+    DecideFork,
 }
 
 impl ConductorPurposeDto {
@@ -464,6 +467,7 @@ impl ConductorPurposeDto {
             Self::ReplyToChat => "reply_to_chat",
             Self::SummarizeGate => "summarize_gate",
             Self::GenerateTitle => "generate_title",
+            Self::DecideFork => "decide_fork",
         }
     }
 }

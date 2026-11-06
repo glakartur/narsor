@@ -33,7 +33,7 @@ pub use runner::{
     OutputRescue, PendingStep, Recovery, RunHandle, StepFailure, TransitionPlan,
     UndoneOutputDecision, EVENT_CHANNEL_CAPACITY, METADATA_CONDUCTOR_RETRY_KEY,
     METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY, METADATA_OUTPUT_RESCUE_KEY,
-    METADATA_STEP_FAILURE_KEY,
+    METADATA_STEP_FAILURE_KEY, METADATA_STEP_LOCALS_KEY,
 };
 pub use timeline::{
     build_timeline, ConversationState, EventLink, Position, PositionStatus, Timeline,

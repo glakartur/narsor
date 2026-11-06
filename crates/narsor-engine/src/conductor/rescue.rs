@@ -31,7 +31,7 @@ use crate::conductor::store::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, QueuedRequest, SavedDecision,
 };
 use crate::conductor::ConductorRegistry;
-use crate::domain::{ConductorDecisionKind, ConductorTrigger};
+use crate::domain::ConductorDecisionKind;
 use crate::persistence::Result;
 
 impl ConductorRegistry {
@@ -148,7 +148,7 @@ impl ConductorRegistry {
 /// at a time — the one of the pass holding its claim — so anything left is
 /// stale.
 fn forget_parked_rescue(state: &mut ConductorState) {
-    let is_rescue = |request: &QueuedRequest| request.trigger == ConductorTrigger::OutputRescue;
+    let is_rescue = |request: &QueuedRequest| request.trigger.is_inline();
     state.queue.retain(|request| !is_rescue(request));
     if state
         .pending
@@ -167,6 +167,7 @@ fn describe(decision: &SavedDecision) -> String {
         }
         (ConductorDecisionKind::Reprompt, _) => "Asked the agent again".to_string(),
         (ConductorDecisionKind::Escalate, _) => "Handed the step to the operator".to_string(),
+        (ConductorDecisionKind::AnswerQuestion, _) => "Answered the agent's question".to_string(),
         (kind, _) => format!("Decided: {}", kind.name()),
     };
     match &decision.rationale {

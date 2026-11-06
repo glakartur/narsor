@@ -3886,6 +3886,38 @@ mod task_app_detail {
         }
 
         #[test]
+        fn an_answer_of_the_conductor_to_the_agent_shows_its_rationale() {
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            let events = vec![
+                entered(1, "work"),
+                ev(
+                    2,
+                    EventData::ConductorDecision {
+                        decision_id: "d2".to_string(),
+                        kind: narsor_engine::domain::ConductorDecisionKind::AnswerQuestion,
+                        state_id: Some("work".to_string()),
+                        output_label: None,
+                        episode: None,
+                        confidence: Default::default(),
+                        rationale: Some("the task names the version".to_string()),
+                    },
+                ),
+            ];
+            let conversation = build_conversation(Scope::Whole, &[], &Attempts::default(), &events);
+            let answers: Vec<String> = conversation
+                .entries
+                .iter()
+                .filter(|entry| entry.id.as_str().starts_with("conductor-answer/"))
+                .map(|entry| entry.rendered_lines.join(" "))
+                .collect();
+            assert_eq!(answers.len(), 1);
+            assert!(
+                answers[0].contains("the task names the version"),
+                "{answers:?}"
+            );
+        }
+
+        #[test]
         fn a_users_answer_and_the_decision_it_produced_are_one_user_choice() {
             let events = vec![
                 entered(1, "gate"),

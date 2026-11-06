@@ -18,9 +18,10 @@ use chrono::Utc;
 use engine_support::{fixtures, workflow, Harness};
 use narsor_engine::conductor::snapshot::{render, ConversationTail, SnapshotBudget, SnapshotInput};
 use narsor_engine::conductor::{
-    prompt::conductor_prompt, ChatAuthor, ChatEntry, ChatEntryKind, ConductorAccess,
-    ConductorRegistry, ConductorResponse, ConductorStore, Decision, DecisionKind, HarnessInvoker,
-    Invocation, InvocationOutcome, LiveHarness, QueuedRequest, ResponseError,
+    prompt::{conductor_prompt, conductor_prompt_for},
+    Autopilot, ChatAuthor, ChatEntry, ChatEntryKind, ConductorAccess, ConductorRegistry,
+    ConductorResponse, ConductorStore, Decision, DecisionKind, HarnessInvoker, Invocation,
+    InvocationOutcome, LiveHarness, QueuedRequest, ResponseError,
 };
 use narsor_engine::domain::{
     ArtifactReference, ChoiceDefinition, ConductorOutcome, ConductorPurpose, ConductorTrigger,
@@ -1256,6 +1257,7 @@ fn every_purpose_offers_exactly_the_decisions_it_allows() {
         ConductorPurpose::DiagnoseFailure,
         ConductorPurpose::ReplyToChat,
         ConductorPurpose::SummarizeGate,
+        ConductorPurpose::DecideFork,
     ];
     let all = [
         DecisionKind::ChooseOutput,
@@ -1287,4 +1289,35 @@ fn every_purpose_offers_exactly_the_decisions_it_allows() {
         }
     }
     assert!(!offered[&("diagnose_failure", "choose_output")]);
+}
+
+/// The task and the answer contract of `prompt`, split where the contract
+/// lists the decisions.
+fn task_and_contract(prompt: &str) -> (String, String) {
+    let (task, contract) = prompt
+        .split_once("`decision` must be exactly one of:")
+        .expect("the answer contract");
+    (task.to_string(), contract.to_string())
+}
+
+/// The modes of the autopilot differ in what the conductor is told, never in
+/// what it may answer with.
+#[test]
+fn the_autopilot_modes_change_the_task_and_not_the_answer_contract() {
+    let prompt_in = |mode| {
+        conductor_prompt_for(
+            ConductorPurpose::AnswerAgentQuestion,
+            ConductorAccess::Isolated,
+            "",
+            &[],
+            mode,
+        )
+    };
+    let (task, contract) = task_and_contract(&prompt_in(Some(Autopilot::On)));
+    let (best_effort_task, best_effort_contract) =
+        task_and_contract(&prompt_in(Some(Autopilot::BestEffort)));
+
+    assert_ne!(task, best_effort_task);
+    assert_eq!(contract, best_effort_contract);
+    assert_eq!(prompt_in(None), prompt_in(Some(Autopilot::On)));
 }

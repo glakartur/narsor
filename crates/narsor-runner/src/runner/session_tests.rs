@@ -249,7 +249,9 @@ fn answer_key(purpose: ConductorPurpose) -> &'static str {
         ConductorPurpose::ReplyToChat => "reply",
         ConductorPurpose::SummarizeGate => "annotate",
         ConductorPurpose::GenerateTitle => "title",
-        ConductorPurpose::ChooseOutput | ConductorPurpose::ChooseOutputAfterReprompt => "choose",
+        ConductorPurpose::ChooseOutput
+        | ConductorPurpose::ChooseOutputAfterReprompt
+        | ConductorPurpose::DecideFork => "choose",
     }
 }
 

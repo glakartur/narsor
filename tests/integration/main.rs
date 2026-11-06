@@ -30,6 +30,7 @@ mod cli_conversation_text;
 mod cli_task_create;
 mod cli_task_text;
 mod conductor_chat;
+mod conductor_decision;
 mod conductor_failure;
 mod conductor_invoke;
 mod conductor_label;

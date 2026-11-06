@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::conductor::actor::{ConductorAnswer, ConductorInvoker, Invocation, InvocationOutcome};
+use crate::conductor::autopilot::Autopilot;
 use crate::conductor::prompt::{answer_schema, conductor_prompt_for};
 use crate::conductor::response::ConductorResponse;
 use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
@@ -275,6 +276,7 @@ impl HarnessInvoker {
             access,
             &snapshot.text,
             &repositories,
+            Autopilot::of_payload(&invocation.request.payload),
         );
 
         let read_only_dirs: Vec<PathBuf> = repositories

@@ -29,6 +29,7 @@ use narsor_engine::domain::{
     ProblemKind, RepromptedBy, WorkflowExecution,
 };
 use narsor_engine::engine::actions::agent::MISSING_OUTPUT_LABEL;
+use narsor_engine::engine::actions::{PermissionDenialDetails, PermissionRequestDetails};
 use narsor_engine::engine::{
     owed_output_rescue, ActionExecutor, ActionKind, ActionOutcome, ActionRequest, Engine,
     HumanInputDelivery, HumanInputRequest, InputContinuation, OutputProblem, PendingHumanInput,
@@ -50,6 +51,8 @@ enum Reply {
     Label(&'static str),
     /// A question, in the agent's own session.
     Ask(&'static str),
+    /// A request for a permission, in the agent's own session.
+    AskPermission,
 }
 
 /// What the scripted agent was handed on one call.
@@ -136,6 +139,29 @@ impl ActionExecutor for ScriptedAgent {
                         agent_session_id: Some("agent-session".to_string()),
                         prefilled_answer: None,
                         permission: None,
+                    }),
+                )),
+                Reply::AskPermission => Ok(ActionOutcome::Suspended(
+                    SuspendedAction::AwaitingAgentInput(HumanInputRequest {
+                        action_execution_id,
+                        instruction: "Claude Code needs a permission decision.".to_string(),
+                        fields: Vec::new(),
+                        reason: None,
+                        required_values: Vec::new(),
+                        answer_tail: None,
+                        agent_harness: Some("claude-code".to_string()),
+                        agent_session_id: Some("agent-session".to_string()),
+                        prefilled_answer: None,
+                        permission: Some(PermissionRequestDetails {
+                            denials: vec![PermissionDenialDetails {
+                                tool_name: "Bash".to_string(),
+                                tool_use_id: "tool-permission".to_string(),
+                                input: json!({ "command": "cargo build" }),
+                                cwd: "/tmp".to_string(),
+                                reason_type: None,
+                                reason: None,
+                            }],
+                        }),
                     }),
                 )),
                 Reply::Label(label) => Ok(ActionOutcome::Completed(ActionResult {
@@ -1362,6 +1388,14 @@ fn question_after_reprompt(label: &'static str) -> Vec<Reply> {
 
 /// A started execution whose context carries `autopilot`.
 async fn run_with_autopilot(fixture: &Fixture, autopilot: Option<&str>) -> WorkflowExecution {
+    run_with_autopilot_value(fixture, autopilot.map(Value::from)).await
+}
+
+/// [`run_with_autopilot`] with a value of any JSON type.
+async fn run_with_autopilot_value(
+    fixture: &Fixture,
+    autopilot: Option<Value>,
+) -> WorkflowExecution {
     let definition = workflow("agent_problem");
     let mut execution = fixture
         .engine
@@ -1371,7 +1405,7 @@ async fn run_with_autopilot(fixture: &Fixture, autopilot: Option<&str>) -> Workf
         execution
             .context
             .variables
-            .insert("autopilot".to_string(), json!(autopilot));
+            .insert("autopilot".to_string(), autopilot);
         fixture
             .harness
             .store()
@@ -1480,4 +1514,176 @@ async fn with_autopilot_on_an_unsure_conductor_forwards_the_question() {
 
     agent_question(&fixture, &execution);
     assert_eq!(fixture.conductor.calls().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Autopilot: who receives the agent's questions
+// ---------------------------------------------------------------------------
+
+/// A sure answer of the conductor to a question.
+fn sure_reply(message: &str) -> Script {
+    Script::Answer(json!({
+        "decision": "reply",
+        "confidence": "high",
+        "rationale": "the task names it",
+        "message": message,
+    }))
+}
+
+/// The conductor never sees the question unless `autopilot` is `on` or
+/// `best-effort`: a boolean, `true` and any other word leave it off.
+#[tokio::test]
+async fn only_on_and_best_effort_switch_the_autopilot_on() {
+    for value in [json!(true), json!("true"), json!("always"), json!("off")] {
+        let fixture = Fixture::new(question_after_reprompt("implemented"), Vec::new());
+        let execution = run_with_autopilot_value(&fixture, Some(value.clone())).await;
+
+        agent_question(&fixture, &execution);
+        assert!(
+            fixture.conductor.calls().is_empty(),
+            "{value} asked the conductor"
+        );
+    }
+}
+
+/// The first question of an automatic step — no reprompt before it — goes to
+/// the conductor as well.
+#[tokio::test]
+async fn the_first_question_of_a_step_goes_to_the_conductor_in_autopilot() {
+    let fixture = Fixture::new(
+        vec![
+            Reply::Ask("Which API version?"),
+            Reply::Label("implemented"),
+        ],
+        vec![sure_reply("Use version 2.")],
+    );
+    let execution = run_with_autopilot(&fixture, Some("on")).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(
+        fixture.conductor.purposes(),
+        vec![(ConductorPurpose::AnswerAgentQuestion, 1)]
+    );
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].prompt.contains("Use version 2."));
+}
+
+/// Without autopilot the first question waits for the operator.
+#[tokio::test]
+async fn the_first_question_of_a_step_waits_for_the_operator_by_default() {
+    let fixture = Fixture::new(vec![Reply::Ask("Which API version?")], Vec::new());
+    let execution = run_with_autopilot(&fixture, None).await;
+
+    agent_question(&fixture, &execution);
+    assert!(fixture.conductor.calls().is_empty());
+}
+
+/// A request for a permission is the operator's, in any mode.
+#[tokio::test]
+async fn a_permission_request_always_goes_to_the_operator() {
+    for mode in ["on", "best-effort"] {
+        let fixture = Fixture::new(vec![Reply::AskPermission], Vec::new());
+        let execution = run_with_autopilot(&fixture, Some(mode)).await;
+
+        assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+        let pending: PendingHumanInput = fixture
+            .harness
+            .store()
+            .load_pending_input(&execution.id)
+            .expect("read the pending input")
+            .expect("a pending input");
+        assert_eq!(pending.continuation, InputContinuation::ResolvePermission);
+        assert!(fixture.conductor.calls().is_empty(), "{mode}");
+    }
+}
+
+/// `best-effort` changes what the conductor is told, not what it may decide
+/// or how sure it has to be: the request names the mode, the purpose and
+/// the confidence that counts stay the same.
+#[tokio::test]
+async fn best_effort_names_its_mode_in_the_request_and_keeps_the_threshold() {
+    for mode in ["on", "best-effort"] {
+        let fixture = Fixture::new(
+            vec![Reply::Ask("Which API version?")],
+            vec![Script::Answer(json!({
+                "decision": "reply",
+                "confidence": "low",
+                "rationale": "a guess",
+                "message": "Use version 2.",
+            }))],
+        );
+        let execution = run_with_autopilot(&fixture, Some(mode)).await;
+
+        let calls = fixture.conductor.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request.purpose,
+            ConductorPurpose::AnswerAgentQuestion
+        );
+        assert_eq!(calls[0].request.payload["autopilot"], json!(mode));
+        // An unsure answer does not count, in either mode.
+        assert_eq!(execution.status, ExecutionStatus::InputNeeded, "{mode}");
+    }
+}
+
+/// The answer's rationale is on record: in the `ConductorDecision` event and
+/// in the conductor's chat.
+#[tokio::test]
+async fn the_rationale_of_an_answer_is_recorded_in_the_event_and_the_chat() {
+    let fixture = Fixture::new(
+        vec![
+            Reply::Ask("Which API version?"),
+            Reply::Label("implemented"),
+        ],
+        vec![sure_reply("Use version 2.")],
+    );
+    let execution = run_with_autopilot(&fixture, Some("best-effort")).await;
+
+    let answered: Vec<_> = fixture
+        .events(&execution.id)
+        .into_iter()
+        .filter_map(|data| match data {
+            EventData::ConductorDecision {
+                kind: ConductorDecisionKind::AnswerQuestion,
+                rationale,
+                confidence,
+                ..
+            } => Some((rationale, confidence)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        answered,
+        vec![(Some("the task names it".to_string()), Confidence::High)]
+    );
+    let chat = fixture
+        .conductor_store(&execution.id)
+        .read_chat()
+        .expect("read the chat");
+    let entry = chat
+        .iter()
+        .find(|entry| entry.kind == ChatEntryKind::Decision)
+        .expect("the answer in the chat");
+    assert_eq!(entry.text, "Use version 2.");
+    let payload = entry.payload.as_ref().expect("the saved decision");
+    assert_eq!(payload["kind"], json!("answer_question"));
+    assert_eq!(payload["rationale"], json!("the task names it"));
+}
+
+/// The conductor answers five questions of one entry into a step; the sixth
+/// goes to the operator, who is asked exactly what the agent asked.
+#[tokio::test]
+async fn the_sixth_question_of_one_entry_goes_to_the_operator() {
+    let mut replies = vec![Reply::Ask("Which API version?"); 6];
+    replies.push(Reply::Label("implemented"));
+    let fixture = Fixture::new(
+        replies,
+        (0..5).map(|_| sure_reply("Use version 2.")).collect(),
+    );
+    let execution = run_with_autopilot(&fixture, Some("on")).await;
+
+    agent_question(&fixture, &execution);
+    assert_eq!(fixture.conductor.calls().len(), 5);
+    assert_eq!(fixture.agent.calls().len(), 6);
 }

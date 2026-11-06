@@ -535,6 +535,8 @@ pub enum ConductorTrigger {
     Annotation,
     /// The task has no title and the runner asks for one.
     Title,
+    /// A `decision` step declared `by: conductor` was entered.
+    DecisionStep,
 }
 
 impl ConductorTrigger {
@@ -546,6 +548,7 @@ impl ConductorTrigger {
             Self::Chat => "chat",
             Self::Annotation => "annotation",
             Self::Title => "title",
+            Self::DecisionStep => "decision_step",
         }
     }
 
@@ -553,15 +556,24 @@ impl ConductorTrigger {
     /// than an operator — which is what puts it first in the queue and
     /// makes a failed invocation a problem (KTD11, KTD12).
     pub fn is_automatic(&self) -> bool {
-        matches!(self, Self::OutputRescue | Self::StepFailure)
+        matches!(
+            self,
+            Self::OutputRescue | Self::StepFailure | Self::DecisionStep
+        )
+    }
+
+    /// Whether the pass that waits for the answer runs the invocation
+    /// inline, under its own claim: the label rescue (F1) and a decision
+    /// step of the conductor's.
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::OutputRescue | Self::DecisionStep)
     }
 
     /// Whether an invocation for this trigger works beside the execution,
     /// without its claim, and is stopped through the registry of advisory
-    /// interrupts (KTD10): everything but the label rescue (F1), which runs
-    /// inline under the claim of the pass that waits for it.
+    /// interrupts (KTD10): everything but the inline ones.
     pub fn is_advisory(&self) -> bool {
-        !matches!(self, Self::OutputRescue)
+        !self.is_inline()
     }
 }
 
@@ -586,6 +598,8 @@ pub enum ConductorPurpose {
     SummarizeGate,
     /// Give a task the operator named no title a short one.
     GenerateTitle,
+    /// Pick the label of a `decision` step declared `by: conductor`.
+    DecideFork,
 }
 
 impl ConductorPurpose {
@@ -599,6 +613,7 @@ impl ConductorPurpose {
             Self::ReplyToChat => "reply_to_chat",
             Self::SummarizeGate => "summarize_gate",
             Self::GenerateTitle => "generate_title",
+            Self::DecideFork => "decide_fork",
         }
     }
 }
@@ -641,6 +656,9 @@ pub enum ConductorDecisionKind {
     Retry,
     /// A proposal the operator confirmed was carried out (R28).
     ExecuteProposal,
+    /// The conductor answered a question the agent asked, in the
+    /// operator's place (`autopilot`).
+    AnswerQuestion,
 }
 
 impl ConductorDecisionKind {
@@ -652,6 +670,7 @@ impl ConductorDecisionKind {
             Self::Escalate => "escalate",
             Self::Retry => "retry",
             Self::ExecuteProposal => "execute_proposal",
+            Self::AnswerQuestion => "answer_question",
         }
     }
 }
@@ -937,6 +956,7 @@ impl From<ConductorPurpose> for ConductorPurposeDto {
             ConductorPurpose::ReplyToChat => Self::ReplyToChat,
             ConductorPurpose::SummarizeGate => Self::SummarizeGate,
             ConductorPurpose::GenerateTitle => Self::GenerateTitle,
+            ConductorPurpose::DecideFork => Self::DecideFork,
         }
     }
 }
@@ -949,6 +969,7 @@ impl From<ConductorTrigger> for ConductorTriggerDto {
             ConductorTrigger::Chat => Self::Chat,
             ConductorTrigger::Annotation => Self::Annotation,
             ConductorTrigger::Title => Self::Title,
+            ConductorTrigger::DecisionStep => Self::DecisionStep,
         }
     }
 }

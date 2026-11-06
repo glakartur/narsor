@@ -117,6 +117,7 @@ use crate::workflow::{
     action_context_references, places_step_history, DeclaredNames, StepMemory, TemplateScope,
 };
 
+mod conductor_decision;
 mod failure;
 mod gate_context;
 mod operations;
@@ -853,6 +854,9 @@ enum AttemptOutcome {
     /// An agent answered without an output label the state accepts: a format
     /// error, answered with a reprompt rather than a retry (KTD7).
     OutputRejected(OutputRejection),
+    /// A `decision` declared `by: conductor`: the conductor is asked, with
+    /// the message as the step rendered it.
+    AwaitingConductor(String),
 }
 
 /// How the whole action of a state ended, retries included.
@@ -2376,8 +2380,20 @@ impl Engine {
                     return Ok(ActionUpshot::Stopped);
                 }
                 Ok(AttemptOutcome::AwaitingAgentInput(request)) => {
-                    self.suspend_for_agent_input(execution, state, request)?;
-                    return Ok(ActionUpshot::Stopped);
+                    let flow = self.route_agent_question(execution, state, request).await?;
+                    return Ok(ActionUpshot::settled(flow));
+                }
+                Ok(AttemptOutcome::AwaitingConductor(message)) => {
+                    let flow = self
+                        .decide_by_conductor(
+                            definition,
+                            execution,
+                            state,
+                            &action_execution_id,
+                            message,
+                        )
+                        .await?;
+                    return Ok(ActionUpshot::settled(flow));
                 }
                 Ok(AttemptOutcome::OutputRejected(rejection)) => {
                     // Outside the retry schedule on purpose (R15): a format
@@ -2526,14 +2542,22 @@ impl Engine {
             .render_action(action, &location)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
         // A decision for the operator is asked as a form: the step's
-        // variables are its fields.
+        // variables are its fields. One for the conductor is no action to
+        // run: the caller asks the conductor.
         if let ActionConfig::Decision(decision) = &rendered {
-            if decision.by == DecisionMaker::Human {
-                rendered = ActionConfig::Human(HumanActionConfig {
-                    instruction: decision.message.to_string(),
-                    inputs: decision_fields(state),
-                    input_schema: None,
-                });
+            match decision.by {
+                DecisionMaker::Human => {
+                    rendered = ActionConfig::Human(HumanActionConfig {
+                        instruction: decision.message.to_string(),
+                        inputs: decision_fields(state),
+                        input_schema: None,
+                    });
+                }
+                DecisionMaker::Conductor => {
+                    return Ok(AttemptOutcome::AwaitingConductor(
+                        decision.message.to_string(),
+                    ));
+                }
             }
         }
 
@@ -3124,11 +3148,7 @@ impl Engine {
         };
         let request = HumanInputRequest {
             action_execution_id: action_execution_id.clone(),
-            instruction: format!(
-                "The agent of state '{}' did not give a usable output label. Choose the \
-                 label its step ends with, and the data and variables it would have given.",
-                state.id
-            ),
+            instruction: output_problem_instruction(state),
             fields: Vec::new(),
             reason: None,
             required_values: Vec::new(),
@@ -3138,13 +3158,17 @@ impl Engine {
             prefilled_answer: None,
             permission: None,
         };
-        let pending = PendingHumanInput::for_problem(
+        let mut pending = PendingHumanInput::for_problem(
             execution.id.clone(),
             state.id.clone(),
             request,
             decision::permitted_outputs(state),
             problem,
         );
+        if matches!(state.action, Some(ActionConfig::Decision(_))) {
+            let kept_locals = step_memory::step_locals(execution, &state.id)?;
+            pending.local_values = local_values(state, &kept_locals);
+        }
 
         let from = self.store.event_log(&execution.id).next_sequence()?;
         human::suspend(&self.store, execution, &pending)?;
@@ -4347,6 +4371,23 @@ fn keep_previous_reply(mut result: ActionResult, previous_reply: Option<&str>) -
         result.reply = Some(previous);
     }
     result
+}
+
+/// What the operator is asked when the step `state` has no output label of
+/// its own to go on with.
+fn output_problem_instruction(state: &State) -> String {
+    match state.action {
+        Some(ActionConfig::Decision(_)) => format!(
+            "The conductor did not settle the decision of state '{}'. Choose the label its step \
+             ends with, and the variables it needs.",
+            state.id
+        ),
+        _ => format!(
+            "The agent of state '{}' did not give a usable output label. Choose the \
+             label its step ends with, and the data and variables it would have given.",
+            state.id
+        ),
+    }
 }
 
 /// The rescue of `execution`'s output label under way, when it belongs to

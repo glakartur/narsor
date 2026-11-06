@@ -58,6 +58,11 @@ pub struct StepAttempts {
     /// What its entries ended with, oldest first.
     #[serde(default)]
     pub attempts: Vec<StepAttempt>,
+
+    /// How many questions of its agent the conductor answered since the
+    /// latest entry.
+    #[serde(default)]
+    pub conductor_answers: u32,
 }
 
 /// What one attempt at a step ended with.
@@ -80,13 +85,36 @@ pub enum StepAttempt {
 type AttemptsByStep = BTreeMap<StateId, StepAttempts>;
 type LocalsByStep = BTreeMap<StateId, Map<String, Value>>;
 
-/// Counts one more entry into `state_id`.
+/// Counts one more entry into `state_id`, which starts its count of the
+/// conductor's answers over.
 pub(super) fn count_step_entry(
     execution: &mut WorkflowExecution,
     state_id: &str,
 ) -> Result<(), EngineError> {
     update_attempts(execution, state_id, |record| {
         record.entries = record.entries.saturating_add(1);
+        record.conductor_answers = 0;
+    })
+}
+
+/// How many questions of the agent of `state_id` the conductor answered
+/// since the step was last entered.
+pub(super) fn conductor_answers(
+    execution: &WorkflowExecution,
+    state_id: &str,
+) -> Result<u32, EngineError> {
+    Ok(read_attempts(execution)?
+        .get(state_id)
+        .map_or(0, |record| record.conductor_answers))
+}
+
+/// Counts one more answer of the conductor's in `state_id`.
+pub(super) fn count_conductor_answer(
+    execution: &mut WorkflowExecution,
+    state_id: &str,
+) -> Result<(), EngineError> {
+    update_attempts(execution, state_id, |record| {
+        record.conductor_answers = record.conductor_answers.saturating_add(1);
     })
 }
 

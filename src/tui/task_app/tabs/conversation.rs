@@ -883,7 +883,7 @@ fn workflow_choices(events: &[Event]) -> Vec<(u64, TranscriptEntry)> {
                     workflow_choice_entry(event, human)
                 }
             }
-            _ => workflow_choice_entry(event, false),
+            _ => workflow_choice_entry(event, false).or_else(|| conductor_answer_entry(event)),
         };
         choices.extend(entry.map(|entry| (event.sequence, entry)));
     }
@@ -958,6 +958,41 @@ fn workflow_choice_entry(event: &Event, by_person: bool) -> Option<TranscriptEnt
         .with_presentation(presentation)
         .with_clipped_head()
         .as_workflow_choice(),
+    )
+}
+
+/// The entry of a question the conductor answered for the agent in
+/// `autopilot`, with the rationale it gave.
+fn conductor_answer_entry(event: &Event) -> Option<TranscriptEntry> {
+    use crate::domain::ConductorDecisionKind;
+
+    let EventData::ConductorDecision {
+        kind: ConductorDecisionKind::AnswerQuestion,
+        rationale,
+        ..
+    } = &event.data
+    else {
+        return None;
+    };
+    let mut lines = vec!["Dyrygent odpowiedział na pytanie agenta".to_string()];
+    if let Some(rationale) = rationale.as_deref().filter(|text| !text.trim().is_empty()) {
+        lines.push(format!(
+            "uzasadnienie: {}",
+            crate::domain::display::without_unsafe_chars(rationale)
+        ));
+    }
+    Some(
+        TranscriptEntry::new(
+            TranscriptEntryId::from(format!("conductor-answer/{}", event.sequence)),
+            lines,
+            Vec::new(),
+        )
+        .with_header(format!(
+            "ODPOWIEDŹ DYRYGENTA · {}",
+            event.timestamp.format("%H:%M:%S")
+        ))
+        .with_presentation(TranscriptPresentation::Conductor)
+        .with_clipped_head(),
     )
 }
 
