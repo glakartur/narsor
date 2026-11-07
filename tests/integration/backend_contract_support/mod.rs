@@ -1703,10 +1703,18 @@ pub async fn a_reader_that_dies_is_replaced_while_it_is_wanted<T: ContractTarget
 /// Expands the whole suite for one target into a module of tests.
 macro_rules! contract_suite {
     ($module:ident, $target:ty) => {
+        contract_suite!(@module $module; $target;);
+    };
+    // For an adapter whose scenarios start processes: they are `#[ignore]`d
+    // and run with `cargo test -- --include-ignored`.
+    ($module:ident, $target:ty, ignore = $reason:literal) => {
+        contract_suite!(@module $module; $target; ignore($reason));
+    };
+    (@module $module:ident; $target:ty; $($mode:tt)*) => {
         mod $module {
             #[allow(unused_imports)]
             use super::*;
-            contract_suite!(@tests $target;
+            contract_suite!(@tests $($mode)* $target;
                 lifecycle_round_trip,
                 reconnect_reconciles_instead_of_duplicating,
                 a_lost_launch_answer_is_reconciled_not_duplicated,
@@ -1731,6 +1739,15 @@ macro_rules! contract_suite {
                 a_reader_that_cannot_start_leaves_the_task_alone,
                 a_reader_that_dies_is_replaced_while_it_is_wanted);
         }
+    };
+    (@tests ignore($reason:literal) $target:ty; $($scenario:ident),* $(,)?) => {
+        $(
+            #[ignore = $reason]
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn $scenario() {
+                crate::backend_contract_support::$scenario::<$target>().await;
+            }
+        )*
     };
     (@tests $target:ty; $($scenario:ident),* $(,)?) => {
         $(

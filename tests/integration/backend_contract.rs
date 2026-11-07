@@ -164,7 +164,11 @@ impl ContractTarget for LocalTarget {
     }
 }
 
-contract_suite!(local, crate::backend_contract::LocalTarget);
+contract_suite!(
+    local,
+    crate::backend_contract::LocalTarget,
+    ignore = "starts runner processes and kills their process groups; run with --include-ignored"
+);
 
 // ---------------------------------------------------------------------------
 // Local adapter specifics
