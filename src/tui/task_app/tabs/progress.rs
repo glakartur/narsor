@@ -31,6 +31,7 @@ use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
+use super::super::detail::{cells as width_of, fit_step_name, step_name};
 use super::super::layout::first_row;
 use super::super::list::fit;
 use super::super::StepFocus;
@@ -388,7 +389,8 @@ pub(super) fn status_look(status: PositionStatus) -> (&'static str, Role, &'stat
 fn axis_line(position: &Position, width: usize, styles: &Styles, stale: bool) -> Line<'static> {
     let (glyph, role, word) = status_look(position.status);
     let grey = |role: Role| if stale { Role::Done } else { role };
-    let label = fit(
+    let label = fit_step_name(
+        position.icon(),
         &one_line(&position.label),
         width.saturating_sub(3 + word.chars().count()),
     );
@@ -423,17 +425,17 @@ impl Column {
     fn width(&self) -> usize {
         self.cells
             .iter()
-            .map(|cell| cell.chars().count())
+            .map(|cell| width_of(cell))
             .max()
             .unwrap_or(0)
     }
 
     fn text(&self, row: usize) -> String {
-        let width = self.width();
+        let gap = " ".repeat(self.width().saturating_sub(width_of(&self.cells[row])));
         if self.right {
-            format!("{:>width$}", self.cells[row])
+            format!("{gap}{}", self.cells[row])
         } else {
-            format!("{:<width$}", self.cells[row])
+            format!("{}{gap}", self.cells[row])
         }
     }
 }
@@ -601,7 +603,7 @@ impl AxisLayout {
         };
         let labels: Vec<String> = positions
             .iter()
-            .map(|position| one_line(&position.label))
+            .map(|position| step_name(position.icon(), &one_line(&position.label)))
             .collect();
         let label = Column::new(false, labels);
         let word = Column::new(
@@ -657,11 +659,12 @@ impl AxisLayout {
             .enumerate()
             .map(|(index, position)| {
                 let (glyph, role, _) = status_look(position.status);
-                let text = fit(&label.cells[index], shown_label);
+                let text = fit_step_name(position.icon(), &one_line(&position.label), shown_label);
+                let padding = " ".repeat(shown_label.saturating_sub(width_of(&text)));
                 let mut spans = vec![
                     Span::styled(glyph, styles.of(grey(role))),
                     Span::raw(" "),
-                    Span::styled(format!("{text:<shown_label$}"), styles.of(grey(Role::Calm))),
+                    Span::styled(format!("{text}{padding}"), styles.of(grey(Role::Calm))),
                 ];
                 if shown_word > 0 {
                     spans.push(Span::styled(
@@ -707,12 +710,21 @@ fn step_lines(
     let (glyph, role, word) = status_look(position.status);
     let mut head = vec![
         Span::styled(format!("{glyph} "), styles.of(role)),
-        Span::styled(one_line(&position.label), styles.of(Role::Focus)),
+        Span::styled(
+            step_name(position.icon(), &one_line(&position.label)),
+            styles.of(Role::Focus),
+        ),
         Span::styled(format!(" · {word}"), styles.of(role)),
     ];
     if let Some(action) = &position.action_type {
         head.push(Span::styled(
             format!(" · {}", one_line(action)),
+            styles.of(Role::Done),
+        ));
+    }
+    if let (Some("decision"), Some(by)) = (position.action_type.as_deref(), &position.decision_by) {
+        head.push(Span::styled(
+            format!(" · {}", one_line(by)),
             styles.of(Role::Done),
         ));
     }

@@ -123,6 +123,11 @@ pub(crate) fn build(
         .iter()
         .rev()
         .find(|position| position.action_execution_id.is_some());
+    // The kind of the step the task is in now: the latest attempt tells it
+    // only while it belongs to the state the engine is in (a task that has
+    // just entered a state, or ended, has no attempt of it yet).
+    let in_current_state = current_position
+        .filter(|position| Some(position.state_id.as_str()) == execution.current_state.as_deref());
 
     Ok(RunnerSnapshot {
         snapshot_sequence: 0,
@@ -132,8 +137,8 @@ pub(crate) fn build(
             current_state: execution.current_state.clone(),
             action_execution_id: current_position
                 .and_then(|position| position.action_execution_id.clone()),
-            current_action_type: current_position.and_then(|position| position.action_type.clone()),
-            current_decision_by: current_position.and_then(|position| position.decision_by.clone()),
+            current_action_type: in_current_state.and_then(|position| position.action_type.clone()),
+            current_decision_by: in_current_state.and_then(|position| position.decision_by.clone()),
         },
         event_cursor,
         pending_input,

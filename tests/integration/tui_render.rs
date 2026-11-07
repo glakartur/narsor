@@ -34,8 +34,26 @@ fn rows(buffer: &Buffer) -> Vec<String> {
     buffer
         .content()
         .chunks(width)
-        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .map(|row| text_of(row))
         .collect()
+}
+
+/// The text of a row of cells. The cell after a wide symbol (an emoji) is
+/// filler the terminal never draws, so it is no part of the text.
+fn text_of(row: &[Cell]) -> String {
+    let mut text = String::new();
+    let mut covered = 0;
+    for cell in row {
+        if covered > 0 {
+            covered -= 1;
+            continue;
+        }
+        text.push_str(cell.symbol());
+        covered = ratatui::text::Span::raw(cell.symbol())
+            .width()
+            .saturating_sub(1);
+    }
+    text
 }
 
 fn screen(buffer: &Buffer) -> String {
@@ -2012,9 +2030,9 @@ mod task_app_detail_render {
     use narsor_protocol::api::{PositionUsage, TokenCounts};
 
     use crate::task_app_support::{
-        execution_events, header_workspace, listing, offered, position, queued, task, timeline,
-        titled, with_controller, with_harness_unavailable, with_header_workspaces, with_pr,
-        with_runner,
+        execution_events, header_workspace, in_step_of_kind, listing, of_kind, offered, position,
+        queued, task, timeline, titled, with_controller, with_harness_unavailable,
+        with_header_workspaces, with_pr, with_runner,
     };
 
     fn app() -> TaskApp {
@@ -2091,7 +2109,7 @@ mod task_app_detail_render {
         let rows = rows(&buffer);
         let state = &rows[STATE_ROW];
         assert!(state.contains("● running"), "{state}");
-        assert!(state.contains("krok 3 review"), "{state}");
+        assert!(state.contains("krok 3 · review"), "{state}");
         assert!(!state.contains("3/5"), "{state}");
         assert!(state.contains("implement-feature v3"), "{state}");
         assert!(
@@ -2632,6 +2650,174 @@ mod task_app_detail_render {
         assert!(!narrow[row(&narrow, "$0.03")].contains('×'));
     }
 
+    /// An app whose task has run `steps`, each `(state, kind, decider)`, the
+    /// last one in progress, on the *Przebieg* tab.
+    fn app_with_steps(steps: &[(&str, &str, Option<&str>)]) -> TaskApp {
+        let mut app = app();
+        let running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            steps.last().expect("a step").0,
+        );
+        app.load(listing(vec![titled(running, "NAR-12")], "c"));
+        let positions = steps
+            .iter()
+            .enumerate()
+            .map(|(index, (state, kind, by))| {
+                let status = if index + 1 == steps.len() {
+                    PositionStatus::InProgress
+                } else {
+                    PositionStatus::Succeeded
+                };
+                of_kind(position(state, status), kind, *by)
+            })
+            .collect();
+        let current = format!("{} #1", steps.last().unwrap().0);
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", positions, Some(&current)))),
+        );
+        press(&mut app, KeyCode::Enter);
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
+        app
+    }
+
+    #[test]
+    fn the_axis_shows_the_icon_of_each_kind_after_the_status() {
+        let mut app = app_with_steps(&[
+            ("test", "script", None),
+            ("triage", "decision", Some("conductor")),
+            ("work", "agent", None),
+            ("hold", "wait", None),
+            ("approval", "decision", Some("human")),
+        ]);
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        for expected in [
+            "✓ 📜 test #1",
+            "✓ ⚡🔀 triage #1",
+            "✓ ✨ work #1",
+            "✓ ✋ hold #1",
+            "● 🧑🔀 approval #1",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} in\n{screen}");
+        }
+    }
+
+    #[test]
+    fn a_step_of_no_known_kind_is_its_name_alone() {
+        let mut app = app_with_steps(&[
+            ("plan", "agent", None),
+            ("odd", "none", None),
+            ("old", "human", None),
+        ]);
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(screen.contains("✓ plan #1") || screen.contains("✓ ✨ plan #1"));
+        for name in ["odd #1", "old #1"] {
+            let at = screen
+                .find(name)
+                .unwrap_or_else(|| panic!("{name:?} in\n{screen}"));
+            let before = &screen[..at];
+            assert!(
+                before.ends_with("✓ ") || before.ends_with("● "),
+                "no icon and no indent before {name}: {before:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_axis_of_a_step_with_usage_keeps_the_names_in_one_column() {
+        let mut app = running_app_with_usage(vec![
+            reported(120_000, 8_000, (0, 0), 0.42),
+            reported(2_100, 400, (0, 0), 0.03),
+        ]);
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 200, 30));
+        let first = rows.iter().find(|row| row.contains("$0.42")).unwrap();
+        let second = rows.iter().find(|row| row.contains("$0.03")).unwrap();
+        let column = |row: &str| ratatui::text::Span::raw(&row[..row.find('$').unwrap()]).width();
+        assert!(first.contains("✨ "), "{first}");
+        assert_eq!(column(first), column(second), "{first}\n{second}");
+    }
+
+    #[test]
+    fn the_step_header_says_the_kind_in_words_and_who_decides() {
+        let mut app = app_with_steps(&[
+            ("work", "agent", None),
+            ("approval", "decision", Some("human")),
+        ]);
+        let on_screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(
+            on_screen.contains("🧑🔀 approval #1 · w toku · decision · human"),
+            "{on_screen}"
+        );
+        let mut app = app_with_steps(&[("work", "agent", None)]);
+        let text = screen(&render(&mut app, &Styles::new(false)));
+        assert!(text.contains("✨ work #1 · w toku · agent"), "{text}");
+    }
+
+    #[test]
+    fn a_narrow_axis_cuts_the_name_and_keeps_the_status_and_the_icon() {
+        let mut app = app_with_steps(&[(
+            "a-very-long-step-name-that-cannot-fit",
+            "decision",
+            Some("conductor"),
+        )]);
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
+        assert!(
+            rows.iter().any(|row| row.contains("● ⚡🔀 a…")
+                && row.contains('…')
+                && row.contains("w toku")),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_task_list_and_the_task_header_name_the_kind_of_the_step() {
+        let mut app = app();
+        let running = in_step_of_kind(
+            with_runner(
+                with_controller(task("a", "local", "running", 1)),
+                ExecutionStatus::Running,
+                "review",
+            ),
+            "decision",
+            Some("human"),
+        );
+        app.load(listing(vec![titled(running, "NAR-12")], "c"));
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline(
+                "a",
+                vec![
+                    position("plan", PositionStatus::Succeeded),
+                    of_kind(
+                        position("review", PositionStatus::AwaitingDecision),
+                        "decision",
+                        Some("human"),
+                    ),
+                ],
+                Some("review #1"),
+            ))),
+        );
+        press(&mut app, KeyCode::Enter);
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(screen.contains("running · 🧑🔀 re"), "list:\n{screen}");
+        assert!(screen.contains("krok 2 · 🧑🔀 review"), "header:\n{screen}");
+    }
+
+    #[test]
+    fn a_task_whose_runner_names_no_kind_shows_the_step_name_alone() {
+        let mut app = running_app();
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(screen.contains("running · review"), "{screen}");
+        assert!(screen.contains("krok 3 · review"), "{screen}");
+    }
+
     #[test]
     fn the_axis_has_a_row_per_step_and_brackets_the_selected_one() {
         let mut app = running_app();
@@ -2639,7 +2825,7 @@ mod task_app_detail_render {
             .set_tab(narsor::tui::task_app::DetailTab::Progress);
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
-        for expected in ["✓ plan #1", "✓ edit #1", "● review #1 w toku"] {
+        for expected in ["✓ ✨ plan #1", "✓ ✨ edit #1", "● ✨ review #1 w toku"] {
             assert!(screen.contains(expected), "{expected:?} in\n{screen}");
         }
         assert!(!below_the_frame_title(&buffer).contains('▸'), "{screen}");
@@ -2673,14 +2859,14 @@ mod task_app_detail_render {
             "the rule below the selected step"
         );
         // The keys are on the axis: a bracket in the focus role.
-        assert_axis_bracket(&buffer, "● review #1 w toku", marks(true, false));
-        assert!(no_reversed_on_the_axis(&buffer, "● review #1 w toku"));
+        assert_axis_bracket(&buffer, "● ✨ review #1 w toku", marks(true, false));
+        assert!(no_reversed_on_the_axis(&buffer, "● ✨ review #1 w toku"));
         // Without colour the same is said in words, glyphs and weight.
         let plain = render(&mut app, &Styles::new(true));
-        assert_axis_bracket(&plain, "● review #1 w toku", marks(true, true));
-        let (y, x) = spot(&plain, "● review #1 w toku");
+        assert_axis_bracket(&plain, "● ✨ review #1 w toku", marks(true, true));
+        let (y, x) = spot(&plain, "● ✨ review #1 w toku");
         assert!(bold_at(&plain, x - 2, y) && bold_at(&plain, x, y - 1));
-        assert!(no_reversed_on_the_axis(&plain, "● review #1 w toku"));
+        assert!(no_reversed_on_the_axis(&plain, "● ✨ review #1 w toku"));
     }
 
     #[test]
@@ -2961,10 +3147,10 @@ mod task_app_detail_render {
         let rows = rows(&buffer);
         let strip = TAB_MARKER_ROW + 2;
         let text = &rows[strip];
-        let (review, plan) = (text.find("● review #1"), text.find("✓ plan #1"));
+        let (review, plan) = (text.find("● ✨ review #1"), text.find("✓ ✨ plan #1"));
         assert!(review.is_some() && plan.is_some(), "{}", screen(&buffer));
         assert!(review < plan, "newest first: {text}");
-        assert!(text.contains("review #1 · ✓ plan #1"), "{text}");
+        assert!(text.contains("review #1 · ✓ ✨ plan #1"), "{text}");
         for rule in [strip - 1, strip + 1] {
             let details = &rows[rule][rows[rule].find('─').unwrap()..];
             assert!(
@@ -3015,6 +3201,65 @@ mod task_app_detail_render {
         assert!(
             screen_text.contains("what the review said"),
             "{screen_text}"
+        );
+    }
+
+    #[test]
+    fn the_strip_and_the_transcript_show_the_icon_of_each_step() {
+        let mut app = conversation_of_two_steps();
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(screen.contains("● ✨ review #1 · ✓ ✨ plan #1"), "{screen}");
+    }
+
+    #[test]
+    fn a_strip_of_wide_icons_keeps_the_selected_step_in_view() {
+        use narsor::tui::task_app::tabs::conversation::{render_step_strip, Conversation};
+        let positions: Vec<_> = (0..12)
+            .map(|index| {
+                of_kind(
+                    position(&format!("step{index}"), PositionStatus::Succeeded),
+                    "decision",
+                    Some("conductor"),
+                )
+            })
+            .collect();
+        let mut conversation = Conversation::new("a");
+        conversation.rebuild(&positions, &Attempts::default());
+        let styles = Styles::new(false);
+        let strip = |conversation: &Conversation| {
+            let buffer = draw(40, 3, |frame| {
+                render_step_strip(frame, Rect::new(0, 0, 40, 3), &styles, conversation, true)
+            });
+            rows(&buffer)[1].clone()
+        };
+        let newest = strip(&conversation);
+        assert!(newest.contains("⚡🔀 step11 #1"), "{newest}");
+        for _ in 0..11 {
+            conversation.select_older();
+        }
+        let oldest = strip(&conversation);
+        assert!(oldest.contains("⚡🔀 step0 #1"), "{oldest}");
+        assert!(!oldest.contains("step11"), "{oldest}");
+    }
+
+    #[test]
+    fn a_step_of_no_known_kind_has_no_icon_on_the_strip() {
+        use narsor::tui::task_app::tabs::conversation::{render_step_strip, Conversation};
+        let positions = [of_kind(
+            position("odd", PositionStatus::Succeeded),
+            "none",
+            None,
+        )];
+        let mut conversation = Conversation::new("a");
+        conversation.rebuild(&positions, &Attempts::default());
+        let styles = Styles::new(false);
+        let buffer = draw(40, 3, |frame| {
+            render_step_strip(frame, Rect::new(0, 0, 40, 3), &styles, &conversation, true)
+        });
+        assert!(
+            rows(&buffer)[1].contains("✓ odd #1"),
+            "{}",
+            rows(&buffer)[1]
         );
     }
 
@@ -3109,7 +3354,7 @@ mod task_app_detail_render {
     fn spot(buffer: &Buffer, needle: &str) -> (u16, u16) {
         let row = row_of(buffer, needle);
         let text = &rows(buffer)[row];
-        let column = text[..text.find(needle).unwrap()].chars().count();
+        let column = ratatui::text::Span::raw(&text[..text.find(needle).unwrap()]).width();
         (row as u16, u16::try_from(column).unwrap())
     }
 
@@ -3211,7 +3456,7 @@ mod task_app_detail_render {
     fn the_bar_and_the_bracket_follow_the_level_of_the_focus() {
         let mut app = recorded_app(three_entries());
         let on_the_axis = render(&mut app, &Styles::new(false));
-        assert_axis_bracket(&on_the_axis, "● review #1 w toku", marks(true, false));
+        assert_axis_bracket(&on_the_axis, "● ✨ review #1 w toku", marks(true, false));
         assert_eq!(
             bar_of(&on_the_axis, "line 3"),
             ("│".to_string(), Color::DarkGray),
@@ -3225,15 +3470,15 @@ mod task_app_detail_render {
         let cell = spot(&reading, "line 2");
         assert_eq!(bar_of(&reading, "line 2"), ("│".to_string(), Color::Cyan));
         assert_eq!(bar_of(&reading, "line 3").0, " ");
-        assert_axis_bracket(&reading, "● review #1 w toku", marks(false, false));
-        assert!(no_reversed_on_the_axis(&reading, "● review #1 w toku"));
+        assert_axis_bracket(&reading, "● ✨ review #1 w toku", marks(false, false));
+        assert!(no_reversed_on_the_axis(&reading, "● ✨ review #1 w toku"));
 
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.step_focus(), StepFocus::Axis);
         let back = render(&mut app, &Styles::new(false));
         assert_eq!(spot(&back, "line 2"), cell, "the entry stays where it was");
         assert_eq!(bar_of(&back, "line 2"), ("│".to_string(), Color::DarkGray));
-        assert_axis_bracket(&back, "● review #1 w toku", marks(true, false));
+        assert_axis_bracket(&back, "● ✨ review #1 w toku", marks(true, false));
     }
 
     /// AE6: without colour the weight tells the two levels apart.
@@ -3241,7 +3486,7 @@ mod task_app_detail_render {
     fn without_colour_the_weight_tells_the_levels_apart() {
         let mut app = recorded_app(three_entries());
         let on_the_axis = render(&mut app, &Styles::new(true));
-        let (y, x) = spot(&on_the_axis, "● review #1 w toku");
+        let (y, x) = spot(&on_the_axis, "● ✨ review #1 w toku");
         assert_eq!(cell_at(&on_the_axis, x - 2, y).0, "│");
         assert!(bold_at(&on_the_axis, x - 2, y));
         let (entry_bar_x, entry_y) = bar_position(&on_the_axis, "line 3");
@@ -3256,7 +3501,7 @@ mod task_app_detail_render {
         assert!(reading[(x - 2, y)].modifier.contains(Modifier::DIM));
         assert_eq!(cell_at(&reading, entry_bar_x, entry_y).0, "│");
         assert!(bold_at(&reading, entry_bar_x, entry_y));
-        assert!(no_reversed_on_the_axis(&reading, "● review #1 w toku"));
+        assert!(no_reversed_on_the_axis(&reading, "● ✨ review #1 w toku"));
         assert!(none_reversed(row_cells(
             &reading,
             entry_y,
@@ -3272,7 +3517,7 @@ mod task_app_detail_render {
             .set_tab(narsor::tui::task_app::DetailTab::Progress);
         press(&mut app, KeyCode::Esc);
         let buffer = render(&mut app, &Styles::new(false));
-        assert_axis_bracket(&buffer, "● review #1 w toku", marks(false, false));
+        assert_axis_bracket(&buffer, "● ✨ review #1 w toku", marks(false, false));
     }
 
     /// `m` from the details moves the list's row: the keys are on the list,
@@ -3313,7 +3558,7 @@ mod task_app_detail_render {
                 .expect("the row on the list")
         };
         let details = render(&mut app, &Styles::new(false));
-        assert_axis_bracket(&details, "● review #1 w toku", marks(true, false));
+        assert_axis_bracket(&details, "● ✨ review #1 w toku", marks(true, false));
         let y = list_row(&details);
         for row in y..y + 2 {
             assert!(is_mark(&details[(1, row)], "│", marks(false, false)));
@@ -3326,11 +3571,11 @@ mod task_app_detail_render {
         for row in y..y + 2 {
             assert!(is_mark(&moving[(1, row)], "│", marks(true, false)));
         }
-        assert_axis_bracket(&moving, "● review #1 w toku", marks(false, false));
+        assert_axis_bracket(&moving, "● ✨ review #1 w toku", marks(false, false));
 
         press(&mut app, KeyCode::Esc);
         let back = render(&mut app, &Styles::new(false));
-        assert_axis_bracket(&back, "● review #1 w toku", marks(true, false));
+        assert_axis_bracket(&back, "● ✨ review #1 w toku", marks(true, false));
     }
 
     /// R11: at 60×20, with more steps than fit, the selected step is in
@@ -3364,10 +3609,10 @@ mod task_app_detail_render {
         };
         press(&mut app, KeyCode::Char('G'));
         let bottom = small(&mut app);
-        assert_axis_bracket(&bottom, "✓ s11 #1 ok", marks(true, false));
+        assert_axis_bracket(&bottom, "✓ ✨ s11 #1 ok", marks(true, false));
         press(&mut app, KeyCode::Char('g'));
         let top = small(&mut app);
-        assert_axis_bracket(&top, "✓ s0 #1 ok", marks(true, false));
+        assert_axis_bracket(&top, "✓ ✨ s0 #1 ok", marks(true, false));
         assert!(!screen(&top).contains("s11 #1"), "{}", screen(&top));
     }
 

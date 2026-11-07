@@ -268,6 +268,26 @@ pub fn position(state: &str, status: PositionStatus) -> Position {
     }
 }
 
+/// `position` of the kind `action_type`, decided by `decision_by` when it is a
+/// decision.
+pub fn of_kind(mut position: Position, action_type: &str, decision_by: Option<&str>) -> Position {
+    position.action_type = Some(action_type.to_string());
+    position.decision_by = decision_by.map(str::to_string);
+    position
+}
+
+/// `task`, with its runner in a step of the kind `action_type`.
+pub fn in_step_of_kind(
+    mut task: TaskSummary,
+    action_type: &str,
+    decision_by: Option<&str>,
+) -> TaskSummary {
+    let cursor = &mut task.runner.as_mut().expect("a runner").execution_cursor;
+    cursor.current_action_type = Some(action_type.to_string());
+    cursor.current_decision_by = decision_by.map(str::to_string);
+    offered(task)
+}
+
 /// What the runner reported as the timeline of `task`: `positions`, and the
 /// step it is at.
 pub fn timeline(task: &str, positions: Vec<Position>, current: Option<&str>) -> TimelineResponse {

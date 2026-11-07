@@ -81,6 +81,11 @@ pub struct Position {
 }
 
 impl Position {
+    /// The icon of the step's kind, when it has one.
+    pub fn icon(&self) -> Option<&'static str> {
+        step_icon(self.action_type.as_deref(), self.decision_by.as_deref())
+    }
+
     /// Every attempt of the entry, oldest first.
     pub fn attempt_ids(&self) -> Vec<&str> {
         if self.attempts.is_empty() {
