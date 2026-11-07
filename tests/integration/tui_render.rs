@@ -5227,7 +5227,7 @@ mod task_app_create_render {
 
     use crate::task_app_support::{
         archived, capabilities, catalogue, catalogue_workflow, legacy, listing, queued, registry,
-        repository, titled, workflow_input,
+        repository, titled, with_workspaces, workflow_input, workspace,
     };
 
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
@@ -5261,25 +5261,27 @@ mod task_app_create_render {
         keys(app, "n");
         app.open_new_task(
             catalogue(vec![
-                catalogue_workflow(
-                    "implement-feature",
-                    "Pełny cykl: plan, implementacja, review, testy i PR.",
-                    vec![
-                        workflow_input(
-                            "ticket_id",
-                            ParamType::String,
-                            true,
-                            Some("numer zgłoszenia"),
-                        ),
-                        workflow_input(
-                            "attempts",
-                            ParamType::Integer,
-                            false,
-                            Some("ile razy ponawiać"),
-                        ),
-                        workflow_input("dry_run", ParamType::Boolean, false, None),
-                        workflow_input("target_repo", ParamType::Repository, false, None),
-                    ],
+                with_workspaces(
+                    catalogue_workflow(
+                        "implement-feature",
+                        "Pełny cykl: plan, implementacja, review, testy i PR.",
+                        vec![
+                            workflow_input(
+                                "ticket_id",
+                                ParamType::String,
+                                true,
+                                Some("numer zgłoszenia"),
+                            ),
+                            workflow_input(
+                                "attempts",
+                                ParamType::Integer,
+                                false,
+                                Some("ile razy ponawiać"),
+                            ),
+                            workflow_input("dry_run", ParamType::Boolean, false, None),
+                        ],
+                    ),
+                    vec![workspace("target_repo", None)],
                 ),
                 catalogue_workflow("fix-bug", "Poprawka błędu.", vec![]),
             ]),
@@ -5319,7 +5321,7 @@ mod task_app_create_render {
             "attempts",
             "dry_run",
             "> ‹ false ›",
-            "Repozytorium",
+            "target_repo",
             "> ‹ narsor ›",
             "brak pola tekstowego w tym workflow",
             // The list of tasks is where it was.
@@ -5359,13 +5361,15 @@ mod task_app_create_render {
         let mut inputs = vec![
             workflow_input("ticket_id", ParamType::String, false, None),
             workflow_input("dry_run", ParamType::Boolean, false, None),
-            workflow_input("target_repo", ParamType::Repository, false, None),
         ];
         for (position, name) in texts.iter().enumerate() {
             inputs.push(workflow_input(name, ParamType::Text, position == 0, None));
         }
         app.open_new_task(
-            catalogue(vec![catalogue_workflow("ship", "Wysyła zmianę.", inputs)]),
+            catalogue(vec![with_workspaces(
+                catalogue_workflow("ship", "Wysyła zmianę.", inputs),
+                vec![workspace("target_repo", None)],
+            )]),
             registry(vec![repository("narsor", "git@github.com:acme/narsor.git")]),
         );
     }
@@ -5740,6 +5744,7 @@ mod task_app_create_render {
                     state_count: 0,
                     initial_state: None,
                     inputs: vec![],
+                    workspaces: vec![],
                     violations: vec![
                         "state 'plan' has no transition".to_string(),
                         "state 'ship' is not reachable".to_string(),
@@ -6686,7 +6691,7 @@ mod active_field_fill {
 mod stacked_form {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use narsor::tui::input_form::branch_field_name;
+    use narsor::tui::input_form::{branch_field_name, repository_field_name};
 
     const WIDTH: u16 = 40;
 
@@ -6761,8 +6766,11 @@ mod stacked_form {
     fn repository_and_branch(branch: &str) -> Vec<ChooserField> {
         vec![
             ChooserField::text("Ticket"),
-            ChooserField::select("repo", vec!["acme/web".into(), "acme/api".into()])
-                .labelled("Repozytorium"),
+            ChooserField::select(
+                repository_field_name("repo"),
+                vec!["acme/web".into(), "acme/api".into()],
+            )
+            .labelled("Repozytorium"),
             ChooserField::suggest(branch_field_name("repo"), vec!["main".into()])
                 .starting_from(branch),
             ChooserField::multiline("Opis"),
@@ -6881,7 +6889,8 @@ mod stacked_form {
         let styles = Styles::new(false);
         let long = format!("acme/{}", "x".repeat(60));
         let mut chooser = entered(vec![
-            ChooserField::select("repo", vec![long.clone()]).labelled("Repozytorium"),
+            ChooserField::select(repository_field_name("repo"), vec![long.clone()])
+                .labelled("Repozytorium"),
             ChooserField::suggest(branch_field_name("repo"), Vec::new()).starting_from("main"),
         ]);
         press(&mut chooser, KeyCode::Down);
@@ -7112,47 +7121,46 @@ mod stacked_form {
         let inputs = vec![
             workflow_input("ticket_id", ParamType::String, false, None),
             workflow_input("description", ParamType::Text, true, None),
-            workflow_input("target_repo", ParamType::Repository, false, None),
             workflow_input("custom_input", ParamType::String, false, None),
         ];
-        let fields = workflow_input_fields(
-            &inputs,
+        let fields = workflow_input_fields(&inputs);
+        let labels: Vec<&str> = fields.iter().map(ChooserField::label).collect();
+        assert_eq!(labels, ["ticket_id", "Opis", "custom_input"]);
+        let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, ["ticket_id", "description", "custom_input"]);
+        let mut chooser = entered(fields);
+        let screen = screen(&draw_chooser(WIDTH, 20, &mut chooser, &Styles::new(false)));
+        assert!(screen.contains("Opis (wymagane)"), "{screen}");
+        assert!(!screen.contains("description"), "{screen}");
+    }
+
+    #[test]
+    fn a_workspace_is_a_repository_and_its_branch_on_one_row_under_its_name() {
+        use crate::task_app_support::workspace;
+        use narsor::tui::input_form::workspace_fields;
+        let mut code = workspace("code", Some("jojo"));
+        code.description = Some("kod zmiany".to_string());
+        let fields = workspace_fields(
+            &[code],
             &[crate::task_app_support::repository(
                 "acme/web",
                 "https://example.com/web.git",
             )],
         );
         let labels: Vec<&str> = fields.iter().map(ChooserField::label).collect();
-        assert_eq!(
-            labels,
-            [
-                "ticket_id",
-                "Opis",
-                "Repozytorium",
-                "Repozytorium · gałąź",
-                "custom_input"
-            ]
-        );
+        assert_eq!(labels, ["code", "code · gałąź"]);
         let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, ["code · repozytorium", "code · gałąź"]);
+        assert!(fields[0].required);
         assert_eq!(
-            names,
-            [
-                "ticket_id",
-                "description",
-                "target_repo",
-                "target_repo · gałąź",
-                "custom_input"
-            ]
+            fields[0].description.as_deref(),
+            Some("repozytorium · kod zmiany")
         );
+        assert_eq!(fields[1].value(), "jojo");
         let mut chooser = entered(fields);
         let screen = screen(&draw_chooser(WIDTH, 20, &mut chooser, &Styles::new(false)));
-        assert!(screen.contains("Opis (wymagane)"), "{screen}");
-        assert!(screen.contains("Repozytorium"), "{screen}");
         assert!(screen.contains("> ‹ acme/web ›"), "{screen}");
-        assert!(
-            !screen.contains("description") && !screen.contains("target_repo"),
-            "{screen}"
-        );
+        assert!(screen.contains("jojo"), "{screen}");
     }
 
     #[test]

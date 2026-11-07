@@ -256,11 +256,13 @@ fn compile_repository(repository: &RepositorySchema) -> RepositoryDefinition {
         name: repository.name.clone(),
         primary: repository.primary,
         base_branch: repository.base_branch.clone(),
+        description: repository.description.clone(),
         source: match &repository.source {
             RepositorySourceSchema::Repository(repository) => RepositorySource::Git {
                 repository: repository.clone(),
             },
             RepositorySourceSchema::Path(path) => RepositorySource::Local { path: path.clone() },
+            RepositorySourceSchema::Chosen => RepositorySource::Chosen,
         },
         preserve_paths: repository.preserve_paths.clone(),
     }
@@ -278,6 +280,7 @@ fn convert_v1_workspace(workspace: &WorkspaceSchema) -> RepositoryDefinition {
                 .to_string(),
             primary: true,
             base_branch: git.git_ref.clone(),
+            description: None,
             source: RepositorySource::Git {
                 repository: git.repository.clone(),
             },
@@ -294,6 +297,7 @@ fn convert_v1_workspace(workspace: &WorkspaceSchema) -> RepositoryDefinition {
                 .to_string(),
             primary: true,
             base_branch: None,
+            description: None,
             source: RepositorySource::Local {
                 path: local.path.clone(),
             },
@@ -322,7 +326,6 @@ fn compile_input(input: InputSchema) -> InputParameter {
             ParamTypeSchema::Text => ParamType::Text,
             ParamTypeSchema::Integer => ParamType::Integer,
             ParamTypeSchema::Boolean => ParamType::Boolean,
-            ParamTypeSchema::Repository => ParamType::Repository,
         },
         required: input.required,
         default: input.default,
@@ -566,10 +569,8 @@ name: multi
 version: 3
 globals:
   workspaces:
-    code: { primary: true, base_branch: main, repository: "{{ inputs.repo }}", preserve_paths: [Cargo.lock] }
+    code: { primary: true, base_branch: main, description: the code, preserve_paths: [Cargo.lock] }
     docs: { base_branch: trunk, path: ../docs }
-inputs:
-  - { name: repo, type: repository }
 "#;
 
     #[test]
@@ -587,6 +588,7 @@ inputs:
                 name: "my-repo".to_string(),
                 primary: true,
                 base_branch: Some("develop".to_string()),
+                description: None,
                 source: RepositorySource::Git {
                     repository: "my-repo".to_string()
                 },
@@ -622,13 +624,10 @@ inputs:
     }
 
     #[test]
-    fn a_templated_v1_repository_gets_a_fixed_folder_name() {
-        let definition = load(
-            "name: legacy\nversion: 1\ninputs:\n  - { name: repo, type: repository }\nglobals:\n  workspace:\n    type: git\n    repository: \"{{ inputs.repo }}\"\n",
-        )
-        .unwrap();
-
-        assert_eq!(definition.repositories[0].name, "repository");
+    fn an_input_of_type_repository_is_an_error() {
+        let error = load("name: x\nversion: 1\ninputs:\n  - { name: repo, type: repository }\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("repository"), "{error}");
     }
 
     #[test]
@@ -713,11 +712,17 @@ terminal_states: [done]
         assert_eq!(definition.version, 3);
         assert_eq!(definition.repositories.len(), 2);
         assert_eq!(definition.primary_repository().unwrap().name, "code");
+        assert_eq!(definition.repositories[0].source, RepositorySource::Chosen);
         assert_eq!(
-            definition.repositories[0].source,
-            RepositorySource::Git {
-                repository: "{{ inputs.repo }}".to_string()
-            }
+            definition.repositories[0].description.as_deref(),
+            Some("the code")
+        );
+        assert_eq!(
+            definition
+                .chosen_repositories()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["code"]
         );
         assert_eq!(
             definition.repositories[1].base_branch.as_deref(),
@@ -795,13 +800,26 @@ terminal_states: [done]
     }
 
     #[test]
-    fn a_repository_names_exactly_one_source() {
-        for source in ["", ", repository: r, path: p"] {
-            let error = load(&format!(
-                "schema: v2\nname: x\nversion: 1\nglobals:\n  workspaces:\n    a: {{ primary: true{source} }}\n"
-            ))
-            .unwrap_err();
-            assert!(error.to_string().contains("exactly one"), "{error}");
-        }
+    fn a_repository_names_at_most_one_source() {
+        let error = load(
+            "schema: v2\nname: x\nversion: 1\nglobals:\n  workspaces:\n    a: { primary: true, repository: r, path: p }\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not both"), "{error}");
+    }
+
+    #[test]
+    fn a_workspace_without_a_source_is_chosen_when_the_task_is_created() {
+        let definition = load(
+            "schema: v2\nname: x\nversion: 1\nglobals:\n  workspaces:\n    a: { primary: true, base_branch: jojo }\n",
+        )
+        .unwrap();
+
+        let [repository] = definition.repositories.as_slice() else {
+            panic!("expected one repository");
+        };
+        assert_eq!(repository.source, RepositorySource::Chosen);
+        assert_eq!(repository.base_branch.as_deref(), Some("jojo"));
+        assert!(definition.primary_workspace_spec().is_none());
     }
 }

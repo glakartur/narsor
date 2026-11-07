@@ -551,6 +551,7 @@ pub fn conductor_view(
 // ---------------------------------------------------------------------------
 
 use narsor::api::LegacyExecutionView;
+use narsor_engine::controller_protocol::WorkflowWorkspaceView;
 use narsor_engine::domain::ParamType;
 use narsor_engine::orchestration::ArchiveTombstone;
 use narsor_protocol::controller::WorkflowInputType;
@@ -573,7 +574,6 @@ pub fn workflow_input(
             ParamType::Text => WorkflowInputType::Text,
             ParamType::Integer => WorkflowInputType::Integer,
             ParamType::Boolean => WorkflowInputType::Boolean,
-            ParamType::Repository => WorkflowInputType::Repository,
         },
         required,
         description: description.map(str::to_string),
@@ -595,6 +595,7 @@ pub fn catalogue_workflow(
         state_count: 1,
         initial_state: Some("start".to_string()),
         inputs,
+        workspaces: Vec::new(),
         valid: true,
         violations: Vec::new(),
         overrides: false,
@@ -602,6 +603,25 @@ pub fn catalogue_workflow(
         shadow_labels: Vec::new(),
         has_builtin: Some(true),
     }
+}
+
+/// A workspace whose repository the owner chooses when creating a task,
+/// with the branch the form suggests.
+pub fn workspace(name: &str, base_branch: Option<&str>) -> WorkflowWorkspaceView {
+    WorkflowWorkspaceView {
+        name: name.to_string(),
+        description: None,
+        base_branch: base_branch.map(str::to_string),
+    }
+}
+
+/// `workflow`, asking a repository for each of `workspaces`.
+pub fn with_workspaces(
+    mut workflow: WorkflowView,
+    workspaces: Vec<WorkflowWorkspaceView>,
+) -> WorkflowView {
+    workflow.workspaces = workspaces;
+    workflow
 }
 
 pub fn catalogue(workflows: Vec<WorkflowView>) -> WorkflowListResponse {

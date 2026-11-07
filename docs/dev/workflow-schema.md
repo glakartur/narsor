@@ -56,8 +56,9 @@ globals:                    # Global settings for the whole workflow (optional)
   workspaces:               # schema v2: named workspaces, one repository each (replaces `workspace`, §3.2.1)
     <name>:                 # Label and folder name in the task directory
       primary: <boolean>    # Exactly one workspace is primary
-      base_branch: <string>
-      repository: <string>  # Registry ID or {{ inputs.x }} (or `path:` instead)
+      description: <string> # Optional: shown in the new-task form for a repository chosen there
+      base_branch: <string> # Optional: the registry default branch when absent
+      repository: <string>  # Registry ID (or `path:`; neither: chosen when the task is created)
       preserve_paths: [<string>]
   image: <image>            # Base image of the remote task, overrides the repository image (optional)
 
@@ -117,18 +118,16 @@ inputs:
     required: true
     description: "Description of the task to be performed by the agent"
   
-  - name: target_repository
-    type: repository
-    required: true
-    description: "The repository in which changes are to be made"
-  
   - name: is_experimental
     type: boolean
     required: false
     default: false
 ```
 
-Input types: `string` (short single-line text), `text` (multi-line text — for the CLI/API it is an ordinary string, in the TUI a large field with focus; use it for prompts and descriptions), `integer`, `boolean`, `repository`. The new task form in the TUI shows `string`/`integer`/`boolean`/`repository` inputs in a narrow bar, and `text` inputs in multi-line fields; a workflow without a `text` input has only the bar.
+Input types: `string` (short single-line text), `text` (multi-line text — for the CLI/API it is an ordinary string, in the TUI a large field with focus; use it for prompts and descriptions), `integer`, `boolean`. The new task form in the TUI shows `string`/`integer`/`boolean` inputs in a narrow bar, and `text` inputs in multi-line fields; a workflow without a `text` input has only the bar.
+
+A repository is not an input: a workspace of `globals.workspaces` without `repository` and `path`
+is chosen when the task is created (§3.2.1). The former `repository` input type is an error.
 
 ### 3.2. Globals (Global Settings)
 
@@ -140,7 +139,7 @@ An optional section defining default behavior for the whole workflow.
     *   `backoff`: Wait time between attempts (e.g. "10s").
 *   `workspace`: Default work environment configuration.
     *   `type`: `git` (requires `repository`; `ref` is optional) or `local` (requires `path`).
-    *   `repository`: ID of a repository registered in the system.
+    *   `repository`: ID of a repository registered in the system. It cannot be a template.
     *   `ref`: Branch, tag or commit. It takes precedence over the branch from the repository configuration. Without `ref` the task fetches that branch, and without it the `HEAD` of the remote repository.
     *   `path`: Path to a local folder (for the `local` type).
     *   `preserve_paths` (for both types, `git` and `local`): A list of paths that should go into the
@@ -179,17 +178,38 @@ error. The file is checked against its own schema: a `v2` file cannot use `v1` c
     of the file is kept.
 *   `primary`: exactly one repository is primary. A step without a `workspaces` section starts there,
     and the conductor reads task artifacts from it.
+*   At most one source: `repository` (a registry ID, never a template, as in
+    `globals.workspace.repository`) or `path` (a local folder, as in `globals.workspace` of type
+    `local`). With neither, the owner chooses the repository when creating the task.
 *   `base_branch`: the branch a new task starts from, and the one a pull request targets. It is
-    required for a registered repository. Narsor does not create a working branch: a step does.
-    The task keeps for each repository its name and branch. For a repository whose source is an
-    `{{ inputs.x }}` template, the owner can choose another branch when creating the task
-    (`--branch x=<branch>` in the CLI, the branch field in the TUI form). That branch replaces
-    `base_branch` for that repository only; a repository fixed in the workflow keeps its own. On a
-    backend that runs container images the primary repository still needs a pinned commit, so a
-    chosen branch there works only together with `--commit`.
-*   Exactly one source: `repository` (a registry ID or an `{{ inputs.x }}` template naming an input
-    of type `repository`, as in `globals.workspace.repository`) or `path` (a local folder, as in
-    `globals.workspace` of type `local`).
+    optional: without it the task starts on the `default_branch` of the repository in the
+    registry, else on the remote's `HEAD`. Narsor does not create a working branch: a step does.
+    The task keeps for each repository its name and branch.
+*   `description`: optional text the new-task form shows for a repository chosen there.
+
+**A repository chosen when the task is created.** The new-task form asks for every workspace
+without `repository` and `path`, in the order of the file: a registered repository and its branch.
+The branch field starts on `base_branch`, else on the repository's `default_branch`, and the owner
+can change it; the branch on screen is the branch sent. A workspace whose repository the workflow
+names is not asked for. The CLI takes the same choices by workspace name: `--repository
+<name>=<id>` and `--branch <name>=<branch>`; `--commit <name>=<sha>` pins any Git workspace. The
+API takes them as `workspaces: { <name>: { repository, branch, commit } }` of the launch request.
+The server refuses a chosen workspace without a repository, a repository or branch for a workspace
+the workflow names, and anything for a local folder. A commit is optional on every backend: without
+it the runner clones the branch when it first starts the task and keeps the commit it got.
+
+```yaml
+globals:
+  workspaces:
+    code:
+      primary: true
+      description: The repository the change is made in   # asked: repository + branch
+    docs:
+      repository: acme-docs                                # not asked
+      base_branch: main                                    # optional
+    code2:
+      base_branch: jojo                                    # asked; the branch field starts on jojo
+```
 *   `preserve_paths`: as in §3.2, per repository.
 
 **Step `workspaces` (v2).** Says which repositories a step gets.
@@ -1067,9 +1087,6 @@ inputs:
   - name: description
     type: string
     required: true
-  - name: target_repo
-    type: repository
-    required: true
 
 globals:
   timeout: 2h
@@ -1078,7 +1095,7 @@ globals:
     backoff: 10s
   workspace:
     type: git
-    repository: "{{ inputs.target_repo }}"
+    repository: target-repo
     ref: main
 
 states:
@@ -1224,9 +1241,6 @@ inputs:
   - name: description
     type: string
     required: true
-  - name: target_repo
-    type: repository
-    required: true
 
 globals:
   timeout: 2h
@@ -1236,8 +1250,8 @@ globals:
   workspaces:
     repo:
       primary: true
+      description: The repository the feature is implemented in
       base_branch: main
-      repository: "{{ inputs.target_repo }}"
 
 states:
   analyze:

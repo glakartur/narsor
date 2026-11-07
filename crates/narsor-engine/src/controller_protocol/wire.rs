@@ -50,9 +50,9 @@ pub use narsor_protocol::controller::{
     TaskEventKind, TaskListResponse, TaskState, TaskSummary, TimelineResponse, TransitionExit,
     TransitionOffer, ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType,
     WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowSourceRequest,
-    WorkflowSourceResponse, WorkflowView, WorkspaceRequest, CONVERSATION_READER_STARTING,
-    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
-    CONVERSATION_UNAVAILABLE,
+    WorkflowSourceResponse, WorkflowView, WorkflowWorkspaceView, WorkspaceRequest,
+    CONVERSATION_READER_STARTING, CONVERSATION_RECORD_UNREADABLE,
+    CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
 };
 
 use crate::domain::TaskId;

@@ -3,16 +3,11 @@ name: code-and-docs
 version: 1
 description: Implements a change in the code repository, then documents it in the docs repository.
 
-inputs:
-  - name: code_repo
-    type: repository
-    required: true
-
 globals:
   workspaces:
     code:
       primary: true
-      repository: "{{ inputs.code_repo }}"
+      description: The repository the change is made in.
       base_branch: main
     docs:
       repository: acme-docs

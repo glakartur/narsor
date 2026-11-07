@@ -35,7 +35,7 @@ use narsor_engine::controller_protocol::{
     ProtocolError, RepositoryBranchesResponse, RepositoryListResponse, RepositoryView,
     ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType, WorkflowInputView,
     WorkflowListResponse, WorkflowSource, WorkflowSourceRequest, WorkflowSourceResponse,
-    WorkflowView,
+    WorkflowView, WorkflowWorkspaceView,
 };
 use narsor_engine::domain::display::{
     without_unsafe_chars, without_unsafe_chars_json, without_unsafe_chars_multiline,
@@ -201,15 +201,16 @@ fn workflow_view(resolver: &WorkflowResolver, entry: WorkflowEntry) -> WorkflowV
         .as_ref()
         .map_err(|_| vec!["the workflow could not be read".to_string()])
         .and_then(|resolved| tasks::load_resolved(resolved).map_err(violations_of));
-    let (version, state_count, initial_state, inputs, violations) = match loaded {
+    let (version, state_count, initial_state, inputs, workspaces, violations) = match loaded {
         Ok(definition) => (
             Some(definition.version),
             definition.states.len(),
             Some(definition.initial_state.clone()),
             inputs_of(&definition),
+            workspaces_of(&definition),
             Vec::new(),
         ),
-        Err(violations) => (None, 0, None, Vec::new(), violations),
+        Err(violations) => (None, 0, None, Vec::new(), Vec::new(), violations),
     };
     let overrides = entry.is_override();
     let origin_label = entry.origin.label().to_string();
@@ -234,6 +235,7 @@ fn workflow_view(resolver: &WorkflowResolver, entry: WorkflowEntry) -> WorkflowV
         state_count,
         initial_state,
         inputs,
+        workspaces,
         violations,
         origin_label,
         shadow_labels,
@@ -253,7 +255,6 @@ fn inputs_of(definition: &WorkflowDefinition) -> Vec<WorkflowInputView> {
                 ParamType::Text => WorkflowInputType::Text,
                 ParamType::Integer => WorkflowInputType::Integer,
                 ParamType::Boolean => WorkflowInputType::Boolean,
-                ParamType::Repository => WorkflowInputType::Repository,
             },
             required: input.required,
             description: input
@@ -264,6 +265,21 @@ fn inputs_of(definition: &WorkflowDefinition) -> Vec<WorkflowInputView> {
                 without_unsafe_chars_json(&mut default);
                 default
             }),
+        })
+        .collect()
+}
+
+/// The workspaces whose repository the owner chooses, cleaned for display.
+fn workspaces_of(definition: &WorkflowDefinition) -> Vec<WorkflowWorkspaceView> {
+    definition
+        .chosen_repositories()
+        .map(|repository| WorkflowWorkspaceView {
+            name: without_unsafe_chars(&repository.name),
+            description: repository
+                .description
+                .as_deref()
+                .map(without_unsafe_chars_multiline),
+            base_branch: repository.base_branch.as_deref().map(without_unsafe_chars),
         })
         .collect()
 }
@@ -358,6 +374,7 @@ fn verdict_on(source: &str) -> ValidateWorkflowResponse {
         state_count: 0,
         initial_state: None,
         inputs: Vec::new(),
+        workspaces: Vec::new(),
         violations,
     };
     let clean = |text: String| without_unsafe_chars_multiline(&text);
@@ -374,6 +391,7 @@ fn verdict_on(source: &str) -> ValidateWorkflowResponse {
                 state_count: definition.states.len(),
                 initial_state: Some(without_unsafe_chars(&definition.initial_state)),
                 inputs: inputs_of(&definition),
+                workspaces: workspaces_of(&definition),
                 violations: Vec::new(),
             },
             Err(error) => refused(vec![clean(error.to_string())]),

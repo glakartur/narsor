@@ -228,8 +228,7 @@ pub enum TaskCommand {
             long,
             value_name = "PATH",
             conflicts_with_all = [
-                "workflow_version", "backend", "profile", "harness", "repository", "commit",
-                "branches"
+                "workflow_version", "backend", "profile", "harness"
             ]
         )]
         file: Option<PathBuf>,
@@ -240,10 +239,19 @@ pub enum TaskCommand {
         /// JSON is taken as that; with `--file` the declared type decides.
         #[arg(long = "input", value_name = "NAME=VALUE")]
         inputs: Vec<String>,
-        /// Gałąź dla wejścia typu repozytorium, `WEJŚCIE=GAŁĄŹ` (powtarzalne).
-        /// Wejście bez gałęzi startuje na gałęzi domyślnej repozytorium.
-        #[arg(long = "branch", value_name = "INPUT=BRANCH")]
+        /// Registered repository for a workspace the workflow leaves to be
+        /// chosen, `WORKSPACE=ID` (repeatable). Every such workspace needs one.
+        #[arg(long = "repository", value_name = "WORKSPACE=ID")]
+        repositories: Vec<String>,
+        /// Branch for a workspace the workflow leaves to be chosen,
+        /// `WORKSPACE=BRANCH` (repeatable); its `base_branch`, then the
+        /// repository's default branch, when omitted.
+        #[arg(long = "branch", value_name = "WORKSPACE=BRANCH")]
         branches: Vec<String>,
+        /// Full commit id to clone for a Git workspace, `WORKSPACE=SHA`
+        /// (repeatable).
+        #[arg(long = "commit", value_name = "WORKSPACE=SHA")]
+        commits: Vec<String>,
         /// Backend to pin the task to; the default backend when omitted.
         #[arg(long, value_name = "BACKEND")]
         backend: Option<String>,
@@ -253,12 +261,6 @@ pub enum TaskCommand {
         /// Harness for agent steps that name none.
         #[arg(long, value_name = "HARNESS")]
         harness: Option<String>,
-        /// Registered repository to clone; the workflow's when omitted.
-        #[arg(long, value_name = "ID")]
-        repository: Option<String>,
-        /// Full commit id to clone.
-        #[arg(long, value_name = "SHA")]
-        commit: Option<String>,
         /// Client-chosen task id: repeating the same request with it is
         /// safe and returns the same task.
         #[arg(long = "task-id", value_name = "ID")]
@@ -897,12 +899,12 @@ pub fn create_request(command: &TaskCommand) -> Result<Option<(CreateTaskRequest
             workflow: Some(workflow),
             workflow_version,
             inputs,
+            repositories,
             branches,
+            commits,
             backend,
             profile,
             harness,
-            repository,
-            commit,
             task_id,
             ..
         } => Some((
@@ -913,13 +915,7 @@ pub fn create_request(command: &TaskCommand) -> Result<Option<(CreateTaskRequest
                     workflow_id: workflow.clone(),
                     workflow_version: workflow_version.unwrap_or_default(),
                     inputs: Value::Object(parse_pairs("input", inputs)?),
-                    workspace: (repository.is_some() || commit.is_some()).then(|| {
-                        WorkspaceRequest {
-                            repository: repository.clone(),
-                            commit: commit.clone(),
-                        }
-                    }),
-                    branches: parse_branches(branches)?,
+                    workspaces: parse_workspaces(repositories, branches, commits)?,
                     profile: profile.clone(),
                     harness: harness.clone(),
                     resources: None,
@@ -974,9 +970,15 @@ pub async fn task(
         TaskCommand::Create {
             file: Some(file),
             inputs,
+            repositories,
+            branches,
+            commits,
             task_id,
             ..
-        } => create_from_file(&client, &file, &inputs, task_id).await,
+        } => {
+            let workspaces = parse_workspaces(&repositories, &branches, &commits)?;
+            create_from_file(&client, &file, &inputs, workspaces, task_id).await
+        }
         TaskCommand::Create { .. } => {
             let (mut request, requested_version) = create.expect("built above");
             if requested_version.is_none() {
@@ -1724,15 +1726,34 @@ fn parse_pairs(flag: &str, pairs: &[String]) -> Result<Map<String, Value>> {
     Ok(values)
 }
 
-/// `input=branch` pairs of `--branch`; a branch name is always text.
-fn parse_branches(pairs: &[String]) -> Result<BTreeMap<String, String>> {
-    pairs
-        .iter()
-        .map(|pair| {
-            split_pair("branch", pair)
-                .map(|(input, branch)| (input.to_string(), branch.to_string()))
-        })
-        .collect()
+/// What `--repository`, `--branch` and `--commit` chose, by workspace name;
+/// every value is text.
+fn parse_workspaces(
+    repositories: &[String],
+    branches: &[String],
+    commits: &[String],
+) -> Result<BTreeMap<String, WorkspaceRequest>> {
+    let mut workspaces: BTreeMap<String, WorkspaceRequest> = BTreeMap::new();
+    let mut choose = |flag: &str, pairs: &[String], set: fn(&mut WorkspaceRequest, String)| {
+        for pair in pairs {
+            let (workspace, value) = split_pair(flag, pair)?;
+            set(
+                workspaces.entry(workspace.to_string()).or_default(),
+                value.to_string(),
+            );
+        }
+        Ok::<(), CliError>(())
+    };
+    choose("repository", repositories, |choice, id| {
+        choice.repository = Some(id)
+    })?;
+    choose("branch", branches, |choice, branch| {
+        choice.branch = Some(branch)
+    })?;
+    choose("commit", commits, |choice, commit| {
+        choice.commit = Some(commit)
+    })?;
+    Ok(workspaces)
 }
 
 /// `name=value` of `--{flag}`, the name trimmed; a usage error otherwise.

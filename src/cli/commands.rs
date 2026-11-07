@@ -276,7 +276,7 @@ fn declared_input_names(schema: &[WorkflowInputView]) -> String {
 /// from guessing at the text.
 fn parse_input_value(parameter: &WorkflowInputView, raw: &str) -> Result<Value> {
     match parameter.input_type {
-        WorkflowInputType::String | WorkflowInputType::Text | WorkflowInputType::Repository => {
+        WorkflowInputType::String | WorkflowInputType::Text => {
             Ok(Value::String(raw.to_string()))
         }
         WorkflowInputType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {

@@ -289,10 +289,7 @@ fn implement_prompt_from_the_reference_fixture_expands_fully() {
         .and_then(|state| state.action.as_ref())
         .expect("state 'implement' must carry an action");
 
-    let inputs = inputs(&[
-        ("description", json!("logowanie przez OAuth")),
-        ("target_repo", json!("acme/app")),
-    ]);
+    let inputs = inputs(&[("description", json!("logowanie przez OAuth"))]);
     // Deliberately empty: `implement` is reachable from `analyze` (label `ready`)
     // without passing through `human_clarification`, so the prompt must render
     // on a context that carries nothing at all.

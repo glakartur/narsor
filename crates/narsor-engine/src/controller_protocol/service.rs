@@ -508,7 +508,6 @@ impl ProtocolService {
             .map_err(label_refusal)?;
         let title = normalize_label("title", launch.title.as_deref(), TITLE_MAX_CHARS)
             .map_err(label_refusal)?;
-        let workspace = launch.workspace.unwrap_or_default();
         let resolved = self
             .launch
             .resolve(&LaunchIntent {
@@ -516,9 +515,7 @@ impl ProtocolService {
                 workflow_id: launch.workflow_id,
                 workflow_version: launch.workflow_version,
                 inputs: launch.inputs,
-                repository: workspace.repository,
-                commit: workspace.commit,
-                branches: launch.branches,
+                workspaces: launch.workspaces,
                 profile: launch.profile,
                 harness: launch.harness,
                 resources: launch.resources.map(|resources| {

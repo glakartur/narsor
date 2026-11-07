@@ -277,29 +277,26 @@ impl ApiClient {
         workflow: &str,
         inputs: Map<String, Value>,
     ) -> Result<StartTaskResponse, ClientError> {
-        self.start_task_with_labels(task_id, workflow, inputs, None, None)
-            .await
-    }
-
-    /// [`Self::start_task`] with the ticket and title the operator typed,
-    /// passed on as typed: the server trims and validates them.
-    pub async fn start_task_with_labels(
-        &self,
-        task_id: &str,
-        workflow: &str,
-        inputs: Map<String, Value>,
-        ticket: Option<String>,
-        title: Option<String>,
-    ) -> Result<StartTaskResponse, ClientError> {
-        let url = format!("{}/tasks", self.base_url);
-        let body = StartTaskRequest {
+        self.start_task_request(&StartTaskRequest {
             task_id: task_id.to_string(),
             workflow: workflow.to_string(),
             inputs,
-            ticket,
-            title,
-        };
-        self.post_json(&url, &body).await
+            workspaces: Default::default(),
+            ticket: None,
+            title: None,
+        })
+        .await
+    }
+
+    /// [`Self::start_task`] with everything the operator chose: the
+    /// workspaces, the ticket and the title, passed on as typed — the server
+    /// trims and validates them.
+    pub async fn start_task_request(
+        &self,
+        body: &StartTaskRequest,
+    ) -> Result<StartTaskResponse, ClientError> {
+        let url = format!("{}/tasks", self.base_url);
+        self.post_json(&url, body).await
     }
 
     /// Resumes a paused execution — `POST /executions/:id/resume`.

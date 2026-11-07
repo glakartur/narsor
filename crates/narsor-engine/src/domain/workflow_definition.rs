@@ -84,9 +84,20 @@ impl WorkflowDefinition {
 
     /// The primary repository as the single-workspace declaration the
     /// single-repository runtime still consumes.
+    ///
+    /// `None` when the workflow declares no repository or its primary
+    /// repository is chosen when the task is created.
     pub fn primary_workspace_spec(&self) -> Option<WorkspaceSpec> {
         self.primary_repository()
-            .map(RepositoryDefinition::workspace_spec)
+            .and_then(RepositoryDefinition::workspace_spec)
+    }
+
+    /// The repositories chosen when a task is created, in the order of the
+    /// file.
+    pub fn chosen_repositories(&self) -> impl Iterator<Item = &RepositoryDefinition> {
+        self.repositories
+            .iter()
+            .filter(|repository| repository.source == RepositorySource::Chosen)
     }
 }
 
@@ -135,9 +146,14 @@ pub struct RepositoryDefinition {
     pub primary: bool,
 
     /// Branch a new task starts on. `None` leaves the choice to the
-    /// registry's default branch.
+    /// registry's default branch. For a repository chosen when the task is
+    /// created it is only the branch the new-task form suggests.
     #[serde(default)]
     pub base_branch: Option<String>,
+
+    /// What the repository is for, in words for the new-task form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 
     /// Where the repository comes from.
     pub source: RepositorySource,
@@ -151,8 +167,9 @@ pub struct RepositoryDefinition {
 impl RepositoryDefinition {
     /// The repository as the single-workspace declaration of the
     /// single-repository runtime; `base_branch` plays the part of `ref`.
-    pub fn workspace_spec(&self) -> WorkspaceSpec {
-        match &self.source {
+    /// `None` for a repository chosen when the task is created.
+    pub fn workspace_spec(&self) -> Option<WorkspaceSpec> {
+        let spec = match &self.source {
             RepositorySource::Git { repository } => WorkspaceSpec::Git {
                 repository: repository.clone(),
                 git_ref: self.base_branch.clone(),
@@ -162,7 +179,9 @@ impl RepositoryDefinition {
                 path: path.clone(),
                 preserve_paths: self.preserve_paths.clone(),
             },
-        }
+            RepositorySource::Chosen => return None,
+        };
+        Some(spec)
     }
 }
 
@@ -170,11 +189,12 @@ impl RepositoryDefinition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RepositorySource {
-    /// Registered repository: a registry id, or a `{{ inputs.x }}` template
-    /// naming an input of type `repository`.
+    /// Registered repository, by its registry id.
     Git { repository: String },
     /// Plain local folder, relative to the task directory.
     Local { path: String },
+    /// A registered repository the owner chooses when creating the task.
+    Chosen,
 }
 
 /// What a step may touch: the `workspaces` section of a step.
@@ -270,13 +290,15 @@ pub enum WorkspaceSpec {
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum ParamType {
+    /// Also how a definition saved with the former `repository` type reads:
+    /// repositories are now chosen per workspace (`globals.workspaces`).
     #[default]
+    #[serde(alias = "repository")]
     String,
     /// Multi-line text: a string whose value is prose, shown as a large field in the TUI.
     Text,
     Integer,
     Boolean,
-    Repository,
 }
 
 /// Input parameter definition

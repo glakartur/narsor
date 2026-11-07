@@ -281,6 +281,10 @@ pub struct StartTaskRequest {
     pub workflow: String,
     #[serde(default)]
     pub inputs: Map<String, Value>,
+    /// What the owner chose for the workspaces of the workflow, by workspace
+    /// name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspaces: BTreeMap<String, crate::controller::WorkspaceRequest>,
     /// Ticket the operator typed; the server trims and validates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,

@@ -8,12 +8,13 @@
 //! trusted local daemon does; any other server refuses them with the reason
 //! its capabilities give.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use clap::Subcommand;
 
-use crate::api::ApiClient;
-use crate::controller_protocol::CreateRepositoryRequest;
+use crate::api::{ApiClient, StartTaskRequest};
+use crate::controller_protocol::{CreateRepositoryRequest, WorkspaceRequest};
 use crate::domain::without_unsafe_chars;
 
 use super::commands::{CliError, Result};
@@ -221,6 +222,7 @@ pub async fn create_from_file(
     client: &ApiClient,
     file: &Path,
     inputs: &[String],
+    workspaces: BTreeMap<String, WorkspaceRequest>,
     task_id: Option<String>,
 ) -> Result<()> {
     require_local_daemon(client, "Creating a task from a workflow file").await?;
@@ -239,7 +241,14 @@ pub async fn create_from_file(
     let inputs = typed_inputs(&verdict.inputs, inputs)?;
     let task_id = task_id.unwrap_or_else(|| format!("task-{}", uuid::Uuid::new_v4().simple()));
     let started = client
-        .start_task(&task_id, &path, inputs)
+        .start_task_request(&StartTaskRequest {
+            task_id,
+            workflow: path,
+            inputs,
+            workspaces,
+            ticket: None,
+            title: None,
+        })
         .await
         .map_err(|error| failure("Could not create the task", error))?;
     print_created(&started.task);
