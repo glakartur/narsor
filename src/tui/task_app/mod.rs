@@ -894,6 +894,8 @@ impl TaskApp {
             | Action::RawAll
             | Action::NextConversationView
             | Action::Follow
+            | Action::NewerStep
+            | Action::OlderStep
                 if context == Context::Details =>
             {
                 self.on_detail_action(action)

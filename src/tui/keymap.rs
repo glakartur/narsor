@@ -266,6 +266,10 @@ pub enum Action {
     EnterStep,
     /// Leave the step's conversation for the timeline, on the same step.
     LeaveStep,
+    /// *Rozmowa*: the newer step on the strip of steps.
+    NewerStep,
+    /// *Rozmowa*: the older step on the strip of steps.
+    OlderStep,
     /// Back to the list.
     Back,
     /// Move a queued task one place up.
@@ -1607,6 +1611,27 @@ pub static BINDINGS: &[Binding] = &[
         Action::RawEntry,
         "źródło",
         "pokaż albo ukryj źródło wpisu",
+    ),
+    bind(
+        Context::AgentConversation,
+        Key::char('f'),
+        Action::Follow,
+        "śledź",
+        "włącz albo wyłącz śledzenie najnowszego kroku i jego najnowszego wpisu",
+    ),
+    bind(
+        Context::AgentConversation,
+        Key::code(KeyCode::Left),
+        Action::NewerStep,
+        "kroki",
+        "nowszy krok (w lewo na pasku kroków)",
+    ),
+    bind(
+        Context::AgentConversation,
+        Key::code(KeyCode::Right),
+        Action::OlderStep,
+        "",
+        "starszy krok (w prawo na pasku kroków)",
     ),
     // Every other tab: reading what it shows.
     bind(
