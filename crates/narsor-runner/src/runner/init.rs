@@ -161,6 +161,7 @@ fn provision_git(
             &repository,
             &identity.remote_url,
             &identity.commit,
+            identity.git_ref.as_deref(),
             &partial,
             credential.as_deref(),
             git,
@@ -506,6 +507,98 @@ terminal_states: [completed]
             storage.workspace_dir().display().to_string()
         );
         assert!(!storage.partial_clone_dir().exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// The branch a checkout is on, or `None` on a detached HEAD.
+    fn current_branch(dir: &Path) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .output()
+            .expect("run git");
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// A workflow starts its own branch from the one the task was started on,
+    /// so the clone must sit on that branch (tracking the remote's), at the
+    /// pinned commit — never on a detached HEAD.
+    #[test]
+    fn a_cloned_workspace_is_on_its_branch_not_on_a_detached_head() {
+        let base = temp("on-branch");
+        let (bare, head) = origin(&base);
+        let work = base.join("origin-work");
+        git(&work, &["switch", "-q", "-c", "feature"]);
+        fs::write(work.join("feature.md"), "feature\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "feature"]);
+        let feature = git(&work, &["rev-parse", "HEAD"]);
+        git(
+            &work,
+            &["push", "-q", &bare.display().to_string(), "feature"],
+        );
+
+        let pinned = |commit: &str, git_ref: Option<&str>| {
+            TaskWorkspace::single(TaskRepository::new(
+                "demo",
+                TaskRepositorySource::Git(Box::new(GitIdentity {
+                    repository: Some("demo".to_string()),
+                    remote_url: bare.display().to_string(),
+                    commit: commit.to_string(),
+                    git_ref: git_ref.map(str::to_string),
+                    ref_origin: None,
+                    credential: None,
+                })),
+            ))
+        };
+        let cases = [
+            ("default", unpinned(&bare, None, None), "main", &head),
+            ("main", unpinned(&bare, Some("main"), None), "main", &head),
+            (
+                "feature",
+                unpinned(&bare, Some("feature"), None),
+                "feature",
+                &feature,
+            ),
+            ("pinned-default", pinned(&head, None), "main", &head),
+            (
+                "pinned-feature",
+                pinned(&feature, Some("feature")),
+                "feature",
+                &feature,
+            ),
+        ];
+        for (name, workspace, branch, commit) in cases {
+            let storage = TaskStorage::new(base.join(format!("storage-{name}")));
+            fs::create_dir_all(storage.root()).unwrap();
+
+            initialize(
+                &storage,
+                &storage.store(),
+                &task(),
+                &spec(workspace),
+                &MountedSecrets::new(None),
+                &GitAccess::User,
+            )
+            .unwrap();
+
+            let checkout = storage.repository_dir("demo");
+            assert_eq!(
+                current_branch(&checkout).as_deref(),
+                Some(branch),
+                "{name}: the clone is on a detached HEAD or a wrong branch"
+            );
+            assert_eq!(&git(&checkout, &["rev-parse", "HEAD"]), commit, "{name}");
+            assert_eq!(
+                git(&checkout, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+                format!("origin/{branch}"),
+                "{name}"
+            );
+        }
         let _ = fs::remove_dir_all(base);
     }
 
