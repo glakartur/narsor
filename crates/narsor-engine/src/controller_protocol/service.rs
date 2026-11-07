@@ -37,7 +37,7 @@ use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{
     effective_title, normalize_label, one_line_label, AnsweredBy, BackendId, LabelError,
-    LaunchDefinitionError, ResourceProfile, TaskDisplay, TaskId, WorkflowDefinition,
+    LaunchDefinitionError, ResourceProfile, TaskId, WorkflowDefinition, WorkspaceHeader,
     GENERATED_TITLE_MAX_CHARS, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use crate::engine::{
@@ -52,7 +52,7 @@ use crate::orchestration::{
     NewTask, Observation, OperatorCommand, OperatorCommandRequest, OwnerRef, ResumePolicy,
     RunnerObservation, RunnerState, TaskEvent, TaskRecord, RETIRED_CONDUCTOR_HARNESS,
 };
-use crate::workflow::TemplateScope;
+use crate::workspace::state::launch_headers;
 use relay::Relay;
 
 /// Converts a configured period; one too large for the calendar counts as
@@ -2155,7 +2155,7 @@ impl ProtocolService {
                 .collect(),
             attention: task_attention(record),
             queue: record.queue.as_ref().map(QueueView::from),
-            display: task_display(record),
+            workspaces: task_workspaces(record),
             ticket: record.launch_spec.ticket.clone(),
             title: task_title(record),
             manual_transitions: manual_transitions(record),
@@ -2495,9 +2495,6 @@ fn current_position(timeline: &Timeline) -> Option<String> {
         .map(|position| position.label.clone())
 }
 
-/// What a task shows as its title and links: the runner's latest rendering,
-/// else the workflow's `display` rendered from the sealed inputs alone —
-/// which is all there is to go on while the task still waits in the queue.
 /// The transitions an owner can ask for out of the state the runner last
 /// reported: read from the sealed workflow snapshot, only while the task is
 /// running (nothing else can carry one out).
@@ -2567,31 +2564,24 @@ fn task_title(record: &TaskRecord) -> Option<String> {
     effective_title(record.launch_spec.title.as_deref(), generated.as_deref())
 }
 
-fn task_display(record: &TaskRecord) -> TaskDisplay {
-    if let Some(reported) = record
+/// The workspace rows a task shows: what its runner reported, else what the
+/// launch spec knows, which is all there is while the task waits in the
+/// queue. The workspaces keep the launch spec's order.
+pub fn task_workspaces(record: &TaskRecord) -> Vec<WorkspaceHeader> {
+    let reported = record
         .runner
         .as_ref()
-        .and_then(|runner| runner.snapshot.display.clone())
-    {
+        .map(|runner| runner.snapshot.workspaces.as_slice())
+        .filter(|workspaces| !workspaces.is_empty());
+    match reported {
         // A remote runner's word is not trusted with a terminal.
-        return reported.sanitized();
+        Some(workspaces) => workspaces
+            .iter()
+            .cloned()
+            .map(WorkspaceHeader::sanitized)
+            .collect(),
+        None => launch_headers(&record.launch_spec.workspace),
     }
-    let Some(spec) = record.launch_spec.display_spec() else {
-        return TaskDisplay::default();
-    };
-    let no_variables = HashMap::new();
-    let inputs = record
-        .launch_spec
-        .inputs
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    TemplateScope::from_parts(&inputs, &no_variables)
-        .with_task_fields(
-            record.launch_spec.ticket.as_deref(),
-            record.launch_spec.title.as_deref(),
-        )
-        .render_display(&spec)
 }
 
 /// The desired state of one task as of `now`. `reader_needed` is the reader

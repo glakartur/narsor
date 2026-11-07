@@ -4,7 +4,7 @@
 //! [`super::lifecycle`] and the durable mutation protocol in
 //! [`super::control_plane`].
 
-use crate::domain::{BackendId, ExecutionStatus, TaskDisplay, TaskId, TaskLaunchSpec};
+use crate::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec, WorkspaceHeader};
 use crate::engine::{HumanInputDelivery, PendingHumanInput, Timeline};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -836,12 +836,12 @@ pub struct RunnerSnapshot {
     /// this is information for the owner, never a [`RunnerProblem`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_harness_unavailable: Option<HarnessUnavailable>,
-    /// The workflow's `display` rendered against the execution's inputs and
-    /// current variables. `None` when the runner could not render one (no
-    /// execution yet), which leaves what the control plane rendered at
-    /// creation in place; the last report that has one wins.
-    #[serde(default)]
-    pub display: Option<TaskDisplay>,
+    /// The header values of the task's workspaces, in the workflow's order.
+    /// Empty when the runner has none to report, which leaves what the
+    /// control plane knows from the launch in place; the last report that
+    /// has some wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<WorkspaceHeader>,
     /// Title the conductor generated for a task whose operator gave none;
     /// the last report that has one wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]

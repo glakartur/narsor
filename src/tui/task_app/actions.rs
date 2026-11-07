@@ -15,7 +15,7 @@
 //! | `t` | manual transition; override `!` | the state has exits (override: always, or `allow_manual_override` in the legacy shape) |
 //! | `s` | start again | interrupted, failed provisioning |
 //! | `a` | archive `!` | finished, interrupted |
-//! | `o` | open a link | `display.links` has a value |
+//! | `o` | open a link | a workspace has a pull request link |
 //!
 //! # Confirmation
 //!
@@ -224,10 +224,8 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
         TaskAction::OpenLink => {
             if openable_links(task).next().is_some() {
                 Availability::Available
-            } else if task.display.links.is_empty() {
-                Availability::because("workflow nie deklaruje linków")
             } else {
-                Availability::because("linki zadania nie mają jeszcze wartości")
+                Availability::because("zadanie nie ma jeszcze linku do PR")
             }
         }
         TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => {
@@ -242,11 +240,13 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
     }
 }
 
-/// The links a browser can be pointed at: those with a safe address.
-fn openable_links(task: &TaskSummary) -> impl Iterator<Item = (&str, &str, String)> {
-    task.display.links.iter().filter_map(|link| {
-        let url = link.url.as_deref().and_then(safe_link_url)?;
-        Some((link.label.as_str(), link.text.as_str(), url))
+/// The pull request links a browser can be pointed at: the workspace's name,
+/// what the header shows for the pull request and its safe address.
+fn openable_links(task: &TaskSummary) -> impl Iterator<Item = (&str, String, String)> {
+    task.workspaces.iter().filter_map(|workspace| {
+        let label = workspace.pr_label();
+        let text = label.text();
+        Some((workspace.name.as_str(), text, label.url?))
     })
 }
 
@@ -543,7 +543,7 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
         ),
         TaskAction::OpenLink => (
             "otwórz link".to_string(),
-            "Otwiera w przeglądarce link z `display.links` zadania.".to_string(),
+            "Otwiera w przeglądarce link do PR zadania.".to_string(),
         ),
         TaskAction::Comment => (WRITE_TO_AGENT.to_lowercase(), comment_effect(task)),
     };
@@ -674,7 +674,7 @@ fn link_list(task: &TaskSummary) -> LinkList {
     let mut items = Vec::new();
     for (label, text, url) in openable_links(task) {
         items.push(ChooserItem::new(
-            format!("{}: {}", one_line(label), one_line(text)),
+            format!("{}: {}", one_line(label), one_line(&text)),
             format!("Otwiera w przeglądarce:\n{url}"),
         ));
         links.push(LinkRequest {

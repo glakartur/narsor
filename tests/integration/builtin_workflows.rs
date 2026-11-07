@@ -79,7 +79,6 @@ fn the_template_is_the_only_builtin_and_demonstrates_engine_features_safely() {
 
     let definition = load_from_str(entry.source).expect("template loads");
     assert_eq!(definition.name, "template");
-    assert!(definition.display.is_some());
     assert_eq!(definition.inputs.len(), 1);
     assert_eq!(definition.globals.timeout_secs, Some(120));
     assert_eq!(

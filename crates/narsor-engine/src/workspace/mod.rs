@@ -19,6 +19,7 @@
 
 pub mod checkpoint;
 pub mod provisioner;
+pub mod state;
 
 pub use checkpoint::{
     capture, materialise, Base, Capture, CaptureRequest, CheckpointError, MaterialiseRequest,

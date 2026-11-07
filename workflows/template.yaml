@@ -9,13 +9,6 @@ inputs:
     required: true
     description: Text shown at the human decision gate.
 
-display:
-  title: Narsor workflow template
-  links:
-    - label: schema
-      text: Workflow schema
-      url: https://github.com/glakartur/narsor/blob/main/docs/dev/workflow-schema.md
-
 globals:
   timeout: 2m
   retry_policy:

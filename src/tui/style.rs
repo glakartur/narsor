@@ -75,7 +75,6 @@ pub enum Role {
     Focus,
     /// The conductor: `◆` recommendations, proposed values, its entries.
     Conductor,
-    /// A link from `display.links`.
     Link,
 }
 

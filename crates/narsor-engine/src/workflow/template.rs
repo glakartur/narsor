@@ -18,10 +18,6 @@
 //!   a failed action naming the variable and the place it was used. A name
 //!   the workflow declares ([`DeclaredNames`]) is not unknown, only unset:
 //!   it renders as empty text (KTD6).
-//! * The `display` section is the one exception to the first rule
-//!   ([`TemplateScope::render_display`]): a title or link is shown while the
-//!   task is still queued, before the variables it names exist, so there an
-//!   unknown variable makes the whole string empty instead of an error.
 //! * Substitution is single-pass. The rendered result is never rescanned, so
 //!   a variable whose value itself contains `{{ ... }}` cannot cause
 //!   recursion.
@@ -35,10 +31,9 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value};
 
 use crate::domain::{
-    safe_link_url, ActionConfig, AgentActionConfig, ArtifactReference, Context,
-    DecisionActionConfig, DisplayLink, DisplaySpec, HumanActionConfig, PromptPart, PromptText,
-    ScriptActionConfig, TaskDisplay, VariableDefinition, WaitActionConfig, WorkflowDefinition,
-    EMPTY_LINK_TEXT, LOCAL_VARIABLE_PREFIX,
+    ActionConfig, AgentActionConfig, ArtifactReference, Context, DecisionActionConfig,
+    HumanActionConfig, PromptPart, PromptText, ScriptActionConfig, VariableDefinition,
+    WaitActionConfig, WorkflowDefinition, LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -316,49 +311,6 @@ impl<'a> TemplateScope<'a> {
     pub fn render(&self, template: &str, location: &str) -> Result<String, TemplateError> {
         self.render_with(template, location, Unknown::Error)
             .map(|rendered| rendered.unwrap_or_default())
-    }
-
-    /// Renders every template of a `display` section against this scope.
-    ///
-    /// Lenient, and infallible: a string that mentions a variable with no
-    /// value yet, or cannot be rendered at all (a filter, an unclosed `{{`
-    /// — the validator reports those), renders as empty. An empty title
-    /// leaves the task's id to stand in for it; a link without a usable
-    /// target has no URL, and one without text shows [`EMPTY_LINK_TEXT`].
-    /// A URL that is not an `http(s)` one is dropped ([`safe_link_url`]), and
-    /// control characters are stripped from the text ([`TaskDisplay::sanitized`]).
-    pub fn render_display(&self, display: &DisplaySpec) -> TaskDisplay {
-        let lenient = |template: &str| {
-            self.render_with(template, "display", Unknown::Blank)
-                .ok()
-                .flatten()
-                .unwrap_or_default()
-        };
-        let links = display
-            .links
-            .iter()
-            .map(|link| {
-                let url = safe_link_url(&lenient(&link.url));
-                let text = match &link.text {
-                    Some(text) => lenient(text),
-                    None => url.clone().unwrap_or_default(),
-                };
-                DisplayLink {
-                    label: link.label.clone(),
-                    text: if text.is_empty() {
-                        EMPTY_LINK_TEXT.to_string()
-                    } else {
-                        text
-                    },
-                    url,
-                }
-            })
-            .collect();
-        TaskDisplay {
-            title: display.title.as_deref().map(lenient).unwrap_or_default(),
-            links,
-        }
-        .sanitized()
     }
 
     /// The one renderer. `None` means [`Unknown::Blank`] met a variable

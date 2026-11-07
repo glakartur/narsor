@@ -3,7 +3,7 @@
 `template.yaml` is the only workflow definition shipped by Narsor. It is a safe,
 runnable tour of the workflow engine rather than a project automation pipeline:
 
-- a typed input and a display link;
+- a typed input;
 - a no-op `printf` script step with one `exit`, returning a variable and
   artifact-path metadata;
 - a human `decision` step with an optional comment, whose choices write the

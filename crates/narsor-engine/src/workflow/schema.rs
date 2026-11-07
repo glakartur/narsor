@@ -52,8 +52,9 @@ pub struct WorkflowFile {
     /// Workflow-wide defaults.
     pub globals: Option<GlobalsSchema>,
 
-    /// How a task introduces itself: title and links (§3.6).
-    pub display: Option<DisplaySchema>,
+    /// The retired `display` section as it was written. It is read only so
+    /// that the loader can report that it is ignored.
+    pub ignored_display: Option<serde_yaml::Value>,
 
     /// The state graph. Order is significant: without an explicit
     /// `initial: true` flag the first state is the entry point, so the mapping
@@ -108,7 +109,7 @@ struct RawWorkflowFile {
     #[serde(default)]
     globals: Option<GlobalsSchema>,
     #[serde(default)]
-    display: Option<DisplaySchema>,
+    display: Option<serde_yaml::Value>,
     #[serde(deserialize_with = "deserialize_ordered_states")]
     states: Vec<(String, serde_yaml::Value)>,
     #[serde(default)]
@@ -194,7 +195,7 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
             description: raw.description,
             inputs: raw.inputs,
             globals: raw.globals,
-            display: raw.display,
+            ignored_display: raw.display,
             states,
             terminal_states: raw.terminal_states,
             shape,
@@ -245,7 +246,7 @@ fn parse_state(
     value: serde_yaml::Value,
 ) -> Result<StateSchema, String> {
     let failed = |error: serde_yaml::Error| format!("states.{id}: {error}");
-    match shape {
+    let state = match shape {
         StateShape::Legacy => serde_yaml::from_value::<LegacyStateSchema>(value)
             .map(StateSchema::from)
             .map_err(failed),
@@ -256,8 +257,21 @@ fn parse_state(
                     .into_schema()
                     .map_err(|error| format!("states.{id}: {error}"))
             }),
+    }?;
+    if state
+        .variables
+        .iter()
+        .any(|variable| variable.name == RESERVED_WORKSPACE_NAME)
+    {
+        return Err(format!(
+            "states.{id}: variable '{RESERVED_WORKSPACE_NAME}' is reserved: \
+             'context.{RESERVED_WORKSPACE_NAME}' holds the workspaces of the task"
+        ));
     }
+    Ok(state)
 }
+
+const RESERVED_WORKSPACE_NAME: &str = "workspace";
 
 /// The rules of the unified shape that need more than one state: one form of
 /// `terminal_states`, no gate with `inputs`, and no exit on a terminal state.
@@ -286,35 +300,6 @@ fn check_unified_file(
         }
     }
     Ok(())
-}
-
-/// The `display` section (§3.6): templates for a task's title and links.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DisplaySchema {
-    /// Template of the task title.
-    #[serde(default)]
-    pub title: Option<String>,
-
-    /// Links shown next to the title.
-    #[serde(default)]
-    pub links: Vec<DisplayLinkSchema>,
-}
-
-/// One entry of `display.links`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DisplayLinkSchema {
-    /// What the link is; unique within the section.
-    pub label: String,
-
-    /// Template of the visible text.
-    #[serde(default)]
-    pub text: Option<String>,
-
-    /// Template of the target; rendered values other than `http(s)` URLs are
-    /// dropped.
-    pub url: String,
 }
 
 /// The `terminal_states` section (§3.5), in either of its two forms.
@@ -930,9 +915,10 @@ impl ExitObjectSchema {
     }
 }
 
-/// Reads a `set` mapping: a name per shared variable, and the reserved key
-/// `local` holding a mapping of the step's own variables. Every value is
-/// text, a number or a boolean.
+/// Reads a `set` mapping: a name per shared variable, the reserved key
+/// `local` holding a mapping of the step's own variables, and the reserved
+/// key `workspace` holding, per workspace name, a mapping of the pull
+/// request values to set. Every value is text, a number or a boolean.
 fn parse_set(raw: BTreeMap<String, serde_json::Value>) -> Result<SetDefinition, String> {
     let mut set = SetDefinition::default();
     for (name, value) in raw {
@@ -944,12 +930,39 @@ fn parse_set(raw: BTreeMap<String, serde_json::Value>) -> Result<SetDefinition, 
                 check_set_value(&format!("set.local.{local_name}"), &local_value)?;
                 set.local.insert(local_name, local_value);
             }
+        } else if name == RESERVED_WORKSPACE_NAME {
+            set.workspace = parse_set_workspace(value)?;
         } else {
             check_set_value(&format!("set.{name}"), &value)?;
             set.global.insert(name, value);
         }
     }
     Ok(set)
+}
+
+/// Reads `set.workspace`: a mapping from workspace name to a mapping of
+/// value name to value. The validator checks the names.
+fn parse_set_workspace(
+    value: serde_json::Value,
+) -> Result<BTreeMap<String, BTreeMap<String, serde_json::Value>>, String> {
+    const SHAPE: &str = "'set.workspace' must be a mapping of workspace name to a mapping of \
+                         value name to value";
+    let serde_json::Value::Object(workspaces) = value else {
+        return Err(SHAPE.to_string());
+    };
+    let mut parsed = BTreeMap::new();
+    for (workspace, values) in workspaces {
+        let serde_json::Value::Object(values) = values else {
+            return Err(SHAPE.to_string());
+        };
+        let mut assigned = BTreeMap::new();
+        for (key, value) in values {
+            check_set_value(&format!("set.workspace.{workspace}.{key}"), &value)?;
+            assigned.insert(key, value);
+        }
+        parsed.insert(workspace, assigned);
+    }
+    Ok(parsed)
 }
 
 fn check_set_value(field: &str, value: &serde_json::Value) -> Result<(), String> {

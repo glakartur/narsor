@@ -102,6 +102,7 @@ mod session_tests;
 mod snapshot;
 pub mod storage;
 mod usage;
+mod workspaces;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -119,8 +120,9 @@ use crate::controller_protocol::{
     RunnerLaunchView, RunnerPollQuery, RunnerPollResponse, TaskDefaultHarness,
 };
 use crate::domain::{
-    AnsweredBy, ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec,
-    TaskRepositorySource, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceRepository,
+    AnsweredBy, EventData, ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId,
+    TaskLaunchSpec, TaskRepositorySource, WorkflowDefinition, WorkflowExecution, Workspace,
+    WorkspaceRepository,
 };
 use crate::engine::{Engine, EngineError, HumanInputDelivery, Recovery, UsageReporter};
 use crate::orchestration::{
@@ -485,6 +487,8 @@ fn assemble_session(
     let engine = Arc::new(customize(engine, &reporter));
 
     let conductor = conductor(&engine, &storage, Arc::clone(&harness), &definition);
+    let workspaces =
+        workspaces::WorkspaceTracker::new(&storage, &spec.workspace, Arc::clone(&readings_changed));
     Session {
         storage,
         engine,
@@ -493,6 +497,7 @@ fn assemble_session(
         harness_unavailable: None,
         report_forced: false,
         definition,
+        workspaces,
         incarnation: config.incarnation.clone(),
         timing: config.timing.clone(),
         link,
@@ -630,7 +635,7 @@ async fn report_problem(
         conductor_available: false,
         conductor_unavailable_reason: Some("the runner cannot work".to_string()),
         default_harness_unavailable: None,
-        display: None,
+        workspaces: Vec::new(),
         generated_title: None,
         observed_at,
     };
@@ -780,6 +785,9 @@ struct Session {
     /// about the default harness did.
     report_forced: bool,
     definition: Arc<WorkflowDefinition>,
+    /// The headers of the task's workspaces, with the git state read after
+    /// the last step.
+    workspaces: workspaces::WorkspaceTracker,
     incarnation: String,
     timing: RunnerTiming,
     link: Link,
@@ -960,6 +968,7 @@ impl Session {
         // After the runner's own recovery, like the daemon's startup hook.
         self.conductor.restore_at_startup();
         self.request_title();
+        self.workspaces.refresh();
         Ok(None)
     }
 
@@ -980,7 +989,7 @@ impl Session {
         let Ok(execution) = self.engine.store().load_execution(&execution_id) else {
             return;
         };
-        let description = snapshot::task_description(&self.engine, &self.definition, &execution);
+        let description = snapshot::task_description(&self.definition, &execution);
         match registry.request_title(&execution_id, &description) {
             Ok(true) => {
                 self.title_wanted = false;
@@ -1292,7 +1301,7 @@ impl Session {
             &self.engine,
             &mut self.cache,
             snapshot::SnapshotContext {
-                definition: &self.definition,
+                workspaces: &self.workspaces,
                 execution_id: self.execution_id.as_deref(),
                 pass_active,
                 problem,
@@ -1388,6 +1397,7 @@ impl Session {
             tokio::select! {
                 finished = wait_for(&mut self.pass) => {
                     self.pass = None;
+                    self.workspaces.refresh();
                     dirty = true;
                     self.outbox_due = true;
                     match finished {
@@ -1413,6 +1423,9 @@ impl Session {
                     }
                 }
                 event = events.recv() => {
+                    if matches!(&event, Ok(event) if matches!(event.data, EventData::TransitionTaken { .. })) {
+                        self.workspaces.refresh();
+                    }
                     if !matches!(event, Err(broadcast::error::RecvError::Closed)) {
                         dirty = true;
                     }

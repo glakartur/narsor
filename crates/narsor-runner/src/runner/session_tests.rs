@@ -35,8 +35,8 @@ use crate::controller_protocol::{
     ConductorReadRequest, DeliveredOperatorCommand, HarnessUsageReport, UsageLimit,
 };
 use crate::domain::{
-    ActionConfig, ActionError, ActionResult, ConductorPurpose, EventData, ResolvedEnvironment,
-    ResourceProfile, TaskWorkspace,
+    ActionConfig, ActionError, ActionResult, ConductorPurpose, EventData, GitIdentity,
+    ResolvedEnvironment, ResourceProfile, TaskRepository, TaskRepositorySource, TaskWorkspace,
 };
 use crate::engine::{ActionExecutor, ActionKind, ActionOutcome, ActionRequest, UsageReporter};
 use crate::orchestration::{AttentionKind, OperatorCommand};
@@ -414,6 +414,33 @@ impl Fixture {
             .start_work(&spec)
             .await
             .expect("start the work")
+    }
+
+    /// Waits until the git readings the work asked for are done, and clears
+    /// the wake-up they left, so the next one is the next reading.
+    async fn readings_settled(&self) {
+        let session = &self.session;
+        wait_for("the git readings to end", || {
+            !session.workspaces.reading_running()
+        })
+        .await;
+        let _ =
+            tokio::time::timeout(Duration::ZERO, self.session.readings_changed.notified()).await;
+    }
+
+    /// Runs the control loop while `release` lets the step go on, and stops
+    /// it when a git reading lands: what the loop asks for after a step.
+    async fn drive_until_a_reading_lands(&mut self, release: impl FnOnce()) {
+        let changed = Arc::clone(&self.session.readings_changed);
+        let drive = self.session.drive();
+        tokio::pin!(drive);
+        release();
+        tokio::select! {
+            _ = &mut drive => panic!("the control loop ended"),
+            landed = tokio::time::timeout(PATIENCE, changed.notified()) => {
+                landed.expect("a git reading lands after the step");
+            }
+        }
     }
 
     fn execution_id(&self) -> String {
@@ -1003,53 +1030,292 @@ async fn the_latest_report_of_each_harness_reaches_the_control_plane() {
 // What the snapshot says
 // ---------------------------------------------------------------------------
 
-const DISPLAY: &str = r#"
+const WORKSPACES: &str = r#"
+schema: v2
 name: shown-task
 version: 1
-display:
-  title: Shown
-  links:
-    - label: PR
-      text: "!{{ context.variables.pr_number }}"
-      url: "{{ context.variables.pr_url }}"
+globals:
+  workspaces:
+    code:
+      primary: true
+      base_branch: main
+    docs:
+      base_branch: main
 states:
   open_pr:
     action:
       type: agent
       prompt: Open the PR.
     variables:
-      - { name: pr_number, description: What the step reports as pr_number. }
       - { name: pr_url, description: What the step reports as pr_url. }
-    choices: [done]
-    transitions:
-      done: completed
+    choices:
+      done:
+        set:
+          workspace:
+            code:
+              pr_url: "{{ context.pr_url }}"
+        next: completed
   completed:
     description: Done.
-terminal_states: [completed]
+terminal_states:
+  completed: completed
 "#;
 
-/// The runner renders `display` against the variables its steps set.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn origin_repository(root: &TempRoot, name: &str) -> PathBuf {
+    let dir = root.dir(name);
+    git(&dir, &["init", "-q"]);
+    fs::write(dir.join("a.txt"), "1\n2\n3\n").unwrap();
+    git(&dir, &["add", "a.txt"]);
+    git(&dir, &["commit", "-q", "-m", "first"]);
+    dir
+}
+
+fn git_repository(name: &str, origin: &Path) -> TaskRepository {
+    let mut repository = TaskRepository::new(
+        name,
+        TaskRepositorySource::Git(Box::new(GitIdentity {
+            repository: None,
+            remote_url: origin.display().to_string(),
+            commit: String::new(),
+            git_ref: Some("main".to_string()),
+            ref_origin: None,
+            credential: None,
+        })),
+    );
+    repository.branch = Some("main".to_string());
+    repository
+}
+
+fn two_repository_spec(root: &TempRoot, yaml: &str) -> TaskLaunchSpec {
+    let mut spec = spec(yaml, "claude-code");
+    spec.workspace = TaskWorkspace {
+        repositories: vec![
+            git_repository("code", &origin_repository(root, "code-origin")),
+            git_repository("docs", &origin_repository(root, "docs-origin")),
+        ],
+    };
+    spec.digest = spec.compute_digest();
+    spec
+}
+
+/// Two agent steps on a task with two workspaces.
+const WORKSPACES_TWO_STEPS: &str = r#"
+schema: v2
+name: shown-task-steps
+version: 1
+globals:
+  workspaces:
+    code:
+      primary: true
+      base_branch: main
+    docs:
+      base_branch: main
+states:
+  one:
+    action:
+      type: agent
+      prompt: First.
+    choices:
+      done:
+        next: two
+  two:
+    action:
+      type: agent
+      prompt: Second.
+    choices:
+      done:
+        next: completed
+  completed:
+    description: Done.
+terminal_states:
+  completed: completed
+"#;
+
 #[tokio::test]
-async fn the_snapshot_carries_the_display_rendered_from_context_variables() {
+async fn the_snapshot_carries_the_workspaces_with_the_pull_request_the_exit_set() {
     let root = TempRoot::new();
     let agent = Agent::new(
         vec![Reply::Variables(
             "done",
-            json!({"pr_number": 42, "pr_url": "https://git.example/pr/42"}),
+            json!({"pr_url": "https://git.example/pr/42"}),
         )],
         Reply::Fail,
     );
-    let mut fixture = Fixture::start(&root, &spec(DISPLAY, "claude-code"), agent);
+    let spec = two_repository_spec(&root, WORKSPACES);
+    let mut fixture = Fixture::start(&root, &spec, agent);
     fixture.begin().await;
     fixture.settled().await;
+    fixture.readings_settled().await;
 
-    let display = fixture.snapshot().display.expect("a display");
-    assert_eq!(display.title, "Shown");
-    assert_eq!(display.links[0].text, "!42");
+    let workspaces = fixture.snapshot().workspaces;
+
+    let names: Vec<_> = workspaces.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["code", "docs"]);
     assert_eq!(
-        display.links[0].url.as_deref(),
+        workspaces[0].pr_url.as_deref(),
         Some("https://git.example/pr/42")
     );
+    assert_eq!(workspaces[1].pr_url, None);
+    assert_eq!(workspaces[0].branch.as_deref(), Some("main"));
+    assert_eq!(workspaces[0].base_branch.as_deref(), Some("main"));
+}
+
+/// The clone starts clean on `main`; the step leaves a branch and two changed
+/// lines in it (an untracked file does not count).
+fn leave_work_in_the_clone(root: &TempRoot) {
+    let code = TaskStorage::new(&root.0.join("storage")).repository_dir("code");
+    git(&code, &["checkout", "-q", "-b", "feat/x"]);
+    fs::write(code.join("a.txt"), "1\n2\n3\n4\n5\n").unwrap();
+    fs::write(code.join("untracked.txt"), "new\n").unwrap();
+}
+
+fn assert_clean_on_main(header: &crate::domain::WorkspaceHeader) {
+    assert_eq!(header.branch.as_deref(), Some("main"));
+    assert_eq!((header.added, header.removed), (Some(0), Some(0)));
+}
+
+fn assert_left_by_the_step(header: &crate::domain::WorkspaceHeader) {
+    assert_eq!(header.branch.as_deref(), Some("feat/x"));
+    assert_eq!(header.base_branch.as_deref(), Some("main"));
+    assert_eq!((header.added, header.removed), (Some(2), Some(0)));
+}
+
+#[tokio::test]
+async fn the_snapshot_shows_the_branch_and_changed_lines_the_step_left() {
+    let root = TempRoot::new();
+    let gate = Arc::new(Notify::new());
+    let agent = Agent::new(vec![Reply::After(Arc::clone(&gate), "done")], Reply::Fail);
+    let spec = two_repository_spec(&root, WORKSPACES);
+    let mut fixture = Fixture::start(&root, &spec, agent);
+    fixture.begin().await;
+    fixture.readings_settled().await;
+    assert_clean_on_main(&fixture.snapshot().workspaces[0]);
+
+    leave_work_in_the_clone(&root);
+    fixture
+        .drive_until_a_reading_lands(|| gate.notify_one())
+        .await;
+
+    assert_left_by_the_step(&fixture.snapshot().workspaces[0]);
+}
+
+#[tokio::test]
+async fn a_transition_between_two_steps_refreshes_the_workspaces() {
+    let root = TempRoot::new();
+    let first = Arc::new(Notify::new());
+    let agent = Agent::new(vec![Reply::After(Arc::clone(&first), "done")], Reply::Hang);
+    let spec = two_repository_spec(&root, WORKSPACES_TWO_STEPS);
+    let mut fixture = Fixture::start(&root, &spec, agent);
+    fixture.begin().await;
+    fixture.readings_settled().await;
+    assert_clean_on_main(&fixture.snapshot().workspaces[0]);
+
+    leave_work_in_the_clone(&root);
+    fixture
+        .drive_until_a_reading_lands(|| first.notify_one())
+        .await;
+
+    // The first signal may come from a reading that began before the step
+    // left its work, so wait for the reading that sees the transition.
+    let session = &mut fixture.session;
+    wait_for("the reading after the transition", || {
+        session
+            .snapshot(None, false)
+            .expect("a snapshot")
+            .workspaces[0]
+            .branch
+            .as_deref()
+            == Some("feat/x")
+    })
+    .await;
+
+    // The second step still runs: only the transition asked for the reading.
+    assert!(fixture.session.pass_active());
+    assert_left_by_the_step(&fixture.snapshot().workspaces[0]);
+}
+
+#[tokio::test]
+async fn a_snapshot_alone_does_not_read_git() {
+    let root = TempRoot::new();
+    let spec = two_repository_spec(&root, WORKSPACES);
+    let mut fixture = Fixture::start(&root, &spec, Agent::new(vec![], Reply::Hang));
+    fixture.begin().await;
+    fixture.readings_settled().await;
+    let code = TaskStorage::new(&root.0.join("storage")).repository_dir("code");
+    fs::write(code.join("a.txt"), "changed\n").unwrap();
+
+    let first = fixture.snapshot().workspaces.remove(0);
+    let second = fixture.snapshot().workspaces.remove(0);
+
+    assert_eq!(first, second);
+    assert_eq!((first.added, first.removed), (Some(0), Some(0)));
+}
+
+#[tokio::test]
+async fn a_failed_git_read_keeps_the_last_workspace_state() {
+    let root = TempRoot::new();
+    let agent = Agent::new(vec![Reply::Label("done")], Reply::Fail);
+    let spec = two_repository_spec(&root, WORKSPACES);
+    let mut fixture = Fixture::start(&root, &spec, agent);
+    let code = TaskStorage::new(&root.0.join("storage")).repository_dir("code");
+    fs::remove_dir_all(&code).unwrap();
+    fixture.begin().await;
+    fixture.settled().await;
+    fixture.readings_settled().await;
+
+    let header = fixture.snapshot().workspaces.remove(0);
+
+    assert_eq!(header.branch.as_deref(), Some("main"));
+    assert_eq!(header.added, None);
+}
+
+#[tokio::test]
+async fn a_local_folder_workspace_shows_its_path_and_nothing_else() {
+    let root = TempRoot::new();
+    let folder = root.dir("notes");
+    let mut spec = spec(WORKSPACES, "claude-code");
+    spec.workspace = TaskWorkspace::single(TaskRepository::new(
+        "notes",
+        TaskRepositorySource::Local {
+            path: folder.display().to_string(),
+        },
+    ));
+    spec.digest = spec.compute_digest();
+    let mut fixture = Fixture::start(&root, &spec, Agent::new(vec![], Reply::Hang));
+    fixture.begin().await;
+
+    let header = fixture.snapshot().workspaces.remove(0);
+
+    assert_eq!(header.name, "notes");
+    assert_eq!(header.repo, folder.display().to_string());
+    assert_eq!(header.branch, None);
+    assert_eq!(header.base_branch, None);
+    assert_eq!((header.added, header.removed), (None, None));
+    assert_eq!(header.pr_url, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -2137,8 +2403,11 @@ async fn the_conductor_comes_up_once_the_default_is_a_harness_the_task_can_run()
 const TITLED: &str = r#"
 name: titled-task
 version: 1
-display:
-  title: "Przebudowa obslugi zamowien hurtowych"
+inputs:
+  - name: description
+    type: text
+    required: true
+    description: What to do.
 states:
   work:
     action:
@@ -2189,7 +2458,10 @@ fn titling(root: &TempRoot, spec: &TaskLaunchSpec) -> Fixture {
 #[tokio::test]
 async fn a_task_without_a_title_is_named_by_the_conductor() {
     let root = TempRoot::new();
-    let mut fixture = titling(&root, &untitled(TITLED, "claude-code"));
+    let mut spec = untitled(TITLED, "claude-code");
+    spec.inputs = json!({"description": "Przebudowa obslugi zamowien hurtowych"});
+    spec.digest = spec.compute_digest();
+    let mut fixture = titling(&root, &spec);
     assert_eq!(fixture.snapshot().generated_title, None);
     fixture.begin().await;
 
@@ -2222,7 +2494,7 @@ async fn a_task_without_a_title_is_named_by_the_conductor() {
             .payload
             .to_string()
             .contains("Przebudowa obslugi zamowien hurtowych"),
-        "named from the display title: {:?}",
+        "named from the text input: {:?}",
         asked[0].request.payload
     );
 }

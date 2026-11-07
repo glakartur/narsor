@@ -10,7 +10,7 @@ use narsor_engine::controller_protocol::{
     ControlEventEnvelope, Freshness, QueueView, RunnerView, TaskListResponse, TaskSummary,
     TimelineResponse,
 };
-use narsor_engine::domain::display::DisplayLink;
+use narsor_engine::domain::display::WorkspaceHeader;
 use narsor_engine::domain::{ConductorDecisionKind, Event, EventData, ExecutionStatus, TaskId};
 use narsor_engine::engine::{ConversationState, Position, PositionStatus, Timeline};
 use narsor_engine::orchestration::{
@@ -105,7 +105,7 @@ pub fn queued(id: &str, rank: u32) -> TaskSummary {
 }
 
 pub fn titled(mut task: TaskSummary, title: &str) -> TaskSummary {
-    task.display.title = title.to_string();
+    task.title = Some(title.to_string());
     offered(task)
 }
 
@@ -215,21 +215,26 @@ pub fn ids(list: &[&str]) -> Vec<TaskId> {
     list.iter().map(|id| TaskId::parse(*id).unwrap()).collect()
 }
 
-/// The task shows `title` and these links: `(label, text, url)`.
-pub fn displayed(
+pub fn header_workspace(name: &str, repo: &str, branch: &str) -> WorkspaceHeader {
+    WorkspaceHeader {
+        name: name.to_string(),
+        repo: repo.to_string(),
+        branch: Some(branch.to_string()),
+        base_branch: Some("main".to_string()),
+        ..WorkspaceHeader::default()
+    }
+}
+
+pub fn with_pr(mut workspace: WorkspaceHeader, url: &str) -> WorkspaceHeader {
+    workspace.pr_url = Some(url.to_string());
+    workspace
+}
+
+pub fn with_header_workspaces(
     mut task: TaskSummary,
-    title: &str,
-    links: &[(&str, &str, Option<&str>)],
+    workspaces: Vec<WorkspaceHeader>,
 ) -> TaskSummary {
-    task.display.title = title.to_string();
-    task.display.links = links
-        .iter()
-        .map(|(label, text, url)| DisplayLink {
-            label: (*label).to_string(),
-            text: (*text).to_string(),
-            url: url.map(str::to_string),
-        })
-        .collect();
+    task.workspaces = workspaces;
     offered(task)
 }
 

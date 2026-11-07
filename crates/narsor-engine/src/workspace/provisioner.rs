@@ -1159,7 +1159,7 @@ fn run_git_with(repository: &str, args: &[&str], access: &GitAccess) -> Result<S
 /// Runs `git` where a failure is an answer rather than an error: `None` means
 /// "git said no", which is how the absence of an upstream or of a remote is
 /// detected.
-fn git_stdout(args: &[&str]) -> Option<String> {
+pub(crate) fn git_stdout(args: &[&str]) -> Option<String> {
     let run = git_run(args).ok()?;
     run.ok.then_some(run.stdout)
 }

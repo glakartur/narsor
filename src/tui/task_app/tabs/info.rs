@@ -133,17 +133,14 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
     if let Some(ticket) = task.ticket.as_deref().filter(|ticket| !ticket.is_empty()) {
         sheet.row("ticket", ticket, Role::Calm);
     }
-    // The task's own title replaces the one the workflow's `display` renders.
-    match task.title.as_deref().filter(|title| !title.is_empty()) {
-        Some(title) => sheet.row("tytuł", title, Role::Calm),
-        None if !task.display.title.trim().is_empty() => {
-            sheet.row("tytuł", task.display.title.clone(), Role::Calm);
-        }
-        None => {}
+    if let Some(title) = task.title.as_deref().filter(|title| !title.is_empty()) {
+        sheet.row("tytuł", title, Role::Calm);
     }
-    for link in &task.display.links {
-        let target = link.url.as_deref().unwrap_or("brak adresu");
-        sheet.row(&link.label, format!("{} → {target}", link.text), Role::Calm);
+    for workspace in &task.workspaces {
+        let label = workspace.pr_label();
+        if let (Some(number), Some(url)) = (label.number, label.url) {
+            sheet.row(&workspace.name, format!("PR {number} → {url}"), Role::Calm);
+        }
     }
     if task.inputs.is_empty() {
         sheet.row("odpowiedzi", "brak", Role::Done);

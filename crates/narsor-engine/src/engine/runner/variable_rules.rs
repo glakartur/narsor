@@ -6,7 +6,9 @@
 //! template first.
 
 use super::*;
-use crate::domain::{VariableDefinition, VariableSource, VariableType};
+use crate::domain::{
+    ChoiceDefinition, VariableDefinition, VariableSource, VariableType, WorkspacePrField,
+};
 use crate::workflow::template::render_scalar;
 
 /// One variable a label's `set` assigns, with its value rendered.
@@ -17,6 +19,19 @@ pub(super) struct Assignment {
     pub(super) value: Value,
     /// Whether the variable is the step's own memory.
     pub(super) local: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct WorkspaceAssignment {
+    pub(super) workspace: String,
+    pub(super) field: WorkspacePrField,
+    pub(super) value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct RenderedSet {
+    pub(super) variables: Vec<Assignment>,
+    pub(super) workspaces: Vec<WorkspaceAssignment>,
 }
 
 /// Why the first variable `variables` gives is not one of its declared
@@ -46,9 +61,9 @@ pub(super) fn render_assignments(
     state: &State,
     label: &str,
     scope: &TemplateScope<'_>,
-) -> Result<Vec<Assignment>, String> {
+) -> Result<RenderedSet, String> {
     let Some(choice) = state.choices.iter().find(|choice| choice.label == label) else {
-        return Ok(Vec::new());
+        return Ok(RenderedSet::default());
     };
     let globals = choice
         .set
@@ -60,10 +75,50 @@ pub(super) fn render_assignments(
         .local
         .iter()
         .map(|(name, value)| (name, value, true));
-    globals
+    let variables = globals
         .chain(locals)
         .map(|(name, value, local)| render_assignment(state, label, scope, name, value, local))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    let workspaces = render_workspace_assignments(state, label, choice, scope)?;
+    Ok(RenderedSet {
+        variables,
+        workspaces,
+    })
+}
+
+fn render_workspace_assignments(
+    state: &State,
+    label: &str,
+    choice: &ChoiceDefinition,
+    scope: &TemplateScope<'_>,
+) -> Result<Vec<WorkspaceAssignment>, String> {
+    let mut assignments = Vec::new();
+    for (workspace, values) in &choice.set.workspace {
+        for (key, value) in values {
+            let Some(field) = WorkspacePrField::from_key(key) else {
+                return Err(format!(
+                    "'set' of '{label}' sets 'workspace.{workspace}.{key}'; only 'pr' and \
+                     'pr_url' can be set"
+                ));
+            };
+            let location = format!(
+                "state '{}', set 'workspace.{workspace}.{key}' of '{label}'",
+                state.id
+            );
+            let rendered = scope
+                .render_value(value, &location)
+                .map_err(|error| error.to_string())?;
+            let text = render_scalar(&rendered).trim().to_string();
+            if !text.is_empty() {
+                assignments.push(WorkspaceAssignment {
+                    workspace: workspace.clone(),
+                    field,
+                    value: text,
+                });
+            }
+        }
+    }
+    Ok(assignments)
 }
 
 fn render_assignment(

@@ -51,7 +51,8 @@ use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::background::{JobKey, OpeningKind, Outcome};
 use super::detail::{
-    edge_layout, recorded_attempts, render_view, KeysAt, StepLevel, TaskDetail, ViewOptions,
+    edge_layout, recorded_attempts, render_view, title_is_cut, KeysAt, StepLevel, TaskDetail,
+    ViewOptions,
 };
 use super::list::{fit, history_row_text, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
@@ -228,7 +229,7 @@ fn legacy_summary(view: &LegacyExecutionView) -> TaskSummary {
             "freshness": "live",
         },
         "inputs": [],
-        "display": { "title": legacy_title(view), "links": [] },
+        "title": legacy_title(view),
         "as_of": at,
     });
     serde_json::from_value(summary).expect("the summary of an old execution")
@@ -1076,6 +1077,7 @@ pub fn render_details(
         deferred: false,
         details_opened: true,
         loading: false,
+        title_cut: title_is_cut(task, &edge),
     };
     render_view(frame, inner, view, styles, options);
 }

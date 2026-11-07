@@ -53,7 +53,7 @@ action (`K` / `J` / `m`, the TUI's `narsor-cli task move`). A row takes two line
 The first holds the attention mark (`?` a question or an approval, `!` a
 problem, a failed step or a failed provisioning), the state icon (`●` running,
 `◷` queued, `⟳` provisioning, `‖` paused, `✗` failed or interrupted, `✓` done,
-`↻` being sent) and the title from the workflow's `display` (the task id when
+`↻` being sent) and the task's title (the task id when
 there is none) on the whole width of the list. The second, under the title,
 is the label: the current step, `#n` in the queue, `offline` when no
 controller holds the backend, `nie wysłano`, or the place preview `↕ n/m`
@@ -77,14 +77,22 @@ finished tasks show no age. `/` filters by ticket, title or full id without
 changing server order; state changes and refreshes likewise keep rows in place,
 and only an explicit queue move reorders them. `Esc` cancels filter editing.
 
-**The details** show the header (title and links from `display`, lifecycle,
-step, duration; under the links, once a harness reported any, a row with the
-usage it reported for the whole task: cost, tokens `in` / `out` and the
-subagents' part; when the conductor used a harness, `· dyrygent $… · razem $…`
-ends the row, and the first numbers stay the agents' alone) and five tabs: *Przebieg* (the steps and the selected one; once a harness reported usage,
+**The details** show the header and five tabs. The header has a fixed layout that
+the workflow does not change. The title is on the top edge of the frame; when
+the edge has to cut it, the header's first row says it in full. Then come the
+status row (`● running · krok 3 implement · code-review v3 · 14m`) and one row
+for each workspace of the workflow: its name, the repository, the branch
+(`branch → base branch`; one name while the work is on the base branch), the
+changed lines `+N −M` against the base branch and the pull request (`PR #42 ↗`,
+a link in terminals that support them; `—` when there is none). A narrow
+terminal cuts the rows in this order: the base branch, the changed lines, the
+branch, the repository; the workspace name and the pull request stay. Once a
+harness reported any usage, a last row shows it: `razem $1.25 · agenci $1.20
+↑120k ↓8k (subagenci ↑40k ↓3k ×2) · dyrygent $0.05 ↑9k ↓1k`, where `↑` is the
+tokens in and `↓` the tokens out; a part nobody reported reads `—`. and five tabs: *Przebieg* (the steps and the selected one; once a harness reported usage,
 each step's row also shows its cost (and, when the conductor decided in it, its own
-cost as `dyr. $…`) and its tokens `↓in ↑out`, with the
-subagents' count and tokens after them (`3× ↓40k ↑3k`, or `3× ↕45k` when the
+cost as `dyr. $…`) and its tokens `↑in ↓out`, with the
+subagents' count and tokens after them (`3× ↑40k ↓3k`, or `3× ↕45k` when the
 harness gave only their sum), in columns aligned across the steps; a second row
 under each step gives its start time and duration, then its model, effort and
 harness. The step list may take up to 70% of the tab, and a step that reported
@@ -178,7 +186,7 @@ danych". An action marked `!` asks `y` / `n` first.
 | `t` | manual transition; with a reason, a forced jump (override) where the workflow allows it. A `schema: v2` workflow in the unified shape allows it from every state that is not terminal. A workflow in the older shape allows it only from a state with `allow_manual_override: true` | `narsor-cli task transition [--override --reason]` |
 | `s` | start again an interrupted task or a failed provisioning | `narsor-cli task start` |
 | `a` | archive (`!`) | `narsor-cli task archive` |
-| `o` | open a link of the task (`display.links`) in the browser | — |
+| `o` | open a pull request link of a workspace in the browser | — |
 | `c` | action 0, `Napisz do agenta` (first in the menu), in one step: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a pause: the note goes to the agent and the task resumes. A text that was not sent stays as a draft of the task | — |
 | `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
 | `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor-cli task conductor undo` |

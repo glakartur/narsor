@@ -15,7 +15,7 @@
 //! * [`list`] — the tasks in server order, how events patch a row, how a row
 //!   reads, the move mode.
 //! * [`layout`] — the three layouts and the frame (header, details, bar).
-//! * [`detail`] and [`tabs`] — the details of the selected task: the `display`
+//! * [`detail`] and [`tabs`] — the details of the selected task: the fixed
 //!   header and the tabs, what they remember per task and how they read.
 //! * [`notify`] — the notification on the bar.
 //! * [`EventFeed`] — the control-plane event stream, resumed from the cursor
@@ -106,6 +106,7 @@ pub mod panel;
 pub mod repositories;
 pub mod tabs;
 pub mod usage;
+pub mod workspace_rows;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

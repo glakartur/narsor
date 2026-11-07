@@ -1,0 +1,44 @@
+# `set.workspace` records the pull request of a workspace when a choice is taken.
+schema: v2
+name: engine-set-workspace
+version: 1
+
+globals:
+  workspaces:
+    code:
+      primary: true
+      base_branch: main
+    docs:
+      base_branch: main
+
+states:
+  open_pr:
+    action:
+      type: agent
+      prompt: Open the pull request.
+    variables:
+      - name: pr_url
+      - name: pr_number
+      - name: mode
+        options: [fast, careful]
+    choices:
+      opened:
+        set:
+          workspace:
+            code:
+              pr: "{{ context.pr_number }}"
+              pr_url: "{{ context.pr_url }}"
+        next: done
+      rejected:
+        set:
+          mode: "{{ context.pr_url }}"
+          workspace:
+            code:
+              pr_url: "https://git.example/never-written"
+        next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

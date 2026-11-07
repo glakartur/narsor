@@ -312,7 +312,6 @@ fn initial_state_that_does_not_exist_is_rejected() {
         source_schema: Default::default(),
         shape: Default::default(),
         repositories: Vec::new(),
-        display: None,
         states,
         initial_state: "missing".to_string(),
     };
@@ -405,26 +404,12 @@ fn a_step_field_other_than_reply_is_rejected() {
 }
 
 #[test]
-fn a_step_reply_in_the_display_title_is_rejected() {
-    let errors = errors_of("step_reply_in_display_title.yaml");
-    assert!(
-        errors.iter().any(|err| matches!(
-            err,
-            ValidationError::InvalidDisplay { field, reason }
-                if field == "display.title" && reason.contains("step values")
-        )),
-        "got: {}",
-        describe(&errors)
-    );
-}
-
-#[test]
 fn a_step_reply_in_the_workspace_is_rejected() {
     let errors = errors_of("step_reply_in_workspace.yaml");
     assert!(
         errors.iter().any(|err| matches!(
             err,
-            ValidationError::InvalidDisplay { field, reason }
+            ValidationError::InvalidGlobalsField { field, reason }
                 if field == "globals.workspace.path" && reason.contains("step values")
         )),
         "got: {}",
@@ -1044,143 +1029,77 @@ fn a_tag_under_the_resolve_policy_is_valid_until_task_creation() {
     assert!(errors.is_empty(), "{}", describe(&errors));
 }
 
-// ---------------------------------------------------------------------------
-// Display (§3.6)
-// ---------------------------------------------------------------------------
-
-/// A valid workflow with `display` and `extra` spliced in.
-fn with_display(display: &str, extra: &str) -> String {
-    format!(
-        "name: shown\nversion: 1\ninputs:\n  - name: ticket\n    type: string\n    required: true\n\
-         {display}\n{extra}states:\n  work:\n    action:\n      type: script\n      command: \"true\"\n\
-         \x20   choices: [ok]\n    transitions:\n      ok: done\n  done:\n    description: end\n\
-         terminal_states: [done]\n"
-    )
-}
-
-fn display_errors(display: &str) -> Vec<ValidationError> {
-    narsor_engine::workflow::validate_source(&with_display(display, "")).expect("the YAML loads")
+fn workspace_set_errors(set: &str) -> Vec<ValidationError> {
+    let yaml = format!(
+        "schema: v2\nname: shown\nversion: 1\nglobals:\n  workspaces:\n    code:\n      \
+         primary: true\n    docs: {{}}\nstates:\n  work:\n    action: {{ type: agent, prompt: p }}\n    \
+         variables:\n      - {{ name: pr_url }}\n    exit: {{ set: {set}, next: done }}\n  done:\n    \
+         description: end\nterminal_states:\n  done: completed\n"
+    );
+    narsor_engine::workflow::validate_source(&yaml).expect("the file loads")
 }
 
 #[test]
-fn a_valid_display_section_passes() {
-    let errors = display_errors(
-        "display:\n  title: \"{{ inputs.ticket }}\"\n  links:\n    - label: Jira\n      \
-         text: \"{{ inputs.ticket }}\"\n      url: \"https://j.example/{{ inputs.ticket }}\"\n    \
-         - label: PR\n      text: \"!{{ context.variables.pr_number }}\"\n      \
-         url: \"{{ context.variables.pr_url }}\"",
+fn a_set_of_the_pull_request_of_a_declared_workspace_passes() {
+    let errors = workspace_set_errors(
+        "{ workspace: { code: { pr_url: \"{{ context.pr_url }}\", pr: \"7\" }, docs: { pr: \"8\" } } }",
     );
 
     assert!(errors.is_empty(), "got: {}", describe(&errors));
 }
 
 #[test]
-fn display_may_be_absent_or_empty() {
-    assert!(display_errors("").is_empty());
-    assert!(display_errors("display: {}").is_empty());
+fn a_set_for_an_unknown_workspace_names_the_step_and_the_workspace() {
+    let errors =
+        workspace_set_errors("{ workspace: { payments: { pr_url: \"https://x.example\" } } }");
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::SetUnknownWorkspace { state, workspace, .. }
+                if state == "work" && workspace == "payments"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+    let text = describe(&errors);
+    assert!(text.contains("work") && text.contains("payments"), "{text}");
 }
 
 #[test]
-fn display_referencing_an_undeclared_input_is_a_violation() {
-    let errors = display_errors(
-        "display:\n  title: \"{{ inputs.nieistnieje }}\"\n  links:\n    - label: L\n      \
-         url: \"https://x.example/{{ inputs.tez_nie }}\"",
-    );
+fn a_set_of_a_workspace_value_other_than_pr_and_pr_url_is_a_violation() {
+    let errors = workspace_set_errors("{ workspace: { code: { branch: feat } } }");
 
-    let unknown: Vec<_> = errors
-        .iter()
-        .filter_map(|error| match error {
-            ValidationError::UnknownInputReferenceInDisplay { field, variable } => {
-                Some((field.as_str(), variable.as_str()))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        unknown,
-        vec![
-            ("display.title", "nieistnieje"),
-            ("display.links[0].url", "tez_nie")
-        ],
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::SetUnknownWorkspaceValue { workspace, key, .. }
+                if workspace == "code" && key == "branch"
+        )),
         "got: {}",
         describe(&errors)
     );
 }
 
 #[test]
-fn display_violations_are_reported_together_with_the_others() {
-    let source = with_display(
-        "display:\n  title: \"{{ inputs.nieistnieje }}\"",
-        "globals:\n  workspace:\n    type: local\n    path: \"{{ inputs.brak }}\"\n",
-    );
+fn a_set_of_the_pull_request_of_a_local_folder_workspace_is_a_violation() {
+    let yaml = "schema: v2\nname: shown\nversion: 1\nglobals:\n  workspaces:\n    code:\n      \
+         primary: true\n    notes:\n      path: notes\nstates:\n  work:\n    \
+         action: { type: agent, prompt: p }\n    variables:\n      - { name: pr_url }\n    \
+         exit: { set: { workspace: { notes: { pr: \"7\" } } }, next: done }\n  done:\n    \
+         description: end\nterminal_states:\n  done: completed\n";
 
-    let errors = narsor_engine::workflow::validate_source(&source).unwrap();
+    let errors = narsor_engine::workflow::validate_source(yaml).expect("the file loads");
 
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, ValidationError::UnknownInputReferenceInDisplay { .. })));
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, ValidationError::UnknownInputReferenceInGlobals { .. })));
-}
-
-#[test]
-fn a_duplicate_or_empty_link_label_is_a_violation() {
-    let errors = display_errors(
-        "display:\n  links:\n    - label: PR\n      url: \"https://a.example\"\n    \
-         - label: PR\n      url: \"https://b.example\"\n    - label: \" \"\n      \
-         url: \"https://c.example\"",
-    );
-
-    let fields: Vec<_> = errors
-        .iter()
-        .filter_map(|error| match error {
-            ValidationError::InvalidDisplay { field, .. } => Some(field.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        fields,
-        vec!["display.links[1].label", "display.links[2].label"],
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::SetWorkspaceNotGit { state, workspace, .. }
+                if state == "work" && workspace == "notes"
+        )),
         "got: {}",
         describe(&errors)
     );
-}
-
-#[test]
-fn a_filter_or_unclosed_placeholder_in_display_is_a_violation() {
-    let errors = display_errors(
-        "display:\n  title: \"{{ context.x | default('y') }}\"\n  links:\n    - label: L\n      \
-         url: \"https://x.example/{{ inputs.ticket\"",
-    );
-
-    let fields: Vec<_> = errors
-        .iter()
-        .filter_map(|error| match error {
-            ValidationError::InvalidDisplay { field, .. } => Some(field.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(fields, vec!["display.title", "display.links[0].url"]);
-}
-
-#[test]
-fn an_unset_context_variable_in_display_is_not_a_violation() {
-    let errors = display_errors("display:\n  title: \"{{ context.variables.never_set }}\"");
-
-    assert!(errors.is_empty(), "got: {}", describe(&errors));
-}
-
-#[test]
-fn an_unknown_field_in_display_is_rejected_at_load() {
-    for display in [
-        "display:\n  subtitle: x",
-        "display:\n  links:\n    - label: L\n      url: \"https://x.example\"\n      icon: i",
-        "display:\n  links:\n    - label: L",
-    ] {
-        let result = narsor_engine::workflow::validate_source(&with_display(display, ""));
-        assert!(result.is_err(), "{display:?} must not load");
-    }
 }
 
 /// Validates a unified-shape file whose `states` section is `states`; `done`

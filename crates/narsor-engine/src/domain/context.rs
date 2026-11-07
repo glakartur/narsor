@@ -3,7 +3,7 @@
 //! Represents the shared state of a workflow execution.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Workflow context - shared state across all steps
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -27,6 +27,22 @@ pub struct Context {
     /// Workspace reference
     #[serde(default)]
     pub workspace: Option<WorkspaceInfo>,
+
+    /// The pull request of each workspace of the workflow, by workspace
+    /// name. A step's `exit.set.workspace` writes it.
+    #[serde(default)]
+    pub workspace_prs: BTreeMap<String, WorkspacePr>,
+}
+
+/// The pull request a workflow recorded for one workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacePr {
+    /// The pull request number, without a prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<String>,
+    /// The pull request address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
 }
 
 /// Task information
@@ -89,5 +105,20 @@ impl Context {
     /// Gets a variable by key
     pub fn get_variable(&self, key: &str) -> Option<&serde_json::Value> {
         self.variables.get(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stored_context_without_workspace_prs_reads_with_none() {
+        let stored = r#"{"variables":{"a":1},"artifacts":{},"repositories":{},"workspace":null}"#;
+
+        let context: Context = serde_json::from_str(stored).expect("an old context reads");
+
+        assert!(context.workspace_prs.is_empty());
+        assert_eq!(context.variables["a"], 1);
     }
 }
