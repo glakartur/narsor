@@ -11,10 +11,10 @@ execution: code
 
 ## Goal Capsule
 
-- **Objective:** Operator w szczegółach zadania widzi zawsze ten sam nagłówek: tytuł, status z krokiem i workflow oraz każde repozytorium zadania z gałęzią roboczą, gałęzią bazową i linkiem do PR. Autor workflow nie definiuje już widoku.
-- **Means:** Usunąć sekcję `display` ze schematu workflow. Dodać stałe, systemowe wartości `context.workspace.<nazwa>.{repo,branch,base_branch,pr,pr_url}`. Nagłówek TUI i CLI czyta tylko te wartości, nie `context.variables.*`.
-- **Product authority:** Zmiana schematu workflow, protokołu migawki (snapshot) runnera, nagłówka TUI i tekstu zadania w CLI. Dokument powstał bez dialogu z użytkownikiem (tryb nieinteraktywny). Każde przyjęte założenie jest w sekcji "Założenia do potwierdzenia".
-- **Open blockers:** Brak twardych blokad. Pytania Q1 i Q2 w sekcji "Pytania otwarte dla użytkownika" zmieniają kształt R6 i R7 oraz założenie A4; plan może ruszyć z założeniami A3 i A4.
+- **Objective:** Operator w szczegółach zadania widzi zawsze ten sam nagłówek: tytuł, status z krokiem i workflow oraz każde repozytorium zadania z gałęzią roboczą, gałęzią bazową, liczbą zmienionych linii i linkiem do PR. Autor workflow nie definiuje już widoku.
+- **Means:** Usunąć sekcję `display` ze schematu workflow. Dodać stałe, systemowe wartości `context.workspace.<nazwa>.{repo,branch,base_branch,added,removed,pr,pr_url}`. Nagłówek TUI i CLI czyta tylko te wartości, nie `context.variables.*`.
+- **Product authority:** Zmiana schematu workflow, protokołu migawki (snapshot) runnera, nagłówka TUI i tekstu zadania w CLI. Dokument powstał bez dialogu z użytkownikiem (tryb nieinteraktywny). Użytkownik potwierdził albo zmienił założenia i odpowiedział na pytania w recenzji PR #80 (2026-11-07); sekcje "Założenia" i "Pytania" mają te odpowiedzi.
+- **Open blockers:** Brak. Użytkownik odpowiedział na Q1–Q4 w recenzji (2026-11-07).
 
 ---
 
@@ -22,7 +22,7 @@ execution: code
 
 ### Summary
 
-Sekcja `display` znika z definicji workflow. TUI dostaje stały nagłówek szczegółów: tytuł zadania, wiersz statusu (`status · krok N nazwa · workflow`) i po jednym wierszu na każdy workspace z definicji workflow (nazwa, gałąź → gałąź bazowa, numer PR z linkiem). Dane nagłówka pochodzą z nowej przestrzeni `context.workspace.<nazwa>.*`. Agent nadal ustawia `context.variables.pr_url`, a wyjście kroku (`exit` / choice) przenosi wartość do `context.workspace.<nazwa>.pr_url`.
+Sekcja `display` znika z definicji workflow. TUI dostaje stały nagłówek szczegółów: tytuł zadania (tylko gdy krawędź ramki nie mieści go w całości), wiersz statusu (`status · krok N nazwa · workflow`), po jednym wierszu na każdy workspace z definicji workflow (nazwa workspace, nazwa repozytorium, gałąź → gałąź bazowa, `+N −M`, numer PR z linkiem) i wiersz zużycia (koszt razem, agenci, dyrygent, tokeny ze strzałkami). Dane nagłówka pochodzą z nowej przestrzeni `context.workspace.<nazwa>.*`. Agent nadal ustawia `context.variables.pr_url`, a wyjście kroku (`exit` / choice) przenosi wartość do `context.workspace.<nazwa>.pr_url`.
 
 ### Problem Frame
 
@@ -33,7 +33,7 @@ Workflow opisuje proces backendowy, ale dziś zawiera też widok: `display.title
 - **Widok należy do klienta, nie do workflow.** Każdy frontend sam decyduje, jak pokazać zadanie; workflow daje tylko dane. (session-settled: user-directed — chosen over keeping `display` in the workflow: workflow defines a backend task and different frontends may need different views.) Governs R1, R2, R11.
 - **Nagłówek czyta tylko stałe ścieżki `context.workspace.<nazwa>.*`, nigdy `context.variables.*`.** Kontrakt nagłówka nie zależy od nazw zmiennych wybranych przez autora workflow. (session-settled: user-directed — chosen over rendering header from free context variables: the header must rely on fixed paths.) Governs R4, R5, R12.
 - **Agent ustawia zwykłą zmienną, wyjście kroku przenosi ją do `context.workspace`.** Agent nie musi znać ścieżki workspace. (session-settled: user-directed — chosen over agents writing `context.workspace.*` directly: the agent should not need to know the path.) Governs R7, R8.
-- **Przeniesienie jest jawne w definicji kroku (rozszerzenie `set` na wyjściu kroku), a nie automatyczne.** Workflow z kilkoma repozytoriami musi wskazać, do którego workspace należy PR; automatyczna reguła musiałaby zgadywać. Wariant automatyczny jest w Q1. Governs R7.
+- **Przeniesienie jest jawne w definicji kroku (rozszerzenie `set` na wyjściu kroku), a nie automatyczne.** Workflow z kilkoma repozytoriami musi wskazać, do którego workspace należy PR; automatyczna reguła musiałaby zgadywać. (user-confirmed w recenzji, Q1.) Governs R7.
 
 ### Requirements
 
@@ -45,9 +45,10 @@ Workflow opisuje proces backendowy, ale dziś zawiera też widok: `display.title
 
 **Dane `context.workspace`**
 
-- R4. Dla każdego workspace z `globals.workspaces` (kolejność z pliku) zadanie ma wartości `context.workspace.<nazwa>.repo`, `.branch`, `.base_branch`, `.pr`, `.pr_url`. Workflow v1 po konwersji ma jeden workspace (nazwa wg §3.2.1).
+- R4. Dla każdego workspace z `globals.workspaces` (kolejność z pliku) zadanie ma wartości `context.workspace.<nazwa>.repo`, `.branch`, `.base_branch`, `.added`, `.removed`, `.pr`, `.pr_url`. Workflow v1 po konwersji ma jeden workspace (nazwa wg §3.2.1).
 - R5. `repo` i `base_branch` ustawia system przy tworzeniu zadania (repozytorium z rejestru lub wybrane w formularzu; gałąź bazowa z definicji, w przeciwnym razie `default_branch`). Workflow i agent nie mogą ich zmienić.
 - R6. `branch` to aktualna gałąź robocza repozytorium. Na starcie ma wartość gałęzi startowej zadania. System odświeża ją ze stanu git workspace po każdym kroku (patrz A3, Q2). Runner klonuje repozytorium z odłączonym HEAD (detached), więc gdy po kroku HEAD jest odłączony albo odczyt git się nie udał, `branch` zachowuje ostatnią wartość (na starcie: gałąź startowa).
+- R6a. `added` i `removed` to liczba dodanych i usuniętych linii w repozytorium workspace względem `base_branch`: różnica od wspólnego przodka (`merge-base`) `base_branch` i `HEAD` do drzewa roboczego, z niezatwierdzonymi zmianami. System odczytuje je razem z `branch` po każdym kroku (A3). Na starcie wartości są puste; gdy odczyt git się nie udał, zachowują ostatni wynik. Workflow i agent nie mogą ich zmienić.
 - R7. Wyjście kroku (`exit` lub choice) może zapisać `pr` i `pr_url` wybranego workspace przez `set`, np. `set: { workspace: { code: { pr_url: "{{ context.pr_url }}" } } }`. `set` jest dostępne tylko w kształcie unified (§3.7.1, §3.7.5): plik v1 i plik v2 w starym kształcie nie mogą zapisać `pr`/`pr_url`. Nazwa workspace musi istnieć w `globals.workspaces`; walidator odrzuca nieznaną nazwę i klucz inny niż `pr`/`pr_url`.
 - R8. `context.workspace.<nazwa>.*` jest dostępne do odczytu w szablonach (`{{ context.workspace.code.pr_url }}`) i w `when`. Brak wartości daje pusty tekst, jak dla zadeklarowanej zmiennej bez wartości (§ "Scope of templates").
 - R9. Nazwa `workspace` jest zarezerwowana: zmienna kroku o tej nazwie jest błędem ładowania, bo skrót `context.NAME` kolidowałby z `context.workspace.*`.
@@ -56,17 +57,17 @@ Workflow opisuje proces backendowy, ale dziś zawiera też widok: `display.title
 **Nagłówek szczegółów w TUI**
 
 - R11. Nagłówek szczegółów ma stały układ (widok poniżej):
-  - wiersz 1: tytuł zadania (R3) i krótki identyfikator, jak dziś;
+  - wiersz 1: tytuł zadania (R3) i krótki identyfikator, jak dziś. Wiersz znika, gdy krawędź ramki szczegółów (`edge_layout`) pokazuje tytuł w całości, bez obcięcia; wtedy nagłówek zaczyna się od wiersza 2;
   - wiersz 2: `● status · krok N nazwa_kroku · workflow vX`, potem obecne dodatki (czas, `bez slotu`, `kontroler offline`);
   - wiersze workspace: po jednym na workspace, w kolejności z definicji workflow;
-  - wiersz zużycia: bez zmian, gdy harness podał zużycie.
-- R12. Wiersz workspace pokazuje: nazwę workspace, `branch → base_branch` i `PR <numer>` z linkiem OSC 8 do `pr_url`. Kolumny są wyrównane między wierszami.
+  - wiersz zużycia, gdy harness podał zużycie: najpierw koszt razem, potem koszt agentów, potem koszt dyrygenta, potem tokeny. Tokeny wejścia mają strzałkę `↑`, tokeny wyjścia strzałkę `↓` (zamiast `in` / `out`). Subagenci mają tylko tokeny i liczbę (dziś harness nie podaje ich kosztu osobno). Część bez danych ma `—`; część dyrygenta jest tylko, gdy dyrygent podał zużycie. Ta sama zmiana dotyczy tekstu zużycia w CLI (`task_usage_text::line`).
+- R12. Wiersz workspace zaczyna się od nazwy workspace (prefiks wiersza). Potem są: nazwa repozytorium (`repo`), `branch → base_branch`, `+added −removed` i `PR <numer>` z linkiem OSC 8 do `pr_url`. Gdy brak `added` i `removed`, kolumna zmian jest pusta. Kolumny są wyrównane między wierszami.
 - R13. Gdy `branch` równa się `base_branch`, wiersz pokazuje tylko jedną nazwę gałęzi (zmiana nie ma jeszcze gałęzi roboczej).
 - R14. Gdy nie ma PR, w miejscu PR stoi wyszarzony znak `—`. Gdy jest `pr_url`, a nie ma `pr`, numer jest brany z końcowego segmentu liczbowego adresu; gdy go brak, pokazany jest tekst `PR ↗`.
 - R15. Workspace typu lokalny folder (`path`) pokazuje nazwę i ścieżkę zamiast gałęzi; nie ma kolumny PR.
-- R16. Przy wąskim terminalu kolejność skracania: najpierw `base_branch`, potem `branch` (obcięta z `…`), nigdy nazwa workspace i numer PR.
-- R17. Gdy workspace jest więcej niż 3, nagłówek pokazuje 3 pierwsze i wiersz `+N więcej — Info`; zakładka *Info* pokazuje pełną listę z `repo`.
-- R18. Zadanie w kolejce (bez runnera) pokazuje wiersze workspace z danymi z tworzenia zadania (`repo`, gałąź startowa, `base_branch`), bez PR.
+- R16. Przy wąskim terminalu kolejność skracania: najpierw `base_branch`, potem kolumna zmian `+N −M` (znika), potem `branch` (obcięta z `…`), potem nazwa repozytorium (obcięta z `…`). Nazwa workspace i numer PR nie są nigdy skracane.
+- R17. Nagłówek pokazuje wiersz dla każdego workspace, bez limitu liczby wierszy (decyzja w recenzji: na razie nie ograniczamy wysokości nagłówka).
+- R18. Zadanie w kolejce (bez runnera) pokazuje wiersze workspace z danymi z tworzenia zadania (`repo`, gałąź startowa, `base_branch`), bez zmian `+N −M` i bez PR.
 
 **CLI**
 
@@ -74,12 +75,14 @@ Workflow opisuje proces backendowy, ale dziś zawiera też widok: `display.title
 
 ### Widok nagłówka
 
+Krawędź ramki mieści tytuł w całości, więc wiersza 1 nie ma (R11):
+
 ```text
-NAR-12  Zmiana API zamówień                                      a1b2c3d4
+┌ NAR-12  Zmiana API zamówień ──────────────────────────────── a1b2c3d4 ┐
 ● running · krok 3 implement · code-review v3 · 14m
-  code    feat/nar-12-orders → main          PR !42 ↗
-  docs    main                               —
-$1.20 · in 120k out 8k · w tym subagenci in 40k out 3k (2)
+code  orders-api  feat/nar-12-orders → main   +120 −34   PR #42 ↗
+docs  orders-docs main                                   —
+razem $1.25 · agenci $1.20 · dyrygent $0.05 · ↑120k ↓8k · subagenci ↑40k ↓3k (2)
 ────────────────────────────────────────────────────────────────────────
  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info                 podąża
 ```
@@ -88,8 +91,8 @@ Wąski terminal (R16):
 
 ```text
 ● running · krok 3 implement · code-review v3
-  code    feat/nar-12-o… → …    PR !42 ↗
-  docs    main                  —
+code  orders-a…  feat/nar-1… → …  PR #42 ↗
+docs  orders-d…  main             —
 ```
 
 ### Przepływ wartości PR
@@ -99,54 +102,57 @@ flowchart LR
   A[Agent kroku open_pr] -->|variables.pr_url| V[context.variables.pr_url]
   V -->|exit.set.workspace.code.pr_url| W[context.workspace.code.pr_url]
   S[System: tworzenie zadania] -->|repo, base_branch| W
-  G[System: stan git po kroku] -->|branch| W
+  G[System: stan git po kroku] -->|branch, added, removed| W
   W --> T[Nagłówek TUI]
   W --> C[Tekst zadania CLI]
 ```
 
 ### Acceptance Examples
 
-- AE1. **Covers R7, R12.** **Given** workflow z workspace `code` i `docs` oraz krokiem `open_pr` z `exit.set.workspace.code.pr_url: "{{ context.pr_url }}"`. **When** agent zwraca `pr_url = https://gitlab.example/g/api/-/merge_requests/42`. **Then** wiersz `code` pokazuje `PR !42 ↗` z linkiem, wiersz `docs` pokazuje `—`.
+- AE1. **Covers R7, R12.** **Given** workflow z workspace `code` i `docs` oraz krokiem `open_pr` z `exit.set.workspace.code.pr_url: "{{ context.pr_url }}"`. **When** agent zwraca `pr_url = https://gitlab.example/g/api/-/merge_requests/42`. **Then** wiersz `code` pokazuje `PR #42 ↗` z linkiem, wiersz `docs` pokazuje `—`.
 - AE2. **Covers R7.** **Given** `set.workspace.payments.pr_url` w workflow bez workspace `payments`. **When** workflow jest ładowany. **Then** ładowanie kończy się błędem z nazwą kroku i nazwą `payments`.
 - AE3. **Covers R2.** **Given** stary plik z sekcją `display`. **When** jest ładowany. **Then** workflow działa, sekcja jest pominięta, w logu jest ostrzeżenie.
-- AE4. **Covers R13, R6.** **Given** nowe zadanie na `main`, krok jeszcze nie utworzył gałęzi. **Then** wiersz pokazuje `main`. **When** krok tworzy `feat/x` i się kończy. **Then** wiersz pokazuje `feat/x → main`.
+- AE4. **Covers R13, R6.** **Given** nowe zadanie na `main`, krok jeszcze nie utworzył gałęzi. **Then** wiersz pokazuje `main`. **When** krok tworzy `feat/x` i się kończy. **Then** wiersz pokazuje `feat/x → main` i `+N −M` ze stanu git względem `main`.
 - AE5. **Covers R14.** **Given** `pr_url = https://github.com/o/r/pull/7` i brak `pr`. **Then** wiersz pokazuje `PR #7 ↗`. **Given** `pr_url = https://host/review/abc`. **Then** wiersz pokazuje `PR ↗`.
 - AE6. **Covers R10.** **Given** agent zwraca `pr_url = javascript:alert(1)` i wyjście kopiuje go do workspace. **Then** nagłówek pokazuje tekst bez linku.
 - AE7. **Covers R9.** **Given** krok deklaruje zmienną `workspace`. **Then** ładowanie kończy się błędem.
+- AE8. **Covers R11.** **Given** tytuł zadania mieści się w całości na krawędzi ramki. **Then** nagłówek nie ma wiersza 1. **Given** tytuł jest obcięty na krawędzi. **Then** wiersz 1 pokazuje tytuł.
+- AE9. **Covers R17.** **Given** workflow z pięcioma workspace. **Then** nagłówek ma pięć wierszy workspace.
 
 ### Scope Boundaries
 
 - Poza zakresem: konfiguracja widoku po stronie klienta (motywy, układ wybierany przez użytkownika).
 - Poza zakresem: automatyczne wykrywanie PR przez API GitLab/GitHub; PR podaje tylko workflow (R7).
-- Poza zakresem: inne pola `context.workspace` niż pięć z R4 (np. status pipeline, commit).
+- Poza zakresem: inne pola `context.workspace` niż siedem z R4 (np. status pipeline, commit).
 - Poza zakresem: zmiana listy zadań poza źródłem tytułu (R3).
-- Odłożone: link Jira z `task.ticket` w nagłówku. Dziś możliwy przez `display.links`; po zmianie ticket nadal stoi w wierszu 1 bez linku (patrz Q4).
+- Poza zakresem: link Jira z `task.ticket` w nagłówku. Dziś możliwy przez `display.links`; po zmianie ticket stoi bez linku (Q4: na razie bez linku).
 
 ---
 
-## Założenia do potwierdzenia
+## Założenia (potwierdzone w recenzji 2026-11-07)
 
-- A1. **Stary plik z `display` nie przestaje działać.** Loader pomija sekcję z ostrzeżeniem (R2), zamiast zgłosić błąd. Powód: bezpieczniej dla istniejących workflow użytkowników. Alternatywa: błąd ładowania w `schema: v2` (ostrzejszy kontrakt).
-- A2. **Krok w wierszu 2 używa obecnej numeracji** (`krok N` z pozycji osi czasu w *Przebiegu*) i identyfikatora stanu jako nazwy kroku. Pokazuję `krok N nazwa` zamiast obecnego `krok N/M`, bo przy pętlach w grafie `M` jest mylące. Nazwa workflow to `workflow_id vX`, jak dziś w wierszu 3.
-- A3. **`branch` odświeża system ze stanu git po każdym kroku**, a nie agent. Powód: nagłówek ma nie zależeć od zmiennych ustawianych przez agenta, a Narsor nie tworzy gałęzi roboczej sam (§3.2.1: robi to krok). Dla zdalnego runnera dane idą w migawce (snapshot) tak jak dziś `display`.
-- A4. **Do zapisu przez `set` dostępne są tylko `pr` i `pr_url`.** `repo`, `base_branch` i `branch` są tylko do odczytu (R5, R6).
-- A5. **Numer PR bez prefiksu zależnego od dostawcy w danych; prefiks `!` dla adresu GitLab (`/merge_requests/`), `#` w pozostałych przypadkach** — tylko w prezentacji. Na szkicu: `PR !42`.
-- A6. **Nagłówek pokazuje nazwę workspace, nie identyfikator repozytorium** (zgodnie z prośbą). `repo` jest w zakładce *Info* (R17). Dla workflow z jednym workspace nazwa po konwersji v1 to i tak identyfikator repozytorium.
-- A7. **Limit 3 wierszy workspace w nagłówku** (R17), żeby nagłówek nie zabierał miejsca zakładkom w workflow z wieloma repozytoriami.
-- A8. **CLI dostaje ten sam układ danych co TUI** (R19), bo dziś też czyta `display`; inaczej po usunięciu sekcji CLI straciłby link PR.
-- A9. **Starszy runner/serwer, który jeszcze raportuje `display`, jest ignorowany przez nowego klienta** — nowy klient pokazuje wtedy wiersze workspace z danych tworzenia zadania (R18). Szczegóły kompatybilności protokołu ustala plan.
+- A1. **Stary plik z `display` nie przestaje działać.** Loader pomija sekcję z ostrzeżeniem (R2), zamiast zgłosić błąd. Powód: bezpieczniej dla istniejących workflow użytkowników. Alternatywa: błąd ładowania w `schema: v2` (ostrzejszy kontrakt). *Potwierdzone.*
+- A2. **Krok w wierszu 2 używa obecnej numeracji** (`krok N` z pozycji osi czasu w *Przebiegu*) i identyfikatora stanu jako nazwy kroku. Pokazuję `krok N nazwa` zamiast obecnego `krok N/M`, bo przy pętlach w grafie `M` jest mylące. Nazwa workflow to `workflow_id vX`, jak dziś w wierszu 3. *Potwierdzone: bez `M`.*
+- A3. **`branch` odświeża system ze stanu git po każdym kroku**, a nie agent. Powód: nagłówek ma nie zależeć od zmiennych ustawianych przez agenta, a Narsor nie tworzy gałęzi roboczej sam (§3.2.1: robi to krok). Dla zdalnego runnera dane idą w migawce (snapshot) tak jak dziś `display`. *Potwierdzone; przy tym samym odczycie git system pobiera też `added` i `removed` (R6a).*
+- A4. **Do zapisu przez `set` dostępne są tylko `pr` i `pr_url`.** `repo`, `base_branch`, `branch`, `added` i `removed` są tylko do odczytu (R5, R6, R6a). *Potwierdzone. Powód blokady: system nadpisuje `branch`, `added` i `removed` po każdym kroku, więc zapis przez `set` byłby nietrwały; `repo` i `base_branch` opisują klon zrobiony przy tworzeniu zadania, a inna wartość dawałaby nagłówek niezgodny z workspace.*
+- A5. **Numer PR ma zawsze prefiks `#`**, także dla GitLab. W danych numer jest bez prefiksu. *Zmienione w recenzji (wcześniej `!` dla GitLab).*
+- A6. **Nazwa workspace jest prefiksem wiersza, a w wierszu jest nazwa repozytorium** (R12). *Zmienione w recenzji (wcześniej tylko nazwa workspace, `repo` w zakładce *Info*).* Dla workflow v1 po konwersji obie nazwy mogą być takie same; wiersz pokazuje wtedy obie.
+- A7. **Bez limitu wierszy workspace w nagłówku** (R17). *Zmienione w recenzji (wcześniej limit 3).* Dodatkowo wiersz tytułu znika, gdy krawędź ramki mieści cały tytuł (R11).
+- A8. **CLI dostaje ten sam układ danych co TUI** (R19), bo dziś też czyta `display`; inaczej po usunięciu sekcji CLI straciłby link PR. *Potwierdzone: serwer daje wszystkim klientom ten sam komunikat.*
+- A9. **Bez zgodności wstecznej z runnerem/serwerem, który raportuje `display`.** Nowy klient ignoruje `display`. Wdrożenie zakłada restart całego systemu (serwer, runnery, klienci), więc protokół nie potrzebuje trybu zgodności. *Potwierdzone w recenzji.*
 
-## Pytania otwarte dla użytkownika
+## Pytania do użytkownika (odpowiedzi z recenzji 2026-11-07)
 
-- Q1. **Jawne `set` czy automatyczne kopiowanie?** Plan zakłada jawne `exit.set.workspace.<nazwa>.pr_url` (Key Decisions). Alternatywa: silnik po każdym kroku sam kopiuje `context.variables.pr_url` (i `pr`) do workspace, w którym krok startuje (`workspaces.root`, domyślnie primary). Jest prostsza dla autora workflow, ale niejednoznaczna dla `root: .` i kroku, który otwiera PR w dwóch repozytoriach. Którą wersję wybierasz? *(Resolve Before Planning — zmienia R7.)*
-- Q2. **Skąd `branch`?** Plan zakłada odczyt stanu git przez system (A3). Czy wolisz, żeby `branch` też przychodził od agenta przez `set` (jak `pr_url`)? *(Resolve Before Planning — zmienia R6 i A4.)*
-- Q3. **Plik z `display`: ostrzeżenie czy błąd?** (A1). *(Deferred to Planning, jeśli brak odpowiedzi — zostaje ostrzeżenie.)*
-- Q4. **Link Jira w nagłówku.** Dziś workflow może dać link do ticketu przez `display.links`. Czy nagłówek ma budować link z `task.ticket` według ustawienia klienta (np. bazowy adres Jira w konfiguracji TUI), czy ticket zostaje bez linku? *(Deferred to Planning — domyślnie bez linku.)*
+- Q1. **Jawne `set` czy automatyczne kopiowanie?** Plan zakłada jawne `exit.set.workspace.<nazwa>.pr_url` (Key Decisions). Alternatywa: silnik po każdym kroku sam kopiuje `context.variables.pr_url` (i `pr`) do workspace, w którym krok startuje (`workspaces.root`, domyślnie primary). Jest prostsza dla autora workflow, ale niejednoznaczna dla `root: .` i kroku, który otwiera PR w dwóch repozytoriach. Którą wersję wybierasz? **Odpowiedź: jawne `set`** — silnik nie wie, do którego repozytorium należą zmienne.
+- Q2. **Skąd `branch`?** Plan zakłada odczyt stanu git przez system (A3). Czy wolisz, żeby `branch` też przychodził od agenta przez `set` (jak `pr_url`)? **Odpowiedź: nie** — `branch` z odczytu git (A3).
+- Q3. **Plik z `display`: ostrzeżenie czy błąd?** (A1). **Odpowiedź: ostrzeżenie** (A1 potwierdzone).
+- Q4. **Link Jira w nagłówku.** Dziś workflow może dać link do ticketu przez `display.links`. Czy nagłówek ma budować link z `task.ticket` według ustawienia klienta (np. bazowy adres Jira w konfiguracji TUI), czy ticket zostaje bez linku? **Odpowiedź: na razie bez linku.**
 
 ### Deferred to Planning
 
 - Jak dane `context.workspace` trafiają do `TaskSummary` (pole w migawce runnera vs widok serwera) i jak to wpływa na wersję protokołu i launch spec.
-- Czy `TaskDisplay` / `DisplaySpec` w `narsor-protocol` znika całkowicie, czy zostaje tylko jako zgodność wsteczna odczytu.
+- Jak usunąć `TaskDisplay` / `DisplaySpec` z `narsor-protocol` całkowicie (A9: bez zgodności wstecznej); które funkcje (`sanitized`, `safe_link_url`) przenieść do nowego kodu nagłówka.
+- Jak runner liczy `added` / `removed` (R6a) tanio po każdym kroku i jak przekazuje je w migawce.
 - Jak walidator rozszerza `set` o klucz zarezerwowany `workspace` (wzór: istniejący klucz `local` w §3.7.5).
 
 ---
@@ -168,11 +174,6 @@ Te pozycje to wyniki recenzji pozostawione autorowi. Nie blokują implementacji.
 
 ### From 2026-11-07 review
 
-- **Goal Capsule mówi "brak blokad", a Q1 i Q2 mają znacznik "Resolve Before Planning"** — Goal Capsule, Open blockers (P1, coherence, confidence 100)
-
-  Wykonawca nie wie, czy planowanie może ruszyć. Odpowiedź na Q2 może unieważnić założenia A3 i A4, na których plan ma ruszyć.
-  Change: wybrać jedną wersję — albo Q1 i Q2 są blokadami planowania (Goal Capsule to mówi), albo zmienić ich znacznik na "Deferred to Planning" z domyślnymi A3 i A4.
-
 - **Workflow v1 i v2 w starym kształcie tracą link PR bez widocznego sygnału** — R2, A1 (P1, adversarial, feasibility, confidence 100)
 
   Dziś te pliki pokazują PR przez `display.links`. Po zmianie nagłówek pokazuje `—`, a ostrzeżenie w logu mówi tylko, że sekcja jest pominięta. Autor nie wie, co dodać.
@@ -182,9 +183,4 @@ Te pozycje to wyniki recenzji pozostawione autorowi. Nie blokują implementacji.
 
   "Tekst bez linku" nie mówi, co stoi w kolumnie PR. Surowa, długa wartość od agenta psuje wyrównanie kolumn, a R16 zabrania skracania kolumny PR.
   Change: wartość, która nie jest bezwzględnym adresem `http`/`https`, nigdy nie jest pokazana dosłownie; kolumna PR pokazuje numer z `pr` albo `PR` bez znaku `↗` i bez linku. AE6 oczekuje `PR` bez linku.
-
-- **Limit 3 wierszy workspace przeczy celowi "każde repozytorium"** — R17, A7, Summary (P2, coherence, scope-guardian, confidence 100)
-
-  Objective i Summary obiecują wiersz dla każdego workspace, a R17 ukrywa czwarty i dalsze za wierszem `+N więcej — Info`. Wykonawca musi wybrać jedną z dwóch reguł.
-  Change: decyzja użytkownika — zostawić limit (i dopisać go do Summary i Objective) albo usunąć limit z R17 i A7.
 
