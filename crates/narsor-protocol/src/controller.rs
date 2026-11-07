@@ -1476,14 +1476,21 @@ pub struct ResourceProfileRequest {
     pub memory_mib: u64,
 }
 
-/// The workspace portion of a task creation request.
+/// What the owner chose for one workspace of the workflow
+/// (`globals.workspaces.<name>`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceRequest {
-    /// Registered repository id; the workflow's when absent.
+    /// Registered repository id. Required for a workspace the workflow leaves
+    /// to be chosen; refused for one whose repository the workflow names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
-    /// Full commit id to clone.
+    /// Branch to start from, for a workspace the workflow leaves to be
+    /// chosen; its `base_branch`, then the registry's default branch, when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Full commit id to clone, for any Git workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
 }
@@ -1500,13 +1507,10 @@ pub struct LaunchRequest {
     /// Workflow inputs.
     #[serde(default)]
     pub inputs: Value,
-    /// Repository and pinned commit to clone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<WorkspaceRequest>,
-    /// Branch to start from, by the name of the `repository` input it is
-    /// for. An input without an entry starts on its default branch.
+    /// What the owner chose for the workspaces of the workflow, by workspace
+    /// name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub branches: BTreeMap<String, String>,
+    pub workspaces: BTreeMap<String, WorkspaceRequest>,
     /// Environment profile; owner default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -1754,7 +1758,19 @@ pub enum WorkflowInputType {
     Text,
     Integer,
     Boolean,
-    Repository,
+}
+
+/// One workspace whose repository the owner chooses when creating a task
+/// (`globals.workspaces.<name>` without `repository` or `path`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowWorkspaceView {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The branch the form suggests; the repository's default branch when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 /// One declared workflow input, reduced to fields an owner form needs.
@@ -1793,6 +1809,9 @@ pub struct WorkflowView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_state: Option<String>,
     pub inputs: Vec<WorkflowInputView>,
+    /// The workspaces to choose a repository for, in the order of the file.
+    #[serde(default)]
+    pub workspaces: Vec<WorkflowWorkspaceView>,
     pub valid: bool,
     #[serde(default)]
     pub violations: Vec<String>,
@@ -1851,6 +1870,8 @@ pub struct ValidateWorkflowResponse {
     pub initial_state: Option<String>,
     #[serde(default)]
     pub inputs: Vec<WorkflowInputView>,
+    #[serde(default)]
+    pub workspaces: Vec<WorkflowWorkspaceView>,
     #[serde(default)]
     pub violations: Vec<String>,
 }
@@ -2457,6 +2478,7 @@ mod tests {
                     description: None,
                     default: None,
                 }],
+                workspaces: vec![],
                 valid: true,
                 violations: vec![],
                 overrides: false,
@@ -2516,6 +2538,7 @@ mod tests {
             state_count: 0,
             initial_state: None,
             inputs: vec![],
+            workspaces: vec![],
             violations: vec!["missing state".into()],
         };
 
@@ -2671,11 +2694,14 @@ mod tests {
                 workflow_id: "hello".into(),
                 workflow_version: 2,
                 inputs: serde_json::json!({"count": 3}),
-                workspace: Some(WorkspaceRequest {
-                    repository: Some("repo".into()),
-                    commit: Some("abc123".into()),
-                }),
-                branches: Default::default(),
+                workspaces: std::collections::BTreeMap::from([(
+                    "code".to_string(),
+                    WorkspaceRequest {
+                        repository: Some("repo".into()),
+                        branch: Some("develop".into()),
+                        commit: Some("abc123".into()),
+                    },
+                )]),
                 profile: None,
                 harness: None,
                 resources: Some(ResourceProfileRequest {
@@ -2690,7 +2716,8 @@ mod tests {
         assert!(value["launch"].get("ticket").is_none());
         assert!(value["launch"].get("title").is_none());
         assert_eq!(value["launch"]["workflow_id"], "hello");
-        assert_eq!(value["launch"]["workspace"]["commit"], "abc123");
+        assert_eq!(value["launch"]["workspaces"]["code"]["commit"], "abc123");
+        assert_eq!(value["launch"]["workspaces"]["code"]["branch"], "develop");
         assert_eq!(value["launch"]["resources"]["cpu_millicores"], 1500);
         assert_eq!(value["launch"]["resources"]["memory_mib"], 2048);
     }

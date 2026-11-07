@@ -22,45 +22,52 @@ fn request(arguments: &[&str]) -> CreateTaskRequest {
 }
 
 #[test]
-fn a_branch_names_the_input_it_is_for() {
-    let request = request(&["flow", "--input", "code=acme", "--branch", "code=develop"]);
-
-    assert_eq!(request.launch.branches.len(), 1);
-    assert_eq!(request.launch.branches["code"], "develop");
-}
-
-#[test]
-fn two_branches_for_two_inputs_are_both_sent() {
+fn repository_branch_and_commit_name_the_workspace_they_are_for() {
     let request = request(&[
         "flow",
+        "--repository",
+        "code=acme",
         "--branch",
         "code=develop",
-        "--branch",
-        "docs=release/1.2",
+        "--commit",
+        "docs=0123abcd",
     ]);
 
-    assert_eq!(request.launch.branches["code"], "develop");
-    assert_eq!(request.launch.branches["docs"], "release/1.2");
+    let code = &request.launch.workspaces["code"];
+    assert_eq!(code.repository.as_deref(), Some("acme"));
+    assert_eq!(code.branch.as_deref(), Some("develop"));
+    assert_eq!(code.commit, None);
+    assert_eq!(
+        request.launch.workspaces["docs"].commit.as_deref(),
+        Some("0123abcd")
+    );
+    assert_eq!(request.launch.workspaces.len(), 2);
 }
 
 #[test]
 fn a_branch_that_reads_as_json_stays_text() {
     let request = request(&["flow", "--branch", "code=123", "--branch", "docs=true"]);
 
-    assert_eq!(request.launch.branches["code"], "123");
-    assert_eq!(request.launch.branches["docs"], "true");
+    assert_eq!(
+        request.launch.workspaces["code"].branch.as_deref(),
+        Some("123")
+    );
+    assert_eq!(
+        request.launch.workspaces["docs"].branch.as_deref(),
+        Some("true")
+    );
 }
 
 #[test]
-fn without_a_branch_the_request_has_no_branches_key() {
+fn without_a_choice_the_request_has_no_workspaces_key() {
     let request = request(&["flow", "--input", "code=acme"]);
 
     let json = serde_json::to_value(&request.launch).expect("serializes");
-    assert!(json.get("branches").is_none(), "{json}");
+    assert!(json.get("workspaces").is_none(), "{json}");
 }
 
 #[test]
-fn a_branch_without_an_input_name_is_a_usage_error_with_the_format() {
+fn a_branch_without_a_workspace_name_is_a_usage_error_with_the_format() {
     let Command::Task { command } = parse(&["flow", "--branch", "develop"])
         .expect("clap accepts the value")
         .command
@@ -75,9 +82,18 @@ fn a_branch_without_an_input_name_is_a_usage_error_with_the_format() {
 }
 
 #[test]
-fn a_branch_does_not_go_with_a_definition_file() {
-    let error = parse(&["--file", "flow.yaml", "--branch", "code=develop"])
-        .expect_err("a file carries no branch");
-
-    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+fn a_definition_file_takes_workspace_choices() {
+    let Command::Task { .. } = parse(&[
+        "--file",
+        "flow.yaml",
+        "--repository",
+        "code=acme",
+        "--branch",
+        "code=develop",
+    ])
+    .expect("a file takes workspace choices")
+    .command
+    else {
+        panic!("not a task command");
+    };
 }

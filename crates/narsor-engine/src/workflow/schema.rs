@@ -474,7 +474,6 @@ pub enum ParamTypeSchema {
     Text,
     Integer,
     Boolean,
-    Repository,
 }
 
 /// The `globals` section (§3.2).
@@ -536,7 +535,7 @@ pub enum WorkspaceSchema {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitWorkspaceSchema {
-    /// Repository id from the registry; may be a `{{ }}` template.
+    /// Repository id from the registry.
     pub repository: String,
 
     /// Branch, tag or commit.
@@ -582,7 +581,8 @@ pub struct LocalWorkspaceSchema {
 
 /// One entry of `globals.workspaces` (`schema: v2`).
 ///
-/// Exactly one of `repository` and `path` names the source.
+/// At most one of `repository` and `path` names the source; with neither,
+/// the owner chooses the repository when creating the task.
 #[derive(Debug, Clone)]
 pub struct RepositorySchema {
     /// The key of the entry: the label of the repository and the name of its
@@ -595,6 +595,9 @@ pub struct RepositorySchema {
     /// Branch a new task starts from (`base_branch`).
     pub base_branch: Option<String>,
 
+    /// What the repository is for, in words for the new-task form.
+    pub description: Option<String>,
+
     /// Where the repository comes from.
     pub source: RepositorySourceSchema,
 
@@ -606,10 +609,12 @@ pub struct RepositorySchema {
 /// The source of a `globals.workspaces` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepositorySourceSchema {
-    /// Repository id from the registry; may be a `{{ }}` template.
+    /// Repository id from the registry.
     Repository(String),
     /// Local folder, relative to the task directory.
     Path(String),
+    /// Chosen by the owner when the task is created.
+    Chosen,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -619,6 +624,8 @@ struct RawRepositorySchema {
     primary: bool,
     #[serde(default)]
     base_branch: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     repository: Option<String>,
     #[serde(default)]
@@ -633,9 +640,10 @@ impl RawRepositorySchema {
         let source = match (raw.repository, raw.path) {
             (Some(repository), None) => RepositorySourceSchema::Repository(repository),
             (None, Some(path)) => RepositorySourceSchema::Path(path),
-            _ => {
+            (None, None) => RepositorySourceSchema::Chosen,
+            (Some(_), Some(_)) => {
                 return Err(format!(
-                    "workspace '{name}' needs exactly one of 'repository' and 'path'"
+                    "workspace '{name}' takes 'repository' or 'path', not both"
                 ))
             }
         };
@@ -643,6 +651,7 @@ impl RawRepositorySchema {
             name,
             primary: raw.primary,
             base_branch: raw.base_branch,
+            description: raw.description,
             source,
             preserve_paths: raw.preserve_paths,
         })

@@ -21,17 +21,19 @@
 //! `Enter` validates the path (every violation, as `narsor validate` prints
 //! them, goes in the description) and the inputs of the definition appear.
 //!
-//! # The branch of a repository
+//! # The repository and branch of a workspace
 //!
-//! Every `repository` input of a workflow is followed by the field of its
-//! branch, drawn on the same row: `> ‹ repo ›   gałąź: [main        ]`. The
-//! branch is a free line that starts from the repository's default branch;
-//! `→` at its end completes from the branches the server lists for it
-//! ([`Request::ReadBranches`]), which are not drawn.
-//! Choosing another repository puts that repository's default in the field and
-//! reads its list again; a list that cannot be read leaves a plain line and
-//! says why. What is typed is never checked against the list. Only a branch
-//! that is not empty and not the default the field started from is sent.
+//! Every workspace whose repository the workflow leaves to be chosen
+//! (`globals.workspaces.<name>` without `repository` or `path`) gets a
+//! repository field followed by the field of its branch, in the order of the
+//! file, drawn on one row: `> ‹ repo ›   gałąź: [main        ]`. The branch is
+//! a free line that starts from the workspace's `base_branch`, else the
+//! repository's default branch; `→` at its end completes from the branches the
+//! server lists for it ([`Request::ReadBranches`]), which are not drawn.
+//! Choosing another repository puts the branch it starts from in the field
+//! again and reads its list again; a list that cannot be read leaves a plain
+//! line and says why. What is typed is never checked against the list, and the
+//! branch on screen is the branch sent.
 //!
 //! # Sending
 //!
@@ -80,18 +82,19 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use serde_json::{Map, Value};
 
-use crate::api::{BranchSource, ClientError};
+use crate::api::{BranchSource, ClientError, StartTaskRequest};
 use crate::controller_protocol::{
     CreateTaskRequest, LaunchRequest, RepositoryListResponse, RepositoryView, TaskSummary,
     ValidateWorkflowResponse, WorkflowInputView, WorkflowListResponse, WorkflowSource,
-    WorkflowView,
+    WorkflowView, WorkflowWorkspaceView, WorkspaceRequest,
 };
 use narsor_protocol::controller::WorkflowInputType;
 use narsor_protocol::display::GENERATED_TITLE_MAX_CHARS;
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, FieldKind};
 use super::super::input_form::{
-    branch_field_name, default_branch_of, workflow_input_fields, workflow_input_values,
+    branch_field_name, repository_field_name, suggested_branch, workflow_input_fields,
+    workflow_input_values, workspace_choices, workspace_fields,
 };
 use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
@@ -177,6 +180,8 @@ pub enum PathVerdict {
         version: u32,
         /// Its declared inputs.
         inputs: Vec<WorkflowInputView>,
+        /// The workspaces to choose a repository for.
+        workspaces: Vec<WorkflowWorkspaceView>,
     },
     /// It does not: every violation.
     Invalid(Vec<String>),
@@ -213,7 +218,7 @@ pub struct NewTaskForm {
 struct BranchSlot {
     entry: usize,
     repository: String,
-    input: String,
+    workspace: WorkflowWorkspaceView,
     branch_field: String,
 }
 
@@ -292,18 +297,32 @@ impl NewTaskForm {
         &self.repositories
     }
 
+    /// The workspaces entry `entry` asks a repository for: a workflow's, or
+    /// those of the workflow file once it was accepted.
+    fn workspaces_of(&self, entry: usize) -> &[WorkflowWorkspaceView] {
+        match self.entries.get(entry) {
+            Some(Entry::Workflow(workflow)) => &workflow.workspaces,
+            Some(Entry::Path) => match &self.check {
+                Some(PathCheck {
+                    verdict: PathVerdict::Valid { workspaces, .. },
+                    ..
+                }) => workspaces,
+                _ => &[],
+            },
+            None => &[],
+        }
+    }
+
     fn branch_slots(&self) -> Vec<BranchSlot> {
         let mut slots = Vec::new();
-        for (entry, kind) in self.entries.iter().enumerate() {
-            let Entry::Workflow(workflow) = kind else {
-                continue;
-            };
+        for entry in 0..self.entries.len() {
             let fields = self.chooser.fields_of(entry);
-            for input in &workflow.inputs {
-                let branch_field = branch_field_name(&input.name);
+            for workspace in self.workspaces_of(entry) {
+                let repository_field = repository_field_name(&workspace.name);
+                let branch_field = branch_field_name(&workspace.name);
                 let repository = fields
                     .iter()
-                    .find(|field| field.name == input.name)
+                    .find(|field| field.name == repository_field)
                     .filter(|field| matches!(field.kind, FieldKind::Select(_)))
                     .map(|field| field.value().to_string());
                 let has_branch = fields.iter().any(|field| field.name == branch_field);
@@ -311,7 +330,7 @@ impl NewTaskForm {
                     slots.push(BranchSlot {
                         entry,
                         repository,
-                        input: input.name.clone(),
+                        workspace: workspace.clone(),
                         branch_field,
                     });
                 }
@@ -328,7 +347,7 @@ impl NewTaskForm {
     }
 
     /// After a key: a repository that changed gives its branch field the
-    /// default of the new repository and is read again; then every branch
+    /// branch it starts from again and is read again; then every branch
     /// field shows what is known of its repository's branches. Returns the
     /// repositories of the highlighted entry that were never asked for, now
     /// marked as asked.
@@ -338,13 +357,14 @@ impl NewTaskForm {
         for slot in slots.iter().filter(|slot| slot.entry == selected) {
             let changed = before.iter().any(|earlier| {
                 earlier.entry == slot.entry
-                    && earlier.input == slot.input
+                    && earlier.workspace.name == slot.workspace.name
                     && earlier.repository != slot.repository
             });
             if changed {
-                let default = default_branch_of(&self.repositories, &slot.repository);
+                let branch =
+                    suggested_branch(&slot.workspace, &self.repositories, &slot.repository);
                 self.chooser
-                    .reset_field(slot.entry, &slot.branch_field, &default);
+                    .reset_field(slot.entry, &slot.branch_field, &branch);
                 self.branch_lists.remove(&slot.repository);
                 self.branch_reads.remove(&slot.repository);
             }
@@ -448,6 +468,12 @@ fn workflow_item(workflow: &WorkflowView, repositories: &[RepositoryView]) -> Ch
         facts.push("przesłania inną kopię o tej nazwie".to_string());
     }
     lines.push(facts.join(" · "));
+    if !workflow.workspaces.is_empty() {
+        lines.push(format!(
+            "Repozytoria: {}",
+            workspaces_summary(&workflow.workspaces)
+        ));
+    }
     if !workflow.inputs.is_empty() {
         lines.push(format!("Wejścia: {}", inputs_summary(&workflow.inputs)));
     }
@@ -466,42 +492,36 @@ fn workflow_item(workflow: &WorkflowView, repositories: &[RepositoryView]) -> Ch
     if workflow.version.is_none() {
         return item.unavailable("definicja się nie wczytuje");
     }
-    form_fields(&workflow.inputs, repositories)
+    form_fields(&workflow.inputs, &workflow.workspaces, repositories)
         .into_iter()
         .fold(item, ChooserItem::with_field)
 }
 
 /// The fields of a workflow's form, in the order they stand on the screen:
-/// ticket, title, the repositories each followed by its branch, the other
-/// inputs and last the main text field, which takes the rest of the room.
-fn form_fields(inputs: &[WorkflowInputView], repositories: &[RepositoryView]) -> Vec<ChooserField> {
-    let mut fields = workflow_input_fields(inputs, repositories);
-    let repository_inputs: Vec<&str> = inputs
-        .iter()
-        .filter(|input| matches!(input.input_type, WorkflowInputType::Repository))
-        .map(|input| input.name.as_str())
-        .collect();
-    let mut is_repository: Vec<bool> = fields
-        .iter()
-        .map(|field| {
-            repository_inputs.contains(&field.name.as_str())
-                || matches!(field.kind, FieldKind::Suggest(_))
-        })
-        .collect();
-    let main = chooser::main_field_of(&fields).map(|index| {
-        is_repository.remove(index);
-        fields.remove(index)
-    });
-    let (repository, others): (Vec<_>, Vec<_>) = is_repository
-        .into_iter()
-        .zip(fields)
-        .partition(|(is_repository, _)| *is_repository);
+/// ticket, title, the workspaces each as a repository followed by its branch,
+/// the inputs and last the main text field, which takes the rest of the room.
+fn form_fields(
+    inputs: &[WorkflowInputView],
+    workspaces: &[WorkflowWorkspaceView],
+    repositories: &[RepositoryView],
+) -> Vec<ChooserField> {
+    let mut fields = workflow_input_fields(inputs);
+    let main = chooser::main_field_of(&fields).map(|index| fields.remove(index));
     label_fields()
         .into_iter()
-        .chain(repository.into_iter().map(|(_, field)| field))
-        .chain(others.into_iter().map(|(_, field)| field))
+        .chain(workspace_fields(workspaces, repositories))
+        .chain(fields)
         .chain(main)
         .collect()
+}
+
+/// `code, docs`: the workspaces to choose a repository for.
+fn workspaces_summary(workspaces: &[WorkflowWorkspaceView]) -> String {
+    workspaces
+        .iter()
+        .map(|workspace| one_line(&workspace.name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `ticket_id*, repository, dry_run`: the inputs, required ones starred.
@@ -551,20 +571,17 @@ fn path_item(
         return item.unavailable(reason);
     }
     if let Some(PathCheck {
-        verdict: PathVerdict::Valid { inputs, .. },
+        verdict: PathVerdict::Valid {
+            inputs, workspaces, ..
+        },
         ..
     }) = check
     {
         // Only once the file is accepted: until then `Enter` on the path asks
         // the server to check it, as the path is the last field.
-        // A workflow file is created through the local façade, which takes no
-        // branch: its repositories have none to choose.
-        for field in form_fields(inputs, repositories)
+        item = form_fields(inputs, workspaces, repositories)
             .into_iter()
-            .filter(|field| !matches!(field.kind, FieldKind::Suggest(_)))
-        {
-            item = item.with_field(field);
-        }
+            .fold(item, ChooserItem::with_field);
     }
     item
 }
@@ -579,8 +596,15 @@ fn path_description(check: Option<&PathCheck>) -> String {
             name,
             version,
             inputs,
+            workspaces,
         }) => {
             let mut text = format!("✓ {} v{version} — definicja jest poprawna.", one_line(name));
+            if !workspaces.is_empty() {
+                text.push_str(&format!(
+                    "\nRepozytoria: {}",
+                    workspaces_summary(workspaces)
+                ));
+            }
             if !inputs.is_empty() {
                 text.push_str(&format!("\nWejścia: {}", inputs_summary(inputs)));
             }
@@ -624,44 +648,13 @@ pub enum CreateHow {
         workflow: String,
         /// The inputs.
         inputs: Map<String, Value>,
+        /// What was chosen for the workspaces, by workspace name.
+        workspaces: BTreeMap<String, WorkspaceRequest>,
         /// The ticket as typed, if any.
         ticket: Option<String>,
         /// The title as typed, if any.
         title: Option<String>,
     },
-}
-
-/// The branches the operator chose: for each `repository` input that has a
-/// value, what was typed in its branch field, unless that is empty or the
-/// default branch the field started from. An input left on its default sends
-/// nothing, so what the workflow says of its branch holds.
-fn chosen_branches(
-    declared: &[WorkflowInputView],
-    repositories: &[RepositoryView],
-    inputs: &Map<String, Value>,
-    values: &[(String, String)],
-) -> BTreeMap<String, String> {
-    let mut branches = BTreeMap::new();
-    for input in declared
-        .iter()
-        .filter(|input| matches!(input.input_type, WorkflowInputType::Repository))
-    {
-        let Some(repository) = inputs.get(&input.name).and_then(Value::as_str) else {
-            continue;
-        };
-        let field = branch_field_name(&input.name);
-        let typed = values
-            .iter()
-            .find(|(name, _)| *name == field)
-            .map(|(_, value)| value.trim())
-            .filter(|value| !value.is_empty());
-        if let Some(typed) =
-            typed.filter(|typed| *typed != default_branch_of(repositories, repository))
-        {
-            branches.insert(input.name.clone(), typed.to_string());
-        }
-    }
-    branches
 }
 
 /// A task being created: the id it will have, made before the first attempt,
@@ -699,7 +692,7 @@ fn title_for(workflow: &str, inputs: &[WorkflowInputView], values: &Map<String, 
             .find_map(|input| values.get(&input.name).and_then(Value::as_str))
             .filter(|text| !text.trim().is_empty())
     };
-    first_given(&[WorkflowInputType::String, WorkflowInputType::Repository])
+    first_given(&[WorkflowInputType::String])
         .or_else(|| first_given(&[WorkflowInputType::Text]))
         .and_then(|text| text.trim().lines().next())
         .map_or_else(|| workflow.to_string(), |line| line.trim().to_string())
@@ -986,6 +979,8 @@ impl TaskApp {
         let Some(entry) = form.entries.get(submission.index).cloned() else {
             return Request::None;
         };
+        let workspaces =
+            workspace_choices(form.workspaces_of(submission.index), &submission.values);
         let (workflow, declared, how_for) = match entry {
             Entry::Workflow(workflow) => {
                 let Some(version) = workflow.version else {
@@ -1021,7 +1016,6 @@ impl TaskApp {
                 return Request::None;
             }
         };
-        let branches = chosen_branches(&declared, &form.repositories, &inputs, &submission.values);
         if !self.mutation_allowed() {
             return Request::None;
         }
@@ -1038,8 +1032,7 @@ impl TaskApp {
                         workflow_id: name,
                         workflow_version: version,
                         inputs: Value::Object(inputs.clone()),
-                        workspace: None,
-                        branches,
+                        workspaces,
                         profile: None,
                         harness: None,
                         resources: None,
@@ -1051,6 +1044,7 @@ impl TaskApp {
             Sending::Path { path } => CreateHow::Path {
                 workflow: path,
                 inputs: inputs.clone(),
+                workspaces,
                 ticket: ticket_typed,
                 title: title_typed,
             },
@@ -1104,17 +1098,19 @@ impl TaskApp {
             CreateHow::Path {
                 workflow,
                 inputs,
+                workspaces,
                 ticket,
                 title,
             } => self
                 .client
-                .start_task_with_labels(
-                    &outgoing.task_id,
-                    workflow,
-                    inputs.clone(),
-                    ticket.clone(),
-                    title.clone(),
-                )
+                .start_task_request(&StartTaskRequest {
+                    task_id: outgoing.task_id.clone(),
+                    workflow: workflow.clone(),
+                    inputs: inputs.clone(),
+                    workspaces: workspaces.clone(),
+                    ticket: ticket.clone(),
+                    title: title.clone(),
+                })
                 .await
                 .map(|started| started.task),
         };
@@ -1324,12 +1320,14 @@ impl TaskApp {
                 name,
                 version,
                 inputs,
+                workspaces,
                 ..
             }) => match (name, version) {
                 (Some(name), Some(version)) => PathVerdict::Valid {
                     name,
                     version,
                     inputs,
+                    workspaces,
                 },
                 _ => PathVerdict::Failed("serwer nie podał nazwy ani wersji definicji".to_string()),
             },

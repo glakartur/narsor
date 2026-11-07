@@ -2357,7 +2357,7 @@ async fn the_reference_workflow_runs_end_to_end_on_the_fake_harness() {
         .engine()
         .start_and_run(
             &definition,
-            json!({ "description": "add login", "target_repo": "acme/web" }),
+            json!({ "description": "add login" }),
             fixture.workspace(),
         )
         .await

@@ -33,17 +33,8 @@ fn inputs_are_typed_by_what_the_definition_declares() {
     greeting.default = None;
     let mut flag = input("flag", ParamType::Boolean, false);
     flag.default = Some(json!(false));
-    let declared = vec![
-        greeting,
-        input("count", ParamType::Integer, false),
-        flag,
-        input("repo", ParamType::Repository, false),
-    ];
-    let values = typed_inputs(
-        &declared,
-        &["greeting=42".into(), "count=7".into(), "repo=api".into()],
-    )
-    .unwrap();
+    let declared = vec![greeting, input("count", ParamType::Integer, false), flag];
+    let values = typed_inputs(&declared, &["greeting=42".into(), "count=7".into()]).unwrap();
     assert_eq!(values["greeting"], json!("42"), "a string stays text");
     assert_eq!(values["count"], json!(7));
     assert_eq!(
@@ -51,7 +42,6 @@ fn inputs_are_typed_by_what_the_definition_declares() {
         json!(false),
         "the default fills what is left out"
     );
-    assert_eq!(values["repo"], json!("api"));
 }
 
 #[test]
@@ -120,6 +110,7 @@ fn a_verdict_lists_every_violation_or_the_definition() {
         state_count: 0,
         initial_state: None,
         inputs: Vec::new(),
+        workspaces: Vec::new(),
         violations: vec!["first".into(), "second".into()],
     };
     assert_eq!(
@@ -133,6 +124,7 @@ fn a_verdict_lists_every_violation_or_the_definition() {
         state_count: 2,
         initial_state: Some("start".into()),
         inputs: vec![input("who", ParamType::String, true)],
+        workspaces: Vec::new(),
         violations: Vec::new(),
     };
     let text = texts(validation_lines(&valid));

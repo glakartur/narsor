@@ -1211,6 +1211,7 @@ async fn post_start_task(
                 workflow_id: definition.id.clone(),
                 workflow_version: definition.version,
                 inputs,
+                workspaces: body.workspaces.clone(),
                 ticket,
                 title,
                 ..LaunchIntent::default()

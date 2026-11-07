@@ -6,6 +6,7 @@
 //! [`crate::tui::task_app::panel`]; its names are given again here, so a path
 //! through `input_form` still leads to them.
 
+use std::collections::BTreeMap;
 use std::iter::Peekable;
 use std::str::Chars;
 
@@ -13,7 +14,9 @@ use serde_json::{Map, Value};
 
 use crate::domain::display::is_invisible_format;
 use crate::tui::chooser::{ChooserField, FieldKind};
-use narsor_protocol::controller::{RepositoryView, WorkflowInputType, WorkflowInputView};
+use narsor_protocol::controller::{
+    RepositoryView, WorkflowInputType, WorkflowInputView, WorkflowWorkspaceView, WorkspaceRequest,
+};
 use narsor_protocol::event::{AnsweredBy, EventData, InputCloseReason};
 use narsor_protocol::panel::value_as_text;
 
@@ -222,28 +225,43 @@ fn step_index(current: usize, delta: isize, length: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// The inputs a workflow declares (the new-task form)
+// The inputs and workspaces a workflow declares (the new-task form)
 // ---------------------------------------------------------------------------
 //
-// A workflow's `inputs` are typed (`string`, `integer`, `boolean`,
-// `repository`); the new-task form edits them as fields of the chooser, and
-// the typed values become the task's JSON inputs exactly as `narsor run
-// --input` parses them: `is_experimental=true` reaches the task as a boolean.
+// A workflow's `inputs` are typed (`string`, `text`, `integer`, `boolean`);
+// the new-task form edits them as fields of the chooser, and the typed values
+// become the task's JSON inputs exactly as `narsor run --input` parses them:
+// `is_experimental=true` reaches the task as a boolean. A workspace whose
+// repository the workflow leaves to be chosen is a repository field followed
+// by its branch field.
 
 /// The two values of a `boolean` input.
 const BOOLEAN_OPTIONS: [&str; 2] = ["true", "false"];
 
 /// The labels drawn above the inputs the bundled workflows name alike. The
 /// name stays the key of the value; an input not listed is drawn under its name.
-const INPUT_LABELS: [(&str, &str); 2] = [("target_repo", "Repozytorium"), ("description", "Opis")];
+const INPUT_LABELS: [(&str, &str); 1] = [("description", "Opis")];
 
 const BRANCH_SUFFIX: &str = " · gałąź";
 
-/// The name of the field that holds the branch of the `repository` input
-/// `input`: it stands right after that input and keeps the name of its value
-/// apart from every declared input.
-pub fn branch_field_name(input: &str) -> String {
-    format!("{input}{BRANCH_SUFFIX}")
+const REPOSITORY_SUFFIX: &str = " · repozytorium";
+
+/// The name of the field that holds the repository of `workspace`; apart
+/// from every declared input, which may share the workspace's name.
+pub fn repository_field_name(workspace: &str) -> String {
+    format!("{workspace}{REPOSITORY_SUFFIX}")
+}
+
+/// The name of the field that holds the branch of `workspace`: it stands
+/// right after the repository field ([`repository_field_name`]).
+pub fn branch_field_name(workspace: &str) -> String {
+    format!("{workspace}{BRANCH_SUFFIX}")
+}
+
+/// The name of the branch field that belongs to the field `field`, when that
+/// is the repository field of a workspace.
+pub fn branch_field_of(field: &str) -> Option<String> {
+    field.strip_suffix(REPOSITORY_SUFFIX).map(branch_field_name)
 }
 
 /// One field per declared input, in declaration order.
@@ -251,36 +269,18 @@ pub fn branch_field_name(input: &str) -> String {
 /// * `boolean` is a choice between `true` and `false`; with no default it
 ///   starts on `false`, the value that changes nothing, so it is never unset
 ///   on screen;
-/// * `repository` is a choice among the `repositories` the server has
-///   registered, starting on the default or the first one — with none
-///   registered it is a free line, so a remote the resolver still accepts can
-///   be typed;
 /// * `integer` is a number: the chooser refuses anything else next to the
 ///   field, before anything is sent;
+/// * `text` is a field of many lines;
 /// * `string` is a free line.
-///
-/// Right after every `repository` input stands the field of its branch
-/// ([`branch_field_name`]): a free line that starts from the repository's
-/// default branch. The new-task form draws the two on one row.
 ///
 /// An input is required when the workflow says so and gives no default; a
 /// default is shown as the value the field starts with.
-pub fn workflow_input_fields(
-    inputs: &[WorkflowInputView],
-    repositories: &[RepositoryView],
-) -> Vec<ChooserField> {
-    inputs
-        .iter()
-        .flat_map(|input| {
-            let field = input_field(input, repositories);
-            let branch = matches!(input.input_type, WorkflowInputType::Repository)
-                .then(|| branch_field(input, &field, repositories));
-            std::iter::once(field).chain(branch)
-        })
-        .collect()
+pub fn workflow_input_fields(inputs: &[WorkflowInputView]) -> Vec<ChooserField> {
+    inputs.iter().map(input_field).collect()
 }
 
-fn input_field(input: &WorkflowInputView, repositories: &[RepositoryView]) -> ChooserField {
+fn input_field(input: &WorkflowInputView) -> ChooserField {
     let mut field = match input.input_type {
         WorkflowInputType::Boolean => ChooserField::select(
             input.name.clone(),
@@ -290,18 +290,9 @@ fn input_field(input: &WorkflowInputView, repositories: &[RepositoryView]) -> Ch
                 .collect(),
         )
         .with_value(BOOLEAN_OPTIONS[1]),
-        WorkflowInputType::Repository if !repositories.is_empty() => ChooserField::select(
-            input.name.clone(),
-            repositories
-                .iter()
-                .map(|repository| repository.id.clone())
-                .collect(),
-        ),
         WorkflowInputType::Integer => ChooserField::integer(input.name.clone()),
         WorkflowInputType::Text => ChooserField::multiline(input.name.clone()),
-        WorkflowInputType::String | WorkflowInputType::Repository => {
-            ChooserField::text(input.name.clone())
-        }
+        WorkflowInputType::String => ChooserField::text(input.name.clone()),
     };
     if let Some(default) = &input.default {
         field = field.with_value(value_as_text(default));
@@ -318,17 +309,82 @@ fn input_field(input: &WorkflowInputView, repositories: &[RepositoryView]) -> Ch
     }
 }
 
-fn branch_field(
-    input: &WorkflowInputView,
-    field: &ChooserField,
+/// Two fields per workspace to choose a repository for, in the order of the
+/// file: the repository ([`repository_field_name`]) and its branch
+/// ([`branch_field_name`]), which the new-task form draws on one row.
+///
+/// The repository is required: a choice among the `repositories` the server
+/// has registered, starting on the first — with none registered it is a free
+/// line. The branch is a free line that starts from the workspace's
+/// `base_branch`, else the repository's default branch.
+pub fn workspace_fields(
+    workspaces: &[WorkflowWorkspaceView],
     repositories: &[RepositoryView],
-) -> ChooserField {
-    ChooserField::suggest(branch_field_name(&input.name), Vec::new())
-        .labelled(format!("{}{BRANCH_SUFFIX}", field.label()))
-        .starting_from(default_branch_of(repositories, field.value()))
+) -> Vec<ChooserField> {
+    workspaces
+        .iter()
+        .flat_map(|workspace| {
+            let repository = repository_field(workspace, repositories);
+            let branch = ChooserField::suggest(branch_field_name(&workspace.name), Vec::new())
+                .labelled(format!("{}{BRANCH_SUFFIX}", workspace.name))
+                .starting_from(suggested_branch(
+                    workspace,
+                    repositories,
+                    repository.value(),
+                ));
+            [repository, branch]
+        })
+        .collect()
 }
 
-pub fn default_branch_of(repositories: &[RepositoryView], id: &str) -> String {
+fn repository_field(
+    workspace: &WorkflowWorkspaceView,
+    repositories: &[RepositoryView],
+) -> ChooserField {
+    let name = repository_field_name(&workspace.name);
+    let field = if repositories.is_empty() {
+        ChooserField::text(name)
+    } else {
+        ChooserField::select(
+            name,
+            repositories
+                .iter()
+                .map(|repository| repository.id.clone())
+                .collect(),
+        )
+    };
+    let said = workspace
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    field
+        .required()
+        .labelled(workspace.name.clone())
+        .described(match said {
+            Some(said) => format!("repozytorium · {said}"),
+            None => "repozytorium".to_string(),
+        })
+}
+
+/// The branch the field of `workspace` starts from when `repository` is
+/// chosen: the workspace's `base_branch`, else the repository's default
+/// branch.
+pub fn suggested_branch(
+    workspace: &WorkflowWorkspaceView,
+    repositories: &[RepositoryView],
+    repository: &str,
+) -> String {
+    workspace
+        .base_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_branch_of(repositories, repository))
+}
+
+fn default_branch_of(repositories: &[RepositoryView], id: &str) -> String {
     repositories
         .iter()
         .find(|repository| repository.id == id)
@@ -338,6 +394,33 @@ pub fn default_branch_of(repositories: &[RepositoryView], id: &str) -> String {
         .to_string()
 }
 
+/// What the form chose for each workspace (`(name, value)` as the form
+/// returned them): the repository and the branch, a blank one left out.
+pub fn workspace_choices(
+    workspaces: &[WorkflowWorkspaceView],
+    values: &[(String, String)],
+) -> BTreeMap<String, WorkspaceRequest> {
+    let given = |field: &str| {
+        values
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    workspaces
+        .iter()
+        .map(|workspace| {
+            let choice = WorkspaceRequest {
+                repository: given(&repository_field_name(&workspace.name)),
+                branch: given(&branch_field_name(&workspace.name)),
+                commit: None,
+            };
+            (workspace.name.clone(), choice)
+        })
+        .collect()
+}
+
 /// What the current field is for: its type when that is not obvious, then
 /// what the workflow says of it.
 fn input_description(input: &WorkflowInputView) -> Option<String> {
@@ -345,7 +428,6 @@ fn input_description(input: &WorkflowInputView) -> Option<String> {
         WorkflowInputType::String | WorkflowInputType::Text => None,
         WorkflowInputType::Integer => Some("liczba całkowita"),
         WorkflowInputType::Boolean => Some("true / false"),
-        WorkflowInputType::Repository => Some("repozytorium"),
     };
     let said = input
         .description
@@ -389,9 +471,7 @@ pub fn workflow_input_values(
             continue;
         };
         let value = match input.input_type {
-            WorkflowInputType::String | WorkflowInputType::Text | WorkflowInputType::Repository => {
-                Value::String(raw.to_string())
-            }
+            WorkflowInputType::String | WorkflowInputType::Text => Value::String(raw.to_string()),
             WorkflowInputType::Integer => {
                 raw.parse::<i64>()
                     .map(Value::from)

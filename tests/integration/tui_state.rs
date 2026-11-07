@@ -9508,8 +9508,9 @@ mod task_app_create {
 
     use super::task_app_support::{
         archived, capabilities, catalogue, catalogue_workflow, legacy, listing, queued, registry,
-        repository, titled, workflow_input,
+        repository, titled, with_workspaces, workflow_input, workspace,
     };
+    use narsor_protocol::controller::WorkspaceRequest;
 
     fn offline_client() -> ApiClient {
         ApiClient::new("127.0.0.1:9".parse().unwrap(), "token")
@@ -9554,25 +9555,27 @@ mod task_app_create {
 
     fn workflows() -> WorkflowListResponse {
         catalogue(vec![
-            catalogue_workflow(
-                "implement-feature",
-                "Pełny cykl: plan, implementacja, review, testy i PR.",
-                vec![
-                    workflow_input(
-                        "ticket_id",
-                        ParamType::String,
-                        true,
-                        Some("numer zgłoszenia"),
-                    ),
-                    workflow_input(
-                        "attempts",
-                        ParamType::Integer,
-                        false,
-                        Some("ile razy ponawiać"),
-                    ),
-                    workflow_input("dry_run", ParamType::Boolean, false, None),
-                    workflow_input("target_repo", ParamType::Repository, false, None),
-                ],
+            with_workspaces(
+                catalogue_workflow(
+                    "implement-feature",
+                    "Pełny cykl: plan, implementacja, review, testy i PR.",
+                    vec![
+                        workflow_input(
+                            "ticket_id",
+                            ParamType::String,
+                            true,
+                            Some("numer zgłoszenia"),
+                        ),
+                        workflow_input(
+                            "attempts",
+                            ParamType::Integer,
+                            false,
+                            Some("ile razy ponawiać"),
+                        ),
+                        workflow_input("dry_run", ParamType::Boolean, false, None),
+                    ],
+                ),
+                vec![workspace("target_repo", None)],
             ),
             catalogue_workflow(
                 "fix-bug",
@@ -9729,7 +9732,7 @@ mod task_app_create {
                 [
                     TICKET_FIELD,
                     TITLE_FIELD,
-                    "target_repo",
+                    "target_repo · repozytorium",
                     "target_repo · gałąź",
                     "ticket_id",
                     "attempts",
@@ -9752,11 +9755,19 @@ mod task_app_create {
         /// of a new task lists them.
         fn field_names(
             inputs: Vec<narsor_engine::controller_protocol::WorkflowInputView>,
+            workspaces: &[&str],
         ) -> Vec<String> {
             let mut app = app_with(vec![]);
             ch(&mut app, 'n');
+            let workspaces = workspaces
+                .iter()
+                .map(|name| workspace(name, None))
+                .collect();
             app.open_new_task(
-                catalogue(vec![catalogue_workflow("flow", "Opis.", inputs)]),
+                catalogue(vec![with_workspaces(
+                    catalogue_workflow("flow", "Opis.", inputs),
+                    workspaces,
+                )]),
                 narsor_registry(),
             );
             chooser_item(&app, "flow")
@@ -9767,19 +9778,23 @@ mod task_app_create {
         }
 
         #[test]
-        fn the_main_text_field_is_last_and_the_repository_follows_the_title() {
-            let names = field_names(vec![
-                workflow_input("prompt", ParamType::Text, true, None),
-                workflow_input("dry_run", ParamType::Boolean, false, None),
-                workflow_input("repository", ParamType::Repository, false, None),
-            ]);
+        fn the_main_text_field_is_last_and_the_workspaces_follow_the_title_in_file_order() {
+            let names = field_names(
+                vec![
+                    workflow_input("prompt", ParamType::Text, true, None),
+                    workflow_input("dry_run", ParamType::Boolean, false, None),
+                ],
+                &["code", "docs"],
+            );
             assert_eq!(
                 names,
                 [
                     "Ticket",
                     "Tytuł",
-                    "repository",
-                    "repository · gałąź",
+                    "code · repozytorium",
+                    "code · gałąź",
+                    "docs · repozytorium",
+                    "docs · gałąź",
                     "dry_run",
                     "prompt"
                 ]
@@ -9789,21 +9804,24 @@ mod task_app_create {
         #[test]
         fn a_workflow_without_a_repository_or_a_text_field_leaves_no_gap() {
             assert_eq!(
-                field_names(vec![
-                    workflow_input("dry_run", ParamType::Boolean, false, None),
-                    workflow_input("prompt", ParamType::Text, false, None),
-                ]),
+                field_names(
+                    vec![
+                        workflow_input("dry_run", ParamType::Boolean, false, None),
+                        workflow_input("prompt", ParamType::Text, false, None),
+                    ],
+                    &[],
+                ),
                 ["Ticket", "Tytuł", "dry_run", "prompt"]
             );
             assert_eq!(
-                field_names(vec![
-                    workflow_input("repository", ParamType::Repository, false, None),
-                    workflow_input("count", ParamType::Integer, false, None),
-                ]),
+                field_names(
+                    vec![workflow_input("count", ParamType::Integer, false, None)],
+                    &["repository"],
+                ),
                 [
                     "Ticket",
                     "Tytuł",
-                    "repository",
+                    "repository · repozytorium",
                     "repository · gałąź",
                     "count"
                 ]
@@ -9813,11 +9831,14 @@ mod task_app_create {
         #[test]
         fn the_required_text_field_is_the_main_one_and_ticket_id_is_an_ordinary_input() {
             assert_eq!(
-                field_names(vec![
-                    workflow_input("notes", ParamType::Text, false, None),
-                    workflow_input("prompt", ParamType::Text, true, None),
-                    workflow_input("ticket_id", ParamType::String, false, None),
-                ]),
+                field_names(
+                    vec![
+                        workflow_input("notes", ParamType::Text, false, None),
+                        workflow_input("prompt", ParamType::Text, true, None),
+                        workflow_input("ticket_id", ParamType::String, false, None),
+                    ],
+                    &[],
+                ),
                 ["Ticket", "Tytuł", "notes", "ticket_id", "prompt"]
             );
         }
@@ -10199,6 +10220,7 @@ mod task_app_create {
                     state_count: 0,
                     initial_state: None,
                     inputs: vec![],
+                    workspaces: vec![],
                     violations: vec![
                         "state 'plan' has no transition for output 'ok'".to_string(),
                         "state 'ship' is not reachable".to_string(),
@@ -10242,6 +10264,7 @@ mod task_app_create {
                     state_count: 2,
                     initial_state: Some("start".to_string()),
                     inputs: vec![workflow_input("ticket", ParamType::String, true, None)],
+                    workspaces: vec![],
                     violations: vec![],
                 }),
             );
@@ -10275,6 +10298,7 @@ mod task_app_create {
                 CreateHow::Path {
                     workflow: "/srv/ok.yaml".to_string(),
                     inputs: json!({ "ticket": "NAR-3" }).as_object().unwrap().clone(),
+                    workspaces: Default::default(),
                     ticket: None,
                     title: None,
                 }
@@ -10369,8 +10393,13 @@ mod task_app_create {
                     "ticket_id": "NAR-18",
                     "attempts": 3,
                     "dry_run": false,
-                    "target_repo": "docs",
                 })
+            );
+            assert_eq!(
+                request.launch.workspaces["target_repo"]
+                    .repository
+                    .as_deref(),
+                Some("docs")
             );
         }
 
@@ -10992,8 +11021,9 @@ mod task_app_create {
         }
     }
 
-    /// The branch of each repository input: preselected, suggested from the
-    /// server's list, typed freely, and sent only when it is a choice.
+    /// The repository and branch of each workspace the workflow leaves to be
+    /// chosen: the branch preselected, suggested from the server's list,
+    /// typed freely, and sent as it stands.
     mod branch_field {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
@@ -11001,7 +11031,7 @@ mod task_app_create {
         use super::*;
         use narsor::api::{BranchRead, BranchSource};
         use narsor::tui::chooser::FieldKind;
-        use narsor::tui::input_form::branch_field_name;
+        use narsor::tui::input_form::{branch_field_name, repository_field_name};
 
         /// The branches the server would list, by repository id; a repository
         /// that is not in the map fails to list.
@@ -11046,8 +11076,12 @@ mod task_app_create {
             }
         }
 
-        fn branch_of(input: &str) -> String {
-            branch_field_name(input)
+        fn branch_of(workspace: &str) -> String {
+            branch_field_name(workspace)
+        }
+
+        fn repository_of(workspace: &str) -> String {
+            repository_field_name(workspace)
         }
 
         fn repository_with(
@@ -11082,15 +11116,14 @@ mod task_app_create {
             opened(app, workflows(), repositories).await;
         }
 
-        fn two_repository_inputs() -> WorkflowListResponse {
-            catalogue(vec![catalogue_workflow(
-                "compare",
-                "Porównuje dwa repozytoria.",
-                vec![
-                    workflow_input("ticket_id", ParamType::String, true, None),
-                    workflow_input("code", ParamType::Repository, false, None),
-                    workflow_input("docs_repo", ParamType::Repository, false, None),
-                ],
+        fn two_workspaces() -> WorkflowListResponse {
+            catalogue(vec![with_workspaces(
+                catalogue_workflow(
+                    "compare",
+                    "Porównuje dwa repozytoria.",
+                    vec![workflow_input("ticket_id", ParamType::String, true, None)],
+                ),
+                vec![workspace("code", None), workspace("docs_repo", None)],
             )])
         }
 
@@ -11141,8 +11174,8 @@ mod task_app_create {
                 .collect()
         }
 
-        /// What the form sends for the workflow it is on, with the ticket
-        /// filled in.
+        /// The branches the form sends for the workflow it is on, with the
+        /// ticket filled in, by workspace.
         fn sent_branches(app: &mut TaskApp) -> std::collections::BTreeMap<String, String> {
             let Request::SendTask(_) = enter_until_send(app) else {
                 panic!("a send was expected");
@@ -11150,7 +11183,12 @@ mod task_app_create {
             let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
                 panic!("a workflow of the catalogue goes through the control plane");
             };
-            request.launch.branches.clone()
+            request
+                .launch
+                .workspaces
+                .iter()
+                .filter_map(|(name, choice)| Some((name.clone(), choice.branch.clone()?)))
+                .collect()
         }
 
         /// Types the ticket into the field under the one the keys are in,
@@ -11161,7 +11199,8 @@ mod task_app_create {
         }
 
         #[tokio::test]
-        async fn a_repository_input_has_a_branch_field_right_after_it_that_starts_on_the_default() {
+        async fn a_workspace_has_a_branch_field_right_after_its_repository_that_starts_on_the_default(
+        ) {
             let remotes = Remotes::listing(&[("docs", &["develop", "main"])]);
             let mut app = app_reading(&remotes);
             open_default(
@@ -11182,7 +11221,7 @@ mod task_app_create {
                 [
                     "Ticket".to_string(),
                     "Tytuł".to_string(),
-                    "target_repo".to_string(),
+                    repository_of("target_repo"),
                     branch_of("target_repo"),
                     "ticket_id".to_string(),
                     "attempts".to_string(),
@@ -11196,7 +11235,7 @@ mod task_app_create {
             assert_eq!(
                 chooser_item(&app, "fix-bug").fields.len(),
                 3,
-                "a workflow without a repository input has no branch field"
+                "a workflow without a workspace to choose has no branch field"
             );
         }
 
@@ -11321,7 +11360,7 @@ mod task_app_create {
             press(&mut app, KeyCode::Up);
             key(&mut app, KeyCode::Right).await;
             assert_eq!(
-                field_value(&app, "implement-feature", "target_repo"),
+                field_value(&app, "implement-feature", &repository_of("target_repo")),
                 "narsor"
             );
             assert_eq!(field_value(&app, "implement-feature", &name), "trunk");
@@ -11333,12 +11372,12 @@ mod task_app_create {
         }
 
         #[tokio::test]
-        async fn two_repository_inputs_have_two_independent_branch_fields() {
+        async fn two_workspaces_have_two_independent_branch_fields() {
             let remotes = Remotes::listing(&[("docs", &["main", "a"]), ("narsor", &["main", "b"])]);
             let mut app = app_reading(&remotes);
             opened(
                 &mut app,
-                two_repository_inputs(),
+                two_workspaces(),
                 vec![
                     repository_with("docs", Some("main")),
                     repository_with("narsor", Some("main")),
@@ -11355,15 +11394,15 @@ mod task_app_create {
                 [
                     "Ticket".to_string(),
                     "Tytuł".to_string(),
-                    "code".to_string(),
+                    repository_of("code"),
                     branch_of("code"),
-                    "docs_repo".to_string(),
+                    repository_of("docs_repo"),
                     branch_of("docs_repo"),
                     "ticket_id".to_string(),
                 ]
             );
             // The second repository is another one.
-            go_to(&mut app, "compare", "docs_repo");
+            go_to(&mut app, "compare", &repository_of("docs_repo"));
             key(&mut app, KeyCode::Right).await;
             press(&mut app, KeyCode::Down);
             erase(&mut app, 4);
@@ -11372,13 +11411,17 @@ mod task_app_create {
             fill_ticket_below(&mut app);
             assert_eq!(
                 sent_branches(&mut app),
-                [("docs_repo".to_string(), "b".to_string())].into(),
-                "the first input kept its default, so it sends nothing"
+                [
+                    ("code".to_string(), "main".to_string()),
+                    ("docs_repo".to_string(), "b".to_string())
+                ]
+                .into(),
+                "each workspace sends the branch it shows"
             );
         }
 
         #[tokio::test]
-        async fn a_repository_without_a_default_starts_empty_and_sends_nothing_untouched() {
+        async fn a_repository_without_a_default_starts_empty_and_sends_no_branch_untouched() {
             let remotes = Remotes::listing(&[("docs", &["master"])]);
             let mut app = app_reading(&remotes);
             open_default(&mut app, vec![repository_with("docs", None)]).await;
@@ -11404,29 +11447,53 @@ mod task_app_create {
         }
 
         #[tokio::test]
-        async fn an_untouched_form_sends_no_branches_and_asks_nothing_when_left() {
+        async fn an_untouched_form_sends_the_branch_it_shows_and_asks_nothing_when_left() {
             let remotes = Remotes::listing(&[("docs", &["main"])]);
             let mut app = app_reading(&remotes);
             open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
             assert_eq!(app.new_task_form().unwrap().draft_text(), "");
             fill_ticket(&mut app, "NAR-18");
-            assert!(sent_branches(&mut app).is_empty());
+            let Request::SendTask(_) = enter_until_send(&mut app) else {
+                panic!("a send was expected");
+            };
+            let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
+                panic!("a workflow of the catalogue goes through the control plane");
+            };
+            assert_eq!(
+                request.launch.workspaces,
+                [(
+                    "target_repo".to_string(),
+                    WorkspaceRequest {
+                        repository: Some("docs".to_string()),
+                        branch: Some("main".to_string()),
+                        commit: None,
+                    }
+                )]
+                .into()
+            );
         }
 
         #[tokio::test]
-        async fn typing_the_default_back_is_no_choice_and_sends_nothing() {
-            let remotes = Remotes::listing(&[("docs", &["main", "develop"])]);
+        async fn the_base_branch_of_the_workspace_is_suggested_whatever_the_repository() {
+            let remotes = Remotes::listing(&[("docs", &["main"]), ("narsor", &["trunk"])]);
             let mut app = app_reading(&remotes);
-            open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
-            let name = branch_of("target_repo");
-            go_to(&mut app, "implement-feature", &name);
-            erase(&mut app, 4);
-            typed(&mut app, "develop");
-            assert_ne!(app.new_task_form().unwrap().draft_text(), "");
-            erase(&mut app, 7);
-            typed(&mut app, "main");
-            fill_ticket_below(&mut app);
-            assert!(sent_branches(&mut app).is_empty());
+            opened(
+                &mut app,
+                catalogue(vec![with_workspaces(
+                    catalogue_workflow("flow", "Opis.", vec![]),
+                    vec![workspace("code", Some("jojo"))],
+                )]),
+                vec![
+                    repository_with("docs", Some("main")),
+                    repository_with("narsor", Some("trunk")),
+                ],
+            )
+            .await;
+            assert_eq!(field_value(&app, "flow", &branch_of("code")), "jojo");
+            go_to(&mut app, "flow", &repository_of("code"));
+            key(&mut app, KeyCode::Right).await;
+            assert_eq!(field_value(&app, "flow", &repository_of("code")), "narsor");
+            assert_eq!(field_value(&app, "flow", &branch_of("code")), "jojo");
         }
 
         #[tokio::test]
@@ -11446,7 +11513,7 @@ mod task_app_create {
         }
 
         #[tokio::test]
-        async fn a_workflow_file_has_no_branch_field() {
+        async fn a_workflow_file_asks_for_its_workspaces_too() {
             let remotes = Remotes::listing(&[("docs", &["main"])]);
             let mut app = app_reading(&remotes);
             open_default(&mut app, vec![repository_with("docs", Some("main"))]).await;
@@ -11461,20 +11528,24 @@ mod task_app_create {
                     version: Some(4),
                     state_count: 2,
                     initial_state: Some("start".to_string()),
-                    inputs: vec![workflow_input("repo", ParamType::Repository, false, None)],
+                    inputs: vec![],
+                    workspaces: vec![workspace("repo", None)],
                     violations: vec![],
                 }),
             );
             let item = chooser_item(&app, PATH_LABEL);
-            assert!(item.fields.iter().any(|field| field.name == "repo"));
-            assert!(
-                !item
-                    .fields
-                    .iter()
-                    .any(|field| matches!(field.kind, FieldKind::Suggest(_))),
-                "{:?}",
-                item.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+            let names: Vec<&str> = item.fields.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    PATH_FIELD,
+                    TICKET_FIELD,
+                    TITLE_FIELD,
+                    repository_of("repo").as_str(),
+                    branch_of("repo").as_str()
+                ]
             );
+            assert!(matches!(item.fields[4].kind, FieldKind::Suggest(_)));
         }
     }
 

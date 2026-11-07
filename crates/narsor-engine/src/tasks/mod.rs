@@ -129,6 +129,11 @@ pub enum TaskError {
         violations: Vec<String>,
     },
 
+    /// The workflow leaves a repository to be chosen when the task is
+    /// created, which this path cannot ask for.
+    #[error("workspace '{0}' needs a repository chosen when the task is created")]
+    ChosenRepository(String),
+
     /// A `{{ ... }}` inside `globals.workspace` could not be expanded.
     #[error("Could not expand the workspace template: {0}")]
     Template(#[from] TemplateError),
@@ -330,12 +335,16 @@ pub fn start_task_with(
 /// Builds the workspace request from the definition, expanding templates in it.
 ///
 /// `None` means the definition declares no workspace and the fallback directory
-/// is used.
+/// is used. A repository chosen when the task is created has no place here:
+/// such a workflow runs through the launch resolver only.
 pub fn workspace_request(
     catalog: &Path,
     definition: &WorkflowDefinition,
     inputs: &Map<String, Value>,
 ) -> Result<Option<WorkspaceRequest>> {
+    if let Some(chosen) = definition.chosen_repositories().next() {
+        return Err(TaskError::ChosenRepository(chosen.name.clone()));
+    }
     let Some(spec) = definition.primary_workspace_spec() else {
         return Ok(None);
     };

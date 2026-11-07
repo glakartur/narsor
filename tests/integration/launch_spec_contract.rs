@@ -63,32 +63,44 @@ fn every_serialized_key_exists_in_the_envelope() {
     assert!(envelope.ticket.is_some() && envelope.title.is_some() && envelope.definition.is_some());
 }
 
-fn launch_request(branches: serde_json::Value) -> serde_json::Value {
+fn launch_request(workspaces: serde_json::Value) -> serde_json::Value {
     let mut value = serde_json::json!({
         "workflow_id": "wf",
         "workflow_version": 1,
         "inputs": {"code": "app"},
     });
-    if !branches.is_null() {
-        value["branches"] = branches;
+    if !workspaces.is_null() {
+        value["workspaces"] = workspaces;
     }
     value
 }
 
 #[test]
-fn a_launch_request_without_branches_serializes_exactly_as_before() {
+fn a_launch_request_without_workspaces_serializes_exactly_as_before() {
     let plain = launch_request(serde_json::Value::Null);
     let request: LaunchRequest = serde_json::from_value(plain.clone()).unwrap();
-    assert!(request.branches.is_empty());
+    assert!(request.workspaces.is_empty());
     assert_eq!(serde_json::to_value(&request).unwrap(), plain);
 }
 
 #[test]
-fn a_launch_request_carries_a_branch_per_input() {
-    let with = launch_request(serde_json::json!({"code": "develop"}));
+fn a_launch_request_carries_a_choice_per_workspace() {
+    let with =
+        launch_request(serde_json::json!({"code": {"repository": "app", "branch": "develop"}}));
     let request: LaunchRequest = serde_json::from_value(with.clone()).unwrap();
-    assert_eq!(request.branches["code"], "develop");
+    assert_eq!(
+        request.workspaces["code"].branch.as_deref(),
+        Some("develop")
+    );
     assert_eq!(serde_json::to_value(&request).unwrap(), with);
+}
+
+#[test]
+fn a_launch_request_with_the_former_branches_key_is_refused() {
+    let former = launch_request(serde_json::Value::Null);
+    let mut former = former;
+    former["branches"] = serde_json::json!({"code": "develop"});
+    assert!(serde_json::from_value::<LaunchRequest>(former).is_err());
 }
 
 fn sealed_with(definition_yaml: &str) -> TaskLaunchSpec {

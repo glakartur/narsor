@@ -27,9 +27,9 @@ use std::path::Path;
 
 use crate::domain::{
     ActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel, PromptPart, PromptText,
-    RepositorySource, SchemaVersion, State, StateId, ValidationError, VariableDefinition,
-    VariableScope, VariableSource, VariableType, WorkflowDefinition, LOCAL_VARIABLE_PREFIX,
-    TIMEOUT_LABEL, WORKSPACE_ROOT,
+    RepositoryDefinition, RepositorySource, SchemaVersion, State, StateId, ValidationError,
+    VariableDefinition, VariableScope, VariableSource, VariableType, WorkflowDefinition,
+    LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
 use crate::workspace::provisioner::is_usable_directory_name;
 
@@ -1017,8 +1017,10 @@ fn repository_field(definition: &WorkflowDefinition, name: &str, field: &str) ->
 }
 
 /// The rules of `globals.workspaces`: usable and distinct names, exactly one
-/// primary repository, a branch for every registered one, and templates that
-/// only name declared inputs.
+/// primary repository, and sources as [`validate_repository_source`] says.
+///
+/// `base_branch` is optional: without it a task starts on the branch chosen
+/// in the new-task form or on the registry's default branch.
 fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<ValidationError>) {
     let invalid =
         |field: String, reason: String| ValidationError::InvalidRepository { field, reason };
@@ -1039,35 +1041,9 @@ fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<Valid
                     format!("the name '{}' is used more than once", repository.name),
                 ));
             }
-            if matches!(repository.source, RepositorySource::Git { .. })
-                && repository.base_branch.as_deref().is_none_or(str::is_empty)
-            {
-                errors.push(invalid(
-                    repository_field(definition, &repository.name, "base_branch"),
-                    "a registered repository needs a base branch".to_string(),
-                ));
-            }
         }
 
-        let (field, text) = match &repository.source {
-            RepositorySource::Git { repository } => ("repository", repository.as_str()),
-            RepositorySource::Local { path } => ("path", path.as_str()),
-        };
-        let field = repository_field(definition, &repository.name, field);
-        for variable in extract_input_references(text) {
-            if !declares_input(definition, &variable) {
-                errors.push(ValidationError::UnknownInputReferenceInGlobals {
-                    field: field.clone(),
-                    variable,
-                });
-            }
-        }
-        if !step_reply_references(text).is_empty() || !step_stream_references(text).is_empty() {
-            errors.push(ValidationError::InvalidDisplay {
-                field,
-                reason: "step values are not supported in workspace fields".to_string(),
-            });
-        }
+        validate_repository_source(definition, repository, errors);
     }
 
     if definition.source_schema == SchemaVersion::V2 && !definition.repositories.is_empty() {
@@ -1082,6 +1058,68 @@ fn validate_repositories(definition: &WorkflowDefinition, errors: &mut Vec<Valid
                 format!("exactly one repository must be primary, found {primaries}"),
             ));
         }
+    }
+}
+
+/// The rules of where one repository comes from: a registry id is never a
+/// template (a repository the owner picks is chosen when the task is
+/// created), a local path names only declared inputs, and the branch the form
+/// suggests for a chosen repository is plain text.
+fn validate_repository_source(
+    definition: &WorkflowDefinition,
+    repository: &RepositoryDefinition,
+    errors: &mut Vec<ValidationError>,
+) {
+    let field = |name: &str| repository_field(definition, &repository.name, name);
+    match &repository.source {
+        RepositorySource::Git { repository: id } if id.contains("{{") => {
+            errors.push(ValidationError::InvalidRepository {
+                field: field("repository"),
+                reason: "a repository is a registry id, not a template; leave 'repository' \
+                         out to choose it when the task is created"
+                    .to_string(),
+            });
+        }
+        RepositorySource::Git { .. } => {}
+        RepositorySource::Local { path } => {
+            validate_local_path(definition, field("path"), path, errors)
+        }
+        RepositorySource::Chosen => {
+            if repository
+                .base_branch
+                .as_deref()
+                .is_some_and(|branch| branch.contains("{{"))
+            {
+                errors.push(ValidationError::InvalidRepository {
+                    field: field("base_branch"),
+                    reason: "the branch suggested for a chosen repository cannot be a template"
+                        .to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// A local path may name declared inputs, never step values.
+fn validate_local_path(
+    definition: &WorkflowDefinition,
+    field: String,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    for variable in extract_input_references(path) {
+        if !declares_input(definition, &variable) {
+            errors.push(ValidationError::UnknownInputReferenceInGlobals {
+                field: field.clone(),
+                variable,
+            });
+        }
+    }
+    if !step_reply_references(path).is_empty() || !step_stream_references(path).is_empty() {
+        errors.push(ValidationError::InvalidDisplay {
+            field,
+            reason: "step values are not supported in workspace fields".to_string(),
+        });
     }
 }
 
@@ -1216,13 +1254,6 @@ fn extract_input_references(text: &str) -> Vec<String> {
     }
 
     references
-}
-
-/// The input a template names and nothing else: `{{ inputs.x }}` gives `x`,
-/// while `{{ inputs.x }}/y` or a filtered expression gives `None`.
-pub(crate) fn sole_input_reference(template: &str) -> Option<String> {
-    let inner = template.trim().strip_prefix("{{")?.strip_suffix("}}")?;
-    plain_input_reference(inner.trim())
 }
 
 /// Returns the input name of a bare `inputs.<name>` expression, or `None` for
@@ -1380,7 +1411,7 @@ globals:
 
     fn repository_errors(repositories: &str) -> Vec<String> {
         let header = format!(
-            "schema: v2\nname: r\nversion: 1\ninputs:\n  - {{ name: repo, type: repository }}\nglobals:\n  workspaces:\n{repositories}"
+            "schema: v2\nname: r\nversion: 1\ninputs:\n  - {{ name: dir }}\nglobals:\n  workspaces:\n{repositories}"
         );
         errors_of(&header, "")
             .iter()
@@ -1418,8 +1449,23 @@ globals:
     }
 
     #[test]
-    fn a_registered_v2_repository_needs_a_base_branch() {
+    fn a_registered_v2_repository_needs_no_base_branch() {
         let errors = repository_errors("    a: { primary: true, repository: r }\n");
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn a_workspace_without_a_source_is_valid_and_may_suggest_a_branch() {
+        let errors = repository_errors(
+            "    a: { primary: true, description: the code, base_branch: jojo }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn a_branch_suggested_for_a_chosen_repository_is_not_a_template() {
+        let errors =
+            repository_errors("    a: { primary: true, base_branch: \"{{ inputs.dir }}\" }\n");
         assert!(
             errors
                 .iter()
@@ -1429,14 +1475,26 @@ globals:
     }
 
     #[test]
-    fn an_undeclared_input_in_a_v2_source_names_the_v2_field() {
+    fn a_templated_v2_repository_is_refused_naming_the_v2_field() {
         let errors = repository_errors(
-            "    a: { primary: true, base_branch: main, repository: \"{{ inputs.ghost }}\" }\n",
+            "    a: { primary: true, base_branch: main, repository: \"{{ inputs.dir }}\" }\n",
         );
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("globals.workspaces.a.repository") && e.contains("ghost")),
+                .any(|e| e.contains("globals.workspaces.a.repository")
+                    && e.contains("leave 'repository' out")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_input_in_a_v2_path_names_the_v2_field() {
+        let errors = repository_errors("    a: { primary: true, path: \"{{ inputs.ghost }}\" }\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("globals.workspaces.a.path") && e.contains("ghost")),
             "{errors:?}"
         );
     }
@@ -1454,7 +1512,7 @@ globals:
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("globals.workspace.repository") && e.contains("ghost")),
+                .any(|e| e.contains("globals.workspace.repository") && e.contains("template")),
             "{errors:?}"
         );
         assert!(

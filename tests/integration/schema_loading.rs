@@ -229,10 +229,7 @@ fn inputs_keep_their_declared_types() {
     assert_eq!(feature.name, "description");
     assert_eq!(feature.param_type, ParamType::String);
     assert!(feature.required);
-
-    let repo = &definition.inputs[1];
-    assert_eq!(repo.name, "target_repo");
-    assert_eq!(repo.param_type, ParamType::Repository);
+    assert_eq!(definition.inputs.len(), 1);
 }
 
 #[test]
@@ -280,7 +277,7 @@ fn global_workspace_becomes_a_definition_level_spec() {
             git_ref,
             preserve_paths,
         } => {
-            assert_eq!(repository, "{{ inputs.target_repo }}");
+            assert_eq!(repository, "target-repo");
             assert_eq!(git_ref.as_deref(), Some("main"));
             assert!(preserve_paths.is_empty());
         }

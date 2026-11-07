@@ -15,7 +15,7 @@ use crate::tui::form::field::{
     clip, fill_padding, header_line, repository_branch_line, value_lines, value_rows, RowFocus,
 };
 use crate::tui::form::layout::{text_width, window_start, wrap};
-use crate::tui::input_form::branch_field_name;
+use crate::tui::input_form::branch_field_of;
 use crate::tui::scroll::{one_line, sanitize};
 use crate::tui::style::{Role, Styles};
 
@@ -214,7 +214,7 @@ fn has_branch_after(fields: &[ChooserField], index: usize) -> bool {
     matches!(field.kind, FieldKind::Select(_))
         && fields
             .get(index + 1)
-            .is_some_and(|next| next.name == branch_field_name(&field.name))
+            .is_some_and(|next| Some(&next.name) == branch_field_of(&field.name).as_ref())
 }
 
 /// Whether field `index` is the branch drawn on its repository's row.
