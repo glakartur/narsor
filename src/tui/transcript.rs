@@ -3,11 +3,12 @@
 //! Source adapters own their records and actions. This module only keeps the
 //! reading position stable while a conversation grows or changes presentation.
 
-use narsor_protocol::chat::SubagentRef;
+use narsor_protocol::chat::{SubagentRef, UNNAMED_SUBAGENT};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use super::form::field::clip;
 use super::scroll::{one_line, wrap_line, ScrollState};
 
 /// Stable identity of a conversation, normally an attempt or chat id.
@@ -524,9 +525,6 @@ fn subagent_threads(entries: &[TranscriptEntry]) -> Vec<SubagentThread> {
     threads
 }
 
-/// What a subagent is called when it has no name of its own.
-const UNNAMED_SUBAGENT: &str = "subagent";
-
 /// The name of the subagent at `order` (from 0) as one safe line. A missing
 /// name, and a name another subagent also has, get the subagent's number so
 /// the groups stay apart.
@@ -558,17 +556,8 @@ fn subagent_header(name: &str, members: usize, failures: usize, width: usize) ->
     if failures > 0 {
         tail.push_str(&format!(" · błędy: {failures}"));
     }
-    // The fold marker and its space come before the header.
     let room = width.saturating_sub(2 + tail.chars().count()).max(1);
-    let shown = if name.chars().count() <= room {
-        name.to_owned()
-    } else {
-        name.chars()
-            .take(room - 1)
-            .chain(std::iter::once('…'))
-            .collect()
-    };
-    format!("{shown}{tail}")
+    format!("{}{tail}", clip(name, room))
 }
 
 /// The Polish form of a noun after `count`: one, a few, many.

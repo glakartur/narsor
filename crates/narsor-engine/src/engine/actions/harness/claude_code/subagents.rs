@@ -6,11 +6,8 @@
 
 use std::collections::HashMap;
 
-use narsor_protocol::chat::SubagentRef;
+use narsor_protocol::chat::{SubagentRef, UNNAMED_SUBAGENT};
 use serde_json::{Map, Value};
-
-/// The name of a subagent whose call has neither a description nor a type.
-const UNNAMED_SUBAGENT: &str = "subagent";
 
 /// The tools that start a subagent.
 const SUBAGENT_TOOLS: [&str; 2] = ["Task", "Agent"];

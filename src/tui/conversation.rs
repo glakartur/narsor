@@ -676,8 +676,6 @@ mod tests {
         );
     }
 
-    // --- subagent groups ---
-
     fn subagent(id: &str, name: &str) -> SubagentRef {
         SubagentRef {
             id: id.into(),

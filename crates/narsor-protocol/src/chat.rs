@@ -20,6 +20,10 @@ pub const SUMMARY_MAX_CHARS: usize = 200;
 /// Appended to a summary cut at [`SUMMARY_MAX_CHARS`].
 const SUMMARY_ELLIPSIS: char = '…';
 
+/// The name of a subagent whose call has neither a description nor a type.
+/// The adapter writes it and the views number it instead of showing it as is.
+pub const UNNAMED_SUBAGENT: &str = "subagent";
+
 /// The subagent a conversation line or a tool call came from.
 ///
 /// Harness-independent: the stream parser of each harness fills it in, so

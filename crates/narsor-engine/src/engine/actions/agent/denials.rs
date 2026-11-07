@@ -5,7 +5,7 @@ use crate::engine::actions::answer::AnswerShape;
 use crate::engine::actions::harness::{HarnessRun, PermissionDenial};
 
 /// The denials of a run, split by whether they stop the step.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct DenialSplit<'a> {
     pub blocking: Vec<&'a PermissionDenial>,
     pub ignored: Vec<&'a PermissionDenial>,
@@ -15,6 +15,9 @@ pub(super) struct DenialSplit<'a> {
 /// final answer. A denial of a subagent never does: the engine talks to the
 /// main agent only.
 pub(super) fn split_denials(run: &HarnessRun, shape: AnswerShape) -> DenialSplit<'_> {
+    if run.permission_denials.is_empty() {
+        return DenialSplit::default();
+    }
     let answered = has_usable_final_answer(run, shape);
     let (ignored, blocking) = run
         .permission_denials
