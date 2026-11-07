@@ -7,9 +7,10 @@
 use serde_json::Value;
 
 use crate::domain::{Event, EventData, InputCloseReason};
+use narsor_protocol::chat::SubagentRef;
 use narsor_protocol::display::TRUNCATION_MARKER;
 
-use super::scroll::sanitize;
+use super::scroll::{one_line, sanitize};
 
 /// A one-line description of an event, for the stream panel.
 pub fn event_line(event: &Event) -> String {
@@ -203,7 +204,12 @@ pub fn event_line(event: &Event) -> String {
             "agent_session_failed  {error} (attempt {})",
             short_id(action_execution_id.as_deref())
         ),
-        EventData::PermissionDeniedIgnored { .. } => "permission_denied_ignored".to_string(),
+        EventData::PermissionDeniedIgnored {
+            tool_name,
+            summary,
+            source,
+            ..
+        } => ignored_denial_row(tool_name, summary, source.as_ref()),
         EventData::AgentMessage {
             role,
             content,
@@ -227,13 +233,93 @@ pub fn event_line(event: &Event) -> String {
 /// The first line of a multi-line string, trimmed and elided, so a long
 /// agent message cannot break the one-line-per-event stream panel.
 fn first_line(text: &str) -> String {
-    const LIMIT: usize = 80;
-    let line = text.lines().next().unwrap_or("").trim();
-    if line.chars().count() <= LIMIT {
-        return line.to_string();
+    elide(text.lines().next().unwrap_or(""), 80)
+}
+
+/// `text` trimmed and cut to `limit` characters, with an ellipsis when cut.
+fn elide(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= limit {
+        return text.to_string();
     }
-    let cut: String = line.chars().take(LIMIT).collect();
+    let cut: String = text.chars().take(limit).collect();
     format!("{cut}…")
+}
+
+/// The row of a permission denial that did not stop the step:
+/// `odmowa pominięta · <source> · <tool> · <key parameter>`.
+///
+/// The source comes before the key parameter and only the key parameter is
+/// cut at the end, so on a narrow terminal the operator still sees who was
+/// denied. A part that is empty leaves no separator behind.
+fn ignored_denial_row(tool_name: &str, summary: &str, source: Option<&SubagentRef>) -> String {
+    const NAME_LIMIT: usize = 40;
+    const KEY_LIMIT: usize = 80;
+
+    let source = match source {
+        None => "agent".to_string(),
+        Some(subagent) => join_present(
+            &["subagent", &elide(&one_line(&subagent.name), NAME_LIMIT)],
+            " ",
+        ),
+    };
+    let tool = elide(&one_line(tool_name), NAME_LIMIT);
+    let key = elide(&one_line(summary), KEY_LIMIT);
+    join_present(&["odmowa pominięta", &source, &tool, &key], " · ")
+}
+
+/// The parts that are not empty, joined by `separator`.
+fn join_present(parts: &[&str], separator: &str) -> String {
+    let present: Vec<&str> = parts
+        .iter()
+        .copied()
+        .filter(|part| !part.is_empty())
+        .collect();
+    present.join(separator)
+}
+
+/// Readable lines for the detail window of an ignored denial, above the
+/// full event dump: tool, ids, reason and the whole key parameter.
+fn ignored_denial_detail_lines(data: &EventData) -> Vec<String> {
+    let EventData::PermissionDeniedIgnored {
+        action_execution_id,
+        tool_name,
+        tool_use_id,
+        summary,
+        reason,
+        source,
+        ..
+    } = data
+    else {
+        return Vec::new();
+    };
+
+    let source = match source {
+        Some(subagent) => format!("subagent {} ({})", subagent.name, subagent.id),
+        None => "agent".to_string(),
+    };
+    let mut fields = vec![
+        ("źródło", source),
+        ("narzędzie", tool_name.clone()),
+        ("id wywołania", tool_use_id.clone()),
+        ("id próby", action_execution_id.clone().unwrap_or_default()),
+        ("powód", reason.clone().unwrap_or_default()),
+        ("wejście", summary.clone()),
+    ];
+    fields.retain(|(_, value)| !value.trim().is_empty());
+
+    let mut lines: Vec<String> = fields
+        .iter()
+        .flat_map(|(label, value)| {
+            let text = format!("{label}: {value}");
+            sanitize(&text)
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    lines.push(String::new());
+    lines
 }
 
 /// A value set by the workflow, on one short line: a string as it is,
@@ -274,6 +360,8 @@ pub fn event_detail_lines(event: &Event) -> Vec<String> {
             lines.push(String::new());
         }
     }
+
+    lines.extend(ignored_denial_detail_lines(&event.data));
 
     let value = serde_json::to_value(event).unwrap_or(Value::Null);
     let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
