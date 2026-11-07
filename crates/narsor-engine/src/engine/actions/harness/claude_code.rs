@@ -62,6 +62,7 @@
 //! the workflow contract portable instead of exposing Claude-specific modes.
 
 mod classify;
+mod subagents;
 mod tools;
 mod usage;
 
@@ -78,7 +79,7 @@ use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
 use crate::engine::actions::agent;
 use crate::engine::actions::answer::AnswerShape;
-use narsor_protocol::chat::ChatElement;
+use narsor_protocol::chat::{ChatElement, SubagentRef};
 use narsor_protocol::controller::UsageLimit;
 
 /// The `harness:` value this adapter answers to.
@@ -256,6 +257,8 @@ struct ClaudeCodeStreamParser {
     answer_shape: AnswerShape,
     /// Turns lines into chat elements; remembers tool calls by id.
     classifier: classify::Classifier,
+    /// Tells which lines and denials belong to a subagent.
+    subagents: subagents::SubagentTracker,
     /// The earliest session id seen, from `system`/`init` or `result`.
     session_id: Option<String>,
     /// Whether a `result` line was ever seen — its absence is itself a
@@ -289,6 +292,20 @@ impl ClaudeCodeStreamParser {
         }
     }
 
+    /// Adds the denials not yet seen. A `result` line may list a denial an
+    /// earlier one listed already; one denial counts once, by its call id.
+    fn keep_new_denials(&mut self, denials: &[PermissionDenial]) {
+        for denial in denials {
+            let known = self
+                .permission_denials
+                .iter()
+                .any(|kept| kept.tool_use_id == denial.tool_use_id);
+            if !known {
+                self.permission_denials.push(denial.clone());
+            }
+        }
+    }
+
     /// Folds one parsed stdout line into what
     /// [`HarnessStreamParser::finish`] needs; lines that carry none of it
     /// are ignored. `result` is what [`classify::ResultLine::take`] read
@@ -303,7 +320,7 @@ impl ClaudeCodeStreamParser {
 
         let Some(result) = result else {
             if object.get("type").and_then(Value::as_str) == Some("assistant")
-                && object.get("parent_tool_use_id").is_none_or(Value::is_null)
+                && subagents::parent_call_id(object).is_none()
             {
                 if let Some(content) = object
                     .get("message")
@@ -369,7 +386,7 @@ impl ClaudeCodeStreamParser {
                 .and_then(|text| agent::closing_answer(text, self.answer_shape))
                 .map(|(value, kind)| (value, Some(kind)))
         };
-        self.permission_denials = result.permission_denials.clone();
+        self.keep_new_denials(&result.permission_denials);
         let Some((value, kind)) = answered else {
             // Neither the answer nor the text it came from is replaced.
             if result.is_error || self.structured_output.is_none() {
@@ -414,9 +431,11 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
                 );
             }
         }
+        self.subagents.observe(&object);
         let mut result = classify::ResultLine::take(&mut object);
         if let Some(result) = result.as_mut() {
             for denial in &mut result.permission_denials {
+                denial.subagent = self.subagents.subagent_of_call(&denial.tool_use_id);
                 if let Some((reason_type, reason)) = self.denial_reasons.get(&denial.tool_use_id) {
                     denial.reason_type = reason_type.clone();
                     denial.reason = reason.clone();
@@ -437,6 +456,10 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
 
     fn take_usage(&mut self) -> Option<Vec<UsageLimit>> {
         self.usage.take()
+    }
+
+    fn last_line_subagent(&self) -> Option<SubagentRef> {
+        self.subagents.last_line()
     }
 
     fn final_answer(&self) -> Option<FinalAnswer> {

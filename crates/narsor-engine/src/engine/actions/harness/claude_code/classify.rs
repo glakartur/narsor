@@ -90,10 +90,13 @@ impl ResultLine {
                 entries
                     .iter()
                     .filter_map(|entry| {
+                        let tool_name = entry.get("tool_name")?.as_str()?.to_string();
+                        let input = entry.get("tool_input")?.clone();
                         Some(PermissionDenial {
-                            tool_name: entry.get("tool_name")?.as_str()?.to_string(),
+                            summary: call_summary(&tool_name, &input),
+                            tool_name,
                             tool_use_id: entry.get("tool_use_id")?.as_str()?.to_string(),
-                            input: entry.get("tool_input")?.clone(),
+                            input,
                             reason_type: entry
                                 .get("decision_reason_type")
                                 .and_then(Value::as_str)
@@ -107,7 +110,6 @@ impl ResultLine {
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
                             subagent: None,
-                            summary: String::new(),
                         })
                     })
                     .collect()

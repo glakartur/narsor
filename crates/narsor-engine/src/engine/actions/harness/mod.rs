@@ -265,6 +265,13 @@ pub trait HarnessStreamParser: Send {
         None
     }
 
+    /// The subagent that wrote the last line fed to [`Self::on_stdout_line`];
+    /// `None` when the main agent did, and always for a harness that does not
+    /// tell subagents apart (the default).
+    fn last_line_subagent(&self) -> Option<SubagentRef> {
+        None
+    }
+
     /// The final answer the stream has delivered so far, once a `result`
     /// line has carried one. The executor ends the step shortly after it,
     /// whether or not the process has exited. `None` for a harness that

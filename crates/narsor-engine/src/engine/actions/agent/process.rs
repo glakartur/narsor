@@ -248,14 +248,23 @@ async fn spawn_and_wait(
     let (answered_tx, mut answered_rx) = tokio::sync::watch::channel(false);
 
     let stdout_task = stream_lines(&mut stdout_pipe, |line| {
-        let elements = if line.len() <= PARSE_LINE_LIMIT {
-            parser.on_stdout_line(line)
+        let (elements, subagent) = if line.len() <= PARSE_LINE_LIMIT {
+            let elements = parser.on_stdout_line(line);
+            (elements, parser.last_line_subagent())
         } else {
-            vec![ChatElement::Unclassified {
+            let too_large = vec![ChatElement::Unclassified {
                 reason: UnclassifiedReason::TooLarge,
-            }]
+            }];
+            (too_large, None)
         };
-        record_stdout_line(parser.as_mut(), conversation, usage, line, &elements);
+        record_stdout_line(
+            parser.as_mut(),
+            conversation,
+            usage,
+            line,
+            &elements,
+            subagent.as_ref(),
+        );
         let ends_step = match parser.final_answer() {
             Some(FinalAnswer::Choice) => true,
             Some(FinalAnswer::AwaitingInput) => KILL_AFTER_QUESTION,
@@ -267,7 +276,12 @@ async fn spawn_and_wait(
     });
 
     let stderr_task = stream_lines(&mut stderr_pipe, |line| {
-        conversation.append(ConversationSource::Stderr, line, &[stderr_element(line)]);
+        conversation.append(
+            ConversationSource::Stderr,
+            line,
+            &[stderr_element(line)],
+            None,
+        );
         accumulate_capped(&mut stderr_capture, line, MAX_BUFFERED_OUTPUT_BYTES);
         accumulate_capped(&mut stderr_capture, b"\n", MAX_BUFFERED_OUTPUT_BYTES);
     });
