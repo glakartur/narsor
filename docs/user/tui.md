@@ -229,7 +229,7 @@ the current step or a draft.
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `c` `r`, `h` default harness, `L` task limit |
 | Details | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
-| — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all |
+| — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry (a subagent's group `▸` / `▾` too), `v` raw entry, `Ctrl+V` raw all |
 | — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |
 | Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold (with the server's forms: next form), `1`–`9` choose, `[` / `]` previous / next waiting (not with the server's forms) |
 | Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |

@@ -600,7 +600,8 @@ fn print_conversation_entry(entry: &crate::api::ConversationEntryDto) {
 /// is narsor's own and needs no summary. An unclassified element (an
 /// opencode or codex line, a legacy record) says why, followed by the start
 /// of its raw line on the same line — the summary alone would hide what the
-/// harness printed.
+/// harness printed. A line a subagent wrote is indented by two spaces and its
+/// text starts with `↳ [name]`.
 pub fn conversation_entry_lines(entry: &crate::api::ConversationEntryDto) -> Vec<String> {
     let narsor = matches!(entry.source, crate::api::ConversationEntrySource::Narsor);
     classify(entry)
@@ -629,14 +630,31 @@ pub fn conversation_entry_lines(entry: &crate::api::ConversationEntryDto) -> Vec
             } else {
                 crate::tui::scroll::sanitize(&classified.summary)
             };
-            format!(
-                "{:>5}  {}  {:<10} {body}",
+            let line = format!(
+                "{:>5}  {}  {:<10} {}{body}",
                 classified.entry_number,
                 classified.timestamp.to_rfc3339(),
                 classified.kind.label(),
-            )
+                subagent_prefix(classified.subagent.as_ref()),
+            );
+            if classified.subagent.is_some() {
+                format!("  {line}")
+            } else {
+                line
+            }
         })
         .collect()
+}
+
+/// `↳ [name] ` before the text of a line a subagent wrote; nothing for the
+/// main agent. The name is one safe line, as in the TUI.
+fn subagent_prefix(subagent: Option<&narsor_protocol::chat::SubagentRef>) -> String {
+    subagent.map_or_else(String::new, |subagent| {
+        format!(
+            "↳ [{}] ",
+            crate::tui::scroll::one_line(&subagent.name).trim()
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------

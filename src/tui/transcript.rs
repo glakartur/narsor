@@ -3,11 +3,12 @@
 //! Source adapters own their records and actions. This module only keeps the
 //! reading position stable while a conversation grows or changes presentation.
 
+use narsor_protocol::chat::SubagentRef;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::scroll::{wrap_line, ScrollState};
+use super::scroll::{one_line, wrap_line, ScrollState};
 
 /// Stable identity of a conversation, normally an attempt or chat id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -147,6 +148,12 @@ pub struct TranscriptEntry {
     /// Source-neutral runner state metadata used to recognize a safe, contiguous
     /// summary card. Adapters decide which harness events qualify.
     grouping: Option<TranscriptGrouping>,
+    /// The subagent this entry came from; none for the main agent. Entries
+    /// of one subagent are shown as one group, whatever stands between them.
+    pub subagent: Option<SubagentRef>,
+    /// The header of a subagent group: a header line only, with a fold
+    /// marker, no body.
+    group_header: bool,
     /// Source identities represented by this item. A normal card has one;
     /// a Conversation summary card has every source event it collapsed.
     source_ids: Vec<TranscriptEntryId>,
@@ -184,8 +191,16 @@ impl TranscriptEntry {
             raw: raw.into(),
             shares_previous_raw: false,
             grouping: None,
+            subagent: None,
+            group_header: false,
             source_ids,
         }
+    }
+
+    /// Marks this entry as coming from `subagent` (none: the main agent).
+    pub fn with_subagent(mut self, subagent: Option<SubagentRef>) -> Self {
+        self.subagent = subagent;
+        self
     }
 
     /// Marks [`Self::raw`] as the source line of the entry before this one,
@@ -317,6 +332,8 @@ pub struct TranscriptLine {
     pub presentation: TranscriptPresentation,
     pub header: bool,
     pub indented: bool,
+    /// Inside a subagent group: drawn two columns further in.
+    pub nested: bool,
     pub selected: bool,
     /// Part of a workflow choice card; every wrapped fragment keeps it.
     pub workflow_choice: bool,
@@ -327,7 +344,12 @@ pub struct TranscriptLine {
 /// The fragments of `line` at `width`: one clipped fragment for a line that
 /// is one line by nature.
 fn fragments(line: &TranscriptLine, width: usize) -> Vec<String> {
-    let width = wrapped_width(line.indented, width);
+    let width = wrapped_width(line.indented, width).saturating_sub(if line.nested {
+        NESTED_INDENT
+    } else {
+        0
+    });
+    let width = width.max(1);
     if !line.clipped {
         return wrap_line(&line.text, width);
     }
@@ -374,6 +396,7 @@ pub fn wrap_visible_lines(
                 presentation: line.presentation,
                 header: line.header && fragment == 0,
                 indented: line.indented,
+                nested: line.nested,
                 // The cursor is a vertical rail for the whole entry. Headers
                 // only own their first wrapped fragment, but body fragments
                 // all remain visibly selected.
@@ -466,6 +489,95 @@ fn is_error_entry(entry: &TranscriptEntry) -> bool {
                 .get("error.message")
                 .is_some_and(|error| !error.is_null() && error != "")
         })
+}
+
+/// Columns a subagent group's entries are drawn further in.
+const NESTED_INDENT: usize = 2;
+
+/// The entries of one subagent, in the order they were recorded.
+struct SubagentThread {
+    subagent: SubagentRef,
+    /// Position of the first entry among all entries.
+    first: usize,
+    members: Vec<TranscriptEntry>,
+}
+
+/// One thread per subagent id, in the order of each subagent's first entry.
+fn subagent_threads(entries: &[TranscriptEntry]) -> Vec<SubagentThread> {
+    let mut threads: Vec<SubagentThread> = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        let Some(subagent) = &entry.subagent else {
+            continue;
+        };
+        match threads
+            .iter_mut()
+            .find(|thread| thread.subagent.id == subagent.id)
+        {
+            Some(thread) => thread.members.push(entry.clone()),
+            None => threads.push(SubagentThread {
+                subagent: subagent.clone(),
+                first: position,
+                members: vec![entry.clone()],
+            }),
+        }
+    }
+    threads
+}
+
+/// What a subagent is called when it has no name of its own.
+const UNNAMED_SUBAGENT: &str = "subagent";
+
+/// The name of the subagent at `order` (from 0) as one safe line. A missing
+/// name, and a name another subagent also has, get the subagent's number so
+/// the groups stay apart.
+fn subagent_name(order: usize, threads: &[SubagentThread]) -> String {
+    let clean = |thread: &SubagentThread| one_line(&thread.subagent.name).trim().to_owned();
+    let name = clean(&threads[order]);
+    let unnamed = name.is_empty() || name == UNNAMED_SUBAGENT;
+    let repeated = threads
+        .iter()
+        .filter(|thread| clean(thread) == name)
+        .count()
+        > 1;
+    match (unnamed, repeated) {
+        (true, _) => format!("{UNNAMED_SUBAGENT} {}", order + 1),
+        (false, true) => format!("{name} {}", order + 1),
+        (false, false) => name,
+    }
+}
+
+/// `name · N wpisy · błędy: F`, on one line at `width`: the name is cut with
+/// `…`, the rest never is. No run state is shown: the stream carries no
+/// reliable end signal for a subagent (a background one answers its `Task`
+/// call at once and keeps running).
+fn subagent_header(name: &str, members: usize, failures: usize, width: usize) -> String {
+    let mut tail = format!(
+        " · {members} {}",
+        plural(members, ["wpis", "wpisy", "wpisów"])
+    );
+    if failures > 0 {
+        tail.push_str(&format!(" · błędy: {failures}"));
+    }
+    // The fold marker and its space come before the header.
+    let room = width.saturating_sub(2 + tail.chars().count()).max(1);
+    let shown = if name.chars().count() <= room {
+        name.to_owned()
+    } else {
+        name.chars()
+            .take(room - 1)
+            .chain(std::iter::once('…'))
+            .collect()
+    };
+    format!("{shown}{tail}")
+}
+
+/// The Polish form of a noun after `count`: one, a few, many.
+fn plural(count: usize, forms: [&'static str; 3]) -> &'static str {
+    match (count, count % 10, count % 100) {
+        (1, _, _) => forms[0],
+        (_, 2..=4, tens) if !(12..=14).contains(&tens) => forms[1],
+        _ => forms[2],
+    }
 }
 
 fn wrapped_width(indented: bool, width: usize) -> usize {
@@ -777,6 +889,7 @@ impl TranscriptState {
                     presentation: TranscriptPresentation::Neutral,
                     header: false,
                     indented: false,
+                    nested: false,
                     selected: false,
                     workflow_choice: false,
                     clipped: false,
@@ -945,10 +1058,111 @@ impl TranscriptState {
             DisplayMode::Chronology => return self.entries.clone(),
             DisplayMode::Raw => return self.raw_lines(),
         }
+        if self.entries.iter().all(|entry| entry.subagent.is_none()) {
+            return self.fold_contiguous_groups(&self.entries);
+        }
+        self.fold_subagent_threads()
+    }
+
+    /// The main thread folded as before, with each subagent's entries
+    /// gathered into one group at the place of the subagent's first entry.
+    /// The main thread is folded without the subagent entries, so a tool
+    /// call and its result stay one operation card around a subagent's run.
+    fn fold_subagent_threads(&self) -> Vec<TranscriptEntry> {
+        let main: Vec<TranscriptEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.subagent.is_none())
+            .cloned()
+            .collect();
+        let threads = subagent_threads(&self.entries);
+        let position: HashMap<&TranscriptEntryId, usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (&entry.id, index))
+            .collect();
+        let mut projected = Vec::new();
+        let mut waiting = threads.iter().enumerate().peekable();
+        for entry in self.fold_contiguous_groups(&main) {
+            let at = entry
+                .source_ids
+                .iter()
+                .filter_map(|id| position.get(id))
+                .min()
+                .copied()
+                .unwrap_or(0);
+            while let Some((order, thread)) = waiting.next_if(|(_, thread)| thread.first < at) {
+                projected.extend(self.subagent_block(order, thread, &threads));
+            }
+            projected.push(entry);
+        }
+        for (order, thread) in waiting {
+            projected.extend(self.subagent_block(order, thread, &threads));
+        }
+        projected
+    }
+
+    /// The group header of one subagent and, while it is open, its entries
+    /// folded like the main thread's, so each stays expandable by itself.
+    fn subagent_block(
+        &self,
+        order: usize,
+        thread: &SubagentThread,
+        threads: &[SubagentThread],
+    ) -> Vec<TranscriptEntry> {
+        let id = TranscriptEntryId::from(format!("subagent/{}", thread.subagent.id));
+        let open = self.expanded.contains(&self.expansion_identity(&id));
+        let failures = thread
+            .members
+            .iter()
+            .filter(|member| is_error_entry(member))
+            .count();
+        let header = subagent_header(
+            &subagent_name(order, threads),
+            thread.members.len(),
+            failures,
+            self.width,
+        );
+        let raw: Arc<[u8]> = thread
+            .members
+            .iter()
+            .enumerate()
+            .flat_map(|(index, member)| {
+                (index > 0)
+                    .then_some(b'\n')
+                    .into_iter()
+                    .chain(member.raw.iter().copied())
+            })
+            .collect();
+        let mut group = TranscriptEntry::new(id, Vec::new(), raw)
+            .with_header(header)
+            .with_presentation(TranscriptPresentation::Technical)
+            .with_clipped_head();
+        group.group_header = true;
+        if !open {
+            group.source_ids = std::iter::once(group.id.clone())
+                .chain(
+                    thread
+                        .members
+                        .iter()
+                        .flat_map(|member| member.source_ids.clone()),
+                )
+                .collect();
+            return vec![group];
+        }
+        let mut block = vec![group];
+        block.extend(self.fold_contiguous_groups(&thread.members));
+        block
+    }
+
+    /// Folds contiguous technical events and correlated tool operations of
+    /// `entries` into summary and operation cards.
+    fn fold_contiguous_groups(&self, entries: &[TranscriptEntry]) -> Vec<TranscriptEntry> {
         let mut projected = Vec::new();
         let mut cursor = 0;
-        while cursor < self.entries.len() {
-            let entry = &self.entries[cursor];
+        while cursor < entries.len() {
+            let entry = &entries[cursor];
             let Some(grouping) = entry.grouping.as_ref() else {
                 projected.push(entry.clone());
                 cursor += 1;
@@ -976,14 +1190,14 @@ impl TranscriptState {
                         })
                 };
                 if grouping.phase.as_deref() != Some("started") {
-                    let started_before = self.entries[..cursor].iter().any(|candidate| {
+                    let started_before = entries[..cursor].iter().any(|candidate| {
                         same_operation(candidate)
                             && candidate.grouping.as_ref().is_some_and(|metadata| {
                                 metadata.phase.as_deref() == Some("started")
                             })
                     });
                     if started_before {
-                        let start = self.entries[..cursor]
+                        let start = entries[..cursor]
                             .iter()
                             .rposition(|candidate| {
                                 same_operation(candidate)
@@ -992,7 +1206,7 @@ impl TranscriptState {
                                     })
                             })
                             .expect("started operation exists");
-                        let group_identity = self.expansion_identity(&self.entries[start].id);
+                        let group_identity = self.expansion_identity(&entries[start].id);
                         if self
                             .revealed_members
                             .get(&group_identity)
@@ -1007,7 +1221,7 @@ impl TranscriptState {
                     continue;
                 }
                 let mut members = vec![entry];
-                if let Some(completed) = self.entries[cursor + 1..].iter().find(|candidate| {
+                if let Some(completed) = entries[cursor + 1..].iter().find(|candidate| {
                     same_operation(candidate)
                         && candidate
                             .grouping
@@ -1066,8 +1280,8 @@ impl TranscriptState {
                 continue;
             }
             let mut end = cursor;
-            while end < self.entries.len() {
-                let candidate = &self.entries[end];
+            while end < entries.len() {
+                let candidate = &entries[end];
                 let Some(candidate_grouping) = candidate.grouping.as_ref() else {
                     break;
                 };
@@ -1083,7 +1297,7 @@ impl TranscriptState {
                 cursor += 1;
                 continue;
             }
-            let members = &self.entries[cursor..end];
+            let members = &entries[cursor..end];
             let group_identity = self.expansion_identity(&entry.id);
             let included: Vec<_> = self
                 .revealed_members
@@ -1198,6 +1412,8 @@ impl TranscriptState {
         // Raw views show source bytes, not the choice card, so only the
         // rendered card carries the highlight.
         let card = self.mode != DisplayMode::Raw && !self.is_raw(&entry.id);
+        let nested =
+            self.mode == DisplayMode::Rendered && entry.subagent.is_some() && !entry.group_header;
         let lines =
             match self.mode {
                 DisplayMode::Raw => {
@@ -1214,6 +1430,18 @@ impl TranscriptState {
                             raw_display(&entry.raw),
                             TranscriptPresentation::Neutral,
                             false,
+                            false,
+                        )]
+                    } else if entry.group_header {
+                        let marker = if self.is_expanded(&entry.id) {
+                            "▾"
+                        } else {
+                            "▸"
+                        };
+                        vec![(
+                            format!("{marker} {}", entry.header),
+                            entry.presentation,
+                            true,
                             false,
                         )]
                     } else {
@@ -1272,6 +1500,7 @@ impl TranscriptState {
                     presentation,
                     header,
                     indented,
+                    nested,
                     selected: self.selected.as_ref() == Some(&entry.id),
                     workflow_choice: card && entry.workflow_choice,
                     clipped: card
@@ -1723,6 +1952,7 @@ mod tests {
             presentation: TranscriptPresentation::Agent,
             header: false,
             indented: true,
+            nested: false,
             selected: true,
             workflow_choice: false,
             clipped: false,
