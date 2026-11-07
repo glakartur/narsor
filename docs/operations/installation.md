@@ -127,6 +127,10 @@ until you restart them. Non-interactive installation never stops anything
 unless you pass `--stop-running`; without it the installer only prints the
 list. `--stop-running` also skips the question in an interactive run.
 
+`--progress` shows a progress bar while the release archive downloads
+(`curl --progress-bar`, or `wget --show-progress`); without it the download is
+silent.
+
 `--update-bashrc` explicitly opts into adding the binary directory to
 `~/.bashrc`. Without it, non-interactive installation never changes a shell
 startup file. The line carries a `# narsor-installer` marker so uninstall can

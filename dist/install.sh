@@ -3,14 +3,15 @@
 #
 # Instalacja:    install.sh [wersja] [--role local|frontend|server] [--bin-dir KATALOG]
 #                           [--with-frontend] [--update-bashrc] [--non-interactive]
-#                           [--stop-running]
+#                           [--stop-running] [--progress]
 #                           [opcje narsor-cli init, np. --data-dir, --config-file]
 # Odinstalowanie: install.sh --uninstall [--purge] [--bin-dir KATALOG]
 #                           [--data-dir KATALOG] [--config-file PLIK] [--non-interactive]
 #
 # Skrypt pobiera i weryfikuje archiwum, kopiuje binaria i (za zgodą) dopisuje
 # katalog do ~/.bashrc. Gdy działają już procesy Narsora, pyta, czy je zatrzymać
-# (--stop-running robi to bez pytania). Konfigurację tworzy `narsor-cli init`: pyta o katalog
+# (--stop-running robi to bez pytania). --progress pokazuje pasek postępu
+# pobierania archiwum. Konfigurację tworzy `narsor-cli init`: pyta o katalog
 # główny danych (domyślnie ~/.narsor; w pliku trafiają catalog_dir, state_dir
 # i work_dir). Istniejącej konfiguracji nie rusza: obok zapisuje config.yaml.new.
 set -euo pipefail
@@ -32,7 +33,7 @@ usage() {
 Instalacja:
   install.sh [wersja] [--role local|frontend|server] [--bin-dir KATALOG]
              [--with-frontend] [--update-bashrc] [--non-interactive]
-             [--stop-running]
+             [--stop-running] [--progress]
              [opcje narsor-cli init, np. --data-dir, --config-file]
 Odinstalowanie:
   install.sh --uninstall [--purge] [--bin-dir KATALOG]
@@ -283,13 +284,18 @@ install() {
     fi
 
     if command -v curl >/dev/null 2>&1; then
+        # Trzeci argument "progress": pasek postępu zamiast trybu cichego.
         download() {
-            curl --fail --location --proto '=https' --proto-redir '=https' --silent --show-error \
+            local quiet=(--silent --show-error)
+            [[ "${3:-}" == progress ]] && quiet=(--progress-bar)
+            curl --fail --location --proto '=https' --proto-redir '=https' "${quiet[@]}" \
                 "$1" --output "$2"
         }
     elif command -v wget >/dev/null 2>&1; then
         download() {
-            wget --https-only --quiet "$1" --output-document="$2"
+            local quiet=(--quiet)
+            [[ "${3:-}" == progress ]] && quiet=(--quiet --show-progress)
+            wget --https-only "${quiet[@]}" "$1" --output-document="$2"
         }
     else
         fail "curl or wget is required"
@@ -298,7 +304,7 @@ install() {
     work_dir="$(mktemp -d)"
     # Zmienna lokalna znika przed EXIT, więc ścieżka jest wstawiana od razu.
     trap "rm -rf -- $(shell_quote "$work_dir")" EXIT
-    download "$base_url/$archive" "$work_dir/$archive"
+    download "$base_url/$archive" "$work_dir/$archive" "$( ((show_progress)) && printf progress)"
     download "$base_url/$archive.sha256" "$work_dir/$archive.sha256"
 
     (cd "$work_dir" && sha256sum --check "$archive.sha256") || fail "release archive checksum verification failed"
@@ -369,7 +375,7 @@ install() {
 }
 
 main() {
-    local role= bin_dir= with_frontend=0 update_bashrc=0 non_interactive=0 stop_running=0
+    local role= bin_dir= with_frontend=0 update_bashrc=0 non_interactive=0 stop_running=0 show_progress=0
     local uninstall_mode=0 purge=0 interactive=0
     local -a passthrough=()
 
@@ -389,6 +395,7 @@ main() {
             --with-frontend) with_frontend=1; shift ;;
             --update-bashrc) update_bashrc=1; shift ;;
             --stop-running) stop_running=1; shift ;;
+            --progress) show_progress=1; shift ;;
             --non-interactive) non_interactive=1; shift ;;
             --uninstall) uninstall_mode=1; shift ;;
             --purge) purge=1; shift ;;
