@@ -118,6 +118,15 @@ with the effective value are rejected. If an effective system-wide config is
 not writable, the interactive installer asks for another target. A
 non-interactive invocation must use a writable `--config-file`.
 
+If Narsor processes (`narsor`, `narsor-server`, `narsor-controller`,
+`narsor-runner`) of your user are already running, the installer lists them
+before it replaces the binaries and asks whether to stop them. Stopping them
+interrupts running tasks. A stopped process gets `SIGTERM` and 10 seconds to
+exit, then `SIGKILL`. If you answer no, they keep running the previous version
+until you restart them. Non-interactive installation never stops anything
+unless you pass `--stop-running`; without it the installer only prints the
+list. `--stop-running` also skips the question in an interactive run.
+
 `--update-bashrc` explicitly opts into adding the binary directory to
 `~/.bashrc`. Without it, non-interactive installation never changes a shell
 startup file. The line carries a `# narsor-installer` marker so uninstall can
