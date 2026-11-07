@@ -23,7 +23,7 @@ execution: code
 
 ### Summary
 
-Każdy krok w widoku Przebieg (oś kroków i nagłówek kroku) oraz w widoku Rozmowa (pasek kroków i nagłówki w transkrypcie) ma ikonę rodzaju przed nazwą, np. `✨ implement #1`, `⚡🔀 triage #1`, `📜 test #2`. Ikona to część wyświetlanej nazwy kroku. Pierwsza ikona mówi, kto wykonuje krok. Druga ikona (🔀) jest tylko przy kroku `decision`. Krok `wait` ma tylko ✋. Ikona pochodzi tylko z definicji workflow, nie ze stanu przebiegu.
+Każdy krok o znanym rodzaju (R1–R4) w widoku Przebieg (oś kroków i nagłówek kroku) oraz w widoku Rozmowa (pasek kroków i nagłówki w transkrypcie) ma ikonę rodzaju przed nazwą, np. `✨ implement #1`, `⚡🔀 triage #1`, `📜 test #2`. Kroki o nieznanym rodzaju (R6) i stan końcowy nie mają ikony. Ikona to część wyświetlanej nazwy kroku. Dla agenta, skryptu i decyzji pierwsza ikona mówi, kto wykonuje krok (R1–R3). Druga ikona (🔀) jest tylko przy kroku `decision`. Krok `wait` ma tylko ✋. Ikona pochodzi tylko z definicji workflow, nie ze stanu przebiegu.
 
 ### Problem Frame
 
@@ -33,7 +33,7 @@ Dziś TUI pokazuje przy kroku tylko status (`✓`, `✗`, `●`, `?`) i nazwę (
 
 - **Ikona = "kto" + opcjonalnie "co".** Pierwsza ikona to wykonawca kroku (✨ agent, ⚡ dyrygent, 🧑 człowiek, 📜 skrypt). Druga ikona to 🔀 (krok `decision`). Najwięcej dwie ikony. Wyjątek: krok `wait` nie ma wykonawcy, więc ma tylko ikonę ✋ (R4). Governs R1–R5.
 - **🔀 ma tylko krok `decision`.** Nie badamy liczby wyjść kroku. Agent i skrypt mają zawsze jedną ikonę. Governs R1–R3.
-- **Źródło ikony to definicja workflow, której zadanie używa.** TUI nie zgaduje ikony ze statusu ani z nazwy kroku. Status (`✓`, `●`, `?`) zostaje osobnym znakiem przed ikoną. Governs R6–R8.
+- **Źródło ikony to definicja workflow, której zadanie używa.** TUI nie zgaduje ikony ze statusu ani z nazwy kroku. Status (`✓`, `●`, `?`) zostaje osobnym znakiem przed ikoną. Governs R6, R11.
 
 ### Requirements
 
@@ -113,3 +113,13 @@ Te pozycje to wyniki recenzji pozostawione autorowi. Nie blokują implementacji.
 
   Dyrygent, który nie jest pewny decyzji, przekazuje krok operatorowi. Wtedy operator musi działać, ale ikona `⚡🔀` dalej mówi, że decyduje dyrygent. Dokument nie mówi, czy to jest akceptowane.
   Change: Zalecenie: zostawić ikonę stałą (R11) i zapisać w założeniach, że oczekiwanie na operatora pokazuje znak statusu `?`, a nie ikona.
+
+- **Widok Rozmowa nie ma tekstowego klucza do ikon** — R9 (typ tekstem tylko w nagłówku Przebiegu) (P3, design-lens, confidence 50)
+
+  Operator, który pracuje tylko w Rozmowie, widzi ✨, ⚡, 📜, 🔀, ale nie ma tekstu, który potwierdza ich znaczenie. Znaczenie ⚡ (dyrygent) i 📜 (skrypt) nie jest oczywiste.
+  Change: Dodać jednowierszowy klucz ikon w stopce albo pomocy, albo typ akcji tekstem w nagłówku kroku w Rozmowie. Wymaga decyzji autora.
+
+- **R10 nie pokazuje statusu w wierszu listy zadań i w nagłówku zadania** — R10 i Z5 (P3, coherence, confidence 50)
+
+  Z5 mówi, że status jest pierwszym znakiem. Przykład `krok N · ✨ nazwa` w R10 nie ma statusu. Implementer może wybrać różne układy.
+  Change: Zapisać w R10, czy status stoi przed „krok N”, albo że R10 go nie dotyczy.
