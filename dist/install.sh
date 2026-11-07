@@ -3,12 +3,15 @@
 #
 # Instalacja:    install.sh [wersja] [--role local|frontend|server] [--bin-dir KATALOG]
 #                           [--with-frontend] [--update-bashrc] [--non-interactive]
+#                           [--stop-running] [--progress]
 #                           [opcje narsor-cli init, np. --data-dir, --config-file]
 # Odinstalowanie: install.sh --uninstall [--purge] [--bin-dir KATALOG]
 #                           [--data-dir KATALOG] [--config-file PLIK] [--non-interactive]
 #
 # Skrypt pobiera i weryfikuje archiwum, kopiuje binaria i (za zgodą) dopisuje
-# katalog do ~/.bashrc. Konfigurację tworzy `narsor-cli init`: pyta o katalog
+# katalog do ~/.bashrc. Gdy działają już procesy Narsora, pyta, czy je zatrzymać
+# (--stop-running robi to bez pytania). --progress pokazuje pasek postępu
+# pobierania archiwum. Konfigurację tworzy `narsor-cli init`: pyta o katalog
 # główny danych (domyślnie ~/.narsor; w pliku trafiają catalog_dir, state_dir
 # i work_dir). Istniejącej konfiguracji nie rusza: obok zapisuje config.yaml.new.
 set -euo pipefail
@@ -30,6 +33,7 @@ usage() {
 Instalacja:
   install.sh [wersja] [--role local|frontend|server] [--bin-dir KATALOG]
              [--with-frontend] [--update-bashrc] [--non-interactive]
+             [--stop-running] [--progress]
              [opcje narsor-cli init, np. --data-dir, --config-file]
 Odinstalowanie:
   install.sh --uninstall [--purge] [--bin-dir KATALOG]
@@ -159,6 +163,77 @@ remove_from_bashrc() {
     printf "Removed '%s' from %s.\n" "$1" "$bashrc"
 }
 
+# Procesy Narsora tego użytkownika: plik wykonywalny (/proc/PID/exe) nazywa się
+# jak jedna z naszych binariów. Nazwa z `comm` się nie nadaje, bo jądro obcina
+# ją do 15 znaków (narsor-controller ma 16). Wypisuje wiersze "PID<TAB>ścieżka".
+# Pomija sam instalator i jego rodzica.
+running_narsor_processes() {
+    local exe pid path name known
+    for exe in /proc/[0-9]*/exe; do
+        pid=${exe#/proc/}
+        pid=${pid%/exe}
+        ((pid == $$ || pid == PPID)) && continue
+        path="$(readlink "$exe" 2>/dev/null)" || continue
+        path=${path% (deleted)}
+        name=${path##*/}
+        for known in "${all_binaries[@]}"; do
+            if [[ "$name" == "$known" ]]; then
+                printf '%s\t%s\n' "$pid" "$path"
+                break
+            fi
+        done
+    done
+}
+
+# SIGTERM, do 10 s czekania, potem SIGKILL dla tych, które nie wyszły.
+stop_processes() {
+    local pid waited=0
+    local -a alive=("$@")
+    kill -TERM "${alive[@]}" 2>/dev/null || true
+    while ((waited < 10)); do
+        local -a still=()
+        for pid in "${alive[@]}"; do
+            kill -0 "$pid" 2>/dev/null && still+=("$pid")
+        done
+        alive=(${still[@]+"${still[@]}"})
+        ((${#alive[@]} == 0)) && return 0
+        sleep 1
+        waited=$((waited + 1))
+    done
+    printf 'Still running after 10 s, sending SIGKILL: %s\n' "${alive[*]}" >&2
+    kill -KILL "${alive[@]}" 2>/dev/null || true
+}
+
+# Wymiana binariów nie przerywa działających procesów (zachowują stary plik do
+# końca), ale pracują na starej wersji. Pytamy więc, czy je zatrzymać.
+handle_running_processes() {
+    local line pid path answer
+    local -a lines=() pids=()
+    mapfile -t lines < <(running_narsor_processes)
+    ((${#lines[@]})) || return 0
+    printf 'Narsor is running (%d process(es)):\n' "${#lines[@]}"
+    for line in "${lines[@]}"; do
+        pid=${line%%$'\t'*}
+        path=${line#*$'\t'}
+        pids+=("$pid")
+        printf '  %s  %s\n' "$pid" "$path"
+    done
+    if ((!stop_running)); then
+        if ((interactive)); then
+            answer="$(ask 'Stop them before installing? Running tasks are interrupted. [y/N]: ')"
+            case "${answer,,}" in y|yes) stop_running=1 ;; esac
+        else
+            printf 'Not stopping them; pass --stop-running to do so.\n'
+        fi
+    fi
+    if ((stop_running)); then
+        stop_processes "${pids[@]}"
+        printf 'Stopped %d process(es).\n' "${#pids[@]}"
+    else
+        printf 'They keep running the previous version until you restart them.\n'
+    fi
+}
+
 install_binaries() {
     local source_dir=$1 destination=$2 name
     shift 2
@@ -209,13 +284,18 @@ install() {
     fi
 
     if command -v curl >/dev/null 2>&1; then
+        # Trzeci argument "progress": pasek postępu zamiast trybu cichego.
         download() {
-            curl --fail --location --proto '=https' --proto-redir '=https' --silent --show-error \
+            local quiet=(--silent --show-error)
+            [[ "${3:-}" == progress ]] && quiet=(--progress-bar)
+            curl --fail --location --proto '=https' --proto-redir '=https' "${quiet[@]}" \
                 "$1" --output "$2"
         }
     elif command -v wget >/dev/null 2>&1; then
         download() {
-            wget --https-only --quiet "$1" --output-document="$2"
+            local quiet=(--quiet)
+            [[ "${3:-}" == progress ]] && quiet=(--quiet --show-progress)
+            wget --https-only "${quiet[@]}" "$1" --output-document="$2"
         }
     else
         fail "curl or wget is required"
@@ -224,7 +304,7 @@ install() {
     work_dir="$(mktemp -d)"
     # Zmienna lokalna znika przed EXIT, więc ścieżka jest wstawiana od razu.
     trap "rm -rf -- $(shell_quote "$work_dir")" EXIT
-    download "$base_url/$archive" "$work_dir/$archive"
+    download "$base_url/$archive" "$work_dir/$archive" "$( ((show_progress)) && printf progress)"
     download "$base_url/$archive.sha256" "$work_dir/$archive.sha256"
 
     (cd "$work_dir" && sha256sum --check "$archive.sha256") || fail "release archive checksum verification failed"
@@ -274,6 +354,7 @@ install() {
 
     local -a binaries
     mapfile -t binaries < <(binaries_for_role)
+    handle_running_processes
     install_binaries "$work_dir" "$bin_dir" "${binaries[@]}"
 
     if ! path_contains "$bin_dir"; then
@@ -294,7 +375,7 @@ install() {
 }
 
 main() {
-    local role= bin_dir= with_frontend=0 update_bashrc=0 non_interactive=0
+    local role= bin_dir= with_frontend=0 update_bashrc=0 non_interactive=0 stop_running=0 show_progress=0
     local uninstall_mode=0 purge=0 interactive=0
     local -a passthrough=()
 
@@ -313,6 +394,8 @@ main() {
             --bin-dir=*) bin_dir=${1#*=}; shift ;;
             --with-frontend) with_frontend=1; shift ;;
             --update-bashrc) update_bashrc=1; shift ;;
+            --stop-running) stop_running=1; shift ;;
+            --progress) show_progress=1; shift ;;
             --non-interactive) non_interactive=1; shift ;;
             --uninstall) uninstall_mode=1; shift ;;
             --purge) purge=1; shift ;;

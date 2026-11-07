@@ -28,9 +28,12 @@ cargo build --workspace --bins --release
 ```
 
 Ignored tests drive the real `claude` binary (they cost money and need
-credentials), start `narsor-controller` processes, or need a live Kubernetes
-cluster (the smoke test also requires its documented `NARSOR_K8S_SMOKE_*`
-environment variables).
+credentials), start `narsor-controller` processes, start the stub runner
+processes of the local backend contract suite (`backend_contract::local`), or
+need a live Kubernetes cluster (the smoke test also requires its documented
+`NARSOR_K8S_SMOKE_*` environment variables). The default `cargo test` and CI do
+not run them; run `cargo test -p narsor --test integration backend_contract --
+--include-ignored` after a change to the local backend.
 
 ### Test layout
 

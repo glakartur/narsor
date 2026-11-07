@@ -13,7 +13,7 @@ by this artifact.
 Run the installer of the newest release and follow its prompts:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh | bash
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh | bash
 ```
 
 The URL pins a release tag because every release is currently published as a
@@ -25,7 +25,7 @@ without a version.
 To select a different version, pass its tag to the script:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh |
   bash -s -- v1.2.3
 ```
 
@@ -75,7 +75,7 @@ configuration file is used, or the user's default config path if none exists.
 Use `--config-file` to choose another file explicitly:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh |
   bash -s -- --role frontend --non-interactive \
     --bin-dir /usr/local/bin \
     --data-dir /var/lib/narsor \
@@ -94,7 +94,7 @@ non-interactive mode; `--data-dir` defaults to `~/.narsor`. For `server`, also s
 For example, on a dedicated VM behind an existing corporate proxy:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh |
   sudo bash -s -- --role server --non-interactive \
     --bin-dir /usr/local/bin \
     --data-dir /var/lib/narsor \
@@ -118,6 +118,19 @@ with the effective value are rejected. If an effective system-wide config is
 not writable, the interactive installer asks for another target. A
 non-interactive invocation must use a writable `--config-file`.
 
+If Narsor processes (`narsor`, `narsor-server`, `narsor-controller`,
+`narsor-runner`) of your user are already running, the installer lists them
+before it replaces the binaries and asks whether to stop them. Stopping them
+interrupts running tasks. A stopped process gets `SIGTERM` and 10 seconds to
+exit, then `SIGKILL`. If you answer no, they keep running the previous version
+until you restart them. Non-interactive installation never stops anything
+unless you pass `--stop-running`; without it the installer only prints the
+list. `--stop-running` also skips the question in an interactive run.
+
+`--progress` shows a progress bar while the release archive downloads
+(`curl --progress-bar`, or `wget --show-progress`); without it the download is
+silent.
+
 `--update-bashrc` explicitly opts into adding the binary directory to
 `~/.bashrc`. Without it, non-interactive installation never changes a shell
 startup file. The line carries a `# narsor-installer` marker so uninstall can
@@ -128,7 +141,7 @@ find it. To build from source, see the README.
 The same script removes what it installed:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.4.0/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh |
   bash -s -- --uninstall
 ```
 

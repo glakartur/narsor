@@ -488,6 +488,25 @@ impl<T: ContractTarget> Harness<T> {
         }
     }
 
+    /// Waits for what the probe counted to satisfy `check`. The probe counts
+    /// a removal when the backend call returns, which is after the platform
+    /// shows the effect, so a reader seen gone through [`Self::reader`] can
+    /// be counted a moment later.
+    pub async fn wait_counters(&self, what: &str, check: impl Fn(&ProbeCounters) -> bool) {
+        let deadline = Instant::now() + self.target.patience();
+        loop {
+            let counters = self.counters();
+            if check(&counters) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}; counters {counters:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Waits for a running reader and returns it.
     pub async fn running_reader(&self, task: &str) -> WorkloadState {
         self.wait_reader(task, "a running reader", |reader| {
@@ -1496,6 +1515,10 @@ pub async fn a_reader_reads_a_stopped_task_and_leaves_with_its_lease<T: Contract
     h.service.notify(&TaskId::parse("task-1").unwrap());
     h.wait_reader("task-1", "the lease to end the reader", |r| r.is_none())
         .await;
+    h.wait_counters("the reader's removal to be counted", |c| {
+        c.reader_deletions >= 1
+    })
+    .await;
     assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);
     assert_eq!(
         h.storage_digest("task-1"),
@@ -1680,10 +1703,18 @@ pub async fn a_reader_that_dies_is_replaced_while_it_is_wanted<T: ContractTarget
 /// Expands the whole suite for one target into a module of tests.
 macro_rules! contract_suite {
     ($module:ident, $target:ty) => {
+        contract_suite!(@module $module; $target;);
+    };
+    // For an adapter whose scenarios start processes: they are `#[ignore]`d
+    // and run with `cargo test -- --include-ignored`.
+    ($module:ident, $target:ty, ignore = $reason:literal) => {
+        contract_suite!(@module $module; $target; ignore($reason));
+    };
+    (@module $module:ident; $target:ty; $($mode:tt)*) => {
         mod $module {
             #[allow(unused_imports)]
             use super::*;
-            contract_suite!(@tests $target;
+            contract_suite!(@tests $($mode)* $target;
                 lifecycle_round_trip,
                 reconnect_reconciles_instead_of_duplicating,
                 a_lost_launch_answer_is_reconciled_not_duplicated,
@@ -1708,6 +1739,15 @@ macro_rules! contract_suite {
                 a_reader_that_cannot_start_leaves_the_task_alone,
                 a_reader_that_dies_is_replaced_while_it_is_wanted);
         }
+    };
+    (@tests ignore($reason:literal) $target:ty; $($scenario:ident),* $(,)?) => {
+        $(
+            #[ignore = $reason]
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn $scenario() {
+                crate::backend_contract_support::$scenario::<$target>().await;
+            }
+        )*
     };
     (@tests $target:ty; $($scenario:ident),* $(,)?) => {
         $(
