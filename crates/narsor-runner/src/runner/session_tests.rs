@@ -1239,6 +1239,20 @@ async fn a_transition_between_two_steps_refreshes_the_workspaces() {
         .drive_until_a_reading_lands(|| first.notify_one())
         .await;
 
+    // The first signal may come from a reading that began before the step
+    // left its work, so wait for the reading that sees the transition.
+    let session = &mut fixture.session;
+    wait_for("the reading after the transition", || {
+        session
+            .snapshot(None, false)
+            .expect("a snapshot")
+            .workspaces[0]
+            .branch
+            .as_deref()
+            == Some("feat/x")
+    })
+    .await;
+
     // The second step still runs: only the transition asked for the reading.
     assert!(fixture.session.pass_active());
     assert_left_by_the_step(&fixture.snapshot().workspaces[0]);

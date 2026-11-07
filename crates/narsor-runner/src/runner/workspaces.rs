@@ -70,8 +70,10 @@ impl WorkspaceTracker {
             tokio::task::spawn_blocking(move || {
                 let result = state::read(&dir, base.as_deref());
                 apply(&mut lock(&header), result);
-                reading.store(false, Ordering::Release);
+                // Signal first: once `reading` is false, the signal is already
+                // stored, so a caller that waits for idle can drain it.
                 changed.notify_one();
+                reading.store(false, Ordering::Release);
             });
         }
     }
