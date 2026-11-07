@@ -86,6 +86,7 @@ use crate::persistence::{
 
 mod contract;
 pub(crate) mod conversation;
+mod denials;
 pub(crate) mod process;
 mod response;
 
@@ -98,6 +99,7 @@ pub use contract::{
 use contract::{new_session, resume_session, AWAITING_INPUT};
 pub use conversation::{AgentEventSink, LoggingEventSink, UsageReporter};
 use conversation::{ConversationSink, UsageRelay};
+use denials::split_denials;
 pub(crate) use process::stderr_element;
 use process::{harness_error, run_harness_invocation, FINAL_ANSWER_GRACE};
 pub(crate) use process::{run_harness_process, FinishedRun, SpawnEnding};
@@ -460,7 +462,23 @@ impl AgentExecutor {
             );
         }
 
-        if !run.permission_denials.is_empty() {
+        let denials = split_denials(&run, answer_shape);
+        for denial in &denials.ignored {
+            self.emit(
+                request.execution_id,
+                EventData::PermissionDeniedIgnored {
+                    session_id: session.id.clone(),
+                    action_execution_id: Some(request.action_execution_id.to_string()),
+                    tool_name: denial.tool_name.clone(),
+                    tool_use_id: denial.tool_use_id.clone(),
+                    summary: denial.summary.clone(),
+                    reason: denial.reason.clone(),
+                    source: denial.subagent.clone(),
+                },
+            );
+        }
+
+        if !denials.blocking.is_empty() {
             conversation.finish();
             session.status = AgentSessionStatus::Completed;
             session.ended_at = Some(Utc::now());
@@ -488,8 +506,8 @@ impl AgentExecutor {
                     agent_session_id: run.session_id.clone(),
                     prefilled_answer: None,
                     permission: Some(PermissionRequestDetails {
-                        denials: run
-                            .permission_denials
+                        denials: denials
+                            .blocking
                             .iter()
                             .map(|denial| PermissionDenialDetails {
                                 tool_name: denial.tool_name.clone(),

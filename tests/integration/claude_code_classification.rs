@@ -1163,13 +1163,13 @@ fn a_result_preserves_structured_permission_denials_and_correlation() {
         denial.reason.as_deref(),
         Some("Approval is required for this command.")
     );
-    assert!(run
-        .failure
-        .as_deref()
-        .is_some_and(|failure| failure.contains("reported an error")));
+    assert!(run.failure.is_none());
     assert!(matches!(
         elements.last(),
-        Some(ChatElement::RunResult { is_error: true, .. })
+        Some(ChatElement::RunResult {
+            is_error: false,
+            ..
+        })
     ));
 }
 

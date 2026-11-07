@@ -69,7 +69,7 @@ impl ResultLine {
             return None;
         }
         let subtype = str_field(line, "subtype").map(str::to_string);
-        let mut is_error = line
+        let is_error = line
             .get("is_error")
             .and_then(Value::as_bool)
             .unwrap_or(false)
@@ -115,10 +115,6 @@ impl ResultLine {
                     .collect()
             })
             .unwrap_or_default();
-        // Claude Code can report subtype `success` after recovering from a
-        // denied tool call. Until Narsor has handled that denial, the run is
-        // not a completed success.
-        is_error |= !permission_denials.is_empty();
         Some(Self {
             subtype,
             is_error,
