@@ -27,6 +27,7 @@ pub fn conversation_response_from_snapshot(
                     },
                     raw_base64: base64_encode(&entry.raw),
                     elements: elements_of(&mut entry),
+                    subagent: entry.subagent,
                 })
                 .collect(),
             next_entry: snapshot.next_entry,

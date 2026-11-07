@@ -409,6 +409,10 @@ pub fn build_timeline(
             EventData::AgentMessage {
                 action_execution_id,
                 ..
+            }
+            | EventData::PermissionDeniedIgnored {
+                action_execution_id,
+                ..
             } => {
                 link_agent_event(
                     &mut drafts,

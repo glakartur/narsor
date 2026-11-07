@@ -53,6 +53,7 @@ albo `awaiting_input`).
 | `noschema_plain.ndjson` | *(bez `--json-schema`)* `--disallowedTools ScheduleWakeup CronCreate Monitor --permission-mode acceptEdits` | komentarz tekstowy, `Bash`, JSON odpowiedzi w ostatniej wiadomości; jedna sesja, jedna linia `result`, w której `result` to ten JSON (nie ma `structured_output`) |
 | `noschema_background.ndjson` | to samo | zadanie w tle (`Bash` z `run_in_background`), komentarz tekstowy i koniec tury: pierwsza linia `result` to sam tekst, proces żyje; po `task_notification` druga tura (`system/init`) i druga linia `result` z JSON |
 | `schema_mismatch.ndjson` | `--json-schema <schemat> --permission-mode acceptEdits` | prompt żąda labela spoza `enum`; CLI odrzuca wywołanie `StructuredOutput` i model poprawia odpowiedź |
+| `subagent_denial.ndjson` | *(ręcznie napisane, nie nagranie)* | główny agent, dwóch subagentów (jeden w tle, jeden na pierwszym planie, ten drugi z zagnieżdżonym), `parent_tool_use_id` na liniach subagentów, odmowa `Bash` w subagencie, dwie linie `result` z tą samą odmową w `permission_denials`, odpowiedź końcowa w ostatniej. Treść zmyślona. |
 
 ## Odpowiedzi na pytania odłożone do implementacji
 

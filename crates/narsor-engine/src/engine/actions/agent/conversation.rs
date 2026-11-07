@@ -1,6 +1,6 @@
 use super::*;
 use crate::engine::timeline_file::{reading_from_element, ReadingSink};
-use narsor_protocol::chat::TechnicalCategory;
+use narsor_protocol::chat::{SubagentRef, TechnicalCategory};
 
 /// Receives the agent-session events of a run.
 ///
@@ -51,7 +51,8 @@ impl UsageRelay<'_> {
 }
 
 /// Records one stdout line the parser has just been fed, with its
-/// `elements`: in the conversation, unless the line was a usage report.
+/// `elements` and the `subagent` that wrote it (`None` for the main agent):
+/// in the conversation, unless the line was a usage report.
 ///
 /// A usage report is not part of the conversation (R8a): its limits go to
 /// `usage` instead, when there are any and somewhere to send them.
@@ -61,9 +62,10 @@ pub(crate) fn record_stdout_line(
     usage: Option<UsageRelay<'_>>,
     line: &[u8],
     elements: &[ChatElement],
+    subagent: Option<&SubagentRef>,
 ) {
     match parser.take_usage() {
-        None => conversation.append(ConversationSource::Stdout, line, elements),
+        None => conversation.append(ConversationSource::Stdout, line, elements, subagent),
         Some(limits) if limits.is_empty() => {}
         Some(limits) => {
             if let Some(usage) = usage {
@@ -202,7 +204,13 @@ impl ConversationSink {
 
     /// Appends one entry with its elements, logging (and otherwise
     /// ignoring) a failure to.
-    pub(super) fn append(&self, source: ConversationSource, raw: &[u8], elements: &[ChatElement]) {
+    pub(super) fn append(
+        &self,
+        source: ConversationSource,
+        raw: &[u8],
+        elements: &[ChatElement],
+        subagent: Option<&SubagentRef>,
+    ) {
         let already_empty = elements.is_empty();
         if source == ConversationSource::Stdout {
             if let Some(tap) = &self.1 {
@@ -221,14 +229,14 @@ impl ConversationSink {
         let mut writer = writer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Err(error) = writer.append(source, raw, &elements) {
+        if let Err(error) = writer.append_for_subagent(source, raw, &elements, subagent) {
             tracing::warn!(%error, "could not append a conversation entry");
         }
     }
 
     /// Convenience for a narsor-authored entry (the prompt, the outcome).
     pub(super) fn append_narsor(&self, text: &str, elements: &[ChatElement]) {
-        self.append(ConversationSource::Narsor, text.as_bytes(), elements);
+        self.append(ConversationSource::Narsor, text.as_bytes(), elements, None);
     }
 
     /// A narsor-authored entry about the harness process — its exit code,

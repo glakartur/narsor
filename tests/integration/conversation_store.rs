@@ -11,7 +11,9 @@ use narsor_engine::domain::{
 use narsor_engine::persistence::conversation::ConversationSource;
 use narsor_engine::persistence::recovery::compress_closed_conversations;
 use narsor_engine::persistence::ExecutionStore;
-use narsor_protocol::chat::{ChatElement, PromptPurpose, TechnicalCategory, UnclassifiedReason};
+use narsor_protocol::chat::{
+    ChatElement, PromptPurpose, SubagentRef, TechnicalCategory, UnclassifiedReason,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -213,6 +215,62 @@ fn an_entry_without_elements_is_written_without_the_field() {
     let line = fs::read_to_string(conversations.dir().join("attempt-1.jsonl")).expect("read");
     let envelope: serde_json::Value = serde_json::from_str(line.trim()).expect("an envelope");
     assert!(envelope.get("elements").is_none(), "{line}");
+}
+
+#[test]
+fn an_entry_of_a_subagent_survives_write_and_read_and_a_main_agent_entry_stays_unmarked() {
+    let root = TempRoot::new();
+    let conversations = root.store().conversation_store("exec-1");
+    let subagent = SubagentRef {
+        id: "toolu_1".to_string(),
+        name: "Testy".to_string(),
+    };
+    let mut writer = conversations.writer("attempt-1").expect("open writer");
+    writer
+        .append_for_subagent(
+            ConversationSource::Stdout,
+            b"from the subagent",
+            &[],
+            Some(&subagent),
+        )
+        .expect("append subagent line");
+    writer
+        .append(ConversationSource::Stdout, b"from the main agent", &[])
+        .expect("append main agent line");
+    writer.finish().expect("finish writer");
+
+    let snapshot = conversations
+        .read("attempt-1", 1, usize::MAX)
+        .expect("read")
+        .expect("a record");
+
+    assert_eq!(snapshot.entries[0].subagent, Some(subagent));
+    assert_eq!(snapshot.entries[1].subagent, None);
+    let line = fs::read_to_string(conversations.dir().join("attempt-1.jsonl")).expect("read");
+    let main_agent_line = line.lines().nth(1).expect("second line");
+    assert!(!main_agent_line.contains("subagent"), "{main_agent_line}");
+}
+
+#[test]
+fn an_envelope_written_before_subagents_existed_reads_with_none() {
+    let root = TempRoot::new();
+    let conversations = root.store().conversation_store("exec-1");
+    fs::create_dir_all(conversations.dir()).expect("create the directory");
+    fs::write(
+        conversations.dir().join("attempt-old.jsonl"),
+        concat!(
+            r#"{"n":1,"ts":"2026-01-02T03:04:05Z","source":"stdout","raw_b64":"e30=","elements":[{"kind":"agent_text","text":"hi"}]}"#,
+            "\n",
+        ),
+    )
+    .expect("write an old record");
+
+    let snapshot = conversations
+        .read("attempt-old", 1, usize::MAX)
+        .expect("read")
+        .expect("a record");
+
+    assert_eq!(snapshot.entries[0].subagent, None);
 }
 
 #[test]

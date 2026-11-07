@@ -11,7 +11,8 @@ use chrono::DateTime;
 use narsor_engine::engine::actions::harness::HarnessStreamParser;
 use narsor_engine::engine::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter};
 use narsor_protocol::chat::{
-    ChatElement, QuestionSource, TechnicalCategory, ToolResultStatus, UnclassifiedReason,
+    ChatElement, QuestionSource, SubagentRef, TechnicalCategory, ToolResultStatus,
+    UnclassifiedReason,
 };
 use narsor_protocol::controller::{UsageLimit, UsageStatus};
 use serde_json::{json, Value};
@@ -1162,13 +1163,13 @@ fn a_result_preserves_structured_permission_denials_and_correlation() {
         denial.reason.as_deref(),
         Some("Approval is required for this command.")
     );
-    assert!(run
-        .failure
-        .as_deref()
-        .is_some_and(|failure| failure.contains("reported an error")));
+    assert!(run.failure.is_none());
     assert!(matches!(
         elements.last(),
-        Some(ChatElement::RunResult { is_error: true, .. })
+        Some(ChatElement::RunResult {
+            is_error: false,
+            ..
+        })
     ));
 }
 
@@ -1424,4 +1425,187 @@ fn a_recording_with_background_work_answers_only_on_its_second_result_line() {
     assert_eq!(parser.final_answer(), Some(FinalAnswer::Choice));
     let run = parser.finish(0, "");
     assert_eq!(run.structured_output.expect("an answer")["choice"], "done");
+}
+
+const SUBAGENT_DENIAL: &str = include_str!("../fixtures/claude-code/subagent_denial.ndjson");
+
+/// The subagent each line of `lines` came from, from one fresh parser.
+fn subagents_of<S: AsRef<str>>(lines: &[S]) -> Vec<Option<SubagentRef>> {
+    let mut parser = parser();
+    lines
+        .iter()
+        .map(|line| {
+            parser.on_stdout_line(line.as_ref().as_bytes());
+            parser.last_line_subagent()
+        })
+        .collect()
+}
+
+fn named(id: &str, name: &str) -> Option<SubagentRef> {
+    Some(SubagentRef {
+        id: id.into(),
+        name: name.into(),
+    })
+}
+
+fn line_from(parent: Option<&str>, kind: &str, content: Value) -> String {
+    json!({
+        "type": kind,
+        "message": {"role": kind, "content": content},
+        "parent_tool_use_id": parent,
+        "session_id": "session-1",
+    })
+    .to_string()
+}
+
+#[test]
+fn subagent_lines_carry_the_name_of_their_task_and_main_lines_none() {
+    let lines: Vec<&str> = SUBAGENT_DENIAL.lines().collect();
+
+    let marks = subagents_of(&lines);
+
+    assert_eq!(marks[0], None);
+    assert_eq!(marks[1], None);
+    assert_eq!(marks[3], named("toolu_bg", "Index the notes"));
+    assert_eq!(marks[4], named("toolu_fg", "Check the build"));
+    assert_eq!(marks[6], named("toolu_fg", "Check the build"));
+    assert_eq!(marks[11], None);
+}
+
+#[test]
+fn a_nested_line_belongs_to_its_nearest_task_call() {
+    let lines: Vec<&str> = SUBAGENT_DENIAL.lines().collect();
+
+    let marks = subagents_of(&lines);
+
+    assert_eq!(marks[8], named("toolu_nested", "Read the config"));
+}
+
+#[test]
+fn a_task_without_a_description_is_named_by_its_type_then_by_a_fixed_text() {
+    let lines = [
+        line_from(
+            None,
+            "assistant",
+            json!([
+                tool_use("t1", "Task", json!({"subagent_type": "Explore"})),
+                tool_use("t2", "Agent", json!({"description": " "})),
+            ]),
+        ),
+        line_from(
+            Some("t1"),
+            "assistant",
+            json!([{"type": "text", "text": "a"}]),
+        ),
+        line_from(
+            Some("t2"),
+            "assistant",
+            json!([{"type": "text", "text": "b"}]),
+        ),
+    ];
+
+    let marks = subagents_of(&lines);
+
+    assert_eq!(marks[1], named("t1", "Explore"));
+    assert_eq!(marks[2], named("t2", "subagent"));
+}
+
+#[test]
+fn the_elements_of_a_line_do_not_depend_on_its_subagent() {
+    let line = line_from(
+        Some("t1"),
+        "assistant",
+        json!([{"type": "text", "text": "hello"}]),
+    );
+
+    let elements = classify_one(&line);
+
+    assert!(matches!(
+        elements.as_slice(),
+        [ChatElement::AgentText { text }] if text == "hello"
+    ));
+}
+
+#[test]
+fn a_denial_of_a_subagent_call_names_the_subagent_and_a_main_denial_does_not() {
+    let mut lines: Vec<String> = SUBAGENT_DENIAL.lines().map(str::to_string).collect();
+    lines.pop();
+    lines.push(line_from(
+        None,
+        "assistant",
+        json!([tool_use(
+            "toolu_main_bash",
+            "Bash",
+            json!({"command": "ls"})
+        )]),
+    ));
+    lines.push(
+        json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "session_id": "session-1", "result": "done",
+            "permission_denials": [
+                {"tool_name": "Bash", "tool_use_id": "toolu_sub_bash",
+                 "tool_input": {"command": "make build"}},
+                {"tool_name": "Bash", "tool_use_id": "toolu_main_bash",
+                 "tool_input": {"command": "ls"}},
+            ],
+        })
+        .to_string(),
+    );
+
+    let run = run_of_lines_fed(&lines);
+
+    let by_id = |id: &str| {
+        run.permission_denials
+            .iter()
+            .find(|denial| denial.tool_use_id == id)
+            .unwrap_or_else(|| panic!("no denial for {id}"))
+    };
+    assert_eq!(
+        by_id("toolu_sub_bash").subagent,
+        named("toolu_fg", "Check the build")
+    );
+    assert_eq!(by_id("toolu_sub_bash").summary, "make build");
+    assert_eq!(by_id("toolu_main_bash").subagent, None);
+    assert_eq!(by_id("toolu_main_bash").summary, "ls");
+}
+
+#[test]
+fn two_result_lines_listing_the_same_denial_give_one_denial() {
+    let lines: Vec<&str> = SUBAGENT_DENIAL.lines().collect();
+
+    let run = run_of_lines_fed(&lines);
+
+    assert_eq!(run.permission_denials.len(), 1);
+    assert_eq!(run.permission_denials[0].tool_use_id, "toolu_sub_bash");
+}
+
+#[test]
+fn denials_of_different_result_lines_are_all_kept() {
+    let first = json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "session_id": "session-1", "result": "one",
+        "permission_denials": [{"tool_name": "Bash", "tool_use_id": "d1", "tool_input": {}}],
+    })
+    .to_string();
+    let second = first.replace("\"d1\"", "\"d2\"");
+
+    let run = run_of_lines_fed(&[first, second]);
+
+    let ids: Vec<&str> = run
+        .permission_denials
+        .iter()
+        .map(|denial| denial.tool_use_id.as_str())
+        .collect();
+    assert_eq!(ids, ["d1", "d2"]);
+}
+
+fn run_of_lines_fed<S: AsRef<str>>(
+    lines: &[S],
+) -> narsor_engine::engine::actions::harness::HarnessRun {
+    let mut parser = parser();
+    for line in lines {
+        parser.on_stdout_line(line.as_ref().as_bytes());
+    }
+    parser.finish(0, "")
 }

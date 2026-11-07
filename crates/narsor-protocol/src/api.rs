@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::chat::ChatElement;
+use crate::chat::{ChatElement, SubagentRef};
 use crate::controller::ExecutionEventsSource;
 
 /// Discovery record published by `narsor-server` for local clients.
@@ -315,6 +315,10 @@ pub struct ConversationEntryDto {
     /// the page comes from a server older than the element model.
     #[serde(default)]
     pub elements: Vec<ChatElement>,
+    /// The subagent that wrote the line. Absent for the main agent and for
+    /// pages from a server older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentRef>,
 }
 
 /// One raw conversation page. `NoRecord` is a successful answer.
@@ -570,6 +574,7 @@ mod tests {
                     summary: "boom".into(),
                     data: None,
                 }],
+                subagent: None,
             }],
             next_entry: 4,
             closed: true,
@@ -585,6 +590,32 @@ mod tests {
         assert_eq!(value["entries"][0]["elements"][0]["kind"], "technical");
         assert!(value.get("source").is_none());
         assert!(value.get("recorded_at").is_none());
+        assert!(value["entries"][0].get("subagent").is_none());
+    }
+
+    #[test]
+    fn conversation_entry_of_a_subagent_roundtrips() {
+        let entry = ConversationEntryDto {
+            entry_number: 5,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            source: ConversationEntrySource::Stdout,
+            raw_base64: "e30=".into(),
+            elements: vec![],
+            subagent: Some(crate::chat::SubagentRef {
+                id: "toolu_1".into(),
+                name: "Testy".into(),
+            }),
+        };
+
+        let value = serde_json::to_value(&entry).unwrap();
+
+        assert_eq!(value["subagent"]["name"], "Testy");
+        assert_eq!(
+            serde_json::from_value::<ConversationEntryDto>(value).unwrap(),
+            entry
+        );
     }
 
     #[test]
@@ -597,6 +628,7 @@ mod tests {
         }))
         .unwrap();
         assert!(entry.elements.is_empty());
+        assert_eq!(entry.subagent, None);
     }
 
     #[test]

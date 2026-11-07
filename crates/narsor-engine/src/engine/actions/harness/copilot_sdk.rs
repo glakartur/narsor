@@ -140,6 +140,7 @@ fn feed_copilot_sdk_record(
         usage,
         line.as_bytes(),
         &elements,
+        None,
     );
 }
 

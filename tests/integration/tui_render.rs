@@ -3272,6 +3272,7 @@ mod task_app_detail_render {
             .flat_map(|(index, line)| {
                 use base64::Engine as _;
                 let elements = parser.on_stdout_line(line.as_bytes());
+                let subagent = parser.last_line_subagent();
                 // Like the stdout loop: a usage report line is not recorded.
                 if parser.take_usage().is_some() {
                     return Vec::new();
@@ -3282,9 +3283,39 @@ mod task_app_detail_render {
                     source: narsor::api::ConversationEntrySource::Stdout,
                     raw_base64: base64::engine::general_purpose::STANDARD.encode(line),
                     elements,
+                    subagent,
                 })
             })
             .collect()
+    }
+
+    /// A recording with three subagents (one in the background, one denied a
+    /// tool) and a third: *Rozmowa* shows one collapsed group for each, named and
+    /// counted, and the main thread outside them.
+    #[test]
+    fn the_conversation_tab_folds_each_subagent_of_a_recording_into_one_group() {
+        let mut tab = conversation_tab(recorded_claude_entries("subagent_denial.ndjson"));
+        let headers: Vec<String> = tab
+            .transcript()
+            .logical_lines()
+            .into_iter()
+            .filter(|line| line.header && line.text.starts_with("▸ "))
+            .map(|line| line.text)
+            .collect();
+        assert_eq!(headers.len(), 3, "{headers:#?}");
+        assert!(headers[0].contains("Index the notes"), "{headers:#?}");
+        assert!(headers[1].contains("Check the build"), "{headers:#?}");
+        assert!(headers[1].contains("błędy: 1"), "{headers:#?}");
+
+        let drawn = screen(&draw_conversation_at(
+            100,
+            30,
+            &mut tab,
+            &Styles::new(false),
+            false,
+            true,
+        ));
+        assert!(drawn.contains("▸ Check the build · "), "{drawn}");
     }
 
     /// U6: *Rozmowa* over every real recording shows model elements only —

@@ -10,7 +10,9 @@ use serde_json::json;
 use narsor::cli::commands::conversation_entry_lines;
 use narsor::tui::conversation::classify;
 use narsor_protocol::api::{ConversationEntryDto, ConversationEntrySource};
-use narsor_protocol::chat::{ChatElement, PromptPurpose, ToolResultStatus, UnclassifiedReason};
+use narsor_protocol::chat::{
+    ChatElement, PromptPurpose, SubagentRef, ToolResultStatus, UnclassifiedReason,
+};
 
 fn entry(
     source: ConversationEntrySource,
@@ -23,6 +25,7 @@ fn entry(
         source,
         raw_base64: BASE64.encode(raw),
         elements,
+        subagent: None,
     }
 }
 
@@ -163,4 +166,45 @@ fn the_cli_and_the_tui_agree_on_label_and_summary() {
 
     assert!(line.contains(event.kind.label()), "{line}");
     assert!(line.contains(&event.summary), "{line}");
+}
+
+#[test]
+fn a_subagent_line_has_its_name_and_an_indent_and_a_main_agent_line_does_not() {
+    let main = conversation_entry_lines(&entry(
+        ConversationEntrySource::Stdout,
+        b"{}",
+        vec![bash_call()],
+    ));
+    let mut by_subagent = entry(ConversationEntrySource::Stdout, b"{}", vec![bash_call()]);
+    by_subagent.subagent = Some(SubagentRef {
+        id: "toolu_task".to_string(),
+        name: "Check the build".to_string(),
+    });
+    let lines = conversation_entry_lines(&by_subagent);
+
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("      7  "), "{}", lines[0]);
+    assert!(
+        lines[0].contains("↳ [Check the build] Bash cargo test"),
+        "{}",
+        lines[0]
+    );
+    assert!(main[0].starts_with("    7  "), "{}", main[0]);
+    assert!(!main[0].contains('↳'), "{}", main[0]);
+}
+
+#[test]
+fn a_subagent_name_with_control_characters_stays_on_one_line() {
+    let mut by_subagent = entry(ConversationEntrySource::Stdout, b"{}", vec![bash_call()]);
+    by_subagent.subagent = Some(SubagentRef {
+        id: "toolu_task".to_string(),
+        name: "Check\nthe\u{1b}[31m build".to_string(),
+    });
+    let lines = conversation_entry_lines(&by_subagent);
+
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        !lines[0].contains('\u{1b}') && !lines[0].contains('\n'),
+        "{lines:?}"
+    );
 }

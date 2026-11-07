@@ -155,6 +155,7 @@ fn every_event_data_variant() -> Vec<EventData> {
             role: "assistant".to_string(),
             action_execution_id: Some("a1".to_string()),
         },
+        ignored_denial("Bash", "ls /root", Some("not allowed"), None),
         EventData::DecisionRequested {
             provider: "claude".to_string(),
         },
@@ -12189,5 +12190,109 @@ mod task_app_auto_resume {
         assert!(!attempt.from_record());
         assert_eq!(attempt.len(), 4);
         assert_eq!(attempt.transcript().selected_entry().unwrap().as_str(), "2");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The row of a permission denial that did not stop the step
+// ---------------------------------------------------------------------------
+
+fn ignored_denial(
+    tool: &str,
+    summary: &str,
+    reason: Option<&str>,
+    source: Option<(&str, &str)>,
+) -> EventData {
+    EventData::PermissionDeniedIgnored {
+        session_id: "sess".to_string(),
+        action_execution_id: Some("a1b2c3d4-0000".to_string()),
+        tool_name: tool.to_string(),
+        tool_use_id: "toolu_77".to_string(),
+        summary: summary.to_string(),
+        reason: reason.map(str::to_string),
+        source: source.map(|(id, name)| narsor_protocol::chat::SubagentRef {
+            id: id.to_string(),
+            name: name.to_string(),
+        }),
+    }
+}
+
+fn ignored_denial_line(data: EventData) -> String {
+    event_line(&Event::new("exec-1".to_string(), data, 1))
+}
+
+#[test]
+fn ignored_denial_row_names_the_main_agent_or_the_subagent() {
+    let main = ignored_denial_line(ignored_denial("Bash", "ls", None, None));
+    let sub = ignored_denial_line(ignored_denial("Bash", "ls", None, Some(("t1", "reviewer"))));
+
+    assert!(
+        main.ends_with("odmowa pominięta · agent · Bash · ls"),
+        "{main:?}"
+    );
+    assert!(
+        sub.ends_with("odmowa pominięta · subagent reviewer · Bash · ls"),
+        "{sub:?}"
+    );
+}
+
+#[test]
+fn ignored_denial_row_shows_the_source_before_a_cut_key_parameter() {
+    let command = "x".repeat(500);
+    let line = ignored_denial_line(ignored_denial(
+        "Bash",
+        &command,
+        None,
+        Some(("t1", "reviewer")),
+    ));
+
+    assert_eq!(line.lines().count(), 1);
+    assert!(line.chars().count() < 200, "the key parameter is cut");
+    assert!(line.ends_with('…'), "the cut is marked: {line:?}");
+    let source_at = line.find("subagent reviewer").expect("source in row");
+    let key_at = line.find("xxx").expect("key parameter in row");
+    assert!(source_at < key_at, "source comes first: {line:?}");
+}
+
+#[test]
+fn ignored_denial_row_is_one_line_without_control_characters() {
+    let line = ignored_denial_line(ignored_denial(
+        "Bash",
+        "echo a\nb\u{1b}[31m\u{7}",
+        Some("no\nway"),
+        Some(("t1", "name\twith\ncontrol\u{7}")),
+    ));
+
+    assert_eq!(line.lines().count(), 1, "{line:?}");
+    assert!(
+        !line.chars().any(char::is_control),
+        "control character in {line:?}"
+    );
+}
+
+#[test]
+fn ignored_denial_row_leaves_no_empty_separators_for_missing_parts() {
+    let line = ignored_denial_line(ignored_denial("Bash", "", None, Some(("t1", "  "))));
+
+    assert!(
+        line.ends_with("odmowa pominięta · subagent · Bash"),
+        "{line:?}"
+    );
+    assert!(!line.contains("()") && !line.contains("[]"), "{line:?}");
+}
+
+#[test]
+fn ignored_denial_details_show_tool_ids_reason_and_the_full_input() {
+    let command = format!("echo {}", "y".repeat(300));
+    let event = Event::new(
+        "exec-1".to_string(),
+        ignored_denial("Bash", &command, Some("not allowed"), None),
+        1,
+    );
+
+    let detail = event_detail_lines(&event).join("\n");
+
+    for expected in ["Bash", "toolu_77", "a1b2c3d4-0000", "not allowed", &command] {
+        assert!(detail.contains(expected), "{expected} missing in {detail}");
     }
 }

@@ -69,7 +69,7 @@ impl ResultLine {
             return None;
         }
         let subtype = str_field(line, "subtype").map(str::to_string);
-        let mut is_error = line
+        let is_error = line
             .get("is_error")
             .and_then(Value::as_bool)
             .unwrap_or(false)
@@ -90,10 +90,13 @@ impl ResultLine {
                 entries
                     .iter()
                     .filter_map(|entry| {
+                        let tool_name = entry.get("tool_name")?.as_str()?.to_string();
+                        let input = entry.get("tool_input")?.clone();
                         Some(PermissionDenial {
-                            tool_name: entry.get("tool_name")?.as_str()?.to_string(),
+                            summary: call_summary(&tool_name, &input),
+                            tool_name,
                             tool_use_id: entry.get("tool_use_id")?.as_str()?.to_string(),
-                            input: entry.get("tool_input")?.clone(),
+                            input,
                             reason_type: entry
                                 .get("decision_reason_type")
                                 .and_then(Value::as_str)
@@ -106,15 +109,12 @@ impl ResultLine {
                                 .get("session_id")
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
+                            subagent: None,
                         })
                     })
                     .collect()
             })
             .unwrap_or_default();
-        // Claude Code can report subtype `success` after recovering from a
-        // denied tool call. Until Narsor has handled that denial, the run is
-        // not a completed success.
-        is_error |= !permission_denials.is_empty();
         Some(Self {
             subtype,
             is_error,

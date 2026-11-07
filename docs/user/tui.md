@@ -104,7 +104,19 @@ the whole one narrowed to that entry into the step, so the workflow choices
 (`WYBÓR WORKFLOW`) made in the step show in both, and the one-line parts (the
 headers and the choices) are clipped with `…` in a narrow window while the text
 wraps. The history's
-details work the same way, without following. A task that has not started says so and where it stands in
+details work the same way, without following.
+
+In the conversation, the entries of one subagent form **one collapsed group**,
+placed at the subagent's first entry even when main-agent entries come between
+its lines. The header reads `▸ <name> · N entries[ · błędy: F]` (`▾` when open;
+the name is cut with `…`, the counts never are; two subagents with the same name,
+or with no name, get an order number). `Enter` / `Space` open it; the members are
+indented and each expands on its own. A failed or denied tool call inside the
+group shows in the header as `błędy: F`, so it is visible while the group is
+closed. The header shows no run state: the stream has no reliable end signal for
+a background subagent. An entry from a harness that does not mark subagents looks
+as before. `narsor-cli` prints a subagent's lines with `↳ [name]` and a two-space
+indent. A task that has not started says so and where it stands in
 the queue. When a running task cannot follow the default harness — its
 backend does not run it, or the binary is not on the runner's `PATH` — one
 line under the header says so (`opencode niedostępny tutaj — zostaje
@@ -229,7 +241,7 @@ the current step or a draft.
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `c` `r`, `h` default harness, `L` task limit |
 | Details | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
-| — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all |
+| — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry (a subagent's group `▸` / `▾` too), `v` raw entry, `Ctrl+V` raw all |
 | — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |
 | Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold (with the server's forms: next form), `1`–`9` choose, `[` / `]` previous / next waiting (not with the server's forms) |
 | Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |

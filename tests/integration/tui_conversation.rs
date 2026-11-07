@@ -26,6 +26,7 @@ fn entry(number: u64, raw: &str, elements: Vec<ChatElement>) -> ConversationEntr
         source: ConversationSource::Stdout,
         raw_base64: BASE64.encode(raw.as_bytes()),
         elements,
+        subagent: None,
     }
 }
 

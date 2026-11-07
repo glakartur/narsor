@@ -32,7 +32,7 @@ pub mod opencode;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
+use narsor_protocol::chat::{ChatElement, SubagentRef, UnclassifiedReason};
 use narsor_protocol::controller::UsageLimit;
 use serde_json::Value;
 
@@ -209,6 +209,10 @@ pub struct PermissionDenial {
     pub reason_type: Option<String>,
     pub reason: Option<String>,
     pub session_id: Option<String>,
+    /// The subagent that made the call; `None` for the main agent.
+    pub subagent: Option<SubagentRef>,
+    /// The key parameter of the call on one line.
+    pub summary: String,
 }
 
 /// What kind of final answer a harness's stream has delivered so far.
@@ -258,6 +262,13 @@ pub trait HarnessStreamParser: Send {
     /// * `Some` of limits: the line is a usage report. It is not part of the
     ///   conversation; the limits are.
     fn take_usage(&mut self) -> Option<Vec<UsageLimit>> {
+        None
+    }
+
+    /// The subagent that wrote the last line fed to [`Self::on_stdout_line`];
+    /// `None` when the main agent did, and always for a harness that does not
+    /// tell subagents apart (the default).
+    fn last_line_subagent(&self) -> Option<SubagentRef> {
         None
     }
 

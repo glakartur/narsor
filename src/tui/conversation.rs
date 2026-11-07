@@ -21,7 +21,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use narsor_protocol::chat::{
-    ChatCategory, ChatElement, PromptAuthor, TechnicalCategory, ToolResultStatus,
+    ChatCategory, ChatElement, PromptAuthor, SubagentRef, TechnicalCategory, ToolResultStatus,
     UnclassifiedReason,
 };
 use serde_json::Value;
@@ -138,6 +138,8 @@ pub struct TranscriptEvent {
     pub raw: Arc<[u8]>,
     /// The element's one-line description ([`ChatElement::summary`]).
     pub summary: String,
+    /// The subagent the entry came from; none for the main agent.
+    pub subagent: Option<SubagentRef>,
 }
 
 /// The events of one entry off the wire, one per element.
@@ -169,6 +171,7 @@ pub fn classify(entry: &ConversationEntryDto) -> Vec<TranscriptEvent> {
             element: element.clone(),
             raw: Arc::clone(&raw),
             summary: element.summary(),
+            subagent: entry.subagent.clone(),
         })
         .collect()
 }
@@ -213,7 +216,8 @@ pub(crate) fn agent_transcript_entry(event: &TranscriptEvent) -> TranscriptEntry
         TranscriptEntry::new(TranscriptEntryId::from(id), body, Arc::clone(&event.raw))
             .with_header(header)
             .with_details(details)
-            .with_presentation(presentation);
+            .with_presentation(presentation)
+            .with_subagent(event.subagent.clone());
     if event.element_index > 0 {
         transcript = transcript.sharing_previous_raw();
     }
@@ -461,6 +465,7 @@ mod tests {
             source: ConversationEntrySource::Stdout,
             raw_base64: BASE64.encode(raw.as_bytes()),
             elements,
+            subagent: None,
         }
     }
 
@@ -669,5 +674,315 @@ mod tests {
                 .any(|line| line == "Techniczne · hook · 3 wpisy"),
             "{rendered:?}"
         );
+    }
+
+    fn subagent(id: &str, name: &str) -> SubagentRef {
+        SubagentRef {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    fn by(number: u64, who: &SubagentRef, element: ChatElement) -> ConversationEntryDto {
+        ConversationEntryDto {
+            subagent: Some(who.clone()),
+            ..entry(number, "{}", vec![element])
+        }
+    }
+
+    fn said(number: u64, text: &str) -> ConversationEntryDto {
+        entry(
+            number,
+            "{}",
+            vec![ChatElement::AgentText { text: text.into() }],
+        )
+    }
+
+    fn text(who: &SubagentRef, number: u64) -> ConversationEntryDto {
+        by(number, who, ChatElement::AgentText { text: "w".into() })
+    }
+
+    fn state_of(entries: &[ConversationEntryDto], width: usize) -> TranscriptState {
+        let mut state = TranscriptState::new(TranscriptId::from("t"));
+        state.set_width(width);
+        state.load(entries.iter().flat_map(transcript_entries).collect());
+        state
+    }
+
+    fn group_headers(state: &TranscriptState) -> Vec<String> {
+        state
+            .logical_lines()
+            .into_iter()
+            .filter(|line| {
+                line.header && (line.text.starts_with("▸ ") || line.text.starts_with("▾ "))
+            })
+            .map(|line| line.text)
+            .collect()
+    }
+
+    fn group_id(state: &TranscriptState, index: usize) -> TranscriptEntryId {
+        state
+            .logical_lines()
+            .into_iter()
+            .filter(|line| {
+                line.header && (line.text.starts_with("▸ ") || line.text.starts_with("▾ "))
+            })
+            .nth(index)
+            .expect("group header")
+            .entry_id
+    }
+
+    fn call(number: u64, who: &SubagentRef, call_id: &str) -> ConversationEntryDto {
+        by(
+            number,
+            who,
+            ChatElement::ToolCall {
+                call_id: Some(call_id.into()),
+                tool: "Bash".into(),
+                summary: "ls".into(),
+                input: json!({}),
+            },
+        )
+    }
+
+    fn result(
+        number: u64,
+        who: &SubagentRef,
+        call_id: &str,
+        status: ToolResultStatus,
+    ) -> ConversationEntryDto {
+        by(
+            number,
+            who,
+            ChatElement::ToolResult {
+                call_id: Some(call_id.into()),
+                tool: Some("Bash".into()),
+                call_summary: Some("ls".into()),
+                status,
+                content: "out".into(),
+                truncated: false,
+            },
+        )
+    }
+
+    #[test]
+    fn the_entries_of_one_subagent_form_one_group_apart_from_the_main_agent() {
+        let first = subagent("a", "Walidacja");
+        let second = subagent("b", "Przegląd");
+        let state = state_of(
+            &[
+                said(1, "main"),
+                text(&first, 2),
+                text(&first, 3),
+                text(&first, 4),
+                text(&second, 5),
+                said(6, "main again"),
+            ],
+            80,
+        );
+        let headers = group_headers(&state);
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert!(
+            headers[0].starts_with("▸ Walidacja · 3 wpisy"),
+            "{headers:?}"
+        );
+        assert!(headers[1].starts_with("▸ Przegląd · 1 wpis"), "{headers:?}");
+        let main = state
+            .logical_lines()
+            .into_iter()
+            .filter(|line| line.header && line.text.contains("AGENT · Agent"))
+            .count();
+        assert_eq!(main, 2);
+    }
+
+    #[test]
+    fn entries_of_one_subagent_apart_in_time_form_one_group_at_the_first_entry() {
+        let who = subagent("a", "Walidacja");
+        let state = state_of(&[text(&who, 1), said(2, "main"), text(&who, 3)], 80);
+        let headers: Vec<_> = state
+            .logical_lines()
+            .into_iter()
+            .filter(|line| line.header)
+            .map(|line| line.text)
+            .collect();
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert!(
+            headers[0].starts_with("▸ Walidacja · 2 wpisy"),
+            "{headers:?}"
+        );
+        assert!(headers[1].contains("AGENT · Agent"), "{headers:?}");
+    }
+
+    #[test]
+    fn the_header_marker_follows_the_fold_state() {
+        let who = subagent("a", "Walidacja");
+        let mut state = state_of(&[text(&who, 1), text(&who, 2)], 80);
+        let id = group_id(&state, 0);
+        assert!(group_headers(&state)[0].starts_with("▸ "));
+        state.toggle_expanded(&id);
+        assert!(group_headers(&state)[0].starts_with("▾ "));
+        assert!(state.logical_lines().iter().any(|line| line.nested));
+        state.toggle_expanded(&id);
+        assert!(group_headers(&state)[0].starts_with("▸ "));
+    }
+
+    #[test]
+    fn the_header_stays_one_line_with_the_count_for_any_name() {
+        let long =
+            "Bardzo długa nazwa subagenta, która nie mieści się w wąskim terminalu".to_owned();
+        let control = "Walidacja\u{1b}[31m\nczerwona\u{7}".to_owned();
+        for names in [
+            ["Alfa".to_owned(), "Alfa".to_owned()],
+            [long.clone(), "Inny".to_owned()],
+            [control.clone(), "Inny".to_owned()],
+            [String::new(), "Inny".to_owned()],
+        ] {
+            let first = subagent("a", &names[0]);
+            let second = subagent("b", &names[1]);
+            let state = state_of(&[text(&first, 1), text(&first, 2), text(&second, 3)], 36);
+            let lines = state.logical_lines();
+            let visible = crate::tui::transcript::wrap_visible_lines(&lines, 36, 0, 100);
+            for (index, count) in ["2 wpisy", "1 wpis"].into_iter().enumerate() {
+                let id = group_id(&state, index);
+                let rows: Vec<_> = visible
+                    .iter()
+                    .filter(|line| line.entry_id == id && line.header)
+                    .collect();
+                assert_eq!(rows.len(), 1, "{names:?} {rows:?}");
+                assert!(rows[0].text.contains(count), "{names:?} {}", rows[0].text);
+                assert!(!rows[0].text.contains('\u{1b}') && !rows[0].text.contains('\n'));
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_or_repeated_name_gets_the_number_of_the_subagent() {
+        let unnamed = subagent("a", "");
+        let twin = subagent("b", "Alfa");
+        let other_twin = subagent("c", "Alfa");
+        let state = state_of(
+            &[text(&unnamed, 1), text(&twin, 2), text(&other_twin, 3)],
+            80,
+        );
+        let headers = group_headers(&state);
+        assert!(headers[0].starts_with("▸ subagent 1 · "), "{headers:?}");
+        assert!(headers[1].starts_with("▸ Alfa 2 · "), "{headers:?}");
+        assert!(headers[2].starts_with("▸ Alfa 3 · "), "{headers:?}");
+    }
+
+    #[test]
+    fn a_tool_call_and_its_result_of_a_subagent_stay_one_card_inside_its_group() {
+        let who = subagent("a", "Walidacja");
+        let mut state = state_of(
+            &[
+                call(1, &who, "c1"),
+                result(2, &who, "c1", ToolResultStatus::Ok),
+            ],
+            80,
+        );
+        let id = group_id(&state, 0);
+        state.toggle_expanded(&id);
+        let lines = state.logical_lines();
+        let headers = lines
+            .iter()
+            .filter(|line| line.header && line.nested)
+            .count();
+        let operations = lines
+            .iter()
+            .filter(|line| line.nested && line.text.contains("Narzędzie · Bash ls · zakończone"))
+            .count();
+        assert_eq!((headers, operations), (1, 1), "{lines:?}");
+    }
+
+    #[test]
+    fn entries_without_a_subagent_render_as_before_next_to_a_group() {
+        let who = subagent("a", "Walidacja");
+        let main = [said(1, "one"), said(2, "two")];
+        let alone = state_of(&main, 80);
+        let mixed = state_of(&[main[0].clone(), text(&who, 3), main[1].clone()], 80);
+        let rows_of = |state: &TranscriptState, id: &str| -> Vec<(String, bool, bool)> {
+            state
+                .logical_lines()
+                .into_iter()
+                .filter(|line| line.entry_id.as_str() == id)
+                .filter(|line| !line.text.is_empty())
+                .map(|line| (line.text, line.nested, line.indented))
+                .collect()
+        };
+        for id in ["1", "2"] {
+            assert_eq!(rows_of(&alone, id), rows_of(&mixed, id), "{id}");
+        }
+        assert!(group_headers(&alone).is_empty());
+    }
+
+    #[test]
+    fn the_header_counts_failed_calls_and_claims_no_run_state() {
+        let who = subagent("task1", "Walidacja");
+        let task_call = entry(
+            1,
+            "{}",
+            vec![ChatElement::ToolCall {
+                call_id: Some("task1".into()),
+                tool: "Task".into(),
+                summary: "Walidacja".into(),
+                input: json!({}),
+            }],
+        );
+        let task_result = entry(
+            9,
+            "{}",
+            vec![ChatElement::ToolResult {
+                call_id: Some("task1".into()),
+                tool: Some("Task".into()),
+                call_summary: None,
+                status: ToolResultStatus::Ok,
+                content: "ok".into(),
+                truncated: false,
+            }],
+        );
+        let work = [
+            call(2, &who, "c1"),
+            result(3, &who, "c1", ToolResultStatus::Error),
+        ];
+        let running = state_of(&[task_call.clone(), work[0].clone(), work[1].clone()], 80);
+        let header = &group_headers(&running)[0];
+        assert!(
+            !header.contains("trwa") && !header.contains("zakończony"),
+            "{header}"
+        );
+        assert!(header.contains("błędy: 1"), "{header}");
+        let done = state_of(
+            &[task_call, work[0].clone(), work[1].clone(), task_result],
+            80,
+        );
+        assert_eq!(group_headers(&done)[0], group_headers(&running)[0]);
+    }
+
+    #[test]
+    fn a_new_entry_updates_the_count_and_keeps_the_fold_state_and_the_cursor() {
+        let who = subagent("a", "Walidacja");
+        let mut state = state_of(&[text(&who, 1), said(2, "main")], 80);
+        let id = group_id(&state, 0);
+        state.to_top();
+        assert_eq!(state.selected_entry(), Some(&id));
+        state.append(transcript_entries(&text(&who, 3)));
+        let headers = group_headers(&state);
+        assert!(
+            headers[0].starts_with("▸ Walidacja · 2 wpisy"),
+            "{headers:?}"
+        );
+        assert_eq!(state.selected_entry(), Some(&id));
+        assert!(!state.is_following_end());
+        assert!(!state.is_expanded(&id));
+    }
+
+    #[test]
+    fn a_new_subagent_entry_does_not_take_the_cursor_from_the_main_thread() {
+        let who = subagent("a", "Walidacja");
+        let mut state = state_of(&[text(&who, 1), said(2, "main")], 80);
+        let main_id = state.selected_entry().cloned().unwrap();
+        state.append(transcript_entries(&text(&who, 3)));
+        assert_eq!(state.selected_entry(), Some(&main_id));
+        assert!(state.is_following_end());
     }
 }
