@@ -121,6 +121,9 @@ fn remote_head_branch(git: &Git, dir: &str) -> Option<String> {
 /// the working tree. A fresh clone has only the remote base branch, so
 /// `origin/<base>` wins over a local `<base>`.
 fn changed_lines(git: &Git, dir: &str, base_branch: &str) -> Option<ChangedLines> {
+    if defines_filters(git, dir) {
+        return None;
+    }
     let base = base_ref(git, dir, base_branch)?;
     let ancestor = git.stdout(&["-C", dir, "merge-base", &base, "HEAD"])?;
     // `--no-optional-locks` keeps the read from refreshing the index.
@@ -131,9 +134,29 @@ fn changed_lines(git: &Git, dir: &str, base_branch: &str) -> Option<ChangedLines
         "diff",
         "--numstat",
         "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
         &ancestor,
     ])?;
     Some(sum_numstat(&numstat))
+}
+
+/// Whether the repository's own config defines a `filter.<x>` command. Git
+/// would run its `clean` command on a diff of the working tree when
+/// `info/attributes` selects it, and that file cannot be switched off, so
+/// such a repository gets no line count.
+fn defines_filters(git: &Git, dir: &str) -> bool {
+    git.stdout(&[
+        "-C",
+        dir,
+        "config",
+        "--local",
+        "--includes",
+        "--name-only",
+        "--get-regexp",
+        "^filter\\.",
+    ])
+    .is_some_and(|names| !names.is_empty())
 }
 
 fn base_ref(git: &Git, dir: &str, base_branch: &str) -> Option<String> {
@@ -150,15 +173,27 @@ fn base_ref(git: &Git, dir: &str, base_branch: &str) -> Option<String> {
 
 /// Config that stops a repository from running its own code during a read.
 /// A task's repository can set `core.fsmonitor` or a hook, and git would run
-/// that command on a plain `git diff`. Every read gets these first.
-const READ_ONLY_CONFIG: [&str; 6] = [
+/// that command on a plain `git diff`. It can also name a `filter.<x>.clean`
+/// command and select it with `.gitattributes` or `info/attributes`, so every
+/// read ignores attributes: the system and global files, and the repository's
+/// own, which an empty tree as the attribute source replaces (git 2.40 or
+/// newer; an older git fails the read, so no line count is shown).
+/// Every read gets these first.
+const READ_ONLY_CONFIG: [&str; 10] = [
     "-c",
     "core.fsmonitor=false",
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
     "core.untrackedCache=false",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "--attr-source",
+    EMPTY_TREE,
 ];
+
+/// The id of the empty tree, which every git knows without storing it.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Runs read-only git commands that all share one deadline.
 struct Git {
@@ -174,6 +209,7 @@ impl Git {
         }
         let args: Vec<&str> = READ_ONLY_CONFIG.iter().chain(args).copied().collect();
         let mut child = git_command(&args, &GitAccess::User)
+            .env("GIT_ATTR_NOSYSTEM", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -497,6 +533,46 @@ mod tests {
 
         assert!(reading.changes.is_some());
         assert!(!marker.exists(), "the fsmonitor command ran during read");
+    }
+
+    #[test]
+    fn reading_does_not_run_a_clean_filter_of_the_repository() {
+        let scratch = Scratch::new();
+        let clone = origin_and_clone(&scratch);
+        let marker = scratch.0.join("filter-ran");
+        fs::write(clone.join(".gitattributes"), "*.txt filter=x\n").unwrap();
+        git(&clone, &["add", ".gitattributes"]);
+        git(&clone, &["commit", "-q", "-m", "attributes"]);
+        let command = format!("touch {}; cat", marker.display());
+        git(&clone, &["config", "filter.x.clean", &command]);
+        fs::write(clone.join("a.txt"), "changed\n").unwrap();
+
+        let reading = read(&clone, Some("main"));
+
+        assert!(
+            reading.changes.is_none(),
+            "a filter repository gets no count"
+        );
+        assert!(!marker.exists(), "the clean filter ran during read");
+    }
+
+    #[test]
+    fn reading_does_not_run_a_filter_named_in_info_attributes() {
+        let scratch = Scratch::new();
+        let clone = origin_and_clone(&scratch);
+        let marker = scratch.0.join("filter-ran");
+        fs::write(clone.join(".git/info/attributes"), "*.txt filter=x\n").unwrap();
+        let command = format!("touch {}; cat", marker.display());
+        git(&clone, &["config", "filter.x.clean", &command]);
+        fs::write(clone.join("a.txt"), "changed\n").unwrap();
+
+        let reading = read(&clone, Some("main"));
+
+        assert!(
+            reading.changes.is_none(),
+            "a filter repository gets no count"
+        );
+        assert!(!marker.exists(), "the clean filter ran during read");
     }
 
     #[test]
