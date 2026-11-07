@@ -106,6 +106,7 @@ fn every_event_data_variant() -> Vec<EventData> {
             action_execution_id: "a1".to_string(),
             state_id: "prepare".to_string(),
             action_type: "agent".to_string(),
+            decision_by: None,
         },
         EventData::ActionCompleted {
             action_execution_id: "a1".to_string(),

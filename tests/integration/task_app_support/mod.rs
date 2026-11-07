@@ -124,6 +124,8 @@ pub fn runner(status: ExecutionStatus, step: &str) -> RunnerView {
             execution_id: Some("exec-1".to_string()),
             current_state: Some(step.to_string()),
             action_execution_id: None,
+            current_action_type: None,
+            current_decision_by: None,
         },
         "event_cursor": 1,
         "pending_input": null,
@@ -262,6 +264,7 @@ pub fn position(state: &str, status: PositionStatus) -> Position {
         effort: None,
         harness_session_id: None,
         usage: None,
+        decision_by: None,
     }
 }
 

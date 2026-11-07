@@ -234,6 +234,34 @@ async fn a_sure_choice_takes_the_transition_and_runs_the_set_of_the_label() {
     assert!(!message.contains("{{"), "{message}");
 }
 
+/// The engine says who decides when it starts a decision step, and says
+/// nothing for the agent step before it.
+#[tokio::test]
+async fn the_started_event_of_a_decision_step_says_who_decides() {
+    let fixture = Fixture::new(vec![choose("approve", "high", json!({}))]);
+    let execution = fixture.run(json!({})).await;
+
+    let started: Vec<_> = fixture
+        .events(&execution.id)
+        .into_iter()
+        .filter_map(|data| match data {
+            EventData::ActionStarted {
+                action_type,
+                decision_by,
+                ..
+            } => Some((action_type, decision_by)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        [
+            ("agent".to_string(), None),
+            ("decision".to_string(), Some("conductor".to_string())),
+        ]
+    );
+}
+
 /// A label that needs a variable is taken when the conductor delivers it.
 #[tokio::test]
 async fn a_label_with_requirements_is_taken_when_they_are_met() {

@@ -118,17 +118,22 @@ pub(crate) fn build(
         }
     };
 
+    let current_position = timeline
+        .positions
+        .iter()
+        .rev()
+        .find(|position| position.action_execution_id.is_some());
+
     Ok(RunnerSnapshot {
         snapshot_sequence: 0,
         execution_status: execution.status,
         execution_cursor: ExecutionCursor {
             execution_id: Some(execution.id.clone()),
             current_state: execution.current_state.clone(),
-            action_execution_id: timeline
-                .positions
-                .iter()
-                .rev()
-                .find_map(|position| position.action_execution_id.clone()),
+            action_execution_id: current_position
+                .and_then(|position| position.action_execution_id.clone()),
+            current_action_type: current_position.and_then(|position| position.action_type.clone()),
+            current_decision_by: current_position.and_then(|position| position.decision_by.clone()),
         },
         event_cursor,
         pending_input,
@@ -293,7 +298,57 @@ mod tests {
             action_execution_id: attempt.to_string(),
             state_id: "plan".to_string(),
             action_type: "agent".to_string(),
+            decision_by: None,
         }
+    }
+
+    /// The task's cursor says what kind of step the task is in, so a list of
+    /// tasks needs no timeline to show it.
+    #[test]
+    fn the_cursor_carries_the_kind_of_the_current_step() {
+        let root =
+            TempRoot(std::env::temp_dir().join(format!("narsor-cursor-{}", uuid::Uuid::new_v4())));
+        let store = ExecutionStore::new(&root.0);
+        let execution = execution("exec-1");
+        store.save_execution(&execution).expect("execution");
+        store
+            .event_log("exec-1")
+            .append_next(
+                &execution.id,
+                EventData::ActionStarted {
+                    action_execution_id: "act-1".to_string(),
+                    state_id: "plan".to_string(),
+                    action_type: "decision".to_string(),
+                    decision_by: Some("human".to_string()),
+                },
+            )
+            .expect("event");
+
+        let engine = Engine::new(store.clone());
+        let workspaces = WorkspaceTracker::new(
+            &crate::runner::storage::TaskStorage::new(&root.0),
+            &crate::domain::TaskWorkspace::none(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        let snapshot = build(
+            &engine,
+            &mut ConversationCache::default(),
+            SnapshotContext {
+                workspaces: &workspaces,
+                execution_id: Some("exec-1"),
+                pass_active: false,
+                problem: None,
+                stopping: false,
+                conductor_unavailable: Some("no conductor in this test"),
+                default_harness_unavailable: None,
+            },
+        )
+        .expect("snapshot");
+
+        let cursor = snapshot.execution_cursor;
+        assert_eq!(cursor.action_execution_id.as_deref(), Some("act-1"));
+        assert_eq!(cursor.current_action_type.as_deref(), Some("decision"));
+        assert_eq!(cursor.current_decision_by.as_deref(), Some("human"));
     }
 
     /// The daemon reads a stopped local task's summaries with the very

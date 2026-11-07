@@ -118,6 +118,7 @@ struct Draft {
     visit: u32,
     action_execution_id: Option<String>,
     action_type: Option<String>,
+    decision_by: Option<String>,
     outcome: Option<Outcome>,
     interrupted: bool,
     resolved_via_attempt_failed: bool,
@@ -200,6 +201,7 @@ pub fn build_timeline(
                 action_execution_id,
                 state_id,
                 action_type,
+                decision_by,
             } => {
                 let idx = push_attempt(
                     &mut drafts,
@@ -209,6 +211,7 @@ pub fn build_timeline(
                     Some(action_type.clone()),
                     event.timestamp,
                 );
+                drafts[idx].decision_by.clone_from(decision_by);
                 by_attempt.insert(action_execution_id.clone(), idx);
                 current_visit_last_position = Some(idx);
                 open_position = Some(idx);
@@ -229,6 +232,8 @@ pub fn build_timeline(
                 };
                 let inherited_action_type =
                     current_visit_last_position.and_then(|idx| drafts[idx].action_type.clone());
+                let inherited_decision_by =
+                    current_visit_last_position.and_then(|idx| drafts[idx].decision_by.clone());
                 let idx = push_attempt(
                     &mut drafts,
                     &state_visit_counts,
@@ -237,6 +242,7 @@ pub fn build_timeline(
                     inherited_action_type,
                     event.timestamp,
                 );
+                drafts[idx].decision_by = inherited_decision_by;
                 by_attempt.insert(action_execution_id.clone(), idx);
                 current_visit_last_position = Some(idx);
                 open_position = Some(idx);
@@ -252,6 +258,8 @@ pub fn build_timeline(
                 // a retry, and runs the same (agent) action.
                 let inherited_action_type =
                     current_visit_last_position.and_then(|idx| drafts[idx].action_type.clone());
+                let inherited_decision_by =
+                    current_visit_last_position.and_then(|idx| drafts[idx].decision_by.clone());
                 let idx = push_attempt(
                     &mut drafts,
                     &state_visit_counts,
@@ -260,6 +268,7 @@ pub fn build_timeline(
                     inherited_action_type,
                     event.timestamp,
                 );
+                drafts[idx].decision_by = inherited_decision_by;
                 by_attempt.insert(action_execution_id.clone(), idx);
                 current_visit_last_position = Some(idx);
                 open_position = Some(idx);
@@ -727,6 +736,7 @@ fn push_attempt(
         visit,
         action_execution_id,
         action_type,
+        decision_by: None,
         outcome: None,
         interrupted: false,
         resolved_via_attempt_failed: false,
@@ -861,6 +871,7 @@ fn finalize(
         visit: draft.visit,
         action_execution_id: draft.action_execution_id,
         action_type: draft.action_type,
+        decision_by: draft.decision_by,
         status,
         started_at: draft.started_at,
         ended_at: draft.ended_at,

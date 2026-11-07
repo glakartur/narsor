@@ -638,6 +638,12 @@ pub struct ExecutionCursor {
     pub execution_id: Option<String>,
     pub current_state: Option<String>,
     pub action_execution_id: Option<String>,
+    /// The action type of the step the cursor is in, as the timeline says.
+    #[serde(default)]
+    pub current_action_type: Option<String>,
+    /// Who decides the step when it is a `decision`.
+    #[serde(default)]
+    pub current_decision_by: Option<String>,
 }
 
 /// A default harness a task cannot follow.

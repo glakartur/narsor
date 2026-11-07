@@ -3302,6 +3302,7 @@ async fn a_reprompt_after_a_restart_runs_on_the_recorded_harness_not_the_new_def
             action_execution_id: "attempt-1".to_string(),
             state_id: "work".to_string(),
             action_type: "agent".to_string(),
+            decision_by: None,
         },
         EventData::ActionOutputRejected {
             action_execution_id: "attempt-1".to_string(),
@@ -3371,6 +3372,7 @@ async fn a_restart_between_rejection_and_reprompt_continues_with_the_reprompt() 
             action_execution_id: "attempt-1".to_string(),
             state_id: "work".to_string(),
             action_type: "agent".to_string(),
+            decision_by: None,
         },
         EventData::ActionOutputRejected {
             action_execution_id: "attempt-1".to_string(),

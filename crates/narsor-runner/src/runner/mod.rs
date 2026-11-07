@@ -622,6 +622,8 @@ async fn report_problem(
             execution_id: existing.as_ref().map(|execution| execution.id.clone()),
             current_state: existing.and_then(|execution| execution.current_state),
             action_execution_id: None,
+            current_action_type: None,
+            current_decision_by: None,
         },
         event_cursor,
         pending_input: None,

@@ -69,6 +69,11 @@ pub enum EventData {
         action_execution_id: String,
         state_id: String,
         action_type: String,
+        /// Who decides a `decision` step (`conductor` or `human`); `None`
+        /// for every other kind. `#[serde(default)]` so a log written before
+        /// the field existed still deserializes.
+        #[serde(default)]
+        decision_by: Option<String>,
     },
     ActionCompleted {
         action_execution_id: String,

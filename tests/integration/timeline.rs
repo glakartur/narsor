@@ -52,6 +52,7 @@ fn action_started(id: &str, state_id: &str, action_type: &str) -> EventData {
         action_execution_id: id.to_string(),
         state_id: state_id.to_string(),
         action_type: action_type.to_string(),
+        decision_by: None,
     }
 }
 
@@ -113,6 +114,71 @@ fn presence(ids: &[&str]) -> HashSet<String> {
 // ---------------------------------------------------------------------------
 // Happy paths
 // ---------------------------------------------------------------------------
+
+fn decision_started(id: &str, state_id: &str, by: &str) -> EventData {
+    EventData::ActionStarted {
+        action_execution_id: id.to_string(),
+        state_id: state_id.to_string(),
+        action_type: "decision".to_string(),
+        decision_by: Some(by.to_string()),
+    }
+}
+
+/// The steps of `decision_conductor.yaml`: only the decision step says who
+/// decides.
+#[test]
+fn only_a_decision_step_carries_who_decides() {
+    let mut log = Log::new();
+    log.push(state_entered("test"));
+    log.push(action_started("a1", "test", "script"));
+    log.push(action_completed("a1", "failed"));
+    log.push(state_entered("triage"));
+    log.push(decision_started("a2", "triage", "conductor"));
+    log.push(action_completed("a2", "fix"));
+    log.push(state_entered("work"));
+    log.push(action_started("a3", "work", "agent"));
+    log.push(state_entered("approval"));
+    log.push(decision_started("a4", "approval", "human"));
+
+    let timeline = build_timeline(&log.events, ExecutionStatus::Running, &HashSet::new());
+
+    let by: Vec<_> = timeline
+        .positions
+        .iter()
+        .map(|position| (position.state_id.as_str(), position.decision_by.as_deref()))
+        .collect();
+    assert_eq!(
+        by,
+        [
+            ("test", None),
+            ("triage", Some("conductor")),
+            ("work", None),
+            ("approval", Some("human")),
+        ]
+    );
+}
+
+/// A retry of a step is the same kind of step as its first attempt.
+#[test]
+fn a_retry_inherits_who_decides_from_its_step() {
+    let mut log = Log::new();
+    log.push(state_entered("triage"));
+    log.push(decision_started("a1", "triage", "conductor"));
+    log.push(action_attempt_failed(
+        "a1",
+        "triage",
+        "the conductor crashed",
+    ));
+    log.push(action_retrying("a2", "triage"));
+
+    let timeline = build_timeline(&log.events, ExecutionStatus::Running, &HashSet::new());
+
+    assert_eq!(timeline.positions.len(), 2);
+    for position in &timeline.positions {
+        assert_eq!(position.action_type.as_deref(), Some("decision"));
+        assert_eq!(position.decision_by.as_deref(), Some("conductor"));
+    }
+}
 
 /// Covers AE7: a failed first attempt followed by a successful second one
 /// produces two independently-tracked positions.
