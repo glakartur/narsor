@@ -44,14 +44,14 @@ Scope from the brainstorm (session history):
 ## Guidance
 
 ### 1. Count a loss once, as the task enters `Interrupted`; reset after a stable run before any other branch
-`ResumePolicy` (`src/orchestration/resume.rs`) is fixed:
+`ResumePolicy` (`crates/narsor-engine/src/orchestration/resume.rs`) is fixed:
 - delays `[0, 30s, 2m, 10m, 30m]`, and the length of that list is the limit;
 - a stability window of 10 minutes.
 
 `count_loss` reads the remembered `last_loss` and either plans `next_attempt_at` or sets `exhausted`. The periodic pass only acts on attempts that are due (`TaskRecord::auto_resume_due`), so the counting rule and the timing are tested separately from the loop.
 
 ```rust
-if loss.from == TaskLifecycle::PauseRequested { return; }   // the owner wanted a pause
+if loss.from == RunnerState::PauseRequested { return; }   // the owner wanted a pause
 if started_successfully {                                    // reset FIRST
     resume.consecutive_losses = 0;
     resume.uncounted_losses = 0;
@@ -75,7 +75,7 @@ match policy.delay(resume.consecutive_losses) {
 A loss reported under a newer lease epoch than `TaskRecord.workload_epoch` was found by a controller that took over after the launch. The workload's own behaviour did not cause it, so it costs no attempt; `AutoResumed { attempt: 0, .. }` marks such a resume. These free losses are capped at `limit` in a row. Past the cap they count like any other loss, so a controller crash loop still ends in exhaustion.
 
 ### 3. Leave `Unknown` for `Interrupted` only on a confirmed loss
-The controller's `confirm_loss` (`src/backends/controller.rs`) reports `Observation::LossConfirmed` only when both hold:
+The controller's `confirm_loss` (`crates/narsor-controller-runtime/src/controller.rs`) reports `Observation::LossConfirmed` only when both hold:
 - the storage is `Present`;
 - the workload is either absent or `Exited`.
 
@@ -100,12 +100,12 @@ self.command(task_id,
 `Observation`, `TaskEventKind` and `ConversationUnavailableReason` each end in `#[serde(other)] Unrecognized`. The control plane refuses `Unrecognized` in a report. The upgrade order is documented in D58/D59 and in `docs/operations/remote-backends.md` §9: control plane first, then controllers, then clients together with their server.
 
 ### 7. Kill a dead runner's orphaned process group before relaunch (local backend)
-Local runners are spawned with `NARSOR_LOCAL_WORKLOAD_UID=<uid>`. `remove_workload` / `kill_marked_group` (`src/backends/local.rs`) send SIGKILL to `-pgid` only while a live, non-zombie member of that group carries the mark in `/proc/<pid>/environ`. Such a member proves the group is ours, and its pgid cannot be reused while it lives.
+Local runners are spawned with `NARSOR_LOCAL_WORKLOAD_UID=<uid>`. `remove_workload` / `kill_marked_group` (`crates/narsor-engine/src/backends/local.rs`) send SIGKILL to `-pgid` only while a live, non-zombie member of that group carries the mark in `/proc/<pid>/environ`. Such a member proves the group is ours, and its pgid cannot be reused while it lives.
 
 ### 8. Expose the loop body and test it without a daemon
-`pub fn run_periodic_pass(&ProtocolService)` in `src/cli/daemon.rs` runs `reschedule_all`, `auto_resume_pass` and `sweep_materials`. The default-run test `the_daemons_periodic_pass_resumes_a_due_interrupted_task` in `tests/controller_protocol.rs` calls it directly. Tests that start a real daemon are `#[ignore]`d because they leak processes. `recover()` adopts legacy `Interrupted` tasks from the event log (`loss_from_history`), and an unreadable log skips only that task.
+`pub fn run_periodic_pass(&ProtocolService)` in `crates/narsor-server/src/runtime.rs` is the loop body of the daemon. It runs `auto_resume_pass` next to other periodic passes (limit stop, slot release, reader lease). The tests call `service.auto_resume_pass()` directly (`tests/integration/backend_contract_support/mod.rs`) and need no daemon. Tests that start a real daemon are `#[ignore]`d because they leak processes. `recover()` adopts legacy `Interrupted` tasks from the event log (`loss_from_history`), and an unreadable log skips only that task.
 
-The loss classifier (`LossState` / `loss_state`) also lives in `orchestration/resume.rs`, so the TUI and the CLI describe a lost task the same way.
+The loss classifier (`LossState` / `loss_state`) lives in `crates/narsor-protocol/src/display.rs`, so the TUI and the CLI describe a lost task the same way.
 
 ## Why This Matters
 Code review of the branch caught three real defects (fixes 637657f, d319ecf and neighbours):
@@ -140,15 +140,7 @@ resume.consecutive_losses = if started_successfully { 1 } else { resume.consecut
 ```
 After: see §1. The reset happens first, and the free path is bounded by `uncounted_losses < limit`.
 
-**Forward-compatible enum** (`src/orchestration/model.rs`):
-```rust
-    /// An observation of a newer version this one does not know. Never
-    /// written: it only lets a client decode a newer server's event or
-    /// summary instead of dropping it, and the control plane refuses it in
-    /// a report.
-    #[serde(other)]
-    Unrecognized,
-```
+**Forward-compatible enum** (`Observation` in `crates/narsor-protocol/src/controller.rs` ends in `#[serde(other)] Unrecognized`; the control plane treats it as an illegal observation). The raw-JSON test (`tests/integration/orchestration.rs`):
 ```rust
 let observation: Observation =
     serde_json::from_value(serde_json::json!({ "kind": "workload_teleported" }))
@@ -156,14 +148,10 @@ let observation: Observation =
 assert_eq!(observation, Observation::Unrecognized);
 ```
 
-**Wiring tested without a daemon:**
-```rust
-let pass = narsor::cli::daemon::run_periodic_pass(&harness.service);
-assert_eq!(pass.resumed, vec![TaskId::parse("task-1").unwrap()]);
-```
+**Wiring tested without a daemon:** call the pass on the service, not through a daemon (`service.auto_resume_pass()` in `tests/integration/backend_contract_support/mod.rs`).
 
 ## Related
-- `ARCHITECTURE_DECISIONS.md`: D58 (automatic resume), D59 (conversation from storage), D23 (crash recovery, ancestor of `recover()`)
+- `docs/dev/architecture.md`: D58 (automatic resume), D59 (conversation from storage; superseded by D63, only its `source` and `recorded_at` fields survive), D23 (crash recovery, ancestor of `recover()`)
 - `docs/operations/remote-backends.md` §9 (task lifecycle, upgrade order) and §10 (slots)
 - `docs/brainstorms/2026-10-10-wznawianie-utraconych-zadan-requirements.md`
 - `docs/plans/2026-10-10-003-feat-automatyczne-wznawianie-utraconych-zadan-plan.md`

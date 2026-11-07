@@ -114,7 +114,7 @@ Przed odpowiedzią `progress` ten błąd był niewidoczny. Każde `choice` końc
 
 ### Sources / Research
 
-- `docs/solutions/runtime-errors/progress-note-recorded-as-failed-session-2026-10-27.md` (tabela eksperymentów, otwarty punkt o rezygnacji ze schematu).
+- `docs/solutions/runtime-errors/progress-note-recorded-as-failed-session-2026-10-27.md` (dokument usunięty po odświeżeniu rozwiązań, zob. historia gita) (tabela eksperymentów, otwarty punkt o rezygnacji ze schematu).
 - `docs/brainstorms/2026-10-26-zamykanie-kroku-agenta-i-odpowiedz-progress-requirements.md` (R1, R5–R9).
 - `ARCHITECTURE_DECISIONS.md`, D60.
 
@@ -229,7 +229,7 @@ Przed odpowiedzią `progress` ten błąd był niewidoczny. Każde `choice` końc
 - **Files:**
   - `ARCHITECTURE_DECISIONS.md` (nowy wpis D69 zawężający D60: schemat tylko u conductora)
   - `workflows/README.md` (akapit o `contract_note` i `StructuredOutput`)
-  - `docs/solutions/runtime-errors/progress-note-recorded-as-failed-session-2026-10-27.md` (punkt o rezygnacji ze schematu jest rozwiązany)
+  - `docs/solutions/runtime-errors/progress-note-recorded-as-failed-session-2026-10-27.md` (dokument usunięty po odświeżeniu rozwiązań, zob. historia gita) (punkt o rezygnacji ze schematu jest rozwiązany)
 - **Approach:** Wpis w tabeli w formacie istniejących decyzji (status, uzasadnienie). Nie zmieniaj D60, tylko wskaż D69 jako zawężenie.
 - **Test expectation:** none -- zmiana tylko w dokumentacji.
 - **Verification:** przegląd różnic.
@@ -240,7 +240,7 @@ Przed odpowiedzią `progress` ten błąd był niewidoczny. Każde `choice` końc
 
 | Komenda | Kiedy |
 |---|---|
-| `cargo test --workspace` | po każdej jednostce, przed scaleniem. Tak jest zapisane w rozwiązaniu `docs/solutions/runtime-errors/progress-note-recorded-as-failed-session-2026-10-27.md` (po #39 `tests/actions_agent.rs` nie kompilował się na `main`). |
+| `cargo test --workspace` | po każdej jednostce, przed scaleniem. Tak jest zapisane w rozwiązaniu `docs/solutions/runtime-errors/progress-note-recorded-as-failed-session-2026-10-27.md` (dokument usunięty po odświeżeniu rozwiązań, zob. historia gita) (po #39 `tests/actions_agent.rs` nie kompilował się na `main`). |
 | `cargo test --test claude_code_classification --test actions_agent` | U2–U4 |
 | Eksperyment z README rozwiązania, bez `--json-schema`, z zadaniem w tle | to samo co spike z U4, powtórzone raz po U2 na gotowym kodzie, na prawdziwym `claude` |
 
