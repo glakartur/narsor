@@ -102,7 +102,8 @@ use super::super::scroll::sanitize;
 use super::super::style::{Role, Styles};
 use super::actions::chooser_context;
 use super::background::{JobKey, Outcome};
-use super::list::{fit, PendingRow, PendingState};
+use super::detail::fit_cells;
+use super::list::{PendingRow, PendingState};
 use super::notify::Severity;
 use super::{failure_reason, is_transport, Focus, Request, TaskApp, View};
 
@@ -1417,7 +1418,7 @@ pub fn render_pending(
     let role = text.icon.role();
     let mut lines = vec![
         Line::styled(
-            fit(&one_line(&row.title), usize::from(area.width)),
+            fit_cells(&one_line(&row.title), usize::from(area.width)),
             styles.strong(Role::Calm),
         ),
         Line::from(vec![

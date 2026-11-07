@@ -32,7 +32,7 @@ use crate::tui::selection::{bar_prefix, PREFIX_WIDTH};
 use crate::tui::style::{Role, Styles};
 
 use super::super::super::scroll::one_line;
-use super::super::list::fit;
+use super::super::detail::fit_cells;
 use super::READER_RETRY;
 
 /// Events asked for at once.
@@ -352,7 +352,7 @@ pub fn render(
         .skip(events.top)
         .take(height)
         .map(|(index, event)| {
-            let text = fit(&row_text(event, events.raw), width);
+            let text = fit_cells(&row_text(event, events.raw), width);
             Line::from(vec![
                 bar_prefix(styles, index == events.cursor, focused),
                 Span::styled(text, styles.of(grey(Role::Calm))),

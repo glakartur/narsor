@@ -353,6 +353,54 @@ mod tests {
         assert_eq!(cursor.current_decision_by.as_deref(), Some("human"));
     }
 
+    #[test]
+    fn the_cursor_has_no_kind_when_the_current_step_has_not_started() {
+        let root =
+            TempRoot(std::env::temp_dir().join(format!("narsor-cursor-{}", uuid::Uuid::new_v4())));
+        let store = ExecutionStore::new(&root.0);
+        let mut execution = execution("exec-2");
+        execution.current_state = Some("review".to_string());
+        store.save_execution(&execution).expect("execution");
+        store
+            .event_log("exec-2")
+            .append_next(
+                &execution.id,
+                EventData::ActionStarted {
+                    action_execution_id: "act-plan".to_string(),
+                    state_id: "plan".to_string(),
+                    action_type: "decision".to_string(),
+                    decision_by: Some("human".to_string()),
+                },
+            )
+            .expect("event");
+
+        let engine = Engine::new(store.clone());
+        let workspaces = WorkspaceTracker::new(
+            &crate::runner::storage::TaskStorage::new(&root.0),
+            &crate::domain::TaskWorkspace::none(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        let snapshot = build(
+            &engine,
+            &mut ConversationCache::default(),
+            SnapshotContext {
+                workspaces: &workspaces,
+                execution_id: Some("exec-2"),
+                pass_active: false,
+                problem: None,
+                stopping: false,
+                conductor_unavailable: Some("no conductor in this test"),
+                default_harness_unavailable: None,
+            },
+        )
+        .expect("snapshot");
+
+        let cursor = snapshot.execution_cursor;
+        assert_eq!(cursor.action_execution_id.as_deref(), Some("act-plan"));
+        assert_eq!(cursor.current_action_type, None);
+        assert_eq!(cursor.current_decision_by, None);
+    }
+
     /// The daemon reads a stopped local task's summaries with the very
     /// function the runner's snapshot uses: both say the same of the same
     /// storage.

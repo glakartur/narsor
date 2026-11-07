@@ -806,18 +806,16 @@ pub fn build_conversation(
         };
         until(&mut builder.built.entries, Some(visits[0].sequence));
         for (index, visit) in visits.iter().enumerate() {
-            let mut shown = false;
-            for position in by_visit
+            let at_visit = by_visit
                 .get(&(visit.state_id.as_str(), visit.visit))
-                .into_iter()
-                .flatten()
-            {
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut shown = false;
+            for position in at_visit {
                 shown |= builder.push_position(position, attempts) != Pushed::Nothing;
             }
             if !shown {
-                let icon = by_visit
-                    .get(&(visit.state_id.as_str(), visit.visit))
-                    .and_then(|positions| positions.iter().find_map(|position| position.icon()));
+                let icon = at_visit.iter().find_map(|position| position.icon());
                 builder.push_step_heading(&visit.state_id, visit.visit, icon);
             }
             until(

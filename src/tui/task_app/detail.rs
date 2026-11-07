@@ -73,7 +73,7 @@ use super::super::keymap::Action;
 use super::super::scroll::one_line;
 use super::super::style::{PanelEdge, Role, Styles};
 use super::background::{DetailJob, JobKey, Outcome};
-use super::list::{describe_loss, fit, state_icon, title_of};
+use super::list::{describe_loss, state_icon, title_of};
 use super::notify::Severity;
 use super::panel::WaitingPanel;
 use super::tabs::conductor::{self, Conductor};
@@ -918,7 +918,7 @@ struct LinkSpot {
 pub(super) fn panel_title(title: &str, width: u16) -> String {
     format!(
         " {} ",
-        fit(&one_line(title), usize::from(width).saturating_sub(4))
+        fit_cells(&one_line(title), usize::from(width).saturating_sub(4))
     )
 }
 
@@ -1684,7 +1684,7 @@ fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Optio
             Role::Attention
         };
         return Some(Line::styled(
-            fit(&describe_loss(&loss), usize::from(width)),
+            fit_cells(&describe_loss(&loss), usize::from(width)),
             styles.of(greyed(role, stale)),
         ));
     }
@@ -1695,7 +1695,7 @@ fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Optio
         one_line(&unavailable.kept)
     );
     Some(Line::styled(
-        fit(&text, usize::from(width)),
+        fit_cells(&text, usize::from(width)),
         styles.of(greyed(Role::Attention, stale)),
     ))
 }

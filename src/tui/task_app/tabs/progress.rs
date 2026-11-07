@@ -31,9 +31,8 @@ use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
-use super::super::detail::{cells as width_of, fit_step_name, step_name};
+use super::super::detail::{cells as width_of, fit_cells, fit_step_name, step_name};
 use super::super::layout::first_row;
-use super::super::list::fit;
 use super::super::StepFocus;
 use super::conversation::Attempts;
 use super::conversation::{
@@ -558,7 +557,7 @@ impl AxisLayout {
                 row.push_str(&format!("{:DETAIL_GAP$}{}", "", joined(&agent, index)));
             }
             rows.push(Line::styled(
-                fit(row.trim_end(), content),
+                fit_cells(row.trim_end(), content),
                 styles.of(Role::Done),
             ));
         }

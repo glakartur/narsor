@@ -42,8 +42,9 @@ use ratatui::Frame;
 use super::super::keymap::{self, Context};
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
+use super::detail::fit_cells;
 use super::harness::HarnessHeader;
-use super::list::{fit as fit_text, Counters, Slots, TaskList};
+use super::list::{Counters, Slots, TaskList};
 use super::{actions, detail, history, new_task, repositories, usage};
 use super::{Focus, TaskApp, View};
 
@@ -377,7 +378,7 @@ fn harness_name(app: &TaskApp) -> String {
 /// `harness opencode…` while a change waits for its answer. The name is cut
 /// to `room` columns.
 fn harness_spans(app: &TaskApp, styles: &Styles, fit: Fit, room: usize) -> Vec<Span<'static>> {
-    let name = fit_text(&harness_name(app), room);
+    let name = fit_cells(&harness_name(app), room);
     let mut spans = vec![
         Span::styled("harness ", styles.of(Role::Done)),
         Span::styled(name, styles.of(Role::Calm)),
@@ -517,7 +518,7 @@ fn bar_right(
     room: usize,
 ) -> Line<'static> {
     if let Some(note) = app.notifier().span(styles, now) {
-        return Line::from(Span::styled(fit_text(&note.content, room), note.style));
+        return Line::from(Span::styled(fit_cells(&note.content, room), note.style));
     }
     app.harness_usage().map_or_else(Line::default, |state| {
         Line::from(usage::bar_spans(state, now_utc, styles, room))

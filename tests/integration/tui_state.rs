@@ -4108,6 +4108,23 @@ mod task_app_detail {
         }
 
         #[test]
+        fn a_step_heading_without_an_attempt_entry_keeps_the_icon_of_its_kind() {
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            let positions = vec![crate::task_app_support::of_kind(
+                position("test", PositionStatus::Succeeded),
+                "script",
+                None,
+            )];
+            let built = build_conversation(
+                Scope::Whole,
+                &positions,
+                &Attempts::default(),
+                &[entered(1, "test")],
+            );
+            assert_eq!(built.entries[0].header, "── 📜 test #1 ──");
+        }
+
+        #[test]
         fn a_gate_heading_reads_the_step_and_its_visit() {
             use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
             let events = vec![entered(1, "gate")];
