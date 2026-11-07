@@ -598,17 +598,22 @@ impl<'a> TemplateScope<'a> {
 
             "context" => match parse_context_path(path).ok_or_else(unsupported)? {
                 ContextPath::Variable { name, fields } => {
-                    let base = match self.variables.get(name) {
-                        Some(value) => value.clone(),
-                        None if self.declares_variable(name) && fields.is_empty() => {
-                            Value::String(String::new())
-                        }
-                        None => return Err(unknown()),
+                    let Some(base) = self.variables.get(name) else {
+                        return if self.declares_variable(name) && fields.is_empty() {
+                            Ok(Value::String(String::new()))
+                        } else {
+                            Err(unknown())
+                        };
                     };
-                    fields.iter().try_fold(base, |value, field| match value {
-                        Value::Object(mut entries) => entries.remove(*field).ok_or_else(unknown),
-                        _ => Err(unknown()),
-                    })
+                    fields
+                        .iter()
+                        .try_fold(base, |value, field| {
+                            value
+                                .as_object()
+                                .and_then(|entries| entries.get(*field))
+                                .ok_or_else(unknown)
+                        })
+                        .cloned()
                 }
                 ContextPath::Workspace { name, field } => {
                     let field = WorkspaceField::from_key(field).ok_or_else(unknown)?;
@@ -689,12 +694,11 @@ impl<'a> TemplateScope<'a> {
         match field {
             WorkspaceField::Pr | WorkspaceField::PrUrl => {
                 let pr = self.workspace_prs?.get(name)?;
-                let text = if field == WorkspaceField::Pr {
-                    &pr.pr
-                } else {
-                    &pr.pr_url
-                };
-                text.clone().map(Value::String)
+                match field {
+                    WorkspaceField::Pr => pr.pr.clone(),
+                    _ => pr.pr_url.clone(),
+                }
+                .map(Value::String)
             }
             _ => self.workspace_values?.value(name, field),
         }

@@ -862,10 +862,6 @@ fn a_condition_without_references_does_not_load() {
     assert!(narsor_engine::workflow::load_from_str(&yaml).is_err());
 }
 
-// ---------------------------------------------------------------------------
-// context.workspace.<name>.<field> and fields of an object variable
-// ---------------------------------------------------------------------------
-
 use narsor_engine::domain::WorkspaceField;
 use narsor_engine::workflow::template::{check_syntax, WorkspaceValues};
 
@@ -875,7 +871,8 @@ struct FakeWorkspaces(HashMap<(String, String), Value>);
 
 impl FakeWorkspaces {
     fn with(mut self, workspace: &str, field: &str, value: Value) -> Self {
-        self.0.insert((workspace.to_string(), field.to_string()), value);
+        self.0
+            .insert((workspace.to_string(), field.to_string()), value);
         self
     }
 }
@@ -1039,7 +1036,10 @@ fn a_scope_that_declares_no_names_knows_no_workspace() {
     )
     .expect_err("no names declared");
 
-    assert!(matches!(error, TemplateError::UnknownVariable { .. }), "{error:?}");
+    assert!(
+        matches!(error, TemplateError::UnknownVariable { .. }),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -1052,7 +1052,10 @@ fn a_workspace_field_outside_the_registry_is_an_unknown_variable() {
     )
     .expect_err("title is not a field");
 
-    assert!(matches!(error, TemplateError::UnknownVariable { .. }), "{error:?}");
+    assert!(
+        matches!(error, TemplateError::UnknownVariable { .. }),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -1087,7 +1090,10 @@ fn a_filter_on_a_workspace_reference_is_still_refused() {
     )
     .expect_err("filters are not supported");
 
-    assert!(matches!(error, TemplateError::FilterUnsupported { .. }), "{error:?}");
+    assert!(
+        matches!(error, TemplateError::FilterUnsupported { .. }),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -1117,7 +1123,10 @@ fn a_field_of_an_object_variable_is_read_by_name() {
 
 #[test]
 fn a_missing_field_or_a_field_of_a_text_value_is_an_unknown_variable() {
-    let context = context(&[("cfg", json!({ "name": "alpha" })), ("text", json!("plain"))]);
+    let context = context(&[
+        ("cfg", json!({ "name": "alpha" })),
+        ("text", json!("plain")),
+    ]);
 
     for reference in [
         "context.variables.cfg.nope",
@@ -1169,7 +1178,9 @@ fn a_workspace_reference_in_the_workspace_setting_of_a_new_task_is_an_unknown_na
     .expect_err("a new task has no workspace values yet");
 
     assert!(
-        error.to_string().contains("unknown template variable 'context.workspace.code.pr_url'"),
+        error
+            .to_string()
+            .contains("unknown template variable 'context.workspace.code.pr_url'"),
         "{error}"
     );
 }

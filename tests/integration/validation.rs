@@ -1484,10 +1484,6 @@ fn a_loop_of_exits_without_a_way_out_is_a_deadlock() {
         .any(|err| matches!(err, ValidationError::NoPathToTerminal(state) if state == "first")));
 }
 
-// ---------------------------------------------------------------------------
-// context.workspace.NAME.FIELD references
-// ---------------------------------------------------------------------------
-
 /// Validates a v2 workflow with the git workspace `code` whose step `work`
 /// has `action` and `exit`, both given as YAML text.
 fn workspace_reference_errors(action: &str, exit: &str) -> Vec<ValidationError> {
@@ -1546,8 +1542,10 @@ fn a_prompt_reading_an_undeclared_workspace_names_the_step_and_the_reference() {
 
 #[test]
 fn a_prompt_reading_a_field_no_workspace_has_is_a_violation() {
-    let errors =
-        workspace_reference_errors(&prompt_action("{{ context.workspace.code.title }}"), PLAIN_EXIT);
+    let errors = workspace_reference_errors(
+        &prompt_action("{{ context.workspace.code.title }}"),
+        PLAIN_EXIT,
+    );
 
     assert!(
         has_workspace_reference_error(&errors, "action.prompt", "context.workspace.code.title"),
@@ -1559,8 +1557,10 @@ fn a_prompt_reading_a_field_no_workspace_has_is_a_violation() {
 #[test]
 fn a_workspace_reference_without_a_field_is_a_violation() {
     for reference in ["context.workspace.code", "context.workspace"] {
-        let errors =
-            workspace_reference_errors(&prompt_action(&format!("{{{{ {reference} }}}}")), PLAIN_EXIT);
+        let errors = workspace_reference_errors(
+            &prompt_action(&format!("{{{{ {reference} }}}}")),
+            PLAIN_EXIT,
+        );
 
         assert!(
             has_workspace_reference_error(&errors, "action.prompt", reference),

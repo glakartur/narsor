@@ -1238,7 +1238,6 @@ impl Engine {
         self
     }
 
-    /// `scope` that also reads the runner's workspace values, when there are any.
     fn reading_workspaces<'a>(&'a self, scope: TemplateScope<'a>) -> TemplateScope<'a> {
         match self.workspace_values.as_deref() {
             Some(values) => scope.with_workspace_values(values),

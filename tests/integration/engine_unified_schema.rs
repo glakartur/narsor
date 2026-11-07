@@ -712,7 +712,9 @@ async fn a_step_reads_the_pull_request_the_step_before_recorded_and_the_runners_
     let agent = Arc::new(ScriptedAgentExecutor::new(read_turns()));
 
     let execution = read_workspace_values(
-        harness.engine().with_workspace_values(Arc::new(ReportedWorkspace)),
+        harness
+            .engine()
+            .with_workspace_values(Arc::new(ReportedWorkspace)),
         &agent,
         &harness,
     )

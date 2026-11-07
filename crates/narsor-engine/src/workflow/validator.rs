@@ -1061,7 +1061,6 @@ fn validate_set_references(
     }
 }
 
-/// Every string inside a JSON value.
 fn strings_of(value: &serde_json::Value) -> Vec<&str> {
     match value {
         serde_json::Value::String(text) => vec![text.as_str()],
