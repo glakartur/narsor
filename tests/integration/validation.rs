@@ -1067,14 +1067,31 @@ fn a_set_for_an_unknown_workspace_names_the_step_and_the_workspace() {
 }
 
 #[test]
-fn a_set_of_a_workspace_value_other_than_pr_and_pr_url_is_a_violation() {
-    let errors = workspace_set_errors("{ workspace: { code: { branch: feat } } }");
+fn a_set_of_a_read_only_workspace_value_is_a_violation_that_names_it() {
+    for key in ["branch", "added", "removed", "repo", "base_branch"] {
+        let errors = workspace_set_errors(&format!("{{ workspace: {{ code: {{ {key}: x }} }} }}"));
+
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::SetReadOnlyWorkspaceValue { state, workspace, key: named, .. }
+                    if state == "work" && workspace == "code" && named == key
+            )),
+            "{key}: {}",
+            describe(&errors)
+        );
+    }
+}
+
+#[test]
+fn a_set_of_a_value_no_workspace_has_lists_the_workspace_fields() {
+    let errors = workspace_set_errors("{ workspace: { code: { title: feat } } }");
 
     assert!(
         errors.iter().any(|error| matches!(
             error,
-            ValidationError::SetUnknownWorkspaceValue { workspace, key, .. }
-                if workspace == "code" && key == "branch"
+            ValidationError::SetUnknownWorkspaceValue { workspace, key, fields, .. }
+                if workspace == "code" && key == "title" && fields.contains("'base_branch'")
         )),
         "got: {}",
         describe(&errors)

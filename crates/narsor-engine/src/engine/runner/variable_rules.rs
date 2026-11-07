@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::domain::{
-    ChoiceDefinition, VariableDefinition, VariableSource, VariableType, WorkspacePrField,
+    ChoiceDefinition, VariableDefinition, VariableSource, VariableType, WorkspaceField,
 };
 use crate::workflow::template::render_scalar;
 
@@ -24,7 +24,7 @@ pub(super) struct Assignment {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct WorkspaceAssignment {
     pub(super) workspace: String,
-    pub(super) field: WorkspacePrField,
+    pub(super) field: WorkspaceField,
     pub(super) value: String,
 }
 
@@ -95,10 +95,11 @@ fn render_workspace_assignments(
     let mut assignments = Vec::new();
     for (workspace, values) in &choice.set.workspace {
         for (key, value) in values {
-            let Some(field) = WorkspacePrField::from_key(key) else {
+            let Some(field) = WorkspaceField::from_key(key).filter(|field| field.writable())
+            else {
                 return Err(format!(
-                    "'set' of '{label}' sets 'workspace.{workspace}.{key}'; only 'pr' and \
-                     'pr_url' can be set"
+                    "'set' of '{label}' sets 'workspace.{workspace}.{key}'; only {} can be set",
+                    WorkspaceField::writable_keys()
                 ));
             };
             let location = format!(

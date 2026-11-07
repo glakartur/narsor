@@ -26,7 +26,7 @@ use crate::domain::{
     ActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel, PromptPart, PromptText,
     RepositoryDefinition, RepositorySource, SchemaVersion, State, StateId, ValidationError,
     VariableDefinition, VariableScope, VariableSource, VariableType, WorkflowDefinition,
-    WorkspacePrField, LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
+    WorkspaceField, LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
 use crate::workspace::provisioner::is_usable_directory_name;
 
@@ -669,7 +669,7 @@ fn validate_set_assignments(state: &State, errors: &mut Vec<ValidationError>) {
 }
 
 /// The `set.workspace` of each choice: only git workspaces the workflow
-/// declares, and only the pull request values `pr` and `pr_url`. A workspace
+/// declares, and only the writable fields (`pr` and `pr_url`). A workspace
 /// chosen when the task is created may still turn out to be a local folder;
 /// the runner reports that when it happens.
 fn validate_set_workspace(
@@ -699,16 +699,26 @@ fn validate_set_workspace(
                 });
                 continue;
             }
-            for key in values
-                .keys()
-                .filter(|key| WorkspacePrField::from_key(key).is_none())
-            {
-                errors.push(ValidationError::SetUnknownWorkspaceValue {
-                    state: state.id.clone(),
-                    label: choice.label.clone(),
-                    workspace: workspace.clone(),
-                    key: key.clone(),
-                });
+            for key in values.keys() {
+                match WorkspaceField::from_key(key) {
+                    None => errors.push(ValidationError::SetUnknownWorkspaceValue {
+                        state: state.id.clone(),
+                        label: choice.label.clone(),
+                        workspace: workspace.clone(),
+                        key: key.clone(),
+                        fields: WorkspaceField::all_keys(),
+                    }),
+                    Some(field) if !field.writable() => {
+                        errors.push(ValidationError::SetReadOnlyWorkspaceValue {
+                            state: state.id.clone(),
+                            label: choice.label.clone(),
+                            workspace: workspace.clone(),
+                            key: key.clone(),
+                            writable: WorkspaceField::writable_keys(),
+                        })
+                    }
+                    Some(_) => {}
+                }
             }
         }
     }

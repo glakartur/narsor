@@ -125,7 +125,7 @@ mod rescue;
 mod step_memory;
 mod variable_rules;
 
-use crate::domain::WorkspacePrField;
+use crate::domain::WorkspaceField;
 use gate_context::{
     decision_fields, has_step_contract, holds_variables_to_declarations, local_values, GateContext,
 };
@@ -540,8 +540,16 @@ fn write_assignments(
             .or_default();
         let value = Some(assignment.value.clone());
         match assignment.field {
-            WorkspacePrField::Pr => pr.pr = value,
-            WorkspacePrField::PrUrl => pr.pr_url = value,
+            WorkspaceField::Pr => pr.pr = value,
+            WorkspaceField::PrUrl => pr.pr_url = value,
+            read_only => {
+                return Err(EngineError::InvalidDefinition {
+                    violations: vec![format!(
+                        "workspace field '{}' is read-only and cannot be written",
+                        read_only.key()
+                    )],
+                })
+            }
         }
     }
     let (local, global): (Vec<&Assignment>, Vec<&Assignment>) = assigned
