@@ -59,7 +59,7 @@ use super::{PersistenceError, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
+use narsor_protocol::chat::{ChatElement, SubagentRef, UnclassifiedReason};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::fs::{self, File, OpenOptions};
@@ -96,6 +96,9 @@ struct Envelope<'a> {
     /// What the line means. Omitted when there are none.
     #[serde(skip_serializing_if = "<[ChatElement]>::is_empty")]
     elements: &'a [ChatElement],
+    /// The subagent that wrote the line. Omitted for the main agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subagent: Option<&'a SubagentRef>,
 }
 
 /// An [`Envelope`] as read back, with every element still raw JSON.
@@ -115,6 +118,10 @@ struct StoredEnvelope<'a> {
     /// Absent in records written before elements existed.
     #[serde(default, borrow)]
     elements: Vec<&'a RawValue>,
+    /// Absent for the main agent and in records written before subagents
+    /// were marked.
+    #[serde(default)]
+    subagent: Option<SubagentRef>,
 }
 
 /// The first fields of an [`Envelope`], read without decoding the rest:
@@ -147,6 +154,9 @@ pub struct ConversationEntry {
     /// What the line means, as recorded with it. Empty for an entry written
     /// before elements existed.
     pub elements: Vec<ChatElement>,
+    /// The subagent that wrote the line; `None` for the main agent and for
+    /// an entry written before subagents were marked.
+    pub subagent: Option<SubagentRef>,
 }
 
 /// The result of reading a conversation from a given cursor.
@@ -232,6 +242,18 @@ impl ConversationWriter {
         raw: &[u8],
         elements: &[ChatElement],
     ) -> Result<u64> {
+        self.append_for_subagent(source, raw, elements, None)
+    }
+
+    /// Like [`ConversationWriter::append`], for a line a subagent wrote
+    /// (`Some`) or the main agent did (`None`).
+    pub fn append_for_subagent(
+        &mut self,
+        source: ConversationSource,
+        raw: &[u8],
+        elements: &[ChatElement],
+        subagent: Option<&SubagentRef>,
+    ) -> Result<u64> {
         let entry_number = self.next_entry;
         let envelope = Envelope {
             n: entry_number,
@@ -239,6 +261,7 @@ impl ConversationWriter {
             source,
             raw_b64: BASE64.encode(raw),
             elements,
+            subagent,
         };
         let mut bytes =
             serde_json::to_vec(&envelope).map_err(|source| PersistenceError::Serialize {
@@ -431,6 +454,7 @@ impl ConversationStore {
                 source: envelope.source,
                 raw,
                 elements: envelope.elements.into_iter().map(decode_element).collect(),
+                subagent: envelope.subagent,
             });
             budget_used += line.len();
             next_entry = envelope.n + 1;

@@ -3282,6 +3282,7 @@ mod task_app_detail_render {
                     source: narsor::api::ConversationEntrySource::Stdout,
                     raw_base64: base64::engine::general_purpose::STANDARD.encode(line),
                     elements,
+                    subagent: None,
                 })
             })
             .collect()

@@ -23,6 +23,7 @@ fn entry(
         source,
         raw_base64: BASE64.encode(raw),
         elements,
+        subagent: None,
     }
 }
 

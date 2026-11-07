@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::{ConductorPurposeDto, ConductorTriggerDto, ProblemKindDto, RequiredValue};
+use crate::chat::SubagentRef;
 
 /// Unique identifier for an event
 pub type EventId = String;
@@ -204,6 +205,22 @@ pub enum EventData {
         /// failing.
         #[serde(default)]
         harness_session_id: Option<String>,
+    },
+    /// A permission denial that did not stop the step: the agent finished
+    /// with a usable answer, or the denied call came from a subagent.
+    PermissionDeniedIgnored {
+        session_id: String,
+        /// The action attempt this session belongs to.
+        #[serde(default)]
+        action_execution_id: Option<String>,
+        tool_name: String,
+        tool_use_id: String,
+        /// The key parameter of the denied call on one line.
+        summary: String,
+        reason: Option<String>,
+        /// The subagent that made the call; `None` for the main agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<SubagentRef>,
     },
     AgentMessage {
         session_id: String,
@@ -800,6 +817,15 @@ impl Event {
             EventData::AgentSessionFailed { error, .. } => {
                 format!("Agent session failed: {error}")
             }
+            EventData::PermissionDeniedIgnored {
+                tool_name, source, ..
+            } => match source {
+                Some(subagent) => format!(
+                    "Permission denial ignored: {tool_name} of subagent '{}'",
+                    subagent.name
+                ),
+                None => format!("Permission denial ignored: {tool_name} of the agent"),
+            },
             EventData::AgentMessage { role, content, .. } => {
                 format!("Agent message ({role}): {}", first_line(content))
             }
@@ -1014,8 +1040,51 @@ fn summarize_input(input: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Event, EventData};
+    use super::{
+        ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Event, EventData, SubagentRef,
+    };
     use crate::api::{ConductorPurposeDto, ConductorTriggerDto};
+
+    fn ignored_denial(source: Option<SubagentRef>) -> EventData {
+        EventData::PermissionDeniedIgnored {
+            session_id: "session-1".into(),
+            action_execution_id: Some("attempt-1".into()),
+            tool_name: "Bash".into(),
+            tool_use_id: "toolu_9".into(),
+            summary: "cargo test".into(),
+            reason: Some("Brak zgody".into()),
+            source,
+        }
+    }
+
+    #[test]
+    fn ignored_denial_roundtrips_for_main_agent_and_subagent() {
+        let subagent = SubagentRef {
+            id: "toolu_1".into(),
+            name: "Testy".into(),
+        };
+        for source in [None, Some(subagent)] {
+            let event = Event::new("execution-1".into(), ignored_denial(source), 3);
+
+            let json = serde_json::to_string(&event).unwrap();
+            let back: Event = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(
+                serde_json::to_value(&back).unwrap(),
+                serde_json::to_value(&event).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_denial_has_its_own_wire_type_and_a_summary_with_the_tool() {
+        let event = Event::new("execution-1".into(), ignored_denial(None), 3);
+
+        let value = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(value["data"]["type"], "permission_denied_ignored");
+        assert!(event.description().contains("Bash"));
+    }
 
     #[test]
     fn event_keeps_the_existing_persisted_wire_shape() {

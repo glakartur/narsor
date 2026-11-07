@@ -461,6 +461,7 @@ mod tests {
             source: ConversationEntrySource::Stdout,
             raw_base64: BASE64.encode(raw.as_bytes()),
             elements,
+            subagent: None,
         }
     }
 

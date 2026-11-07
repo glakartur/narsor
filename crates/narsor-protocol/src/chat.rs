@@ -20,6 +20,18 @@ pub const SUMMARY_MAX_CHARS: usize = 200;
 /// Appended to a summary cut at [`SUMMARY_MAX_CHARS`].
 const SUMMARY_ELLIPSIS: char = '…';
 
+/// The subagent a conversation line or a tool call came from.
+///
+/// Harness-independent: the stream parser of each harness fills it in, so
+/// the engine and the views never read a harness field to find out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRef {
+    /// The id of the call that started the subagent.
+    pub id: String,
+    /// A short name the operator can read, e.g. the task description.
+    pub name: String,
+}
+
 /// One element of a conversation, as the operator sees it.
 ///
 /// Serialized with an internal `kind` tag, e.g.
@@ -526,6 +538,25 @@ pub fn summary_line(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn subagent_ref_roundtrips_with_its_wire_shape() {
+        let subagent = SubagentRef {
+            id: "toolu_1".into(),
+            name: "Szukaj w repozytorium".into(),
+        };
+
+        let value = serde_json::to_value(&subagent).unwrap();
+
+        assert_eq!(
+            value,
+            json!({"id": "toolu_1", "name": "Szukaj w repozytorium"})
+        );
+        assert_eq!(
+            serde_json::from_value::<SubagentRef>(value).unwrap(),
+            subagent
+        );
+    }
 
     fn every_variant() -> Vec<ChatElement> {
         vec![

@@ -32,7 +32,7 @@ pub mod opencode;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
+use narsor_protocol::chat::{ChatElement, SubagentRef, UnclassifiedReason};
 use narsor_protocol::controller::UsageLimit;
 use serde_json::Value;
 
@@ -209,6 +209,10 @@ pub struct PermissionDenial {
     pub reason_type: Option<String>,
     pub reason: Option<String>,
     pub session_id: Option<String>,
+    /// The subagent that made the call; `None` for the main agent.
+    pub subagent: Option<SubagentRef>,
+    /// The key parameter of the call on one line.
+    pub summary: String,
 }
 
 /// What kind of final answer a harness's stream has delivered so far.

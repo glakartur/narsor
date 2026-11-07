@@ -203,6 +203,7 @@ pub fn event_line(event: &Event) -> String {
             "agent_session_failed  {error} (attempt {})",
             short_id(action_execution_id.as_deref())
         ),
+        EventData::PermissionDeniedIgnored { .. } => "permission_denied_ignored".to_string(),
         EventData::AgentMessage {
             role,
             content,

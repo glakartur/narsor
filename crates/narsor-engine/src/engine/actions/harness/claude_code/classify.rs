@@ -106,6 +106,8 @@ impl ResultLine {
                                 .get("session_id")
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
+                            subagent: None,
+                            summary: String::new(),
                         })
                     })
                     .collect()
