@@ -234,8 +234,6 @@ async fn a_sure_choice_takes_the_transition_and_runs_the_set_of_the_label() {
     assert!(!message.contains("{{"), "{message}");
 }
 
-/// The engine says who decides when it starts a decision step, and says
-/// nothing for the agent step before it.
 #[tokio::test]
 async fn the_started_event_of_a_decision_step_says_who_decides() {
     let fixture = Fixture::new(vec![choose("approve", "high", json!({}))]);

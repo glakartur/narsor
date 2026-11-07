@@ -43,7 +43,7 @@ use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{bar_prefix, PREFIX_WIDTH};
-use super::super::detail::step_name;
+use super::super::detail::{cells, step_name};
 use super::super::layout::first_row;
 use super::READER_RETRY;
 use crate::tui::conversation::transcript_entries;
@@ -494,7 +494,6 @@ pub struct StepChip {
     /// The label of the entry, unique within the timeline.
     pub label: String,
     pub status: PositionStatus,
-    /// The icon of the step's kind; none for a kind that has no icon.
     pub icon: Option<&'static str>,
 }
 
@@ -1345,10 +1344,7 @@ fn step_strip_line(
     }
     let chip_widths: Vec<usize> = steps
         .iter()
-        .map(|step| {
-            2 + step.icon.map_or(0, |icon| Span::raw(icon).width() + 1)
-                + Span::raw(one_line(&step.label)).width()
-        })
+        .map(|step| 2 + cells(&step_name(step.icon, &one_line(&step.label))))
         .collect();
     let separator = Span::raw(STEP_SEPARATOR).width();
     let more = Span::raw(STEP_MORE).width() + 1;
@@ -1386,7 +1382,7 @@ fn step_strip_line(
     Line::from(spans)
 }
 
-/// A step on the strip: its status glyph, the icon of its kind and its label.
+/// A step on the strip: its status glyph and its name.
 fn step_chip(
     step: &StepChip,
     selected: bool,

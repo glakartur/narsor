@@ -484,6 +484,16 @@ pub enum DecisionMaker {
     Human,
 }
 
+impl DecisionMaker {
+    /// The name this decider has in the YAML contract and in events.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Conductor => "conductor",
+            Self::Human => "human",
+        }
+    }
+}
+
 /// Agent action configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentActionConfig {

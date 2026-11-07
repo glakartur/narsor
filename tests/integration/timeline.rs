@@ -124,8 +124,6 @@ fn decision_started(id: &str, state_id: &str, by: &str) -> EventData {
     }
 }
 
-/// The steps of `decision_conductor.yaml`: only the decision step says who
-/// decides.
 #[test]
 fn only_a_decision_step_carries_who_decides() {
     let mut log = Log::new();
@@ -158,7 +156,6 @@ fn only_a_decision_step_carries_who_decides() {
     );
 }
 
-/// A retry of a step is the same kind of step as its first attempt.
 #[test]
 fn a_retry_inherits_who_decides_from_its_step() {
     let mut log = Log::new();

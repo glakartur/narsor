@@ -31,11 +31,7 @@ fn draw(width: u16, height: u16, paint: impl FnOnce(&mut ratatui::Frame)) -> Buf
 
 fn rows(buffer: &Buffer) -> Vec<String> {
     let width = usize::from(buffer.area.width);
-    buffer
-        .content()
-        .chunks(width)
-        .map(|row| text_of(row))
-        .collect()
+    buffer.content().chunks(width).map(text_of).collect()
 }
 
 /// The text of a row of cells. The cell after a wide symbol (an emoji) is
@@ -2650,8 +2646,6 @@ mod task_app_detail_render {
         assert!(!narrow[row(&narrow, "$0.03")].contains('×'));
     }
 
-    /// An app whose task has run `steps`, each `(state, kind, decider)`, the
-    /// last one in progress, on the *Przebieg* tab.
     fn app_with_steps(steps: &[(&str, &str, Option<&str>)]) -> TaskApp {
         let mut app = app();
         let running = with_runner(
@@ -2713,7 +2707,7 @@ mod task_app_detail_render {
             ("old", "human", None),
         ]);
         let screen = screen(&render(&mut app, &Styles::new(false)));
-        assert!(screen.contains("✓ plan #1") || screen.contains("✓ ✨ plan #1"));
+        assert!(screen.contains("✓ ✨ plan #1"), "{screen}");
         for name in ["odd #1", "old #1"] {
             let at = screen
                 .find(name)
@@ -3202,13 +3196,6 @@ mod task_app_detail_render {
             screen_text.contains("what the review said"),
             "{screen_text}"
         );
-    }
-
-    #[test]
-    fn the_strip_and_the_transcript_show_the_icon_of_each_step() {
-        let mut app = conversation_of_two_steps();
-        let screen = screen(&render(&mut app, &Styles::new(false)));
-        assert!(screen.contains("● ✨ review #1 · ✓ ✨ plan #1"), "{screen}");
     }
 
     #[test]

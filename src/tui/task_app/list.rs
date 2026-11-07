@@ -61,7 +61,6 @@ use super::super::scroll::one_line;
 use super::super::selection::{render_barred_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::detail::step_name;
-use narsor_protocol::api::step_icon;
 
 /// What a row asks of the operator (column 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,11 +274,7 @@ pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
 fn current_step(task: &TaskSummary) -> Option<String> {
     let cursor = &task.runner.as_ref()?.execution_cursor;
     let step = one_line(cursor.current_state.as_deref()?);
-    let icon = step_icon(
-        cursor.current_action_type.as_deref(),
-        cursor.current_decision_by.as_deref(),
-    );
-    (!step.trim().is_empty()).then(|| step_name(icon, &step))
+    (!step.trim().is_empty()).then(|| step_name(cursor.icon(), &step))
 }
 
 /// A task as the list shows it, for tests and the details placeholder.
@@ -1508,8 +1503,6 @@ fn replace_reported_attention(
     *current = items;
 }
 
-/// Fits `text` into `width` terminal cells, ending in `…` when it is cut. A
-/// wide character (an emoji) takes two cells.
 pub fn fit(text: &str, width: usize) -> String {
     super::detail::fit_cells(text, width)
 }

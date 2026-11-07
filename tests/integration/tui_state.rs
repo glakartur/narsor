@@ -4091,6 +4091,23 @@ mod task_app_detail {
         }
 
         #[test]
+        fn a_step_heading_starts_with_the_icon_of_its_kind() {
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            let positions = vec![crate::task_app_support::of_kind(
+                recorded("implement", 1, "i"),
+                "agent",
+                None,
+            )];
+            let built = build_conversation(
+                Scope::Whole,
+                &positions,
+                &attempts(&["i"]),
+                &[entered(1, "implement")],
+            );
+            assert_eq!(built.entries[0].header, "── ✨ implement #1 ──");
+        }
+
+        #[test]
         fn a_gate_heading_reads_the_step_and_its_visit() {
             use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
             let events = vec![entered(1, "gate")];

@@ -646,6 +646,16 @@ pub struct ExecutionCursor {
     pub current_decision_by: Option<String>,
 }
 
+impl ExecutionCursor {
+    /// The icon of the kind of the step the cursor is in, when it has one.
+    pub fn icon(&self) -> Option<&'static str> {
+        crate::api::step_icon(
+            self.current_action_type.as_deref(),
+            self.current_decision_by.as_deref(),
+        )
+    }
+}
+
 /// A default harness a task cannot follow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HarnessUnavailable {

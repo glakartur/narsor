@@ -2377,13 +2377,7 @@ impl Engine {
                 state_id: state.id.clone(),
                 action_type: kind.name().to_string(),
                 decision_by: match action {
-                    ActionConfig::Decision(decision) => Some(
-                        match decision.by {
-                            DecisionMaker::Conductor => "conductor",
-                            DecisionMaker::Human => "human",
-                        }
-                        .to_string(),
-                    ),
+                    ActionConfig::Decision(decision) => Some(decision.by.name().to_string()),
                     _ => None,
                 },
             },

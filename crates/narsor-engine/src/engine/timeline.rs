@@ -209,9 +209,9 @@ pub fn build_timeline(
                     state_id.clone(),
                     Some(action_execution_id.clone()),
                     Some(action_type.clone()),
+                    decision_by.clone(),
                     event.timestamp,
                 );
-                drafts[idx].decision_by.clone_from(decision_by);
                 by_attempt.insert(action_execution_id.clone(), idx);
                 current_visit_last_position = Some(idx);
                 open_position = Some(idx);
@@ -240,9 +240,9 @@ pub fn build_timeline(
                     state_id,
                     Some(action_execution_id.clone()),
                     inherited_action_type,
+                    inherited_decision_by,
                     event.timestamp,
                 );
-                drafts[idx].decision_by = inherited_decision_by;
                 by_attempt.insert(action_execution_id.clone(), idx);
                 current_visit_last_position = Some(idx);
                 open_position = Some(idx);
@@ -266,9 +266,9 @@ pub fn build_timeline(
                     state_id.clone(),
                     Some(action_execution_id.clone()),
                     inherited_action_type,
+                    inherited_decision_by,
                     event.timestamp,
                 );
-                drafts[idx].decision_by = inherited_decision_by;
                 by_attempt.insert(action_execution_id.clone(), idx);
                 current_visit_last_position = Some(idx);
                 open_position = Some(idx);
@@ -524,6 +524,7 @@ pub fn build_timeline(
                         state_id,
                         None,
                         None,
+                        None,
                         event.timestamp,
                     );
                     drafts[idx].outcome = Some(Outcome::Failed);
@@ -727,6 +728,7 @@ fn push_attempt(
     state_id: String,
     action_execution_id: Option<String>,
     action_type: Option<String>,
+    decision_by: Option<String>,
     started_at: DateTime<Utc>,
 ) -> usize {
     let visit = *state_visit_counts.get(&state_id).unwrap_or(&1);
@@ -736,7 +738,7 @@ fn push_attempt(
         visit,
         action_execution_id,
         action_type,
-        decision_by: None,
+        decision_by,
         outcome: None,
         interrupted: false,
         resolved_via_attempt_failed: false,

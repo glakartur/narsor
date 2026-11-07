@@ -66,7 +66,7 @@ use crate::controller_protocol::{
     TimelineResponse,
 };
 use crate::task_usage_text::{self, TaskUsage};
-use narsor_protocol::api::{step_icon, ConversationState};
+use narsor_protocol::api::ConversationState;
 use narsor_protocol::controller::{QueueReason, TaskState};
 
 use super::super::keymap::Action;
@@ -1635,14 +1635,10 @@ pub(super) fn cells(text: &str) -> usize {
     Span::raw(text).width()
 }
 
-/// A step's name as the views show it: the icon of its kind, a space, then
-/// the label. A step of no known kind is its label alone.
 pub(super) fn step_name(icon: Option<&str>, label: &str) -> String {
     icon.map_or_else(|| label.to_string(), |icon| format!("{icon} {label}"))
 }
 
-/// Fits a step's name into `width` cells: the icon stays whole and the label
-/// takes the cut.
 pub(super) fn fit_step_name(icon: Option<&str>, label: &str, width: usize) -> String {
     let icon_cells = icon.map_or(0, |icon| cells(icon) + 1);
     match icon {
@@ -1731,11 +1727,7 @@ fn status_parts(
     let named = task.runner.as_ref().and_then(|runner| {
         let cursor = &runner.execution_cursor;
         let name = one_line(cursor.current_state.as_deref()?);
-        let icon = step_icon(
-            cursor.current_action_type.as_deref(),
-            cursor.current_decision_by.as_deref(),
-        );
-        (!name.trim().is_empty()).then(|| step_name(icon, &name))
+        (!name.trim().is_empty()).then(|| step_name(cursor.icon(), &name))
     });
     let step_number = progress.step_count().map(|(at, _)| at);
     match (step_number, named) {
