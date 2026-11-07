@@ -74,6 +74,9 @@ pub struct OrchestrationStore {
     /// a build that predates version 2 writes version 1 records, so a backend
     /// does not become legacy again while handles to it are alive.
     migrated: Arc<Mutex<HashSet<BackendId>>>,
+    /// Archived tasks this process already warned it leaves out of scans,
+    /// so a poll every few seconds does not repeat the warning.
+    skipped_archives: Arc<Mutex<HashSet<TaskId>>>,
 }
 
 impl OrchestrationStore {
@@ -82,6 +85,7 @@ impl OrchestrationStore {
         Self {
             paths,
             migrated: Arc::default(),
+            skipped_archives: Arc::default(),
         }
     }
 
@@ -188,8 +192,23 @@ impl OrchestrationStore {
     ///
     /// A directory without `task.json` (a crash between creating the
     /// directory and linking the record in) or with a name that is not a
-    /// valid identifier is not a task and is skipped.
+    /// valid identifier is not a task and is skipped, and so is an archived
+    /// record this build cannot read ([`skip_unreadable_archive`]).
     pub fn list_task_ids(&self) -> Result<Vec<TaskId>> {
+        let mut ids = Vec::new();
+        for task_id in self.task_ids_on_disk()? {
+            if self
+                .scanned(&task_id, self.load_task_unmigrated(&task_id))?
+                .is_some()
+            {
+                ids.push(task_id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Identifiers of every task with a record, readable or not, sorted.
+    fn task_ids_on_disk(&self) -> Result<Vec<TaskId>> {
         let dir = self.paths.orchestration_tasks_dir();
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -217,11 +236,10 @@ impl OrchestrationStore {
     /// creation order among equal ranks, which only a crash in the middle
     /// of a renumbering can leave) within each.
     pub fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
-        let mut tasks = self
-            .list_task_ids()?
-            .iter()
-            .map(|task_id| self.load_task(task_id))
-            .collect::<Result<Vec<_>>>()?;
+        let mut tasks = Vec::new();
+        for task_id in self.task_ids_on_disk()? {
+            tasks.extend(self.scanned(&task_id, self.load_task(&task_id))?);
+        }
         // Backends in the order their oldest task was created — stable, so
         // a new task never reorders another backend's rows — and each
         // backend's tasks in queue order.
@@ -253,11 +271,11 @@ impl OrchestrationStore {
     fn migrate_backend(&self, backend_id: &BackendId) -> Result<()> {
         let _schedule =
             FileLock::acquire(self.paths.backend_schedule_lock_file(backend_id.as_str()))?;
-        let (mut legacy, mut current): (Vec<_>, Vec<_>) = self
-            .list_task_ids()?
-            .iter()
-            .map(|task_id| self.load_task_unmigrated(task_id))
-            .collect::<Result<Vec<_>>>()?
+        let mut records = Vec::new();
+        for task_id in self.task_ids_on_disk()? {
+            records.extend(self.scanned(&task_id, self.load_task_unmigrated(&task_id))?);
+        }
+        let (mut legacy, mut current): (Vec<_>, Vec<_>) = records
             .into_iter()
             .filter(|record| record.assignment.backend_id == *backend_id)
             .partition(|record| record.record_version < TASK_RECORD_VERSION);
@@ -295,8 +313,10 @@ impl OrchestrationStore {
             return Ok(());
         }
         let mut legacy = false;
-        for task_id in self.list_task_ids()? {
-            let record = self.load_task_unmigrated(&task_id)?;
+        for task_id in self.task_ids_on_disk()? {
+            let Some(record) = self.scanned(&task_id, self.load_task_unmigrated(&task_id))? else {
+                continue;
+            };
             if record.assignment.backend_id == *backend_id
                 && record.record_version < TASK_RECORD_VERSION
             {
@@ -309,6 +329,35 @@ impl OrchestrationStore {
         }
         self.migrated_backends().insert(backend_id.clone());
         Ok(())
+    }
+
+    /// `loaded` as a whole-store scan takes it; see [`skip_unreadable_archive`].
+    /// The first time this process leaves a task out, it says so.
+    fn scanned(&self, task_id: &TaskId, loaded: Result<TaskRecord>) -> Result<Option<TaskRecord>> {
+        let scanned = skip_unreadable_archive(loaded, || {
+            fs::read(self.paths.orchestration_task_file(task_id.as_str()))
+                .is_ok_and(|raw| is_archived_record(&raw))
+        })?;
+        match scanned {
+            Scanned::Read(record) => Ok(Some(*record)),
+            Scanned::UnreadableArchive(error) => {
+                if self.first_skip_of(task_id) {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        %error,
+                        "an archived task this build cannot read is left out"
+                    );
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn first_skip_of(&self, task_id: &TaskId) -> bool {
+        self.skipped_archives
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task_id.clone())
     }
 
     fn migrated_backends(&self) -> std::sync::MutexGuard<'_, HashSet<BackendId>> {
@@ -582,5 +631,100 @@ impl Drop for FileLock {
         // SAFETY: the descriptor is still owned by `self.file`. Closing it
         // would release the lock anyway; unlocking first just makes it prompt.
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// One record as a whole-store scan sees it.
+#[derive(Debug)]
+enum Scanned {
+    /// Loaded; the scan takes it.
+    Read(Box<TaskRecord>),
+    /// Archived but unparsable; the scan leaves it out.
+    UnreadableArchive(PersistenceError),
+}
+
+/// What a whole-store scan does with one record it tried to load.
+///
+/// An archived record this build cannot parse — most often one whose launch
+/// spec predates the versions it reads — is left out: nothing
+/// will run it again, and a scan that failed on it would cost every other
+/// task its listing, its scheduling and the interface its live connection.
+/// Any other failure, or an unparsable record that is not archived, stays
+/// an error.
+fn skip_unreadable_archive(
+    loaded: Result<TaskRecord>,
+    is_archived: impl FnOnce() -> bool,
+) -> Result<Scanned> {
+    match loaded {
+        Err(OrchestrationError::Persistence(error @ PersistenceError::Deserialize { .. }))
+            if is_archived() =>
+        {
+            Ok(Scanned::UnreadableArchive(error))
+        }
+        loaded => loaded.map(|record| Scanned::Read(Box::new(record))),
+    }
+}
+
+/// Whether `raw` is a task record, of any shape, marked archived.
+fn is_archived_record(raw: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .is_ok_and(|record| record["runner_state"] == "archived")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARCHIVED_V3: &[u8] =
+        br#"{"record_version":2,"runner_state":"archived","launch_spec":{"version":3}}"#;
+
+    fn unparsable() -> Result<TaskRecord> {
+        let source = serde_json::from_slice::<TaskRecord>(ARCHIVED_V3).unwrap_err();
+        Err(PersistenceError::Deserialize {
+            path: PathBuf::from("task.json"),
+            source,
+        }
+        .into())
+    }
+
+    #[test]
+    fn an_unparsable_archived_record_is_left_out_of_a_scan() {
+        let scanned = skip_unreadable_archive(unparsable(), || true);
+
+        assert!(
+            matches!(scanned, Ok(Scanned::UnreadableArchive(_))),
+            "{scanned:?}"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_record_that_is_not_archived_stays_an_error() {
+        let scanned = skip_unreadable_archive(unparsable(), || false);
+
+        assert!(scanned.is_err());
+    }
+
+    #[test]
+    fn an_archived_record_that_cannot_be_read_at_all_stays_an_error() {
+        let io = Err(PersistenceError::io(
+            Path::new("task.json"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .into());
+
+        let scanned = skip_unreadable_archive(io, || true);
+
+        assert!(scanned.is_err());
+    }
+
+    #[test]
+    fn a_record_marked_archived_is_recognised_whatever_its_launch_spec() {
+        assert!(is_archived_record(ARCHIVED_V3));
+    }
+
+    #[test]
+    fn a_record_in_another_state_or_no_json_is_not_archived() {
+        assert!(!is_archived_record(br#"{"runner_state":"archiving"}"#));
+        assert!(!is_archived_record(b"{\"half\":"));
     }
 }
