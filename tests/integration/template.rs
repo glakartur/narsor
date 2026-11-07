@@ -335,8 +335,8 @@ fn context_references_are_listed_once_in_first_use_order() {
 
 #[test]
 fn what_rendering_would_refuse_is_not_a_reference() {
-    let template = "{{ context.a | default('x') }} {{ context.a.b }} {{ context. }} \
-                    {{ workspace.path }} {{ context.open";
+    let template = "{{ context.a | default('x') }} {{ context. }} {{ context.variables }} \
+                    {{ context.workspace.code }} {{ workspace.path }} {{ context.open";
     assert!(context_references(template).is_empty());
     assert!(context_references("no placeholders at all").is_empty());
 }
@@ -860,4 +860,294 @@ fn a_condition_without_references_does_not_load() {
     );
 
     assert!(narsor_engine::workflow::load_from_str(&yaml).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// context.workspace.<name>.<field> and fields of an object variable
+// ---------------------------------------------------------------------------
+
+use narsor_engine::domain::WorkspaceField;
+use narsor_engine::workflow::template::{check_syntax, WorkspaceValues};
+
+/// Values of the runner's workspaces, keyed by workspace name and field key.
+#[derive(Debug, Default)]
+struct FakeWorkspaces(HashMap<(String, String), Value>);
+
+impl FakeWorkspaces {
+    fn with(mut self, workspace: &str, field: &str, value: Value) -> Self {
+        self.0.insert((workspace.to_string(), field.to_string()), value);
+        self
+    }
+}
+
+impl WorkspaceValues for FakeWorkspaces {
+    fn value(&self, workspace: &str, field: WorkspaceField) -> Option<Value> {
+        self.0
+            .get(&(workspace.to_string(), field.key().to_string()))
+            .cloned()
+    }
+}
+
+/// Answers every question, so only the scope's own name check can refuse.
+#[derive(Debug)]
+struct EveryWorkspaceHasEverything;
+
+impl WorkspaceValues for EveryWorkspaceHasEverything {
+    fn value(&self, _workspace: &str, _field: WorkspaceField) -> Option<Value> {
+        Some(json!("value"))
+    }
+}
+
+fn workspace_definition() -> narsor_engine::domain::WorkflowDefinition {
+    narsor_engine::workflow::load_from_str(
+        "schema: v2\nname: ws\nversion: 1\nglobals:\n  workspaces:\n    code:\n      \
+         primary: true\nstates:\n  work:\n    action: { type: agent, prompt: p }\n    \
+         variables:\n      - { name: cfg }\n    exit: { next: done }\n  done:\n    \
+         description: end\nterminal_states:\n  done: completed\n",
+    )
+    .expect("the workflow loads")
+}
+
+fn render_workspace(
+    template: &str,
+    context: &Context,
+    provider: Option<&dyn WorkspaceValues>,
+    declare: bool,
+) -> Result<String, TemplateError> {
+    let definition = workspace_definition();
+    let declared = DeclaredNames::of(&definition);
+    let inputs = Map::new();
+    let mut scope = TemplateScope::new(&inputs, context);
+    if declare {
+        scope = scope.with_declared(&declared);
+    }
+    if let Some(provider) = provider {
+        scope = scope.with_workspace_values(provider);
+    }
+    scope.render(template, WHERE)
+}
+
+#[test]
+fn a_workspace_field_comes_from_the_provider() {
+    let provider = FakeWorkspaces::default().with("code", "branch", json!("feat/x"));
+
+    let rendered = render_workspace(
+        "on {{ context.workspace.code.branch }}",
+        &Context::new(),
+        Some(&provider),
+        true,
+    );
+
+    assert_eq!(rendered.as_deref(), Ok("on feat/x"));
+}
+
+#[test]
+fn the_pull_request_of_a_workspace_comes_from_the_context() {
+    let mut context = Context::new();
+    context.workspace_prs.insert(
+        "code".to_string(),
+        narsor_engine::domain::WorkspacePr {
+            pr: Some("7".to_string()),
+            pr_url: Some("https://git.example/pr/7".to_string()),
+        },
+    );
+
+    let rendered = render_workspace(
+        "{{ context.workspace.code.pr }} {{ context.workspace.code.pr_url }}",
+        &context,
+        None,
+        true,
+    );
+
+    assert_eq!(rendered.as_deref(), Ok("7 https://git.example/pr/7"));
+}
+
+#[test]
+fn a_counted_workspace_field_renders_as_a_bare_number() {
+    let provider = FakeWorkspaces::default().with("code", "added", json!(12));
+
+    let rendered = render_workspace(
+        "+{{ context.workspace.code.added }}",
+        &Context::new(),
+        Some(&provider),
+        true,
+    );
+
+    assert_eq!(rendered.as_deref(), Ok("+12"));
+}
+
+#[test]
+fn a_known_workspace_field_without_a_value_renders_empty() {
+    let provider = FakeWorkspaces::default();
+    for field in WorkspaceField::ALL {
+        let template = format!("[{{{{ context.workspace.code.{} }}}}]", field.key());
+
+        let with_provider = render_workspace(&template, &Context::new(), Some(&provider), true);
+        let without_provider = render_workspace(&template, &Context::new(), None, true);
+
+        assert_eq!(with_provider.as_deref(), Ok("[]"), "{}", field.key());
+        assert_eq!(without_provider.as_deref(), Ok("[]"), "{}", field.key());
+    }
+}
+
+#[test]
+fn a_workspace_field_without_a_value_is_an_empty_reference_in_a_when() {
+    let part = narsor_engine::domain::PromptPart {
+        text: "has pr".to_string(),
+        when: vec!["context.workspace.code.added".to_string()],
+    };
+    let text = narsor_engine::domain::PromptText::from_parts(vec![part]);
+    let definition = workspace_definition();
+    let declared = DeclaredNames::of(&definition);
+    let context = Context::new();
+    let inputs = Map::new();
+
+    let rendered = TemplateScope::new(&inputs, &context)
+        .with_declared(&declared)
+        .render_text(&text, WHERE)
+        .expect("the reference is known");
+
+    assert_eq!(rendered.parts()[0].text, "");
+}
+
+#[test]
+fn an_undeclared_workspace_is_an_unknown_variable_even_if_the_provider_answers() {
+    let error = render_workspace(
+        "{{ context.workspace.nope.pr_url }}",
+        &Context::new(),
+        Some(&EveryWorkspaceHasEverything),
+        true,
+    )
+    .expect_err("nope is not a workspace of the workflow");
+
+    assert_eq!(
+        error,
+        TemplateError::UnknownVariable {
+            reference: "context.workspace.nope.pr_url".to_string(),
+            location: WHERE.to_string(),
+        }
+    );
+}
+
+#[test]
+fn a_scope_that_declares_no_names_knows_no_workspace() {
+    let error = render_workspace(
+        "{{ context.workspace.code.pr_url }}",
+        &Context::new(),
+        None,
+        false,
+    )
+    .expect_err("no names declared");
+
+    assert!(matches!(error, TemplateError::UnknownVariable { .. }), "{error:?}");
+}
+
+#[test]
+fn a_workspace_field_outside_the_registry_is_an_unknown_variable() {
+    let error = render_workspace(
+        "{{ context.workspace.code.title }}",
+        &Context::new(),
+        Some(&EveryWorkspaceHasEverything),
+        true,
+    )
+    .expect_err("title is not a field");
+
+    assert!(matches!(error, TemplateError::UnknownVariable { .. }), "{error:?}");
+}
+
+#[test]
+fn a_workspace_reference_without_a_name_and_field_is_unsupported() {
+    for reference in [
+        "context.workspace",
+        "context.workspace.code",
+        "context.workspace.code.pr.x",
+    ] {
+        let error = render_workspace(
+            &format!("{{{{ {reference} }}}}"),
+            &Context::new(),
+            None,
+            true,
+        )
+        .expect_err(reference);
+
+        assert!(
+            matches!(error, TemplateError::UnsupportedReference { .. }),
+            "{reference}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_filter_on_a_workspace_reference_is_still_refused() {
+    let error = render_workspace(
+        "{{ context.workspace.code.pr | default(\"x\") }}",
+        &Context::new(),
+        None,
+        true,
+    )
+    .expect_err("filters are not supported");
+
+    assert!(matches!(error, TemplateError::FilterUnsupported { .. }), "{error:?}");
+}
+
+#[test]
+fn the_shorthand_and_the_variables_form_read_the_same_variable() {
+    let context = context(&[("cfg", json!("on"))]);
+
+    let short = render_workspace("{{ context.cfg }}", &context, None, true);
+    let long = render_workspace("{{ context.variables.cfg }}", &context, None, true);
+
+    assert_eq!(short, long);
+    assert_eq!(short.as_deref(), Ok("on"));
+}
+
+#[test]
+fn a_field_of_an_object_variable_is_read_by_name() {
+    let context = context(&[("cfg", json!({ "name": "alpha", "inner": { "n": 3 } }))]);
+
+    assert_eq!(
+        render_workspace("{{ context.variables.cfg.name }}", &context, None, true).as_deref(),
+        Ok("alpha")
+    );
+    assert_eq!(
+        render_workspace("{{ context.cfg.inner.n }}", &context, None, true).as_deref(),
+        Ok("3")
+    );
+}
+
+#[test]
+fn a_missing_field_or_a_field_of_a_text_value_is_an_unknown_variable() {
+    let context = context(&[("cfg", json!({ "name": "alpha" })), ("text", json!("plain"))]);
+
+    for reference in [
+        "context.variables.cfg.nope",
+        "context.variables.text.name",
+        "context.variables.unset.name",
+    ] {
+        let error = render_workspace(&format!("{{{{ {reference} }}}}"), &context, None, true)
+            .expect_err(reference);
+
+        assert!(
+            matches!(error, TemplateError::UnknownVariable { .. }),
+            "{reference}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn syntax_check_accepts_workspace_references_without_names_or_provider() {
+    assert!(check_syntax("{{ context.workspace.code.pr_url }}", "f").is_ok());
+    assert!(matches!(
+        check_syntax("{{ context.workspace.code }}", "f"),
+        Err(TemplateError::UnsupportedReference { .. })
+    ));
+}
+
+#[test]
+fn only_the_variable_of_a_reference_counts_as_a_context_reference() {
+    assert!(context_references("{{ context.workspace.code.pr_url }}").is_empty());
+    assert_eq!(
+        context_references("{{ context.variables.cfg.name }} {{ context.cfg.other }}"),
+        vec!["cfg".to_string()]
+    );
 }
