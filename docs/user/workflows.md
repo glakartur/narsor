@@ -170,7 +170,7 @@ there, so executions created before this existed keep resolving unchanged;
 
 `workflows/template.yaml` is the only workflow shipped in the binary. It
 is written in the unified `schema: v2` shape and demonstrates typed inputs,
-task display links, a script step with one `exit`, variables, artifact-path
+a script step with one `exit`, variables, artifact-path
 metadata, a human `decision` step that writes a variable with `set`, terminal
 statuses, timeouts and retry policy. Its `printf` step has no side effects; the artifact path is a
 placeholder and no file is created. The workflow does not invoke an agent or

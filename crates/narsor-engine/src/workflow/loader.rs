@@ -35,18 +35,18 @@ use crate::workspace::provisioner::is_usable_directory_name;
 
 use crate::domain::{
     ActionConfig, AgentActionConfig, AgentDecisionConfig, ArtifactDefinition, ChoiceDefinition,
-    DecisionActionConfig, DecisionConfig, DefinitionShape, DisplayLinkSpec, DisplaySpec,
-    GlobalsConfig, HumanActionConfig, HumanDecisionConfig, HumanInputField, HumanInputType,
-    InputParameter, ParamType, RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion,
-    ScriptActionConfig, State, StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig,
-    WorkflowDefinition, WorkspaceAccess, EXIT_LABEL,
+    DecisionActionConfig, DecisionConfig, DefinitionShape, GlobalsConfig, HumanActionConfig,
+    HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter, ParamType,
+    RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion, ScriptActionConfig, State,
+    StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig, WorkflowDefinition,
+    WorkspaceAccess, EXIT_LABEL,
 };
 
 use super::schema::{
-    ActionSchema, ChoiceSchema, DecisionSchema, DisplaySchema, ExitSchema, GlobalsSchema,
-    HumanInputTypeSchema, InputSchema, ParamTypeSchema, RepositorySchema, RepositorySourceSchema,
-    RetryPolicySchema, StateSchema, StateShape, StepWorkspaceSchema, TerminalStatusSchema,
-    VariableSchema, WorkflowFile, WorkspaceSchema,
+    ActionSchema, ChoiceSchema, DecisionSchema, ExitSchema, GlobalsSchema, HumanInputTypeSchema,
+    InputSchema, ParamTypeSchema, RepositorySchema, RepositorySourceSchema, RetryPolicySchema,
+    StateSchema, StateShape, StepWorkspaceSchema, TerminalStatusSchema, VariableSchema,
+    WorkflowFile, WorkspaceSchema,
 };
 
 /// Errors that can occur while loading a workflow definition from YAML.
@@ -84,6 +84,33 @@ pub enum LoadDiagnostic {
          'choices' as a mapping with 'next' and use 'exit' for a linear step"
     )]
     DeprecatedStateShape { workflow: String },
+
+    /// The file still has the retired `display` section. It is skipped: a
+    /// client shows the same task header for every workflow.
+    #[error(
+        "workflow '{workflow}' has a 'display' section; the section is ignored{}",
+        ignored_display_hint(*.had_links, *.unified_shape)
+    )]
+    IgnoredDisplay {
+        workflow: String,
+        had_links: bool,
+        unified_shape: bool,
+    },
+}
+
+/// What to do instead of the `display` links.
+fn ignored_display_hint(had_links: bool, unified_shape: bool) -> &'static str {
+    match (had_links, unified_shape) {
+        (false, _) => "",
+        (true, true) => {
+            ": a pull request link now needs 'exit.set.workspace.<name>.pr_url' on the step \
+             that opens the pull request"
+        }
+        (true, false) => {
+            ": a pull request link needs the unified state shape ('schema: v2'), with \
+             'exit.set.workspace.<name>.pr_url' on the step that opens the pull request"
+        }
+    }
 }
 
 /// A compiled definition with what its loading had to say.
@@ -114,7 +141,11 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<WorkflowDefinition, Loa
             source,
         })?;
 
-    compile(file)
+    let loaded = compile_with_diagnostics(file)?;
+    for diagnostic in &loaded.diagnostics {
+        tracing::warn!("{}: {diagnostic}", path.display());
+    }
+    Ok(loaded.definition)
 }
 
 /// Loads and compiles a workflow definition from a YAML string.
@@ -141,6 +172,16 @@ pub fn compile_with_diagnostics(file: WorkflowFile) -> Result<LoadedWorkflow, Lo
     if file.uses_deprecated_state_shape() {
         diagnostics.push(LoadDiagnostic::DeprecatedStateShape {
             workflow: file.name.clone(),
+        });
+    }
+    if let Some(display) = &file.ignored_display {
+        diagnostics.push(LoadDiagnostic::IgnoredDisplay {
+            workflow: file.name.clone(),
+            had_links: display
+                .get("links")
+                .and_then(serde_yaml::Value::as_sequence)
+                .is_some_and(|links| !links.is_empty()),
+            unified_shape: file.shape == StateShape::Unified,
         });
     }
     let definition = compile_definition(file)?;
@@ -205,7 +246,6 @@ fn compile_definition(file: WorkflowFile) -> Result<WorkflowDefinition, LoadErro
             StateShape::Unified => DefinitionShape::Unified,
         },
         repositories,
-        display: file.display.map(compile_display),
         states,
         initial_state,
     })
@@ -216,21 +256,6 @@ fn compile_globals(globals: &GlobalsSchema) -> GlobalsConfig {
         timeout_secs: globals.timeout.map(|d| d.as_secs()),
         retry_policy: globals.retry_policy.as_ref().map(compile_retry_policy),
         image: globals.image.clone(),
-    }
-}
-
-fn compile_display(display: DisplaySchema) -> DisplaySpec {
-    DisplaySpec {
-        title: display.title,
-        links: display
-            .links
-            .into_iter()
-            .map(|link| DisplayLinkSpec {
-                label: link.label,
-                text: link.text,
-                url: link.url,
-            })
-            .collect(),
     }
 }
 

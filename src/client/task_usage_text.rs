@@ -2,7 +2,7 @@
 //! and the part of them the subagents used.
 //!
 //! The numbers are those the harness reported on each timeline position, added
-//! up as they are: `in` and `out` are the `input` and `output` of
+//! up as they are: `↑` and `↓` are the `input` and `output` of
 //! [`TokenCounts`], and the cache counts are neither added to them nor read.
 //!
 //! What the conductor used is reported apart from what the agents used, and
@@ -84,29 +84,36 @@ fn add<T: Copy>(a: Option<T>, b: Option<T>, plus: impl Fn(T, T) -> T) -> Option<
     }
 }
 
-/// `$1.20 · in 120k out 8k`, with `· w tym subagenci in 40k out 3k (2)` when
-/// `with_subagents` and the subagents used anything. A part that is unknown
-/// reads `—`. When the conductor reported use, `· dyrygent $0.05 · razem
-/// $1.25` ends the line: the first numbers stay the agents' alone.
+/// `razem $1.25 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2) · dyrygent
+/// $0.05 ↑9k ↓1k`: the cost of all, then each group with its cost and its
+/// tokens in (`↑`) and out (`↓`). The subagents stand in the agents' group,
+/// with tokens and count only, when `with_subagents` and they used anything.
+/// The conductor's group is there only when it reported use. A part that is
+/// unknown reads `—`.
 pub fn line(usage: &TaskUsage, with_subagents: bool) -> String {
-    let mut text = format!("{} · {}", money(usage.cost_usd), tokens(usage.total));
+    let mut agents = format!("agenci {} {}", money(usage.cost_usd), tokens(usage.total));
     let subagents = usage
         .subagents
         .filter(|counts| counts.input + counts.output > 0);
     if let (true, Some(counts)) = (with_subagents, subagents) {
-        text.push_str(&format!(" · w tym subagenci {}", tokens(Some(counts))));
-        if let Some(count) = usage.subagent_count.filter(|count| *count > 0) {
-            text.push_str(&format!(" ({count})"));
-        }
+        let count = usage
+            .subagent_count
+            .filter(|count| *count > 0)
+            .map_or_else(String::new, |count| format!(" ×{count}"));
+        agents.push_str(&format!(" (subagenci {}{count})", tokens(Some(counts))));
     }
+    let mut groups = vec![
+        format!("razem {}", money(usage.combined_cost_usd())),
+        agents,
+    ];
     if usage.has_conductor() {
-        text.push_str(&format!(
-            " · dyrygent {} · razem {}",
+        groups.push(format!(
+            "dyrygent {} {}",
             money(usage.conductor_cost_usd),
-            money(usage.combined_cost_usd())
+            tokens(usage.conductor_total)
         ));
     }
-    text
+    groups.join(" · ")
 }
 
 fn money(cost: Option<f64>) -> String {
@@ -161,15 +168,15 @@ pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
         ..StepCells::default()
     };
     if let Some(counts) = usage.total {
-        cells.input = format!("↓{}", scaled(counts.input));
-        cells.output = format!("↑{}", scaled(counts.output));
+        cells.input = format!("↑{}", scaled(counts.input));
+        cells.output = format!("↓{}", scaled(counts.output));
     }
     if let Some(counts) = usage
         .subagents
         .filter(|counts| counts.input + counts.output > 0)
     {
-        cells.subagent_input = format!("↓{}", scaled(counts.input));
-        cells.subagent_output = format!("↑{}", scaled(counts.output));
+        cells.subagent_input = format!("↑{}", scaled(counts.input));
+        cells.subagent_output = format!("↓{}", scaled(counts.output));
         if let Some(count) = usage.subagent_count.filter(|count| *count > 0) {
             cells.subagent_count = format!("{count}×");
         }
@@ -186,7 +193,7 @@ pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
 
 fn tokens(counts: Option<TokenCounts>) -> String {
     match counts {
-        Some(counts) => format!("in {} out {}", scaled(counts.input), scaled(counts.output)),
+        Some(counts) => format!("↑{} ↓{}", scaled(counts.input), scaled(counts.output)),
         None => UNKNOWN.to_string(),
     }
 }
@@ -274,9 +281,9 @@ mod tests {
         let usage = sum(&positions).unwrap();
         assert_eq!(
             line(&usage, true),
-            "$1.20 · in 120k out 8k · w tym subagenci in 40k out 3k (2)"
+            "razem $1.20 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2)"
         );
-        assert_eq!(line(&usage, false), "$1.20 · in 120k out 8k");
+        assert_eq!(line(&usage, false), "razem $1.20 · agenci $1.20 ↑120k ↓8k");
     }
 
     #[test]
@@ -298,11 +305,11 @@ mod tests {
         };
         assert_eq!(
             line(&sum(&[position(Some(only_cost))]).unwrap(), true),
-            "$0.50 · —"
+            "razem $0.50 · agenci $0.50 —"
         );
         assert_eq!(
             line(&sum(&[position(Some(only_tokens))]).unwrap(), true),
-            "— · in 1.5k out 20"
+            "razem — · agenci — ↑1.5k ↓20"
         );
     }
 
@@ -312,7 +319,7 @@ mod tests {
         let zero = used((1_000, 100), Some((0, 0)), 0.1);
         for usage in [none, zero] {
             let usage = sum(&[position(Some(usage))]).unwrap();
-            assert_eq!(line(&usage, true), "$0.10 · in 1k out 100");
+            assert_eq!(line(&usage, true), "razem $0.10 · agenci $0.10 ↑1k ↓100");
         }
     }
 
@@ -340,12 +347,12 @@ mod tests {
             let usage = sum(&[position(Some(used((1, 1), None, cost)))]).unwrap();
             line(&usage, false)
         };
-        assert!(at(0.004).starts_with("$0.00 "));
-        assert!(at(1.236).starts_with("$1.24 "));
+        assert!(at(0.004).starts_with("razem $0.00 "));
+        assert!(at(1.236).starts_with("razem $1.24 "));
     }
 
     #[test]
-    fn the_cache_does_not_change_what_in_counts() {
+    fn the_cache_does_not_change_what_the_arrow_up_counts() {
         let cached = PositionUsage {
             total: Some(TokenCounts {
                 input: 2_000,
@@ -356,7 +363,7 @@ mod tests {
             ..PositionUsage::default()
         };
         let usage = sum(&[position(Some(cached))]).unwrap();
-        assert_eq!(line(&usage, true), "— · in 2k out 100");
+        assert_eq!(line(&usage, true), "razem — · agenci — ↑2k ↓100");
     }
 
     #[test]
@@ -371,7 +378,7 @@ mod tests {
                 cells.subagent_input.as_str(),
                 cells.subagent_output.as_str(),
             ),
-            ("$0.42", "↓120k", "↑8k", "1×", "↓40k", "↑3k")
+            ("$0.42", "↑120k", "↓8k", "1×", "↑40k", "↓3k")
         );
         assert!(cells.has_main() && cells.has_subagents());
     }
@@ -393,7 +400,7 @@ mod tests {
         let cells = step_cells(Some(&only_tokens));
         assert_eq!(
             (cells.input.as_str(), cells.output.as_str()),
-            ("↓950", "↑2.4M")
+            ("↑950", "↓2.4M")
         );
         assert!(cells.cost.is_empty());
         assert!(!step_cells(Some(&PositionUsage::default())).has_main());
@@ -442,7 +449,7 @@ mod tests {
                 cells.subagent_input.as_str(),
                 cells.subagent_total.as_str()
             ),
-            ("4×", "↓40k", "")
+            ("4×", "↑40k", "")
         );
     }
 
@@ -468,7 +475,7 @@ mod tests {
         let cells = step_cells(Some(&cached));
         assert_eq!(
             (cells.input.as_str(), cells.output.as_str()),
-            ("↓2k", "↑100")
+            ("↑2k", "↓100")
         );
     }
 
@@ -514,9 +521,11 @@ mod tests {
         assert!(!without.contains("dyrygent"));
 
         usage.conductor_cost_usd = Some(0.25);
-        let with = line(&usage, true);
-        assert!(with.starts_with(&without));
-        assert!(with.ends_with(" · dyrygent $0.25 · razem $1.25"));
+        usage.conductor_total = Some(counts(9_000, 1_000));
+        assert_eq!(
+            line(&usage, true),
+            "razem $1.25 · agenci $1.00 ↑1k ↓100 · dyrygent $0.25 ↑9k ↓1k"
+        );
     }
 
     #[test]

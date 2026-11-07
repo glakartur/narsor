@@ -9,14 +9,13 @@ use chrono::{Duration, TimeZone, Utc};
 use narsor::api::{ClientError, HarnessSelectionSnapshot};
 use narsor::cli::task_text::{
     activity_age, age, attention_lines, command_outcome, conversation_lines, conversation_origin,
-    default_harness_line, detail_lines, display_lines, event_line, list_line, next_waiting,
+    default_harness_line, detail_lines, event_line, header_lines, list_line, next_waiting,
     queue_badge, record_unreadable_detail, safe_json, state_hint, Tone,
 };
 use narsor_engine::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, ExecutionEventsSource, QueueView,
     CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
 };
-use narsor_engine::domain::display::DisplayLink;
 use narsor_engine::domain::{ExecutionStatus, TaskId};
 use narsor_engine::orchestration::{
     AttentionKind, ConversationAttemptSummary, HarnessUnavailable, OwnerCommand, QueueReason,
@@ -24,7 +23,10 @@ use narsor_engine::orchestration::{
 };
 
 use crate::task_app_support;
-use task_app_support::{at, exhausted, interrupted, queued, task, titled, waiting_on, with_runner};
+use task_app_support::{
+    at, exhausted, header_workspace, interrupted, queued, task, titled, waiting_on,
+    with_header_workspaces, with_pr, with_runner,
+};
 
 fn queue(reason: QueueReason) -> QueueView {
     QueueView {
@@ -158,7 +160,10 @@ fn a_list_row_shows_the_attention_mark_the_status_and_the_title() {
     );
     let asking = list_line(&asking);
     assert!(asking.contains("#2         ? paused · no slot"), "{asking}");
-    assert!(!asking.contains('—'), "no title, no dash: {asking}");
+    assert!(
+        asking.ends_with("t-2"),
+        "no title, the task id stands in its place: {asking}"
+    );
 
     let wrong = waiting_on(
         task("t-3", "local", "paused", 3),
@@ -183,28 +188,30 @@ fn a_list_row_never_carries_what_a_terminal_would_act_on() {
 }
 
 #[test]
-fn the_details_name_the_title_the_links_and_what_the_task_waits_on() {
-    let mut subject = titled(
-        waiting_on(
-            task("t-1", "local", "paused", 1),
-            AttentionKind::Approval,
-            "pending-7",
-            Some("review"),
+fn the_details_name_the_title_the_workspaces_and_what_the_task_waits_on() {
+    let subject = with_header_workspaces(
+        titled(
+            waiting_on(
+                task("t-1", "local", "paused", 1),
+                AttentionKind::Approval,
+                "pending-7",
+                Some("review"),
+            ),
+            "NAR-1 login",
         ),
-        "NAR-1 login",
+        vec![
+            {
+                let mut code = with_pr(
+                    header_workspace("code", "orders-api", "feat/x"),
+                    "https://gitlab.example/g/api/-/merge_requests/42",
+                );
+                code.added = Some(120);
+                code.removed = Some(34);
+                code
+            },
+            header_workspace("docs", "orders-docs", "main"),
+        ],
     );
-    subject.display.links = vec![
-        DisplayLink {
-            label: "Jira".into(),
-            text: "NAR-1".into(),
-            url: Some("https://jira.example/NAR-1".into()),
-        },
-        DisplayLink {
-            label: "PR".into(),
-            text: String::new(),
-            url: None,
-        },
-    ];
     let text: Vec<String> = detail_lines(&subject, None, None)
         .into_iter()
         .map(|line| line.text)
@@ -212,29 +219,31 @@ fn the_details_name_the_title_the_links_and_what_the_task_waits_on() {
     let has = |needle: &str| text.iter().any(|line| line.contains(needle));
     assert!(has("Title      NAR-1 login"), "{text:#?}");
     assert!(
-        has("Link       Jira: NAR-1 <https://jira.example/NAR-1>"),
+        has("Workspace  code  orders-api  feat/x → main  +120 −34  PR #42 <https://gitlab.example/g/api/-/merge_requests/42>"),
         "{text:#?}"
     );
-    assert!(has("Link       PR: —"), "{text:#?}");
+    assert!(has("Workspace  docs  orders-docs  main"), "{text:#?}");
     assert!(
         has("Waiting    ? approval in 'review' for 0s (id pending-7)"),
         "{text:#?}"
     );
-    assert_eq!(display_lines(&task("t-2", "local", "paused", 1)).len(), 0);
+    assert!(header_lines(&task("t-2", "local", "paused", 1)).is_empty());
     assert!(attention_lines(&task("t-2", "local", "paused", 1)).is_empty());
 }
 
 #[test]
-fn a_link_that_is_not_http_is_not_printed() {
+fn a_pull_request_address_that_is_not_http_is_not_printed() {
     let mut subject = task("t-1", "local", "paused", 1);
-    subject.display.links = vec![DisplayLink {
-        label: "Evil".into(),
-        text: "click".into(),
-        url: Some("javascript:alert(1)".into()),
-    }];
-    let lines = display_lines(&subject);
+    let mut code = header_workspace("code", "orders-api", "feat/x");
+    code.pr = Some("42".into());
+    code.pr_url = Some("javascript:alert(1)".into());
+    subject.workspaces = vec![code];
+    let lines = header_lines(&subject);
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].text, "Link       Evil: click");
+    assert_eq!(
+        lines[0].text,
+        "Workspace  code  orders-api  feat/x → main  PR #42"
+    );
 }
 
 #[test]
@@ -262,7 +271,7 @@ fn json_output_is_valid_and_free_of_invisible_characters() {
     let text = safe_json(&vec![hostile]).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed[0]["task_id"], "t-1");
-    assert_eq!(parsed[0]["display"]["title"], "abc");
+    assert_eq!(parsed[0]["title"], "abc");
     assert!(!text.contains('\u{202e}'));
 }
 

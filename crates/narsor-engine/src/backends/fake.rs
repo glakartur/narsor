@@ -679,7 +679,7 @@ impl SimulatedRunner<'_> {
             conductor_available: false,
             conductor_unavailable_reason: None,
             default_harness_unavailable: None,
-            display: None,
+            workspaces: Vec::new(),
             generated_title: None,
             observed_at: Utc::now(),
         };

@@ -1,9 +1,6 @@
-//! The `display` section of a workflow and what it renders to.
-//!
-//! A workflow declares how its tasks introduce themselves — a title and a few
-//! links (ticket, pull request) — as templates ([`DisplaySpec`]). Rendering
-//! against a task's inputs and variables yields a [`TaskDisplay`], the plain
-//! values a client shows. `docs/dev/workflow-schema.md` §3.6 is the external contract.
+//! What a client shows about a task: the header values of its workspaces
+//! ([`WorkspaceHeader`]), the loss states of an interrupted task, and the
+//! sanitizers that make text from outside safe to print.
 
 use crate::controller::{ResumeState, RunnerState};
 use serde::{Deserialize, Serialize};
@@ -14,9 +11,6 @@ pub const TRUNCATION_MARKER: &str = "\n… [truncated by narsor]";
 /// Longest title the conductor generates, in characters. The new-task form
 /// stops the operator's title at the same length.
 pub const GENERATED_TITLE_MAX_CHARS: usize = 50;
-
-/// What a link shows when it has no text to show.
-pub const EMPTY_LINK_TEXT: &str = "—";
 
 /// What a gate shows for a step that gave no reason.
 pub const NO_REASON: &str = "brak uzasadnienia";
@@ -74,83 +68,109 @@ pub fn loss_state(runner_state: RunnerState, resume: &ResumeState) -> Option<Los
     }
 }
 
-/// The declared, still templated `display` of a workflow.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DisplaySpec {
-    /// Template of the task title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-
-    /// Links shown next to the title, in declaration order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub links: Vec<DisplayLinkSpec>,
-}
-
-/// One declared link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DisplayLinkSpec {
-    /// What the link is (`Jira`, `PR`); unique within the section.
-    pub label: String,
-
-    /// Template of the visible text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-
-    /// Template of the target; only `http` and `https` survive rendering.
-    pub url: String,
-}
-
-/// The rendered `display` of one task.
+/// What a task shows about one of its workspaces: the fixed header values a
+/// client renders as one row. The list of them is the task's
+/// `context.workspace.<name>.*` contract (`docs/dev/workflow-schema.md`).
 ///
-/// `Default` is "nothing to show": an empty title makes a client fall back to
-/// the task id.
+/// `Default` is a workspace with nothing known yet.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskDisplay {
-    /// Rendered title; empty when the workflow declares none or it cannot
-    /// be rendered yet.
+pub struct WorkspaceHeader {
+    /// The workspace name from the workflow's `globals.workspaces`.
     #[serde(default)]
-    pub title: String,
+    pub name: String,
 
-    /// Rendered links, one per declared link, in declaration order.
+    /// The repository name, or the folder path of a local workspace.
     #[serde(default)]
-    pub links: Vec<DisplayLink>,
+    pub repo: String,
+
+    /// The branch the work is on; `None` while it is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+
+    /// The branch the changes are counted against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+
+    /// Lines added against the base branch; `None` while not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<u64>,
+
+    /// Lines removed against the base branch; `None` while not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<u64>,
+
+    /// The pull request number, without a prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<String>,
+
+    /// The pull request address, as the workflow set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
 }
 
-impl TaskDisplay {
-    /// The same display made safe to print in a terminal: control characters
+impl WorkspaceHeader {
+    /// The same header made safe to print in a terminal: control characters
     /// (an ESC that starts an escape sequence among them) are removed from
-    /// the title, labels and texts, and a URL that is not an `http(s)` one
-    /// is dropped. Applied wherever a display comes from outside the
-    /// control plane's own rendering — a remote runner reports one.
+    /// every text, and a `pr_url` that is not an `http(s)` address is
+    /// dropped. Applied wherever a header comes from outside the control
+    /// plane's own data: a remote runner reports it.
     pub fn sanitized(self) -> Self {
         let plain = |text: String| without_unsafe_chars(&text);
         Self {
-            title: plain(self.title),
-            links: self
-                .links
-                .into_iter()
-                .map(|link| DisplayLink {
-                    label: plain(link.label),
-                    text: plain(link.text),
-                    url: link.url.as_deref().and_then(safe_link_url),
-                })
-                .collect(),
+            name: plain(self.name),
+            repo: plain(self.repo),
+            branch: self.branch.map(plain),
+            base_branch: self.base_branch.map(plain),
+            added: self.added,
+            removed: self.removed,
+            pr: self.pr.map(plain),
+            pr_url: self.pr_url.as_deref().and_then(safe_link_url),
+        }
+    }
+
+    /// What a client shows for the pull request of this workspace.
+    pub fn pr_label(&self) -> PrLabel {
+        let url = self.pr_url.as_deref().and_then(safe_link_url);
+        let number = self
+            .pr
+            .as_deref()
+            .map(str::trim)
+            .filter(|pr| !pr.is_empty())
+            .map(|pr| pr.trim_start_matches('#').to_string())
+            .or_else(|| url.as_deref().and_then(number_in_url))
+            .map(|number| format!("#{number}"));
+        PrLabel { number, url }
+    }
+}
+
+/// How a client shows a pull request: the number with its `#` prefix and the
+/// link. Both are `None` when there is no pull request. A link exists only
+/// for an absolute `http(s)` address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrLabel {
+    pub number: Option<String>,
+    pub url: Option<String>,
+}
+
+impl PrLabel {
+    /// `PR #42`, or `PR` when the number is not known.
+    pub fn text(&self) -> String {
+        match &self.number {
+            Some(number) => format!("PR {number}"),
+            None => "PR".to_string(),
         }
     }
 }
 
-/// One rendered link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DisplayLink {
-    /// The declared label.
-    pub label: String,
-
-    /// Visible text; [`EMPTY_LINK_TEXT`] when there is none.
-    pub text: String,
-
-    /// Target, or `None` while it is unknown or not an `http(s)` URL.
-    #[serde(default)]
-    pub url: Option<String>,
+/// The number at the end of a pull request address, such as the `42` of
+/// `.../merge_requests/42`.
+fn number_in_url(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let (_, tail) = path.split_once("://")?;
+    let (_, path) = tail.split_once('/')?;
+    let segment = path.trim_end_matches('/').rsplit('/').next()?;
+    (!segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_digit()))
+        .then(|| segment.to_string())
 }
 
 /// `text` without the characters a terminal must never be handed from an
@@ -256,23 +276,107 @@ pub fn safe_link_url(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_link_url, without_unsafe_chars_multiline, DisplayLink, TaskDisplay};
+    use super::{safe_link_url, without_unsafe_chars_multiline, WorkspaceHeader};
+
+    fn header_with_pr(pr: Option<&str>, pr_url: Option<&str>) -> WorkspaceHeader {
+        WorkspaceHeader {
+            name: "code".into(),
+            pr: pr.map(str::to_string),
+            pr_url: pr_url.map(str::to_string),
+            ..WorkspaceHeader::default()
+        }
+    }
 
     #[test]
-    fn sanitizing_strips_invisible_format_characters() {
-        let display = TaskDisplay {
-            title: "NAR-1\u{202E}gnp.exe\u{200B}\u{2028}".into(),
-            links: vec![DisplayLink {
-                label: "PR\u{2066}".into(),
-                text: "go\u{FEFF}".into(),
-                url: Some("https://x.example/\u{202E}a".into()),
-            }],
+    fn sanitizing_strips_control_and_invisible_characters_from_texts() {
+        let header = WorkspaceHeader {
+            name: "co\u{1b}de".into(),
+            repo: "NAR-1\u{202E}gnp.exe\u{200B}\u{2028}".into(),
+            branch: Some("feat/\u{1b}[31mx".into()),
+            base_branch: Some("main\u{FEFF}".into()),
+            pr: Some("4\u{2066}2".into()),
+            ..WorkspaceHeader::default()
         }
         .sanitized();
-        assert_eq!(display.title, "NAR-1gnp.exe");
-        assert_eq!(display.links[0].label, "PR");
-        assert_eq!(display.links[0].text, "go");
-        assert_eq!(display.links[0].url, None);
+        assert_eq!(header.name, "code");
+        assert_eq!(header.repo, "NAR-1gnp.exe");
+        assert_eq!(header.branch.as_deref(), Some("feat/[31mx"));
+        assert_eq!(header.base_branch.as_deref(), Some("main"));
+        assert_eq!(header.pr.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn sanitizing_drops_a_pr_url_that_is_not_http() {
+        let header = header_with_pr(None, Some("javascript:alert(1)")).sanitized();
+        assert_eq!(header.pr_url, None);
+        let header = header_with_pr(None, Some("https://x.example/\u{202E}a")).sanitized();
+        assert_eq!(header.pr_url, None);
+        let header = header_with_pr(None, Some("https://x.example/pull/1")).sanitized();
+        assert_eq!(header.pr_url.as_deref(), Some("https://x.example/pull/1"));
+    }
+
+    #[test]
+    fn a_header_without_a_workspaces_field_in_json_has_defaults() {
+        let header: WorkspaceHeader = serde_json::from_str(r#"{"name":"code"}"#).unwrap();
+        assert_eq!(header.name, "code");
+        assert_eq!(header.repo, "");
+        assert_eq!(header.branch, None);
+        assert_eq!(header.added, None);
+    }
+
+    #[test]
+    fn the_pr_number_comes_from_the_end_of_the_address_when_pr_is_missing() {
+        let label = header_with_pr(None, Some("https://github.com/o/r/pull/7")).pr_label();
+        assert_eq!(label.number.as_deref(), Some("#7"));
+        assert_eq!(label.url.as_deref(), Some("https://github.com/o/r/pull/7"));
+
+        let label = header_with_pr(
+            None,
+            Some("https://gitlab.example/g/api/-/merge_requests/42/"),
+        )
+        .pr_label();
+        assert_eq!(label.number.as_deref(), Some("#42"));
+    }
+
+    #[test]
+    fn an_address_without_a_number_gives_a_link_and_no_number() {
+        let label = header_with_pr(None, Some("https://host/review/abc")).pr_label();
+        assert_eq!(label.number, None);
+        assert_eq!(label.url.as_deref(), Some("https://host/review/abc"));
+
+        let label = header_with_pr(None, Some("https://host")).pr_label();
+        assert_eq!(label.number, None);
+    }
+
+    #[test]
+    fn a_pr_number_wins_over_the_address() {
+        let label = header_with_pr(Some("42"), Some("https://host/pull/7")).pr_label();
+        assert_eq!(label.number.as_deref(), Some("#42"));
+        assert_eq!(label.url.as_deref(), Some("https://host/pull/7"));
+    }
+
+    #[test]
+    fn an_unsafe_address_is_never_a_link_or_a_number_source() {
+        let label = header_with_pr(None, Some("javascript:alert(1)")).pr_label();
+        assert_eq!(label.number, None);
+        assert_eq!(label.url, None);
+
+        let label = header_with_pr(Some("42"), Some("javascript:alert(1)")).pr_label();
+        assert_eq!(label.number.as_deref(), Some("#42"));
+        assert_eq!(label.url, None);
+
+        let label = header_with_pr(None, Some("file:///etc/7")).pr_label();
+        assert_eq!(label.number, None);
+        assert_eq!(label.url, None);
+    }
+
+    #[test]
+    fn no_pr_and_no_address_give_an_empty_label() {
+        let label = header_with_pr(None, None).pr_label();
+        assert_eq!(label.number, None);
+        assert_eq!(label.url, None);
+        let label = header_with_pr(Some("  "), None).pr_label();
+        assert_eq!(label.number, None);
     }
 
     #[test]

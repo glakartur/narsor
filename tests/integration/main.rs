@@ -54,6 +54,7 @@ mod persistence;
 mod registry;
 mod schema_loading;
 mod task_labels;
+mod task_workspaces;
 mod template;
 mod timeline;
 mod tui_background;

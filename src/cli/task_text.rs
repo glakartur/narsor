@@ -25,7 +25,7 @@ use narsor_protocol::controller::{
     AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OperatorCommand,
     OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskEvent, TaskEventKind, TaskState,
 };
-use narsor_protocol::display::{exhaustion_loss, loss_state, LossState};
+use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, WorkspaceHeader};
 
 /// Soft cap on the raw bytes of one relayed conversation page.
 pub const PAGE_BYTE_BUDGET: u64 = 64 * 1024;
@@ -288,8 +288,7 @@ pub fn status_badge(task: &TaskSummary) -> ToneLine {
 }
 
 /// One row of `narsor task list`: id, backend, queue place, the attention
-/// mark (`?` asks, `!` is wrong), the status and — when the workflow declares
-/// one — the title.
+/// mark (`?` asks, `!` is wrong), the status and the title, or else the task id.
 pub fn list_line(task: &TaskSummary) -> String {
     let title = display_title(task);
     let title = if title.is_empty() {
@@ -307,9 +306,15 @@ pub fn list_line(task: &TaskSummary) -> String {
     ))
 }
 
-/// The task's title from its `display`, made safe to print.
+/// The task's own title made safe to print; `None` when it has none.
+fn safe_title(task: &TaskSummary) -> Option<String> {
+    let title = without_unsafe_chars(task.title.as_deref().unwrap_or_default().trim());
+    (!title.is_empty()).then_some(title)
+}
+
+/// The task's own title made safe to print; the task id when it has none.
 fn display_title(task: &TaskSummary) -> String {
-    without_unsafe_chars(task.display.title.trim())
+    safe_title(task).unwrap_or_else(|| task.task_id.to_string())
 }
 
 /// What a kind of waiting is called.
@@ -326,36 +331,46 @@ pub fn attention_kind_name(kind: AttentionKind) -> &'static str {
     }
 }
 
-/// The title and the links of the task's `display`; nothing when the
-/// workflow declares none. A link without a value reads `—`.
-pub fn display_lines(task: &TaskSummary) -> Vec<ToneLine> {
-    // A runner reports its own display: it is cleaned (and a URL that is not
-    // `http(s)` dropped) before anything is printed.
-    let display = task.display.clone().sanitized();
-    let mut lines = Vec::new();
-    if !display.title.trim().is_empty() {
-        lines.push(ToneLine::new(
-            format!("Title      {}", display.title.trim()),
-            Tone::Normal,
+/// The title of the task, when it has one, and a line for each workspace:
+/// its repository, branch, changed lines and pull request.
+pub fn header_lines(task: &TaskSummary) -> Vec<ToneLine> {
+    let title =
+        safe_title(task).map(|title| ToneLine::new(format!("Title      {title}"), Tone::Normal));
+    // A runner reports its own workspaces: they are cleaned (and a URL that
+    // is not `http(s)` dropped) before anything is printed.
+    let workspaces = task
+        .workspaces
+        .iter()
+        .map(|workspace| workspace_line(&workspace.clone().sanitized()));
+    title.into_iter().chain(workspaces).collect()
+}
+
+/// `Workspace  code  orders-api  feat/x → main  +120 −34  PR #42 <url>`; the
+/// parts the workspace does not have are left out.
+fn workspace_line(workspace: &WorkspaceHeader) -> ToneLine {
+    let mut parts = vec![workspace.name.clone(), workspace.repo.clone()];
+    match (
+        workspace.branch.as_deref(),
+        workspace.base_branch.as_deref(),
+    ) {
+        (Some(branch), Some(base)) if branch != base => parts.push(format!("{branch} → {base}")),
+        (Some(name), _) | (None, Some(name)) => parts.push(name.to_string()),
+        (None, None) => {}
+    }
+    if workspace.added.is_some() || workspace.removed.is_some() {
+        parts.push(format!(
+            "+{} −{}",
+            workspace.added.unwrap_or(0),
+            workspace.removed.unwrap_or(0)
         ));
     }
-    for link in &display.links {
-        let text = if link.text.trim().is_empty() {
-            crate::domain::EMPTY_LINK_TEXT
-        } else {
-            link.text.trim()
-        };
-        let url = link
-            .url
-            .as_deref()
-            .map(|url| format!(" <{url}>"))
-            .unwrap_or_default();
-        lines.push(ToneLine::new(
-            format!("Link       {}: {text}{url}", link.label),
-            Tone::Normal,
-        ));
+    let label = workspace.pr_label();
+    match (&label.number, &label.url) {
+        (_, Some(url)) => parts.push(format!("{} <{url}>", label.text())),
+        (Some(_), None) => parts.push(label.text()),
+        (None, None) => {}
     }
-    lines
+    ToneLine::new(format!("Workspace  {}", parts.join("  ")), Tone::Normal)
 }
 
 /// What the task waits on its owner for, oldest first: the kind, the state
@@ -575,7 +590,7 @@ pub fn detail_lines(
             Tone::Normal,
         ),
     ];
-    lines.splice(1..1, display_lines(task));
+    lines.splice(1..1, header_lines(task));
     if let Some(hint) = state_hint(task) {
         lines.push(hint);
     }

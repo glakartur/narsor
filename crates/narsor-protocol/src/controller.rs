@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::HumanInputDeliveryDto;
 use crate::api::{ExecutionStatusDto, Timeline};
 use crate::chat::is_false;
-use crate::display::TaskDisplay;
+use crate::display::WorkspaceHeader;
 use crate::event::Event;
 use crate::identifier::BackendId;
 use crate::identifier::TaskId;
@@ -735,8 +735,9 @@ pub struct RunnerSnapshotRequest {
     pub conductor_unavailable_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_harness_unavailable: Option<HarnessUnavailable>,
-    #[serde(default)]
-    pub display: Option<TaskDisplay>,
+    /// The header values of the task's workspaces, in the workflow's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<WorkspaceHeader>,
     /// Title the conductor generated for a task whose operator gave none;
     /// the last report that has one wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -896,8 +897,9 @@ pub struct TaskSummary {
     pub attention: Vec<AttentionItem>,
     #[serde(default)]
     pub queue: Option<QueueView>,
+    /// The header values of the task's workspaces, in the workflow's order.
     #[serde(default)]
-    pub display: crate::display::TaskDisplay,
+    pub workspaces: Vec<WorkspaceHeader>,
     /// Ticket the operator gave the task, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,

@@ -17,7 +17,7 @@
 //! * hiding finished tasks (`z`) is a filter over the same order
 //!   ([`TaskList::visible`]), not a regrouping.
 //! * text filtering (`/`) matches the ticket, the task's title, its
-//!   `display.title` or the full id without changing the relative order of
+//!   or the full id without changing the relative order of
 //!   the visible tasks.
 //!
 //! # A row
@@ -211,23 +211,10 @@ pub fn state_icon(task: &TaskSummary) -> StateIcon {
     }
 }
 
-/// The title of a row: `display.title`, or the task id when there is none.
+/// The title of a row, and of the detail frame's edge (`edge_layout`): the
+/// task's own `title` when it is not blank, otherwise its id.
 pub fn title_of(task: &TaskSummary) -> String {
-    let title = one_line(&task.display.title);
-    if title.trim().is_empty() {
-        task.task_id.to_string()
-    } else {
-        title
-    }
-}
-
-/// The title a list row shows: the task's own `title` when it has one that is
-/// not blank, otherwise [`title_of`]. For a task without a ticket this is the
-/// rule of the detail frame's edge (`edge_layout`), so the row and the frame
-/// show the same title; a task with a ticket and no title shows only the
-/// ticket on the frame, while its row falls back to `display.title`.
-pub fn row_title_of(task: &TaskSummary) -> String {
-    non_blank_line(task.title.as_deref()).unwrap_or_else(|| title_of(task))
+    non_blank_line(task.title.as_deref()).unwrap_or_else(|| task.task_id.to_string())
 }
 
 /// `text` on one line, or `None` when it is missing or blank.
@@ -682,12 +669,9 @@ impl TaskList {
             || ticket.is_some_and(|ticket| ticket.to_lowercase().contains(&needle))
     }
 
-    /// The row title and `display.title` both match, so a task with a title
-    /// is still found by the words of its description.
     fn matches_task(&self, task: &TaskSummary) -> bool {
         let (ticket, task_id) = (task.ticket.as_deref(), task.task_id.as_str());
-        self.matches_filter(ticket, &row_title_of(task), task_id)
-            || self.matches_filter(ticket, &title_of(task), task_id)
+        self.matches_filter(ticket, &title_of(task), task_id)
     }
 
     fn matches_pending(&self, row: &PendingRow) -> bool {
@@ -743,7 +727,7 @@ impl TaskList {
             id: short_task_id(task.task_id.as_str()),
             attention: attention_of(task),
             icon: state_icon(task),
-            title: row_title_of(task),
+            title: title_of(task),
             status: task_state_name(task.state).to_string(),
             since: activity_since(task),
             label: label_of(task, positions.get(&index).copied()),

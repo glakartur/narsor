@@ -1,12 +1,14 @@
-//! The details of the selected task (U9): a three-line header (with a fourth
-//! line of the task's usage when a harness reported any) made of the
-//! workflow's `display` and an optional notice, a separator, the tabs, and
-//! what the active tab shows. The separator makes the tabs a distinct strip.
+//! The details of the selected task: a header (the title when the frame's edge
+//! cuts it, the status line, a row for each workspace and — when a harness
+//! reported any — the task's usage) and an optional notice, a separator, the
+//! tabs, and what the active tab shows. The separator makes the tabs a
+//! distinct strip.
 //!
 //! ```text
-//! NAR-12  Zmiana API zamówień                             implement v3
-//! Jira NAR-12 ↗   PR: —   ● running · krok 3/5 · 14m
-//! $1.20 · in 120k out 8k · w tym subagenci in 40k out 3k (2)
+//! ● running · krok 3 implement · code-review v3 · 14m
+//! code  orders-api   feat/nar-12-orders → main  +120 −34  PR #42 ↗
+//! docs  orders-docs  main                                 —
+//! razem $1.25 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2) · dyrygent $0.05 ↑9k ↓1k
 //! ────────────────────────────────────────────────────────────────────
 //!  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info          podąża
 //!   ✓ plan ok         …
@@ -25,7 +27,7 @@
 //! # Reading
 //!
 //! [`TaskApp::sync_detail`] reads what the selected task's visible tab needs
-//! and has not got: the timeline always (the header's `krok n/m` and the
+//! and has not got: the timeline always (the header's `krok n` and the
 //! following need it), the attempts of the conversation for *Przebieg* and
 //! *Rozmowa*, the events for *Zdarzenia*. A task whose row moved to a newer
 //! revision, or a list that was read again, makes the data due; nothing is
@@ -63,7 +65,6 @@ use crate::controller_protocol::{
     ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
     TimelineResponse,
 };
-use crate::domain::display::{safe_link_url, DisplayLink, EMPTY_LINK_TEXT};
 use crate::task_usage_text::{self, TaskUsage};
 use narsor_protocol::api::ConversationState;
 use narsor_protocol::controller::{QueueReason, TaskState};
@@ -82,6 +83,7 @@ use super::tabs::conversation::{
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
 use super::tabs::progress::{self, Progress, StepView};
+use super::workspace_rows::{self, Part, Piece};
 use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
 
 /// Everything the details of one task remember.
@@ -481,7 +483,7 @@ pub fn hyperlinks_supported(var: impl Fn(&str) -> Option<String>) -> bool {
 /// Where the parts of the details go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Areas {
-    /// The three header lines, their separator, and the optional notice
+    /// The header lines, their separator, and the optional notice
     /// ([`notice`]).
     pub header: Rect,
     /// The tab titles and active-tab marker.
@@ -492,16 +494,15 @@ pub struct Areas {
     pub panel: Option<Rect>,
 }
 
-/// The three lines of task metadata and the quiet row above the tabs.
-const HEADER_LINES: u16 = 5;
-
 /// How much of the task id the frame's edge shows: the number the operator
 /// reads out loud. It is never cut.
 const SHORT_ID_CHARS: usize = 8;
+const QUIET_ROW: u16 = 1;
+const SEPARATOR_ROW: u16 = 1;
 
-/// Splits the details `area`: a header `header_lines` high — one more than
-/// [`HEADER_LINES`] while the task has a notice, which moves the two-row tabs
-/// strip down — the content and — when `panel_height` is not zero — a panel at
+/// Splits the details `area`: a header `header_lines` high — the quiet row,
+/// the lines of [`header`], the notice if there is one and the separator —
+/// the content and — when `panel_height` is not zero — a panel at
 /// the bottom. The content never goes below one row.
 pub fn areas(area: Rect, header_lines: u16, panel_height: u16) -> Areas {
     let header = Rect::new(area.x, area.y, area.width, header_lines.min(area.height));
@@ -901,10 +902,13 @@ pub(super) fn recorded_attempts(position: &narsor_protocol::api::Position) -> Ve
 // Drawing
 // ---------------------------------------------------------------------
 
-/// A link that may be made clickable: where it starts in the line, how wide it
-/// is, and where it points.
+/// A link that may be made clickable: the line it is on, where it starts in
+/// the line, how wide it is, and where it points.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LinkSpot {
+    /// The line of the header's own lines (not counting the quiet row above
+    /// them).
+    row: u16,
     column: u16,
     width: u16,
     url: String,
@@ -926,7 +930,7 @@ const MIN_TICKET_CELLS: usize = 3;
 /// `width` cells wide: the ticket and the title on the left, the short task id
 /// on the right. The id is never cut; the title is cut first, then the ticket,
 /// then the title and the ticket leave one after the other. Without a ticket
-/// and a title the left side is the task's title as `display` renders it.
+/// and a title the left side is the task id.
 /// `loading` is the marker of a task being loaded.
 pub fn edge_layout(
     task: &TaskSummary,
@@ -1007,6 +1011,21 @@ pub fn edge_layout(
     edge
 }
 
+/// Whether the frame's `edge` shows less than the whole title of `task`: the
+/// header then says the title on a line of its own. A task without a title
+/// never has one cut.
+pub fn title_is_cut(task: &TaskSummary, edge: &PanelEdge) -> bool {
+    let Some(title) = task
+        .title
+        .as_deref()
+        .map(one_line)
+        .filter(|title| !title.trim().is_empty())
+    else {
+        return false;
+    };
+    edge.left.last() != Some(&title)
+}
+
 /// Draws the details of the selected task into `area`: a frame named after
 /// the task, lit while the keys are in the details — in the answer panel too
 /// (R4), but not in the move mode, whose keys move the list's row — and what
@@ -1066,6 +1085,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         deferred: view.deferred,
         details_opened: view.details_opened,
         loading,
+        title_cut: title_is_cut(view.task, &edge),
     };
     render_view(frame, inner, view, styles, options);
 }
@@ -1098,6 +1118,8 @@ pub(super) struct ViewOptions {
     pub(super) details_opened: bool,
     /// A background read of the selected task is under way.
     pub(super) loading: bool,
+    /// The frame's edge cuts the title, so the header says it in full.
+    pub(super) title_cut: bool,
 }
 
 /// Draws `view` — the details of a task, or of an entry of the history —
@@ -1117,6 +1139,7 @@ pub(super) fn render_view(
         deferred,
         details_opened,
         loading,
+        title_cut,
     } = options;
     let content_keys = match keys {
         KeysAt::Content(step) => Some(step),
@@ -1129,7 +1152,21 @@ pub(super) fn render_view(
         .and_then(|response| response.timeline.as_ref())
         .and_then(|timeline| task_usage_text::sum(&timeline.positions));
     let notice = notice(view.task, styles, stale, inner_width);
-    let base_lines = HEADER_LINES + u16::from(notice.is_some()) + u16::from(usage.is_some());
+    let (mut lines, spots) = header(
+        view.task,
+        view.queue_place,
+        &view.detail.progress,
+        usage.as_ref(),
+        styles,
+        HeaderOptions {
+            stale,
+            title_cut,
+            width: inner_width,
+        },
+    );
+    let base_lines = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(QUIET_ROW + SEPARATOR_ROW + u16::from(notice.is_some()));
     let panel_height = view
         .detail
         .waiting
@@ -1140,15 +1177,6 @@ pub(super) fn render_view(
         parts.content.y.saturating_add(1),
         parts.content.width.saturating_sub(3),
         parts.content.height.saturating_sub(2),
-    );
-    let (mut lines, spots) = header(
-        view.task,
-        view.queue_place,
-        &view.detail.progress,
-        usage.as_ref(),
-        styles,
-        stale,
-        inner_width,
     );
     lines.insert(0, Line::default());
     lines.extend(notice);
@@ -1429,22 +1457,78 @@ fn tab_bar(
     ]
 }
 
-/// The header lines of `task` — a fourth with what it used, when `usage` is
-/// there — and where its links are on the third.
+#[derive(Debug, Clone, Copy)]
+struct HeaderOptions {
+    stale: bool,
+    /// The frame's edge cuts the title: the header's first line says it.
+    title_cut: bool,
+    width: u16,
+}
+
+fn greyed(role: Role, stale: bool) -> Role {
+    if stale {
+        Role::Done
+    } else {
+        role
+    }
+}
+
 fn header(
     task: &TaskSummary,
     queue_place: Option<usize>,
     progress: &Progress,
     usage: Option<&TaskUsage>,
     styles: &Styles,
-    stale: bool,
-    width: u16,
+    options: HeaderOptions,
 ) -> (Vec<Line<'static>>, Vec<LinkSpot>) {
-    let grey = |role: Role| if stale { Role::Done } else { role };
+    let HeaderOptions {
+        stale,
+        title_cut,
+        width,
+    } = options;
     let width = usize::from(width);
 
-    // Line 1: title and task identity.
-    let workflow = format!("{} v{}", one_line(&task.workflow_id), task.workflow_version);
+    let mut lines = Vec::new();
+    if title_cut {
+        lines.push(title_line(task, styles, greyed(Role::Calm, stale), width));
+    }
+    lines.push(status_line(
+        task,
+        queue_place,
+        progress,
+        styles,
+        stale,
+        width,
+    ));
+    let mut spots = Vec::new();
+    for row in workspace_rows::rows(&task.workspaces, width) {
+        let row_index = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let (line, link) = workspace_line(&row, styles, stale);
+        spots.extend(link.map(|(column, width, url)| LinkSpot {
+            row: row_index,
+            column,
+            width,
+            url,
+        }));
+        lines.push(line);
+    }
+
+    if let Some(usage) = usage {
+        let full = task_usage_text::line(usage, true);
+        let text = if cells(&full) <= width {
+            full
+        } else {
+            fit_cells(&task_usage_text::line(usage, false), width)
+        };
+        lines.push(Line::from(Span::styled(
+            text,
+            styles.of(greyed(Role::Calm, stale)),
+        )));
+    }
+    (lines, spots)
+}
+
+fn title_line(task: &TaskSummary, styles: &Styles, role: Role, width: usize) -> Line<'static> {
     let title = title_of(task);
     let identity = task.task_id.to_string();
     let identity_is_leading = title.strip_prefix(&identity).is_some_and(|suffix| {
@@ -1454,25 +1538,39 @@ fn header(
                 .next()
                 .is_some_and(|ch| !ch.is_alphanumeric() && ch != '-' && ch != '_')
     });
-    let first_text = if identity_is_leading {
+    let text = if identity_is_leading {
         fit_cells(&title, width)
     } else {
         let identity_suffix = format!("  {identity}");
-        if Span::raw(identity_suffix.as_str()).width() <= width {
-            let title_width = width - Span::raw(identity_suffix.as_str()).width();
-            format!("{}{}", fit_cells(&title, title_width), identity_suffix)
+        let suffix_width = cells(&identity_suffix);
+        if suffix_width <= width {
+            format!(
+                "{}{identity_suffix}",
+                fit_cells(&title, width - suffix_width)
+            )
         } else {
             fit_cells(&identity, width)
         }
     };
-    let first = Line::from(Span::styled(first_text, styles.strong(grey(Role::Calm))));
+    Line::from(Span::styled(text, styles.strong(role)))
+}
 
-    // Line 2: runner state, warnings, and compact step/queue context.
-    let mut second: Vec<Span<'static>> = Vec::new();
+fn status_line(
+    task: &TaskSummary,
+    queue_place: Option<usize>,
+    progress: &Progress,
+    styles: &Styles,
+    stale: bool,
+    width: usize,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
     let icon = state_icon(task);
     let state = format!("{} {}", icon.glyph(), status_word(task));
-    second.push(Span::styled(state.clone(), styles.of(grey(icon.role()))));
-    let mut used = Span::raw(state).width();
+    spans.push(Span::styled(
+        state.clone(),
+        styles.of(greyed(icon.role(), stale)),
+    ));
+    let mut used = cells(&state);
     let mut ordered = status_parts(task, queue_place, progress);
     // Preserve warning cues before optional duration and secondary detail.
     ordered.sort_by_key(|(_, role)| match role {
@@ -1484,84 +1582,60 @@ fn header(
     for (text, role) in ordered {
         let separator = " · ";
         let remaining = width.saturating_sub(used);
-        let needed = Span::raw(separator).width() + Span::raw(text.as_str()).width();
+        let needed = cells(separator) + cells(&text);
         if used + needed <= width {
-            second.push(Span::styled(separator, styles.of(Role::Done)));
-            second.push(Span::styled(text.clone(), styles.of(grey(role))));
+            spans.push(Span::styled(separator, styles.of(Role::Done)));
+            spans.push(Span::styled(text.clone(), styles.of(greyed(role, stale))));
             used += needed;
         } else if role == Role::Done {
             continue;
-        } else if remaining > Span::raw(separator).width() {
-            let shortened = fit_cells(&text, remaining - Span::raw(separator).width());
+        } else if remaining > cells(separator) {
+            let shortened = fit_cells(&text, remaining - cells(separator));
             if !shortened.is_empty() {
-                second.push(Span::styled(separator, styles.of(Role::Done)));
-                second.push(Span::styled(shortened, styles.of(grey(role))));
+                spans.push(Span::styled(separator, styles.of(Role::Done)));
+                spans.push(Span::styled(shortened, styles.of(greyed(role, stale))));
             }
             break;
         }
     }
+    Line::from(spans)
+}
 
-    // Line 3: whole links first, then workflow/version metadata.
-    let mut third: Vec<Span<'static>> = Vec::new();
-    let mut spots = Vec::new();
+/// One workspace row as a line and, when it has a pull request link, where
+/// the link is in it: `(column, width, url)`.
+fn workspace_line(
+    row: &[Piece],
+    styles: &Styles,
+    stale: bool,
+) -> (Line<'static>, Option<(u16, u16, String)>) {
+    let mut spans = Vec::new();
+    let mut link = None;
     let mut column = 0usize;
-    for link in &task.display.links {
-        let (text, url) = link_text(link);
-        let text_width = Span::raw(text.as_str()).width();
-        let gap = if third.is_empty() { 0 } else { 3 };
-        if column + gap + text_width > width {
-            break;
-        }
-        if gap > 0 {
-            third.push(Span::raw("   "));
-            column += gap;
-        }
-        let role = if url.is_some() {
-            Role::Link
-        } else {
-            Role::Done
+    for piece in row {
+        let role = match piece.part {
+            Part::Name | Part::Repo | Part::Branch | Part::PrText => Role::Calm,
+            Part::Changes | Part::Gap | Part::NoPr => Role::Done,
+            Part::PrLink => Role::Link,
         };
-        let span = Span::styled(text, styles.of(if stale { Role::Done } else { role }));
-        if let Some(url) = url {
-            if let (Ok(column), Ok(width)) = (u16::try_from(column), u16::try_from(span.width())) {
-                spots.push(LinkSpot { column, width, url });
-            }
+        let width = cells(&piece.text);
+        if let (Some(url), Ok(column), Ok(width)) =
+            (&piece.url, u16::try_from(column), u16::try_from(width))
+        {
+            link = Some((column, width, url.clone()));
         }
-        column += span.width();
-        third.push(span);
+        column += width;
+        let role = if stale { Role::Done } else { role };
+        spans.push(Span::styled(piece.text.clone(), styles.of(role)));
     }
-    let workflow = if third.is_empty() {
-        workflow
-    } else {
-        format!("   {workflow}")
-    };
-    if column + Span::raw(workflow.as_str()).width() <= width {
-        third.push(Span::styled(workflow, styles.of(Role::Done)));
-    }
-    let mut lines = vec![first, Line::from(second), Line::from(third)];
-
-    // Line 4: what the task used, when a harness reported any.
-    if let Some(usage) = usage {
-        let full = task_usage_text::line(usage, true);
-        let text = if cells(&full) <= width {
-            full
-        } else {
-            fit_cells(&task_usage_text::line(usage, false), width)
-        };
-        lines.push(Line::from(Span::styled(
-            text,
-            styles.of(if stale { Role::Done } else { Role::Calm }),
-        )));
-    }
-    (lines, spots)
+    (Line::from(spans), link)
 }
 
 /// Display width of `text` in terminal cells.
-fn cells(text: &str) -> usize {
+pub(super) fn cells(text: &str) -> usize {
     Span::raw(text).width()
 }
 
-fn fit_cells(text: &str, width: usize) -> String {
+pub(super) fn fit_cells(text: &str, width: usize) -> String {
     if Span::raw(text).width() <= width {
         return text.to_string();
     }
@@ -1588,7 +1662,6 @@ fn fit_cells(text: &str, width: usize) -> String {
 /// it keeps (R16c), cut to `width`; `None` when there is nothing to say. The
 /// harness's full reason is in *Info*.
 fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Option<Line<'static>> {
-    let grey = |role: Role| if stale { Role::Done } else { role };
     if let Some(loss) = narsor_protocol::display::loss_state(task.runner_state, &task.resume) {
         let role = if loss.needs_owner() {
             Role::Problem
@@ -1597,7 +1670,7 @@ fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Optio
         };
         return Some(Line::styled(
             fit(&describe_loss(&loss), usize::from(width)),
-            styles.of(grey(role)),
+            styles.of(greyed(role, stale)),
         ));
     }
     let unavailable = task.runner.as_ref()?.default_harness_unavailable.as_ref()?;
@@ -1608,55 +1681,48 @@ fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Optio
     );
     Some(Line::styled(
         fit(&text, usize::from(width)),
-        styles.of(grey(Role::Attention)),
+        styles.of(greyed(Role::Attention, stale)),
     ))
 }
 
-/// The visible text of a link and, when it can be followed, its target.
-/// A link without a value is `label: —`.
-fn link_text(link: &DisplayLink) -> (String, Option<String>) {
-    let label = one_line(&link.label);
-    let text = one_line(&link.text);
-    if text.trim().is_empty() || text == EMPTY_LINK_TEXT {
-        return (format!("{label}: {EMPTY_LINK_TEXT}"), None);
-    }
-    match link.url.as_deref().and_then(safe_link_url) {
-        Some(url) => (format!("{label} {text} ↗"), Some(url)),
-        None => (format!("{label} {text}"), None),
-    }
-}
-
-/// The task's state in a word.
 fn status_word(task: &TaskSummary) -> &'static str {
     task_state_name(task.state)
 }
 
-/// What follows the state on line 2: the queue, or the step, the time and a
-/// controller that is not there.
+/// What follows the state on the status line: the queue, or the step, the
+/// workflow, the time and a controller that is not there.
 fn status_parts(
     task: &TaskSummary,
     queue_place: Option<usize>,
     progress: &Progress,
 ) -> Vec<(String, Role)> {
+    let workflow = (
+        format!("{} v{}", one_line(&task.workflow_id), task.workflow_version),
+        Role::Done,
+    );
     let mut parts = Vec::new();
     if task.state == TaskState::Queued {
         parts.push((queue_text(task, queue_place), Role::Calm));
+        parts.push(workflow);
         return parts;
     }
     if without_slot(task) {
         parts.push(("bez slotu".to_string(), Role::Calm));
     }
-    if let Some((at, of)) = progress.step_count() {
-        parts.push((format!("krok {at}/{of}"), Role::Calm));
-    } else if let Some(step) = task
+    let step_name = task
         .runner
         .as_ref()
         .and_then(|runner| runner.execution_cursor.current_state.as_deref())
         .map(one_line)
-        .filter(|step| !step.trim().is_empty())
-    {
-        parts.push((format!("krok {step}"), Role::Calm));
+        .filter(|step| !step.trim().is_empty());
+    let step_number = progress.step_count().map(|(at, _)| at);
+    match (step_number, step_name) {
+        (Some(at), Some(name)) => parts.push((format!("krok {at} {name}"), Role::Calm)),
+        (Some(at), None) => parts.push((format!("krok {at}"), Role::Calm)),
+        (None, Some(name)) => parts.push((format!("krok {name}"), Role::Calm)),
+        (None, None) => {}
     }
+    parts.push(workflow);
     if let Some(seconds) = elapsed(task) {
         parts.push((short_age(seconds), Role::Done));
     }
@@ -1746,12 +1812,11 @@ fn is_safe_link_target(url: &str) -> bool {
 /// draws over the cells the text spans. A link that does not fit on the line is
 /// left as plain text.
 fn link_spots(buffer: &mut Buffer, header: Rect, spots: &[LinkSpot]) {
-    // Below the padding row, the identity and the state.
-    if header.height < 4 {
-        return;
-    }
-    let y = header.y + 3;
     for spot in spots {
+        let y = header.y.saturating_add(QUIET_ROW).saturating_add(spot.row);
+        if y >= header.y.saturating_add(header.height) {
+            continue;
+        }
         let end = u32::from(spot.column) + u32::from(spot.width);
         let (Some(width), true) = (NonZeroU16::new(spot.width), end <= u32::from(header.width))
         else {

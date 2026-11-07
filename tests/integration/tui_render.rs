@@ -1121,9 +1121,8 @@ mod task_app_render {
         let buffer = render(120, 30, &mut app, &Styles::new(false));
         assert_frame(&buffer, 0, list_right, ROUNDED, Color::DarkGray);
         assert_frame(&buffer, detail_left, 119, ROUNDED, Color::Cyan);
-        // The title has the colour of its frame and, with the focus, is bold.
         let title = column_of(&buffer, 1, detail_left, "N").unwrap();
-        assert_eq!(cell_at(&buffer, title, 1).1, Color::Cyan);
+        assert_eq!(buffer[(title, 1)].bg, Color::Cyan);
         assert!(bold_at(&buffer, title, 1));
         assert_eq!(cell_at(&buffer, 2, 1), ("Z".to_string(), Color::DarkGray));
         assert!(!bold_at(&buffer, 2, 1));
@@ -1757,7 +1756,7 @@ mod task_app_render {
         let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 12, 0).unwrap();
         let mut subject = crate::task_app_support::task("task-abcdef1234", "local", "running", 1);
         subject.ticket = Some("NAR-42".into());
-        subject.display.title = "Refaktor parser".into();
+        subject.title = Some("Refaktor parser".into());
         subject.state = TaskState::HumanNeeded;
         subject
             .attention
@@ -2013,8 +2012,9 @@ mod task_app_detail_render {
     use narsor_protocol::api::{PositionUsage, TokenCounts};
 
     use crate::task_app_support::{
-        displayed, execution_events, listing, position, queued, task, timeline, with_controller,
-        with_harness_unavailable, with_runner,
+        execution_events, header_workspace, listing, offered, position, queued, task, timeline,
+        titled, with_controller, with_harness_unavailable, with_header_workspaces, with_pr,
+        with_runner,
     };
 
     fn app() -> TaskApp {
@@ -2030,13 +2030,10 @@ mod task_app_detail_render {
         render_at(app, styles, 120, 30)
     }
 
-    // The rows of the details header under the top bar and the frame: a
-    // padded blank row, the identity, the state and the metadata (links and
-    // workflow); then a rule, the tabs and the marker under the open tab. A
-    // notice (an unavailable harness) adds a row under the metadata.
-    const IDENTITY_ROW: usize = 3;
-    const STATE_ROW: usize = 4;
-    const METADATA_ROW: usize = 5;
+    const TITLE_ROW: usize = 3;
+    const STATE_ROW: usize = 3;
+    const WORKSPACE_ROW: usize = 4;
+    const USAGE_ROW: usize = WORKSPACE_ROW + 2;
     const TABS_ROW: usize = 7;
     const TAB_MARKER_ROW: usize = 8;
 
@@ -2046,8 +2043,6 @@ mod task_app_detail_render {
         })
     }
 
-    /// `NAR-12`: running at the third of five steps, with a Jira link and a PR
-    /// link that has no value.
     fn running_app() -> TaskApp {
         let mut app = app();
         let running = with_runner(
@@ -2056,12 +2051,14 @@ mod task_app_detail_render {
             "review",
         );
         app.load(listing(
-            vec![displayed(
-                running,
-                "NAR-12 Zmiana API zamówień",
-                &[
-                    ("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12")),
-                    ("PR", "—", None),
+            vec![with_header_workspaces(
+                titled(running, "NAR-12 Zmiana API zamówień"),
+                vec![
+                    with_pr(
+                        header_workspace("code", "orders-api", "feat/nar-12-orders"),
+                        "https://gitlab.example/g/api/-/merge_requests/42",
+                    ),
+                    header_workspace("docs", "orders-docs", "main"),
                 ],
             )],
             "c",
@@ -2088,28 +2085,37 @@ mod task_app_detail_render {
     }
 
     #[test]
-    fn the_header_of_a_running_task_shows_the_display_the_step_and_the_state() {
+    fn the_header_of_a_running_task_shows_the_status_the_step_and_each_workspace() {
         let mut app = running_app();
         let buffer = render(&mut app, &Styles::new(false));
         let rows = rows(&buffer);
-        // The details start under a padded blank row, with identity, state,
-        // and metadata rows.
-        assert!(
-            rows[IDENTITY_ROW].contains("NAR-12 Zmiana API zamówień"),
-            "{}",
-            rows[IDENTITY_ROW]
-        );
-        let metadata = &rows[METADATA_ROW];
-        assert!(metadata.contains("implement-feature v3"), "{metadata}");
-        assert!(metadata.contains("Jira NAR-12 ↗"), "{metadata}");
-        assert!(
-            metadata.contains("PR: —"),
-            "a link without a value: {metadata}"
-        );
-        assert!(!metadata.contains("PR — ↗"));
         let state = &rows[STATE_ROW];
         assert!(state.contains("● running"), "{state}");
-        assert!(state.contains("krok 3/5"), "{state}");
+        assert!(state.contains("krok 3 review"), "{state}");
+        assert!(!state.contains("3/5"), "{state}");
+        assert!(state.contains("implement-feature v3"), "{state}");
+        assert!(
+            screen(&buffer)
+                .matches("NAR-12 Zmiana API zamówień")
+                .count()
+                == 1,
+            "the title is on the edge only"
+        );
+        let code = &rows[WORKSPACE_ROW];
+        assert!(code.contains("│  code  orders-api"), "{code}");
+        assert!(code.contains("orders-api"), "{code}");
+        assert!(code.contains("feat/nar-12-orders → main"), "{code}");
+        assert!(code.contains("PR #42 ↗"), "{code}");
+        let docs = &rows[WORKSPACE_ROW + 1];
+        assert!(
+            docs.contains("docs") && docs.contains("orders-docs"),
+            "{docs}"
+        );
+        assert!(
+            !docs.contains("→"),
+            "one name when branch is the base: {docs}"
+        );
+        assert!(docs.contains('—'), "no pull request: {docs}");
         let tabs = &rows[TABS_ROW];
         for tab in ["Przebieg", "Rozmowa", "Zdarzenia", "Dyrygent", "Info"] {
             assert!(tabs.contains(tab), "{tab} in {tabs}");
@@ -2189,6 +2195,158 @@ mod task_app_detail_render {
         .any(|cell| cell.symbol() == "─" && cell.fg == Color::Black));
     }
 
+    fn app_with_workspaces(workspaces: Vec<narsor_protocol::display::WorkspaceHeader>) -> TaskApp {
+        let mut app = app();
+        let running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        app.load(listing(
+            vec![with_header_workspaces(
+                titled(running, "NAR-12"),
+                workspaces,
+            )],
+            "c",
+        ));
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    fn changed_workspace() -> narsor_protocol::display::WorkspaceHeader {
+        let mut code = with_pr(
+            header_workspace("code", "orders-api-gateway-service", "feat/nar-12-refactor"),
+            "https://gitlab.example/g/api/-/merge_requests/42",
+        );
+        code.added = Some(120);
+        code.removed = Some(34);
+        code
+    }
+
+    fn code_row(app: &mut TaskApp, width: u16) -> String {
+        let rows = rows(&render_at(app, &Styles::new(false), width, 30));
+        let row = rows
+            .iter()
+            .find(|row| row.contains("│  code"))
+            .unwrap_or_else(|| panic!("no workspace row in {rows:#?}"));
+        row[row.find("│  code").unwrap()..].to_string()
+    }
+
+    #[test]
+    fn a_narrower_terminal_cuts_the_workspace_row_in_a_fixed_order() {
+        let mut app = app_with_workspaces(vec![changed_workspace()]);
+        let full = code_row(&mut app, 120);
+        assert!(full.contains("feat/nar-12-refactor → main"), "{full}");
+        assert!(full.contains("+120 −34"), "{full}");
+
+        let no_base = code_row(&mut app, 85);
+        assert!(
+            !no_base.contains("→"),
+            "the base branch goes first: {no_base}"
+        );
+        assert!(no_base.contains("feat/nar-12-refactor") && no_base.contains("+120 −34"));
+
+        let no_changes = code_row(&mut app, 75);
+        assert!(
+            !no_changes.contains("+120"),
+            "then the changes: {no_changes}"
+        );
+        assert!(no_changes.contains("feat/nar-12-refactor"), "{no_changes}");
+
+        let cut_branch = code_row(&mut app, 65);
+        assert!(!cut_branch.contains("feat/nar-12-refactor"), "{cut_branch}");
+        assert!(
+            cut_branch.contains("feat/nar-12-ref…"),
+            "then the branch: {cut_branch}"
+        );
+        assert!(
+            cut_branch.contains("orders-api-gateway-service"),
+            "{cut_branch}"
+        );
+
+        let mut long = changed_workspace();
+        long.repo = "orders-api-gateway-service-for-the-wholesale-department".into();
+        let mut app = app_with_workspaces(vec![long]);
+        let cut_repo = code_row(&mut app, 60);
+        assert!(
+            cut_repo.contains("orders-api-gateway-service-for"),
+            "{cut_repo}"
+        );
+        assert!(
+            !cut_repo.contains("wholesale-department"),
+            "then the repository: {cut_repo}"
+        );
+        for row in [&cut_branch, &cut_repo] {
+            assert!(row.contains("code") && row.contains("PR #42 ↗"), "{row}");
+        }
+    }
+
+    #[test]
+    fn the_header_has_a_row_for_each_workspace() {
+        let names = ["one", "two", "three", "four", "five"];
+        let mut app = app_with_workspaces(
+            names
+                .iter()
+                .map(|name| header_workspace(name, &format!("repo-{name}"), "main"))
+                .collect(),
+        );
+        let rows = rows(&render(&mut app, &Styles::new(false)));
+        for (at, name) in names.iter().enumerate() {
+            assert!(
+                rows[WORKSPACE_ROW + at].contains(&format!("repo-{name}")),
+                "{}",
+                rows[WORKSPACE_ROW + at]
+            );
+        }
+        assert!(rows[WORKSPACE_ROW + names.len() + 1].contains("Przebieg"));
+    }
+
+    #[test]
+    fn a_workspace_row_never_shows_an_address_that_is_not_http() {
+        let mut hostile = header_workspace("code", "orders-api", "feat/x");
+        hostile.pr = Some("42".into());
+        hostile.pr_url = Some("javascript:alert(1)".into());
+        let mut app = app_with_workspaces(vec![hostile]);
+        let row = code_row(&mut app, 120);
+        assert!(row.contains("PR #42") && !row.contains('↗'), "{row}");
+        assert!(!row.contains("javascript"), "{row}");
+    }
+
+    #[test]
+    fn a_queued_task_shows_its_workspaces_without_changes_or_a_pull_request() {
+        let mut app = app();
+        let mut docs = header_workspace("code", "orders-api", "main");
+        docs.branch = None;
+        app.load(listing(
+            vec![with_header_workspaces(
+                titled(queued("a", 1), "NAR-12"),
+                vec![docs],
+            )],
+            "c",
+        ));
+        press(&mut app, KeyCode::Enter);
+        let row = code_row(&mut app, 120);
+        assert!(row.contains("orders-api") && row.contains("main"), "{row}");
+        assert!(!row.contains("+") && !row.contains("PR"), "{row}");
+    }
+
+    #[test]
+    fn a_title_the_edge_cuts_is_said_in_full_on_the_first_header_row() {
+        let title = "Przebudowa obsługi zamówień hurtowych wraz z migracją danych klientów";
+        let mut app = labelled_app(None, Some(title));
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 24));
+        assert!(
+            rows[TITLE_ROW].contains("Przebudowa obsługi"),
+            "{}",
+            rows[TITLE_ROW]
+        );
+        assert!(
+            rows[TITLE_ROW + 1].contains("● running"),
+            "{}",
+            rows[TITLE_ROW + 1]
+        );
+    }
+
     #[test]
     fn a_fitted_title_keeps_the_task_id_visible() {
         let mut app = app();
@@ -2198,14 +2356,14 @@ mod task_app_detail_render {
             "review",
         );
         let title = format!("{} RUN-1", "a very long task title ".repeat(6));
-        app.load(listing(vec![displayed(running, &title, &[])], "c"));
+        app.load(listing(vec![titled(running, &title)], "c"));
         press(&mut app, KeyCode::Enter);
 
         let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 20));
         assert!(
-            rows[IDENTITY_ROW].contains("…  RUN-1"),
+            rows[TITLE_ROW].contains("…  RUN-1"),
             "identity survives fitting: {}",
-            rows[IDENTITY_ROW]
+            rows[TITLE_ROW]
         );
     }
 
@@ -2246,7 +2404,7 @@ mod task_app_detail_render {
     }
 
     #[test]
-    fn the_header_shows_what_the_task_used_in_a_row_under_the_links() {
+    fn the_header_shows_what_the_task_used_in_a_row_under_the_workspaces() {
         let mut app = running_app_with_usage(vec![
             reported(80_000, 5_000, (30_000, 2_000), 0.8),
             None,
@@ -2254,15 +2412,15 @@ mod task_app_detail_render {
         ]);
         let rows = rows(&render(&mut app, &Styles::new(false)));
         assert!(
-            rows[METADATA_ROW].contains("Jira NAR-12 ↗"),
+            rows[WORKSPACE_ROW].contains("PR #42 ↗"),
             "{}",
-            rows[METADATA_ROW]
+            rows[WORKSPACE_ROW]
         );
         assert!(
-            rows[METADATA_ROW + 1]
-                .contains("$1.20 · in 120k out 8k · w tym subagenci in 40k out 3k (2)"),
+            rows[USAGE_ROW]
+                .contains("razem $1.20 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2)"),
             "{}",
-            rows[METADATA_ROW + 1]
+            rows[USAGE_ROW]
         );
         assert!(
             rows[TABS_ROW + 1].contains("Przebieg"),
@@ -2282,10 +2440,13 @@ mod task_app_detail_render {
     fn a_narrow_header_drops_the_subagents_part_first() {
         let mut app = running_app_with_usage(vec![reported(120_000, 8_000, (40_000, 3_000), 1.2)]);
         let wide = rows(&render_at(&mut app, &Styles::new(false), 120, 30));
-        assert!(wide[METADATA_ROW + 1].contains("w tym subagenci in 40k out 3k (1)"));
+        assert!(wide[USAGE_ROW].contains("(subagenci ↑40k ↓3k ×1)"));
         let narrow = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
-        let row = &narrow[METADATA_ROW + 1];
-        assert!(row.contains("$1.20 · in 120k out 8k"), "{row}");
+        let row = &narrow[USAGE_ROW];
+        assert!(
+            row.contains("razem $1.20 · agenci $1.20 ↑120k ↓8k"),
+            "{row}"
+        );
         assert!(!row.contains("subagenci"), "{row}");
     }
 
@@ -2301,14 +2462,14 @@ mod task_app_detail_render {
         );
         let rows = rows(&render(&mut app, &Styles::new(false)));
         assert!(
-            rows[METADATA_ROW + 1].contains("$0.10 · in 1k out 100"),
+            rows[USAGE_ROW].contains("razem $0.10 · agenci $0.10 ↑1k ↓100"),
             "{}",
-            rows[METADATA_ROW + 1]
+            rows[USAGE_ROW]
         );
         assert!(
-            rows[METADATA_ROW + 2].contains("opencode niedostępny"),
+            rows[USAGE_ROW + 1].contains("opencode niedostępny"),
             "{}",
-            rows[METADATA_ROW + 2]
+            rows[USAGE_ROW + 1]
         );
         assert!(
             rows[TABS_ROW + 2].contains("Przebieg"),
@@ -2326,15 +2487,21 @@ mod task_app_detail_render {
             ExecutionStatus::Running,
             "review",
         );
-        app.load(listing(vec![displayed(running, "short title", &[])], "c"));
+        app.load(listing(vec![titled(running, "short title")], "c"));
         press(&mut app, KeyCode::Enter);
 
-        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 20));
-        assert_eq!(rows[IDENTITY_ROW].chars().count(), 60);
+        let buffer = render_at(&mut app, &Styles::new(false), 60, 20);
+        let screen = screen(&buffer);
+        assert!(screen.contains(&"A".repeat(8)), "{screen}");
         assert!(
-            rows[IDENTITY_ROW].contains('…'),
-            "long identity is marked as fitted: {}",
-            rows[IDENTITY_ROW]
+            !screen.contains(&"A".repeat(9)),
+            "the frame's edge shows the first eight characters of the id: {screen}"
+        );
+        assert!(
+            rows(&buffer)[TITLE_ROW - 1..]
+                .iter()
+                .all(|row| row.chars().count() <= 60),
+            "{screen}"
         );
     }
 
@@ -2353,7 +2520,13 @@ mod task_app_detail_render {
             "backend 'k8s' runs only claude-code",
         );
         app.load(listing(
-            vec![displayed(running, "NAR-12 Zmiana API zamówień", &[])],
+            vec![with_header_workspaces(
+                titled(running, "NAR-12 Zmiana API zamówień"),
+                vec![
+                    header_workspace("code", "orders-api", "feat/nar-12-orders"),
+                    header_workspace("docs", "orders-docs", "main"),
+                ],
+            )],
             "c",
         ));
         press(&mut app, KeyCode::Enter);
@@ -2368,7 +2541,7 @@ mod task_app_detail_render {
         let buffer = render(&mut app, &Styles::new(false));
         let rows = rows(&buffer);
         assert!(rows[STATE_ROW].contains("● running"), "{}", rows[STATE_ROW]);
-        let notice = METADATA_ROW + 1;
+        let notice = USAGE_ROW;
         assert!(
             rows[notice].contains("opencode niedostępny tutaj — zostaje claude-code"),
             "{}",
@@ -2447,15 +2620,15 @@ mod task_app_detail_render {
                 .unwrap_or_else(|| panic!("{needle:?} in\n{}", rows.join("\n")))
         };
         let step0 = row(&wide, "$0.42");
-        assert!(wide[step0].contains("1×  ↓40k  ↑3k"), "{}", wide.join("\n"));
-        assert!(wide[row(&wide, "$0.03")].contains("↓2.1k"));
+        assert!(wide[step0].contains("1×  ↑40k  ↓3k"), "{}", wide.join("\n"));
+        assert!(wide[row(&wide, "$0.03")].contains("↑2.1k"));
 
         let mut app = running_app_with_usage(steps());
         app.detail_mut()
             .set_tab(narsor::tui::task_app::DetailTab::Progress);
         let narrow = rows(&render_at(&mut app, &Styles::new(false), 62, 30));
         let step0 = row(&narrow, "$0.42");
-        assert!(narrow[step0].contains("↓120k"), "{}", narrow.join("\n"));
+        assert!(narrow[step0].contains("↑120k"), "{}", narrow.join("\n"));
         assert!(!narrow[row(&narrow, "$0.03")].contains('×'));
     }
 
@@ -2521,19 +2694,19 @@ mod task_app_detail_render {
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
         assert!(
-            screen.contains("\u{1b}]8;;https://jira.example/browse/NAR-12\u{1b}\\Jira NAR-12 ↗\u{1b}]8;;\u{1b}\\"),
+            screen.contains("\u{1b}]8;;https://gitlab.example/g/api/-/merge_requests/42\u{1b}\\PR #42 ↗\u{1b}]8;;\u{1b}\\"),
             "{:?}",
-            rows(&buffer)[METADATA_ROW]
+            rows(&buffer)[WORKSPACE_ROW]
         );
         assert_eq!(
             screen.matches("\u{1b}]8;;https").count(),
             1,
             "only the link with a target"
         );
-        let row = &rows(&plain_buffer)[METADATA_ROW];
-        let byte = row.find("Jira NAR-12 ↗").unwrap();
+        let row = &rows(&plain_buffer)[WORKSPACE_ROW];
+        let byte = row.find("PR #42 ↗").unwrap();
         let column = u16::try_from(row[..byte].chars().count()).unwrap();
-        let y = METADATA_ROW as u16;
+        let y = WORKSPACE_ROW as u16;
         let link_cell = (0..buffer.area.width)
             .find(|&x| buffer[(x, y)].symbol().starts_with("\u{1b}]8;;https://"));
         assert_eq!(
@@ -2541,7 +2714,7 @@ mod task_app_detail_render {
             Some(column),
             "link hit region begins under its label"
         );
-        assert!(buffer[(column, y)].symbol().contains("Jira NAR-12 ↗"));
+        assert!(buffer[(column, y)].symbol().contains("PR #42 ↗"));
     }
 
     #[test]
@@ -2560,10 +2733,9 @@ mod task_app_detail_render {
                 "review",
             );
             app.load(listing(
-                vec![displayed(
-                    running,
-                    "NAR-12",
-                    &[("Jira", "NAR-12", Some(url))],
+                vec![with_header_workspaces(
+                    titled(running, "NAR-12"),
+                    vec![with_pr(header_workspace("code", "orders-api", "main"), url)],
                 )],
                 "c",
             ));
@@ -2581,7 +2753,7 @@ mod task_app_detail_render {
         let mut app = app();
         let waiting = narsor_waiting(queued("b", 2), 2, 2, 3);
         app.load(listing(
-            vec![queued("a", 1), displayed(waiting, "NAR-17", &[])],
+            vec![queued("a", 1), titled(waiting, "NAR-17")],
             "c",
         ));
         app.list_mut().select("b");
@@ -2900,13 +3072,11 @@ mod task_app_detail_render {
             "review",
         );
         app.load(listing(
-            vec![displayed(
-                running,
-                &hostile("T@itle"),
-                &[(
-                    &hostile("La@bel"),
-                    &hostile("Te@xt"),
-                    Some("https://x.example/"),
+            vec![with_header_workspaces(
+                titled(running, &hostile("T@itle")),
+                vec![with_pr(
+                    header_workspace(&hostile("La@bel"), &hostile("Re@po"), &hostile("Bra@nch")),
+                    "https://x.example/",
                 )],
             )],
             "c",
@@ -2991,7 +3161,7 @@ mod task_app_detail_render {
             ExecutionStatus::Running,
             "review",
         );
-        app.load(listing(vec![displayed(running, "NAR-12", &[])], "c"));
+        app.load(listing(vec![titled(running, "NAR-12")], "c"));
         let mut done = position("plan", PositionStatus::Succeeded);
         done.conversation = ConversationState::Recorded;
         let mut review = position("review", PositionStatus::InProgress);
@@ -3115,8 +3285,8 @@ mod task_app_detail_render {
         let requeued = with_runner(queued("a", 1), ExecutionStatus::Running, "review");
         app.load(listing(
             vec![
-                displayed(requeued, "Requeued one", &[]),
-                displayed(queued("b", 2), "Queued two", &[]),
+                titled(requeued, "Requeued one"),
+                titled(queued("b", 2), "Queued two"),
             ],
             "c",
         ));
@@ -3173,7 +3343,7 @@ mod task_app_detail_render {
             ExecutionStatus::Running,
             "s5",
         );
-        app.load(listing(vec![displayed(running, "NAR-12", &[])], "c"));
+        app.load(listing(vec![titled(running, "NAR-12")], "c"));
         let steps: Vec<String> = (0..12).map(|index| format!("s{index}")).collect();
         let positions = steps
             .iter()
@@ -3608,9 +3778,9 @@ mod task_app_detail_render {
         for (lost, words, marked) in cases {
             for no_color in [false, true] {
                 let mut app = app();
-                let first = displayed(queued("a", 1), "NAR-1", &[]);
-                let third = displayed(queued("c", 3), "NAR-3", &[]);
-                let mut lost = displayed(lost.clone(), "NAR-2", &[]);
+                let first = titled(queued("a", 1), "NAR-1");
+                let third = titled(queued("c", 3), "NAR-3");
+                let mut lost = titled(lost.clone(), "NAR-2");
                 lost.rank = 2;
                 app.load(listing(vec![first, lost, third], "c"));
                 press(&mut app, KeyCode::Down);
@@ -3715,7 +3885,7 @@ mod task_app_detail_render {
         running.task_id = narsor_engine::domain::TaskId::parse("6a7ceacfdc604d52").unwrap();
         running.ticket = ticket.map(str::to_string);
         running.title = title.map(str::to_string);
-        app.load(listing(vec![displayed(running, "NAR-12 opis", &[])], "c"));
+        app.load(listing(vec![offered(running)], "c"));
         app.list_mut().select("6a7ceacfdc604d52");
         press(&mut app, KeyCode::Enter);
         app
@@ -3808,17 +3978,12 @@ mod task_app_detail_render {
     }
 
     #[test]
-    fn a_task_without_ticket_and_title_shows_its_display_title_and_the_id_on_the_edge() {
+    fn a_task_without_ticket_and_title_shows_its_id_on_the_edge() {
         let mut app = labelled_app(None, None);
         let rows = rows(&render(&mut app, &Styles::new(false)));
         let row = edge_row(&rows);
-        assert!(row.contains("NAR-12 opis"), "{row}");
+        assert!(row.contains("6a7ceacfdc604d52"), "{row}");
         assert!(!row.contains("┤"), "no empty pills: {row}");
-        assert!(
-            rows[IDENTITY_ROW].contains("NAR-12 opis"),
-            "{}",
-            rows[IDENTITY_ROW]
-        );
     }
 
     #[test]
@@ -3865,7 +4030,7 @@ mod task_app_detail_render {
 
     #[test]
     fn the_list_row_and_the_edge_show_the_same_title() {
-        let mut summary = displayed(task("a", "local", "running", 1), "Opis zadania", &[]);
+        let mut summary = titled(task("a", "local", "running", 1), "Opis zadania");
         summary.title = Some("Zmiana API zamówień".into());
         let edge = narsor::tui::task_app::detail::edge_layout(&summary, 200, 4, false, None);
         let mut app = app();
@@ -3927,7 +4092,7 @@ mod task_app_detail_render {
         let mut app = labelled_app(Some("   "), Some("\n"));
         let rows = rows(&render(&mut app, &Styles::new(true)));
         let row = edge_row(&rows);
-        assert!(row.contains("NAR-12 opis"), "{row}");
+        assert!(row.contains("6a7ceacfdc604d52"), "{row}");
     }
 
     #[test]
@@ -4644,7 +4809,8 @@ mod task_app_actions_render {
     use narsor_engine::domain::ExecutionStatus;
 
     use crate::task_app_support::{
-        displayed, listing, queued, task, titled, with_controller, with_runner, with_transitions,
+        header_workspace, listing, queued, task, titled, with_controller, with_header_workspaces,
+        with_pr, with_runner, with_transitions,
     };
 
     fn press(app: &mut TaskApp, code: KeyCode) {
@@ -4925,37 +5091,37 @@ mod task_app_actions_render {
 
     #[test]
     fn the_link_list_shows_the_addresses_it_would_open() {
-        let task = displayed(
-            running(),
-            "NAR-12",
-            &[
-                ("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12")),
-                ("PR", "—", None),
+        let task = with_header_workspaces(
+            titled(running(), "NAR-12"),
+            vec![
+                with_pr(
+                    header_workspace("code", "orders-api", "feat/x"),
+                    "https://gitlab.example/g/api/-/merge_requests/42",
+                ),
+                header_workspace("docs", "orders-docs", "main"),
             ],
         );
         let mut app = opened(task, "o");
         let screen = draw_app(&mut app, 120, 40, false);
         assert!(
             screen.contains("Linki · NAR-12")
-                && screen.contains("Jira: NAR-12")
-                && screen.contains("https://jira.example/browse/NAR-12"),
+                && screen.contains("code: PR #42")
+                && screen.contains("https://gitlab.example/g/api/-/merge_requests/42"),
             "{screen}"
         );
         assert!(
-            screen.matches("PR: —").count() == 1,
-            "an empty link is in the header only, not in the list:\n{screen}"
+            !screen.contains("docs: PR"),
+            "a workspace without a pull request is not in the list:\n{screen}"
         );
     }
 
     #[test]
     fn a_hostile_label_in_a_link_cannot_reach_the_terminal() {
-        let task = displayed(
-            running(),
-            "NAR-12",
-            &[(
-                "Ji\u{1b}[31mra\u{202e}",
-                "NAR",
-                Some("https://jira.example/x"),
+        let task = with_header_workspaces(
+            titled(running(), "NAR-12"),
+            vec![with_pr(
+                header_workspace("Ji\u{1b}[31mra\u{202e}", "orders-api", "main"),
+                "https://jira.example/x",
             )],
         );
         let mut app = opened(task, "o");

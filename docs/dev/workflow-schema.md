@@ -34,13 +34,6 @@ inputs:                     # Definition of inputs required to start (optional)
     required: <boolean>
     default: <any>          # Default value (optional)
 
-display:                    # Task header in the TUI and CLI (optional, §3.6)
-  title: <template>         # E.g. "{{ inputs.ticket_id }}"
-  links:
-    - label: <string>       # Non-empty, unique within the section
-      text: <template>      # Visible text (optional)
-      url: <template>       # Only http/https after rendering
-
 globals:                    # Global settings for the whole workflow (optional)
   timeout: <duration>       # E.g. "1h", "30m"
   retry_policy:             # Default retry policy for actions
@@ -663,7 +656,7 @@ Templates are substituted right before an action executes. The following referen
 
 - `{{ inputs.NAME }}` — a workflow input declared in the `inputs` section,
 - `{{ context.variables.NAME }}` — a context variable, together with the shorthand `{{ context.NAME }}`, which means exactly the same.
-- `{{ task.ticket }}` and `{{ task.title }}` — the task's ticket and title. The operator enters them in the new task form. They work in every step, in `display` and in `globals.workspace`, regardless of `inputs`. They do not need to be declared. When the task has none, they render as empty text. Any other name after `task.` is an error. `task.title` is the operator's title, and when it is missing — the title assigned by the conductor. The conductor assigns it in the background, so a step rendered before the title is stored sees empty text. A title from the conductor has only letters, digits, spaces and the characters `- _ . , : ( )`.
+- `{{ task.ticket }}` and `{{ task.title }}` — the task's ticket and title. The operator enters them in the new task form. They work in every step and in `globals.workspace`, regardless of `inputs`. They do not need to be declared. When the task has none, they render as empty text. Any other name after `task.` is an error. `task.title` is the operator's title, and when it is missing — the title assigned by the conductor. The conductor assigns it in the background, so a step rendered before the title is stored sees empty text. A title from the conductor has only letters, digits, spaces and the characters `- _ . , : ( )`.
 - `{{ artifacts.NAME }}` — the path of the last write of the artifact with that name in the execution. The name must be defined in the `artifacts` of some step.
 - `{{ steps.ID.reply }}` — the final text response of a successful attempt of agent step `ID`.
 - `{{ steps.ID.stdout }}` and `{{ steps.ID.stderr }}` — the captured output of the last finished run of script step `ID`.
@@ -778,30 +771,50 @@ The identifiers listed in `terminal_states` must correspond to existing states (
 
 ---
 
-### 3.6. Display (Task Header)
+### 3.6. Task header
 
-An optional section says how the task presents itself to the operator: a title and links (ticket, pull request).
+A workflow does not define how a task is shown. There is no `display` section. Each client shows the
+same header: the title of the task, its status with the step and the workflow, and one row for each
+workspace.
+
+The header reads fixed values of each workspace of `globals.workspaces`, in the order of the file:
+
+| Value | Set by | Meaning |
+|---|---|---|
+| `repo` | the system, when the task is created | The repository name, or the folder path of a local workspace. |
+| `base_branch` | the system, when the task is created | The branch the task starts from. It is the branch chosen in the form, else `base_branch` of the workspace, else the default branch of the repository. |
+| `branch` | the system, after each step | The branch the work is on. It keeps the last value while `HEAD` is detached or git cannot be read. |
+| `added`, `removed` | the system, after each step | Lines added and removed against `base_branch`: from the common ancestor with `origin/<base_branch>` to the working tree. Untracked files are not counted. |
+| `pr`, `pr_url` | the workflow, with `set.workspace` (§3.7.5) | The pull request number and address. |
+
+A workflow and an agent cannot change `repo`, `base_branch`, `branch`, `added` and `removed`. A local
+folder workspace has only `repo`: the folder path. `set.workspace` on a workspace with `path:` is a
+validation error. A workspace chosen at task creation that turns out to be a local folder shows no pull
+request, and the runner logs a warning.
+
+An agent returns the address as a normal variable. The `exit` or the choice of the step moves it to
+the workspace:
 
 ```yaml
-display:
-  title: "{{ inputs.ticket_id }}"
-  links:
-    - label: Jira
-      text: "{{ inputs.ticket_id }}"
-      url: "https://jira.example/browse/{{ inputs.ticket_id }}"
-    - label: PR
-      text: "!{{ context.variables.pr_number }}"
-      url: "{{ context.variables.pr_url }}"
+open_pr:
+  action: { type: agent, prompt: Open the pull request. }
+  variables:
+    - { name: pr_url }
+  exit:
+    set:
+      workspace:
+        code:
+          pr_url: "{{ context.pr_url }}"
+    next: done
 ```
 
-*   `title`, `links[].text` and `links[].url` are templates with the same syntax as the rest of the workflow: `{{ inputs.NAME }}` and `{{ context.variables.NAME }}` (shorthand `{{ context.NAME }}`). There are no filters.
-*   **Lenient rendering.** Unlike in actions, an unknown or not-yet-set variable is not an error: the whole text that contains it is empty. The title appears while the task is waiting in the queue, and context variables (e.g. `pr_url`) come into being only during the work.
-    *   Empty `title` — the client shows the task identifier.
-    *   Empty `text` — the link shows `—`. A missing `text` field — the link shows its address, and when there is none, `—`.
-    *   Empty `url` — a link without an address (shown, but inactive).
-*   **Address.** After rendering it must be an absolute `http` or `https` address with a host. Any other scheme (`javascript:`, `file:` etc.) or whitespace and control characters yield a link without an address. Control characters are removed from all texts.
-*   **Two rendering places.** The control plane renders the section from the sealed `inputs` when the task is created (the variables are then empty). The runner renders it again from `context.variables` and reports it in the snapshot; the last report wins.
-*   `label` is non-empty and unique within the section; an unknown field in `display` or in a link is a load error.
+*   The header shows `pr_url` as a link only when it is an absolute `http` or `https` address with a
+    host. Any other value is not shown. Control characters are removed from all values.
+*   The title of the task is `task.title`. When there is none, the client shows the task identifier.
+*   A file that still has a `display` section loads. The loader ignores the section and logs a
+    warning.
+*   The name `workspace` is reserved: a step variable cannot have it, because `context.workspace`
+    would clash with the shorthand `context.NAME`.
 
 ### 3.7. Unified State Shape (`schema: v2`)
 
@@ -1009,6 +1022,11 @@ choices:
     value that the step returned.
 *   Each assignment is an event: `VariableSetByWorkflow` (shown as `variable_set`).
 *   A manual jump of the operator (§3.7.8) does not apply `set`.
+*   The key `workspace` is reserved for the pull request of a workspace:
+    `set: { workspace: { <workspace name>: { pr: <value>, pr_url: <value> } } }`. The workspace must
+    be one of `globals.workspaces`. Only `pr` and `pr_url` can be set. The values are templates,
+    rendered like the other values of `set`. A value that renders empty does not replace the earlier
+    one. The header shows them (§3.6).
 
 #### 3.7.6. Prompt and message parts (`when`)
 
@@ -1407,10 +1425,8 @@ Before a workflow is run, the definition must pass validation:
     *   Any other field after `steps.ID.` (e.g. `steps.ID.data`) is an error.
     *   `{{ artifacts.NAME }}` must point to an artifact defined on some step.
 
-5.  **Display (§3.6):**
-    *   `{{ inputs.xxx }}` in `title`, `text` and `url` must concern a defined input; a context variable without a value is not an error.
-    *   A filter or an unclosed `{{` in these templates is an error.
-    *   `label` is non-empty and unique.
+5.  **Task header (§3.6):**
+    *   A step variable is not named `workspace`. This is a load error.
 
 6.  **Images:**
     *   `globals.image` and a step's `image` must be a valid OCI reference with an explicit tag or digest; under the `pinned` policy a digest is mandatory.
@@ -1435,6 +1451,7 @@ Before a workflow is run, the definition must pass validation:
 9.  **`set` (§3.7.5):**
     *   A key names a variable of the same step. Global variables are set directly and local variables under `set.local`.
     *   A literal value is text, a number or a boolean, and it fits the `type` and the `options` of the variable. A value with a template is checked when the engine applies it.
+    *   `set.workspace` names workspaces of `globals.workspaces` and sets only `pr` and `pr_url`. It exists only in the unified shape.
 
 10. **Prompt parts and step labels (§3.7.6, §3.7.7):**
     *   `when` is a plain reference, with no braces, filter or white space. The list is not empty. The reference follows the same rules as a `{{ }}` placeholder in that text.

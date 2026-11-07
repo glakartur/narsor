@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-use crate::domain::{DisplaySpec, ExecutionStatus, ImageSpec, PromptText};
+use crate::domain::{ExecutionStatus, ImageSpec, PromptText};
 
 /// Unique identifier for a workflow definition
 pub type WorkflowDefinitionId = String;
@@ -61,11 +61,6 @@ pub struct WorkflowDefinition {
     /// per execution, never per state. Empty for a workflow without any.
     #[serde(default)]
     pub repositories: Vec<RepositoryDefinition>,
-
-    /// How a task of this workflow introduces itself: title and links, still
-    /// templated (`display` in YAML).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display: Option<DisplaySpec>,
 
     /// States in the workflow graph
     pub states: HashMap<StateId, State>,
@@ -860,12 +855,34 @@ pub struct SetDefinition {
     /// The step's own `scope: local` variables, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub local: BTreeMap<String, serde_json::Value>,
+    /// The pull request values of workspaces (`pr`, `pr_url`), by workspace
+    /// name and then by value name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
 }
 
 impl SetDefinition {
     /// Whether nothing is set.
     pub fn is_empty(&self) -> bool {
-        self.global.is_empty() && self.local.is_empty()
+        self.global.is_empty() && self.local.is_empty() && self.workspace.is_empty()
+    }
+}
+
+/// A value of a workspace's pull request that `set.workspace` can assign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspacePrField {
+    Pr,
+    PrUrl,
+}
+
+impl WorkspacePrField {
+    /// The field a `set.workspace` key names: `pr` or `pr_url`.
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "pr" => Some(Self::Pr),
+            "pr_url" => Some(Self::PrUrl),
+            _ => None,
+        }
     }
 }
 
@@ -1147,6 +1164,28 @@ pub enum ValidationError {
         name: String,
     },
 
+    #[error("Choice '{label}' in state '{state}' sets 'workspace.{workspace}', but the workflow has no such workspace")]
+    SetUnknownWorkspace {
+        state: StateId,
+        label: OutputLabel,
+        workspace: String,
+    },
+
+    #[error("Choice '{label}' in state '{state}' sets 'workspace.{workspace}', which is a local folder; only a git workspace has a pull request")]
+    SetWorkspaceNotGit {
+        state: StateId,
+        label: OutputLabel,
+        workspace: String,
+    },
+
+    #[error("Choice '{label}' in state '{state}' sets 'workspace.{workspace}.{key}'; only 'pr' and 'pr_url' can be set")]
+    SetUnknownWorkspaceValue {
+        state: StateId,
+        label: OutputLabel,
+        workspace: String,
+        key: String,
+    },
+
     #[error("Choice '{label}' in state '{state}' sets variable '{name}', which the state does not declare")]
     SetUnknownVariable {
         state: StateId,
@@ -1224,12 +1263,8 @@ pub enum ValidationError {
         reason: String,
     },
 
-    // --- Display (§3.6) ---
-    #[error("Field '{field}' references unknown input '{variable}'")]
-    UnknownInputReferenceInDisplay { field: String, variable: String },
-
     #[error("Field '{field}' is invalid: {reason}")]
-    InvalidDisplay { field: String, reason: String },
+    InvalidGlobalsField { field: String, reason: String },
 
     // --- Environment (R15) ---
     #[error("Field '{field}' has an unusable image: {reason}")]

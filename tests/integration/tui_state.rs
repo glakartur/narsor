@@ -2321,10 +2321,9 @@ mod task_app_list {
 
         fn with_title(
             id: &str,
-            display: &str,
             title: Option<&str>,
         ) -> narsor_engine::controller_protocol::TaskSummary {
-            let mut task = titled(queued(id, 1), display);
+            let mut task = queued(id, 1);
             task.title = title.map(str::to_string);
             task
         }
@@ -2336,42 +2335,32 @@ mod task_app_list {
         }
 
         #[test]
-        fn the_row_shows_the_task_title_instead_of_the_description() {
-            let task = with_title(
-                "a",
-                "Proszę przerobić endpoint zamówień tak, żeby…",
-                Some("Zmiana API zamówień"),
-            );
+        fn the_row_shows_the_task_title() {
+            let task = with_title("a", Some("Zmiana API zamówień"));
             assert_eq!(row_title_after_load(task), "Zmiana API zamówień");
         }
 
         #[test]
-        fn without_a_title_the_row_shows_the_description_until_a_refresh_brings_one() {
+        fn without_a_title_the_row_shows_the_task_id_until_a_refresh_brings_one() {
             let mut app = app();
-            app.load(listing(vec![with_title("a", "Opis", None)], "c1"));
-            assert_eq!(titles(&app), ["Opis"]);
+            app.load(listing(vec![with_title("a", None)], "c1"));
+            assert_eq!(titles(&app), ["a"]);
 
-            let mut retitled = with_title("a", "Opis", Some("Tytuł dyrygenta"));
+            let mut retitled = with_title("a", Some("Tytuł dyrygenta"));
             retitled.revision = 2;
             app.load(listing(vec![retitled], "c2"));
             assert_eq!(titles(&app), ["Tytuł dyrygenta"]);
         }
 
         #[test]
-        fn a_blank_title_falls_back_to_the_description() {
-            let task = with_title("a", "Opis", Some("   "));
-            assert_eq!(row_title_after_load(task), "Opis");
-        }
-
-        #[test]
-        fn without_a_title_and_a_description_the_row_shows_the_task_id() {
-            let task = with_title("task-a", "", None);
+        fn a_blank_title_shows_the_task_id() {
+            let task = with_title("task-a", Some("   "));
             assert_eq!(row_title_after_load(task), "task-a");
         }
 
         #[test]
         fn a_title_with_a_new_line_is_shown_on_one_line() {
-            let task = with_title("a", "Opis", Some("Linia1\nLinia2"));
+            let task = with_title("a", Some("Linia1\nLinia2"));
             let title = row_title_after_load(task);
             assert!(!title.contains('\n'), "{title:?}");
             assert!(
@@ -2381,12 +2370,12 @@ mod task_app_list {
         }
 
         #[test]
-        fn the_filter_matches_the_task_title_and_still_the_description() {
+        fn the_filter_matches_the_task_title_and_the_id() {
             let mut app = app();
             app.load(listing(
                 vec![
-                    with_title("task-a", "Parser cleanup", Some("Zmiana API zamówień")),
-                    with_title("task-b", "Inne", None),
+                    with_title("task-a", Some("Zmiana API zamówień")),
+                    with_title("task-b", None),
                 ],
                 "c",
             ));
@@ -2399,10 +2388,10 @@ mod task_app_list {
             for _ in "api zam".chars() {
                 press(&mut app, KeyCode::Backspace);
             }
-            for character in "parser".chars() {
+            for character in "task-b".chars() {
                 ch(&mut app, character);
             }
-            assert_eq!(app.list().visible_ids(), ["task-a"]);
+            assert_eq!(app.list().visible_ids(), ["task-b"]);
         }
     }
 
@@ -6927,8 +6916,8 @@ mod task_app_actions {
     };
 
     use super::task_app_support::{
-        displayed, event, listing, offered, queued, task, titled, waiting_on, with_controller,
-        with_runner, with_transitions,
+        event, header_workspace, listing, offered, queued, task, titled, waiting_on,
+        with_controller, with_header_workspaces, with_pr, with_runner, with_transitions,
     };
 
     fn offline_client() -> ApiClient {
@@ -6967,6 +6956,17 @@ mod task_app_actions {
             .unwrap_or_default()
     }
 
+    /// A running task whose workspace `code` has a pull request.
+    fn with_pull_request(task: TaskSummary) -> TaskSummary {
+        with_header_workspaces(
+            task,
+            vec![with_pr(
+                header_workspace("code", "orders-api", "feat/x"),
+                "https://gitlab.example/g/api/-/merge_requests/42",
+            )],
+        )
+    }
+
     fn running(id: &str, rank: u32) -> TaskSummary {
         with_runner(
             with_controller(task(id, "local", "running", rank)),
@@ -6990,7 +6990,7 @@ mod task_app_actions {
     /// A title for the row, and nothing else: the actions the test put on the
     /// task stay as they are.
     fn titled_as_served(mut task: TaskSummary) -> TaskSummary {
-        task.display.title = "NAR-12".to_string();
+        task.title = Some("NAR-12".to_string());
         task
     }
 
@@ -7351,28 +7351,31 @@ mod task_app_actions {
         }
 
         #[test]
-        fn a_link_needs_a_value() {
+        fn a_link_needs_a_pull_request_address() {
             assert_eq!(
                 unavailable(&running("a", 1), TaskAction::OpenLink),
-                "workflow nie deklaruje linków"
+                "zadanie nie ma jeszcze linku do PR"
             );
-            let unresolved = displayed(running("a", 1), "NAR-12", &[("Jira", "—", None)]);
-            assert_eq!(
-                unavailable(&unresolved, TaskAction::OpenLink),
-                "linki zadania nie mają jeszcze wartości"
-            );
-            let unsafe_scheme = displayed(
+            let without_pr = with_header_workspaces(
                 running("a", 1),
-                "NAR-12",
-                &[("Ewil", "x", Some("javascript:alert(1)"))],
+                vec![header_workspace("code", "orders-api", "main")],
+            );
+            assert_eq!(
+                unavailable(&without_pr, TaskAction::OpenLink),
+                "zadanie nie ma jeszcze linku do PR"
+            );
+            let unsafe_scheme = with_header_workspaces(
+                running("a", 1),
+                vec![with_pr(
+                    header_workspace("code", "orders-api", "main"),
+                    "javascript:alert(1)",
+                )],
             );
             assert!(!available(&unsafe_scheme, TaskAction::OpenLink));
-            let ok = displayed(
-                running("a", 1),
-                "NAR-12",
-                &[("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12"))],
-            );
-            assert!(available(&ok, TaskAction::OpenLink));
+            assert!(available(
+                &with_pull_request(running("a", 1)),
+                TaskAction::OpenLink
+            ));
         }
 
         #[test]
@@ -8000,23 +8003,31 @@ mod task_app_actions {
         fn o_without_a_link_value_says_why() {
             let mut app = loaded(running("a", 1));
             assert_eq!(ch(&mut app, 'o'), Request::None);
-            assert_eq!(note(&app), "link: workflow nie deklaruje linków");
-            let unresolved = displayed(running("a", 1), "NAR-12", &[("Jira", "—", None)]);
+            assert_eq!(note(&app), "link: zadanie nie ma jeszcze linku do PR");
+            let unresolved = with_header_workspaces(
+                running("a", 1),
+                vec![header_workspace("code", "orders-api", "main")],
+            );
             let mut app = loaded(unresolved);
             assert_eq!(ch(&mut app, 'o'), Request::None);
-            assert_eq!(note(&app), "link: linki zadania nie mają jeszcze wartości");
+            assert_eq!(note(&app), "link: zadanie nie ma jeszcze linku do PR");
             assert!(app.overlay().is_none());
         }
 
         #[test]
         fn o_lists_the_links_with_a_value_and_enter_opens_one() {
-            let task = displayed(
+            let task = with_header_workspaces(
                 running("a", 1),
-                "NAR-12",
-                &[
-                    ("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12")),
-                    ("PR", "—", None),
-                    ("Docs", "doc", Some("https://docs.example/x")),
+                vec![
+                    with_pr(
+                        header_workspace("code", "orders-api", "feat/x"),
+                        "https://gitlab.example/g/api/-/merge_requests/42",
+                    ),
+                    header_workspace("tests", "orders-tests", "main"),
+                    with_pr(
+                        header_workspace("docs", "orders-docs", "feat/x"),
+                        "https://docs.example/x",
+                    ),
                 ],
             );
             let mut app = loaded(task);
@@ -8027,25 +8038,30 @@ mod task_app_actions {
                 2,
                 "the unresolved one is not offered"
             );
-            assert!(chooser.items()[0].label.contains("Jira"));
+            assert!(chooser.items()[0].label.contains("code"));
             ch(&mut app, '2');
             let request = press(&mut app, KeyCode::Enter);
             let Request::OpenLink(link) = request else {
                 panic!("a link was expected");
             };
             assert_eq!(link.url, "https://docs.example/x");
-            assert_eq!(link.label, "Docs");
+            assert_eq!(link.label, "docs");
             assert!(app.overlay().is_none());
         }
 
         #[test]
         fn a_paste_on_the_links_opens_none_and_leaves_the_list_open() {
-            let task = displayed(
+            let task = with_header_workspaces(
                 running("a", 1),
-                "NAR-12",
-                &[
-                    ("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12")),
-                    ("Docs", "doc", Some("https://docs.example/x")),
+                vec![
+                    with_pr(
+                        header_workspace("code", "orders-api", "feat/x"),
+                        "https://gitlab.example/g/api/-/merge_requests/42",
+                    ),
+                    with_pr(
+                        header_workspace("docs", "orders-docs", "feat/x"),
+                        "https://docs.example/x",
+                    ),
                 ],
             );
             let mut app = loaded(task);
@@ -8062,7 +8078,7 @@ mod task_app_actions {
             let Request::OpenLink(link) = press(&mut app, KeyCode::Enter) else {
                 panic!("a link was expected");
             };
-            assert_eq!(link.label, "Jira", "the list's own keys still work");
+            assert_eq!(link.label, "code", "the list's own keys still work");
         }
 
         #[tokio::test]
@@ -8113,11 +8129,7 @@ mod task_app_actions {
 
         #[test]
         fn the_menu_greys_out_what_changes_state_and_leaves_the_links() {
-            let task = displayed(
-                running("a", 1),
-                "NAR-12",
-                &[("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12"))],
-            );
+            let task = with_pull_request(running("a", 1));
             let mut app = disconnected(task);
             ch(&mut app, '.');
             let chooser = app.overlay().unwrap().chooser().unwrap();

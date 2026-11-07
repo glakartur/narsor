@@ -13,9 +13,6 @@
 //! §4 is legal because `test` also has an edge to `create_pr`, so the rule is
 //! "a path to some terminal state exists", not "there are no cycles".
 //!
-//! The `display` section (§3.6) is checked with the same rules, apart from
-//! its labels, which must be non-empty and unique.
-//!
 //! Template references are only checked where they can be checked statically.
 //! `{{ inputs.x }}` must name a declared input and `{{ artifacts.x }}` an
 //! artifact some step defines; `{{ context.* }}` and anything
@@ -29,15 +26,15 @@ use crate::domain::{
     ActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel, PromptPart, PromptText,
     RepositoryDefinition, RepositorySource, SchemaVersion, State, StateId, ValidationError,
     VariableDefinition, VariableScope, VariableSource, VariableType, WorkflowDefinition,
-    LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
+    WorkspacePrField, LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
 use crate::workspace::provisioner::is_usable_directory_name;
 
 use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
 use super::template::{
-    artifact_references, check_syntax, step_label_references, step_reply_references,
-    step_stream_references, unsupported_step_references, DeclaredNames,
+    artifact_references, step_label_references, step_reply_references, step_stream_references,
+    unsupported_step_references, DeclaredNames,
 };
 
 /// Validates a compiled workflow definition.
@@ -56,6 +53,7 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_step_contract(state, &mut errors);
         validate_variable_declarations(state, &mut errors);
         validate_set_assignments(state, &mut errors);
+        validate_set_workspace(definition, state, &mut errors);
         validate_exit_and_timeout(definition, state, &mut errors);
         validate_decision(state, &mut errors);
         validate_state_templates(definition, &declared, state, &mut errors);
@@ -64,7 +62,6 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
     }
     validate_variable_consistency(definition, &mut errors);
     validate_repositories(definition, &mut errors);
-    validate_display(definition, &mut errors);
     if let Some(image) = &definition.globals.image {
         validate_image("globals.image", image, &mut errors);
     }
@@ -671,6 +668,52 @@ fn validate_set_assignments(state: &State, errors: &mut Vec<ValidationError>) {
     }
 }
 
+/// The `set.workspace` of each choice: only git workspaces the workflow
+/// declares, and only the pull request values `pr` and `pr_url`. A workspace
+/// chosen when the task is created may still turn out to be a local folder;
+/// the runner reports that when it happens.
+fn validate_set_workspace(
+    definition: &WorkflowDefinition,
+    state: &State,
+    errors: &mut Vec<ValidationError>,
+) {
+    for choice in &state.choices {
+        for (workspace, values) in &choice.set.workspace {
+            let Some(repository) = definition
+                .repositories
+                .iter()
+                .find(|r| &r.name == workspace)
+            else {
+                errors.push(ValidationError::SetUnknownWorkspace {
+                    state: state.id.clone(),
+                    label: choice.label.clone(),
+                    workspace: workspace.clone(),
+                });
+                continue;
+            };
+            if matches!(repository.source, RepositorySource::Local { .. }) {
+                errors.push(ValidationError::SetWorkspaceNotGit {
+                    state: state.id.clone(),
+                    label: choice.label.clone(),
+                    workspace: workspace.clone(),
+                });
+                continue;
+            }
+            for key in values
+                .keys()
+                .filter(|key| WorkspacePrField::from_key(key).is_none())
+            {
+                errors.push(ValidationError::SetUnknownWorkspaceValue {
+                    state: state.id.clone(),
+                    label: choice.label.clone(),
+                    workspace: workspace.clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+    }
+}
+
 /// Why `variable` does not accept the literal `value`, if it does not.
 fn rejected_value(variable: &VariableDefinition, value: &serde_json::Value) -> Option<String> {
     use serde_json::Value;
@@ -1116,7 +1159,7 @@ fn validate_local_path(
         }
     }
     if !step_reply_references(path).is_empty() || !step_stream_references(path).is_empty() {
-        errors.push(ValidationError::InvalidDisplay {
+        errors.push(ValidationError::InvalidGlobalsField {
             field,
             reason: "step values are not supported in workspace fields".to_string(),
         });
@@ -1165,66 +1208,6 @@ fn validate_step_workspace(
                 section.root
             ),
         ));
-    }
-}
-
-/// The `display` section (§3.6): its templates, and that its labels are
-/// usable and distinct.
-///
-/// `{{ inputs.x }}` must be declared like anywhere else, but a variable
-/// without a value is *not* an error here — a display is rendered before
-/// the variables it shows exist — so only what rendering could never make
-/// sense of (a filter, an unclosed `{{`) is reported besides.
-fn validate_display(definition: &WorkflowDefinition, errors: &mut Vec<ValidationError>) {
-    let Some(display) = &definition.display else {
-        return;
-    };
-
-    let mut templated: Vec<(String, &str)> = Vec::new();
-    if let Some(title) = &display.title {
-        templated.push(("display.title".to_string(), title.as_str()));
-    }
-    let mut labels = HashSet::new();
-    for (index, link) in display.links.iter().enumerate() {
-        let field = format!("display.links[{index}]");
-        if link.label.trim().is_empty() {
-            errors.push(ValidationError::InvalidDisplay {
-                field: format!("{field}.label"),
-                reason: "the label must not be empty".to_string(),
-            });
-        } else if !labels.insert(link.label.as_str()) {
-            errors.push(ValidationError::InvalidDisplay {
-                field: format!("{field}.label"),
-                reason: format!("the label '{}' is used more than once", link.label),
-            });
-        }
-        if let Some(text) = &link.text {
-            templated.push((format!("{field}.text"), text.as_str()));
-        }
-        templated.push((format!("{field}.url"), link.url.as_str()));
-    }
-
-    for (field, text) in templated {
-        if let Err(error) = check_syntax(text, &field) {
-            errors.push(ValidationError::InvalidDisplay {
-                field: field.clone(),
-                reason: error.to_string(),
-            });
-        }
-        if !step_reply_references(text).is_empty() || !step_stream_references(text).is_empty() {
-            errors.push(ValidationError::InvalidDisplay {
-                field: field.clone(),
-                reason: "step values are not supported in display fields".to_string(),
-            });
-        }
-        for variable in extract_input_references(text) {
-            if !declares_input(definition, &variable) {
-                errors.push(ValidationError::UnknownInputReferenceInDisplay {
-                    field: field.clone(),
-                    variable,
-                });
-            }
-        }
     }
 }
 

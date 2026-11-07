@@ -12,12 +12,12 @@
 //! the event cursor in particular comes from the log, which outlives every
 //! incarnation and therefore never goes backwards.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 
 use crate::conductor::{pending_chat_proposals, ConductorStore};
-use crate::domain::{
-    ExecutionStatus, ParamType, TaskDisplay, WorkflowDefinition, WorkflowExecution,
-};
+use crate::domain::{ExecutionStatus, ParamType, WorkflowDefinition, WorkflowExecution};
 use crate::engine::conversation_summary::summaries;
 pub(crate) use crate::engine::conversation_summary::ConversationCache;
 use crate::engine::{current_timeline, step_failure, Engine, InputContinuation, PendingHumanInput};
@@ -26,14 +26,14 @@ use crate::orchestration::{
     PendingInputRef, RunnerProblem, RunnerSnapshot,
 };
 use crate::persistence::ExecutionStore;
-use crate::workflow::TemplateScope;
 
+use super::workspaces::WorkspaceTracker;
 use super::RunnerError;
 
 /// What the runner knows beyond the files.
 pub(crate) struct SnapshotContext<'a> {
-    /// The workflow the task runs, for its `display`.
-    pub definition: &'a WorkflowDefinition,
+    /// The headers of the task's workspaces.
+    pub workspaces: &'a WorkspaceTracker,
     /// The execution on this storage, once it exists.
     pub execution_id: Option<&'a str>,
     /// Whether an Engine pass is driving it right now.
@@ -77,9 +77,7 @@ pub(crate) fn build(
             conductor_available: context.conductor_unavailable.is_none(),
             conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
             default_harness_unavailable: context.default_harness_unavailable.cloned(),
-            // Nothing to render against yet; the control plane's own
-            // rendering from the sealed inputs stays in force.
-            display: None,
+            workspaces: context.workspaces.headers(&BTreeMap::new()),
             generated_title: engine.generated_title(),
             observed_at,
         });
@@ -142,7 +140,7 @@ pub(crate) fn build(
         conductor_available: context.conductor_unavailable.is_none(),
         conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
         default_harness_unavailable: context.default_harness_unavailable.cloned(),
-        display: render_display(engine, context.definition, &execution),
+        workspaces: context.workspaces.headers(&execution.context.workspace_prs),
         generated_title: engine.generated_title(),
         observed_at,
     })
@@ -223,21 +221,6 @@ fn conductor_attention(
     Ok(items)
 }
 
-/// The workflow's `display` against what the execution knows now: its inputs
-/// and the variables its steps have set so far.
-fn render_display(
-    engine: &Engine,
-    definition: &WorkflowDefinition,
-    execution: &WorkflowExecution,
-) -> Option<TaskDisplay> {
-    let spec = definition.display.as_ref()?;
-    let title = engine.task_title();
-    let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
-        .ok()?
-        .with_task_fields(engine.task_ticket(), title.as_deref());
-    Some(scope.render_display(spec))
-}
-
 /// Takes the title the conductor stored into the engine, once it exists, so
 /// the steps rendered from then on and this snapshot carry it.
 fn adopt_stored_title(engine: &Engine, execution_id: &str) {
@@ -255,27 +238,21 @@ fn adopt_stored_title(engine: &Engine, execution_id: &str) {
 /// The longest description the conductor is given, in characters.
 const DESCRIPTION_MAX_CHARS: usize = 2000;
 
-/// The text the conductor names the task from: the rendered `display.title`
-/// of the workflow, or else its text inputs (`string` and `text`) in the order
-/// they are declared. Empty when the task has no text at all.
+/// The text the conductor names the task from: the text inputs (`string` and
+/// `text`) in the order they are declared. Empty when the task has no text
+/// at all.
 pub(crate) fn task_description(
-    engine: &Engine,
     definition: &WorkflowDefinition,
     execution: &WorkflowExecution,
 ) -> String {
-    let from_display = render_display(engine, definition, execution)
-        .map(|display| display.title)
-        .filter(|title| !title.trim().is_empty());
-    let text = from_display.unwrap_or_else(|| {
-        definition
-            .inputs
-            .iter()
-            .filter(|input| matches!(input.param_type, ParamType::String | ParamType::Text))
-            .filter_map(|input| execution.inputs.get(&input.name)?.as_str())
-            .filter(|text| !text.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-    });
+    let text = definition
+        .inputs
+        .iter()
+        .filter(|input| matches!(input.param_type, ParamType::String | ParamType::Text))
+        .filter_map(|input| execution.inputs.get(&input.name)?.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     text.trim().chars().take(DESCRIPTION_MAX_CHARS).collect()
 }
 
@@ -285,19 +262,6 @@ mod tests {
 
     use crate::domain::{Context, EventData, Workspace};
     use crate::engine::conversation_summary::read_summaries;
-
-    const WORKFLOW: &str = r#"
-name: summaries
-version: 1
-states:
-  plan:
-    action:
-      type: script
-      command: "true"
-    choices: [done]
-    transitions:
-      done: completed
-"#;
 
     struct TempRoot(std::path::PathBuf);
 
@@ -372,12 +336,16 @@ states:
         conversations.close_attempt("act-2").expect("close");
 
         let engine = Engine::new(store.clone());
-        let definition = crate::workflow::load_from_str(WORKFLOW).expect("workflow");
+        let workspaces = WorkspaceTracker::new(
+            &crate::runner::storage::TaskStorage::new(&root.0),
+            &crate::domain::TaskWorkspace::none(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
         let snapshot = build(
             &engine,
             &mut ConversationCache::default(),
             SnapshotContext {
-                definition: &definition,
+                workspaces: &workspaces,
                 execution_id: Some("exec-1"),
                 pass_active: false,
                 problem: None,

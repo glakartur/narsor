@@ -418,6 +418,61 @@ async fn set_overwrites_the_value_the_step_returned() {
     assert_eq!(variable(&execution, "summary"), Some(json!("forced")));
 }
 
+#[tokio::test]
+async fn set_workspace_records_the_pull_request_of_the_named_workspace_only() {
+    let harness = Harness::new();
+    let (_agent, execution) = run(
+        &harness,
+        "v2/engine_set_workspace.yaml",
+        vec![AgentTurn::with_variables(
+            "opened",
+            json!({ "pr_url": "https://git.example/g/api/-/merge_requests/42", "pr_number": 42 }),
+        )],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let code = &execution.context.workspace_prs["code"];
+    assert_eq!(code.pr.as_deref(), Some("42"));
+    assert_eq!(
+        code.pr_url.as_deref(),
+        Some("https://git.example/g/api/-/merge_requests/42")
+    );
+    assert!(!execution.context.workspace_prs.contains_key("docs"));
+}
+
+#[tokio::test]
+async fn set_workspace_with_an_empty_value_records_nothing() {
+    let harness = Harness::new();
+    let (_agent, execution) = run(
+        &harness,
+        "v2/engine_set_workspace.yaml",
+        vec![AgentTurn::label("opened", "no pull request")],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert!(execution.context.workspace_prs.is_empty());
+}
+
+#[tokio::test]
+async fn set_is_applied_whole_or_not_at_all() {
+    let harness = Harness::new();
+    let (_agent, execution) = run(
+        &harness,
+        "v2/engine_set_workspace.yaml",
+        vec![AgentTurn::with_variables(
+            "rejected",
+            json!({ "pr_url": "https://git.example/pr/1" }),
+        )],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert!(execution.context.workspace_prs.is_empty());
+    assert_eq!(variable(&execution, "mode"), None);
+}
+
 /// `set.local` writes the leaving step's own memory, rendered against the
 /// step's result; it never reaches the context.
 #[tokio::test]

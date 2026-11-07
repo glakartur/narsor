@@ -17,7 +17,7 @@ pub use narsor_protocol::launch::{
 use narsor_protocol::launch::LaunchSpecEnvelope;
 
 use super::environment::{canonical_sha256, ResolvedEnvironment, ResourceProfile, TaskWorkspace};
-use super::{DefinitionShape, DisplaySpec, WorkflowDefinition};
+use super::{DefinitionShape, WorkflowDefinition};
 
 /// Longest ticket, in characters.
 pub const TICKET_MAX_CHARS: usize = 64;
@@ -336,14 +336,6 @@ impl TaskLaunchSpec {
                 violations: violations.iter().map(ToString::to_string).collect(),
             })?;
         Ok(definition)
-    }
-
-    /// The `display` section of the sealed definition, without reading the
-    /// rest of it: every task summary asks, and the display is cosmetic, so
-    /// a snapshot that has none or cannot be read simply shows nothing.
-    pub fn display_spec(&self) -> Option<DisplaySpec> {
-        let display = self.definition.as_ref()?.get("display")?;
-        serde_json::from_value(display.clone()).ok()
     }
 
     /// Recomputes the digest from the content fields.

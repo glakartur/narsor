@@ -1353,34 +1353,89 @@ terminal_states: [done]
     assert!(load_from_str(yaml).is_err());
 }
 
-#[test]
-fn display_section_compiles_into_the_definition() {
-    let definition = load_from_str(
-        "name: shown\nversion: 1\ndisplay:\n  title: T\n  links:\n    - label: A\n      \
-         text: a\n      url: \"https://a.example\"\n    - label: B\n      url: \"{{ inputs.u }}\"\n\
-         states:\n  work:\n    action:\n      type: script\n      command: \"true\"\n    \
-         choices: [ok]\n    transitions:\n      ok: done\n  done:\n    description: end\n\
-         terminal_states: [done]\n",
-    )
-    .expect("loads");
+const SHOWN_STATES: &str = "states:\n  work:\n    action:\n      type: script\n      command: \
+     \"true\"\n    choices: [ok]\n    transitions:\n      ok: done\n  done:\n    \
+     description: end\nterminal_states: [done]\n";
 
-    let display = definition.display.expect("a display section");
-    assert_eq!(display.title.as_deref(), Some("T"));
-    assert_eq!(display.links.len(), 2);
-    assert_eq!(display.links[0].text.as_deref(), Some("a"));
-    assert_eq!(display.links[1].text, None);
+#[test]
+fn a_display_section_is_ignored_and_reported() {
+    let yaml = format!(
+        "name: shown\nversion: 1\ndisplay:\n  title: T\n  links:\n    - label: A\n      \
+         url: \"https://a.example\"\n{SHOWN_STATES}"
+    );
+
+    let loaded = load_from_str_with_diagnostics(&yaml).expect("the file still loads");
+
+    assert_eq!(loaded.definition.name, "shown");
+    let [diagnostic] = loaded.diagnostics.as_slice() else {
+        panic!("one diagnostic: {:?}", loaded.diagnostics);
+    };
+    let text = diagnostic.to_string();
+    assert!(
+        text.contains("'shown'") && text.contains("ignored"),
+        "{text}"
+    );
+    assert!(
+        text.contains("unified") && text.contains("exit.set.workspace"),
+        "a file in the legacy shape is told to move to the unified shape: {text}"
+    );
 }
 
 #[test]
-fn a_definition_without_display_has_none_and_serialises_without_the_key() {
+fn the_ignored_display_of_a_unified_file_points_at_the_exit_set() {
+    let yaml = format!(
+        "schema: v2\nname: shown\nversion: 1\ndisplay:\n  links:\n    - label: A\n      \
+         url: \"https://a.example\"\nstates:\n  work:\n    action: {{ type: script, command: \
+         \"true\" }}\n    exit: {{ next: done }}\n  done:\n    description: end\n\
+         terminal_states:\n  done: completed\n"
+    );
+
+    let loaded = load_from_str_with_diagnostics(&yaml).expect("loads");
+
+    let text = loaded.diagnostics[0].to_string();
+    assert!(text.contains("exit.set.workspace"), "{text}");
+    assert!(!text.contains("unified"), "{text}");
+}
+
+#[test]
+fn an_ignored_display_without_links_has_no_hint_about_the_pull_request() {
+    let yaml = format!("name: shown\nversion: 1\ndisplay:\n  title: T\n{SHOWN_STATES}");
+
+    let loaded = load_from_str_with_diagnostics(&yaml).expect("loads");
+
+    let text = loaded.diagnostics[0].to_string();
+    assert!(
+        text.contains("ignored") && !text.contains("pr_url"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_display_of_any_shape_is_ignored() {
+    for display in ["display: {}", "display: text", "display:\n  subtitle: x"] {
+        let yaml = format!("name: shown\nversion: 1\n{display}\n{SHOWN_STATES}");
+        assert!(load_from_str(&yaml).is_ok(), "{display:?} must load");
+    }
+}
+
+#[test]
+fn a_definition_serialises_without_a_display_key() {
     let definition = load_reference();
 
-    assert!(definition.display.is_none());
     let json = serde_json::to_value(&definition).unwrap();
-    assert!(
-        json.get("display").is_none(),
-        "an absent display must not change the sealed snapshot or its digest"
-    );
+
+    assert!(json.get("display").is_none());
+}
+
+#[test]
+fn a_sealed_definition_that_still_has_display_reads_back() {
+    let mut json = serde_json::to_value(load_reference()).unwrap();
+    json["display"] = serde_json::json!({"title": "T", "links": []});
+
+    let definition: narsor_engine::domain::WorkflowDefinition =
+        serde_json::from_value(json).expect("an old snapshot reads");
+
+    assert_eq!(definition.name, load_reference().name);
 }
 
 const UNIFIED_FIXTURES: [&str; 6] = [
@@ -1604,6 +1659,63 @@ fn a_set_value_is_a_scalar_and_local_is_a_mapping() {
     assert!(load_error(&state("{ local: 1 }")).contains("set.local"));
     assert!(load_error(&state("{ local: { b: { c: 1 } } }")).contains("set.local.b"));
     assert!(load_from_str(&state("{ a: 1, b: true, c: text, local: { d: 2 } }")).is_ok());
+}
+
+#[test]
+fn set_workspace_is_a_mapping_of_workspace_name_to_values() {
+    let state = |set: &str| {
+        unified(&format!(
+            "  work:\n    action: {{ type: script, command: ./a.sh }}\n    exit: {{ set: {set}, next: done }}"
+        ))
+    };
+    assert!(load_error(&state("{ workspace: 1 }")).contains("set.workspace"));
+    assert!(load_error(&state("{ workspace: { code: 1 } }")).contains("set.workspace"));
+    assert!(load_error(&state("{ workspace: { code: { pr: [1] } } }"))
+        .contains("set.workspace.code.pr"));
+
+    let definition = load_from_str(&state(
+        "{ workspace: { code: { pr_url: \"{{ context.u }}\" } } }",
+    ))
+    .expect("loads");
+    let exit = &definition.states["work"].choices[0];
+    assert_eq!(exit.set.workspace["code"]["pr_url"], "{{ context.u }}");
+}
+
+#[test]
+fn set_workspace_is_not_available_outside_the_unified_shape() {
+    let legacy_v2 = "schema: v2\nname: x\nversion: 1\nstates:\n  work:\n    action: { type: script, \
+                     command: ./a.sh }\n    choices: [ok]\n    set: { workspace: { code: { pr: 1 } } }\n    \
+                     transitions: { ok: done }\n  done: {}\nterminal_states: [done]\n";
+    let v1 = "name: x\nversion: 1\nstates:\n  work:\n    action: { type: script, command: ./a.sh }\n    \
+              exit: { set: { workspace: { code: { pr: 1 } } }, next: done }\n  done: {}\n\
+              terminal_states: [done]\n";
+    assert!(load_from_str(legacy_v2).is_err());
+    assert!(load_from_str(v1).is_err());
+}
+
+#[test]
+fn a_step_variable_named_workspace_does_not_load() {
+    let unified_yaml = unified(
+        "  work:\n    action: { type: agent, prompt: p }\n    variables:\n      - { name: workspace }\n    \
+         exit: { next: done }",
+    );
+    let error = load_error(&unified_yaml);
+    assert!(
+        error.contains("workspace") && error.contains("reserved"),
+        "{error}"
+    );
+
+    let legacy =
+        "name: x\nversion: 1\nstates:\n  work:\n    action: { type: agent, prompt: p }\n    \
+                  variables:\n      - { name: workspace, description: d }\n    choices: [ok]\n    \
+                  transitions: { ok: done }\n  done: {}\nterminal_states: [done]\n";
+    assert!(load_error(legacy).contains("reserved"));
+
+    let other = unified(
+        "  work:\n    action: { type: agent, prompt: p }\n    variables:\n      - { name: workspaces }\n    \
+         exit: { next: done }",
+    );
+    assert!(load_from_str(&other).is_ok());
 }
 
 #[test]

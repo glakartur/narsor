@@ -125,10 +125,11 @@ mod rescue;
 mod step_memory;
 mod variable_rules;
 
+use crate::domain::WorkspacePrField;
 use gate_context::{
     decision_fields, has_step_contract, holds_variables_to_declarations, local_values, GateContext,
 };
-use variable_rules::Assignment;
+use variable_rules::{Assignment, RenderedSet};
 
 pub use failure::{
     step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
@@ -524,14 +525,29 @@ fn unmet_requirements(
 }
 
 /// Writes what `set` assigned: shared variables into the context, local
-/// ones into the memory of `state_id`.
+/// ones into the memory of `state_id`, pull request values into the
+/// context's workspaces.
 fn write_assignments(
     execution: &mut WorkflowExecution,
     state_id: &str,
-    assignments: &[Assignment],
+    assigned: &RenderedSet,
 ) -> Result<(), EngineError> {
-    let (local, global): (Vec<&Assignment>, Vec<&Assignment>) =
-        assignments.iter().partition(|assignment| assignment.local);
+    for assignment in &assigned.workspaces {
+        let pr = execution
+            .context
+            .workspace_prs
+            .entry(assignment.workspace.clone())
+            .or_default();
+        let value = Some(assignment.value.clone());
+        match assignment.field {
+            WorkspacePrField::Pr => pr.pr = value,
+            WorkspacePrField::PrUrl => pr.pr_url = value,
+        }
+    }
+    let (local, global): (Vec<&Assignment>, Vec<&Assignment>) = assigned
+        .variables
+        .iter()
+        .partition(|assignment| assignment.local);
     for assignment in global {
         execution
             .context
@@ -3496,7 +3512,7 @@ impl Engine {
         // crash, over the result and the `set` already applied. A crash
         // before the one save below leaves the pending step, and the step
         // resumes at its decision.
-        for assignment in assignments {
+        for assignment in assignments.variables {
             self.emit(
                 &execution.id,
                 EventData::VariableSetByWorkflow {
@@ -3561,13 +3577,13 @@ impl Engine {
         state: &State,
         pending: &PendingStep,
         label: &str,
-    ) -> Result<Vec<Assignment>, String> {
+    ) -> Result<RenderedSet, String> {
         let sets_nothing = state
             .choices
             .iter()
             .all(|choice| choice.label != label || choice.set.is_empty());
         if sets_nothing {
-            return Ok(Vec::new());
+            return Ok(RenderedSet::default());
         }
         let unreadable = |error: EngineError| error.to_string();
         let mut context = execution.context.clone();
