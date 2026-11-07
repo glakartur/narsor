@@ -115,6 +115,7 @@ use crate::workflow::template::{
 };
 use crate::workflow::{
     action_context_references, places_step_history, DeclaredNames, StepMemory, TemplateScope,
+    WorkspaceValues,
 };
 
 mod conductor_decision;
@@ -1042,6 +1043,7 @@ pub struct Engine {
     checkpoints: bool,
     conductor: OnceLock<Weak<ConductorRegistry>>,
     task_labels: TaskLabels,
+    workspace_values: Option<Arc<dyn WorkspaceValues>>,
 }
 
 /// The ticket and title `{{ task.ticket }}` and `{{ task.title }}` render.
@@ -1216,6 +1218,7 @@ impl Engine {
             checkpoints: false,
             conductor: OnceLock::new(),
             task_labels: TaskLabels::default(),
+            workspace_values: None,
         }
     }
 
@@ -1225,6 +1228,22 @@ impl Engine {
         self.task_labels.ticket = ticket;
         self.task_labels.title = title;
         self
+    }
+
+    /// Returns the engine reading the workspace values the runner owns
+    /// (`context.workspace.NAME.FIELD`) from `values`. Without them those
+    /// fields render as empty text.
+    pub fn with_workspace_values(mut self, values: Arc<dyn WorkspaceValues>) -> Self {
+        self.workspace_values = Some(values);
+        self
+    }
+
+    /// `scope` that also reads the runner's workspace values, when there are any.
+    fn reading_workspaces<'a>(&'a self, scope: TemplateScope<'a>) -> TemplateScope<'a> {
+        match self.workspace_values.as_deref() {
+            Some(values) => scope.with_workspace_values(values),
+            None => scope,
+        }
     }
 
     /// The ticket the operator typed, if any.
@@ -2562,6 +2581,7 @@ impl Engine {
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
         let task_title = self.task_labels.effective_title();
+        let scope = self.reading_workspaces(scope);
         let scope = scope
             .with_task_fields(self.task_labels.ticket.as_deref(), task_title.as_deref())
             .with_declared(declared)
@@ -3610,7 +3630,9 @@ impl Engine {
         let declared = DeclaredNames::of(definition);
         let task_title = self.task_labels.effective_title();
         let scope = TemplateScope::from_execution(&execution.inputs, &context)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let scope = self
+            .reading_workspaces(scope)
             .with_task_fields(self.task_labels.ticket.as_deref(), task_title.as_deref())
             .with_declared(&declared)
             .with_step_labels(&labels)

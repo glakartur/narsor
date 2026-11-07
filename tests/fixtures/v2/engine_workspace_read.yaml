@@ -1,0 +1,44 @@
+# A step reads the values of a workspace: the pull request the step before
+# recorded, the branch the runner reports, and the base branch.
+schema: v2
+name: engine-workspace-read
+version: 1
+
+globals:
+  workspaces:
+    code:
+      primary: true
+      base_branch: main
+
+states:
+  open_pr:
+    action:
+      type: agent
+      prompt: Open the pull request.
+    variables:
+      - name: pr_url
+    choices:
+      opened:
+        set:
+          workspace:
+            code:
+              pr_url: "{{ context.pr_url }}"
+        next: review
+
+  review:
+    action:
+      type: agent
+      prompt: "Review {{ context.workspace.code.pr_url }} on [{{ context.workspace.code.branch }}] with {{ context.workspace.code.added }} added."
+    variables:
+      - name: base
+    choices:
+      reviewed:
+        set:
+          base: "{{ context.workspace.code.base_branch }}"
+        next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

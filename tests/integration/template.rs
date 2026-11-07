@@ -1151,3 +1151,25 @@ fn only_the_variable_of_a_reference_counts_as_a_context_reference() {
         vec!["cfg".to_string()]
     );
 }
+
+#[test]
+fn a_workspace_reference_in_the_workspace_setting_of_a_new_task_is_an_unknown_name() {
+    let definition = narsor_engine::workflow::load_from_str(
+        "name: early\nversion: 1\nglobals:\n  workspace:\n    type: local\n    path: \"{{ context.workspace.code.pr_url }}\"\n\
+         states:\n  work:\n    action: { type: agent, prompt: p }\n    choices: [done]\n    \
+         transitions: { done: finished }\n  finished: { description: end }\nterminal_states: [finished]\n",
+    )
+    .expect("the workflow loads");
+
+    let error = narsor_engine::tasks::workspace_request(
+        std::path::Path::new("."),
+        &definition,
+        &Map::new(),
+    )
+    .expect_err("a new task has no workspace values yet");
+
+    assert!(
+        error.to_string().contains("unknown template variable 'context.workspace.code.pr_url'"),
+        "{error}"
+    );
+}
