@@ -148,6 +148,18 @@ fn base_ref(git: &Git, dir: &str, base_branch: &str) -> Option<String> {
     })
 }
 
+/// Config that stops a repository from running its own code during a read.
+/// A task's repository can set `core.fsmonitor` or a hook, and git would run
+/// that command on a plain `git diff`. Every read gets these first.
+const READ_ONLY_CONFIG: [&str; 6] = [
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.untrackedCache=false",
+];
+
 /// Runs read-only git commands that all share one deadline.
 struct Git {
     deadline: Instant,
@@ -160,7 +172,8 @@ impl Git {
         if Instant::now() >= self.deadline {
             return None;
         }
-        let mut child = git_command(args, &GitAccess::User)
+        let args: Vec<&str> = READ_ONLY_CONFIG.iter().chain(args).copied().collect();
+        let mut child = git_command(&args, &GitAccess::User)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -469,6 +482,21 @@ mod tests {
         read(&clone, Some("main"));
 
         assert_eq!(git(&clone, &["status", "--porcelain=v2"]), before);
+    }
+
+    #[test]
+    fn reading_does_not_run_the_fsmonitor_command_of_the_repository() {
+        let scratch = Scratch::new();
+        let clone = origin_and_clone(&scratch);
+        fs::write(clone.join("a.txt"), "changed\n").unwrap();
+        let marker = scratch.0.join("fsmonitor-ran");
+        let command = format!("touch {}; true", marker.display());
+        git(&clone, &["config", "core.fsmonitor", &command]);
+
+        let reading = read(&clone, Some("main"));
+
+        assert!(reading.changes.is_some());
+        assert!(!marker.exists(), "the fsmonitor command ran during read");
     }
 
     #[test]
