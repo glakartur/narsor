@@ -124,6 +124,8 @@ pub fn runner(status: ExecutionStatus, step: &str) -> RunnerView {
             execution_id: Some("exec-1".to_string()),
             current_state: Some(step.to_string()),
             action_execution_id: None,
+            current_action_type: None,
+            current_decision_by: None,
         },
         "event_cursor": 1,
         "pending_input": null,
@@ -262,7 +264,25 @@ pub fn position(state: &str, status: PositionStatus) -> Position {
         effort: None,
         harness_session_id: None,
         usage: None,
+        decision_by: None,
     }
+}
+
+pub fn of_kind(mut position: Position, action_type: &str, decision_by: Option<&str>) -> Position {
+    position.action_type = Some(action_type.to_string());
+    position.decision_by = decision_by.map(str::to_string);
+    position
+}
+
+pub fn in_step_of_kind(
+    mut task: TaskSummary,
+    action_type: &str,
+    decision_by: Option<&str>,
+) -> TaskSummary {
+    let cursor = &mut task.runner.as_mut().expect("a runner").execution_cursor;
+    cursor.current_action_type = Some(action_type.to_string());
+    cursor.current_decision_by = decision_by.map(str::to_string);
+    offered(task)
 }
 
 /// What the runner reported as the timeline of `task`: `positions`, and the

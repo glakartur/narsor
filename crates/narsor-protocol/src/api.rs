@@ -734,6 +734,7 @@ mod tests {
                 visit: 1,
                 action_execution_id: Some("attempt-1".into()),
                 action_type: Some("human".into()),
+                decision_by: None,
                 status: PositionStatus::AwaitingDecision,
                 started_at: None,
                 ended_at: None,
@@ -803,6 +804,57 @@ mod tests {
         assert_eq!(position.attempt_ids(), ["attempt-1"]);
         assert_eq!(position.usage, None);
         assert_eq!(position.harness_session_id, None);
+        assert_eq!(position.decision_by, None);
+    }
+
+    #[test]
+    fn step_icon_names_who_runs_the_step_and_what_it_is() {
+        use super::step_icon;
+        assert_eq!(step_icon(Some("agent"), None), Some("✨"));
+        assert_eq!(step_icon(Some("script"), None), Some("📜"));
+        assert_eq!(step_icon(Some("wait"), None), Some("✋"));
+        assert_eq!(step_icon(Some("decision"), Some("conductor")), Some("⚡🔀"));
+        assert_eq!(step_icon(Some("decision"), Some("human")), Some("🧑🔀"));
+    }
+
+    #[test]
+    fn step_icon_of_a_decision_without_a_decider_does_not_name_one() {
+        assert_eq!(super::step_icon(Some("decision"), None), Some("🔀"));
+    }
+
+    #[test]
+    fn step_icon_is_none_for_a_kind_without_an_icon() {
+        use super::step_icon;
+        for kind in [Some("human"), Some("none"), Some("terminal"), None] {
+            assert_eq!(step_icon(kind, None), None);
+            assert_eq!(step_icon(kind, Some("human")), None);
+        }
+    }
+
+    #[test]
+    fn an_event_and_a_cursor_of_an_older_version_still_read() {
+        let started: crate::event::EventData = serde_json::from_value(serde_json::json!({
+            "type": "action_started",
+            "action_execution_id": "a",
+            "state_id": "s",
+            "action_type": "agent"
+        }))
+        .unwrap();
+        match started {
+            crate::event::EventData::ActionStarted { decision_by, .. } => {
+                assert_eq!(decision_by, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let cursor: crate::controller::ExecutionCursor =
+            serde_json::from_value(serde_json::json!({
+                "execution_id": "e",
+                "current_state": "s",
+                "action_execution_id": "a"
+            }))
+            .unwrap();
+        assert_eq!(cursor.current_action_type, None);
+        assert_eq!(cursor.current_decision_by, None);
     }
 
     #[test]

@@ -60,6 +60,7 @@ use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFI
 use super::super::scroll::one_line;
 use super::super::selection::{render_barred_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
+use super::detail::{fit_cells, step_name};
 
 /// What a row asks of the operator (column 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,14 +272,9 @@ pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
 
 /// The workflow state the runner reports being in.
 fn current_step(task: &TaskSummary) -> Option<String> {
-    let step = task
-        .runner
-        .as_ref()?
-        .execution_cursor
-        .current_state
-        .as_deref()?;
-    let step = one_line(step);
-    (!step.trim().is_empty()).then_some(step)
+    let cursor = &task.runner.as_ref()?.execution_cursor;
+    let step = one_line(cursor.current_state.as_deref()?);
+    (!step.trim().is_empty()).then(|| step_name(cursor.icon(), &step))
 }
 
 /// A task as the list shows it, for tests and the details placeholder.
@@ -1507,23 +1503,6 @@ fn replace_reported_attention(
     *current = items;
 }
 
-/// Fits `text` into `width` characters, ending in `…` when it is cut.
-pub fn fit(text: &str, width: usize) -> String {
-    let length = text.chars().count();
-    if length <= width {
-        return text.to_string();
-    }
-    match width {
-        0 => String::new(),
-        1 => "…".to_string(),
-        _ => text
-            .chars()
-            .take(width - 1)
-            .chain(std::iter::once('…'))
-            .collect(),
-    }
-}
-
 /// The columns before the text under the markers: attention, a space, state,
 /// two spaces.
 const ROW_PREFIX: usize = 5;
@@ -1543,9 +1522,9 @@ pub(super) fn row_text(
     let mut label = if let Some(since) = row.since {
         let age = format!(" · {}", activity_age((now - since).num_seconds()));
         let status_width = text_width.saturating_sub(age.chars().count());
-        format!("{}{age}", fit(&row.status, status_width))
+        format!("{}{age}", fit_cells(&row.status, status_width))
     } else {
-        fit(&row.status, text_width)
+        fit_cells(&row.status, text_width)
     };
     let status_prefix = format!("{} · ", row.status);
     let extra_label = row
@@ -1555,11 +1534,11 @@ pub(super) fn row_text(
         .unwrap_or_default();
     if !extra_label.is_empty() {
         if label.is_empty() {
-            label = fit(extra_label, text_width);
+            label = fit_cells(extra_label, text_width);
         } else {
             let remaining = text_width.saturating_sub(label.chars().count() + 3);
             if remaining > 0 {
-                label = format!("{label} · {}", fit(extra_label, remaining));
+                label = format!("{label} · {}", fit_cells(extra_label, remaining));
             }
         }
     }
@@ -1581,15 +1560,21 @@ pub(super) fn row_text(
             styles.of(grey(row.icon.role())),
         ),
         Span::raw("  "),
-        Span::styled(fit(identifier, text_width), styles.of(grey(Role::Calm))),
+        Span::styled(
+            fit_cells(identifier, text_width),
+            styles.of(grey(Role::Calm)),
+        ),
     ]);
     let second = Line::from(vec![
         Span::raw(" ".repeat(ROW_PREFIX.min(width))),
-        Span::styled(fit(&row.title, text_width), styles.of(grey(Role::Calm))),
+        Span::styled(
+            fit_cells(&row.title, text_width),
+            styles.of(grey(Role::Calm)),
+        ),
     ]);
     let third = Line::from(vec![
         Span::raw(" ".repeat(ROW_PREFIX.min(width))),
-        Span::styled(fit(&label, text_width), styles.of(grey(label_role))),
+        Span::styled(fit_cells(&label, text_width), styles.of(grey(label_role))),
     ]);
     vec![first, second, third]
 }
@@ -1621,11 +1606,17 @@ pub(super) fn history_row_text(
                 styles.of(grey(row.icon.role())),
             ),
             Span::raw("  "),
-            Span::styled(fit(&row.title, text_width), styles.of(grey(Role::Calm))),
+            Span::styled(
+                fit_cells(&row.title, text_width),
+                styles.of(grey(Role::Calm)),
+            ),
         ]),
         Line::from(vec![
             Span::raw(" ".repeat(ROW_PREFIX.min(width))),
-            Span::styled(fit(&row.label, text_width), styles.of(grey(label_role))),
+            Span::styled(
+                fit_cells(&row.label, text_width),
+                styles.of(grey(label_role)),
+            ),
         ]),
     ]
 }

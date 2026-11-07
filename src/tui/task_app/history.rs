@@ -51,10 +51,10 @@ use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::background::{JobKey, OpeningKind, Outcome};
 use super::detail::{
-    edge_layout, recorded_attempts, render_view, title_is_cut, KeysAt, StepLevel, TaskDetail,
-    ViewOptions,
+    edge_layout, fit_cells, recorded_attempts, render_view, title_is_cut, KeysAt, StepLevel,
+    TaskDetail, ViewOptions,
 };
-use super::list::{fit, history_row_text, title_of, Attention, RowText, StateIcon};
+use super::list::{history_row_text, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
 use super::tabs::conversation::{read_history_attempt, AttemptRead, ReadFailure};
 use super::tabs::events;
@@ -995,7 +995,7 @@ pub fn render_list(
             ratatui::widgets::Paragraph::new(Line::styled(
                 format!(
                     " {}",
-                    fit(&one_line(&text), usize::from(inner.width).saturating_sub(2))
+                    fit_cells(&one_line(&text), usize::from(inner.width).saturating_sub(2))
                 ),
                 styles.of(Role::Done),
             )),

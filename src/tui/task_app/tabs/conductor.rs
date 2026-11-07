@@ -65,9 +65,8 @@ use narsor_protocol::controller::{OperatorCommand, OperatorCommandStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::actions::{ActionSend, ConductorSent, Confirmation, Confirmed, Overlay};
-use super::super::detail::short_age;
+use super::super::detail::{fit_cells, short_age};
 use super::super::layout::first_row;
-use super::super::list::fit;
 use super::super::notify::Severity;
 use super::super::{DetailTab, Focus, Request, TaskApp};
 use super::conversation::{render_transcript, transcript_action};
@@ -477,7 +476,7 @@ pub fn render(
             bottom.push(Line::styled(
                 format!(
                     "✎ szkic: {}",
-                    fit(
+                    fit_cells(
                         &one_line(conductor.draft()),
                         usize::from(area.width).saturating_sub(10)
                     )

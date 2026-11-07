@@ -51,6 +51,7 @@ fn interrupt_during_action(harness: &Harness, execution: &WorkflowExecution) -> 
             action_execution_id: action_execution_id.clone(),
             state_id: "first".to_string(),
             action_type: "script".to_string(),
+            decision_by: None,
         },
     )
     .expect("append ActionStarted");
@@ -121,6 +122,7 @@ fn interrupt_during_backoff(harness: &Harness, execution: &WorkflowExecution) ->
             action_execution_id: action_execution_id.clone(),
             state_id: "first".to_string(),
             action_type: "script".to_string(),
+            decision_by: None,
         },
     )
     .expect("append ActionStarted");
@@ -241,6 +243,7 @@ async fn a_crash_after_the_action_resumes_at_the_decision() {
             action_execution_id: "action-1".to_string(),
             state_id: "first".to_string(),
             action_type: "script".to_string(),
+            decision_by: None,
         },
     )
     .expect("append");
@@ -402,6 +405,7 @@ fn reject_output(harness: &Harness, execution: &WorkflowExecution) -> String {
             action_execution_id: rejected.clone(),
             state_id: "first".to_string(),
             action_type: "agent".to_string(),
+            decision_by: None,
         },
         EventData::ActionOutputRejected {
             action_execution_id: rejected.clone(),
@@ -775,6 +779,7 @@ fn leave_rescue(harness: &Harness, engine: &Engine) -> WorkflowExecution {
             action_execution_id: "attempt-rejected".to_string(),
             state_id: "work".to_string(),
             action_type: "agent".to_string(),
+            decision_by: None,
         },
         EventData::ActionOutputRejected {
             action_execution_id: "attempt-rejected".to_string(),
@@ -1342,6 +1347,7 @@ async fn a_recovered_step_keeps_its_history_and_notes() {
             action_execution_id: "plan-under-way".to_string(),
             state_id: "plan".to_string(),
             action_type: "agent".to_string(),
+            decision_by: None,
         },
     ] {
         log.append_next(&execution.id, data).expect("append");

@@ -73,7 +73,7 @@ use super::super::keymap::Action;
 use super::super::scroll::one_line;
 use super::super::style::{PanelEdge, Role, Styles};
 use super::background::{DetailJob, JobKey, Outcome};
-use super::list::{describe_loss, fit, state_icon, title_of};
+use super::list::{describe_loss, state_icon, title_of};
 use super::notify::Severity;
 use super::panel::WaitingPanel;
 use super::tabs::conductor::{self, Conductor};
@@ -918,7 +918,7 @@ struct LinkSpot {
 pub(super) fn panel_title(title: &str, width: u16) -> String {
     format!(
         " {} ",
-        fit(&one_line(title), usize::from(width).saturating_sub(4))
+        fit_cells(&one_line(title), usize::from(width).saturating_sub(4))
     )
 }
 
@@ -1635,6 +1635,21 @@ pub(super) fn cells(text: &str) -> usize {
     Span::raw(text).width()
 }
 
+pub(super) fn step_name(icon: Option<&str>, label: &str) -> String {
+    icon.map_or_else(|| label.to_string(), |icon| format!("{icon} {label}"))
+}
+
+pub(super) fn fit_step_name(icon: Option<&str>, label: &str, width: usize) -> String {
+    let icon_cells = icon.map_or(0, |icon| cells(icon) + 1);
+    match icon {
+        Some(icon) if width >= icon_cells => {
+            format!("{icon} {}", fit_cells(label, width - icon_cells))
+        }
+        Some(_) => fit_cells(&step_name(icon, label), width),
+        None => fit_cells(label, width),
+    }
+}
+
 pub(super) fn fit_cells(text: &str, width: usize) -> String {
     if Span::raw(text).width() <= width {
         return text.to_string();
@@ -1669,7 +1684,7 @@ fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Optio
             Role::Attention
         };
         return Some(Line::styled(
-            fit(&describe_loss(&loss), usize::from(width)),
+            fit_cells(&describe_loss(&loss), usize::from(width)),
             styles.of(greyed(role, stale)),
         ));
     }
@@ -1680,7 +1695,7 @@ fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Optio
         one_line(&unavailable.kept)
     );
     Some(Line::styled(
-        fit(&text, usize::from(width)),
+        fit_cells(&text, usize::from(width)),
         styles.of(greyed(Role::Attention, stale)),
     ))
 }
@@ -1709,15 +1724,14 @@ fn status_parts(
     if without_slot(task) {
         parts.push(("bez slotu".to_string(), Role::Calm));
     }
-    let step_name = task
-        .runner
-        .as_ref()
-        .and_then(|runner| runner.execution_cursor.current_state.as_deref())
-        .map(one_line)
-        .filter(|step| !step.trim().is_empty());
+    let named = task.runner.as_ref().and_then(|runner| {
+        let cursor = &runner.execution_cursor;
+        let name = one_line(cursor.current_state.as_deref()?);
+        (!name.trim().is_empty()).then(|| step_name(cursor.icon(), &name))
+    });
     let step_number = progress.step_count().map(|(at, _)| at);
-    match (step_number, step_name) {
-        (Some(at), Some(name)) => parts.push((format!("krok {at} {name}"), Role::Calm)),
+    match (step_number, named) {
+        (Some(at), Some(name)) => parts.push((format!("krok {at} · {name}"), Role::Calm)),
         (Some(at), None) => parts.push((format!("krok {at}"), Role::Calm)),
         (None, Some(name)) => parts.push((format!("krok {name}"), Role::Calm)),
         (None, None) => {}

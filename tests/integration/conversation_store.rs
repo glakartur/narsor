@@ -75,6 +75,7 @@ fn action_started(action_execution_id: &str) -> EventData {
         action_execution_id: action_execution_id.to_string(),
         state_id: "plan".to_string(),
         action_type: "agent".to_string(),
+        decision_by: None,
     }
 }
 

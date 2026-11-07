@@ -638,6 +638,22 @@ pub struct ExecutionCursor {
     pub execution_id: Option<String>,
     pub current_state: Option<String>,
     pub action_execution_id: Option<String>,
+    /// The action type of the step the cursor is in, as the timeline says.
+    #[serde(default)]
+    pub current_action_type: Option<String>,
+    /// Who decides the step when it is a `decision`.
+    #[serde(default)]
+    pub current_decision_by: Option<String>,
+}
+
+impl ExecutionCursor {
+    /// The icon of the kind of the step the cursor is in, when it has one.
+    pub fn icon(&self) -> Option<&'static str> {
+        crate::api::step_icon(
+            self.current_action_type.as_deref(),
+            self.current_decision_by.as_deref(),
+        )
+    }
 }
 
 /// A default harness a task cannot follow.

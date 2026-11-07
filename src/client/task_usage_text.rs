@@ -257,6 +257,7 @@ mod tests {
             effort: None,
             harness_session_id: None,
             usage,
+            decision_by: None,
         }
     }
 

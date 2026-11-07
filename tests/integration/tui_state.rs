@@ -106,6 +106,7 @@ fn every_event_data_variant() -> Vec<EventData> {
             action_execution_id: "a1".to_string(),
             state_id: "prepare".to_string(),
             action_type: "agent".to_string(),
+            decision_by: None,
         },
         EventData::ActionCompleted {
             action_execution_id: "a1".to_string(),
@@ -4087,6 +4088,40 @@ mod task_app_detail {
                     "step:step-visit/gate/2"
                 ]
             );
+        }
+
+        #[test]
+        fn a_step_heading_starts_with_the_icon_of_its_kind() {
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            let positions = vec![crate::task_app_support::of_kind(
+                recorded("implement", 1, "i"),
+                "agent",
+                None,
+            )];
+            let built = build_conversation(
+                Scope::Whole,
+                &positions,
+                &attempts(&["i"]),
+                &[entered(1, "implement")],
+            );
+            assert_eq!(built.entries[0].header, "── ✨ implement #1 ──");
+        }
+
+        #[test]
+        fn a_step_heading_without_an_attempt_entry_keeps_the_icon_of_its_kind() {
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            let positions = vec![crate::task_app_support::of_kind(
+                position("test", PositionStatus::Succeeded),
+                "script",
+                None,
+            )];
+            let built = build_conversation(
+                Scope::Whole,
+                &positions,
+                &Attempts::default(),
+                &[entered(1, "test")],
+            );
+            assert_eq!(built.entries[0].header, "── 📜 test #1 ──");
         }
 
         #[test]

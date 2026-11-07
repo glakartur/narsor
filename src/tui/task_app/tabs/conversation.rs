@@ -43,6 +43,7 @@ use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{bar_prefix, PREFIX_WIDTH};
+use super::super::detail::{cells, step_name};
 use super::super::layout::first_row;
 use super::READER_RETRY;
 use crate::tui::conversation::transcript_entries;
@@ -493,6 +494,7 @@ pub struct StepChip {
     /// The label of the entry, unique within the timeline.
     pub label: String,
     pub status: PositionStatus,
+    pub icon: Option<&'static str>,
 }
 
 /// *Rozmowa*: the conversation of one step entry at a time, picked on the
@@ -668,6 +670,7 @@ impl Conversation {
             .map(|position| StepChip {
                 label: position.label.clone(),
                 status: position.status,
+                icon: position.icon(),
             })
             .collect();
         if self.follow || self.selected_index().is_none() {
@@ -803,16 +806,17 @@ pub fn build_conversation(
         };
         until(&mut builder.built.entries, Some(visits[0].sequence));
         for (index, visit) in visits.iter().enumerate() {
-            let mut shown = false;
-            for position in by_visit
+            let at_visit = by_visit
                 .get(&(visit.state_id.as_str(), visit.visit))
-                .into_iter()
-                .flatten()
-            {
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut shown = false;
+            for position in at_visit {
                 shown |= builder.push_position(position, attempts) != Pushed::Nothing;
             }
             if !shown {
-                builder.push_step_heading(&visit.state_id, visit.visit);
+                let icon = at_visit.iter().find_map(|position| position.icon());
+                builder.push_step_heading(&visit.state_id, visit.visit, icon);
             }
             until(
                 &mut builder.built.entries,
@@ -894,9 +898,10 @@ impl<'a> Builder<'a> {
         }
         built.has_conversation |= attempt.has_conversation();
         if self.headings && heading_wanted {
-            built
-                .entries
-                .push(heading(format!("{attempt_id}/step"), &position.label));
+            built.entries.push(heading(
+                format!("{attempt_id}/step"),
+                &step_name(position.icon(), &position.label),
+            ));
         }
         built.entries.extend(attempt.entries.iter().map(|entry| {
             let mut entry = entry.clone();
@@ -907,11 +912,11 @@ impl<'a> Builder<'a> {
     }
 
     /// The heading of a step entry that has no conversation of its own.
-    fn push_step_heading(&mut self, state_id: &str, visit: u32) {
+    fn push_step_heading(&mut self, state_id: &str, visit: u32, icon: Option<&str>) {
         if self.headings {
             self.built.entries.push(heading(
                 format!("step-visit/{state_id}/{visit}/step"),
-                &format!("{state_id} #{visit}"),
+                &step_name(icon, &format!("{state_id} #{visit}")),
             ));
         }
     }
@@ -1337,7 +1342,7 @@ fn step_strip_line(
     }
     let chip_widths: Vec<usize> = steps
         .iter()
-        .map(|step| 2 + Span::raw(one_line(&step.label)).width())
+        .map(|step| 2 + cells(&step_name(step.icon, &one_line(&step.label))))
         .collect();
     let separator = Span::raw(STEP_SEPARATOR).width();
     let more = Span::raw(STEP_MORE).width() + 1;
@@ -1375,7 +1380,7 @@ fn step_strip_line(
     Line::from(spans)
 }
 
-/// A step on the strip: its status glyph and its label.
+/// A step on the strip: its status glyph and its name.
 fn step_chip(
     step: &StepChip,
     selected: bool,
@@ -1392,7 +1397,7 @@ fn step_chip(
     };
     [
         Span::styled(format!("{glyph} "), styles.of(role)),
-        Span::styled(label, label_style),
+        Span::styled(step_name(step.icon, &label), label_style),
     ]
 }
 

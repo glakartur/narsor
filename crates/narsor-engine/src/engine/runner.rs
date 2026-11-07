@@ -2291,6 +2291,7 @@ impl Engine {
                     action_execution_id: id.clone(),
                     state_id: state.id.clone(),
                     action_type: "none".to_string(),
+                    decision_by: None,
                 },
             )?;
             self.fail_action(
@@ -2375,6 +2376,10 @@ impl Engine {
                 action_execution_id: action_execution_id.clone(),
                 state_id: state.id.clone(),
                 action_type: kind.name().to_string(),
+                decision_by: match action {
+                    ActionConfig::Decision(decision) => Some(decision.by.name().to_string()),
+                    _ => None,
+                },
             },
         )?;
 
