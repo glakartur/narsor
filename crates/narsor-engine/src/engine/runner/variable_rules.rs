@@ -95,8 +95,7 @@ fn render_workspace_assignments(
     let mut assignments = Vec::new();
     for (workspace, values) in &choice.set.workspace {
         for (key, value) in values {
-            let Some(field) = WorkspaceField::from_key(key).filter(|field| field.writable())
-            else {
+            let Some(field) = WorkspaceField::from_key(key).filter(|field| field.writable()) else {
                 return Err(format!(
                     "'set' of '{label}' sets 'workspace.{workspace}.{key}'; only {} can be set",
                     WorkspaceField::writable_keys()

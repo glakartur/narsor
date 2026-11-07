@@ -757,6 +757,42 @@ pub fn context_references(template: &str) -> Vec<String> {
     names
 }
 
+/// The `context.workspace…` references of a template that cannot be read, as
+/// `(reference, reason)` in order of use: a form other than
+/// `context.workspace.<name>.<field>`, a workspace `declared` does not know,
+/// or a field outside [`WorkspaceField`]. Nothing is resolved.
+pub fn workspace_reference_problems(
+    template: &str,
+    declared: &DeclaredNames,
+) -> Vec<(String, String)> {
+    let mut problems = Vec::new();
+    for expression in expressions(template) {
+        let Some(path) = expression.strip_prefix("context.") else {
+            continue;
+        };
+        if expression.contains('|') || path.split('.').next() != Some("workspace") {
+            continue;
+        }
+        let reason = match parse_context_path(path) {
+            Some(ContextPath::Workspace { name, field }) => {
+                if !declared.declares_workspace(name) {
+                    format!("the workflow declares no workspace '{name}'")
+                } else if WorkspaceField::from_key(field).is_none() {
+                    format!(
+                        "'{field}' is not a workspace field (fields: {})",
+                        WorkspaceField::all_keys()
+                    )
+                } else {
+                    continue;
+                }
+            }
+            _ => "write it as 'context.workspace.<name>.<field>'".to_string(),
+        };
+        problems.push((expression.to_string(), reason));
+    }
+    problems
+}
+
 /// The artifact names a template refers to through `artifacts.NAME`, in
 /// first-use order and without repeats (KTD7).
 pub fn artifact_references(template: &str) -> Vec<String> {

@@ -1310,6 +1310,17 @@ pub enum ValidationError {
         artifact: String,
     },
 
+    #[error(
+        "State '{state}' reads '{reference}' in field '{field}', which is not a value of a \
+         workspace: {reason}"
+    )]
+    InvalidWorkspaceReference {
+        state: StateId,
+        field: String,
+        reference: String,
+        reason: String,
+    },
+
     #[error("Field '{field}' references unknown input '{variable}'")]
     UnknownInputReferenceInGlobals { field: String, variable: String },
 

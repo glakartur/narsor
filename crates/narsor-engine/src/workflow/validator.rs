@@ -34,7 +34,7 @@ use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
 use super::template::{
     artifact_references, step_label_references, step_reply_references, step_stream_references,
-    unsupported_step_references, DeclaredNames,
+    unsupported_step_references, workspace_reference_problems, DeclaredNames,
 };
 
 /// Validates a compiled workflow definition.
@@ -54,6 +54,7 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_variable_declarations(state, &mut errors);
         validate_set_assignments(state, &mut errors);
         validate_set_workspace(definition, state, &mut errors);
+        validate_set_references(&declared, state, &mut errors);
         validate_exit_and_timeout(definition, state, &mut errors);
         validate_decision(state, &mut errors);
         validate_state_templates(definition, &declared, state, &mut errors);
@@ -999,6 +1000,74 @@ fn validate_state_templates(
                 });
             }
         }
+        push_workspace_reference_errors(state, &field, text, declared, errors);
+    }
+}
+
+fn push_workspace_reference_errors(
+    state: &State,
+    field: &str,
+    text: &str,
+    declared: &DeclaredNames,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (reference, reason) in workspace_reference_problems(text, declared) {
+        errors.push(ValidationError::InvalidWorkspaceReference {
+            state: state.id.clone(),
+            field: field.to_string(),
+            reference,
+            reason,
+        });
+    }
+}
+
+/// The workspace references in the values of each choice's `set`. Whether
+/// the rest of such a value fits is known only when it is rendered.
+fn validate_set_references(
+    declared: &DeclaredNames,
+    state: &State,
+    errors: &mut Vec<ValidationError>,
+) {
+    for choice in &state.choices {
+        let label = &choice.label;
+        let mut values: Vec<(String, &serde_json::Value)> = Vec::new();
+        values.extend(
+            choice
+                .set
+                .global
+                .iter()
+                .map(|(name, value)| (format!("choices.{label}.set.global.{name}"), value)),
+        );
+        values.extend(
+            choice
+                .set
+                .local
+                .iter()
+                .map(|(name, value)| (format!("choices.{label}.set.local.{name}"), value)),
+        );
+        for (workspace, fields) in &choice.set.workspace {
+            values.extend(fields.iter().map(|(key, value)| {
+                (
+                    format!("choices.{label}.set.workspace.{workspace}.{key}"),
+                    value,
+                )
+            }));
+        }
+        for (field, value) in values {
+            for text in strings_of(value) {
+                push_workspace_reference_errors(state, &field, text, declared, errors);
+            }
+        }
+    }
+}
+
+/// Every string inside a JSON value.
+fn strings_of(value: &serde_json::Value) -> Vec<&str> {
+    match value {
+        serde_json::Value::String(text) => vec![text.as_str()],
+        serde_json::Value::Array(items) => items.iter().flat_map(strings_of).collect(),
+        serde_json::Value::Object(entries) => entries.values().flat_map(strings_of).collect(),
+        _ => Vec::new(),
     }
 }
 
