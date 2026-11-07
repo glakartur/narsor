@@ -22,7 +22,7 @@ execution: code
 
 ### Summary
 
-Sekcja `display` znika z definicji workflow. TUI dostaje stały nagłówek szczegółów: tytuł zadania (tylko gdy krawędź ramki nie mieści go w całości), wiersz statusu (`status · krok N nazwa · workflow`), po jednym wierszu na każdy workspace z definicji workflow (nazwa workspace, nazwa repozytorium, gałąź → gałąź bazowa, `+N −M`, numer PR z linkiem) i wiersz zużycia (koszt razem, agenci, dyrygent, tokeny ze strzałkami). Dane nagłówka pochodzą z nowej przestrzeni `context.workspace.<nazwa>.*`. Agent nadal ustawia `context.variables.pr_url`, a wyjście kroku (`exit` / choice) przenosi wartość do `context.workspace.<nazwa>.pr_url`.
+Sekcja `display` znika z definicji workflow. TUI dostaje stały nagłówek szczegółów: tytuł zadania (tylko gdy krawędź ramki nie mieści go w całości), wiersz statusu (`status · krok N nazwa · workflow`), po jednym wierszu na każdy workspace z definicji workflow (nazwa workspace, nazwa repozytorium, gałąź → gałąź bazowa, `+N −M`, numer PR z linkiem) i wiersz zużycia (koszt razem, agenci, dyrygent; przy każdej grupie koszt i tokeny ze strzałkami). Dane nagłówka pochodzą z nowej przestrzeni `context.workspace.<nazwa>.*`. Agent nadal ustawia `context.variables.pr_url`, a wyjście kroku (`exit` / choice) przenosi wartość do `context.workspace.<nazwa>.pr_url`.
 
 ### Problem Frame
 
@@ -60,7 +60,7 @@ Workflow opisuje proces backendowy, ale dziś zawiera też widok: `display.title
   - wiersz 1: tytuł zadania (R3) i krótki identyfikator, jak dziś. Wiersz znika, gdy krawędź ramki szczegółów (`edge_layout`) pokazuje tytuł w całości, bez obcięcia; wtedy nagłówek zaczyna się od wiersza 2;
   - wiersz 2: `● status · krok N nazwa_kroku · workflow vX`, potem obecne dodatki (czas, `bez slotu`, `kontroler offline`);
   - wiersze workspace: po jednym na workspace, w kolejności z definicji workflow;
-  - wiersz zużycia, gdy harness podał zużycie: najpierw koszt razem, potem koszt agentów, potem koszt dyrygenta, potem tokeny. Tokeny wejścia mają strzałkę `↑`, tokeny wyjścia strzałkę `↓` (zamiast `in` / `out`). Subagenci mają tylko tokeny i liczbę (dziś harness nie podaje ich kosztu osobno). Część bez danych ma `—`; część dyrygenta jest tylko, gdy dyrygent podał zużycie. Ta sama zmiana dotyczy tekstu zużycia w CLI (`task_usage_text::line`).
+  - wiersz zużycia, gdy harness podał zużycie: najpierw koszt razem, potem grupa agentów, potem grupa dyrygenta. Każda grupa ma koszt i tokeny razem: `agenci $1.20 ↑120k ↓8k`. Tokeny wejścia mają strzałkę `↑`, tokeny wyjścia strzałkę `↓` (zamiast `in` / `out`). Subagenci są w nawiasie przy agentach i mają tylko tokeny i liczbę (dziś harness nie podaje ich kosztu osobno): `(subagenci ↑40k ↓3k ×2)`. Część bez danych ma `—`; grupa dyrygenta jest tylko, gdy dyrygent podał zużycie. Ta sama zmiana dotyczy tekstu zużycia w CLI (`task_usage_text::line`).
 - R12. Wiersz workspace zaczyna się od nazwy workspace (prefiks wiersza). Potem są: nazwa repozytorium (`repo`), `branch → base_branch`, `+added −removed` i `PR <numer>` z linkiem OSC 8 do `pr_url`. Gdy brak `added` i `removed`, kolumna zmian jest pusta. Kolumny są wyrównane między wierszami.
 - R13. Gdy `branch` równa się `base_branch`, wiersz pokazuje tylko jedną nazwę gałęzi (zmiana nie ma jeszcze gałęzi roboczej).
 - R14. Gdy nie ma PR, w miejscu PR stoi wyszarzony znak `—`. Gdy jest `pr_url`, a nie ma `pr`, numer jest brany z końcowego segmentu liczbowego adresu; gdy go brak, pokazany jest tekst `PR ↗`.
@@ -82,7 +82,7 @@ Krawędź ramki mieści tytuł w całości, więc wiersza 1 nie ma (R11):
 ● running · krok 3 implement · code-review v3 · 14m
 code  orders-api  feat/nar-12-orders → main   +120 −34   PR #42 ↗
 docs  orders-docs main                                   —
-razem $1.25 · agenci $1.20 · dyrygent $0.05 · ↑120k ↓8k · subagenci ↑40k ↓3k (2)
+razem $1.25 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2) · dyrygent $0.05 ↑9k ↓1k
 ────────────────────────────────────────────────────────────────────────
  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info                 podąża
 ```
