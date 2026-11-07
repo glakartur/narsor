@@ -656,6 +656,8 @@ Templates are substituted right before an action executes. The following referen
 
 - `{{ inputs.NAME }}` — a workflow input declared in the `inputs` section,
 - `{{ context.variables.NAME }}` — a context variable, together with the shorthand `{{ context.NAME }}`, which means exactly the same.
+- `{{ context.variables.NAME.field }}` — a field of the value of a variable, when the value is an object. The shorthand `{{ context.NAME.field }}` works too. A field that the object does not have, and a field of a value that is not an object, are errors.
+- `{{ context.workspace.NAME.FIELD }}` — a value of the workspace `NAME` of `globals.workspaces` (the fields are in §3.6). It works in prompts, in `when` and in the values of `set`. A workspace that the workflow does not declare, a field outside the table of §3.6, and the forms `context.workspace` and `context.workspace.NAME` are errors, and the validator reports them when the file loads. A field of a workspace without a value renders as empty text, and a `when` on it is false.
 - `{{ task.ticket }}` and `{{ task.title }}` — the task's ticket and title. The operator enters them in the new task form. They work in every step and in `globals.workspace`, regardless of `inputs`. They do not need to be declared. When the task has none, they render as empty text. Any other name after `task.` is an error. `task.title` is the operator's title, and when it is missing — the title assigned by the conductor. The conductor assigns it in the background, so a step rendered before the title is stored sees empty text. A title from the conductor has only letters, digits, spaces and the characters `- _ . , : ( )`.
 - `{{ artifacts.NAME }}` — the path of the last write of the artifact with that name in the execution. The name must be defined in the `artifacts` of some step.
 - `{{ steps.ID.reply }}` — the final text response of a successful attempt of agent step `ID`.
@@ -675,11 +677,12 @@ The `ticket` and `title` fields do not mask data. Do not put customers' personal
 
 Whitespace inside `{{ }}` is ignored. There are no filters (`| default(...)`), expressions, conditions or loops — this is a deliberately simple substitution mechanism, not a template engine. A reference to a nonexistent input or an undeclared variable without a value is an **error** that aborts the action. Substitution is single-pass: if a variable's value itself contains `{{ ... }}`, it is not expanded again.
 
-**Exception: a declared name without a value renders as empty text.** This applies to three cases:
+**Exception: a declared name without a value renders as empty text.** This applies to four cases:
 
 - `{{ context.NAME }}`, when some step defines a global variable `NAME` or some gate has a `NAME` field in `inputs`;
 - `{{ artifacts.NAME }}`, when some step defines an artifact `NAME`;
-- `{{ local.NAME }}`, when the current step defines `local.NAME` (e.g. on the first entry).
+- `{{ local.NAME }}`, when the current step defines `local.NAME` (e.g. on the first entry);
+- `{{ context.workspace.NAME.FIELD }}`, when the workflow declares the workspace `NAME` and the field has no value yet.
 
 Thanks to this a step can refer to its own document or to a variable that is set only by a later step. On the first entry the render is empty. On the next entry the template yields the value.
 
@@ -787,7 +790,14 @@ The header reads fixed values of each workspace of `globals.workspaces`, in the 
 | `added`, `removed` | the system, after each step | Lines added and removed against `base_branch`: from the common ancestor with `origin/<base_branch>` to the working tree. Untracked files are not counted. |
 | `pr`, `pr_url` | the workflow, with `set.workspace` (§3.7.5) | The pull request number and address. |
 
-A workflow and an agent cannot change `repo`, `base_branch`, `branch`, `added` and `removed`. A local
+Steps read every value of the table as `{{ context.workspace.NAME.FIELD }}` (§3.3, scope of templates).
+The system values are the last reading of git: it runs in the background after each step, so a prompt
+rendered right after a step can still see the state from before that step. `added` and `removed`
+render as numbers.
+
+Only `pr` and `pr_url` are writable, with `set.workspace` (§3.7.5). A workflow and an agent cannot
+change `repo`, `base_branch`, `branch`, `added` and `removed`; setting one is a validation error that
+names the field. A local
 folder workspace has only `repo`: the folder path. `set.workspace` on a workspace with `path:` is a
 validation error. A workspace chosen at task creation that turns out to be a local folder shows no pull
 request, and the runner logs a warning.
@@ -1016,7 +1026,8 @@ choices:
     renders them when the choice is taken. The scope has the context after the step result, the
     local values of the step, and the label that each step last chose, this step included.
 *   The validator checks literal values against `type` and `options`. A value with a template is
-    checked by the engine when it applies the value.
+    checked by the engine when it applies the value. The validator does check the
+    `context.workspace` references inside such a value (§3.3).
 *   The engine renders and checks every assignment first. If one fails, the step fails and nothing is
     written. Otherwise it writes the assignments after the result of the step, so `set` wins over a
     value that the step returned.
@@ -1024,7 +1035,8 @@ choices:
 *   A manual jump of the operator (§3.7.8) does not apply `set`.
 *   The key `workspace` is reserved for the pull request of a workspace:
     `set: { workspace: { <workspace name>: { pr: <value>, pr_url: <value> } } }`. The workspace must
-    be one of `globals.workspaces`. Only `pr` and `pr_url` can be set. The values are templates,
+    be one of `globals.workspaces`. Only the writable fields of §3.6 (`pr` and `pr_url`) can be set;
+    a read-only field is a validation error. The values are templates,
     rendered like the other values of `set`. A value that renders empty does not replace the earlier
     one. The header shows them (§3.6).
 
