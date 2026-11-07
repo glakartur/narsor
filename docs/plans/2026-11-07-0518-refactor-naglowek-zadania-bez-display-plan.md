@@ -48,7 +48,7 @@ Workflow opisuje proces backendowy, ale dziś zawiera też widok: `display.title
 - R4. Dla każdego workspace z `globals.workspaces` (kolejność z pliku) zadanie ma wartości `context.workspace.<nazwa>.repo`, `.branch`, `.base_branch`, `.added`, `.removed`, `.pr`, `.pr_url`. Workflow v1 po konwersji ma jeden workspace (nazwa wg §3.2.1).
 - R5. `repo` i `base_branch` ustawia system przy tworzeniu zadania (repozytorium z rejestru lub wybrane w formularzu; gałąź bazowa z definicji, w przeciwnym razie `default_branch`). Workflow i agent nie mogą ich zmienić.
 - R6. `branch` to aktualna gałąź robocza repozytorium. Na starcie ma wartość gałęzi startowej zadania. System odświeża ją ze stanu git workspace po każdym kroku (patrz A3, Q2). Runner klonuje repozytorium z odłączonym HEAD (detached), więc gdy po kroku HEAD jest odłączony albo odczyt git się nie udał, `branch` zachowuje ostatnią wartość (na starcie: gałąź startowa).
-- R6a. `added` i `removed` to liczba dodanych i usuniętych linii w repozytorium workspace względem `base_branch`: różnica od wspólnego przodka (`merge-base`) `base_branch` i `HEAD` do drzewa roboczego, z niezatwierdzonymi zmianami. System odczytuje je razem z `branch` po każdym kroku (A3). Na starcie wartości są puste; gdy odczyt git się nie udał, zachowują ostatni wynik. Workflow i agent nie mogą ich zmienić.
+- R6a. `added` i `removed` to liczba dodanych i usuniętych linii w repozytorium workspace względem `base_branch`: różnica od wspólnego przodka (`merge-base`) `origin/<base_branch>` i `HEAD` do drzewa roboczego, z niezatwierdzonymi zmianami. Świeży klon ma lokalnie tylko gałąź domyślną, więc baza to gałąź zdalna; lokalna `<base_branch>` tylko wtedy, gdy gałęzi zdalnej nie ma. System odczytuje je razem z `branch` po każdym kroku (A3). Na starcie wartości są puste; gdy odczyt git się nie udał, zachowują ostatni wynik. Workflow i agent nie mogą ich zmienić.
 - R7. Wyjście kroku (`exit` lub choice) może zapisać `pr` i `pr_url` wybranego workspace przez `set`, np. `set: { workspace: { code: { pr_url: "{{ context.pr_url }}" } } }`. `set` jest dostępne tylko w kształcie unified (§3.7.1, §3.7.5): plik v1 i plik v2 w starym kształcie nie mogą zapisać `pr`/`pr_url`. Nazwa workspace musi istnieć w `globals.workspaces`; walidator odrzuca nieznaną nazwę i klucz inny niż `pr`/`pr_url`.
 - R8. `context.workspace.<nazwa>.*` jest dostępne do odczytu w szablonach (`{{ context.workspace.code.pr_url }}`) i w `when`. Brak wartości daje pusty tekst, jak dla zadeklarowanej zmiennej bez wartości (§ "Scope of templates").
 - R9. Nazwa `workspace` jest zarezerwowana: zmienna kroku o tej nazwie jest błędem ładowania, bo skrót `context.NAME` kolidowałby z `context.workspace.*`.
@@ -64,7 +64,7 @@ Workflow opisuje proces backendowy, ale dziś zawiera też widok: `display.title
 - R12. Wiersz workspace zaczyna się od nazwy workspace (prefiks wiersza). Potem są: nazwa repozytorium (`repo`), `branch → base_branch`, `+added −removed` i `PR <numer>` z linkiem OSC 8 do `pr_url`. Gdy brak `added` i `removed`, kolumna zmian jest pusta. Kolumny są wyrównane między wierszami.
 - R13. Gdy `branch` równa się `base_branch`, wiersz pokazuje tylko jedną nazwę gałęzi (zmiana nie ma jeszcze gałęzi roboczej).
 - R14. Gdy nie ma PR, w miejscu PR stoi wyszarzony znak `—`. Gdy jest `pr_url`, a nie ma `pr`, numer jest brany z końcowego segmentu liczbowego adresu; gdy go brak, pokazany jest tekst `PR ↗`.
-- R15. Workspace typu lokalny folder (`path`) pokazuje nazwę i ścieżkę zamiast gałęzi; nie ma kolumny PR.
+- R15. Workspace typu lokalny folder (`path`) pokazuje nazwę i ścieżkę zamiast gałęzi; nie ma kolumny PR. Dla takiego workspace system ustawia `repo` na ścieżkę folderu; `branch`, `base_branch`, `added`, `removed`, `pr` i `pr_url` są puste, a system nie odczytuje ich z git (R6, R6a).
 - R16. Przy wąskim terminalu kolejność skracania: najpierw `base_branch`, potem kolumna zmian `+N −M` (znika), potem `branch` (obcięta z `…`), potem nazwa repozytorium (obcięta z `…`). Nazwa workspace i numer PR nie są nigdy skracane.
 - R17. Nagłówek pokazuje wiersz dla każdego workspace, bez limitu liczby wierszy (decyzja w recenzji: na razie nie ograniczamy wysokości nagłówka).
 - R18. Zadanie w kolejce (bez runnera) pokazuje wiersze workspace z danymi z tworzenia zadania (`repo`, gałąź startowa, `base_branch`), bez zmian `+N −M` i bez PR.
@@ -184,3 +184,22 @@ Te pozycje to wyniki recenzji pozostawione autorowi. Nie blokują implementacji.
   "Tekst bez linku" nie mówi, co stoi w kolumnie PR. Surowa, długa wartość od agenta psuje wyrównanie kolumn, a R16 zabrania skracania kolumny PR.
   Change: wartość, która nie jest bezwzględnym adresem `http`/`https`, nigdy nie jest pokazana dosłownie; kolumna PR pokazuje numer z `pr` albo `PR` bez znaku `↗` i bez linku. AE6 oczekuje `PR` bez linku.
 
+- **Gałąź bazowa w nagłówku ignoruje gałąź startową wybraną przez właściciela** — R5 (P2, feasibility, confidence 75)
+
+  Gdy właściciel w formularzu lub w CLI (`--branch`) wybiera gałąź startową inną niż w definicji, np. `release/2.0`, nagłówek od startu pokazuje `release/2.0 → main`. Reguła jednej nazwy gałęzi (R13) nie działa, a liczby linii (R6a) liczą wszystkie commity `release/2.0` od rozejścia z `main`.
+  Change: w R5 gałąź bazowa to gałąź startowa wysłana przy tworzeniu zadania (wybór właściciela, w przeciwnym razie `base_branch` z definicji, w przeciwnym razie `default_branch`); to jest baza dla R6a i R13. Decyzja: czy gałąź wybrana w formularzu jest też celem PR.
+
+- **Brak gałęzi bazowej, gdy ani definicja, ani rejestr jej nie podają** — R5, R18 (P2, feasibility, confidence 75)
+
+  Schemat (§3.2.1) mówi, że wtedy zadanie startuje na `HEAD` zdalnego repozytorium, ale system zna tę gałąź dopiero po pierwszym klonie. Bez reguły serwer i migawka runnera pokażą różne wartości, a liczby linii (R6a) nie mają bazy.
+  Change: dodać do R5: gdy definicja i rejestr nie podają gałęzi, gałąź bazowa i startowa są puste do pierwszego klonu; potem runner ustawia obie na gałąź, na którą wskazuje `HEAD` zdalnego repozytorium. Do tego czasu wiersz zadania w kolejce (R18) pokazuje tylko `repo`.
+
+- **Reguła kolumny PR nie opisuje `pr` bez `pr_url` ani różnych numerów w `pr` i `pr_url`** — R14 (P2, coherence, confidence 75)
+
+  Implementacje mogą się rozejść: jedna pokaże `↗` bez linku, druga numer z adresu zamiast z `pr`.
+  Change: dopisać do R14: numer z `pr`, a gdy go brak, z końcowego segmentu `pr_url`; `↗` i link tylko, gdy `pr_url` spełnia R10; gdy jest `pr`, a nie ma `pr_url`, kolumna pokazuje `PR #<pr>` bez `↗` i bez linku.
+
+- **Odczyt `context.workspace` w szablonach i `when` nie ma konsumenta** — R8 (P3, scope-guardian, confidence 75)
+
+  Nagłówek TUI i tekst CLI czytają dane bezpośrednio. Żaden workflow w dokumencie nie używa `{{ context.workspace.* }}`; przykład w R7 używa `{{ context.pr_url }}`. R8 wymaga zmian w rozwiązywaniu szablonów, analizie statycznej i walidatorze oraz poszerza publiczny kontrakt schematu. Dodanie go później jest tanie.
+  Change (decyzja użytkownika): przenieść R8 do Scope Boundaries jako poza zakresem; zarezerwowana nazwa `workspace` (R9) zostaje.
