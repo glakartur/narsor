@@ -27,11 +27,12 @@ The first fix copied the "workflow ref, else `default_branch`" choice into two p
 
 ## Solution
 
-1. Remove `ref: main` from the bundled workflows. Without a workflow `ref`, the registry `default_branch` applies. With neither, the clone takes the remote `HEAD`.
-2. Keep the choice in one method, `RepositoryEntry::named_ref(workflow_ref)`. It returns the ref and a `RefOrigin` (`Workflow` or `Repository`). An explicit workflow ref wins. A blank `default_branch` counts as unset.
+1. Remove `ref: main` from the bundled workflows (a past fix; the bundled set has changed since). Without a workflow ref, the registry `default_branch` applies. With neither, the clone takes the remote `HEAD`. In schema v2 the workflow field is `base_branch` (`docs/dev/workflow-schema.md`); the same advice applies to it.
+2. Keep the choice in one method, `RepositoryEntry::named_ref(user_ref, workflow_ref)` in `crates/narsor-engine/src/registry/store.rs`. Its callers are `resolve_repository` (`tasks/mod.rs`) and the environment resolver. It returns the ref and a `RefOrigin` (`User`, `Workflow` or `Repository`). The order is: a ref the user chose for the task, an explicit workflow ref, then `default_branch`. A blank `default_branch` counts as unset.
 3. Carry `ref_origin` through `RepositorySpec` and `RepositorySource::Git` to the provisioner. `WorkspaceError::RefNotFound` now says where the name came from.
 
 ```rust
+// Shape of the rule when this learning was written (before the user ref):
 pub fn named_ref(&self, workflow_ref: Option<&str>) -> Option<(String, RefOrigin)> {
     match workflow_ref {
         Some(git_ref) => Some((git_ref.to_string(), RefOrigin::Workflow)),
@@ -48,6 +49,6 @@ The repository configuration is the only place that knows the real default branc
 
 ## Prevention
 
-- Do not pin a branch in bundled workflows. Leave `ref` empty unless the workflow needs a specific ref.
+- Do not pin a branch in bundled workflows. Leave `base_branch` (formerly `ref`) empty unless the workflow needs a specific one.
 - Add a rule that applies in two code paths to one function, and call it from both.
-- Keep tests for: explicit workflow ref wins, `default_branch` is used, blank `default_branch` is ignored, and the missing-branch message names its origin (`tests/builtin_workflows.rs`, `tests/environment.rs`, `tests/tasks.rs`).
+- Keep tests for: explicit workflow ref wins, `default_branch` is used, blank `default_branch` is ignored, and the missing-branch message names its origin (`tests/integration/environment.rs` for the precedence; `crates/narsor-runner/src/runner/init.rs` for the origin in the error).

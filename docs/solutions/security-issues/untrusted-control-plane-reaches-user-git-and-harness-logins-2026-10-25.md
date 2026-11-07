@@ -36,7 +36,7 @@ related_components: [narsor-engine workspace provisioner, narsor-engine local ba
 ## Solution
 All in commit `23db582`. The restrictions apply only when the control plane is `Remote` (beyond loopback) and the HOME mode is `private`. `--accept-host-home` turns them off, and the controller then prints a warning for each harness directory it gives to tasks.
 
-1. **The launch check refuses a Git remote that is not plain `https://` to an external host** (`check_remote` and `is_internal` in `untrusted.rs`). Internal means: loopback, RFC 1918, link-local (including `169.254.169.254`), unspecified, broadcast, RFC 6598 (`100.64.0.0/10`), IPv6 ULA `fc00::/7`, IPv6 link-local `fe80::/10`, IPv4-mapped IPv6 of these, and `localhost`/`*.localhost` (also with a final dot). Integer hosts such as `https://2130706433/` are normalized by the URL parser and refused. A refusal message removes the user name and password from the remote (`without_credentials`).
+1. **The launch check refuses a Git remote that is not plain `https://` to an external host** (`check_remote` in `untrusted.rs` calls `check_https_remote`, `is_internal` and `without_credentials` in `crates/narsor-engine/src/registry/remote_policy.rs`). Internal means: loopback, RFC 1918, link-local (including `169.254.169.254`), unspecified, broadcast, RFC 6598 (`100.64.0.0/10`), IPv6 ULA `fc00::/7`, IPv6 link-local `fe80::/10`, IPv4-mapped IPv6 of these, and `localhost`/`*.localhost` (also with a final dot). Integer hosts such as `https://2130706433/` are normalized by the URL parser and refused. A refusal message removes the user name and password from the remote (`without_credentials`).
 
 2. **The runner clones with none of the user's git setup** (`GitAccess::PinnedOnly` and `restrict_git_access` in `crates/narsor-engine/src/workspace/provisioner.rs`, runner flag `--pinned-git-credential-only`):
 
@@ -56,7 +56,7 @@ All in commit `23db582`. The restrictions apply only when the control plane is `
 
    The pinned credential of the task is the only one git has. `http.followRedirects=false` stops a public host from sending the clone on to a private network. `GIT_ALLOW_PROTOCOL=https` is a second guard behind the launch check (it also blocks submodules over other transports).
 
-3. **The local backend does not give the runner the user's credential variables** (`withhold_user_credentials` and `is_user_credential` in `crates/narsor-engine/src/backends/local.rs`). It removes every `GIT_CONFIG*` variable, the git list above, and `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR`, `GITLAB_TOKEN`, `GL_TOKEN`, `GLAB_TOKEN`, `GLAB_CONFIG_DIR`. This is in addition to the `NARSOR_*` variables, which a runner never inherits.
+3. **The local backend does not give the runner the user's credential variables** (the `withhold_user_credentials` setting and the `is_user_credential` check in `crates/narsor-engine/src/backends/local.rs`). It removes every `GIT_CONFIG*` variable, the git list above, and `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR`, `GITLAB_TOKEN`, `GL_TOKEN`, `GLAB_TOKEN`, `GLAB_CONFIG_DIR`. This is in addition to the `NARSOR_*` variables, which a runner never inherits.
 
 4. **Harness directories need consent** (`resolve_home` in `crates/narsor-controller/src/local.rs`). With a remote control plane and no `--accept-host-home`, a harness directory flag is a usage error. The harness directories from the configuration file are ignored.
 
@@ -84,5 +84,5 @@ The checks are layered, so one gap (for example, a new git variable) does not op
 
 ## Related Issues
 - `docs/solutions/integration-issues/runner-private-home-hides-harness-login-2026-10-10.md` — the other side of the same setting: for a trusted local daemon the default is `host`, so that harness logins work (D57). This doc covers why `private` alone is not sufficient for an untrusted server.
-- `ARCHITECTURE_DECISIONS.md` D57 (HOME mode), D68 (local controller as a separate process).
+- `docs/dev/architecture.md` D57 (HOME mode), D68 (local controller as a separate process).
 - `docs/plans/2026-10-25-004-refactor-lokalny-controller-osobny-proces-plan.md` — requirements R16–R18.

@@ -55,7 +55,7 @@ replace_reported_attention(&mut task.attention, attention, &task.inputs);
 status_changed || pending_changed || task.attention != before
 ```
 
-A report that moves only `event_cursor` asks for no read. The runner's current step now shows with the periodic read, up to `tui_refresh_interval` late. README states this. A row without a runner still asks for a read.
+A report that moves only `event_cursor` asks for no read. The runner's current step now shows with the periodic read, up to `tui_refresh_interval` late. `docs/user/tui.md` states this. A row without a runner still asks for a read.
 
 ## Why This Works
 
@@ -65,7 +65,7 @@ The row shows status, pending input and attention. The event carries all three, 
 
 - When an event handler returns "needs a read", state which field the event cannot carry. Return `true` only for a real change in the fields that the row shows.
 - Every kind of event that returns `_ => true` in `patch_row` is a possible hidden poll. Check the event rate of a kind before you let it ask for a read. A general cap on event-driven reads is deferred in the plan until another kind proves frequent.
-- Tests in `tests/tui_state.rs`: a report that moves only the cursor asks for no read (10 reports in a row); a change of status, pending input or attention asks for a read; a row without a runner asks for a read.
+- Tests in `tests/integration/tui_state.rs`: a report that moves only the cursor asks for no read (10 reports in a row); a change of status, pending input or attention asks for a read; a row without a runner asks for a read.
 - A periodic timer that restarts after every read hides event-driven reads. Find who calls `schedule.request` before you suspect the timer.
 
 ## Related Issues

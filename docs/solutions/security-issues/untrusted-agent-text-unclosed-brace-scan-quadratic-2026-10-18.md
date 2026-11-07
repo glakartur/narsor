@@ -10,7 +10,7 @@ related_components:
   - testing_framework
 severity: high
 symptoms:
-  - "A security review flagged the JSON-object scanners in agent.rs as O(n^2) on agent output full of unclosed `{`"
+  - "A security review flagged the JSON-object scanners in the agent step as O(n^2) on agent output full of unclosed `{`"
   - "A text of 200000 `{` followed by a contract makes the label and reply scans read to the end of the text once per brace"
   - "`narsor-cli` printed pending human input (instruction with a step reply, problem reason, answer tails) with raw control characters"
 root_cause: missing_validation
@@ -22,7 +22,7 @@ tags: [untrusted-input, agent-output, algorithmic-dos, quadratic-scan, brace-sca
 
 ## Problem
 
-Text from an agent is untrusted: an LLM, or a prompt-injected repository, controls it. The engine scans that text for JSON objects in `crates/narsor-engine/src/engine/actions/agent.rs`:
+Text from an agent is untrusted: an LLM, or a prompt-injected repository, controls it. The engine scans that text for JSON objects in `crates/narsor-engine/src/engine/actions/agent/response.rs`:
 
 - `json_objects` finds the output label (`extract_response`; `conductor/response.rs` uses it too).
 - `final_contract_start` and `last_contract_span` find the output-contract object, and `clean_reply` cuts it out of the step's reply. Later prompts and human gates receive that reply through `{{ steps.<step>.reply }}`.
