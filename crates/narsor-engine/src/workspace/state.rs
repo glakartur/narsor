@@ -141,22 +141,30 @@ fn changed_lines(git: &Git, dir: &str, base_branch: &str) -> Option<ChangedLines
     Some(sum_numstat(&numstat))
 }
 
-/// Whether the repository's own config defines a `filter.<x>` command. Git
+/// Whether a config the task can write defines a `filter.<x>` command. Git
 /// would run its `clean` command on a diff of the working tree when
 /// `info/attributes` selects it, and that file cannot be switched off, so
-/// such a repository gets no line count.
+/// such a repository gets no line count. The task can write `.git/config`,
+/// `.git/config.worktree` and files they include, so every scope but the
+/// system and global files counts; those are the user's, and a filter there
+/// (git-lfs) is not the task's.
 fn defines_filters(git: &Git, dir: &str) -> bool {
     git.stdout(&[
         "-C",
         dir,
         "config",
-        "--local",
+        "--show-scope",
         "--includes",
         "--name-only",
         "--get-regexp",
         "^filter\\.",
     ])
-    .is_some_and(|names| !names.is_empty())
+    .is_some_and(|entries| {
+        entries.lines().any(|entry| {
+            let scope = entry.split_whitespace().next().unwrap_or_default();
+            !matches!(scope, "system" | "global")
+        })
+    })
 }
 
 fn base_ref(git: &Git, dir: &str, base_branch: &str) -> Option<String> {
@@ -564,6 +572,30 @@ mod tests {
         fs::write(clone.join(".git/info/attributes"), "*.txt filter=x\n").unwrap();
         let command = format!("touch {}; cat", marker.display());
         git(&clone, &["config", "filter.x.clean", &command]);
+        fs::write(clone.join("a.txt"), "changed\n").unwrap();
+
+        let reading = read(&clone, Some("main"));
+
+        assert!(
+            reading.changes.is_none(),
+            "a filter repository gets no count"
+        );
+        assert!(!marker.exists(), "the clean filter ran during read");
+    }
+
+    #[test]
+    fn reading_does_not_run_a_filter_defined_in_the_worktree_config() {
+        let scratch = Scratch::new();
+        let clone = origin_and_clone(&scratch);
+        let marker = scratch.0.join("filter-ran");
+        git(&clone, &["config", "extensions.worktreeConfig", "true"]);
+        let command = format!("touch {}; cat", marker.display());
+        fs::write(
+            clone.join(".git/config.worktree"),
+            format!("[filter \"x\"]\n\tclean = {command}\n"),
+        )
+        .unwrap();
+        fs::write(clone.join(".git/info/attributes"), "*.txt filter=x\n").unwrap();
         fs::write(clone.join("a.txt"), "changed\n").unwrap();
 
         let reading = read(&clone, Some("main"));
