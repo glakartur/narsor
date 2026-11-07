@@ -197,6 +197,27 @@ section (see [the workflow schema](../dev/workflow-schema.md), §3.2.1): the ste
 repository with its path and mode, and `claude-code` and `codex` are given the extra directories;
 other harnesses rely on that prompt.
 
+#### A denied tool call that did not stop the agent
+
+Claude Code in print mode refuses a tool call it cannot ask about and reports it
+in `permission_denials` of the `result` line. The agent often goes on and ends
+with a valid answer. The narsor treats such a denial as a log entry, not as a
+stop:
+
+- A denial of a **subagent's** call never stops the step.
+- A denial of the **main agent's** call stops the step with a permission request
+  only when the run has no usable final answer (the run did not fail and the
+  answer has the shape the step expects). With a usable answer the step goes on.
+- Every denial that did not stop the step is recorded as the event
+  `permission_denied_ignored` (tool, call id, one-line summary, reason when
+  known, and the source: `agent` or the subagent's name). The *Zdarzenia* row reads
+  `odmowa pominięta · <agent | subagent name> · <tool> · <key parameter>`; the
+  details window holds the full input.
+
+The narsor talks to the main agent only. A subagent is recognised by the
+`parent_tool_use_id` of a stream line, not by `session_id`. The conversation
+shows subagents as separate groups (see [the TUI](tui.md)).
+
 **The security consequence is real and is not hypothetical.** Containerisation
 (D14) is still deferred, so the only boundary around an agent is D15's
 filesystem layout and permission bits — which protects against a mistake, not
