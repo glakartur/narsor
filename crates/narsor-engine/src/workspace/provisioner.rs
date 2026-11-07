@@ -780,6 +780,7 @@ pub fn clone_pinned_commit(
     repository: &str,
     remote: &str,
     commit: &str,
+    git_ref: Option<&str>,
     target: &Path,
     credential_file: Option<&Path>,
     access: &GitAccess,
@@ -809,7 +810,7 @@ pub fn clone_pinned_commit(
     })?;
 
     match head_commit(target, repository)? {
-        Some(head) if head == commit => Ok(()),
+        Some(head) if head == commit => attach_to_branch(repository, &target_arg, git_ref, access),
         head => Err(WorkspaceError::RefNotFound {
             git_ref: commit.to_string(),
             origin: None,
@@ -822,9 +823,10 @@ pub fn clone_pinned_commit(
     }
 }
 
-/// Clones `remote` into `target` and leaves it detached on whatever
-/// `git_ref` (a branch or a tag; the remote's `HEAD` when `None`) names right
-/// now, returning that commit.
+/// Clones `remote` into `target` and checks out whatever `git_ref` (a branch
+/// or a tag; the remote's `HEAD` when `None`) names right now, returning
+/// that commit. A branch is checked out as a local branch tracking the
+/// remote's (see [`attach_to_branch`]); a tag stays detached.
 ///
 /// The admission-time counterpart of [`clone_pinned_commit`]: the commit is
 /// not known when the task is created, so it is pinned here, by the one
@@ -866,14 +868,16 @@ pub fn clone_resolving_ref(
             access,
         ) {
             Ok(_) => {
-                return head_commit(target, repository)?.ok_or_else(|| {
+                let commit = head_commit(target, repository)?.ok_or_else(|| {
                     WorkspaceError::RefNotFound {
                         git_ref: wanted.to_string(),
                         origin: ref_origin.filter(|_| git_ref.is_some()),
                         repository: repository.to_string(),
                         detail: "the checkout has no commit".to_string(),
                     }
-                })
+                })?;
+                attach_to_branch(repository, &target_arg, git_ref, access)?;
+                return Ok(commit);
             }
             Err(error) => last_error = Some(error),
         }
@@ -888,6 +892,73 @@ pub fn clone_resolving_ref(
         Some(other) => other,
         None => unreachable!("at least one candidate is always tried"),
     })
+}
+
+/// Moves a detached checkout onto the branch `git_ref` names (the remote's
+/// default branch when `None`), at the commit it already sits at, tracking
+/// the remote's branch.
+///
+/// A workflow starts its own working branch from the branch the task was
+/// started on, so a detached HEAD would leave it nothing to start from. Only
+/// a ref that names no branch of the remote (a tag) stays detached.
+fn attach_to_branch(
+    repository: &str,
+    target: &str,
+    git_ref: Option<&str>,
+    access: &GitAccess,
+) -> Result<()> {
+    let stdout_if_ok = |args: &[&str]| {
+        git_run_with(args, access)
+            .map(|run| run.ok.then_some(run.stdout))
+            .ok()
+            .flatten()
+    };
+    let branch = match git_ref {
+        Some(git_ref) => git_ref.to_string(),
+        None => match stdout_if_ok(&[
+            "-C",
+            target,
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ]) {
+            Some(default) => default.trim_start_matches("origin/").to_string(),
+            None => return Ok(()),
+        },
+    };
+    let upstream = format!("origin/{branch}");
+    let remote_branch = format!("refs/remotes/{upstream}");
+    if stdout_if_ok(&[
+        "-C",
+        target,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        &remote_branch,
+    ])
+    .is_none()
+    {
+        return Ok(());
+    }
+    run_git_with(
+        repository,
+        &["-C", target, "checkout", "--quiet", "-B", &branch, "HEAD"],
+        access,
+    )?;
+    run_git_with(
+        repository,
+        &[
+            "-C",
+            target,
+            "branch",
+            "--quiet",
+            &format!("--set-upstream-to={upstream}"),
+            &branch,
+        ],
+        access,
+    )?;
+    Ok(())
 }
 
 /// The commit `path` is checked out at, when it is a git work tree with one.
