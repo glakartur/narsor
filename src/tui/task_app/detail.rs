@@ -5,7 +5,7 @@
 //! distinct strip.
 //!
 //! ```text
-//! ● running · krok 3 implement · code-review v3 · 14m
+//! ● running · krok 3 · implement · code-review v3 · 14m
 //! code  orders-api   feat/nar-12-orders → main  +120 −34  PR #42 ↗
 //! docs  orders-docs  main                                 —
 //! razem $1.25 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2) · dyrygent $0.05 ↑9k ↓1k
@@ -494,9 +494,15 @@ pub struct Areas {
     pub panel: Option<Rect>,
 }
 
-/// How much of the task id the frame's edge shows: the number the operator
-/// reads out loud. It is never cut.
-const SHORT_ID_CHARS: usize = 8;
+/// How much of the task id the frame's edge and the task list show: the
+/// number the operator reads out loud. The edge never cuts it further; a
+/// shorter id is shown whole.
+pub const TASK_ID_CHARS: usize = 11;
+
+/// The first [`TASK_ID_CHARS`] characters of `task_id`.
+pub fn short_task_id(task_id: &str) -> String {
+    task_id.chars().take(TASK_ID_CHARS).collect()
+}
 const QUIET_ROW: u16 = 1;
 const SEPARATOR_ROW: u16 = 1;
 
@@ -945,12 +951,7 @@ pub fn edge_layout(
             .filter(|text| !text.trim().is_empty())
     };
     let (ticket, title) = (plain(&task.ticket), plain(&task.title));
-    let id: String = task
-        .task_id
-        .to_string()
-        .chars()
-        .take(SHORT_ID_CHARS)
-        .collect();
+    let id = short_task_id(&task.task_id.to_string());
     // The corners, the id's pill and one cell of line between the two sides.
     let tail = loading.map_or(0, |glyph| 1 + cells(glyph));
     let marker = usize::from(focused);

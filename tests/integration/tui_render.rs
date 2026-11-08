@@ -1808,7 +1808,7 @@ mod task_app_render {
     }
 
     #[test]
-    fn a_missing_ticket_uses_an_eight_character_id_prefix_without_colour() {
+    fn a_missing_ticket_uses_an_eleven_character_id_prefix_without_colour() {
         let subject = titled(
             crate::task_app_support::task("task-abcdef1234", "local", "running", 1),
             "No ticket",
@@ -1818,7 +1818,7 @@ mod task_app_render {
         let buffer = render(120, 30, &mut app, &Styles::new(true));
         let row = list_row(&buffer, "No ticket");
         assert!(
-            content_text(&buffer, row).starts_with("  ●  id:task-abc"),
+            content_text(&buffer, row).starts_with("  ●  id:task-abcdef"),
             "{}",
             screen(&buffer)
         );
@@ -2506,10 +2506,10 @@ mod task_app_detail_render {
 
         let buffer = render_at(&mut app, &Styles::new(false), 60, 20);
         let screen = screen(&buffer);
-        assert!(screen.contains(&"A".repeat(8)), "{screen}");
+        assert!(screen.contains(&"A".repeat(11)), "{screen}");
         assert!(
-            !screen.contains(&"A".repeat(9)),
-            "the frame's edge shows the first eight characters of the id: {screen}"
+            !screen.contains(&"A".repeat(12)),
+            "the frame's edge shows the first eleven characters of the id: {screen}"
         );
         assert!(
             rows(&buffer)[TITLE_ROW - 1..]
@@ -4171,8 +4171,8 @@ mod task_app_detail_render {
             row.contains("NAR-12") && row.contains("Zmiana API zamówień"),
             "{row}"
         );
-        assert!(row.contains("6a7ceacf"), "{row}");
-        assert!(!row.contains("6a7ceacfd"), "only 8 characters: {row}");
+        assert!(row.contains("6a7ceacfdc6"), "{row}");
+        assert!(!row.contains("6a7ceacfdc60"), "only 11 characters: {row}");
         assert!(row.find("NAR-12").unwrap() < row.find("Zmiana").unwrap());
         assert!(row.find("Zmiana").unwrap() < row.find("6a7ceacf").unwrap());
         assert!(row.contains('╭') && row.contains('╮'), "{row}");
@@ -4309,7 +4309,7 @@ mod task_app_detail_render {
             let edge = edge_of(Some("NAR-12345-LONG"), Some(title), width);
             assert_eq!(
                 edge.right.as_deref(),
-                Some("6a7ceacf"),
+                Some("6a7ceacfdc6"),
                 "id whole at {width}"
             );
             assert!(
@@ -4336,6 +4336,59 @@ mod task_app_detail_render {
 
         let roomy = edge_of(Some("NAR-12"), Some("Zmiana"), 200);
         assert_eq!(roomy.left, vec!["NAR-12".to_string(), "Zmiana".to_string()]);
+    }
+
+    /// The edge of a task whose id is `id`, titled `title`, `width` wide.
+    fn edge_of_id(id: &str, title: &str, width: u16) -> narsor::tui::style::PanelEdge {
+        let mut summary = task("a", "local", "running", 1);
+        summary.task_id = narsor_engine::domain::TaskId::parse(id).unwrap();
+        summary.title = Some(title.to_string());
+        narsor::tui::task_app::detail::edge_layout(&summary, width, 4, false, None)
+    }
+
+    #[test]
+    fn a_task_id_shorter_than_eleven_characters_is_shown_whole_and_an_eleven_character_one_is_unchanged(
+    ) {
+        let short = edge_of_id("task-12", "Zmiana", 80);
+        assert_eq!(short.right.as_deref(), Some("task-12"));
+        let exact = edge_of_id("task-123456", "Zmiana", 80);
+        assert_eq!(exact.right.as_deref(), Some("task-123456"));
+        let long = edge_of_id("task-1234567890abcdef", "Zmiana", 80);
+        assert_eq!(long.right.as_deref(), Some("task-123456"));
+    }
+
+    /// The longer id takes three cells from the title: a title that fits the
+    /// old eight-character edge is cut by the eleven-character one.
+    #[test]
+    fn the_longer_id_leaves_the_title_three_cells_less() {
+        let title = "Przebudowa obsługi zamówień hurtowych";
+        let full = title.chars().count();
+        // Corners 2, id pill 11 + 4, pills of the title 4, one cell of line.
+        let width = u16::try_from(2 + 11 + 4 + 4 + 1 + full).unwrap();
+        let fits = edge_of_id("task-1234567890abcdef", title, width);
+        assert_eq!(
+            fits.left.last().map(String::as_str),
+            Some(title),
+            "{fits:?}"
+        );
+        let cut = edge_of_id("task-1234567890abcdef", title, width - 1);
+        assert_ne!(cut.left.last().map(String::as_str), Some(title), "{cut:?}");
+    }
+
+    #[test]
+    fn the_title_row_appears_only_when_the_edge_cuts_the_title() {
+        let title = "Przebudowa obsługi zamówień hurtowych";
+        let mut summary = task("a", "local", "running", 1);
+        summary.task_id = narsor_engine::domain::TaskId::parse("task-1234567890abcdef").unwrap();
+        summary.title = Some(title.to_string());
+        let wide = narsor::tui::task_app::detail::edge_layout(&summary, 120, 4, false, None);
+        assert!(!narsor::tui::task_app::detail::title_is_cut(
+            &summary, &wide
+        ));
+        let narrow = narsor::tui::task_app::detail::edge_layout(&summary, 40, 4, false, None);
+        assert!(narsor::tui::task_app::detail::title_is_cut(
+            &summary, &narrow
+        ));
     }
 
     #[test]

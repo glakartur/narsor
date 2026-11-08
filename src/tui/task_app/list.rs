@@ -60,7 +60,7 @@ use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFI
 use super::super::scroll::one_line;
 use super::super::selection::{render_barred_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
-use super::detail::{fit_cells, step_name};
+use super::detail::{fit_cells, short_task_id, step_name};
 
 /// What a row asks of the operator (column 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,8 +235,8 @@ fn activity_since(task: &TaskSummary) -> Option<DateTime<Utc>> {
     }
 }
 
-fn short_task_id(task_id: &str) -> String {
-    format!("id:{}", task_id.chars().take(8).collect::<String>())
+fn id_label(task_id: &str) -> String {
+    format!("id:{}", short_task_id(task_id))
 }
 
 /// Whether the task's backend has no controller holding its lease right now:
@@ -461,7 +461,7 @@ impl PendingRow {
         };
         RowText {
             ticket: None,
-            id: short_task_id(&self.task_id),
+            id: id_label(&self.task_id),
             attention: Attention::None,
             icon,
             title: one_line(&self.title),
@@ -720,7 +720,7 @@ impl TaskList {
         let task = &self.tasks[index];
         RowText {
             ticket: non_blank_line(task.ticket.as_deref()),
-            id: short_task_id(task.task_id.as_str()),
+            id: id_label(task.task_id.as_str()),
             attention: attention_of(task),
             icon: state_icon(task),
             title: title_of(task),
