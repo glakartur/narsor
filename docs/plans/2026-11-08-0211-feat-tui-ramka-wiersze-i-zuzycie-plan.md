@@ -14,7 +14,7 @@ execution: code
 
 - **Objective:** Operator czyta w szczegółach zadania krótszy, czytelniejszy nagłówek: pełniejszy identyfikator zadania w ramce, wiersze workspace z kolorowymi zmianami i linkiem PR oraz wiersz zużycia z ikonami, który nie pokazuje pustych bloków.
 - **Product authority:** Zmiany dotyczą tylko wyglądu nagłówka szczegółów zadania w TUI. Dokument powstał bez dialogu z użytkownikiem (tryb nieinteraktywny). Użytkownik potwierdza założenia i odpowiada na pytania w recenzji MR.
-- **Open blockers:** Brak blokad planowania. Pytania Q1–Q3 nie blokują, bo mają bezpieczne założenia.
+- **Open blockers:** Brak. Użytkownik odpowiedział na Q1–Q3 w recenzji MR (patrz Decyzje).
 - **Product Contract preservation:** nowy dokument. Rozszerza układ nagłówka z `docs/plans/2026-11-07-0518-refactor-naglowek-zadania-bez-display-plan.md` (R11, R12, R14, R16). Tam, gdzie ten dokument zmienia tamten zapis, ten dokument wygrywa.
 
 ---
@@ -35,6 +35,7 @@ Id `task-728` ma 8 znaków, więc zgadza się z początkiem identyfikatora tylko
 
 - R1. Identyfikator zadania po prawej stronie górnej krawędzi ramki ma 11 znaków (dziś 8), np. `task-123456`. Id dłuższy niż 11 znaków jest skrócony do pierwszych 11 znaków. Id krótszy niż 11 znaków jest pokazany w całości. Krawędź ramki nigdy nie skraca id dalej, tylko tytuł.
 - R2. Wiersz tytułu w nagłówku jest pokazany tylko wtedy, gdy krawędź ramki skraca tytuł. Gdy ramka mieści tytuł w całości, nagłówek nie ma tego wiersza i zaczyna się od wiersza statusu.
+- R1a. Lista zadań w TUI pokazuje id zadania w tej samej długości co ramka (11 znaków, ta sama zasada skracania co w R1). CLI (`task_text`) zostaje bez zmian. Planowanie wskazuje miejsce w liście, które dziś skraca id, i używa jednej wspólnej stałej.
 - R3. Dłuższy id (R1) zabiera ramce 3 komórki. Decyzję z R2 podejmuje układ krawędzi z nową szerokością id.
 
 **Krok**
@@ -50,7 +51,7 @@ Id `task-728` ma 8 znaków, więc zgadza się z początkiem identyfikatora tylko
 
 **Wiersz zużycia**
 
-- R9. Wiersz ma postać `razem $34.15 · ✨ $34.15 ↑304 ↓72k (◈ 2 $123 ↑304 ↓72k) · ⚡ $34.15 ↑304 ↓72k`. Bloki: `razem` (koszt agentów i dyrygenta), `✨` agenci, `◈` subagenci, `⚡` dyrygent.
+- R9. Koszt `✨` obejmuje agentów razem z subagentami (D2). Wiersz ma postać `razem $34.15 · ✨ $34.15 ↑304 ↓72k (◈ 2 $123 ↑304 ↓72k) · ⚡ $34.15 ↑304 ↓72k`. Bloki: `razem` (koszt agentów i dyrygenta), `✨` agenci, `◈` subagenci, `⚡` dyrygent.
 - R10. `◈` stoi w nawiasie po bloku agentów. Pierwsza liczba po `◈` to liczba subagentów. Potem są koszt (gdy znany), `↑` tokeny wejścia i `↓` tokeny wyjścia.
 - R11. Blok bez danych nie jest pokazany. Dotyczy `razem`, `✨`, `◈` i `⚡`. Część bloku bez danych (np. brak kosztu) też nie jest pokazana: nie ma znaku `—`. Dotyczy to tylko wiersza zużycia (`task_usage_text::line`). Komórki kroków w zakładce postępu (`step_cells`) używają tej samej stałej `UNKNOWN` i zostają bez zmian. Wyjątek: `—` w wierszu workspace bez PR (R8) zostaje. Gdy nie ma żadnego bloku, wiersz zużycia nie istnieje.
 - R12. Gdy wiersz zużycia jest za szeroki, najpierw znika blok `◈`, potem tekst jest obcięty z `…`, jak dziś.
@@ -65,13 +66,13 @@ Id `task-728` ma 8 znaków, więc zgadza się z początkiem identyfikatora tylko
 
 ### Scope Boundaries
 
-- Bez zmian: protokół, dane `context.workspace.*`, źródła zużycia, CLI (`task_text`) i lista zadań.
-- Poza zakresem: nowy kontrakt danych kosztu subagentów. Dziś harness podaje ich tokeny i liczbę, nie koszt (patrz Q1).
-- Poza zakresem: zmiana długości id w liście zadań, w CLI i w identyfikatorach zapisanych w systemie. Zmiana dotyczy tylko ramki szczegółów (patrz A1).
+- Bez zmian: protokół, dane `context.workspace.*`, źródła zużycia i CLI (`task_text`).
+- Poza zakresem: nowy kontrakt danych kosztu subagentów i wyliczanie kosztu z cennika. Dziś harness podaje ich tokeny i liczbę, nie koszt (patrz D1).
+- Poza zakresem: zmiana długości id w CLI i w identyfikatorach zapisanych w systemie (patrz D3).
 
 ### Założenia do potwierdzenia
 
-- A1. "Numer w ramce" to krótki identyfikator zadania po prawej stronie górnej krawędzi (`SHORT_ID_CHARS` w `src/tui/task_app/detail.rs`, dziś 8). Zmieniamy tylko jego długość: 8 → 11. Id ma prefiks `task-`, więc 11 znaków to `task-` i 6 znaków numeru.
+- A1. "Numer w ramce" to krótki identyfikator zadania po prawej stronie górnej krawędzi (`SHORT_ID_CHARS` w `src/tui/task_app/detail.rs`, dziś 8). Zmieniamy jego długość: 8 → 11. To samo dotyczy id w liście zadań (D3). Id ma prefiks `task-`, więc 11 znaków to `task-` i 6 znaków numeru.
 - A2. Zwijanie wiersza tytułu (R2) już działa przez `title_is_cut`. Dokument potwierdza to zachowanie i wymaga, żeby przeżyło zmianę R1. Nie zakładamy żadnej nowej logiki.
 - A3. ` · ` między krokiem i nazwą (R4) istnieje już w wierszu statusu (`krok 3 · implement`). Nieaktualny jest komentarz modułu w `src/tui/task_app/detail.rs`, który pokazuje `krok 3 implement`. Planowanie ma sprawdzić, czy inne miejsca TUI (zakładki, lista, Info) pokazują numer z nazwą bez separatora, i ujednolicić je.
 - A4. W wierszu zmian używamy znaku `−` (U+2212), jak dziś, a nie myślnika `-` z opisu zadania.
@@ -80,11 +81,11 @@ Id `task-728` ma 8 znaków, więc zgadza się z początkiem identyfikatora tylko
 - A7. Zmiany nie obejmują CLI. Tekst zadania w CLI nie ma wiersza zużycia i zostaje taki sam.
 - A8. Symbol `⎇` i ikony `✨`, `◈`, `⚡` mogą mieć różną szerokość w różnych terminalach. Układ liczy szerokość tak jak dziś (funkcja `cells`) i nie wprowadza własnych tablic szerokości.
 
-### Pytania otwarte dla użytkownika
+### Decyzje użytkownika
 
-- Q1. Wiersz `◈ 2 $123 ↑304 ↓72k` pokazuje koszt subagentów. Harness dziś nie podaje ich kosztu osobno (`PositionUsage` ma tokeny i liczbę). Czy koszt subagentów ma być pokazany tylko wtedy, gdy harness go poda (założenie tego dokumentu), czy mamy go wyliczać z cennika? Wyliczanie wymaga osobnej decyzji o źródle cen.
-- Q2. Czy `✨ $34.15` ma być kosztem agentów razem z subagentami, czy bez nich? Dziś koszt agentów nie rozdziela subagentów, a `razem` to agenci plus dyrygent. Zakładamy, że koszt `✨` obejmuje subagentów, a `◈` pokazuje ich część.
-- Q3. Czy 11 znaków id ma też obowiązywać w liście zadań i w CLI (A1 ogranicza zmianę do ramki)?
+- D1 (Q1). Koszt subagentów jest pokazany tylko wtedy, gdy harness go poda. Nie wyliczamy go z cennika. Bez kosztu blok `◈` ma liczbę i tokeny (AE5).
+- D2 (Q2). `✨` pokazuje agentów razem z subagentami. `◈` pokazuje same subagenty. Blok `◈` stoi w nawiasie po `✨` (R10).
+- D3 (Q3). 11 znaków id obowiązuje w ramce i w liście zadań (R1a). CLI zostaje bez zmian.
 
 ### Sources / Research
 
