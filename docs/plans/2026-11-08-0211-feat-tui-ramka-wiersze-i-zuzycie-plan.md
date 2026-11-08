@@ -51,7 +51,7 @@ Id `task-728` ma 8 znaków, więc zgadza się z początkiem identyfikatora tylko
 
 **Wiersz zużycia**
 
-- R9. Koszt `✨` obejmuje agentów razem z subagentami (D2). Wiersz ma postać `razem $34.15 · ✨ $34.15 ↑304 ↓72k (◈ 2 $123 ↑304 ↓72k) · ⚡ $34.15 ↑304 ↓72k`. Bloki: `razem` (koszt agentów i dyrygenta), `✨` agenci, `◈` subagenci, `⚡` dyrygent.
+- R9. Koszt `✨` obejmuje agentów razem z subagentami (D2). Wiersz ma postać `razem $68.30 · ✨ $34.15 ↑304 ↓72k (◈ 2 $12 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k`. Bloki: `razem` (koszt agentów i dyrygenta), `✨` agenci, `◈` subagenci, `⚡` dyrygent.
 - R10. `◈` stoi w nawiasie po bloku agentów. Pierwsza liczba po `◈` to liczba subagentów. Potem są koszt (gdy znany), `↑` tokeny wejścia i `↓` tokeny wyjścia.
 - R11. Blok bez danych nie jest pokazany. Dotyczy `razem`, `✨`, `◈` i `⚡`. Część bloku bez danych (np. brak kosztu) też nie jest pokazana: nie ma znaku `—`. Dotyczy to tylko wiersza zużycia (`task_usage_text::line`). Komórki kroków w zakładce postępu (`step_cells`) używają tej samej stałej `UNKNOWN` i zostają bez zmian. Wyjątek: `—` w wierszu workspace bez PR (R8) zostaje. Gdy nie ma żadnego bloku, wiersz zużycia nie istnieje.
 - R12. Gdy wiersz zużycia jest za szeroki, najpierw znika blok `◈`, potem tekst jest obcięty z `…`, jak dziś.
