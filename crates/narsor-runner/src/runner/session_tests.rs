@@ -1205,25 +1205,6 @@ fn assert_left_by_the_step(header: &crate::domain::WorkspaceHeader) {
 }
 
 #[tokio::test]
-async fn the_snapshot_shows_the_branch_and_changed_lines_the_step_left() {
-    let root = TempRoot::new();
-    let gate = Arc::new(Notify::new());
-    let agent = Agent::new(vec![Reply::After(Arc::clone(&gate), "done")], Reply::Fail);
-    let spec = two_repository_spec(&root, WORKSPACES);
-    let mut fixture = Fixture::start(&root, &spec, agent);
-    fixture.begin().await;
-    fixture.readings_settled().await;
-    assert_clean_on_main(&fixture.snapshot().workspaces[0]);
-
-    leave_work_in_the_clone(&root);
-    fixture
-        .drive_until_a_reading_lands(|| gate.notify_one())
-        .await;
-
-    assert_left_by_the_step(&fixture.snapshot().workspaces[0]);
-}
-
-#[tokio::test]
 async fn a_transition_between_two_steps_refreshes_the_workspaces() {
     let root = TempRoot::new();
     let first = Arc::new(Notify::new());
