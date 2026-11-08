@@ -15,7 +15,6 @@ const THOUSAND: u64 = 1_000;
 const MILLION: u64 = 1_000_000;
 /// Below this a count still rounds to a thousand, not to a million.
 const MILLION_ROUNDED: u64 = MILLION - THOUSAND / 2;
-const UNKNOWN: &str = "—";
 
 /// The usage of all positions of a task, a part no position reported being
 /// `None`.
@@ -25,6 +24,9 @@ pub struct TaskUsage {
     pub subagents: Option<TokenCounts>,
     pub subagent_count: Option<u32>,
     pub cost_usd: Option<f64>,
+    /// What the subagents cost, when the harness says. It never does today,
+    /// so it stays `None` and the line shows no cost for them.
+    pub subagent_cost_usd: Option<f64>,
     /// What the conductor used when it decided, apart from the above.
     pub conductor_total: Option<TokenCounts>,
     pub conductor_cost_usd: Option<f64>,
@@ -57,6 +59,7 @@ pub fn sum(positions: &[Position]) -> Option<TaskUsage> {
                 u32::saturating_add,
             ),
             cost_usd: add(so_far.cost_usd, usage.cost_usd, |a, b| a + b),
+            subagent_cost_usd: None,
             conductor_total: add(
                 so_far.conductor_total,
                 usage.conductor_total,
@@ -84,40 +87,66 @@ fn add<T: Copy>(a: Option<T>, b: Option<T>, plus: impl Fn(T, T) -> T) -> Option<
     }
 }
 
-/// `razem $1.25 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2) · dyrygent
-/// $0.05 ↑9k ↓1k`: the cost of all, then each group with its cost and its
-/// tokens in (`↑`) and out (`↓`). The subagents stand in the agents' group,
-/// with tokens and count only, when `with_subagents` and they used anything.
-/// The conductor's group is there only when it reported use. A part that is
-/// unknown reads `—`.
-pub fn line(usage: &TaskUsage, with_subagents: bool) -> String {
-    let mut agents = format!("agenci {} {}", money(usage.cost_usd), tokens(usage.total));
-    let subagents = usage
-        .subagents
-        .filter(|counts| counts.input + counts.output > 0);
-    if let (true, Some(counts)) = (with_subagents, subagents) {
-        let count = usage
-            .subagent_count
-            .filter(|count| *count > 0)
-            .map_or_else(String::new, |count| format!(" ×{count}"));
-        agents.push_str(&format!(" (subagenci {}{count})", tokens(Some(counts))));
-    }
-    let mut groups = vec![
-        format!("razem {}", money(usage.combined_cost_usd())),
-        agents,
-    ];
-    if usage.has_conductor() {
-        groups.push(format!(
-            "dyrygent {} {}",
-            money(usage.conductor_cost_usd),
-            tokens(usage.conductor_total)
-        ));
-    }
-    groups.join(" · ")
+/// `razem $68.30 · ✨ $34.15 ↑304 ↓72k (◈ 2 $12 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k`:
+/// the cost of all, then each group with its cost and its tokens in (`↑`) and
+/// out (`↓`): `✨` the agents (their numbers include the subagents'), `◈` the
+/// subagents in brackets after them — their count first — and `⚡` the
+/// conductor. A group or a part nobody reported is left out, so the line has
+/// no placeholder; `None` when there is nothing to say. The subagents are
+/// left out when not `with_subagents`.
+pub fn line(usage: &TaskUsage, with_subagents: bool) -> Option<String> {
+    let subagents = with_subagents.then(|| subagents_block(usage)).flatten();
+    let agents = parts_of(usage.cost_usd, usage.total);
+    let agents_group = match (agents.is_empty(), subagents) {
+        (true, None) => None,
+        (true, Some(subagents)) => Some(format!("({subagents})")),
+        (false, None) => Some(format!("✨ {agents}")),
+        (false, Some(subagents)) => Some(format!("✨ {agents} ({subagents})")),
+    };
+    let conductor = parts_of(usage.conductor_cost_usd, usage.conductor_total);
+    let groups: Vec<String> = [
+        usage
+            .combined_cost_usd()
+            .map(|cost| format!("razem {}", money(cost))),
+        agents_group,
+        (!conductor.is_empty()).then(|| format!("⚡ {conductor}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!groups.is_empty()).then(|| groups.join(" · "))
 }
 
-fn money(cost: Option<f64>) -> String {
-    cost.map_or_else(|| UNKNOWN.to_string(), |cost| format!("${cost:.2}"))
+/// `◈ 2 $12 ↑100 ↓20k`: the subagents' count, cost and tokens, each part
+/// only when known. Subagents that used nothing and cost nothing are not a
+/// block, whatever their count.
+fn subagents_block(usage: &TaskUsage) -> Option<String> {
+    let counts = usage
+        .subagents
+        .filter(|counts| counts.input + counts.output > 0);
+    let used = parts_of(usage.subagent_cost_usd, counts);
+    if used.is_empty() {
+        return None;
+    }
+    let count = usage
+        .subagent_count
+        .filter(|count| *count > 0)
+        .map(|count| format!("{count} "));
+    Some(format!("◈ {}{used}", count.unwrap_or_default()))
+}
+
+/// The cost, then the tokens, those known, separated by a space; empty when
+/// neither is.
+fn parts_of(cost: Option<f64>, counts: Option<TokenCounts>) -> String {
+    [cost.map(money), counts.map(tokens)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn money(cost: f64) -> String {
+    format!("${cost:.2}")
 }
 
 /// What one step used, as the cells of a table row: each one is empty when
@@ -191,11 +220,8 @@ pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
     cells
 }
 
-fn tokens(counts: Option<TokenCounts>) -> String {
-    match counts {
-        Some(counts) => format!("↑{} ↓{}", scaled(counts.input), scaled(counts.output)),
-        None => UNKNOWN.to_string(),
-    }
+fn tokens(counts: TokenCounts) -> String {
+    format!("↑{} ↓{}", scaled(counts.input), scaled(counts.output))
 }
 
 /// `950`, `1.5k`, `120k`, `2.4M`: the count with at most the three digits.
@@ -272,6 +298,87 @@ mod tests {
         }
     }
 
+    /// The line, which has to exist.
+    fn text(usage: &TaskUsage, with_subagents: bool) -> String {
+        line(usage, with_subagents).expect("a line")
+    }
+
+    fn full_usage() -> TaskUsage {
+        TaskUsage {
+            total: Some(counts(304, 72_000)),
+            subagents: Some(counts(100, 20_000)),
+            subagent_count: Some(2),
+            cost_usd: Some(34.15),
+            subagent_cost_usd: Some(12.0),
+            conductor_total: Some(counts(304, 72_000)),
+            conductor_cost_usd: Some(34.15),
+        }
+    }
+
+    #[test]
+    fn the_full_line_has_the_icons_and_the_subagents_in_brackets() {
+        assert_eq!(
+            text(&full_usage(), true),
+            "razem $68.30 · ✨ $34.15 ↑304 ↓72k (◈ 2 $12.00 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k"
+        );
+        assert_eq!(
+            text(&full_usage(), false),
+            "razem $68.30 · ✨ $34.15 ↑304 ↓72k · ⚡ $34.15 ↑304 ↓72k"
+        );
+    }
+
+    /// Covers AE4: what nobody reported has no block.
+    #[test]
+    fn a_line_has_only_the_blocks_with_data() {
+        let usage = TaskUsage {
+            total: Some(counts(304, 72_000)),
+            cost_usd: Some(34.15),
+            ..TaskUsage::default()
+        };
+        assert_eq!(text(&usage, true), "razem $34.15 · ✨ $34.15 ↑304 ↓72k");
+    }
+
+    /// Covers AE5: no cost for the subagents, and no dash in its place.
+    #[test]
+    fn subagents_without_a_cost_show_their_count_and_tokens_only() {
+        let usage = TaskUsage {
+            total: Some(counts(304, 72_000)),
+            subagents: Some(counts(304, 72_000)),
+            subagent_count: Some(2),
+            ..TaskUsage::default()
+        };
+        assert_eq!(text(&usage, true), "✨ ↑304 ↓72k (◈ 2 ↑304 ↓72k)");
+        assert!(!text(&usage, true).contains('—'));
+    }
+
+    #[test]
+    fn subagents_alone_stand_in_brackets_and_a_task_with_nothing_has_no_line() {
+        let only_subagents = TaskUsage {
+            subagents: Some(counts(100, 20_000)),
+            subagent_count: Some(2),
+            ..TaskUsage::default()
+        };
+        assert_eq!(text(&only_subagents, true), "(◈ 2 ↑100 ↓20k)");
+        assert_eq!(line(&only_subagents, false), None);
+        assert_eq!(line(&TaskUsage::default(), true), None);
+        let zero = TaskUsage {
+            subagents: Some(counts(0, 0)),
+            subagent_count: Some(2),
+            ..TaskUsage::default()
+        };
+        assert_eq!(line(&zero, true), None);
+    }
+
+    #[test]
+    fn subagents_without_a_count_show_their_tokens() {
+        let usage = TaskUsage {
+            total: Some(counts(304, 72_000)),
+            subagents: Some(counts(100, 20_000)),
+            ..TaskUsage::default()
+        };
+        assert_eq!(text(&usage, true), "✨ ↑304 ↓72k (◈ ↑100 ↓20k)");
+    }
+
     #[test]
     fn the_steps_of_a_task_are_added_up() {
         let positions = [
@@ -281,10 +388,10 @@ mod tests {
         ];
         let usage = sum(&positions).unwrap();
         assert_eq!(
-            line(&usage, true),
-            "razem $1.20 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2)"
+            text(&usage, true),
+            "razem $1.20 · ✨ $1.20 ↑120k ↓8k (◈ 2 ↑40k ↓3k)"
         );
-        assert_eq!(line(&usage, false), "razem $1.20 · agenci $1.20 ↑120k ↓8k");
+        assert_eq!(text(&usage, false), "razem $1.20 · ✨ $1.20 ↑120k ↓8k");
     }
 
     #[test]
@@ -295,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn a_part_nobody_reported_reads_a_dash() {
+    fn a_part_nobody_reported_is_left_out() {
         let only_cost = PositionUsage {
             cost_usd: Some(0.5),
             ..PositionUsage::default()
@@ -305,12 +412,12 @@ mod tests {
             ..PositionUsage::default()
         };
         assert_eq!(
-            line(&sum(&[position(Some(only_cost))]).unwrap(), true),
-            "razem $0.50 · agenci $0.50 —"
+            text(&sum(&[position(Some(only_cost))]).unwrap(), true),
+            "razem $0.50 · ✨ $0.50"
         );
         assert_eq!(
-            line(&sum(&[position(Some(only_tokens))]).unwrap(), true),
-            "razem — · agenci — ↑1.5k ↓20"
+            text(&sum(&[position(Some(only_tokens))]).unwrap(), true),
+            "✨ ↑1.5k ↓20"
         );
     }
 
@@ -320,7 +427,7 @@ mod tests {
         let zero = used((1_000, 100), Some((0, 0)), 0.1);
         for usage in [none, zero] {
             let usage = sum(&[position(Some(usage))]).unwrap();
-            assert_eq!(line(&usage, true), "razem $0.10 · agenci $0.10 ↑1k ↓100");
+            assert_eq!(text(&usage, true), "razem $0.10 · ✨ $0.10 ↑1k ↓100");
         }
     }
 
@@ -346,7 +453,7 @@ mod tests {
     fn the_cost_is_rounded_to_cents() {
         let at = |cost| {
             let usage = sum(&[position(Some(used((1, 1), None, cost)))]).unwrap();
-            line(&usage, false)
+            text(&usage, false)
         };
         assert!(at(0.004).starts_with("razem $0.00 "));
         assert!(at(1.236).starts_with("razem $1.24 "));
@@ -364,7 +471,7 @@ mod tests {
             ..PositionUsage::default()
         };
         let usage = sum(&[position(Some(cached))]).unwrap();
-        assert_eq!(line(&usage, true), "razem — · agenci — ↑2k ↓100");
+        assert_eq!(text(&usage, true), "✨ ↑2k ↓100");
     }
 
     #[test]
@@ -518,14 +625,14 @@ mod tests {
             total: Some(counts(1_000, 100)),
             ..TaskUsage::default()
         };
-        let without = line(&usage, true);
-        assert!(!without.contains("dyrygent"));
+        let without = text(&usage, true);
+        assert!(!without.contains('⚡'));
 
         usage.conductor_cost_usd = Some(0.25);
         usage.conductor_total = Some(counts(9_000, 1_000));
         assert_eq!(
-            line(&usage, true),
-            "razem $1.25 · agenci $1.00 ↑1k ↓100 · dyrygent $0.25 ↑9k ↓1k"
+            text(&usage, true),
+            "razem $1.25 · ✨ $1.00 ↑1k ↓100 · ⚡ $0.25 ↑9k ↓1k"
         );
     }
 

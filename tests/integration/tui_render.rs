@@ -1808,7 +1808,7 @@ mod task_app_render {
     }
 
     #[test]
-    fn a_missing_ticket_uses_an_eight_character_id_prefix_without_colour() {
+    fn a_missing_ticket_uses_an_eleven_character_id_prefix_without_colour() {
         let subject = titled(
             crate::task_app_support::task("task-abcdef1234", "local", "running", 1),
             "No ticket",
@@ -1818,7 +1818,7 @@ mod task_app_render {
         let buffer = render(120, 30, &mut app, &Styles::new(true));
         let row = list_row(&buffer, "No ticket");
         assert!(
-            content_text(&buffer, row).starts_with("  ●  id:task-abc"),
+            content_text(&buffer, row).starts_with("  ●  id:task-abcdef"),
             "{}",
             screen(&buffer)
         );
@@ -2116,13 +2116,13 @@ mod task_app_detail_render {
             "the title is on the edge only"
         );
         let code = &rows[WORKSPACE_ROW];
-        assert!(code.contains("│  code  orders-api"), "{code}");
+        assert!(code.contains("│  code: orders-api"), "{code}");
         assert!(code.contains("orders-api"), "{code}");
-        assert!(code.contains("feat/nar-12-orders → main"), "{code}");
-        assert!(code.contains("PR #42 ↗"), "{code}");
+        assert!(code.contains("⎇ feat/nar-12-orders → main"), "{code}");
+        assert!(code.contains("#42 ↗") && !code.contains("PR"), "{code}");
         let docs = &rows[WORKSPACE_ROW + 1];
         assert!(
-            docs.contains("docs") && docs.contains("orders-docs"),
+            docs.contains("docs:") && docs.contains("orders-docs"),
             "{docs}"
         );
         assert!(
@@ -2250,24 +2250,24 @@ mod task_app_detail_render {
     fn a_narrower_terminal_cuts_the_workspace_row_in_a_fixed_order() {
         let mut app = app_with_workspaces(vec![changed_workspace()]);
         let full = code_row(&mut app, 120);
-        assert!(full.contains("feat/nar-12-refactor → main"), "{full}");
+        assert!(full.contains("⎇ feat/nar-12-refactor → main"), "{full}");
         assert!(full.contains("+120 −34"), "{full}");
 
-        let no_base = code_row(&mut app, 85);
+        let no_base = code_row(&mut app, 78);
         assert!(
             !no_base.contains("→"),
             "the base branch goes first: {no_base}"
         );
         assert!(no_base.contains("feat/nar-12-refactor") && no_base.contains("+120 −34"));
 
-        let no_changes = code_row(&mut app, 75);
+        let no_changes = code_row(&mut app, 70);
         assert!(
             !no_changes.contains("+120"),
             "then the changes: {no_changes}"
         );
         assert!(no_changes.contains("feat/nar-12-refactor"), "{no_changes}");
 
-        let cut_branch = code_row(&mut app, 65);
+        let cut_branch = code_row(&mut app, 62);
         assert!(!cut_branch.contains("feat/nar-12-refactor"), "{cut_branch}");
         assert!(
             cut_branch.contains("feat/nar-12-ref…"),
@@ -2291,7 +2291,7 @@ mod task_app_detail_render {
             "then the repository: {cut_repo}"
         );
         for row in [&cut_branch, &cut_repo] {
-            assert!(row.contains("code") && row.contains("PR #42 ↗"), "{row}");
+            assert!(row.contains("code:") && row.contains("#42 ↗"), "{row}");
         }
     }
 
@@ -2315,6 +2315,119 @@ mod task_app_detail_render {
         assert!(rows[WORKSPACE_ROW + names.len() + 1].contains("Przebieg"));
     }
 
+    /// The cell where `needle` starts on the workspace row of `buffer`.
+    fn workspace_cell(buffer: &Buffer, needle: &str) -> ratatui::buffer::Cell {
+        let rows = rows(buffer);
+        let (y, row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.contains("code:"))
+            .unwrap_or_else(|| panic!("no workspace row in {rows:#?}"));
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} in {row}"));
+        let x = u16::try_from(row[..byte].chars().count()).unwrap();
+        buffer[(x, u16::try_from(y).unwrap())].clone()
+    }
+
+    fn ae3_workspace() -> narsor_protocol::display::WorkspaceHeader {
+        let mut code = with_pr(
+            header_workspace("code", "orders-api", "feat/x"),
+            "https://gitlab.example/g/api/-/merge_requests/42",
+        );
+        code.added = Some(123);
+        code.removed = Some(45);
+        code
+    }
+
+    /// Covers AE3: the row, the colours of the changes and the link.
+    #[test]
+    fn the_workspace_row_has_coloured_changes_and_a_pull_request_link() {
+        let mut app = app_with_workspaces(vec![ae3_workspace()]);
+        let buffer = render_at(&mut app, &Styles::new(false), 120, 30);
+        let row = rows(&buffer)
+            .into_iter()
+            .find(|row| row.contains("code:"))
+            .unwrap();
+        assert!(
+            row.contains("code: orders-api ⎇ feat/x → main +123 −45 #42 ↗"),
+            "{row}"
+        );
+        assert_eq!(workspace_cell(&buffer, "+123").fg, Color::Green);
+        assert_eq!(workspace_cell(&buffer, "−45").fg, Color::Red);
+
+        app.detail_mut().set_hyperlinks(true);
+        let linked = screen(&render_at(&mut app, &Styles::new(false), 120, 30));
+        assert!(
+            linked.contains(
+                "\u{1b}]8;;https://gitlab.example/g/api/-/merge_requests/42\u{1b}\\#42 ↗\u{1b}]8;;\u{1b}\\"
+            ),
+            "{linked:?}"
+        );
+    }
+
+    #[test]
+    fn without_colour_the_changes_keep_their_signs_and_no_style() {
+        let mut app = app_with_workspaces(vec![ae3_workspace()]);
+        let buffer = render_at(&mut app, &Styles::new(true), 120, 30);
+        for needle in ["+123", "−45"] {
+            let cell = workspace_cell(&buffer, needle);
+            assert_eq!(cell.fg, Color::Reset, "{needle}");
+            assert!(!cell.modifier.contains(Modifier::BOLD), "{needle}");
+        }
+    }
+
+    #[test]
+    fn stale_data_greys_the_changes() {
+        let mut app = app_with_workspaces(vec![ae3_workspace()]);
+        app.on_stream(Some(Err(narsor::api::ClientError::Unavailable(
+            "reset".into(),
+        ))));
+        let buffer = render_at(&mut app, &Styles::new(false), 120, 30);
+        assert_eq!(workspace_cell(&buffer, "+123").fg, Color::DarkGray);
+        assert_eq!(workspace_cell(&buffer, "−45").fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn a_link_without_a_number_shows_pr_and_the_arrow() {
+        let mut code = header_workspace("code", "orders-api", "feat/x");
+        code.pr_url = Some("https://example.com/review".into());
+        let mut app = app_with_workspaces(vec![code]);
+        let row = code_row(&mut app, 120);
+        assert!(row.contains("PR ↗") && !row.contains('#'), "{row}");
+    }
+
+    #[test]
+    fn only_one_known_change_count_shows_the_other_as_zero() {
+        let mut code = ae3_workspace();
+        code.removed = None;
+        let mut app = app_with_workspaces(vec![code]);
+        let row = code_row(&mut app, 120);
+        assert!(row.contains("+123 −0"), "{row}");
+    }
+
+    #[test]
+    fn the_columns_of_two_workspaces_line_up() {
+        let mut long = ae3_workspace();
+        long.name = "documentation".into();
+        let mut app = app_with_workspaces(vec![ae3_workspace(), long]);
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 140, 30));
+        let columns: Vec<usize> = ["⎇", "+123"]
+            .iter()
+            .map(|needle| {
+                let found: Vec<usize> = rows
+                    .iter()
+                    .filter(|row| row.contains("⎇"))
+                    .map(|row| row[..row.find(needle).unwrap()].chars().count())
+                    .collect();
+                assert_eq!(found.len(), 2, "{rows:#?}");
+                assert_eq!(found[0], found[1], "{needle} in {rows:#?}");
+                found[0]
+            })
+            .collect();
+        assert!(columns[0] < columns[1]);
+    }
+
     #[test]
     fn a_workspace_row_never_shows_an_address_that_is_not_http() {
         let mut hostile = header_workspace("code", "orders-api", "feat/x");
@@ -2322,7 +2435,7 @@ mod task_app_detail_render {
         hostile.pr_url = Some("javascript:alert(1)".into());
         let mut app = app_with_workspaces(vec![hostile]);
         let row = code_row(&mut app, 120);
-        assert!(row.contains("PR #42") && !row.contains('↗'), "{row}");
+        assert!(row.contains("#42") && !row.contains('↗'), "{row}");
         assert!(!row.contains("javascript"), "{row}");
     }
 
@@ -2426,13 +2539,12 @@ mod task_app_detail_render {
         ]);
         let rows = rows(&render(&mut app, &Styles::new(false)));
         assert!(
-            rows[WORKSPACE_ROW].contains("PR #42 ↗"),
+            rows[WORKSPACE_ROW].contains("#42 ↗"),
             "{}",
             rows[WORKSPACE_ROW]
         );
         assert!(
-            rows[USAGE_ROW]
-                .contains("razem $1.20 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2)"),
+            rows[USAGE_ROW].contains("razem $1.20 · ✨ $1.20 ↑120k ↓8k (◈ 2 ↑40k ↓3k)"),
             "{}",
             rows[USAGE_ROW]
         );
@@ -2454,14 +2566,46 @@ mod task_app_detail_render {
     fn a_narrow_header_drops_the_subagents_part_first() {
         let mut app = running_app_with_usage(vec![reported(120_000, 8_000, (40_000, 3_000), 1.2)]);
         let wide = rows(&render_at(&mut app, &Styles::new(false), 120, 30));
-        assert!(wide[USAGE_ROW].contains("(subagenci ↑40k ↓3k ×1)"));
+        assert!(wide[USAGE_ROW].contains("(◈ 1 ↑40k ↓3k)"));
+
+        // 60 columns leave 56 cells for the line: this one needs 57 with the
+        // subagents and 41 without them.
+        let mut app = running_app_with_usage(vec![reported(
+            120_000_000,
+            80_000_000,
+            (40_000_000, 30_000_000),
+            123_456.5,
+        )]);
+        let wide = rows(&render_at(&mut app, &Styles::new(false), 120, 30));
+        assert!(
+            wide[USAGE_ROW].contains("(◈ 1 ↑40M ↓30M)"),
+            "{}",
+            wide[USAGE_ROW]
+        );
         let narrow = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
         let row = &narrow[USAGE_ROW];
         assert!(
-            row.contains("razem $1.20 · agenci $1.20 ↑120k ↓8k"),
+            row.contains("razem $123456.50 · ✨ $123456.50 ↑120M ↓80M"),
             "{row}"
         );
-        assert!(!row.contains("subagenci"), "{row}");
+        assert!(!row.contains('◈'), "{row}");
+    }
+
+    #[test]
+    fn a_usage_line_too_wide_even_without_the_subagents_is_cut_with_an_ellipsis() {
+        let mut app = running_app_with_usage(vec![reported(
+            120_000_000,
+            80_000_000,
+            (40_000_000, 30_000_000),
+            1.0e15,
+        )]);
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
+        let row = &rows[USAGE_ROW];
+        assert!(row.contains("razem $1000000000000000.00"), "{row}");
+        assert!(
+            row.contains('…') && !row.contains('◈') && !row.contains('—'),
+            "{row}"
+        );
     }
 
     #[test]
@@ -2476,7 +2620,7 @@ mod task_app_detail_render {
         );
         let rows = rows(&render(&mut app, &Styles::new(false)));
         assert!(
-            rows[USAGE_ROW].contains("razem $0.10 · agenci $0.10 ↑1k ↓100"),
+            rows[USAGE_ROW].contains("razem $0.10 · ✨ $0.10 ↑1k ↓100"),
             "{}",
             rows[USAGE_ROW]
         );
@@ -2506,10 +2650,10 @@ mod task_app_detail_render {
 
         let buffer = render_at(&mut app, &Styles::new(false), 60, 20);
         let screen = screen(&buffer);
-        assert!(screen.contains(&"A".repeat(8)), "{screen}");
+        assert!(screen.contains(&"A".repeat(11)), "{screen}");
         assert!(
-            !screen.contains(&"A".repeat(9)),
-            "the frame's edge shows the first eight characters of the id: {screen}"
+            !screen.contains(&"A".repeat(12)),
+            "the frame's edge shows the first eleven characters of the id: {screen}"
         );
         assert!(
             rows(&buffer)[TITLE_ROW - 1..]
@@ -2874,7 +3018,7 @@ mod task_app_detail_render {
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
         assert!(
-            screen.contains("\u{1b}]8;;https://gitlab.example/g/api/-/merge_requests/42\u{1b}\\PR #42 ↗\u{1b}]8;;\u{1b}\\"),
+            screen.contains("\u{1b}]8;;https://gitlab.example/g/api/-/merge_requests/42\u{1b}\\#42 ↗\u{1b}]8;;\u{1b}\\"),
             "{:?}",
             rows(&buffer)[WORKSPACE_ROW]
         );
@@ -2884,7 +3028,7 @@ mod task_app_detail_render {
             "only the link with a target"
         );
         let row = &rows(&plain_buffer)[WORKSPACE_ROW];
-        let byte = row.find("PR #42 ↗").unwrap();
+        let byte = row.find("#42 ↗").unwrap();
         let column = u16::try_from(row[..byte].chars().count()).unwrap();
         let y = WORKSPACE_ROW as u16;
         let link_cell = (0..buffer.area.width)
@@ -2894,7 +3038,7 @@ mod task_app_detail_render {
             Some(column),
             "link hit region begins under its label"
         );
-        assert!(buffer[(column, y)].symbol().contains("PR #42 ↗"));
+        assert!(buffer[(column, y)].symbol().contains("#42 ↗"));
     }
 
     #[test]
@@ -4171,8 +4315,8 @@ mod task_app_detail_render {
             row.contains("NAR-12") && row.contains("Zmiana API zamówień"),
             "{row}"
         );
-        assert!(row.contains("6a7ceacf"), "{row}");
-        assert!(!row.contains("6a7ceacfd"), "only 8 characters: {row}");
+        assert!(row.contains("6a7ceacfdc6"), "{row}");
+        assert!(!row.contains("6a7ceacfdc60"), "only 11 characters: {row}");
         assert!(row.find("NAR-12").unwrap() < row.find("Zmiana").unwrap());
         assert!(row.find("Zmiana").unwrap() < row.find("6a7ceacf").unwrap());
         assert!(row.contains('╭') && row.contains('╮'), "{row}");
@@ -4309,7 +4453,7 @@ mod task_app_detail_render {
             let edge = edge_of(Some("NAR-12345-LONG"), Some(title), width);
             assert_eq!(
                 edge.right.as_deref(),
-                Some("6a7ceacf"),
+                Some("6a7ceacfdc6"),
                 "id whole at {width}"
             );
             assert!(
@@ -4336,6 +4480,59 @@ mod task_app_detail_render {
 
         let roomy = edge_of(Some("NAR-12"), Some("Zmiana"), 200);
         assert_eq!(roomy.left, vec!["NAR-12".to_string(), "Zmiana".to_string()]);
+    }
+
+    /// The edge of a task whose id is `id`, titled `title`, `width` wide.
+    fn edge_of_id(id: &str, title: &str, width: u16) -> narsor::tui::style::PanelEdge {
+        let mut summary = task("a", "local", "running", 1);
+        summary.task_id = narsor_engine::domain::TaskId::parse(id).unwrap();
+        summary.title = Some(title.to_string());
+        narsor::tui::task_app::detail::edge_layout(&summary, width, 4, false, None)
+    }
+
+    #[test]
+    fn a_task_id_shorter_than_eleven_characters_is_shown_whole_and_an_eleven_character_one_is_unchanged(
+    ) {
+        let short = edge_of_id("task-12", "Zmiana", 80);
+        assert_eq!(short.right.as_deref(), Some("task-12"));
+        let exact = edge_of_id("task-123456", "Zmiana", 80);
+        assert_eq!(exact.right.as_deref(), Some("task-123456"));
+        let long = edge_of_id("task-1234567890abcdef", "Zmiana", 80);
+        assert_eq!(long.right.as_deref(), Some("task-123456"));
+    }
+
+    /// The longer id takes three cells from the title: a title that fits the
+    /// old eight-character edge is cut by the eleven-character one.
+    #[test]
+    fn the_longer_id_leaves_the_title_three_cells_less() {
+        let title = "Przebudowa obsługi zamówień hurtowych";
+        let full = title.chars().count();
+        // Corners 2, id pill 11 + 4, pills of the title 4, one cell of line.
+        let width = u16::try_from(2 + 11 + 4 + 4 + 1 + full).unwrap();
+        let fits = edge_of_id("task-1234567890abcdef", title, width);
+        assert_eq!(
+            fits.left.last().map(String::as_str),
+            Some(title),
+            "{fits:?}"
+        );
+        let cut = edge_of_id("task-1234567890abcdef", title, width - 1);
+        assert_ne!(cut.left.last().map(String::as_str), Some(title), "{cut:?}");
+    }
+
+    #[test]
+    fn the_title_row_appears_only_when_the_edge_cuts_the_title() {
+        let title = "Przebudowa obsługi zamówień hurtowych";
+        let mut summary = task("a", "local", "running", 1);
+        summary.task_id = narsor_engine::domain::TaskId::parse("task-1234567890abcdef").unwrap();
+        summary.title = Some(title.to_string());
+        let wide = narsor::tui::task_app::detail::edge_layout(&summary, 120, 4, false, None);
+        assert!(!narsor::tui::task_app::detail::title_is_cut(
+            &summary, &wide
+        ));
+        let narrow = narsor::tui::task_app::detail::edge_layout(&summary, 40, 4, false, None);
+        assert!(narsor::tui::task_app::detail::title_is_cut(
+            &summary, &narrow
+        ));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! columns aligned between the rows and cut to the width of the terminal.
 //!
 //! ```text
-//! code  orders-api   feat/nar-12-orders → main  +120 −34  PR #42 ↗
-//! docs  orders-docs  main                                 —
+//! code: orders-api  ⎇ feat/nar-12-orders → main +120 −34 #42 ↗
+//! docs: orders-docs ⎇ main                             —
 //! ```
 //!
 //! A narrow terminal takes from the right of the rows what matters least: the
@@ -14,7 +14,9 @@ use narsor_protocol::display::WorkspaceHeader;
 
 use super::detail::{cells, fit_cells};
 
-const GAP: &str = "  ";
+const GAP: &str = " ";
+/// Stands before the branch name.
+const BRANCH_MARK: &str = "⎇ ";
 const NO_PR: &str = "—";
 /// The smallest a cut branch or repository gets: one character and `…`.
 const MIN_CUT_CELLS: usize = 2;
@@ -26,7 +28,10 @@ pub(super) enum Part {
     Gap,
     Repo,
     Branch,
-    Changes,
+    /// `+N`.
+    Added,
+    /// `−M`.
+    Removed,
     /// A pull request with an address to follow.
     PrLink,
     PrText,
@@ -39,6 +44,8 @@ pub(super) struct Piece {
     pub part: Part,
     /// Where a [`Part::PrLink`] points.
     pub url: Option<String>,
+    /// Stands against the piece before it, without the gap between columns.
+    pub joined: bool,
 }
 
 /// The rows of `workspaces`, each one a list of pieces ending where the text
@@ -54,7 +61,8 @@ struct Entry {
     repo: String,
     branch: Option<String>,
     base_branch: Option<String>,
-    changes: String,
+    /// `(+N, −M)`, when the workspace reports either.
+    changes: Option<(String, String)>,
     pr: Option<Piece>,
 }
 
@@ -69,35 +77,48 @@ impl Entry {
         let label = workspace.pr_label();
         let branch_known = branch.is_some() || base_branch.is_some();
         let pr = match (&label.number, &label.url) {
-            (_, Some(url)) => Some(Piece {
-                text: format!("{} ↗", label.text()),
+            (number, Some(url)) => Some(Piece {
+                text: format!("{} ↗", number.as_deref().unwrap_or("PR")),
                 part: Part::PrLink,
                 url: Some(url.clone()),
+                joined: false,
             }),
-            (Some(_), None) => Some(Piece {
-                text: label.text(),
+            (Some(number), None) => Some(Piece {
+                text: number.clone(),
                 part: Part::PrText,
                 url: None,
+                joined: false,
             }),
             (None, None) if branch_known => Some(Piece {
                 text: NO_PR.to_string(),
                 part: Part::NoPr,
                 url: None,
+                joined: false,
             }),
             (None, None) => None,
         };
         let changes = match (workspace.added, workspace.removed) {
-            (None, None) => String::new(),
-            (added, removed) => format!("+{} −{}", added.unwrap_or(0), removed.unwrap_or(0)),
+            (None, None) => None,
+            (added, removed) => Some((
+                format!("+{}", added.unwrap_or(0)),
+                format!("−{}", removed.unwrap_or(0)),
+            )),
         };
         Self {
-            name: super::super::scroll::one_line(&workspace.name),
+            name: format!("{}:", super::super::scroll::one_line(&workspace.name)),
             repo: super::super::scroll::one_line(&workspace.repo),
             branch,
             base_branch,
             changes,
             pr,
         }
+    }
+
+    /// The changes as they are shown: `+N −M`.
+    fn changes_text(&self) -> String {
+        self.changes
+            .as_ref()
+            .map_or_else(String::new, |(added, removed)| format!("{added} {removed}"))
     }
 
     /// `branch → base`, or the one name when the work is not on a branch of
@@ -138,7 +159,7 @@ impl Columns {
             repo: widest(&|entry| entry.repo.clone()),
             branches: widest(&|entry| entry.branches(true)),
             with_base: true,
-            changes: widest(&|entry| entry.changes.clone()),
+            changes: widest(&|entry| entry.changes_text()),
             pr: widest(&|entry| {
                 entry
                     .pr
@@ -161,7 +182,18 @@ impl Columns {
     }
 
     fn overflow(&self, width: usize) -> usize {
-        let columns = [self.name, self.repo, self.branches, self.changes, self.pr];
+        let mark = if self.branches > 0 {
+            cells(BRANCH_MARK)
+        } else {
+            0
+        };
+        let columns = [
+            self.name,
+            self.repo,
+            self.branches + mark,
+            self.changes,
+            self.pr,
+        ];
         let shown = columns.iter().filter(|column| **column > 0).count();
         let total = columns.iter().sum::<usize>() + cells(GAP) * shown.saturating_sub(1);
         total.saturating_sub(width)
@@ -171,25 +203,71 @@ impl Columns {
         let mut pieces = vec![
             self.piece(&entry.name, self.name, Part::Name),
             self.piece(&entry.repo, self.repo, Part::Repo),
-            self.piece(&entry.branches(self.with_base), self.branches, Part::Branch),
-            self.piece(&entry.changes, self.changes, Part::Changes),
+            self.branch_piece(entry),
         ];
+        pieces.extend(self.change_pieces(entry));
         pieces.push(match &entry.pr {
             Some(pr) => pr.clone(),
             None => self.piece("", self.pr, Part::PrText),
         });
         let mut row = Vec::new();
         for piece in pieces.into_iter().filter(|piece| !piece.text.is_empty()) {
-            if !row.is_empty() {
+            if !row.is_empty() && !piece.joined {
                 row.push(Piece {
                     text: GAP.to_string(),
                     part: Part::Gap,
                     url: None,
+                    joined: false,
                 });
             }
             row.push(piece);
         }
         row
+    }
+
+    /// The branch column: the mark and the name, or as many blanks.
+    fn branch_piece(&self, entry: &Entry) -> Piece {
+        if self.branches == 0 {
+            return self.piece("", 0, Part::Branch);
+        }
+        let text = entry.branches(self.with_base);
+        let mark = if text.is_empty() {
+            " ".repeat(cells(BRANCH_MARK))
+        } else {
+            BRANCH_MARK.to_string()
+        };
+        let mut piece = self.piece(&text, self.branches, Part::Branch);
+        piece.text = format!("{mark}{}", piece.text);
+        piece
+    }
+
+    /// `+N`, a space and `−M`, the pair padded to the width of the column;
+    /// nothing when the column was dropped.
+    fn change_pieces(&self, entry: &Entry) -> Vec<Piece> {
+        if self.changes == 0 {
+            return Vec::new();
+        }
+        let Some((added, removed)) = &entry.changes else {
+            return vec![self.piece("", self.changes, Part::Added)];
+        };
+        let padding = " ".repeat(self.changes.saturating_sub(cells(&entry.changes_text())));
+        let plain = |text: String, part| Piece {
+            text,
+            part,
+            url: None,
+            joined: false,
+        };
+        vec![
+            plain(added.clone(), Part::Added),
+            Piece {
+                joined: true,
+                ..plain(" ".to_string(), Part::Gap)
+            },
+            Piece {
+                joined: true,
+                ..plain(format!("{removed}{padding}"), Part::Removed)
+            },
+        ]
     }
 
     fn piece(&self, text: &str, width: usize, part: Part) -> Piece {
@@ -199,6 +277,7 @@ impl Columns {
             text: format!("{cut}{padding}"),
             part,
             url: None,
+            joined: false,
         }
     }
 }

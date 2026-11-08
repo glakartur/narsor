@@ -76,11 +76,17 @@ pub enum Role {
     /// The conductor: `◆` recommendations, proposed values, its entries.
     Conductor,
     Link,
+    /// Lines a workspace added: `+N`. Green; the sign carries the meaning
+    /// when there is no colour.
+    Added,
+    /// Lines a workspace removed: `−M`. Red; the sign carries the meaning
+    /// when there is no colour.
+    Removed,
 }
 
 impl Role {
     /// Every role, for tests that walk them.
-    pub const ALL: [Role; 8] = [
+    pub const ALL: [Role; 10] = [
         Role::Attention,
         Role::Problem,
         Role::Live,
@@ -89,6 +95,8 @@ impl Role {
         Role::Focus,
         Role::Conductor,
         Role::Link,
+        Role::Added,
+        Role::Removed,
     ];
 }
 
@@ -154,7 +162,9 @@ impl Styles {
         if self.no_color {
             return match role {
                 Role::Attention | Role::Problem | Role::Focus => bold,
-                Role::Live | Role::Calm | Role::Conductor => Style::default(),
+                Role::Live | Role::Calm | Role::Conductor | Role::Added | Role::Removed => {
+                    Style::default()
+                }
                 Role::Done => Style::default().add_modifier(Modifier::DIM),
                 Role::Link => Style::default().add_modifier(Modifier::UNDERLINED),
             };
@@ -162,7 +172,8 @@ impl Styles {
         match role {
             Role::Attention => bold.fg(Color::Yellow),
             Role::Problem => Style::default().fg(Color::Red),
-            Role::Live => Style::default().fg(Color::Green),
+            Role::Live | Role::Added => Style::default().fg(Color::Green),
+            Role::Removed => Style::default().fg(Color::Red),
             Role::Calm => Style::default(),
             Role::Done => Style::default().fg(Color::DarkGray),
             Role::Focus => Style::default().fg(Color::Cyan),
