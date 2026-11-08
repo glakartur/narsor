@@ -3,7 +3,9 @@
 //! The scope is deliberately minimal (D6): the only things recognised inside
 //! `{{ }}` are a workflow input (`inputs.NAME`), a context variable
 //! (`context.variables.NAME`, or the shorthand `context.NAME` used by
-//! `docs/dev/workflow-schema.md` §3.3.D), a named artifact (`artifacts.NAME`, the path
+//! `docs/dev/workflow-schema.md` §3.3.D) and a field of its value when that is
+//! an object (`context.variables.NAME.field`), a value of a workspace
+//! (`context.workspace.NAME.field`, [`WorkspaceField`]), a named artifact (`artifacts.NAME`, the path
 //! it was last written to, KTD7), selected step fields (`reply`,
 //! `stdout`, `stderr`), the current step's own memory (`local.NAME`, R13)
 //! and the history of its earlier attempts (`step.history`, R18). There are
@@ -26,14 +28,14 @@
 //! `{{ context.variables.x }}` picks up the value current at that moment and
 //! the workflow definition itself stays immutable (D31).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
 use crate::domain::{
     ActionConfig, AgentActionConfig, ArtifactReference, Context, DecisionActionConfig,
     HumanActionConfig, PromptPart, PromptText, ScriptActionConfig, VariableDefinition,
-    WaitActionConfig, WorkflowDefinition, LOCAL_VARIABLE_PREFIX,
+    WaitActionConfig, WorkflowDefinition, WorkspaceField, WorkspacePr, LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -106,6 +108,19 @@ pub enum TemplateError {
     },
 }
 
+/// The workspace values the runner owns: the repository, the branches and the
+/// size of the change. The engine only reads them, when a template is
+/// rendered; it never stores them.
+///
+/// A value is the last one the runner read, which can be older than the step
+/// that just ended.
+pub trait WorkspaceValues: std::fmt::Debug + Send + Sync {
+    /// The value of `field` of the workspace `workspace`, `None` when it has
+    /// none. The scope has checked the workspace name, and answers `pr` and
+    /// `pr_url` itself.
+    fn value(&self, workspace: &str, field: WorkspaceField) -> Option<Value>;
+}
+
 /// The values a template is rendered against: workflow inputs plus the
 /// variables of the live execution context.
 ///
@@ -118,6 +133,8 @@ pub struct TemplateScope<'a> {
     variables: &'a HashMap<String, Value>,
     artifacts: Option<&'a HashMap<String, ArtifactReference>>,
     declared: Option<&'a DeclaredNames>,
+    workspace_prs: Option<&'a BTreeMap<String, WorkspacePr>>,
+    workspace_values: Option<&'a dyn WorkspaceValues>,
     step_replies: Option<&'a HashMap<String, Value>>,
     step_streams: Option<&'a HashMap<String, Value>>,
     step_labels: Option<&'a HashMap<String, Value>>,
@@ -172,17 +189,25 @@ impl StepMemory<'_> {
 ///
 /// A context variable is declared by a step that defines it, or by a gate
 /// that asks for a field of that name; an artifact by a step that defines
-/// it. A step's own `local.*` variables are not context variables.
+/// it; a workspace by the workflow's repositories. A step's own `local.*`
+/// variables are not context variables.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeclaredNames {
     variables: HashSet<String>,
     artifacts: HashSet<String>,
+    workspaces: HashSet<String>,
 }
 
 impl DeclaredNames {
     /// The names `definition` declares.
     pub fn of(definition: &WorkflowDefinition) -> Self {
         let mut declared = Self::default();
+        declared.workspaces.extend(
+            definition
+                .repositories
+                .iter()
+                .map(|repository| repository.name.clone()),
+        );
         for state in definition.states.values() {
             let step_variables = state
                 .variables
@@ -207,6 +232,11 @@ impl DeclaredNames {
         self.variables.contains(name)
     }
 
+    /// Whether the workflow declares the workspace `name`.
+    pub fn declares_workspace(&self, name: &str) -> bool {
+        self.workspaces.contains(name)
+    }
+
     /// Whether some step defines the artifact `name`.
     pub fn declares_artifact(&self, name: &str) -> bool {
         self.artifacts.contains(name)
@@ -221,6 +251,8 @@ impl<'a> TemplateScope<'a> {
             variables: &context.variables,
             artifacts: Some(&context.artifacts),
             declared: None,
+            workspace_prs: Some(&context.workspace_prs),
+            workspace_values: None,
             step_replies: None,
             step_streams: None,
             step_labels: None,
@@ -241,6 +273,8 @@ impl<'a> TemplateScope<'a> {
             variables,
             artifacts: None,
             declared: None,
+            workspace_prs: None,
+            workspace_values: None,
             step_replies: None,
             step_streams: None,
             step_labels: None,
@@ -254,6 +288,14 @@ impl<'a> TemplateScope<'a> {
     /// artifact without a value renders as empty text (KTD6).
     pub fn with_declared(mut self, declared: &'a DeclaredNames) -> Self {
         self.declared = Some(declared);
+        self
+    }
+
+    /// Adds the workspace values the runner owns: `{{ context.workspace.NAME.FIELD }}`
+    /// for every field but `pr` and `pr_url`. A scope without them reads
+    /// those fields as empty text.
+    pub fn with_workspace_values(mut self, values: &'a dyn WorkspaceValues) -> Self {
+        self.workspace_values = Some(values);
         self
     }
 
@@ -554,17 +596,35 @@ impl<'a> TemplateScope<'a> {
                 self.inputs.get(name).cloned().ok_or_else(unknown)
             }
 
-            "context" => {
-                // Both `context.variables.NAME` and the `context.NAME`
-                // shorthand from §3.3.D address the same map.
-                let name = path.strip_prefix("variables.").unwrap_or(path);
-                let name = plain_name(name).ok_or_else(unsupported)?;
-                match self.variables.get(name) {
-                    Some(value) => Ok(value.clone()),
-                    None if self.declares_variable(name) => Ok(Value::String(String::new())),
-                    None => Err(unknown()),
+            "context" => match parse_context_path(path).ok_or_else(unsupported)? {
+                ContextPath::Variable { name, fields } => {
+                    let Some(base) = self.variables.get(name) else {
+                        return if self.declares_variable(name) && fields.is_empty() {
+                            Ok(Value::String(String::new()))
+                        } else {
+                            Err(unknown())
+                        };
+                    };
+                    fields
+                        .iter()
+                        .try_fold(base, |value, field| {
+                            value
+                                .as_object()
+                                .and_then(|entries| entries.get(*field))
+                                .ok_or_else(unknown)
+                        })
+                        .cloned()
                 }
-            }
+                ContextPath::Workspace { name, field } => {
+                    let field = WorkspaceField::from_key(field).ok_or_else(unknown)?;
+                    if !self.declares_workspace(name) {
+                        return Err(unknown());
+                    }
+                    Ok(self
+                        .workspace_value(name, field)
+                        .unwrap_or_else(|| Value::String(String::new())))
+                }
+            },
 
             "artifacts" => {
                 let name = plain_name(path).ok_or_else(unsupported)?;
@@ -628,6 +688,27 @@ impl<'a> TemplateScope<'a> {
             .map(|artifact| artifact.location.as_str())
     }
 
+    /// The value of `field` of the declared workspace `name`: the pull
+    /// request values from the context, the others from the runner.
+    fn workspace_value(&self, name: &str, field: WorkspaceField) -> Option<Value> {
+        match field {
+            WorkspaceField::Pr | WorkspaceField::PrUrl => {
+                let pr = self.workspace_prs?.get(name)?;
+                match field {
+                    WorkspaceField::Pr => pr.pr.clone(),
+                    _ => pr.pr_url.clone(),
+                }
+                .map(Value::String)
+            }
+            _ => self.workspace_values?.value(name, field),
+        }
+    }
+
+    fn declares_workspace(&self, name: &str) -> bool {
+        self.declared
+            .is_some_and(|declared| declared.declares_workspace(name))
+    }
+
     fn declares_variable(&self, name: &str) -> bool {
         self.declared
             .is_some_and(|declared| declared.declares_variable(name))
@@ -678,6 +759,42 @@ pub fn context_references(template: &str) -> Vec<String> {
     let mut names = Vec::new();
     collect_context_references(template, &mut names);
     names
+}
+
+/// The `context.workspace…` references of a template that cannot be read, as
+/// `(reference, reason)` in order of use: a form other than
+/// `context.workspace.<name>.<field>`, a workspace `declared` does not know,
+/// or a field outside [`WorkspaceField`]. Nothing is resolved.
+pub fn workspace_reference_problems(
+    template: &str,
+    declared: &DeclaredNames,
+) -> Vec<(String, String)> {
+    let mut problems = Vec::new();
+    for expression in expressions(template) {
+        let Some(path) = expression.strip_prefix("context.") else {
+            continue;
+        };
+        if expression.contains('|') || path.split('.').next() != Some("workspace") {
+            continue;
+        }
+        let reason = match parse_context_path(path) {
+            Some(ContextPath::Workspace { name, field }) => {
+                if !declared.declares_workspace(name) {
+                    format!("the workflow declares no workspace '{name}'")
+                } else if WorkspaceField::from_key(field).is_none() {
+                    format!(
+                        "'{field}' is not a workspace field (fields: {})",
+                        WorkspaceField::all_keys()
+                    )
+                } else {
+                    continue;
+                }
+            }
+            _ => "write it as 'context.workspace.<name>.<field>'".to_string(),
+        };
+        problems.push((expression.to_string(), reason));
+    }
+    problems
 }
 
 /// The artifact names a template refers to through `artifacts.NAME`, in
@@ -866,13 +983,51 @@ fn collect_value_references(value: &Value, names: &mut Vec<String>) {
     }
 }
 
-/// The variable a `context.NAME` / `context.variables.NAME` reference names.
+/// The variable a `context.NAME`, `context.variables.NAME` or
+/// `context.variables.NAME.field` reference names. A workspace reference
+/// names no variable.
 fn context_name(reference: &str) -> Option<&str> {
     if reference.contains('|') || reference.contains(char::is_whitespace) {
         return None;
     }
-    let path = reference.strip_prefix("context.")?;
-    plain_name(path.strip_prefix("variables.").unwrap_or(path))
+    match parse_context_path(reference.strip_prefix("context.")?)? {
+        ContextPath::Variable { name, .. } => Some(name),
+        ContextPath::Workspace { .. } => None,
+    }
+}
+
+/// What a `context.` reference reads.
+#[derive(Debug, PartialEq, Eq)]
+enum ContextPath<'a> {
+    /// A variable and, when its value is an object, the fields to descend.
+    Variable { name: &'a str, fields: Vec<&'a str> },
+    /// The value `field` of the workspace `name`; the field is not checked
+    /// against [`WorkspaceField`] here.
+    Workspace { name: &'a str, field: &'a str },
+}
+
+/// Reads what follows `context.` in a reference: `workspace.NAME.FIELD`, or a
+/// variable as `variables.NAME…` or the shorthand `NAME…`. `None` when the
+/// text is not one of those forms.
+fn parse_context_path(path: &str) -> Option<ContextPath<'_>> {
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    match segments.as_slice() {
+        ["workspace", name, field] => Some(ContextPath::Workspace { name, field }),
+        ["workspace", ..] => None,
+        ["variables", name, fields @ ..] => Some(ContextPath::Variable {
+            name,
+            fields: fields.to_vec(),
+        }),
+        ["variables"] => None,
+        [name, fields @ ..] => Some(ContextPath::Variable {
+            name,
+            fields: fields.to_vec(),
+        }),
+        [] => None,
+    }
 }
 
 /// Accepts a bare variable name, rejecting empty names and nested paths — the

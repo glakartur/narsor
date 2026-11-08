@@ -26,7 +26,7 @@ use crate::domain::{
     ActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel, PromptPart, PromptText,
     RepositoryDefinition, RepositorySource, SchemaVersion, State, StateId, ValidationError,
     VariableDefinition, VariableScope, VariableSource, VariableType, WorkflowDefinition,
-    WorkspacePrField, LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
+    WorkspaceField, LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
 use crate::workspace::provisioner::is_usable_directory_name;
 
@@ -34,7 +34,7 @@ use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
 use super::template::{
     artifact_references, step_label_references, step_reply_references, step_stream_references,
-    unsupported_step_references, DeclaredNames,
+    unsupported_step_references, workspace_reference_problems, DeclaredNames,
 };
 
 /// Validates a compiled workflow definition.
@@ -54,6 +54,7 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_variable_declarations(state, &mut errors);
         validate_set_assignments(state, &mut errors);
         validate_set_workspace(definition, state, &mut errors);
+        validate_set_references(&declared, state, &mut errors);
         validate_exit_and_timeout(definition, state, &mut errors);
         validate_decision(state, &mut errors);
         validate_state_templates(definition, &declared, state, &mut errors);
@@ -669,7 +670,7 @@ fn validate_set_assignments(state: &State, errors: &mut Vec<ValidationError>) {
 }
 
 /// The `set.workspace` of each choice: only git workspaces the workflow
-/// declares, and only the pull request values `pr` and `pr_url`. A workspace
+/// declares, and only the writable fields (`pr` and `pr_url`). A workspace
 /// chosen when the task is created may still turn out to be a local folder;
 /// the runner reports that when it happens.
 fn validate_set_workspace(
@@ -699,16 +700,26 @@ fn validate_set_workspace(
                 });
                 continue;
             }
-            for key in values
-                .keys()
-                .filter(|key| WorkspacePrField::from_key(key).is_none())
-            {
-                errors.push(ValidationError::SetUnknownWorkspaceValue {
-                    state: state.id.clone(),
-                    label: choice.label.clone(),
-                    workspace: workspace.clone(),
-                    key: key.clone(),
-                });
+            for key in values.keys() {
+                match WorkspaceField::from_key(key) {
+                    None => errors.push(ValidationError::SetUnknownWorkspaceValue {
+                        state: state.id.clone(),
+                        label: choice.label.clone(),
+                        workspace: workspace.clone(),
+                        key: key.clone(),
+                        fields: WorkspaceField::all_keys(),
+                    }),
+                    Some(field) if !field.writable() => {
+                        errors.push(ValidationError::SetReadOnlyWorkspaceValue {
+                            state: state.id.clone(),
+                            label: choice.label.clone(),
+                            workspace: workspace.clone(),
+                            key: key.clone(),
+                            writable: WorkspaceField::writable_keys(),
+                        })
+                    }
+                    Some(_) => {}
+                }
             }
         }
     }
@@ -989,6 +1000,73 @@ fn validate_state_templates(
                 });
             }
         }
+        push_workspace_reference_errors(state, &field, text, declared, errors);
+    }
+}
+
+fn push_workspace_reference_errors(
+    state: &State,
+    field: &str,
+    text: &str,
+    declared: &DeclaredNames,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (reference, reason) in workspace_reference_problems(text, declared) {
+        errors.push(ValidationError::InvalidWorkspaceReference {
+            state: state.id.clone(),
+            field: field.to_string(),
+            reference,
+            reason,
+        });
+    }
+}
+
+/// The workspace references in the values of each choice's `set`. Whether
+/// the rest of such a value fits is known only when it is rendered.
+fn validate_set_references(
+    declared: &DeclaredNames,
+    state: &State,
+    errors: &mut Vec<ValidationError>,
+) {
+    for choice in &state.choices {
+        let label = &choice.label;
+        let mut values: Vec<(String, &serde_json::Value)> = Vec::new();
+        values.extend(
+            choice
+                .set
+                .global
+                .iter()
+                .map(|(name, value)| (format!("choices.{label}.set.global.{name}"), value)),
+        );
+        values.extend(
+            choice
+                .set
+                .local
+                .iter()
+                .map(|(name, value)| (format!("choices.{label}.set.local.{name}"), value)),
+        );
+        for (workspace, fields) in &choice.set.workspace {
+            values.extend(fields.iter().map(|(key, value)| {
+                (
+                    format!("choices.{label}.set.workspace.{workspace}.{key}"),
+                    value,
+                )
+            }));
+        }
+        for (field, value) in values {
+            for text in strings_of(value) {
+                push_workspace_reference_errors(state, &field, text, declared, errors);
+            }
+        }
+    }
+}
+
+fn strings_of(value: &serde_json::Value) -> Vec<&str> {
+    match value {
+        serde_json::Value::String(text) => vec![text.as_str()],
+        serde_json::Value::Array(items) => items.iter().flat_map(strings_of).collect(),
+        serde_json::Value::Object(entries) => entries.values().flat_map(strings_of).collect(),
+        _ => Vec::new(),
     }
 }
 

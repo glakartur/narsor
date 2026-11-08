@@ -10,8 +10,9 @@ use crate::engine_support;
 use std::sync::Arc;
 
 use engine_support::{workflow_file, AgentTurn, Harness, ScriptedAgentExecutor};
-use narsor_engine::domain::{EventData, ExecutionStatus, WorkflowExecution};
+use narsor_engine::domain::{EventData, ExecutionStatus, WorkflowExecution, WorkspaceField};
 use narsor_engine::engine::{ActionKind, Engine, ManualTransition};
+use narsor_engine::workflow::WorkspaceValues;
 use serde_json::{json, Value};
 
 fn engine_with(harness: &Harness, agent: &Arc<ScriptedAgentExecutor>) -> Engine {
@@ -663,4 +664,81 @@ async fn parts_of_a_prompt_appear_when_their_values_do() {
         "the parts must follow each other, separated by an empty line: {}",
         drafts[1]
     );
+}
+
+/// The values the runner would report for the workspace `code`.
+#[derive(Debug)]
+struct ReportedWorkspace;
+
+impl WorkspaceValues for ReportedWorkspace {
+    fn value(&self, workspace: &str, field: WorkspaceField) -> Option<Value> {
+        match (workspace, field) {
+            ("code", WorkspaceField::Branch) => Some(json!("feat/x")),
+            ("code", WorkspaceField::BaseBranch) => Some(json!("main")),
+            ("code", WorkspaceField::Added) => Some(json!(12)),
+            _ => None,
+        }
+    }
+}
+
+/// Runs `v2/engine_workspace_read.yaml` through two steps; the first one
+/// reports a pull request address.
+async fn read_workspace_values(
+    engine: Engine,
+    agent: &Arc<ScriptedAgentExecutor>,
+    harness: &Harness,
+) -> WorkflowExecution {
+    let engine = engine.with_executor(ActionKind::Agent, agent.clone());
+    engine
+        .start_and_run(
+            &workflow_file("v2/engine_workspace_read.yaml"),
+            json!({}),
+            harness.workspace(),
+        )
+        .await
+        .expect("run")
+}
+
+fn read_turns() -> Vec<AgentTurn> {
+    vec![
+        AgentTurn::with_variables("opened", json!({ "pr_url": "https://git.example/pr/3" })),
+        AgentTurn::label("reviewed", "ok"),
+    ]
+}
+
+#[tokio::test]
+async fn a_step_reads_the_pull_request_the_step_before_recorded_and_the_runners_values() {
+    let harness = Harness::new();
+    let agent = Arc::new(ScriptedAgentExecutor::new(read_turns()));
+
+    let execution = read_workspace_values(
+        harness
+            .engine()
+            .with_workspace_values(Arc::new(ReportedWorkspace)),
+        &agent,
+        &harness,
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(
+        agent.prompts()[1],
+        "Review https://git.example/pr/3 on [feat/x] with 12 added."
+    );
+    assert_eq!(variable(&execution, "base"), Some(json!("main")));
+}
+
+#[tokio::test]
+async fn an_engine_without_workspace_values_renders_the_runners_fields_empty() {
+    let harness = Harness::new();
+    let agent = Arc::new(ScriptedAgentExecutor::new(read_turns()));
+
+    let execution = read_workspace_values(harness.engine(), &agent, &harness).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(
+        agent.prompts()[1],
+        "Review https://git.example/pr/3 on [] with  added."
+    );
+    assert_eq!(variable(&execution, "base"), Some(json!("")));
 }

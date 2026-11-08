@@ -17,7 +17,8 @@ pub use loader::{
 };
 pub use schema::{parse_duration, DurationParseError, DurationSecs, WorkflowFile};
 pub use template::{
-    action_context_references, context_references, places_step_history, DeclaredNames, StepMemory,
-    TemplateError, TemplateScope,
+    action_context_references, context_references, places_step_history,
+    workspace_reference_problems, DeclaredNames, StepMemory, TemplateError, TemplateScope,
+    WorkspaceValues,
 };
 pub use validator::{validate, validate_path, validate_source};

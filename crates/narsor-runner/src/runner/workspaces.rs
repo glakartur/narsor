@@ -12,6 +12,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use narsor_engine::domain::WorkspaceField;
+use narsor_engine::workflow::WorkspaceValues;
+use serde_json::Value;
+
 use crate::domain::{TaskRepositorySource, TaskWorkspace, WorkspaceHeader, WorkspacePr};
 use crate::workspace::state::{self, GitReading};
 
@@ -108,6 +112,40 @@ impl WorkspaceTracker {
     }
 }
 
+impl std::fmt::Debug for WorkspaceTracker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceTracker")
+            .field("workspaces", &self.entries.len())
+            .finish()
+    }
+}
+
+/// The steps read the last reading of git, not a fresh one.
+impl WorkspaceValues for WorkspaceTracker {
+    fn value(&self, workspace: &str, field: WorkspaceField) -> Option<Value> {
+        self.entries.iter().find_map(|entry| {
+            let header = lock(&entry.header);
+            (header.name == workspace)
+                .then(|| field_value(&header, field))
+                .flatten()
+        })
+    }
+}
+
+/// The value of `field` in the reading `header` holds. The pull request
+/// values are not read here: the engine keeps them in its context.
+fn field_value(header: &WorkspaceHeader, field: WorkspaceField) -> Option<Value> {
+    match field {
+        WorkspaceField::Repo => Some(Value::String(header.repo.clone())),
+        WorkspaceField::BaseBranch => header.base_branch.clone().map(Value::String),
+        WorkspaceField::Branch => header.branch.clone().map(Value::String),
+        WorkspaceField::Added => header.added.map(Value::from),
+        WorkspaceField::Removed => header.removed.map(Value::from),
+        WorkspaceField::Pr | WorkspaceField::PrUrl => None,
+    }
+}
+
 fn lock(header: &Mutex<WorkspaceHeader>) -> std::sync::MutexGuard<'_, WorkspaceHeader> {
     header.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -138,6 +176,78 @@ mod tests {
             base_branch: Some("main".into()),
             ..WorkspaceHeader::default()
         }
+    }
+
+    fn tracker_of(header: WorkspaceHeader) -> WorkspaceTracker {
+        WorkspaceTracker {
+            entries: vec![Tracked {
+                header: Arc::new(Mutex::new(header)),
+                git_dir: None,
+                reading: Arc::new(AtomicBool::new(false)),
+                pr_ignored_reported: AtomicBool::new(false),
+            }],
+            changed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[test]
+    fn a_header_gives_the_values_of_its_reading() {
+        let tracker = tracker_of(WorkspaceHeader {
+            branch: Some("feat/x".into()),
+            added: Some(4),
+            removed: Some(1),
+            ..header()
+        });
+
+        let read = |field| tracker.value("code", field);
+
+        assert_eq!(read(WorkspaceField::Repo), Some(Value::from("orders-api")));
+        assert_eq!(read(WorkspaceField::Branch), Some(Value::from("feat/x")));
+        assert_eq!(read(WorkspaceField::BaseBranch), Some(Value::from("main")));
+        assert_eq!(read(WorkspaceField::Added), Some(Value::from(4)));
+        assert_eq!(read(WorkspaceField::Removed), Some(Value::from(1)));
+    }
+
+    #[test]
+    fn a_value_not_read_yet_is_no_value_not_zero() {
+        let tracker = tracker_of(header());
+
+        assert_eq!(tracker.value("code", WorkspaceField::Added), None);
+        assert_eq!(tracker.value("code", WorkspaceField::Removed), None);
+    }
+
+    #[test]
+    fn the_pull_request_values_are_left_to_the_engine() {
+        let tracker = tracker_of(WorkspaceHeader {
+            pr: Some("7".into()),
+            pr_url: Some("https://git.example/pr/7".into()),
+            ..header()
+        });
+
+        assert_eq!(tracker.value("code", WorkspaceField::Pr), None);
+        assert_eq!(tracker.value("code", WorkspaceField::PrUrl), None);
+    }
+
+    #[test]
+    fn another_workspace_name_has_no_value() {
+        let tracker = tracker_of(header());
+
+        assert_eq!(tracker.value("docs", WorkspaceField::Repo), None);
+    }
+
+    #[test]
+    fn a_folder_workspace_has_a_repo_and_no_branch() {
+        let tracker = tracker_of(WorkspaceHeader {
+            name: "notes".into(),
+            repo: "/srv/notes".into(),
+            ..WorkspaceHeader::default()
+        });
+
+        assert_eq!(
+            tracker.value("notes", WorkspaceField::Repo),
+            Some(Value::from("/srv/notes"))
+        );
+        assert_eq!(tracker.value("notes", WorkspaceField::Branch), None);
     }
 
     #[test]

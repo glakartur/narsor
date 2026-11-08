@@ -865,8 +865,8 @@ pub struct SetDefinition {
     /// The step's own `scope: local` variables, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub local: BTreeMap<String, serde_json::Value>,
-    /// The pull request values of workspaces (`pr`, `pr_url`), by workspace
-    /// name and then by value name.
+    /// The writable values of workspaces (`pr`, `pr_url`), by workspace name
+    /// and then by value name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
 }
@@ -878,21 +878,72 @@ impl SetDefinition {
     }
 }
 
-/// A value of a workspace's pull request that `set.workspace` can assign.
+/// A value a workspace has, readable as `context.workspace.<name>.<field>`.
+///
+/// This is the one list of workspace fields: reading, writing, validation
+/// and their messages all take their fields from here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkspacePrField {
+pub enum WorkspaceField {
+    Repo,
+    BaseBranch,
+    Branch,
+    Added,
+    Removed,
     Pr,
     PrUrl,
 }
 
-impl WorkspacePrField {
-    /// The field a `set.workspace` key names: `pr` or `pr_url`.
+impl WorkspaceField {
+    /// Every field, in the order documentation and messages list them.
+    pub const ALL: [Self; 7] = [
+        Self::Repo,
+        Self::BaseBranch,
+        Self::Branch,
+        Self::Added,
+        Self::Removed,
+        Self::Pr,
+        Self::PrUrl,
+    ];
+
+    /// The field a key names (`pr_url`, `branch`, ...).
     pub fn from_key(key: &str) -> Option<Self> {
-        match key {
-            "pr" => Some(Self::Pr),
-            "pr_url" => Some(Self::PrUrl),
-            _ => None,
+        Self::ALL.into_iter().find(|field| field.key() == key)
+    }
+
+    /// The name of the field in a reference and in `set.workspace`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Repo => "repo",
+            Self::BaseBranch => "base_branch",
+            Self::Branch => "branch",
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::Pr => "pr",
+            Self::PrUrl => "pr_url",
         }
+    }
+
+    /// Whether `set.workspace` can assign the field. The runner owns the
+    /// others and rewrites them after every step.
+    pub fn writable(self) -> bool {
+        matches!(self, Self::Pr | Self::PrUrl)
+    }
+
+    /// The keys of all fields, comma separated, for messages.
+    pub fn all_keys() -> String {
+        Self::list_keys(Self::ALL.into_iter())
+    }
+
+    /// The keys of the writable fields, comma separated, for messages.
+    pub fn writable_keys() -> String {
+        Self::list_keys(Self::ALL.into_iter().filter(|field| field.writable()))
+    }
+
+    fn list_keys(fields: impl Iterator<Item = Self>) -> String {
+        fields
+            .map(|field| format!("'{}'", field.key()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -1188,12 +1239,22 @@ pub enum ValidationError {
         workspace: String,
     },
 
-    #[error("Choice '{label}' in state '{state}' sets 'workspace.{workspace}.{key}'; only 'pr' and 'pr_url' can be set")]
+    #[error("Choice '{label}' in state '{state}' sets 'workspace.{workspace}.{key}', which is not a workspace field (fields: {fields})")]
     SetUnknownWorkspaceValue {
         state: StateId,
         label: OutputLabel,
         workspace: String,
         key: String,
+        fields: String,
+    },
+
+    #[error("Choice '{label}' in state '{state}' sets 'workspace.{workspace}.{key}', which is read-only; only {writable} can be set")]
+    SetReadOnlyWorkspaceValue {
+        state: StateId,
+        label: OutputLabel,
+        workspace: String,
+        key: String,
+        writable: String,
     },
 
     #[error("Choice '{label}' in state '{state}' sets variable '{name}', which the state does not declare")]
@@ -1259,6 +1320,17 @@ pub enum ValidationError {
         artifact: String,
     },
 
+    #[error(
+        "State '{state}' reads '{reference}' in field '{field}', which is not a value of a \
+         workspace: {reason}"
+    )]
+    InvalidWorkspaceReference {
+        state: StateId,
+        field: String,
+        reference: String,
+        reason: String,
+    },
+
     #[error("Field '{field}' references unknown input '{variable}'")]
     UnknownInputReferenceInGlobals { field: String, variable: String },
 
@@ -1282,4 +1354,29 @@ pub enum ValidationError {
 
     #[error("Terminal state '{0}' cannot override the image: it runs nothing")]
     ImageOnTerminalState(StateId),
+}
+
+#[cfg(test)]
+mod workspace_field_tests {
+    use super::WorkspaceField;
+
+    #[test]
+    fn every_key_names_its_field_and_only_the_pull_request_values_are_writable() {
+        let cases = [
+            ("repo", false),
+            ("base_branch", false),
+            ("branch", false),
+            ("added", false),
+            ("removed", false),
+            ("pr", true),
+            ("pr_url", true),
+        ];
+        for (key, writable) in cases {
+            let field = WorkspaceField::from_key(key).expect(key);
+            assert_eq!(field.key(), key);
+            assert_eq!(field.writable(), writable, "{key}");
+        }
+        assert_eq!(WorkspaceField::ALL.len(), cases.len());
+        assert_eq!(WorkspaceField::from_key("title"), None);
+    }
 }

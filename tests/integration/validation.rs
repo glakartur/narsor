@@ -1067,14 +1067,31 @@ fn a_set_for_an_unknown_workspace_names_the_step_and_the_workspace() {
 }
 
 #[test]
-fn a_set_of_a_workspace_value_other_than_pr_and_pr_url_is_a_violation() {
-    let errors = workspace_set_errors("{ workspace: { code: { branch: feat } } }");
+fn a_set_of_a_read_only_workspace_value_is_a_violation_that_names_it() {
+    for key in ["branch", "added", "removed", "repo", "base_branch"] {
+        let errors = workspace_set_errors(&format!("{{ workspace: {{ code: {{ {key}: x }} }} }}"));
+
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::SetReadOnlyWorkspaceValue { state, workspace, key: named, .. }
+                    if state == "work" && workspace == "code" && named == key
+            )),
+            "{key}: {}",
+            describe(&errors)
+        );
+    }
+}
+
+#[test]
+fn a_set_of_a_value_no_workspace_has_lists_the_workspace_fields() {
+    let errors = workspace_set_errors("{ workspace: { code: { title: feat } } }");
 
     assert!(
         errors.iter().any(|error| matches!(
             error,
-            ValidationError::SetUnknownWorkspaceValue { workspace, key, .. }
-                if workspace == "code" && key == "branch"
+            ValidationError::SetUnknownWorkspaceValue { workspace, key, fields, .. }
+                if workspace == "code" && key == "title" && fields.contains("'base_branch'")
         )),
         "got: {}",
         describe(&errors)
@@ -1465,4 +1482,155 @@ fn a_loop_of_exits_without_a_way_out_is_a_deadlock() {
     assert!(errors
         .iter()
         .any(|err| matches!(err, ValidationError::NoPathToTerminal(state) if state == "first")));
+}
+
+/// Validates a v2 workflow with the git workspace `code` whose step `work`
+/// has `action` and `exit`, both given as YAML text.
+fn workspace_reference_errors(action: &str, exit: &str) -> Vec<ValidationError> {
+    let yaml = format!(
+        "schema: v2\nname: refs\nversion: 1\nglobals:\n  workspaces:\n    code:\n      \
+         primary: true\nstates:\n  work:\n    action: {action}\n    variables:\n      \
+         - {{ name: note }}\n    exit: {exit}\n  done:\n    description: end\n\
+         terminal_states:\n  done: completed\n"
+    );
+    narsor_engine::workflow::validate_source(&yaml).expect("the file loads")
+}
+
+fn prompt_action(prompt: &str) -> String {
+    format!("{{ type: agent, prompt: \"{prompt}\" }}")
+}
+
+const PLAIN_EXIT: &str = "{ next: done }";
+
+fn has_workspace_reference_error(errors: &[ValidationError], field: &str, reference: &str) -> bool {
+    errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::InvalidWorkspaceReference { state, field: at, reference: named, .. }
+                if state == "work" && at == field && named == reference
+        )
+    })
+}
+
+#[test]
+fn a_prompt_may_read_the_fields_of_a_declared_workspace() {
+    let errors = workspace_reference_errors(
+        &prompt_action("{{ context.workspace.code.pr_url }} {{ context.workspace.code.added }}"),
+        PLAIN_EXIT,
+    );
+
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
+fn a_prompt_reading_an_undeclared_workspace_names_the_step_and_the_reference() {
+    let errors = workspace_reference_errors(
+        &prompt_action("{{ context.workspace.payments.pr_url }}"),
+        PLAIN_EXIT,
+    );
+
+    assert!(
+        has_workspace_reference_error(
+            &errors,
+            "action.prompt",
+            "context.workspace.payments.pr_url"
+        ),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_prompt_reading_a_field_no_workspace_has_is_a_violation() {
+    let errors = workspace_reference_errors(
+        &prompt_action("{{ context.workspace.code.title }}"),
+        PLAIN_EXIT,
+    );
+
+    assert!(
+        has_workspace_reference_error(&errors, "action.prompt", "context.workspace.code.title"),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_workspace_reference_without_a_field_is_a_violation() {
+    for reference in ["context.workspace.code", "context.workspace"] {
+        let errors = workspace_reference_errors(
+            &prompt_action(&format!("{{{{ {reference} }}}}")),
+            PLAIN_EXIT,
+        );
+
+        assert!(
+            has_workspace_reference_error(&errors, "action.prompt", reference),
+            "{reference}: {}",
+            describe(&errors)
+        );
+    }
+}
+
+#[test]
+fn a_condition_of_a_prompt_part_reads_workspace_fields_like_a_placeholder() {
+    let action = |reference: &str| {
+        format!("{{ type: agent, prompt: [\"Do it.\", {{ when: {reference}, text: More. }}] }}")
+    };
+
+    let good = workspace_reference_errors(&action("context.workspace.code.pr_url"), PLAIN_EXIT);
+    let bad = workspace_reference_errors(&action("context.workspace.nope.pr"), PLAIN_EXIT);
+
+    assert!(good.is_empty(), "got: {}", describe(&good));
+    assert!(
+        has_workspace_reference_error(&bad, "action.prompt[2].when", "context.workspace.nope.pr"),
+        "got: {}",
+        describe(&bad)
+    );
+}
+
+#[test]
+fn a_set_value_is_checked_for_workspace_references_at_load() {
+    let exit = |value: &str| {
+        format!("{{ set: {{ workspace: {{ code: {{ pr_url: \"{value}\" }} }} }}, next: done }}")
+    };
+
+    let good = workspace_reference_errors(
+        &prompt_action("p"),
+        &exit("{{ context.workspace.code.pr_url }}"),
+    );
+    let bad = workspace_reference_errors(
+        &prompt_action("p"),
+        &exit("{{ context.workspace.nope.pr }}"),
+    );
+
+    assert!(good.is_empty(), "got: {}", describe(&good));
+    assert!(
+        bad.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidWorkspaceReference { state, field, reference, .. }
+                if state == "work"
+                    && field.contains("set")
+                    && field.contains("workspace.code.pr_url")
+                    && reference == "context.workspace.nope.pr"
+        )),
+        "got: {}",
+        describe(&bad)
+    );
+}
+
+#[test]
+fn a_global_set_value_is_checked_for_workspace_references_too() {
+    let errors = workspace_reference_errors(
+        &prompt_action("p"),
+        "{ set: { note: \"{{ context.workspace.code.title }}\" }, next: done }",
+    );
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidWorkspaceReference { reference, .. }
+                if reference == "context.workspace.code.title"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
 }

@@ -475,6 +475,11 @@ fn assemble_session(
     let reporter: Arc<dyn UsageReporter> = usage.clone();
     let harness = Arc::new(LiveHarness::new(starting_harness(&storage, spec)));
     let readings_changed = Arc::new(tokio::sync::Notify::new());
+    let workspaces = Arc::new(workspaces::WorkspaceTracker::new(
+        &storage,
+        &spec.workspace,
+        Arc::clone(&readings_changed),
+    ));
     let engine = Engine::new(storage.store())
         .with_agent_args(config.agent_args.clone())
         .with_usage_reporter(Arc::clone(&reporter))
@@ -483,12 +488,11 @@ fn assemble_session(
             Arc::new(move || readings_changed.notify_one())
         })
         .with_default_harness_source(harness.clone())
-        .with_task_labels(spec.ticket.clone(), spec.title.clone());
+        .with_task_labels(spec.ticket.clone(), spec.title.clone())
+        .with_workspace_values(workspaces.clone());
     let engine = Arc::new(customize(engine, &reporter));
 
     let conductor = conductor(&engine, &storage, Arc::clone(&harness), &definition);
-    let workspaces =
-        workspaces::WorkspaceTracker::new(&storage, &spec.workspace, Arc::clone(&readings_changed));
     Session {
         storage,
         engine,
@@ -789,7 +793,7 @@ struct Session {
     definition: Arc<WorkflowDefinition>,
     /// The headers of the task's workspaces, with the git state read after
     /// the last step.
-    workspaces: workspaces::WorkspaceTracker,
+    workspaces: Arc<workspaces::WorkspaceTracker>,
     incarnation: String,
     timing: RunnerTiming,
     link: Link,
