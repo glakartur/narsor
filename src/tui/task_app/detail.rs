@@ -6,9 +6,9 @@
 //!
 //! ```text
 //! ● running · krok 3 · implement · code-review v3 · 14m
-//! code  orders-api   feat/nar-12-orders → main  +120 −34  PR #42 ↗
-//! docs  orders-docs  main                                 —
-//! razem $1.25 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2) · dyrygent $0.05 ↑9k ↓1k
+//! code: orders-api  ⎇ feat/nar-12-orders → main +120 −34 #42 ↗
+//! docs: orders-docs ⎇ main                             —
+//! razem $68.30 · ✨ $34.15 ↑304 ↓72k (◈ 2 $12 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k
 //! ────────────────────────────────────────────────────────────────────
 //!  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info          podąża
 //!   ✓ plan ok         …
@@ -951,7 +951,7 @@ pub fn edge_layout(
             .filter(|text| !text.trim().is_empty())
     };
     let (ticket, title) = (plain(&task.ticket), plain(&task.title));
-    let id = short_task_id(&task.task_id.to_string());
+    let id = short_task_id(task.task_id.as_ref());
     // The corners, the id's pill and one cell of line between the two sides.
     let tail = loading.map_or(0, |glyph| 1 + cells(glyph));
     let marker = usize::from(focused);
@@ -1514,19 +1514,24 @@ fn header(
         lines.push(line);
     }
 
-    if let Some(usage) = usage {
-        let full = task_usage_text::line(usage, true);
-        let text = if cells(&full) <= width {
-            full
-        } else {
-            fit_cells(&task_usage_text::line(usage, false), width)
-        };
+    if let Some(text) = usage.and_then(|usage| usage_text(usage, width)) {
         lines.push(Line::from(Span::styled(
             text,
             styles.of(greyed(Role::Calm, stale)),
         )));
     }
     (lines, spots)
+}
+
+/// The usage line in `width` cells: whole, else without the subagents, else
+/// cut with `…`; `None` when there is nothing to show.
+fn usage_text(usage: &TaskUsage, width: usize) -> Option<String> {
+    let full = task_usage_text::line(usage, true)?;
+    if cells(&full) <= width {
+        return Some(full);
+    }
+    let shorter = task_usage_text::line(usage, false).unwrap_or(full);
+    Some(fit_cells(&shorter, width))
 }
 
 fn title_line(task: &TaskSummary, styles: &Styles, role: Role, width: usize) -> Line<'static> {

@@ -2544,8 +2544,7 @@ mod task_app_detail_render {
             rows[WORKSPACE_ROW]
         );
         assert!(
-            rows[USAGE_ROW]
-                .contains("razem $1.20 · agenci $1.20 ↑120k ↓8k (subagenci ↑40k ↓3k ×2)"),
+            rows[USAGE_ROW].contains("razem $1.20 · ✨ $1.20 ↑120k ↓8k (◈ 2 ↑40k ↓3k)"),
             "{}",
             rows[USAGE_ROW]
         );
@@ -2567,14 +2566,46 @@ mod task_app_detail_render {
     fn a_narrow_header_drops_the_subagents_part_first() {
         let mut app = running_app_with_usage(vec![reported(120_000, 8_000, (40_000, 3_000), 1.2)]);
         let wide = rows(&render_at(&mut app, &Styles::new(false), 120, 30));
-        assert!(wide[USAGE_ROW].contains("(subagenci ↑40k ↓3k ×1)"));
+        assert!(wide[USAGE_ROW].contains("(◈ 1 ↑40k ↓3k)"));
+
+        // 60 columns leave 56 cells for the line: this one needs 57 with the
+        // subagents and 41 without them.
+        let mut app = running_app_with_usage(vec![reported(
+            120_000_000,
+            80_000_000,
+            (40_000_000, 30_000_000),
+            123_456.5,
+        )]);
+        let wide = rows(&render_at(&mut app, &Styles::new(false), 120, 30));
+        assert!(
+            wide[USAGE_ROW].contains("(◈ 1 ↑40M ↓30M)"),
+            "{}",
+            wide[USAGE_ROW]
+        );
         let narrow = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
         let row = &narrow[USAGE_ROW];
         assert!(
-            row.contains("razem $1.20 · agenci $1.20 ↑120k ↓8k"),
+            row.contains("razem $123456.50 · ✨ $123456.50 ↑120M ↓80M"),
             "{row}"
         );
-        assert!(!row.contains("subagenci"), "{row}");
+        assert!(!row.contains('◈'), "{row}");
+    }
+
+    #[test]
+    fn a_usage_line_too_wide_even_without_the_subagents_is_cut_with_an_ellipsis() {
+        let mut app = running_app_with_usage(vec![reported(
+            120_000_000,
+            80_000_000,
+            (40_000_000, 30_000_000),
+            1.0e15,
+        )]);
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
+        let row = &rows[USAGE_ROW];
+        assert!(row.contains("razem $1000000000000000.00"), "{row}");
+        assert!(
+            row.contains('…') && !row.contains('◈') && !row.contains('—'),
+            "{row}"
+        );
     }
 
     #[test]
@@ -2589,7 +2620,7 @@ mod task_app_detail_render {
         );
         let rows = rows(&render(&mut app, &Styles::new(false)));
         assert!(
-            rows[USAGE_ROW].contains("razem $0.10 · agenci $0.10 ↑1k ↓100"),
+            rows[USAGE_ROW].contains("razem $0.10 · ✨ $0.10 ↑1k ↓100"),
             "{}",
             rows[USAGE_ROW]
         );
