@@ -1615,7 +1615,9 @@ fn workspace_line(
     for piece in row {
         let role = match piece.part {
             Part::Name | Part::Repo | Part::Branch | Part::PrText => Role::Calm,
-            Part::Changes | Part::Gap | Part::NoPr => Role::Done,
+            Part::Gap | Part::NoPr => Role::Done,
+            Part::Added => Role::Added,
+            Part::Removed => Role::Removed,
             Part::PrLink => Role::Link,
         };
         let width = cells(&piece.text);

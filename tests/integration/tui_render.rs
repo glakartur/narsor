@@ -2116,13 +2116,13 @@ mod task_app_detail_render {
             "the title is on the edge only"
         );
         let code = &rows[WORKSPACE_ROW];
-        assert!(code.contains("│  code  orders-api"), "{code}");
+        assert!(code.contains("│  code: orders-api"), "{code}");
         assert!(code.contains("orders-api"), "{code}");
-        assert!(code.contains("feat/nar-12-orders → main"), "{code}");
-        assert!(code.contains("PR #42 ↗"), "{code}");
+        assert!(code.contains("⎇ feat/nar-12-orders → main"), "{code}");
+        assert!(code.contains("#42 ↗") && !code.contains("PR"), "{code}");
         let docs = &rows[WORKSPACE_ROW + 1];
         assert!(
-            docs.contains("docs") && docs.contains("orders-docs"),
+            docs.contains("docs:") && docs.contains("orders-docs"),
             "{docs}"
         );
         assert!(
@@ -2250,24 +2250,24 @@ mod task_app_detail_render {
     fn a_narrower_terminal_cuts_the_workspace_row_in_a_fixed_order() {
         let mut app = app_with_workspaces(vec![changed_workspace()]);
         let full = code_row(&mut app, 120);
-        assert!(full.contains("feat/nar-12-refactor → main"), "{full}");
+        assert!(full.contains("⎇ feat/nar-12-refactor → main"), "{full}");
         assert!(full.contains("+120 −34"), "{full}");
 
-        let no_base = code_row(&mut app, 85);
+        let no_base = code_row(&mut app, 78);
         assert!(
             !no_base.contains("→"),
             "the base branch goes first: {no_base}"
         );
         assert!(no_base.contains("feat/nar-12-refactor") && no_base.contains("+120 −34"));
 
-        let no_changes = code_row(&mut app, 75);
+        let no_changes = code_row(&mut app, 70);
         assert!(
             !no_changes.contains("+120"),
             "then the changes: {no_changes}"
         );
         assert!(no_changes.contains("feat/nar-12-refactor"), "{no_changes}");
 
-        let cut_branch = code_row(&mut app, 65);
+        let cut_branch = code_row(&mut app, 62);
         assert!(!cut_branch.contains("feat/nar-12-refactor"), "{cut_branch}");
         assert!(
             cut_branch.contains("feat/nar-12-ref…"),
@@ -2291,7 +2291,7 @@ mod task_app_detail_render {
             "then the repository: {cut_repo}"
         );
         for row in [&cut_branch, &cut_repo] {
-            assert!(row.contains("code") && row.contains("PR #42 ↗"), "{row}");
+            assert!(row.contains("code:") && row.contains("#42 ↗"), "{row}");
         }
     }
 
@@ -2315,6 +2315,119 @@ mod task_app_detail_render {
         assert!(rows[WORKSPACE_ROW + names.len() + 1].contains("Przebieg"));
     }
 
+    /// The cell where `needle` starts on the workspace row of `buffer`.
+    fn workspace_cell(buffer: &Buffer, needle: &str) -> ratatui::buffer::Cell {
+        let rows = rows(buffer);
+        let (y, row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.contains("code:"))
+            .unwrap_or_else(|| panic!("no workspace row in {rows:#?}"));
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} in {row}"));
+        let x = u16::try_from(row[..byte].chars().count()).unwrap();
+        buffer[(x, u16::try_from(y).unwrap())].clone()
+    }
+
+    fn ae3_workspace() -> narsor_protocol::display::WorkspaceHeader {
+        let mut code = with_pr(
+            header_workspace("code", "orders-api", "feat/x"),
+            "https://gitlab.example/g/api/-/merge_requests/42",
+        );
+        code.added = Some(123);
+        code.removed = Some(45);
+        code
+    }
+
+    /// Covers AE3: the row, the colours of the changes and the link.
+    #[test]
+    fn the_workspace_row_has_coloured_changes_and_a_pull_request_link() {
+        let mut app = app_with_workspaces(vec![ae3_workspace()]);
+        let buffer = render_at(&mut app, &Styles::new(false), 120, 30);
+        let row = rows(&buffer)
+            .into_iter()
+            .find(|row| row.contains("code:"))
+            .unwrap();
+        assert!(
+            row.contains("code: orders-api ⎇ feat/x → main +123 −45 #42 ↗"),
+            "{row}"
+        );
+        assert_eq!(workspace_cell(&buffer, "+123").fg, Color::Green);
+        assert_eq!(workspace_cell(&buffer, "−45").fg, Color::Red);
+
+        app.detail_mut().set_hyperlinks(true);
+        let linked = screen(&render_at(&mut app, &Styles::new(false), 120, 30));
+        assert!(
+            linked.contains(
+                "\u{1b}]8;;https://gitlab.example/g/api/-/merge_requests/42\u{1b}\\#42 ↗\u{1b}]8;;\u{1b}\\"
+            ),
+            "{linked:?}"
+        );
+    }
+
+    #[test]
+    fn without_colour_the_changes_keep_their_signs_and_no_style() {
+        let mut app = app_with_workspaces(vec![ae3_workspace()]);
+        let buffer = render_at(&mut app, &Styles::new(true), 120, 30);
+        for needle in ["+123", "−45"] {
+            let cell = workspace_cell(&buffer, needle);
+            assert_eq!(cell.fg, Color::Reset, "{needle}");
+            assert!(!cell.modifier.contains(Modifier::BOLD), "{needle}");
+        }
+    }
+
+    #[test]
+    fn stale_data_greys_the_changes() {
+        let mut app = app_with_workspaces(vec![ae3_workspace()]);
+        app.on_stream(Some(Err(narsor::api::ClientError::Unavailable(
+            "reset".into(),
+        ))));
+        let buffer = render_at(&mut app, &Styles::new(false), 120, 30);
+        assert_eq!(workspace_cell(&buffer, "+123").fg, Color::DarkGray);
+        assert_eq!(workspace_cell(&buffer, "−45").fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn a_link_without_a_number_shows_pr_and_the_arrow() {
+        let mut code = header_workspace("code", "orders-api", "feat/x");
+        code.pr_url = Some("https://example.com/review".into());
+        let mut app = app_with_workspaces(vec![code]);
+        let row = code_row(&mut app, 120);
+        assert!(row.contains("PR ↗") && !row.contains('#'), "{row}");
+    }
+
+    #[test]
+    fn only_one_known_change_count_shows_the_other_as_zero() {
+        let mut code = ae3_workspace();
+        code.removed = None;
+        let mut app = app_with_workspaces(vec![code]);
+        let row = code_row(&mut app, 120);
+        assert!(row.contains("+123 −0"), "{row}");
+    }
+
+    #[test]
+    fn the_columns_of_two_workspaces_line_up() {
+        let mut long = ae3_workspace();
+        long.name = "documentation".into();
+        let mut app = app_with_workspaces(vec![ae3_workspace(), long]);
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 140, 30));
+        let columns: Vec<usize> = ["⎇", "+123"]
+            .iter()
+            .map(|needle| {
+                let found: Vec<usize> = rows
+                    .iter()
+                    .filter(|row| row.contains("⎇"))
+                    .map(|row| row[..row.find(needle).unwrap()].chars().count())
+                    .collect();
+                assert_eq!(found.len(), 2, "{rows:#?}");
+                assert_eq!(found[0], found[1], "{needle} in {rows:#?}");
+                found[0]
+            })
+            .collect();
+        assert!(columns[0] < columns[1]);
+    }
+
     #[test]
     fn a_workspace_row_never_shows_an_address_that_is_not_http() {
         let mut hostile = header_workspace("code", "orders-api", "feat/x");
@@ -2322,7 +2435,7 @@ mod task_app_detail_render {
         hostile.pr_url = Some("javascript:alert(1)".into());
         let mut app = app_with_workspaces(vec![hostile]);
         let row = code_row(&mut app, 120);
-        assert!(row.contains("PR #42") && !row.contains('↗'), "{row}");
+        assert!(row.contains("#42") && !row.contains('↗'), "{row}");
         assert!(!row.contains("javascript"), "{row}");
     }
 
@@ -2426,7 +2539,7 @@ mod task_app_detail_render {
         ]);
         let rows = rows(&render(&mut app, &Styles::new(false)));
         assert!(
-            rows[WORKSPACE_ROW].contains("PR #42 ↗"),
+            rows[WORKSPACE_ROW].contains("#42 ↗"),
             "{}",
             rows[WORKSPACE_ROW]
         );
@@ -2874,7 +2987,7 @@ mod task_app_detail_render {
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
         assert!(
-            screen.contains("\u{1b}]8;;https://gitlab.example/g/api/-/merge_requests/42\u{1b}\\PR #42 ↗\u{1b}]8;;\u{1b}\\"),
+            screen.contains("\u{1b}]8;;https://gitlab.example/g/api/-/merge_requests/42\u{1b}\\#42 ↗\u{1b}]8;;\u{1b}\\"),
             "{:?}",
             rows(&buffer)[WORKSPACE_ROW]
         );
@@ -2884,7 +2997,7 @@ mod task_app_detail_render {
             "only the link with a target"
         );
         let row = &rows(&plain_buffer)[WORKSPACE_ROW];
-        let byte = row.find("PR #42 ↗").unwrap();
+        let byte = row.find("#42 ↗").unwrap();
         let column = u16::try_from(row[..byte].chars().count()).unwrap();
         let y = WORKSPACE_ROW as u16;
         let link_cell = (0..buffer.area.width)
@@ -2894,7 +3007,7 @@ mod task_app_detail_render {
             Some(column),
             "link hit region begins under its label"
         );
-        assert!(buffer[(column, y)].symbol().contains("PR #42 ↗"));
+        assert!(buffer[(column, y)].symbol().contains("#42 ↗"));
     }
 
     #[test]
