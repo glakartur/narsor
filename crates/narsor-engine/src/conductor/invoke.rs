@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use crate::conductor::actor::{ConductorAnswer, ConductorInvoker, Invocation, InvocationOutcome};
 use crate::conductor::autopilot::Autopilot;
-use crate::conductor::prompt::{answer_schema, conductor_prompt_for};
+use crate::conductor::prompt::{answer_schema, conductor_prompt_for, ConductorRepository};
 use crate::conductor::response::ConductorResponse;
 use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
 use crate::conductor::store::ConductorStore;
@@ -299,11 +299,19 @@ impl HarnessInvoker {
         input.request = Some(invocation.request.clone());
         input.chat_message = invocation.chat_message.clone();
         let snapshot = render(&input, &self.budget);
+        let descriptions = self.repository_descriptions(&execution);
+        let listed: Vec<ConductorRepository> = repositories
+            .iter()
+            .map(|repository| {
+                let description = descriptions.get(&repository.name).map(String::as_str);
+                ConductorRepository::new(repository, description)
+            })
+            .collect();
         let prompt = conductor_prompt_for(
             invocation.request.purpose,
             access,
             &snapshot.text,
-            &repositories,
+            &listed,
             Autopilot::of_payload(&invocation.request.payload),
         );
 
@@ -405,6 +413,30 @@ impl HarnessInvoker {
             })
             .unwrap_or_default();
         Ok((resolved.source, outputs))
+    }
+
+    /// What the workflow says each repository is for, by repository name.
+    fn repository_descriptions(
+        &self,
+        execution: &WorkflowExecution,
+    ) -> std::collections::BTreeMap<String, String> {
+        let described = |definition: &WorkflowDefinition| {
+            definition
+                .repositories
+                .iter()
+                .filter_map(|repository| {
+                    Some((repository.name.clone(), repository.description.clone()?))
+                })
+                .collect()
+        };
+        if let Some(definition) = &self.pinned_definition {
+            return described(definition);
+        }
+        crate::tasks::resolve_definition(&self.catalog_dir, self.store.paths(), execution)
+            .ok()
+            .and_then(|resolved| resolved.load().ok())
+            .map(|definition| described(&definition))
+            .unwrap_or_default()
     }
 
     /// The scratch directory of `execution_id`, emptied: an isolated

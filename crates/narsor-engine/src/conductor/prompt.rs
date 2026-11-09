@@ -19,6 +19,26 @@ use crate::conductor::invoke::ConductorAccess;
 use crate::conductor::response::{allowed_decisions, proposals_allowed, DecisionKind};
 use crate::domain::{ConductorPurpose, WorkspaceRepository};
 
+/// A repository of the task as the prompt lists it: where it is and, when the
+/// workflow declares one, what it is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConductorRepository {
+    pub name: String,
+    pub path: String,
+    pub description: Option<String>,
+}
+
+impl ConductorRepository {
+    /// `repository` with the description the workflow declares for it, if any.
+    pub fn new(repository: &WorkspaceRepository, description: Option<&str>) -> Self {
+        Self {
+            name: repository.name.clone(),
+            path: repository.path.clone(),
+            description: description.map(str::to_string),
+        }
+    }
+}
+
 /// The whole prompt of one invocation for `purpose`, around `snapshot`.
 pub fn conductor_prompt(
     purpose: ConductorPurpose,
@@ -36,7 +56,7 @@ pub fn conductor_prompt_for(
     purpose: ConductorPurpose,
     access: ConductorAccess,
     snapshot: &str,
-    repositories: &[WorkspaceRepository],
+    repositories: &[ConductorRepository],
     autopilot: Option<Autopilot>,
 ) -> String {
     let mut text = String::new();
@@ -60,7 +80,14 @@ choose the more cautious decision.\n",
 You may read their files to check what the snapshot says. The repositories, all read-only:\n",
             );
             for repository in repositories {
-                let _ = writeln!(text, "  - {} ({})", repository.name, repository.path);
+                let _ = write!(text, "  - {} ({})", repository.name, repository.path);
+                // One line: the description is data from the workflow file.
+                match repository.description.as_deref().map(single_line) {
+                    Some(description) if !description.is_empty() => {
+                        let _ = writeln!(text, ": {description}");
+                    }
+                    _ => text.push('\n'),
+                }
             }
         }
         ConductorAccess::ReadOnlyWorkspace => text.push_str(
@@ -80,6 +107,11 @@ scratch directory. Everything you know about the task is in the snapshot below.\
     text.push_str("\n\n");
     text.push_str(&answer_contract(purpose));
     text
+}
+
+/// `text` on one line, its runs of whitespace collapsed.
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// What the invocation is for, in the conductor's terms.
@@ -298,4 +330,36 @@ fn proposals_schema() -> Value {
             "additionalProperties": false,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repository(name: &str, description: Option<&str>) -> ConductorRepository {
+        ConductorRepository {
+            name: name.to_string(),
+            path: format!("/task/{name}"),
+            description: description.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_list_names_what_each_repository_is_for_on_one_line() {
+        let prompt = conductor_prompt_for(
+            ConductorPurpose::ReplyToChat,
+            ConductorAccess::ReadOnlyWorkspace,
+            "",
+            &[
+                repository("api", Some("REST backend\n  of the  shop")),
+                repository("docs", None),
+                repository("web", Some("   ")),
+            ],
+            None,
+        );
+
+        assert!(prompt.contains("  - api (/task/api): REST backend of the shop\n"));
+        assert!(prompt.contains("  - docs (/task/docs)\n"));
+        assert!(prompt.contains("  - web (/task/web)\n"));
+    }
 }
