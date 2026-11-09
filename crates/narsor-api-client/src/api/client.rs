@@ -171,6 +171,17 @@ impl ApiClient {
         )
     }
 
+    /// Like [`ApiClient::new`], with a request timeout of the caller's
+    /// choice, for calls that are not awaited on the TUI's key path (the
+    /// daemon health check).
+    pub fn with_timeout(addr: SocketAddr, token: impl Into<String>, timeout: Duration) -> Self {
+        Self::build(
+            format!("http://{addr}"),
+            TokenSource::Static(token.into()),
+            timeout,
+        )
+    }
+
     /// Builds a client for the control plane at `base_url`, presenting the
     /// token `source` yields.
     ///

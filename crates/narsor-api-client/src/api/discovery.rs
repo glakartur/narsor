@@ -67,6 +67,19 @@ const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// recovery sweep, socket bind — that its own path never pays for.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long one health check may wait for a loopback daemon's answer.
+///
+/// A busy daemon (several tasks running) can need more than the TUI's
+/// 800 ms request bound. A slow answer is not a dead daemon.
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many health checks a live PID gets before the daemon is called
+/// unresponsive.
+const HEALTH_CHECK_ATTEMPTS: u32 = 3;
+
+/// Pause between two health checks of one live PID.
+const HEALTH_CHECK_PAUSE: Duration = Duration::from_secs(1);
+
 /// The log a daemon this client spawns writes to, in its state directory.
 const DAEMON_LOG: &str = "narsor.log";
 
@@ -178,7 +191,12 @@ pub async fn ensure_daemon_running(
         if pid_is_alive(info.pid) && info.token.is_empty() {
             return Err(DiscoveryError::NetworkMode);
         }
-        if pid_is_alive(info.pid) && health_check(&info).await {
+        if pid_is_alive(info.pid)
+            && is_responsive(HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_PAUSE, || {
+                health_check(&info)
+            })
+            .await
+        {
             return Ok(client_for(&info));
         }
         // Stale entry (dead PID — AE3) or a PID that answers to nothing
@@ -445,14 +463,62 @@ fn read_protected(path: &Path) -> Result<Option<DaemonDiscoveryRecord>, Discover
 /// reuses an ordinary read endpoint, `GET /executions`, exactly as an
 /// ordinary [`ApiClient`] caller would.
 async fn health_check(info: &DaemonDiscoveryRecord) -> bool {
-    let client = client_for(info);
+    let client = ApiClient::with_timeout(info.addr, info.token.clone(), HEALTH_CHECK_TIMEOUT);
     client.control_capabilities().await.is_ok()
+}
+
+/// Whether `probe` succeeds within `attempts` tries, `pause` apart. Stops
+/// at the first success.
+async fn is_responsive<F, Fut>(attempts: u32, pause: Duration, mut probe: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(pause).await;
+        }
+        if probe().await {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn run_responsive(results: Vec<bool>) -> (bool, usize) {
+        let calls = std::cell::Cell::new(0usize);
+        let attempts = results.len() as u32;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let verdict = runtime.block_on(is_responsive(attempts, Duration::ZERO, || {
+            let answer = results[calls.get()];
+            calls.set(calls.get() + 1);
+            async move { answer }
+        }));
+        (verdict, calls.get())
+    }
+
+    #[test]
+    fn a_daemon_that_answers_late_is_responsive() {
+        assert_eq!(run_responsive(vec![false, false, true]), (true, 3));
+    }
+
+    #[test]
+    fn a_daemon_that_answers_at_once_is_probed_once() {
+        assert_eq!(run_responsive(vec![true, false, false]), (true, 1));
+    }
+
+    #[test]
+    fn a_daemon_that_never_answers_is_unresponsive_after_all_attempts() {
+        assert_eq!(run_responsive(vec![false, false, false]), (false, 3));
+    }
 
     #[test]
     fn daemon_launch_args_reappends_root_and_config_flags() {

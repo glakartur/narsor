@@ -278,6 +278,12 @@ impl StatePaths {
         self.root.join(DAEMON_FILE)
     }
 
+    /// `{root}/daemon.instance.lock`: held by the running daemon for its
+    /// whole life, so a second daemon cannot start beside it.
+    pub fn daemon_instance_lock_file(&self) -> PathBuf {
+        self.root.join("daemon.instance.lock")
+    }
+
     /// `{root}/daemon.lock`
     pub fn daemon_lock_file(&self) -> PathBuf {
         self.root.join(DAEMON_LOCK_FILE)
