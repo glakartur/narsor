@@ -6,6 +6,7 @@
 //! executor start from the same scope, and the prompt block and the harness
 //! adapters are fed from it.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::domain::{StepWorkspace, Workspace, WORKSPACE_ROOT};
@@ -15,6 +16,8 @@ use crate::domain::{StepWorkspace, Workspace, WORKSPACE_ROOT};
 pub struct ScopedRepository {
     pub name: String,
     pub path: PathBuf,
+    /// What the workflow says the repository is for, when it says anything.
+    pub description: Option<String>,
 }
 
 /// Where a step starts and what it may write or read.
@@ -51,6 +54,7 @@ impl StepScope {
                 .map(|entry| ScopedRepository {
                     name: entry.name.clone(),
                     path: PathBuf::from(&entry.path),
+                    description: None,
                 })
         };
         let multi_repository = entries.len() > 1;
@@ -61,6 +65,7 @@ impl StepScope {
             let scoped = |entry: &&crate::domain::WorkspaceRepository| ScopedRepository {
                 name: entry.name.clone(),
                 path: PathBuf::from(&entry.path),
+                description: None,
             };
             return Self {
                 start_dir: PathBuf::from(&workspace.path),
@@ -95,6 +100,15 @@ impl StepScope {
         }
     }
 
+    /// The same scope with the description of each repository the workflow
+    /// gives (`descriptions`, by repository name).
+    pub fn with_descriptions(mut self, descriptions: &BTreeMap<String, String>) -> Self {
+        for repository in self.write.iter_mut().chain(self.read.iter_mut()) {
+            repository.description = descriptions.get(&repository.name).cloned();
+        }
+        self
+    }
+
     /// The same scope with every repository read-only, for a run that must
     /// not change anything (a reprompt, the conductor).
     pub fn read_only(mut self) -> Self {
@@ -123,11 +137,22 @@ impl StepScope {
         for (repositories, mode) in [(&self.write, "write"), (&self.read, "read-only")] {
             for repository in repositories {
                 block.push_str(&format!(
-                    "- {} ({}): {}\n",
+                    "- {} ({}): {}",
                     repository.name,
                     repository.path.display(),
                     mode
                 ));
+                // One line: the description is data from the workflow file.
+                let description = repository
+                    .description
+                    .as_deref()
+                    .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                if !description.is_empty() {
+                    block.push_str(" — ");
+                    block.push_str(&description);
+                }
+                block.push('\n');
             }
         }
         block.push_str("Do not modify the read-only repositories.");
@@ -225,5 +250,31 @@ mod tests {
         let scope = StepScope::resolve(None, &workspace).read_only();
         assert!(scope.write.is_empty());
         assert_eq!(names(&scope.read), ["code", "docs"]);
+    }
+
+    #[test]
+    fn the_block_names_what_each_repository_is_for_on_one_line() {
+        let workspace = workspace(&["code", "docs", "web"]);
+        let descriptions = BTreeMap::from([
+            (
+                "code".to_string(),
+                "REST backend\n  of the  shop".to_string(),
+            ),
+            ("web".to_string(), "   ".to_string()),
+        ]);
+        let block = StepScope::resolve(None, &workspace)
+            .with_descriptions(&descriptions)
+            .prompt_block();
+        assert!(block.contains("- code (/task/workspace/code): write — REST backend of the shop\n"));
+        assert!(block.contains("- docs (/task/workspace/docs): read-only\n"));
+        assert!(block.contains("- web (/task/workspace/web): read-only\n"));
+    }
+
+    #[test]
+    fn a_single_repository_with_a_description_still_has_no_block() {
+        let workspace = Workspace::local_folder("/task/workspace/app".to_string());
+        let descriptions = BTreeMap::from([("app".to_string(), "the app".to_string())]);
+        let scope = StepScope::resolve(None, &workspace).with_descriptions(&descriptions);
+        assert_eq!(scope.prompt_block(), "");
     }
 }

@@ -420,22 +420,13 @@ impl HarnessInvoker {
         &self,
         execution: &WorkflowExecution,
     ) -> std::collections::BTreeMap<String, String> {
-        let described = |definition: &WorkflowDefinition| {
-            definition
-                .repositories
-                .iter()
-                .filter_map(|repository| {
-                    Some((repository.name.clone(), repository.description.clone()?))
-                })
-                .collect()
-        };
         if let Some(definition) = &self.pinned_definition {
-            return described(definition);
+            return definition.repository_descriptions();
         }
         crate::tasks::resolve_definition(&self.catalog_dir, self.store.paths(), execution)
             .ok()
             .and_then(|resolved| resolved.load().ok())
-            .map(|definition| described(&definition))
+            .map(|definition| definition.repository_descriptions())
             .unwrap_or_default()
     }
 
