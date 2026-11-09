@@ -93,6 +93,11 @@ use narsor_shared::cli_error::{CliError, Result};
 /// boundary and short enough that `daemon stop` still feels responsive.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many times a starting daemon tries the instance lock, and the pause
+/// between tries: about 20 s, longer than a predecessor's shutdown drain.
+const INSTANCE_LOCK_ATTEMPTS: u32 = 40;
+const INSTANCE_LOCK_PAUSE: Duration = Duration::from_millis(500);
+
 /// How often the drain loop re-checks [`Engine::active_run_ids`].
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -132,6 +137,17 @@ const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// the only way out is that signal.
 pub async fn run_daemon(config: &Resolved) -> Result<()> {
     let paths = narsor_engine::persistence::StatePaths::new(config.state_dir());
+    // One daemon per state directory, held until this function returns. A
+    // predecessor that is still shutting down is waited for: two daemons
+    // must never drive the same tasks.
+    let mut instance_lock = crate::instance_lock::FlockFile::new(paths.daemon_instance_lock_file());
+    crate::instance_lock::acquire(
+        &mut instance_lock,
+        INSTANCE_LOCK_ATTEMPTS,
+        INSTANCE_LOCK_PAUSE,
+    )
+    .await
+    .map_err(|error| CliError::failure(error.to_string()))?;
     // Before anything is touched: a security configuration that does not
     // hold up must stop the daemon, not leave it half started (U7).
     let security = server_security(config, &paths)?;
@@ -297,8 +313,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| {
         CliError::failure(format!("could not install the SIGTERM handler: {error}"))
     })?;
-    terminate.recv().await;
-    tracing::info!("daemon: received SIGTERM, shutting down");
+    wait_for_sigterm_keeping_discovery(&mut terminate, &paths.daemon_file(), &info).await;
 
     // Stop the local controller while the API still accepts its signed
     // lease release (R8). A successor can then acquire the lease
@@ -704,6 +719,82 @@ fn spawn_owed_step(
     Ok(true)
 }
 
+/// How often the daemon checks that its discovery file is still there.
+const DISCOVERY_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What the daemon found at its discovery file.
+#[derive(Debug, PartialEq, Eq)]
+enum DiscoveryRead {
+    /// The file is gone.
+    Missing,
+    /// The file names this PID.
+    Pid(u32),
+    /// The file exists but could not be read now. Not a reason to write it.
+    Unreadable,
+}
+
+impl DiscoveryRead {
+    fn from_result(result: narsor_engine::persistence::Result<DaemonInfo>) -> Self {
+        use narsor_engine::persistence::PersistenceError;
+        match result {
+            Ok(info) => Self::Pid(info.pid),
+            Err(PersistenceError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Self::Missing
+            }
+            Err(_) => Self::Unreadable,
+        }
+    }
+
+    /// `true` when no client can find this daemon: a client removed the
+    /// file, or it names another PID. The daemon holds the instance lock,
+    /// so it is the only legitimate daemon and writes the record again.
+    fn needs_rewrite(&self, own_pid: u32) -> bool {
+        match self {
+            Self::Missing => true,
+            Self::Pid(pid) => *pid != own_pid,
+            Self::Unreadable => false,
+        }
+    }
+}
+
+/// Waits for `SIGTERM`. Meanwhile, writes `info` again whenever the
+/// discovery file is gone, so a client that removed it by mistake does not
+/// leave a running daemon undiscoverable.
+async fn wait_for_sigterm_keeping_discovery(
+    terminate: &mut tokio::signal::unix::Signal,
+    daemon_file: &Path,
+    info: &DaemonInfo,
+) {
+    let mut interval = tokio::time::interval(DISCOVERY_WATCH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = terminate.recv() => {
+                tracing::info!("daemon: received SIGTERM, shutting down");
+                return;
+            }
+            _ = interval.tick() => {
+                let read = DiscoveryRead::from_result(DaemonInfo::read(daemon_file));
+                if read.needs_rewrite(info.pid) {
+                    match info.write(daemon_file) {
+                        Ok(()) => tracing::warn!(
+                            ?read,
+                            "daemon: the discovery file was gone or foreign, wrote it again"
+                        ),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "daemon: could not write the discovery file again"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn cleanup_discovery_file(path: &Path) {
     if let Err(error) = std::fs::remove_file(path) {
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -741,5 +832,44 @@ pub async fn drain_active_runs(engine: &Engine, timeout: Duration) -> bool {
             return false;
         }
         tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod discovery_watch_tests {
+    use super::*;
+    use narsor_engine::persistence::PersistenceError;
+    use std::io;
+    use std::path::PathBuf;
+
+    fn io_error(kind: io::ErrorKind) -> PersistenceError {
+        PersistenceError::Io {
+            path: PathBuf::from("daemon.json"),
+            source: io::Error::from(kind),
+        }
+    }
+
+    #[test]
+    fn a_missing_file_is_written_again() {
+        let read = DiscoveryRead::from_result(Err(io_error(io::ErrorKind::NotFound)));
+        assert_eq!(read, DiscoveryRead::Missing);
+        assert!(read.needs_rewrite(10));
+    }
+
+    #[test]
+    fn a_file_with_another_pid_is_written_again() {
+        assert!(DiscoveryRead::Pid(11).needs_rewrite(10));
+    }
+
+    #[test]
+    fn a_file_with_its_own_pid_is_left_alone() {
+        assert!(!DiscoveryRead::Pid(10).needs_rewrite(10));
+    }
+
+    #[test]
+    fn a_read_failure_other_than_not_found_is_left_alone() {
+        let read = DiscoveryRead::from_result(Err(io_error(io::ErrorKind::PermissionDenied)));
+        assert_eq!(read, DiscoveryRead::Unreadable);
+        assert!(!read.needs_rewrite(10));
     }
 }
