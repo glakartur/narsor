@@ -87,6 +87,17 @@ impl WorkflowDefinition {
             .and_then(RepositoryDefinition::workspace_spec)
     }
 
+    /// What the workflow says each repository is for, by repository name.
+    /// A repository without a description is not in the map.
+    pub fn repository_descriptions(&self) -> BTreeMap<String, String> {
+        self.repositories
+            .iter()
+            .filter_map(|repository| {
+                Some((repository.name.clone(), repository.description.clone()?))
+            })
+            .collect()
+    }
+
     /// The repositories chosen when a task is created, in the order of the
     /// file.
     pub fn chosen_repositories(&self) -> impl Iterator<Item = &RepositoryDefinition> {
