@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-11-10-dynamiczny-model-i-effort-kroku-requirements
 
 ## Summary
 
-Krok agenta dostaje model i effort z trzech źródeł, w tej kolejności: wartość domyślna z definicji workflow, profil zapisany przez dyrygenta po kroku planu, eskalacja po powtórzonych błędach. Plan dodaje pola `effort` i górną granicę do definicji kroku, czystą funkcję, która wylicza profil efektywny, przekazanie effortu do harnessów, zapis profilu obok stanu dyrygenta, nowe wywołanie dyrygenta po planie, eskalację w silniku i podgląd w TUI. Plan nie zmienia wartości domyślnych w workflow. Tabela z dokumentu źródłowego pozostaje hipotezą.
+Krok agenta dostaje model i effort z trzech źródeł, w tej kolejności: wartość domyślna z definicji workflow, profil zapisany przez dyrygenta po kroku planu, eskalacja po powtórzonych błędach. Plan dodaje pola `effort` i górną granicę do definicji kroku, czystą funkcję, która wylicza profil efektywny, przekazanie effortu do harnessów, zapis profilu obok stanu dyrygenta, nowe wywołanie dyrygenta po planie, eskalację w silniku i podgląd w TUI. Plan nie dotyczy konkretnego workflow i nie zmienia ich wartości domyślnych. Tabela z dokumentu źródłowego pozostaje hipotezą.
 
 ---
 
@@ -409,7 +409,6 @@ effective(step):
 | Flagi effortu różnią się między harnessami i wersjami CLI | Zły argument psuje start kroku | Sprawdzenie na zainstalowanych CLI przed U2. Harness bez obsługi ignoruje pole z ostrzeżeniem. |
 | Model nie ma naturalnego porządku | Granica i eskalacja modelu są niejednoznaczne | `model_ladder` w workflow. Model spoza listy nie jest porównywany. |
 | Wywołanie dyrygenta po planie opóźnia następny krok | Zadanie wolniejsze | Limit czasu i wartości domyślne po jego upływie (U5). |
-| Plik `workflows/compound-engineering.yaml` z dokumentu źródłowego nie istnieje w repozytorium | Nie wiadomo, gdzie zapisać wartości domyślne | Pytanie otwarte 1. Plan przyjmuje zalecenie. |
 | Dyrygent obniża profil za agresywnie | Więcej rund przeglądu | Eskalacja po błędach (U8) i pomiar po wdrożeniu (Deferred to Follow-Up Work). |
 
 ---
@@ -430,18 +429,13 @@ effective(step):
 - Limit czasu wywołania dyrygenta po planie (U5).
 - Czy ponowne wejście do kroku zeruje licznik błędów (U8).
 - Czy istniejący mechanizm próśb obsługuje prośbę nieblokującą (U6).
-- Lokalizacja i właściciel pliku workflow `compound-engineering.yaml` (patrz pytania otwarte).
 
 ---
 
-## Pytania otwarte dla użytkownika
+## Decyzje operatora i pytania otwarte
 
-1. **Gdzie leży workflow `compound-engineering.yaml`?** Dokument źródłowy (`docs/follow-ups/2026-10-28-dobor-modelu-i-effortu-per-krok-workflow.md`) wskazuje ten plik. W katalogu `workflows/` repozytorium go nie ma (jest tylko `template.yaml`). Wartości domyślne, granice, `model_ladder` i znacznik kroku planu muszą trafić do tego pliku.
-   - Opcja A (zalecana): Plan dodaje pola i ich dokumentację do silnika i `template.yaml`. Wartości domyślne dla workflow zespołu dopisuje właściciel pliku w osobnym zadaniu, gdy wskaże jego lokalizację.
-   - Opcja B: Plan tworzy `workflows/compound-engineering.yaml` z wartościami z tabeli w dokumencie źródłowym. Tabela jest hipotezą, więc ta opcja zatwierdza je w praktyce.
-2. **Jak krok `work` rozpoznaje jednostkę planu (R11)?** Origin wymaga profilu per jednostka (`ce-work: unit 3`). Nie wiadomo, czy workflow uruchamia `work` osobnym krokiem na jednostkę, czy jednym krokiem na cały plan.
+1. **Zakres: każdy workflow.** Plan nie dotyczy konkretnego workflow (np. `compound-engineering.yaml`). Plan tworzy możliwość sterowania modelem i effortem w każdym workflow. Pola i dokumentacja trafiają do silnika, `template.yaml` i `docs/dev/workflow-schema.md`. Wartości domyślne konkretnych workflow są poza zakresem.
+2. **Jak krok `work` rozpoznaje jednostkę planu (R11)?** Pytanie otwarte. Origin wymaga profilu per jednostka (`ce-work: unit 3`). Nie wiadomo, czy workflow uruchamia `work` osobnym krokiem na jednostkę, czy jednym krokiem na cały plan.
    - Opcja A (zalecana): Pierwsza wersja zapisuje profil per krok, a klucz `unit` jest w danych (U3), ale silnik go jeszcze nie wypełnia. Profil per jednostka wchodzi, gdy workflow zacznie przekazywać numer jednostki.
    - Opcja B: Pierwsza wersja wymaga, aby workflow przekazywał numer jednostki do kroku `work` (zmiana definicji kroku i pętli). Zakres rośnie o zmianę modelu pętli.
-3. **Jak operator rozstrzyga prośbę o wyjście poza granicę?** Decyzja operatora wymaga otwartej prośby, ale origin wyklucza edycję profilu. Origin nie mówi, czy operator może prośbę zatwierdzić.
-   - Opcja A (zalecana): Pierwsza wersja tworzy i pokazuje prośbę (U6, U7). Zatwierdzenie wchodzi w osobnym zadaniu. Do tego czasu krok zostaje na granicy.
-   - Opcja B: Pierwsza wersja dodaje akcję „zatwierdź/odrzuć" w TUI. To rozszerza zakres o akcję zapisu, której origin nie opisuje.
+3. **Rozstrzyganie prośby o wyjście poza granicę: poza zakresem.** Operator na razie tym nie steruje. Plan tworzy i pokazuje prośbę (U6, U7). Krok zostaje na granicy. Plan nie dodaje akcji zatwierdź/odrzuć.
