@@ -2645,6 +2645,23 @@ async fn paused_between_steps(root: &TempRoot) -> PathBuf {
     storage
 }
 
+/// A runner lost between its steps without closing its session, whose
+/// execution an earlier recovery attempt had already marked `Unknown`; the
+/// storage it leaves.
+async fn lost_unknown_between_steps(root: &TempRoot) -> PathBuf {
+    let storage = paused_between_steps(root).await;
+    let task_storage = TaskStorage::new(&storage);
+    let store = task_storage.store();
+    let execution_id = store.list_execution_ids().unwrap().remove(0);
+    let mut execution = store.load_execution(&execution_id).unwrap();
+    execution.status = ExecutionStatus::Unknown;
+    store.save_execution(&execution).unwrap();
+    task_storage
+        .write_session(&SessionRecord::open("pod-1", Some(1)))
+        .unwrap();
+    storage
+}
+
 /// A runner resumed after a pause, with its launch view.
 fn resumed(root: &TempRoot, storage: &Path, launch: Option<RunnerLaunchView>) -> Fixture {
     let path = harness_path(root, &["claude"]);
@@ -2721,4 +2738,27 @@ async fn without_the_control_plane_a_resume_goes_on_without_the_comment() {
     fixture.session.link.launch = Some(launch_with_comment("pod-2"));
     assert_eq!(fixture.session.taken_resume_message_key(), None);
     assert!(fixture.session.untaken_resume_message().unwrap().is_some());
+}
+
+/// A resume after an earlier recovery left the execution `Unknown` still
+/// recovers it, and the owner's comment rides on the recovery instead of
+/// stopping the launch.
+#[tokio::test]
+async fn a_comment_on_an_unknown_execution_goes_with_its_recovery() {
+    let root = TempRoot::new();
+    let storage = lost_unknown_between_steps(&root).await;
+    let mut fixture = resumed(&root, &storage, Some(launch_with_comment("pod-2")));
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].prompt.contains("Mind the flaky test."),
+        "{}",
+        calls[0].prompt
+    );
+    assert_eq!(fixture.session.untaken_resume_message().unwrap(), None);
 }

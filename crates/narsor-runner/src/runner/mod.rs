@@ -1236,12 +1236,23 @@ impl Session {
     }
 
     /// Runs reconciliation the owner or the resume policy authorized and,
-    /// when it finds an action that was in flight, starts that action again.
+    /// when it finds an action that was in flight (or an execution an earlier
+    /// attempt already left `Unknown`), starts that action again.
     fn recover(&mut self, decision: Decision) -> Result<(), RunnerError> {
         let execution_id = self.execution_id.clone().unwrap_or_default();
         let reconciliation = reconcile(self.engine.store(), &execution_id)?;
         tracing::info!(?decision, outcome = ?reconciliation.outcome, "recovering after an unexpected stop");
-        if let ReconciliationOutcome::InterruptedAction { .. } = reconciliation.outcome {
+        // An execution an earlier attempt already turned `Unknown` is not
+        // examined again, but it is still waiting for this explicit recovery,
+        // and it takes no comment on its own.
+        let needs_recovery = matches!(
+            reconciliation.outcome,
+            ReconciliationOutcome::InterruptedAction { .. }
+                | ReconciliationOutcome::NotApplicable {
+                    status: ExecutionStatus::Unknown
+                }
+        );
+        if needs_recovery {
             // The recovery's own note would replace the owner's comment, so
             // the comment rides on it.
             let message = self.untaken_resume_message()?;

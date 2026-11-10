@@ -2394,6 +2394,7 @@ impl Engine {
         // at its first attempt, kept for every retry (R16a).
         let mut pinned_harness = None;
         let declared = DeclaredNames::of(definition);
+        let descriptions = definition.repository_descriptions();
 
         execution.current_action_execution = Some(action_execution_id.clone());
         self.emit(
@@ -2416,6 +2417,7 @@ impl Engine {
                     state,
                     action,
                     &declared,
+                    &descriptions,
                     &action_execution_id,
                     timeout,
                     &mut pinned_harness,
@@ -2527,6 +2529,7 @@ impl Engine {
         state: &State,
         action: &ActionConfig,
         declared: &DeclaredNames,
+        descriptions: &BTreeMap<String, String>,
         action_execution_id: &str,
         timeout: Option<Duration>,
         pinned_harness: &mut Option<String>,
@@ -2664,6 +2667,7 @@ impl Engine {
                 execution,
                 state,
                 &rendered,
+                descriptions,
                 action_execution_id,
                 PromptPurpose::Step,
                 author,
@@ -2778,6 +2782,7 @@ impl Engine {
         execution: &WorkflowExecution,
         state: &State,
         rendered: &ActionConfig,
+        descriptions: &BTreeMap<String, String>,
         action_execution_id: &str,
         purpose: PromptPurpose,
         author: PromptAuthor,
@@ -2809,7 +2814,8 @@ impl Engine {
         };
 
         let conversation_store = self.store.conversation_store(&execution.id);
-        let scope = StepScope::resolve(state.workspace.as_ref(), &execution.workspace);
+        let scope = StepScope::resolve(state.workspace.as_ref(), &execution.workspace)
+            .with_descriptions(descriptions);
         let request = ActionRequest::new(rendered, &execution.workspace, action_execution_id)
             .with_scope(&scope)
             .with_timeout(timeout)
@@ -3030,6 +3036,9 @@ impl Engine {
                 execution,
                 state,
                 &rendered,
+                // A reprompt resumes the agent's session, which was told about
+                // the repositories when it began: no block, no descriptions.
+                &BTreeMap::new(),
                 &action_execution_id,
                 PromptPurpose::Reprompt,
                 match by {
