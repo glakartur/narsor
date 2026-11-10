@@ -25,7 +25,7 @@ Złożoność zadania jest znana dopiero po planie. Plan zawiera rozmiar jednost
 
 - A1. Autor workflow: zapisuje w definicji domyślny model i effort oraz górną granicę dla każdego kroku.
 - A2. Dyrygent: czyta plan i zapisuje profil kroków. Nie pisze kodu.
-- A3. Operator: widzi profil w TUI. Zatwierdza wyjście poza górną granicę.
+- A3. Operator: widzi profil w TUI. Widzi profil bez możliwości edycji. Zatwierdza wyjście poza górną granicę.
 - A4. Agent kroku: dostaje model i effort przy starcie kroku.
 
 ---
@@ -42,7 +42,7 @@ Złożoność zadania jest znana dopiero po planie. Plan zawiera rozmiar jednost
 - F2. Profil po planie
   - **Trigger:** Krok planu kończy się sukcesem.
   - **Actors:** A2, A3
-  - **Steps:** Dyrygent czyta plan i ocenę. Dla każdego kroku następnego zapisuje model i effort w granicach z workflow. Profil trafia do danych zadania i do TUI. Gdy dyrygent chce wyjść poza granicę, zadanie czeka na zgodę operatora. Gdy dyrygent nie jest pewny albo zawodzi, obowiązują wartości domyślne.
+  - **Steps:** Dyrygent czyta plan i ocenę. Dla każdego kroku następnego zapisuje model i effort w granicach z workflow. Profil trafia do danych zadania i do TUI. Gdy dyrygent chce wyjść poza granicę, krok startuje na granicy, a prośba o zgodę operatora zostaje otwarta. Gdy dyrygent nie jest pewny albo zawodzi, obowiązują wartości domyślne.
   - **Outcome:** Każdy krok ma profil. Operator widzi go przed startem kroku.
   - **Covered by:** R3, R4, R6, R7, R8
 
@@ -66,11 +66,11 @@ Złożoność zadania jest znana dopiero po planie. Plan zawiera rozmiar jednost
 - R4. Profil jest zapisany w danych zadania, wraz z krótkim uzasadnieniem dyrygenta. TUI pokazuje profil kroku.
 - R5. Krok planu zwraca ocenę złożoności (np. liczba plików i modułów, migracje lub zmiany kontraktów, brak testów, zależności jednostek). Dyrygent opiera się na tej ocenie i na planie. Dyrygent nie ocenia ukrytej trudności.
 - R6. Dyrygent może obniżyć model lub effort poniżej wartości domyślnej bez ograniczeń.
-- R7. Dyrygent może podnieść model lub effort tylko do górnej granicy z R2. Wyjście poza granicę wymaga zgody operatora.
+- R7. Dyrygent może podnieść model lub effort tylko do górnej granicy z R2. Wyjście poza granicę wymaga zgody operatora. Do czasu zgody krok startuje na granicy, a prośba zostaje otwarta. Zadanie nie czeka.
 - R8. Gdy dyrygent nie jest pewny, albo jego wywołanie zawodzi, krok używa wartości domyślnej z workflow.
 
 **Eskalacja**
-- R9. Pierwsza i druga próba kroku używają tego samego profilu. Eskalacja zaczyna się po progu nieudanych prób. Próg jest parametrem konfiguracji.
+- R9. Pierwsza i druga próba kroku używają tego samego profilu. Eskalacja zaczyna się po progu nieudanych prób. Próg jest jednym parametrem globalnym konfiguracji (nie per krok). Wartość domyślna to 3.
 - R10. Eskalacja podnosi najpierw effort, potem model, i nigdy nie przekracza granicy z R2.
 
 **Jednostki pracy**
@@ -81,7 +81,7 @@ Złożoność zadania jest znana dopiero po planie. Plan zawiera rozmiar jednost
 ## Acceptance Examples
 
 - AE1. **Covers R3, R6.** Given plan z jedną małą zmianą w jednym pliku, when dyrygent zapisuje profil, then krok `work` dostaje model niższy niż domyślny.
-- AE2. **Covers R7.** Given granica górna `opus/high` i propozycja `opus/max`, when dyrygent zapisuje profil, then zadanie czeka na zgodę operatora i do zgody używa `opus/high`.
+- AE2. **Covers R7.** Given granica górna `opus/high` i propozycja `opus/max`, when dyrygent zapisuje profil, then krok startuje na `opus/high`, a prośba o `opus/max` zostaje otwarta do decyzji operatora. Zadanie nie czeka.
 - AE3. **Covers R8.** Given wywołanie dyrygenta kończy się błędem po planie, when krok `work` startuje, then używa wartości domyślnych z workflow.
 - AE4. **Covers R9, R10.** Given próg 3 i krok, który kończy się błędem trzy razy z tym samym profilem, when startuje próba czwarta, then effort jest wyższy. Gdy effort jest już na granicy, rośnie model.
 - AE5. **Covers R1.** Given workflow bez pól `effort`, when krok startuje, then harness dostaje te same argumenty co dziś.
@@ -100,7 +100,7 @@ Złożoność zadania jest znana dopiero po planie. Plan zawiera rozmiar jednost
 
 - Dobór profilu przed krokiem planu na podstawie treści zadania. Powód: złożoność jest wtedy nieznana.
 - Dyrygent nie pyta o profil przed każdym krokiem.
-- Edycja profilu przez człowieka w bramce po planie: odroczona (patrz pytania otwarte).
+- Edycja profilu przez człowieka (w bramce po planie lub gdzie indziej): poza zakresem pierwszej wersji. Operator ma tylko podgląd w TUI. Edycja może wejść w osobnym zadaniu.
 - Automatyczne uczenie wartości domyślnych z historii zadań.
 - Wartości domyślne z tabeli w dokumencie źródłowym są hipotezą. Ten dokument ich nie zatwierdza.
 
@@ -130,16 +130,16 @@ Złożoność zadania jest znana dopiero po planie. Plan zawiera rozmiar jednost
 - Brak profilu lub błąd dyrygenta nigdy nie blokuje zadania (R8).
 - Ocenę złożoności zwraca krok planu jako dodatkowe dane. Dyrygent jej nie wylicza sam od zera.
 - Harness bez obsługi effortu ignoruje to pole z widocznym ostrzeżeniem w zdarzeniach.
-- Próg eskalacji domyślnie wynosi 3 (trzecia nieudana próba). Wartość do pomiaru.
+- Próg eskalacji wynosi 3 (trzecia nieudana próba) i jest parametrem globalnym. Wartość do pomiaru.
 - Górna granica jest wymagana tylko tam, gdzie autor chce ją mieć. Bez granicy dyrygent może podnieść ustawienie tylko do wartości domyślnej kroku.
 
 ---
 
-## Pytania otwarte dla użytkownika
+## Decyzje operatora
 
-1. **Edycja profilu przez człowieka.** Czy operator ma móc zmienić profil po planie, przed startem kroków? Opcje: (a) tak, w istniejącej bramce po planie, (b) tylko podgląd w TUI, bez edycji, (c) edycja później, w osobnym zadaniu. Rekomendacja: (b) w pierwszej wersji.
-2. **Granica bez zgody.** Co dzieje się, gdy dyrygent chce wyjść poza granicę, a operator nie odpowiada? Opcje: (a) zadanie czeka, (b) krok startuje na granicy i prośba zostaje otwarta, (c) krok startuje na wartości domyślnej. Rekomendacja: (b).
-3. **Próg eskalacji.** Trzecia czy czwarta nieudana próba? Opcje: (a) trzecia, (b) czwarta, (c) parametr per krok. Rekomendacja: (a) jako parametr globalny.
+1. **Edycja profilu:** tylko podgląd w TUI, bez edycji (Q1: b).
+2. **Granica bez zgody:** krok startuje na granicy, prośba zostaje otwarta (Q2: b).
+3. **Próg eskalacji:** trzecia próba, parametr globalny (Q3: a).
 
 ## Deferred to Planning
 
