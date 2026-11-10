@@ -60,7 +60,7 @@ use ratatui::Frame;
 
 use crate::api::ClientError;
 pub use crate::cli::task_text::short_age;
-use crate::cli::task_text::{task_state_name, without_slot};
+use crate::cli::task_text::without_slot;
 use crate::controller_protocol::{
     ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
     TimelineResponse,
@@ -73,7 +73,7 @@ use super::super::keymap::Action;
 use super::super::scroll::one_line;
 use super::super::style::{PanelEdge, Role, Styles};
 use super::background::{DetailJob, JobKey, Outcome};
-use super::list::{describe_loss, state_icon, title_of};
+use super::list::{describe_loss, state_icon, title_of, StateIcon};
 use super::notify::Severity;
 use super::panel::WaitingPanel;
 use super::tabs::conductor::{self, Conductor};
@@ -1571,7 +1571,7 @@ fn status_line(
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let icon = state_icon(task);
-    let state = format!("{} {}", icon.glyph(), status_word(task));
+    let state = format!("{} {}", icon.glyph(), status_word(task, icon));
     spans.push(Span::styled(
         state.clone(),
         styles.of(greyed(icon.role(), stale)),
@@ -1708,8 +1708,15 @@ fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Optio
     ))
 }
 
-fn status_word(task: &TaskSummary) -> &'static str {
-    task_state_name(task.state)
+/// The state in a word, from the same icon the list draws, so the two never
+/// disagree. A task in the error state is `failed`; any other problem is
+/// just a `problem`.
+fn status_word(task: &TaskSummary, icon: StateIcon) -> &'static str {
+    if icon == StateIcon::Problem && task.state == TaskState::Error {
+        "failed"
+    } else {
+        icon.word()
+    }
 }
 
 /// What follows the state on the status line: the queue, or the step, the

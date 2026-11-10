@@ -1674,7 +1674,7 @@ mod task_app_list {
 
     use narsor::api::{ApiClient, ClientError};
     use narsor::tui::connection::LinkState;
-    use narsor::tui::task_app::list::{Attention, StateIcon};
+    use narsor::tui::task_app::list::StateIcon;
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{layout, DetailTab, EventFeed, Focus, Request, TaskApp};
 
@@ -1748,14 +1748,14 @@ mod task_app_list {
         assert_eq!(titles(&app), ["c", "a", "b"]);
     }
 
-    fn row(app: &TaskApp, title: &str) -> (Attention, StateIcon, String) {
+    fn row(app: &TaskApp, title: &str) -> (StateIcon, String) {
         let row = app
             .list()
             .rows()
             .into_iter()
             .find(|row| row.title == title)
             .unwrap_or_else(|| panic!("no row {title}"));
-        (row.attention, row.icon, row.label)
+        (row.icon, row.label)
     }
 
     fn note(app: &TaskApp) -> String {
@@ -1814,7 +1814,7 @@ mod task_app_list {
             app.load(queued_all());
             let order = vec!["a", "b", "c"];
             assert_eq!(titles(&app), order);
-            assert_eq!(row(&app, "b").2, "#2");
+            assert_eq!(row(&app, "b").1, "#2");
 
             let mut sequence = 1;
             for (index, id) in ["a", "b", "c"].into_iter().enumerate() {
@@ -1832,12 +1832,12 @@ mod task_app_list {
                 assert_eq!(titles(&app), order, "{id} provisioning");
                 assert!(app.refresh_wanted(), "the event carries no state to show");
                 reread(&mut app, id, sequence, |task| task.holds_slot = true);
-                assert_eq!(row(&app, id).1, StateIcon::Queued);
+                assert_eq!(row(&app, id).0, StateIcon::Starting);
                 // Whoever waits behind moves up in the queue, not on screen.
                 let waiting_behind = ["a", "b", "c"].iter().skip(index + 1).count();
                 if waiting_behind > 0 {
                     let next = ["a", "b", "c"][index + 1];
-                    assert_eq!(row(&app, next).2, "#1");
+                    assert_eq!(row(&app, next).1, "#1");
                 }
 
                 sequence += 1;
@@ -1853,7 +1853,7 @@ mod task_app_list {
                 ));
                 assert_eq!(titles(&app), order, "{id} running");
                 reread(&mut app, id, sequence, |task| task.holds_slot = true);
-                assert_eq!(row(&app, id).1, StateIcon::Running);
+                assert_eq!(row(&app, id).0, StateIcon::Running);
 
                 // The debounced read brings the runner's step.
                 let mut tasks = app.list().tasks().to_vec();
@@ -1861,7 +1861,7 @@ mod task_app_list {
                     with_runner(tasks[index].clone(), ExecutionStatus::Running, "implement");
                 tasks[index].revision = sequence;
                 app.load(listing(tasks, "read"));
-                assert_eq!(row(&app, id).2, "implement");
+                assert_eq!(row(&app, id).1, "implement");
 
                 sequence += 1;
                 app.on_stream(event(
@@ -1881,10 +1881,7 @@ mod task_app_list {
                 reread(&mut app, id, sequence, |task| {
                     task.runner.as_mut().unwrap().execution_status = ExecutionStatus::Completed;
                 });
-                assert_eq!(
-                    row(&app, id),
-                    (Attention::None, StateIcon::Done, "done".into())
-                );
+                assert_eq!(row(&app, id), (StateIcon::Done, String::new()));
             }
         }
 
@@ -1901,7 +1898,7 @@ mod task_app_list {
                 RunnerState::Queued,
                 TaskEventKind::Created,
             ));
-            assert_eq!(row(&app, "a").1, StateIcon::Running);
+            assert_eq!(row(&app, "a").0, StateIcon::Running);
             assert_eq!(
                 app.cursor(),
                 Some("c7"),
@@ -2063,7 +2060,7 @@ mod task_app_list {
             );
             waiting_task.runner = Some(narsor_runner());
             app.load(listing(vec![waiting_task, queued("b", 2)], "c"));
-            assert_eq!(row(&app, "a").0, Attention::Question);
+            assert_eq!(row(&app, "a").0, StateIcon::NeedsReply);
 
             let waiting_id = app.list().tasks()[0].attention[0].waiting_id.clone();
             app.on_stream(event(
@@ -2076,7 +2073,7 @@ mod task_app_list {
                     pending_input_id: waiting_id,
                 },
             ));
-            assert_eq!(row(&app, "a").0, Attention::None);
+            assert!(!row(&app, "a").0.needs_operator());
             assert!(!app.refresh_wanted(), "an answer shows without a read");
 
             app.on_stream(event(
@@ -2088,7 +2085,7 @@ mod task_app_list {
                     reason: QueueReason::ControllerOffline,
                 },
             ));
-            assert_eq!(row(&app, "b").2, "offline");
+            assert_eq!(row(&app, "b").0, StateIcon::Blocked);
             assert!(!app.refresh_wanted());
         }
 
@@ -2216,7 +2213,7 @@ mod task_app_list {
                 AttentionKind::FailedStep,
             );
             app.load(listing(vec![both], "c"));
-            assert_eq!(row(&app, "a").0, Attention::Problem);
+            assert_eq!(row(&app, "a").0, StateIcon::Problem);
             let counters = app.list().counters();
             assert_eq!((counters.questions, counters.problems), (0, 1));
         }
@@ -10571,7 +10568,7 @@ mod task_app_create {
             assert_eq!(app.outgoing()[0].task_id, id, "under the same id");
             assert_eq!(
                 rows(&app)[2],
-                ('✗', "NAR-18".to_string(), "nie wysłano".to_string())
+                ('!', "NAR-18".to_string(), "nie wysłano".to_string())
             );
             assert_eq!(app.list().pending()[0].state, PendingState::NotSent);
             assert!(app.next_outgoing_due().is_none(), "no more by itself");
@@ -10642,7 +10639,7 @@ mod task_app_create {
             });
             let screen = screen(&mut app, 120, 30);
             for expected in [
-                "✗ nie wysłano",
+                "! nie wysłano",
                 &id,
                 "Dane zostały zachowane",
                 "implement-feature",
@@ -12341,5 +12338,250 @@ fn ignored_denial_details_show_tool_ids_reason_and_the_full_input() {
 
     for expected in ["Bash", "toolu_77", "a1b2c3d4-0000", "not allowed", &command] {
         assert!(detail.contains(expected), "{expected} missing in {detail}");
+    }
+}
+
+/// The one icon of a row, worked out from the fields the server sends (the
+/// state icons plan, U1, U3 and U4).
+mod task_app_state_icons {
+    use narsor::api::ApiClient;
+    use narsor::tui::task_app::list::{state_icon, StateIcon};
+    use narsor::tui::task_app::TaskApp;
+    use narsor_engine::controller_protocol::TaskSummary;
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_engine::orchestration::{AttentionKind, QueueReason, RunnerState, TaskState};
+
+    use super::task_app_support::{
+        exhausted, interrupted, listing, queue_view, queued, task, titled, waiting,
+        waiting_for_capacity, with_controller, with_runner,
+    };
+
+    fn app() -> TaskApp {
+        TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        )
+    }
+
+    fn running(id: &str) -> TaskSummary {
+        with_controller(with_runner(
+            task(id, "local", "running", 1),
+            ExecutionStatus::Running,
+            "edit",
+        ))
+    }
+
+    fn in_state(mut task: TaskSummary, state: TaskState) -> TaskSummary {
+        task.state = state;
+        task
+    }
+
+    fn offline(mut task: TaskSummary) -> TaskSummary {
+        task.controller = None;
+        task
+    }
+
+    #[test]
+    fn a_running_task_is_running_and_a_problem_wins_over_it() {
+        assert_eq!(state_icon(&running("a")), StateIcon::Running);
+        let failing = waiting(running("a"), AttentionKind::FailedStep);
+        assert_eq!(state_icon(&failing), StateIcon::Problem);
+    }
+
+    #[test]
+    fn a_question_and_a_proposal_have_the_same_icon() {
+        for kind in [AttentionKind::Question, AttentionKind::ConductorProposal] {
+            assert_eq!(
+                state_icon(&waiting(running("a"), kind)),
+                StateIcon::NeedsReply,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finished_and_an_archived_task_have_different_icons() {
+        let finished = in_state(running("a"), TaskState::Finished);
+        let archived = in_state(running("a"), TaskState::Archived);
+        assert_eq!(state_icon(&finished), StateIcon::Done);
+        assert_eq!(state_icon(&archived), StateIcon::Archived);
+        let left_over = waiting(archived, AttentionKind::Question);
+        assert_eq!(state_icon(&left_over), StateIcon::Archived);
+    }
+
+    #[test]
+    fn a_blocked_queue_and_a_running_task_without_a_controller_are_blocked() {
+        let mut offline_queue = queued("a", 1);
+        offline_queue.queue = Some(queue_view(QueueReason::ControllerOffline));
+        assert_eq!(state_icon(&offline_queue), StateIcon::Blocked);
+        assert_eq!(state_icon(&offline(running("a"))), StateIcon::Blocked);
+        let plain = waiting_for_capacity(queued("a", 1), 1, 2, 2);
+        assert_eq!(state_icon(&plain), StateIcon::Queued);
+    }
+
+    #[test]
+    fn a_problem_or_a_question_wins_over_a_blocked_queue() {
+        let failing = waiting(offline(running("a")), AttentionKind::Problem);
+        assert_eq!(state_icon(&failing), StateIcon::Problem);
+        let asking = waiting(offline(running("a")), AttentionKind::Question);
+        assert_eq!(state_icon(&asking), StateIcon::NeedsReply);
+    }
+
+    #[test]
+    fn a_task_being_provisioned_is_starting_not_queued() {
+        let starting = with_controller(task("a", "local", "provisioning", 1));
+        assert_eq!(starting.state, TaskState::Queued);
+        assert_eq!(state_icon(&starting), StateIcon::Starting);
+    }
+
+    #[test]
+    fn an_automatic_resume_is_resuming_and_blocked_without_a_controller() {
+        let planned = with_controller(interrupted("a", RunnerState::Running, 1, true));
+        assert_eq!(state_icon(&planned), StateIcon::Resuming);
+        assert_eq!(state_icon(&offline(planned)), StateIcon::Blocked);
+    }
+
+    #[test]
+    fn a_resume_that_gave_up_is_a_problem() {
+        let given_up = exhausted(
+            with_controller(interrupted("a", RunnerState::Running, 6, false)),
+            "could not resume automatically: pod evicted",
+        );
+        assert_eq!(state_icon(&given_up), StateIcon::Problem);
+    }
+
+    #[test]
+    fn pausing_and_a_stop_by_hand_differ_and_a_policy_pause_is_running() {
+        let pausing = in_state(
+            with_controller(task("a", "local", "pause_requested", 1)),
+            TaskState::Paused,
+        );
+        assert_eq!(state_icon(&pausing), StateIcon::Pausing);
+        let stopped = in_state(
+            with_controller(task("a", "local", "stopped", 1)),
+            TaskState::Paused,
+        );
+        assert_eq!(state_icon(&stopped), StateIcon::Stopped);
+        let by_policy = in_state(
+            with_controller(task("a", "local", "pause_requested", 1)),
+            TaskState::Running,
+        );
+        assert_eq!(state_icon(&by_policy), StateIcon::Running);
+    }
+
+    #[test]
+    fn an_unknown_state_is_neutral() {
+        let unknown = in_state(running("a"), TaskState::Unrecognized);
+        assert_eq!(state_icon(&unknown), StateIcon::Unknown);
+    }
+
+    #[test]
+    fn the_error_state_is_a_problem_without_an_attention_item() {
+        let failed = in_state(running("a"), TaskState::Error);
+        assert_eq!(state_icon(&failed), StateIcon::Problem);
+    }
+
+    #[test]
+    fn every_icon_has_a_glyph_and_a_word_of_its_own() {
+        let all = [
+            StateIcon::New,
+            StateIcon::Queued,
+            StateIcon::Blocked,
+            StateIcon::Starting,
+            StateIcon::Running,
+            StateIcon::Resuming,
+            StateIcon::NeedsReply,
+            StateIcon::Problem,
+            StateIcon::Pausing,
+            StateIcon::Stopped,
+            StateIcon::Done,
+            StateIcon::Archived,
+            StateIcon::Unknown,
+            StateIcon::Sending,
+        ];
+        for (index, icon) in all.iter().enumerate() {
+            for other in &all[index + 1..] {
+                assert_ne!(icon.glyph(), other.glyph(), "{icon:?} {other:?}");
+                assert_ne!(icon.word(), other.word(), "{icon:?} {other:?}");
+            }
+        }
+        assert_eq!(StateIcon::Running.word(), "running");
+        assert_eq!(StateIcon::NeedsReply.word(), "awaiting input");
+    }
+
+    /// R13a: the counters count icons, and `Space` stops on the same rows.
+    #[test]
+    fn the_counters_and_space_follow_the_icon_of_the_row() {
+        let mut app = app();
+        let asking = titled(waiting(running("ask"), AttentionKind::Question), "asking");
+        let failing = titled(in_state(running("err"), TaskState::Error), "failing");
+        let left_over = titled(
+            waiting(
+                in_state(running("arc"), TaskState::Archived),
+                AttentionKind::Problem,
+            ),
+            "archived",
+        );
+        let blocked_asking = titled(
+            waiting(offline(running("blk")), AttentionKind::Question),
+            "blocked asking",
+        );
+        let calm = titled(running("calm"), "calm");
+        app.load(listing(
+            vec![calm, left_over, asking, failing, blocked_asking],
+            "c",
+        ));
+        let counters = app.list().counters();
+        assert_eq!((counters.questions, counters.problems), (2, 1));
+
+        let mut stops = Vec::new();
+        for _ in 0..3 {
+            assert!(app.list_mut().select_next_waiting());
+            stops.push(app.list().selected_id().map(str::to_string).unwrap());
+        }
+        assert_eq!(stops, ["ask", "err", "blk"]);
+    }
+
+    /// R12b: `z` hides finished and archived tasks by state.
+    #[test]
+    fn z_hides_finished_and_archived_tasks() {
+        let mut app = app();
+        app.load(listing(
+            vec![
+                titled(in_state(running("a"), TaskState::Finished), "finished"),
+                titled(in_state(running("b"), TaskState::Archived), "archived"),
+                titled(running("c"), "running"),
+            ],
+            "c",
+        ));
+        app.list_mut().toggle_hide_done();
+        assert_eq!(app.list().hidden_count(), 2);
+        assert_eq!(app.list().visible_ids(), ["c"]);
+    }
+
+    /// R9–R12: the third line holds the step or the place and never a word of
+    /// the state.
+    #[test]
+    fn the_label_is_the_step_or_the_place_and_nothing_else() {
+        let mut app = app();
+        app.load(listing(
+            vec![
+                titled(running("a"), "stepping"),
+                titled(waiting_for_capacity(queued("b", 2), 1, 2, 2), "waiting"),
+                titled(in_state(running("c"), TaskState::Finished), "finished"),
+                titled(in_state(running("d"), TaskState::Error), "failed"),
+                titled(
+                    in_state(
+                        with_controller(task("e", "local", "stopped", 4)),
+                        TaskState::Paused,
+                    ),
+                    "stopped",
+                ),
+            ],
+            "c",
+        ));
+        let labels: Vec<String> = app.list().rows().into_iter().map(|row| row.label).collect();
+        assert_eq!(labels, ["edit", "#1", "", "", ""]);
     }
 }

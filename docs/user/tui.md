@@ -15,14 +15,14 @@ server. Use `narsor-cli --server https://control.example ...` for CLI commands.
 ```text
 narsor · local ● live             harness claude-code (konfiguracja) · sloty 2/3 · ? 1 · ! 1
 ╭▸ Zadania ────────────────╮╭ Zmiana API zamówień ─────────────────────────────────────────╮
-│    ●  NAR-14 Edycja pars…││ Zmiana API zamówień · NAR-12                    implement v3 │
-│       edit               ││ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
+│  ●  NAR-14 Edycja pars…  ││ Zmiana API zamówień · NAR-12                    implement v3 │
+│     edit · 14m           ││ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
 │──────────────────────────││ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info                 │
-││ ? ●  Zmiana API zamówień││───────────────────│   Read src/api.rs                        │
-││      approval           │││ ● review_api     │   Edit src/api.rs  +12 −3                │
+││ ?  Zmiana API zamówień  ││───────────────────│   Read src/api.rs                        │
+││    3m                   │││ ● review_api     │   Edit src/api.rs  +12 −3                │
 │──────────────────────────││───────────────────│ │ assistant: Zmieniam sygnaturę…         │
-│  ! ✗  Migracja bazy dany…││╭ ? Czeka na Ciebie: approval · 3m ──────────────────────────╮│
-│       failed             │││ the answer panel                                           ││
+│  !  Migracja bazy dany…  ││╭ ? Czeka na Ciebie: approval · 3m ──────────────────────────╮│
+│                          │││ the answer panel                                           ││
 │                          ││╰────────────────────────────────────────────────────────────╯│
 │                          ││                                                              │
 ╰──────────────────────────╯╰──────────────────────────────────────────────────────────────╯
@@ -49,16 +49,43 @@ repositories use the same frames.
 
 **The list** is the queue: tasks stand in the order of the scheduler (`rank`),
 are never grouped or sorted by state, and change place only by an explicit
-action (`K` / `J` / `m`, the TUI's `narsor-cli task move`). A row takes two lines.
-The first holds the attention mark (`?` a question or an approval, `!` a
-problem, a failed step or a failed provisioning), the state icon (`●` running,
-`◷` queued, `⟳` provisioning, `‖` paused, `✗` failed or interrupted, `✓` done,
-`↻` being sent) and the task's title (the task id when
-there is none) on the whole width of the list. The second, under the title,
-is the label: the current step, `#n` in the queue, `offline` when no
-controller holds the backend, `nie wysłano`, or the place preview `↕ n/m`
-while moving. Every row is two lines even with no label and the rows stack
-directly, so the list scrolls by whole tasks. The selection is a bracket,
+action (`K` / `J` / `m`, the TUI's `narsor-cli task move`). A row takes three
+lines and has one icon column that says the state of the task:
+
+| Icon | State |
+|---|---|
+| `○` | new (reserved, no task shows it yet) |
+| `◷` | queued |
+| `⊘` | blocked: no controller holds the backend |
+| `⟳` | starting |
+| `●` | running |
+| `↺` | lost, resumed automatically |
+| `?` | waits for your reaction: a question, an approval, a conductor proposal |
+| `!` | has a problem: a failed step, a failed start, an error |
+| `◑` | pausing |
+| `‖` | stopped by hand |
+| `✓` | finished |
+| `▪` | archived |
+| `·` | a state this version does not know |
+| `↻` | being sent (the new-task form) |
+
+The icon is worked out on the client from the fields the server sends. When
+several states fit, the first of these wins: archived, problem, reaction,
+blocked, finished, pausing, starting, resuming, stopped, queued, running. So a
+problem or a question shows even on a task that is blocked or running. `?` and
+`!` are the loud ones: bold, in colour, and the title of the row is bold too,
+so they read without colour. The counters in the header (`? n`, `! n`) and
+`Space` count and stop on the same icons. The header of the details says the
+state of the icon in a word (`⊘ blocked`, `↺ resuming`), so the word teaches
+the icon.
+
+The first line of a row holds the icon and the task's ticket (an `id:` prefix
+when there is none). The second is the title (the task id when there is none).
+The third is the current step of a running task or `#n` in the queue, then the
+time in the current state; `nie wysłano` and the place preview `↕ n/m` use it
+too. On a narrow list the step is cut first and the time stays. The third line
+of a finished, archived, failed or stopped task is empty or only the time. The
+rows stack directly, so the list scrolls by whole tasks. The selection is a bracket,
 never a fill: a thin rule across the whole width of the list in a row of its
 own directly above the task, another directly below it and a bar beside both
 its lines, so the row keeps its own colours. Only the selected task has the
@@ -66,14 +93,11 @@ rules, so moving the selection shifts its neighbours by a row. The bracket is
 always thin: cyan where the keys are, grey elsewhere (bold and dim without
 colour). The history, the steps on *Przebieg* and every list of choices (the
 menu, the answer panel, the new task, the repositories) mark their selection
-the same way; a conversation and *Zdarzenia* keep only the bar. `z` hides finished tasks as
-a filter; `a` archives one. The selection follows the task, not the row,
-through every refresh.
-
-Each task uses three lines: its ticket (or an `id:` prefix and the first eight
-id characters), title, then state, time in that state and the existing short
-label. Activity time advances on redraw; tasks without a known start time and
-finished tasks show no age. `/` filters by ticket, title or full id without
+the same way; a conversation and *Zdarzenia* keep only the bar. `z` hides
+finished and archived tasks as a filter; `a` archives one. The selection follows
+the task, not the row, through every refresh. Activity time advances on redraw;
+tasks without a known start time and finished tasks show no time.
+`/` filters by ticket, title or full id without
 changing server order; state changes and refreshes likewise keep rows in place,
 and only an explicit queue move reorders them. `Esc` cancels filter editing.
 

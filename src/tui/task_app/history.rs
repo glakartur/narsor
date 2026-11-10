@@ -54,7 +54,7 @@ use super::detail::{
     edge_layout, fit_cells, recorded_attempts, render_view, title_is_cut, KeysAt, StepLevel,
     TaskDetail, ViewOptions,
 };
-use super::list::{history_row_text, title_of, Attention, RowText, StateIcon};
+use super::list::{history_row_text, title_of, RowText, StateIcon};
 use super::notify::Severity;
 use super::tabs::conversation::{read_history_attempt, AttemptRead, ReadFailure};
 use super::tabs::events;
@@ -104,20 +104,16 @@ impl HistoryEntry {
             Self::Archived(task) => RowText {
                 ticket: None,
                 id: String::new(),
-                attention: Attention::None,
-                icon: StateIcon::Done,
+                icon: StateIcon::Archived,
                 title: title_of(task),
-                status: String::new(),
                 since: None,
                 label: "archiwum".to_string(),
             },
             Self::Legacy(legacy) => RowText {
                 ticket: None,
                 id: String::new(),
-                attention: Attention::None,
                 icon: legacy_icon(&legacy.view.status),
                 title: legacy_title(&legacy.view),
-                status: String::new(),
                 since: None,
                 label: legacy.view.status.as_str().to_string(),
             },
@@ -159,11 +155,11 @@ fn legacy_icon(status: &ExecutionStatus) -> StateIcon {
     match status {
         ExecutionStatus::Completed => StateIcon::Done,
         ExecutionStatus::Failed | ExecutionStatus::Cancelled | ExecutionStatus::Unknown => {
-            StateIcon::Failed
+            StateIcon::Problem
         }
         ExecutionStatus::Paused
         | ExecutionStatus::InputNeeded
-        | ExecutionStatus::WaitingForEvent => StateIcon::Paused,
+        | ExecutionStatus::WaitingForEvent => StateIcon::Stopped,
         ExecutionStatus::Running => StateIcon::Running,
     }
 }
