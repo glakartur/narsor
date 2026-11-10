@@ -23,20 +23,22 @@
 //! # A row
 //!
 //! ```text
-//! ? ●  NAR-42
-//!      Refactor parser
-//!      running · 2h 10m · approval
+//! ●  NAR-42
+//!    Refactor parser
+//!    Review · 2h 10m
 //! ```
 //!
-//! A row has three lines: markers and ticket (or a short `id:`), title, then
-//! state, activity age and the existing short label. Activity age advances
-//! on redraw; it is omitted when its start is unknown or the task is final.
+//! A row has three lines: the state icon and the ticket (or a short `id:`),
+//! the title, then the step (or `#n` in the queue) and the activity age. One
+//! icon says the state ([`state_icon`]); `?` and `!` are loud. Activity age
+//! advances on redraw; it is omitted when its start is unknown or the task is
+//! final.
 //! Everything that comes from the server is passed through [`one_line`]
 //! before it is drawn.
 //!
 //! The rows are drawn as a bar marked list ([`render_barred_list`]): tasks
 //! stay stacked directly, and the selected one keeps a left bar beside all
-//! lines instead of reverse video, so its markers keep their colours. Every
+//! lines instead of reverse video, so its icon keeps its colour. Every
 //! task takes the same three rows.
 
 use std::collections::HashMap;
@@ -46,7 +48,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::cli::task_text::{activity_age, task_state_name, without_slot};
+use crate::cli::task_text::activity_age;
 use crate::controller_protocol::{
     Freshness, InputView, OperatorCommandView, QueueView, TaskSummary,
 };
@@ -60,9 +62,10 @@ use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFI
 use super::super::scroll::one_line;
 use super::super::selection::{render_barred_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
-use super::detail::{fit_cells, short_task_id, step_name};
+use super::detail::{cells, fit_cells, short_task_id, step_name};
 
-/// What a row asks of the operator (column 1).
+/// What a row asks of the operator, worked out for the CLI and as one source
+/// of the row's icon ([`state_icon`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attention {
     /// Nothing.
@@ -74,7 +77,7 @@ pub enum Attention {
 }
 
 impl Attention {
-    /// The glyph of the first column.
+    /// The glyph of the CLI row.
     pub fn glyph(self) -> char {
         match self {
             Self::None => ' ',
@@ -82,31 +85,35 @@ impl Attention {
             Self::Problem => '!',
         }
     }
-
-    fn role(self) -> Role {
-        match self {
-            Self::None => Role::Calm,
-            Self::Question => Role::Attention,
-            Self::Problem => Role::Problem,
-        }
-    }
 }
 
-/// What is happening to a row's task (column 2).
+/// What is happening to a row's task: the one icon of the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateIcon {
-    /// `●` the runner works.
-    Running,
+    /// `○` a new task. Reserved: no task shows it yet.
+    New,
     /// `◷` waits in the queue.
     Queued,
-    /// `◐` waits for the owner's answer.
-    Waiting,
-    /// `‖` paused or pausing.
-    Paused,
-    /// `✗` ended with an error.
-    Failed,
+    /// `⊘` waits, and no controller is there to work on it.
+    Blocked,
+    /// `⟳` the runner is starting.
+    Starting,
+    /// `●` the runner works.
+    Running,
+    /// `↺` lost, and the control plane resumes it by itself.
+    Resuming,
+    /// `?` waits for the owner's reaction: a question, an approval, a proposal.
+    NeedsReply,
+    /// `!` has a problem.
+    Problem,
+    /// `◑` is being paused.
+    Pausing,
+    /// `‖` stopped by hand.
+    Stopped,
     /// `✓` finished.
     Done,
+    /// `▪` archived.
+    Archived,
     /// `·` a state this version does not know.
     Unknown,
     /// `↻` a new task being sent (the new-task form).
@@ -114,15 +121,21 @@ pub enum StateIcon {
 }
 
 impl StateIcon {
-    /// The glyph of the second column.
+    /// The glyph of the row.
     pub fn glyph(self) -> char {
         match self {
-            Self::Running => '●',
+            Self::New => '○',
             Self::Queued => '◷',
-            Self::Waiting => '◐',
-            Self::Paused => '‖',
-            Self::Failed => '✗',
+            Self::Blocked => '⊘',
+            Self::Starting => '⟳',
+            Self::Running => '●',
+            Self::Resuming => '↺',
+            Self::NeedsReply => '?',
+            Self::Problem => '!',
+            Self::Pausing => '◑',
+            Self::Stopped => '‖',
             Self::Done => '✓',
+            Self::Archived => '▪',
             Self::Unknown => '·',
             Self::Sending => '↻',
         }
@@ -131,10 +144,45 @@ impl StateIcon {
     /// The role the icon is drawn in.
     pub fn role(self) -> Role {
         match self {
-            Self::Running => Role::Live,
-            Self::Queued | Self::Paused | Self::Sending | Self::Waiting => Role::Calm,
-            Self::Failed => Role::Problem,
-            Self::Done | Self::Unknown => Role::Done,
+            Self::Starting | Self::Running => Role::Live,
+            Self::New
+            | Self::Queued
+            | Self::Blocked
+            | Self::Resuming
+            | Self::Pausing
+            | Self::Stopped
+            | Self::Sending => Role::Calm,
+            Self::NeedsReply => Role::Attention,
+            Self::Problem => Role::Problem,
+            Self::Done | Self::Archived | Self::Unknown => Role::Done,
+        }
+    }
+
+    /// Whether the icon asks the owner for something: a reaction or a look at
+    /// a problem. Such a row is loud, the header counts it and `Space` stops
+    /// on it.
+    pub fn needs_operator(self) -> bool {
+        matches!(self, Self::NeedsReply | Self::Problem)
+    }
+
+    /// The state in a word, for the header of the details. The word teaches
+    /// the icon, so each icon has a word of its own.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Queued => "queued",
+            Self::Blocked => "blocked",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Resuming => "resuming",
+            Self::NeedsReply => "awaiting input",
+            Self::Problem => "problem",
+            Self::Pausing => "pausing",
+            Self::Stopped => "paused",
+            Self::Done => "done",
+            Self::Archived => "archived",
+            Self::Unknown => "unknown",
+            Self::Sending => "sending",
         }
     }
 }
@@ -197,19 +245,66 @@ pub fn attention_of(task: &TaskSummary) -> Attention {
     }
 }
 
-/// What the second column shows for `task`: one icon for each [`TaskState`],
-/// whatever the slot or the runner is doing. A state this version does not
+/// What the icon of the row shows for `task`: the first of these that holds
+/// wins — archived, problem, reaction, blocked queue, finished, pausing,
+/// starting, automatic resume, stopped by hand, queued, running. A problem
+/// has precedence over a question and over a task that runs (origin R6);
+/// both have it over a blocked queue (R12a). A state this version does not
 /// know (or a summary from a control plane that sends none) is neutral.
 pub fn state_icon(task: &TaskSummary) -> StateIcon {
+    if task.state == TaskState::Archived {
+        return StateIcon::Archived;
+    }
+    let attention = attention_of(task);
+    if attention == Attention::Problem || task.state == TaskState::Error {
+        return StateIcon::Problem;
+    }
+    if attention == Attention::Question || task.state == TaskState::HumanNeeded {
+        return StateIcon::NeedsReply;
+    }
+    let resumes = matches!(
+        loss_state(task.runner_state, &task.resume),
+        Some(LossState::AutoResume { .. })
+    );
+    let queue_blocked = task.state == TaskState::Queued
+        && matches!(
+            task.queue.as_ref().map(|queue| &queue.reason),
+            Some(QueueReason::ControllerOffline | QueueReason::BackendUnknown { .. })
+        );
+    let run_blocked = (task.state == TaskState::Running || resumes) && controller_offline(task);
+    if queue_blocked || run_blocked {
+        return StateIcon::Blocked;
+    }
+    if task.state == TaskState::Finished {
+        return StateIcon::Done;
+    }
+    let pausing =
+        task.state == TaskState::Paused && task.runner_state == RunnerState::PauseRequested;
+    if pausing {
+        return StateIcon::Pausing;
+    }
+    if task.runner_state == RunnerState::Provisioning {
+        return StateIcon::Starting;
+    }
+    if resumes {
+        return StateIcon::Resuming;
+    }
     match task.state {
+        TaskState::Paused => StateIcon::Stopped,
         TaskState::Queued => StateIcon::Queued,
         TaskState::Running => StateIcon::Running,
-        TaskState::HumanNeeded => StateIcon::Waiting,
-        TaskState::Paused => StateIcon::Paused,
-        TaskState::Finished | TaskState::Archived => StateIcon::Done,
-        TaskState::Error => StateIcon::Failed,
         TaskState::Unrecognized => StateIcon::Unknown,
+        // Settled above; listed so that a new state fails to compile here.
+        TaskState::Finished => StateIcon::Done,
+        TaskState::Archived => StateIcon::Archived,
+        TaskState::Error => StateIcon::Problem,
+        TaskState::HumanNeeded => StateIcon::NeedsReply,
     }
+}
+
+/// Whether the `z` filter hides the task: it is finished or archived.
+fn is_done(task: &TaskSummary) -> bool {
+    matches!(task.state, TaskState::Finished | TaskState::Archived)
 }
 
 /// The title of a row, and of the detail frame's edge (`edge_layout`): the
@@ -247,26 +342,15 @@ fn controller_offline(task: &TaskSummary) -> bool {
         .is_none_or(|controller| controller.freshness != Freshness::Live)
 }
 
-/// The label of a row (its second line): the state in a word, the step for a
-/// running task, the place for a queued one, and "bez slotu" when the task
-/// is in a state that no longer needs one. `queue_position` is the 1-based
-/// place among the queued tasks of the backend, in list order.
+/// The label of a row (its third line, before the time): the step of a
+/// running task, the place of a queued one, and nothing else — the icon says
+/// the state. `queue_position` is the 1-based place among the queued tasks of
+/// the backend, in list order.
 pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
-    let label = match task.state {
-        TaskState::Queued => match task.queue.as_ref().map(|queue| &queue.reason) {
-            Some(QueueReason::ControllerOffline) => "offline".to_string(),
-            _ => queue_position.map_or_else(|| "queued".to_string(), |place| format!("#{place}")),
-        },
-        TaskState::Running if controller_offline(task) => "offline".to_string(),
-        TaskState::Running => {
-            current_step(task).unwrap_or_else(|| task_state_name(TaskState::Running).to_string())
-        }
-        other => task_state_name(other).to_string(),
-    };
-    if without_slot(task) {
-        format!("{label} · bez slotu")
-    } else {
-        label
+    match task.state {
+        TaskState::Queued => queue_position.map_or_else(String::new, |place| format!("#{place}")),
+        TaskState::Running => current_step(task).unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -284,15 +368,12 @@ pub struct RowText {
     pub ticket: Option<String>,
     /// Short identifier, used when there is no ticket.
     pub id: String,
-    pub attention: Attention,
     pub icon: StateIcon,
     /// The title, second line.
     pub title: String,
-    /// Owner-visible state, third line.
-    pub status: String,
     /// When the current state began, if known.
     pub since: Option<DateTime<Utc>>,
-    /// Existing short label, third line.
+    /// The step or the place in the queue, third line.
     pub label: String,
 }
 
@@ -457,15 +538,13 @@ impl PendingRow {
     pub fn text(&self) -> RowText {
         let (icon, label) = match self.state {
             PendingState::Sending => (StateIcon::Sending, "wysyłanie…"),
-            PendingState::NotSent => (StateIcon::Failed, "nie wysłano"),
+            PendingState::NotSent => (StateIcon::Problem, "nie wysłano"),
         };
         RowText {
             ticket: None,
             id: id_label(&self.task_id),
-            attention: Attention::None,
             icon,
             title: one_line(&self.title),
-            status: String::new(),
             since: None,
             label: label.to_string(),
         }
@@ -556,7 +635,7 @@ impl TaskList {
             .tasks
             .iter()
             .enumerate()
-            .filter(|(_, task)| !(self.hide_done && state_icon(task) == StateIcon::Done))
+            .filter(|(_, task)| !(self.hide_done && is_done(task)))
             .filter(|(_, task)| self.matches_task(task))
             .map(|(index, _)| index)
             .collect();
@@ -679,10 +758,7 @@ impl TaskList {
         if !self.hide_done {
             return 0;
         }
-        self.tasks
-            .iter()
-            .filter(|task| state_icon(task) == StateIcon::Done)
-            .count()
+        self.tasks.iter().filter(|task| is_done(task)).count()
     }
 
     /// `n`th queued task of its backend, counted in list order, for each
@@ -721,10 +797,8 @@ impl TaskList {
         RowText {
             ticket: non_blank_line(task.ticket.as_deref()),
             id: id_label(task.task_id.as_str()),
-            attention: attention_of(task),
             icon: state_icon(task),
             title: title_of(task),
-            status: task_state_name(task.state).to_string(),
             since: activity_since(task),
             label: label_of(task, positions.get(&index).copied()),
         }
@@ -823,10 +897,10 @@ impl TaskList {
         self.tasks
             .iter()
             .fold(Counters::default(), |mut counters, task| {
-                match attention_of(task) {
-                    Attention::Question => counters.questions += 1,
-                    Attention::Problem => counters.problems += 1,
-                    Attention::None => {}
+                match state_icon(task) {
+                    StateIcon::NeedsReply => counters.questions += 1,
+                    StateIcon::Problem => counters.problems += 1,
+                    _ => {}
                 }
                 counters
             })
@@ -908,7 +982,7 @@ impl TaskList {
             .map_or(0, |current| current + 1);
         let found = (0..shown.len())
             .map(|offset| shown[(start + offset) % shown.len()])
-            .find(|&index| attention_of(&self.tasks[index]) != Attention::None);
+            .find(|&index| state_icon(&self.tasks[index]).needs_operator());
         match found {
             Some(index) => {
                 self.selected = Some(self.tasks[index].task_id.to_string());
@@ -1503,12 +1577,41 @@ fn replace_reported_attention(
     *current = items;
 }
 
-/// The columns before the text under the markers: attention, a space, state,
-/// two spaces.
-const ROW_PREFIX: usize = 5;
+/// The columns before the text under the icon: the icon, two spaces.
+const ROW_PREFIX: usize = 3;
+
+/// The third line of a row: `label · time`, the time alone, or the label
+/// alone. On a narrow list the label is cut first and the time stays.
+fn third_line(row: &RowText, text_width: usize, now: DateTime<Utc>) -> String {
+    let age = row
+        .since
+        .map(|since| activity_age((now - since).num_seconds()));
+    match age {
+        None => fit_cells(&row.label, text_width),
+        Some(age) if row.label.is_empty() => fit_cells(&age, text_width),
+        Some(age) => {
+            let label_width = text_width.saturating_sub(cells(&age) + cells(" · "));
+            if label_width == 0 {
+                fit_cells(&age, text_width)
+            } else {
+                format!("{} · {age}", fit_cells(&row.label, label_width))
+            }
+        }
+    }
+}
+
+fn label_role(label: &str) -> Role {
+    match label {
+        "nie wysłano" => Role::Problem,
+        label if label.starts_with('#') => Role::Calm,
+        _ => Role::Done,
+    }
+}
 
 /// One row as three styled lines laid out in `width` columns — the content
-/// width, the bracket's column already taken off.
+/// width, the bracket's column already taken off. An icon that asks the owner
+/// for something is bold, and so is the title (the colour never carries it
+/// alone).
 pub(super) fn row_text(
     row: &RowText,
     width: usize,
@@ -1519,46 +1622,20 @@ pub(super) fn row_text(
     let text_width = width.saturating_sub(ROW_PREFIX);
     let grey = |role: Role| if stale { Role::Done } else { role };
     let identifier = row.ticket.as_deref().unwrap_or(&row.id);
-    let mut label = if let Some(since) = row.since {
-        let age = format!(" · {}", activity_age((now - since).num_seconds()));
-        let status_width = text_width.saturating_sub(age.chars().count());
-        format!("{}{age}", fit_cells(&row.status, status_width))
-    } else {
-        fit_cells(&row.status, text_width)
-    };
-    let status_prefix = format!("{} · ", row.status);
-    let extra_label = row
-        .label
-        .strip_prefix(&status_prefix)
-        .or_else(|| (row.label != row.status).then_some(row.label.as_str()))
-        .unwrap_or_default();
-    if !extra_label.is_empty() {
-        if label.is_empty() {
-            label = fit_cells(extra_label, text_width);
+    let loud = row.icon.needs_operator();
+    let paint = |role: Role| {
+        if loud {
+            styles.strong(grey(role))
         } else {
-            let remaining = text_width.saturating_sub(label.chars().count() + 3);
-            if remaining > 0 {
-                label = format!("{label} · {}", fit_cells(extra_label, remaining));
-            }
+            styles.of(grey(role))
         }
-    }
-    let label_role = match row.label.as_str() {
-        "offline" => Role::Attention,
-        "nie wysłano" => Role::Problem,
-        label if label.starts_with('#') => Role::Calm,
-        _ => Role::Done,
     };
+    let icon_style = paint(row.icon.role());
+    let title_style = paint(Role::Calm);
+    let third = third_line(row, text_width, now);
 
     let first = Line::from(vec![
-        Span::styled(
-            row.attention.glyph().to_string(),
-            styles.of(grey(row.attention.role())),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            row.icon.glyph().to_string(),
-            styles.of(grey(row.icon.role())),
-        ),
+        Span::styled(row.icon.glyph().to_string(), icon_style),
         Span::raw("  "),
         Span::styled(
             fit_cells(identifier, text_width),
@@ -1567,14 +1644,11 @@ pub(super) fn row_text(
     ]);
     let second = Line::from(vec![
         Span::raw(" ".repeat(ROW_PREFIX.min(width))),
-        Span::styled(
-            fit_cells(&row.title, text_width),
-            styles.of(grey(Role::Calm)),
-        ),
+        Span::styled(fit_cells(&row.title, text_width), title_style),
     ]);
     let third = Line::from(vec![
         Span::raw(" ".repeat(ROW_PREFIX.min(width))),
-        Span::styled(fit_cells(&label, text_width), styles.of(grey(label_role))),
+        Span::styled(third, styles.of(grey(label_role(&row.label)))),
     ]);
     vec![first, second, third]
 }
@@ -1588,19 +1662,8 @@ pub(super) fn history_row_text(
 ) -> Vec<Line<'static>> {
     let text_width = width.saturating_sub(ROW_PREFIX);
     let grey = |role: Role| if stale { Role::Done } else { role };
-    let label_role = match row.label.as_str() {
-        "offline" => Role::Attention,
-        "nie wysłano" => Role::Problem,
-        label if label.starts_with('#') => Role::Calm,
-        _ => Role::Done,
-    };
     vec![
         Line::from(vec![
-            Span::styled(
-                row.attention.glyph().to_string(),
-                styles.of(grey(row.attention.role())),
-            ),
-            Span::raw(" "),
             Span::styled(
                 row.icon.glyph().to_string(),
                 styles.of(grey(row.icon.role())),
@@ -1615,7 +1678,7 @@ pub(super) fn history_row_text(
             Span::raw(" ".repeat(ROW_PREFIX.min(width))),
             Span::styled(
                 fit_cells(&row.label, text_width),
-                styles.of(grey(label_role)),
+                styles.of(grey(label_role(&row.label))),
             ),
         ]),
     ]

@@ -59,15 +59,15 @@ const CONDUCTOR_BROWN: Color = Color::Indexed(130);
 pub enum Role {
     /// Needs the operator: `?`, the waiting panel's frame, `? n`, `◌ ponawiam`.
     Attention,
-    /// A problem, an error, something irreversible: `!`, `✗`, `! n`,
+    /// A problem, an error, something irreversible: `!`, `! n`,
     /// `✖ brak połączenia`, `!` actions, field errors.
     Problem,
-    /// Happening now: `●` running, `⟳` provisioning, `● live`, a success
+    /// Happening now: `●` running, `⟳` starting, `● live`, a success
     /// notification.
     Live,
-    /// Calm: `◷` queued, `‖` paused. The terminal's own text colour.
+    /// Calm: `◷` queued, `⊘` blocked, `↺` resuming, `◑` pausing, `‖` stopped. The terminal's own text colour.
     Calm,
-    /// Finished or in the background: `✓`, inactive frames, secondary
+    /// Finished or in the background: `✓`, `▪`, inactive frames, secondary
     /// descriptions, ages, stale data, unavailable actions.
     Done,
     /// Focus and interaction: the active frame, the active tab, the
