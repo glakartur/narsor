@@ -435,7 +435,7 @@ effective(step):
 ## Decyzje operatora i pytania otwarte
 
 1. **Zakres: każdy workflow.** Plan nie dotyczy konkretnego workflow (np. `compound-engineering.yaml`). Plan tworzy możliwość sterowania modelem i effortem w każdym workflow. Pola i dokumentacja trafiają do silnika, `template.yaml` i `docs/dev/workflow-schema.md`. Wartości domyślne konkretnych workflow są poza zakresem.
-2. **Jak krok `work` rozpoznaje jednostkę planu (R11)?** Pytanie otwarte. Origin wymaga profilu per jednostka (`ce-work: unit 3`). Nie wiadomo, czy workflow uruchamia `work` osobnym krokiem na jednostkę, czy jednym krokiem na cały plan.
-   - Opcja A (zalecana): Pierwsza wersja zapisuje profil per krok, a klucz `unit` jest w danych (U3), ale silnik go jeszcze nie wypełnia. Profil per jednostka wchodzi, gdy workflow zacznie przekazywać numer jednostki.
-   - Opcja B: Pierwsza wersja wymaga, aby workflow przekazywał numer jednostki do kroku `work` (zmiana definicji kroku i pętli). Zakres rośnie o zmianę modelu pętli.
+2. **Jak krok `work` rozpoznaje jednostkę planu (R11): profil per krok (opcja A).** Operator wybrał opcję A. Origin wymaga profilu per jednostka (`ce-work: unit 3`). Nie wiadomo, czy workflow uruchamia `work` osobnym krokiem na jednostkę, czy jednym krokiem na cały plan.
+   - Opcja A (wybrana): Pierwsza wersja zapisuje profil per krok, a klucz `unit` jest w danych (U3), ale silnik go jeszcze nie wypełnia. Profil per jednostka wchodzi, gdy workflow zacznie przekazywać numer jednostki.
+   - Opcja B (odrzucona): Pierwsza wersja wymaga, aby workflow przekazywał numer jednostki do kroku `work` (zmiana definicji kroku i pętli). Zakres rośnie o zmianę modelu pętli.
 3. **Rozstrzyganie prośby o wyjście poza granicę: poza zakresem.** Operator na razie tym nie steruje. Plan tworzy i pokazuje prośbę (U6, U7). Krok zostaje na granicy. Plan nie dodaje akcji zatwierdź/odrzuć.
