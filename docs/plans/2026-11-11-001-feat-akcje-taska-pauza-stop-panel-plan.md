@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-11-11-akcje-taska-pauza-stop-i-panel-akcji-require
 
 ## Summary
 
-Serwer podaje pełną listę akcji zależną od stanu taska. TUI pokazuje ją w jednym panelu (Ctrl+.) i traci osobne skróty zarządzania taskiem. Plan dodaje akcje `Stop`, `ReleaseSlot` i `SelectStep`. Plan zmienia los akcji `Resume` i `Interrupt`. Plan opisuje też zmiany w runnerze: pauza czeka na koniec pracy, stop zrywa pracę od razu.
+Serwer podaje pełną listę akcji zależną od stanu taska. TUI pokazuje ją w jednym panelu (Ctrl+.) i traci osobne skróty zarządzania taskiem. Plan dodaje akcje `Stop`, `ReleaseSlot` i `SelectStep`. Plan zmienia los akcji `Resume` i `Interrupt`. Plan opisuje też zmiany w runnerze: pauza czeka na koniec pracy, a stop zrywa pracę od razu nową komendą `StopStep` i kończy w `Stopped` (nie w `Interrupted`).
 
 Głębokość: Standard. Zmiana obejmuje protokół, silnik, runner i TUI.
 
@@ -28,9 +28,9 @@ Wymagania R1–R19, akcje A1–A5, przepływy F1–F4 i przykłady AE1–AE8 poc
 
 - R1–R3: lista akcji z serwera, odrzucenie akcji niedozwolonej, klient bez własnej oceny → U1, U2, U5
 - R4–R6: panel Ctrl+., usunięcie skrótów, rozmowa poza panelem → U4, U5, U6
-- R7–R10: pauza i stop dla agenta i skryptu, stan „wstrzymywany" → U1, U2, U3
-- R11–R16: zatrzymany task → U1, U4, U5 (R11, R12 w U4; R13–R16 w U1; R14 także w U5)
-- R17–R19: po zakończeniu workflow → U1, U2, U4, U5 (R18 w U2, U5)
+- R7–R10: pauza i stop dla agenta i skryptu, stan „wstrzymywany" → U1, U2, U3 (nowa ścieżka stopu: U3, wywołanie: U2)
+- R11–R16: zatrzymany task → U1, U2, U3, U4, U5 (R11, R12 w U4; R13–R16 w U1; R14 także w U5; R13 także w U3; R15 także w U2)
+- R17–R19: po zakończeniu workflow → U1, U2, U5 (R18 w U2, U5)
 
 ---
 
@@ -57,7 +57,8 @@ Bez zmian względem dokumentu źródłowego:
 
 - `crates/narsor-engine/src/controller_protocol/service/actions.rs`: funkcja `offer` i `unavailable_reason` są jedynym miejscem reguł dostępności. `require_available` używa ich przy wysyłce (to daje R2). Stałe `OFFERED` ma 12 pozycji.
 - `Pause` jest dziś komendą właściciela (`OwnerCommand::Pause`). Runner zatrzymuje się w bezpiecznym punkcie. Zwolnienie slotu przez politykę używa tej samej komendy (`ControlPlane::release_slot` w `crates/narsor-engine/src/orchestration/control_plane.rs`, aktor `CommandActor::Policy`).
-- `Interrupt` to `OperatorCommand::Interrupt` (`crates/narsor-runner/src/runner/commands.rs`, funkcja `interrupt`). Przerywa przebieg, harness ginie razem z nim, a wykonanie zostaje do odzyskania (`settle_interrupted`). To jest bliskie „Stop" z R9. Zabicie procesu skryptu jest w `crates/narsor-engine/src/engine/actions/process_group.rs` i `script.rs`. Plan zakłada to jako hipotezę do weryfikacji w U3.
+- `Interrupt` to `OperatorCommand::Interrupt` (`crates/narsor-runner/src/runner/commands.rs`, funkcja `interrupt`). Przerywa przebieg (harness ginie razem z nim) i wywołuje `settle_interrupted`. **Nie nadaje się jako „Stop" z R9**: zostawia `RunnerState::Interrupted`, a ten stan (a) podlega automatycznemu wznawianiu (`orchestration/resume.rs`, `auto_resume.rs`), (b) jest traktowany jako utrata zadania (`not_running`, `loss_state` w `actions.rs`), (c) nie spełnia warunku `Stopped` + `TaskState::Paused`, na którym opierają się `ReleaseSlot`, komentarz po stopie (`comment_reason`) i `SelectStep`. Ponadto `interrupt` zwraca błąd, gdy żaden przebieg nie jest aktywny (`pass_active`), więc nie obsłuży stopu w `PauseRequested` (R10), gdy praca już się skończyła.
+- Do `Stopped` prowadzi dziś jedna droga: właściciel wysyła `OwnerCommand::Pause` → `PauseRequested` → runner kończy pracę, zamyka sesję (`finish_at_safe_point`, `close_session`) i zgłasza punkt bezpieczny → sterownik przyjmuje go jako `Stopped` (`control_plane.rs`). Strata z `PauseRequested` nie liczy się jako utrata i nie planuje wznowienia (`resume.rs`). Slot zostaje przy tasku. Nowy stop ma użyć tej drogi, a nie `Interrupted`.
 - `RunnerState` ma już `PauseRequested` i `Stopped`.
 - TUI: `TaskAction` w `src/tui/task_app/actions.rs` mapuje akcje na skróty (`of_key`, `key`). Mapowanie `TaskActionId` → `TaskAction` jest w `src/tui/task_app/panel/state.rs`. Menu otwiera dziś `.`.
 - Protokół ma `#[serde(other)] Unrecognized` w `TaskActionId`. Starszy klient czyta nową akcję jako `Unrecognized`. To daje zgodność wstecz bez wersjonowania.
@@ -73,7 +74,17 @@ Pominięte. Kod ma mocne lokalne wzorce (lista akcji, komendy, menu). Jedyna wie
 ## Key Technical Decisions
 
 - **Nowe identyfikatory akcji dodajemy na końcu `TaskActionId`** (przed `Unrecognized`): `Stop`, `ReleaseSlot`, `SelectStep`. Starszy klient je odczyta jako `Unrecognized`. Nowy klient wobec starego serwera dostaje listę bez nich i pokazuje „brak danych" (R3).
-- **`Stop` jest nowym identyfikatorem w `TaskActionId` (U1) i zastępuje `Interrupt` w ofercie.** Zachowanie runnera (`OperatorCommand::Interrupt`) zostaje, jeśli U3 potwierdzi, że spełnia R9. Nazwa komendy na drucie zostaje, żeby nie łamać kolejek komend. Identyfikator `Interrupt` zostaje w enum jako przestarzały i serwer go nie oferuje.
+- **`Stop` to nowa ścieżka, a nie `Interrupt` (decyzja).** `Stop` = pauza właściciela + natychmiastowe zerwanie pracy, kończące się w `Stopped`. Składa się z dwóch kroków, które serwer wykonuje w tej kolejności:
+  1. Jeśli task jest w `Running`: `OwnerCommand::Pause` (ta sama ścieżka co akcja Pauza). Task przechodzi w `PauseRequested`. Jeśli już jest w `PauseRequested`: ten krok pomijamy.
+  2. Nowa komenda operatora `OperatorCommand::StopStep` do runnera. Runner zrywa aktywny przebieg (agent: harness ginie; skrypt: ginie grupa procesów) i rozlicza wykonanie jako wstrzymane (`Paused`, bez przejścia w `Interrupted`). Pętla runnera widzi `PauseAtSafePoint` bez aktywnego przebiegu i sama wykonuje `finish_at_safe_point`: zamyka sesję agenta (identyfikator sesji zostaje zapisany) i zgłasza punkt bezpieczny. Sterownik przyjmuje go jako `Stopped`.
+  Kolejność jest ważna: gdy runner zginie w trakcie zrywania, strata liczy się „z `PauseRequested`" (bez automatycznego wznowienia), a nie jako utrata zadania.
+  `StopStep` nie jest błędem, gdy żaden przebieg nie jest aktywny (praca skończyła się sama, a runner już zgłasza punkt bezpieczny): komenda kończy się sukcesem „nic do zerwania". To rozwiązuje R10 (Stop w `PauseRequested`).
+- **Relacja `Stop` do `Interrupted`, `Resume` i `Restart` (decyzja).**
+  - `Interrupted` zostaje stanem utraty zadania (padł Pod, utrata łączności). Tylko system go ustawia. Podlega automatycznemu wznawianiu. Stop go nigdy nie ustawia.
+  - `OperatorCommand::Interrupt` i `TaskActionId::Interrupt` zostają w protokole dla zgodności ze starymi klientami i kolejkami komend, zachowanie bez zmian. Serwer przestaje je oferować w panelu. W ofercie jest `Stop`.
+  - Po `Stop` task jest w `Stopped` + `TaskState::Paused`, trzyma slot, nie wznawia się sam. Wyjścia z `Stopped`: komentarz w rozmowie (agent, R11), `Restart` (skrypt, R13), `SelectStep` (R14), `ReleaseSlot` (R15). `ReleaseSlot` używa ścieżki `release_slot` (jak w U2), bez `Resume`. Pozostałe zaczynają od `OwnerCommand::Resume` (runner ze `Stopped` już nie działa, jego proces kończy się po `PauseAtSafePoint`), a komenda operatora (`RestartStep`, `Transition`) jest dołączona do tego samego wznowienia, tak jak robi to `comment_delivery` dla komentarza. Runner stosuje ją przed ruszeniem przebiegu.
+  - `Restart` dziś jest oferowany tylko dla `Interrupted`/`Unknown` i błędu uruchomienia. U1 dodaje do niego `Stopped` z krokiem skryptowym. Dla `Interrupted`/`Unknown` zachowanie bez zmian.
+  - `Resume` jako akcja wychodzi z oferty (Z3), komenda właściciela zostaje.
 - **`Resume` wychodzi z oferty** (Z3). Identyfikator zostaje w enum dla zgodności. Komenda `OwnerCommand::Resume` zostaje w serwerze, bo używa jej panel rozmowy (R11) i automatyczne wznawianie. Zmieniamy tylko to, co serwer pokazuje w panelu akcji.
 - **`Transition` i `Restart` zostają, ale z nowymi regułami.** „Wybór kroku" (R14, R17) to `Transition` z celem dowolnego kroku. Plan wprowadza `SelectStep` jako osobną akcję z listą wszystkich kroków workflow w `options`, a `Transition` zostaje dla wyjść deklarowanych w pracującym tasku (reguły z dokumentu 2026-10-22 bez zmian). Powód: `Transition` ma `manual_transitions` i `override`, a `SelectStep` ma inną regułę (Z9, brak ograniczenia do odwiedzonych kroków).
 - **`ReleaseSlot` używa istniejącej ścieżki `release_slot`** (Pause wydany przez właściciela, nie przez politykę). Dzięki temu zadanie zachowuje się tak samo jak po upływie czasu oczekiwania (R15).
@@ -130,12 +141,14 @@ stateDiagram-v2
 |---|---|---|---|---|---|---|
 | działa | tak | tak | nie | nie | nie | tak |
 | wstrzymywany | nie („zadanie jest już wstrzymywane") | tak | nie | nie | nie | tak |
-| zatrzymany, trzyma slot | nie | nie | tak | tak, gdy krok skryptowy | tak | tak |
+| zatrzymany (`Stopped`), trzyma slot | nie | nie | tak | tak, gdy krok skryptowy | tak | tak |
 | zatrzymany, bez slotu | nie | nie | nie („zadanie nie trzyma slotu") | tak, gdy krok skryptowy | tak | tak |
 | workflow zakończony | nie | nie | nie | nie | tak | tak |
 | w kolejce, provisioning, czeka na człowieka | nie | nie | nie | nie | nie | tak |
 
 Dla czekającego na człowieka obowiązują dotychczasowe akcje z dokumentu 2026-10-22.
+
+Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu uruchomienia dopuszcza `Stopped` z krokiem skryptowym. `Interrupted`/`Unknown` zostają poza ofertą `Stop`, `Pause`, `ReleaseSlot` i `SelectStep` (to utrata zadania: obowiązuje `not_running`, `loss_state`). `Stop` jest dostępny wyłącznie w `Running` i `PauseRequested`.
 
 **Patterns to follow:** istniejąca funkcja `unavailable_reason`, `not_running`, `state_phrase`.
 
@@ -159,7 +172,7 @@ Dla czekającego na człowieka obowiązują dotychczasowe akcje z dokumentu 2026
 
 **Requirements:** R2, R9, R15, R17, R18; AE5, AE6, AE8; Z10.
 
-**Dependencies:** U1, U3 (wynik weryfikacji `interrupt` z U3).
+**Dependencies:** U1, U3 (komenda `StopStep`).
 
 **Files:**
 - `crates/narsor-engine/src/controller_protocol/service.rs`
@@ -171,11 +184,12 @@ Dla czekającego na człowieka obowiązują dotychczasowe akcje z dokumentu 2026
 - Test: `tests/integration` (nowy plik lub istniejący zestaw dla kontrolera)
 
 **Approach:**
-- `Stop` mapuje na `OperatorCommand::Interrupt`. Serwer wywołuje `require_available` z `TaskActionId::Stop`.
+- `Stop` wykonuje dwa kroki z Key Technical Decisions: `OwnerCommand::Pause` (tylko z `Running`), potem `OperatorCommand::StopStep` (U3). Serwer wywołuje `require_available` z `TaskActionId::Stop` przed oboma. Jeśli krok 2 się nie uda, task zostaje w `PauseRequested` (zwykła pauza), a klient dostaje błąd z powodem. `Stop` nigdy nie wysyła `OperatorCommand::Interrupt`.
+- `Restart` ze `Stopped` oraz `SelectStep` ze `Stopped`/`Completed`: `OwnerCommand::Resume` z dołączoną komendą operatora (`RestartStep` / `Transition`), według wzorca `comment_delivery`. Runner stosuje komendę przed ruszeniem przebiegu, żeby nie ruszył stary krok.
 - `ReleaseSlot` używa `release_slot`/`OwnerCommand::Pause` z aktorem właściciela. Dodaj do `owner_action` rozróżnienie, żeby błąd wskazywał właściwą akcję.
 - `SelectStep` przyjmuje nazwę kroku i opcjonalny komentarz. Dla kroku agentowego komentarz trafia do notatki kroku (mechanizm `leave_operator_note`). Dla kroku skryptowego komentarz jest odrzucony lub ignorowany — decyzja w implementacji, udokumentowana w teście.
 - Odrzucenie niedozwolonej akcji zwraca `action_unavailable` z powodem (istniejący kod błędu).
-- Stary klient wysyłający `Interrupt` lub `Pause`/`Resume` nadal działa, jeśli stan na to pozwala (zgodność). Serwer odrzuca `Interrupt` z powodem tylko wtedy, gdy stan jest niedozwolony.
+- Stary klient wysyłający `Interrupt` lub `Pause`/`Resume` nadal działa, jeśli stan na to pozwala (zgodność, `Interrupt` daje `Interrupted` jak dziś). Serwer odrzuca `Interrupt` z powodem tylko wtedy, gdy stan jest niedozwolony.
 
 **Patterns to follow:** `require_owner_command_available`, `require_available`, `comment_delivery`.
 
@@ -186,48 +200,59 @@ Dla czekającego na człowieka obowiązują dotychczasowe akcje z dokumentu 2026
 - Edge: komentarz po ponownym wyborze kroku nie zostaje w następnym przebiegu (Z10).
 - Error: `SelectStep` z nieznanym krokiem → błąd z powodem.
 - Error: `ReleaseSlot` dla taska bez slotu → odrzucone.
-- Integration: `Stop` wysłane do `PauseRequested` → task przechodzi w „zatrzymany" (R10).
+- Integration: `Stop` z `Running` → `PauseRequested` → `Stopped` + `TaskState::Paused`, slot zachowany, brak `Interrupted` i brak próby auto-wznowienia.
+- Integration: `Stop` wysłane do `PauseRequested` → task przechodzi w „zatrzymany" (R10), także gdy przebieg już się skończył.
+- Integration: po `Stop` działają `ReleaseSlot`, komentarz (R11), `SelectStep` i `Restart` skryptu; każde wznawia przez `Resume` z dołączoną komendą i rusza właściwy krok, nie stary.
+- Error: krok 2 (`StopStep`) odrzucony → task w `PauseRequested`, klient widzi powód.
 
 **Verification:** Wszystkie nowe akcje przechodzą przez `require_available`. Test integracyjny pokazuje pełną ścieżkę od klienta do stanu taska.
 
 ---
 
-### U3. Runner: pauza czeka, stop zrywa
+### U3. Runner: pauza czeka, stop zrywa (nowa komenda `StopStep`)
 
-**Goal:** Rozróżnić pauzę i stop dla agenta i dla skryptu zgodnie z R8, R9, Z4, Z5.
+**Goal:** Dodać ścieżkę stopu kończącą się w `Stopped` (sesje i slot zachowane, bez automatycznego wznawiania) i rozróżnić ją od pauzy zgodnie z R8, R9, R10, Z4, Z5.
 
 **Requirements:** R8, R9, R10, R13; F1, F2; AE1, AE2; Z4, Z5.
 
 **Dependencies:** brak (może iść równolegle z U1). U2 zależy od jego wyniku.
 
 **Files:**
-- `crates/narsor-runner/src/runner/commands.rs`
-- `crates/narsor-engine/src/engine/runner.rs`
-- `crates/narsor-engine/src/engine/actions/script.rs`
-- `crates/narsor-engine/src/engine/actions/process_group.rs`
+- `crates/narsor-protocol/src/controller.rs` (nowy wariant `OperatorCommand::StopStep`, opis w `describe`)
+- `crates/narsor-runner/src/runner/commands.rs` (nowa funkcja `stop_step` obok `interrupt`)
+- `crates/narsor-runner/src/runner/mod.rs` (pętla z `PauseAtSafePoint`, `finish_at_safe_point`)
+- `crates/narsor-engine/src/engine/runner/operations.rs` (rozliczenie przerwanego przebiegu do `Paused`, wzorowane na `settle_interrupted`)
+- `crates/narsor-engine/src/engine/actions/script.rs`, `crates/narsor-engine/src/engine/actions/process_group.rs` (zabicie grupy procesów)
 - `crates/narsor-engine/src/engine/actions/agent/process.rs`
-- `crates/narsor-engine/src/orchestration/runner_state.rs`
-- Test: `crates/narsor-runner/src/runner/session_tests.rs`, testy w `crates/narsor-engine/src/engine/actions/script.rs` (jeśli są)
+- `crates/narsor-engine/src/orchestration/control_plane.rs` (przyjęcie punktu bezpiecznego jako `Stopped` — bez zmian, tylko test)
+- Test: `crates/narsor-runner/src/runner/session_tests.rs`, testy w `crates/narsor-engine/src/engine/actions/script.rs`, `crates/narsor-engine/src/orchestration/resume.rs`
 
 **Approach:**
-- Najpierw zweryfikuj hipotezę: czy `interrupt` zabija proces skryptu (grupę procesów) i czy zachowuje sesję agenta możliwą do wznowienia (Z4). Wynik zapisz w opisie zmiany.
-- Jeśli `interrupt` zabija skrypt tylko pośrednio (przez drop przebiegu), dodaj jawne zabicie grupy procesów przy stopie.
-- Pauza: potwierdź, że działa „po zakończeniu bieżącej pracy": dla agenta po końcu sesji harnessu, dla skryptu po końcu skryptu. Jeśli dziś pauza zatrzymuje w innym punkcie (np. między krokami), opisz różnicę i dostosuj do R8.
-- Sesja agenta po stopie zostaje zapisana. Jeśli harness nie umie jej wznowić, zwróć błąd z powodem przy próbie powrotu (Z4).
+- `stop_step`: jeśli przebieg (własny lub dyrygenta) jest aktywny, przerwij go jak `interrupt` (abort, `joined`). Różnice: (1) brak aktywnego przebiegu to sukces „nic do zerwania", nie błąd; (2) przebieg, który zdążył się skończyć, to także sukces (praca się skończyła, więc stan i tak idzie do `Stopped`); (3) rozliczenie nie zostawia `Unknown`/`Interrupted`, tylko wykonanie `Paused`, z operacją w locie zapisaną jako nieznany wynik, który zna zwykłe odzyskiwanie (`reconcile`).
+- Nie zmieniaj `interrupt` ani `settle_interrupted` dla starych klientów. Wspólny kod wyciągnij tylko wtedy, gdy zmniejsza duplikację.
+- Runner po `stop_step` nie zgłasza stanu sam. Stan `PauseRequested` jest już ustawiony przez serwer (U2, krok 1). Pętla runnera widzi `PauseAtSafePoint` i brak przebiegu, zamyka sesję agenta i zgłasza punkt bezpieczny.
+- Skrypt: potwierdź, że abort przebiegu zabija całą grupę procesów (potomków). Jeśli ginie tylko pośrednio (drop), dodaj jawne zabicie grupy w `process_group.rs`.
+- Pauza (`PauseRequested` bez `StopStep`) działa jak dziś: `engine.pause` czeka na granicę kroku. Potwierdź testem, że dla agenta oznacza to koniec sesji harnessu, a dla skryptu koniec skryptu. Jeśli dziś pauza zatrzymuje w innym punkcie, opisz różnicę i dostosuj do R8.
+- Sesja agenta po stopie zostaje zapisana. Jeśli harness nie umie jej wznowić, błąd z powodem przy próbie powrotu (Z4).
 - Po stopie skryptu task stoi na tym kroku, a restart startuje od początku (Z5).
+- Stop nie może zostawić wykonania w stanie `Failed` (ten stan dałby `TaskState::Error`, a nie `Paused`) — test.
 
-**Execution note:** Zacznij od testów charakteryzujących dla `interrupt` i pauzy, zanim zmienisz zachowanie.
+**Execution note:** Zacznij od testów charakteryzujących `interrupt` i pauzy, zanim dodasz `stop_step`.
 
 **Test scenarios:**
-- Covers AE1. Pauza w kroku agentowym: sesja kończy się sama, stan idzie `PauseRequested` → `Stopped`, sesja nie jest zerwana.
-- Covers AE2. Stop w kroku skryptowym: proces skryptu (z potomkami) ginie, stan `Stopped` od razu.
-- Stop w kroku agentowym: sesja zerwana, identyfikator sesji zachowany, wznowienie z promptem działa.
-- Pauza w kroku skryptowym: skrypt dobiega końca, potem stan `Stopped`.
-- Edge: stop w `PauseRequested` przyspiesza zatrzymanie.
-- Edge: krok skończył się przed stopem → odrzucenie z powodem (istniejący komunikat „the step finished before it could be interrupted").
+- Covers AE1. Pauza w kroku agentowym: sesja kończy się sama, `PauseRequested` → `Stopped`, sesja nie jest zerwana.
+- Covers AE2. Stop w kroku skryptowym (`Running`): proces skryptu z potomkami ginie, końcowy stan `Stopped` + `TaskState::Paused`, slot zachowany, `RunnerState::Interrupted` nie występuje na żadnym etapie.
+- Stop w kroku agentowym: sesja zerwana, identyfikator sesji zachowany, wznowienie komentarzem z promptem działa.
+- Pauza w kroku skryptowym: skrypt dobiega końca, potem `Stopped`.
+- Covers R10. Stop w `PauseRequested` z aktywnym przebiegiem: przebieg zerwany, `Stopped` szybciej niż przy samej pauzie.
+- Edge: Stop w `PauseRequested`, gdy przebieg już się skończył (runner zgłasza punkt bezpieczny): `StopStep` kończy się sukcesem, wynik `Stopped`.
+- Edge: runner ginie po kroku 1 (`PauseRequested`), przed `StopStep`: strata nie liczy się, `auto_resume` nie planuje próby (`resume.rs`: z `PauseRequested` bez zmian).
+- Edge: po stopie auto-wznawianie nie rusza taska, a polityka zwolnienia slotu traktuje go jak zwykły `Stopped`.
+- Idempotencja: ta sama komenda `StopStep` dostarczona drugi raz (powtórka po restarcie runnera) nie zmienia wyniku.
+- Zgodność: stary klient wysyła `OperatorCommand::Interrupt` — zachowanie jak dziś (`Interrupted`).
 - Error: wznowienie sesji, której harness nie wznowi → błąd z powodem, możliwy wybór innego kroku.
 
-**Verification:** Zachowanie pauzy i stopu zgadza się z AE1 i AE2 dla obu rodzajów kroku.
+**Verification:** Po `Stop` task zawsze ląduje w `Stopped` + `TaskState::Paused` z zachowanym slotem i sesjami, bez udziału `Interrupted` i automatycznego wznawiania; pauza i stop zgadzają się z AE1 i AE2 dla obu rodzajów kroku.
 
 ---
 
@@ -331,7 +356,7 @@ Dla czekającego na człowieka obowiązują dotychczasowe akcje z dokumentu 2026
 ## System-Wide Impact
 
 - **Protokół:** nowe identyfikatory akcji. Starszy klient je ignoruje przez `Unrecognized`. Nowy klient ze starym serwerem pokazuje „brak danych".
-- **Runner:** zmiana semantyki pauzy i stopu może zmienić zachowanie automatycznego wznawiania (`auto_resume.rs`) i zwalniania slotów (`slot_release.rs`). Sprawdź oba w testach integracyjnych.
+- **Runner:** nowa komenda `StopStep` w protokole (starszy runner jej nie zna: odrzuci ją jako nieznaną, a serwer zostawi task w `PauseRequested`). Stop nie dotyka `Interrupted` ani automatycznego wznawiania (`auto_resume.rs`), ale może zmienić zwalnianie slotów (`slot_release.rs`) — sprawdź w testach integracyjnych.
 - **Operator:** zmiana nawyków (skróty znikają). Opis w `README.md`/`docs/user`.
 - **Klienci inni niż TUI:** jeśli istnieje klient API (`crates/narsor-api-client`), sprawdź, czy używa `Interrupt` lub `Resume`.
 
@@ -341,7 +366,9 @@ Dla czekającego na człowieka obowiązują dotychczasowe akcje z dokumentu 2026
 
 | Ryzyko | Wpływ | Środek |
 |---|---|---|
-| `interrupt` nie zabija procesu skryptu lub gubi sesję agenta | Stop nie spełnia R9 | U3 zaczyna od testów charakteryzujących i poprawia zachowanie |
+| `StopStep` nie zabija grupy procesów skryptu albo gubi sesję agenta | Stop nie spełnia R9 | U3 zaczyna od testów charakteryzujących, dodaje jawne zabicie grupy |
+| Runner po `StopStep` zostawia wykonanie w `Failed`/`Unknown` zamiast `Paused` | Task ląduje w `Error`, komentarz i `SelectStep` niedostępne | Test końcowy U3: `Stopped` + `TaskState::Paused` |
+| Wznowienie ze `Stopped` rusza stary krok przed komendą operatora | `SelectStep`/`Restart` działają na złym kroku | Komenda dołączona do `Resume`, test integracyjny w U2 |
 | Ctrl+. nie dociera przez część terminali | Operator nie otwiera panelu | Zapasowy skrót `.` (Q1) |
 | Ctrl+↑/↓ koliduje z terminalem lub edycją | Przenoszenie w kolejce nie działa | Test kolizji w U6. Decyzja Q3 jest wiążąca; gdy kolizja jest nie do usunięcia, implementator zgłasza ją jako blokadę |
 | Zmiana semantyki pauzy zmienia politykę slotów | Regresja zwalniania slotów | Testy integracyjne `slot_release` i `auto_resume` w U3 |
@@ -353,7 +380,9 @@ Dla czekającego na człowieka obowiązują dotychczasowe akcje z dokumentu 2026
 
 ### Deferred to Implementation
 
-- Dokładne zachowanie `interrupt` dla skryptu i sesji agenta (hipoteza w U3).
+- Czy abort przebiegu zabija całą grupę procesów skryptu bez zmian, czy trzeba dodać jawne zabicie (U3).
+- Jak dokładnie runner stosuje komendę dołączoną do `Resume` przed pierwszym przebiegiem (wzorzec `comment_delivery`).
+- Czy wspólny kod `interrupt` i `stop_step` warto wyciągnąć.
 - Które terminale przekazują Ctrl+. i Ctrl+↑/↓. Wynik wpływa tylko na dokumentację, bo zapasowy skrót jest zapewniony (Q1).
 - Czy `SelectStep` używa nowej komendy runnera, czy istniejącego `Transition`. Wybór zależy od tego, czy `Transition` obsługuje dowolny krok bez override.
 - Obsługa komentarza dla kroku skryptowego w `SelectStep` (ignorowanie czy odrzucenie).
@@ -367,7 +396,7 @@ Brak. Dokument źródłowy rozstrzygnął Q1–Q4 i nie ma pytań blokujących.
 ## Documentation Plan
 
 - Zaktualizuj `README.md` i `docs/user` (lista skrótów, panel akcji, pauza kontra stop).
-- Dopisz wniosek do `docs/solutions/`, jeśli U3 ujawni nieoczywiste zachowanie `interrupt`.
+- Dopisz wniosek do `docs/solutions/` o różnicy `Stop` (ścieżka `Stopped`) i `Interrupt` (ścieżka `Interrupted`), żeby następny implementator ich nie pomylił.
 
 ---
 
