@@ -976,6 +976,8 @@ pub fn event_line(event: &TaskEvent) -> String {
 fn describe_operator_command(command: &OperatorCommand) -> String {
     match command {
         OperatorCommand::Interrupt => "interrupt".to_string(),
+        OperatorCommand::StopStep => "stop step".to_string(),
+        OperatorCommand::SelectStep { target, .. } => format!("select step '{target}'"),
         OperatorCommand::Transition {
             target,
             forced: false,

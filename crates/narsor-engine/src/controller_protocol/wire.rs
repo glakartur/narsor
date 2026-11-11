@@ -44,7 +44,7 @@ pub use narsor_protocol::controller::{
     RotateKeyResponse, RunnerCredentialRequest, RunnerCredentialResponse, RunnerDirective,
     RunnerLaunchView, RunnerPollQuery, RunnerPollResponse, RunnerProblem, RunnerProgress,
     RunnerRenewResponse, RunnerSnapshotRequest, RunnerSnapshotResponse, RunnerState, RunnerView,
-    SetConcurrencyLimitRequest, SetDefaultBackendRequest, SubmitCommentRequest,
+    SetConcurrencyLimitRequest, SetDefaultBackendRequest, StepKind, StepView, SubmitCommentRequest,
     SubmitCommentResponse, SubmitInputRequest, SubmitInputResponse, SubmitOperatorCommandRequest,
     SubmitOperatorCommandResponse, TaskActionId, TaskActionOffer, TaskActionOption, TaskEvent,
     TaskEventKind, TaskListResponse, TaskState, TaskSummary, TimelineResponse, TransitionExit,

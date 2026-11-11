@@ -2449,6 +2449,54 @@ fn an_operator_command_is_bound_to_the_launch_it_was_queued_for() {
 }
 
 #[test]
+fn a_stop_is_taken_and_delivered_while_the_task_pauses_and_ends_stopped() {
+    use narsor_engine::orchestration::{OperatorCommand, RunnerState};
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    running_with_runner(&fx, "task-1", &lease);
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    let pausing = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(pausing.runner_state, RunnerState::PauseRequested);
+    assert!(pausing.holds_capacity(), "the slot is held while pausing");
+
+    // Only a stop is taken while the task pauses.
+    for refused in [
+        OperatorCommand::Interrupt,
+        OperatorCommand::ConductorChat { text: "hi".into() },
+    ] {
+        let error = fx
+            .control
+            .queue_operator_command(&task("task-1"), operator_request(refused, "x-1"))
+            .expect_err("refused while pausing");
+        assert!(error.to_string().contains("pausing"), "{error}");
+    }
+    fx.control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(OperatorCommand::StopStep, "stop-1"),
+        )
+        .expect("a stop is taken while the task pauses");
+
+    let generation = fx.control.task(&task("task-1")).unwrap().generation;
+    let (delivered, _) = fx
+        .control
+        .deliver_operator_commands(&task("task-1"), "pod-1", 1)
+        .expect("the runner polls while pausing");
+    assert_eq!(delivered.len(), 1, "the stop reaches the pausing runner");
+    assert!(generation >= 1);
+
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    let stopped = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    assert!(!stopped.holds_capacity(), "a stopped task holds no slot");
+    assert_eq!(
+        stopped.task_state(),
+        narsor_engine::orchestration::TaskState::Paused
+    );
+}
+
+#[test]
 fn a_superseded_runner_can_neither_poll_nor_settle_operator_commands() {
     use narsor_engine::orchestration::OperatorCommand;
     let fx = Fixture::new();

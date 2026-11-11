@@ -36,9 +36,9 @@ use super::credentials::{
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{
-    effective_title, normalize_label, one_line_label, AnsweredBy, BackendId, LabelError,
-    LaunchDefinitionError, ResourceProfile, TaskId, WorkflowDefinition, WorkspaceHeader,
-    GENERATED_TITLE_MAX_CHARS, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
+    effective_title, normalize_label, one_line_label, ActionConfig, AnsweredBy, BackendId,
+    LabelError, LaunchDefinitionError, ResourceProfile, TaskId, WorkflowDefinition,
+    WorkspaceHeader, GENERATED_TITLE_MAX_CHARS, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use crate::engine::{
     manual_override_allowed, plan_operator_transition, EngineError, HumanInputDelivery,
@@ -1066,12 +1066,33 @@ impl ProtocolService {
                 self.require_available(&record, action, request.expected_generation)?;
             }
         }
+        // A stop is a pause first, then the cut: in this order, so that a
+        // runner lost while cutting counts as lost from `PauseRequested`
+        // (nothing resumes it by itself), not as a lost task.
+        let mut expected_generation = request.expected_generation;
+        if matches!(request.command, OperatorCommand::StopStep)
+            && record.runner_state == RunnerState::Running
+        {
+            self.control.command_with_capacity_from(
+                &record.task_id,
+                CommandRequest {
+                    command: crate::orchestration::OwnerCommand::Pause,
+                    idempotency_key: format!("stop-pause:{}", request.idempotency_key),
+                    expected_generation,
+                    actor: CommandActor::Owner,
+                },
+                || self.scheduling_policy(&record.assignment.backend_id),
+            )?;
+            self.notify(&record.task_id);
+            // The pause moved the generation the owner saw.
+            expected_generation = None;
+        }
         let outcome = self.control.queue_operator_command(
             &record.task_id,
             OperatorCommandRequest {
                 command: request.command,
                 idempotency_key: request.idempotency_key,
-                expected_generation: request.expected_generation,
+                expected_generation,
                 requested_by: owner.clone(),
             },
         )?;
@@ -1138,7 +1159,33 @@ impl ProtocolService {
             }
             self.check_transition_legal(record, target, *forced)?;
         }
+        if let OperatorCommand::SelectStep { target, .. } = command {
+            self.check_step_exists(record, target)?;
+        }
         check_conductor_command(command)
+    }
+
+    /// Checks the step an owner chose against the workflow snapshot; silent
+    /// when the task has none to check against.
+    fn check_step_exists(&self, record: &TaskRecord, target: &str) -> ProtocolResult<()> {
+        if target.trim().is_empty() {
+            return Err(ProtocolError::bad_request(
+                "missing_target",
+                "a step choice needs a step",
+            ));
+        }
+        match record.launch_spec.definition() {
+            Ok(definition) if !definition.states.contains_key(target) => {
+                Err(ProtocolError::bad_request(
+                    "unknown_step",
+                    format!("the workflow has no step '{target}'"),
+                ))
+            }
+            Ok(_) | Err(LaunchDefinitionError::Missing(_)) => Ok(()),
+            Err(error) => Err(ProtocolError::Internal(format!(
+                "the task's workflow snapshot is unusable: {error}"
+            ))),
+        }
     }
 
     /// Checks a transition against the workflow snapshot and the state the
@@ -2159,6 +2206,8 @@ impl ProtocolService {
             ticket: record.launch_spec.ticket.clone(),
             title: task_title(record),
             manual_transitions: manual_transitions(record),
+            slot_release_pending: record.slot_release_pending(),
+            steps: workflow_steps(record),
             actions: None,
             panel: None,
             resume: record.resume.clone(),
@@ -2390,6 +2439,8 @@ pub fn task_actions(task: &TaskSummary) -> Vec<TaskActionOffer> {
 fn operator_action(command: &OperatorCommand) -> Option<TaskActionId> {
     match command {
         OperatorCommand::Interrupt => Some(TaskActionId::Interrupt),
+        OperatorCommand::StopStep => Some(TaskActionId::Stop),
+        OperatorCommand::SelectStep { .. } => Some(TaskActionId::SelectStep),
         OperatorCommand::Transition { .. } => Some(TaskActionId::Transition),
         _ => None,
     }
@@ -2511,6 +2562,44 @@ fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
         .as_deref()?;
     let definition = record.launch_spec.definition().ok()?;
     transition_offer(&definition, current)
+}
+
+/// Every step of the workflow, for the stop in which the owner may choose
+/// one: the task is stopped (a finished workflow is stopped too). The first is the
+/// initial step, the rest follow by name. `None` elsewhere, so a list of
+/// tasks does not carry it, and when the sealed workflow cannot be read.
+fn workflow_steps(record: &TaskRecord) -> Option<Vec<StepView>> {
+    if record.runner_state != RunnerState::Stopped {
+        return None;
+    }
+    let definition = record.launch_spec.definition().ok()?;
+    let initial = definition.initial_state.to_string();
+    let mut ids: Vec<String> = definition.states.keys().map(ToString::to_string).collect();
+    ids.sort();
+    if let Some(at) = ids.iter().position(|id| *id == initial) {
+        let first = ids.remove(at);
+        ids.insert(0, first);
+    }
+    Some(
+        ids.into_iter()
+            .filter_map(|id| {
+                let state = definition.states.get(id.as_str())?;
+                let kind = match &state.action {
+                    Some(ActionConfig::Agent(_)) => StepKind::Agent,
+                    Some(ActionConfig::Script(_)) => StepKind::Script,
+                    Some(ActionConfig::Human(_)) => StepKind::Human,
+                    Some(ActionConfig::Wait(_)) => StepKind::Wait,
+                    Some(ActionConfig::Decision(_)) => StepKind::Decision,
+                    None => StepKind::Terminal,
+                };
+                Some(StepView {
+                    label: id.clone(),
+                    id,
+                    kind,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// What an owner can ask for out of `current` in `definition`.

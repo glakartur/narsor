@@ -278,16 +278,6 @@ pub enum Action {
     MoveDown,
     /// Enter the move mode.
     MoveMode,
-    /// Pause or resume.
-    PauseResume,
-    /// Interrupt the running step.
-    Interrupt,
-    /// A manual transition.
-    Transition,
-    /// Start again.
-    Restart,
-    /// Archive.
-    Archive,
     /// Open a link.
     OpenLink,
     /// Comment to the agent.
@@ -360,6 +350,11 @@ impl Key {
     /// A key with Alt held.
     pub const fn alt(code: KeyCode) -> Self {
         Self::Press(code, KeyModifiers::ALT)
+    }
+
+    /// A non-character key with Control held.
+    pub const fn ctrl_code(code: KeyCode) -> Self {
+        Self::Press(code, KeyModifiers::CONTROL)
     }
 
     /// A character with Control held.
@@ -563,10 +558,17 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::List,
-        Key::char('.'),
+        Key::ctrl('.'),
         Action::ActionMenu,
         "akcje",
-        "menu akcji zadania",
+        "panel akcji zadania",
+    ),
+    bind(
+        Context::List,
+        Key::char('.'),
+        Action::ActionMenu,
+        "",
+        "panel akcji zadania (zapasowy skrót, gdy terminal nie przekazuje Ctrl+.)",
     ),
     bind(
         Context::List,
@@ -619,14 +621,14 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::List,
-        Key::char('K'),
+        Key::ctrl_code(KeyCode::Up),
         Action::MoveUp,
         "",
         "przesuń zadanie w kolejce o jedno miejsce wyżej",
     ),
     bind(
         Context::List,
-        Key::char('J'),
+        Key::ctrl_code(KeyCode::Down),
         Action::MoveDown,
         "",
         "przesuń zadanie w kolejce o jedno miejsce niżej",
@@ -637,41 +639,6 @@ pub static BINDINGS: &[Binding] = &[
         Action::MoveMode,
         "",
         "tryb przesuwania: wybierz miejsce w kolejce",
-    ),
-    bind(
-        Context::List,
-        Key::char('p'),
-        Action::PauseResume,
-        "",
-        "wstrzymaj albo wznów zadanie",
-    ),
-    bind(
-        Context::List,
-        Key::char('x'),
-        Action::Interrupt,
-        "",
-        "przerwij bieżący krok (wymaga potwierdzenia)",
-    ),
-    bind(
-        Context::List,
-        Key::char('t'),
-        Action::Transition,
-        "",
-        "przejście ręczne do wybranego stanu",
-    ),
-    bind(
-        Context::List,
-        Key::char('s'),
-        Action::Restart,
-        "",
-        "uruchom zadanie od nowa",
-    ),
-    bind(
-        Context::List,
-        Key::char('a'),
-        Action::Archive,
-        "",
-        "archiwizuj zadanie (wymaga potwierdzenia)",
     ),
     bind(
         Context::List,
@@ -726,21 +693,28 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::Details,
-        Key::char('.'),
+        Key::ctrl('.'),
         Action::ActionMenu,
         "akcje",
-        "menu akcji zadania",
+        "panel akcji zadania",
     ),
     bind(
         Context::Details,
-        Key::char('K'),
+        Key::char('.'),
+        Action::ActionMenu,
+        "",
+        "panel akcji zadania (zapasowy skrót, gdy terminal nie przekazuje Ctrl+.)",
+    ),
+    bind(
+        Context::Details,
+        Key::ctrl_code(KeyCode::Up),
         Action::MoveUp,
         "",
         "przesuń zadanie w kolejce o jedno miejsce wyżej",
     ),
     bind(
         Context::Details,
-        Key::char('J'),
+        Key::ctrl_code(KeyCode::Down),
         Action::MoveDown,
         "",
         "przesuń zadanie w kolejce o jedno miejsce niżej",
@@ -751,41 +725,6 @@ pub static BINDINGS: &[Binding] = &[
         Action::MoveMode,
         "",
         "tryb przesuwania: wybierz miejsce w kolejce",
-    ),
-    bind(
-        Context::Details,
-        Key::char('p'),
-        Action::PauseResume,
-        "",
-        "wstrzymaj albo wznów zadanie",
-    ),
-    bind(
-        Context::Details,
-        Key::char('x'),
-        Action::Interrupt,
-        "",
-        "przerwij bieżący krok (wymaga potwierdzenia)",
-    ),
-    bind(
-        Context::Details,
-        Key::char('t'),
-        Action::Transition,
-        "",
-        "przejście ręczne do wybranego stanu",
-    ),
-    bind(
-        Context::Details,
-        Key::char('s'),
-        Action::Restart,
-        "",
-        "uruchom zadanie od nowa",
-    ),
-    bind(
-        Context::Details,
-        Key::char('a'),
-        Action::Archive,
-        "",
-        "archiwizuj zadanie (wymaga potwierdzenia)",
     ),
     bind(
         Context::Details,
@@ -1003,14 +942,14 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::Menu,
-        Key::char('K'),
+        Key::ctrl_code(KeyCode::Up),
         Action::MoveUp,
         "",
         "przesuń zadanie w kolejce o jedno miejsce wyżej",
     ),
     bind(
         Context::Menu,
-        Key::char('J'),
+        Key::ctrl_code(KeyCode::Down),
         Action::MoveDown,
         "",
         "przesuń zadanie w kolejce o jedno miejsce niżej",
@@ -1024,52 +963,10 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::Menu,
-        Key::char('p'),
-        Action::PauseResume,
-        "",
-        "wstrzymaj albo wznów zadanie",
-    ),
-    bind(
-        Context::Menu,
-        Key::char('x'),
-        Action::Interrupt,
-        "",
-        "przerwij bieżący krok (wymaga potwierdzenia)",
-    ),
-    bind(
-        Context::Menu,
-        Key::char('t'),
-        Action::Transition,
-        "",
-        "przejście ręczne do wybranego stanu",
-    ),
-    bind(
-        Context::Menu,
-        Key::char('s'),
-        Action::Restart,
-        "",
-        "uruchom zadanie od nowa",
-    ),
-    bind(
-        Context::Menu,
-        Key::char('a'),
-        Action::Archive,
-        "",
-        "archiwizuj zadanie (wymaga potwierdzenia)",
-    ),
-    bind(
-        Context::Menu,
         Key::char('o'),
         Action::OpenLink,
         "",
         "otwórz link zadania w przeglądarce",
-    ),
-    bind(
-        Context::Menu,
-        Key::char('c'),
-        Action::Comment,
-        "",
-        "napisz do agenta (serwer wybiera skutek według stanu zadania)",
     ),
     // The confirmation window of an action `!`: the same for all of them.
     bind(

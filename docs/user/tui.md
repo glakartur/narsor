@@ -49,7 +49,7 @@ repositories use the same frames.
 
 **The list** is the queue: tasks stand in the order of the scheduler (`rank`),
 are never grouped or sorted by state, and change place only by an explicit
-action (`K` / `J` / `m`, the TUI's `narsor-cli task move`). A row takes three
+action (`Ctrl+↑` / `Ctrl+↓` / `m`, the TUI's `narsor-cli task move`). A row takes three
 lines and has one icon column that says the state of the task:
 
 | Icon | State |
@@ -196,22 +196,33 @@ before it sends. Such a panel is not folded by `Esc`; `Tab` leaves it.
 `Space` on the list jumps to the next task that waits, `[` / `]` move between
 several waitings of one task. The header counts them (`? 1 · ! 1`).
 
-**The action menu** (`.`) lists everything that can be done with the selected
-task, each with its shortcut, and greys out what cannot be done with the
-reason. What can be done comes from the server (it checks the same rule when
-the command arrives); a server that does not say shows "niedostępne: brak
-danych". An action marked `!` asks `y` / `n` first.
+**The action panel** (`Ctrl+.`, or `.` where the terminal does not pass
+`Ctrl+.`) is the one place for everything that can be done to the selected
+task. The actions have no shortcut of their own. The panel greys out what
+cannot be done, with the reason. What can be done comes from the server (it
+checks the same rule when the command arrives); a server that does not say shows
+"niedostępne: brak danych". An action marked `!` asks `y` / `n` first.
+
+*Pause* waits for the work to end its step, then the task stops at a safe point
+and gives its slot back. *Stop* cuts the work at once; the task ends stopped
+too (never "interrupted", which is only what the system sets when a workload is
+lost), the agent's session stays, and a script starts its step from the
+beginning. A stopped task does not keep a slot, and it does not resume by
+itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
+*Wybierz krok*. When there is no free slot, it waits in the queue first.
 
 | Key | Action | The CLI it stands for |
 |---|---|---|
-| `K` / `J` / `m` | move in the queue (a place preview, `Enter` confirms) | `narsor-cli task move` |
-| `p` | pause or resume | `narsor-cli task pause` / `resume` |
-| `x` | interrupt the running step (`!`) | `narsor-cli task interrupt` |
-| `t` | manual transition; with a reason, a forced jump (override) where the workflow allows it. A `schema: v2` workflow in the unified shape allows it from every state that is not terminal. A workflow in the older shape allows it only from a state with `allow_manual_override: true` | `narsor-cli task transition [--override --reason]` |
-| `s` | start again an interrupted task or a failed provisioning | `narsor-cli task start` |
-| `a` | archive (`!`) | `narsor-cli task archive` |
+| `Ctrl+↑` / `Ctrl+↓` / `m` | move in the queue (a place preview, `Enter` confirms); not an entry of the panel | `narsor-cli task move` |
+| the panel: *pauza* | pause: the work ends its step | `narsor-cli task pause` |
+| the panel: *stop* (`!`) | stop: the work is cut at once | — |
+| the panel: *zwolnij slot* | a task that waits for you: stop it now, not after the wait time | `narsor-cli task pause` |
+| the panel: *przejście ręczne* | manual transition; with a reason, a forced jump (override) where the workflow allows it. A `schema: v2` workflow in the unified shape allows it from every state that is not terminal. A workflow in the older shape allows it only from a state with `allow_manual_override: true` | `narsor-cli task transition [--override --reason]` |
+| the panel: *wybierz krok* | go on from any step of the workflow, a finished workflow too; for an agent step you may add a comment | — |
+| the panel: *uruchom od nowa* | start again the script step of a stopped task, an interrupted task or a failed provisioning | `narsor-cli task start` |
+| the panel: *archiwizuj* (`!`) | archive | `narsor-cli task archive` |
 | `o` | open a pull request link of a workspace in the browser | — |
-| `c` | action 0, `Napisz do agenta` (first in the menu), in one step: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a pause: the note goes to the agent and the task resumes. A text that was not sent stays as a draft of the task | — |
+| `c` | write to the agent, in one step; it is the conversation's, not the panel's: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a stop: the note goes to the agent and the task resumes. A text that was not sent stays as a draft of the task | — |
 | `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
 | `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor-cli task conductor undo` |
 | the panel | confirm / reject a proposal, restart a failed step with a note | `narsor-cli task conductor confirm` / `reject`, `narsor-cli task restart-step` |
@@ -224,7 +235,7 @@ danych". An action marked `!` asks `y` / `n` first.
 | `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `max_concurrent_tasks` applies again) | `max_concurrent_tasks` in the configuration |
 | the header | what the connection offers | `narsor-cli task capabilities` |
 
-**A forced jump** (`t`, with a reason) leaves the declared exits of the step and goes
+**A forced jump** (the panel's *przejście ręczne*, with a reason) leaves the declared exits of the step and goes
 to any other state. It always needs a reason, and the reason is saved in the audit
 trail. A workflow in the unified shape (`schema: v2` with `choices` as a map) allows
 it from every state that is not terminal. A workflow in the older shape honors the
@@ -270,8 +281,8 @@ the current step or a draft.
 | Where | Keys |
 |---|---|
 | Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
-| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `c` `r`, `h` default harness, `L` task limit |
-| Details | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
+| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `Ctrl+.` (or `.`) action panel, `n` `z` `H` `R`, `Ctrl+↑` `Ctrl+↓` `m`, `o` `c` `r`, `h` default harness, `L` task limit |
+| Details | `[` / `]` tabs, `Tab` content ↔ panel, `Ctrl+.` (or `.`) action panel, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
 | — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry (a subagent's group `▸` / `▾` too), `v` raw entry, `Ctrl+V` raw all |
 | — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |

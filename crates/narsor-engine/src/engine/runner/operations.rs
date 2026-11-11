@@ -119,6 +119,10 @@ pub struct OperatorTransition {
     pub reason: Option<String>,
     /// Who asked, for the audit.
     pub requested_by: String,
+    /// The owner chose the step (not an override of the current one): any
+    /// step of the workflow is allowed, out of a finished workflow as well,
+    /// and no reason is needed.
+    pub select: bool,
 }
 
 /// How a transition out of a state is taken: through which declared output
@@ -416,6 +420,20 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| definition.initial_state.clone());
         let from_state = self.state_of(definition, &execution, &from_state_id)?;
+        if transition.select {
+            if !definition.states.contains_key(&transition.target) {
+                return Err(EngineError::InvalidTransition {
+                    message: format!("the workflow has no state '{}'", transition.target),
+                });
+            }
+            let mut manual =
+                ManualTransition::by_operator(None, Some(transition.target.clone()), true);
+            manual.reason = format!(
+                "Step '{}' chosen by {}.",
+                transition.target, transition.requested_by
+            );
+            return self.apply_manual_transition(definition, execution, &manual);
+        }
         let reason = transition
             .reason
             .as_deref()
@@ -532,6 +550,8 @@ impl Engine {
 
         execution.current_state = Some(target.clone());
         execution.current_action_execution = None;
+        // A step chosen after the end of the workflow opens it again.
+        execution.completed_at = None;
         self.clear_pending_step(&mut execution);
 
         let closing = if target_state.terminal {

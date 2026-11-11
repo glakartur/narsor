@@ -356,10 +356,16 @@ fn obsolete_reason(
         return None;
     }
     // A runner polls from its start, while the task is still provisioning.
-    if !matches!(
-        runner_state,
-        RunnerState::Running | RunnerState::Provisioning
-    ) {
+    // A stop is also carried out while the task pauses: it cuts the work
+    // the pause waits for.
+    let stop_while_pausing = matches!(command.command, OperatorCommand::StopStep)
+        && runner_state == RunnerState::PauseRequested;
+    if !stop_while_pausing
+        && !matches!(
+            runner_state,
+            RunnerState::Running | RunnerState::Provisioning
+        )
+    {
         return Some(format!(
             "the task stopped running before the runner took the command (runner state: {runner_state:?})"
         ));

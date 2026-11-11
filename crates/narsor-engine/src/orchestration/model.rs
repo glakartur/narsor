@@ -466,6 +466,17 @@ impl TaskRecord {
             && !self.owner_work_pending()
     }
 
+    /// Whether the task waits for the owner so that its slot could be freed
+    /// now: it runs, its execution is in a state that frees the slot, a
+    /// deadline is set, and nothing of the owner's waits for the runner. The
+    /// deadline need not have passed.
+    pub fn slot_release_pending(&self) -> bool {
+        self.runner_state == RunnerState::Running
+            && self.slot_release_due_at.is_some()
+            && self.slot_release_class().is_some()
+            && !self.owner_work_pending()
+    }
+
     /// Whether the pause the task now waits to complete is the slot-release
     /// policy's, not the owner's.
     pub fn pause_requested_by_policy(&self) -> bool {
@@ -667,8 +678,11 @@ impl TaskRecord {
     /// on a live runner (interrupt, confirm or reject a proposal) is
     /// refused, with the reason.
     pub fn operator_command_refusal(&self, command: &OperatorCommand) -> Option<String> {
+        let stop_while_pausing = matches!(command, OperatorCommand::StopStep)
+            && self.runner_state == RunnerState::PauseRequested;
         let reason = match self.runner_state {
             RunnerState::Running | RunnerState::Stopped => None,
+            RunnerState::PauseRequested if stop_while_pausing => None,
             RunnerState::Queued | RunnerState::Provisioning => self
                 .awaited_launch_generation()
                 .is_none()
@@ -685,12 +699,15 @@ impl TaskRecord {
         if self.runner.is_none() {
             return Some("the task's runner has not reported yet".to_string());
         }
-        if self.runner_state != RunnerState::Running || self.awaited_launch_generation().is_some() {
+        if (self.runner_state != RunnerState::Running && !stop_while_pausing)
+            || self.awaited_launch_generation().is_some()
+        {
             // No live runner to act on: only work that waits for the next
             // start can be taken.
             if matches!(
                 command,
                 OperatorCommand::Interrupt
+                    | OperatorCommand::StopStep
                     | OperatorCommand::ConfirmProposal { .. }
                     | OperatorCommand::RejectProposal { .. }
             ) {

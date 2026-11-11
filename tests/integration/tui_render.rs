@@ -1541,11 +1541,11 @@ mod task_app_render {
     fn the_notification_sits_on_the_bar() {
         let mut app = busy_app();
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('K'));
-        press(&mut app, KeyCode::Char('K'));
-        press(&mut app, KeyCode::Char('K'));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
         press(&mut app, KeyCode::Char('G'));
-        press(&mut app, KeyCode::Char('K'));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
         let buffer = render(120, 30, &mut app, &Styles::new(false));
         // NAR-8 is finished, so it cannot be moved.
         assert!(
@@ -4299,12 +4299,12 @@ mod task_app_detail_render {
                     interrupted("b", RunnerState::Running, 6, false),
                     "could not resume automatically: pod evicted",
                 ),
-                "nie udało się wznowić automatycznie: pod evicted, uruchom od nowa (s)",
+                "nie udało się wznowić automatycznie: pod evicted, uruchom od nowa (Ctrl+.)",
                 true,
             ),
             (
                 interrupted("b", RunnerState::PauseRequested, 0, false),
-                "utracone podczas wstrzymywania, czeka na Ciebie (s)",
+                "utracone podczas wstrzymywania, czeka na Ciebie (Ctrl+.)",
                 true,
             ),
         ];
@@ -5433,18 +5433,20 @@ mod task_app_actions_render {
     #[test]
     fn the_menu_shows_the_actions_their_keys_and_why_the_move_is_grey() {
         let mut app = opened(running(), ".");
-        // Action 0 opens the menu; the move is the next entry.
+        // The third entry frees the slot, which a working task cannot do.
+        press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('j'));
         let screen = draw_app(&mut app, 120, 40, false);
         for expected in [
             "Akcje · NAR-12",
-            "c  napisz do agenta",
-            "p  wstrzymaj",
-            "x  przerwij krok !",
-            "t  przejście ręczne",
-            "a  archiwizuj !",
-            "o  otwórz link",
-            "m  przesuń w kolejce",
+            "pauza",
+            "stop !",
+            "zwolnij slot",
+            "przejście ręczne",
+            "wybierz krok",
+            "uruchom od nowa",
+            "archiwizuj !",
+            "otwórz link",
             "Opis",
         ] {
             assert!(
@@ -5452,12 +5454,14 @@ mod task_app_actions_render {
                 "{expected:?} is missing:\n{screen}"
             );
         }
-        // The highlighted entry is the move, which cannot be done: its
-        // description starts with the reason.
+        // The highlighted entry cannot be done: its description starts with
+        // the reason. A comment and a move are not entries of the panel.
         assert!(
-            screen.contains("niedostępne: zadanie nie jest w kolejce"),
+            screen.contains("niedostępne: zadanie nie czeka na operatora"),
             "{screen}"
         );
+        assert!(!screen.contains("napisz do agenta"), "{screen}");
+        assert!(!screen.contains("przesuń w kolejce"), "{screen}");
     }
 
     #[test]
@@ -5467,7 +5471,7 @@ mod task_app_actions_render {
         let rows: Vec<&str> = screen.lines().collect();
         let list = rows
             .iter()
-            .position(|row| row.contains("o  otwórz link"))
+            .position(|row| row.contains("otwórz link"))
             .expect("the list");
         let description = rows
             .iter()
@@ -5490,22 +5494,19 @@ mod task_app_actions_render {
         let buffer = draw(120, 40, |frame| {
             layout::render(frame, &mut app, &Styles::new(false), Instant::now())
         });
-        assert_bracketed(&buffer, "1 c  napisz do agenta", true, false);
-        assert_eq!(
-            label_colour(&buffer, "1 c  napisz do agenta", "napisz"),
-            Color::DarkGray
-        );
+        assert_bracketed(&buffer, "1 pauza", true, false);
+        assert_eq!(label_colour(&buffer, "1 pauza", "pauza"), Color::Reset);
 
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('j'));
         let buffer = draw(120, 40, |frame| {
             layout::render(frame, &mut app, &Styles::new(false), Instant::now())
         });
-        assert_bracketed(&buffer, "3 p  wstrzymaj", true, false);
-        assert_not_bracketed(&buffer, "1 c  napisz do agenta");
+        assert_bracketed(&buffer, "3 zwolnij slot", true, false);
+        assert_not_bracketed(&buffer, "1 pauza");
         assert_eq!(
-            label_colour(&buffer, "3 p  wstrzymaj", "wstrzymaj"),
-            Color::Reset
+            label_colour(&buffer, "3 zwolnij slot", "zwolnij"),
+            Color::DarkGray
         );
     }
 
@@ -5517,7 +5518,7 @@ mod task_app_actions_render {
         let buffer = draw(120, 40, |frame| {
             layout::render(frame, &mut app, &Styles::new(true), Instant::now())
         });
-        assert_bracketed(&buffer, "1 c  napisz do agenta", true, true);
+        assert_bracketed(&buffer, "1 pauza", true, true);
         assert!(screen(&buffer).contains("archiwizuj !"));
     }
 
@@ -5529,8 +5530,8 @@ mod task_app_actions_render {
             menu.contains("wykonaj") && menu.contains("zamknij"),
             "{menu}"
         );
-        press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
         let asking = draw_app(&mut app, 120, 40, false);
         assert!(
             asking.contains("potwierdź") && asking.contains("anuluj"),
@@ -5560,12 +5561,13 @@ mod task_app_actions_render {
 
     #[test]
     fn the_confirmation_window_says_what_will_happen_and_what_y_and_n_do() {
-        let mut app = opened(running(), "x");
+        let mut app = opened(running(), ".2");
+        press(&mut app, KeyCode::Enter);
         let screen = draw_app(&mut app, 120, 40, false);
         for expected in [
-            "Przerwij bieżący krok !",
-            "Przerywa trwający krok „review” zadania NAR-12.",
-            "odzyskania",
+            "Zatrzymaj zadanie !",
+            "Zrywa pracę w kroku „review” zadania NAR-12.",
+            "bezpiecznym punkcie",
             "y potwierdź",
             "n/Esc anuluj",
         ] {
@@ -5580,7 +5582,8 @@ mod task_app_actions_render {
             ExecutionStatus::Completed,
             "done",
         );
-        let mut app = opened(finished, "a");
+        let mut app = opened(finished, ".7");
+        press(&mut app, KeyCode::Enter);
         let screen = draw_app(&mut app, 100, 30, false);
         assert!(
             screen.contains("Archiwizuj zadanie !")
@@ -5592,10 +5595,11 @@ mod task_app_actions_render {
 
     #[test]
     fn the_confirmation_window_fits_a_narrow_terminal() {
-        let mut app = opened(running(), "x");
+        let mut app = opened(running(), ".2");
+        press(&mut app, KeyCode::Enter);
         let screen = draw_app(&mut app, 64, 24, false);
         assert!(
-            screen.contains("Przerywa trwający krok") && screen.contains("y potwierdź"),
+            screen.contains("Zrywa pracę") && screen.contains("y potwierdź"),
             "{screen}"
         );
     }
@@ -5604,17 +5608,18 @@ mod task_app_actions_render {
     fn without_colour_the_bangs_and_the_reasons_survive() {
         let mut app = opened(running(), ".");
         press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
         let menu = draw_app(&mut app, 120, 40, true);
         assert!(
-            menu.contains("przerwij krok !") && menu.contains("archiwizuj !"),
+            menu.contains("stop !") && menu.contains("archiwizuj !"),
             "{menu}"
         );
         assert!(
-            menu.contains("niedostępne: zadanie nie jest w kolejce"),
+            menu.contains("niedostępne: zadanie nie czeka na operatora"),
             "{menu}"
         );
-        press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
         let confirm = draw_app(&mut app, 120, 40, true);
         assert!(
             confirm.contains("!") && confirm.contains("y potwierdź"),
@@ -5623,7 +5628,7 @@ mod task_app_actions_render {
     }
 
     #[test]
-    fn a_queued_task_has_its_move_available_and_everything_else_greyed() {
+    fn a_queued_task_has_everything_but_the_archive_greyed() {
         let mut app = TaskApp::new(
             ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
             "local",
@@ -5631,7 +5636,7 @@ mod task_app_actions_render {
         );
         app.load(listing(vec![queued("a", 1)], "c"));
         press(&mut app, KeyCode::Char('.'));
-        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('1'));
         let screen = draw_app(&mut app, 120, 40, false);
         assert!(
             screen.contains("niedostępne: zadanie jest w kolejce"),
@@ -5650,7 +5655,8 @@ mod task_app_actions_render {
             ],
             Some(&["plan", "ship"]),
         );
-        let mut app = opened(task, "t");
+        let mut app = opened(task, ".4");
+        press(&mut app, KeyCode::Enter);
         let screen = draw_app(&mut app, 120, 40, false);
         for expected in [
             "Przejście ręczne · NAR-12 · z „review”",
@@ -6939,10 +6945,14 @@ mod task_app_harness_render {
     #[test]
     fn the_list_bar_offers_h() {
         let mut app = app(None);
-        let buffer = draw(140, 24, |frame| {
+        let buffer = draw(160, 24, |frame| {
             layout::render(frame, &mut app, &Styles::new(true), Instant::now())
         });
-        assert!(rows(&buffer).last().unwrap().contains("h harness"));
+        assert!(
+            rows(&buffer).last().unwrap().contains("h harness"),
+            "{}",
+            rows(&buffer).last().unwrap()
+        );
     }
 }
 
