@@ -436,6 +436,7 @@ mod tests {
             secrets_dir: None,
             harness_home: HarnessHome::default(),
             agent_args: Default::default(),
+            conductor_profile: Default::default(),
             incarnation: "reader-1".to_string(),
             timing: RunnerTiming::default(),
             contract: crate::runner::BaseImageContract::default(),

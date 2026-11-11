@@ -162,7 +162,9 @@ mod tests {
             timeout_secs: None,
             retry_policy: Some(policy(2, 1, 1.0)),
             image: None,
-            model_ladder: Vec::new(),
+            default_model: None,
+            default_effort: None,
+            ceiling: None,
         };
 
         let mut state = State {

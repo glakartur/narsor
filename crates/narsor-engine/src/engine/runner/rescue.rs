@@ -223,8 +223,7 @@ impl Engine {
                         (Some(ActionConfig::Agent(config)), Some(harness), Some(session))
                             if rescue.can_reprompt() =>
                         {
-                            let profiled =
-                                self.profiled_template(definition, execution, state, config);
+                            let profiled = self.profiled_template(execution, state, config);
                             agent::conductor_reprompt_config(&profiled, harness, session, &prompt)
                         }
                         // The purpose did not offer (b): a response that

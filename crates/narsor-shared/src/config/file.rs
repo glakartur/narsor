@@ -37,7 +37,8 @@ use narsor_protocol::harness::HARNESSES;
 use narsor_protocol::identifier::BackendId;
 
 use super::settings::{
-    self, SettingKey, SettingValue, LOG_LEVELS, MAX_ESCALATION_THRESHOLD, NO_LIMIT,
+    self, SettingKey, SettingValue, EFFORT_SCALE, LOG_LEVELS, MAX_ESCALATION_THRESHOLD,
+    MODEL_TIERS, NO_LIMIT,
 };
 
 /// The largest configuration file that will be parsed.
@@ -605,6 +606,32 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             }
         }
 
+        SettingKey::ConductorModel => {
+            let written = text.trim();
+            if written.is_empty() || MODEL_TIERS.contains(&written) {
+                Ok(SettingValue::Text(written.to_string()))
+            } else {
+                Err(format!(
+                    "a model tier ({}) was expected, or nothing for the harness's default, \
+                     but '{written}' was found",
+                    MODEL_TIERS.join(", ")
+                ))
+            }
+        }
+
+        SettingKey::ConductorEffort => {
+            let written = text.trim();
+            if written.is_empty() || EFFORT_SCALE.contains(&written) {
+                Ok(SettingValue::Text(written.to_string()))
+            } else {
+                Err(format!(
+                    "an effort ({}) was expected, or nothing for the harness's default, \
+                     but '{written}' was found",
+                    EFFORT_SCALE.join(", ")
+                ))
+            }
+        }
+
         SettingKey::EscalationThreshold => {
             let written = text.trim();
             match written.parse::<u32>() {
@@ -820,6 +847,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_conductor_model_is_a_tier_or_empty() {
+        for good in ["", "small", "medium", "large", "max"] {
+            assert!(
+                value_from_text(SettingKey::ConductorModel, good).is_ok(),
+                "{good}"
+            );
+        }
+        assert!(value_from_text(SettingKey::ConductorModel, "opus").is_err());
+    }
+
+    #[test]
+    fn the_conductor_effort_is_a_value_of_the_scale_or_empty() {
+        for good in ["", "low", "medium", "high", "max"] {
+            assert!(
+                value_from_text(SettingKey::ConductorEffort, good).is_ok(),
+                "{good}"
+            );
+        }
+        assert!(value_from_text(SettingKey::ConductorEffort, "ultra").is_err());
     }
 
     #[test]

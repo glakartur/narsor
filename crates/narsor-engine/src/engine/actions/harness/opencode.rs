@@ -39,8 +39,9 @@
 //! permission bits on the provisioned directories, for both harnesses.
 
 use super::{
-    bool_parameter, not_classified, reject_option_like, resolve_read_only_path, string_parameter,
-    tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
+    bool_parameter, model_for_tier, not_classified, reject_option_like, resolve_read_only_path,
+    string_parameter, tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
+    HarnessStreamParser,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -86,6 +87,15 @@ impl Default for OpenCodeAdapter {
 }
 
 impl HarnessAdapter for OpenCodeAdapter {
+    fn model_tiers(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("small", "anthropic/claude-haiku-4-5"),
+            ("medium", "anthropic/claude-sonnet-4-5"),
+            ("large", "anthropic/claude-opus-4-5"),
+            ("max", "anthropic/claude-opus-4-5"),
+        ]
+    }
+
     fn name(&self) -> &str {
         OPENCODE
     }
@@ -98,10 +108,11 @@ impl HarnessAdapter for OpenCodeAdapter {
         let config = request.config;
         let mut args = vec!["run".to_string()];
 
-        if let Some(model) = &config.model {
-            reject_option_like(model, "model", OPENCODE)?;
+        if let Some(tier) = &config.model {
+            let model = model_for_tier(self, tier)?;
+            reject_option_like(&model, "model", OPENCODE)?;
             args.push("--model".to_string());
-            args.push(model.clone());
+            args.push(model);
         }
 
         if let Some(agent) = string_parameter(config, "agent", OPENCODE)? {

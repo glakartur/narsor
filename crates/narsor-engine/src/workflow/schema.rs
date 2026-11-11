@@ -488,10 +488,20 @@ pub struct GlobalsSchema {
     #[serde(default)]
     pub image: Option<crate::domain::ImageSpec>,
 
-    /// Models from the cheapest to the strongest, for `ceiling` and
-    /// escalation.
+    /// The model tier of an agent step that names none: `small`, `medium`,
+    /// `large` or `max`. The step's own `model` wins.
     #[serde(default)]
-    pub model_ladder: Vec<String>,
+    pub default_model: Option<String>,
+
+    /// The effort of an agent step that names none. The step's own `effort`
+    /// wins.
+    #[serde(default)]
+    pub default_effort: Option<String>,
+
+    /// The general ceiling: the most a step without its own ceiling may be
+    /// raised to. A step's own `ceiling` field wins field by field.
+    #[serde(default)]
+    pub ceiling: Option<crate::domain::StepCeiling>,
 }
 
 /// Retry policy, both globally and per state (§3.2, §3.3).

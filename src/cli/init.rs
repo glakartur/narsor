@@ -392,6 +392,16 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "Failed attempts of an agent step after which its effort, then its model, is raised within its ceiling; 0 turns it off.",
     ),
     (
+        SettingKey::ConductorModel,
+        "\"\"",
+        "Model tier of the conductor (small, medium, large, max); empty is the harness's default.",
+    ),
+    (
+        SettingKey::ConductorEffort,
+        "\"\"",
+        "Effort of the conductor (low, medium, high, max); empty is the harness's default.",
+    ),
+    (
         SettingKey::LogLevel,
         "off",
         "off, error, warn, info, debug or trace (RUST_LOG wins).",

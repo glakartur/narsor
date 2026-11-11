@@ -101,16 +101,15 @@ fn request() -> ProfileRequest {
         steps: vec![
             ProfileCandidate {
                 step_id: "work".into(),
-                default: Setting::new(Some("sonnet"), Some("medium")),
-                ceiling: Some(Setting::new(Some("opus"), Some("high"))),
+                default: Setting::new(Some("medium"), Some("medium")),
+                ceiling: Some(Setting::new(Some("large"), Some("high"))),
             },
             ProfileCandidate {
                 step_id: "review".into(),
-                default: Setting::new(Some("sonnet"), Some("medium")),
-                ceiling: Some(Setting::new(Some("opus"), Some("high"))),
+                default: Setting::new(Some("medium"), Some("medium")),
+                ceiling: Some(Setting::new(Some("large"), Some("high"))),
             },
         ],
-        model_ladder: ["haiku", "sonnet", "opus"].map(String::from).to_vec(),
     }
 }
 
@@ -121,7 +120,7 @@ fn answer(steps: Value) -> Option<Value> {
 #[tokio::test]
 async fn a_lower_profile_is_stored_with_its_rationale() {
     let fixture = Fixture::new(vec![answer(json!([
-        { "step_id": "work", "model": "haiku", "effort": "low", "rationale": "one small change" }
+        { "step_id": "work", "model": "small", "effort": "low", "rationale": "one small change" }
     ]))]);
 
     fixture.profile().await;
@@ -130,7 +129,7 @@ async fn a_lower_profile_is_stored_with_its_rationale() {
     assert_eq!(call.request.purpose, ConductorPurpose::ProfileSteps);
     let profile = fixture.store().load_profile().unwrap();
     let entry = profile.lookup("work", None).expect("an entry for work");
-    assert_eq!(entry.setting, Setting::new(Some("haiku"), Some("low")));
+    assert_eq!(entry.setting, Setting::new(Some("small"), Some("low")));
     assert_eq!(entry.rationale, "one small change");
     assert!(profile.lookup("review", None).is_none());
 }
@@ -138,15 +137,15 @@ async fn a_lower_profile_is_stored_with_its_rationale() {
 #[tokio::test]
 async fn a_request_above_the_ceiling_starts_on_the_ceiling_and_is_recorded() {
     let fixture = Fixture::new(vec![answer(json!([
-        { "step_id": "work", "model": "opus", "effort": "max", "rationale": "risky migration" },
-        { "step_id": "review", "model": "opus", "effort": "high", "rationale": "within" }
+        { "step_id": "work", "model": "large", "effort": "max", "rationale": "risky migration" },
+        { "step_id": "review", "model": "large", "effort": "high", "rationale": "within" }
     ]))]);
 
     fixture.profile().await;
 
     let profile = fixture.store().load_profile().unwrap();
     let work = profile.lookup("work", None).unwrap();
-    assert_eq!(work.setting, Setting::new(Some("opus"), Some("high")));
+    assert_eq!(work.setting, Setting::new(Some("large"), Some("high")));
     assert_eq!(
         work.requested_over_ceiling,
         Some(Setting::new(None, Some("max")))
@@ -158,8 +157,8 @@ async fn a_request_above_the_ceiling_starts_on_the_ceiling_and_is_recorded() {
 #[tokio::test]
 async fn an_unsure_entry_and_a_unit_entry_are_handled() {
     let fixture = Fixture::new(vec![answer(json!([
-        { "step_id": "work", "unit": "3", "model": "opus", "effort": "high", "rationale": "unit 3" },
-        { "step_id": "review", "model": "haiku", "effort": "low", "rationale": "?", "confident": false }
+        { "step_id": "work", "unit": "3", "model": "large", "effort": "high", "rationale": "unit 3" },
+        { "step_id": "review", "model": "small", "effort": "low", "rationale": "?", "confident": false }
     ]))]);
 
     fixture.profile().await;
@@ -183,10 +182,10 @@ async fn a_conductor_that_fails_leaves_no_profile() {
 async fn a_second_profile_does_not_replace_the_first() {
     let fixture = Fixture::new(vec![
         answer(
-            json!([{ "step_id": "work", "model": "haiku", "effort": "low", "rationale": "first" }]),
+            json!([{ "step_id": "work", "model": "small", "effort": "low", "rationale": "first" }]),
         ),
         answer(
-            json!([{ "step_id": "work", "model": "opus", "effort": "high", "rationale": "second" }]),
+            json!([{ "step_id": "work", "model": "large", "effort": "high", "rationale": "second" }]),
         ),
     ]);
 
@@ -195,6 +194,45 @@ async fn a_second_profile_does_not_replace_the_first() {
 
     let profile = fixture.store().load_profile().unwrap();
     assert_eq!(profile.lookup("work", None).unwrap().rationale, "first");
+}
+
+#[tokio::test]
+async fn a_step_that_already_started_is_not_profiled() {
+    // `check` is the state the execution was started in: it was entered once
+    // while the conductor was still answering (D7).
+    let fixture = Fixture::new(vec![answer(json!([
+        { "step_id": "check", "model": "small", "effort": "low", "rationale": "late" },
+        { "step_id": "work", "model": "small", "effort": "low", "rationale": "in time" }
+    ]))]);
+    let mut execution = fixture
+        .harness
+        .store()
+        .load_execution(&fixture.execution_id)
+        .expect("the execution");
+    execution.metadata = json!({ "engine": { "state_entries": { "check": 1 } } });
+    fixture
+        .harness
+        .store()
+        .save_execution(&execution)
+        .expect("save the execution");
+    let mut asked = request();
+    asked.steps.push(ProfileCandidate {
+        step_id: "check".into(),
+        default: Setting::new(Some("medium"), Some("medium")),
+        ceiling: Some(Setting::new(Some("large"), Some("high"))),
+    });
+
+    fixture
+        .registry
+        .actor(&fixture.execution_id)
+        .expect("the actor")
+        .invoke(asked.into_queued())
+        .await
+        .expect("the invocation");
+
+    let profile = fixture.store().load_profile().unwrap();
+    assert!(profile.lookup("check", None).is_none());
+    assert!(profile.lookup("work", None).is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -353,10 +391,12 @@ async fn the_request_lists_the_agent_steps_that_have_not_started_and_not_the_pla
     let ids: Vec<&str> = asked.steps.iter().map(|s| s.step_id.as_str()).collect();
     assert_eq!(ids, ["review", "work"]);
     assert_eq!(asked.plan_step, "plan");
-    assert_eq!(asked.model_ladder, ["haiku", "sonnet", "opus"]);
     let work = asked.steps.iter().find(|s| s.step_id == "work").unwrap();
-    assert_eq!(work.default, Setting::new(Some("sonnet"), Some("low")));
-    assert_eq!(work.ceiling, Some(Setting::new(Some("opus"), Some("high"))));
+    assert_eq!(work.default, Setting::new(Some("medium"), Some("low")));
+    assert_eq!(
+        work.ceiling,
+        Some(Setting::new(Some("large"), Some("high")))
+    );
 }
 
 #[tokio::test]
@@ -423,7 +463,7 @@ async fn a_failing_interrupted_or_silent_conductor_is_recorded_and_the_task_goes
         // Every step ran on its default.
         assert_eq!(
             setting_of(&flow.call_of("Do it")[0]),
-            (Some("sonnet"), Some("low"))
+            (Some("medium"), Some("low"))
         );
     }
 }
@@ -433,8 +473,8 @@ async fn the_profile_sets_the_model_and_the_effort_of_the_step() {
     let flow = Flow::new(
         vec![exit(); 3],
         vec![profile_answer(json!([
-            { "step_id": "work", "model": "opus", "effort": "high", "rationale": "risky" },
-            { "step_id": "review", "model": "haiku", "effort": "low", "rationale": "small" }
+            { "step_id": "work", "model": "large", "effort": "high", "rationale": "risky" },
+            { "step_id": "review", "model": "small", "effort": "low", "rationale": "small" }
         ]))],
         true,
     );
@@ -444,15 +484,15 @@ async fn the_profile_sets_the_model_and_the_effort_of_the_step() {
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(
         setting_of(&flow.call_of("Plan it")[0]),
-        (Some("sonnet"), Some("medium"))
+        (Some("medium"), Some("medium"))
     );
     assert_eq!(
         setting_of(&flow.call_of("Do it")[0]),
-        (Some("opus"), Some("high"))
+        (Some("large"), Some("high"))
     );
     assert_eq!(
         setting_of(&flow.call_of("Review it")[0]),
-        (Some("haiku"), Some("low"))
+        (Some("small"), Some("low"))
     );
     assert!(flow.profile_events(&execution.id).is_empty());
 }
@@ -487,9 +527,9 @@ async fn a_step_that_fails_repeatedly_is_raised_within_its_ceiling() {
     assert_eq!(
         work,
         [
-            seen("sonnet", "low"),
-            seen("sonnet", "low"),
-            seen("sonnet", "medium")
+            seen("medium", "low"),
+            seen("medium", "low"),
+            seen("medium", "medium")
         ]
     );
     let events = flow.profile_events(&execution.id);
@@ -515,8 +555,8 @@ async fn the_limit_is_announced_only_for_a_step_with_a_ceiling() {
             exit(),
         ],
         vec![profile_answer(json!([
-            { "step_id": "work", "model": "opus", "effort": "high", "rationale": "top" },
-            { "step_id": "review", "model": "sonnet", "effort": "medium", "rationale": "same" }
+            { "step_id": "work", "model": "large", "effort": "high", "rationale": "top" },
+            { "step_id": "review", "model": "medium", "effort": "medium", "rationale": "same" }
         ]))],
     );
 
@@ -566,7 +606,7 @@ async fn an_entry_that_cannot_be_used_keeps_the_default_and_is_recorded() {
     assert_eq!(execution.status, ExecutionStatus::Completed);
     // "max" is above the ceiling's "high": clamped; the model is rejected.
     let work = &flow.call_of("Do it")[0];
-    assert_eq!(work.model.as_deref(), Some("sonnet"));
+    assert_eq!(work.model.as_deref(), Some("medium"));
     let events = flow.profile_events(&execution.id);
     assert!(
         events
@@ -596,7 +636,7 @@ async fn a_damaged_profile_means_no_profile() {
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(
         setting_of(&flow.call_of("Do it")[0]),
-        (Some("sonnet"), Some("low"))
+        (Some("medium"), Some("low"))
     );
     assert!(flow.profile_events(&execution.id).is_empty());
 }
@@ -614,7 +654,7 @@ async fn a_reprompt_resumes_the_session_on_the_profiled_model_and_effort() {
             exit(),
         ],
         vec![profile_answer(json!([
-            { "step_id": "work", "model": "opus", "effort": "high", "rationale": "risky" }
+            { "step_id": "work", "model": "large", "effort": "high", "rationale": "risky" }
         ]))],
         true,
     );
@@ -626,10 +666,10 @@ async fn a_reprompt_resumes_the_session_on_the_profiled_model_and_effort() {
         .agent
         .calls()
         .into_iter()
-        .filter(|call| call.model.as_deref() == Some("opus"))
+        .filter(|call| call.model.as_deref() == Some("large"))
         .collect();
     assert_eq!(work.len(), 2, "{:?}", flow.agent.calls());
     assert!(work[0].resume_session.is_none());
     assert!(work[1].resume_session.is_some());
-    assert_eq!(setting_of(&work[1]), (Some("opus"), Some("high")));
+    assert_eq!(setting_of(&work[1]), (Some("large"), Some("high")));
 }

@@ -87,6 +87,8 @@ impl Flags {
             | SettingKey::AgentArgs
             | SettingKey::MaxConcurrentTasks
             | SettingKey::EscalationThreshold
+            | SettingKey::ConductorModel
+            | SettingKey::ConductorEffort
             | SettingKey::LogLevel
             | SettingKey::TuiRefreshInterval
             | SettingKey::DefaultBackend
@@ -325,6 +327,20 @@ impl Resolved {
             .unwrap_or_default()
     }
 
+    /// The model tier the conductor runs on; `None` is the harness's default.
+    pub fn conductor_model(&self) -> Option<String> {
+        self.text(SettingKey::ConductorModel)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The effort the conductor runs with; `None` is the harness's default.
+    pub fn conductor_effort(&self) -> Option<String> {
+        self.text(SettingKey::ConductorEffort)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    }
+
     /// What the engine needs from the configuration for an `agent` action.
     pub fn agent_defaults(&self) -> AgentDefaults {
         AgentDefaults {
@@ -332,6 +348,8 @@ impl Resolved {
             timeout_secs: self.agent_timeout(),
             args: self.agent_args(),
             escalation_threshold: self.escalation_threshold(),
+            conductor_model: self.conductor_model(),
+            conductor_effort: self.conductor_effort(),
         }
     }
 
@@ -378,6 +396,10 @@ pub struct AgentDefaults {
     /// Consecutive failed attempts of a step after which its model or effort
     /// is raised within its ceiling; `0` turns escalation off.
     pub escalation_threshold: u32,
+    /// The model tier the conductor runs on; `None` is the harness's default.
+    pub conductor_model: Option<String>,
+    /// The effort the conductor runs with; `None` is the harness's default.
+    pub conductor_effort: Option<String>,
 }
 
 /// Works out every setting, reading the environment that was handed in.

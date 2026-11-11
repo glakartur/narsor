@@ -722,7 +722,7 @@ states:
     action:
       type: agent
       harness: claude-code
-      model: sonnet-3.5
+      model: medium
       prompt: |
         Analizuj kod.
       parameters:
@@ -745,7 +745,7 @@ terminal_states: [done]
     };
 
     assert_eq!(agent.harness.as_deref(), Some("claude-code"));
-    assert_eq!(agent.model.as_deref(), Some("sonnet-3.5"));
+    assert_eq!(agent.model.as_deref(), Some("medium"));
     assert_eq!(agent.read_only_paths, vec!["../other-repo/src"]);
     assert_eq!(agent.parameters["max_tokens"], serde_json::json!(4096));
 }

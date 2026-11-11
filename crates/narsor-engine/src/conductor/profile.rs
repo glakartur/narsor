@@ -5,7 +5,7 @@
 //! for the answer at most [`PROFILE_WAIT`]: a conductor that is slow, fails or
 //! is unsure leaves the steps on their defaults and never holds the task (R8).
 //! What it chose is checked here against each step's ceiling and the
-//! workflow's model ladder through [`step_profile::resolve`] and kept in the
+//! model tiers through [`step_profile::resolve`] and kept in the
 //! conductor's store ([`ConductorStore::add_profile_entries`]); the engine
 //! reads it when a step starts.
 //!
@@ -56,8 +56,6 @@ pub struct ProfileRequest {
     pub complexity: Option<Value>,
     /// The steps that have not started.
     pub steps: Vec<ProfileCandidate>,
-    /// The workflow's models from the cheapest.
-    pub model_ladder: Vec<String>,
 }
 
 impl ProfileRequest {
@@ -118,7 +116,6 @@ pub fn entries_of(
             default: &candidate.default,
             ceiling: candidate.ceiling.as_ref(),
             conductor: Some(&wanted),
-            ladder: &asked.model_ladder,
             failures: 0,
             threshold: 0,
         });
@@ -153,10 +150,9 @@ mod tests {
             complexity: None,
             steps: vec![ProfileCandidate {
                 step_id: "work".into(),
-                default: Setting::new(Some("sonnet"), Some("medium")),
-                ceiling: Some(Setting::new(Some("opus"), Some("high"))),
+                default: Setting::new(Some("medium"), Some("medium")),
+                ceiling: Some(Setting::new(Some("large"), Some("high"))),
             }],
-            model_ladder: ["haiku", "sonnet", "opus"].map(String::from).to_vec(),
         }
     }
 
@@ -173,14 +169,17 @@ mod tests {
 
     #[test]
     fn a_lower_profile_is_kept() {
-        let entries = entries_of(&asked(), vec![step("work", "haiku", "low", true)]);
-        assert_eq!(entries[0].setting, Setting::new(Some("haiku"), Some("low")));
+        let entries = entries_of(&asked(), vec![step("work", "small", "low", true)]);
+        assert_eq!(entries[0].setting, Setting::new(Some("small"), Some("low")));
     }
 
     #[test]
     fn a_request_above_the_ceiling_starts_on_the_ceiling_and_is_recorded() {
-        let entries = entries_of(&asked(), vec![step("work", "opus", "max", true)]);
-        assert_eq!(entries[0].setting, Setting::new(Some("opus"), Some("high")));
+        let entries = entries_of(&asked(), vec![step("work", "large", "max", true)]);
+        assert_eq!(
+            entries[0].setting,
+            Setting::new(Some("large"), Some("high"))
+        );
         assert_eq!(
             entries[0].requested_over_ceiling,
             Some(Setting::new(None, Some("max")))
@@ -192,10 +191,10 @@ mod tests {
         let entries = entries_of(
             &asked(),
             vec![
-                step("work", "haiku", "low", false),
-                step("other", "haiku", "low", true),
+                step("work", "small", "low", false),
+                step("other", "small", "low", true),
                 step("work", "mystery", "mystery", true),
-                step("work", "sonnet", "medium", true),
+                step("work", "medium", "medium", true),
             ],
         );
         assert!(entries.is_empty());
@@ -206,16 +205,16 @@ mod tests {
         let entries = entries_of(&asked(), vec![step("work", "mystery", "low", true)]);
         assert_eq!(
             entries[0].setting,
-            Setting::new(Some("sonnet"), Some("low"))
+            Setting::new(Some("medium"), Some("low"))
         );
     }
 
     #[test]
     fn a_step_without_an_effort_ceiling_still_takes_a_model() {
         let mut asked = asked();
-        asked.steps[0].default = Setting::new(Some("sonnet"), None);
-        asked.steps[0].ceiling = Some(Setting::new(Some("opus"), None));
-        let entries = entries_of(&asked, vec![step("work", "haiku", "high", true)]);
-        assert_eq!(entries[0].setting, Setting::new(Some("haiku"), None));
+        asked.steps[0].default = Setting::new(Some("medium"), None);
+        asked.steps[0].ceiling = Some(Setting::new(Some("large"), None));
+        let entries = entries_of(&asked, vec![step("work", "small", "high", true)]);
+        assert_eq!(entries[0].setting, Setting::new(Some("small"), None));
     }
 }

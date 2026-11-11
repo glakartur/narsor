@@ -745,14 +745,25 @@ impl ConductorActor {
             conclude_title(&self.store, outcome)?;
         }
         if invocation.request.trigger == ConductorTrigger::Profile {
-            // The request lists only steps that had not started when it was
-            // made, so nothing else can be written.
-            conclude_profile(
-                &self.store,
-                &invocation.request,
-                outcome,
-                &std::collections::BTreeSet::new(),
-            )?;
+            // Steps that began while the conductor was answering keep their
+            // defaults: the profile is decided once, before the step starts
+            // (D7). When the execution cannot be read nothing is written.
+            match self
+                .engine
+                .store()
+                .load_execution(&self.execution_id)
+                .map_err(|error| error.to_string())
+                .and_then(|execution| {
+                    crate::engine::runner::started_states(&execution)
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(started) => {
+                    conclude_profile(&self.store, &invocation.request, outcome, &started)?;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not tell which steps started; no profile written");
+                }
+            }
         }
 
         let mut next = inner.state.clone();

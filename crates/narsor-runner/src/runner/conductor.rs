@@ -76,6 +76,7 @@ impl ConductorHost {
         harness: Arc<LiveHarness>,
         definition: &Arc<WorkflowDefinition>,
         extra_args: AgentArgs,
+        profile: narsor_engine::conductor::ConductorProfile,
     ) -> Self {
         let invoker = HarnessInvoker::new(
             engine.store().clone(),
@@ -84,6 +85,7 @@ impl ConductorHost {
         )
         .with_default_harness_source(harness.clone())
         .with_extra_args(extra_args)
+        .with_profile(profile)
         .with_reading_sink(engine.reading_sink())
         .with_pinned_definition(Arc::clone(definition));
         Self::assemble_with(

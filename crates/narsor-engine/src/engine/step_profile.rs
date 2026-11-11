@@ -8,9 +8,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Efforts from the cheapest to the strongest. A workflow value outside this
-/// scale is a validation error.
-pub const EFFORT_SCALE: [&str; 4] = ["low", "medium", "high", "max"];
+/// Efforts from the cheapest to the strongest, and the model tiers likewise.
+/// A workflow value outside them is a validation error. A workflow, the
+/// conductor and an escalation name a tier; each harness maps a tier to a
+/// model name ([`super::actions::harness::HarnessAdapter::model_tiers`]).
+pub use crate::config::{EFFORT_SCALE, MODEL_TIERS};
+
+/// Position of a model tier on [`MODEL_TIERS`].
+pub fn tier_rank(tier: &str) -> Option<usize> {
+    MODEL_TIERS.iter().position(|known| *known == tier)
+}
 
 /// Position of an effort on [`EFFORT_SCALE`].
 pub fn effort_rank(effort: &str) -> Option<usize> {
@@ -20,7 +27,7 @@ pub fn effort_rank(effort: &str) -> Option<usize> {
 /// A model and an effort; either may be unset.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Setting {
-    /// Model name, as the harness takes it.
+    /// Model tier, one of [`MODEL_TIERS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Effort, one of [`EFFORT_SCALE`].
@@ -78,8 +85,6 @@ pub struct ProfileInput<'a> {
     pub ceiling: Option<&'a Setting>,
     /// The conductor's profile for this step.
     pub conductor: Option<&'a Setting>,
-    /// Models from the cheapest. Models outside it are never compared.
-    pub ladder: &'a [String],
     /// Consecutive failed attempts of this step.
     pub failures: u32,
     /// Failures per escalation; `0` turns escalation off.
@@ -95,15 +100,12 @@ pub struct EffectiveProfile {
     pub source: ProfileSource,
     /// What the conductor wanted when it was above the ceiling.
     pub requested_over_ceiling: Option<Setting>,
-    /// The conductor named a model or effort that cannot be used (outside the
-    /// scale or the ladder); the default was kept for it.
+    /// The conductor named a model or effort that cannot be used (outside
+    /// the tiers or the scale); the default was kept for it.
     pub rejected: bool,
     /// An escalation was due and both fields already stand on the ceiling.
+    /// Never set for a step without a ceiling: nothing was reached.
     pub limit_reached: bool,
-}
-
-fn model_rank(ladder: &[String], model: &str) -> Option<usize> {
-    ladder.iter().position(|known| known == model)
 }
 
 /// Computes the profile of the next attempt.
@@ -129,11 +131,8 @@ pub fn resolve(input: ProfileInput<'_>) -> EffectiveProfile {
             // The default itself is always allowed.
             if Some(model) != input.default.model.as_ref() {
                 match (
-                    model_rank(input.ladder, model),
-                    ceiling
-                        .model
-                        .as_deref()
-                        .and_then(|c| model_rank(input.ladder, c)),
+                    tier_rank(model),
+                    ceiling.model.as_deref().and_then(tier_rank),
                 ) {
                     (Some(rank), Some(cap)) if rank <= cap => {
                         setting.model = Some(model.clone());
@@ -172,8 +171,9 @@ pub fn resolve(input: ProfileInput<'_>) -> EffectiveProfile {
     let mut limit_reached = false;
     if input.threshold > 0 {
         for _ in 0..input.failures / input.threshold {
-            if !raise(&mut setting, &ceiling, input.ladder) {
-                limit_reached = true;
+            if !raise(&mut setting, &ceiling) {
+                // Without a ceiling nothing was reached (D8).
+                limit_reached = input.ceiling.is_some();
                 break;
             }
             if source != ProfileSource::Clamped {
@@ -192,9 +192,9 @@ pub fn resolve(input: ProfileInput<'_>) -> EffectiveProfile {
     }
 }
 
-/// Raises the effort one step, or the model one rung when the effort cannot
+/// Raises the effort one step, or the model one tier when the effort cannot
 /// rise; `false` when neither can.
-fn raise(setting: &mut Setting, ceiling: &Setting, ladder: &[String]) -> bool {
+fn raise(setting: &mut Setting, ceiling: &Setting) -> bool {
     if let (Some(current), Some(cap)) = (
         setting.effort.as_deref().and_then(effort_rank),
         ceiling.effort.as_deref().and_then(effort_rank),
@@ -205,11 +205,11 @@ fn raise(setting: &mut Setting, ceiling: &Setting, ladder: &[String]) -> bool {
         }
     }
     if let (Some(current), Some(cap)) = (
-        setting.model.as_deref().and_then(|m| model_rank(ladder, m)),
-        ceiling.model.as_deref().and_then(|m| model_rank(ladder, m)),
+        setting.model.as_deref().and_then(tier_rank),
+        ceiling.model.as_deref().and_then(tier_rank),
     ) {
         if current < cap {
-            setting.model = Some(ladder[current + 1].clone());
+            setting.model = Some(MODEL_TIERS[current + 1].to_string());
             return true;
         }
     }
@@ -220,22 +220,16 @@ fn raise(setting: &mut Setting, ceiling: &Setting, ladder: &[String]) -> bool {
 mod tests {
     use super::*;
 
-    fn ladder() -> Vec<String> {
-        ["haiku", "sonnet", "opus"].map(String::from).to_vec()
-    }
-
     fn input<'a>(
         default: &'a Setting,
         ceiling: Option<&'a Setting>,
         conductor: Option<&'a Setting>,
-        ladder: &'a [String],
         failures: u32,
     ) -> ProfileInput<'a> {
         ProfileInput {
             default,
             ceiling,
             conductor,
-            ladder,
             failures,
             threshold: 3,
         }
@@ -243,8 +237,8 @@ mod tests {
 
     #[test]
     fn without_any_source_the_default_stands() {
-        let default = Setting::new(Some("opus"), Some("high"));
-        let out = resolve(input(&default, None, None, &[], 0));
+        let default = Setting::new(Some("large"), Some("high"));
+        let out = resolve(input(&default, None, None, 0));
         assert_eq!(out.setting, default);
         assert_eq!(out.source, ProfileSource::Default);
         assert!(!out.limit_reached && !out.rejected);
@@ -253,27 +247,25 @@ mod tests {
     #[test]
     fn an_empty_default_stays_empty() {
         let default = Setting::default();
-        let out = resolve(input(&default, None, None, &[], 5));
+        let out = resolve(input(&default, None, None, 5));
         assert_eq!(out.setting, default);
     }
 
     #[test]
     fn a_lower_conductor_profile_is_taken() {
-        let l = ladder();
-        let default = Setting::new(Some("opus"), Some("high"));
+        let default = Setting::new(Some("large"), Some("high"));
         let ceiling = default.clone();
-        let wanted = Setting::new(Some("haiku"), Some("low"));
-        let out = resolve(input(&default, Some(&ceiling), Some(&wanted), &l, 0));
+        let wanted = Setting::new(Some("small"), Some("low"));
+        let out = resolve(input(&default, Some(&ceiling), Some(&wanted), 0));
         assert_eq!(out.setting, wanted);
         assert_eq!(out.source, ProfileSource::Conductor);
     }
 
     #[test]
     fn a_profile_on_the_ceiling_is_taken() {
-        let l = ladder();
-        let default = Setting::new(Some("sonnet"), Some("medium"));
-        let ceiling = Setting::new(Some("opus"), Some("high"));
-        let out = resolve(input(&default, Some(&ceiling), Some(&ceiling), &l, 0));
+        let default = Setting::new(Some("medium"), Some("medium"));
+        let ceiling = Setting::new(Some("large"), Some("high"));
+        let out = resolve(input(&default, Some(&ceiling), Some(&ceiling), 0));
         assert_eq!(out.setting, ceiling);
         assert_eq!(out.source, ProfileSource::Conductor);
         assert_eq!(out.requested_over_ceiling, None);
@@ -281,11 +273,10 @@ mod tests {
 
     #[test]
     fn a_request_above_the_ceiling_starts_on_the_ceiling() {
-        let l = ladder();
-        let default = Setting::new(Some("sonnet"), Some("medium"));
-        let ceiling = Setting::new(Some("opus"), Some("high"));
-        let wanted = Setting::new(Some("opus"), Some("max"));
-        let out = resolve(input(&default, Some(&ceiling), Some(&wanted), &l, 0));
+        let default = Setting::new(Some("medium"), Some("medium"));
+        let ceiling = Setting::new(Some("large"), Some("high"));
+        let wanted = Setting::new(Some("large"), Some("max"));
+        let out = resolve(input(&default, Some(&ceiling), Some(&wanted), 0));
         assert_eq!(out.setting, ceiling);
         assert_eq!(out.source, ProfileSource::Clamped);
         assert_eq!(
@@ -296,21 +287,19 @@ mod tests {
 
     #[test]
     fn without_a_ceiling_the_conductor_cannot_go_above_the_default() {
-        let l = ladder();
-        let default = Setting::new(Some("sonnet"), Some("medium"));
-        let wanted = Setting::new(Some("opus"), Some("high"));
-        let out = resolve(input(&default, None, Some(&wanted), &l, 0));
+        let default = Setting::new(Some("medium"), Some("medium"));
+        let wanted = Setting::new(Some("large"), Some("high"));
+        let out = resolve(input(&default, None, Some(&wanted), 0));
         assert_eq!(out.setting, default);
         assert!(out.requested_over_ceiling.is_some());
     }
 
     #[test]
-    fn a_model_outside_the_ladder_is_rejected() {
-        let l = ladder();
-        let default = Setting::new(Some("sonnet"), Some("medium"));
-        let ceiling = Setting::new(Some("opus"), Some("high"));
+    fn a_model_outside_the_tiers_is_rejected() {
+        let default = Setting::new(Some("medium"), Some("medium"));
+        let ceiling = Setting::new(Some("large"), Some("high"));
         let wanted = Setting::new(Some("mystery"), None);
-        let out = resolve(input(&default, Some(&ceiling), Some(&wanted), &l, 0));
+        let out = resolve(input(&default, Some(&ceiling), Some(&wanted), 0));
         assert_eq!(out.setting, default);
         assert!(out.rejected);
     }
@@ -319,58 +308,54 @@ mod tests {
     fn an_effort_outside_the_scale_is_rejected() {
         let default = Setting::new(None, Some("medium"));
         let wanted = Setting::new(None, Some("ultra"));
-        let out = resolve(input(&default, None, Some(&wanted), &[], 0));
+        let out = resolve(input(&default, None, Some(&wanted), 0));
         assert_eq!(out.setting, default);
         assert!(out.rejected);
     }
 
     #[test]
     fn the_effort_rises_only_after_the_threshold() {
-        let l = ladder();
-        let default = Setting::new(Some("sonnet"), Some("low"));
-        let ceiling = Setting::new(Some("opus"), Some("high"));
+        let default = Setting::new(Some("medium"), Some("low"));
+        let ceiling = Setting::new(Some("large"), Some("high"));
         for failures in 0..3 {
-            let out = resolve(input(&default, Some(&ceiling), None, &l, failures));
+            let out = resolve(input(&default, Some(&ceiling), None, failures));
             assert_eq!(out.setting, default, "failures {failures}");
         }
-        let out = resolve(input(&default, Some(&ceiling), None, &l, 3));
-        assert_eq!(out.setting, Setting::new(Some("sonnet"), Some("medium")));
+        let out = resolve(input(&default, Some(&ceiling), None, 3));
+        assert_eq!(out.setting, Setting::new(Some("medium"), Some("medium")));
         assert_eq!(out.source, ProfileSource::Escalated);
     }
 
     #[test]
     fn the_model_rises_when_the_effort_stands_on_the_ceiling() {
-        let l = ladder();
-        let default = Setting::new(Some("sonnet"), Some("high"));
-        let ceiling = Setting::new(Some("opus"), Some("high"));
-        let out = resolve(input(&default, Some(&ceiling), None, &l, 3));
-        assert_eq!(out.setting, Setting::new(Some("opus"), Some("high")));
+        let default = Setting::new(Some("medium"), Some("high"));
+        let ceiling = Setting::new(Some("large"), Some("high"));
+        let out = resolve(input(&default, Some(&ceiling), None, 3));
+        assert_eq!(out.setting, Setting::new(Some("large"), Some("high")));
         assert_eq!(out.source, ProfileSource::Escalated);
     }
 
     #[test]
     fn both_on_the_ceiling_reports_the_limit() {
-        let l = ladder();
-        let default = Setting::new(Some("opus"), Some("high"));
-        let out = resolve(input(&default, Some(&default), None, &l, 3));
+        let default = Setting::new(Some("large"), Some("high"));
+        let out = resolve(input(&default, Some(&default), None, 3));
         assert_eq!(out.setting, default);
         assert!(out.limit_reached);
     }
 
     #[test]
     fn without_a_ceiling_nothing_escalates() {
-        let l = ladder();
-        let default = Setting::new(Some("sonnet"), Some("medium"));
-        let out = resolve(input(&default, None, None, &l, 9));
+        let default = Setting::new(Some("medium"), Some("medium"));
+        let out = resolve(input(&default, None, None, 9));
         assert_eq!(out.setting, default);
-        assert!(out.limit_reached);
+        assert!(!out.limit_reached, "no ceiling, so no limit was reached");
     }
 
     #[test]
     fn a_zero_threshold_turns_escalation_off() {
         let default = Setting::new(None, Some("low"));
         let ceiling = Setting::new(None, Some("max"));
-        let mut i = input(&default, Some(&ceiling), None, &[], 9);
+        let mut i = input(&default, Some(&ceiling), None, 9);
         i.threshold = 0;
         assert_eq!(resolve(i).setting, default);
     }
@@ -379,7 +364,7 @@ mod tests {
     fn a_changed_threshold_moves_the_escalation() {
         let default = Setting::new(None, Some("low"));
         let ceiling = Setting::new(None, Some("max"));
-        let mut i = input(&default, Some(&ceiling), None, &[], 2);
+        let mut i = input(&default, Some(&ceiling), None, 2);
         i.threshold = 2;
         assert_eq!(resolve(i).setting.effort.as_deref(), Some("medium"));
     }

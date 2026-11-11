@@ -309,6 +309,15 @@ pub trait HarnessAdapter: Send + Sync + std::fmt::Debug {
     /// Builds the command line for one run.
     fn invocation(&self, request: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError>;
 
+    /// The model names of the four model tiers (`small`, `medium`, `large`,
+    /// `max`), as this harness takes them. A workflow and the conductor name
+    /// a tier, never a model, so the same workflow runs on every harness. An
+    /// adapter that lists no tier cannot run a step that names a model;
+    /// [`HarnessRegistry::check_model_tiers`] refuses it at the daemon's start.
+    fn model_tiers(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     /// Whether the adapter passes the step's `effort` to its CLI. One that
     /// does not ignores the field; the executor says so in an event.
     fn supports_effort(&self) -> bool {
@@ -389,6 +398,31 @@ impl HarnessRegistry {
             })
     }
 
+    /// Checks that every adapter names a model for every tier. A missing entry
+    /// is an error at the daemon's start, not a step that fails later.
+    pub fn check_model_tiers(&self) -> Result<(), String> {
+        let mut missing = Vec::new();
+        for adapter in &self.adapters {
+            let tiers = adapter.model_tiers();
+            for tier in crate::engine::step_profile::MODEL_TIERS {
+                if !tiers
+                    .iter()
+                    .any(|(known, model)| *known == tier && !model.trim().is_empty())
+                {
+                    missing.push(format!("{}: {tier}", adapter.name()));
+                }
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the harness model tiers have no model name for: {}",
+                missing.join(", ")
+            ))
+        }
+    }
+
     /// The registered harness names, in registration order.
     pub fn supported(&self) -> Vec<&str> {
         self.adapters.iter().map(|adapter| adapter.name()).collect()
@@ -454,6 +488,30 @@ fn parameter_type_error(key: &str, harness: &str, expected: &str, got: &Value) -
         error_type: Some("invalid_parameter".to_string()),
         details: Some(serde_json::json!({ "parameter": key, "harness": harness })),
     }
+}
+
+/// The model name `adapter` takes for the tier `tier`.
+///
+/// A value that is not a tier is an error: the workflow validator refuses it,
+/// so only a templated value reaches this point wrong.
+pub(crate) fn model_for_tier(
+    adapter: &dyn HarnessAdapter,
+    tier: &str,
+) -> Result<String, ActionError> {
+    adapter
+        .model_tiers()
+        .iter()
+        .find(|(known, _)| *known == tier)
+        .map(|(_, model)| (*model).to_string())
+        .ok_or_else(|| ActionError {
+            message: format!(
+                "{}: '{tier}' is not a model tier with a model name; the tiers are {}",
+                adapter.name(),
+                crate::engine::step_profile::MODEL_TIERS.join(", ")
+            ),
+            error_type: Some("unknown_model_tier".to_string()),
+            details: Some(serde_json::json!({ "harness": adapter.name(), "model": tier })),
+        })
 }
 
 /// Rejects a value the harness CLI would read as an option rather than a value.
@@ -558,5 +616,57 @@ mod extra_args_tests {
         let mut run = invocation(&["--effort", "low"]);
         apply_extra_args(&mut run, "x", &extra(&["--effort=high"]));
         assert_eq!(run.args, ["--effort=high"]);
+    }
+}
+
+#[cfg(test)]
+mod model_tier_tests {
+    use super::*;
+
+    #[test]
+    fn every_stock_harness_names_a_model_for_every_tier() {
+        HarnessRegistry::defaults()
+            .check_model_tiers()
+            .expect("the stock harnesses map every tier");
+    }
+
+    #[derive(Debug)]
+    struct Partial;
+
+    impl HarnessAdapter for Partial {
+        fn name(&self) -> &str {
+            "partial"
+        }
+        fn program(&self) -> &str {
+            "partial"
+        }
+        fn invocation(&self, _: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError> {
+            unreachable!("not run")
+        }
+        fn model_tiers(&self) -> &'static [(&'static str, &'static str)] {
+            &[("small", "s"), ("medium", "m")]
+        }
+        fn stream_parser(&self, _: AnswerShape) -> Box<dyn HarnessStreamParser> {
+            unreachable!("not run")
+        }
+    }
+
+    #[test]
+    fn a_harness_without_a_tier_entry_fails_the_check() {
+        let error = HarnessRegistry::empty()
+            .with_adapter(Arc::new(Partial))
+            .check_model_tiers()
+            .expect_err("large and max are missing");
+        assert!(
+            error.contains("partial: large") && error.contains("partial: max"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_tier_without_an_entry_is_an_error_for_a_step() {
+        let error = model_for_tier(&Partial, "large").expect_err("no entry");
+        assert_eq!(error.error_type.as_deref(), Some("unknown_model_tier"));
+        assert_eq!(model_for_tier(&Partial, "small").unwrap(), "s");
     }
 }

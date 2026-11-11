@@ -13,7 +13,7 @@ analyze:
   action:
     type: agent
     harness: claude-code          # optional; or: codex, github-copilot, opencode
-    model: opus                   # optional, passed through verbatim
+    model: large                  # optional tier: small, medium, large or max; the harness maps it to a model
     workspace_access: read-only   # optional; default: read-write
     prompt: |
       Analyse the repository for: {{ inputs.description }}.

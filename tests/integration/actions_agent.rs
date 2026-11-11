@@ -1129,7 +1129,7 @@ async fn the_model_and_the_read_only_paths_reach_the_argv() {
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
-    config.model = Some("opus".to_string());
+    config.model = Some("large".to_string());
     config.read_only_paths = vec!["../other-repo/src".to_string()];
 
     complete(&executor(&fake), config, &root.workspace()).await;
@@ -1382,7 +1382,7 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
 
     let mut config = agent_action("look around");
     config.harness = Some("opencode".to_string());
-    config.model = Some("anthropic/claude-sonnet-4".to_string());
+    config.model = Some("medium".to_string());
     let result = complete(&executor, config, &root.workspace()).await;
 
     assert_eq!(result.output_label, "ready");
@@ -1395,7 +1395,7 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
     assert_eq!(args[0], "run");
     assert!(
         args.windows(2)
-            .any(|pair| pair[0] == "--model" && pair[1] == "anthropic/claude-sonnet-4"),
+            .any(|pair| pair[0] == "--model" && pair[1] == "anthropic/claude-sonnet-4-5"),
         "{args:?}"
     );
     assert!(args.contains(&"--auto".to_string()), "{args:?}");
@@ -1410,7 +1410,7 @@ async fn the_effort_reaches_the_claude_argv_and_a_step_without_one_is_unchanged(
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
-    config.model = Some("opus".to_string());
+    config.model = Some("large".to_string());
     config.effort = Some("high".to_string());
     complete(&executor(&fake), config, &root.workspace()).await;
     let with_effort = fake.args(1);
@@ -1424,7 +1424,7 @@ async fn the_effort_reaches_the_claude_argv_and_a_step_without_one_is_unchanged(
     let fake = FakeHarness::install(root.dir("bin2"));
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
     let mut config = agent_action("look around");
-    config.model = Some("opus".to_string());
+    config.model = Some("large".to_string());
     complete(&executor(&fake), config, &root.workspace()).await;
     let without = fake.args(1);
     assert!(
@@ -1526,7 +1526,7 @@ async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thre
     );
     let mut config = agent_action("look around");
     config.harness = Some("codex".to_string());
-    config.model = Some("gpt-5-codex".to_string());
+    config.model = Some("medium".to_string());
     config.read_only_paths = vec!["../reference".to_string()];
 
     let result = complete(&executor, config, &root.workspace()).await;
@@ -1540,7 +1540,7 @@ async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thre
     assert_eq!(args[0], "exec");
     assert!(
         args.windows(2)
-            .any(|pair| pair == ["--model", "gpt-5-codex"]),
+            .any(|pair| pair == ["--model", "gpt-5.1-codex"]),
         "{args:?}"
     );
     assert!(
@@ -4518,7 +4518,7 @@ async fn the_real_claude_binary_answers_in_the_closing_json_of_its_text() {
          a tool. When the task has finished, read bg.txt with `cat` and finish with the label \
          'done'.",
     );
-    config.model = Some("haiku".to_string());
+    config.model = Some("small".to_string());
     let conversation = ConversationFixture::new(&root);
 
     let outcome = execute_with_choices(
@@ -4581,7 +4581,7 @@ async fn a_model_that_would_be_read_as_a_flag_is_refused() {
 
     let error = fail(&executor(&fake), config, &root.workspace()).await;
 
-    assert_eq!(error.error_type.as_deref(), Some("unsafe_harness_argument"));
+    assert_eq!(error.error_type.as_deref(), Some("unknown_model_tier"));
     assert!(
         error.message.contains("model"),
         "the error must name the offending field: {}",

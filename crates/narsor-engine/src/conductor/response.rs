@@ -205,7 +205,7 @@ pub struct ProfiledStep {
     /// The plan unit, when the choice is per unit.
     #[serde(default)]
     pub unit: Option<String>,
-    /// The model chosen; must be on the workflow's ladder.
+    /// The model tier chosen: `small`, `medium`, `large` or `max`.
     #[serde(default)]
     pub model: Option<String>,
     /// The effort chosen.

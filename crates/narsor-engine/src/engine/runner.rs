@@ -184,6 +184,9 @@ const METADATA_AGENT_SESSIONS_KEY: &str = "completed_agent_sessions";
 const METADATA_STEP_REPLIES_KEY: &str = "step_replies";
 const METADATA_STEP_STREAMS_KEY: &str = "step_streams";
 const METADATA_STATE_ENTRIES_KEY: &str = "state_entries";
+/// When each state was entered for the first time: a step profile decided
+/// later than that is not used (D7).
+const METADATA_STATE_FIRST_ENTRY_KEY: &str = "state_first_entry";
 
 /// The one-shot instruction delivered by an operator to an agent step.
 /// `harness` and `session` are optional for records written before
@@ -1056,11 +1059,9 @@ pub struct Engine {
 
 /// What [`Engine::apply_step_profile`] needs to know about the attempt.
 #[derive(Clone, Copy)]
-struct AttemptProfile<'a> {
+struct AttemptProfile {
     /// Failed attempts of the step in a row.
     failures: u32,
-    /// The workflow's `globals.model_ladder`.
-    ladder: &'a [String],
     /// Whether a rejected or escalated profile is recorded as an event. A
     /// reprompt of a rejected attempt resolves the same profile again and
     /// stays quiet: the attempt itself already recorded it.
@@ -2436,7 +2437,6 @@ impl Engine {
                 .filter(|value| ComplexityAssessment::from_value(value).is_some())
                 .cloned(),
             steps,
-            model_ladder: definition.globals.model_ladder.clone(),
         }
         .into_queued();
         let asked = match registry.actor(&execution.id) {
@@ -2555,7 +2555,6 @@ impl Engine {
                     &mut pinned_harness,
                     AttemptProfile {
                         failures: attempt - 1,
-                        ladder: &definition.globals.model_ladder,
                         announce: true,
                     },
                 )
@@ -2670,7 +2669,7 @@ impl Engine {
         action_execution_id: &str,
         timeout: Option<Duration>,
         pinned_harness: &mut Option<String>,
-        profile: AttemptProfile<'_>,
+        profile: AttemptProfile,
     ) -> Result<AttemptOutcome, AttemptFailure> {
         let location = format!("state '{}'", state.id);
 
@@ -2897,7 +2896,7 @@ impl Engine {
         execution: &WorkflowExecution,
         state: &State,
         config: &mut AgentActionConfig,
-        attempt: AttemptProfile<'_>,
+        attempt: AttemptProfile,
     ) {
         let default = Setting::default_of(config);
         let ceiling = Setting::ceiling_of(config);
@@ -2908,8 +2907,11 @@ impl Engine {
                 tracing::warn!(%error, "damaged step profile; running on the defaults");
                 Default::default()
             });
+        // A profile decided after the step's first attempt is not used (D7).
+        let first_entry = first_entry_at(execution, &state.id);
         let conductor = stored
             .lookup(&state.id, None)
+            .filter(|entry| first_entry.is_none_or(|first| entry.decided_at <= first))
             .map(|entry| entry.setting.clone());
         if conductor.is_none() && ceiling.is_none() {
             return;
@@ -2918,7 +2920,6 @@ impl Engine {
             default: &default,
             ceiling: ceiling.as_ref(),
             conductor: conductor.as_ref(),
-            ladder: attempt.ladder,
             failures: attempt.failures,
             threshold: self.escalation_threshold,
         });
@@ -2942,7 +2943,7 @@ impl Engine {
                 &default,
                 &resolved.setting,
             );
-        } else if resolved.limit_reached && ceiling.is_some() {
+        } else if resolved.limit_reached {
             self.note_step_profile(
                 execution,
                 state,
@@ -2962,7 +2963,6 @@ impl Engine {
     /// rejection.
     pub(super) fn profiled_template(
         &self,
-        definition: &WorkflowDefinition,
         execution: &WorkflowExecution,
         state: &State,
         template: &AgentActionConfig,
@@ -2974,7 +2974,6 @@ impl Engine {
             &mut config,
             AttemptProfile {
                 failures: 0,
-                ladder: &definition.globals.model_ladder,
                 announce: false,
             },
         );
@@ -3193,7 +3192,7 @@ impl Engine {
         let mut rescue = OutputRescue::after(&rejection);
         let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
             (ActionConfig::Agent(config), Some(harness), Some(session)) => {
-                let profiled = self.profiled_template(definition, execution, state, config);
+                let profiled = self.profiled_template(execution, state, config);
                 Some(agent::reprompt_config(
                     &profiled,
                     harness,
@@ -4813,8 +4812,42 @@ fn count_entry(execution: &mut WorkflowExecution, state_id: &str) -> Result<(), 
     let mut counts: BTreeMap<String, u32> =
         read_engine_record(execution, METADATA_STATE_ENTRIES_KEY)?.unwrap_or_default();
     let count = counts.entry(state_id.to_string()).or_default();
+    let first = *count == 0;
     *count = count.saturating_add(1);
-    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)
+    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)?;
+    if first {
+        let mut firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
+            read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)?.unwrap_or_default();
+        firsts.insert(state_id.to_string(), chrono::Utc::now());
+        write_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY, &firsts)?;
+    }
+    Ok(())
+}
+
+/// The states that were entered at least once (D7): their step profile is
+/// settled and is not written any more.
+pub(crate) fn started_states(
+    execution: &WorkflowExecution,
+) -> Result<std::collections::BTreeSet<String>, EngineError> {
+    let counts: BTreeMap<String, u32> =
+        read_engine_record(execution, METADATA_STATE_ENTRIES_KEY)?.unwrap_or_default();
+    Ok(counts
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(state, _)| state)
+        .collect())
+}
+
+/// When `state_id` was first entered, if it was.
+fn first_entry_at(
+    execution: &WorkflowExecution,
+    state_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
+        read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)
+            .ok()
+            .flatten()?;
+    firsts.get(state_id).copied()
 }
 
 /// The entry counts of `execution` (R10), as a decision saves them for an
@@ -4841,7 +4874,12 @@ fn restore_state_entries(
             message: format!("the entry counts saved with the decision are unreadable: {error}"),
         }
     })?;
-    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)
+    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)?;
+    // A state that is not entered any more has no first entry.
+    let mut firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
+        read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)?.unwrap_or_default();
+    firsts.retain(|state, _| counts.get(state).is_some_and(|count| *count > 0));
+    write_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY, &firsts)
 }
 
 /// What choosing each label of `state` requires of an answer to a problem

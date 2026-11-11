@@ -38,8 +38,8 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    reject_option_like, string_parameter, tail, HarnessAdapter, HarnessInvocation, HarnessRequest,
-    HarnessRun, HarnessStreamParser,
+    model_for_tier, reject_option_like, string_parameter, tail, HarnessAdapter, HarnessInvocation,
+    HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -88,6 +88,15 @@ impl Default for GitHubCopilotAdapter {
 }
 
 impl HarnessAdapter for GitHubCopilotAdapter {
+    fn model_tiers(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("small", "claude-haiku-4.5"),
+            ("medium", "claude-sonnet-4.5"),
+            ("large", "claude-opus-4.5"),
+            ("max", "claude-opus-4.5"),
+        ]
+    }
+
     fn name(&self) -> &str {
         GITHUB_COPILOT
     }
@@ -113,9 +122,10 @@ impl HarnessAdapter for GitHubCopilotAdapter {
             "prompt": prompt,
         });
 
-        if let Some(model) = &request.config.model {
-            reject_option_like(model, "model", GITHUB_COPILOT)?;
-            sdk_config["model"] = Value::String(model.clone());
+        if let Some(tier) = &request.config.model {
+            let model = model_for_tier(self, tier)?;
+            reject_option_like(&model, "model", GITHUB_COPILOT)?;
+            sdk_config["model"] = Value::String(model);
         }
 
         if let Some(session) = request.resume_session {

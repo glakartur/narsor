@@ -43,7 +43,7 @@ Wymagania R1–R11, aktorzy A1–A4, przepływy F1–F3 i przykłady AE1–AE5 p
 - Edycja profilu przez człowieka. TUI pokazuje tylko podgląd.
 - Uczenie wartości domyślnych z historii.
 - Zatwierdzenie wartości domyślnych z tabeli w dokumencie źródłowym.
-- Kroki dyrygenta (jego własny model) są poza zakresem.
+- Model i effort samego dyrygenta ustawia konfiguracja demona (D10). Dyrygent nie dobiera ich sam.
 
 ### Deferred to Follow-Up Work
 
@@ -81,7 +81,7 @@ Wymagania R1–R11, aktorzy A1–A4, przepływy F1–F3 i przykłady AE1–AE5 p
 ## Key Technical Decisions
 
 - **Jedna czysta funkcja profilu.** Nowy moduł `crates/narsor-engine/src/engine/step_profile.rs` (nazwa robocza) przyjmuje: wartość domyślną kroku, granicę, profil dyrygenta, liczbę kolejnych błędów i próg. Zwraca profil efektywny i powód (`default`, `conductor`, `escalated`, `clamped`). Kolejność źródeł, reguła granic i reguła eskalacji żyją tylko tu. Dzięki temu wykonawca niczego nie wymyśla (cel z Success Criteria).
-- **Skala effortu i modeli jest uporządkowana danymi workflow.** Effort ma stałą skalę `low < medium < high < max` (rozszerzalną). Modele nie mają naturalnego porządku, więc workflow może podać uporządkowaną listę `model_ladder` (od najtańszego) w sekcji globalnej. Granica modelu i obniżanie modelu działają tylko na modelach z tej listy. Model spoza listy nie jest porównywany: dyrygent nie może go wybrać, a eskalacja go pomija.
+- **Skala effortu i modeli jest uporządkowana danymi workflow.** Effort ma stałą skalę `low < medium < high < max` (rozszerzalną). Modele mają cztery poziomy niezależne od harnessu: `small < medium < large < max` (D11). Workflow, profil dyrygenta, eskalacja i sufit kroku podają poziom, nie nazwę modelu. Każdy harness mapuje poziom na nazwę modelu (`engine/actions/harness/mod.rs`, `HarnessAdapter::model_tiers`). Brak wpisu w mapie to błąd przy starcie demona. Wartość spoza czterech poziomów jest błędem walidacji, a w profilu dyrygenta jest odrzucona.
 - **Granica jest opcjonalna.** Bez granicy dyrygent może podnieść ustawienie tylko do wartości domyślnej kroku (origin, założenia). Bez granicy eskalacja podnosi tylko do wartości domyślnej, czyli nie podnosi niczego.
 - **Brak pól oznacza brak zmian (AE5).** Gdy krok nie ma `effort`, `model`, profilu ani eskalacji, adapter dostaje te same argumenty co dziś.
 - **Profil w katalogu dyrygenta, nie w stanie wykonania.** Powód jest ten sam co w `conductor/store.rs`: silnik zapisuje `state.json` wykonania w całości i zgubiłby cudzy zapis. Silnik czyta profil przy starcie kroku. Odczyt jest bezpieczny z dowolnego miejsca.
@@ -104,8 +104,8 @@ effective(step):
   else: start = wanted            # lowering is always allowed
   if failures >= threshold:
       raise effort one step up to ceiling.effort
-      if effort at ceiling: raise model one rung up to ceiling.model
-      if both at ceiling: fail the step
+      if effort at ceiling: raise model one tier up to ceiling.model
+      if both at ceiling and a ceiling exists: limit reached (D8)
 ```
 
 ---
@@ -133,8 +133,8 @@ effective(step):
 
 **Approach:**
 - Dodaj `effort: Option<String>` i `ceiling: Option<{model, effort}>` do `AgentActionConfig` z `#[serde(default)]`, tak jak `model`. Wykonania zapisane przed zmianą muszą się wczytywać.
-- Dodaj `model_ladder` do sekcji globalnej (opcjonalna lista).
-- Walidator: effort tylko z dozwolonej skali. Granica nie jest niższa niż wartość domyślna. Model z granicy musi być na `model_ladder`, gdy lista istnieje. Pola `effort` i `ceiling` przechodzą ten sam test szablonów co `model` (`action.model` w `validator.rs`).
+- Dodaj do sekcji globalnej `default_model`, `default_effort` i sufit ogólny `ceiling` (D9). Krok nadpisuje pole po polu. Ładowanie kopiuje wartości do kroku.
+- Walidator: effort tylko z dozwolonej skali. Granica nie jest niższa niż wartość domyślna. Model i model z granicy to jeden z czterech poziomów (D11). Krok z sufitem ma model i effort po dziedziczeniu z `globals` (D8). Pola `effort` i `ceiling` przechodzą ten sam test szablonów co `model` (`action.model` w `validator.rs`).
 - `step_profile.rs` implementuje szkic z Key Technical Decisions jako funkcje bez wejścia/wyjścia.
 
 **Patterns to follow:** `engine/retry.rs` (logika w jednym miejscu, testy bez workflow), obsługa `model` w `loader.rs` i `validator.rs`.
@@ -145,11 +145,11 @@ effective(step):
 - Happy path: profil dyrygenta równy granicy jest przyjęty.
 - Edge case: profil `opus/max` przy granicy `opus/high` daje start `opus/high` i znacznik „żądano powyżej granicy" z wartością `opus/max`. Covers AE2.
 - Edge case: brak granicy, profil wyższy niż domyślny: wynik to wartość domyślna.
-- Edge case: model spoza `model_ladder` w profilu dyrygenta: wartość domyślna modelu i znacznik odrzucenia.
+- Edge case: model spoza poziomów w profilu dyrygenta: wartość domyślna modelu i znacznik odrzucenia.
 - Edge case: próg 3, błędy 0, 1, 2: ten sam profil. Błąd 3: effort o stopień wyżej. Covers AE4.
-- Edge case: effort na granicy, błąd po progu: model o szczebel wyżej na `model_ladder`. Covers AE4.
-- Error path: oba na granicy, błąd po progu: wynik „granica osiągnięta".
-- Error path: walidator odrzuca `effort: ultra`, granicę niższą niż domyślna i model granicy spoza `model_ladder`.
+- Edge case: effort na granicy, błąd po progu: model o poziom wyżej. Covers AE4.
+- Error path: oba na granicy, błąd po progu: wynik „granica osiągnięta". Bez sufitu nic nie jest osiągnięte (D8).
+- Error path: walidator odrzuca `effort: ultra`, granicę niższą niż domyślna, model spoza poziomów oraz krok z sufitem bez modelu lub effortu po dziedziczeniu z `globals`.
 - Integration: stary zapis `AgentActionConfig` bez nowych pól wczytuje się bez błędu.
 
 **Verification:** Wszystkie testy funkcji profilu przechodzą bez uruchamiania workflow. Istniejące testy loadera i walidatora przechodzą bez zmian.
@@ -275,7 +275,7 @@ effective(step):
 
 **Approach:**
 - Wyzwalacz: zakończenie sukcesem kroku oznaczonego w workflow jako krok planu (znacznik w definicji kroku; nazwa pola ustala wykonawca razem z U1/U4). Pozostałe kroki nie wyzwalają.
-- Prompt dostaje plan, ocenę złożoności, listę kroków jeszcze nieuruchomionych (z wartościami domyślnymi i granicami) oraz `model_ladder`. Odpowiedź ma ściśle zdefiniowany schemat: lista `{step_id, unit?, model, effort, rationale, confident}`.
+- Prompt dostaje plan, ocenę złożoności, listę kroków jeszcze nieuruchomionych (z wartościami domyślnymi i granicami) oraz skale poziomów i effortu z kodu (`MODEL_TIERS`, `EFFORT_SCALE`, D9). Odpowiedź ma ściśle zdefiniowany schemat: lista `{step_id, unit?, model, effort, rationale, confident}`.
 - Walidacja odpowiedzi przechodzi przez `step_profile`: wartości nad granicę są obcinane do granicy, a `requested_over_ceiling` zapisuje żądanie. Wpisy z `confident: false` albo niepoprawne są pomijane (wartość domyślna, R8).
 - Wywołanie nie blokuje zadania. Silnik nie czeka na dyrygenta w nieskończoność: gdy wywołanie nie skończy się przed startem następnego kroku, ten krok startuje na wartościach domyślnych (R8). Limit czasu to parametr, wartość ustala wykonawca w U5 i dokumentuje w konfiguracji.
 - Dyrygent nie pisze kodu i nie zmienia innych danych (A2).
@@ -407,7 +407,7 @@ effective(step):
 | Ryzyko | Skutek | Środek |
 |---|---|---|
 | Flagi effortu różnią się między harnessami i wersjami CLI | Zły argument psuje start kroku | Sprawdzenie na zainstalowanych CLI przed U2. Harness bez obsługi ignoruje pole z ostrzeżeniem. |
-| Model nie ma naturalnego porządku | Granica i eskalacja modelu są niejednoznaczne | `model_ladder` w workflow. Model spoza listy nie jest porównywany. |
+| Model nie ma naturalnego porządku | Granica i eskalacja modelu są niejednoznaczne | Cztery poziomy modeli niezależne od harnessu (D11). Mapa poziom na nazwę modelu w adapterze harnessu. |
 | Wywołanie dyrygenta po planie opóźnia następny krok | Zadanie wolniejsze | Limit czasu i wartości domyślne po jego upływie (U5). |
 | Dyrygent obniża profil za agresywnie | Więcej rund przeglądu | Eskalacja po błędach (U8) i pomiar po wdrożeniu (Deferred to Follow-Up Work). |
 
@@ -415,7 +415,7 @@ effective(step):
 
 ## Documentation Plan
 
-- `docs/dev/workflow-schema.md`: pola `effort`, `ceiling`, `model_ladder`, znacznik kroku planu, schemat oceny złożoności.
+- `docs/dev/workflow-schema.md`: pola `effort`, `ceiling`, `default_model`, `default_effort`, znacznik kroku planu, schemat oceny złożoności.
 - `workflows/template.yaml`: przykład użycia pól.
 - Dokument operacyjny: parametr progu eskalacji i znaczenie profilu w TUI.
 - `docs/follow-ups/2026-10-28-dobor-modelu-i-effortu-per-krok-workflow.md`: dopisać odnośnik do tego planu po wdrożeniu.
@@ -425,7 +425,7 @@ effective(step):
 ## Deferred to Implementation
 
 - Dokładne flagi effortu i mapowanie poziomów dla Claude Code, Codex i OpenCode. Wykonawca sprawdza je na zainstalowanych CLI. Obsługa effortu w Copilot (SDK i CLI) jest niesprawdzona.
-- Dokładne nazwy pól i typów (`ceiling`, `model_ladder`, znacznik kroku planu, `step_profile`).
+- Dokładne nazwy pól i typów (`ceiling`, `default_model`, `default_effort`, znacznik kroku planu, `step_profile`).
 - Limit czasu wywołania dyrygenta po planie (U5).
 - Czy ponowne wejście do kroku zeruje licznik błędów (U8).
 - Czy istniejący mechanizm próśb obsługuje prośbę nieblokującą (U6).
@@ -439,3 +439,8 @@ effective(step):
    - Opcja A (wybrana): Pierwsza wersja zapisuje profil per krok, a klucz `unit` jest w danych (U3), ale silnik go jeszcze nie wypełnia. Profil per jednostka wchodzi, gdy workflow zacznie przekazywać numer jednostki.
    - Opcja B (odrzucona): Pierwsza wersja wymaga, aby workflow przekazywał numer jednostki do kroku `work` (zmiana definicji kroku i pętli). Zakres rośnie o zmianę modelu pętli.
 3. **Rozstrzyganie prośby o wyjście poza granicę: poza zakresem.** Operator na razie tym nie steruje. Plan tworzy i pokazuje prośbę (U6, U7). Krok zostaje na granicy. Plan nie dodaje akcji zatwierdź/odrzuć.
+4. **Krok jest „rozpoczęty" według licznika wejść (D7, Q7 A).** `conclude_profile` i `profile_after_plan` liczą kroki rozpoczęte z `state_entry_count > 0`. Wpis profilu dla takiego kroku nie jest zapisywany. `apply_step_profile` ignoruje wpis ustalony po pierwszym wejściu w krok (silnik zapisuje czas pierwszego wejścia).
+5. **Sufit i eskalacja (D8, Q8 A).** Walidator przy ładowaniu workflow sprawdza każdy krok z sufitem (własnym lub ogólnym): ma model i effort po dziedziczeniu z `globals`, a sufit ma wartość dla każdego pola ustawionego w kroku. `limit_reached` ma wartość prawda tylko wtedy, gdy sufit istnieje i został osiągnięty.
+6. **Wartości domyślne ogólne (D9).** `globals.default_model`, `globals.default_effort` i `globals.ceiling`. Krok nadpisuje pole po polu. Prompt dyrygenta bierze skale z `EFFORT_SCALE` i `MODEL_TIERS`, nie z kopii w tekście.
+7. **Model i effort dyrygenta (D10).** Ustawienia demona `conductor_model` (poziom) i `conductor_effort`. Puste pole znaczy domyślny harnessu. `conductor_config` w `invoke.rs` je stosuje.
+8. **Poziomy modeli niezależne od harnessu (D11, Q8 A).** `globals.model_ladder` usunięte. Cztery poziomy `small`, `medium`, `large`, `max` obowiązują w workflow, w profilu dyrygenta, w eskalacji, w suficie kroku oraz w `conductor_model`. Mapa poziom na nazwę modelu jest w adapterze harnessu; brak wpisu to błąd przy starcie demona. Nazwy modeli w mapie to wartości domyślne do potwierdzenia przez operatora (zwłaszcza codex, opencode i copilot).
