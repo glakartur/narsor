@@ -615,19 +615,12 @@ fn submit_cancel_and_edit_are_reported() {
 // -- the look --------------------------------------------------------------
 
 #[test]
-fn the_field_in_edit_is_a_navy_darker_than_the_task_header() {
+fn the_field_in_edit_is_a_navy() {
     let styles = Styles::new(false);
     let Some(Color::Rgb(r, g, b)) = styles.field_editing().bg else {
         panic!("a field in edit has an RGB fill");
     };
     assert!(b > r && b > g, "navy: blue leads ({r},{g},{b})");
-    let Some(Color::Rgb(hr, hg, hb)) = styles.task_header_background().bg else {
-        panic!("the header has an RGB fill");
-    };
-    assert!(
-        u32::from(r) + u32::from(g) + u32::from(b) < u32::from(hr) + u32::from(hg) + u32::from(hb),
-        "darker than the header"
-    );
     assert_eq!(
         styles.field_editing().fg,
         None,

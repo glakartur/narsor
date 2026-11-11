@@ -179,8 +179,8 @@ pub enum DetailTab {
 impl DetailTab {
     /// Every tab, left to right.
     pub const ALL: [DetailTab; 5] = [
-        DetailTab::Progress,
         DetailTab::Conversation,
+        DetailTab::Progress,
         DetailTab::Events,
         DetailTab::Conductor,
         DetailTab::Info,

@@ -259,16 +259,6 @@ impl Styles {
         }
     }
 
-    /// Backgrounds that keep the task header and its answer panel distinct
-    /// without drawing separator rules between them and the content.
-    pub fn task_header_background(&self) -> Style {
-        if self.no_color {
-            Style::default()
-        } else {
-            Style::default().bg(Color::Rgb(34, 48, 72))
-        }
-    }
-
     /// The answer panel sits on a dark neutral background; without colour,
     /// focus remains indicated by its structural marker.
     pub fn answer_panel_background(&self) -> Style {
@@ -279,8 +269,8 @@ impl Styles {
         }
     }
 
-    /// The fill behind the field being edited: a navy darker than the task
-    /// header, so the field stands out on it. Without colour the field is
+    /// The fill behind the field being edited: a navy that stands out
+    /// on the panel. Without colour the field is
     /// told apart by its `>` in the focus role.
     pub fn field_editing(&self) -> Style {
         if self.no_color {
@@ -299,15 +289,6 @@ impl Styles {
     /// The answer panel's edge shows focus across its full height.
     pub fn answer_panel_marker(&self, focused: bool) -> Style {
         self.of(if focused { Role::Focus } else { Role::Done })
-    }
-
-    /// A quiet rule that separates the task tabs from the content below.
-    pub fn task_tabs_divider(&self) -> Style {
-        if self.no_color {
-            Style::default()
-        } else {
-            Style::default().fg(Color::Black)
-        }
     }
 
     /// Draws the frame of a panel titled `title` (see [`Styles::panel`]) over
@@ -350,7 +331,7 @@ impl Styles {
             Span::styled("\u{e0b6}", cap),
             Span::styled(
                 format!(" {text} "),
-                weight(Style::default().fg(Color::Black).bg(ground)),
+                weight(Style::default().fg(Color::Rgb(0, 0, 0)).bg(ground)),
             ),
             Span::styled("\u{e0b4}", cap),
         ]

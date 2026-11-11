@@ -924,6 +924,8 @@ mod colour_discipline {
             .lines()
             .filter(|line| line.contains("Color::Rgb") || line.contains("Color::Indexed"))
             .filter(|line| !line.contains("CONDUCTOR_BROWN"))
+            // The one exception: the text of a pill on the frame is true black.
+            .filter(|line| !line.contains("fg(Color::Rgb(0, 0, 0)).bg(ground)"))
         {
             assert!(
                 line.contains(".bg(") && !line.contains(".fg("),
@@ -2170,12 +2172,13 @@ mod task_app_detail_render {
         render_at(app, styles, 120, 30)
     }
 
-    const TITLE_ROW: usize = 3;
-    const STATE_ROW: usize = 3;
-    const WORKSPACE_ROW: usize = 4;
-    const USAGE_ROW: usize = WORKSPACE_ROW + 2;
-    const TABS_ROW: usize = 7;
-    const TAB_MARKER_ROW: usize = 8;
+    const TITLE_ROW: usize = 2;
+    const WORKSPACE_ROW: usize = 2;
+    /// After two workspaces.
+    const STATE_ROW: usize = WORKSPACE_ROW + 2;
+    const USAGE_ROW: usize = STATE_ROW + 1;
+    const TABS_ROW: usize = 6;
+    const TAB_MARKER_ROW: usize = 7;
 
     fn render_at(app: &mut TaskApp, styles: &Styles, width: u16, height: u16) -> Buffer {
         draw(width, height, |frame| {
@@ -2255,12 +2258,17 @@ mod task_app_detail_render {
             !docs.contains("→"),
             "one name when branch is the base: {docs}"
         );
-        assert!(docs.contains('—'), "no pull request: {docs}");
+        assert!(!docs.contains('—'), "no pull request, no dash: {docs}");
+        assert!(!state.contains("bez slotu"), "{state}");
         let tabs = &rows[TABS_ROW];
         for tab in ["Przebieg", "Rozmowa", "Zdarzenia", "Dyrygent", "Info"] {
             assert!(tabs.contains(tab), "{tab} in {tabs}");
         }
-        assert!(tabs.contains("śledzi"), "{tabs}");
+        assert!(!tabs.contains("śledzi"), "{tabs}");
+        assert!(
+            tabs.find("Rozmowa").unwrap() < tabs.find("Przebieg").unwrap(),
+            "Rozmowa is the first tab: {tabs}"
+        );
         let selected_byte = tabs.find("Rozmowa").unwrap();
         let selected_start = tabs[..selected_byte].chars().count();
         assert_eq!(
@@ -2285,54 +2293,104 @@ mod task_app_detail_render {
         let unfocused_rows = super::rows(&render(&mut app, &Styles::new(false)));
         assert_eq!(
             unfocused_rows[TAB_MARKER_ROW].chars().nth(selected_start),
-            Some('─')
+            Some('━'),
+            "the segment is heavy in both cases"
         );
     }
 
     #[test]
-    fn the_task_header_uses_a_muted_navy_background_and_rule_above_tabs() {
+    fn the_header_and_the_tab_bar_have_no_background_and_sit_between_two_rules() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Enter);
         let buffer = render_at(&mut app, &Styles::new(false), 120, 40);
-        let navy = Color::Rgb(34, 48, 72);
         let tabs_y = u16::try_from(row_of(&buffer, "Przebieg")).unwrap();
-        let first_line_y = tabs_y - 5;
+        let first_y = u16::try_from(row_of(&buffer, "code:")).unwrap();
+        assert_eq!(first_y, 2, "no blank row above the header");
+        for y in first_y..=tabs_y + 1 {
+            for cell in row_cells(&buffer, y, layout::LIST_WIDTH + 1..buffer.area.width - 1) {
+                assert_eq!(cell.bg, Color::Reset, "row {y}");
+            }
+        }
+        let rows = rows(&buffer);
+        let upper = &rows[usize::from(tabs_y) - 1];
+        let lower = &rows[usize::from(tabs_y) + 1];
         assert!(
+            upper.contains("├─") && upper.trim_end().ends_with('┤'),
+            "{upper}"
+        );
+        assert!(
+            lower.contains("├─") && lower.contains('━') && lower.trim_end().ends_with('┤'),
+            "{lower}"
+        );
+    }
+
+    #[test]
+    fn the_rules_follow_the_frame_role_and_the_segment_the_keys() {
+        let mut app = running_app();
+        let styles = Styles::new(false);
+        let focus = styles.of(narsor::tui::style::Role::Focus).fg;
+        let done = styles.of(narsor::tui::style::Role::Done).fg;
+        let rule_fg = |buffer: &Buffer, y: usize| {
             row_cells(
-                &buffer,
-                first_line_y,
-                layout::LIST_WIDTH + 1..buffer.area.width - 1
+                buffer,
+                u16::try_from(y).unwrap(),
+                layout::LIST_WIDTH + 2..buffer.area.width - 2,
             )
-            .all(|cell| cell.symbol() == " " && cell.bg == navy),
-            "the upper panel starts with a padded blank row"
-        );
-        assert_eq!(buffer[(layout::LIST_WIDTH + 2, tabs_y)].bg, navy);
-        let underline_y = tabs_y + 1;
-        let underline_cells = row_cells(
+            .find(|cell| cell.symbol() == "─")
+            .map(|cell| cell.fg)
+        };
+        // Keys in the tab: the frame and the rules are in focus, the segment too.
+        let buffer = render_at(&mut app, &styles, 120, 40);
+        let tabs_y = row_of(&buffer, "Przebieg");
+        assert_eq!(rule_fg(&buffer, tabs_y - 1), focus);
+        assert_eq!(rule_fg(&buffer, tabs_y + 1), focus);
+        let segment = row_cells(
             &buffer,
-            underline_y,
-            layout::LIST_WIDTH + 1..buffer.area.width - 1,
+            u16::try_from(tabs_y + 1).unwrap(),
+            0..buffer.area.width,
         )
-        .collect::<Vec<_>>();
-        assert!(
-            underline_cells.iter().all(|cell| cell.bg == Color::Reset),
-            "the entire underline row, including both ends, uses the main panel background"
-        );
-        let underline = underline_cells
+        .find(|cell| cell.symbol() == "━")
+        .unwrap();
+        assert_eq!(Some(segment.fg), focus);
+        assert!(segment.modifier.contains(ratatui::style::Modifier::BOLD));
+        let rows_now = rows(&buffer);
+        let names_at = rows_now[tabs_y]
+            .find("Rozmowa")
+            .map(|b| rows_now[tabs_y][..b].chars().count())
+            .unwrap();
+        let heavy_at = rows_now[tabs_y + 1]
+            .chars()
+            .position(|ch| ch == '━')
+            .unwrap();
+        assert_eq!(names_at, heavy_at, "the segment is under the active tab");
+        // Keys on the list: the frame is grey, so are the rules; the segment is bold grey.
+        press(&mut app, KeyCode::Esc);
+        let buffer = render_at(&mut app, &styles, 120, 40);
+        assert_eq!(rule_fg(&buffer, tabs_y - 1), done);
+        assert_eq!(rule_fg(&buffer, tabs_y + 1), done);
+        let segment = row_cells(
+            &buffer,
+            u16::try_from(tabs_y + 1).unwrap(),
+            0..buffer.area.width,
+        )
+        .find(|cell| cell.symbol() == "━")
+        .unwrap();
+        assert_eq!(Some(segment.fg), done);
+        assert!(segment.modifier.contains(ratatui::style::Modifier::BOLD));
+        // The connectors stand on the frame.
+        let joint = &buffer[(layout::LIST_WIDTH, u16::try_from(tabs_y - 1).unwrap())];
+        assert_eq!(joint.symbol(), "├");
+    }
+
+    #[test]
+    fn the_tabs_are_in_the_order_of_the_plan_and_the_keys_follow_it() {
+        let mut app = running_app();
+        let buffer = render_at(&mut app, &Styles::new(false), 120, 40);
+        let tabs = &rows(&buffer)[row_of(&buffer, "Rozmowa")];
+        let positions: Vec<usize> = ["Rozmowa", "Przebieg", "Zdarzenia", "Dyrygent", "Info"]
             .iter()
-            .find(|cell| matches!(cell.symbol(), "─" | "━"))
-            .expect("the active tab has an underline");
-        assert_eq!(
-            underline.bg,
-            Color::Reset,
-            "the underline is on the main panel background"
-        );
-        assert!(row_cells(
-            &buffer,
-            tabs_y - 1,
-            layout::LIST_WIDTH + 1..buffer.area.width - 1
-        )
-        .any(|cell| cell.symbol() == "─" && cell.fg == Color::Black));
+            .map(|tab| tabs.find(tab).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{tabs}");
     }
 
     fn app_with_workspaces(workspaces: Vec<narsor_protocol::display::WorkspaceHeader>) -> TaskApp {
@@ -2379,24 +2437,24 @@ mod task_app_detail_render {
         assert!(full.contains("⎇ feat/nar-12-refactor → main"), "{full}");
         assert!(full.contains("+120 −34"), "{full}");
 
-        let no_base = code_row(&mut app, 78);
+        let no_base = code_row(&mut app, 84);
         assert!(
             !no_base.contains("→"),
             "the base branch goes first: {no_base}"
         );
         assert!(no_base.contains("feat/nar-12-refactor") && no_base.contains("+120 −34"));
 
-        let no_changes = code_row(&mut app, 70);
+        let no_changes = code_row(&mut app, 76);
         assert!(
             !no_changes.contains("+120"),
             "then the changes: {no_changes}"
         );
         assert!(no_changes.contains("feat/nar-12-refactor"), "{no_changes}");
 
-        let cut_branch = code_row(&mut app, 62);
+        let cut_branch = code_row(&mut app, 68);
         assert!(!cut_branch.contains("feat/nar-12-refactor"), "{cut_branch}");
         assert!(
-            cut_branch.contains("feat/nar-12-ref…"),
+            cut_branch.contains("feat/nar-12-ref") && cut_branch.contains('…'),
             "then the branch: {cut_branch}"
         );
         assert!(
@@ -2407,7 +2465,7 @@ mod task_app_detail_render {
         let mut long = changed_workspace();
         long.repo = "orders-api-gateway-service-for-the-wholesale-department".into();
         let mut app = app_with_workspaces(vec![long]);
-        let cut_repo = code_row(&mut app, 60);
+        let cut_repo = code_row(&mut app, 66);
         assert!(
             cut_repo.contains("orders-api-gateway-service-for"),
             "{cut_repo}"
@@ -2438,7 +2496,7 @@ mod task_app_detail_render {
                 rows[WORKSPACE_ROW + at]
             );
         }
-        assert!(rows[WORKSPACE_ROW + names.len() + 1].contains("Przebieg"));
+        assert!(rows[WORKSPACE_ROW + names.len() + 2].contains("Przebieg"));
     }
 
     /// The cell where `needle` starts on the workspace row of `buffer`.
@@ -2476,7 +2534,7 @@ mod task_app_detail_render {
             .find(|row| row.contains("code:"))
             .unwrap();
         assert!(
-            row.contains("code: orders-api ⎇ feat/x → main +123 −45 #42 ↗"),
+            row.contains("code: orders-api · ⎇ feat/x → main · +123 −45 · #42 ↗"),
             "{row}"
         );
         assert_eq!(workspace_cell(&buffer, "+123").fg, Color::Green);
@@ -2584,19 +2642,111 @@ mod task_app_detail_render {
     }
 
     #[test]
-    fn a_title_the_edge_cuts_is_said_in_full_on_the_first_header_row() {
+    fn a_title_the_edge_cuts_is_said_on_the_first_header_row_before_the_workspaces() {
         let title = "Przebudowa obsługi zamówień hurtowych wraz z migracją danych klientów";
-        let mut app = labelled_app(None, Some(title));
+        let mut app = labelled_app_with_workspaces(
+            title,
+            vec![
+                header_workspace("code", "orders-api", "main"),
+                header_workspace("docs", "orders-docs", "main"),
+            ],
+        );
         let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 24));
+        let edge = &rows[TITLE_ROW - 1];
+        assert!(!edge.contains("migrac"), "the edge cuts the title: {edge}");
+        // The first header row says more of the title than the edge; the
+        // frame's width still cuts it, so its end is an ellipsis.
         assert!(
-            rows[TITLE_ROW].contains("Przebudowa obsługi"),
+            rows[TITLE_ROW].contains("Przebudowa obsługi zamówień hurtowych wraz z migrac"),
             "{}",
             rows[TITLE_ROW]
         );
         assert!(
-            rows[TITLE_ROW + 1].contains("● running"),
+            rows[TITLE_ROW + 1].contains("code:"),
             "{}",
             rows[TITLE_ROW + 1]
+        );
+        assert!(
+            rows[TITLE_ROW + 2].contains("docs:"),
+            "{}",
+            rows[TITLE_ROW + 2]
+        );
+        assert!(
+            rows[TITLE_ROW + 3].contains("● running"),
+            "{}",
+            rows[TITLE_ROW + 3]
+        );
+    }
+
+    /// A running task titled `title`, with `workspaces` in its header.
+    fn labelled_app_with_workspaces(
+        title: &str,
+        workspaces: Vec<narsor_protocol::display::WorkspaceHeader>,
+    ) -> TaskApp {
+        let mut app = app();
+        let mut running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        running.title = Some(title.to_string());
+        app.load(listing(
+            vec![with_header_workspaces(running, workspaces)],
+            "c",
+        ));
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    #[test]
+    fn the_header_of_a_finished_task_without_a_slot_does_not_say_so_but_info_does() {
+        let mut app = app();
+        let mut finished = with_controller(task("a", "local", "stopped", 1));
+        finished.state = narsor_engine::orchestration::TaskState::Finished;
+        finished.holds_slot = false;
+        app.load(listing(vec![titled(finished, "NAR-12")], "c"));
+        press(&mut app, KeyCode::Enter);
+        let rows = rows(&render(&mut app, &Styles::new(false)));
+        assert!(
+            rows.iter().all(|row| !row.contains("bez slotu")),
+            "{rows:#?}"
+        );
+
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Info);
+        let info = screen(&render(&mut app, &Styles::new(false)));
+        assert!(info.contains("bez slotu"), "positive control: {info}");
+    }
+
+    #[test]
+    fn a_frame_too_low_for_every_header_row_draws_no_rule_over_the_last_one() {
+        let workspaces = (0..30)
+            .map(|index| {
+                with_pr(
+                    header_workspace("code", &format!("repo-{index}"), "main"),
+                    &format!("https://gitlab.example/g/api/-/merge_requests/{index}"),
+                )
+            })
+            .collect();
+        let mut app = app_with_workspaces(workspaces);
+        app.detail_mut().set_hyperlinks(true);
+        let buffer = render_at(&mut app, &Styles::new(false), 120, 20);
+        let rows = rows(&buffer);
+        let last = rows
+            .iter()
+            .rposition(|row| row.contains("repo-"))
+            .expect("a workspace row");
+        assert!(
+            rows[last + 1].contains('╰'),
+            "the header fills the frame, no rule over its last row: {}",
+            rows[last + 1]
+        );
+        let text = screen(&buffer);
+        assert!(
+            text.matches("\u{1b}]8;;https://gitlab.example/g/api/-/merge_requests/")
+                .count()
+                > 1,
+            "the links stay: {text:?}"
         );
     }
 
@@ -2854,7 +3004,7 @@ mod task_app_detail_render {
             rows[list_row]
         );
 
-        for _ in 0..3 {
+        for _ in 0..4 {
             press(&mut app, KeyCode::Char(']'));
         }
         let info = screen(&draw(120, 50, |frame| {
@@ -3212,9 +3362,9 @@ mod task_app_detail_render {
         let buffer = render(&mut app, &Styles::new(false));
         let rows = rows(&buffer);
         assert!(
-            rows[STATE_ROW].contains("#2 · czeka na slot (2/3)"),
+            rows[WORKSPACE_ROW].contains("#2 · czeka na slot (2/3)"),
             "{}",
-            rows[STATE_ROW]
+            rows[WORKSPACE_ROW]
         );
         let screen = screen(&buffer);
         assert!(
@@ -3229,7 +3379,9 @@ mod task_app_detail_render {
         press(&mut app, KeyCode::Char(']'));
         assert!(super::screen(&render(&mut app, &Styles::new(false)))
             .contains("jeszcze nie wystartowało"));
-        press(&mut app, KeyCode::Char(']'));
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char(']'));
+        }
         let info = super::screen(&render(&mut app, &Styles::new(false)));
         assert!(
             info.contains("Zapieczętowane wejścia") && info.contains("launch digest"),
@@ -3268,9 +3420,9 @@ mod task_app_detail_render {
         app.load(listing(vec![waiting], "c"));
         let buffer = render(&mut app, &Styles::new(false));
         assert!(
-            rows(&buffer)[STATE_ROW].contains("kontroler offline 4m"),
+            rows(&buffer)[WORKSPACE_ROW].contains("kontroler offline 4m"),
             "{}",
-            rows(&buffer)[STATE_ROW]
+            rows(&buffer)[WORKSPACE_ROW]
         );
     }
 
@@ -3415,7 +3567,14 @@ mod task_app_detail_render {
         assert!(review.is_some() && plan.is_some(), "{}", screen(&buffer));
         assert!(review < plan, "newest first: {text}");
         assert!(text.contains("review #1 · ✓ ✨ plan #1"), "{text}");
-        for rule in [strip - 1, strip + 1] {
+        let top = &rows[strip - 1];
+        assert!(
+            top.contains("─ ↧ śledzi [f] ─"),
+            "the marker is on the line over the steps: {top}"
+        );
+        assert!(!rows[TABS_ROW].contains("śledzi"), "{}", rows[TABS_ROW]);
+        assert!(!rows[strip + 1].contains("śledzi"), "{}", rows[strip + 1]);
+        for rule in [strip + 1] {
             let details = &rows[rule][rows[rule].find('─').unwrap()..];
             assert!(
                 details
@@ -3443,6 +3602,37 @@ mod task_app_detail_render {
         );
         let (y, x) = spot(&buffer, "plan #1");
         assert!(!buffer[(x, y)].modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn f_turns_the_marker_over_the_steps_to_manual_and_back() {
+        let styles = Styles::new(false);
+        let mut app = conversation_of_two_steps();
+        let top = |app: &mut TaskApp| rows(&render(app, &styles))[TAB_MARKER_ROW + 1].clone();
+        let buffer = render(&mut app, &styles);
+        let (y, x) = spot(&buffer, "↧ śledzi");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            styles.of(narsor::tui::style::Role::Live).fg.unwrap()
+        );
+        press(&mut app, KeyCode::Char('f'));
+        let text = top(&mut app);
+        assert!(text.contains("─ ⏸ ręcznie [f] ─"), "{text}");
+        let buffer = render(&mut app, &styles);
+        let (y, x) = spot(&buffer, "⏸ ręcznie");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            styles.of(narsor::tui::style::Role::Attention).fg.unwrap()
+        );
+    }
+
+    #[test]
+    fn a_strip_rule_too_short_for_the_marker_is_the_rule_alone() {
+        let styles = Styles::new(false);
+        let mut app = conversation_of_two_steps();
+        // Wide enough for the strip, but the details are cut to a few cells.
+        let rows = rows(&render_at(&mut app, &styles, 44, 30));
+        assert!(rows.iter().all(|row| !row.contains("[f]")), "{rows:#?}");
     }
 
     #[test]
@@ -3485,7 +3675,14 @@ mod task_app_detail_render {
         let styles = Styles::new(false);
         let strip = |conversation: &Conversation| {
             let buffer = draw(40, 3, |frame| {
-                render_step_strip(frame, Rect::new(0, 0, 40, 3), &styles, conversation, true)
+                render_step_strip(
+                    frame,
+                    Rect::new(0, 0, 40, 3),
+                    &styles,
+                    conversation,
+                    true,
+                    false,
+                )
             });
             rows(&buffer)[1].clone()
         };
@@ -3511,7 +3708,14 @@ mod task_app_detail_render {
         conversation.rebuild(&positions, &Attempts::default());
         let styles = Styles::new(false);
         let buffer = draw(40, 3, |frame| {
-            render_step_strip(frame, Rect::new(0, 0, 40, 3), &styles, &conversation, true)
+            render_step_strip(
+                frame,
+                Rect::new(0, 0, 40, 3),
+                &styles,
+                &conversation,
+                true,
+                false,
+            )
         });
         assert!(
             rows(&buffer)[1].contains("✓ odd #1"),
@@ -3531,7 +3735,14 @@ mod task_app_detail_render {
         let styles = Styles::new(false);
         let strip = |conversation: &Conversation| {
             let buffer = draw(40, 3, |frame| {
-                render_step_strip(frame, Rect::new(0, 0, 40, 3), &styles, conversation, true)
+                render_step_strip(
+                    frame,
+                    Rect::new(0, 0, 40, 3),
+                    &styles,
+                    conversation,
+                    true,
+                    false,
+                )
             });
             rows(&buffer)[1].clone()
         };
@@ -3559,6 +3770,7 @@ mod task_app_detail_render {
                     &styles,
                     &conversation,
                     true,
+                    false,
                 )
             });
         }
@@ -4159,7 +4371,9 @@ mod task_app_detail_render {
     #[test]
     fn the_selected_event_has_the_bar_and_no_reverse_video() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Char(']'));
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char(']'));
+        }
         app.on_detail_read(
             "a",
             1,
@@ -4214,7 +4428,7 @@ mod task_app_detail_render {
 
     /// The first column of the details' content: where the tab bar starts.
     fn content_column(buffer: &Buffer) -> u16 {
-        spot(buffer, "Przebieg").1 - 1
+        spot(buffer, "Rozmowa").1 - 1
     }
 
     /// A read of `review`'s conversation from `source`, written three
@@ -4486,7 +4700,7 @@ mod task_app_detail_render {
             .unwrap();
         let x = screen_rows[y].chars().position(|c| c == 'N').unwrap();
         let cell = &buffer[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())];
-        assert_eq!(cell.fg, ratatui::style::Color::Black);
+        assert_eq!(cell.fg, ratatui::style::Color::Rgb(0, 0, 0));
         assert_eq!(cell.bg, ratatui::style::Color::Cyan);
     }
 
@@ -4744,7 +4958,7 @@ mod task_app_detail_render {
     #[test]
     fn info_lists_the_ticket_and_title_only_when_there_are_any() {
         let mut with = labelled_app(Some("NAR-12"), Some("Zmiana API"));
-        for _ in 0..3 {
+        for _ in 0..4 {
             press(&mut with, KeyCode::Char(']'));
         }
         let info = screen(&render(&mut with, &Styles::new(false)));
@@ -4752,7 +4966,7 @@ mod task_app_detail_render {
         assert!(info.contains("Zmiana API"), "{info}");
 
         let mut without = labelled_app(None, None);
-        for _ in 0..3 {
+        for _ in 0..4 {
             press(&mut without, KeyCode::Char(']'));
         }
         let info = screen(&render(&mut without, &Styles::new(false)));
@@ -4890,7 +5104,10 @@ mod task_app_waiting_render {
             Color::Rgb(38, 40, 43)
         );
         let header_color = Color::Rgb(34, 48, 72);
-        assert!(buffer.content.iter().any(|cell| cell.bg == header_color));
+        assert!(
+            buffer.content.iter().all(|cell| cell.bg != header_color),
+            "the header has no background of its own"
+        );
         assert!(
             !rows(&buffer)[usize::from(y - 1)].contains('─'),
             "the panel has no separator rule:\n{}",
@@ -4980,7 +5197,11 @@ mod task_app_waiting_render {
         let tabs_row = row_of(&buffer, "Przebieg");
         let divider_y = u16::try_from(tabs_row - 1).unwrap();
         assert_eq!(buffer[(layout::LIST_WIDTH + 4, divider_y)].symbol(), "─");
-        assert_eq!(buffer[(layout::LIST_WIDTH + 4, divider_y)].fg, Color::Black);
+        assert_eq!(
+            buffer[(layout::LIST_WIDTH + 4, divider_y)].fg,
+            Color::Cyan,
+            "the rule takes the colour of the frame, which has the keys"
+        );
     }
 
     /// A gate after an agent step, with the agent's reason and the values its
