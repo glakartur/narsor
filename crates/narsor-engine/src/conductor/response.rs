@@ -64,6 +64,8 @@ pub enum DecisionKind {
     Annotate,
     /// Name the task in one short line.
     Title,
+    /// Choose the model and effort of the steps that have not started.
+    Profile,
 }
 
 impl DecisionKind {
@@ -78,6 +80,7 @@ impl DecisionKind {
             Self::Reply => "reply",
             Self::Annotate => "annotate",
             Self::Title => "title",
+            Self::Profile => "profile",
         }
     }
 }
@@ -108,6 +111,7 @@ pub fn allowed_decisions(purpose: ConductorPurpose) -> &'static [DecisionKind] {
         ConductorPurpose::ReplyToChat => &[DecisionKind::Reply],
         ConductorPurpose::SummarizeGate => &[DecisionKind::Annotate],
         ConductorPurpose::GenerateTitle => &[DecisionKind::Title],
+        ConductorPurpose::ProfileSteps => &[DecisionKind::Profile],
         ConductorPurpose::DecideFork => &[DecisionKind::ChooseOutput, DecisionKind::Escalate],
         ConductorPurpose::Unrecognized => &[DecisionKind::Escalate],
     }
@@ -185,6 +189,38 @@ pub enum Decision {
         /// The title, one short line.
         title: String,
     },
+    /// The steps that have not started get a model and an effort.
+    Profile {
+        /// One entry per step, or per plan unit of a step.
+        #[serde(default)]
+        steps: Vec<ProfiledStep>,
+    },
+}
+
+/// What the conductor chose for one step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfiledStep {
+    /// The step.
+    pub step_id: String,
+    /// The plan unit, when the choice is per unit.
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// The model chosen; must be on the workflow's ladder.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The effort chosen.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Why, in a sentence.
+    #[serde(default)]
+    pub rationale: String,
+    /// Whether the conductor is sure; an unsure entry is dropped.
+    #[serde(default = "sure")]
+    pub confident: bool,
+}
+
+fn sure() -> bool {
+    true
 }
 
 impl Decision {
@@ -199,6 +235,7 @@ impl Decision {
             Self::Reply => DecisionKind::Reply,
             Self::Annotate { .. } => DecisionKind::Annotate,
             Self::Title { .. } => DecisionKind::Title,
+            Self::Profile { .. } => DecisionKind::Profile,
         }
     }
 }
@@ -419,6 +456,11 @@ impl ConductorResponse {
             }
             Decision::Annotate { summary, .. } => required_text("summary", summary)?,
             Decision::Title { title } => required_text("title", title)?,
+            Decision::Profile { steps } => {
+                for step in steps {
+                    required_text("steps[].step_id", &step.step_id)?;
+                }
+            }
         }
 
         if !self.proposals.is_empty() && !proposals_allowed(purpose) {

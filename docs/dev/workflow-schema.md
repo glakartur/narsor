@@ -155,6 +155,9 @@ An optional section defining default behavior for the whole workflow.
     digest; a bare tag (or an implicit `latest`) is a validation error. The chosen image, its
     digest and its source go into the task's `ResolvedEnvironment` and do not change after a later
     change to the definition.
+*   `model_ladder`: Models from the cheapest to the strongest, e.g. `[haiku, sonnet, opus]`. A step's
+    `ceiling.model` and the escalation after failures compare only models on this list; the conductor
+    may choose only models on it. Without it, models are never compared.
 
 ### 3.2.1. Schema versions, repositories and step workspaces
 
@@ -424,6 +427,17 @@ action:
                                       # Only an explicit `harness:` pins the action; without it the action
                                       # takes the default at the first attempt and keeps it to the end.
   model: <string>                     # AI model (optional, e.g. "sonnet-3.5")
+  effort: <low|medium|high|max>       # Default effort (optional). Passed as `--effort` to claude-code and as
+                                      # `-c model_reasoning_effort=…` to codex (`max` becomes `xhigh`). opencode and
+                                      # the Copilot harnesses ignore it; the timeline notes that.
+  ceiling:                            # Optional upper bound for what the conductor or an escalation may set.
+    model: <string>                   #   must be on `globals.model_ladder` when that list exists
+    effort: <low|medium|high|max>     #   not lower than the step's own `effort`
+  plan: <bool>                        # Marks the plan step. When it succeeds, the conductor chooses the model and
+                                      # effort of the agent steps that have not started (shown in the TUI, read-only).
+                                      # The step may report `complexity` (an object with the optional fields `files`,
+                                      # `modules`, `migration_or_contract`, `missing_tests`, `unit_dependencies`)
+                                      # in a step variable of that name; the engine only passes it on.
   workspace_access: <read-write|read-only> # schema v1 only; read-write by default (v2: step `workspaces`, §3.2.1).
   prompt: |                           # Instruction for the agent
     Analyze the code in the current directory.

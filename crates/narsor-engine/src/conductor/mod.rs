@@ -57,6 +57,7 @@ pub mod autopilot;
 pub mod chat;
 pub mod failure;
 pub mod invoke;
+pub mod profile;
 pub mod prompt;
 pub mod proposal;
 pub mod rescue;

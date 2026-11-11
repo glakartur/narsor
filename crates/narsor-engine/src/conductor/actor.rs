@@ -55,6 +55,7 @@ use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 use crate::conductor::chat::{chat_answer, conclude_annotation, still_pending, ProposalContext};
+use crate::conductor::profile::conclude_profile;
 use crate::conductor::store::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
@@ -742,6 +743,16 @@ impl ConductorActor {
 
         if invocation.request.trigger == ConductorTrigger::Title {
             conclude_title(&self.store, outcome)?;
+        }
+        if invocation.request.trigger == ConductorTrigger::Profile {
+            // The request lists only steps that had not started when it was
+            // made, so nothing else can be written.
+            conclude_profile(
+                &self.store,
+                &invocation.request,
+                outcome,
+                &std::collections::BTreeSet::new(),
+            )?;
         }
 
         let mut next = inner.state.clone();

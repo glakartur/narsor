@@ -53,6 +53,7 @@ mod orchestration;
 mod persistence;
 mod registry;
 mod schema_loading;
+mod step_profile_flow;
 mod task_labels;
 mod task_workspaces;
 mod template;

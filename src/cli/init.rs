@@ -387,6 +387,11 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "Tasks processed at once across all backends (replaces backend limits), or none.",
     ),
     (
+        SettingKey::EscalationThreshold,
+        "3",
+        "Failed attempts of an agent step after which its effort, then its model, is raised within its ceiling; 0 turns it off.",
+    ),
+    (
         SettingKey::LogLevel,
         "off",
         "off, error, warn, info, debug or trace (RUST_LOG wins).",

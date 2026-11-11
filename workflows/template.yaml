@@ -15,6 +15,21 @@ globals:
     max_attempts: 2
     backoff: 0s
 
+# Model and effort per agent step (not used below, which has no agent step):
+#
+#   globals:
+#     model_ladder: [haiku, sonnet, opus]
+#   states:
+#     plan:
+#       action: { type: agent, plan: true, model: sonnet, effort: medium, prompt: "..." }
+#     work:
+#       action:
+#         type: agent
+#         model: sonnet
+#         effort: medium
+#         ceiling: { model: opus, effort: high }   # the most the conductor or an escalation may set
+#         prompt: "..."
+
 states:
   demonstrate:
     description: Prints a structured result without changing files or calling external services.
