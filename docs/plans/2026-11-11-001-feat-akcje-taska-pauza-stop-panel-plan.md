@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-11-11-akcje-taska-pauza-stop-i-panel-akcji-require
 
 ## Summary
 
-Serwer podaje pełną listę akcji zależną od stanu taska. TUI pokazuje ją w jednym panelu (Ctrl+.) i traci osobne skróty zarządzania taskiem. Plan dodaje akcje `Stop`, `ReleaseSlot` i `SelectStep`. Plan zmienia los akcji `Resume` i `Interrupt`. Plan opisuje też zmiany w runnerze: pauza czeka na koniec pracy, a stop zrywa pracę od razu nową komendą `StopStep` i kończy w `Stopped` (nie w `Interrupted`). Plan nie zmienia reguły slotów: `Stopped` oddaje slot w chwili potwierdzenia punktu bezpiecznego (`holds_capacity` jest wtedy fałszywe). Dlatego `ReleaseSlot` dotyczy taska, który nadal pracuje i czeka na reakcję operatora (patrz „Odstępstwa od dokumentu źródłowego").
+Serwer podaje pełną listę akcji zależną od stanu taska. TUI pokazuje ją w jednym panelu (Ctrl+.) i traci osobne skróty zarządzania taskiem. Plan dodaje akcje `Stop`, `ReleaseSlot` i `SelectStep`. Plan zmienia los akcji `Resume` i `Interrupt`. Plan opisuje też zmiany w runnerze: pauza czeka na koniec pracy, a stop zrywa pracę od razu nową komendą `StopStep` i kończy w `Stopped` (nie w `Interrupted`). Plan zmienia regułę slotów (decyzja Q5, opcja B): `Stopped` po `Pauza` albo `Stop` trzyma slot do końca czasu oczekiwania, a `ReleaseSlot` albo `Archiwizuj` kończy to trzymanie od razu (patrz „Zgodność z dokumentem źródłowym i model pojemności").
 
 Głębokość: Standard. Zmiana obejmuje protokół, silnik, runner i TUI.
 
@@ -29,19 +29,21 @@ Wymagania R1–R19, akcje A1–A5, przepływy F1–F4 i przykłady AE1–AE8 poc
 - R1–R3: lista akcji z serwera, odrzucenie akcji niedozwolonej, klient bez własnej oceny → U1, U2, U5
 - R4–R6: panel Ctrl+., usunięcie skrótów, rozmowa poza panelem → U4, U5, U6
 - R7–R10: pauza i stop dla agenta i skryptu, stan „wstrzymywany" → U1, U2, U3 (nowa ścieżka stopu: U3, wywołanie: U2)
-- R11–R16: zatrzymany task → U1, U2, U3, U4, U5 (R11, R12 w U4; R13–R16 w U1; R14 także w U5; R13 także w U3; R15 w zmienionym brzmieniu: U1, U2, U5)
+- R11–R16: zatrzymany task → U1, U2, U3, U4, U5 (R11, R12 w U4; R13–R16 w U1; R14 także w U5; R13 także w U3; R15: U1, U2, U5, a model pojemności w U3)
 - R17–R19: po zakończeniu workflow → U1, U2, U5 (R18 w U2, U5)
 
-### Odstępstwa od dokumentu źródłowego
+### Zgodność z dokumentem źródłowym i model pojemności
 
-Dokument źródłowy zakłada, że zatrzymany task trzyma slot do końca czasu oczekiwania (R15, Z7, AE5). Kod tego nie robi: `TaskRecord::holds_capacity` zwraca dla `Stopped` fałsz, bo punkt bezpieczny usuwa compute, a wznowienie ze `Stopped` idzie przez `queue_resume` (kolejka, gdy brak wolnego slotu). Czas oczekiwania (`slot_release_due_at`) dotyczy taska w stanie `Running`, którego wykonanie czeka (np. na człowieka). Wtedy polityka po terminie wysyła `Pause`, a task kończy w `Stopped` bez slotu. Plan **nie zmienia** `holds_capacity` (zmiana złamałaby model pojemności z dokumentu 2026-10-18 i kolejkę wznowień). Plan **redefiniuje** R15, Z7 i AE5 tak, by zachować intencję („operator nie czeka na koniec czasu oczekiwania"):
+Dokument źródłowy zakłada, że zatrzymany task trzyma slot do końca czasu oczekiwania (R15, Z7, AE5). Kod tego nie robił: `TaskRecord::holds_capacity` zwracało dla `Stopped` fałsz. **Decyzja Q5 (opcja B): plan nie odstępuje od R15, Z7 i AE5, tylko zmienia model pojemności.** Reguły:
 
-- „Zwolnij slot" jest dostępne dla taska `Running`, który czeka na reakcję operatora i ma ustawiony termin zwolnienia slotu (`slot_release_due_at`), jeszcze przed upływem terminu.
-- Akcja wysyła ten sam `Pause` co polityka (aktor: właściciel). Task idzie ścieżką `PauseRequested` → `Stopped`, a slot jest wolny po potwierdzeniu punktu bezpiecznego. Następny task z kolejki może wystartować. Task da się potem wznowić (rozmowa, `SelectStep`, `Restart` skryptu), jak po zwolnieniu przez politykę.
-- Dla taska już w `Stopped` slot jest wolny z definicji, więc akcji nie ma (powód: „zadanie nie trzyma slotu").
-- Po `Stop` i po `Pauza` task także nie trzyma slotu po potwierdzeniu punktu bezpiecznego. Wznowienie może więc trafić do kolejki.
+- `Stopped` po `Pauza` albo `Stop` trzyma slot do końca czasu oczekiwania. Trzymanie dotyczy taska, który czekał na operatora (`slot_release_pending`) i miał termin (`slot_release_due_at`) w przyszłości. Termin trzymania jest tym samym `slot_release_due_at`. Rekord zapisuje go w nowym polu `slot_hold_until`. `holds_capacity` dla `Stopped` jest prawdziwe, gdy to pole jest ustawione.
+- Trzymanie kończy: (1) upływ terminu (okresowy przebieg `slot_release_pass` wywołuje `ControlPlane::end_slot_hold`), (2) akcja „Zwolnij slot" (`ReleaseSlot`), (3) „Archiwizuj", (4) wznowienie. Wznowienie taska, który trzyma slot, nie potrzebuje nowego slotu: idzie prosto do `Provisioning`, bez kolejki.
+- Task, który pracował (brak terminu), po `Pause` albo `Stop` nie trzyma slotu. Pauza z polityki (termin minął) i zatrzymanie z powodu obniżonego limitu też go nie trzymają. Wtedy „czas oczekiwania" już minął albo go nie było.
+- „Zwolnij slot" jest dostępne dla `Stopped`, który trzyma slot (przed terminem). Dla `Running`, który czeka na operatora, nadal wysyła pauzę bez trzymania slotu (wcześniejsze zwolnienie).
+- `Stopped` bez `slot_hold_until` nie trzyma slotu. Powód akcji `ReleaseSlot`: „zadanie nie trzyma slotu".
+- `holds_compute_slot` nie liczy `Stopped` (brak compute), więc obniżony limit nie próbuje zatrzymywać taska `Stopped`.
 
-To odstępstwo jest zapisane jako pytanie w „Pytania otwarte dla użytkownika".
+Skutek dla dokumentu 2026-10-18 (model pojemności): zdanie „`Stopped` oddaje slot" dostaje wyjątek opisany wyżej. Dokument jest zaktualizowany w tym samym zadaniu.
 
 ---
 
@@ -69,9 +71,9 @@ Bez zmian względem dokumentu źródłowego:
 - `crates/narsor-engine/src/controller_protocol/service/actions.rs`: funkcja `offer` i `unavailable_reason` są jedynym miejscem reguł dostępności. `require_available` używa ich przy wysyłce (to daje R2). Stałe `OFFERED` ma 12 pozycji.
 - `Pause` jest dziś komendą właściciela (`OwnerCommand::Pause`). Runner zatrzymuje się w bezpiecznym punkcie. Zwolnienie slotu przez politykę używa tej samej komendy (`ControlPlane::release_slot` w `crates/narsor-engine/src/orchestration/control_plane.rs`, aktor `CommandActor::Policy`).
 - `Interrupt` to `OperatorCommand::Interrupt` (`crates/narsor-runner/src/runner/commands.rs`, funkcja `interrupt`). Przerywa przebieg (harness ginie razem z nim) i wywołuje `settle_interrupted`. **Nie nadaje się jako „Stop" z R9**: zostawia `RunnerState::Interrupted`, a ten stan (a) podlega automatycznemu wznawianiu (`orchestration/resume.rs`, `auto_resume.rs`), (b) jest traktowany jako utrata zadania (`not_running`, `loss_state` w `actions.rs`), (c) nie spełnia warunku `Stopped` + `TaskState::Paused`, na którym opierają się `ReleaseSlot`, komentarz po stopie (`comment_reason`) i `SelectStep`. Ponadto `interrupt` zwraca błąd, gdy żaden przebieg nie jest aktywny (`pass_active`), więc nie obsłuży stopu w `PauseRequested` (R10), gdy praca już się skończyła.
-- Do `Stopped` prowadzi dziś jedna droga: właściciel wysyła `OwnerCommand::Pause` → `PauseRequested` → runner kończy pracę, zamyka sesję (`finish_at_safe_point`, `close_session`) i zgłasza punkt bezpieczny → sterownik przyjmuje go jako `Stopped` (`control_plane.rs`). Strata z `PauseRequested` nie liczy się jako utrata i nie planuje wznowienia (`resume.rs`). Po potwierdzeniu punktu bezpiecznego compute znika, a `holds_capacity` jest fałszywe (slot wolny). Do tego czasu (`PauseRequested`) slot jest zajęty. Nowy stop ma użyć tej drogi, a nie `Interrupted`.
+- Do `Stopped` prowadzi dziś jedna droga: właściciel wysyła `OwnerCommand::Pause` → `PauseRequested` → runner kończy pracę, zamyka sesję (`finish_at_safe_point`, `close_session`) i zgłasza punkt bezpieczny → sterownik przyjmuje go jako `Stopped` (`control_plane.rs`). Strata z `PauseRequested` nie liczy się jako utrata i nie planuje wznowienia (`resume.rs`). Po potwierdzeniu punktu bezpiecznego compute znika. Slot jest wolny, chyba że obowiązuje trzymanie slotu po pauzie albo stopie (decyzja Q5). Do tego czasu (`PauseRequested`) slot jest zajęty. Nowy stop ma użyć tej drogi, a nie `Interrupted`.
 - `RunnerState` ma już `PauseRequested` i `Stopped`.
-- `TaskRecord::holds_capacity` (`crates/narsor-engine/src/orchestration/model.rs`): `Stopped` i `Archived` nie trzymają slotu; `Provisioning`, `Running`, `PauseRequested`, `Interrupted`, `Unknown`, `Archiving` trzymają. Wznowienie ze `Stopped` bez wolnego slotu idzie do kolejki (`command_routed` z `queue_resume`, `orchestration/control_plane.rs`).
+- `TaskRecord::holds_capacity` (`crates/narsor-engine/src/orchestration/model.rs`): `Archived` nie trzyma slotu, a `Stopped` trzyma go tylko przy ustawionym `slot_hold_until` (decyzja Q5); `Provisioning`, `Running`, `PauseRequested`, `Interrupted`, `Unknown`, `Archiving` trzymają. Wznowienie ze `Stopped` bez wolnego slotu idzie do kolejki (`command_routed` z `queue_resume`, `orchestration/control_plane.rs`).
 - Zwolnienie slotu (`ControlPlane::release_slot`, `slot_release_due`, `slot_release_due_at`) działa tylko dla `Running` z wykonaniem w stanie zwalniającym slot, po upływie terminu i bez pracy właściciela w toku (`owner_work_pending`). Wysyła `Pause` z aktorem `Policy`; `command_routed` odrzuca takie `Pause` poza `policy_may_act`. `TaskSummary` nie wystawia dziś ani terminu, ani flagi zwolnienia slotu.
 - `TaskRecord::operator_command_refusal` (`model.rs`) odrzuca **każdą** komendę operatora w `PauseRequested` („the task is pausing"), a `Interrupt`, `ConfirmProposal` i `RejectProposal` także w każdym stanie innym niż `Running` z runnerem bieżącego uruchomienia. Dlatego sekwencja `Pause` → `StopStep` jest dziś niemożliwa. `queue_operator_command` (`orchestration/operator_commands.rs`) woła tę funkcję przy przyjęciu komendy.
 - `TaskSummary` (`crates/narsor-protocol/src/controller.rs`) nie ma listy kroków workflow ani rodzaju kroku. Ma `manual_transitions: Option<TransitionOffer>` (tylko dla `Running`; `override_targets` to wszystkie stany poza bieżącym, i tylko gdy `manual_override_allowed`). Definicja workflow (`WorkflowDefinition::states`, `State::action: Option<ActionConfig>` z wariantami `Agent`, `Script`, `Human`, `Wait`, `Decision`) jest dostępna serwerowi przez `record.launch_spec.definition()` i nie wychodzi do klienta.
@@ -99,12 +101,12 @@ Pominięte. Kod ma mocne lokalne wzorce (lista akcji, komendy, menu). Jedyna wie
 - **Relacja `Stop` do `Interrupted`, `Resume` i `Restart` (decyzja).**
   - `Interrupted` zostaje stanem utraty zadania (padł Pod, utrata łączności). Tylko system go ustawia. Podlega automatycznemu wznawianiu. Stop go nigdy nie ustawia.
   - `OperatorCommand::Interrupt` i `TaskActionId::Interrupt` zostają w protokole dla zgodności ze starymi klientami i kolejkami komend, zachowanie bez zmian. Serwer przestaje je oferować w panelu. W ofercie jest `Stop`.
-  - Po `Stop` task jest w `Stopped` + `TaskState::Paused`, **nie trzyma slotu** (po potwierdzeniu punktu bezpiecznego), nie wznawia się sam. Wyjścia ze `Stopped`: komentarz w rozmowie (agent, R11), `Restart` (skrypt, R13), `SelectStep` (R14). Wszystkie zaczynają od `OwnerCommand::Resume` (przez `command_routed`: wznowienie idzie do `Provisioning` albo, gdy brak wolnego slotu, na początek kolejki; runner ze `Stopped` już nie działa, jego proces kończy się po `PauseAtSafePoint`), a komenda operatora (`RestartStep`, `Transition`) jest dołączona do tego samego wznowienia, tak jak robi to `comment_delivery` dla komentarza. Runner stosuje ją przed ruszeniem przebiegu.
+  - Po `Stop` task jest w `Stopped` + `TaskState::Paused`, trzyma slot do końca czasu oczekiwania, jeśli czekał na operatora (decyzja Q5); inaczej slot jest wolny po potwierdzeniu punktu bezpiecznego. Nie wznawia się sam. Wyjścia ze `Stopped`: komentarz w rozmowie (agent, R11), `Restart` (skrypt, R13), `SelectStep` (R14). Wszystkie zaczynają od `OwnerCommand::Resume` (przez `command_routed`: wznowienie idzie do `Provisioning` (task, który trzyma slot, nie potrzebuje nowego) albo, gdy brak wolnego slotu, na początek kolejki; runner ze `Stopped` już nie działa, jego proces kończy się po `PauseAtSafePoint`), a komenda operatora (`RestartStep`, `Transition`) jest dołączona do tego samego wznowienia, tak jak robi to `comment_delivery` dla komentarza. Runner stosuje ją przed ruszeniem przebiegu.
   - `Restart` dziś jest oferowany tylko dla `Interrupted`/`Unknown` i błędu uruchomienia. U1 dodaje do niego `Stopped` z krokiem skryptowym. Dla `Interrupted`/`Unknown` zachowanie bez zmian.
   - `Resume` jako akcja wychodzi z oferty (Z3), komenda właściciela zostaje.
 - **`Resume` wychodzi z oferty** (Z3). Identyfikator zostaje w enum dla zgodności. Komenda `OwnerCommand::Resume` zostaje w serwerze, bo używa jej panel rozmowy (R11) i automatyczne wznawianie. Zmieniamy tylko to, co serwer pokazuje w panelu akcji.
 - **`Transition` i `Restart` zostają, ale z nowymi regułami.** „Wybór kroku" (R14, R17) to `Transition` z celem dowolnego kroku. Plan wprowadza `SelectStep` jako osobną akcję z listą wszystkich kroków workflow w `options`, a `Transition` zostaje dla wyjść deklarowanych w pracującym tasku (reguły z dokumentu 2026-10-22 bez zmian). Powód: `Transition` ma `manual_transitions` i `override`, a `SelectStep` ma inną regułę (Z9, brak ograniczenia do odwiedzonych kroków). `SelectStep` jest wykonywany jako `OperatorCommand::Transition { forced: true }` dołączony do `Resume` (bez zmiany `allow_manual_override` — nowa ścieżka nie sprawdza tej flagi, bo to osobna akcja operatora; potwierdzić w U2).
-- **`ReleaseSlot` to „zwolnij slot taska czekającego" (redefinicja R15, decyzja).** Akcja dotyczy `Running` z `slot_release_due_at` i wykonaniem w stanie zwalniającym slot, przed terminem. Dodajemy `ControlPlane::release_slot_now` obok `release_slot`: ten sam `Pause`, aktor `Owner`, własny klucz idempotencji. `command_routed` dopuszcza ten wariant, gdy `TaskRecord::slot_release_pending` (nowy predykat: `Running`, klasa zwolnienia ustawiona, brak `owner_work_pending`, termin niezależnie od tego, czy minął) jest prawdziwy. Efekt jest taki sam jak po terminie: `PauseRequested` → `Stopped`, slot wolny po punkcie bezpiecznym. `TaskSummary` dostaje pole `slot_release_pending: bool` (domyślnie fałsz, dla zgodności), na którym opiera się oferta. `holds_capacity` i polityka czasu oczekiwania zostają bez zmian.
+- **`ReleaseSlot` kończy trzymanie slotu (R15, decyzja Q5 B).** Akcja dotyczy `Stopped`, który trzyma slot (`slot_hold_until`), albo `Running` czekającego na operatora (`slot_release_pending`). `OwnerCommand::ReleaseSlot` ze `Stopped` zostaje w `Stopped`, czyści `slot_hold_until` i podnosi generację; slot wraca do puli, a `reschedule_all` przelicza kolejkę. Z `Running` działa jak dotąd (`ControlPlane::release_slot_now`: pauza bez trzymania slotu). `command_routed` odrzuca `ReleaseSlot` w innych stanach (`IllegalCommand`). `TaskSummary::slot_release_pending` zostaje; dla `Stopped` oferta opiera się na `runner_state == Stopped` i `holds_slot`. Pole `slot_hold_until` jest w rekordzie z `#[serde(default)]`, więc starsze rekordy ładują się bez trzymania.
 - **`SelectStep` dostaje dane z serwera (decyzja).** `TaskSummary` dostaje opcjonalną listę `steps: Option<Vec<StepView>>` (`id`, `label`, `kind`: `agent`/`script`/`human`/`wait`/`decision`/`terminal`), budowaną z `launch_spec.definition()` w kolejności workflow (gdy brak definicji: `None`). Serwer wypełnia ją dla stanów, w których `SelectStep` jest oferowany (Stopped, workflow zakończony); dla innych zostaje `None`, żeby nie powiększać listy zadań. Lista zawiera wszystkie kroki (Z9), bez ograniczenia z `manual_transitions`. `options` akcji `SelectStep` odtwarza tę listę (etykieta kroku, opis). Klient decyduje o polu komentarza z `kind == agent` (R18), a nie z własnej wiedzy o workflow. `Transition` zostaje bez zmian.
 - **Komentarz z R18 wchodzi do `SelectStep` jako opcjonalny tekst.** Serwer dokleja go przez istniejący mechanizm notatki dla kroku (`leave_operator_note` / `RestartStep { note }`). Komentarz nie jest trwały (Z10).
 - **Panel akcji to istniejące menu**, a nie nowy widok. Zmieniamy jego źródło danych na ofertę serwera i usuwamy skróty. Zapasowy skrót (Q1) to dotychczasowe `.`.
@@ -112,7 +114,7 @@ Pominięte. Kod ma mocne lokalne wzorce (lista akcji, komendy, menu). Jedyna wie
 
 ### Przepływ stanów pauzy i stopu
 
-Szkic kierunkowy do przeglądu, nie specyfikacja implementacji. „Zatrzymany" (`Stopped`) nie trzyma slotu. „Wstrzymywany" (`PauseRequested`) trzyma.
+Szkic kierunkowy do przeglądu, nie specyfikacja implementacji. „Zatrzymany" (`Stopped`) trzyma slot do końca czasu oczekiwania, jeśli task czekał na operatora (Q5). „Wstrzymywany" (`PauseRequested`) trzyma.
 
 ```mermaid
 stateDiagram-v2
@@ -122,6 +124,7 @@ stateDiagram-v2
     Wstrzymywany --> Zatrzymany: sesja albo skrypt kończy pracę
     Wstrzymywany --> Wstrzymywany: StopStep zrywa pracę
     Dziala --> Wstrzymywany: Zwolnij slot (czeka na operatora)
+    Zatrzymany --> Zatrzymany: Zwolnij slot albo koniec czasu oczekiwania (slot wolny)
     Zatrzymany --> Dziala: rozmowa, restart skryptu, wybór kroku (albo kolejka, gdy brak slotu)
     Zatrzymany --> Archiwum: Archiwizuj
     Zakonczony --> Dziala: wybór kroku
@@ -136,7 +139,7 @@ stateDiagram-v2
 
 **Goal:** Serwer podaje akcje z R7–R19 z dostępnością i powodem.
 
-**Requirements:** R1, R7, R10, R13–R17, R19; AE3; Z3, Z6, Z8, Z9 (R15, Z7 i AE5 w zmienionym brzmieniu, patrz „Odstępstwa od dokumentu źródłowego").
+**Requirements:** R1, R7, R10, R13–R17, R19; AE3; Z3, Z6, Z8, Z9 (R15, Z7 i AE5 bez zmian; model pojemności wg decyzji Q5, patrz „Zgodność z dokumentem źródłowym i model pojemności").
 
 **Dependencies:** brak.
 
@@ -160,13 +163,14 @@ stateDiagram-v2
 | Stan taska | Pauza | Stop | Zwolnij slot | Restart skryptu | Wybór kroku | Archiwizuj |
 |---|---|---|---|---|---|---|
 | działa (`Running`), wykonanie pracuje | tak | tak | nie („zadanie nie czeka na operatora") | nie | nie | tak |
-| działa, czeka na operatora, `slot_release_pending` | tak | tak | tak | nie | nie | tak |
+| działa, czeka na operatora, `slot_release_pending` | tak | tak | tak (bez trzymania slotu) | nie | nie | tak |
 | wstrzymywany (`PauseRequested`) | nie („zadanie jest już wstrzymywane") | tak | nie | nie | nie | tak |
+| zatrzymany (`Stopped`), trzyma slot (`slot_hold_until`) | nie | nie | tak | tak, gdy krok skryptowy | tak | tak |
 | zatrzymany (`Stopped`), nie trzyma slotu | nie | nie | nie („zadanie nie trzyma slotu") | tak, gdy krok skryptowy | tak | tak |
 | workflow zakończony | nie | nie | nie | nie | tak | tak |
 | w kolejce, provisioning | nie | nie | nie | nie | nie | tak |
 
-Dla taska czekającego na człowieka obowiązują dotychczasowe akcje z dokumentu 2026-10-22. „Zwolnij slot" dla takiego taska jest nową akcją z drugiego wiersza tabeli.
+Dla taska czekającego na człowieka obowiązują dotychczasowe akcje z dokumentu 2026-10-22. „Zwolnij slot" dla takiego taska jest nową akcją z drugiego i czwartego wiersza tabeli.
 
 Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu uruchomienia dopuszcza `Stopped` z krokiem skryptowym. `Interrupted`/`Unknown` zostają poza ofertą `Stop`, `Pause`, `ReleaseSlot` i `SelectStep` (to utrata zadania: obowiązuje `not_running`, `loss_state`). `Stop` jest dostępny wyłącznie w `Running` i `PauseRequested`.
 
@@ -175,8 +179,8 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 **Test scenarios:**
 - Happy path: task `Running` → `Pause` i `Stop` dostępne, `ReleaseSlot` niedostępne z powodem.
 - Covers AE3. Task `PauseRequested` → `Pause` niedostępne z powodem „zadanie jest już wstrzymywane", `Stop` dostępne.
-- Covers AE5 (w zmienionym brzmieniu). Task `Running` czekający na operatora z `slot_release_pending` → `ReleaseSlot` dostępne. Task `Running` z pracującym wykonaniem → niedostępne z powodem.
-- Zatrzymany (`Stopped`, `holds_capacity` fałsz) → `ReleaseSlot` niedostępne z powodem „zadanie nie trzyma slotu". Wiersza „Stopped + trzyma slot" nie ma.
+- Covers AE5. Zatrzymany (`Stopped`), który trzyma slot (`holds_slot` prawdziwe) → `ReleaseSlot` dostępne; `Pause` i `Stop` niedostępne. Task `Running` czekający na operatora z `slot_release_pending` → `ReleaseSlot` dostępne. Task `Running` z pracującym wykonaniem → niedostępne z powodem.
+- Zatrzymany (`Stopped`) bez slotu → `ReleaseSlot` niedostępne z powodem „zadanie nie trzyma slotu".
 - `SelectStep`: `options` to wszystkie kroki z `steps` wraz z rodzajem kroku; brak `steps` → niedostępne z powodem.
 - Zatrzymany z krokiem skryptowym → `Restart` dostępne. Z krokiem agentowym → niedostępne.
 - Zakończony workflow → `SelectStep` dostępne z listą wszystkich kroków (także nieodwiedzonych), `Archive` dostępne.
@@ -192,7 +196,7 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 
 **Goal:** Ścieżki wysyłki dla `Stop`, `ReleaseSlot`, `SelectStep` z kontrolą dostępności w chwili wysyłki.
 
-**Requirements:** R2, R9, R15 (zmienione), R17, R18; AE5 (zmienione), AE6, AE8; Z10.
+**Requirements:** R2, R9, R15, R17, R18; AE5, AE6, AE8; Z7, Z10.
 
 **Dependencies:** U1, U3 (komenda `StopStep`).
 
@@ -202,7 +206,7 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 - `crates/narsor-engine/src/controller_protocol/service/slot_release.rs`
 - `crates/narsor-engine/src/orchestration/control_plane.rs`
 - `crates/narsor-engine/src/orchestration/lifecycle.rs`
-- `crates/narsor-engine/src/orchestration/model.rs` (`slot_release_pending`; `operator_command_refusal` zmienia U3)
+- `crates/narsor-engine/src/orchestration/model.rs` (`slot_release_pending`, `slot_hold_until`, `holds_capacity`, `holds_stopped_slot`; `operator_command_refusal` zmienia U3)
 - `crates/narsor-engine/src/orchestration/operator_commands.rs`
 - `crates/narsor-protocol/src/controller.rs` (komenda `OperatorCommand` dla wyboru kroku z komentarzem, jeśli `Transition` nie wystarcza)
 - Test: `tests/integration` (nowy plik lub istniejący zestaw dla kontrolera)
@@ -210,7 +214,7 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 **Approach:**
 - `Stop` wykonuje dwa kroki z Key Technical Decisions: `OwnerCommand::Pause` (tylko z `Running`), potem `OperatorCommand::StopStep` (U3). Serwer wywołuje `require_available` z `TaskActionId::Stop` przed oboma. Jeśli krok 2 się nie uda, task zostaje w `PauseRequested` (zwykła pauza), a klient dostaje błąd z powodem. `Stop` nigdy nie wysyła `OperatorCommand::Interrupt`.
 - `Restart` ze `Stopped` oraz `SelectStep` ze `Stopped`/`Completed`: `OwnerCommand::Resume` z dołączoną komendą operatora (`RestartStep` / `Transition`), według wzorca `comment_delivery`. Runner stosuje komendę przed ruszeniem przebiegu, żeby nie ruszył stary krok.
-- `ReleaseSlot`: nowa metoda `ControlPlane::release_slot_now` (`OwnerCommand::Pause`, aktor `Owner`, klucz idempotencji z przedrostkiem odróżniającym od `slot_release_key` polityki), dozwolona przez `command_routed`, gdy `TaskRecord::slot_release_pending`. Serwer sprawdza `require_available(ReleaseSlot)` przed wysyłką. Wynik: `PauseRequested` → `Stopped`; slot jest wolny po potwierdzeniu punktu bezpiecznego. Konkurencja z polityką (termin minął w tej samej chwili): drugi `Pause` kończy się `StaleGeneration` albo `IllegalCommand`, a klient widzi powód. Dodaj do `owner_action` rozróżnienie, żeby błąd wskazywał właściwą akcję.
+- `ReleaseSlot`: `OwnerCommand::ReleaseSlot` (klucz `owner_slot_release_key`, aktor `Owner`), dozwolone przez `command_routed`, gdy `TaskRecord::slot_release_pending` albo `TaskRecord::holds_stopped_slot`. Ze `Stopped` czyści `slot_hold_until` (slot wolny od razu, kolejka przeliczona). Z `Running` wysyła pauzę bez trzymania slotu. Serwer sprawdza `require_available(ReleaseSlot)` przed wysyłką. Konkurencja z polityką (termin minął w tej samej chwili): drugi `Pause` kończy się `StaleGeneration` albo `IllegalCommand`, a klient widzi powód. Trzymanie slotu po `Pause`/`Stop` ustawia `command_routed` (aktor `Owner`, task `slot_release_pending`, termin w przyszłości). Okresowy przebieg `slot_release_pass` kończy trzymanie po terminie (`ControlPlane::end_slot_hold`). Dodaj do `owner_action` rozróżnienie, żeby błąd wskazywał właściwą akcję.
 - `SelectStep` przyjmuje nazwę kroku i opcjonalny komentarz. Dla kroku agentowego komentarz trafia do notatki kroku (mechanizm `leave_operator_note`). Dla kroku skryptowego komentarz jest odrzucony lub ignorowany — decyzja w implementacji, udokumentowana w teście.
 - Odrzucenie niedozwolonej akcji zwraca `action_unavailable` z powodem (istniejący kod błędu).
 - Stary klient wysyłający `Interrupt` lub `Pause`/`Resume` nadal działa, jeśli stan na to pozwala (zgodność, `Interrupt` daje `Interrupted` jak dziś). Serwer odrzuca `Interrupt` z powodem tylko wtedy, gdy stan jest niedozwolony.
@@ -218,14 +222,15 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 **Patterns to follow:** `require_owner_command_available`, `require_available`, `comment_delivery`.
 
 **Test scenarios:**
-- Covers AE5 (zmienione). Task `Running` czekający na operatora, przed terminem → `ReleaseSlot` → `PauseRequested` → `Stopped`, `holds_capacity` fałsz, następny task z kolejki startuje, task da się wznowić (rozmowa albo `SelectStep`; wznowienie bez wolnego slotu idzie na początek kolejki).
+- Covers AE5. Task `Running` czekający na operatora, przed terminem → `Pause` → `Stopped` trzyma slot (`holds_capacity` prawdziwe) → `ReleaseSlot` → slot wolny, następny task z kolejki startuje. Po upływie terminu bez `ReleaseSlot` slot też wraca do puli. Wznowienie taska, który trzyma slot, idzie prosto do `Provisioning`; wznowienie po zwolnieniu slotu bez wolnego miejsca idzie na początek kolejki.
+- Edge: `Pause` taska, który pracuje (brak terminu), pauza z polityki i zatrzymanie z powodu limitu → `Stopped` bez slotu. `Archiwizuj` kończy trzymanie.
 - Edge: `ReleaseSlot` i polityka w tej samej chwili → jeden `Pause` wygrywa, drugi jest odrzucony bez zmiany stanu.
 - Covers AE8. Archiwizacja wysłana po zmianie stanu na niedozwolony → odrzucenie z `action_unavailable` i powodem. Uwaga: Z8 mówi, że archiwizacja działa w każdym stanie, więc scenariusz testuj na innej akcji (np. `Stop` po tym jak task już się zatrzymał) i zapisz to w teście.
 - Covers AE6. `SelectStep` na zakończonym workflow z komentarzem → krok rusza, a prompt zawiera komentarz. Bez komentarza → zwykły prompt.
 - Edge: komentarz po ponownym wyborze kroku nie zostaje w następnym przebiegu (Z10).
 - Error: `SelectStep` z nieznanym krokiem → błąd z powodem.
 - Error: `ReleaseSlot` dla taska `Stopped` albo `Running` z pracującym wykonaniem → odrzucone z `action_unavailable` i powodem.
-- Integration: `Stop` z `Running` → `PauseRequested` → `Stopped` + `TaskState::Paused`, slot zajęty w `PauseRequested` i wolny po punkcie bezpiecznym, brak `Interrupted` i brak próby auto-wznowienia.
+- Integration: `Stop` z `Running` → `PauseRequested` → `Stopped` + `TaskState::Paused`, slot zajęty w `PauseRequested`; po punkcie bezpiecznym trzymany do końca czasu oczekiwania albo wolny, gdy task nie czekał na operatora, brak `Interrupted` i brak próby auto-wznowienia.
 - Integration: `Pause` (właściciel), potem `StopStep` w `PauseRequested` → przyjęty (nie „the task is pausing"), a każda inna komenda operatora w `PauseRequested` nadal odrzucona.
 - Integration: `Stop` wysłane do `PauseRequested` → task przechodzi w „zatrzymany" (R10), także gdy przebieg już się skończył.
 - Integration: po `Stop` działają komentarz (R11), `SelectStep` i `Restart` skryptu; każde wznawia przez `Resume` z dołączoną komendą i rusza właściwy krok, nie stary. Gdy brak wolnego slotu, task czeka w kolejce z dołączoną komendą i rusza po przydziale slotu.
@@ -237,7 +242,7 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 
 ### U3. Runner: pauza czeka, stop zrywa (nowa komenda `StopStep`)
 
-**Goal:** Dodać ścieżkę stopu kończącą się w `Stopped` (sesje zachowane, slot oddany jak przy pauzie, bez automatycznego wznawiania) i rozróżnić ją od pauzy zgodnie z R8, R9, R10, Z4, Z5.
+**Goal:** Dodać ścieżkę stopu kończącą się w `Stopped` (sesje zachowane, slot wg reguły Q5, tak jak przy pauzie, bez automatycznego wznawiania) i rozróżnić ją od pauzy zgodnie z R8, R9, R10, Z4, Z5.
 
 **Requirements:** R8, R9, R10, R13; F1, F2; AE1, AE2; Z4, Z5.
 
@@ -270,7 +275,7 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 
 **Test scenarios:**
 - Covers AE1. Pauza w kroku agentowym: sesja kończy się sama, `PauseRequested` → `Stopped`, sesja nie jest zerwana.
-- Covers AE2. Stop w kroku skryptowym (`Running`): proces skryptu z potomkami ginie, końcowy stan `Stopped` + `TaskState::Paused`, slot wolny po punkcie bezpiecznym, `RunnerState::Interrupted` nie występuje na żadnym etapie.
+- Covers AE2. Stop w kroku skryptowym (`Running`): proces skryptu z potomkami ginie, końcowy stan `Stopped` + `TaskState::Paused`, slot po punkcie bezpiecznym według reguły Q5, `RunnerState::Interrupted` nie występuje na żadnym etapie.
 - Stop w kroku agentowym: sesja zerwana, identyfikator sesji zachowany, wznowienie komentarzem z promptem działa.
 - Pauza w kroku skryptowym: skrypt dobiega końca, potem `Stopped`.
 - Covers R10. Stop w `PauseRequested` z aktywnym przebiegiem: przebieg zerwany, `Stopped` szybciej niż przy samej pauzie.
@@ -282,7 +287,7 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 - Zgodność: stary klient wysyła `OperatorCommand::Interrupt` — zachowanie jak dziś (`Interrupted`).
 - Error: wznowienie sesji, której harness nie wznowi → błąd z powodem, możliwy wybór innego kroku.
 
-**Verification:** Po `Stop` task zawsze ląduje w `Stopped` + `TaskState::Paused` z zachowanymi sesjami (slot oddany jak przy pauzie), bez udziału `Interrupted` i automatycznego wznawiania; pauza i stop zgadzają się z AE1 i AE2 dla obu rodzajów kroku.
+**Verification:** Po `Stop` task zawsze ląduje w `Stopped` + `TaskState::Paused` z zachowanymi sesjami (slot wg reguły Q5, tak jak przy pauzie), bez udziału `Interrupted` i automatycznego wznawiania; pauza i stop zgadzają się z AE1 i AE2 dla obu rodzajów kroku.
 
 ---
 
@@ -336,7 +341,7 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 - Rozszerz `TaskAction` o `Stop`, `ReleaseSlot`, `SelectStep`. Usuń `PauseResume` (zostaje `Pause`). Zaktualizuj `TaskAction::ALL` i mapowanie w `panel/state.rs`.
 - Źródłem dostępności jest wyłącznie `TaskSummary::actions`. Gdy serwer nie podał listy, każda akcja jest niedostępna z powodem „brak danych" (R3). Usuń pozostałości lokalnej oceny (`availability` z lokalnymi regułami, np. `PauseResume` przy `Stopped`).
 - Formularz `SelectStep`: lista kroków z `TaskSummary::steps` (zgodna z `options` akcji), a dla kroku z `kind == agent` pole opcjonalnego komentarza. Klient nie czyta definicji workflow i nie zgaduje rodzaju kroku. Gdy `steps` brak, akcja jest niedostępna z powodem.
-- „Zwolnij slot" pokazuje się według oferty serwera (`slot_release_pending`), bez lokalnej reguły.
+- „Zwolnij slot" pokazuje się według oferty serwera (`slot_release_pending` albo `Stopped` z `holds_slot`), bez lokalnej reguły.
 - Po odrzuceniu akcji przez serwer pokaż powód i odśwież panel (AE8). Zachowaj kontrakt z `docs/solutions/design-patterns/tui-modal-confirmation-keyboard-contract.md`. Odświeżenie w tle nie może zamknąć potwierdzenia (`docs/solutions/ui-bugs/tui-confirmation-popup-closed-by-background-refresh-2026-10-26.md`).
 - Potwierdzenie dla `Stop` i `Archive` zostaje (`needs_confirmation`).
 
@@ -407,7 +412,7 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 | Zmiana semantyki pauzy zmienia politykę slotów | Regresja zwalniania slotów | Testy integracyjne `slot_release` i `auto_resume` w U3 |
 | Stary klient wysyła `Resume`/`Interrupt` | Błąd zgodności | Serwer zachowuje komendy, zmienia tylko ofertę |
 | `StopStep` w `PauseRequested` poluzowuje `operator_command_refusal` za bardzo | Inne komendy operatora trafiają do pauzującego runnera | Test komenda × stan w `model.rs`; wyjątek tylko dla `StopStep` |
-| Operator oczekuje „zwolnij slot po Stop", a slot jest już wolny | Rozbieżność z dokumentem źródłowym (R15, AE5) | Odstępstwo opisane i zgłoszone jako pytanie otwarte; akcja dotyczy taska czekającego |
+| Trzymanie slotu po `Pause`/`Stop` blokuje kolejkę do końca czasu oczekiwania | Task w kolejce czeka dłużej | Termin trzymania to ten sam `slot_release_due_at`; „Zwolnij slot" i „Archiwizuj" kończą go od razu; test integracyjny `slot_release` |
 | `steps` w `TaskSummary` powiększa listę zadań | Koszt odpowiedzi listy | `steps` tylko dla stanów, w których `SelectStep` jest oferowany |
 
 ---
@@ -425,10 +430,11 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 
 ### Pytania otwarte dla użytkownika
 
-1. **Sekcja: Requirements R15, Z7, AE5 (zwolnienie slotu).** Dokument źródłowy zakłada, że zatrzymany task trzyma slot do końca czasu oczekiwania. W kodzie `Stopped` oddaje slot od razu (`holds_capacity` jest fałszywe). Jak zdefiniować „Zwolnij slot"?
-   - **A (zalecane):** akcja dotyczy taska `Running`, który czeka na reakcję operatora i ma termin zwolnienia slotu. Wysyła ten sam `Pause` co polityka, przed terminem. Taski `Stopped` tej akcji nie mają. Plan jest napisany według tej opcji.
-   - **B:** zmienić model pojemności tak, by `Stopped` po pauzie albo stopie trzymał slot do końca czasu oczekiwania. To zmienia `holds_capacity`, kolejkę wznowień i dokument 2026-10-18.
-   - **C:** usunąć R15, Z7, AE5 i akcję „Zwolnij slot" z zakresu.
+Brak pytań otwartych.
+
+### Decyzje
+
+- **Q5 (zamknięte, opcja B).** `Stopped` po `Pauza` albo `Stop` trzyma slot do końca czasu oczekiwania, a `ReleaseSlot` go kończy. R15, Z7 i AE5 obowiązują bez odstępstwa. Zmienia to `holds_capacity`, kolejkę wznowień i dokument 2026-10-18. Czas trwania trzymania po `Stop`: ten sam `slot_release_due_at`; `Zwolnij slot` albo `Archiwizuj` kończy go od razu (zalecenie przyjęte).
 
 ---
 

@@ -74,6 +74,7 @@ Proste zatrzymanie runnera po zakończeniu (automatyczna pauza) ma koszt. Gdy ru
 - R5. Zwolnienie slotu od razu przelicza kolejkę backendu. Następny task dostaje slot bez działania właściciela.
 - R6. Okres oczekiwania jest ustawieniem backendu z wartością domyślną ok. 5 minut.
 - R7. Otwarcie szczegółów taska w stanie chwilowym, który ma jeszcze slot, wydłuża okres oczekiwania o kilka minut. Wydłużenie jest ustawieniem backendu.
+- R7a. (Zmiana z 2026-11-11, plan `2026-11-11-001-feat-akcje-taska-pauza-stop-panel-plan.md`, decyzja Q5.) Gdy właściciel wstrzyma (Pauza) albo zatrzyma (Stop) task w okresie oczekiwania, task w stanie `Stopped` trzyma slot do końca tego okresu (ten sam termin `slot_release_due_at`, zapisany jako `slot_hold_until`). Akcja „Zwolnij slot" i archiwizacja kończą trzymanie od razu. Wznowienie taska, który trzyma slot, nie potrzebuje nowego slotu. Pauza z polityki, pauza taska, który pracuje, i zatrzymanie z powodu limitu nie trzymają slotu. Poza tym wyjątkiem `Stopped` nie trzyma slotu.
 
 **Runner tylko do odczytu**
 - R8. Odczyt rozmowy, zdarzeń albo czatu dyrygenta taska bez działającego runnera idzie na każdym backendzie tą samą drogą: centrala prosi controller o runnera tylko do odczytu. Centrala nie czyta storage taska bezpośrednio.
