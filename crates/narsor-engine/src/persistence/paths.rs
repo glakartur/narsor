@@ -110,6 +110,9 @@ pub const STATE_FILE: &str = "state.json";
 /// File holding the serialized `Context`.
 pub const CONTEXT_FILE: &str = "context.json";
 
+/// The latest result of a `profile` step, inside an execution directory.
+pub const STEP_PROFILE_FILE: &str = "step-profile.json";
+
 /// The definition an execution was started from, pinned inside its directory.
 ///
 /// An execution is resumable from its own record alone, so the definition
@@ -339,6 +342,11 @@ impl StatePaths {
         self.execution_dir(execution_id)
             .join("step-replies")
             .join(format!("{attempt_id}.txt"))
+    }
+
+    /// `{root}/executions/{execution_id}/step-profile.json`
+    pub fn step_profile_file(&self, execution_id: &str) -> PathBuf {
+        self.execution_dir(execution_id).join(STEP_PROFILE_FILE)
     }
 
     /// `{root}/orchestration`
