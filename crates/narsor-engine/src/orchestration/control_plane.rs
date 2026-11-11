@@ -197,6 +197,7 @@ impl ControlPlane {
             workload_epoch: None,
             resume: ResumeState::default(),
             slot_release_due_at: None,
+            slot_hold_until: None,
             limit_stop_accepted: false,
             reader_lease: None,
             resume_message: None,
@@ -300,7 +301,8 @@ impl ControlPlane {
             // for the owner; a stale or other client cannot release the slot
             // of a task that works.
             if request.command == OwnerCommand::ReleaseSlot
-                && (request.actor == CommandActor::Policy || !record.slot_release_pending())
+                && (request.actor == CommandActor::Policy
+                    || !(record.slot_release_pending() || record.holds_stopped_slot()))
             {
                 return Err(OrchestrationError::IllegalCommand {
                     task_id: record.task_id.clone(),
@@ -380,6 +382,16 @@ impl ControlPlane {
                     } else {
                         next
                     };
+                    // The owner's pause of a task that waits for the owner
+                    // keeps the slot until the wait would end; any other
+                    // command (a resume, an archive, `ReleaseSlot`) ends a
+                    // hold. Read before the state changes.
+                    let slot_hold = (request.command == OwnerCommand::Pause
+                        && request.actor == CommandActor::Owner
+                        && record.slot_release_pending())
+                    .then_some(record.slot_release_due_at)
+                    .flatten()
+                    .filter(|due_at| *due_at > now);
                     record.generation += 1;
                     record.runner_state = next;
                     // The accepted safe point belongs to the pause it was
@@ -387,6 +399,7 @@ impl ControlPlane {
                     if next != RunnerState::PauseRequested {
                         record.limit_stop_accepted = false;
                     }
+                    record.slot_hold_until = slot_hold;
                     // A new desired state ends whatever the last snapshot
                     // made the policy wait for.
                     record.slot_release_due_at = None;
@@ -481,6 +494,25 @@ impl ControlPlane {
             )
             .expecting_generation(generation),
         )
+    }
+
+    /// Ends the slot hold of a `Stopped` task whose deadline passed: the
+    /// slot is free from now on. `None` when the task holds no slot that is
+    /// due.
+    pub fn end_slot_hold(&self, task_id: &TaskId) -> Result<Option<TaskRecord>> {
+        let (record, ended) = self.mutate(task_id, |record, now| {
+            if !record.slot_hold_expired(now) {
+                return Ok(Mutation::Unchanged(false));
+            }
+            record.slot_hold_until = None;
+            Ok(Mutation::Changed(
+                TaskEventKind::SlotReleased {
+                    reason: SlotReleaseReason::GraceElapsed,
+                },
+                true,
+            ))
+        })?;
+        Ok(ended.then_some(record))
     }
 
     /// Plans the slot release of a running task whose last snapshot is in a
@@ -799,6 +831,7 @@ impl ControlPlane {
                     let next = if next == RunnerState::Stopped && record.limit_stop_accepted {
                         record.limit_stop_accepted = false;
                         record.slot_release_due_at = None;
+                        record.slot_hold_until = None;
                         record.reservation = None;
                         record.queue = None;
                         record.generation += 1;

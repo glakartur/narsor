@@ -448,7 +448,9 @@ pub fn safe_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
 
 /// Whether a runner that holds a slot is expected to report.
 fn is_live(task: &TaskSummary) -> bool {
-    task.holds_slot && matches!(task.state, TaskState::Running | TaskState::Paused)
+    task.holds_slot
+        && task.runner_state != RunnerState::Stopped
+        && matches!(task.state, TaskState::Running | TaskState::Paused)
 }
 
 /// What the owner can do about the task now, in words.
@@ -479,6 +481,13 @@ pub fn state_hint(task: &TaskSummary) -> Option<ToneLine> {
         // Lost while pausing: no attempt is planned, the owner decides.
         TaskState::Paused if task.runner_state == RunnerState::Interrupted => {
             interrupted_hint(task)
+        }
+        TaskState::Paused if task.runner_state == RunnerState::Stopped && task.holds_slot => {
+            ToneLine::new(
+                "stopped at a safe point; the slot is held until the wait ends — resume (u), \
+                 release the slot or archive (a)",
+                Tone::Normal,
+            )
         }
         TaskState::Paused if task.holds_slot => ToneLine::new(
             "pausing: waiting for the runner to reach a safe point",

@@ -53,6 +53,27 @@ impl ProtocolService {
         };
         let mut pass = SlotReleasePass::default();
         let mut timings: HashMap<BackendId, SlotReleaseTimings> = HashMap::new();
+        let mut ended_hold = false;
+        for task in &tasks {
+            if !task.slot_hold_expired(self.control.now()) {
+                continue;
+            }
+            match self.control.end_slot_hold(&task.task_id) {
+                Ok(Some(_)) => {
+                    ended_hold = true;
+                    pass.released.push(task.task_id.clone());
+                    self.notify(&task.task_id);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(task = %task.task_id, %error, "slot release: cannot end the hold of a stopped task");
+                }
+            }
+        }
+        if ended_hold {
+            // A freed global slot can admit queued work on any backend.
+            self.reschedule_all();
+        }
         for task in tasks {
             if task.runner_state != RunnerState::Running || task.slot_release_class().is_none() {
                 continue;

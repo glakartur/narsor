@@ -47,6 +47,8 @@ pub(crate) fn command_effect(current: RunnerState, command: OwnerCommand) -> Com
         (OwnerCommand::Pause | OwnerCommand::ReleaseSlot, Running) => {
             CommandEffect::Transition(PauseRequested)
         }
+        // The owner ends the slot hold of a stopped task; the state stays.
+        (OwnerCommand::ReleaseSlot, Stopped) => CommandEffect::Transition(Stopped),
         (OwnerCommand::Resume, Stopped | Interrupted | Unknown) => {
             CommandEffect::Transition(Provisioning)
         }

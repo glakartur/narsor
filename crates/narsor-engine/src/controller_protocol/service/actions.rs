@@ -99,7 +99,9 @@ pub(super) fn unavailable_reason(task: &TaskSummary, id: TaskActionId) -> Option
             _ => not_running(task).or(runner_unreachable(task)),
         },
         TaskActionId::ReleaseSlot => {
-            if task.slot_release_pending {
+            if task.slot_release_pending
+                || (task.runner_state == RunnerState::Stopped && task.holds_slot)
+            {
                 None
             } else if !task.holds_slot {
                 Some("zadanie nie trzyma slotu".to_string())
@@ -355,6 +357,9 @@ fn state_phrase(task: &TaskSummary) -> &'static str {
         TaskState::Queued => "zadanie jest w kolejce",
         TaskState::Running => "zadanie działa",
         TaskState::HumanNeeded => "zadanie czeka na odpowiedź",
+        TaskState::Paused if task.runner_state == RunnerState::Stopped && task.holds_slot => {
+            "zadanie jest wstrzymane i trzyma slot"
+        }
         TaskState::Paused if task.holds_slot => "zadanie jest wstrzymywane",
         TaskState::Paused => "zadanie jest wstrzymane",
         TaskState::Finished => "zadanie jest zakończone",
@@ -818,6 +823,14 @@ mod tests {
         let release = offered(&task, TaskActionId::ReleaseSlot);
         assert!(!release.available);
         assert_eq!(release.reason.as_deref(), Some("zadanie nie trzyma slotu"));
+    }
+
+    #[test]
+    fn a_stopped_task_that_still_holds_its_slot_offers_the_release() {
+        let task = summary("stopped", "paused", true);
+        assert!(offered(&task, TaskActionId::ReleaseSlot).available);
+        assert!(!offered(&task, TaskActionId::Pause).available);
+        assert!(!offered(&task, TaskActionId::Stop).available);
     }
 
     #[test]

@@ -42,7 +42,9 @@
 //!
 //! See [`TaskRecord::holds_capacity`]: everything that has or may have
 //! compute, conservatively including `Interrupted`, `Unknown` and
-//! `Archiving`; a `Stopped` task released its compute and its slot.
+//! `Archiving`. A `Stopped` task released its compute; it keeps its slot only
+//! after the owner's `Pause` or `Stop` of a task that waited for the owner,
+//! until that wait's deadline, `ReleaseSlot`, a resume or an archive ends it.
 //!
 //! # An offline controller
 //!

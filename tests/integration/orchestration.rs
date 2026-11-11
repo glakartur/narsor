@@ -4513,6 +4513,106 @@ fn the_owner_frees_the_slot_of_a_waiting_task_before_the_deadline() {
     assert!(!stopped.holds_capacity());
 }
 
+/// The owner pauses a task that waits for them, and the safe point is
+/// acknowledged: the task is `Stopped`.
+fn owner_pauses_waiting_task(fx: &Fixture, lease: &BackendLease) -> TaskRecord {
+    fx.running("task-1", lease);
+    runner_reports(fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    fx.clock.advance(Duration::seconds(10));
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    fx.observe("task-1", lease, Observation::PausedAtSafePoint)
+        .expect("the safe point");
+    fx.control.task(&task("task-1")).unwrap()
+}
+
+#[test]
+fn a_stopped_task_keeps_its_slot_until_the_wait_deadline() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    let stopped = owner_pauses_waiting_task(&fx, &lease);
+
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    assert!(stopped.holds_capacity());
+    assert!(stopped.holds_stopped_slot());
+    assert!(!stopped.holds_compute_slot());
+    assert_eq!(fx.control.total_capacity_in_use().unwrap(), 1);
+    assert!(fx.control.end_slot_hold(&task("task-1")).unwrap().is_none());
+
+    fx.clock.advance(Duration::seconds(301));
+    let released = fx
+        .control
+        .end_slot_hold(&task("task-1"))
+        .unwrap()
+        .expect("the wait is over");
+    assert!(!released.holds_capacity());
+    assert_eq!(fx.control.total_capacity_in_use().unwrap(), 0);
+}
+
+#[test]
+fn release_slot_ends_the_hold_of_a_stopped_task_at_once() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    owner_pauses_waiting_task(&fx, &lease);
+
+    let released = release_slot_now(&fx, "task-1").expect("the task holds a slot");
+
+    assert_eq!(released.runner_state, RunnerState::Stopped);
+    assert!(!released.holds_capacity());
+    assert_eq!(fx.control.total_capacity_in_use().unwrap(), 0);
+    assert!(matches!(
+        release_slot_now(&fx, "task-1"),
+        Err(OrchestrationError::IllegalCommand { .. })
+    ));
+}
+
+#[test]
+fn a_resume_of_a_stopped_task_that_holds_a_slot_needs_no_new_one() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    owner_pauses_waiting_task(&fx, &lease);
+
+    let resumed = fx.command("task-1", OwnerCommand::Resume, "resume-1");
+
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
+    assert!(resumed.holds_capacity());
+    assert_eq!(resumed.slot_hold_until, None);
+}
+
+#[test]
+fn an_archive_ends_the_hold_of_a_stopped_task() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    owner_pauses_waiting_task(&fx, &lease);
+
+    let archived = fx.command("task-1", OwnerCommand::Archive, "archive-1");
+
+    assert_eq!(archived.slot_hold_until, None);
+}
+
+#[test]
+fn a_pause_of_a_task_that_works_or_by_the_policy_holds_no_slot() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::Running, None);
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .expect("the safe point");
+    let stopped = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    assert!(!stopped.holds_capacity());
+
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    fx.clock.advance(Duration::seconds(301));
+    release_slot(&fx, "task-1").expect("the policy");
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .expect("the safe point");
+    assert!(!fx.control.task(&task("task-1")).unwrap().holds_capacity());
+}
+
 #[test]
 fn the_owner_cannot_free_the_slot_of_a_task_that_works() {
     let fx = Fixture::new();
@@ -4832,6 +4932,12 @@ fn stopped_waiting_on_input(fx: &Fixture, lease: &BackendLease) {
         )
         .unwrap();
     report_now(fx, "task-1", lease, Observation::PausedAtSafePoint).unwrap();
+    // The owner's pause kept the slot for the wait; here it has ended.
+    let stopped = fx.control.task(&task("task-1")).unwrap();
+    assert!(stopped.holds_stopped_slot());
+    fx.control
+        .release_slot_now(&task("task-1"), stopped.generation)
+        .unwrap();
 }
 
 fn answer(pending: &str, key: &str) -> narsor_engine::orchestration::InputRequest {
