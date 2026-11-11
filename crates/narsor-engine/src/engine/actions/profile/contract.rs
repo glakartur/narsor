@@ -4,9 +4,7 @@
 use serde_json::{json, Value};
 
 use super::candidates::ProfileCandidate;
-use crate::domain::{ProfileActionConfig, WorkspaceAccess};
-use crate::engine::actions::session::RESUME_SESSION_PARAMETER;
-use crate::engine::step_profile::{Setting, EFFORT_SCALE, MODEL_TIERS};
+use crate::engine::step_profile::{effective_ceiling, Setting, EFFORT_SCALE, MODEL_TIERS};
 
 /// The answer object of a `profile` step.
 const PROFILE_ANSWER_SHAPE: &str = "{\"entries\": [{\"step\": \"<step id>\", \"model\": \
@@ -51,10 +49,7 @@ fn candidate_line(candidate: &ProfileCandidate) -> String {
     match &candidate.ceiling {
         Some(ceiling) => line.push_str(&format!(
             "; ceiling: {}",
-            setting_text(&Setting {
-                model: ceiling.model.clone().or(candidate.default.model.clone()),
-                effort: ceiling.effort.clone().or(candidate.default.effort.clone()),
-            })
+            setting_text(&effective_ceiling(&candidate.default, Some(ceiling)))
         )),
         None => line.push_str("; no ceiling: a value above the default is lowered to it"),
     }
@@ -144,26 +139,6 @@ pub const PROFILE_REPROMPT: &str = "Your previous reply could not be used by the
 because it did not end with a valid step profile object. Do not do any further work and \
 do not change any files. Reply only with the JSON object described below, with the \
 profile you already decided on.";
-
-/// The configuration of the engine's reprompt of a profiling agent (R13):
-/// resumes `harness_session` on `harness`, read-only, asking only for the
-/// profile object. `reason` says why the previous answer was rejected.
-pub fn reprompt_config(
-    original: &ProfileActionConfig,
-    harness: &str,
-    harness_session: &str,
-    reason: &str,
-) -> ProfileActionConfig {
-    let mut config = original.clone();
-    config.harness_step.harness = Some(harness.to_string());
-    config.harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
-    config.prompt = format!("{PROFILE_REPROMPT}\n\nWhy it was rejected: {reason}").into();
-    config.harness_step.parameters.insert(
-        RESUME_SESSION_PARAMETER.to_string(),
-        Value::String(harness_session.to_string()),
-    );
-    config
-}
 
 #[cfg(test)]
 mod tests {

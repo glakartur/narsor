@@ -86,15 +86,14 @@ use crate::conductor::ConductorRegistry;
 use crate::config::DEFAULT_ESCALATION_THRESHOLD;
 use crate::config::{AgentArgs, AgentDefaults};
 use crate::domain::{
-    effective_title, ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy,
-    Artifact, ArtifactReference, ChoiceDefinition, DecisionMaker, DecisionProviderType, Event,
-    EventData, ExecutionId, ExecutionStatus, HarnessStepConfig, HumanActionConfig, HumanInputField,
+    effective_title, ActionConfig, ActionError, ActionResult, AnsweredBy, Artifact,
+    ArtifactReference, ChoiceDefinition, DecisionMaker, DecisionProviderType, Event, EventData,
+    ExecutionId, ExecutionStatus, HarnessStepConfig, HumanActionConfig, HumanInputField,
     HumanInputType, InputCloseReason, ProblemKind, RepromptedBy, State, StateId, VariableSource,
     WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
 };
 use crate::engine::actions::agent::{
-    self, DefaultHarnessSource, UsageReporter, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL,
-    SESSION_DATA_KEY,
+    self, DefaultHarnessSource, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL, SESSION_DATA_KEY,
 };
 use crate::engine::actions::harness;
 use crate::engine::actions::human::{
@@ -106,7 +105,7 @@ use crate::engine::actions::human::{
 use crate::engine::actions::profile::{self as profile_action, ProfileExecutor};
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
-    ScriptExecutor, StepContract, StepScope, SuspendedAction,
+    ScriptExecutor, StepContract, StepScope, SuspendedAction, UsageReporter,
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
@@ -177,6 +176,9 @@ const ANSWER_TAIL_BYTES: usize = 2 * 1024;
 /// A one-shot operator note to attach to the next recovered agent attempt.
 const METADATA_OPERATOR_RECOVERY_NOTE_KEY: &str = "operator_recovery_note";
 const METADATA_AGENT_INPUT_KEY: &str = "agent_input";
+/// Set once the execution recorded that its step profile file could not be
+/// read; cleared when a `profile` step writes the file again.
+const METADATA_UNREADABLE_STEP_PROFILE_KEY: &str = "unreadable_step_profile_noted";
 /// The key of the last comment on a pause the engine was given.
 const METADATA_RESUME_MESSAGE_KEY: &str = "resume_message_key";
 const METADATA_AGENT_SESSIONS_KEY: &str = "completed_agent_sessions";
@@ -292,14 +294,23 @@ impl ActionKind {
         }
     }
 
-    /// Whether an answer that breaks the step contract — a label the state
-    /// does not declare, a value outside its `options` — is rejected and
-    /// asked for again (KTD7) rather than failing the action.
-    pub fn reprompts_rejected_output(self) -> bool {
+    /// What the engine's reprompt asks when an answer breaks the step
+    /// contract — a label the state does not declare, a value outside its
+    /// `options` — and is asked for again (KTD7). `None` for an action whose
+    /// such answer fails the action instead.
+    pub fn reprompt_text(self) -> Option<&'static str> {
         match self {
-            Self::Agent | Self::Profile => true,
-            Self::Script | Self::Human | Self::Wait | Self::Decision => false,
+            Self::Agent => Some(agent::OUTPUT_REPROMPT),
+            Self::Profile => Some(profile_action::PROFILE_REPROMPT),
+            Self::Script | Self::Human | Self::Wait | Self::Decision => None,
         }
+    }
+
+    /// Whether an answer that breaks the step contract is rejected and
+    /// asked for again ([`Self::reprompt_text`]) rather than failing the
+    /// action.
+    pub fn reprompts_rejected_output(self) -> bool {
+        self.reprompt_text().is_some()
     }
 
     /// Whether the conductor may settle an output the reprompt did not
@@ -986,6 +997,15 @@ impl ActionUpshot {
             Flow::Continue => Self::Transitioned,
         }
     }
+}
+
+/// Where an output the engine's reprompt did not repair goes.
+#[derive(Clone, Copy)]
+enum Unrepaired {
+    /// To the conductor's rescue (F1).
+    Rescued,
+    /// Back as a failed attempt, for `retry_policy` (R13).
+    Retried,
 }
 
 /// How one attempt asking the agent again for its label ended.
@@ -2552,17 +2572,17 @@ impl Engine {
                     // Outside the retry schedule on purpose (R15): a format
                     // error is repaired in the same session, not re-run.
                     self.reject_output(execution, &rejection)?;
-                    if !kind.retries_unrepaired_output() {
-                        return self
-                            .reprompt(definition, execution, state, action, rejection, timeout)
-                            .await;
-                    }
                     // Unless the step's own retries come next (R13): the
                     // reprompt attempt that is still unusable is the one
                     // that fails.
+                    let unrepaired = if kind.retries_unrepaired_output() {
+                        Unrepaired::Retried
+                    } else {
+                        Unrepaired::Rescued
+                    };
                     match self
-                        .reprompt_before_retry(
-                            definition, execution, state, action, rejection, timeout,
+                        .reprompt(
+                            definition, execution, state, action, rejection, timeout, unrepaired,
                         )
                         .await?
                     {
@@ -2977,10 +2997,25 @@ impl Engine {
             .timeout_for(ActionKind::of(action), state, definition)
             .map(Duration::from_secs);
 
-        match self
-            .reprompt(definition, execution, state, action, rejection, timeout)
+        let upshot = match self
+            .reprompt(
+                definition,
+                execution,
+                state,
+                action,
+                rejection,
+                timeout,
+                Unrepaired::Rescued,
+            )
             .await?
         {
+            Ok(upshot) => upshot,
+            Err((failed_attempt, failure)) => {
+                self.fail_attempts(execution, &failed_attempt, failure, false)?;
+                return Ok(Flow::Stop);
+            }
+        };
+        match upshot {
             ActionUpshot::Stopped => Ok(Flow::Stop),
             ActionUpshot::Transitioned => Ok(Flow::Continue),
             ActionUpshot::Completed {
@@ -2995,10 +3030,12 @@ impl Engine {
     /// only for the output object.
     ///
     /// Not a `retry_policy` retry (R15): it is announced by `OutputReprompted`,
-    /// never `ActionRetrying`. Whatever it ends with but a label — another
-    /// format error, a question, a failure — and a rejected attempt with no
-    /// session to resume, hands the step to the conductor (F1,
-    /// [`Engine::rescue_output`]).
+    /// never `ActionRetrying`. Whatever it ends with but a usable answer —
+    /// another format error, a failure — and a rejected attempt with no
+    /// session to resume, goes where `unrepaired` says: to the conductor
+    /// (F1, [`Engine::rescue_output`]), or back as the failure of the still
+    /// open attempt that gave it, for `retry_policy` to judge (R13).
+    #[allow(clippy::too_many_arguments)]
     async fn reprompt(
         &self,
         definition: &WorkflowDefinition,
@@ -3007,129 +3044,40 @@ impl Engine {
         action: &ActionConfig,
         rejection: OutputRejection,
         timeout: Option<Duration>,
-    ) -> Result<ActionUpshot, EngineError> {
-        let mut rescue = OutputRescue::after(&rejection);
-        let Some(config) = self.reprompt_config(execution, state, action, &rejection) else {
-            rescue.reason = format!(
-                "{} The agent could not be asked again for its output label: its \
-                 harness reported no session to resume.",
-                rejection.reason
-            );
-            self.begin_rescue(execution, &rescue)?;
-            let flow = self
-                .rescue_output(definition, execution, state, rescue, timeout)
-                .await?;
-            return Ok(ActionUpshot::settled(flow));
-        };
-
-        match self
-            .reprompt_attempt(
-                definition,
-                execution,
-                state,
-                config,
-                &rejection.action_execution_id,
-                rejection.reply.as_deref(),
-                RepromptedBy::Engine,
-                timeout,
-            )
-            .await?
-        {
-            RepromptEnd::Labelled {
-                action_execution_id,
-                result,
-            } => Ok(ActionUpshot::Completed {
-                action_execution_id,
-                result,
-            }),
-            RepromptEnd::Stopped => Ok(ActionUpshot::Stopped),
-            RepromptEnd::Asked(request) => {
-                let flow = self.route_agent_question(execution, state, request).await?;
-                Ok(ActionUpshot::settled(flow))
-            }
-            RepromptEnd::Unlabelled(failure) => {
-                rescue.record(&failure);
-                // The record before the event that closes the attempt: a
-                // crash in between leaves the attempt open (`Unknown`), and
-                // one after it leaves the rescue to continue from (F1).
-                self.begin_rescue(execution, &rescue)?;
-                self.close_unlabelled(execution, state, &failure.answer)?;
-                let flow = self
-                    .rescue_output(definition, execution, state, rescue, timeout)
-                    .await?;
-                Ok(ActionUpshot::settled(flow))
-            }
-        }
-    }
-
-    /// The configuration of the engine's reprompt of `rejection`: its
-    /// harness session resumed, read-only, asking only for the output.
-    /// `None` when the action cannot be asked again, or its harness
-    /// reported no session to resume.
-    fn reprompt_config(
-        &self,
-        execution: &WorkflowExecution,
-        state: &State,
-        action: &ActionConfig,
-        rejection: &OutputRejection,
-    ) -> Option<ActionConfig> {
-        let (Some(harness), Some(session)) = (&rejection.harness, &rejection.harness_session_id)
-        else {
-            return None;
-        };
-        match action {
-            ActionConfig::Agent(config) => {
-                let profiled = self.profiled_template(execution, state, config);
-                Some(ActionConfig::Agent(agent::reprompt_config(
-                    &profiled,
-                    harness,
-                    session,
-                    &rejection.reason,
-                )))
-            }
-            ActionConfig::Profile(config) => {
-                let profiled = self.profiled_profile_template(execution, state, config);
-                Some(ActionConfig::Profile(profile_action::reprompt_config(
-                    &profiled,
-                    harness,
-                    session,
-                    &rejection.reason,
-                )))
-            }
-            ActionConfig::Script(_)
-            | ActionConfig::Human(_)
-            | ActionConfig::Wait(_)
-            | ActionConfig::Decision(_) => None,
-        }
-    }
-
-    /// The engine's reprompt of a step whose unrepaired output is a failed
-    /// attempt ([`ActionKind::retries_unrepaired_output`], R13): like
-    /// [`Engine::reprompt`], but an answer still unusable — or no session
-    /// to resume — comes back as the failure of the still open attempt
-    /// that gave it, for `retry_policy` to judge, instead of going to a
-    /// rescue.
-    async fn reprompt_before_retry(
-        &self,
-        definition: &WorkflowDefinition,
-        execution: &mut WorkflowExecution,
-        state: &State,
-        action: &ActionConfig,
-        rejection: OutputRejection,
-        timeout: Option<Duration>,
+        unrepaired: Unrepaired,
     ) -> Result<Result<ActionUpshot, (String, AttemptFailure)>, EngineError> {
         let Some(config) = self.reprompt_config(execution, state, action, &rejection) else {
-            // Nothing is owed any more: the step's next attempt starts afresh.
-            clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
-            self.store.save_execution(execution)?;
-            return Ok(Err((
-                rejection.action_execution_id,
-                AttemptFailure::retriable(format!(
-                    "{} It could not be asked again: its harness reported no session to resume.",
-                    rejection.reason
-                )),
-            )));
+            return match unrepaired {
+                Unrepaired::Rescued => {
+                    let mut rescue = OutputRescue::after(&rejection);
+                    rescue.reason = format!(
+                        "{} The agent could not be asked again for its output label: its \
+                         harness reported no session to resume.",
+                        rejection.reason
+                    );
+                    self.begin_rescue(execution, &rescue)?;
+                    let flow = self
+                        .rescue_output(definition, execution, state, rescue, timeout)
+                        .await?;
+                    Ok(Ok(ActionUpshot::settled(flow)))
+                }
+                Unrepaired::Retried => {
+                    // Nothing is owed any more: the step's next attempt
+                    // starts afresh.
+                    clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+                    self.store.save_execution(execution)?;
+                    Ok(Err((
+                        rejection.action_execution_id,
+                        AttemptFailure::retriable(format!(
+                            "{} It could not be asked again: its harness reported no session \
+                             to resume.",
+                            rejection.reason
+                        )),
+                    )))
+                }
+            };
         };
+
         let end = self
             .reprompt_attempt(
                 definition,
@@ -3142,24 +3090,66 @@ impl Engine {
                 timeout,
             )
             .await?;
-        Ok(match end {
+        Ok(Ok(match end {
             RepromptEnd::Labelled {
                 action_execution_id,
                 result,
-            } => Ok(ActionUpshot::Completed {
+            } => ActionUpshot::Completed {
                 action_execution_id,
                 result,
-            }),
-            RepromptEnd::Stopped => Ok(ActionUpshot::Stopped),
+            },
+            RepromptEnd::Stopped => ActionUpshot::Stopped,
             RepromptEnd::Asked(request) => {
                 let flow = self.route_agent_question(execution, state, request).await?;
-                Ok(ActionUpshot::settled(flow))
+                ActionUpshot::settled(flow)
             }
-            RepromptEnd::Unlabelled(failure) => Err((
-                failure.answer.action_execution_id,
-                AttemptFailure::retriable(failure.reason),
-            )),
-        })
+            RepromptEnd::Unlabelled(failure) => match unrepaired {
+                Unrepaired::Rescued => {
+                    let mut rescue = OutputRescue::after(&rejection);
+                    rescue.record(&failure);
+                    // The record before the event that closes the attempt: a
+                    // crash in between leaves the attempt open (`Unknown`),
+                    // and one after it leaves the rescue to continue from (F1).
+                    self.begin_rescue(execution, &rescue)?;
+                    self.close_unlabelled(execution, state, &failure.answer)?;
+                    let flow = self
+                        .rescue_output(definition, execution, state, rescue, timeout)
+                        .await?;
+                    ActionUpshot::settled(flow)
+                }
+                Unrepaired::Retried => {
+                    return Ok(Err((
+                        failure.answer.action_execution_id,
+                        AttemptFailure::retriable(failure.reason),
+                    )))
+                }
+            },
+        }))
+    }
+
+    /// The configuration of the engine's reprompt of `rejection`: its
+    /// harness session resumed, read-only, asking only for the output.
+    /// `None` when the action cannot be asked again, or its harness
+    /// reported no session to resume.
+    fn reprompt_config(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        action: &ActionConfig,
+        rejection: &OutputRejection,
+    ) -> Option<ActionConfig> {
+        let (Some(harness), Some(session)) = (&rejection.harness, &rejection.harness_session_id)
+        else {
+            return None;
+        };
+        let text = ActionKind::of(action).reprompt_text()?;
+        let message = format!("{text}\n\nWhy it was rejected: {}", rejection.reason);
+        agent::reprompt_config(
+            self.profiled_action(execution, state, action),
+            harness,
+            session,
+            &message,
+        )
     }
 
     /// One attempt asking the agent of `previous_attempt` again for its
@@ -3598,10 +3588,12 @@ impl Engine {
     /// whose output was never usable — leaves the file alone.
     fn store_step_profile(
         &self,
-        execution: &WorkflowExecution,
+        execution: &mut WorkflowExecution,
         state: &State,
         pending: &PendingStep,
     ) -> Result<(), String> {
+        // Not the data key alone: a human step's form answer is its result's
+        // `data`, and an author may name a field `step_profile`.
         if !matches!(state.action, Some(ActionConfig::Profile(_))) {
             return Ok(());
         }
@@ -3621,7 +3613,11 @@ impl Engine {
                     "the step profile of state '{}' could not be written: {error}",
                     state.id
                 )
-            })
+            })?;
+        // A new file: one that cannot be read later is noted again. Saved
+        // with the execution after the decision.
+        clear_engine_metadata(execution, METADATA_UNREADABLE_STEP_PROFILE_KEY);
+        Ok(())
     }
 
     /// `DecisionMade` → context (D10) → `TransitionTaken` → `state.json`.
@@ -5057,30 +5053,39 @@ mod tests {
     /// Every action kind, with what the runner checked before it asked the
     /// kind's capabilities: `kind == Agent`, `is_agent`, `has_step_contract`
     /// and `holds_variables_to_declarations` as they were.
-    const KINDS: [ActionKind; 5] = [
+    const KINDS: [ActionKind; 6] = [
         ActionKind::Agent,
         ActionKind::Script,
         ActionKind::Human,
         ActionKind::Wait,
         ActionKind::Decision,
+        ActionKind::Profile,
     ];
 
     #[test]
-    fn only_an_agent_runs_on_a_harness() {
+    fn only_an_agent_and_a_profile_step_run_on_a_harness() {
         for kind in KINDS {
-            assert_eq!(kind.runs_harness(), kind == ActionKind::Agent, "{kind:?}");
+            assert_eq!(
+                kind.runs_harness(),
+                matches!(kind, ActionKind::Agent | ActionKind::Profile),
+                "{kind:?}"
+            );
         }
     }
 
     #[test]
-    fn only_an_agent_is_asked_again_for_a_rejected_output() {
+    fn only_an_agent_and_a_profile_step_are_asked_again_for_a_rejected_output() {
         for kind in KINDS {
             assert_eq!(
                 kind.reprompts_rejected_output(),
-                kind == ActionKind::Agent,
+                matches!(kind, ActionKind::Agent | ActionKind::Profile),
                 "{kind:?}"
             );
         }
+        assert_eq!(
+            ActionKind::Profile.reprompt_text(),
+            Some(profile_action::PROFILE_REPROMPT)
+        );
     }
 
     #[test]
@@ -5092,7 +5097,17 @@ mod tests {
                 "{kind:?}"
             );
         }
-        assert!(!ActionKind::Profile.rescues_output_label());
+    }
+
+    #[test]
+    fn only_a_profile_step_retries_an_unrepaired_output() {
+        for kind in KINDS {
+            assert_eq!(
+                kind.retries_unrepaired_output(),
+                kind == ActionKind::Profile,
+                "{kind:?}"
+            );
+        }
     }
 
     /// A `profile` step runs on a harness like an agent and is asked again

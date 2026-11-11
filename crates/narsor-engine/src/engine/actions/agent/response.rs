@@ -123,7 +123,7 @@ pub(crate) fn closing_answer(text: &str, shape: AnswerShape) -> Option<(Value, F
 fn structured_response(value: &Value, shape: AnswerShape) -> Result<AgentResponse, ActionError> {
     let object = value
         .as_object()
-        .filter(|object| is_answer_object(object, shape))
+        .filter(|object| shape.accepts(object))
         .ok_or_else(|| {
             no_label_error(
                 "the structured output has neither a string 'choice' nor an 'awaiting_input' status",
@@ -172,11 +172,7 @@ fn extract_response(text: &str, shape: AnswerShape) -> Result<AgentResponse, Act
         ));
     }
 
-    let Some(object) = objects.iter().rev().find_map(|value| {
-        value
-            .as_object()
-            .filter(|object| is_answer_object(object, shape))
-    }) else {
+    let Some(object) = shape.last_answer(&objects) else {
         return Err(no_label_error(
             "the agent's answer contains JSON, but no object with a string 'choice' key",
             text,
@@ -186,23 +182,6 @@ fn extract_response(text: &str, shape: AnswerShape) -> Result<AgentResponse, Act
     response_from_object(object, shape).map_err(|reason| no_label_error(reason, text))
 }
 
-/// Whether `object` is an answer at all: a question, a string `choice`, or
-/// for a step with an `exit` any object; for a `profile` step, an object
-/// with its entries.
-fn is_answer_object(object: &Map<String, Value>, shape: AnswerShape) -> bool {
-    match shape {
-        AnswerShape::Choice => is_question(object) || answer::has_choice(object),
-        AnswerShape::Exit => true,
-        // A `profile` step asks nobody: only its entries end it.
-        AnswerShape::Profile => answer::has_profile_entries(object),
-    }
-}
-
-/// Whether `object` asks a person before the task continues.
-fn is_question(object: &Map<String, Value>) -> bool {
-    object.get("status").and_then(Value::as_str) == Some(AWAITING_INPUT)
-}
-
 /// Turns an answer object into the response it stands for. An error is the
 /// reason the object is unusable; the caller quotes the answer it came
 /// from (the agent's text, or the structured output) with it.
@@ -210,7 +189,7 @@ fn response_from_object(
     object: &Map<String, Value>,
     shape: AnswerShape,
 ) -> Result<AgentResponse, &'static str> {
-    if shape != AnswerShape::Profile && is_question(object) {
+    if shape.may_ask() && answer::is_question(object) {
         return question_from_object(object);
     }
     answer::read_answer(object, shape)
@@ -316,7 +295,7 @@ fn contract_reply(reason: &str, additional_data: &Map<String, Value>) -> Option<
 
 /// Adds the attempt's reply to the details of an extraction failure, so a
 /// format reprompt can keep it instead of its own text (R3).
-pub(super) fn record_reply_in_details(
+pub(crate) fn record_reply_in_details(
     error: &mut ActionError,
     run: &HarnessRun,
     shape: AnswerShape,
@@ -372,11 +351,7 @@ fn final_contract(text: &str, shape: AnswerShape) -> Option<(usize, &str)> {
 fn is_contract(object: &str, shape: AnswerShape) -> bool {
     serde_json::from_str::<Value>(object)
         .ok()
-        .and_then(|value| {
-            value
-                .as_object()
-                .map(|object| is_answer_object(object, shape))
-        })
+        .and_then(|value| value.as_object().map(|object| shape.accepts(object)))
         .unwrap_or(false)
 }
 

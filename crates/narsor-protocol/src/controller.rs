@@ -2080,6 +2080,22 @@ pub enum StepKind {
     Unrecognized,
 }
 
+impl StepKind {
+    /// Whether the step runs an agent: an `agent` step, and a `profile`
+    /// step, whose agent profiles the others.
+    pub fn runs_agent(self) -> bool {
+        match self {
+            Self::Agent | Self::Profile => true,
+            Self::Script
+            | Self::Human
+            | Self::Wait
+            | Self::Decision
+            | Self::Terminal
+            | Self::Unrecognized => false,
+        }
+    }
+}
+
 /// One step of the workflow as the owner can choose it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StepView {

@@ -30,7 +30,7 @@ use std::pin::Pin;
 use chrono::Utc;
 use serde_json::Value;
 
-use super::agent::{run_reply, AgentExecutor, SESSION_DATA_KEY};
+use super::agent::{record_reply_in_details, run_reply, AgentExecutor, SESSION_DATA_KEY};
 use super::answer::AnswerShape;
 use super::harness::HarnessRegistry;
 use super::script::truncate;
@@ -47,20 +47,21 @@ mod contract;
 mod entries;
 mod report;
 
-pub use answer::{read_profile_answer, ProfileAnswer, ProposedEntry, ProposedSetting};
+pub use answer::{read_profile_answer, ProfileAnswer};
 pub use candidates::{profile_candidates, ProfileCandidate};
-pub use contract::{answer_contract, answer_schema, data_block, reprompt_config, PROFILE_REPROMPT};
-pub use entries::{check_profile, CheckedProfile, EntryOutcome};
-pub use report::{report_text, summary};
+use contract::{answer_contract, data_block};
+pub use contract::{answer_schema, PROFILE_REPROMPT};
+use entries::check_profile;
+use report::summary;
 
 /// The [`ActionResult::data`] key carrying the checked entries of a
 /// `profile` step, as a list of [`StepProfileEntry`].
-pub const STEP_PROFILE_DATA_KEY: &str = "step_profile";
+pub(crate) const STEP_PROFILE_DATA_KEY: &str = "step_profile";
 
 /// The entries a `profile` step's `result` carries, for the engine to
 /// store. `None` for a result without them — another action's, or one the
 /// operator gave by hand, which leaves the stored profile alone.
-pub fn step_profile_of(
+pub(crate) fn step_profile_of(
     result: &ActionResult,
 ) -> Option<Result<Vec<StepProfileEntry>, serde_json::Error>> {
     let entries = result.data.get(STEP_PROFILE_DATA_KEY)?;
@@ -74,12 +75,6 @@ pub struct ProfileExecutor {
 }
 
 impl ProfileExecutor {
-    /// An executor with the stock harnesses, no event sink and no usage
-    /// reporter.
-    pub fn new() -> Self {
-        Self::with_harnesses(HarnessRegistry::defaults())
-    }
-
     /// An executor with a registry of its own.
     pub fn with_harnesses(harnesses: HarnessRegistry) -> Self {
         Self {
@@ -94,12 +89,6 @@ impl ProfileExecutor {
         Self {
             sessions: agent.sessions().clone(),
         }
-    }
-}
-
-impl Default for ProfileExecutor {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -167,12 +156,7 @@ impl ProfileExecutor {
         let answer = match read_profile_answer(session.run()) {
             Ok(answer) => answer,
             Err(mut error) => {
-                if let (Some(reply), Some(Value::Object(details))) = (
-                    run_reply(session.run(), AnswerShape::Profile),
-                    error.details.as_mut(),
-                ) {
-                    details.insert("reply".to_string(), Value::String(reply));
-                }
+                record_reply_in_details(&mut error, session.run(), AnswerShape::Profile);
                 return Err(session.reject(error));
             }
         };

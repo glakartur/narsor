@@ -186,9 +186,6 @@ fn required_clause(kind: &str, names: &[String]) -> Option<String> {
     Some(format!("Required {kind}: {}\n", names.join(", ")))
 }
 
-/// The `status` of an answer that asks a person before the task continues.
-pub(super) const AWAITING_INPUT: &str = "awaiting_input";
-
 /// The `error_type` of an answer no output label could be extracted from — a
 /// format error the engine answers with a reprompt, not with `retry_policy`
 /// (KTD7).
@@ -206,29 +203,25 @@ change any files: the work is already done. Reply only with the JSON object desc
 below, choosing the label that describes the work you already did. If you cannot choose \
 because you need an answer from a person first, ask it with `awaiting_input` instead.";
 
-/// The configuration of the engine's reprompt of an agent (KTD7).
+/// The configuration of the engine's or the conductor's reprompt (KTD7,
+/// F1, R13): `action` resuming `harness_session` on `harness` — the harness
+/// the rejected attempt ran on, never the current default, which may have
+/// changed since — asking `message` instead of its prompt.
 ///
-/// Resumes `harness_session` on `harness` — the harness the rejected attempt
-/// ran on, never the current default, which may have changed since — with
-/// read-only workspace access, whatever the workflow declares: fixing the
-/// format of an answer is not further work. Any `resume_session` of the
-/// workflow's own is replaced by the session being repaired. `reason` says
-/// why the previous answer was rejected.
+/// Workspace access is read-only, whatever the workflow declares: fixing
+/// the format of an answer is not further work. Any `resume_session` of the
+/// workflow's own is replaced by the session being repaired. `None` for an
+/// action that runs no harness.
 pub fn reprompt_config(
-    original: &AgentActionConfig,
+    mut action: ActionConfig,
     harness: &str,
     harness_session: &str,
-    reason: &str,
-) -> AgentActionConfig {
-    let mut config = original.clone();
-    config.harness_step.harness = Some(harness.to_string());
-    config.harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
-    config.prompt = format!("{OUTPUT_REPROMPT}\n\nWhy it was rejected: {reason}").into();
-    config.harness_step.parameters.insert(
-        RESUME_SESSION_PARAMETER.to_string(),
-        Value::String(harness_session.to_string()),
-    );
-    config
+    message: &str,
+) -> Option<ActionConfig> {
+    let (step, prompt) = action.harness_step_and_prompt_mut()?;
+    continue_session(step, prompt, harness, harness_session, message);
+    step.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    Some(action)
 }
 
 /// What follows the conductor's own words when it asks the agent again
@@ -238,17 +231,15 @@ files. Reply only with the JSON object described below, or ask your question wit
 `awaiting_input` if you need an answer first.";
 
 /// The configuration of the conductor's reprompt of an agent (F1, R17):
-/// [`reprompt_config`] with the conductor's `prompt` in place of the
-/// engine's generic one.
+/// [`reprompt_config`] with the conductor's `prompt` and the guard.
 pub fn conductor_reprompt_config(
-    original: &AgentActionConfig,
+    original: ActionConfig,
     harness: &str,
     harness_session: &str,
     prompt: &str,
-) -> AgentActionConfig {
-    let mut config = reprompt_config(original, harness, harness_session, "");
-    config.prompt = format!("{}\n\n{CONDUCTOR_REPROMPT_GUARD}", prompt.trim()).into();
-    config
+) -> Option<ActionConfig> {
+    let message = format!("{}\n\n{CONDUCTOR_REPROMPT_GUARD}", prompt.trim());
+    reprompt_config(original, harness, harness_session, &message)
 }
 
 /// Turns the next normal attempt into a continuation of an operator-facing

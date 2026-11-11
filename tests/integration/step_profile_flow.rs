@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use engine_support::{workflow_file, AgentCall, AgentTurn, Harness, ScriptedAgentExecutor};
+use engine_support::{exit, workflow_file, AgentCall, AgentTurn, Harness, ScriptedAgentExecutor};
 use narsor_engine::conductor::assembly::assemble;
 use narsor_engine::conductor::{
     ConductorInvoker, ConductorStore, Invocation, InvocationOutcome, QueuedRequest,
@@ -22,10 +22,6 @@ use serde_json::{json, Value};
 /// The workflow: a first agent step, a script, `work` (with a ceiling and
 /// retries) and `review`.
 const WORKFLOW: &str = "v2/engine_step_profile.yaml";
-
-fn exit() -> AgentTurn {
-    AgentTurn::label("exit", "done")
-}
 
 /// The `step_profile` events: (message, context).
 fn profile_events(harness: &Harness, execution_id: &str) -> Vec<(String, Value)> {

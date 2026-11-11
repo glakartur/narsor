@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::domain::ActionError;
 use crate::engine::actions::agent::MISSING_OUTPUT_LABEL;
-use crate::engine::actions::answer::{has_profile_entries, PROFILE_ENTRIES_KEY};
+use crate::engine::actions::answer::{AnswerShape, PROFILE_ENTRIES_KEY};
 use crate::engine::actions::harness::{tail, HarnessRun};
 use crate::engine::actions::session::response::{json_objects, structured_then_text};
 
@@ -65,12 +65,13 @@ pub struct ProposedSetting {
 /// the harness reported one with entries, then the last object with an
 /// `entries` array in its text.
 pub fn read_profile_answer(run: &HarnessRun) -> Result<ProfileAnswer, ActionError> {
+    let shape = AnswerShape::Profile;
     structured_then_text(
         run,
         |value| {
             value
                 .as_object()
-                .filter(|object| has_profile_entries(object))
+                .filter(|object| shape.accepts(object))
                 .map(answer_of)
                 .ok_or_else(|| {
                     no_profile_error(
@@ -80,11 +81,8 @@ pub fn read_profile_answer(run: &HarnessRun) -> Result<ProfileAnswer, ActionErro
                 })
         },
         |text| {
-            json_objects(text)
-                .iter()
-                .rev()
-                .filter_map(Value::as_object)
-                .find(|object| has_profile_entries(object))
+            shape
+                .last_answer(&json_objects(text))
                 .map(answer_of)
                 .ok_or_else(|| {
                     no_profile_error(

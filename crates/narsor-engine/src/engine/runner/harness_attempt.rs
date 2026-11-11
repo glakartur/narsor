@@ -6,7 +6,7 @@
 //! note. Everything here works on an already rendered `config`.
 
 use super::*;
-use crate::domain::{ProfileActionConfig, PromptText};
+use crate::domain::PromptText;
 use crate::persistence::StepProfileEntry;
 
 /// What [`Engine::apply_step_profile`] needs to know about the attempt.
@@ -100,7 +100,7 @@ impl Engine {
     /// (F3). Writing it does not touch `attempt.failures` (R12).
     fn apply_step_profile(
         &self,
-        execution: &WorkflowExecution,
+        execution: &mut WorkflowExecution,
         state: &State,
         config: &mut HarnessStepConfig,
         attempt: AttemptProfile,
@@ -161,10 +161,11 @@ impl Engine {
     ///
     /// A file that cannot be read — damaged, too large, of an unknown
     /// version — is "no profile" (R8): the step runs on its defaults, and
-    /// the execution records it once, not at every attempt.
+    /// the execution records it once, not at every attempt, until a
+    /// `profile` step writes the file again.
     fn stored_step_profile(
         &self,
-        execution: &WorkflowExecution,
+        execution: &mut WorkflowExecution,
         state: &State,
     ) -> Option<StepProfileEntry> {
         match self.store.read_step_profile(&execution.id) {
@@ -178,18 +179,18 @@ impl Engine {
     }
 
     /// Records that the step profile file could not be read, unless the
-    /// execution already recorded it.
+    /// execution already recorded it for the file it has now.
     fn note_unreadable_step_profile(
         &self,
-        execution: &WorkflowExecution,
+        execution: &mut WorkflowExecution,
         state: &State,
         error: &str,
     ) {
-        let noted = self
-            .store
-            .event_log(&execution.id)
-            .read_all()
-            .is_ok_and(|events| events.iter().any(is_unreadable_step_profile_note));
+        let noted = execution
+            .metadata
+            .get(METADATA_ENGINE_KEY)
+            .and_then(|engine| engine.get(METADATA_UNREADABLE_STEP_PROFILE_KEY))
+            .is_some();
         if noted {
             return;
         }
@@ -207,42 +208,40 @@ impl Engine {
             },
         ) {
             tracing::warn!(%error, "could not record an unreadable step profile");
+            return;
+        }
+        engine_metadata_mut(execution).insert(
+            METADATA_UNREADABLE_STEP_PROFILE_KEY.to_string(),
+            json!(true),
+        );
+        if let Err(error) = self.store.save_execution(execution) {
+            tracing::warn!(%error, "could not record that the step profile was noted");
         }
     }
 
-    /// `template` with the stored step profile applied, for a reprompt that
+    /// `action` with the stored step profile applied, for a reprompt that
     /// resumes a session: the reprompt runs on the model and effort of the
     /// attempt it repairs, not on the workflow's default. An escalation is
     /// not carried over — the count of failed attempts is not kept with the
     /// rejection.
-    pub(super) fn profiled_template(
+    pub(super) fn profiled_action(
         &self,
-        execution: &WorkflowExecution,
+        execution: &mut WorkflowExecution,
         state: &State,
-        template: &AgentActionConfig,
-    ) -> AgentActionConfig {
-        let mut config = template.clone();
-        self.profile_quietly(execution, state, &mut config.harness_step);
-        config
-    }
-
-    /// [`Self::profiled_template`] for a `profile` step.
-    pub(super) fn profiled_profile_template(
-        &self,
-        execution: &WorkflowExecution,
-        state: &State,
-        template: &ProfileActionConfig,
-    ) -> ProfileActionConfig {
-        let mut config = template.clone();
-        self.profile_quietly(execution, state, &mut config.harness_step);
-        config
+        action: &ActionConfig,
+    ) -> ActionConfig {
+        let mut action = action.clone();
+        if let Some(step) = action.harness_step_mut() {
+            self.profile_quietly(execution, state, step);
+        }
+        action
     }
 
     /// Applies the step profile to `step` without escalation and without
     /// recording anything.
     fn profile_quietly(
         &self,
-        execution: &WorkflowExecution,
+        execution: &mut WorkflowExecution,
         state: &State,
         step: &mut HarnessStepConfig,
     ) {
@@ -389,13 +388,4 @@ impl Engine {
         }
         Ok(input)
     }
-}
-
-/// Whether `event` is the note of [`Engine::note_unreadable_step_profile`].
-fn is_unreadable_step_profile_note(event: &crate::domain::Event) -> bool {
-    matches!(
-        &event.data,
-        EventData::Error { context, .. }
-            if context["step_profile"]["unreadable"] == json!(true)
-    )
 }

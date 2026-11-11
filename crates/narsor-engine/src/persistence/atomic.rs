@@ -16,7 +16,7 @@ use crate::persistence::paths::{is_temp_file, unique_temp_path_for};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Creates `dir` and all missing parents.
@@ -143,6 +143,46 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Reads `path` as JSON, `None` when the file does not exist.
+///
+/// A file larger than `limit` bytes is [`PersistenceError::FileTooLarge`]:
+/// nothing past the limit is read, even from a file that grows while it is
+/// read.
+pub fn read_json_capped<T: DeserializeOwned>(path: &Path, limit: u64) -> Result<Option<T>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(PersistenceError::io(path, source)),
+    };
+    let declared = file
+        .metadata()
+        .map_err(|source| PersistenceError::io(path, source))?
+        .len();
+    let too_large = |size| PersistenceError::FileTooLarge {
+        path: path.to_path_buf(),
+        size,
+        limit,
+    };
+    if declared > limit {
+        return Err(too_large(declared));
+    }
+    // The file may grow between the check and the read; the cap holds.
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| PersistenceError::io(path, source))?;
+    let size = bytes.len() as u64;
+    if size > limit {
+        return Err(too_large(size));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|source| PersistenceError::Deserialize {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 /// Removes every `*.tmp` file directly inside `dir`.

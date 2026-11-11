@@ -15,11 +15,10 @@ use crate::engine_support;
 
 use std::fs;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use engine_support::{event_type, workflow_file, Harness};
+use engine_support::{envelope, event_type, workflow_file, FakeHarness, Harness};
 use narsor_engine::domain::{
     ActionError, ActionResult, EventData, ExecutionStatus, WorkflowDefinition, WorkflowExecution,
 };
@@ -38,67 +37,6 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
-
-/// The fake harness CLI, installed in a directory of its own.
-struct FakeHarness {
-    dir: PathBuf,
-    program: PathBuf,
-}
-
-impl FakeHarness {
-    /// Copies the fixture script into `dir`, through a temporary name and a
-    /// rename (see `actions_agent.rs` for why).
-    fn install(dir: PathBuf) -> Self {
-        fs::create_dir_all(&dir).expect("create the harness directory");
-        let source = engine_support::fixtures().join("harness/fake_harness.sh");
-        let program = dir.join("fake_harness.sh");
-        let temp = dir.join(format!(".fake_harness.sh.{}.tmp", uuid::Uuid::new_v4()));
-        fs::copy(&source, &temp).expect("copy the fake harness");
-        fs::rename(&temp, &program).expect("move the fake harness into place");
-        Self { dir, program }
-    }
-
-    /// What the harness prints on the `nth` call (1-based).
-    fn answers_on_call(&self, nth: usize, stdout: &str) -> &Self {
-        fs::write(self.dir.join(format!("stdout.{nth}")), stdout).expect("write the answer");
-        self
-    }
-
-    /// Makes the harness sleep after answering, on every call.
-    fn sleeps(&self, seconds: u64) -> &Self {
-        fs::write(self.dir.join("sleep"), seconds.to_string()).expect("write the sleep");
-        self
-    }
-
-    /// The arguments of the `nth` call.
-    fn args(&self, nth: usize) -> Vec<String> {
-        fs::read_to_string(self.dir.join(format!("args.{nth}")))
-            .expect("the harness recorded its arguments")
-            .split("\n--%ARG%--\n")
-            .filter(|arg| !arg.is_empty())
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// How many times the harness was called.
-    fn calls(&self) -> usize {
-        fs::read_to_string(self.dir.join("count"))
-            .map(|raw| raw.trim().parse().expect("the count is a number"))
-            .unwrap_or(0)
-    }
-}
-
-/// A single `stream-json` `result` line carrying `text`.
-fn envelope(text: &str) -> String {
-    json!({
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-        "session_id": "fake-session-1",
-        "result": text,
-    })
-    .to_string()
-}
 
 /// A profile answer with `entries`, as the agent's closing JSON.
 fn profile_answer(entries: Value) -> String {
@@ -175,10 +113,9 @@ impl Fixture {
     }
 
     fn engine(&self) -> Engine {
-        let profile =
-            ProfileExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(Arc::new(
-                ClaudeCodeAdapter::with_program(self.fake.program.to_string_lossy().into_owned()),
-            )));
+        let profile = ProfileExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(
+            Arc::new(ClaudeCodeAdapter::with_program(self.fake.program())),
+        ));
         Engine::new(self.harness.store())
             .with_executor(ActionKind::Agent, self.agent.clone())
             .with_executor(ActionKind::Profile, Arc::new(profile))
@@ -639,7 +576,7 @@ fn the_real_claude_binary_takes_the_profile_answer_schema() {
 
 use std::collections::{HashMap, VecDeque};
 
-use engine_support::{AgentCall, AgentTurn, ScriptedAgentExecutor};
+use engine_support::{exit, AgentCall, AgentTurn, ScriptedAgentExecutor};
 
 /// A `profile` executor that answers each run with the next of `runs`, as
 /// the real one does: the label `exit`, the checked entries in its data.
@@ -806,10 +743,6 @@ impl Steps {
 
 fn setting(model: &str, effort: &str) -> (Option<String>, Option<String>) {
     (Some(model.to_string()), Some(effort.to_string()))
-}
-
-fn exit() -> AgentTurn {
-    AgentTurn::label("exit", "done")
 }
 
 /// AE5 and the entry for `work`: a step with an entry runs on it; one
@@ -1039,7 +972,7 @@ async fn the_next_agent_step_starts_its_harness_on_the_stored_profile() {
         .answers_on_call(2, &envelope(r#"{"reason":"done"}"#));
     let adapter = || {
         HarnessRegistry::defaults().with_adapter(Arc::new(ClaudeCodeAdapter::with_program(
-            fixture.fake.program.to_string_lossy().into_owned(),
+            fixture.fake.program(),
         )))
     };
     let engine = Engine::new(fixture.harness.store())

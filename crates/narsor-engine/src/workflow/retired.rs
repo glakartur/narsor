@@ -27,6 +27,10 @@ const RETIRED_AGENT_KEY: &str = "plan";
 /// problem as for any definition. Only `plan` in a `type: agent` action
 /// mapping is removed; every other unknown field still fails to load.
 pub fn without_retired_fields(yaml: &str) -> Cow<'_, str> {
+    // Most pinned copies have no retired field: no need to parse them.
+    if !yaml.contains(RETIRED_AGENT_KEY) {
+        return Cow::Borrowed(yaml);
+    }
     let Ok(mut document) = serde_yaml::from_str::<Value>(yaml) else {
         return Cow::Borrowed(yaml);
     };

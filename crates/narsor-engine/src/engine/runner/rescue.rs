@@ -226,29 +226,32 @@ impl Engine {
                 Decision::Reprompt { prompt } => {
                     let config = match (&state.action, &rescue.harness, &rescue.harness_session_id)
                     {
-                        (Some(ActionConfig::Agent(config)), Some(harness), Some(session))
+                        (Some(action @ ActionConfig::Agent(_)), Some(harness), Some(session))
                             if rescue.can_reprompt() =>
                         {
-                            let profiled = self.profiled_template(execution, state, config);
-                            ActionConfig::Agent(agent::conductor_reprompt_config(
-                                &profiled, harness, session, &prompt,
-                            ))
+                            agent::conductor_reprompt_config(
+                                self.profiled_action(execution, state, action),
+                                harness,
+                                session,
+                                &prompt,
+                            )
                         }
-                        // The purpose did not offer (b): a response that
-                        // takes it anyway was refused before it got here.
-                        _ => {
-                            return self.escalate_output(
-                                definition,
-                                execution,
-                                state,
-                                rescue,
-                                &response,
-                                Choice::default(),
-                                "the conductor asked to repeat the question, but the agent \
-                                 cannot be asked again"
-                                    .to_string(),
-                            );
-                        }
+                        _ => None,
+                    };
+                    // The purpose did not offer (b): a response that takes it
+                    // anyway was refused before it got here.
+                    let Some(config) = config else {
+                        return self.escalate_output(
+                            definition,
+                            execution,
+                            state,
+                            rescue,
+                            &response,
+                            Choice::default(),
+                            "the conductor asked to repeat the question, but the agent \
+                             cannot be asked again"
+                                .to_string(),
+                        );
                     };
 
                     let decision = unsaved_decision(

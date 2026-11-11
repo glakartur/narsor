@@ -62,14 +62,11 @@ impl Setting {
 }
 
 /// Where the effective profile came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileSource {
     /// The workflow default.
     Default,
-    /// The entry a `profile` step stored. Read as `conductor` too: the name
-    /// before the conductor stopped profiling steps.
-    #[serde(alias = "conductor")]
+    /// The entry a `profile` step stored.
     Profiled,
     /// Raised after repeated failures.
     Escalated,
@@ -110,18 +107,23 @@ pub struct EffectiveProfile {
     pub limit_reached: bool,
 }
 
+/// The highest setting a step may run on: its `ceiling`, with the step's
+/// `default` for a value the ceiling leaves unset — or the default alone
+/// for a step without a ceiling.
+pub fn effective_ceiling(default: &Setting, ceiling: Option<&Setting>) -> Setting {
+    Setting {
+        model: ceiling
+            .and_then(|c| c.model.clone())
+            .or_else(|| default.model.clone()),
+        effort: ceiling
+            .and_then(|c| c.effort.clone())
+            .or_else(|| default.effort.clone()),
+    }
+}
+
 /// Computes the profile of the next attempt.
 pub fn resolve(input: ProfileInput<'_>) -> EffectiveProfile {
-    let ceiling = Setting {
-        model: input
-            .ceiling
-            .and_then(|c| c.model.clone())
-            .or_else(|| input.default.model.clone()),
-        effort: input
-            .ceiling
-            .and_then(|c| c.effort.clone())
-            .or_else(|| input.default.effort.clone()),
-    };
+    let ceiling = effective_ceiling(input.default, input.ceiling);
 
     let mut setting = input.default.clone();
     let mut source = ProfileSource::Default;
@@ -363,17 +365,6 @@ mod tests {
         let out = resolve(input(&default, Some(&ceiling), Some(&wanted), 3));
         assert_eq!(out.setting, Setting::new(Some("medium"), Some("high")));
         assert_eq!(out.source, ProfileSource::Escalated);
-    }
-
-    #[test]
-    fn the_old_name_of_a_profiled_source_still_reads() {
-        let source: ProfileSource =
-            serde_json::from_value(serde_json::json!("conductor")).expect("the old name");
-        assert_eq!(source, ProfileSource::Profiled);
-        assert_eq!(
-            serde_json::to_value(ProfileSource::Profiled).expect("serialize"),
-            serde_json::json!("profiled")
-        );
     }
 
     #[test]

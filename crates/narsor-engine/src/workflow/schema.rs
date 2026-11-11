@@ -1220,22 +1220,44 @@ fn default_history() -> bool {
 
 impl AgentActionSchema {
     /// The harness session settings the step declares, before `globals` fill
-    /// what it leaves out. The YAML contract has no per-action workspace (§6
-    /// lists it as a future extension) and no permission grants, so both stay
-    /// unset.
+    /// what it leaves out. Only an agent step can be pinned: it marks a step
+    /// that sets both its own model and effort.
     pub fn harness_step(&self) -> HarnessStepConfig {
         HarnessStepConfig {
-            harness: self.harness.clone(),
-            permission_grants: Vec::new(),
-            model: self.model.clone(),
-            effort: self.effort.clone(),
-            ceiling: self.ceiling.clone(),
             workspace_access: self.workspace_access,
-            workspace: None,
-            parameters: self.parameters.clone(),
-            read_only_paths: self.read_only_paths.clone(),
             own_model_and_effort: self.model.is_some() && self.effort.is_some(),
+            ..declared_harness_step(
+                &self.harness,
+                &self.model,
+                &self.effort,
+                &self.ceiling,
+                &self.parameters,
+                &self.read_only_paths,
+            )
         }
+    }
+}
+
+/// The harness fields an `agent` and a `profile` step share. The YAML
+/// contract has no per-action workspace (§6 lists it as a future extension)
+/// and no permission grants, so both stay unset, as does the access each
+/// step decides on its own.
+fn declared_harness_step(
+    harness: &Option<String>,
+    model: &Option<String>,
+    effort: &Option<String>,
+    ceiling: &Option<crate::domain::StepCeiling>,
+    parameters: &HashMap<String, serde_json::Value>,
+    read_only_paths: &[String],
+) -> HarnessStepConfig {
+    HarnessStepConfig {
+        harness: harness.clone(),
+        model: model.clone(),
+        effort: effort.clone(),
+        ceiling: ceiling.clone(),
+        parameters: parameters.clone(),
+        read_only_paths: read_only_paths.to_vec(),
+        ..HarnessStepConfig::default()
     }
 }
 
@@ -1278,18 +1300,14 @@ impl ProfileActionSchema {
     /// fill what it leaves out. Access is decided by the loader, which sees
     /// the step's `workspaces` section.
     pub fn harness_step(&self) -> HarnessStepConfig {
-        HarnessStepConfig {
-            harness: self.harness.clone(),
-            permission_grants: Vec::new(),
-            model: self.model.clone(),
-            effort: self.effort.clone(),
-            ceiling: self.ceiling.clone(),
-            workspace_access: None,
-            workspace: None,
-            parameters: self.parameters.clone(),
-            read_only_paths: self.read_only_paths.clone(),
-            own_model_and_effort: self.model.is_some() && self.effort.is_some(),
-        }
+        declared_harness_step(
+            &self.harness,
+            &self.model,
+            &self.effort,
+            &self.ceiling,
+            &self.parameters,
+            &self.read_only_paths,
+        )
     }
 }
 

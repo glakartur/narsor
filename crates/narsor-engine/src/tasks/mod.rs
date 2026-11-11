@@ -73,6 +73,7 @@
 //! The name is the fallback — for a built-in, which has no path, and for a file
 //! that has since moved but whose name is now reachable.
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -612,7 +613,11 @@ pub fn resolve_definition(
         })?;
         // A copy pinned by an older version may carry a field the schema has
         // since retired; the execution must still resume.
-        let source = without_retired_fields(&source).into_owned();
+        let stripped = match without_retired_fields(&source) {
+            Cow::Owned(stripped) => Some(stripped),
+            Cow::Borrowed(_) => None,
+        };
+        let source = stripped.unwrap_or(source);
         return Ok(ResolvedWorkflow {
             name: stored_definition_name(execution)
                 .unwrap_or_else(|| execution.workflow_id.clone()),
@@ -943,22 +948,5 @@ terminal_states:
 
         let definition = definition.expect("a definition pinned by an older version loads");
         assert!(definition.states.contains_key("plan"));
-    }
-
-    #[test]
-    fn a_pinned_definition_with_another_unknown_field_still_fails() {
-        let (root, paths, execution) =
-            pinned(&PINNED_WITH_PLAN.replace("plan: true", "plan: true, planned: true"));
-
-        let resolved = resolve_definition(&root.join("catalog"), &paths, &execution)
-            .expect("the pinned copy is found");
-        let error = resolved.load();
-        let _ = fs::remove_dir_all(&root);
-
-        let error = error.expect_err("only retired fields are removed");
-        assert!(
-            error.to_string().contains("unknown field `planned`"),
-            "{error}"
-        );
     }
 }

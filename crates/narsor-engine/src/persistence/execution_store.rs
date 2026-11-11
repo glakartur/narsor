@@ -3,8 +3,8 @@
 use super::{PersistenceError, Result};
 use crate::domain::{Context, ExecutionId, TaskId, TaskLaunchSpec, WorkflowExecution};
 use crate::persistence::atomic::{
-    cleanup_orphaned_temp_files, ensure_dir, read_json, write_atomic, write_json_atomic,
-    write_json_atomic_exclusive,
+    cleanup_orphaned_temp_files, ensure_dir, read_json, read_json_capped, write_atomic,
+    write_json_atomic, write_json_atomic_exclusive,
 };
 use crate::persistence::conversation::ConversationStore;
 use crate::persistence::event_log::EventLog;
@@ -15,7 +15,6 @@ use crate::persistence::step_profile::{
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs;
-use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
 
 /// File holding the input request an execution is currently waiting on.
@@ -283,42 +282,10 @@ impl ExecutionStore {
     /// profile".
     pub fn read_step_profile(&self, execution_id: &str) -> Result<StepProfileResult> {
         let path = self.paths.step_profile_file(execution_id);
-        let file = match fs::File::open(&path) {
-            Ok(file) => file,
-            Err(source) if source.kind() == ErrorKind::NotFound => {
-                return Ok(StepProfileResult::default())
-            }
-            Err(source) => return Err(PersistenceError::io(&path, source)),
+        let Some(result) = read_json_capped::<StepProfileResult>(&path, MAX_STEP_PROFILE_BYTES)?
+        else {
+            return Ok(StepProfileResult::default());
         };
-        let declared = file
-            .metadata()
-            .map_err(|source| PersistenceError::io(&path, source))?
-            .len();
-        if declared > MAX_STEP_PROFILE_BYTES {
-            return Err(PersistenceError::FileTooLarge {
-                path,
-                size: declared,
-                limit: MAX_STEP_PROFILE_BYTES,
-            });
-        }
-        // The file may grow between the check and the read; the cap holds.
-        let mut bytes = Vec::new();
-        file.take(MAX_STEP_PROFILE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|source| PersistenceError::io(&path, source))?;
-        let size = bytes.len() as u64;
-        if size > MAX_STEP_PROFILE_BYTES {
-            return Err(PersistenceError::FileTooLarge {
-                path,
-                size,
-                limit: MAX_STEP_PROFILE_BYTES,
-            });
-        }
-        let result: StepProfileResult =
-            serde_json::from_slice(&bytes).map_err(|source| PersistenceError::Deserialize {
-                path: path.clone(),
-                source,
-            })?;
         if result.version != STEP_PROFILE_VERSION {
             return Err(PersistenceError::UnsupportedVersion {
                 path,

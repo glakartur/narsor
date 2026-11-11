@@ -81,14 +81,6 @@ impl StepProfileEntry {
     pub fn setting(&self) -> Setting {
         Setting::new(self.model.as_deref(), self.effort.as_deref())
     }
-
-    /// The model and effort the agent asked for, before the clamp.
-    pub fn requested(&self) -> Setting {
-        Setting::new(
-            self.requested_model.as_deref(),
-            self.requested_effort.as_deref(),
-        )
-    }
 }
 
 /// The content of `step-profile.json`. A missing file reads as the empty

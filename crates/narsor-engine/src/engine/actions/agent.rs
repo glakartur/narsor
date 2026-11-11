@@ -59,23 +59,19 @@ use crate::domain::{
 mod contract;
 mod response;
 
+use super::session::{AgentEventSink, UsageReporter};
 pub use super::session::{
-    AgentEventSink, LoggingEventSink, UsageReporter, BUILT_IN_HARNESS, PARSE_LINE_LIMIT,
-    RESUME_SESSION_PARAMETER, RESUME_SESSION_REJECTED,
+    BUILT_IN_HARNESS, PARSE_LINE_LIMIT, RESUME_SESSION_PARAMETER, RESUME_SESSION_REJECTED,
 };
-use contract::AWAITING_INPUT;
 pub use contract::{
     conductor_reprompt_config, continue_session, output_contract, reprompt_config,
     DefaultHarnessSource, CONDUCTOR_REPROMPT_GUARD, MISSING_OUTPUT_LABEL, OUTPUT_REPROMPT,
     SESSION_DATA_KEY, SESSION_ID_VARIABLE,
 };
 pub use response::extract_output;
-pub(crate) use response::run_reply;
-use response::{
-    agent_input_fields, build_result, read_response, record_question, record_reply_in_details,
-    AgentResponse,
-};
+use response::{agent_input_fields, build_result, read_response, record_question, AgentResponse};
 pub(crate) use response::{closing_answer, final_answer_kind};
+pub(crate) use response::{record_reply_in_details, run_reply};
 
 /// Executes `AgentAction` states.
 ///

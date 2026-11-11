@@ -23,13 +23,13 @@ use narsor_engine::domain::{
     WorkspaceAccess,
 };
 use narsor_engine::engine::actions::agent::{
-    output_contract, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
+    output_contract, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
 };
 use narsor_engine::engine::{
-    ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
-    CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry, InputContinuation,
-    LoggingEventSink, OpenCodeAdapter, OutputProblem, OutputRejection, PendingHumanInput,
-    StepContract, SuspendedAction, UsageReporter, METADATA_ENGINE_KEY,
+    ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor,
+    ClaudeCodeAdapter, CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry,
+    InputContinuation, LoggingEventSink, OpenCodeAdapter, OutputProblem, OutputRejection,
+    PendingHumanInput, StepContract, SuspendedAction, UsageReporter, METADATA_ENGINE_KEY,
     METADATA_OUTPUT_REJECTION_KEY,
 };
 use narsor_engine::persistence::{
@@ -42,6 +42,8 @@ use narsor_protocol::chat::{
 };
 use narsor_protocol::controller::{HarnessUsageReport, UsageStatus};
 use serde_json::{json, Value};
+
+use crate::engine_support::{envelope, FakeHarness};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -82,126 +84,6 @@ impl Drop for TempRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
-}
-
-/// The fake harness CLI, installed in a directory of its own.
-struct FakeHarness {
-    dir: PathBuf,
-    program: PathBuf,
-}
-
-impl FakeHarness {
-    /// Copies the fixture script into `dir` and returns a handle to it.
-    ///
-    /// Copies to a temporary name in the same directory and renames it into
-    /// place, rather than `fs::copy`-ing straight to `program`: writing
-    /// directly to the final name and then, moments later, `execve`-ing it
-    /// (once this test's harness runs) has been an intermittent ETXTBSY
-    /// flake under `cargo test`'s parallel test threads — many threads
-    /// copying and exec'ing fake-harness binaries at once occasionally hits
-    /// the kernel's "text file busy" window before a fresh file's write
-    /// handle is fully torn down. The temp-name-then-rename here is the same
-    /// atomic-swap idiom `src/persistence/atomic.rs` uses for durability: the
-    /// final path is only ever created by a single `rename`, never opened for
-    /// writing itself, so there is nothing left for a concurrent `execve` to
-    /// collide with.
-    fn install(dir: PathBuf) -> Self {
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
-        let program = dir.join("fake_harness.sh");
-        let temp = dir.join(format!(".fake_harness.sh.{}.tmp", uuid::Uuid::new_v4()));
-        fs::copy(&source, &temp).expect("copy the fake harness");
-        fs::rename(&temp, &program).expect("move the fake harness into place");
-        Self { dir, program }
-    }
-
-    /// The program an adapter is built with.
-    fn program(&self) -> String {
-        self.program.to_string_lossy().into_owned()
-    }
-
-    /// What the harness prints on stdout, on every call.
-    fn answers(&self, stdout: &str) -> &Self {
-        fs::write(self.dir.join("stdout"), stdout).expect("write the harness answer");
-        self
-    }
-
-    /// What the harness prints on the `nth` call (1-based).
-    fn answers_on_call(&self, nth: usize, stdout: &str) -> &Self {
-        fs::write(self.dir.join(format!("stdout.{nth}")), stdout).expect("write the answer");
-        self
-    }
-
-    /// Makes the harness sleep before answering.
-    fn sleeps(&self, seconds: u64) -> &Self {
-        fs::write(self.dir.join("sleep"), seconds.to_string()).expect("write the sleep");
-        self
-    }
-
-    /// Makes the `nth` call (1-based) sleep after answering.
-    fn sleeps_on_call(&self, nth: usize, seconds: u64) -> &Self {
-        fs::write(self.dir.join(format!("sleep.{nth}")), seconds.to_string())
-            .expect("write the sleep");
-        self
-    }
-
-    /// Makes the harness fail with an exit code and a message on stderr.
-    fn fails(&self, code: i32, stderr: &str) -> &Self {
-        fs::write(self.dir.join("exit"), code.to_string()).expect("write the exit code");
-        fs::write(self.dir.join("stderr"), stderr).expect("write the stderr");
-        self
-    }
-
-    /// The arguments of the `nth` call.
-    fn args(&self, nth: usize) -> Vec<String> {
-        let raw = fs::read_to_string(self.dir.join(format!("args.{nth}")))
-            .expect("the harness recorded its arguments");
-        raw.split("\n--%ARG%--\n")
-            .filter(|arg| !arg.is_empty())
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// The working directory of the `nth` call.
-    fn cwd(&self, nth: usize) -> String {
-        read_line(&self.dir.join(format!("cwd.{nth}")))
-    }
-
-    /// The `ORCHESTRATOR_ACTION_ID` the `nth` call saw.
-    fn action_id(&self, nth: usize) -> String {
-        read_line(&self.dir.join(format!("action_id.{nth}")))
-    }
-
-    /// How many times the harness was called.
-    fn calls(&self) -> usize {
-        fs::read_to_string(self.dir.join("count"))
-            .map(|raw| raw.trim().parse().expect("the count is a number"))
-            .unwrap_or(0)
-    }
-}
-
-/// The first line of a file the harness wrote.
-fn read_line(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-        .trim_end()
-        .to_string()
-}
-
-/// A single `stream-json` `result` line carrying `text`.
-///
-/// A single line is still a well-formed (if minimal) NDJSON stream, so this
-/// keeps working as the stand-in for "the harness answered" in every test
-/// that does not care about the lines leading up to it.
-fn envelope(text: &str) -> String {
-    json!({
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-        "session_id": "fake-session-1",
-        "result": text,
-    })
-    .to_string()
 }
 
 /// A single `stream-json` `result` line reporting a failed run.
