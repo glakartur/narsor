@@ -30,7 +30,9 @@ as built-ins.
 
 `compound-engineering-change.yaml` is an example, not a built-in: Narsor does
 not embed it, and an installed binary does not know it. It shows a real
-pipeline on one repository:
+pipeline on one repository. The diagram of its flow, its gates and its loops
+is in [`compound-engineering-change.md`](compound-engineering-change.md).
+The workflow has:
 
 - brainstorm, plan, work, code review and compound, each run by an agent with
   the `compound-engineering` skills;
