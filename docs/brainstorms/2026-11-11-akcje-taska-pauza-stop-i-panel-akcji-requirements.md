@@ -76,14 +76,14 @@ Obecny model stanów zatrzymania jest niejasny z punktu widzenia operatora:
 **Panel akcji w TUI**
 
 - R4. W TUI lista akcji taska jest dostępna tylko przez panel akcji, otwierany skrótem Ctrl+.. Panel pokazuje akcje z serwera, także niedostępne, z powodem.
-- R5. TUI usuwa pozostałe skróty klawiszowe do zarządzania taskiem (pauza/wznów, przerwij, przejście, restart, archiwizacja i podobne). Skróty nawigacji i edycji (zakładki, lista, edycja tekstu) zostają. Zakres usuwanych skrótów opisuje „Założenia do potwierdzenia" (Z1).
+- R5. TUI usuwa pozostałe skróty klawiszowe do zarządzania taskiem (pauza/wznów, przerwij, przejście, restart, archiwizacja i podobne). Skróty nawigacji i edycji (zakładki, lista, edycja tekstu) zostają. Przenoszenie taska w kolejce zostaje skrótem na liście, zmienionym na Ctrl+strzałka w górę i Ctrl+strzałka w dół (Z1). Zakres usuwanych skrótów opisuje „Założenia do potwierdzenia" (Z1).
 - R6. Akcje, które z natury należą do rozmowy, nie są w panelu akcji. Dotyczy to ręcznego wywołania akcji na kroku i powrotu do agenta z dodatkowym promptem. Operator robi je w panelu rozmowy.
 
 **Task działający**
 
 - R7. Działający task ma dwie akcje zatrzymania: „Pauza" i „Stop". Obie są dostępne dla kroku agentowego i skryptowego.
 - R8. Pauza zatrzymuje task w pierwszym możliwym momencie. Dla agenta to chwila, gdy sesja z harnessem się zakończy (harness się wyłączy). Dla skryptu to chwila, gdy skrypt przestanie się przetwarzać. Pauza niczego nie zrywa.
-- R9. Stop zatrzymuje task natychmiast. Dla agenta runner od razu zrywa sesję. Dla skryptu runner zrywa skrypt i zabija jego proces.
+- R9. Stop zatrzymuje task natychmiast. Dla agenta runner od razu zrywa sesję, ale sesja zostaje zachowana i da się ją wznowić (Z4). Dla skryptu runner zrywa skrypt i zabija jego proces.
 - R10. Między wywołaniem pauzy a zatrzymaniem task ma widoczny stan „wstrzymywany". W tym stanie „Stop" nadal jest dostępny, żeby operator mógł przyspieszyć zatrzymanie. „Pauza" nie jest dostępna ponownie.
 
 **Task zatrzymany (pauza lub stop)**
@@ -157,10 +157,10 @@ Obecny model stanów zatrzymania jest niejasny z punktu widzenia operatora:
 
 ## Założenia do potwierdzenia
 
-- Z1. Usuwamy skróty do: pauza/wznów, przerwij, ręczne przejście, restart, archiwizacja, przenoszenie w kolejce i podobne czynności zarządzania taskiem. Zostają skróty nawigacji, zakładek, edycji tekstu i wyjścia. Wybrano szeroką interpretację zdania „rezygnujemy z pozostałych skrótów dotyczących zarządzania taskiem".
-- Z2. Jeśli terminal nie przekaże Ctrl+., TUI nadal musi dać dostęp do panelu. Zakładamy jeden dodatkowy, zapasowy skrót otwierający ten sam panel. Zapasowy skrót nie daje dostępu do pojedynczych akcji. To jedyny wyjątek od R5.
-- Z3. Akcja „Wznów" z dokumentu 2026-10-22 zostaje w panelu akcji zatrzymanego taska jako powrót do pracy bez komentarza. Powrót z promptem idzie przez panel rozmowy (R11). Stop i pauza po tym samym wznowieniu wracają do pracy tak samo.
-- Z4. Po „Stop" kroku agentowego sesja agenta zostaje zachowana. Powrót (R11) używa tej sesji. Gdy harness nie potrafi jej wznowić, operator widzi błąd z powodem i może wybrać inny krok (R14).
+- Z1. Usuwamy skróty do: pauza/wznów, przerwij, ręczne przejście, restart, archiwizacja i podobne czynności zarządzania taskiem. Zostają skróty nawigacji, zakładek, edycji tekstu i wyjścia. Przenoszenie taska w kolejce to operacja na liście, nie na tasku: zostaje, a jej skrót zmienia się na Ctrl+strzałka w górę i Ctrl+strzałka w dół (decyzja Q3). Do sprawdzenia w planowaniu: czy te skróty nie kolidują z nawigacją i edycją tekstu w TUI i w terminalach.
+- Z2. Jeśli terminal nie przekaże Ctrl+., TUI nadal musi dać dostęp do panelu. Dopuszczono jeden dodatkowy, zapasowy skrót otwierający ten sam panel (decyzja Q1). Zapasowy skrót nie daje dostępu do pojedynczych akcji. To jedyny wyjątek od R5, obok skrótu przenoszenia w kolejce (Z1).
+- Z3. Akcja „Wznów" (bez promptu) nie jest w panelu akcji (decyzja Q2). Dla zatrzymanego kroku agentowego wznowienie odbywa się tylko w panelu rozmowy (R11). Dla kroku skryptowego nie ma „Wznów": task wraca do pracy przez restart skryptu (R13) albo wybór kroku (R14). Zmienia to akcję `Resume` z dokumentu 2026-10-22: w planowaniu trzeba ustalić jej los w protokole.
+- Z4. Po „Stop" kroku agentowego sesja agenta zawsze zostaje zachowana i możliwa do wznowienia (decyzja Q4). Powrót (R11) używa tej sesji. Gdy harness nie potrafi jej wznowić, operator widzi błąd z powodem i może wybrać inny krok (R14). Bezpowrotny koniec sesji to archiwizacja (R16), a nie „Stop".
 - Z5. Po „Stop" kroku skryptowego task stoi na tym kroku. Restart skryptu (R13) startuje skrypt od początku.
 - Z6. Pauza dotyczy tylko taska w stanie „działa”. Stop dotyczy tasków w stanie „działa” i „wstrzymywany” (R10). Task w kolejce, w trakcie przygotowania (provisioning) lub czekający na człowieka nie ma tych akcji. Czeka na człowieka — wtedy działają dotychczasowe akcje z dokumentu 2026-10-22.
 - Z7. „Zwolnij slot" jest dostępne tylko dla taska zatrzymanego, który trzyma slot. Task bez slotu nie ma tej akcji.
@@ -168,18 +168,18 @@ Obecny model stanów zatrzymania jest niejasny z punktu widzenia operatora:
 - Z9. Po zakończeniu workflow wybór kroku nie ogranicza się do kroków wcześniej odwiedzonych. Dowolny krok workflow jest dozwolony.
 - Z10. Komentarz z R18 jest zwykłym tekstem. Dotyczy tylko kroku, który operator wybrał. Nie jest zapisywany jako trwały element workflow.
 
-## Pytania otwarte dla użytkownika
+## Rozstrzygnięte decyzje
 
-- P1. Zapasowy skrót do panelu akcji (Z2): czy jest dopuszczalny, jeśli Ctrl+. nie działa w części terminali? Zalecane: tak, jeden zapasowy skrót. Alternatywa: tylko Ctrl+., bez zapasowego.
-- P2. Wznowienie po pauzie bez promptu (Z3): czy akcja „Wznów" ma zostać w panelu akcji? Zalecane: tak. Alternatywa: wznowienie tylko przez panel rozmowy.
-- P3. Zakres usuwanych skrótów (Z1): czy przenoszenie taska w kolejce też przechodzi do panelu akcji? Zalecane: tak. Alternatywa: ten skrót zostaje, bo jest operacją na liście, a nie na tasku.
-- P4. Stan po „Stop" agenta (Z4): czy przy stopie sesja ma zawsze zostać możliwa do wznowienia? Zalecane: tak, z błędem i wyborem innego kroku, gdy się nie da. Alternatywa: stop kończy sesję bezpowrotnie i powrót zaczyna nową sesję.
+- Q1 (Z2). Dopuszczony jeden zapasowy skrót do panelu akcji.
+- Q2 (Z3). „Wznów" bez promptu nie jest w panelu akcji. Wznowienie kroku agentowego tylko przez panel rozmowy.
+- Q3 (Z1). Przenoszenie w kolejce zostaje na liście, ze skrótem Ctrl+strzałka w górę i w dół.
+- Q4 (Z4). Sesja po „Stop" agenta zawsze możliwa do wznowienia. Bezpowrotny koniec to archiwizacja.
 
 ## Outstanding Questions
 
 ### Resolve Before Planning
 
-Brak. P1–P4 zapisano jako założenia Z1–Z4. Zmiana któregoś z nich zmienia tylko wskazane wymagania.
+Brak. Decyzje Q1–Q4 są zapisane w Z1–Z4.
 
 ### Deferred to Planning
 
