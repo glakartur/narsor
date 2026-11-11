@@ -65,6 +65,10 @@ pub enum AnswerShape {
     /// The step has one `exit`: any object is the answer, and it needs no
     /// `choice` — the step's only label is [`EXIT_LABEL`].
     Exit,
+    /// The step is a `profile` step: the answer is an object with an array
+    /// under [`PROFILE_ENTRIES_KEY`], and the step's only label is
+    /// [`EXIT_LABEL`]. It has no question to ask.
+    Profile,
 }
 
 impl AnswerShape {
@@ -76,6 +80,15 @@ impl AnswerShape {
             Self::Choice
         }
     }
+}
+
+/// The key of the entries a `profile` step answers with.
+pub const PROFILE_ENTRIES_KEY: &str = "entries";
+
+/// Whether `object` carries an array of profile entries, which makes it the
+/// answer of a `profile` step.
+pub fn has_profile_entries(object: &Map<String, Value>) -> bool {
+    object.get(PROFILE_ENTRIES_KEY).is_some_and(Value::is_array)
 }
 
 /// Whether `object` carries a string `choice`, which makes it an answer.
@@ -109,6 +122,13 @@ pub fn read_answer(
                 .to_string();
             Some(answer_with(choice, object))
         }
+        AnswerShape::Profile => has_profile_entries(object).then(|| {
+            Ok(ChoiceAnswer {
+                choice: EXIT_LABEL.to_string(),
+                reason: reason(object)?,
+                ..ChoiceAnswer::default()
+            })
+        }),
     }
 }
 

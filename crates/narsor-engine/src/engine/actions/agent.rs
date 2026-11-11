@@ -70,7 +70,6 @@ pub use contract::{
     SESSION_DATA_KEY, SESSION_ID_VARIABLE,
 };
 pub use response::extract_output;
-#[cfg(test)]
 pub(crate) use response::run_reply;
 use response::{
     agent_input_fields, build_result, read_response, record_question, record_reply_in_details,
@@ -140,6 +139,12 @@ impl AgentExecutor {
     /// The harnesses this executor can run.
     pub fn harnesses(&self) -> &HarnessRegistry {
         self.sessions.harnesses()
+    }
+
+    /// The runner its harness sessions run on, with everything it was
+    /// built with, for an executor that runs its sessions the same way.
+    pub(crate) fn sessions(&self) -> &SessionRunner {
+        &self.sessions
     }
 }
 

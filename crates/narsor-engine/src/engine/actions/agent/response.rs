@@ -187,9 +187,15 @@ fn extract_response(text: &str, shape: AnswerShape) -> Result<AgentResponse, Act
 }
 
 /// Whether `object` is an answer at all: a question, a string `choice`, or
-/// for a step with an `exit` any object.
+/// for a step with an `exit` any object; for a `profile` step, an object
+/// with its entries.
 fn is_answer_object(object: &Map<String, Value>, shape: AnswerShape) -> bool {
-    is_question(object) || shape == AnswerShape::Exit || answer::has_choice(object)
+    match shape {
+        AnswerShape::Choice => is_question(object) || answer::has_choice(object),
+        AnswerShape::Exit => true,
+        // A `profile` step asks nobody: only its entries end it.
+        AnswerShape::Profile => answer::has_profile_entries(object),
+    }
 }
 
 /// Whether `object` asks a person before the task continues.
@@ -204,7 +210,7 @@ fn response_from_object(
     object: &Map<String, Value>,
     shape: AnswerShape,
 ) -> Result<AgentResponse, &'static str> {
-    if is_question(object) {
+    if shape != AnswerShape::Profile && is_question(object) {
         return question_from_object(object);
     }
     answer::read_answer(object, shape)

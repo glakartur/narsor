@@ -107,6 +107,7 @@ use crate::engine::actions::human::{
     OutputRequirement, PendingHumanInput, RejectedAnswer, RequiredValue, APPROVE_OUTPUT_LABEL,
     ENTRY_LIMIT_CONTINUE_LABEL, ENTRY_LIMIT_RESET_LABEL, RESUME_AGENT_LABEL,
 };
+use crate::engine::actions::profile::{self as profile_action, ProfileExecutor};
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
     ScriptExecutor, StepContract, StepScope, SuspendedAction,
@@ -316,6 +317,17 @@ impl ActionKind {
         match self {
             Self::Agent => true,
             Self::Profile | Self::Script | Self::Human | Self::Wait | Self::Decision => false,
+        }
+    }
+
+    /// Whether an output the engine's reprompt did not repair counts as a
+    /// failed attempt of the step, so that `retry_policy` runs the action
+    /// again before the operator is asked (R13). An `agent` step goes to
+    /// the conductor's rescue instead.
+    pub fn retries_unrepaired_output(self) -> bool {
+        match self {
+            Self::Profile => true,
+            Self::Agent | Self::Script | Self::Human | Self::Wait | Self::Decision => false,
         }
     }
 
@@ -1274,6 +1286,7 @@ impl Engine {
         let mut executors: HashMap<ActionKind, Arc<dyn ActionExecutor>> = HashMap::new();
         executors.insert(ActionKind::Script, Arc::new(ScriptExecutor::new()));
         executors.insert(ActionKind::Human, Arc::new(HumanExecutor::new()));
+        executors.insert(ActionKind::Profile, Arc::new(ProfileExecutor::like(&agent)));
         executors.insert(ActionKind::Agent, Arc::new(agent));
 
         Self {
@@ -1388,6 +1401,8 @@ impl Engine {
         if let Some(reporter) = &self.usage_reporter {
             agent = agent.with_usage_reporter(Arc::clone(reporter));
         }
+        self.executors
+            .insert(ActionKind::Profile, Arc::new(ProfileExecutor::like(&agent)));
         self.executors.insert(ActionKind::Agent, Arc::new(agent));
     }
 
@@ -2595,6 +2610,7 @@ impl Engine {
         loop {
             let attempted = self
                 .attempt_action(
+                    definition,
                     execution,
                     state,
                     action,
@@ -2645,9 +2661,26 @@ impl Engine {
                     // Outside the retry schedule on purpose (R15): a format
                     // error is repaired in the same session, not re-run.
                     self.reject_output(execution, &rejection)?;
-                    return self
-                        .reprompt(definition, execution, state, action, rejection, timeout)
-                        .await;
+                    if !kind.retries_unrepaired_output() {
+                        return self
+                            .reprompt(definition, execution, state, action, rejection, timeout)
+                            .await;
+                    }
+                    // Unless the step's own retries come next (R13): the
+                    // reprompt attempt that is still unusable is the one
+                    // that fails.
+                    match self
+                        .reprompt_before_retry(
+                            definition, execution, state, action, rejection, timeout,
+                        )
+                        .await?
+                    {
+                        Ok(upshot) => return Ok(upshot),
+                        Err((failed_attempt, failure)) => {
+                            action_execution_id = failed_attempt;
+                            failure
+                        }
+                    }
                 }
                 Ok(AttemptOutcome::Completed(result)) => {
                     return Ok(ActionUpshot::Completed {
@@ -2711,6 +2744,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn attempt_action(
         &self,
+        definition: &WorkflowDefinition,
         execution: &mut WorkflowExecution,
         state: &State,
         action: &ActionConfig,
@@ -2829,6 +2863,7 @@ impl Engine {
         let kind = ActionKind::of(action);
         let outcome = self
             .execute_rendered(
+                definition,
                 execution,
                 state,
                 &rendered,
@@ -2919,8 +2954,10 @@ impl Engine {
     ///
     /// The outer `Err` is a failure before anything ran (no executor for the
     /// action type); the inner result is the executor's own.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_rendered(
         &self,
+        definition: &WorkflowDefinition,
         execution: &WorkflowExecution,
         state: &State,
         rendered: &ActionConfig,
@@ -2966,7 +3003,8 @@ impl Engine {
             .with_conversation_store(&conversation_store)
             .with_contract(StepContract::of(state))
             .with_purpose(purpose)
-            .with_author(author);
+            .with_author(author)
+            .with_workflow(definition, &state.id);
 
         let outcome = executor.execute(request).await;
 
@@ -3080,21 +3118,7 @@ impl Engine {
         timeout: Option<Duration>,
     ) -> Result<ActionUpshot, EngineError> {
         let mut rescue = OutputRescue::after(&rejection);
-        // A `profile` step has no reprompt of its own yet: its unusable
-        // output goes to the operator (see `rescue_output`).
-        let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
-            (ActionConfig::Agent(config), Some(harness), Some(session)) => {
-                let profiled = self.profiled_template(execution, state, config);
-                Some(ActionConfig::Agent(agent::reprompt_config(
-                    &profiled,
-                    harness,
-                    session,
-                    &rejection.reason,
-                )))
-            }
-            _ => None,
-        };
-        let Some(config) = resumable else {
+        let Some(config) = self.reprompt_config(execution, state, action, &rejection) else {
             rescue.reason = format!(
                 "{} The agent could not be asked again for its output label: its \
                  harness reported no session to resume.",
@@ -3109,6 +3133,7 @@ impl Engine {
 
         match self
             .reprompt_attempt(
+                definition,
                 execution,
                 state,
                 config,
@@ -3146,6 +3171,106 @@ impl Engine {
         }
     }
 
+    /// The configuration of the engine's reprompt of `rejection`: its
+    /// harness session resumed, read-only, asking only for the output.
+    /// `None` when the action cannot be asked again, or its harness
+    /// reported no session to resume.
+    fn reprompt_config(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        action: &ActionConfig,
+        rejection: &OutputRejection,
+    ) -> Option<ActionConfig> {
+        let (Some(harness), Some(session)) = (&rejection.harness, &rejection.harness_session_id)
+        else {
+            return None;
+        };
+        match action {
+            ActionConfig::Agent(config) => {
+                let profiled = self.profiled_template(execution, state, config);
+                Some(ActionConfig::Agent(agent::reprompt_config(
+                    &profiled,
+                    harness,
+                    session,
+                    &rejection.reason,
+                )))
+            }
+            ActionConfig::Profile(config) => {
+                let profiled = self.profiled_profile_template(execution, state, config);
+                Some(ActionConfig::Profile(profile_action::reprompt_config(
+                    &profiled,
+                    harness,
+                    session,
+                    &rejection.reason,
+                )))
+            }
+            ActionConfig::Script(_)
+            | ActionConfig::Human(_)
+            | ActionConfig::Wait(_)
+            | ActionConfig::Decision(_) => None,
+        }
+    }
+
+    /// The engine's reprompt of a step whose unrepaired output is a failed
+    /// attempt ([`ActionKind::retries_unrepaired_output`], R13): like
+    /// [`Engine::reprompt`], but an answer still unusable — or no session
+    /// to resume — comes back as the failure of the still open attempt
+    /// that gave it, for `retry_policy` to judge, instead of going to a
+    /// rescue.
+    async fn reprompt_before_retry(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        action: &ActionConfig,
+        rejection: OutputRejection,
+        timeout: Option<Duration>,
+    ) -> Result<Result<ActionUpshot, (String, AttemptFailure)>, EngineError> {
+        let Some(config) = self.reprompt_config(execution, state, action, &rejection) else {
+            // Nothing is owed any more: the step's next attempt starts afresh.
+            clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+            self.store.save_execution(execution)?;
+            return Ok(Err((
+                rejection.action_execution_id,
+                AttemptFailure::retriable(format!(
+                    "{} It could not be asked again: its harness reported no session to resume.",
+                    rejection.reason
+                )),
+            )));
+        };
+        let end = self
+            .reprompt_attempt(
+                definition,
+                execution,
+                state,
+                config,
+                &rejection.action_execution_id,
+                rejection.reply.as_deref(),
+                RepromptedBy::Engine,
+                timeout,
+            )
+            .await?;
+        Ok(match end {
+            RepromptEnd::Labelled {
+                action_execution_id,
+                result,
+            } => Ok(ActionUpshot::Completed {
+                action_execution_id,
+                result,
+            }),
+            RepromptEnd::Stopped => Ok(ActionUpshot::Stopped),
+            RepromptEnd::Asked(request) => {
+                let flow = self.route_agent_question(execution, state, request).await?;
+                Ok(ActionUpshot::settled(flow))
+            }
+            RepromptEnd::Unlabelled(failure) => Err((
+                failure.answer.action_execution_id,
+                AttemptFailure::retriable(failure.reason),
+            )),
+        })
+    }
+
     /// One attempt asking the agent of `previous_attempt` again for its
     /// output label, resuming its session with `config` (KTD7) — the engine's
     /// reprompt or the conductor's (F1).
@@ -3156,6 +3281,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn reprompt_attempt(
         &self,
+        definition: &WorkflowDefinition,
         execution: &mut WorkflowExecution,
         state: &State,
         rendered: ActionConfig,
@@ -3183,6 +3309,7 @@ impl Engine {
 
         let outcome = match self
             .execute_rendered(
+                definition,
                 execution,
                 state,
                 &rendered,
@@ -3574,6 +3701,38 @@ impl Engine {
         self.apply_decision(definition, execution, state, pending, outcome)
     }
 
+    /// Writes the profile a `profile` step's result carries to
+    /// `step-profile.json`, replacing the one before; an empty profile
+    /// replaces it too. A result without one — the operator's, for a step
+    /// whose output was never usable — leaves the file alone.
+    fn store_step_profile(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        pending: &PendingStep,
+    ) -> Result<(), String> {
+        if !matches!(state.action, Some(ActionConfig::Profile(_))) {
+            return Ok(());
+        }
+        let Some(entries) = profile_action::step_profile_of(&pending.result) else {
+            return Ok(());
+        };
+        let entries = entries.map_err(|error| {
+            format!(
+                "the step profile of state '{}' is damaged: {error}",
+                state.id
+            )
+        })?;
+        self.store
+            .write_step_profile(&execution.id, &entries)
+            .map_err(|error| {
+                format!(
+                    "the step profile of state '{}' could not be written: {error}",
+                    state.id
+                )
+            })
+    }
+
     /// `DecisionMade` → context (D10) → `TransitionTaken` → `state.json`.
     fn apply_decision(
         &self,
@@ -3604,6 +3763,13 @@ impl Engine {
                     return Ok(Flow::Stop);
                 }
             };
+
+        // Before the step goes on, and again when a restart completes it
+        // again: the same file, written whole.
+        if let Err(message) = self.store_step_profile(execution, state, &pending) {
+            self.fail_action(execution, &pending.action_execution_id, message)?;
+            return Ok(Flow::Stop);
+        }
 
         self.emit(
             &execution.id,

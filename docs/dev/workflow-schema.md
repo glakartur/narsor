@@ -1157,10 +1157,21 @@ profile:
     action names both `model` and `effort` and it has no `ceiling`. Values from
     `globals.default_model` and `globals.default_effort` do not count as the step's own values. A
     ceiling from `globals.ceiling` counts as a ceiling, so such a step stays on the list.
+*   The agent ends with one JSON object: `{"entries": [{"step", "model", "effort", "rationale",
+    "confident"}], "reason"}`. It has no `choice`. The engine checks each entry. It skips an entry
+    for a step that is not on the list, a second entry for the same step (the first entry counts)
+    and an entry with `confident: false`. It checks the model and the effort separately: a value
+    outside the tiers or the efforts keeps the step's default, and the other value still counts. A
+    value above the `ceiling` is clamped to the `ceiling`. Without a `ceiling`, a value above the
+    default is clamped to the default. An entry that changes nothing is skipped.
+*   The engine writes the checked entries to `executions/{id}/step-profile.json` before the step
+    takes its transition. Each run replaces the whole file, also with an empty list. The step's
+    conversation gets one Narsor entry with the requested value, the stored value, the clamp and
+    the rationale of each entry. The step's reason gives the number of stored and skipped entries.
 *   A profile step fails like an agent step. A failed attempt, for example a time-out, follows
     `retry_policy`. For an unusable answer the engine asks the agent again once, in the same
-    session. An answer that is still unusable goes to the operator. The conductor does not choose
-    a label for it.
+    session. When that answer is also unusable, the attempt fails and `retry_policy` applies. When
+    no attempts are left, the step fails. The conductor does not choose a label for it.
 
 ---
 

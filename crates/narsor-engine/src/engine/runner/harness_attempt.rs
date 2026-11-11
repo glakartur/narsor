@@ -6,7 +6,7 @@
 //! note. Everything here works on an already rendered `config`.
 
 use super::*;
-use crate::domain::PromptText;
+use crate::domain::{ProfileActionConfig, PromptText};
 
 /// What [`Engine::apply_step_profile`] needs to know about the attempt.
 #[derive(Clone, Copy)]
@@ -170,16 +170,39 @@ impl Engine {
         template: &AgentActionConfig,
     ) -> AgentActionConfig {
         let mut config = template.clone();
+        self.profile_quietly(execution, state, &mut config.harness_step);
+        config
+    }
+
+    /// [`Self::profiled_template`] for a `profile` step.
+    pub(super) fn profiled_profile_template(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        template: &ProfileActionConfig,
+    ) -> ProfileActionConfig {
+        let mut config = template.clone();
+        self.profile_quietly(execution, state, &mut config.harness_step);
+        config
+    }
+
+    /// Applies the step profile to `step` without escalation and without
+    /// recording anything.
+    fn profile_quietly(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        step: &mut HarnessStepConfig,
+    ) {
         self.apply_step_profile(
             execution,
             state,
-            &mut config.harness_step,
+            step,
             AttemptProfile {
                 failures: 0,
                 announce: false,
             },
         );
-        config
     }
 
     /// Records a profile decision as an event, best-effort.

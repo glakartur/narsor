@@ -269,6 +269,7 @@ impl Engine {
                     let previous = rescue.episode().to_string();
                     match self
                         .reprompt_attempt(
+                            definition,
                             execution,
                             state,
                             config,

@@ -51,6 +51,7 @@ mod kubernetes_adapter;
 mod launch_spec_contract;
 mod orchestration;
 mod persistence;
+mod profile_step_flow;
 mod registry;
 mod schema_loading;
 mod step_profile_flow;

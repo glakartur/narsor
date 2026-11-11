@@ -49,7 +49,7 @@ pub use actions::{
     HarnessInvocation, HarnessRegistry, HarnessRequest, HarnessRun, HumanActionError,
     HumanExecutor, HumanInputDelivery, HumanInputRequest, InputContinuation, LoggingEventSink,
     OpenCodeAdapter, OutputProblem, OutputRequirement, PendingHumanInput, PermissionDecision,
-    PermissionDecisionKind, PermissionGrantScope, RejectedAnswer, ResumedHumanAction,
-    ScriptExecutor, StepContract, StepScope, SuspendedAction, TimedOutAction, UsageReporter,
-    ACTION_ID_ENV_VAR,
+    PermissionDecisionKind, PermissionGrantScope, ProfileExecutor, RejectedAnswer,
+    ResumedHumanAction, ScriptExecutor, StepContract, StepInWorkflow, StepScope, SuspendedAction,
+    TimedOutAction, UsageReporter, ACTION_ID_ENV_VAR,
 };
