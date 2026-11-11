@@ -1,6 +1,9 @@
 //! Which permission denials of a finished run stop the step.
+//!
+//! Whether the run has a usable final answer is decided by the one rule the
+//! stream parsers use too ([`final_answer_kind`], [`closing_answer`]).
 
-use super::response::{closing_answer, final_answer_kind};
+use crate::engine::actions::agent::{closing_answer, final_answer_kind};
 use crate::engine::actions::answer::AnswerShape;
 use crate::engine::actions::harness::{HarnessRun, PermissionDenial};
 

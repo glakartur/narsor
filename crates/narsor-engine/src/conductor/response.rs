@@ -41,7 +41,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use crate::domain::{ConductorPurpose, Confidence};
-use crate::engine::actions::agent::json_objects;
+use crate::engine::actions::session::response::json_objects;
 
 /// The kinds of decision a conductor can answer with, as `decision` spells
 /// them.

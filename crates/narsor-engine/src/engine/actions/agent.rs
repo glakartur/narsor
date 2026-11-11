@@ -28,177 +28,118 @@
 //!    and the engine resumes that session once, read-only, with
 //!    [`reprompt_config`] — outside the state's `retry_policy`, which stays
 //!    for real failures (KTD7).
-//! 3. **Record the session.** Every run creates an [`AgentSession`] and emits
-//!    `AgentSessionStarted` before it and `AgentSessionCompleted` /
-//!    `AgentSessionFailed` after it, with the harness's own session id captured
-//!    from its output (D18).
-//!
-//! # Why the executor emits events itself
-//!
-//! Everything else an executor produces is described by its return value, but a
-//! harness session is a thing that exists *during* the run: it starts before
-//! there is a result and it can fail without one. So the executor is given an
-//! [`AgentEventSink`] — the engine wires in [`LoggingEventSink`], which appends
-//! to the execution's log and republishes on the live channel, exactly as the
-//! engine's own `emit` does. Without a sink (a direct unit test) the run is
-//! unchanged and the events simply go nowhere.
+//! 3. **Leave the run to the session.** Spawning the harness, its time
+//!    limit, the conversation file, the session record and its events and
+//!    the permission denials are the shared [`super::session`]'s: this
+//!    executor builds the prompt before it and reads the answer after it.
 
 use std::future::Future;
-use std::io;
-use std::path::Path;
 use std::pin::Pin;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
-use narsor_protocol::chat::{ChatElement, PromptAuthor, UnclassifiedReason};
-use narsor_protocol::controller::{HarnessUsageReport, UsageLimit};
+use narsor_protocol::chat::ChatElement;
 use serde_json::{Map, Value};
-use std::process::ExitStatus;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::Command;
-use tokio::sync::broadcast;
-use uuid::Uuid;
 
-use crate::config::{agent_args_for, AgentArgs};
+use crate::config::AgentArgs;
 use crate::engine::timeline_file::ReadingSink;
 
 use super::answer::{self, AnswerShape, ChoiceAnswer};
-use super::harness::{
-    apply_extra_args, FinalAnswer, HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun,
-    HarnessStreamParser,
+use super::harness::{FinalAnswer, HarnessRegistry, HarnessRun};
+use super::human::HumanInputRequest;
+use super::script::truncate;
+use super::session::{
+    resume_session, ConversationSink, FinishedRun, SessionEnd, SessionRunner, SessionStart,
 };
-use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
-use super::process_group::{self, GroupGuard};
-use super::script::{truncate, MAX_BUFFERED_OUTPUT_BYTES};
-use super::{
-    ActionExecutor, ActionOutcome, ActionRequest, StepContract, SuspendedAction, TimedOutAction,
-    ACTION_ID_ENV_VAR,
-};
+use super::{ActionExecutor, ActionOutcome, ActionRequest, StepContract, SuspendedAction};
 use crate::domain::{
-    ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, AgentSessionStatus,
-    Event, EventData, WorkspaceAccess,
-};
-use crate::persistence::{
-    ConversationSource, ConversationStore, ConversationWriter, ExecutionStore,
+    ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, WorkspaceAccess,
 };
 
 mod contract;
-pub(crate) mod conversation;
-mod denials;
-pub(crate) mod process;
 mod response;
 
+pub use super::session::{
+    AgentEventSink, LoggingEventSink, UsageReporter, BUILT_IN_HARNESS, PARSE_LINE_LIMIT,
+    RESUME_SESSION_PARAMETER, RESUME_SESSION_REJECTED,
+};
+use contract::AWAITING_INPUT;
 pub use contract::{
     conductor_reprompt_config, continuation_config, output_contract, reprompt_config,
-    DefaultHarnessSource, BUILT_IN_HARNESS, CONDUCTOR_REPROMPT_GUARD, MISSING_OUTPUT_LABEL,
-    OUTPUT_REPROMPT, PARSE_LINE_LIMIT, RESUME_SESSION_PARAMETER, RESUME_SESSION_REJECTED,
+    DefaultHarnessSource, CONDUCTOR_REPROMPT_GUARD, MISSING_OUTPUT_LABEL, OUTPUT_REPROMPT,
     SESSION_DATA_KEY, SESSION_ID_VARIABLE,
 };
-use contract::{new_session, resume_session, AWAITING_INPUT};
-pub use conversation::{AgentEventSink, LoggingEventSink, UsageReporter};
-use conversation::{ConversationSink, UsageRelay};
-use denials::split_denials;
-pub(crate) use process::stderr_element;
-use process::{harness_error, run_harness_invocation, FINAL_ANSWER_GRACE};
-pub(crate) use process::{run_harness_process, FinishedRun, SpawnEnding};
 pub use response::extract_output;
 #[cfg(test)]
 pub(crate) use response::run_reply;
 use response::{
     agent_input_fields, build_result, read_response, record_question, record_reply_in_details,
-    record_session_in_details, AgentResponse,
+    AgentResponse,
 };
-pub(crate) use response::{closing_answer, final_answer_kind, json_objects};
+pub(crate) use response::{closing_answer, final_answer_kind};
 
 /// Executes `AgentAction` states.
 ///
-/// Holds the harness registry, so pointing `claude-code` at a different binary
-/// — a wrapper, an absolute path, the test suite's fake harness — is a matter
-/// of building the executor with another registry.
+/// Holds the [`SessionRunner`] its harness sessions run on, so pointing
+/// `claude-code` at a different binary — a wrapper, an absolute path, the
+/// test suite's fake harness — is a matter of building the executor with
+/// another registry.
 #[derive(Debug, Clone)]
 pub struct AgentExecutor {
-    harnesses: HarnessRegistry,
-    events: Option<Arc<dyn AgentEventSink>>,
-    usage: Option<Arc<dyn UsageReporter>>,
-    readings: Option<Arc<dyn ReadingSink>>,
-    /// How long a harness may go on after its final answer.
-    final_answer_grace: Duration,
-    /// Extra arguments of every run, winning over the adapter's own.
-    extra_args: AgentArgs,
+    sessions: SessionRunner,
 }
 
 impl AgentExecutor {
     /// An executor with the stock harnesses, no event sink and no usage
     /// reporter.
     pub fn new() -> Self {
-        Self {
-            harnesses: HarnessRegistry::defaults(),
-            events: None,
-            usage: None,
-            readings: None,
-            final_answer_grace: FINAL_ANSWER_GRACE,
-            extra_args: AgentArgs::new(),
-        }
+        Self::with_harnesses(HarnessRegistry::defaults())
     }
 
     /// The same executor, waiting `grace` after a final answer before it ends
     /// the harness's process group.
     pub fn with_final_answer_grace(mut self, grace: Duration) -> Self {
-        self.final_answer_grace = grace;
+        self.sessions.set_final_answer_grace(grace);
         self
     }
 
     /// The same executor, adding `args` to every harness run; on a conflict
     /// they replace the arguments the adapter decided on.
     pub fn with_extra_args(mut self, args: AgentArgs) -> Self {
-        self.extra_args = args;
+        self.sessions.set_extra_args(args);
         self
     }
 
     /// An executor with a registry of its own.
     pub fn with_harnesses(harnesses: HarnessRegistry) -> Self {
         Self {
-            harnesses,
-            events: None,
-            usage: None,
-            readings: None,
-            final_answer_grace: FINAL_ANSWER_GRACE,
-            extra_args: AgentArgs::new(),
+            sessions: SessionRunner::new(harnesses),
         }
     }
 
     /// Returns the executor with the session events routed to `sink`.
     pub fn with_event_sink(mut self, sink: Arc<dyn AgentEventSink>) -> Self {
-        self.events = Some(sink);
+        self.sessions.set_event_sink(sink);
         self
     }
 
     /// Returns the executor with the usage limits its harnesses report
     /// routed to `reporter`.
     pub fn with_usage_reporter(mut self, reporter: Arc<dyn UsageReporter>) -> Self {
-        self.usage = Some(reporter);
+        self.sessions.set_usage_reporter(reporter);
         self
     }
 
     /// Returns the executor with the tokens and cost its harnesses report
     /// handed to `sink`.
     pub fn with_reading_sink(mut self, sink: Arc<dyn ReadingSink>) -> Self {
-        self.readings = Some(sink);
+        self.sessions.set_reading_sink(sink);
         self
     }
 
     /// The harnesses this executor can run.
     pub fn harnesses(&self) -> &HarnessRegistry {
-        &self.harnesses
-    }
-
-    /// Emits an event for `execution_id`, when both are there to emit with.
-    fn emit(&self, execution_id: Option<&str>, data: EventData) {
-        if let (Some(sink), Some(execution_id)) = (&self.events, execution_id) {
-            sink.emit(execution_id, data);
-        }
+        self.sessions.harnesses()
     }
 }
 
@@ -218,80 +159,13 @@ impl ActionExecutor for AgentExecutor {
 }
 
 impl AgentExecutor {
-    /// Opens this attempt's conversation file, if there is a store to open it
-    /// in, and writes the prompt entry — the first line any conversation ever
-    /// has: the prompt sent, the harness, and the session it continues, if
-    /// any — with a [`ChatElement::Prompt`] carrying the full prompt.
-    fn open_conversation(
-        &self,
-        request: &ActionRequest<'_>,
-        harness: &str,
-        resume: Option<&str>,
-        prompt: &str,
-    ) -> ConversationSink {
-        let Some(store) = request.conversation_store else {
-            return ConversationSink::none();
-        };
-        let sink = ConversationSink::open(store, request.action_execution_id);
-        let entry = serde_json::json!({
-            "event": "prompt",
-            "harness": harness,
-            "resumed_session": resume,
-            "prompt": prompt,
-        })
-        .to_string();
-        let element = ChatElement::Prompt {
-            text: prompt.to_string(),
-            resumed_session: resume.map(str::to_string),
-            purpose: request.purpose,
-            author: Some(request.author.unwrap_or(PromptAuthor::Engine)),
-        };
-        sink.append_narsor(&entry, &[element]);
-        match (&self.readings, request.execution_id) {
-            (Some(readings), Some(execution_id)) => sink.with_readings(conversation::ReadingTap {
-                sink: Arc::clone(readings),
-                execution_id: execution_id.to_string(),
-                attempt_id: request.action_execution_id.to_string(),
-                harness: harness.to_string(),
-            }),
-            _ => sink,
-        }
-    }
-
-    /// One agent run, from the session record to the output label.
+    /// One agent run: the prompt, the harness session, and the output label
+    /// read from its answer.
     async fn run(&self, request: ActionRequest<'_>) -> Result<ActionOutcome, ActionError> {
         let config = agent_config(request.action)?;
-        let answer_shape = AnswerShape::of_step(request.contract.has_exit());
+        let shape = AnswerShape::of_step(request.contract.has_exit());
         let resume = resume_session(config)?;
-        if resume.is_some() && config.harness.is_none() {
-            return Err(ActionError {
-                message: format!(
-                    "parameter '{RESUME_SESSION_PARAMETER}' requires an explicit 'harness'"
-                ),
-                error_type: Some("invalid_parameter".to_string()),
-                details: None,
-            });
-        }
-
-        // The engine makes every attempt explicit, pinning its default
-        // harness once per action (R16a); only a caller other than the
-        // engine hands over one without, and gets the built-in.
-        let harness = config.harness.as_deref().unwrap_or(BUILT_IN_HARNESS);
-        let adapter = self.harnesses.get(harness)?;
-
-        if config.effort.is_some() && !adapter.supports_effort() {
-            self.emit(
-                request.execution_id,
-                EventData::Error {
-                    message: format!(
-                        "Harness '{harness}' does not take an effort; the step's effort is ignored"
-                    ),
-                    context: serde_json::json!({ "effort_ignored": harness }),
-                },
-            );
-        }
-
-        let mut session = new_session(config, harness, request.execution_id);
+        let harness = self.sessions.harness(config)?;
 
         let mut scope = request.step_scope();
         if config.workspace_access == Some(WorkspaceAccess::ReadOnly) {
@@ -307,293 +181,48 @@ impl AgentExecutor {
             "{}{}{}",
             config.prompt,
             repositories,
-            output_contract(&request.contract, adapter.contract_note())
+            output_contract(&request.contract, harness.contract_note())
         );
-        let workspace = scope.start_dir.as_path();
-        let writable_dirs = scope.write_dirs();
-        let read_only_dirs = scope.read_dirs();
 
-        // Opened before `invocation` (Key Technical Decisions): even an
-        // invocation that never runs (a bad parameter, a missing binary)
-        // leaves a conversation file behind, with the prompt and why the
-        // harness never started.
-        let conversation = self.open_conversation(&request, harness, resume, &prompt);
-
-        let invocation = match adapter.invocation(&HarnessRequest {
-            config,
-            workspace_access: config.workspace_access,
-            prompt: &prompt,
-            workspace,
-            writable_dirs: &writable_dirs,
-            read_only_dirs: &read_only_dirs,
-            resume_session: resume,
-            output_schema: None,
-        }) {
-            Ok(mut invocation) => {
-                apply_extra_args(
-                    &mut invocation,
-                    &prompt,
-                    agent_args_for(&self.extra_args, harness),
-                );
-                invocation
-            }
-            Err(error) => {
-                conversation.append_outcome(
-                    &format!("harness did not start: {}", error.message),
-                    serde_json::json!({ "error_type": error.error_type }),
-                );
-                conversation.finish();
-                return Err(error);
-            }
+        let session = match self
+            .sessions
+            .run(
+                &request,
+                SessionStart {
+                    harness,
+                    config,
+                    scope: &scope,
+                    resume,
+                    prompt,
+                    shape,
+                },
+            )
+            .await?
+        {
+            SessionEnd::Answered(session) => session,
+            SessionEnd::Stopped(outcome) => return Ok(outcome),
         };
 
-        self.emit(
-            request.execution_id,
-            EventData::AgentSessionStarted {
-                session_id: session.id.clone(),
-                // The harness that actually ran, never "unspecified".
-                harness: harness.to_string(),
-                action_execution_id: Some(request.action_execution_id.to_string()),
-                resumed_session: resume.map(ToString::to_string),
-                model: flag_value(&invocation.args, &["--model", "-m"])
-                    .or_else(|| config.model.clone()),
-                effort: flag_value(&invocation.args, &["--effort", "--reasoning-effort"]),
-            },
-        );
-        session.status = AgentSessionStatus::Running;
-
-        let usage = self.usage.as_deref().map(|reporter| UsageRelay {
-            harness: adapter.name(),
-            reporter,
-        });
-        let ending = run_harness_invocation(
-            &invocation.program,
-            &invocation.args,
-            invocation.stdin.as_deref(),
-            workspace,
-            Some(request.action_execution_id),
-            request.timeout,
-            self.final_answer_grace,
-            adapter.stream_parser(answer_shape),
-            &conversation,
-            usage,
-        )
-        .await;
-
-        let finished = match ending {
-            Ok(SpawnEnding::Finished(finished)) => {
-                if let Some(group) = finished.terminated_group {
-                    conversation.append_outcome(
-                        &format!("agent process group {group} terminated after the final answer"),
-                        serde_json::json!({ "process_group": group, "reason": "final_answer" }),
-                    );
-                }
-                if finished.exit_code != 0 {
-                    conversation.append_outcome(
-                        &format!("harness exited with code {}", finished.exit_code),
-                        serde_json::json!({ "exit_code": finished.exit_code }),
-                    );
-                }
-                finished
-            }
-            Ok(SpawnEnding::TimedOut) => {
-                let limit = request.timeout.unwrap_or_default();
-                conversation.append_outcome(
-                    &format!(
-                        "harness timed out after {}s and was killed",
-                        limit.as_secs_f64()
-                    ),
-                    serde_json::json!({ "timed_out_after_secs": limit.as_secs_f64() }),
-                );
-                conversation.finish();
-
-                self.fail_session(
-                    request.execution_id,
-                    request.action_execution_id,
-                    &mut session,
-                    None,
-                    format!(
-                        "the harness was still running after {}s and was killed",
-                        limit.as_secs_f64()
-                    ),
-                );
-
-                return Ok(ActionOutcome::TimedOut(TimedOutAction {
-                    timeout: limit,
-                    subject: format!("agent harness '{}'", adapter.name()),
-                }));
-            }
-            Err(error) => {
-                let started = !matches!(
-                    error.error_type.as_deref(),
-                    Some("harness_not_found") | Some("spawn_failed")
-                );
-                conversation.append_outcome(
-                    &if started {
-                        format!("harness run failed: {}", error.message)
-                    } else {
-                        format!("harness did not start: {}", error.message)
-                    },
-                    serde_json::json!({ "error_type": error.error_type }),
-                );
-                conversation.finish();
-
-                self.fail_session(
-                    request.execution_id,
-                    request.action_execution_id,
-                    &mut session,
-                    None,
-                    error.message.clone(),
-                );
-                return Err(error);
-            }
-        };
-
-        let run = finished.run.clone();
-
-        if let Some(session_id) = &run.session_id {
-            session
-                .config
-                .as_object_mut()
-                .expect("the session config is built as an object")
-                .insert(
-                    "harness_session_id".to_string(),
-                    Value::String(session_id.clone()),
-                );
-        }
-
-        if !run.text.trim().is_empty() {
-            self.emit(
-                request.execution_id,
-                EventData::AgentMessage {
-                    session_id: session.id.clone(),
-                    content: truncate(&run.text),
-                    role: "assistant".to_string(),
-                    action_execution_id: Some(request.action_execution_id.to_string()),
-                },
-            );
-        }
-
-        let denials = split_denials(&run, answer_shape);
-        for denial in &denials.ignored {
-            self.emit(
-                request.execution_id,
-                EventData::PermissionDeniedIgnored {
-                    session_id: session.id.clone(),
-                    action_execution_id: Some(request.action_execution_id.to_string()),
-                    tool_name: denial.tool_name.clone(),
-                    tool_use_id: denial.tool_use_id.clone(),
-                    summary: denial.summary.clone(),
-                    reason: denial.reason.clone(),
-                    source: denial.subagent.clone(),
-                },
-            );
-        }
-
-        if !denials.blocking.is_empty() {
-            conversation.finish();
-            session.status = AgentSessionStatus::Completed;
-            session.ended_at = Some(Utc::now());
-            self.emit(
-                request.execution_id,
-                EventData::AgentSessionCompleted {
-                    session_id: session.id.clone(),
-                    action_execution_id: Some(request.action_execution_id.to_string()),
-                    harness_session_id: run.session_id.clone(),
-                },
-            );
-            let cwd = scope.start_dir.to_string_lossy().into_owned();
-            return Ok(ActionOutcome::Suspended(
-                SuspendedAction::AwaitingAgentInput(HumanInputRequest {
-                    action_execution_id: request.action_execution_id.to_string(),
-                    instruction: format!(
-                        "{} needs a permission decision before this task can continue.",
-                        narsor_protocol::harness::display_name(harness)
-                    ),
-                    fields: Vec::new(),
-                    reason: None,
-                    required_values: Vec::new(),
-                    answer_tail: Some(run.text.clone()),
-                    agent_harness: Some(harness.to_string()),
-                    agent_session_id: run.session_id.clone(),
-                    prefilled_answer: None,
-                    permission: Some(PermissionRequestDetails {
-                        denials: denials
-                            .blocking
-                            .iter()
-                            .map(|denial| PermissionDenialDetails {
-                                tool_name: denial.tool_name.clone(),
-                                tool_use_id: denial.tool_use_id.clone(),
-                                input: denial.input.clone(),
-                                cwd: cwd.clone(),
-                                reason_type: denial.reason_type.clone(),
-                                reason: denial.reason.clone(),
-                            })
-                            .collect(),
-                    }),
-                }),
-            ));
-        }
-
-        if let Some(failure) = &run.failure {
-            conversation.finish();
-            self.fail_session(
-                request.execution_id,
-                request.action_execution_id,
-                &mut session,
-                run.session_id.clone(),
-                failure.clone(),
-            );
-            return Err(harness_error(
-                adapter.as_ref(),
-                failure,
-                &finished,
-                &run,
-                resume,
-            ));
-        }
-
-        let output = match read_response(&run, answer_shape) {
+        let output = match read_response(session.run(), shape) {
             Ok(output) => {
-                record_question(&conversation, &output);
-                conversation.finish();
+                record_question(session.conversation(), &output);
                 output
             }
             Err(mut error) => {
-                conversation.finish();
-                // What the engine needs to ask this same session again
-                // (KTD7): the harness it ran on and the session it left.
-                record_session_in_details(&mut error, harness, run.session_id.as_deref());
-                record_reply_in_details(&mut error, &run, answer_shape);
-                self.fail_session(
-                    request.execution_id,
-                    request.action_execution_id,
-                    &mut session,
-                    run.session_id.clone(),
-                    error.message.clone(),
-                );
-                return Err(error);
+                record_reply_in_details(&mut error, session.run(), shape);
+                return Err(session.reject(error));
             }
         };
-
-        session.status = AgentSessionStatus::Completed;
-        session.ended_at = Some(Utc::now());
-        self.emit(
-            request.execution_id,
-            EventData::AgentSessionCompleted {
-                session_id: session.id.clone(),
-                action_execution_id: Some(request.action_execution_id.to_string()),
-                harness_session_id: run.session_id.clone(),
-            },
-        );
+        let completed = session.complete();
+        let run = &completed.finished.run;
 
         match output {
             AgentResponse::Completed(output) => Ok(ActionOutcome::Completed(build_result(
                 output,
-                &session,
-                &run,
-                &finished,
-                answer_shape,
+                &completed.record,
+                run,
+                &completed.finished,
+                shape,
             ))),
             AgentResponse::AwaitingInput { question, options } => Ok(ActionOutcome::Suspended(
                 SuspendedAction::AwaitingAgentInput(HumanInputRequest {
@@ -603,35 +232,13 @@ impl AgentExecutor {
                     reason: None,
                     required_values: Vec::new(),
                     answer_tail: None,
-                    agent_harness: Some(harness.to_string()),
+                    agent_harness: Some(completed.record.harness.clone()),
                     agent_session_id: run.session_id.clone(),
                     prefilled_answer: None,
                     permission: None,
                 }),
             )),
         }
-    }
-
-    /// Marks the session failed and says so in the log.
-    fn fail_session(
-        &self,
-        execution_id: Option<&str>,
-        action_execution_id: &str,
-        session: &mut AgentSession,
-        harness_session_id: Option<String>,
-        error: String,
-    ) {
-        session.status = AgentSessionStatus::Failed;
-        session.ended_at = Some(Utc::now());
-        self.emit(
-            execution_id,
-            EventData::AgentSessionFailed {
-                session_id: session.id.clone(),
-                error,
-                action_execution_id: Some(action_execution_id.to_string()),
-                harness_session_id,
-            },
-        );
     }
 }
 
@@ -658,45 +265,5 @@ fn action_type_name(action: &ActionConfig) -> &'static str {
         ActionConfig::Human(_) => "human",
         ActionConfig::Wait(_) => "wait",
         ActionConfig::Decision(_) => "decision",
-    }
-}
-
-/// The value of the first of `flags` on a harness command line, written as
-/// `--flag value` or `--flag=value`.
-fn flag_value(args: &[String], flags: &[&str]) -> Option<String> {
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        if let Some((name, value)) = arg.split_once('=') {
-            if flags.contains(&name) && !value.is_empty() {
-                return Some(value.to_string());
-            }
-        } else if flags.contains(&arg.as_str()) {
-            return args.next().filter(|v| !v.starts_with('-')).cloned();
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod flag_value_tests {
-    use super::flag_value;
-
-    fn args(args: &[&str]) -> Vec<String> {
-        args.iter().map(ToString::to_string).collect()
-    }
-
-    #[test]
-    fn a_flag_gives_its_value_either_way() {
-        let flags = ["--model", "-m"];
-        assert_eq!(
-            flag_value(&args(&["-p", "--model", "opus"]), &flags),
-            Some("opus".into())
-        );
-        assert_eq!(
-            flag_value(&args(&["--model=sonnet"]), &flags),
-            Some("sonnet".into())
-        );
-        assert_eq!(flag_value(&args(&["--model"]), &flags), None);
-        assert_eq!(flag_value(&args(&["--other", "x"]), &flags), None);
     }
 }

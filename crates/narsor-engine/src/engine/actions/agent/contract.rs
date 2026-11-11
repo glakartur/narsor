@@ -24,42 +24,6 @@ impl DefaultHarnessSource for DefaultHarnessSelector {
     }
 }
 
-pub(super) fn new_session(
-    config: &AgentActionConfig,
-    harness: &str,
-    execution_id: Option<&str>,
-) -> AgentSession {
-    AgentSession {
-        id: Uuid::new_v4().to_string(),
-        workflow_execution_id: execution_id.unwrap_or_default().to_string(),
-        harness: harness.to_string(),
-        started_at: Utc::now(),
-        ended_at: None,
-        status: AgentSessionStatus::Starting,
-        model: config.model.clone(),
-        config: serde_json::json!({
-            "harness": harness,
-            "read_only_paths": config.read_only_paths,
-            "parameters": config.parameters,
-        }),
-    }
-}
-
-pub(super) fn resume_session(config: &AgentActionConfig) -> Result<Option<&str>, ActionError> {
-    match config.parameters.get(RESUME_SESSION_PARAMETER) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(session)) if session.is_empty() => Ok(None),
-        Some(Value::String(session)) => Ok(Some(session.as_str())),
-        Some(other) => Err(ActionError {
-            message: format!(
-                "parameter '{RESUME_SESSION_PARAMETER}' must be a session id string, got {other}"
-            ),
-            error_type: Some("invalid_parameter".to_string()),
-            details: None,
-        }),
-    }
-}
-
 /// The answer object of a step that chooses a label.
 const CHOICE_ANSWER_SHAPE: &str = "{\"choice\": \"<label>\", \"reason\": \"<one line>\", \
 \"variables\": {}, \"artifacts\": {}, \"additional_data\": {}, \"additional_artifacts\": []}";
@@ -287,20 +251,6 @@ pub fn conductor_reprompt_config(
     config
 }
 
-/// The harness used when neither the action nor the configuration names one.
-///
-/// The name the adapter itself registers under, not a second spelling of it:
-/// a default that `HarnessRegistry::get` does not know would fail at run time
-/// rather than at compile time.
-pub const BUILT_IN_HARNESS: &str = super::super::harness::claude_code::CLAUDE_CODE;
-
-/// The `parameters` key that continues an existing harness session (D18).
-pub const RESUME_SESSION_PARAMETER: &str = "resume_session";
-
-/// The harness refused a saved session id. The runner turns this into a new
-/// operator choice instead of retrying it or discarding the drafted message.
-pub const RESUME_SESSION_REJECTED: &str = "resume_session_rejected";
-
 /// Configures the next normal attempt as a continuation of an operator-facing
 /// conversation. Unlike [`reprompt_config`], this preserves the action's
 /// workspace permission: the operator is explicitly asking the agent to keep
@@ -326,13 +276,3 @@ pub const SESSION_ID_VARIABLE: &str = "agent_session_id";
 
 /// The `data` key carrying the session record of the run.
 pub const SESSION_DATA_KEY: &str = "agent_session";
-
-/// The most a single stdout line is handed to the harness's stream parser.
-///
-/// Every line reaches the conversation file in full regardless (R14) — this
-/// only bounds what is fed to [`HarnessStreamParser::on_stdout_line`]. Tens of
-/// megabytes is well past anything a harness's own JSON envelope needs (a
-/// multi-megabyte `tool_result` line is ordinary; the final `result`/`text`
-/// line is not), so a line past this limit is bulky tool output, not the
-/// answer, and is safely skipped for parsing.
-pub const PARSE_LINE_LIMIT: usize = 32 * 1024 * 1024;

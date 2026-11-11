@@ -38,6 +38,7 @@ pub mod human;
 mod process_group;
 pub mod scope;
 pub mod script;
+pub(crate) mod session;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -51,9 +52,7 @@ use crate::domain::{
 };
 use crate::persistence::ConversationStore;
 
-pub use agent::{
-    AgentEventSink, AgentExecutor, DefaultHarnessSource, LoggingEventSink, UsageReporter,
-};
+pub use agent::{AgentExecutor, DefaultHarnessSource};
 pub use answer::ChoiceAnswer;
 pub use harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry,
@@ -67,6 +66,7 @@ pub use human::{
 };
 pub use scope::{ScopedRepository, StepScope};
 pub use script::ScriptExecutor;
+pub use session::{AgentEventSink, LoggingEventSink, UsageReporter};
 
 /// Environment variable carrying the [`crate::domain::ActionExecution`] id into
 /// the child process.

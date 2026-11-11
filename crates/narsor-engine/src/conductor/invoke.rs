@@ -58,14 +58,12 @@ use crate::config::{agent_args_for, AgentArgs};
 use crate::domain::{
     AgentActionConfig, ChoiceDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
 };
-use crate::engine::actions::agent::conversation::ReadingTap;
-use crate::engine::actions::agent::{
-    run_harness_process, DefaultHarnessSource, SpawnEnding, BUILT_IN_HARNESS,
-};
+use crate::engine::actions::agent::{DefaultHarnessSource, BUILT_IN_HARNESS};
 use crate::engine::actions::answer::AnswerShape;
 use crate::engine::actions::harness::{
     apply_extra_args, HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX,
 };
+use crate::engine::actions::session::{run_harness_process, ReadingTap, SpawnEnding};
 use crate::engine::timeline_file::{ReadingSink, UsageReading};
 use crate::persistence::{ExecutionStore, WorkPaths};
 

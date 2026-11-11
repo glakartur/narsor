@@ -1,4 +1,7 @@
 use super::*;
+use crate::engine::actions::session::response::{
+    closing_object, json_objects, structured_then_text, top_level_objects,
+};
 use narsor_protocol::chat::QuestionSource;
 
 #[derive(Debug, Clone)]
@@ -84,16 +87,11 @@ pub(super) fn read_response(
     run: &HarnessRun,
     shape: AnswerShape,
 ) -> Result<AgentResponse, ActionError> {
-    if let Some(structured) = &run.structured_output {
-        match structured_response(structured, shape) {
-            Ok(response) => return Ok(response),
-            Err(error) => tracing::warn!(
-                reason = %error.message,
-                "the harness's structured output is not a usable answer; reading the text instead"
-            ),
-        }
-    }
-    extract_response(&run.text, shape)
+    structured_then_text(
+        run,
+        |structured| structured_response(structured, shape),
+        |text| extract_response(text, shape),
+    )
 }
 
 /// What kind of final answer `value` is, by the same rule [`read_response`]
@@ -259,75 +257,6 @@ fn no_label_error(reason: &str, text: &str) -> ActionError {
     }
 }
 
-/// Adds the harness and its session id to the details of an extraction
-/// failure, so the engine can resume that session to ask for the label again.
-pub(super) fn record_session_in_details(
-    error: &mut ActionError,
-    harness: &str,
-    session_id: Option<&str>,
-) {
-    let details = error
-        .details
-        .get_or_insert_with(|| Value::Object(Map::new()));
-    if let Value::Object(details) = details {
-        details.insert("harness".to_string(), Value::String(harness.to_string()));
-        details.insert(
-            "harness_session_id".to_string(),
-            session_id.map_or(Value::Null, |id| Value::String(id.to_string())),
-        );
-    }
-}
-
-/// How many `{` that never close a scan of an agent's text skips, and how
-/// many candidates it tries from the right, before it gives up.
-///
-/// Each one costs a scan to the end of the text, so without a bound a text
-/// full of stray braces takes quadratic time. Prose has a few; the contract
-/// is near the end.
-const MAX_BRACE_CANDIDATES: usize = 64;
-
-/// Every top-level JSON object in `text`, in the order they appear.
-///
-/// Scanning for balanced braces — string- and escape-aware, so a `}` inside a
-/// string never ends an object — rather than looking for fences: it finds the
-/// fenced case too, since the fence markers are outside the braces. A `{`
-/// that never closes (a brace in the prose) is skipped, and the scan goes on
-/// from the next one, so it cannot hide an object after it — up to
-/// [`MAX_BRACE_CANDIDATES`] of them.
-pub(crate) fn json_objects(text: &str) -> Vec<Value> {
-    let mut found = Vec::new();
-    for (start, end) in top_level_objects(text) {
-        if let Ok(value) = serde_json::from_str::<Value>(&text[start..end]) {
-            if value.is_object() {
-                found.push(value);
-            }
-        }
-    }
-    found
-}
-
-/// The spans of the top-level balanced objects of `text`, skipping at most
-/// [`MAX_BRACE_CANDIDATES`] braces that never close.
-fn top_level_objects(text: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let (mut from, mut unclosed) = (0, 0);
-    while let Some(offset) = text[from..].find('{') {
-        let start = from + offset;
-        match object_end(text, start) {
-            Some(end) => {
-                spans.push((start, end));
-                from = end;
-            }
-            None if unclosed < MAX_BRACE_CANDIDATES => {
-                unclosed += 1;
-                from = start + 1;
-            }
-            None => break,
-        }
-    }
-    spans
-}
-
 /// Builds the action result of a successful run.
 pub(super) fn build_result(
     answer: ChoiceAnswer,
@@ -423,80 +352,14 @@ fn clean_reply(text: &str, shape: AnswerShape) -> Option<String> {
 }
 
 /// Where the text's closing output-contract object starts — or the code
-/// fence wrapping it, when one does.
-///
-/// The object is the one that ends where the text ends (but for whitespace
-/// and a closing fence), found from the right, so a brace in the prose
-/// before it never hides it. At most [`MAX_BRACE_CANDIDATES`] braces are
-/// tried.
+/// fence wrapping it, when one does ([`closing_object`]).
 fn final_contract_start(text: &str, shape: AnswerShape) -> Option<usize> {
     final_contract(text, shape).map(|(cut, _)| cut)
 }
 
 /// [`final_contract_start`], with the text of the closing object as well.
 fn final_contract(text: &str, shape: AnswerShape) -> Option<(usize, &str)> {
-    let trimmed = text.trim_end();
-    let (body, fenced) = match trimmed.strip_suffix("```") {
-        Some(rest) => (rest.trim_end(), true),
-        None => (trimmed, false),
-    };
-    let mut candidates = body;
-    let mut tried = 0;
-    while let Some(start) = candidates.rfind('{') {
-        tried += 1;
-        if tried > MAX_BRACE_CANDIDATES {
-            return None;
-        }
-        candidates = &body[..start];
-        if object_end(body, start) != Some(body.len()) || !is_contract(&body[start..], shape) {
-            continue;
-        }
-        if !fenced {
-            return Some((start, &body[start..]));
-        }
-        let before = body[..start].trim_end();
-        let opening = before.strip_suffix("```").or_else(|| {
-            let split = before.len().checked_sub("```json".len())?;
-            before
-                .get(split..)
-                .filter(|tail| tail.eq_ignore_ascii_case("```json"))
-                .map(|_| &before[..split])
-        });
-        // A closing fence that does not wrap the object belongs to
-        // something else.
-        return opening.map(|opening| (opening.len(), &body[start..]));
-    }
-    None
-}
-
-/// The end (exclusive) of the JSON object opening at `start`: string- and
-/// escape-aware brace matching. `None` when it never closes.
-fn object_end(text: &str, start: usize) -> Option<usize> {
-    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
-    for (index, ch) in text[start..].char_indices() {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                quoted = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => quoted = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(start + index + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    closing_object(text, |object| is_contract(object, shape))
 }
 
 /// Whether `object` is an output-contract object: an answer or a question.
@@ -523,7 +386,6 @@ fn last_contract_span(text: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod json_object_tests {
     use super::{extract_response, json_objects, AgentResponse};
-    use serde_json::json;
 
     fn label_of(text: &str) -> String {
         match extract_response(text, super::AnswerShape::Choice).expect("a response") {
@@ -542,17 +404,6 @@ mod json_object_tests {
             label_of("Open { and a \"quote.\n```json\n{\"choice\":\"clean\"}\n```"),
             "clean"
         );
-    }
-
-    #[test]
-    fn braces_in_strings_stay_inside_their_object() {
-        let objects = json_objects(
-            "Report.\n{\"choice\":\"findings\",\"additional_data\":{\"note\":\"a } and a {\",\
-             \"nested\":{\"choice\":\"inner\"}}}",
-        );
-        assert_eq!(objects.len(), 1);
-        assert_eq!(objects[0]["choice"], json!("findings"));
-        assert_eq!(objects[0]["additional_data"]["note"], json!("a } and a {"));
     }
 
     #[test]
