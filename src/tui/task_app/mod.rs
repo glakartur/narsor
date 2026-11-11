@@ -63,8 +63,8 @@
 //!   height from [`detail::render`] and the tab content gives up the rows; the
 //!   keys of [`keymap::Context::Panel`] apply while it has the focus (`Tab` is
 //!   [`Action::SwitchFocus`], ignored until then).
-//! * **The action menu (U11)** is in: [`actions`]. `.` opens it, every action
-//!   has a shortcut, and [`actions::availability`] decides — for the menu, the
+//! * **The action menu (U11)** is in: [`actions`]. `Ctrl+.` (or `.`) opens it, no action
+//!   has its own shortcut, and [`actions::availability`] decides — for the menu, the
 //!   shortcuts and the bar — whether an action can be done and why not. What
 //!   sits over the screen is an [`Overlay`] in the field next to `help_open`;
 //!   it takes the keys first ([`TaskApp::key_context`], [`TaskApp::on_key`]).
@@ -1068,14 +1068,14 @@ impl TaskApp {
             return false;
         };
         if let Availability::Unavailable(reason) = availability(task, TaskAction::Move) {
-            let word = actions::verb(task, TaskAction::Move);
+            let word = actions::verb(TaskAction::Move);
             self.notify(Severity::Warning, format!("{word}: {reason}"));
             return false;
         }
         self.mutation_allowed()
     }
 
-    /// `K` / `J`: one place up or down, relative to the neighbouring row.
+    /// `Ctrl+↑` / `Ctrl+↓`: one place up or down, relative to the neighbouring row.
     fn step_move(&mut self, up: bool) -> Request {
         if !self.movable_selection() {
             return Request::None;

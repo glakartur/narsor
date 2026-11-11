@@ -194,11 +194,11 @@ pub fn describe_loss(loss: &LossState) -> String {
             format!("wznowienie automatyczne, próba {attempt}/{limit}")
         }
         LossState::Exhausted(reason) => format!(
-            "nie udało się wznowić automatycznie: {}, uruchom od nowa (s)",
+            "nie udało się wznowić automatycznie: {}, uruchom od nowa (Ctrl+.)",
             exhaustion_detail(reason)
         ),
         LossState::LostWhilePausing => {
-            "utracone podczas wstrzymywania, czeka na Ciebie (s)".to_string()
+            "utracone podczas wstrzymywania, czeka na Ciebie (Ctrl+.)".to_string()
         }
     }
 }

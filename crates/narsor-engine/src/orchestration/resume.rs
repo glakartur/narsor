@@ -44,6 +44,13 @@ pub fn slot_release_key(generation: u64) -> String {
     format!("{SLOT_RELEASE_KEY_PREFIX}{generation}")
 }
 
+/// The idempotency key of the owner's early release of the slot of the task
+/// running at `generation`. Not reserved: the owner's keys are free, and
+/// this one only serves [`ControlPlane::release_slot_now`].
+pub fn owner_slot_release_key(generation: u64) -> String {
+    format!("owner-release-slot:{generation}")
+}
+
 /// The prefix of the idempotency keys of the commands a lowered limit of
 /// concurrent tasks causes (`limit-stop:<generation>`), reserved like
 /// [`AUTO_RESUME_KEY_PREFIX`].

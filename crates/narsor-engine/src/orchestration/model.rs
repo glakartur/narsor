@@ -327,6 +327,14 @@ pub struct TaskRecord {
     /// record so a restart of the daemon neither loses nor shortens it.
     #[serde(default)]
     pub slot_release_due_at: Option<DateTime<Utc>>,
+    /// Until when a task stopped by its owner's `Pause` or `Stop` keeps its
+    /// slot. Set from `slot_release_due_at` when the owner stops a task that
+    /// waits for the owner and the deadline did not pass; the same deadline
+    /// ends the hold, and so do `ReleaseSlot`, a resume and an archive. While
+    /// it is set, a `Stopped` task holds capacity (see
+    /// [`TaskRecord::holds_capacity`]).
+    #[serde(default)]
+    pub slot_hold_until: Option<DateTime<Utc>>,
     /// The control plane accepted the safe point of this task's pause for a
     /// lowered limit: the task goes back to the queue once its compute is
     /// gone. Set under the backend's schedule lock, so the accepted stops
@@ -466,6 +474,28 @@ impl TaskRecord {
             && !self.owner_work_pending()
     }
 
+    /// Whether the task waits for the owner so that its slot could be freed
+    /// now: it runs, its execution is in a state that frees the slot, a
+    /// deadline is set, and nothing of the owner's waits for the runner. The
+    /// deadline need not have passed.
+    pub fn slot_release_pending(&self) -> bool {
+        self.runner_state == RunnerState::Running
+            && self.slot_release_due_at.is_some()
+            && self.slot_release_class().is_some()
+            && !self.owner_work_pending()
+    }
+
+    /// Whether the task is `Stopped` and still holds its slot until
+    /// `slot_hold_until`; the owner can end that wait with `ReleaseSlot`.
+    pub fn holds_stopped_slot(&self) -> bool {
+        self.runner_state == RunnerState::Stopped && self.slot_hold_until.is_some()
+    }
+
+    /// Whether the hold of a `Stopped` task is over at `now`.
+    pub fn slot_hold_expired(&self, now: DateTime<Utc>) -> bool {
+        self.holds_stopped_slot() && self.slot_hold_until.is_some_and(|until| until <= now)
+    }
+
     /// Whether the pause the task now waits to complete is the slot-release
     /// policy's, not the owner's.
     pub fn pause_requested_by_policy(&self) -> bool {
@@ -501,7 +531,11 @@ impl TaskRecord {
     /// Whether the task holds a slot with compute that exists or may exist,
     /// as opposed to a reservation that nothing started on yet.
     pub fn holds_compute_slot(&self) -> bool {
-        self.holds_capacity() && self.runner_state != RunnerState::Queued
+        self.holds_capacity()
+            && !matches!(
+                self.runner_state,
+                RunnerState::Queued | RunnerState::Stopped
+            )
     }
 
     /// The receipt of the start or resume that produced `launch_generation`
@@ -529,9 +563,13 @@ impl TaskRecord {
     ///   explicitly, so a retry never has to wait for capacity;
     /// * `Archiving` — deletion is requested but not confirmed.
     ///
-    /// `Stopped` releases its slot: the safe point was acknowledged and the
-    /// compute removed (R12). `Archived` and an unadmitted `Queued` task
-    /// hold nothing.
+    /// `Stopped` has no compute: the safe point was acknowledged and the
+    /// compute removed (R12). It keeps the slot only while
+    /// [`Self::slot_hold_until`] is set, that is after the owner's `Pause` or
+    /// `Stop` of a task that waited for the owner, until that wait ends
+    /// (its deadline, `ReleaseSlot`, a resume or an archive). A resume of
+    /// such a task needs no new slot. `Archived` and an unadmitted `Queued`
+    /// task hold nothing.
     pub fn holds_capacity(&self) -> bool {
         match self.runner_state {
             RunnerState::Queued => self.reservation.is_some(),
@@ -541,7 +579,8 @@ impl TaskRecord {
             | RunnerState::Interrupted
             | RunnerState::Unknown
             | RunnerState::Archiving => true,
-            RunnerState::Stopped | RunnerState::Archived => false,
+            RunnerState::Stopped => self.slot_hold_until.is_some(),
+            RunnerState::Archived => false,
         }
     }
 
@@ -667,8 +706,11 @@ impl TaskRecord {
     /// on a live runner (interrupt, confirm or reject a proposal) is
     /// refused, with the reason.
     pub fn operator_command_refusal(&self, command: &OperatorCommand) -> Option<String> {
+        let stop_while_pausing = matches!(command, OperatorCommand::StopStep)
+            && self.runner_state == RunnerState::PauseRequested;
         let reason = match self.runner_state {
             RunnerState::Running | RunnerState::Stopped => None,
+            RunnerState::PauseRequested if stop_while_pausing => None,
             RunnerState::Queued | RunnerState::Provisioning => self
                 .awaited_launch_generation()
                 .is_none()
@@ -685,12 +727,15 @@ impl TaskRecord {
         if self.runner.is_none() {
             return Some("the task's runner has not reported yet".to_string());
         }
-        if self.runner_state != RunnerState::Running || self.awaited_launch_generation().is_some() {
+        if (self.runner_state != RunnerState::Running && !stop_while_pausing)
+            || self.awaited_launch_generation().is_some()
+        {
             // No live runner to act on: only work that waits for the next
             // start can be taken.
             if matches!(
                 command,
                 OperatorCommand::Interrupt
+                    | OperatorCommand::StopStep
                     | OperatorCommand::ConfirmProposal { .. }
                     | OperatorCommand::RejectProposal { .. }
             ) {

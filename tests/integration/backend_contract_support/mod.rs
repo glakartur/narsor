@@ -1477,6 +1477,83 @@ pub async fn operator_commands_reach_the_runner_and_come_back_with_a_verdict<T: 
     }
 }
 
+/// A stop is a pause first, then the cut: the pause is made once however
+/// often the stop is retried, a stale generation does not fail the second
+/// step, and a task already pausing is not paused again.
+pub async fn a_stop_pauses_once_and_then_queues_the_cut<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    let controller = h.start_controller();
+    h.running("task-1").await;
+    h.running("task-2").await;
+    // Nothing acts on the pause: the tasks stay in `PauseRequested`.
+    h.sever(controller);
+    let owner = OwnerRef::new(LOCAL_OWNER);
+    let stop = |key: &str, generation: Option<u64>| SubmitOperatorCommandRequest {
+        command: OperatorCommand::StopStep,
+        idempotency_key: key.to_string(),
+        expected_generation: generation,
+    };
+    let pauses = |h: &Harness<T>, task: &str| {
+        h.record(task)
+            .commands
+            .iter()
+            .filter(|receipt| receipt.command == OwnerCommand::Pause)
+            .count()
+    };
+
+    let generation = h.record("task-1").generation;
+    let first = h
+        .service
+        .submit_operator_command(&owner, "task-1", stop("stop-1", Some(generation)))
+        .expect("a stop of a running task, at the generation the owner saw");
+    assert!(!first.replayed);
+    let record = h.record("task-1");
+    assert_eq!(record.runner_state, RunnerState::PauseRequested);
+    assert!(record.generation > generation, "the pause moved it");
+    assert_eq!(pauses(&h, "task-1"), 1);
+    assert!(record.operator_commands.iter().any(|queued| {
+        queued.idempotency_key == "stop-1" && queued.command == OperatorCommand::StopStep
+    }));
+    let events = h.events("task-1");
+    let pause_at = events
+        .iter()
+        .position(|kind| {
+            matches!(
+                kind,
+                TaskEventKind::OwnerCommandAccepted {
+                    command: OwnerCommand::Pause,
+                    ..
+                }
+            )
+        })
+        .expect("the pause is announced");
+    let cut_at = events
+        .iter()
+        .position(|kind| matches!(kind, TaskEventKind::OperatorCommandQueued { .. }))
+        .expect("the cut is queued");
+    assert!(pause_at < cut_at, "the pause comes first: {events:?}");
+
+    // A retry of the same key, now at a stale generation, is the same stop.
+    let retried = h
+        .service
+        .submit_operator_command(&owner, "task-1", stop("stop-1", Some(generation)))
+        .expect("a retry of the key");
+    assert!(retried.replayed);
+    assert_eq!(retried.command.command_id, first.command.command_id);
+    assert_eq!(pauses(&h, "task-1"), 1, "no second pause");
+
+    // A task that already pauses is cut, not paused again.
+    h.must("task-2", OwnerCommand::Pause, "pause-2");
+    assert_eq!(pauses(&h, "task-2"), 1);
+    h.service
+        .submit_operator_command(&owner, "task-2", stop("stop-2", None))
+        .expect("a stop of a pausing task");
+    assert_eq!(pauses(&h, "task-2"), 1, "the pause is skipped");
+    assert_eq!(h.record("task-2").operator_commands.len(), 1);
+}
+
 /// AE5: the owner reads a stopped task. The controller starts a read-only
 /// runner beside nothing — no workload, no slot, storage untouched — keeps
 /// it through the owner's lease, and removes it when the lease runs out; the
@@ -1732,6 +1809,7 @@ macro_rules! contract_suite {
                 parallel_tasks_are_isolated,
                 the_controller_never_starts_more_than_the_limit,
                 operator_commands_reach_the_runner_and_come_back_with_a_verdict,
+                a_stop_pauses_once_and_then_queues_the_cut,
                 a_reader_reads_a_stopped_task_and_leaves_with_its_lease,
                 a_resume_removes_the_reader_before_the_work_starts,
                 an_interrupted_task_is_read_and_resumed_without_a_second_runner,

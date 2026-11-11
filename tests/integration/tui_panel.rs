@@ -634,8 +634,8 @@ fn act(action: TaskActionId, runner_state: &str) -> narsor::tui::task_app::actio
 
 #[test]
 fn the_manual_action_form_sends_the_task_action() {
-    let request = act(TaskActionId::Resume, "stopped");
-    assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Resume));
+    let request = act(TaskActionId::Pause, "running");
+    assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Pause));
 }
 
 // -- `prepare`: the refusals ------------------------------------------------

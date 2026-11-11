@@ -14,7 +14,7 @@ use narsor_protocol::api::{
     PermissionDecisionDto, PermissionDecisionKindDto,
 };
 use narsor_protocol::controller::{
-    AttentionKind, Freshness, RunnerState, SubmitCommentRequest, SubmitCommentResponse,
+    AttentionKind, Freshness, RunnerState, StepKind, SubmitCommentRequest, SubmitCommentResponse,
     SubmitInputRequest, TaskActionId, TaskActionOffer, TaskActionOption, TaskState, TaskSummary,
     TransitionOffer,
 };
@@ -25,7 +25,7 @@ use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::orchestration::{lifecycle, OwnerCommand, TaskRecord};
 
 /// Every action of the offer, in the order a client lists them.
-const OFFERED: [TaskActionId; 12] = [
+const OFFERED: [TaskActionId; 13] = [
     TaskActionId::Comment,
     TaskActionId::Answer,
     TaskActionId::Approve,
@@ -33,9 +33,10 @@ const OFFERED: [TaskActionId; 12] = [
     TaskActionId::AllowPermission,
     TaskActionId::DenyPermission,
     TaskActionId::Pause,
-    TaskActionId::Resume,
-    TaskActionId::Interrupt,
+    TaskActionId::Stop,
+    TaskActionId::ReleaseSlot,
     TaskActionId::Transition,
+    TaskActionId::SelectStep,
     TaskActionId::Restart,
     TaskActionId::Archive,
 ];
@@ -90,7 +91,25 @@ pub(super) fn unavailable_reason(task: &TaskSummary, id: TaskActionId) -> Option
             RunnerState::PauseRequested => Some("zadanie jest już wstrzymywane".to_string()),
             _ => Some(state_phrase(task).to_string()),
         },
+        // Not in the offer any more (the offer has `Stop`); an older client
+        // may still send it, and it keeps its rule.
         TaskActionId::Interrupt => not_running(task).or(runner_unreachable(task)),
+        TaskActionId::Stop => match task.runner_state {
+            RunnerState::PauseRequested => runner_unreachable(task),
+            _ => not_running(task).or(runner_unreachable(task)),
+        },
+        TaskActionId::ReleaseSlot => {
+            if task.slot_release_pending
+                || (task.runner_state == RunnerState::Stopped && task.holds_slot)
+            {
+                None
+            } else if !task.holds_slot {
+                Some("zadanie nie trzyma slotu".to_string())
+            } else {
+                Some("zadanie nie czeka na operatora".to_string())
+            }
+        }
+        TaskActionId::SelectStep => select_step_reason(task),
         TaskActionId::Transition => {
             if let Some(reason) = not_running(task).or(runner_unreachable(task)) {
                 return Some(reason);
@@ -106,13 +125,19 @@ pub(super) fn unavailable_reason(task: &TaskSummary, id: TaskActionId) -> Option
         }
         TaskActionId::Restart => match task.runner_state {
             RunnerState::Interrupted | RunnerState::Unknown => None,
+            RunnerState::Stopped if stopped_in_script_step(task) => None,
+            RunnerState::Stopped => Some(format!(
+                "{} — krok nie jest skryptem; napisz komentarz albo wybierz krok",
+                state_phrase(task)
+            )),
             _ if provisioning_failed(task) => None,
-            _ if runner_alive(task) => Some(
-                "zadanie działa — jest co przerwać (x), nie ma co uruchamiać od nowa".to_string(),
-            ),
-            RunnerState::Stopped | RunnerState::PauseRequested => {
-                Some(format!("{} — wznów je (p)", state_phrase(task)))
+            _ if runner_alive(task) => {
+                Some("zadanie działa — jest co zatrzymać, nie ma co uruchamiać od nowa".to_string())
             }
+            RunnerState::PauseRequested => Some(format!(
+                "{} — poczekaj, aż się zatrzyma",
+                state_phrase(task)
+            )),
             _ => Some(state_phrase(task).to_string()),
         },
         // The control plane takes an archive in any state ("archive wins":
@@ -137,6 +162,48 @@ fn move_reason(task: &TaskSummary) -> Option<String> {
     }
 }
 
+/// Why the owner cannot choose a step of the workflow now.
+fn select_step_reason(task: &TaskSummary) -> Option<String> {
+    if task.runner_state != RunnerState::Stopped {
+        return Some(format!(
+            "{} — krok wybierzesz, gdy zadanie jest zatrzymane albo zakończone",
+            state_phrase(task)
+        ));
+    }
+    match &task.steps {
+        Some(steps) if !steps.is_empty() => None,
+        _ => Some("serwer nie podał kroków workflow".to_string()),
+    }
+}
+
+/// Whether the task is stopped in a step that is a script.
+fn stopped_in_script_step(task: &TaskSummary) -> bool {
+    let Some(cursor) = task.runner.as_ref().map(|runner| &runner.execution_cursor) else {
+        return false;
+    };
+    let by_steps = cursor.current_state.as_deref().and_then(|current| {
+        task.steps
+            .iter()
+            .flatten()
+            .find(|step| step.id == current)
+            .map(|step| step.kind == StepKind::Script)
+    });
+    by_steps.unwrap_or(cursor.current_action_type.as_deref() == Some("script"))
+}
+
+/// The kind of a step in words for the owner.
+fn step_kind_name(kind: StepKind) -> &'static str {
+    match kind {
+        StepKind::Agent => "agent",
+        StepKind::Script => "skrypt",
+        StepKind::Human => "człowiek",
+        StepKind::Wait => "oczekiwanie",
+        StepKind::Decision => "decyzja",
+        StepKind::Terminal => "koniec",
+        StepKind::Unrecognized => "nieznany",
+    }
+}
+
 /// What the offer says `id` has to choose from.
 pub(super) fn options(task: &TaskSummary, id: TaskActionId) -> Vec<TaskActionOption> {
     match id {
@@ -151,6 +218,15 @@ pub(super) fn options(task: &TaskSummary, id: TaskActionId) -> Vec<TaskActionOpt
                     .collect()
             })
             .unwrap_or_default(),
+        TaskActionId::SelectStep => task
+            .steps
+            .iter()
+            .flatten()
+            .map(|step| TaskActionOption {
+                label: step.id.clone(),
+                description: Some(step_kind_name(step.kind).to_string()),
+            })
+            .collect(),
         TaskActionId::Transition => task
             .manual_transitions
             .iter()
@@ -281,6 +357,9 @@ fn state_phrase(task: &TaskSummary) -> &'static str {
         TaskState::Queued => "zadanie jest w kolejce",
         TaskState::Running => "zadanie działa",
         TaskState::HumanNeeded => "zadanie czeka na odpowiedź",
+        TaskState::Paused if task.runner_state == RunnerState::Stopped && task.holds_slot => {
+            "zadanie jest wstrzymane i trzyma slot"
+        }
         TaskState::Paused if task.holds_slot => "zadanie jest wstrzymywane",
         TaskState::Paused => "zadanie jest wstrzymane",
         TaskState::Finished => "zadanie jest zakończone",
@@ -320,7 +399,7 @@ fn not_running(task: &TaskSummary) -> Option<String> {
         loss_state(task.runner_state, &task.resume)
     {
         return Some(format!(
-            "{phrase} — wznowi się samo (próba {attempt}/{limit}) albo uruchom je od nowa (s)"
+            "{phrase} — wznowi się samo (próba {attempt}/{limit}) albo uruchom je od nowa"
         ));
     }
     if runner_alive(task) {
@@ -330,10 +409,10 @@ fn not_running(task: &TaskSummary) -> Option<String> {
         return Some(format!("{phrase} — odpowiedz, a zadanie wznowi się"));
     }
     if task.runner_state == RunnerState::Stopped {
-        return Some(format!("{phrase} — wznów je (p)"));
+        return Some(format!("{phrase} — napisz komentarz albo wybierz krok"));
     }
     if task.state == TaskState::Error || task.runner_state == RunnerState::Interrupted {
-        return Some(format!("{phrase} — uruchom je od nowa (s)"));
+        return Some(format!("{phrase} — uruchom je od nowa"));
     }
     Some(phrase.to_string())
 }
@@ -372,6 +451,7 @@ fn one_line(text: &str) -> String {
 pub(super) fn owner_action(command: OwnerCommand, task: &TaskRecord) -> TaskActionId {
     match command {
         OwnerCommand::Pause => TaskActionId::Pause,
+        OwnerCommand::ReleaseSlot => TaskActionId::ReleaseSlot,
         OwnerCommand::Archive => TaskActionId::Archive,
         OwnerCommand::Start => TaskActionId::Restart,
         OwnerCommand::Resume
@@ -675,5 +755,192 @@ impl ProtocolService {
             task,
             replayed: response.replayed,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use narsor_protocol::controller::StepView;
+    use serde_json::json;
+
+    /// A summary in `runner_state`/`state`, as the server would serve it
+    /// without a runner (so without the live-runner checks).
+    fn summary(runner_state: &str, state: &str, holds_slot: bool) -> TaskSummary {
+        serde_json::from_value(json!({
+            "task_id": "task-1",
+            "backend_id": "backend-a",
+            "runner_state": runner_state,
+            "state": state,
+            "holds_slot": holds_slot,
+            "generation": 1,
+            "revision": 1,
+            "rank": 0,
+            "created_at": "2026-11-11T10:00:00Z",
+            "queue_sequence": 1,
+            "workflow_id": "wf",
+            "workflow_version": 1,
+            "launch_digest": "d",
+            "environment_identity": "e",
+            "archive": null,
+            "observation": null,
+            "runner": null,
+            "controller": null,
+            "inputs": [],
+            "as_of": "2026-11-11T10:00:00Z"
+        }))
+        .expect("a summary")
+    }
+
+    fn step(id: &str, kind: StepKind) -> StepView {
+        StepView {
+            id: id.to_string(),
+            label: id.to_string(),
+            kind,
+        }
+    }
+
+    fn offered(task: &TaskSummary, id: TaskActionId) -> TaskActionOffer {
+        offer(task)
+            .into_iter()
+            .find(|offer| offer.id == id)
+            .expect("in the offer")
+    }
+
+    #[test]
+    fn resume_and_interrupt_are_not_in_the_offer_but_keep_their_rule() {
+        let task = summary("stopped", "paused", false);
+        let ids: Vec<_> = offer(&task).into_iter().map(|offer| offer.id).collect();
+        assert!(!ids.contains(&TaskActionId::Resume));
+        assert!(!ids.contains(&TaskActionId::Interrupt));
+        assert!(ids.contains(&TaskActionId::Stop));
+        assert!(unavailable_reason(&task, TaskActionId::Resume).is_none());
+    }
+
+    #[test]
+    fn a_stopped_task_holds_no_slot_to_release() {
+        let task = summary("stopped", "paused", false);
+        let release = offered(&task, TaskActionId::ReleaseSlot);
+        assert!(!release.available);
+        assert_eq!(release.reason.as_deref(), Some("zadanie nie trzyma slotu"));
+    }
+
+    #[test]
+    fn a_stopped_task_that_still_holds_its_slot_offers_the_release() {
+        let task = summary("stopped", "paused", true);
+        assert!(offered(&task, TaskActionId::ReleaseSlot).available);
+        assert!(!offered(&task, TaskActionId::Pause).available);
+        assert!(!offered(&task, TaskActionId::Stop).available);
+    }
+
+    #[test]
+    fn a_working_task_has_no_wait_to_cut_short() {
+        let task = summary("running", "running", true);
+        let release = offered(&task, TaskActionId::ReleaseSlot);
+        assert!(!release.available);
+        assert_eq!(
+            release.reason.as_deref(),
+            Some("zadanie nie czeka na operatora")
+        );
+    }
+
+    #[test]
+    fn a_task_that_waits_for_the_owner_offers_the_release_when_the_server_says_so() {
+        let mut task = summary("running", "human_needed", true);
+        task.slot_release_pending = true;
+        assert!(offered(&task, TaskActionId::ReleaseSlot).available);
+    }
+
+    #[test]
+    fn selecting_a_step_needs_a_stopped_task_with_the_steps_of_the_workflow() {
+        let mut task = summary("stopped", "paused", false);
+        let reason = offered(&task, TaskActionId::SelectStep).reason;
+        assert_eq!(reason.as_deref(), Some("serwer nie podał kroków workflow"));
+
+        task.steps = Some(vec![
+            step("work", StepKind::Agent),
+            step("end", StepKind::Terminal),
+        ]);
+        let select = offered(&task, TaskActionId::SelectStep);
+        assert!(select.available);
+        let labels: Vec<_> = select
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect();
+        assert_eq!(labels, ["work", "end"], "every step, none left out");
+
+        let running = summary("running", "running", true);
+        assert!(!offered(&running, TaskActionId::SelectStep).available);
+        let queued = summary("queued", "queued", false);
+        assert!(!offered(&queued, TaskActionId::SelectStep).available);
+    }
+
+    #[test]
+    fn a_restart_of_a_stopped_task_is_for_a_script_step_only() {
+        let mut task = summary("stopped", "paused", false);
+        task.steps = Some(vec![step("work", StepKind::Script)]);
+        let runner = |current: &str, action_type: &str| {
+            serde_json::from_value(json!({
+                "incarnation": "pod-1",
+                "execution_status": "paused",
+                "execution_cursor": {
+                    "execution_id": "e",
+                    "current_state": current,
+                    "action_execution_id": null,
+                    "current_action_type": action_type
+                },
+                "event_cursor": 0,
+                "pending_input": null,
+                "safe_point": true,
+                "observed_at": "2026-11-11T10:00:00Z",
+                "received_at": "2026-11-11T10:00:00Z",
+                "last_contact_at": null,
+                "freshness": "live"
+            }))
+            .expect("a runner view")
+        };
+        task.runner = Some(runner("work", "script"));
+        assert!(offered(&task, TaskActionId::Restart).available);
+
+        task.steps = Some(vec![step("work", StepKind::Agent)]);
+        task.runner = Some(runner("work", "agent"));
+        assert!(!offered(&task, TaskActionId::Restart).available);
+    }
+
+    #[test]
+    fn a_pausing_task_cannot_be_paused_again_but_can_be_stopped() {
+        let task = summary("pause_requested", "paused", true);
+        assert_eq!(
+            offered(&task, TaskActionId::Pause).reason.as_deref(),
+            Some("zadanie jest już wstrzymywane")
+        );
+        // No runner reported in this summary, so only that stops the offer.
+        assert_eq!(
+            offered(&task, TaskActionId::Stop).reason.as_deref(),
+            Some("runner jeszcze się nie zgłosił")
+        );
+    }
+
+    #[test]
+    fn a_queued_task_cannot_be_paused_stopped_or_asked_for_a_step() {
+        let task = summary("queued", "queued", false);
+        for id in [
+            TaskActionId::Pause,
+            TaskActionId::Stop,
+            TaskActionId::SelectStep,
+        ] {
+            assert!(!offered(&task, id).available, "{id:?}");
+        }
+        assert!(offered(&task, TaskActionId::Archive).available);
+    }
+
+    #[test]
+    fn an_older_server_summary_reads_with_the_new_fields_empty() {
+        let task = summary("running", "running", true);
+        assert!(!task.slot_release_pending);
+        assert!(task.steps.is_none());
+        let unknown: TaskActionId = serde_json::from_value(json!("something_new")).unwrap();
+        assert_eq!(unknown, TaskActionId::Unrecognized);
     }
 }

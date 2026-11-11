@@ -1435,6 +1435,28 @@ async fn an_interrupted_step_is_dropped_and_restarted_with_the_owners_note() {
     );
 }
 
+/// A stop cuts the pass like an interrupt does, but having nothing to cut is
+/// not an error: the task is pausing and ends in `Stopped` either way.
+#[tokio::test]
+async fn a_stop_drops_the_pass_and_finding_none_is_not_an_error() {
+    let root = TempRoot::new();
+    let mut fixture = hanging(&root, OVERRIDABLE).await;
+
+    fixture.applied("stop-1", OperatorCommand::StopStep).await;
+    assert!(!fixture.session.pass_active(), "the pass is dropped");
+    // A step cut mid-pass is the unknown outcome a restart of the step
+    // recovers; the task itself is `Paused` once the runner stops.
+    assert_eq!(
+        fixture.status(),
+        ExecutionStatus::Unknown,
+        "a stop leaves the cut step unknown, never failed"
+    );
+
+    // No pass is left: nothing to cut, and still a success.
+    fixture.applied("stop-2", OperatorCommand::StopStep).await;
+    assert!(!fixture.session.pass_active());
+}
+
 /// A command delivered again after its acknowledgement was lost is
 /// answered from the verdict on storage, not carried out twice.
 #[tokio::test]
@@ -1584,6 +1606,76 @@ async fn a_unified_workflow_allows_a_forced_transition_with_a_reason() {
                 && reasoning.contains("the work moved elsewhere")
                 && reasoning.contains(OWNER)
     )));
+}
+
+/// A chosen step needs no declared transition, no override consent and no
+/// reason, and it opens a finished workflow again.
+#[tokio::test]
+async fn a_chosen_step_reopens_a_finished_workflow_and_carries_the_note() {
+    let root = TempRoot::new();
+    let mut fixture = hanging(&root, UNIFIED_AGENT).await;
+    fixture.applied("stop-1", OperatorCommand::StopStep).await;
+    fixture
+        .applied(
+            "transition-1",
+            forced_into_completed(Some("the work moved elsewhere")),
+        )
+        .await;
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    assert!(fixture.execution().completed_at.is_some());
+
+    let select = |target: &str, note: Option<&str>| OperatorCommand::SelectStep {
+        target: target.to_string(),
+        note: note.map(str::to_string),
+    };
+    let unknown = fixture
+        .rejected("select-0", select("no-such-step", None))
+        .await;
+    assert!(unknown.contains("no state"), "{unknown}");
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+
+    fixture
+        .applied("select-1", select("think", Some("Start from the tests.")))
+        .await;
+
+    assert_eq!(fixture.status(), ExecutionStatus::Running);
+    assert!(fixture.session.pass_active(), "the step runs again");
+    assert!(
+        fixture.execution().completed_at.is_none(),
+        "a reopened workflow is not completed"
+    );
+
+    // The step runs again with the owner's note in its prompt.
+    fixture.agent_called(2).await;
+    let calls = fixture.agent.calls();
+    assert!(
+        calls[1].prompt.contains("Start from the tests."),
+        "the note reaches the step: {}",
+        calls[1].prompt
+    );
+}
+
+/// The owner chooses a step only for a runner that has no pass: one that
+/// is running a step must be stopped first.
+#[tokio::test]
+async fn a_step_cannot_be_chosen_while_a_pass_is_active() {
+    let root = TempRoot::new();
+    let mut fixture = hanging(&root, UNIFIED_AGENT).await;
+    assert!(fixture.session.pass_active());
+
+    let busy = fixture
+        .rejected(
+            "select-busy",
+            OperatorCommand::SelectStep {
+                target: "think".to_string(),
+                note: Some("Not now.".to_string()),
+            },
+        )
+        .await;
+
+    assert!(busy.contains("a step is running"), "{busy}");
+    assert!(fixture.session.pass_active(), "the pass was left alone");
+    assert_eq!(fixture.agent.calls().len(), 1, "nothing was started");
 }
 
 #[tokio::test]

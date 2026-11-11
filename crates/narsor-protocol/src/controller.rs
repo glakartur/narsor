@@ -952,6 +952,15 @@ pub struct TaskSummary {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_transitions: Option<TransitionOffer>,
+    /// Whether the task waits for the owner in a state that frees its slot
+    /// and the owner may free it now. `false` from a server before the field.
+    #[serde(default)]
+    pub slot_release_pending: bool,
+    /// Every step of the workflow, for the states in which the owner may
+    /// choose one. `None` where the owner cannot, or from a server before the
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<StepView>>,
     /// What the owner can do to the task now, and why not where it cannot.
     /// `None` when the server did not say (a server from before the field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1414,6 +1423,10 @@ pub enum OwnerCommand {
     Start,
     /// Bring a running task to a safe point and release its compute.
     Pause,
+    /// Free the slot of a running task that only waits for the owner: the
+    /// pause of [`OwnerCommand::Pause`], sent before the wait policy would.
+    /// Refused unless the task waits in a state that frees its slot.
+    ReleaseSlot,
     /// Continue a paused, interrupted or unknown task on the same storage.
     Resume,
     /// Delete workload and storage; archive wins over every other state.
@@ -1449,6 +1462,10 @@ pub struct SubmitInputRequest {
 pub enum OperatorCommand {
     /// Cut the step in flight short; the execution is left recoverable.
     Interrupt,
+    /// Cut the step in flight short for a stop: the execution is left
+    /// paused, and the task ends in `Stopped` (never `Interrupted`). Nothing
+    /// to cut is not an error.
+    StopStep,
     /// Make a declared or forced transition from the current workflow state.
     Transition {
         /// State to enter.
@@ -1459,6 +1476,15 @@ pub enum OperatorCommand {
         /// Why the owner overrides.
         #[serde(default)]
         reason: Option<String>,
+    },
+    /// Go on from any step of the workflow, a finished workflow included:
+    /// no declared transition and no `allow_manual_override` is needed.
+    SelectStep {
+        /// The step to go on from.
+        target: String,
+        /// What the owner tells the agent when the step is an agent step.
+        #[serde(default)]
+        note: Option<String>,
     },
     /// Start the failed or interrupted step again.
     RestartStep {
@@ -1486,6 +1512,8 @@ impl OperatorCommand {
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Interrupt => "interrupt",
+            Self::StopStep => "stop step",
+            Self::SelectStep { .. } => "select step",
             Self::Transition { forced: false, .. } => "transition",
             Self::Transition { forced: true, .. } => "override transition",
             Self::RestartStep { .. } => "restart step",
@@ -2050,8 +2078,38 @@ pub enum TaskActionId {
     Transition,
     Restart,
     Archive,
+    /// Cut the work short and stop at a safe point (ends in `Stopped`).
+    Stop,
+    /// Free the slot of a task that waits for the owner, before the wait
+    /// policy does.
+    ReleaseSlot,
+    /// Choose any step of the workflow to go on from.
+    SelectStep,
     #[serde(other)]
     Unrecognized,
+}
+
+/// What a step of the workflow does, for a client that must not read the
+/// workflow definition itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StepKind {
+    Agent,
+    Script,
+    Human,
+    Wait,
+    Decision,
+    Terminal,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// One step of the workflow as the owner can choose it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StepView {
+    pub id: String,
+    pub label: String,
+    pub kind: StepKind,
 }
 
 /// One action of a task as the server offers it: whether it can be done now

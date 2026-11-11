@@ -36,9 +36,9 @@ use super::credentials::{
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{
-    effective_title, normalize_label, one_line_label, AnsweredBy, BackendId, LabelError,
-    LaunchDefinitionError, ResourceProfile, TaskId, WorkflowDefinition, WorkspaceHeader,
-    GENERATED_TITLE_MAX_CHARS, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
+    effective_title, normalize_label, one_line_label, ActionConfig, AnsweredBy, BackendId,
+    LabelError, LaunchDefinitionError, ResourceProfile, TaskId, WorkflowDefinition,
+    WorkspaceHeader, GENERATED_TITLE_MAX_CHARS, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use crate::engine::{
     manual_override_allowed, plan_operator_transition, EngineError, HumanInputDelivery,
@@ -1066,15 +1066,64 @@ impl ProtocolService {
                 self.require_available(&record, action, request.expected_generation)?;
             }
         }
-        let outcome = self.control.queue_operator_command(
+        // A stop is a pause first, then the cut: in this order, so that a
+        // runner lost while cutting counts as lost from `PauseRequested`
+        // (nothing resumes it by itself), not as a lost task.
+        let mut expected_generation = request.expected_generation;
+        let mut paused_for_stop = false;
+        if matches!(request.command, OperatorCommand::StopStep)
+            && record.runner_state == RunnerState::Running
+        {
+            self.control.command_with_capacity_from(
+                &record.task_id,
+                CommandRequest {
+                    command: crate::orchestration::OwnerCommand::Pause,
+                    idempotency_key: format!("stop-pause:{}", request.idempotency_key),
+                    expected_generation,
+                    actor: CommandActor::Owner,
+                },
+                || self.scheduling_policy(&record.assignment.backend_id),
+            )?;
+            self.notify(&record.task_id);
+            // The pause moved the generation the owner saw.
+            expected_generation = None;
+            paused_for_stop = true;
+        }
+        let queued = self.control.queue_operator_command(
             &record.task_id,
             OperatorCommandRequest {
-                command: request.command,
+                command: request.command.clone(),
                 idempotency_key: request.idempotency_key,
-                expected_generation: request.expected_generation,
+                expected_generation,
                 requested_by: owner.clone(),
             },
-        )?;
+        );
+        let outcome = match queued {
+            Ok(outcome) => outcome,
+            // The runner reached its safe point between the two writes: the
+            // task is stopped, which is what the owner asked for.
+            Err(crate::orchestration::OrchestrationError::OperatorCommandRefused { .. })
+                if paused_for_stop
+                    && self.control.task(&record.task_id)?.runner_state == RunnerState::Stopped =>
+            {
+                let now = self.control.now();
+                return Ok(SubmitOperatorCommandResponse {
+                    command: OperatorCommandView {
+                        command_id: "stopped-before-the-cut".to_string(),
+                        command: request.command,
+                        status: narsor_protocol::controller::OperatorCommandStatus::Applied,
+                        submitted_at: now,
+                        updated_at: now,
+                        detail: Some(
+                            "the task reached its safe point before the cut; it is stopped"
+                                .to_string(),
+                        ),
+                    },
+                    replayed: false,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         if !outcome.replayed {
             self.notify(&record.task_id);
         }
@@ -1137,6 +1186,9 @@ impl ProtocolService {
                 ));
             }
             self.check_transition_legal(record, target, *forced)?;
+        }
+        if let OperatorCommand::SelectStep { target, .. } = command {
+            check_step_exists(record, target)?;
         }
         check_conductor_command(command)
     }
@@ -2159,6 +2211,8 @@ impl ProtocolService {
             ticket: record.launch_spec.ticket.clone(),
             title: task_title(record),
             manual_transitions: manual_transitions(record),
+            slot_release_pending: record.slot_release_pending(),
+            steps: workflow_steps(record),
             actions: None,
             panel: None,
             resume: record.resume.clone(),
@@ -2390,6 +2444,8 @@ pub fn task_actions(task: &TaskSummary) -> Vec<TaskActionOffer> {
 fn operator_action(command: &OperatorCommand) -> Option<TaskActionId> {
     match command {
         OperatorCommand::Interrupt => Some(TaskActionId::Interrupt),
+        OperatorCommand::StopStep => Some(TaskActionId::Stop),
+        OperatorCommand::SelectStep { .. } => Some(TaskActionId::SelectStep),
         OperatorCommand::Transition { .. } => Some(TaskActionId::Transition),
         _ => None,
     }
@@ -2511,6 +2567,67 @@ fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
         .as_deref()?;
     let definition = record.launch_spec.definition().ok()?;
     transition_offer(&definition, current)
+}
+
+/// Checks the step an owner chose against the workflow snapshot; silent
+/// when the task has none to check against.
+fn check_step_exists(record: &TaskRecord, target: &str) -> ProtocolResult<()> {
+    if target.trim().is_empty() {
+        return Err(ProtocolError::bad_request(
+            "missing_target",
+            "a step choice needs a step",
+        ));
+    }
+    match record.launch_spec.definition() {
+        Ok(definition) if !definition.states.contains_key(target) => {
+            Err(ProtocolError::bad_request(
+                "unknown_step",
+                format!("the workflow has no step '{target}'"),
+            ))
+        }
+        Ok(_) | Err(LaunchDefinitionError::Missing(_)) => Ok(()),
+        Err(error) => Err(ProtocolError::Internal(format!(
+            "the task's workflow snapshot is unusable: {error}"
+        ))),
+    }
+}
+
+/// Every step of the workflow, for the stop in which the owner may choose
+/// one: the task is stopped (a finished workflow is stopped too). The first is the
+/// initial step, the rest follow by name. `None` elsewhere, so a list of
+/// tasks does not carry it, and when the sealed workflow cannot be read.
+fn workflow_steps(record: &TaskRecord) -> Option<Vec<StepView>> {
+    if record.runner_state != RunnerState::Stopped {
+        return None;
+    }
+    let definition = record.launch_spec.definition().ok()?;
+    let initial = definition.initial_state.to_string();
+    let mut ids: Vec<String> = definition.states.keys().map(ToString::to_string).collect();
+    ids.sort();
+    if let Some(at) = ids.iter().position(|id| *id == initial) {
+        let first = ids.remove(at);
+        ids.insert(0, first);
+    }
+    Some(
+        ids.into_iter()
+            .filter_map(|id| {
+                let state = definition.states.get(id.as_str())?;
+                let kind = match &state.action {
+                    Some(ActionConfig::Agent(_)) => StepKind::Agent,
+                    Some(ActionConfig::Script(_)) => StepKind::Script,
+                    Some(ActionConfig::Human(_)) => StepKind::Human,
+                    Some(ActionConfig::Wait(_)) => StepKind::Wait,
+                    Some(ActionConfig::Decision(_)) => StepKind::Decision,
+                    None => StepKind::Terminal,
+                };
+                Some(StepView {
+                    label: id.clone(),
+                    id,
+                    kind,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// What an owner can ask for out of `current` in `definition`.
@@ -2862,5 +2979,134 @@ terminal_states: [completed]
             &definition,
             &definition.states["work"]
         ));
+    }
+
+    const STEPS: &str = r#"
+schema: v2
+name: steps
+version: 1
+states:
+  work:
+    action:
+      type: script
+      command: "true"
+    exit: { next: check }
+  check:
+    action:
+      type: script
+      command: "true"
+    exit: { next: completed }
+  completed: {}
+terminal_states: { completed: completed }
+"#;
+
+    /// A record of a task whose launch spec carries `yaml` as its workflow,
+    /// stored by a real control plane, in `runner_state`.
+    fn record_of(yaml: Option<&str>, runner_state: RunnerState) -> TaskRecord {
+        use crate::domain::{
+            GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
+            TaskRepository, TaskRepositorySource, TaskWorkspace,
+        };
+        use crate::orchestration::{ControlPlane, NewTask, OwnerRef};
+        let root = std::env::temp_dir().join(format!("narsor-service-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = TaskWorkspace::single(TaskRepository::new(
+            "narsor",
+            TaskRepositorySource::Git(Box::new(GitIdentity {
+                repository: Some("narsor".to_string()),
+                remote_url: "https://example.com/narsor.git".to_string(),
+                commit: "614c3a8".repeat(5) + "abcde",
+                git_ref: None,
+                ref_origin: None,
+                credential: None,
+            })),
+        ));
+        let mut spec = TaskLaunchSpec::new(
+            "steps",
+            1,
+            serde_json::json!({}),
+            workspace,
+            ResolvedEnvironment::harness_only("claude-code"),
+            ResourceProfile::new(1000, 2048),
+        );
+        if let Some(yaml) = yaml {
+            spec = spec.with_definition(&load_from_str(yaml).unwrap()).unwrap();
+        }
+        let control = ControlPlane::new(crate::persistence::StatePaths::new(&root));
+        let mut record = control
+            .create_task(NewTask::new(
+                TaskId::parse("task-1").unwrap(),
+                OwnerRef::new("oidc:https://issuer|artur"),
+                crate::domain::BackendId::parse("k8s").unwrap(),
+                spec,
+            ))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        record.runner_state = runner_state;
+        record
+    }
+
+    #[test]
+    fn a_step_choice_names_a_step_of_the_workflow() {
+        let record = record_of(Some(STEPS), RunnerState::Stopped);
+
+        assert!(check_step_exists(&record, "check").is_ok());
+        match check_step_exists(&record, "nowhere") {
+            Err(ProtocolError::BadRequest { code, .. }) => assert_eq!(code, "unknown_step"),
+            other => panic!("an unknown step: {other:?}"),
+        }
+        match check_step_exists(&record, "  ") {
+            Err(ProtocolError::BadRequest { code, .. }) => assert_eq!(code, "missing_target"),
+            other => panic!("an empty target: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_step_choice_is_not_checked_without_a_workflow_snapshot() {
+        let record = record_of(None, RunnerState::Stopped);
+
+        assert!(check_step_exists(&record, "anything").is_ok());
+    }
+
+    #[test]
+    fn the_steps_of_a_stopped_task_start_at_the_initial_state_and_name_their_kind() {
+        let record = record_of(Some(STEPS), RunnerState::Stopped);
+        let initial = record
+            .launch_spec
+            .definition()
+            .unwrap()
+            .initial_state
+            .to_string();
+
+        let steps = workflow_steps(&record).expect("a stopped task lists its steps");
+
+        assert_eq!(
+            steps.first().map(|step| step.id.as_str()),
+            Some(initial.as_str())
+        );
+        let mut rest: Vec<&str> = steps.iter().skip(1).map(|step| step.id.as_str()).collect();
+        let sorted = {
+            let mut copy = rest.clone();
+            copy.sort_unstable();
+            copy
+        };
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest.as_mut_slice(), sorted.as_slice());
+        let kind_of = |id: &str| steps.iter().find(|step| step.id == id).unwrap().kind;
+        assert_eq!(kind_of("work"), StepKind::Script);
+        assert_eq!(kind_of("check"), StepKind::Script);
+        assert_eq!(kind_of("completed"), StepKind::Terminal);
+    }
+
+    #[test]
+    fn a_task_that_is_not_stopped_lists_no_steps() {
+        for state in [RunnerState::Running, RunnerState::PauseRequested] {
+            assert!(workflow_steps(&record_of(Some(STEPS), state)).is_none());
+        }
+    }
+
+    #[test]
+    fn a_stopped_task_without_a_workflow_snapshot_lists_no_steps() {
+        assert!(workflow_steps(&record_of(None, RunnerState::Stopped)).is_none());
     }
 }

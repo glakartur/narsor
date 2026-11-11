@@ -1,21 +1,25 @@
-//! The action menu and the operator's actions (U11, origin §3).
+//! The action panel and the operator's actions (U11, origin §3).
 //!
-//! `.` opens a menu of everything the operator can do to the selected task;
-//! every entry also has a shortcut that works from the list and from the
-//! details. One function, [`availability`], says whether an action can be done
-//! to a task *now* and, when it cannot, why — the menu greys the entry out and
-//! shows the reason, a shortcut says the same reason on the bar, and nothing
-//! else decides.
+//! `Ctrl+.` (and `.`, for a terminal that does not pass it) opens one panel of
+//! everything the operator can do to the selected task. It is the only way to
+//! those actions: they have no shortcut of their own. One function,
+//! [`availability`], says whether an action can be done to a task *now* and,
+//! when it cannot, why — and it only reads what the server offered. The panel
+//! greys the entry out and shows the reason; nothing else decides.
 //!
-//! | key | action | available when |
-//! |---|---|---|
-//! | `K` `J` `m` | move in the queue | queued |
-//! | `p` | pause / resume | running, paused |
-//! | `x` | interrupt the step `!` | running |
-//! | `t` | manual transition; override `!` | the state has exits (override: always, or `allow_manual_override` in the legacy shape) |
-//! | `s` | start again | interrupted, failed provisioning |
-//! | `a` | archive `!` | finished, interrupted |
-//! | `o` | open a link | a workspace has a pull request link |
+//! | action | available when the server says |
+//! |---|---|
+//! | pause | the task runs: it waits for the end of the step |
+//! | stop `!` | the task runs or pauses: the work is cut at once |
+//! | free the slot | the task waits for the operator, before the policy stops it |
+//! | transition; override `!` | the state has exits (override: see the workflow) |
+//! | choose a step | the task is stopped or finished: any step of the workflow |
+//! | start again | a script step of a stopped task, an interrupted task, failed provisioning |
+//! | archive `!` | not archived yet |
+//! | open a link (`o`) | a workspace has a pull request link |
+//!
+//! A comment is the conversation's, and moving a queued task is `Ctrl+↑` /
+//! `Ctrl+↓` (or `m`): neither is in the panel.
 //!
 //! # Confirmation
 //!
@@ -26,10 +30,12 @@
 //!
 //! # What goes where
 //!
-//! * pause, resume, start and archive are owner commands
+//! * pause, free the slot, start and archive are owner commands
 //!   (`POST …/commands`) — the answer is the new runner state, which the stream
-//!   shows in the row;
-//! * interrupt and the transitions are operator commands
+//!   shows in the row. Freeing the slot is the pause the wait policy sends,
+//!   sent before its time;
+//! * stop, the transitions, a step chosen and a script step started again are
+//!   operator commands
 //!   (`POST …/operator-commands`): the control plane queues them and the
 //!   *runner* carries them out, so the answer only says "queued". The verdict
 //!   comes as `OperatorCommandResolved` ([`CommandResolved`]) and ends on the
@@ -61,8 +67,8 @@ use crate::controller_protocol::{
 };
 use crate::domain::display::safe_link_url;
 use narsor_protocol::controller::{
-    OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, TaskActionId,
-    TaskActionOffer, TaskState,
+    OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, StepKind, StepView,
+    TaskActionId, TaskActionOffer, TaskState,
 };
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
@@ -83,33 +89,38 @@ use super::{failure_reason, idempotency_key, is_transport, Request, TaskApp};
 /// An action of the menu (origin §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskAction {
-    /// `K` / `J` / `m`: another place in the queue.
+    /// `Ctrl+↑` / `Ctrl+↓` / `m`: another place in the queue.
     Move,
-    /// `p`: pause a running task, resume a paused one.
-    PauseResume,
-    /// `x`: cut the running step short. `!`
-    Interrupt,
-    /// `t`: a manual transition, an override among them.
+    /// Pause: the work comes to the end of its step, then the task stops.
+    Pause,
+    /// Stop: the work is cut at once; the task ends stopped. `!`
+    Stop,
+    /// Free the slot of a task that waits for the operator.
+    ReleaseSlot,
+    /// A manual transition, an override among them.
     Transition,
-    /// `s`: start an interrupted task again.
+    /// Go on from any step of the workflow.
+    SelectStep,
+    /// Start a script step or an interrupted task again.
     Restart,
-    /// `a`: delete the workload and the storage. `!`
+    /// Delete the workload and the storage. `!`
     Archive,
     /// `o`: open a link of the task.
     OpenLink,
     /// `c`: a comment to the agent; the server picks what it does by the
-    /// way the task is stopped.
+    /// way the task is stopped. Not in the panel: the conversation owns it.
     Comment,
 }
 
 impl TaskAction {
-    /// Every action, in the order of the menu.
+    /// Every action of the panel, in its order. A comment and a move in the
+    /// queue are not in it: the conversation writes, `Ctrl+↑` / `Ctrl+↓` move.
     pub const ALL: [TaskAction; 8] = [
-        TaskAction::Comment,
-        TaskAction::Move,
-        TaskAction::PauseResume,
-        TaskAction::Interrupt,
+        TaskAction::Pause,
+        TaskAction::Stop,
+        TaskAction::ReleaseSlot,
         TaskAction::Transition,
+        TaskAction::SelectStep,
         TaskAction::Restart,
         TaskAction::Archive,
         TaskAction::OpenLink,
@@ -119,28 +130,9 @@ impl TaskAction {
     pub fn of_key(action: Action) -> Option<Self> {
         match action {
             Action::MoveUp | Action::MoveDown | Action::MoveMode => Some(Self::Move),
-            Action::PauseResume => Some(Self::PauseResume),
-            Action::Interrupt => Some(Self::Interrupt),
-            Action::Transition => Some(Self::Transition),
-            Action::Restart => Some(Self::Restart),
-            Action::Archive => Some(Self::Archive),
             Action::OpenLink => Some(Self::OpenLink),
             Action::Comment => Some(Self::Comment),
             _ => None,
-        }
-    }
-
-    /// The shortcut, as written in the menu.
-    pub fn key(self) -> char {
-        match self {
-            Self::Move => 'm',
-            Self::PauseResume => 'p',
-            Self::Interrupt => 'x',
-            Self::Transition => 't',
-            Self::Restart => 's',
-            Self::Archive => 'a',
-            Self::OpenLink => 'o',
-            Self::Comment => 'c',
         }
     }
 
@@ -152,7 +144,7 @@ impl TaskAction {
 
     /// Whether it always asks `y` / `n` first.
     pub fn needs_confirmation(self) -> bool {
-        matches!(self, Self::Interrupt | Self::Archive)
+        matches!(self, Self::Stop | Self::Archive)
     }
 }
 
@@ -228,11 +220,10 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
                 Availability::because("zadanie nie ma jeszcze linku do PR")
             }
         }
-        TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => {
-            offered(task, TaskActionId::Resume)
-        }
-        TaskAction::PauseResume => offered(task, TaskActionId::Pause),
-        TaskAction::Interrupt => offered(task, TaskActionId::Interrupt),
+        TaskAction::Pause => offered(task, TaskActionId::Pause),
+        TaskAction::Stop => offered(task, TaskActionId::Stop),
+        TaskAction::ReleaseSlot => offered(task, TaskActionId::ReleaseSlot),
+        TaskAction::SelectStep => offered(task, TaskActionId::SelectStep),
         TaskAction::Transition => offered(task, TaskActionId::Transition),
         TaskAction::Restart => offered(task, TaskActionId::Restart),
         TaskAction::Archive => offered(task, TaskActionId::Archive),
@@ -250,14 +241,15 @@ fn openable_links(task: &TaskSummary) -> impl Iterator<Item = (&str, String, Str
     })
 }
 
-/// The word that opens a notification about `action` on `task`
+/// The word that opens a notification about `action`
 /// ("pauza: zadanie jest w kolejce").
-pub fn verb(task: &TaskSummary, action: TaskAction) -> &'static str {
+pub fn verb(action: TaskAction) -> &'static str {
     match action {
         TaskAction::Move => "przesuń",
-        TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => "wznowienie",
-        TaskAction::PauseResume => "pauza",
-        TaskAction::Interrupt => "przerwanie",
+        TaskAction::Pause => "pauza",
+        TaskAction::Stop => "zatrzymanie",
+        TaskAction::ReleaseSlot => "zwolnienie slotu",
+        TaskAction::SelectStep => "wybór kroku",
         TaskAction::Transition => "przejście",
         TaskAction::Restart => "uruchomienie od nowa",
         TaskAction::Archive => "archiwizacja",
@@ -384,6 +376,14 @@ pub struct TransitionList {
     chooser: Chooser,
 }
 
+/// The steps of the workflow, to go on from one of them.
+#[derive(Debug, Clone)]
+pub struct StepList {
+    task_id: String,
+    steps: Vec<StepView>,
+    chooser: Chooser,
+}
+
 /// The links of the task that have an address.
 #[derive(Debug, Clone)]
 pub struct LinkList {
@@ -406,6 +406,8 @@ pub enum Overlay {
     Menu(Menu),
     /// The exits of the current state, and the override (`t`).
     Transitions(TransitionList),
+    /// The steps of the workflow, to choose one (the panel's "wybierz krok").
+    Steps(StepList),
     /// The links of the task (`o`).
     Links(LinkList),
     /// The installation's default harness (`h`); about no task.
@@ -436,6 +438,7 @@ impl Overlay {
         match self {
             Self::Menu(menu) => Some(&menu.task_id),
             Self::Transitions(list) => Some(&list.task_id),
+            Self::Steps(list) => Some(&list.task_id),
             Self::Links(list) => Some(&list.task_id),
             Self::Comment(form) => Some(&form.task_id),
             Self::Harness(_) | Self::Limit(_) => None,
@@ -448,6 +451,7 @@ impl Overlay {
         match self {
             Self::Menu(menu) => Some(&menu.chooser),
             Self::Transitions(list) => Some(&list.chooser),
+            Self::Steps(list) => Some(&list.chooser),
             Self::Links(list) => Some(&list.chooser),
             Self::Comment(form) => Some(&form.chooser),
             Self::Harness(list) => Some(list.chooser()),
@@ -470,6 +474,7 @@ impl Overlay {
             Self::Menu(_) => Context::Menu,
             Self::Confirm(_) => Context::Confirm,
             Self::Transitions(list) => chooser_context(&list.chooser),
+            Self::Steps(list) => chooser_context(&list.chooser),
             Self::Links(list) => chooser_context(&list.chooser),
             Self::Comment(form) => chooser_context(&form.chooser),
             Self::Harness(list) => chooser_context(list.chooser()),
@@ -499,27 +504,33 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
     let (name, effect) = match action {
         TaskAction::Move => (
             "przesuń w kolejce".to_string(),
-            "Zmienia miejsce zadania w kolejce. `K` / `J` przesuwają o jedno miejsce wyżej / \
+            "Zmienia miejsce zadania w kolejce. `Ctrl+↑` / `Ctrl+↓` przesuwają o jedno miejsce wyżej / \
              niżej, `m` włącza tryb przesuwania: `j` / `k` wybiera miejsce z podglądem, `Enter` \
              zatwierdza, `Esc` anuluje."
                 .to_string(),
         ),
-        TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => (
-            "wznów".to_string(),
-            "Wznawia zadanie na tym samym storage: runner zaczyna od zapisanego stanu. Gdy \
-             backend jest pełny, zadanie czeka w kolejce na pierwszym miejscu."
+        TaskAction::Pause => (
+            "pauza".to_string(),
+            "Czeka, aż trwająca praca skończy krok. Potem zadanie staje w bezpiecznym punkcie \
+             i oddaje zasoby obliczeniowe; storage zostaje."
                 .to_string(),
         ),
-        TaskAction::PauseResume => (
-            "wstrzymaj".to_string(),
-            "Doprowadza zadanie do bezpiecznego punktu i zwalnia jego zasoby obliczeniowe; \
-             storage zostaje. Wznowienie kontynuuje od zapisanego stanu."
+        TaskAction::Stop => (
+            "stop !".to_string(),
+            "Zrywa trwającą pracę od razu. Zadanie staje w bezpiecznym punkcie i oddaje zasoby \
+             obliczeniowe; sesja agenta zostaje. Wymaga potwierdzenia."
                 .to_string(),
         ),
-        TaskAction::Interrupt => (
-            "przerwij krok !".to_string(),
-            "Przerywa trwający krok; execution zostaje możliwy do odzyskania. Wymaga \
-             potwierdzenia."
+        TaskAction::ReleaseSlot => (
+            "zwolnij slot".to_string(),
+            "Zadanie czeka na Ciebie. Ta akcja zatrzymuje je teraz, a nie po czasie \
+             oczekiwania. Slot staje się wolny, a zadanie można potem wznowić."
+                .to_string(),
+        ),
+        TaskAction::SelectStep => (
+            "wybierz krok".to_string(),
+            "Wznawia zadanie od dowolnego kroku workflow, także po jego zakończeniu. Dla kroku \
+             agenta można dopisać komentarz."
                 .to_string(),
         ),
         TaskAction::Transition => (
@@ -531,8 +542,8 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
         ),
         TaskAction::Restart => (
             "uruchom od nowa".to_string(),
-            "Uruchamia przerwane zadanie albo ponawia nieudany provisioning na tym samym \
-             storage."
+            "Uruchamia od początku krok skryptu zatrzymanego zadania, przerwane zadanie albo \
+             ponawia nieudany provisioning na tym samym storage."
                 .to_string(),
         ),
         TaskAction::Archive => (
@@ -547,7 +558,7 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
         ),
         TaskAction::Comment => (WRITE_TO_AGENT.to_lowercase(), comment_effect(task)),
     };
-    (format!("{}  {name}", action.key()), effect)
+    (name, effect)
 }
 
 /// What a comment does to `task`, in words: the server says, by the way the
@@ -669,6 +680,35 @@ fn transition_list(task: &TaskSummary) -> Option<TransitionList> {
     })
 }
 
+/// The steps the server gave, each with the field of a comment when the step
+/// is the agent's. The client does not read the workflow: the kind is the
+/// server's word.
+fn step_list(task: &TaskSummary) -> Option<StepList> {
+    let steps = task.steps.clone()?;
+    let items =
+        steps
+            .iter()
+            .map(|step| {
+                let item = ChooserItem::new(
+                    one_line(&step.label),
+                    format!("Wznawia zadanie od kroku „{}”.", one_line(&step.id)),
+                );
+                if step.kind == StepKind::Agent {
+                    item.with_field(ChooserField::multiline(COMMENT_FIELD).described(
+                        "komentarz dla agenta, opcjonalny; nie zostaje na dalsze przebiegi",
+                    ))
+                } else {
+                    item
+                }
+            })
+            .collect();
+    Some(StepList {
+        task_id: task.task_id.to_string(),
+        steps,
+        chooser: Chooser::new(items),
+    })
+}
+
 fn link_list(task: &TaskSummary) -> LinkList {
     let mut links = Vec::new();
     let mut items = Vec::new();
@@ -693,7 +733,7 @@ fn link_list(task: &TaskSummary) -> LinkList {
 fn effect_lines(task: &TaskSummary, action: TaskAction) -> Vec<String> {
     let title = title_of(task);
     match action {
-        TaskAction::Interrupt => {
+        TaskAction::Stop => {
             let step = task
                 .runner
                 .as_ref()
@@ -702,12 +742,14 @@ fn effect_lines(task: &TaskSummary, action: TaskAction) -> Vec<String> {
                 .filter(|step| !step.is_empty());
             vec![
                 match step {
-                    Some(step) => format!("Przerywa trwający krok „{step}” zadania {title}."),
-                    None => format!("Przerywa trwający krok zadania {title}."),
+                    Some(step) => format!("Zrywa pracę w kroku „{step}” zadania {title}."),
+                    None => format!("Zrywa pracę zadania {title}."),
                 },
-                "Praca agenta w tym kroku zostaje odcięta; execution zostaje możliwy do odzyskania."
+                "Zadanie staje w bezpiecznym punkcie i oddaje slot; sesja agenta zostaje."
                     .to_string(),
-                "Polecenie trafia do runnera; jego wynik pojawi się na pasku.".to_string(),
+                "Skrypt zacznie od początku kroku. Polecenie trafia do runnera; wynik pojawi się \
+                 na pasku."
+                    .to_string(),
             ]
         }
         TaskAction::Archive => vec![
@@ -797,9 +839,10 @@ impl TaskApp {
         match overlay {
             Overlay::Menu(_) => self.on_menu_key(&key),
             Overlay::Confirm(_) => self.on_confirm_key(&key),
-            Overlay::Transitions(_) | Overlay::Links(_) | Overlay::Comment(_) => {
-                self.on_list_key(key)
-            }
+            Overlay::Transitions(_)
+            | Overlay::Steps(_)
+            | Overlay::Links(_)
+            | Overlay::Comment(_) => self.on_list_key(key),
             Overlay::Harness(_) => self.on_harness_key(key),
             Overlay::Limit(_) => self.on_limit_key(key),
         }
@@ -840,7 +883,7 @@ impl TaskApp {
         Request::None
     }
 
-    /// `K` / `J` inside the menu: moves one place, and closes the menu once
+    /// `Ctrl+↑` / `Ctrl+↓` inside the menu: moves one place, and closes the menu once
     /// there is a move to make.
     fn on_move_shortcut(&mut self, up: bool) -> Request {
         let request = self.step_move(up);
@@ -881,6 +924,9 @@ impl TaskApp {
             Some(Overlay::Transitions(list)) => {
                 list.chooser.paste(pasted);
             }
+            Some(Overlay::Steps(list)) => {
+                list.chooser.paste(pasted);
+            }
             Some(Overlay::Links(list)) => {
                 list.chooser.paste(pasted);
             }
@@ -895,6 +941,7 @@ impl TaskApp {
     fn on_list_key(&mut self, key: KeyEvent) -> Request {
         let chooser = match &mut self.overlay {
             Some(Overlay::Transitions(list)) => &mut list.chooser,
+            Some(Overlay::Steps(list)) => &mut list.chooser,
             Some(Overlay::Links(list)) => &mut list.chooser,
             Some(Overlay::Comment(form)) => &mut form.chooser,
             _ => return Request::None,
@@ -911,6 +958,7 @@ impl TaskApp {
             }
             ChooserAction::Submit(submission) => match self.overlay.take() {
                 Some(Overlay::Transitions(list)) => self.chosen_transition(list, &submission),
+                Some(Overlay::Steps(list)) => self.chosen_step(list, &submission),
                 Some(Overlay::Links(list)) => match list.links.get(submission.index) {
                     Some(link) => Request::OpenLink(link.clone()),
                     None => Request::None,
@@ -952,6 +1000,39 @@ impl TaskApp {
             "komentarz",
             "komentarz wysłany".to_string(),
             ActionSend::Comment(text),
+        )))
+    }
+
+    /// The operator chose a step: sent at once, with the comment when the
+    /// step is the agent's and one was written.
+    fn chosen_step(&mut self, list: StepList, submission: &Submission) -> Request {
+        if !self.mutation_allowed() {
+            return Request::None;
+        }
+        let Some(task) = self
+            .list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == list.task_id)
+            .cloned()
+        else {
+            return Request::None;
+        };
+        let Some(step) = list.steps.get(submission.index) else {
+            return Request::None;
+        };
+        let note = (step.kind == StepKind::Agent)
+            .then(|| written_text(submission))
+            .filter(|text| !text.is_empty());
+        let summary = format!("wybór kroku „{}” wysłany do runnera", one_line(&step.id));
+        Request::Act(Box::new(self.action_request(
+            &task,
+            "wybór kroku",
+            summary,
+            ActionSend::Operator(OperatorCommand::SelectStep {
+                target: step.id.clone(),
+                note,
+            }),
         )))
     }
 
@@ -1031,10 +1112,7 @@ impl TaskApp {
             return Request::None;
         };
         if let Availability::Unavailable(reason) = availability(&task, action) {
-            self.notify(
-                Severity::Warning,
-                format!("{}: {reason}", verb(&task, action)),
-            );
+            self.notify(Severity::Warning, format!("{}: {reason}", verb(action)));
             return Request::None;
         }
         if action.changes_state() && !self.mutation_allowed() {
@@ -1046,13 +1124,32 @@ impl TaskApp {
                 self.begin_move();
                 Request::None
             }
-            TaskAction::PauseResume => {
-                let (command, summary) = if task.runner_state == RunnerState::Stopped {
-                    (OwnerCommand::Resume, "wznowienie zlecone")
-                } else {
-                    (OwnerCommand::Pause, "wstrzymanie zlecone")
-                };
-                self.owner_request(&task, verb(&task, action), summary, command)
+            TaskAction::Pause => self.owner_request(
+                &task,
+                verb(action),
+                "wstrzymanie zlecone",
+                OwnerCommand::Pause,
+            ),
+            // The pause the wait policy sends, sent before its time; the server
+            // checks that the task still waits.
+            TaskAction::ReleaseSlot => self.owner_request(
+                &task,
+                verb(action),
+                "zwolnienie slotu zlecone",
+                OwnerCommand::ReleaseSlot,
+            ),
+            // A stopped task starts its script step again through the runner;
+            // an interrupted one starts anew through the owner's command.
+            TaskAction::Restart if task.runner_state == RunnerState::Stopped => {
+                Request::Act(Box::new(self.action_request(
+                    &task,
+                    "uruchomienie od nowa",
+                    "uruchomienie kroku od nowa zlecone".to_string(),
+                    ActionSend::Operator(OperatorCommand::RestartStep {
+                        note: None,
+                        failure_key: None,
+                    }),
+                )))
             }
             TaskAction::Restart => self.owner_request(
                 &task,
@@ -1060,20 +1157,23 @@ impl TaskApp {
                 "uruchomienie od nowa zlecone",
                 OwnerCommand::Start,
             ),
-            TaskAction::Interrupt => {
-                let send = ActionSend::Operator(OperatorCommand::Interrupt);
+            TaskAction::Stop => {
                 let request = self.action_request(
                     &task,
-                    "przerwanie",
-                    "przerwanie kroku wysłane do runnera".to_string(),
-                    send,
+                    verb(action),
+                    "zatrzymanie wysłane do runnera".to_string(),
+                    ActionSend::Operator(OperatorCommand::StopStep),
                 );
                 self.ask(
                     &task,
-                    "Przerwij bieżący krok !",
+                    "Zatrzymaj zadanie !",
                     action,
                     Confirmed::Act(Box::new(request)),
                 );
+                Request::None
+            }
+            TaskAction::SelectStep => {
+                self.overlay = step_list(&task).map(Overlay::Steps);
                 Request::None
             }
             TaskAction::Archive => {
@@ -1376,6 +1476,8 @@ fn conductor_command(send: &ActionSend) -> Option<ConductorSent> {
 fn command_name(command: Option<&OperatorCommand>) -> String {
     match command {
         Some(OperatorCommand::Interrupt) => "przerwanie kroku".to_string(),
+        Some(OperatorCommand::StopStep) => "zatrzymanie kroku".to_string(),
+        Some(OperatorCommand::SelectStep { target, .. }) => format!("wybór kroku „{target}”"),
         Some(OperatorCommand::Transition {
             target,
             forced: false,
@@ -1555,6 +1657,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
                     "Przejście ręczne · {title} · z „{}”",
                     one_line(&list.from_state)
                 ),
+                &mut list.chooser,
+                styles,
+            ),
+            Overlay::Steps(list) => render_list(
+                frame,
+                area,
+                &format!("Wybór kroku · {title}"),
                 &mut list.chooser,
                 styles,
             ),

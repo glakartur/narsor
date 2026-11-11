@@ -415,7 +415,10 @@ impl Entry {
 pub(super) fn panel_action(id: TaskActionId) -> Option<TaskAction> {
     match id {
         TaskActionId::Transition => Some(TaskAction::Transition),
-        TaskActionId::Resume | TaskActionId::Pause => Some(TaskAction::PauseResume),
+        TaskActionId::Pause => Some(TaskAction::Pause),
+        TaskActionId::Stop => Some(TaskAction::Stop),
+        TaskActionId::ReleaseSlot => Some(TaskAction::ReleaseSlot),
+        TaskActionId::SelectStep => Some(TaskAction::SelectStep),
         TaskActionId::Restart => Some(TaskAction::Restart),
         _ => None,
     }
