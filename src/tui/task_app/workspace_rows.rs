@@ -50,8 +50,6 @@ pub(super) struct Piece {
     pub part: Part,
     /// Where a [`Part::PrLink`] points.
     pub url: Option<String>,
-    /// Stands against the piece before it, without the gap between columns.
-    pub joined: bool,
 }
 
 /// The rows of `workspaces`, each one a list of pieces ending where the text
@@ -86,13 +84,11 @@ impl Entry {
                 text: format!("{} ↗", number.as_deref().unwrap_or("PR")),
                 part: Part::PrLink,
                 url: Some(url.clone()),
-                joined: false,
             }),
             (Some(number), None) => Some(Piece {
                 text: number.clone(),
                 part: Part::PrText,
                 url: None,
-                joined: false,
             }),
             (None, None) => None,
         };
@@ -215,14 +211,24 @@ impl Columns {
         // Each column after the name: the separator before it, its pieces,
         // its width with the mark, and whether this row has text in it.
         let columns = [
-            (GAP, Part::Gap, vec![self.piece(&entry.repo, self.repo, Part::Repo)], self.repo),
+            (
+                GAP,
+                Part::Gap,
+                vec![self.piece(&entry.repo, self.repo, Part::Repo)],
+                self.repo,
+            ),
             (
                 SEPARATOR,
                 Part::Separator,
                 vec![self.branch_piece(entry)],
                 self.branches + cells(BRANCH_MARK) * usize::from(self.branches > 0),
             ),
-            (SEPARATOR, Part::Separator, self.change_pieces(entry), self.changes),
+            (
+                SEPARATOR,
+                Part::Separator,
+                self.change_pieces(entry),
+                self.changes,
+            ),
             (SEPARATOR, Part::Separator, pr, self.pr),
         ];
         let has_text = |pieces: &[Piece]| pieces.iter().any(|piece| !piece.text.trim().is_empty());
@@ -234,7 +240,6 @@ impl Columns {
             text,
             part,
             url: None,
-            joined: false,
         };
         for (index, (separator, part, pieces, width)) in columns.into_iter().enumerate() {
             if width == 0 {
@@ -248,12 +253,6 @@ impl Columns {
                 row.extend(pieces);
             } else {
                 row.push(plain(" ".repeat(cells(separator) + width), Part::Gap));
-            }
-        }
-        // The text of the row ends where its last column does.
-        if let Some(last) = row.last_mut() {
-            if last.part == Part::Gap && last.text.trim().is_empty() {
-                row.pop();
             }
         }
         row.retain(|piece| !piece.text.is_empty());
@@ -290,18 +289,11 @@ impl Columns {
             text,
             part,
             url: None,
-            joined: false,
         };
         vec![
             plain(added.clone(), Part::Added),
-            Piece {
-                joined: true,
-                ..plain(" ".to_string(), Part::Gap)
-            },
-            Piece {
-                joined: true,
-                ..plain(format!("{removed}{padding}"), Part::Removed)
-            },
+            plain(" ".to_string(), Part::Gap),
+            plain(format!("{removed}{padding}"), Part::Removed),
         ]
     }
 
@@ -312,7 +304,6 @@ impl Columns {
             text: format!("{cut}{padding}"),
             part,
             url: None,
-            joined: false,
         }
     }
 }

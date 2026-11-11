@@ -1201,9 +1201,17 @@ pub(super) fn render_view(
         Role::Done
     };
     let rule_style = styles.of(rule_role);
-    if parts.header.height > 0 {
+    // A frame too low for every header row has no room for the rule: it would
+    // overwrite the last visible header row.
+    if parts.header.height > 0 && parts.header.height == base_lines {
         let y = parts.header.y + parts.header.height - 1;
-        draw_rule(frame.buffer_mut(), area, y, &rule_line(area.width, rule_style, None, None), rule_style);
+        draw_rule(
+            frame.buffer_mut(),
+            area,
+            y,
+            &rule_line(area.width, rule_style, None, None),
+            rule_style,
+        );
     }
     if deferred {
         let message = Rect::new(
@@ -1240,15 +1248,20 @@ pub(super) fn render_view(
         } else {
             Role::Done
         };
-        let segment = (start, end.saturating_sub(start), styles.of(segment_role).add_modifier(Modifier::BOLD));
-        let label = (view.tab == DetailTab::Progress && !view.detail.progress.positions().is_empty())
-            .then(|| {
-                if view.detail.progress.follows() {
-                    ("↧ podąża [f]", styles.of(greyed(Role::Live, stale)))
-                } else {
-                    ("· ręcznie [f]", styles.of(Role::Done))
-                }
-            });
+        let segment = (
+            start,
+            end.saturating_sub(start),
+            styles.of(segment_role).add_modifier(Modifier::BOLD),
+        );
+        let label = (view.tab == DetailTab::Progress
+            && !view.detail.progress.positions().is_empty())
+        .then(|| {
+            if view.detail.progress.follows() {
+                ("↧ podąża [f]", styles.of(greyed(Role::Live, stale)))
+            } else {
+                ("· ręcznie [f]", styles.of(Role::Done))
+            }
+        });
         draw_rule(
             frame.buffer_mut(),
             area,
@@ -1450,7 +1463,11 @@ pub(super) fn rule_line(
                 for ch in text.chars() {
                     let glyph_width = cells(&ch.to_string());
                     cells_of[at] = (ch, text_style);
-                    for filler in cells_of.iter_mut().skip(at + 1).take(glyph_width.saturating_sub(1)) {
+                    for filler in cells_of
+                        .iter_mut()
+                        .skip(at + 1)
+                        .take(glyph_width.saturating_sub(1))
+                    {
                         *filler = ('\u{200b}', text_style);
                     }
                     at += glyph_width.max(1);
@@ -1486,6 +1503,8 @@ pub(super) fn draw_rule(buffer: &mut Buffer, area: Rect, y: u16, line: &Line<'_>
         for ch in span.content.chars() {
             if x < area.right() {
                 if let Some(cell) = buffer.cell_mut((x, y)) {
+                    // Drops what the cell held before, e.g. a link's forced width.
+                    cell.reset();
                     cell.set_symbol(&ch.to_string());
                     cell.set_style(span.style);
                 }

@@ -1304,9 +1304,15 @@ pub fn render_step_strip(
 ) {
     let done = styles.of(Role::Done);
     let label = if conversation.follows() {
-        ("↧ śledzi [f]", styles.of(if stale { Role::Done } else { Role::Live }))
+        (
+            "↧ śledzi [f]",
+            styles.of(if stale { Role::Done } else { Role::Live }),
+        )
     } else {
-        ("⏸ ręcznie [f]", styles.of(if stale { Role::Done } else { Role::Attention }))
+        (
+            "⏸ ręcznie [f]",
+            styles.of(if stale { Role::Done } else { Role::Attention }),
+        )
     };
     let rows = [
         rule_line(area.width, done, None, Some(label)),

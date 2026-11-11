@@ -2307,14 +2307,20 @@ mod task_app_detail_render {
         assert_eq!(first_y, 2, "no blank row above the header");
         for y in first_y..=tabs_y + 1 {
             for cell in row_cells(&buffer, y, layout::LIST_WIDTH + 1..buffer.area.width - 1) {
-                assert_ne!(cell.bg, Color::Rgb(34, 48, 72), "row {y}");
+                assert_eq!(cell.bg, Color::Reset, "row {y}");
             }
         }
         let rows = rows(&buffer);
         let upper = &rows[usize::from(tabs_y) - 1];
         let lower = &rows[usize::from(tabs_y) + 1];
-        assert!(upper.contains("├─") && upper.trim_end().ends_with('┤'), "{upper}");
-        assert!(lower.contains("├─") && lower.contains('━') && lower.trim_end().ends_with('┤'), "{lower}");
+        assert!(
+            upper.contains("├─") && upper.trim_end().ends_with('┤'),
+            "{upper}"
+        );
+        assert!(
+            lower.contains("├─") && lower.contains('━') && lower.trim_end().ends_with('┤'),
+            "{lower}"
+        );
     }
 
     #[test]
@@ -2324,32 +2330,50 @@ mod task_app_detail_render {
         let focus = styles.of(narsor::tui::style::Role::Focus).fg;
         let done = styles.of(narsor::tui::style::Role::Done).fg;
         let rule_fg = |buffer: &Buffer, y: usize| {
-            row_cells(buffer, u16::try_from(y).unwrap(), layout::LIST_WIDTH + 2..buffer.area.width - 2)
-                .find(|cell| cell.symbol() == "─")
-                .map(|cell| cell.fg)
+            row_cells(
+                buffer,
+                u16::try_from(y).unwrap(),
+                layout::LIST_WIDTH + 2..buffer.area.width - 2,
+            )
+            .find(|cell| cell.symbol() == "─")
+            .map(|cell| cell.fg)
         };
         // Keys in the tab: the frame and the rules are in focus, the segment too.
         let buffer = render_at(&mut app, &styles, 120, 40);
         let tabs_y = row_of(&buffer, "Przebieg");
         assert_eq!(rule_fg(&buffer, tabs_y - 1), focus);
         assert_eq!(rule_fg(&buffer, tabs_y + 1), focus);
-        let segment = row_cells(&buffer, u16::try_from(tabs_y + 1).unwrap(), 0..buffer.area.width)
-            .find(|cell| cell.symbol() == "━")
-            .unwrap();
+        let segment = row_cells(
+            &buffer,
+            u16::try_from(tabs_y + 1).unwrap(),
+            0..buffer.area.width,
+        )
+        .find(|cell| cell.symbol() == "━")
+        .unwrap();
         assert_eq!(Some(segment.fg), focus);
         assert!(segment.modifier.contains(ratatui::style::Modifier::BOLD));
         let rows_now = rows(&buffer);
-        let names_at = rows_now[tabs_y].find("Rozmowa").map(|b| rows_now[tabs_y][..b].chars().count()).unwrap();
-        let heavy_at = rows_now[tabs_y + 1].chars().position(|ch| ch == '━').unwrap();
+        let names_at = rows_now[tabs_y]
+            .find("Rozmowa")
+            .map(|b| rows_now[tabs_y][..b].chars().count())
+            .unwrap();
+        let heavy_at = rows_now[tabs_y + 1]
+            .chars()
+            .position(|ch| ch == '━')
+            .unwrap();
         assert_eq!(names_at, heavy_at, "the segment is under the active tab");
         // Keys on the list: the frame is grey, so are the rules; the segment is bold grey.
         press(&mut app, KeyCode::Esc);
         let buffer = render_at(&mut app, &styles, 120, 40);
         assert_eq!(rule_fg(&buffer, tabs_y - 1), done);
         assert_eq!(rule_fg(&buffer, tabs_y + 1), done);
-        let segment = row_cells(&buffer, u16::try_from(tabs_y + 1).unwrap(), 0..buffer.area.width)
-            .find(|cell| cell.symbol() == "━")
-            .unwrap();
+        let segment = row_cells(
+            &buffer,
+            u16::try_from(tabs_y + 1).unwrap(),
+            0..buffer.area.width,
+        )
+        .find(|cell| cell.symbol() == "━")
+        .unwrap();
         assert_eq!(Some(segment.fg), done);
         assert!(segment.modifier.contains(ratatui::style::Modifier::BOLD));
         // The connectors stand on the frame.
@@ -2618,19 +2642,111 @@ mod task_app_detail_render {
     }
 
     #[test]
-    fn a_title_the_edge_cuts_is_said_in_full_on_the_first_header_row() {
+    fn a_title_the_edge_cuts_is_said_on_the_first_header_row_before_the_workspaces() {
         let title = "Przebudowa obsługi zamówień hurtowych wraz z migracją danych klientów";
-        let mut app = labelled_app(None, Some(title));
+        let mut app = labelled_app_with_workspaces(
+            title,
+            vec![
+                header_workspace("code", "orders-api", "main"),
+                header_workspace("docs", "orders-docs", "main"),
+            ],
+        );
         let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 24));
+        let edge = &rows[TITLE_ROW - 1];
+        assert!(!edge.contains("migrac"), "the edge cuts the title: {edge}");
+        // The first header row says more of the title than the edge; the
+        // frame's width still cuts it, so its end is an ellipsis.
         assert!(
-            rows[TITLE_ROW].contains("Przebudowa obsługi"),
+            rows[TITLE_ROW].contains("Przebudowa obsługi zamówień hurtowych wraz z migrac"),
             "{}",
             rows[TITLE_ROW]
         );
         assert!(
-            rows[TITLE_ROW + 1].contains("● running"),
+            rows[TITLE_ROW + 1].contains("code:"),
             "{}",
             rows[TITLE_ROW + 1]
+        );
+        assert!(
+            rows[TITLE_ROW + 2].contains("docs:"),
+            "{}",
+            rows[TITLE_ROW + 2]
+        );
+        assert!(
+            rows[TITLE_ROW + 3].contains("● running"),
+            "{}",
+            rows[TITLE_ROW + 3]
+        );
+    }
+
+    /// A running task titled `title`, with `workspaces` in its header.
+    fn labelled_app_with_workspaces(
+        title: &str,
+        workspaces: Vec<narsor_protocol::display::WorkspaceHeader>,
+    ) -> TaskApp {
+        let mut app = app();
+        let mut running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        running.title = Some(title.to_string());
+        app.load(listing(
+            vec![with_header_workspaces(running, workspaces)],
+            "c",
+        ));
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    #[test]
+    fn the_header_of_a_finished_task_without_a_slot_does_not_say_so_but_info_does() {
+        let mut app = app();
+        let mut finished = with_controller(task("a", "local", "stopped", 1));
+        finished.state = narsor_engine::orchestration::TaskState::Finished;
+        finished.holds_slot = false;
+        app.load(listing(vec![titled(finished, "NAR-12")], "c"));
+        press(&mut app, KeyCode::Enter);
+        let rows = rows(&render(&mut app, &Styles::new(false)));
+        assert!(
+            rows.iter().all(|row| !row.contains("bez slotu")),
+            "{rows:#?}"
+        );
+
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Info);
+        let info = screen(&render(&mut app, &Styles::new(false)));
+        assert!(info.contains("bez slotu"), "positive control: {info}");
+    }
+
+    #[test]
+    fn a_frame_too_low_for_every_header_row_draws_no_rule_over_the_last_one() {
+        let workspaces = (0..30)
+            .map(|index| {
+                with_pr(
+                    header_workspace("code", &format!("repo-{index}"), "main"),
+                    &format!("https://gitlab.example/g/api/-/merge_requests/{index}"),
+                )
+            })
+            .collect();
+        let mut app = app_with_workspaces(workspaces);
+        app.detail_mut().set_hyperlinks(true);
+        let buffer = render_at(&mut app, &Styles::new(false), 120, 20);
+        let rows = rows(&buffer);
+        let last = rows
+            .iter()
+            .rposition(|row| row.contains("repo-"))
+            .expect("a workspace row");
+        assert!(
+            rows[last + 1].contains('╰'),
+            "the header fills the frame, no rule over its last row: {}",
+            rows[last + 1]
+        );
+        let text = screen(&buffer);
+        assert!(
+            text.matches("\u{1b}]8;;https://gitlab.example/g/api/-/merge_requests/")
+                .count()
+                > 1,
+            "the links stay: {text:?}"
         );
     }
 
@@ -3559,7 +3675,14 @@ mod task_app_detail_render {
         let styles = Styles::new(false);
         let strip = |conversation: &Conversation| {
             let buffer = draw(40, 3, |frame| {
-                render_step_strip(frame, Rect::new(0, 0, 40, 3), &styles, conversation, true, false)
+                render_step_strip(
+                    frame,
+                    Rect::new(0, 0, 40, 3),
+                    &styles,
+                    conversation,
+                    true,
+                    false,
+                )
             });
             rows(&buffer)[1].clone()
         };
@@ -3585,7 +3708,14 @@ mod task_app_detail_render {
         conversation.rebuild(&positions, &Attempts::default());
         let styles = Styles::new(false);
         let buffer = draw(40, 3, |frame| {
-            render_step_strip(frame, Rect::new(0, 0, 40, 3), &styles, &conversation, true, false)
+            render_step_strip(
+                frame,
+                Rect::new(0, 0, 40, 3),
+                &styles,
+                &conversation,
+                true,
+                false,
+            )
         });
         assert!(
             rows(&buffer)[1].contains("✓ odd #1"),
@@ -3605,7 +3735,14 @@ mod task_app_detail_render {
         let styles = Styles::new(false);
         let strip = |conversation: &Conversation| {
             let buffer = draw(40, 3, |frame| {
-                render_step_strip(frame, Rect::new(0, 0, 40, 3), &styles, conversation, true, false)
+                render_step_strip(
+                    frame,
+                    Rect::new(0, 0, 40, 3),
+                    &styles,
+                    conversation,
+                    true,
+                    false,
+                )
             });
             rows(&buffer)[1].clone()
         };
