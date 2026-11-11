@@ -350,6 +350,7 @@ impl ActionExecutor for AnsweringAgentExecutor {
                     .push(config.prompt.to_string());
                 self.resumed_sessions.lock().expect("sessions").push(
                     config
+                        .harness_step
                         .parameters
                         .get("resume_session")
                         .and_then(Value::as_str)
@@ -749,13 +750,14 @@ impl ActionExecutor for ScriptedAgentExecutor {
         self.calls.lock().expect("calls").push(AgentCall {
             prompt: config.prompt.to_string(),
             resume_session: config
+                .harness_step
                 .parameters
                 .get("resume_session")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
             action_execution_id: action_execution_id.clone(),
-            model: config.model.clone(),
-            effort: config.effort.clone(),
+            model: config.harness_step.model.clone(),
+            effort: config.harness_step.effort.clone(),
         });
         let turn = self
             .turns

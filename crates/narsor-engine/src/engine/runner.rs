@@ -91,8 +91,8 @@ use crate::config::{AgentArgs, AgentDefaults};
 use crate::domain::{
     effective_title, ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy,
     Artifact, ArtifactReference, ChoiceDefinition, DecisionMaker, DecisionProviderType, Event,
-    EventData, ExecutionId, ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType,
-    InputCloseReason, ProblemKind, RepromptedBy, State, StateId, VariableSource,
+    EventData, ExecutionId, ExecutionStatus, HarnessStepConfig, HumanActionConfig, HumanInputField,
+    HumanInputType, InputCloseReason, ProblemKind, RepromptedBy, State, StateId, VariableSource,
     WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
 };
 use crate::domain::{ComplexityAssessment, COMPLEXITY_VARIABLE};
@@ -2455,8 +2455,8 @@ impl Engine {
             }
             steps.push(profile::ProfileCandidate {
                 step_id: candidate.id.clone(),
-                default: Setting::default_of(config),
-                ceiling: Setting::ceiling_of(config),
+                default: Setting::default_of(&config.harness_step),
+                ceiling: Setting::ceiling_of(&config.harness_step),
             });
         }
         if steps.is_empty() {
@@ -2932,10 +2932,11 @@ impl Engine {
         let with_access;
         let rendered = match rendered {
             ActionConfig::Agent(config)
-                if config.workspace_access.is_none() && state.workspace_access().is_some() =>
+                if config.harness_step.workspace_access.is_none()
+                    && state.workspace_access().is_some() =>
             {
                 let mut config = config.clone();
-                config.workspace_access = state.workspace_access();
+                config.harness_step.workspace_access = state.workspace_access();
                 with_access = ActionConfig::Agent(config);
                 &with_access
             }

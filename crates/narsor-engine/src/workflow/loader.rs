@@ -503,26 +503,18 @@ fn non_blank(text: Option<String>) -> Option<String> {
 
 fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
     match action {
-        ActionSchema::Agent(agent) => ActionConfig::Agent(AgentActionConfig {
-            harness: agent.harness,
-            permission_grants: Vec::new(),
-            model: agent.model,
-            effort: agent.effort,
-            ceiling: agent.ceiling,
-            plan: agent.plan,
-            workspace_access: if keep_v1_access {
-                agent.workspace_access
-            } else {
-                None
-            },
-            prompt: agent.prompt,
-            // The YAML contract has no per-action workspace (§6 lists it as a
-            // future extension), so this stays unset.
-            workspace: None,
-            parameters: agent.parameters,
-            read_only_paths: agent.read_only_paths,
-            history: agent.history,
-        }),
+        ActionSchema::Agent(agent) => {
+            let mut harness_step = agent.harness_step();
+            if !keep_v1_access {
+                harness_step.workspace_access = None;
+            }
+            ActionConfig::Agent(AgentActionConfig {
+                harness_step,
+                plan: agent.plan,
+                prompt: agent.prompt,
+                history: agent.history,
+            })
+        }
         ActionSchema::Script(script) => ActionConfig::Script(ScriptActionConfig {
             command: script.command,
             args: script.args,
@@ -720,7 +712,10 @@ terminal_states: [done]
         let Some(ActionConfig::Agent(agent)) = &definition.states["review"].action else {
             panic!("an agent action");
         };
-        assert_eq!(agent.workspace_access, Some(WorkspaceAccess::ReadOnly));
+        assert_eq!(
+            agent.harness_step.workspace_access,
+            Some(WorkspaceAccess::ReadOnly)
+        );
     }
 
     #[test]
@@ -883,17 +878,17 @@ terminal_states: [done]
             panic!("an agent step");
         };
         assert!(plan.plan);
-        assert_eq!(plan.model.as_deref(), Some("medium"));
-        assert_eq!(plan.effort.as_deref(), Some("low"));
+        assert_eq!(plan.harness_step.model.as_deref(), Some("medium"));
+        assert_eq!(plan.harness_step.effort.as_deref(), Some("low"));
         assert_eq!(
-            plan.ceiling.as_ref().unwrap().model.as_deref(),
+            plan.harness_step.ceiling.as_ref().unwrap().model.as_deref(),
             Some("large")
         );
         let Some(ActionConfig::Agent(work)) = &definition.states["work"].action else {
             panic!("an agent step");
         };
         assert!(!work.plan);
-        assert!(work.model.is_none() && work.ceiling.is_none());
+        assert!(work.harness_step.model.is_none() && work.harness_step.ceiling.is_none());
     }
 
     #[test]
@@ -924,7 +919,7 @@ terminal_states: [done]
         .expect("the workflow loads");
 
         let agent = |id: &str| match &definition.states[id].action {
-            Some(ActionConfig::Agent(agent)) => agent.clone(),
+            Some(ActionConfig::Agent(agent)) => agent.harness_step.clone(),
             _ => panic!("an agent step"),
         };
         let plain = agent("plain");

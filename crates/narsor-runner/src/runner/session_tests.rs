@@ -158,7 +158,7 @@ impl ActionExecutor for Agent {
         };
         self.calls.lock().unwrap().push(Call {
             prompt: config.prompt.to_string(),
-            harness: config.harness.clone(),
+            harness: config.harness_step.harness.clone(),
         });
         let reply = self
             .replies

@@ -18,8 +18,8 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use crate::domain::{
-    DecisionMaker, PromptText, SchemaVersion, SetDefinition, VariableScope, VariableSource,
-    VariableType, EXIT_LABEL, LOCAL_VARIABLE_PREFIX,
+    DecisionMaker, HarnessStepConfig, PromptText, SchemaVersion, SetDefinition, VariableScope,
+    VariableSource, VariableType, EXIT_LABEL, LOCAL_VARIABLE_PREFIX,
 };
 
 /// The whole workflow file (`docs/dev/workflow-schema.md` §2).
@@ -1216,6 +1216,26 @@ pub struct AgentActionSchema {
 
 fn default_history() -> bool {
     true
+}
+
+impl AgentActionSchema {
+    /// The harness session settings the step declares, before `globals` fill
+    /// what it leaves out. The YAML contract has no per-action workspace (§6
+    /// lists it as a future extension) and no permission grants, so both stay
+    /// unset.
+    pub fn harness_step(&self) -> HarnessStepConfig {
+        HarnessStepConfig {
+            harness: self.harness.clone(),
+            permission_grants: Vec::new(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            ceiling: self.ceiling.clone(),
+            workspace_access: self.workspace_access,
+            workspace: None,
+            parameters: self.parameters.clone(),
+            read_only_paths: self.read_only_paths.clone(),
+        }
+    }
 }
 
 /// `type: script` (§3.3.B).

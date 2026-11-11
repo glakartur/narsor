@@ -65,8 +65,8 @@ impl Engine {
         // Before a resumed session replaces the prompt: a session that
         // goes on already knows its history (KTD9).
         step_memory::add_history(config, &template.prompt, history);
-        self.pin_harness(config, pinned_harness);
-        self.apply_step_profile(execution, state, config, profile);
+        self.pin_harness(&mut config.harness_step, pinned_harness);
+        self.apply_step_profile(execution, state, &mut config.harness_step, profile);
         let input = self.take_agent_input(execution, state)?;
         if let Some(input) = &input {
             if let (Some(harness), Some(session)) =
@@ -79,7 +79,7 @@ impl Engine {
                     .push_str("\n\nHuman answer to your question:\n");
                 config.prompt.push_str(&input.answer);
             }
-            config.permission_grants = input.permission_rules.clone();
+            config.harness_step.permission_grants = input.permission_rules.clone();
         }
         if let Some(note) = self.take_operator_recovery_note(execution)? {
             config.prompt.push_str("\n\nOperator recovery note:\n");
@@ -88,7 +88,7 @@ impl Engine {
         Ok(input)
     }
 
-    /// Sets the model and effort of a rendered agent `config` from the three
+    /// Sets the model and effort of a rendered step `config` from the three
     /// sources — the step's default, the conductor's profile, an escalation —
     /// through [`step_profile::resolve`]. A step with none of them keeps the
     /// arguments it always had.
@@ -96,7 +96,7 @@ impl Engine {
         &self,
         execution: &WorkflowExecution,
         state: &State,
-        config: &mut AgentActionConfig,
+        config: &mut HarnessStepConfig,
         attempt: AttemptProfile,
     ) {
         let default = Setting::default_of(config);
@@ -172,7 +172,7 @@ impl Engine {
         self.apply_step_profile(
             execution,
             state,
-            &mut config,
+            &mut config.harness_step,
             AttemptProfile {
                 failures: 0,
                 announce: false,
@@ -214,7 +214,7 @@ impl Engine {
     /// session of its own (`resume_session`) is left alone: the executor
     /// refuses it without an explicit harness, and a default cannot say
     /// which harness that session belongs to.
-    fn pin_harness(&self, config: &mut AgentActionConfig, pinned: &mut Option<String>) {
+    fn pin_harness(&self, config: &mut HarnessStepConfig, pinned: &mut Option<String>) {
         if config.harness.is_some()
             || config
                 .parameters

@@ -56,7 +56,7 @@ use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
 use crate::conductor::store::ConductorStore;
 use crate::config::{agent_args_for, AgentArgs};
 use crate::domain::{
-    AgentActionConfig, ChoiceDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
+    ChoiceDefinition, HarnessStepConfig, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
 };
 use crate::engine::actions::agent::{DefaultHarnessSource, BUILT_IN_HARNESS};
 use crate::engine::actions::answer::AnswerShape;
@@ -337,7 +337,7 @@ impl HarnessInvoker {
             .iter()
             .map(|repository| PathBuf::from(&repository.path))
             .collect();
-        let config = conductor_config(&prompt, &self.profile);
+        let config = conductor_config(&self.profile);
         let schema = answer_schema(invocation.request.purpose);
         let mut command = adapter
             .invocation(&HarnessRequest {
@@ -499,24 +499,15 @@ fn pinned_source(
     (source, outputs)
 }
 
-/// The action configuration the adapters build the conductor's command line
-/// from: the configured model tier and effort (none means the harness's
-/// default), no parameters, read-only.
-fn conductor_config(prompt: &str, profile: &ConductorProfile) -> AgentActionConfig {
-    AgentActionConfig {
-        harness: None,
-        permission_grants: Vec::new(),
+/// The harness session the adapters build the conductor's command line from:
+/// the configured model tier and effort (none means the harness's default),
+/// no parameters, read-only.
+fn conductor_config(profile: &ConductorProfile) -> HarnessStepConfig {
+    HarnessStepConfig {
         model: profile.model.clone(),
         effort: profile.effort.clone(),
-        ceiling: None,
-        plan: false,
         workspace_access: Some(WorkspaceAccess::ReadOnly),
-        prompt: prompt.into(),
-        workspace: None,
-        parameters: Default::default(),
-        read_only_paths: Vec::new(),
-        // The conductor is not a step: it has no earlier attempts to show.
-        history: false,
+        ..HarnessStepConfig::default()
     }
 }
 
@@ -530,14 +521,14 @@ mod conductor_profile_tests {
             model: Some("small".into()),
             effort: Some("low".into()),
         };
-        let config = conductor_config("p", &profile);
+        let config = conductor_config(&profile);
         assert_eq!(config.model.as_deref(), Some("small"));
         assert_eq!(config.effort.as_deref(), Some("low"));
     }
 
     #[test]
     fn an_empty_profile_leaves_the_choice_to_the_harness() {
-        let config = conductor_config("p", &ConductorProfile::default());
+        let config = conductor_config(&ConductorProfile::default());
         assert!(config.model.is_none() && config.effort.is_none());
     }
 }

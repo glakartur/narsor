@@ -44,16 +44,16 @@ impl Setting {
         }
     }
 
-    /// The default an agent step names.
-    pub fn default_of(config: &crate::domain::AgentActionConfig) -> Self {
+    /// The default a step running a harness names.
+    pub fn default_of(config: &crate::domain::HarnessStepConfig) -> Self {
         Self {
             model: config.model.clone(),
             effort: config.effort.clone(),
         }
     }
 
-    /// The ceiling an agent step names, if any.
-    pub fn ceiling_of(config: &crate::domain::AgentActionConfig) -> Option<Self> {
+    /// The ceiling a step running a harness names, if any.
+    pub fn ceiling_of(config: &crate::domain::HarnessStepConfig) -> Option<Self> {
         config.ceiling.as_ref().map(|ceiling| Self {
             model: ceiling.model.clone(),
             effort: ceiling.effort.clone(),

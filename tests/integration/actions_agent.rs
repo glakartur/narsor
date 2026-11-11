@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use narsor_engine::domain::{
     ActionConfig, ActionError, AgentActionConfig, ArtifactDefinition, ChoiceDefinition, Context,
-    EventData, ExecutionStatus, RepromptedBy, VariableDefinition, Workspace, WorkspaceAccess,
+    EventData, ExecutionStatus, HarnessStepConfig, RepromptedBy, VariableDefinition, Workspace,
+    WorkspaceAccess,
 };
 use narsor_engine::engine::actions::agent::{
     output_contract, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
@@ -389,17 +390,19 @@ async fn execute_with_conversation(
 /// An agent action on the `claude-code` harness.
 fn agent_action(prompt: &str) -> AgentActionConfig {
     AgentActionConfig {
-        harness: Some("claude-code".to_string()),
-        permission_grants: Vec::new(),
-        model: None,
-        effort: None,
-        ceiling: None,
+        harness_step: HarnessStepConfig {
+            harness: Some("claude-code".to_string()),
+            permission_grants: Vec::new(),
+            model: None,
+            effort: None,
+            ceiling: None,
+            workspace_access: Some(WorkspaceAccess::ReadWrite),
+            workspace: None,
+            parameters: HashMap::new(),
+            read_only_paths: Vec::new(),
+        },
         plan: false,
-        workspace_access: Some(WorkspaceAccess::ReadWrite),
         prompt: prompt.into(),
-        workspace: None,
-        parameters: HashMap::new(),
-        read_only_paths: Vec::new(),
         history: true,
     }
 }
@@ -952,7 +955,7 @@ async fn the_session_config_records_the_harness_that_ran() {
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("do the thing");
-    config.harness = None;
+    config.harness_step.harness = None;
     let result = complete(&executor(&fake), config, &root.workspace()).await;
 
     let session = &result.data["agent_session"];
@@ -1093,6 +1096,7 @@ async fn a_session_to_resume_reaches_the_argv() {
 
     let mut config = agent_action("carry on");
     config
+        .harness_step
         .parameters
         .insert("resume_session".to_string(), json!("session-42"));
 
@@ -1129,8 +1133,8 @@ async fn the_model_and_the_read_only_paths_reach_the_argv() {
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
-    config.model = Some("large".to_string());
-    config.read_only_paths = vec!["../other-repo/src".to_string()];
+    config.harness_step.model = Some("large".to_string());
+    config.harness_step.read_only_paths = vec!["../other-repo/src".to_string()];
 
     complete(&executor(&fake), config, &root.workspace()).await;
 
@@ -1183,7 +1187,8 @@ async fn a_task_permission_grant_reaches_claude_as_its_allowed_tool_rules() {
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
     let mut config = agent_action("continue");
-    config.permission_grants = vec!["Bash(cargo build)".to_string(), "Bash(tail -5)".to_string()];
+    config.harness_step.permission_grants =
+        vec!["Bash(cargo build)".to_string(), "Bash(tail -5)".to_string()];
 
     complete(&executor(&fake), config, &root.workspace()).await;
 
@@ -1238,10 +1243,11 @@ async fn a_resumed_grant_never_swallows_the_prompt() {
         let fake = FakeHarness::install(root.dir("bin"));
         fake.answers(&envelope(r#"{"choice":"ready"}"#));
         let mut config = agent_action("The operator approved this action.");
-        config.workspace_access = workspace_access;
-        config.permission_grants = vec!["Bash(git checkout -b feat/x)".to_string()];
-        config.read_only_paths = vec!["../reference".to_string()];
+        config.harness_step.workspace_access = workspace_access;
+        config.harness_step.permission_grants = vec!["Bash(git checkout -b feat/x)".to_string()];
+        config.harness_step.read_only_paths = vec!["../reference".to_string()];
         config
+            .harness_step
             .parameters
             .insert("resume_session".to_string(), json!("session-42"));
 
@@ -1275,6 +1281,7 @@ async fn claude_rejects_harness_specific_workspace_permissions() {
 
     let mut config = agent_action("look around");
     config
+        .harness_step
         .parameters
         .insert("permission_mode".to_string(), json!("bypassPermissions"));
 
@@ -1295,7 +1302,7 @@ async fn claude_maps_read_only_workspace_access_to_plan_mode() {
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
-    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    config.harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
 
     complete(&executor(&fake), config, &root.workspace()).await;
 
@@ -1314,7 +1321,7 @@ async fn claude_omits_the_mode_when_workspace_access_was_not_set() {
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
-    config.workspace_access = None;
+    config.harness_step.workspace_access = None;
     complete(&executor(&fake), config, &root.workspace()).await;
 
     let args = fake.args(1);
@@ -1381,8 +1388,8 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
     );
 
     let mut config = agent_action("look around");
-    config.harness = Some("opencode".to_string());
-    config.model = Some("medium".to_string());
+    config.harness_step.harness = Some("opencode".to_string());
+    config.harness_step.model = Some("medium".to_string());
     let result = complete(&executor, config, &root.workspace()).await;
 
     assert_eq!(result.output_label, "ready");
@@ -1410,8 +1417,8 @@ async fn the_effort_reaches_the_claude_argv_and_a_step_without_one_is_unchanged(
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
-    config.model = Some("large".to_string());
-    config.effort = Some("high".to_string());
+    config.harness_step.model = Some("large".to_string());
+    config.harness_step.effort = Some("high".to_string());
     complete(&executor(&fake), config, &root.workspace()).await;
     let with_effort = fake.args(1);
     assert!(
@@ -1424,7 +1431,7 @@ async fn the_effort_reaches_the_claude_argv_and_a_step_without_one_is_unchanged(
     let fake = FakeHarness::install(root.dir("bin2"));
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
     let mut config = agent_action("look around");
-    config.model = Some("large".to_string());
+    config.harness_step.model = Some("large".to_string());
     complete(&executor(&fake), config, &root.workspace()).await;
     let without = fake.args(1);
     assert!(
@@ -1460,8 +1467,8 @@ async fn a_harness_without_effort_support_warns_that_the_effort_is_ignored() {
     .with_event_sink(sink.clone());
 
     let mut config = agent_action("look around");
-    config.harness = Some("opencode".to_string());
-    config.effort = Some("high".to_string());
+    config.harness_step.harness = Some("opencode".to_string());
+    config.harness_step.effort = Some("high".to_string());
     complete(&executor, config, &root.workspace()).await;
 
     assert_eq!(effort_warnings(&sink), ["opencode"]);
@@ -1476,7 +1483,7 @@ async fn a_harness_with_effort_support_does_not_warn() {
     let executor = executor(&fake).with_event_sink(sink.clone());
 
     let mut config = agent_action("look around");
-    config.effort = Some("high".to_string());
+    config.harness_step.effort = Some("high".to_string());
     complete(&executor, config, &root.workspace()).await;
 
     assert!(effort_warnings(&sink).is_empty());
@@ -1492,8 +1499,8 @@ async fn the_effort_reaches_the_codex_argv_and_max_is_xhigh() {
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
     );
     let mut config = agent_action("look around");
-    config.harness = Some("codex".to_string());
-    config.effort = Some("max".to_string());
+    config.harness_step.harness = Some("codex".to_string());
+    config.harness_step.effort = Some("max".to_string());
     complete(&executor, config, &root.workspace()).await;
     let args = fake.args(1);
     assert!(
@@ -1509,7 +1516,7 @@ async fn an_effort_that_looks_like_an_option_is_rejected() {
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
     let mut config = agent_action("look around");
-    config.effort = Some("--dangerous".to_string());
+    config.harness_step.effort = Some("--dangerous".to_string());
     let error = fail(&executor(&fake), config, &root.workspace()).await;
     assert!(error.message.contains("effort"), "{error:?}");
 }
@@ -1525,9 +1532,9 @@ async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thre
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
     );
     let mut config = agent_action("look around");
-    config.harness = Some("codex".to_string());
-    config.model = Some("medium".to_string());
-    config.read_only_paths = vec!["../reference".to_string()];
+    config.harness_step.harness = Some("codex".to_string());
+    config.harness_step.model = Some("medium".to_string());
+    config.harness_step.read_only_paths = vec!["../reference".to_string()];
 
     let result = complete(&executor, config, &root.workspace()).await;
 
@@ -1572,8 +1579,9 @@ async fn codex_resume_uses_the_exec_resume_grammar() {
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
     );
     let mut config = agent_action("continue");
-    config.harness = Some("codex".to_string());
+    config.harness_step.harness = Some("codex".to_string());
     config
+        .harness_step
         .parameters
         .insert("resume_session".to_string(), json!("thread-42"));
 
@@ -1606,8 +1614,9 @@ async fn codex_rejects_unsafe_sandbox_before_spawn() {
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
     );
     let mut config = agent_action("do the thing");
-    config.harness = Some("codex".to_string());
+    config.harness_step.harness = Some("codex".to_string());
     config
+        .harness_step
         .parameters
         .insert("sandbox".to_string(), json!("danger-full-access"));
 
@@ -1626,8 +1635,8 @@ async fn codex_maps_read_only_workspace_access_to_its_native_sandbox() {
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
     );
     let mut config = agent_action("look around");
-    config.harness = Some("codex".to_string());
-    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    config.harness_step.harness = Some("codex".to_string());
+    config.harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
 
     complete(&executor, config, &root.workspace()).await;
 
@@ -1650,7 +1659,7 @@ async fn codex_requires_a_completed_turn_after_its_agent_message() {
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
     );
     let mut config = agent_action("do the thing");
-    config.harness = Some("codex".to_string());
+    config.harness_step.harness = Some("codex".to_string());
 
     let error = fail(&executor, config, &root.workspace()).await;
     assert_eq!(error.error_type.as_deref(), Some("harness_failed"));
@@ -1675,7 +1684,7 @@ async fn codex_terminal_failure_dominates_an_earlier_agent_message() {
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
     );
     let mut config = agent_action("do the thing");
-    config.harness = Some("codex".to_string());
+    config.harness_step.harness = Some("codex".to_string());
 
     let error = fail(&executor, config, &root.workspace()).await;
     assert_eq!(error.error_type.as_deref(), Some("harness_failed"));
@@ -2241,7 +2250,7 @@ async fn an_unknown_harness_names_the_supported_ones() {
     let root = TempRoot::new();
 
     let mut config = agent_action("look around");
-    config.harness = Some("aider".to_string());
+    config.harness_step.harness = Some("aider".to_string());
 
     let error = fail(&AgentExecutor::new(), config, &root.workspace()).await;
 
@@ -3637,7 +3646,7 @@ async fn an_opencode_stream_is_captured_and_the_label_comes_from_its_text_line()
     );
 
     let mut config = agent_action("look around");
-    config.harness = Some("opencode".to_string());
+    config.harness_step.harness = Some("opencode".to_string());
 
     let result =
         execute_with_conversation(&executor, config, &root.workspace(), &conversation, None)
@@ -4077,6 +4086,7 @@ async fn a_resumed_session_reaches_the_argv_and_the_prompt_entry() {
 
     let mut config = agent_action("carry on");
     config
+        .harness_step
         .parameters
         .insert("resume_session".to_string(), json!("session-42"));
 
@@ -4417,7 +4427,7 @@ async fn an_opencode_step_gets_no_schema_but_still_the_text_contract() {
             .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
     );
     let mut config = agent_action("do the thing");
-    config.harness = Some("opencode".to_string());
+    config.harness_step.harness = Some("opencode".to_string());
 
     execute_with_choices(&executor, config, &root.workspace(), &two_labels(), None)
         .await
@@ -4460,7 +4470,7 @@ async fn the_real_claude_binary_honours_the_output_contract() {
         "Do not use any tools. Answer with the label 'ready' and nothing else \
          beyond the required JSON object.",
     );
-    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    config.harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
 
     let result = complete(&AgentExecutor::new(), config, &root.workspace()).await;
 
@@ -4484,7 +4494,7 @@ async fn the_real_claude_binary_resumes_a_session_killed_after_its_question() {
         "Do not use any tools. Ask the person which colour to use, with \
          `awaiting_input`, and wait for the answer.",
     );
-    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    config.harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
     // The question ends the step only while `KILL_AFTER_QUESTION` is on, so
     // the harness is killed here by the time limit instead: the same kill,
     // a little later.
@@ -4518,7 +4528,7 @@ async fn the_real_claude_binary_answers_in_the_closing_json_of_its_text() {
          a tool. When the task has finished, read bg.txt with `cat` and finish with the label \
          'done'.",
     );
-    config.model = Some("small".to_string());
+    config.harness_step.model = Some("small".to_string());
     let conversation = ConversationFixture::new(&root);
 
     let outcome = execute_with_choices(
@@ -4577,7 +4587,7 @@ async fn a_model_that_would_be_read_as_a_flag_is_refused() {
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("do the thing");
-    config.model = Some("--allow-dangerously-skip-permissions".to_string());
+    config.harness_step.model = Some("--allow-dangerously-skip-permissions".to_string());
 
     let error = fail(&executor(&fake), config, &root.workspace()).await;
 
@@ -4705,7 +4715,7 @@ async fn an_action_without_a_harness_falls_back_to_the_built_in_one() {
     let executor = executor(&fake);
 
     let mut config = agent_action("do the thing");
-    config.harness = None;
+    config.harness_step.harness = None;
 
     let outcome = execute(&executor, config, &root.workspace(), None)
         .await
@@ -4777,8 +4787,9 @@ async fn resuming_a_session_requires_an_explicit_harness() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     let mut config = agent_action("continue");
-    config.harness = None;
+    config.harness_step.harness = None;
     config
+        .harness_step
         .parameters
         .insert("resume_session".to_string(), json!("thread-42"));
 
@@ -4804,7 +4815,7 @@ async fn the_session_event_records_the_harness_that_ran_not_the_absence_of_one()
     let executor = executor(&fake).with_event_sink(Arc::clone(&sink) as Arc<dyn AgentEventSink>);
 
     let mut config = agent_action("do the thing");
-    config.harness = None;
+    config.harness_step.harness = None;
 
     execute(&executor, config, &root.workspace(), None)
         .await
@@ -5079,7 +5090,7 @@ async fn a_codex_step_keeps_every_stdout_line_and_reports_nothing() {
     )
     .with_usage_reporter(reporter.clone());
     let mut config = agent_action("look around");
-    config.harness = Some("codex".to_string());
+    config.harness_step.harness = Some("codex".to_string());
 
     let outcome =
         execute_with_conversation(&executor, config, &root.workspace(), &conversation, None)
@@ -5177,7 +5188,7 @@ async fn a_forced_read_only_run_lists_every_repository_as_read_only() {
 
     let root = TempRoot::new();
     let mut config = agent_action("repair the answer");
-    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    config.harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
     let fake = run_scoped(&root, None, config).await;
     let prompt = fake.args(1).last().unwrap().clone();
     assert!(prompt.contains("/code): read-only"), "{prompt}");
@@ -5198,7 +5209,7 @@ fn adapters_map_scope_dirs_to_what_they_can_enforce() {
     let writable = [start.clone(), PathBuf::from("/task/workspace/notes")];
     let read_only = [PathBuf::from("/task/workspace/code")];
     let request = HarnessRequest {
-        config: &config,
+        config: &config.harness_step,
         workspace_access: Some(WorkspaceAccess::ReadWrite),
         prompt: "go",
         workspace: &start,

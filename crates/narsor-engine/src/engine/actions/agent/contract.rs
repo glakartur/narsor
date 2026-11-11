@@ -221,10 +221,10 @@ pub fn reprompt_config(
     reason: &str,
 ) -> AgentActionConfig {
     let mut config = original.clone();
-    config.harness = Some(harness.to_string());
-    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    config.harness_step.harness = Some(harness.to_string());
+    config.harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
     config.prompt = format!("{OUTPUT_REPROMPT}\n\nWhy it was rejected: {reason}").into();
-    config.parameters.insert(
+    config.harness_step.parameters.insert(
         RESUME_SESSION_PARAMETER.to_string(),
         Value::String(harness_session.to_string()),
     );
@@ -262,8 +262,8 @@ pub fn continuation_config(
     message: &str,
 ) -> AgentActionConfig {
     let mut config = original.clone();
-    config.harness = Some(harness.to_string());
-    config.parameters.insert(
+    config.harness_step.harness = Some(harness.to_string());
+    config.harness_step.parameters.insert(
         RESUME_SESSION_PARAMETER.to_string(),
         Value::String(harness_session.to_string()),
     );

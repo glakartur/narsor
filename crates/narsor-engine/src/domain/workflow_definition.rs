@@ -70,31 +70,17 @@ pub struct WorkflowDefinition {
 }
 
 impl WorkflowDefinition {
-    /// Fills what an agent step leaves out from `globals` (D9): `model` from
-    /// `default_model`, `effort` from `default_effort`, and each field of
-    /// `ceiling` from the general ceiling. What the step names wins. After
-    /// this a step holds its effective values, so nothing downstream looks
-    /// at `globals` again.
+    /// Fills what a step running a harness leaves out from `globals` (D9),
+    /// see [`HarnessStepConfig::inherit_globals`]. After this a step holds its
+    /// effective values, so nothing downstream looks at `globals` again.
     pub fn inherit_global_defaults(&mut self) {
-        let globals = self.globals.clone();
         for state in self.states.values_mut() {
-            let Some(ActionConfig::Agent(agent)) = &mut state.action else {
-                continue;
-            };
-            if agent.model.is_none() {
-                agent.model = globals.default_model.clone();
-            }
-            if agent.effort.is_none() {
-                agent.effort = globals.default_effort.clone();
-            }
-            if let Some(general) = &globals.ceiling {
-                let own = agent.ceiling.get_or_insert_with(StepCeiling::default);
-                if own.model.is_none() {
-                    own.model = general.model.clone();
-                }
-                if own.effort.is_none() {
-                    own.effort = general.effort.clone();
-                }
+            if let Some(step) = state
+                .action
+                .as_mut()
+                .and_then(ActionConfig::harness_step_mut)
+            {
+                step.inherit_globals(&self.globals);
             }
         }
     }
@@ -514,6 +500,25 @@ pub enum ActionConfig {
     Decision(DecisionActionConfig),
 }
 
+impl ActionConfig {
+    /// The harness session settings of a step that runs a harness, `None`
+    /// for every other action.
+    pub fn harness_step(&self) -> Option<&HarnessStepConfig> {
+        match self {
+            Self::Agent(config) => Some(&config.harness_step),
+            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+        }
+    }
+
+    /// The mutable form of [`Self::harness_step`].
+    pub fn harness_step_mut(&mut self) -> Option<&mut HarnessStepConfig> {
+        match self {
+            Self::Agent(config) => Some(&mut config.harness_step),
+            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+        }
+    }
+}
+
 /// Decision action configuration: a fork decided by someone other than the
 /// step itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -558,9 +563,15 @@ pub struct StepCeiling {
     pub effort: Option<String>,
 }
 
-/// Agent action configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentActionConfig {
+/// The settings of a harness session that every step running a harness
+/// shares: which harness, model and effort, how far the step may be raised,
+/// and what the session may touch.
+///
+/// A step's action holds it flattened (`#[serde(flatten)]`), so its fields sit
+/// next to the action's own fields in a saved definition, exactly where they
+/// were before this type existed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarnessStepConfig {
     /// Which harness to use (e.g., "claude-code", "opencode").
     ///
     /// `None` means "whatever the configuration says", resolved by the
@@ -588,11 +599,6 @@ pub struct AgentActionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ceiling: Option<StepCeiling>,
 
-    /// Marks the step whose success makes the conductor profile the steps
-    /// that have not started (`plan: true` in YAML).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub plan: bool,
-
     /// Access the agent receives to its execution workspace.
     ///
     /// Normally derived from the step's `workspace` section
@@ -605,9 +611,6 @@ pub struct AgentActionConfig {
     #[serde(default)]
     pub workspace_access: Option<WorkspaceAccess>,
 
-    /// Prompt to send to the agent
-    pub prompt: PromptText,
-
     /// Workspace configuration (optional, defaults to current)
     #[serde(default)]
     pub workspace: Option<WorkspaceRef>,
@@ -619,6 +622,45 @@ pub struct AgentActionConfig {
     /// Extra paths mounted read-only, relative to the workspace
     #[serde(default)]
     pub read_only_paths: Vec<String>,
+}
+
+impl HarnessStepConfig {
+    /// Fills what the step leaves out from `globals` (D9): `model` from
+    /// `default_model`, `effort` from `default_effort`, and each field of
+    /// `ceiling` from the general ceiling. What the step names wins.
+    pub fn inherit_globals(&mut self, globals: &GlobalsConfig) {
+        if self.model.is_none() {
+            self.model = globals.default_model.clone();
+        }
+        if self.effort.is_none() {
+            self.effort = globals.default_effort.clone();
+        }
+        if let Some(general) = &globals.ceiling {
+            let own = self.ceiling.get_or_insert_with(StepCeiling::default);
+            if own.model.is_none() {
+                own.model = general.model.clone();
+            }
+            if own.effort.is_none() {
+                own.effort = general.effort.clone();
+            }
+        }
+    }
+}
+
+/// Agent action configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentActionConfig {
+    /// The harness session the agent runs in.
+    #[serde(flatten)]
+    pub harness_step: HarnessStepConfig,
+
+    /// Marks the step whose success makes the conductor profile the steps
+    /// that have not started (`plan: true` in YAML).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan: bool,
+
+    /// Prompt to send to the agent
+    pub prompt: PromptText,
 
     /// Whether the engine adds the history of earlier attempts to the prompt
     /// when the step is entered again (`history` in YAML).

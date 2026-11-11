@@ -887,8 +887,8 @@ impl CatalogLaunchResolver {
         // literally (a templated one is only known at run time).
         let mut needed = BTreeSet::from([selected.clone()]);
         for state in definition.states.values() {
-            if let Some(ActionConfig::Agent(agent)) = &state.action {
-                needed.extend(agent.harness.iter().filter(|h| !h.contains("{{")).cloned());
+            if let Some(step) = state.action.as_ref().and_then(ActionConfig::harness_step) {
+                needed.extend(step.harness.iter().filter(|h| !h.contains("{{")).cloned());
             }
             if let Some(DecisionConfig::Agent(agent)) = &state.decision {
                 needed.extend(agent.harness.iter().filter(|h| !h.contains("{{")).cloned());

@@ -164,11 +164,11 @@ impl AgentExecutor {
     async fn run(&self, request: ActionRequest<'_>) -> Result<ActionOutcome, ActionError> {
         let config = agent_config(request.action)?;
         let shape = AnswerShape::of_step(request.contract.has_exit());
-        let resume = resume_session(config)?;
-        let harness = self.sessions.harness(config)?;
+        let resume = resume_session(&config.harness_step)?;
+        let harness = self.sessions.harness(&config.harness_step)?;
 
         let mut scope = request.step_scope();
-        if config.workspace_access == Some(WorkspaceAccess::ReadOnly) {
+        if config.harness_step.workspace_access == Some(WorkspaceAccess::ReadOnly) {
             scope = scope.read_only();
         }
         // A resumed session was told about the repositories when it began.
@@ -190,7 +190,7 @@ impl AgentExecutor {
                 &request,
                 SessionStart {
                     harness,
-                    config,
+                    config: &config.harness_step,
                     scope: &scope,
                     resume,
                     prompt,

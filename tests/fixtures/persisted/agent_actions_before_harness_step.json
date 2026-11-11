@@ -1,0 +1,50 @@
+[
+  {
+    "type": "agent",
+    "harness": "claude-code",
+    "model": "medium",
+    "effort": "high",
+    "ceiling": {
+      "model": "large",
+      "effort": "max"
+    },
+    "plan": true,
+    "workspace_access": "read-only",
+    "prompt": [
+      "Implement {{ task }}.",
+      {
+        "text": "Mind {{ note }}.",
+        "when": [
+          "note"
+        ]
+      }
+    ],
+    "workspace": "current",
+    "parameters": {
+      "temperature": {
+        "value": 0.2,
+        "tags": [
+          "a",
+          "b"
+        ],
+        "n": 3
+      }
+    },
+    "read_only_paths": [
+      "docs",
+      "specs/api"
+    ],
+    "history": false
+  },
+  {
+    "type": "agent",
+    "harness": null,
+    "model": null,
+    "workspace_access": null,
+    "prompt": "Do the thing.",
+    "workspace": null,
+    "parameters": {},
+    "read_only_paths": [],
+    "history": true
+  }
+]

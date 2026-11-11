@@ -57,7 +57,7 @@ use super::scope::StepScope;
 use super::script::{truncate, MAX_BUFFERED_OUTPUT_BYTES};
 use super::{ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR};
 use crate::domain::{
-    ActionError, AgentActionConfig, AgentSession, AgentSessionStatus, Event, EventData,
+    ActionError, AgentSession, AgentSessionStatus, Event, EventData, HarnessStepConfig,
 };
 use crate::persistence::{
     ConversationSource, ConversationStore, ConversationWriter, ExecutionStore,
@@ -133,7 +133,7 @@ impl SessionHarness {
 /// What a session is started with.
 pub(crate) struct SessionStart<'r> {
     pub(crate) harness: SessionHarness,
-    pub(crate) config: &'r AgentActionConfig,
+    pub(crate) config: &'r HarnessStepConfig,
     /// The directories the harness works in and may read and write.
     pub(crate) scope: &'r StepScope,
     /// The harness session this one continues, from [`resume_session`].
@@ -223,7 +223,7 @@ impl SessionRunner {
     /// over one without, and gets the built-in.
     pub(crate) fn harness(
         &self,
-        config: &AgentActionConfig,
+        config: &HarnessStepConfig,
     ) -> Result<SessionHarness, ActionError> {
         let name = config.harness.as_deref().unwrap_or(BUILT_IN_HARNESS);
         let adapter = Arc::clone(self.harnesses.get(name)?);
@@ -649,18 +649,20 @@ impl OpenSession<'_> {
 /// The harness session `config` continues, from its
 /// [`RESUME_SESSION_PARAMETER`], if any. Continuing one needs an explicit
 /// `harness`: a session belongs to the harness that started it.
-pub(crate) fn resume_session(config: &AgentActionConfig) -> Result<Option<&str>, ActionError> {
+pub(crate) fn resume_session(config: &HarnessStepConfig) -> Result<Option<&str>, ActionError> {
     let resume = match config.parameters.get(RESUME_SESSION_PARAMETER) {
         None | Some(Value::Null) => None,
         Some(Value::String(session)) if session.is_empty() => None,
         Some(Value::String(session)) => Some(session.as_str()),
-        Some(other) => return Err(ActionError {
-            message: format!(
+        Some(other) => {
+            return Err(ActionError {
+                message: format!(
                 "parameter '{RESUME_SESSION_PARAMETER}' must be a session id string, got {other}"
             ),
-            error_type: Some("invalid_parameter".to_string()),
-            details: None,
-        }),
+                error_type: Some("invalid_parameter".to_string()),
+                details: None,
+            })
+        }
     };
     if resume.is_some() && config.harness.is_none() {
         return Err(ActionError {
@@ -675,7 +677,7 @@ pub(crate) fn resume_session(config: &AgentActionConfig) -> Result<Option<&str>,
 }
 
 fn new_session(
-    config: &AgentActionConfig,
+    config: &HarnessStepConfig,
     harness: &str,
     execution_id: Option<&str>,
 ) -> AgentSession {

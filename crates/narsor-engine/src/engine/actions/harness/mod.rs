@@ -1,6 +1,6 @@
 //! Harness adapters: one implementation per AI coding CLI (D17).
 //!
-//! An [`AgentActionConfig`] says *what* the agent should do; a
+//! A [`HarnessStepConfig`] says *what* session the step runs in; a
 //! [`HarnessAdapter`] says *how* a particular command-line harness is asked to
 //! do it. Two things are harness-specific and nothing else is:
 //!
@@ -37,7 +37,7 @@ use narsor_protocol::controller::UsageLimit;
 use serde_json::Value;
 
 use super::answer::AnswerShape;
-use crate::domain::{ActionError, AgentActionConfig, WorkspaceAccess};
+use crate::domain::{ActionError, HarnessStepConfig, WorkspaceAccess};
 
 pub use claude_code::{ClaudeCodeAdapter, CLAUDE_CODE};
 pub use codex::{CodexAdapter, CODEX};
@@ -48,7 +48,7 @@ pub use opencode::{OpenCodeAdapter, OPENCODE};
 #[derive(Debug, Clone, Copy)]
 pub struct HarnessRequest<'a> {
     /// The action configuration, templates already expanded.
-    pub config: &'a AgentActionConfig,
+    pub config: &'a HarnessStepConfig,
 
     /// Workflow-level workspace access, already parsed independently of the
     /// selected harness.
@@ -296,7 +296,7 @@ pub(crate) fn not_classified() -> Vec<ChatElement> {
     }]
 }
 
-/// Runs an [`AgentActionConfig`] on one particular harness CLI.
+/// Runs a [`HarnessStepConfig`] session on one particular harness CLI.
 ///
 /// Implementors are stateless value types and are shared behind an [`Arc`].
 pub trait HarnessAdapter: Send + Sync + std::fmt::Debug {
@@ -444,7 +444,7 @@ impl Default for HarnessRegistry {
 /// A parameter of the wrong JSON type is an error rather than a silent default:
 /// `max_turns: true` is a mistake the author wants to be told about.
 pub(crate) fn string_parameter<'a>(
-    config: &'a AgentActionConfig,
+    config: &'a HarnessStepConfig,
     key: &str,
     harness: &str,
 ) -> Result<Option<&'a str>, ActionError> {
@@ -457,7 +457,7 @@ pub(crate) fn string_parameter<'a>(
 
 /// Reads a boolean `parameters` entry.
 pub(crate) fn bool_parameter(
-    config: &AgentActionConfig,
+    config: &HarnessStepConfig,
     key: &str,
     harness: &str,
 ) -> Result<Option<bool>, ActionError> {
@@ -470,7 +470,7 @@ pub(crate) fn bool_parameter(
 
 /// Reads an integer `parameters` entry.
 pub(crate) fn integer_parameter(
-    config: &AgentActionConfig,
+    config: &HarnessStepConfig,
     key: &str,
     harness: &str,
 ) -> Result<Option<i64>, ActionError> {

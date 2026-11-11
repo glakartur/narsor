@@ -744,10 +744,16 @@ terminal_states: [done]
         other => panic!("expected an agent action, got {other:?}"),
     };
 
-    assert_eq!(agent.harness.as_deref(), Some("claude-code"));
-    assert_eq!(agent.model.as_deref(), Some("medium"));
-    assert_eq!(agent.read_only_paths, vec!["../other-repo/src"]);
-    assert_eq!(agent.parameters["max_tokens"], serde_json::json!(4096));
+    assert_eq!(agent.harness_step.harness.as_deref(), Some("claude-code"));
+    assert_eq!(agent.harness_step.model.as_deref(), Some("medium"));
+    assert_eq!(
+        agent.harness_step.read_only_paths,
+        vec!["../other-repo/src"]
+    );
+    assert_eq!(
+        agent.harness_step.parameters["max_tokens"],
+        serde_json::json!(4096)
+    );
 }
 
 #[test]
@@ -1088,13 +1094,13 @@ fn an_agent_action_stored_before_the_harness_became_optional_still_reads() {
     });
     let config: AgentActionConfig =
         serde_json::from_value(old).expect("a record written before the change must still read");
-    assert_eq!(config.harness.as_deref(), Some("claude-code"));
+    assert_eq!(config.harness_step.harness.as_deref(), Some("claude-code"));
 
     let new = serde_json::json!({ "prompt": "Do the thing." });
     let config: AgentActionConfig =
         serde_json::from_value(new).expect("a record written since must read too");
-    assert_eq!(config.harness, None);
-    assert_eq!(config.workspace_access, None);
+    assert_eq!(config.harness_step.harness, None);
+    assert_eq!(config.harness_step.workspace_access, None);
 }
 
 #[test]
@@ -1875,5 +1881,110 @@ fn a_legacy_definition_serializes_without_the_new_fields() {
     assert!(
         variables_seen > 0,
         "the reference example defines variables"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Agent actions saved before the harness step settings had a type of their own
+// ---------------------------------------------------------------------------
+
+/// The two agent actions in `tests/fixtures/persisted/`, written by the code
+/// from before `HarnessStepConfig` existed: one with every field set, one with
+/// none of the optional ones.
+const PERSISTED_AGENT_ACTIONS: &str = "persisted/agent_actions_before_harness_step";
+
+fn persisted_text(extension: &str) -> String {
+    std::fs::read_to_string(fixture_path(&format!(
+        "{PERSISTED_AGENT_ACTIONS}.{extension}"
+    )))
+    .expect("the persisted fixture exists")
+}
+
+/// The actions the fixture holds, as they were built when it was written.
+fn expected_persisted_actions() -> Vec<narsor_engine::domain::AgentActionConfig> {
+    use narsor_engine::domain::{
+        AgentActionConfig, HarnessStepConfig, PromptPart, PromptText, StepCeiling, WorkspaceRef,
+    };
+    let full = AgentActionConfig {
+        harness_step: HarnessStepConfig {
+            harness: Some("claude-code".into()),
+            // Never persisted: it reads back empty.
+            permission_grants: Vec::new(),
+            model: Some("medium".into()),
+            effort: Some("high".into()),
+            ceiling: Some(StepCeiling {
+                model: Some("large".into()),
+                effort: Some("max".into()),
+            }),
+            workspace_access: Some(WorkspaceAccess::ReadOnly),
+            workspace: Some(WorkspaceRef::Current),
+            parameters: [(
+                "temperature".to_string(),
+                serde_json::json!({ "value": 0.2, "tags": ["a", "b"], "n": 3 }),
+            )]
+            .into(),
+            read_only_paths: vec!["docs".into(), "specs/api".into()],
+        },
+        plan: true,
+        prompt: PromptText::from_parts(vec![
+            PromptPart::always("Implement {{ task }}."),
+            PromptPart::when("Mind {{ note }}.", vec!["note".into()]),
+        ]),
+        history: false,
+    };
+    let minimal = AgentActionConfig {
+        harness_step: HarnessStepConfig::default(),
+        plan: false,
+        prompt: PromptText::plain("Do the thing."),
+        history: true,
+    };
+    vec![full, minimal]
+}
+
+fn agent_configs(actions: Vec<ActionConfig>) -> Vec<narsor_engine::domain::AgentActionConfig> {
+    actions
+        .into_iter()
+        .map(|action| match action {
+            ActionConfig::Agent(config) => config,
+            other => panic!("an agent action, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn agent_actions_saved_before_the_harness_step_type_read_back_unchanged() {
+    let expected = format!("{:?}", expected_persisted_actions());
+
+    let from_json: Vec<ActionConfig> =
+        serde_json::from_str(&persisted_text("json")).expect("the saved JSON reads back");
+    let from_yaml: Vec<ActionConfig> =
+        serde_yaml::from_str(&persisted_text("yaml")).expect("the saved YAML reads back");
+
+    assert_eq!(format!("{:?}", agent_configs(from_json)), expected);
+    assert_eq!(format!("{:?}", agent_configs(from_yaml)), expected);
+}
+
+#[test]
+fn agent_actions_are_saved_in_the_shape_they_had_before_the_harness_step_type() {
+    let actions: Vec<ActionConfig> = expected_persisted_actions()
+        .into_iter()
+        .map(ActionConfig::Agent)
+        .collect();
+
+    let json = serde_json::to_value(&actions).expect("the actions serialize to JSON");
+    let saved_json: serde_json::Value =
+        serde_json::from_str(&persisted_text("json")).expect("the fixture is JSON");
+    assert_eq!(json, saved_json);
+
+    let yaml = serde_yaml::to_value(&actions).expect("the actions serialize to YAML");
+    let saved_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&persisted_text("yaml")).expect("the fixture is YAML");
+    assert_eq!(yaml, saved_yaml);
+
+    let reread: Vec<ActionConfig> =
+        serde_yaml::from_str(&serde_yaml::to_string(&actions).unwrap()).expect("reads back");
+    assert_eq!(
+        format!("{:?}", agent_configs(reread)),
+        format!("{:?}", expected_persisted_actions())
     );
 }

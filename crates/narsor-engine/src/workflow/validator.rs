@@ -466,6 +466,7 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             // has been cloned and earlier states have run — instead of failing
             // here, for free, the way it used to.
             if agent
+                .harness_step
                 .harness
                 .as_deref()
                 .is_some_and(|harness| harness.trim().is_empty())
@@ -855,7 +856,7 @@ fn validate_image(field: &str, image: &ImageSpec, errors: &mut Vec<ValidationErr
 /// model and an effort, and its ceiling must name both: the conductor and an
 /// escalation can then never meet a missing bound.
 fn validate_step_profile(state: &State, errors: &mut Vec<ValidationError>) {
-    let Some(ActionConfig::Agent(agent)) = &state.action else {
+    let Some(step) = state.action.as_ref().and_then(ActionConfig::harness_step) else {
         return;
     };
     let id = &state.id;
@@ -890,9 +891,9 @@ fn validate_step_profile(state: &State, errors: &mut Vec<ValidationError>) {
         }
         found
     };
-    let default_model = tier(&agent.model, "model", &mut invalid);
-    let default_effort = effort(&agent.effort, "effort", &mut invalid);
-    if let Some(ceiling) = &agent.ceiling {
+    let default_model = tier(&step.model, "model", &mut invalid);
+    let default_effort = effort(&step.effort, "effort", &mut invalid);
+    if let Some(ceiling) = &step.ceiling {
         let cap_model = tier(&ceiling.model, "ceiling.model", &mut invalid);
         let cap_effort = effort(&ceiling.effort, "ceiling.effort", &mut invalid);
         if let (Some(default), Some(cap)) = (default_model, cap_model) {
@@ -914,34 +915,34 @@ fn validate_step_profile(state: &State, errors: &mut Vec<ValidationError>) {
         // The step has a profile: both fields must be there, in the step
         // (after `globals.default_model` and `default_effort`) and in the
         // ceiling (after `globals.ceiling`).
-        if agent.model.is_none() {
+        if step.model.is_none() {
             invalid(
                 "model",
                 "a step with a ceiling needs a model: set it, or `globals.default_model`"
                     .to_string(),
             );
         }
-        if agent.effort.is_none() {
+        if step.effort.is_none() {
             invalid(
                 "effort",
                 "a step with a ceiling needs an effort: set it, or `globals.default_effort`"
                     .to_string(),
             );
         }
-        if ceiling.model.is_none() && agent.model.is_some() {
+        if ceiling.model.is_none() && step.model.is_some() {
             invalid(
                 "ceiling.model",
                 "the ceiling needs a model: set it, or `globals.ceiling.model`".to_string(),
             );
         }
-        if ceiling.effort.is_none() && agent.effort.is_some() {
+        if ceiling.effort.is_none() && step.effort.is_some() {
             invalid(
                 "ceiling.effort",
                 "the ceiling needs an effort: set it, or `globals.ceiling.effort`".to_string(),
             );
         }
     }
-    if let Some(effort) = &agent.effort {
+    if let Some(effort) = &step.effort {
         if effort.contains("{{") {
             invalid("effort", "cannot be templated".to_string());
         }
@@ -963,7 +964,7 @@ fn validate_state_templates(
     match &state.action {
         Some(ActionConfig::Agent(agent)) => {
             // The same shape the decision branch below already has.
-            if let Some(harness) = &agent.harness {
+            if let Some(harness) = &agent.harness_step.harness {
                 templated.push(("action.harness".to_string(), harness.clone()));
             }
             templated.extend(prompt_templates(
@@ -972,7 +973,7 @@ fn validate_state_templates(
                 &agent.prompt,
                 errors,
             ));
-            if let Some(model) = &agent.model {
+            if let Some(model) = &agent.harness_step.model {
                 templated.push(("action.model".to_string(), model.clone()));
             }
         }
