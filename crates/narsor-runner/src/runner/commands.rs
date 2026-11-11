@@ -168,8 +168,9 @@ impl Session {
     /// Cuts the pass short for a stop. Unlike [`Self::interrupt`], having
     /// nothing to cut (no pass, or one that just finished) is not an error:
     /// the task is already pausing and ends in `Stopped` either way. The
-    /// execution is left `Paused`; the loop then closes the session at the
-    /// safe point.
+    /// execution is left as `Interrupted` leaves it (a step cut mid-pass is
+    /// `Unknown`, recoverable by a restart of the step); the loop then closes
+    /// the session at the safe point and the task is `Stopped`.
     async fn stop_step(&mut self, execution_id: &str) -> Result<(), String> {
         if !self.pass_active() {
             return Ok(());
@@ -208,10 +209,15 @@ impl Session {
         self.engine
             .take_operator_transition(&self.definition, execution_id, &transition)
             .map_err(|error| refusal(&error))?;
+        // The step has moved: a note that cannot be written must not leave
+        // the task without a pass, and a retry would not repeat the move.
         if let Some(note) = note.filter(|note| !note.trim().is_empty()) {
-            self.engine
-                .leave_operator_note(execution_id, &note, None)
-                .map_err(|error| refusal(&error))?;
+            if let Err(error) = self.engine.leave_operator_note(execution_id, &note, None) {
+                tracing::warn!(
+                    "the owner's note for the chosen step was not written: {}",
+                    refusal(&error)
+                );
+            }
         }
         self.resume_pass().map_err(|error| error.to_string())
     }

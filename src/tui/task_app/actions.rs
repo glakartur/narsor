@@ -89,7 +89,7 @@ use super::{failure_reason, idempotency_key, is_transport, Request, TaskApp};
 /// An action of the menu (origin §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskAction {
-    /// `K` / `J` / `m`: another place in the queue.
+    /// `Ctrl+↑` / `Ctrl+↓` / `m`: another place in the queue.
     Move,
     /// Pause: the work comes to the end of its step, then the task stops.
     Pause,
@@ -241,9 +241,9 @@ fn openable_links(task: &TaskSummary) -> impl Iterator<Item = (&str, String, Str
     })
 }
 
-/// The word that opens a notification about `action` on `task`
+/// The word that opens a notification about `action`
 /// ("pauza: zadanie jest w kolejce").
-pub fn verb(_task: &TaskSummary, action: TaskAction) -> &'static str {
+pub fn verb(action: TaskAction) -> &'static str {
     match action {
         TaskAction::Move => "przesuń",
         TaskAction::Pause => "pauza",
@@ -504,7 +504,7 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
     let (name, effect) = match action {
         TaskAction::Move => (
             "przesuń w kolejce".to_string(),
-            "Zmienia miejsce zadania w kolejce. `K` / `J` przesuwają o jedno miejsce wyżej / \
+            "Zmienia miejsce zadania w kolejce. `Ctrl+↑` / `Ctrl+↓` przesuwają o jedno miejsce wyżej / \
              niżej, `m` włącza tryb przesuwania: `j` / `k` wybiera miejsce z podglądem, `Enter` \
              zatwierdza, `Esc` anuluje."
                 .to_string(),
@@ -883,7 +883,7 @@ impl TaskApp {
         Request::None
     }
 
-    /// `K` / `J` inside the menu: moves one place, and closes the menu once
+    /// `Ctrl+↑` / `Ctrl+↓` inside the menu: moves one place, and closes the menu once
     /// there is a move to make.
     fn on_move_shortcut(&mut self, up: bool) -> Request {
         let request = self.step_move(up);
@@ -1112,10 +1112,7 @@ impl TaskApp {
             return Request::None;
         };
         if let Availability::Unavailable(reason) = availability(&task, action) {
-            self.notify(
-                Severity::Warning,
-                format!("{}: {reason}", verb(&task, action)),
-            );
+            self.notify(Severity::Warning, format!("{}: {reason}", verb(action)));
             return Request::None;
         }
         if action.changes_state() && !self.mutation_allowed() {
@@ -1129,16 +1126,17 @@ impl TaskApp {
             }
             TaskAction::Pause => self.owner_request(
                 &task,
-                verb(&task, action),
+                verb(action),
                 "wstrzymanie zlecone",
                 OwnerCommand::Pause,
             ),
-            // The same pause the wait policy sends, sent before its time.
+            // The pause the wait policy sends, sent before its time; the server
+            // checks that the task still waits.
             TaskAction::ReleaseSlot => self.owner_request(
                 &task,
-                verb(&task, action),
+                verb(action),
                 "zwolnienie slotu zlecone",
-                OwnerCommand::Pause,
+                OwnerCommand::ReleaseSlot,
             ),
             // A stopped task starts its script step again through the runner;
             // an interrupted one starts anew through the owner's command.
@@ -1162,7 +1160,7 @@ impl TaskApp {
             TaskAction::Stop => {
                 let request = self.action_request(
                     &task,
-                    verb(&task, action),
+                    verb(action),
                     "zatrzymanie wysłane do runnera".to_string(),
                     ActionSend::Operator(OperatorCommand::StopStep),
                 );

@@ -2497,6 +2497,102 @@ fn a_stop_is_taken_and_delivered_while_the_task_pauses_and_ends_stopped() {
 }
 
 #[test]
+fn a_stop_is_refused_once_the_task_is_stopped() {
+    use narsor_engine::orchestration::OperatorCommand;
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    running_with_runner(&fx, "task-1", &lease);
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Stopped
+    );
+
+    let error = fx
+        .control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(OperatorCommand::StopStep, "stop-late"),
+        )
+        .expect_err("the safe point came before the cut");
+
+    assert!(error.to_string().contains("no running runner"), "{error}");
+    assert!(fx
+        .control
+        .task(&task("task-1"))
+        .unwrap()
+        .operator_commands
+        .is_empty());
+}
+
+#[test]
+fn a_stop_is_refused_for_a_task_whose_runner_is_gone() {
+    use narsor_engine::orchestration::OperatorCommand;
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    running_with_runner(&fx, "task-1", &lease);
+    fx.observe(
+        "task-1",
+        &lease,
+        Observation::WorkloadLost { state_known: true },
+    )
+    .expect("the workload is gone");
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(matches!(
+        record.runner_state,
+        RunnerState::Interrupted | RunnerState::Unknown
+    ));
+
+    let error = fx
+        .control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(OperatorCommand::StopStep, "stop-gone"),
+        )
+        .expect_err("nothing to cut");
+
+    assert!(error.to_string().contains("runner is gone"), "{error}");
+}
+
+#[test]
+fn a_stop_that_waits_is_rejected_when_the_task_stops_before_the_runner_took_it() {
+    use narsor_engine::orchestration::OperatorCommand;
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    running_with_runner(&fx, "task-1", &lease);
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    let queued = fx
+        .control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(OperatorCommand::StopStep, "stop-1"),
+        )
+        .expect("a stop is taken while the task pauses");
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+
+    let (delivered, changed) = fx
+        .control
+        .deliver_operator_commands(&task("task-1"), "pod-1", 1)
+        .expect("the runner polls");
+
+    assert!(delivered.is_empty());
+    assert!(changed);
+    let record = fx.control.task(&task("task-1")).unwrap();
+    let command = record.operator_command(&queued.command.command_id).unwrap();
+    assert_eq!(
+        command.status,
+        narsor_engine::orchestration::OperatorCommandStatus::Rejected
+    );
+    assert!(command
+        .detail
+        .as_deref()
+        .is_some_and(|d| d.contains("stopped running")));
+}
+
+#[test]
 fn a_superseded_runner_can_neither_poll_nor_settle_operator_commands() {
     use narsor_engine::orchestration::OperatorCommand;
     let fx = Fixture::new();
@@ -4385,6 +4481,125 @@ fn an_unsettled_operator_command_keeps_the_slot_past_the_wait() {
     let record = fx.control.task(&task("task-1")).unwrap();
     assert!(record.owner_work_pending());
     assert!(!record.slot_release_due(fx.clock.now()));
+}
+
+/// What the owner does at the current generation of the task.
+fn release_slot_now(fx: &Fixture, id: &str) -> Result<TaskRecord, OrchestrationError> {
+    let generation = fx.control.task(&task(id)).unwrap().generation;
+    fx.control
+        .release_slot_now(&task(id), generation)
+        .map(|outcome| outcome.task)
+}
+
+#[test]
+fn the_owner_frees_the_slot_of_a_waiting_task_before_the_deadline() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    fx.clock.advance(Duration::seconds(10));
+    let waiting = fx.control.task(&task("task-1")).unwrap();
+    assert!(waiting.slot_release_pending());
+    assert!(!waiting.slot_release_due(fx.clock.now()));
+
+    let stopping = release_slot_now(&fx, "task-1").expect("the task waits for the owner");
+
+    assert_eq!(stopping.runner_state, RunnerState::PauseRequested);
+    assert!(!stopping.pause_requested_by_policy());
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .expect("the safe point");
+    let stopped = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    assert!(!stopped.holds_capacity());
+}
+
+#[test]
+fn the_owner_cannot_free_the_slot_of_a_task_that_works() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::Running, None);
+
+    assert!(!fx
+        .control
+        .task(&task("task-1"))
+        .unwrap()
+        .slot_release_pending());
+    assert!(matches!(
+        release_slot_now(&fx, "task-1"),
+        Err(OrchestrationError::IllegalCommand { .. })
+    ));
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Running
+    );
+}
+
+#[test]
+fn the_release_of_the_owner_and_of_the_policy_do_not_both_win() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    fx.clock.advance(Duration::seconds(301));
+
+    release_slot(&fx, "task-1").expect("the policy comes first");
+    let generation = fx.control.task(&task("task-1")).unwrap().generation;
+    let second = fx.control.release_slot_now(&task("task-1"), generation);
+
+    assert!(matches!(
+        second,
+        Err(OrchestrationError::IllegalCommand { .. })
+    ));
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::PauseRequested
+    );
+}
+
+#[test]
+fn a_pending_owner_answer_keeps_the_slot_from_the_owners_release() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    fx.control
+        .queue_input(
+            &task("task-1"),
+            narsor_engine::orchestration::InputRequest {
+                pending_input_id: "ask-1".to_string(),
+                idempotency_key: "answer-1".to_string(),
+                delivery: Default::default(),
+            },
+        )
+        .expect("the owner answers");
+
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(record.owner_work_pending());
+    assert!(!record.slot_release_pending());
+    assert!(matches!(
+        release_slot_now(&fx, "task-1"),
+        Err(OrchestrationError::IllegalCommand { .. })
+    ));
+}
+
+#[test]
+fn a_task_without_a_release_class_or_deadline_is_not_pending_release() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    let working = runner_reports(&fx, "task-1", ExecutionStatus::Running, None);
+    assert_eq!(working.slot_release_due_at, None);
+    assert!(!working.slot_release_pending());
+
+    let mut waiting = runner_reports(&fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    assert!(waiting.slot_release_pending());
+    waiting.slot_release_due_at = None;
+    assert!(!waiting.slot_release_pending(), "no deadline");
+
+    let mut stopped = fx.control.task(&task("task-1")).unwrap();
+    stopped.runner_state = RunnerState::Stopped;
+    assert!(!stopped.slot_release_pending(), "not running");
 }
 
 #[test]

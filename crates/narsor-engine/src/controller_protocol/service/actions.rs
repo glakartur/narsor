@@ -446,6 +446,7 @@ fn one_line(text: &str) -> String {
 pub(super) fn owner_action(command: OwnerCommand, task: &TaskRecord) -> TaskActionId {
     match command {
         OwnerCommand::Pause => TaskActionId::Pause,
+        OwnerCommand::ReleaseSlot => TaskActionId::ReleaseSlot,
         OwnerCommand::Archive => TaskActionId::Archive,
         OwnerCommand::Start => TaskActionId::Restart,
         OwnerCommand::Resume

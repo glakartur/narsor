@@ -26,7 +26,8 @@ use super::model::{
     WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
 use super::resume::{
-    auto_resume_key, count_loss, loss_from_history, slot_release_key, ResumePolicy,
+    auto_resume_key, count_loss, loss_from_history, owner_slot_release_key, slot_release_key,
+    ResumePolicy,
 };
 use super::store::OrchestrationStore;
 use crate::domain::{BackendId, TaskId};
@@ -295,6 +296,18 @@ impl ControlPlane {
                 }
                 _ => false,
             };
+            // The owner's early release is allowed only while the task waits
+            // for the owner; a stale or other client cannot release the slot
+            // of a task that works.
+            if request.command == OwnerCommand::ReleaseSlot
+                && (request.actor == CommandActor::Policy || !record.slot_release_pending())
+            {
+                return Err(OrchestrationError::IllegalCommand {
+                    task_id: record.task_id.clone(),
+                    command: request.command,
+                    runner_state: record.runner_state,
+                });
+            }
             if request.actor == CommandActor::Policy && !policy_may_act {
                 return Err(OrchestrationError::IllegalCommand {
                     task_id: record.task_id.clone(),
@@ -447,6 +460,26 @@ impl ControlPlane {
             CommandRequest::new(OwnerCommand::Pause, slot_release_key(generation))
                 .expecting_generation(generation)
                 .issued_by(CommandActor::Policy),
+        )
+    }
+
+    /// The owner frees the slot of the task running at `generation` before
+    /// the wait policy would: an [`OwnerCommand::ReleaseSlot`] keyed
+    /// [`owner_slot_release_key`]`(generation)` and expecting that generation.
+    ///
+    /// Allowed only while [`TaskRecord::slot_release_pending`]; otherwise
+    /// `IllegalCommand`. The effect is the policy's pause: `Running →
+    /// PauseRequested`, a safe point, `Stopped`. When the policy's pause
+    /// came first, this one is refused with `StaleGeneration` or
+    /// `IllegalCommand`, and the state does not change.
+    pub fn release_slot_now(&self, task_id: &TaskId, generation: u64) -> Result<CommandOutcome> {
+        self.command(
+            task_id,
+            CommandRequest::new(
+                OwnerCommand::ReleaseSlot,
+                owner_slot_release_key(generation),
+            )
+            .expecting_generation(generation),
         )
     }
 

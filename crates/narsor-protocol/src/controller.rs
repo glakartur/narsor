@@ -1396,6 +1396,10 @@ pub enum OwnerCommand {
     Start,
     /// Bring a running task to a safe point and release its compute.
     Pause,
+    /// Free the slot of a running task that only waits for the owner: the
+    /// pause of [`OwnerCommand::Pause`], sent before the wait policy would.
+    /// Refused unless the task waits in a state that frees its slot.
+    ReleaseSlot,
     /// Continue a paused, interrupted or unknown task on the same storage.
     Resume,
     /// Delete workload and storage; archive wins over every other state.

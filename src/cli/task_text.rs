@@ -1071,6 +1071,7 @@ pub fn command_name(command: OwnerCommand) -> &'static str {
     match command {
         OwnerCommand::Start => "start",
         OwnerCommand::Pause => "pause",
+        OwnerCommand::ReleaseSlot => "release-slot",
         OwnerCommand::Resume => "resume",
         OwnerCommand::Archive => "archive",
     }

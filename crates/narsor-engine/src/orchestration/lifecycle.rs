@@ -44,7 +44,9 @@ pub(crate) fn command_effect(current: RunnerState, command: OwnerCommand) -> Com
     match (command, current) {
         (OwnerCommand::Archive, Archiving | Archived) => CommandEffect::ArchiveConverged,
         (OwnerCommand::Archive, _) => CommandEffect::Transition(Archiving),
-        (OwnerCommand::Pause, Running) => CommandEffect::Transition(PauseRequested),
+        (OwnerCommand::Pause | OwnerCommand::ReleaseSlot, Running) => {
+            CommandEffect::Transition(PauseRequested)
+        }
         (OwnerCommand::Resume, Stopped | Interrupted | Unknown) => {
             CommandEffect::Transition(Provisioning)
         }

@@ -7153,7 +7153,7 @@ mod task_app_actions {
             let paused = runner_state("paused");
             assert!(available(&paused, TaskAction::Comment));
             assert!(!TaskAction::ALL.contains(&TaskAction::Comment));
-            assert_eq!(verb(&paused, TaskAction::Comment), "komentarz");
+            assert_eq!(verb(TaskAction::Comment), "komentarz");
         }
 
         #[test]
@@ -7295,7 +7295,7 @@ mod task_app_actions {
         fn pause_for_a_running_task_and_nothing_else() {
             let running = running("a", 1);
             assert!(available(&running, TaskAction::Pause));
-            assert_eq!(verb(&running, TaskAction::Pause), "pauza");
+            assert_eq!(verb(TaskAction::Pause), "pauza");
             // A stopped task is not paused again; it goes on by a comment,
             // a step chosen or a restart, never by a resume of the panel.
             assert!(unavailable(&runner_state("paused"), TaskAction::Pause).contains("wstrzymane"));
@@ -7749,7 +7749,7 @@ mod task_app_actions {
             task.slot_release_pending = true;
             let mut app = loaded(offered(task));
             let release = act(choose(&mut app, TaskAction::ReleaseSlot));
-            assert_eq!(release.send, ActionSend::Owner(OwnerCommand::Pause));
+            assert_eq!(release.send, ActionSend::Owner(OwnerCommand::ReleaseSlot));
             assert_eq!(release.summary, "zwolnienie slotu zlecone");
         }
 
