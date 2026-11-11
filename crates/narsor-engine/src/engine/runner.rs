@@ -85,7 +85,6 @@ use uuid::Uuid;
 use crate::conductor::actor::InvocationOutcome;
 use crate::conductor::profile;
 use crate::conductor::ConductorRegistry;
-use crate::conductor::ConductorStore;
 use crate::config::DEFAULT_ESCALATION_THRESHOLD;
 use crate::config::{AgentArgs, AgentDefaults};
 use crate::domain::{
@@ -187,9 +186,6 @@ const METADATA_AGENT_SESSIONS_KEY: &str = "completed_agent_sessions";
 const METADATA_STEP_REPLIES_KEY: &str = "step_replies";
 const METADATA_STEP_STREAMS_KEY: &str = "step_streams";
 const METADATA_STATE_ENTRIES_KEY: &str = "state_entries";
-/// When each state was entered for the first time: a step profile decided
-/// later than that is not used (D7).
-const METADATA_STATE_FIRST_ENTRY_KEY: &str = "state_first_entry";
 
 /// The one-shot instruction delivered by an operator to an agent step.
 /// `harness` and `session` are optional for records written before
@@ -4790,16 +4786,8 @@ fn count_entry(execution: &mut WorkflowExecution, state_id: &str) -> Result<(), 
     let mut counts: BTreeMap<String, u32> =
         read_engine_record(execution, METADATA_STATE_ENTRIES_KEY)?.unwrap_or_default();
     let count = counts.entry(state_id.to_string()).or_default();
-    let first = *count == 0;
     *count = count.saturating_add(1);
-    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)?;
-    if first {
-        let mut firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
-            read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)?.unwrap_or_default();
-        firsts.insert(state_id.to_string(), chrono::Utc::now());
-        write_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY, &firsts)?;
-    }
-    Ok(())
+    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)
 }
 
 /// The states that were entered at least once (D7): their step profile is
@@ -4840,12 +4828,7 @@ fn restore_state_entries(
             message: format!("the entry counts saved with the decision are unreadable: {error}"),
         }
     })?;
-    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)?;
-    // A state that is not entered any more has no first entry.
-    let mut firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
-        read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)?.unwrap_or_default();
-    firsts.retain(|state, _| counts.get(state).is_some_and(|count| *count > 0));
-    write_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY, &firsts)
+    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)
 }
 
 /// What choosing each label of `state` requires of an answer to a problem

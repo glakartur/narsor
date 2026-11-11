@@ -1,16 +1,16 @@
 //! The model and effort one attempt of an agent step runs with.
 //!
 //! Three sources feed the profile, in this order: the step's default from the
-//! workflow, a profile the conductor stored after the plan step, and an
-//! escalation after repeated failures. The order, the ceiling rule and the
+//! workflow, the entry a `profile` step stored for it, and an escalation
+//! after repeated failures. The order, the ceiling rule and the
 //! escalation rule live here and nowhere else, as pure functions — the same
 //! shape as [`super::retry`].
 
 use serde::{Deserialize, Serialize};
 
 /// Efforts from the cheapest to the strongest, and the model tiers likewise.
-/// A workflow value outside them is a validation error. A workflow, the
-/// conductor and an escalation name a tier; each harness maps a tier to a
+/// A workflow value outside them is a validation error. A workflow, a
+/// `profile` step and an escalation name a tier; each harness maps a tier to a
 /// model name ([`super::actions::harness::HarnessAdapter::model_tiers`]).
 pub use crate::config::{EFFORT_SCALE, MODEL_TIERS};
 
@@ -67,11 +67,13 @@ impl Setting {
 pub enum ProfileSource {
     /// The workflow default.
     Default,
-    /// The profile the conductor stored.
-    Conductor,
+    /// The entry a `profile` step stored. Read as `conductor` too: the name
+    /// before the conductor stopped profiling steps.
+    #[serde(alias = "conductor")]
+    Profiled,
     /// Raised after repeated failures.
     Escalated,
-    /// The conductor asked for more than the ceiling; the step starts on the
+    /// The profile asked for more than the ceiling; the step starts on the
     /// ceiling.
     Clamped,
 }
@@ -83,8 +85,8 @@ pub struct ProfileInput<'a> {
     pub default: &'a Setting,
     /// The ceiling; a missing field falls back to the default's.
     pub ceiling: Option<&'a Setting>,
-    /// The conductor's profile for this step.
-    pub conductor: Option<&'a Setting>,
+    /// The stored profile entry for this step.
+    pub profiled: Option<&'a Setting>,
     /// Consecutive failed attempts of this step.
     pub failures: u32,
     /// Failures per escalation; `0` turns escalation off.
@@ -98,9 +100,9 @@ pub struct EffectiveProfile {
     pub setting: Setting,
     /// Which source decided it.
     pub source: ProfileSource,
-    /// What the conductor wanted when it was above the ceiling.
+    /// What the profile wanted when it was above the ceiling.
     pub requested_over_ceiling: Option<Setting>,
-    /// The conductor named a model or effort that cannot be used (outside
+    /// The profile named a model or effort that cannot be used (outside
     /// the tiers or the scale); the default was kept for it.
     pub rejected: bool,
     /// An escalation was due and both fields already stand on the ceiling.
@@ -126,7 +128,7 @@ pub fn resolve(input: ProfileInput<'_>) -> EffectiveProfile {
     let mut requested = Setting::default();
     let mut rejected = false;
 
-    if let Some(wanted) = input.conductor {
+    if let Some(wanted) = input.profiled {
         if let Some(model) = &wanted.model {
             // The default itself is always allowed.
             if Some(model) != input.default.model.as_ref() {
@@ -136,7 +138,7 @@ pub fn resolve(input: ProfileInput<'_>) -> EffectiveProfile {
                 ) {
                     (Some(rank), Some(cap)) if rank <= cap => {
                         setting.model = Some(model.clone());
-                        source = ProfileSource::Conductor;
+                        source = ProfileSource::Profiled;
                     }
                     (Some(_), Some(_)) => {
                         setting.model = ceiling.model.clone();
@@ -154,7 +156,7 @@ pub fn resolve(input: ProfileInput<'_>) -> EffectiveProfile {
             ) {
                 (Some(rank), Some(cap)) if rank <= cap => {
                     if Some(effort) != input.default.effort.as_ref() {
-                        source = ProfileSource::Conductor;
+                        source = ProfileSource::Profiled;
                     }
                     setting.effort = Some(effort.clone());
                 }
@@ -223,13 +225,13 @@ mod tests {
     fn input<'a>(
         default: &'a Setting,
         ceiling: Option<&'a Setting>,
-        conductor: Option<&'a Setting>,
+        profiled: Option<&'a Setting>,
         failures: u32,
     ) -> ProfileInput<'a> {
         ProfileInput {
             default,
             ceiling,
-            conductor,
+            profiled,
             failures,
             threshold: 3,
         }
@@ -252,13 +254,13 @@ mod tests {
     }
 
     #[test]
-    fn a_lower_conductor_profile_is_taken() {
+    fn a_lower_profile_is_taken() {
         let default = Setting::new(Some("large"), Some("high"));
         let ceiling = default.clone();
         let wanted = Setting::new(Some("small"), Some("low"));
         let out = resolve(input(&default, Some(&ceiling), Some(&wanted), 0));
         assert_eq!(out.setting, wanted);
-        assert_eq!(out.source, ProfileSource::Conductor);
+        assert_eq!(out.source, ProfileSource::Profiled);
     }
 
     #[test]
@@ -267,7 +269,7 @@ mod tests {
         let ceiling = Setting::new(Some("large"), Some("high"));
         let out = resolve(input(&default, Some(&ceiling), Some(&ceiling), 0));
         assert_eq!(out.setting, ceiling);
-        assert_eq!(out.source, ProfileSource::Conductor);
+        assert_eq!(out.source, ProfileSource::Profiled);
         assert_eq!(out.requested_over_ceiling, None);
     }
 
@@ -286,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_ceiling_the_conductor_cannot_go_above_the_default() {
+    fn without_a_ceiling_the_profile_cannot_go_above_the_default() {
         let default = Setting::new(Some("medium"), Some("medium"));
         let wanted = Setting::new(Some("large"), Some("high"));
         let out = resolve(input(&default, None, Some(&wanted), 0));
@@ -349,6 +351,29 @@ mod tests {
         let out = resolve(input(&default, None, None, 9));
         assert_eq!(out.setting, default);
         assert!(!out.limit_reached, "no ceiling, so no limit was reached");
+    }
+
+    #[test]
+    fn an_escalation_starts_from_the_profiled_effort() {
+        // AE6: three failures raise the effort the profile chose, not the
+        // step's default.
+        let default = Setting::new(Some("medium"), Some("low"));
+        let ceiling = Setting::new(Some("large"), Some("max"));
+        let wanted = Setting::new(None, Some("medium"));
+        let out = resolve(input(&default, Some(&ceiling), Some(&wanted), 3));
+        assert_eq!(out.setting, Setting::new(Some("medium"), Some("high")));
+        assert_eq!(out.source, ProfileSource::Escalated);
+    }
+
+    #[test]
+    fn the_old_name_of_a_profiled_source_still_reads() {
+        let source: ProfileSource =
+            serde_json::from_value(serde_json::json!("conductor")).expect("the old name");
+        assert_eq!(source, ProfileSource::Profiled);
+        assert_eq!(
+            serde_json::to_value(ProfileSource::Profiled).expect("serialize"),
+            serde_json::json!("profiled")
+        );
     }
 
     #[test]

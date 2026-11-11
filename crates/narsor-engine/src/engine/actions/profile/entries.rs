@@ -132,7 +132,7 @@ fn checked_entry(
     let resolved = step_profile::resolve(ProfileInput {
         default: &candidate.default,
         ceiling: candidate.ceiling.as_ref(),
-        conductor: Some(&wanted),
+        profiled: Some(&wanted),
         failures: 0,
         threshold: 0,
     });

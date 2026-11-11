@@ -1444,8 +1444,9 @@ fn a_sealed_definition_that_still_has_display_reads_back() {
     assert_eq!(definition.name, load_reference().name);
 }
 
-const UNIFIED_FIXTURES: [&str; 7] = [
+const UNIFIED_FIXTURES: [&str; 8] = [
     "v2/engine_profile_step.yaml",
+    "v2/engine_profile_loop.yaml",
     "v2/prompt_parts.yaml",
     "v2/exit.yaml",
     "v2/set.yaml",

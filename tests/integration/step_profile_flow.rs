@@ -236,20 +236,18 @@ async fn a_step_that_already_started_is_not_profiled() {
 }
 
 // ---------------------------------------------------------------------------
-// The engine: the request after the plan step, and the profile applied when a
-// step starts.
+// The engine: the request after the plan step, and escalation on the
+// defaults. The stored profile a step starts on is in `profile_step_flow`.
 // ---------------------------------------------------------------------------
 
 use std::time::Duration;
 
 use engine_support::{workflow_file, AgentCall, AgentTurn, ScriptedAgentExecutor};
-use narsor_engine::conductor::store::ProfileEntry;
 use narsor_engine::domain::{ActionConfig, EventData, ExecutionStatus, WorkflowExecution};
 use narsor_engine::engine::ActionKind;
 
 /// What the scripted conductor does with one request.
 enum Script {
-    Answer(Value),
     Fail,
     Interrupted,
     /// Never answers.
@@ -270,10 +268,6 @@ impl ConductorInvoker for EngineConductor {
         let script = self.scripts.lock().unwrap().pop_front();
         Box::pin(async move {
             match script.expect("the conductor was asked more often than scripted") {
-                Script::Answer(response) => InvocationOutcome::Answered(ConductorAnswer {
-                    message: None,
-                    response,
-                }),
                 Script::Fail => InvocationOutcome::Failed {
                     error: "the scripted conductor failed".to_string(),
                 },
@@ -366,10 +360,6 @@ impl Flow {
             .filter(|call| call.prompt.starts_with(prompt))
             .collect()
     }
-}
-
-fn profile_answer(steps: Value) -> Script {
-    Script::Answer(json!({ "decision": "profile", "steps": steps, "confidence": "high" }))
 }
 
 fn setting_of(call: &AgentCall) -> (Option<&str>, Option<&str>) {
@@ -468,35 +458,6 @@ async fn a_failing_interrupted_or_silent_conductor_is_recorded_and_the_task_goes
     }
 }
 
-#[tokio::test]
-async fn the_profile_sets_the_model_and_the_effort_of_the_step() {
-    let flow = Flow::new(
-        vec![exit(); 3],
-        vec![profile_answer(json!([
-            { "step_id": "work", "model": "large", "effort": "high", "rationale": "risky" },
-            { "step_id": "review", "model": "small", "effort": "low", "rationale": "small" }
-        ]))],
-        true,
-    );
-
-    let execution = flow.run().await;
-
-    assert_eq!(execution.status, ExecutionStatus::Completed);
-    assert_eq!(
-        setting_of(&flow.call_of("Plan it")[0]),
-        (Some("medium"), Some("medium"))
-    );
-    assert_eq!(
-        setting_of(&flow.call_of("Do it")[0]),
-        (Some("large"), Some("high"))
-    );
-    assert_eq!(
-        setting_of(&flow.call_of("Review it")[0]),
-        (Some("small"), Some("low"))
-    );
-    assert!(flow.profile_events(&execution.id).is_empty());
-}
-
 fn escalation_flow(turns: Vec<AgentTurn>, scripts: Vec<Script>) -> Flow {
     Flow::of(
         "v2/engine_step_profile.yaml",
@@ -539,137 +500,4 @@ async fn a_step_that_fails_repeatedly_is_raised_within_its_ceiling() {
         .collect();
     assert_eq!(raised.len(), 1, "{events:?}");
     assert_eq!(raised[0].1["step_profile"]["step"], "work");
-}
-
-#[tokio::test]
-async fn the_limit_is_announced_only_for_a_step_with_a_ceiling() {
-    // `work` already stands on its ceiling; `review` has none.
-    let flow = escalation_flow(
-        vec![
-            exit(),
-            AgentTurn::Fail,
-            AgentTurn::Fail,
-            exit(),
-            AgentTurn::Fail,
-            AgentTurn::Fail,
-            exit(),
-        ],
-        vec![profile_answer(json!([
-            { "step_id": "work", "model": "large", "effort": "high", "rationale": "top" },
-            { "step_id": "review", "model": "medium", "effort": "medium", "rationale": "same" }
-        ]))],
-    );
-
-    let execution = flow.run().await;
-
-    assert_eq!(execution.status, ExecutionStatus::Completed);
-    let events = flow.profile_events(&execution.id);
-    let limits: Vec<_> = events
-        .iter()
-        .filter(|(message, _)| message.contains("already runs on its ceiling"))
-        .collect();
-    assert_eq!(limits.len(), 1, "{events:?}");
-    assert_eq!(limits[0].1["step_profile"]["step"], "work");
-}
-
-fn entry(step: &str, model: &str, effort: &str) -> ProfileEntry {
-    ProfileEntry {
-        step_id: step.to_string(),
-        unit: None,
-        setting: Setting::new(Some(model), Some(effort)),
-        rationale: "test".to_string(),
-        requested_over_ceiling: None,
-        decided_at: chrono::Utc::now(),
-    }
-}
-
-#[tokio::test]
-async fn an_entry_that_cannot_be_used_keeps_the_default_and_is_recorded() {
-    let flow = Flow::new(vec![exit(); 3], vec![], false);
-    let execution = flow
-        .engine
-        .start(&flow.definition, json!({}), flow.harness.workspace())
-        .expect("start");
-    ConductorStore::new(flow.harness.store().paths(), &execution.id)
-        .add_profile_entries(
-            vec![entry("work", "mystery", "max")],
-            &std::collections::BTreeSet::new(),
-        )
-        .expect("write the profile");
-
-    let execution = flow
-        .engine
-        .run(&flow.definition, &execution.id)
-        .await
-        .expect("run");
-
-    assert_eq!(execution.status, ExecutionStatus::Completed);
-    // "max" is above the ceiling's "high": clamped; the model is rejected.
-    let work = &flow.call_of("Do it")[0];
-    assert_eq!(work.model.as_deref(), Some("medium"));
-    let events = flow.profile_events(&execution.id);
-    assert!(
-        events
-            .iter()
-            .any(|(message, _)| message.contains("cannot be used")),
-        "{events:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_damaged_profile_means_no_profile() {
-    let flow = Flow::new(vec![exit(); 3], vec![], false);
-    let execution = flow
-        .engine
-        .start(&flow.definition, json!({}), flow.harness.workspace())
-        .expect("start");
-    let store = ConductorStore::new(flow.harness.store().paths(), &execution.id);
-    std::fs::create_dir_all(store.dir()).unwrap();
-    std::fs::write(store.dir().join("profile.json"), "{ not json").unwrap();
-
-    let execution = flow
-        .engine
-        .run(&flow.definition, &execution.id)
-        .await
-        .expect("run");
-
-    assert_eq!(execution.status, ExecutionStatus::Completed);
-    assert_eq!(
-        setting_of(&flow.call_of("Do it")[0]),
-        (Some("medium"), Some("low"))
-    );
-    assert!(flow.profile_events(&execution.id).is_empty());
-}
-
-#[tokio::test]
-async fn a_reprompt_resumes_the_session_on_the_profiled_model_and_effort() {
-    let flow = Flow::new(
-        vec![
-            exit(),
-            AgentTurn::NoLabel {
-                reply: Some("no label"),
-                session: true,
-            },
-            exit(),
-            exit(),
-        ],
-        vec![profile_answer(json!([
-            { "step_id": "work", "model": "large", "effort": "high", "rationale": "risky" }
-        ]))],
-        true,
-    );
-
-    let execution = flow.run().await;
-
-    assert_eq!(execution.status, ExecutionStatus::Completed);
-    let work: Vec<_> = flow
-        .agent
-        .calls()
-        .into_iter()
-        .filter(|call| call.model.as_deref() == Some("large"))
-        .collect();
-    assert_eq!(work.len(), 2, "{:?}", flow.agent.calls());
-    assert!(work[0].resume_session.is_none());
-    assert!(work[1].resume_session.is_some());
-    assert_eq!(setting_of(&work[1]), (Some("large"), Some("high")));
 }

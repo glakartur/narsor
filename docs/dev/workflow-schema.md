@@ -1168,6 +1168,13 @@ profile:
     takes its transition. Each run replaces the whole file, also with an empty list. The step's
     conversation gets one Narsor entry with the requested value, the stored value, the clamp and
     the rationale of each entry. The step's reason gives the number of stored and skipped entries.
+*   The engine reads `step-profile.json` at each attempt of an `agent` or `profile` step. A step
+    with an entry starts on the model and the effort of the entry. A step without an entry starts
+    on its own values, or else on the `globals` values. An entry written after the first entry into
+    a step applies from the next attempt. The escalation after failed attempts starts from this
+    value. A new file does not change the count of failed attempts. When the engine cannot read the
+    file, the steps start on their defaults and the execution records one warning. The engine does
+    not read the profile of the conductor (`conductor/profile.json`).
 *   A profile step fails like an agent step. A failed attempt, for example a time-out, follows
     `retry_policy`. For an unusable answer the engine asks the agent again once, in the same
     session. When that answer is also unusable, the attempt fails and `retry_policy` applies. When

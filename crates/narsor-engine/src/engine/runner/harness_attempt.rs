@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::domain::{ProfileActionConfig, PromptText};
+use crate::persistence::StepProfileEntry;
 
 /// What [`Engine::apply_step_profile`] needs to know about the attempt.
 #[derive(Clone, Copy)]
@@ -90,9 +91,13 @@ impl Engine {
     }
 
     /// Sets the model and effort of a rendered step `config` from the three
-    /// sources — the step's default, the conductor's profile, an escalation —
-    /// through [`step_profile::resolve`]. A step with none of them keeps the
-    /// arguments it always had.
+    /// sources — the step's default, the entry a `profile` step stored for
+    /// it, an escalation — through [`step_profile::resolve`]. A step with
+    /// none of them keeps the arguments it always had.
+    ///
+    /// The stored profile is read at every attempt (R9): an entry written
+    /// after the step was first entered applies from the next attempt on
+    /// (F3). Writing it does not touch `attempt.failures` (R12).
     fn apply_step_profile(
         &self,
         execution: &WorkflowExecution,
@@ -102,35 +107,29 @@ impl Engine {
     ) {
         let default = Setting::default_of(config);
         let ceiling = Setting::ceiling_of(config);
-        // A damaged or missing profile is "no profile" (R8).
-        let stored = ConductorStore::new(self.store.paths(), &execution.id)
-            .load_profile()
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "damaged step profile; running on the defaults");
-                Default::default()
-            });
-        // A profile decided after the step's first attempt is not used (D7).
-        let first_entry = first_entry_at(execution, &state.id);
-        let conductor = stored
-            .lookup(&state.id, None)
-            .filter(|entry| first_entry.is_none_or(|first| entry.decided_at <= first))
-            .map(|entry| entry.setting.clone());
-        if conductor.is_none() && ceiling.is_none() {
+        let entry = self.stored_step_profile(execution, state);
+        let profiled = entry.as_ref().map(StepProfileEntry::setting);
+        if profiled.is_none() && ceiling.is_none() {
             return;
         }
         let resolved = step_profile::resolve(ProfileInput {
             default: &default,
             ceiling: ceiling.as_ref(),
-            conductor: conductor.as_ref(),
+            profiled: profiled.as_ref(),
             failures: attempt.failures,
             threshold: self.escalation_threshold,
         });
         if resolved.rejected && attempt.announce {
+            let by = entry
+                .as_ref()
+                .map_or("", |entry| entry.profiled_by.as_str());
             self.note_step_profile(
                 execution,
                 state,
-                "the conductor's profile named a model or effort that cannot be used; \
-                 the step's default stays",
+                &format!(
+                    "the profile from step '{by}' named a model or effort that cannot be \
+                     used; the step's default stays"
+                ),
                 &default,
                 &resolved.setting,
             );
@@ -158,7 +157,60 @@ impl Engine {
         config.effort = resolved.setting.effort;
     }
 
-    /// `template` with the conductor's profile applied, for a reprompt that
+    /// The entry the step profile file holds for `state`, if any.
+    ///
+    /// A file that cannot be read — damaged, too large, of an unknown
+    /// version — is "no profile" (R8): the step runs on its defaults, and
+    /// the execution records it once, not at every attempt.
+    fn stored_step_profile(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+    ) -> Option<StepProfileEntry> {
+        match self.store.read_step_profile(&execution.id) {
+            Ok(stored) => stored.lookup(&state.id).cloned(),
+            Err(error) => {
+                tracing::warn!(%error, "unreadable step profile; running on the defaults");
+                self.note_unreadable_step_profile(execution, state, &error.to_string());
+                None
+            }
+        }
+    }
+
+    /// Records that the step profile file could not be read, unless the
+    /// execution already recorded it.
+    fn note_unreadable_step_profile(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        error: &str,
+    ) {
+        let noted = self
+            .store
+            .event_log(&execution.id)
+            .read_all()
+            .is_ok_and(|events| events.iter().any(is_unreadable_step_profile_note));
+        if noted {
+            return;
+        }
+        if let Err(error) = self.emit(
+            &execution.id,
+            EventData::Error {
+                message: format!(
+                    "Step '{}': the step profile could not be read ({error}); \
+                     the steps run on their defaults",
+                    state.id
+                ),
+                context: json!({
+                    "step_profile": { "step": state.id, "unreadable": true },
+                }),
+            },
+        ) {
+            tracing::warn!(%error, "could not record an unreadable step profile");
+        }
+    }
+
+    /// `template` with the stored step profile applied, for a reprompt that
     /// resumes a session: the reprompt runs on the model and effort of the
     /// attempt it repairs, not on the workflow's default. An escalation is
     /// not carried over — the count of failed attempts is not kept with the
@@ -339,14 +391,11 @@ impl Engine {
     }
 }
 
-/// When `state_id` was first entered, if it was.
-fn first_entry_at(
-    execution: &WorkflowExecution,
-    state_id: &str,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
-        read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)
-            .ok()
-            .flatten()?;
-    firsts.get(state_id).copied()
+/// Whether `event` is the note of [`Engine::note_unreadable_step_profile`].
+fn is_unreadable_step_profile_note(event: &crate::domain::Event) -> bool {
+    matches!(
+        &event.data,
+        EventData::Error { context, .. }
+            if context["step_profile"]["unreadable"] == json!(true)
+    )
 }
