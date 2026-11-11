@@ -1433,6 +1433,55 @@ async fn the_effort_reaches_the_claude_argv_and_a_step_without_one_is_unchanged(
     );
 }
 
+/// The effort-ignored warnings a sink holds.
+fn effort_warnings(sink: &RecordingSink) -> Vec<String> {
+    sink.events()
+        .into_iter()
+        .filter_map(|(_, data)| match data {
+            EventData::Error { context, .. } => context
+                .get("effort_ignored")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_harness_without_effort_support_warns_that_the_effort_is_ignored() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&json!({ "sessionID": "ses_7", "text": "{\"choice\":\"ready\"}" }).to_string());
+    let sink = Arc::new(RecordingSink::default());
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
+    )
+    .with_event_sink(sink.clone());
+
+    let mut config = agent_action("look around");
+    config.harness = Some("opencode".to_string());
+    config.effort = Some("high".to_string());
+    complete(&executor, config, &root.workspace()).await;
+
+    assert_eq!(effort_warnings(&sink), ["opencode"]);
+}
+
+#[tokio::test]
+async fn a_harness_with_effort_support_does_not_warn() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+    let sink = Arc::new(RecordingSink::default());
+    let executor = executor(&fake).with_event_sink(sink.clone());
+
+    let mut config = agent_action("look around");
+    config.effort = Some("high".to_string());
+    complete(&executor, config, &root.workspace()).await;
+
+    assert!(effort_warnings(&sink).is_empty());
+}
+
 #[tokio::test]
 async fn the_effort_reaches_the_codex_argv_and_max_is_xhigh() {
     let root = TempRoot::new();

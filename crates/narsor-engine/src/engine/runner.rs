@@ -1041,6 +1041,7 @@ pub struct Engine {
     agent_timeout_secs: Option<u64>,
     agent_args: AgentArgs,
     escalation_threshold: u32,
+    profile_wait: Duration,
     usage_reporter: Option<Arc<dyn UsageReporter>>,
     reading_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     default_harness: Arc<dyn DefaultHarnessSource>,
@@ -1060,6 +1061,10 @@ struct AttemptProfile<'a> {
     failures: u32,
     /// The workflow's `globals.model_ladder`.
     ladder: &'a [String],
+    /// Whether a rejected or escalated profile is recorded as an event. A
+    /// reprompt of a rejected attempt resolves the same profile again and
+    /// stays quiet: the attempt itself already recorded it.
+    announce: bool,
 }
 
 /// The ticket and title `{{ task.ticket }}` and `{{ task.title }}` render.
@@ -1226,6 +1231,7 @@ impl Engine {
             agent_timeout_secs: None,
             agent_args: AgentArgs::new(),
             escalation_threshold: DEFAULT_ESCALATION_THRESHOLD,
+            profile_wait: profile::PROFILE_WAIT,
             usage_reporter: None,
             reading_notifier: None,
             default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
@@ -1305,6 +1311,13 @@ impl Engine {
     /// consecutive failed attempts; `0` turns escalation off.
     pub fn with_escalation_threshold(mut self, threshold: u32) -> Self {
         self.escalation_threshold = threshold;
+        self
+    }
+
+    /// Returns the engine waiting at most `wait` for the conductor's step
+    /// profile after the plan step (default [`profile::PROFILE_WAIT`]).
+    pub fn with_profile_wait(mut self, wait: Duration) -> Self {
+        self.profile_wait = wait;
         self
     }
 
@@ -2372,7 +2385,7 @@ impl Engine {
 
     /// After the plan step succeeded, has the conductor profile the steps
     /// that have not started, and waits for it at most
-    /// [`profile::PROFILE_WAIT`]. Whatever goes wrong — no conductor, a
+    /// [`profile::PROFILE_WAIT`] (`profile_wait`). Whatever goes wrong — no conductor, a
     /// failure, an unsure answer, the wait running out — leaves the steps on
     /// their defaults and the task unchanged (R8).
     async fn profile_after_plan(
@@ -2406,14 +2419,8 @@ impl Engine {
             }
             steps.push(profile::ProfileCandidate {
                 step_id: candidate.id.clone(),
-                default: Setting {
-                    model: config.model.clone(),
-                    effort: config.effort.clone(),
-                },
-                ceiling: config.ceiling.as_ref().map(|c| Setting {
-                    model: c.model.clone(),
-                    effort: c.effort.clone(),
-                }),
+                default: Setting::default_of(config),
+                ceiling: Setting::ceiling_of(config),
             });
         }
         if steps.is_empty() {
@@ -2433,7 +2440,7 @@ impl Engine {
         }
         .into_queued();
         let asked = match registry.actor(&execution.id) {
-            Ok(actor) => tokio::time::timeout(profile::PROFILE_WAIT, actor.invoke(request)).await,
+            Ok(actor) => tokio::time::timeout(self.profile_wait, actor.invoke(request)).await,
             Err(error) => {
                 tracing::warn!(%error, "no conductor to profile the steps");
                 return;
@@ -2549,6 +2556,7 @@ impl Engine {
                     AttemptProfile {
                         failures: attempt - 1,
                         ladder: &definition.globals.model_ladder,
+                        announce: true,
                     },
                 )
                 .await;
@@ -2891,18 +2899,15 @@ impl Engine {
         config: &mut AgentActionConfig,
         attempt: AttemptProfile<'_>,
     ) {
-        let default = Setting {
-            model: config.model.clone(),
-            effort: config.effort.clone(),
-        };
-        let ceiling = config.ceiling.as_ref().map(|c| Setting {
-            model: c.model.clone(),
-            effort: c.effort.clone(),
-        });
+        let default = Setting::default_of(config);
+        let ceiling = Setting::ceiling_of(config);
         // A damaged or missing profile is "no profile" (R8).
         let stored = ConductorStore::new(self.store.paths(), &execution.id)
             .load_profile()
-            .unwrap_or_default();
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "damaged step profile; running on the defaults");
+                Default::default()
+            });
         let conductor = stored
             .lookup(&state.id, None)
             .map(|entry| entry.setting.clone());
@@ -2917,7 +2922,7 @@ impl Engine {
             failures: attempt.failures,
             threshold: self.escalation_threshold,
         });
-        if resolved.rejected {
+        if resolved.rejected && attempt.announce {
             self.note_step_profile(
                 execution,
                 state,
@@ -2927,7 +2932,9 @@ impl Engine {
                 &resolved.setting,
             );
         }
-        if resolved.source == step_profile::ProfileSource::Escalated {
+        if !attempt.announce {
+            // Nothing more to record.
+        } else if resolved.source == step_profile::ProfileSource::Escalated {
             self.note_step_profile(
                 execution,
                 state,
@@ -2946,6 +2953,32 @@ impl Engine {
         }
         config.model = resolved.setting.model;
         config.effort = resolved.setting.effort;
+    }
+
+    /// `template` with the conductor's profile applied, for a reprompt that
+    /// resumes a session: the reprompt runs on the model and effort of the
+    /// attempt it repairs, not on the workflow's default. An escalation is
+    /// not carried over — the count of failed attempts is not kept with the
+    /// rejection.
+    pub(super) fn profiled_template(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &WorkflowExecution,
+        state: &State,
+        template: &AgentActionConfig,
+    ) -> AgentActionConfig {
+        let mut config = template.clone();
+        self.apply_step_profile(
+            execution,
+            state,
+            &mut config,
+            AttemptProfile {
+                failures: 0,
+                ladder: &definition.globals.model_ladder,
+                announce: false,
+            },
+        );
+        config
     }
 
     /// Records a profile decision as an event, best-effort.
@@ -3159,9 +3192,15 @@ impl Engine {
     ) -> Result<ActionUpshot, EngineError> {
         let mut rescue = OutputRescue::after(&rejection);
         let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
-            (ActionConfig::Agent(config), Some(harness), Some(session)) => Some(
-                agent::reprompt_config(config, harness, session, &rejection.reason),
-            ),
+            (ActionConfig::Agent(config), Some(harness), Some(session)) => {
+                let profiled = self.profiled_template(definition, execution, state, config);
+                Some(agent::reprompt_config(
+                    &profiled,
+                    harness,
+                    session,
+                    &rejection.reason,
+                ))
+            }
             _ => None,
         };
         let Some(config) = resumable else {

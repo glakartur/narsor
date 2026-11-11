@@ -1,0 +1,57 @@
+# A plan step, then steps the conductor may profile: a script (never
+# profiled), `work` (with a ceiling, and retries) and `review` (no ceiling).
+schema: v2
+name: engine-step-profile
+version: 1
+
+globals:
+  model_ladder: [haiku, sonnet, opus]
+
+states:
+  plan:
+    action:
+      type: agent
+      plan: true
+      model: sonnet
+      effort: medium
+      prompt: Plan it.
+    exit:
+      next: check
+
+  check:
+    action:
+      type: script
+      command: "true"
+    exit:
+      next: work
+
+  work:
+    action:
+      type: agent
+      model: sonnet
+      effort: low
+      ceiling: { model: opus, effort: high }
+      prompt: Do it.
+    retry_policy:
+      max_attempts: 5
+      backoff: 0s
+    exit:
+      next: review
+
+  review:
+    action:
+      type: agent
+      model: sonnet
+      effort: medium
+      prompt: Review it.
+    retry_policy:
+      max_attempts: 5
+      backoff: 0s
+    exit:
+      next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

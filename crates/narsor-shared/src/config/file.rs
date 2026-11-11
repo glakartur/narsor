@@ -821,4 +821,28 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn the_escalation_threshold_takes_zero_to_the_largest_number_of_attempts() {
+        for text in ["0", "3", "100", " 7 "] {
+            assert!(
+                value_from_text(SettingKey::EscalationThreshold, text).is_ok(),
+                "'{text}' was refused"
+            );
+        }
+        for text in ["101", "-1", "abc", "", "1.5"] {
+            assert!(
+                value_from_text(SettingKey::EscalationThreshold, text).is_err(),
+                "'{text}' was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_escalation_threshold_may_be_a_yaml_integer() {
+        let raw: serde_yaml::Value = serde_yaml::from_str("5").unwrap();
+        assert!(value_of(SettingKey::EscalationThreshold, &raw).is_ok());
+        let too_big: serde_yaml::Value = serde_yaml::from_str("101").unwrap();
+        assert!(value_of(SettingKey::EscalationThreshold, &too_big).is_err());
+    }
 }

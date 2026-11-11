@@ -851,4 +851,45 @@ terminal_states: [done]
         assert_eq!(repository.base_branch.as_deref(), Some("jojo"));
         assert!(definition.primary_workspace_spec().is_none());
     }
+
+    #[test]
+    fn the_plan_flag_and_the_model_ladder_reach_the_definition() {
+        let definition = load_from_str(
+            r#"
+schema: v2
+name: profiled
+version: 1
+globals:
+  model_ladder: [haiku, sonnet, opus]
+states:
+  plan:
+    action: { type: agent, prompt: x, plan: true, model: sonnet, effort: low, ceiling: { model: opus, effort: high } }
+    choices: [success]
+    transitions: { success: work }
+  work:
+    action: { type: agent, prompt: y }
+    choices: [success]
+    transitions: { success: done }
+  done:
+    description: end
+terminal_states: [done]
+"#,
+        )
+        .expect("the workflow loads");
+
+        assert_eq!(definition.globals.model_ladder, ["haiku", "sonnet", "opus"]);
+        let Some(ActionConfig::Agent(plan)) = &definition.states["plan"].action else {
+            panic!("an agent step");
+        };
+        assert!(plan.plan);
+        assert_eq!(plan.effort.as_deref(), Some("low"));
+        assert_eq!(
+            plan.ceiling.as_ref().unwrap().model.as_deref(),
+            Some("opus")
+        );
+        let Some(ActionConfig::Agent(work)) = &definition.states["work"].action else {
+            panic!("an agent step");
+        };
+        assert!(!work.plan);
+    }
 }

@@ -36,6 +36,22 @@ impl Setting {
             effort: effort.map(str::to_string),
         }
     }
+
+    /// The default an agent step names.
+    pub fn default_of(config: &crate::domain::AgentActionConfig) -> Self {
+        Self {
+            model: config.model.clone(),
+            effort: config.effort.clone(),
+        }
+    }
+
+    /// The ceiling an agent step names, if any.
+    pub fn ceiling_of(config: &crate::domain::AgentActionConfig) -> Option<Self> {
+        config.ceiling.as_ref().map(|ceiling| Self {
+            model: ceiling.model.clone(),
+            effort: ceiling.effort.clone(),
+        })
+    }
 }
 
 /// Where the effective profile came from.
@@ -110,9 +126,8 @@ pub fn resolve(input: ProfileInput<'_>) -> EffectiveProfile {
 
     if let Some(wanted) = input.conductor {
         if let Some(model) = &wanted.model {
-            if Some(model) == input.default.model.as_ref() {
-                // The default itself is always allowed.
-            } else {
+            // The default itself is always allowed.
+            if Some(model) != input.default.model.as_ref() {
                 match (
                     model_rank(input.ladder, model),
                     ceiling

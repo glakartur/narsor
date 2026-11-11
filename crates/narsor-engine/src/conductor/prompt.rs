@@ -381,4 +381,21 @@ mod tests {
         assert!(prompt.contains("  - docs (/task/docs)\n"));
         assert!(prompt.contains("  - web (/task/web)\n"));
     }
+
+    #[test]
+    fn a_profile_request_offers_only_the_profile_decision_and_its_steps() {
+        let prompt = conductor_prompt(
+            ConductorPurpose::ProfileSteps,
+            ConductorAccess::Isolated,
+            "snapshot",
+        );
+        assert!(prompt.contains("- `profile` — choose the profile of the steps"));
+        assert!(prompt.contains("\"step_id\""));
+        assert!(!prompt.contains("- `choose_output`"));
+
+        let schema = answer_schema(ConductorPurpose::ProfileSteps);
+        assert_eq!(schema["properties"]["decision"]["enum"], json!(["profile"]));
+        assert_eq!(schema["properties"]["steps"]["type"], "array");
+        assert!(schema["properties"].get("proposals").is_none());
+    }
 }

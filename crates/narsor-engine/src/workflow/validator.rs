@@ -1517,6 +1517,23 @@ globals:
     }
 
     #[test]
+    fn a_ceiling_model_below_the_step_model_is_rejected() {
+        let errors =
+            profile_errors("{ type: agent, prompt: x, model: opus, ceiling: { model: sonnet } }");
+        assert!(profile_field_rejected(&errors, "ceiling.model"));
+    }
+
+    #[test]
+    fn a_templated_effort_is_rejected() {
+        let errors = profile_errors("{ type: agent, prompt: x, effort: \"{{ vars.level }}\" }");
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidGlobalsField { field, reason, .. }
+                if field.ends_with("effort") && reason.contains("templated")
+        )));
+    }
+
+    #[test]
     fn a_step_without_the_new_fields_is_unchanged() {
         let errors = profile_errors("{ type: agent, prompt: x, model: sonnet }");
         assert!(!errors

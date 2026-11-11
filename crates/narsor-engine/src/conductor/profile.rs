@@ -96,7 +96,8 @@ pub(super) fn conclude_profile(
 }
 
 /// Checks the conductor's `steps` against `asked` and turns what holds up
-/// into entries.
+/// into entries. The model and the effort are judged on their own: one that
+/// cannot be used does not drop the other.
 pub fn entries_of(
     asked: &ProfileRequest,
     steps: Vec<crate::conductor::response::ProfiledStep>,
@@ -121,7 +122,10 @@ pub fn entries_of(
             failures: 0,
             threshold: 0,
         });
-        if resolved.rejected {
+        // A field that cannot be used keeps the step's default
+        // (`resolved.rejected`); the other field still counts. An entry that
+        // changes nothing is not worth keeping.
+        if resolved.setting == candidate.default && resolved.requested_over_ceiling.is_none() {
             continue;
         }
         entries.push(ProfileEntry {
@@ -190,9 +194,28 @@ mod tests {
             vec![
                 step("work", "haiku", "low", false),
                 step("other", "haiku", "low", true),
-                step("work", "mystery", "low", true),
+                step("work", "mystery", "mystery", true),
+                step("work", "sonnet", "medium", true),
             ],
         );
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn an_unusable_model_does_not_drop_a_usable_effort() {
+        let entries = entries_of(&asked(), vec![step("work", "mystery", "low", true)]);
+        assert_eq!(
+            entries[0].setting,
+            Setting::new(Some("sonnet"), Some("low"))
+        );
+    }
+
+    #[test]
+    fn a_step_without_an_effort_ceiling_still_takes_a_model() {
+        let mut asked = asked();
+        asked.steps[0].default = Setting::new(Some("sonnet"), None);
+        asked.steps[0].ceiling = Some(Setting::new(Some("opus"), None));
+        let entries = entries_of(&asked, vec![step("work", "haiku", "high", true)]);
+        assert_eq!(entries[0].setting, Setting::new(Some("haiku"), None));
     }
 }
