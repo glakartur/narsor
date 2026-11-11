@@ -1,0 +1,803 @@
+//! The conductor's rescue of a step without a usable output label (F1, U10).
+//!
+//! When the agent of a step gives no label the state accepts, even after the
+//! engine's one reprompt — or cannot be asked again because its harness
+//! reported no session — the engine hands the step to the conductor, inline,
+//! under the claim of the pass that runs it (KTD10): an operator's `/input`
+//! or `/transition` is refused meanwhile, and interrupting the pass stops the
+//! conductor with it. The conductor answers with one of three paths (R17):
+//!
+//! * **(a) choose the output**: the step completes with the conductor's
+//!   label, `variables` and `artifacts`, as if the agent had given them —
+//!   `ActionCompleted` on the last attempt, then `DecisionMade` with the
+//!   `conductor` provider. Only a sure choice (`high` confidence) of a label
+//!   the state declares, with every value the next step needs (KTD15), is
+//!   taken; any other becomes (c), with the reason in the rationale. The
+//!   decision is saved before it is applied, with the context from before it
+//!   (KTD13; see [`crate::conductor::rescue`]).
+//! * **(b) ask the agent again**, once, in the conductor's words: a new
+//!   attempt announced by `OutputReprompted { by: conductor }`. When it too
+//!   gives no label, the conductor is asked once more, and may then only
+//!   choose (a) or (c). At most two reprompts in all: the engine's and the
+//!   conductor's.
+//! * **(c) escalate**: the step becomes a problem (`InputNeeded` on a
+//!   `ResolveOutput` request, `ProblemRaised`) carrying the agent's answers
+//!   and the conductor's analysis.
+//!
+//! A conductor that cannot answer — after the one repeat R24 allows — makes
+//! the step a problem with the agent's raw answers and no analysis, and
+//! never triggers the conductor again (R25).
+//!
+//! # What survives a restart
+//!
+//! The rescue is recorded in the execution ([`OutputRescue`]) before the
+//! event that closes the last attempt, so a restart at any point from there
+//! finds the execution `Running` with nothing open, and the startup hook
+//! spawns a pass that carries the rescue on ([`Engine::continue_output_rescue`]):
+//!
+//! * before the conductor was invoked, or while it was — the conductor is
+//!   invoked (again); a restart during an invocation spends R24's one repeat;
+//! * after a chosen output was saved — the saved decision is applied without
+//!   asking again;
+//! * during the conductor's reprompt — the attempt is open, the execution is
+//!   `Unknown` like after any interrupted attempt, and a recovery drops the
+//!   record.
+
+use super::*;
+use crate::conductor::{
+    Autopilot, ConductorResponse, Decision, InvocationOutcome, QueuedRequest, SavedDecision,
+    CONDUCTOR_ANSWER_LIMIT,
+};
+use crate::domain::{ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence};
+
+impl Engine {
+    /// Carries on the rescue a pass found recorded for the current state (a
+    /// restart, an interrupted pass).
+    pub(crate) async fn continue_output_rescue(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        rescue: OutputRescue,
+    ) -> Result<Flow, EngineError> {
+        let timeout = state
+            .action
+            .as_ref()
+            .and_then(|action| self.timeout_for(ActionKind::of(action), state, definition))
+            .map(Duration::from_secs);
+        self.rescue_output(definition, execution, state, rescue, timeout)
+            .await
+    }
+
+    /// Hands the step `rescue` records to the conductor and carries out what
+    /// it decides (see the module documentation).
+    ///
+    /// `rescue` is already persisted in the execution. Without a conductor
+    /// attached, or for a step whose label the conductor does not choose
+    /// ([`ActionKind::rescues_output_label`]), the step becomes a problem
+    /// straight away.
+    pub(crate) async fn rescue_output(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        mut rescue: OutputRescue,
+        timeout: Option<Duration>,
+    ) -> Result<Flow, EngineError> {
+        let rescued_by_conductor = state
+            .action
+            .as_ref()
+            .is_some_and(|action| ActionKind::of(action).rescues_output_label());
+        loop {
+            let conductor = self.conductor().filter(|_| rescued_by_conductor);
+
+            if let Some(conductor) = &conductor {
+                // Decided before a restart: applied, never asked again.
+                if let Some(decision) =
+                    conductor.unapplied_decision(&execution.id, rescue.episode())?
+                {
+                    return self.apply_conductor_output(
+                        definition,
+                        execution,
+                        state,
+                        rescue.settled(),
+                        decision,
+                    );
+                }
+            }
+            if let Some(pending) = self.pending_step(execution, &state.id)? {
+                // The step already has its result: only the decision is left.
+                return self.complete_step(definition, execution, state, pending);
+            }
+            let Some(conductor) = conductor else {
+                // No conductor to hand the step to: the operator settles it.
+                self.raise_output_problem(
+                    definition,
+                    execution,
+                    state,
+                    rescue.answers,
+                    rescue.reason,
+                    None,
+                )?;
+                return Ok(Flow::Stop);
+            };
+
+            let purpose = if rescue.can_reprompt() {
+                ConductorPurpose::ChooseOutput
+            } else {
+                ConductorPurpose::ChooseOutputAfterReprompt
+            };
+            let request = QueuedRequest::new(ConductorTrigger::OutputRescue, purpose)
+                .with_episode(rescue.episode())
+                .with_payload(rescue_payload(definition, execution, state, &rescue));
+            let outcome = conductor.choose_output(&execution.id, request).await?;
+
+            let answered = match outcome {
+                InvocationOutcome::Answered(answer) => {
+                    ConductorResponse::from_value(answer.response, purpose)
+                        .map_err(|error| error.to_string())
+                }
+                InvocationOutcome::Failed { error } => Err(error),
+                InvocationOutcome::Interrupted => {
+                    Err("the conductor was stopped before it answered".to_string())
+                }
+            };
+            let response = match answered {
+                Ok(response) => response,
+                Err(error) => {
+                    // R24's repeat is already spent by the actor: the
+                    // operator gets the raw answers, and a failure of the
+                    // conductor never asks the conductor again (R25).
+                    let reason = format!(
+                        "{} The conductor could not settle the output: {error}",
+                        rescue.reason
+                    );
+                    self.raise_output_problem(
+                        definition,
+                        execution,
+                        state,
+                        rescue.answers,
+                        reason,
+                        None,
+                    )?;
+                    return Ok(Flow::Stop);
+                }
+            };
+
+            match response.decision.clone() {
+                Decision::ChooseOutput {
+                    label,
+                    artifacts,
+                    variables,
+                } => {
+                    let choice = Choice {
+                        label,
+                        artifacts,
+                        variables,
+                    };
+                    return match check_choice(definition, execution, state, &response, &choice) {
+                        Ok(()) => {
+                            let decision = SavedDecision {
+                                answers: rescue.answers.clone(),
+                                reason: Some(rescue.reason.clone()),
+                                reply: rescue.reply.clone(),
+                                ..chosen_output_decision(
+                                    execution,
+                                    state,
+                                    rescue.episode(),
+                                    &response,
+                                    choice,
+                                )?
+                            };
+                            conductor.save_decision(
+                                &execution.id,
+                                &decision,
+                                response.message.as_deref(),
+                            )?;
+                            self.apply_conductor_output(
+                                definition,
+                                execution,
+                                state,
+                                rescue.settled(),
+                                decision,
+                            )
+                        }
+                        Err(why) => {
+                            let declared = decision::check_label(state, &choice.label).is_ok();
+                            self.escalate_output(
+                                definition,
+                                execution,
+                                state,
+                                rescue,
+                                &response,
+                                Choice {
+                                    label: if declared {
+                                        choice.label
+                                    } else {
+                                        String::new()
+                                    },
+                                    ..choice
+                                },
+                                why,
+                            )
+                        }
+                    };
+                }
+                Decision::Reprompt { prompt } => {
+                    let config = match (&state.action, &rescue.harness, &rescue.harness_session_id)
+                    {
+                        (Some(action @ ActionConfig::Agent(_)), Some(harness), Some(session))
+                            if rescue.can_reprompt() =>
+                        {
+                            agent::conductor_reprompt_config(
+                                self.profiled_action(execution, state, action),
+                                harness,
+                                session,
+                                &prompt,
+                            )
+                        }
+                        _ => None,
+                    };
+                    // The purpose did not offer (b): a response that takes it
+                    // anyway was refused before it got here.
+                    let Some(config) = config else {
+                        return self.escalate_output(
+                            definition,
+                            execution,
+                            state,
+                            rescue,
+                            &response,
+                            Choice::default(),
+                            "the conductor asked to repeat the question, but the agent \
+                             cannot be asked again"
+                                .to_string(),
+                        );
+                    };
+
+                    let decision = unsaved_decision(
+                        ConductorDecisionKind::Reprompt,
+                        state,
+                        rescue.episode(),
+                        &response,
+                        Choice::default(),
+                        response.rationale.clone(),
+                    );
+                    self.note_decision(&conductor, execution, &decision, &response);
+
+                    // Written by the attempt's own save, after the event that
+                    // opens it: a restart before that asks the conductor
+                    // again, one during it leaves the attempt open.
+                    rescue.conductor_reprompted = true;
+                    set_output_rescue(execution, &rescue)?;
+                    let previous = rescue.episode().to_string();
+                    match self
+                        .reprompt_attempt(
+                            definition,
+                            execution,
+                            state,
+                            config,
+                            &previous,
+                            rescue.reply.as_deref(),
+                            RepromptedBy::Conductor,
+                            timeout,
+                        )
+                        .await?
+                    {
+                        RepromptEnd::Labelled {
+                            action_execution_id,
+                            result,
+                        } => {
+                            // The agent gave its label after all: the step
+                            // completes as it would have, and the rescue is
+                            // over — dropped by the result's own save.
+                            clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
+                            return self.record_completion(
+                                definition,
+                                execution,
+                                state,
+                                action_execution_id,
+                                result,
+                            );
+                        }
+                        RepromptEnd::Stopped => return Ok(Flow::Stop),
+                        RepromptEnd::Asked(request) => {
+                            return self.route_agent_question(execution, state, request).await;
+                        }
+                        RepromptEnd::Unlabelled(failure) => {
+                            rescue.record(&failure);
+                            self.begin_rescue(execution, &rescue)?;
+                            self.close_unlabelled(execution, state, &failure.answer)?;
+                            // Asked once more, without (b) this time.
+                            continue;
+                        }
+                    }
+                }
+                Decision::Escalate {
+                    label,
+                    artifacts,
+                    variables,
+                } => {
+                    let why = response
+                        .rationale
+                        .clone()
+                        .unwrap_or_else(|| "it gave no reason".to_string());
+                    let choice = Choice {
+                        label: label
+                            .filter(|label| decision::check_label(state, label).is_ok())
+                            .unwrap_or_default(),
+                        artifacts,
+                        variables,
+                    };
+                    return self.escalate_output(
+                        definition, execution, state, rescue, &response, choice, why,
+                    );
+                }
+                other => {
+                    // Refused by the purpose's check before it gets here.
+                    let reason = format!(
+                        "{} The conductor answered with a decision a label rescue does not \
+                         take: {}",
+                        rescue.reason,
+                        other.kind().name()
+                    );
+                    self.raise_output_problem(
+                        definition,
+                        execution,
+                        state,
+                        rescue.answers,
+                        reason,
+                        None,
+                    )?;
+                    return Ok(Flow::Stop);
+                }
+            }
+        }
+    }
+
+    /// Routes a question an agent asked: to the operator, or — when the
+    /// context variable `autopilot` is on, a conductor is attached and its
+    /// answers for this entry into the step are not used up — first to the
+    /// conductor, which answers only when it is sure. The step then waits
+    /// on the agent's own question (`ResumeAgent`) or goes on with the
+    /// conductor's answer.
+    pub(crate) async fn route_agent_question(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        request: HumanInputRequest,
+    ) -> Result<Flow, EngineError> {
+        clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+        clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
+
+        if let Some(answer) = self.answer_by_conductor(execution, state, &request).await? {
+            step_memory::count_conductor_answer(execution, &state.id)?;
+            self.store_agent_input(
+                execution,
+                &state.id,
+                &answer,
+                request.agent_harness.as_deref(),
+                request.agent_session_id.as_deref(),
+                Vec::new(),
+                PromptAuthor::Conductor,
+            )?;
+            return Ok(Flow::Continue);
+        }
+
+        self.suspend_for_agent_input(execution, state, request)?;
+        Ok(Flow::Stop)
+    }
+
+    /// The answer the conductor gives to `question`, with its rationale on
+    /// record, or `None` when the operator is to be asked: `autopilot` is
+    /// off, the question is a request for a permission or a notice of the
+    /// engine's, no conductor is attached, its answers for this entry are
+    /// used up, or it is not sure.
+    async fn answer_by_conductor(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        question: &HumanInputRequest,
+    ) -> Result<Option<String>, EngineError> {
+        let autopilot = Autopilot::of(&execution.context.variables);
+        let is_agents_question =
+            question.permission.is_none() && question.prefilled_answer.is_none();
+        if autopilot == Autopilot::Off || !is_agents_question {
+            return Ok(None);
+        }
+        let Some(conductor) = self.conductor() else {
+            return Ok(None);
+        };
+        if step_memory::conductor_answers(execution, &state.id)? >= CONDUCTOR_ANSWER_LIMIT {
+            return Ok(None);
+        }
+
+        let asked = QueuedRequest::new(
+            ConductorTrigger::OutputRescue,
+            ConductorPurpose::AnswerAgentQuestion,
+        )
+        .with_episode(&question.action_execution_id)
+        .with_payload(json!({
+            "state_id": state.id,
+            "question": question.instruction,
+            "options": question.fields,
+            "autopilot": autopilot.name(),
+        }));
+        let outcome = conductor.choose_output(&execution.id, asked).await?;
+        let InvocationOutcome::Answered(answer) = outcome else {
+            return Ok(None);
+        };
+        let Ok(response) =
+            ConductorResponse::from_value(answer.response, ConductorPurpose::AnswerAgentQuestion)
+        else {
+            return Ok(None);
+        };
+        if !matches!(response.decision, Decision::Reply) || response.confidence != Confidence::High
+        {
+            return Ok(None);
+        }
+        let Some(text) = response
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let decision = unsaved_decision(
+            ConductorDecisionKind::AnswerQuestion,
+            state,
+            &question.action_execution_id,
+            &response,
+            Choice::default(),
+            response.rationale.clone(),
+        );
+        self.note_decision(&conductor, execution, &decision, &response);
+        Ok(Some(text.to_string()))
+    }
+
+    /// Applies the conductor's saved choice (a): `ConductorDecision`, then
+    /// the step's result on its last attempt (`ActionCompleted`) and the
+    /// decision with the `conductor` provider — which takes the transition
+    /// and drops the rescue — and last the saved decision.
+    ///
+    /// A result already recorded before a restart is not recorded again.
+    pub(crate) fn apply_conductor_output(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        settled: Settled<'_>,
+        decision: SavedDecision,
+    ) -> Result<Flow, EngineError> {
+        let label = decision.output_label.clone().unwrap_or_default();
+        let outcome = DecisionOutcome {
+            label: label.clone(),
+            provider: DecisionProviderType::Conductor,
+            reasoning: decision.rationale.clone(),
+        };
+
+        let flow = match self.pending_step(execution, &state.id)? {
+            Some(pending) => self.apply_decision(definition, execution, state, pending, outcome)?,
+            None => {
+                self.emit(&execution.id, decision_event(&decision))?;
+                let result = ActionResult {
+                    output_label: label,
+                    artifacts: decision.artifacts.clone(),
+                    variables: match &decision.variables {
+                        Value::Object(variables) => variables.clone(),
+                        _ => Map::new(),
+                    },
+                    exit_code: None,
+                    // What the agent last said: a gate the label leads to
+                    // shows it (KTD8).
+                    stdout: settled.stdout,
+                    stderr: String::new(),
+                    // The conductor settles the label, not what the agent
+                    // said (R3).
+                    reply: settled.reply,
+                    ..ActionResult::default()
+                };
+                match self.record_result(execution, state, settled.episode.to_string(), result)? {
+                    Some(pending) => {
+                        self.apply_decision(definition, execution, state, pending, outcome)?
+                    }
+                    None => Flow::Stop,
+                }
+            }
+        };
+
+        if let Some(conductor) = self.conductor() {
+            if let Err(error) = conductor.decision_applied(&execution.id, &decision.decision_id) {
+                // Harmless: the startup hook drops a decision for a step that
+                // moved on.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    %error,
+                    "could not mark the conductor's decision as applied"
+                );
+            }
+        }
+        Ok(flow)
+    }
+
+    /// (c): records the escalation and makes the step a problem, with the
+    /// conductor's reading of it as the analysis the form prefills.
+    #[allow(clippy::too_many_arguments)]
+    fn escalate_output(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        rescue: OutputRescue,
+        response: &ConductorResponse,
+        choice: Choice,
+        why: String,
+    ) -> Result<Flow, EngineError> {
+        let rationale = match &response.rationale {
+            Some(rationale) if *rationale != why => format!("{why}. {rationale}"),
+            _ => why.clone(),
+        };
+        let analysis = ConductorAnalysis {
+            label: (!choice.label.is_empty()).then(|| choice.label.clone()),
+            artifacts: choice.artifacts.clone(),
+            variables: choice.variables.clone(),
+            rationale: Some(rationale.clone()),
+        };
+        if let Some(conductor) = self.conductor() {
+            let decision = unsaved_decision(
+                ConductorDecisionKind::Escalate,
+                state,
+                rescue.episode(),
+                response,
+                choice,
+                Some(rationale),
+            );
+            self.note_decision(&conductor, execution, &decision, response);
+        }
+
+        let reason = format!(
+            "{} The conductor handed the step to the operator: {why}",
+            rescue.reason
+        );
+        self.raise_output_problem(
+            definition,
+            execution,
+            state,
+            rescue.answers,
+            reason,
+            Some(analysis),
+        )?;
+        Ok(Flow::Stop)
+    }
+
+    /// Records a decision carried out right away ((b), (c)): in the chat and
+    /// as `ConductorDecision`. Best-effort — the decision is carried out
+    /// whether or not its record could be written.
+    pub(crate) fn note_decision(
+        &self,
+        conductor: &ConductorRegistry,
+        execution: &WorkflowExecution,
+        decision: &SavedDecision,
+        response: &ConductorResponse,
+    ) {
+        if let Err(error) =
+            conductor.note_decision(&execution.id, decision, response.message.as_deref())
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                %error,
+                "could not write the conductor's decision to its chat"
+            );
+        }
+        if let Err(error) = self.emit(&execution.id, decision_event(decision)) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                %error,
+                "could not record the conductor's decision"
+            );
+        }
+    }
+}
+
+/// A label and the values that go with it, as the conductor gave them.
+#[derive(Debug, Default)]
+pub(crate) struct Choice {
+    /// The label; empty for none.
+    pub(crate) label: String,
+    /// The step's artifacts, name → path.
+    pub(crate) artifacts: BTreeMap<String, String>,
+    /// The step's `variables`.
+    pub(crate) variables: Map<String, Value>,
+}
+
+/// Whether the conductor's choice (a) can be taken as it is (R18, KTD15):
+/// a sure choice of a label the state declares, with every value the state
+/// it leads to needs. The reason it cannot, otherwise.
+pub(crate) fn check_choice(
+    definition: &WorkflowDefinition,
+    execution: &WorkflowExecution,
+    state: &State,
+    response: &ConductorResponse,
+    choice: &Choice,
+) -> Result<(), String> {
+    let label = &choice.label;
+    if decision::check_label(state, label).is_err() {
+        return Err(format!(
+            "the conductor chose the output '{label}', which state '{}' does not declare",
+            state.id
+        ));
+    }
+    if response.confidence != Confidence::High {
+        return Err(format!(
+            "the conductor chose the output '{label}' without being sure of it (low confidence)"
+        ));
+    }
+
+    if let Some(problem) = variable_rules::value_outside_options(state, &choice.variables) {
+        return Err(format!(
+            "the conductor chose the output '{label}' with a value its step does not allow: \
+             {problem}"
+        ));
+    }
+
+    let requirements = output_requirements(definition, execution, state);
+    let Some(requirement) = requirements
+        .iter()
+        .find(|requirement| requirement.label == *label)
+    else {
+        return Ok(());
+    };
+    let variable_held = |key: &&String| {
+        choice
+            .variables
+            .get(key.as_str())
+            .or_else(|| execution.context.variables.get(key.as_str()))
+            .is_some_and(|value| !human::is_blank(value))
+    };
+    let artifact_given = |name: &&String| {
+        choice
+            .artifacts
+            .get(name.as_str())
+            .is_some_and(|path| !path.trim().is_empty())
+    };
+    if let Some(key) = requirement.variables.iter().find(|key| !variable_held(key)) {
+        return Err(format!(
+            "the conductor chose the output '{label}' without variables.{key}, which it requires"
+        ));
+    }
+    if let Some(name) = requirement
+        .artifacts
+        .iter()
+        .find(|name| !artifact_given(name))
+    {
+        return Err(format!(
+            "the conductor chose the output '{label}' without artifacts.{name}, which it requires"
+        ));
+    }
+    Ok(())
+}
+
+/// What a step is completed with besides the conductor's choice.
+pub(crate) struct Settled<'a> {
+    /// The attempt the step completes under.
+    pub(crate) episode: &'a str,
+    /// What the agent last said, for a gate the label leads to.
+    pub(crate) stdout: String,
+    /// The step's reply.
+    pub(crate) reply: Option<String>,
+}
+
+impl OutputRescue {
+    /// What the rescue's step completes with.
+    fn settled(&self) -> Settled<'_> {
+        Settled {
+            episode: self.episode(),
+            stdout: self
+                .answers
+                .iter()
+                .rev()
+                .find_map(|answer| answer.answer_tail.clone())
+                .unwrap_or_default(),
+            reply: self.reply.clone(),
+        }
+    }
+}
+
+/// The record of the conductor's choice of an output, with the context it
+/// is made in so an undo can take it back.
+pub(crate) fn chosen_output_decision(
+    execution: &WorkflowExecution,
+    state: &State,
+    episode: &str,
+    response: &ConductorResponse,
+    choice: Choice,
+) -> Result<SavedDecision, EngineError> {
+    Ok(SavedDecision {
+        decision_id: Uuid::new_v4().to_string(),
+        kind: ConductorDecisionKind::ChooseOutput,
+        episode: Some(episode.to_string()),
+        state_id: Some(state.id.clone()),
+        output_label: Some(choice.label),
+        artifacts: choice.artifacts,
+        variables: Value::Object(choice.variables),
+        confidence: response.confidence,
+        rationale: response.rationale.clone(),
+        context_before: serde_json::to_value(&execution.context).unwrap_or(Value::Null),
+        answers: Vec::new(),
+        reason: None,
+        reply: None,
+        state_entries_before: state_entries_value(execution)?,
+        step_memory_before: step_memory::step_memory_value(execution)?,
+        saved_at: Utc::now(),
+    })
+}
+
+/// The record of a decision that is carried out rather than saved.
+pub(crate) fn unsaved_decision(
+    kind: ConductorDecisionKind,
+    state: &State,
+    episode: &str,
+    response: &ConductorResponse,
+    choice: Choice,
+    rationale: Option<String>,
+) -> SavedDecision {
+    SavedDecision {
+        decision_id: Uuid::new_v4().to_string(),
+        kind,
+        episode: Some(episode.to_string()),
+        state_id: Some(state.id.clone()),
+        output_label: (!choice.label.is_empty()).then_some(choice.label),
+        artifacts: choice.artifacts,
+        variables: Value::Object(choice.variables),
+        confidence: response.confidence,
+        rationale,
+        context_before: Value::Null,
+        answers: Vec::new(),
+        reason: None,
+        reply: None,
+        state_entries_before: Value::Null,
+        step_memory_before: Value::Null,
+        saved_at: Utc::now(),
+    }
+}
+
+/// The `ConductorDecision` event of `decision`.
+pub(crate) fn decision_event(decision: &SavedDecision) -> EventData {
+    EventData::ConductorDecision {
+        decision_id: decision.decision_id.clone(),
+        kind: decision.kind,
+        state_id: decision.state_id.clone(),
+        output_label: decision.output_label.clone(),
+        episode: decision.episode.clone(),
+        confidence: decision.confidence,
+        rationale: decision.rationale.clone(),
+    }
+}
+
+/// What the conductor is told about the step it rescues, beside its
+/// snapshot: the agent's answers, the labels with what each one needs, and
+/// whether the agent can still be asked again.
+fn rescue_payload(
+    definition: &WorkflowDefinition,
+    execution: &WorkflowExecution,
+    state: &State,
+    rescue: &OutputRescue,
+) -> Value {
+    json!({
+        "state_id": state.id,
+        "reason": rescue.reason,
+        "answers": rescue.answers,
+        "outputs": state.choices,
+        "requirements": output_requirements(definition, execution, state),
+        "agent_can_be_asked_again": rescue.can_reprompt(),
+    })
+}
+
+/// Writes `rescue` into the execution's record, without saving it.
+fn set_output_rescue(
+    execution: &mut WorkflowExecution,
+    rescue: &OutputRescue,
+) -> Result<(), EngineError> {
+    write_engine_record(execution, METADATA_OUTPUT_RESCUE_KEY, rescue)
+}
