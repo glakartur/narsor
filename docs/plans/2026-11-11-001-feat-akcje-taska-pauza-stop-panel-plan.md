@@ -414,6 +414,17 @@ Reguła `Restart` zmienia się: oprócz `Interrupted`/`Unknown` i błędu urucho
 | `StopStep` w `PauseRequested` poluzowuje `operator_command_refusal` za bardzo | Inne komendy operatora trafiają do pauzującego runnera | Test komenda × stan w `model.rs`; wyjątek tylko dla `StopStep` |
 | Trzymanie slotu po `Pause`/`Stop` blokuje kolejkę do końca czasu oczekiwania | Task w kolejce czeka dłużej | Termin trzymania to ten sam `slot_release_due_at`; „Zwolnij slot" i „Archiwizuj" kończą go od razu; test integracyjny `slot_release` |
 | `steps` w `TaskSummary` powiększa listę zadań | Koszt odpowiedzi listy | `steps` tylko dla stanów, w których `SelectStep` jest oferowany |
+| Stary runner odrzuci nowe polecenie (`ReleaseSlot`, `StopStep`, `SelectStep`) przy deserializacji | Polecenie nie działa; serwer zostawia task w poprzednim stanie (np. `PauseRequested`) | Runnery i kontroler aktualizujemy razem (kolejność niżej). Test deserializacji nowych wariantów przez starszy typ |
+
+### Kolejność aktualizacji i zgodność wstecz nowych wariantów
+
+Nowe warianty to `ReleaseSlot`, `StopStep` i `SelectStep`.
+
+- **Kolejność:** najpierw serwer (daemon). Potem runnery i kontroler, razem w jednym kroku. Na końcu klienci TUI (CLI, TUI) razem z serwerem. Ta kolejność jest zgodna z `docs/operations/remote-backends.md` (sekcje „Upgrading to automatic resume" i „Upgrading to the read-only runner").
+- **Runnery i kontroler razem:** stary runner nie zna nowych poleceń i odrzuca je przy deserializacji (patrz ryzyko wyżej). Dlatego nie zostawiamy starych runnerów przy nowym kontrolerze.
+- **Przed klientami TUI:** nowy TUI pokazuje akcje z oferty serwera. Serwer z nowymi wariantami musi działać wcześniej.
+- **Zgodność wstecz nie jest wymagana** dla tych trzech wariantów. Nie dodajemy wersjonowania ani ścieżki zastępczej dla starych runnerów.
+- **Cofnięcie kontrolera nie jest wspierane** po zapisaniu rekordów z nowymi wariantami. Starszy kontroler nie odczyta takich rekordów. Przed cofnięciem trzeba usunąć te rekordy albo odtworzyć dane z kopii.
 
 ---
 
@@ -441,6 +452,7 @@ Brak pytań otwartych.
 ## Documentation Plan
 
 - Zaktualizuj `README.md` i `docs/user` (lista skrótów, panel akcji, pauza kontra stop).
+- Dopisz do `docs/operations/remote-backends.md` punkt „Upgrading to task actions” (sekcja 10, obok „Upgrading to the read-only runner”): kolejność aktualizacji, brak zgodności wstecz i brak wsparcia dla cofnięcia kontrolera (patrz „Kolejność aktualizacji i zgodność wstecz nowych wariantów”).
 - Dopisz wniosek do `docs/solutions/` o różnicy `Stop` (ścieżka `Stopped`) i `Interrupt` (ścieżka `Interrupted`), żeby następny implementator ich nie pomylił.
 
 ---
