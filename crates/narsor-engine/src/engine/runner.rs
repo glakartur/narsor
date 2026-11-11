@@ -469,6 +469,13 @@ pub struct OutputRejection {
     /// The harness's own session id, when it reported one.
     #[serde(default)]
     pub harness_session_id: Option<String>,
+
+    /// The step's attempt under `retry_policy` (1-based) whose output was
+    /// rejected: where the policy goes on from when a reprompt continued
+    /// after a restart is still unusable (R13). Missing in a record from
+    /// before it was kept, read as the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
 }
 
 impl OutputRejection {
@@ -494,6 +501,7 @@ impl OutputRejection {
             reply: detail("reply"),
             harness: detail("harness"),
             harness_session_id: detail("harness_session_id"),
+            attempt: None,
         })
     }
 
@@ -533,6 +541,7 @@ impl OutputRejection {
             reply: result.reply.clone(),
             harness: session_field("/harness"),
             harness_session_id: session_field("/config/harness_session_id"),
+            attempt: None,
         })
     }
 
@@ -550,6 +559,7 @@ impl OutputRejection {
             reply: None,
             harness: None,
             harness_session_id: None,
+            attempt: None,
         }
     }
 }
@@ -1006,6 +1016,29 @@ enum Unrepaired {
     Rescued,
     /// Back as a failed attempt, for `retry_policy` (R13).
     Retried,
+}
+
+impl Unrepaired {
+    /// Where an unrepaired output of a `kind` action goes.
+    fn of(kind: ActionKind) -> Self {
+        if kind.retries_unrepaired_output() {
+            Self::Retried
+        } else {
+            Self::Rescued
+        }
+    }
+}
+
+/// Where a step's attempts under `retry_policy` start from.
+struct AttemptsFrom {
+    /// The attempt (1-based) that runs first, or whose failure is `failed`.
+    attempt: u32,
+    /// Its idempotency key (D24).
+    action_execution_id: String,
+    /// A failure of that attempt which already happened — a reprompt
+    /// continued after a restart that was still unusable (R13): the policy
+    /// judges it before anything runs.
+    failed: Option<AttemptFailure>,
 }
 
 /// How one attempt asking the agent again for its label ended.
@@ -2485,6 +2518,45 @@ impl Engine {
         state: &State,
         action: &ActionConfig,
     ) -> Result<ActionUpshot, EngineError> {
+        let action_execution_id = Uuid::new_v4().to_string();
+        execution.current_action_execution = Some(action_execution_id.clone());
+        self.emit(
+            &execution.id,
+            EventData::ActionStarted {
+                action_execution_id: action_execution_id.clone(),
+                state_id: state.id.clone(),
+                action_type: ActionKind::of(action).name().to_string(),
+                decision_by: match action {
+                    ActionConfig::Decision(decision) => Some(decision.by.name().to_string()),
+                    _ => None,
+                },
+            },
+        )?;
+
+        self.run_attempts(
+            definition,
+            execution,
+            state,
+            action,
+            AttemptsFrom {
+                attempt: 1,
+                action_execution_id,
+                failed: None,
+            },
+        )
+        .await
+    }
+
+    /// The attempts of a started action, from `from` on, as the policy
+    /// allows (D21).
+    async fn run_attempts(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        action: &ActionConfig,
+        from: AttemptsFrom,
+    ) -> Result<ActionUpshot, EngineError> {
         let schedule = RetrySchedule::resolve(state, &definition.globals);
         let kind = ActionKind::of(action);
         let timeout = self
@@ -2494,48 +2566,42 @@ impl Engine {
         // The conductor's retry is one attempt, never a new round of the
         // policy (KTD14).
         let single_attempt = failure::conductor_retry_of(execution, &state.id)?.is_some();
-        let mut side_effect_free = true;
+        // What earlier attempts left is not known after a restart.
+        let mut side_effect_free = from.failed.is_none();
 
-        let mut attempt = 1_u32;
-        let mut action_execution_id = Uuid::new_v4().to_string();
+        let AttemptsFrom {
+            mut attempt,
+            mut action_execution_id,
+            mut failed,
+        } = from;
         // The default harness this action runs on when it names none: read
         // at its first attempt, kept for every retry (R16a).
         let mut pinned_harness = None;
         let declared = DeclaredNames::of(definition);
         let descriptions = definition.repository_descriptions();
 
-        execution.current_action_execution = Some(action_execution_id.clone());
-        self.emit(
-            &execution.id,
-            EventData::ActionStarted {
-                action_execution_id: action_execution_id.clone(),
-                state_id: state.id.clone(),
-                action_type: kind.name().to_string(),
-                decision_by: match action {
-                    ActionConfig::Decision(decision) => Some(decision.by.name().to_string()),
-                    _ => None,
-                },
-            },
-        )?;
-
         loop {
-            let attempted = self
-                .attempt_action(
-                    definition,
-                    execution,
-                    state,
-                    action,
-                    &declared,
-                    &descriptions,
-                    &action_execution_id,
-                    timeout,
-                    &mut pinned_harness,
-                    AttemptProfile {
-                        failures: attempt - 1,
-                        announce: true,
-                    },
-                )
-                .await;
+            let attempted = match failed.take() {
+                Some(failure) => Err(failure),
+                None => {
+                    self.attempt_action(
+                        definition,
+                        execution,
+                        state,
+                        action,
+                        &declared,
+                        &descriptions,
+                        &action_execution_id,
+                        timeout,
+                        &mut pinned_harness,
+                        AttemptProfile {
+                            failures: attempt - 1,
+                            announce: true,
+                        },
+                    )
+                    .await
+                }
+            };
 
             let failure = match attempted {
                 Ok(AttemptOutcome::AwaitingHumanInput(mut request)) => {
@@ -2568,21 +2634,23 @@ impl Engine {
                         .await?;
                     return Ok(ActionUpshot::settled(flow));
                 }
-                Ok(AttemptOutcome::OutputRejected(rejection)) => {
+                Ok(AttemptOutcome::OutputRejected(mut rejection)) => {
                     // Outside the retry schedule on purpose (R15): a format
                     // error is repaired in the same session, not re-run.
+                    rejection.attempt = Some(attempt);
                     self.reject_output(execution, &rejection)?;
                     // Unless the step's own retries come next (R13): the
                     // reprompt attempt that is still unusable is the one
                     // that fails.
-                    let unrepaired = if kind.retries_unrepaired_output() {
-                        Unrepaired::Retried
-                    } else {
-                        Unrepaired::Rescued
-                    };
                     match self
                         .reprompt(
-                            definition, execution, state, action, rejection, timeout, unrepaired,
+                            definition,
+                            execution,
+                            state,
+                            action,
+                            rejection,
+                            timeout,
+                            Unrepaired::of(kind),
                         )
                         .await?
                     {
@@ -2993,9 +3061,11 @@ impl Engine {
             )?;
             return Ok(Flow::Stop);
         };
+        let kind = ActionKind::of(action);
         let timeout = self
-            .timeout_for(ActionKind::of(action), state, definition)
+            .timeout_for(kind, state, definition)
             .map(Duration::from_secs);
+        let attempt = rejection.attempt.unwrap_or(1);
 
         let upshot = match self
             .reprompt(
@@ -3005,14 +3075,27 @@ impl Engine {
                 action,
                 rejection,
                 timeout,
-                Unrepaired::Rescued,
+                Unrepaired::of(kind),
             )
             .await?
         {
             Ok(upshot) => upshot,
+            // A step whose own retries come next (R13): the policy judges
+            // the failed reprompt as the attempt it closed, as it would have
+            // without the restart.
             Err((failed_attempt, failure)) => {
-                self.fail_attempts(execution, &failed_attempt, failure, false)?;
-                return Ok(Flow::Stop);
+                self.run_attempts(
+                    definition,
+                    execution,
+                    state,
+                    action,
+                    AttemptsFrom {
+                        attempt,
+                        action_execution_id: failed_attempt,
+                        failed: Some(failure),
+                    },
+                )
+                .await?
             }
         };
         match upshot {

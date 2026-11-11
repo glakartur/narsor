@@ -3326,6 +3326,7 @@ async fn a_reprompt_after_a_restart_runs_on_the_recorded_harness_not_the_new_def
         reply: None,
         harness: Some("claude-code".to_string()),
         harness_session_id: Some("session-7".to_string()),
+        attempt: None,
     };
     execution.current_state = Some("work".to_string());
     execution.metadata = json!({
@@ -3396,6 +3397,7 @@ async fn a_restart_between_rejection_and_reprompt_continues_with_the_reprompt() 
         reply: None,
         harness: Some("claude-code".to_string()),
         harness_session_id: Some("session-7".to_string()),
+        attempt: None,
     };
     execution.current_state = Some("work".to_string());
     execution.metadata = json!({
@@ -3436,6 +3438,79 @@ async fn a_restart_between_rejection_and_reprompt_continues_with_the_reprompt() 
     assert!(
         types.contains(&"output_reprompted".to_string()),
         "{types:?}"
+    );
+}
+
+/// An `agent` step continued after a restart whose reprompt is still
+/// unusable goes to the conductor's rescue, as without the restart — never
+/// to its `retry_policy` (R13 is the `profile` step's alone).
+#[tokio::test]
+async fn a_reprompt_still_unusable_after_a_restart_is_rescued_for_an_agent_step() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("I already told you, it is done."));
+    let store = fixture.store();
+    let engine = fixture.engine();
+    let definition = fixture.workflow(REPROMPT_WORKFLOW);
+    let mut execution = engine
+        .start(&definition, json!({}), fixture.workspace())
+        .expect("start");
+
+    let log = store.event_log(&execution.id);
+    for data in [
+        EventData::StateEntered {
+            state_id: "work".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "work".to_string(),
+            action_type: "agent".to_string(),
+            decision_by: None,
+        },
+        EventData::ActionOutputRejected {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "work".to_string(),
+            reason: "no output label".to_string(),
+            answer_tail: None,
+        },
+    ] {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    let rejection = OutputRejection {
+        state_id: "work".to_string(),
+        action_execution_id: "attempt-1".to_string(),
+        reason: "no output label".to_string(),
+        answer_tail: None,
+        reply: None,
+        harness: Some("claude-code".to_string()),
+        harness_session_id: Some("session-7".to_string()),
+        attempt: Some(1),
+    };
+    execution.current_state = Some("work".to_string());
+    execution.metadata = json!({
+        METADATA_ENGINE_KEY: { METADATA_OUTPUT_REJECTION_KEY: rejection },
+    });
+    store
+        .save_execution(&execution)
+        .expect("save the execution");
+    recover(&store).expect("recover");
+
+    let execution = engine
+        .resume(&definition, &execution.id)
+        .await
+        .expect("resume");
+
+    assert_eq!(fixture.fake.calls(), 1, "only the reprompt ran");
+    let types = fixture.event_types(&execution.id);
+    for absent in ["action_attempt_failed", "action_retrying"] {
+        assert!(!types.contains(&absent.to_string()), "{types:?}");
+    }
+    let (_, problem) = output_problem(&fixture, &execution);
+    assert!(
+        problem.reason.contains("even when asked again"),
+        "{}",
+        problem.reason
     );
 }
 

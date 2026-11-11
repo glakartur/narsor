@@ -27,9 +27,10 @@ use narsor_engine::engine::actions::profile::{
 };
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
-    Engine, HarnessRegistry, HarnessRun, ProfileExecutor,
+    Engine, HarnessRegistry, HarnessRun, OutputRejection, ProfileExecutor, METADATA_ENGINE_KEY,
+    METADATA_OUTPUT_REJECTION_KEY,
 };
-use narsor_engine::persistence::{ExecutionStore, StepProfileEntry};
+use narsor_engine::persistence::{recover, ExecutionStore, StepProfileEntry};
 use narsor_engine::workflow::load_from_file;
 use narsor_protocol::chat::{ChatElement, TechnicalCategory};
 use serde_json::{json, Value};
@@ -496,6 +497,198 @@ async fn an_unusable_answer_fails_the_step_once_the_retries_are_used_up() {
         .map(event_type)
         .collect();
     assert!(types.contains(&"action_failed".to_string()), "{types:?}");
+    assert!(fixture.stored(&execution.id).is_empty());
+    assert!(fixture.starts().is_empty(), "the next step never starts");
+}
+
+/// What a daemon stopped between a rejected answer of the profile step's
+/// attempt `attempt` and its reprompt leaves behind: the attempts in the
+/// log, the last one closed by its rejection, and the engine's record of it.
+/// Startup recovery has run; the next pass continues with the reprompt.
+async fn stopped_before_the_reprompt(
+    fixture: &Fixture,
+    engine: &Engine,
+    definition: &WorkflowDefinition,
+    attempt: u32,
+) -> WorkflowExecution {
+    let store = fixture.harness.store();
+    let mut execution = engine
+        .start(definition, json!({}), fixture.harness.workspace())
+        .expect("start");
+    let rejected = format!("attempt-{attempt}");
+    let mut events = vec![
+        EventData::StateEntered {
+            state_id: "profile".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "profile".to_string(),
+            action_type: "profile".to_string(),
+            decision_by: None,
+        },
+    ];
+    for earlier in 1..attempt {
+        events.push(EventData::ActionAttemptFailed {
+            action_execution_id: format!("attempt-{earlier}"),
+            state_id: "profile".to_string(),
+            error: "the harness crashed".to_string(),
+            retry_in_ms: 0,
+        });
+        events.push(EventData::ActionRetrying {
+            action_execution_id: format!("attempt-{}", earlier + 1),
+            retry_count: earlier,
+            state_id: Some("profile".to_string()),
+        });
+    }
+    events.push(EventData::ActionOutputRejected {
+        action_execution_id: rejected.clone(),
+        state_id: "profile".to_string(),
+        reason: "no step profile in the answer".to_string(),
+        answer_tail: None,
+    });
+    let log = store.event_log(&execution.id);
+    for data in events {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    let rejection = OutputRejection {
+        state_id: "profile".to_string(),
+        action_execution_id: rejected,
+        reason: "no step profile in the answer".to_string(),
+        answer_tail: None,
+        reply: None,
+        harness: Some("claude-code".to_string()),
+        harness_session_id: Some("session-7".to_string()),
+        attempt: Some(attempt),
+    };
+    execution.current_state = Some("profile".to_string());
+    execution.metadata = json!({
+        METADATA_ENGINE_KEY: { METADATA_OUTPUT_REJECTION_KEY: rejection },
+    });
+    store
+        .save_execution(&execution)
+        .expect("save the execution");
+    recover(&store).expect("recover");
+    execution
+}
+
+/// R13 across a restart: a reprompt continued after the daemon stopped
+/// that is still unusable is a failed attempt under `retry_policy`, as
+/// without the restart — the next attempt runs, not the conductor's rescue.
+#[tokio::test]
+async fn a_reprompt_still_unusable_after_a_restart_is_retried() {
+    let fixture = Fixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("Still no JSON, sorry."))
+        .answers_on_call(
+            2,
+            &profile_answer(json!([
+                {"step": "work", "model": "large", "effort": "high",
+                 "rationale": "hard", "confident": true}
+            ])),
+        );
+    let engine = fixture.engine();
+    let definition = retrying_workflow(&fixture, "");
+    let execution = stopped_before_the_reprompt(&fixture, &engine, &definition, 1).await;
+
+    let execution = engine
+        .resume(&definition, &execution.id)
+        .await
+        .expect("resume");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 2, "the reprompt, then the retry");
+    assert!(
+        fixture
+            .fake
+            .args(1)
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == "session-7"),
+        "{:?}",
+        fixture.fake.args(1)
+    );
+    assert!(!fixture.fake.args(2).iter().any(|arg| arg == "--resume"));
+    let events = fixture.events(&execution.id);
+    let reprompt = events
+        .iter()
+        .find_map(|event| match event {
+            EventData::OutputReprompted {
+                action_execution_id,
+                ..
+            } => Some(action_execution_id.clone()),
+            _ => None,
+        })
+        .expect("the reprompt ran");
+    let failed = events
+        .iter()
+        .find_map(|event| match event {
+            EventData::ActionAttemptFailed {
+                action_execution_id,
+                ..
+            } => Some(action_execution_id.clone()),
+            _ => None,
+        })
+        .expect("an attempt failed");
+    assert_eq!(failed, reprompt, "the reprompt is the attempt that failed");
+    let retry_count = events
+        .iter()
+        .find_map(|event| match event {
+            EventData::ActionRetrying { retry_count, .. } => Some(*retry_count),
+            _ => None,
+        })
+        .expect("the step was retried");
+    assert_eq!(retry_count, 1, "the second attempt of the policy");
+    let types: Vec<String> = fixture
+        .harness
+        .events(&execution.id)
+        .iter()
+        .map(event_type)
+        .collect();
+    assert!(
+        types.contains(&"output_reprompted".to_string()),
+        "{types:?}"
+    );
+    assert!(!types.contains(&"problem_raised".to_string()), "{types:?}");
+    assert_eq!(fixture.stored(&execution.id).len(), 1);
+    assert_eq!(fixture.starts().len(), 1, "the next step ran");
+}
+
+/// With `retry_policy` used up, a reprompt continued after a restart that is
+/// still unusable fails the step, as without the restart — no rescue, no
+/// problem for the operator.
+#[tokio::test]
+async fn a_reprompt_still_unusable_after_a_restart_fails_once_the_retries_are_used_up() {
+    let fixture = Fixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("Still no JSON, sorry."));
+    let engine = fixture.engine();
+    let definition = retrying_workflow(&fixture, "");
+    let execution = stopped_before_the_reprompt(&fixture, &engine, &definition, 2).await;
+
+    let execution = engine
+        .resume(&definition, &execution.id)
+        .await
+        .expect("resume");
+
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert_eq!(fixture.fake.calls(), 1, "only the reprompt ran");
+    let types: Vec<String> = fixture
+        .harness
+        .events(&execution.id)
+        .iter()
+        .map(event_type)
+        .collect();
+    assert!(types.contains(&"action_failed".to_string()), "{types:?}");
+    assert!(!types.contains(&"problem_raised".to_string()), "{types:?}");
+    assert_eq!(
+        types
+            .iter()
+            .filter(|kind| *kind == "action_retrying")
+            .count(),
+        1,
+        "only the retry before the restart: {types:?}"
+    );
     assert!(fixture.stored(&execution.id).is_empty());
     assert!(fixture.starts().is_empty(), "the next step never starts");
 }
