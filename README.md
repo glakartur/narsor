@@ -53,7 +53,7 @@ steps — an agent harness (for example `claude`, `codex` or `opencode`) on
 `PATH`. Rust is not needed.
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.21.0/install.sh | bash
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.21.1/install.sh | bash
 ```
 
 Add `--progress` (`... | bash -s -- --progress`) to show a progress bar while
@@ -67,7 +67,7 @@ overwrites an existing configuration file.
 Unattended install, for example in a container build:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.21.1/install.sh |
   bash -s -- --role frontend --non-interactive \
     --bin-dir /usr/local/bin --data-dir /var/lib/narsor
 ```
@@ -75,7 +75,7 @@ curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install
 Uninstall (add `--purge` to delete configuration and data as well):
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.15.0/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.21.1/install.sh |
   bash -s -- --uninstall
 ```
 
