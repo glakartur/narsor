@@ -126,6 +126,36 @@ fn the_template_is_the_only_builtin_and_demonstrates_engine_features_safely() {
     );
 }
 
+/// The example workflows next to the template are not built in, but they are
+/// part of the repository and must keep loading as the schema changes.
+#[test]
+fn every_example_workflow_in_the_repository_loads_and_validates() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
+    let mut checked = Vec::new();
+    for entry in fs::read_dir(&directory).expect("read workflows directory") {
+        let path = entry.expect("read directory entry").path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read workflow");
+        load_from_str(&source)
+            .unwrap_or_else(|error| panic!("{} loads: {error}", path.display()));
+        let violations = validate_source(&source)
+            .unwrap_or_else(|error| panic!("{} parses: {error}", path.display()));
+        assert!(
+            violations.is_empty(),
+            "{} validates: {violations:?}",
+            path.display()
+        );
+        checked.push(path.file_name().unwrap().to_string_lossy().into_owned());
+    }
+    checked.sort();
+    assert!(
+        checked.contains(&"compound-engineering-change.yaml".to_string()),
+        "the compound engineering example is checked: {checked:?}"
+    );
+}
+
 #[test]
 fn a_bare_name_and_a_suffixed_name_resolve_to_the_same_builtin() {
     let root = TempRoot::new();
