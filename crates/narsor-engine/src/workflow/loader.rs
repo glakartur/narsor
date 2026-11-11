@@ -256,6 +256,7 @@ fn compile_globals(globals: &GlobalsSchema) -> GlobalsConfig {
         timeout_secs: globals.timeout.map(|d| d.as_secs()),
         retry_policy: globals.retry_policy.as_ref().map(compile_retry_policy),
         image: globals.image.clone(),
+        model_ladder: globals.model_ladder.clone(),
     }
 }
 
@@ -502,6 +503,9 @@ fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
             harness: agent.harness,
             permission_grants: Vec::new(),
             model: agent.model,
+            effort: agent.effort,
+            ceiling: agent.ceiling,
+            plan: agent.plan,
             workspace_access: if keep_v1_access {
                 agent.workspace_access
             } else {

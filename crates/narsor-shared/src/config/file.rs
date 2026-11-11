@@ -36,7 +36,9 @@ use narsor_protocol::controller::MAX_CONCURRENT_TASKS_LIMIT;
 use narsor_protocol::harness::HARNESSES;
 use narsor_protocol::identifier::BackendId;
 
-use super::settings::{self, SettingKey, SettingValue, LOG_LEVELS, NO_LIMIT};
+use super::settings::{
+    self, SettingKey, SettingValue, LOG_LEVELS, MAX_ESCALATION_THRESHOLD, NO_LIMIT,
+};
 
 /// The largest configuration file that will be parsed.
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -425,7 +427,10 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
         return agent_args_value(raw);
     }
 
-    if setting == SettingKey::MaxConcurrentTasks {
+    if matches!(
+        setting,
+        SettingKey::MaxConcurrentTasks | SettingKey::EscalationThreshold
+    ) {
         if let Some(number) = raw.as_u64() {
             return value_from_text(setting, &number.to_string());
         }
@@ -596,6 +601,19 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
                 _ => Err(format!(
                     "a number of tasks between 1 and {MAX_CONCURRENT_TASKS_LIMIT} was expected, \
                      or '{NO_LIMIT}', but '{written}' was found"
+                )),
+            }
+        }
+
+        SettingKey::EscalationThreshold => {
+            let written = text.trim();
+            match written.parse::<u32>() {
+                Ok(threshold) if threshold <= MAX_ESCALATION_THRESHOLD => {
+                    Ok(SettingValue::Text(threshold.to_string()))
+                }
+                _ => Err(format!(
+                    "a number of attempts between 0 and {MAX_ESCALATION_THRESHOLD} was expected \
+                     (0 turns escalation off), but '{written}' was found"
                 )),
             }
         }

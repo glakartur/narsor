@@ -83,6 +83,8 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::conductor::ConductorRegistry;
+use crate::conductor::ConductorStore;
+use crate::config::DEFAULT_ESCALATION_THRESHOLD;
 use crate::config::{AgentArgs, AgentDefaults};
 use crate::domain::{
     effective_title, ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy,
@@ -108,6 +110,7 @@ use crate::engine::actions::{
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
+use crate::engine::step_profile::{self, ProfileInput, Setting};
 use crate::engine::timeline_file::{FileReadingSink, ReadingSink};
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
 use crate::workflow::template::{
@@ -1034,6 +1037,7 @@ pub struct Engine {
     executors: HashMap<ActionKind, Arc<dyn ActionExecutor>>,
     agent_timeout_secs: Option<u64>,
     agent_args: AgentArgs,
+    escalation_threshold: u32,
     usage_reporter: Option<Arc<dyn UsageReporter>>,
     reading_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     default_harness: Arc<dyn DefaultHarnessSource>,
@@ -1044,6 +1048,15 @@ pub struct Engine {
     conductor: OnceLock<Weak<ConductorRegistry>>,
     task_labels: TaskLabels,
     workspace_values: Option<Arc<dyn WorkspaceValues>>,
+}
+
+/// What [`Engine::apply_step_profile`] needs to know about the attempt.
+#[derive(Clone, Copy)]
+struct AttemptProfile<'a> {
+    /// Failed attempts of the step in a row.
+    failures: u32,
+    /// The workflow's `globals.model_ladder`.
+    ladder: &'a [String],
 }
 
 /// The ticket and title `{{ task.ticket }}` and `{{ task.title }}` render.
@@ -1209,6 +1222,7 @@ impl Engine {
             executors,
             agent_timeout_secs: None,
             agent_args: AgentArgs::new(),
+            escalation_threshold: DEFAULT_ESCALATION_THRESHOLD,
             usage_reporter: None,
             reading_notifier: None,
             default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
@@ -1280,7 +1294,15 @@ impl Engine {
     pub fn with_agent_defaults(self, defaults: AgentDefaults) -> Self {
         self.with_agent_timeout(defaults.timeout_secs)
             .with_agent_args(defaults.args)
+            .with_escalation_threshold(defaults.escalation_threshold)
             .with_default_harness_source(Arc::new(defaults.harness))
+    }
+
+    /// Returns the engine raising a step's model or effort after `threshold`
+    /// consecutive failed attempts; `0` turns escalation off.
+    pub fn with_escalation_threshold(mut self, threshold: u32) -> Self {
+        self.escalation_threshold = threshold;
+        self
     }
 
     /// Returns the engine adding `args` to every harness run of its agent
@@ -2421,6 +2443,10 @@ impl Engine {
                     &action_execution_id,
                     timeout,
                     &mut pinned_harness,
+                    AttemptProfile {
+                        failures: attempt - 1,
+                        ladder: &definition.globals.model_ladder,
+                    },
                 )
                 .await;
 
@@ -2533,6 +2559,7 @@ impl Engine {
         action_execution_id: &str,
         timeout: Option<Duration>,
         pinned_harness: &mut Option<String>,
+        profile: AttemptProfile<'_>,
     ) -> Result<AttemptOutcome, AttemptFailure> {
         let location = format!("state '{}'", state.id);
 
@@ -2640,6 +2667,7 @@ impl Engine {
             // goes on already knows its history (KTD9).
             step_memory::add_history(config, &template.prompt, &history);
             self.pin_harness(config, pinned_harness);
+            self.apply_step_profile(execution, state, config, profile);
             if let Some(input) = self.take_agent_input(execution, state)? {
                 if let (Some(harness), Some(session)) =
                     (input.harness.as_deref(), input.session.as_deref())
@@ -2746,6 +2774,96 @@ impl Engine {
                     Err(AttemptFailure::of_action(error).side_effect_free_if(clean))
                 }
             },
+        }
+    }
+
+    /// Sets the model and effort of a rendered agent `config` from the three
+    /// sources — the step's default, the conductor's profile, an escalation —
+    /// through [`step_profile::resolve`]. A step with none of them keeps the
+    /// arguments it always had.
+    fn apply_step_profile(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        config: &mut AgentActionConfig,
+        attempt: AttemptProfile<'_>,
+    ) {
+        let default = Setting {
+            model: config.model.clone(),
+            effort: config.effort.clone(),
+        };
+        let ceiling = config.ceiling.as_ref().map(|c| Setting {
+            model: c.model.clone(),
+            effort: c.effort.clone(),
+        });
+        // A damaged or missing profile is "no profile" (R8).
+        let stored = ConductorStore::new(self.store.paths(), &execution.id)
+            .load_profile()
+            .unwrap_or_default();
+        let conductor = stored
+            .lookup(&state.id, None)
+            .map(|entry| entry.setting.clone());
+        if conductor.is_none() && ceiling.is_none() {
+            return;
+        }
+        let resolved = step_profile::resolve(ProfileInput {
+            default: &default,
+            ceiling: ceiling.as_ref(),
+            conductor: conductor.as_ref(),
+            ladder: attempt.ladder,
+            failures: attempt.failures,
+            threshold: self.escalation_threshold,
+        });
+        if resolved.rejected {
+            self.note_step_profile(
+                execution,
+                state,
+                "the conductor's profile named a model or effort that cannot be used; \
+                 the step's default stays",
+                &default,
+                &resolved.setting,
+            );
+        }
+        if resolved.source == step_profile::ProfileSource::Escalated {
+            self.note_step_profile(
+                execution,
+                state,
+                "the step failed repeatedly; its model or effort is raised",
+                &default,
+                &resolved.setting,
+            );
+        } else if resolved.limit_reached && ceiling.is_some() {
+            self.note_step_profile(
+                execution,
+                state,
+                "the step failed repeatedly and already runs on its ceiling",
+                &default,
+                &resolved.setting,
+            );
+        }
+        config.model = resolved.setting.model;
+        config.effort = resolved.setting.effort;
+    }
+
+    /// Records a profile decision as an event, best-effort.
+    fn note_step_profile(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        message: &str,
+        from: &Setting,
+        to: &Setting,
+    ) {
+        if let Err(error) = self.emit(
+            &execution.id,
+            EventData::Error {
+                message: format!("Step '{}': {message}", state.id),
+                context: json!({
+                    "step_profile": { "step": state.id, "from": from, "to": to },
+                }),
+            },
+        ) {
+            tracing::warn!(%error, "could not record a step profile decision");
         }
     }
 

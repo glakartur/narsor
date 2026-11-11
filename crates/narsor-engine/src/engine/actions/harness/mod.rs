@@ -309,6 +309,12 @@ pub trait HarnessAdapter: Send + Sync + std::fmt::Debug {
     /// Builds the command line for one run.
     fn invocation(&self, request: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError>;
 
+    /// Whether the adapter passes the step's `effort` to its CLI. One that
+    /// does not ignores the field; the executor says so in an event.
+    fn supports_effort(&self) -> bool {
+        false
+    }
+
     /// Creates a fresh parser for one run's stdout stream.
     ///
     /// A new one per run: the parser accumulates state (a session id seen so

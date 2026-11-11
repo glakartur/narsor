@@ -17,6 +17,7 @@ pub mod conversation_summary;
 pub mod decision;
 pub mod retry;
 pub mod runner;
+pub mod step_profile;
 pub mod timeline;
 pub mod timeline_file;
 

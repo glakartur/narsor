@@ -260,6 +260,11 @@ pub struct GlobalsConfig {
     /// override from a step override, so each keeps its own field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageSpec>,
+
+    /// Models from the cheapest to the strongest. The ceiling and the
+    /// escalation compare only models on this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_ladder: Vec<String>,
 }
 
 /// Single-repository workspace declaration: the shape of a `v1`
@@ -505,6 +510,18 @@ impl DecisionMaker {
     }
 }
 
+/// The most a step may be raised to (`ceiling` in YAML).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepCeiling {
+    /// Highest model; must be on `globals.model_ladder` when that exists.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Highest effort.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
 /// Agent action configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentActionConfig {
@@ -526,6 +543,19 @@ pub struct AgentActionConfig {
     /// Model specification (optional)
     #[serde(default)]
     pub model: Option<String>,
+
+    /// Default effort of the step, one of `low`, `medium`, `high`, `max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+
+    /// Upper bound for what the conductor and an escalation may set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<StepCeiling>,
+
+    /// Marks the step whose success makes the conductor profile the steps
+    /// that have not started (`plan: true` in YAML).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan: bool,
 
     /// Access the agent receives to its execution workspace.
     ///

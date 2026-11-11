@@ -279,6 +279,18 @@ impl AgentExecutor {
         let harness = config.harness.as_deref().unwrap_or(BUILT_IN_HARNESS);
         let adapter = self.harnesses.get(harness)?;
 
+        if config.effort.is_some() && !adapter.supports_effort() {
+            self.emit(
+                request.execution_id,
+                EventData::Error {
+                    message: format!(
+                        "Harness '{harness}' does not take an effort; the step's effort is ignored"
+                    ),
+                    context: serde_json::json!({ "effort_ignored": harness }),
+                },
+            );
+        }
+
         let mut session = new_session(config, harness, request.execution_id);
 
         let mut scope = request.step_scope();

@@ -130,6 +130,10 @@ impl Default for ClaudeCodeAdapter {
 }
 
 impl HarnessAdapter for ClaudeCodeAdapter {
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         CLAUDE_CODE
     }
@@ -185,6 +189,12 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             reject_option_like(model, "model", CLAUDE_CODE)?;
             args.push("--model".to_string());
             args.push(model.clone());
+        }
+
+        if let Some(effort) = &config.effort {
+            reject_option_like(effort, "effort", CLAUDE_CODE)?;
+            args.push("--effort".to_string());
+            args.push(effort.clone());
         }
 
         if let Some(max_turns) = integer_parameter(config, "max_turns", CLAUDE_CODE)? {

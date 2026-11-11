@@ -487,6 +487,11 @@ pub struct GlobalsSchema {
     /// `reference` and `digest_policy` — see [`crate::domain::ImageSpec`].
     #[serde(default)]
     pub image: Option<crate::domain::ImageSpec>,
+
+    /// Models from the cheapest to the strongest, for `ceiling` and
+    /// escalation.
+    #[serde(default)]
+    pub model_ladder: Vec<String>,
 }
 
 /// Retry policy, both globally and per state (§3.2, §3.3).
@@ -1165,6 +1170,19 @@ pub struct AgentActionSchema {
 
     #[serde(default)]
     pub model: Option<String>,
+
+    /// Default effort: `low`, `medium`, `high` or `max`.
+    #[serde(default)]
+    pub effort: Option<String>,
+
+    /// The most the conductor or an escalation may raise the step to.
+    #[serde(default)]
+    pub ceiling: Option<crate::domain::StepCeiling>,
+
+    /// Marks the plan step: after it succeeds the conductor profiles the
+    /// steps that have not started.
+    #[serde(default)]
+    pub plan: bool,
 
     /// Workspace permission, translated to native harness permissions at run
     /// time. Omission leaves the harness's own configuration in effect.

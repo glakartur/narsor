@@ -392,6 +392,9 @@ fn agent_action(prompt: &str) -> AgentActionConfig {
         harness: Some("claude-code".to_string()),
         permission_grants: Vec::new(),
         model: None,
+        effort: None,
+        ceiling: None,
+        plan: false,
         workspace_access: Some(WorkspaceAccess::ReadWrite),
         prompt: prompt.into(),
         workspace: None,
@@ -1398,6 +1401,68 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
     assert!(args.contains(&"--auto".to_string()), "{args:?}");
     assert_eq!(args[args.len() - 3], "--format");
     assert_eq!(args[args.len() - 2], "json");
+}
+
+#[tokio::test]
+async fn the_effort_reaches_the_claude_argv_and_a_step_without_one_is_unchanged() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+
+    let mut config = agent_action("look around");
+    config.model = Some("opus".to_string());
+    config.effort = Some("high".to_string());
+    complete(&executor(&fake), config, &root.workspace()).await;
+    let with_effort = fake.args(1);
+    assert!(
+        with_effort
+            .windows(2)
+            .any(|pair| pair == ["--effort", "high"]),
+        "{with_effort:?}"
+    );
+
+    let fake = FakeHarness::install(root.dir("bin2"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+    let mut config = agent_action("look around");
+    config.model = Some("opus".to_string());
+    complete(&executor(&fake), config, &root.workspace()).await;
+    let without = fake.args(1);
+    assert!(
+        !without.iter().any(|arg| arg.contains("effort")),
+        "{without:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_effort_reaches_the_codex_argv_and_max_is_xhigh() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&codex_stream("thread-7", r#"{"choice":"ready"}"#));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("look around");
+    config.harness = Some("codex".to_string());
+    config.effort = Some("max".to_string());
+    complete(&executor, config, &root.workspace()).await;
+    let args = fake.args(1);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=\"xhigh\""]),
+        "{args:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_effort_that_looks_like_an_option_is_rejected() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+    let mut config = agent_action("look around");
+    config.effort = Some("--dangerous".to_string());
+    let error = fail(&executor(&fake), config, &root.workspace()).await;
+    assert!(error.message.contains("effort"), "{error:?}");
 }
 
 #[tokio::test]

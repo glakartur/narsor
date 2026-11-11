@@ -28,6 +28,7 @@ use crate::domain::{
     VariableDefinition, VariableScope, VariableSource, VariableType, WorkflowDefinition,
     WorkspaceField, LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
+use crate::engine::step_profile::{effort_rank, EFFORT_SCALE};
 use crate::workspace::provisioner::is_usable_directory_name;
 
 use super::loader::{compile, LoadError};
@@ -59,6 +60,7 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_decision(state, &mut errors);
         validate_state_templates(definition, &declared, state, &mut errors);
         validate_state_image(state, &mut errors);
+        validate_step_profile(definition, state, &mut errors);
         validate_step_workspace(definition, state, &mut errors);
     }
     validate_variable_consistency(definition, &mut errors);
@@ -844,6 +846,73 @@ fn validate_image(field: &str, image: &ImageSpec, errors: &mut Vec<ValidationErr
     }
 }
 
+/// `effort` must be on the scale, the ceiling must not sit below the default,
+/// and a ceiling model must be on `globals.model_ladder` when one is given.
+fn validate_step_profile(
+    definition: &WorkflowDefinition,
+    state: &State,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(ActionConfig::Agent(agent)) = &state.action else {
+        return;
+    };
+    let id = &state.id;
+    let mut invalid = |field: &str, reason: String| {
+        errors.push(ValidationError::InvalidGlobalsField {
+            field: format!("states.{id}.action.{field}"),
+            reason,
+        });
+    };
+    let ladder = &definition.globals.model_ladder;
+    let rank = |effort: &Option<String>, field: &str, bad: &mut dyn FnMut(&str, String)| {
+        let value = effort.as_deref()?;
+        let found = effort_rank(value);
+        if found.is_none() {
+            bad(
+                field,
+                format!("'{value}' is not one of {}", EFFORT_SCALE.join(", ")),
+            );
+        }
+        found
+    };
+    let default_rank = rank(&agent.effort, "effort", &mut invalid);
+    if let Some(ceiling) = &agent.ceiling {
+        let ceiling_rank = rank(&ceiling.effort, "ceiling.effort", &mut invalid);
+        if let (Some(default), Some(cap)) = (default_rank, ceiling_rank) {
+            if cap < default {
+                invalid(
+                    "ceiling.effort",
+                    "is lower than the step's own effort".to_string(),
+                );
+            }
+        }
+        if let Some(model) = &ceiling.model {
+            let position = |m: &str| ladder.iter().position(|known| known == m);
+            if !ladder.is_empty() && position(model).is_none() {
+                invalid(
+                    "ceiling.model",
+                    format!("'{model}' is not on globals.model_ladder"),
+                );
+            }
+            if let Some(default) = &agent.model {
+                if let (Some(d), Some(c)) = (position(default), position(model)) {
+                    if c < d {
+                        invalid(
+                            "ceiling.model",
+                            "is lower than the step's own model".to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Some(effort) = &agent.effort {
+        if effort.contains("{{") {
+            invalid("effort", "cannot be templated".to_string());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Group 4: variable references
 // ---------------------------------------------------------------------------
@@ -1398,6 +1467,62 @@ globals:
     code: { primary: true, base_branch: main, repository: code-repo }
     docs: { base_branch: main, repository: docs-repo }
 "#;
+
+    const PROFILE_HEADER: &str =
+        "schema: v2\nname: p\nversion: 1\nglobals:\n  model_ladder: [haiku, sonnet, opus]\n";
+
+    fn profile_errors(action: &str) -> Vec<ValidationError> {
+        let source = format!(
+            "{PROFILE_HEADER}states:\n  work:\n    action: {action}\n    choices: [success]\n    transitions: {{ success: done }}\n  done:\n    description: end\nterminal_states: [done]\n"
+        );
+        validate_source(&source).expect("the file must parse")
+    }
+
+    fn profile_field_rejected(errors: &[ValidationError], field: &str) -> bool {
+        errors.iter().any(|error| {
+            matches!(error, ValidationError::InvalidGlobalsField { field: f, .. } if f.ends_with(field))
+        })
+    }
+
+    #[test]
+    fn a_valid_profile_passes() {
+        let errors = profile_errors(
+            "{ type: agent, prompt: x, model: sonnet, effort: medium, ceiling: { model: opus, effort: high } }",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidGlobalsField { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_effort_outside_the_scale_is_rejected() {
+        let errors = profile_errors("{ type: agent, prompt: x, effort: ultra }");
+        assert!(profile_field_rejected(&errors, "action.effort"));
+    }
+
+    #[test]
+    fn a_ceiling_below_the_default_is_rejected() {
+        let errors =
+            profile_errors("{ type: agent, prompt: x, effort: high, ceiling: { effort: low } }");
+        assert!(profile_field_rejected(&errors, "ceiling.effort"));
+    }
+
+    #[test]
+    fn a_ceiling_model_off_the_ladder_is_rejected() {
+        let errors = profile_errors("{ type: agent, prompt: x, ceiling: { model: mystery } }");
+        assert!(profile_field_rejected(&errors, "ceiling.model"));
+    }
+
+    #[test]
+    fn a_step_without_the_new_fields_is_unchanged() {
+        let errors = profile_errors("{ type: agent, prompt: x, model: sonnet }");
+        assert!(!errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidGlobalsField { .. })));
+    }
 
     fn workspace_errors(section: &str) -> Vec<ValidationError> {
         errors_of(REPOS, &format!("    workspaces: {section}\n"))
