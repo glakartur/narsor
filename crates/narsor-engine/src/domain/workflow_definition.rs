@@ -70,31 +70,17 @@ pub struct WorkflowDefinition {
 }
 
 impl WorkflowDefinition {
-    /// Fills what an agent step leaves out from `globals` (D9): `model` from
-    /// `default_model`, `effort` from `default_effort`, and each field of
-    /// `ceiling` from the general ceiling. What the step names wins. After
-    /// this a step holds its effective values, so nothing downstream looks
-    /// at `globals` again.
+    /// Fills what a step running a harness leaves out from `globals` (D9),
+    /// see [`HarnessStepConfig::inherit_globals`]. After this a step holds its
+    /// effective values, so nothing downstream looks at `globals` again.
     pub fn inherit_global_defaults(&mut self) {
-        let globals = self.globals.clone();
         for state in self.states.values_mut() {
-            let Some(ActionConfig::Agent(agent)) = &mut state.action else {
-                continue;
-            };
-            if agent.model.is_none() {
-                agent.model = globals.default_model.clone();
-            }
-            if agent.effort.is_none() {
-                agent.effort = globals.default_effort.clone();
-            }
-            if let Some(general) = &globals.ceiling {
-                let own = agent.ceiling.get_or_insert_with(StepCeiling::default);
-                if own.model.is_none() {
-                    own.model = general.model.clone();
-                }
-                if own.effort.is_none() {
-                    own.effort = general.effort.clone();
-                }
+            if let Some(step) = state
+                .action
+                .as_mut()
+                .and_then(ActionConfig::harness_step_mut)
+            {
+                step.inherit_globals(&self.globals);
             }
         }
     }
@@ -512,6 +498,77 @@ pub enum ActionConfig {
     Human(HumanActionConfig),
     Wait(WaitActionConfig),
     Decision(DecisionActionConfig),
+    Profile(ProfileActionConfig),
+}
+
+impl ActionConfig {
+    /// The name of this action type in the YAML contract and in events.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Agent(_) => "agent",
+            Self::Script(_) => "script",
+            Self::Human(_) => "human",
+            Self::Wait(_) => "wait",
+            Self::Decision(_) => "decision",
+            Self::Profile(_) => "profile",
+        }
+    }
+
+    /// The harness session settings of a step that runs a harness, `None`
+    /// for every other action.
+    pub fn harness_step(&self) -> Option<&HarnessStepConfig> {
+        match self {
+            Self::Agent(config) => Some(&config.harness_step),
+            Self::Profile(config) => Some(&config.harness_step),
+            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+        }
+    }
+
+    /// The mutable form of [`Self::harness_step`].
+    pub fn harness_step_mut(&mut self) -> Option<&mut HarnessStepConfig> {
+        match self {
+            Self::Agent(config) => Some(&mut config.harness_step),
+            Self::Profile(config) => Some(&mut config.harness_step),
+            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+        }
+    }
+
+    /// The prompt the workflow author wrote for a step that runs a harness
+    /// (`agent` or `profile`), `None` for every other action.
+    pub fn harness_prompt(&self) -> Option<&PromptText> {
+        match self {
+            Self::Agent(config) => Some(&config.prompt),
+            Self::Profile(config) => Some(&config.prompt),
+            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+        }
+    }
+
+    /// The mutable harness settings and prompt of a step that runs a
+    /// harness, `None` for every other action.
+    pub fn harness_step_and_prompt_mut(
+        &mut self,
+    ) -> Option<(&mut HarnessStepConfig, &mut PromptText)> {
+        match self {
+            Self::Agent(config) => Some((&mut config.harness_step, &mut config.prompt)),
+            Self::Profile(config) => Some((&mut config.harness_step, &mut config.prompt)),
+            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+        }
+    }
+
+    /// Whether a `profile` step may propose a model and effort for this
+    /// step (R3): only an `agent` step that is not pinned
+    /// ([`HarnessStepConfig::is_pinned`]). A `profile` step never profiles
+    /// itself or another `profile` step.
+    pub fn is_profile_candidate(&self) -> bool {
+        match self {
+            Self::Agent(config) => !config.harness_step.is_pinned(),
+            Self::Profile(_)
+            | Self::Script(_)
+            | Self::Human(_)
+            | Self::Wait(_)
+            | Self::Decision(_) => false,
+        }
+    }
 }
 
 /// Decision action configuration: a fork decided by someone other than the
@@ -558,9 +615,15 @@ pub struct StepCeiling {
     pub effort: Option<String>,
 }
 
-/// Agent action configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentActionConfig {
+/// The settings of a harness session that every step running a harness
+/// shares: which harness, model and effort, how far the step may be raised,
+/// and what the session may touch.
+///
+/// A step's action holds it flattened (`#[serde(flatten)]`), so its fields sit
+/// next to the action's own fields in a saved definition, exactly where they
+/// were before this type existed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarnessStepConfig {
     /// Which harness to use (e.g., "claude-code", "opencode").
     ///
     /// `None` means "whatever the configuration says", resolved by the
@@ -584,14 +647,9 @@ pub struct AgentActionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
 
-    /// Upper bound for what the conductor and an escalation may set.
+    /// Upper bound for what a `profile` step and an escalation may set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ceiling: Option<StepCeiling>,
-
-    /// Marks the step whose success makes the conductor profile the steps
-    /// that have not started (`plan: true` in YAML).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub plan: bool,
 
     /// Access the agent receives to its execution workspace.
     ///
@@ -605,9 +663,6 @@ pub struct AgentActionConfig {
     #[serde(default)]
     pub workspace_access: Option<WorkspaceAccess>,
 
-    /// Prompt to send to the agent
-    pub prompt: PromptText,
-
     /// Workspace configuration (optional, defaults to current)
     #[serde(default)]
     pub workspace: Option<WorkspaceRef>,
@@ -620,6 +675,56 @@ pub struct AgentActionConfig {
     #[serde(default)]
     pub read_only_paths: Vec<String>,
 
+    /// Whether the step itself names both `model` and `effort`, recorded by
+    /// the loader before `globals.default_*` fill what the step leaves out
+    /// (R3). After [`Self::inherit_globals`] the two fields alone no longer
+    /// tell an own value from an inherited one. A definition saved before
+    /// the field existed reads it as `false`: the step is not pinned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_model_and_effort: bool,
+}
+
+impl HarnessStepConfig {
+    /// Whether the step keeps its own model and effort, so a `profile` step
+    /// leaves it alone (R3, AE1, AE2): it names both itself and has no
+    /// `ceiling`. A ceiling inherited from `globals.ceiling` counts, because
+    /// the author left room to raise the step.
+    pub fn is_pinned(&self) -> bool {
+        self.own_model_and_effort && self.ceiling.is_none()
+    }
+
+    /// Fills what the step leaves out from `globals` (D9): `model` from
+    /// `default_model`, `effort` from `default_effort`, and each field of
+    /// `ceiling` from the general ceiling. What the step names wins.
+    pub fn inherit_globals(&mut self, globals: &GlobalsConfig) {
+        if self.model.is_none() {
+            self.model = globals.default_model.clone();
+        }
+        if self.effort.is_none() {
+            self.effort = globals.default_effort.clone();
+        }
+        if let Some(general) = &globals.ceiling {
+            let own = self.ceiling.get_or_insert_with(StepCeiling::default);
+            if own.model.is_none() {
+                own.model = general.model.clone();
+            }
+            if own.effort.is_none() {
+                own.effort = general.effort.clone();
+            }
+        }
+    }
+}
+
+/// Agent action configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentActionConfig {
+    /// The harness session the agent runs in.
+    #[serde(flatten)]
+    pub harness_step: HarnessStepConfig,
+
+    /// Prompt to send to the agent
+    pub prompt: PromptText,
+
     /// Whether the engine adds the history of earlier attempts to the prompt
     /// when the step is entered again (`history` in YAML).
     #[serde(default = "default_history")]
@@ -628,6 +733,21 @@ pub struct AgentActionConfig {
 
 fn default_history() -> bool {
     true
+}
+
+/// Profile action configuration (`type: profile`): an agent that proposes a
+/// model and an effort for the workflow's `agent` steps. The engine adds the
+/// list of steps, the allowed tiers and efforts and the defaults to the
+/// author's prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileActionConfig {
+    /// The harness session the profiling agent runs in. Read-only unless
+    /// the step's `workspaces` section says otherwise.
+    #[serde(flatten)]
+    pub harness_step: HarnessStepConfig,
+
+    /// The author's prompt: where the agent finds what the work is about.
+    pub prompt: PromptText,
 }
 
 /// The workspace permission an agent action runs with, derived from the
@@ -1364,6 +1484,9 @@ pub enum ValidationError {
         state: StateId,
         action_type: &'static str,
     },
+
+    #[error("State '{state}' is a profile step and needs a single 'exit' instead of 'choices': it writes the step profile and the workflow goes on")]
+    ProfileNeedsExit { state: StateId },
 
     #[error("State '{state}' declares a 'timeout' choice, which only agent and script steps can produce")]
     TimeoutChoiceNotAllowed { state: StateId },

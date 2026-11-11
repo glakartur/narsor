@@ -23,10 +23,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::domain::{
-    ActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel, PromptPart, PromptText,
-    RepositoryDefinition, RepositorySource, SchemaVersion, State, StateId, ValidationError,
-    VariableDefinition, VariableScope, VariableSource, VariableType, WorkflowDefinition,
-    WorkspaceField, LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
+    ActionConfig, AgentActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel,
+    ProfileActionConfig, PromptPart, PromptText, RepositoryDefinition, RepositorySource,
+    SchemaVersion, State, StateId, ValidationError, VariableDefinition, VariableScope,
+    VariableSource, VariableType, WorkflowDefinition, WorkspaceField, LOCAL_VARIABLE_PREFIX,
+    TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
 use crate::engine::step_profile::{effort_rank, tier_rank, EFFORT_SCALE, MODEL_TIERS};
 use crate::workspace::provisioner::is_usable_directory_name;
@@ -131,7 +132,7 @@ fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
         _ if !defines_anything => {}
         other => errors.push(ValidationError::DefinitionsNotAllowed {
             state: state.id.clone(),
-            action_type: other.as_ref().map_or("terminal", action_type_name),
+            action_type: other.as_ref().map_or("terminal", ActionConfig::type_name),
         }),
     }
 
@@ -206,16 +207,6 @@ fn invalid_name(state: &State, kind: &'static str, name: &str) -> ValidationErro
         state: state.id.clone(),
         kind,
         name: name.to_string(),
-    }
-}
-
-fn action_type_name(action: &ActionConfig) -> &'static str {
-    match action {
-        ActionConfig::Agent(_) => "agent",
-        ActionConfig::Script(_) => "script",
-        ActionConfig::Human(_) => "human",
-        ActionConfig::Wait(_) => "wait",
-        ActionConfig::Decision(_) => "decision",
     }
 }
 
@@ -466,6 +457,7 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             // has been cloned and earlier states have run — instead of failing
             // here, for free, the way it used to.
             if agent
+                .harness_step
                 .harness
                 .as_deref()
                 .is_some_and(|harness| harness.trim().is_empty())
@@ -479,6 +471,26 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
                 errors.push(ValidationError::EmptyChoices {
                     state: state.id.clone(),
                     action_type: "agent",
+                });
+            }
+        }
+        ActionConfig::Profile(profile) => {
+            if profile
+                .harness_step
+                .harness
+                .as_deref()
+                .is_some_and(|harness| harness.trim().is_empty())
+            {
+                errors.push(missing_field(state, "profile", "harness"));
+            }
+            if profile.prompt.is_blank() {
+                errors.push(missing_field(state, "profile", "prompt"));
+            }
+            // One way on: the step writes the profile and the workflow
+            // continues; it never picks a label.
+            if !state.has_exit() {
+                errors.push(ValidationError::ProfileNeedsExit {
+                    state: state.id.clone(),
                 });
             }
         }
@@ -852,10 +864,10 @@ fn validate_image(field: &str, image: &ImageSpec, errors: &mut Vec<ValidationErr
 /// [`EFFORT_SCALE`]; so are the fields of `ceiling`, and a ceiling never sits
 /// below the step's own value. A step with a ceiling — its own or the general
 /// one, which loading has copied into the step already — must also have a
-/// model and an effort, and its ceiling must name both: the conductor and an
+/// model and an effort, and its ceiling must name both: a `profile` step and an
 /// escalation can then never meet a missing bound.
 fn validate_step_profile(state: &State, errors: &mut Vec<ValidationError>) {
-    let Some(ActionConfig::Agent(agent)) = &state.action else {
+    let Some(step) = state.action.as_ref().and_then(ActionConfig::harness_step) else {
         return;
     };
     let id = &state.id;
@@ -890,9 +902,9 @@ fn validate_step_profile(state: &State, errors: &mut Vec<ValidationError>) {
         }
         found
     };
-    let default_model = tier(&agent.model, "model", &mut invalid);
-    let default_effort = effort(&agent.effort, "effort", &mut invalid);
-    if let Some(ceiling) = &agent.ceiling {
+    let default_model = tier(&step.model, "model", &mut invalid);
+    let default_effort = effort(&step.effort, "effort", &mut invalid);
+    if let Some(ceiling) = &step.ceiling {
         let cap_model = tier(&ceiling.model, "ceiling.model", &mut invalid);
         let cap_effort = effort(&ceiling.effort, "ceiling.effort", &mut invalid);
         if let (Some(default), Some(cap)) = (default_model, cap_model) {
@@ -914,34 +926,34 @@ fn validate_step_profile(state: &State, errors: &mut Vec<ValidationError>) {
         // The step has a profile: both fields must be there, in the step
         // (after `globals.default_model` and `default_effort`) and in the
         // ceiling (after `globals.ceiling`).
-        if agent.model.is_none() {
+        if step.model.is_none() {
             invalid(
                 "model",
                 "a step with a ceiling needs a model: set it, or `globals.default_model`"
                     .to_string(),
             );
         }
-        if agent.effort.is_none() {
+        if step.effort.is_none() {
             invalid(
                 "effort",
                 "a step with a ceiling needs an effort: set it, or `globals.default_effort`"
                     .to_string(),
             );
         }
-        if ceiling.model.is_none() && agent.model.is_some() {
+        if ceiling.model.is_none() && step.model.is_some() {
             invalid(
                 "ceiling.model",
                 "the ceiling needs a model: set it, or `globals.ceiling.model`".to_string(),
             );
         }
-        if ceiling.effort.is_none() && agent.effort.is_some() {
+        if ceiling.effort.is_none() && step.effort.is_some() {
             invalid(
                 "ceiling.effort",
                 "the ceiling needs an effort: set it, or `globals.ceiling.effort`".to_string(),
             );
         }
     }
-    if let Some(effort) = &agent.effort {
+    if let Some(effort) = &step.effort {
         if effort.contains("{{") {
             invalid("effort", "cannot be templated".to_string());
         }
@@ -961,18 +973,21 @@ fn validate_state_templates(
     let mut templated: Vec<(String, String)> = Vec::new();
 
     match &state.action {
-        Some(ActionConfig::Agent(agent)) => {
+        Some(ActionConfig::Agent(AgentActionConfig {
+            harness_step,
+            prompt,
+            ..
+        }))
+        | Some(ActionConfig::Profile(ProfileActionConfig {
+            harness_step,
+            prompt,
+        })) => {
             // The same shape the decision branch below already has.
-            if let Some(harness) = &agent.harness {
+            if let Some(harness) = &harness_step.harness {
                 templated.push(("action.harness".to_string(), harness.clone()));
             }
-            templated.extend(prompt_templates(
-                state,
-                "action.prompt",
-                &agent.prompt,
-                errors,
-            ));
-            if let Some(model) = &agent.model {
+            templated.extend(prompt_templates(state, "action.prompt", prompt, errors));
+            if let Some(model) = &harness_step.model {
                 templated.push(("action.model".to_string(), model.clone()));
             }
         }
@@ -1796,6 +1811,127 @@ globals:
         );
         assert!(
             !errors.iter().any(|e| e.contains("globals.workspaces.")),
+            "{errors:?}"
+        );
+    }
+
+    /// A unified file with a `profile` step `body` (indented as a state's
+    /// fields) that leads to the agent step `work`.
+    fn profile_step_errors(body: &str) -> Vec<String> {
+        let source = format!(
+            "schema: v2\nname: p\nversion: 1\nstates:\n  profile:\n{body}\n  work:\n    action: {{ type: agent, prompt: w }}\n    exit: {{ next: done }}\n  done:\n    description: end\nterminal_states:\n  done: completed\n"
+        );
+        validate_source(&source)
+            .expect("the file must parse")
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_profile_step_with_an_exit_is_valid() {
+        let errors = profile_step_errors(
+            "    action: { type: profile, prompt: judge, model: small, effort: low, ceiling: { model: medium, effort: high } }\n    exit: { next: work }",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn a_profile_step_with_choices_is_rejected() {
+        let errors = profile_step_errors(
+            "    action: { type: profile, prompt: judge }\n    choices:\n      easy: { next: work }\n      hard: { next: work }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("'profile'") && e.contains("single 'exit'")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_step_defines_no_variables() {
+        let errors = profile_step_errors(
+            "    action: { type: profile, prompt: judge }\n    variables:\n      - { name: size, type: text }\n    exit: { next: work }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("is a profile step and cannot define variables or artifacts")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_step_defines_no_artifacts() {
+        let errors = profile_step_errors(
+            "    action: { type: profile, prompt: judge }\n    artifacts:\n      - { name: report, description: a report }\n    exit: { next: work }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("is a profile step and cannot define variables or artifacts")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_step_needs_a_prompt_and_a_usable_harness() {
+        let errors = profile_step_errors(
+            "    action: { type: profile, prompt: \"  \", harness: \" \" }\n    exit: { next: work }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("profile action") && e.contains("'prompt'")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("profile action") && e.contains("'harness'")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_step_keeps_the_step_profile_rules() {
+        let templated = profile_step_errors(
+            "    action: { type: profile, prompt: judge, effort: \"{{ inputs.e }}\" }\n    exit: { next: work }",
+        );
+        assert!(
+            templated
+                .iter()
+                .any(|e| e.contains("states.profile.action.effort") && e.contains("templated")),
+            "{templated:?}"
+        );
+        let low_ceiling = profile_step_errors(
+            "    action: { type: profile, prompt: judge, model: large, effort: low, ceiling: { model: small, effort: low } }\n    exit: { next: work }",
+        );
+        assert!(
+            low_ceiling
+                .iter()
+                .any(|e| e.contains("states.profile.action.ceiling.model")),
+            "{low_ceiling:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_prompt_is_checked_like_an_agent_prompt() {
+        let errors = profile_step_errors(
+            "    action: { type: profile, prompt: \"{{ inputs.ghost }} {{ steps.work.reply }}\" }\n    exit: { next: work }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("unknown input 'ghost'") && e.contains("action.prompt")),
+            "{errors:?}"
+        );
+        // An agent's reply may be read: the source is checked, not refused.
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("cannot reference step replies")),
             "{errors:?}"
         );
     }

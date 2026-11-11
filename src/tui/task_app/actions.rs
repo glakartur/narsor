@@ -67,8 +67,8 @@ use crate::controller_protocol::{
 };
 use crate::domain::display::safe_link_url;
 use narsor_protocol::controller::{
-    OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, StepKind, StepView,
-    TaskActionId, TaskActionOffer, TaskState,
+    OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, StepView, TaskActionId,
+    TaskActionOffer, TaskState,
 };
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
@@ -693,7 +693,7 @@ fn step_list(task: &TaskSummary) -> Option<StepList> {
                     one_line(&step.label),
                     format!("Wznawia zadanie od kroku „{}”.", one_line(&step.id)),
                 );
-                if step.kind == StepKind::Agent {
+                if step.kind.runs_agent() {
                     item.with_field(ChooserField::multiline(COMMENT_FIELD).described(
                         "komentarz dla agenta, opcjonalny; nie zostaje na dalsze przebiegi",
                     ))
@@ -1021,7 +1021,9 @@ impl TaskApp {
         let Some(step) = list.steps.get(submission.index) else {
             return Request::None;
         };
-        let note = (step.kind == StepKind::Agent)
+        let note = step
+            .kind
+            .runs_agent()
             .then(|| written_text(submission))
             .filter(|text| !text.is_empty());
         let summary = format!("wybór kroku „{}” wysłany do runnera", one_line(&step.id));

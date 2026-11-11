@@ -252,13 +252,15 @@ impl Engine {
     ) -> bool {
         match kind {
             ActionKind::Script => error.error_type.as_deref() == Some(SCRIPT_SPAWN_FAILED),
-            ActionKind::Agent => match self.store.event_log(execution_id).read_all() {
-                Ok(events) => {
-                    !crate::conductor::agent_attempt_left_traces(&events, action_execution_id)
+            ActionKind::Agent | ActionKind::Profile => {
+                match self.store.event_log(execution_id).read_all() {
+                    Ok(events) => {
+                        !crate::conductor::agent_attempt_left_traces(&events, action_execution_id)
+                    }
+                    // Unknown is not clean.
+                    Err(_) => false,
                 }
-                // Unknown is not clean.
-                Err(_) => false,
-            },
+            }
             ActionKind::Human | ActionKind::Wait | ActionKind::Decision => false,
         }
     }

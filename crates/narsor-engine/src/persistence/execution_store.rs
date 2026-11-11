@@ -3,12 +3,15 @@
 use super::{PersistenceError, Result};
 use crate::domain::{Context, ExecutionId, TaskId, TaskLaunchSpec, WorkflowExecution};
 use crate::persistence::atomic::{
-    cleanup_orphaned_temp_files, ensure_dir, read_json, write_atomic, write_json_atomic,
-    write_json_atomic_exclusive,
+    cleanup_orphaned_temp_files, ensure_dir, read_json, read_json_capped, write_atomic,
+    write_json_atomic, write_json_atomic_exclusive,
 };
 use crate::persistence::conversation::ConversationStore;
 use crate::persistence::event_log::EventLog;
 use crate::persistence::paths::{StatePaths, DEFAULT_ROOT};
+use crate::persistence::step_profile::{
+    StepProfileEntry, StepProfileResult, MAX_STEP_PROFILE_BYTES, STEP_PROFILE_VERSION,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs;
@@ -256,6 +259,43 @@ impl ExecutionStore {
         fs::read_to_string(&path).map_err(|source| PersistenceError::io(&path, source))
     }
 
+    /// Atomically replaces `step-profile.json` with `entries`.
+    ///
+    /// The whole file is replaced: an entry of an earlier write that is not in
+    /// `entries` is gone, and an empty `entries` leaves an empty result. The
+    /// same call after a restart writes the same file again.
+    pub fn write_step_profile(
+        &self,
+        execution_id: &str,
+        entries: &[StepProfileEntry],
+    ) -> Result<()> {
+        write_json_atomic(
+            &self.paths.step_profile_file(execution_id),
+            &StepProfileResult::new(entries.to_vec()),
+        )
+    }
+
+    /// Reads `step-profile.json`; empty when no `profile` step wrote it.
+    ///
+    /// A damaged file, a file larger than [`MAX_STEP_PROFILE_BYTES`] and a
+    /// file of another version are errors, which the caller treats as "no
+    /// profile".
+    pub fn read_step_profile(&self, execution_id: &str) -> Result<StepProfileResult> {
+        let path = self.paths.step_profile_file(execution_id);
+        let Some(result) = read_json_capped::<StepProfileResult>(&path, MAX_STEP_PROFILE_BYTES)?
+        else {
+            return Ok(StepProfileResult::default());
+        };
+        if result.version != STEP_PROFILE_VERSION {
+            return Err(PersistenceError::UnsupportedVersion {
+                path,
+                found: result.version,
+                supported: STEP_PROFILE_VERSION,
+            });
+        }
+        Ok(result)
+    }
+
     /// Creates and returns the directory for one artifact of an execution.
     pub fn artifact_dir(&self, execution_id: &ExecutionId, artifact_id: &str) -> Result<PathBuf> {
         let dir = self.paths.artifact_dir(execution_id, artifact_id);
@@ -317,5 +357,149 @@ impl ExecutionStore {
 impl Default for ExecutionStore {
     fn default() -> Self {
         Self::with_default_root()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    /// A temporary root that deletes itself when it goes out of scope.
+    struct TempRoot {
+        path: PathBuf,
+    }
+
+    impl TempRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("narsor-execution-store-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).expect("create temp root");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    const EXECUTION: &str = "exec-1";
+
+    fn store(root: &TempRoot) -> ExecutionStore {
+        let store = ExecutionStore::new(&root.path);
+        store.create_execution_dirs(EXECUTION).expect("create dirs");
+        store
+    }
+
+    fn entry(step: &str, model: Option<&str>, effort: Option<&str>) -> StepProfileEntry {
+        StepProfileEntry {
+            step_id: step.to_string(),
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
+            rationale: format!("why {step}"),
+            requested_model: model.map(str::to_string),
+            requested_effort: effort.map(str::to_string),
+            profiled_by: "profile".to_string(),
+            decided_at: Utc.with_ymd_and_hms(2026, 11, 11, 10, 0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn step_profile_round_trips_with_rationale_and_requested_values() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        let mut clamped = entry("implement", Some("strong"), Some("high"));
+        clamped.requested_model = Some("strongest".to_string());
+        let entries = vec![clamped, entry("review", None, Some("low"))];
+
+        store.write_step_profile(EXECUTION, &entries).unwrap();
+        let result = store.read_step_profile(EXECUTION).unwrap();
+
+        assert_eq!(result.version, STEP_PROFILE_VERSION);
+        assert_eq!(result.entries, entries);
+        let implement = result.lookup("implement").unwrap();
+        assert_eq!(implement.rationale, "why implement");
+        assert_eq!(implement.requested_model.as_deref(), Some("strongest"));
+        assert_eq!(implement.model.as_deref(), Some("strong"));
+        assert_eq!(result.lookup("review").unwrap().model, None);
+    }
+
+    #[test]
+    fn second_step_profile_write_replaces_the_first() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        store
+            .write_step_profile(
+                EXECUTION,
+                &[
+                    entry("implement", Some("strong"), None),
+                    entry("review", None, Some("low")),
+                ],
+            )
+            .unwrap();
+
+        let second = vec![entry("implement", None, Some("medium"))];
+        store.write_step_profile(EXECUTION, &second).unwrap();
+        let result = store.read_step_profile(EXECUTION).unwrap();
+
+        assert_eq!(result.entries, second);
+        assert!(result.lookup("review").is_none());
+    }
+
+    #[test]
+    fn missing_step_profile_reads_as_empty() {
+        let root = TempRoot::new();
+        let store = store(&root);
+
+        let result = store.read_step_profile(EXECUTION).unwrap();
+
+        assert_eq!(result, StepProfileResult::default());
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn corrupt_step_profile_is_an_error() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        fs::write(store.paths().step_profile_file(EXECUTION), b"{ not json").unwrap();
+
+        let error = store.read_step_profile(EXECUTION).unwrap_err();
+
+        assert!(matches!(error, PersistenceError::Deserialize { .. }));
+    }
+
+    #[test]
+    fn oversized_step_profile_is_an_error() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        let size = usize::try_from(MAX_STEP_PROFILE_BYTES).unwrap() + 1;
+        fs::write(store.paths().step_profile_file(EXECUTION), vec![b' '; size]).unwrap();
+
+        let error = store.read_step_profile(EXECUTION).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PersistenceError::FileTooLarge { limit, .. } if limit == MAX_STEP_PROFILE_BYTES
+        ));
+    }
+
+    #[test]
+    fn step_profile_of_an_unknown_version_is_an_error() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        fs::write(
+            store.paths().step_profile_file(EXECUTION),
+            br#"{"version": 2, "entries": []}"#,
+        )
+        .unwrap();
+
+        let error = store.read_step_profile(EXECUTION).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PersistenceError::UnsupportedVersion { found: 2, .. }
+        ));
     }
 }

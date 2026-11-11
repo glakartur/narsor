@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::{VariableDefinition, VariableSource};
+use crate::domain::{HarnessStepConfig, PromptText, VariableDefinition, VariableSource};
 use crate::persistence::DefaultHarnessSelector;
 
 /// Where the harness of an agent action that names none comes from.
@@ -21,42 +21,6 @@ impl DefaultHarnessSource for String {
 impl DefaultHarnessSource for DefaultHarnessSelector {
     fn current_harness(&self) -> String {
         self.current().effective
-    }
-}
-
-pub(super) fn new_session(
-    config: &AgentActionConfig,
-    harness: &str,
-    execution_id: Option<&str>,
-) -> AgentSession {
-    AgentSession {
-        id: Uuid::new_v4().to_string(),
-        workflow_execution_id: execution_id.unwrap_or_default().to_string(),
-        harness: harness.to_string(),
-        started_at: Utc::now(),
-        ended_at: None,
-        status: AgentSessionStatus::Starting,
-        model: config.model.clone(),
-        config: serde_json::json!({
-            "harness": harness,
-            "read_only_paths": config.read_only_paths,
-            "parameters": config.parameters,
-        }),
-    }
-}
-
-pub(super) fn resume_session(config: &AgentActionConfig) -> Result<Option<&str>, ActionError> {
-    match config.parameters.get(RESUME_SESSION_PARAMETER) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(session)) if session.is_empty() => Ok(None),
-        Some(Value::String(session)) => Ok(Some(session.as_str())),
-        Some(other) => Err(ActionError {
-            message: format!(
-                "parameter '{RESUME_SESSION_PARAMETER}' must be a session id string, got {other}"
-            ),
-            error_type: Some("invalid_parameter".to_string()),
-            details: None,
-        }),
     }
 }
 
@@ -222,9 +186,6 @@ fn required_clause(kind: &str, names: &[String]) -> Option<String> {
     Some(format!("Required {kind}: {}\n", names.join(", ")))
 }
 
-/// The `status` of an answer that asks a person before the task continues.
-pub(super) const AWAITING_INPUT: &str = "awaiting_input";
-
 /// The `error_type` of an answer no output label could be extracted from — a
 /// format error the engine answers with a reprompt, not with `retry_policy`
 /// (KTD7).
@@ -242,29 +203,25 @@ change any files: the work is already done. Reply only with the JSON object desc
 below, choosing the label that describes the work you already did. If you cannot choose \
 because you need an answer from a person first, ask it with `awaiting_input` instead.";
 
-/// The configuration of the engine's reprompt of an agent (KTD7).
+/// The configuration of the engine's or the conductor's reprompt (KTD7,
+/// F1, R13): `action` resuming `harness_session` on `harness` — the harness
+/// the rejected attempt ran on, never the current default, which may have
+/// changed since — asking `message` instead of its prompt.
 ///
-/// Resumes `harness_session` on `harness` — the harness the rejected attempt
-/// ran on, never the current default, which may have changed since — with
-/// read-only workspace access, whatever the workflow declares: fixing the
-/// format of an answer is not further work. Any `resume_session` of the
-/// workflow's own is replaced by the session being repaired. `reason` says
-/// why the previous answer was rejected.
+/// Workspace access is read-only, whatever the workflow declares: fixing
+/// the format of an answer is not further work. Any `resume_session` of the
+/// workflow's own is replaced by the session being repaired. `None` for an
+/// action that runs no harness.
 pub fn reprompt_config(
-    original: &AgentActionConfig,
+    mut action: ActionConfig,
     harness: &str,
     harness_session: &str,
-    reason: &str,
-) -> AgentActionConfig {
-    let mut config = original.clone();
-    config.harness = Some(harness.to_string());
-    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
-    config.prompt = format!("{OUTPUT_REPROMPT}\n\nWhy it was rejected: {reason}").into();
-    config.parameters.insert(
-        RESUME_SESSION_PARAMETER.to_string(),
-        Value::String(harness_session.to_string()),
-    );
-    config
+    message: &str,
+) -> Option<ActionConfig> {
+    let (step, prompt) = action.harness_step_and_prompt_mut()?;
+    continue_session(step, prompt, harness, harness_session, message);
+    step.workspace_access = Some(WorkspaceAccess::ReadOnly);
+    Some(action)
 }
 
 /// What follows the conductor's own words when it asks the agent again
@@ -274,51 +231,34 @@ files. Reply only with the JSON object described below, or ask your question wit
 `awaiting_input` if you need an answer first.";
 
 /// The configuration of the conductor's reprompt of an agent (F1, R17):
-/// [`reprompt_config`] with the conductor's `prompt` in place of the
-/// engine's generic one.
+/// [`reprompt_config`] with the conductor's `prompt` and the guard.
 pub fn conductor_reprompt_config(
-    original: &AgentActionConfig,
+    original: ActionConfig,
     harness: &str,
     harness_session: &str,
     prompt: &str,
-) -> AgentActionConfig {
-    let mut config = reprompt_config(original, harness, harness_session, "");
-    config.prompt = format!("{}\n\n{CONDUCTOR_REPROMPT_GUARD}", prompt.trim()).into();
-    config
+) -> Option<ActionConfig> {
+    let message = format!("{}\n\n{CONDUCTOR_REPROMPT_GUARD}", prompt.trim());
+    reprompt_config(original, harness, harness_session, &message)
 }
 
-/// The harness used when neither the action nor the configuration names one.
-///
-/// The name the adapter itself registers under, not a second spelling of it:
-/// a default that `HarnessRegistry::get` does not know would fail at run time
-/// rather than at compile time.
-pub const BUILT_IN_HARNESS: &str = super::super::harness::claude_code::CLAUDE_CODE;
-
-/// The `parameters` key that continues an existing harness session (D18).
-pub const RESUME_SESSION_PARAMETER: &str = "resume_session";
-
-/// The harness refused a saved session id. The runner turns this into a new
-/// operator choice instead of retrying it or discarding the drafted message.
-pub const RESUME_SESSION_REJECTED: &str = "resume_session_rejected";
-
-/// Configures the next normal attempt as a continuation of an operator-facing
+/// Turns the next normal attempt into a continuation of an operator-facing
 /// conversation. Unlike [`reprompt_config`], this preserves the action's
 /// workspace permission: the operator is explicitly asking the agent to keep
 /// working, not merely to repair an output envelope.
-pub fn continuation_config(
-    original: &AgentActionConfig,
+pub fn continue_session(
+    step: &mut HarnessStepConfig,
+    prompt: &mut PromptText,
     harness: &str,
     harness_session: &str,
     message: &str,
-) -> AgentActionConfig {
-    let mut config = original.clone();
-    config.harness = Some(harness.to_string());
-    config.parameters.insert(
+) {
+    step.harness = Some(harness.to_string());
+    step.parameters.insert(
         RESUME_SESSION_PARAMETER.to_string(),
         Value::String(harness_session.to_string()),
     );
-    config.prompt = message.into();
-    config
+    *prompt = message.into();
 }
 
 /// The variable the harness session id is published as, when there is one.
@@ -326,13 +266,3 @@ pub const SESSION_ID_VARIABLE: &str = "agent_session_id";
 
 /// The `data` key carrying the session record of the run.
 pub const SESSION_DATA_KEY: &str = "agent_session";
-
-/// The most a single stdout line is handed to the harness's stream parser.
-///
-/// Every line reaches the conversation file in full regardless (R14) — this
-/// only bounds what is fed to [`HarnessStreamParser::on_stdout_line`]. Tens of
-/// megabytes is well past anything a harness's own JSON envelope needs (a
-/// multi-megabyte `tool_result` line is ordinary; the final `result`/`text`
-/// line is not), so a line past this limit is bulky tool output, not the
-/// answer, and is safely skipped for parsing.
-pub const PARSE_LINE_LIMIT: usize = 32 * 1024 * 1024;

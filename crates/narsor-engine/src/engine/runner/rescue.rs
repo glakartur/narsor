@@ -73,7 +73,9 @@ impl Engine {
     /// it decides (see the module documentation).
     ///
     /// `rescue` is already persisted in the execution. Without a conductor
-    /// attached, the step becomes a problem straight away.
+    /// attached, or for a step whose label the conductor does not choose
+    /// ([`ActionKind::rescues_output_label`]), the step becomes a problem
+    /// straight away.
     pub(super) async fn rescue_output(
         &self,
         definition: &WorkflowDefinition,
@@ -82,8 +84,12 @@ impl Engine {
         mut rescue: OutputRescue,
         timeout: Option<Duration>,
     ) -> Result<Flow, EngineError> {
+        let rescued_by_conductor = state
+            .action
+            .as_ref()
+            .is_some_and(|action| ActionKind::of(action).rescues_output_label());
         loop {
-            let conductor = self.conductor();
+            let conductor = self.conductor().filter(|_| rescued_by_conductor);
 
             if let Some(conductor) = &conductor {
                 // Decided before a restart: applied, never asked again.
@@ -220,27 +226,32 @@ impl Engine {
                 Decision::Reprompt { prompt } => {
                     let config = match (&state.action, &rescue.harness, &rescue.harness_session_id)
                     {
-                        (Some(ActionConfig::Agent(config)), Some(harness), Some(session))
+                        (Some(action @ ActionConfig::Agent(_)), Some(harness), Some(session))
                             if rescue.can_reprompt() =>
                         {
-                            let profiled = self.profiled_template(execution, state, config);
-                            agent::conductor_reprompt_config(&profiled, harness, session, &prompt)
+                            agent::conductor_reprompt_config(
+                                self.profiled_action(execution, state, action),
+                                harness,
+                                session,
+                                &prompt,
+                            )
                         }
-                        // The purpose did not offer (b): a response that
-                        // takes it anyway was refused before it got here.
-                        _ => {
-                            return self.escalate_output(
-                                definition,
-                                execution,
-                                state,
-                                rescue,
-                                &response,
-                                Choice::default(),
-                                "the conductor asked to repeat the question, but the agent \
-                                 cannot be asked again"
-                                    .to_string(),
-                            );
-                        }
+                        _ => None,
+                    };
+                    // The purpose did not offer (b): a response that takes it
+                    // anyway was refused before it got here.
+                    let Some(config) = config else {
+                        return self.escalate_output(
+                            definition,
+                            execution,
+                            state,
+                            rescue,
+                            &response,
+                            Choice::default(),
+                            "the conductor asked to repeat the question, but the agent \
+                             cannot be asked again"
+                                .to_string(),
+                        );
                     };
 
                     let decision = unsaved_decision(
@@ -261,6 +272,7 @@ impl Engine {
                     let previous = rescue.episode().to_string();
                     match self
                         .reprompt_attempt(
+                            definition,
                             execution,
                             state,
                             config,

@@ -54,10 +54,10 @@ impl GateContext {
 
 /// Whether `state` runs an action that answers with the step contract.
 pub(super) fn has_step_contract(state: &State) -> bool {
-    matches!(
-        state.action,
-        Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_))
-    )
+    state
+        .action
+        .as_ref()
+        .is_some_and(|action| ActionKind::of(action).answers_with_step_contract())
 }
 
 /// Whether the variables a result gives for `state` are held to its
@@ -65,7 +65,10 @@ pub(super) fn has_step_contract(state: &State) -> bool {
 /// conductor may give with variables. Not the same as [`has_step_contract`]:
 /// a decision is no step whose result a gate shows.
 pub(super) fn holds_variables_to_declarations(state: &State) -> bool {
-    has_step_contract(state) || matches!(state.action, Some(ActionConfig::Decision(_)))
+    state
+        .action
+        .as_ref()
+        .is_some_and(|action| ActionKind::of(action).holds_variables_to_declarations())
 }
 
 /// The form of a decision: a field for each variable of the step that the

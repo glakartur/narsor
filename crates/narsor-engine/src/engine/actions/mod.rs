@@ -36,8 +36,10 @@ pub mod answer;
 pub mod harness;
 pub mod human;
 mod process_group;
+pub mod profile;
 pub mod scope;
 pub mod script;
+pub(crate) mod session;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -47,13 +49,11 @@ use narsor_protocol::chat::{PromptAuthor, PromptPurpose};
 
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, ArtifactDefinition, ChoiceDefinition, OutputLabel,
-    State, VariableDefinition, Workspace,
+    State, VariableDefinition, WorkflowDefinition, Workspace,
 };
 use crate::persistence::ConversationStore;
 
-pub use agent::{
-    AgentEventSink, AgentExecutor, DefaultHarnessSource, LoggingEventSink, UsageReporter,
-};
+pub use agent::{AgentExecutor, DefaultHarnessSource};
 pub use answer::ChoiceAnswer;
 pub use harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry,
@@ -65,8 +65,10 @@ pub use human::{
     PermissionDecisionKind, PermissionDenialDetails, PermissionGrantScope,
     PermissionRequestDetails, RejectedAnswer, ResumedHumanAction,
 };
+pub use profile::ProfileExecutor;
 pub use scope::{ScopedRepository, StepScope};
 pub use script::ScriptExecutor;
+pub use session::{AgentEventSink, LoggingEventSink, UsageReporter};
 
 /// Environment variable carrying the [`crate::domain::ActionExecution`] id into
 /// the child process.
@@ -138,6 +140,21 @@ pub struct ActionRequest<'a> {
     /// What the step may touch (KTD5). `None` means a step without a
     /// `workspace` section: every repository, starting in the primary one.
     pub scope: Option<&'a StepScope>,
+
+    /// The workflow the step belongs to and the step's id, where the caller
+    /// knows them. Only [`ProfileExecutor`] reads it: it lists the other
+    /// steps of the workflow for its agent. `None` in a direct call with
+    /// nothing wired up.
+    pub workflow: Option<StepInWorkflow<'a>>,
+}
+
+/// A step and the workflow it belongs to.
+#[derive(Debug, Clone, Copy)]
+pub struct StepInWorkflow<'a> {
+    /// The workflow, as the execution runs it.
+    pub definition: &'a WorkflowDefinition,
+    /// The step the action runs in.
+    pub step_id: &'a str,
 }
 
 impl<'a> ActionRequest<'a> {
@@ -158,7 +175,18 @@ impl<'a> ActionRequest<'a> {
             purpose: PromptPurpose::Step,
             author: None,
             scope: None,
+            workflow: None,
         }
+    }
+
+    /// Returns the same request naming the step `step_id` of `definition`
+    /// it runs in.
+    pub fn with_workflow(mut self, definition: &'a WorkflowDefinition, step_id: &'a str) -> Self {
+        self.workflow = Some(StepInWorkflow {
+            definition,
+            step_id,
+        });
+        self
     }
 
     /// Returns the same request restricted to `scope`.

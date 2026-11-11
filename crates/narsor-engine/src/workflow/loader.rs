@@ -37,9 +37,9 @@ use crate::domain::{
     ActionConfig, AgentActionConfig, AgentDecisionConfig, ArtifactDefinition, ChoiceDefinition,
     DecisionActionConfig, DecisionConfig, DefinitionShape, GlobalsConfig, HumanActionConfig,
     HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter, ParamType,
-    RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion, ScriptActionConfig, State,
-    StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig, WorkflowDefinition,
-    WorkspaceAccess, EXIT_LABEL,
+    ProfileActionConfig, RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion,
+    ScriptActionConfig, State, StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig,
+    WorkflowDefinition, WorkspaceAccess, EXIT_LABEL,
 };
 
 use super::schema::{
@@ -410,8 +410,9 @@ fn compile_state(
     };
 
     // A `v1` agent on a workflow with no repository has no section to carry
-    // its access, so the action keeps it.
-    let keeps_v1_access = workspace.is_none();
+    // its access, so the action keeps it; a `profile` step without one reads
+    // only.
+    let without_section = workspace.is_none();
 
     let (choices, transitions) = compile_exits(state.choices, state.exit, state.transitions);
 
@@ -421,7 +422,7 @@ fn compile_state(
         description: state.description,
         action: state
             .action
-            .map(|action| compile_action(action, keeps_v1_access)),
+            .map(|action| compile_action(action, without_section)),
         variables: state.variables.into_iter().map(compile_variable).collect(),
         artifacts: state
             .artifacts
@@ -501,28 +502,19 @@ fn non_blank(text: Option<String>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
+fn compile_action(action: ActionSchema, without_section: bool) -> ActionConfig {
     match action {
-        ActionSchema::Agent(agent) => ActionConfig::Agent(AgentActionConfig {
-            harness: agent.harness,
-            permission_grants: Vec::new(),
-            model: agent.model,
-            effort: agent.effort,
-            ceiling: agent.ceiling,
-            plan: agent.plan,
-            workspace_access: if keep_v1_access {
-                agent.workspace_access
-            } else {
-                None
-            },
-            prompt: agent.prompt,
-            // The YAML contract has no per-action workspace (§6 lists it as a
-            // future extension), so this stays unset.
-            workspace: None,
-            parameters: agent.parameters,
-            read_only_paths: agent.read_only_paths,
-            history: agent.history,
-        }),
+        ActionSchema::Agent(agent) => {
+            let mut harness_step = agent.harness_step();
+            if !without_section {
+                harness_step.workspace_access = None;
+            }
+            ActionConfig::Agent(AgentActionConfig {
+                harness_step,
+                prompt: agent.prompt,
+                history: agent.history,
+            })
+        }
         ActionSchema::Script(script) => ActionConfig::Script(ScriptActionConfig {
             command: script.command,
             args: script.args,
@@ -550,6 +542,19 @@ fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
                 .collect(),
             input_schema: None,
         }),
+        ActionSchema::Profile(profile) => {
+            let mut harness_step = profile.harness_step();
+            // Profiling only reads (least privilege): without a `workspaces`
+            // section the step runs read-only; with one, the section decides
+            // when the action runs, as for an agent.
+            if without_section {
+                harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
+            }
+            ActionConfig::Profile(ProfileActionConfig {
+                harness_step,
+                prompt: profile.prompt,
+            })
+        }
         ActionSchema::Decision(decision) => ActionConfig::Decision(DecisionActionConfig {
             by: decision.by,
             message: decision.message,
@@ -720,7 +725,10 @@ terminal_states: [done]
         let Some(ActionConfig::Agent(agent)) = &definition.states["review"].action else {
             panic!("an agent action");
         };
-        assert_eq!(agent.workspace_access, Some(WorkspaceAccess::ReadOnly));
+        assert_eq!(
+            agent.harness_step.workspace_access,
+            Some(WorkspaceAccess::ReadOnly)
+        );
     }
 
     #[test]
@@ -857,7 +865,30 @@ terminal_states: [done]
     }
 
     #[test]
-    fn the_plan_flag_and_the_step_profile_reach_the_definition() {
+    fn a_plan_flag_on_an_agent_step_is_an_unknown_field() {
+        let error = load_from_str(
+            r#"
+schema: v2
+name: planned
+version: 1
+states:
+  plan:
+    action: { type: agent, prompt: x, plan: true }
+    exit: { next: done }
+  done:
+    description: end
+terminal_states:
+  done: completed
+"#,
+        )
+        .expect_err("`plan` is no longer a field of an agent step");
+
+        let message = error.to_string();
+        assert!(message.contains("unknown field `plan`"), "{message}");
+    }
+
+    #[test]
+    fn the_step_profile_reaches_the_definition() {
         let definition = load_from_str(
             r#"
 schema: v2
@@ -865,7 +896,7 @@ name: profiled
 version: 1
 states:
   plan:
-    action: { type: agent, prompt: x, plan: true, model: medium, effort: low, ceiling: { model: large, effort: high } }
+    action: { type: agent, prompt: x, model: medium, effort: low, ceiling: { model: large, effort: high } }
     choices: [success]
     transitions: { success: work }
   work:
@@ -882,18 +913,16 @@ terminal_states: [done]
         let Some(ActionConfig::Agent(plan)) = &definition.states["plan"].action else {
             panic!("an agent step");
         };
-        assert!(plan.plan);
-        assert_eq!(plan.model.as_deref(), Some("medium"));
-        assert_eq!(plan.effort.as_deref(), Some("low"));
+        assert_eq!(plan.harness_step.model.as_deref(), Some("medium"));
+        assert_eq!(plan.harness_step.effort.as_deref(), Some("low"));
         assert_eq!(
-            plan.ceiling.as_ref().unwrap().model.as_deref(),
+            plan.harness_step.ceiling.as_ref().unwrap().model.as_deref(),
             Some("large")
         );
         let Some(ActionConfig::Agent(work)) = &definition.states["work"].action else {
             panic!("an agent step");
         };
-        assert!(!work.plan);
-        assert!(work.model.is_none() && work.ceiling.is_none());
+        assert!(work.harness_step.model.is_none() && work.harness_step.ceiling.is_none());
     }
 
     #[test]
@@ -924,7 +953,7 @@ terminal_states: [done]
         .expect("the workflow loads");
 
         let agent = |id: &str| match &definition.states[id].action {
-            Some(ActionConfig::Agent(agent)) => agent.clone(),
+            Some(ActionConfig::Agent(agent)) => agent.harness_step.clone(),
             _ => panic!("an agent step"),
         };
         let plain = agent("plain");

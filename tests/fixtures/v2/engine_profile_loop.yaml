@@ -1,0 +1,52 @@
+# A `profile` step in a loop: `work` may send the task back to it, and the
+# profile it writes then applies at the next entry into `work` (F3).
+# `review` takes the globals' defaults.
+schema: v2
+name: engine-profile-loop
+version: 1
+
+globals:
+  default_model: medium
+  default_effort: medium
+
+states:
+  profile:
+    description: Choose a model and an effort for the steps after it.
+    action:
+      type: profile
+      model: small
+      effort: low
+      prompt: Judge how hard each step is.
+    exit:
+      next: work
+
+  work:
+    action:
+      type: agent
+      model: medium
+      effort: low
+      ceiling: { model: large, effort: high }
+      prompt: Do it.
+    retry_policy:
+      max_attempts: 5
+      backoff: 0s
+    choices:
+      again:
+        description: Profile the steps again.
+        next: profile
+      ready:
+        description: The work is done.
+        next: review
+
+  review:
+    action:
+      type: agent
+      prompt: Review it.
+    exit:
+      next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

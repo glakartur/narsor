@@ -18,8 +18,8 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use crate::domain::{
-    DecisionMaker, PromptText, SchemaVersion, SetDefinition, VariableScope, VariableSource,
-    VariableType, EXIT_LABEL, LOCAL_VARIABLE_PREFIX,
+    DecisionMaker, HarnessStepConfig, PromptText, SchemaVersion, SetDefinition, VariableScope,
+    VariableSource, VariableType, EXIT_LABEL, LOCAL_VARIABLE_PREFIX,
 };
 
 /// The whole workflow file (`docs/dev/workflow-schema.md` §2).
@@ -179,12 +179,15 @@ impl TryFrom<RawWorkflowFile> for WorkflowFile {
         }
         if shape == StateShape::Unified {
             check_unified_file(&states, &raw.terminal_states)?;
-        } else if let Some((id, _)) = states
-            .iter()
-            .find(|(_, state)| matches!(state.action, Some(ActionSchema::Decision(_))))
+        } else if let Some((id, action_type)) =
+            states.iter().find_map(|(id, state)| match state.action {
+                Some(ActionSchema::Decision(_)) => Some((id, "decision")),
+                Some(ActionSchema::Profile(_)) => Some((id, "profile")),
+                _ => None,
+            })
         {
             return Err(format!(
-                "'states.{id}.action.type' is 'decision', which needs a 'schema: v2' file \
+                "'states.{id}.action.type' is '{action_type}', which needs a 'schema: v2' file \
                  in the unified state shape"
             ));
         }
@@ -1153,6 +1156,8 @@ pub enum ActionSchema {
     Wait(WaitActionSchema),
     /// Unified shape only.
     Decision(DecisionActionSchema),
+    /// Unified shape only.
+    Profile(ProfileActionSchema),
 }
 
 /// `type: decision`: a fork someone other than the step decides.
@@ -1185,14 +1190,9 @@ pub struct AgentActionSchema {
     #[serde(default)]
     pub effort: Option<String>,
 
-    /// The most the conductor or an escalation may raise the step to.
+    /// The most a `profile` step or an escalation may raise the step to.
     #[serde(default)]
     pub ceiling: Option<crate::domain::StepCeiling>,
-
-    /// Marks the plan step: after it succeeds the conductor profiles the
-    /// steps that have not started.
-    #[serde(default)]
-    pub plan: bool,
 
     /// Workspace permission, translated to native harness permissions at run
     /// time. Omission leaves the harness's own configuration in effect.
@@ -1216,6 +1216,99 @@ pub struct AgentActionSchema {
 
 fn default_history() -> bool {
     true
+}
+
+impl AgentActionSchema {
+    /// The harness session settings the step declares, before `globals` fill
+    /// what it leaves out. Only an agent step can be pinned: it marks a step
+    /// that sets both its own model and effort.
+    pub fn harness_step(&self) -> HarnessStepConfig {
+        HarnessStepConfig {
+            workspace_access: self.workspace_access,
+            own_model_and_effort: self.model.is_some() && self.effort.is_some(),
+            ..declared_harness_step(
+                &self.harness,
+                &self.model,
+                &self.effort,
+                &self.ceiling,
+                &self.parameters,
+                &self.read_only_paths,
+            )
+        }
+    }
+}
+
+/// The harness fields an `agent` and a `profile` step share. The YAML
+/// contract has no per-action workspace (§6 lists it as a future extension)
+/// and no permission grants, so both stay unset, as does the access each
+/// step decides on its own.
+fn declared_harness_step(
+    harness: &Option<String>,
+    model: &Option<String>,
+    effort: &Option<String>,
+    ceiling: &Option<crate::domain::StepCeiling>,
+    parameters: &HashMap<String, serde_json::Value>,
+    read_only_paths: &[String],
+) -> HarnessStepConfig {
+    HarnessStepConfig {
+        harness: harness.clone(),
+        model: model.clone(),
+        effort: effort.clone(),
+        ceiling: ceiling.clone(),
+        parameters: parameters.clone(),
+        read_only_paths: read_only_paths.to_vec(),
+        ..HarnessStepConfig::default()
+    }
+}
+
+/// `type: profile`: an agent that proposes a model and an effort for the
+/// workflow's `agent` steps. It shares the harness fields of `type: agent`
+/// but has no `plan` and no `history`, and no `workspace_access`: what the
+/// step may touch comes from its `workspaces` section, read-only without one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileActionSchema {
+    /// Optional, as on an agent action.
+    #[serde(default)]
+    pub harness: Option<String>,
+
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Default effort: `low`, `medium`, `high` or `max`.
+    #[serde(default)]
+    pub effort: Option<String>,
+
+    /// The most an escalation may raise the step to.
+    #[serde(default)]
+    pub ceiling: Option<crate::domain::StepCeiling>,
+
+    /// Where the agent finds what the work is about; the engine adds the
+    /// steps to profile and the allowed values.
+    pub prompt: PromptText,
+
+    #[serde(default)]
+    pub parameters: HashMap<String, serde_json::Value>,
+
+    /// Extra folders mounted read-only, relative to the workspace.
+    #[serde(default)]
+    pub read_only_paths: Vec<String>,
+}
+
+impl ProfileActionSchema {
+    /// The harness session settings the step declares, before `globals`
+    /// fill what it leaves out. Access is decided by the loader, which sees
+    /// the step's `workspaces` section.
+    pub fn harness_step(&self) -> HarnessStepConfig {
+        declared_harness_step(
+            &self.harness,
+            &self.model,
+            &self.effort,
+            &self.ceiling,
+            &self.parameters,
+            &self.read_only_paths,
+        )
+    }
 }
 
 /// `type: script` (§3.3.B).

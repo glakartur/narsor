@@ -22,10 +22,21 @@ globals:
 #   globals:
 #     default_model: medium                       # for a step that names none
 #     default_effort: medium
-#     ceiling: { model: large, effort: high }     # the most the conductor or an escalation may set
+#     ceiling: { model: large, effort: high }     # the most a `profile` step or an escalation may set
 #   states:
 #     plan:
-#       action: { type: agent, plan: true, prompt: "..." }
+#       action: { type: agent, prompt: "..." }
+#       exit: { next: profile }
+#     profile:                                    # an agent chooses the model and effort
+#       action:                                   # of the later agent steps
+#         type: profile
+#         model: small
+#         effort: low
+#         prompt: |                               # the engine adds the steps, tiers and defaults
+#           Judge how hard each step is from the plan:
+#
+#           {{ steps.plan.reply }}
+#       exit: { next: work }                      # one exit, no choices; read-only by default
 #     work:
 #       action:
 #         type: agent
@@ -34,7 +45,9 @@ globals:
 #         prompt: "..."
 #
 # A step with a ceiling needs a model and an effort, and the ceiling needs both too,
-# whether the step or `globals` gives them.
+# whether the step or `globals` gives them. The `profile` step stays inside the
+# ceiling; a step that names its own model and effort and has no ceiling is pinned,
+# and the `profile` step does not change it.
 
 states:
   demonstrate:

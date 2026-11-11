@@ -235,7 +235,7 @@ impl ConversationSink {
     }
 
     /// Convenience for a narsor-authored entry (the prompt, the outcome).
-    pub(super) fn append_narsor(&self, text: &str, elements: &[ChatElement]) {
+    pub(crate) fn append_narsor(&self, text: &str, elements: &[ChatElement]) {
         self.append(ConversationSource::Narsor, text.as_bytes(), elements, None);
     }
 

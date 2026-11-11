@@ -557,6 +557,72 @@ mod tests {
         }
     }
 
+    /// The Narsor entry a `profile` step leaves in its conversation, shaped
+    /// as the engine writes it: the report as the raw text, one technical
+    /// process element with the summary and the structured outcome.
+    fn step_profile_entry() -> ConversationEntryDto {
+        let report = "Step profile: 1 stored, 0 skipped.\n- `work`: stored model `large`, \
+                      effort `high` (asked model `huge`, effort `max`); clamped to the \
+                      ceiling. Rationale: a wide refactor";
+        let mut entry = entry(
+            4,
+            report,
+            vec![ChatElement::Technical {
+                category: TechnicalCategory::Process,
+                summary: "Step profile: 1 stored, 0 skipped".into(),
+                data: Some(json!({
+                    "event": "step_profile",
+                    "stored": 1,
+                    "skipped": 0,
+                    "steps": [{
+                        "step": "work",
+                        "requested": { "model": "huge", "effort": "max" },
+                        "stored": { "model": "large", "effort": "high" },
+                        "clamped": true,
+                        "notes": ["clamped to the ceiling"],
+                        "rationale": "a wide refactor"
+                    }]
+                })),
+            }],
+        );
+        entry.source = ConversationEntrySource::Narsor;
+        entry
+    }
+
+    #[test]
+    fn a_step_profile_entry_shows_the_request_the_clamp_and_the_rationale() {
+        let entries = transcript_entries(&step_profile_entry());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].presentation, TranscriptPresentation::System);
+        assert!(
+            entries[0].header.contains("Narsor"),
+            "{}",
+            entries[0].header
+        );
+        assert_eq!(
+            entries[0].rendered_lines,
+            ["process: Step profile: 1 stored, 0 skipped"]
+        );
+
+        let expanded = lines(entries.clone(), DisplayMode::Rendered, true).join("\n");
+        for expected in [
+            "\"requested\"",
+            "\"huge\"",
+            "\"max\"",
+            "\"clamped\": true",
+            "a wide refactor",
+        ] {
+            assert!(expanded.contains(expected), "{expected}: {expanded}");
+        }
+
+        let raw = lines(entries, DisplayMode::Raw, false).join("\n");
+        assert!(
+            raw.contains("asked model `huge`, effort `max`"),
+            "the report itself: {raw}"
+        );
+        assert!(raw.contains("Rationale: a wide refactor"), "{raw}");
+    }
+
     #[test]
     fn an_entry_without_elements_is_one_unclassified_event() {
         let events = classify(&entry(3, "legacy line", Vec::new()));

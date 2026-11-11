@@ -195,6 +195,7 @@ fn stopped_in_script_step(task: &TaskSummary) -> bool {
 fn step_kind_name(kind: StepKind) -> &'static str {
     match kind {
         StepKind::Agent => "agent",
+        StepKind::Profile => "profile",
         StepKind::Script => "skrypt",
         StepKind::Human => "człowiek",
         StepKind::Wait => "oczekiwanie",
@@ -874,6 +875,27 @@ mod tests {
         assert!(!offered(&running, TaskActionId::SelectStep).available);
         let queued = summary("queued", "queued", false);
         assert!(!offered(&queued, TaskActionId::SelectStep).available);
+    }
+
+    #[test]
+    fn a_profile_step_is_offered_with_its_kind() {
+        let mut task = summary("stopped", "paused", false);
+        task.steps = Some(vec![
+            step("profile", StepKind::Profile),
+            step("work", StepKind::Agent),
+        ]);
+
+        let select = offered(&task, TaskActionId::SelectStep);
+
+        let options: Vec<_> = select
+            .options
+            .iter()
+            .map(|option| (option.label.as_str(), option.description.as_deref()))
+            .collect();
+        assert_eq!(
+            options,
+            [("profile", Some("profile")), ("work", Some("agent"))]
+        );
     }
 
     #[test]

@@ -14,11 +14,11 @@ use narsor_protocol::controller::{UsageLimit, UsageStatus};
 use serde_json::Value;
 
 use crate::domain::ActionError;
-use crate::engine::actions::agent::conversation::{
+use crate::engine::actions::harness::HarnessStreamParser;
+use crate::engine::actions::session::conversation::{
     record_stdout_line, ConversationSink, UsageRelay,
 };
-use crate::engine::actions::agent::process::{FinishedRun, SpawnEnding};
-use crate::engine::actions::harness::HarnessStreamParser;
+use crate::engine::actions::session::process::{FinishedRun, SpawnEnding};
 use crate::engine::actions::ACTION_ID_ENV_VAR;
 
 #[allow(clippy::too_many_arguments)]
@@ -488,12 +488,12 @@ mod copilot_sdk_dispatch_tests {
         copilot_usage_limits, run_with_sdk_deadline, CopilotSdkBackend, CopilotSdkOutcome,
         CopilotSdkRequest, CopilotSdkResponse,
     };
-    use crate::engine::actions::agent::conversation::ConversationSink;
-    use crate::engine::actions::agent::process::{
-        run_harness_invocation, run_harness_invocation_with_sdk, SpawnEnding, FINAL_ANSWER_GRACE,
-    };
     use crate::engine::actions::answer::AnswerShape;
     use crate::engine::actions::harness::{GitHubCopilotAdapter, HarnessAdapter};
+    use crate::engine::actions::session::conversation::ConversationSink;
+    use crate::engine::actions::session::process::{
+        run_harness_invocation, run_harness_invocation_with_sdk, SpawnEnding, FINAL_ANSWER_GRACE,
+    };
     use base64::Engine;
     use chrono::Utc;
     use futures::future::BoxFuture;

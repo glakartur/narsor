@@ -1,5 +1,5 @@
-# A plan step, then steps the conductor may profile: a script (never
-# profiled), `work` (with a ceiling, and retries) and `review` (no ceiling).
+# An agent step, a script, `work` (with a ceiling, and retries) and `review`
+# (no ceiling): the steps run on their defaults and escalate on failures.
 schema: v2
 name: engine-step-profile
 version: 1
@@ -10,7 +10,6 @@ states:
   plan:
     action:
       type: agent
-      plan: true
       model: medium
       effort: medium
       prompt: Plan it.

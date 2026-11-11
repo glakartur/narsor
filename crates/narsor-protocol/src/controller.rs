@@ -424,33 +424,6 @@ pub struct ConductorView {
     pub proposals: Vec<ProposalView>,
     #[serde(default)]
     pub decisions: Vec<DecisionView>,
-    /// What the conductor chose for each step's model and effort, with the
-    /// reason. Read-only: an older server leaves it empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub profile: Vec<StepProfileView>,
-}
-
-/// The conductor's profile of one step, for the terminal interface.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StepProfileView {
-    pub step_id: String,
-    /// The plan unit, when the profile is per unit.
-    #[serde(default)]
-    pub unit: Option<String>,
-    /// What the step starts on.
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub effort: Option<String>,
-    /// Why, in the conductor's words.
-    #[serde(default)]
-    pub rationale: String,
-    /// The model the conductor asked for above the ceiling, if it did.
-    #[serde(default)]
-    pub requested_model: Option<String>,
-    /// The effort the conductor asked for above the ceiling, if it did.
-    #[serde(default)]
-    pub requested_effort: Option<String>,
 }
 
 impl ConductorView {
@@ -2095,6 +2068,9 @@ pub enum TaskActionId {
 #[serde(rename_all = "snake_case")]
 pub enum StepKind {
     Agent,
+    /// A step whose agent decides the model and effort of later steps. A
+    /// client that predates it reads it as [`StepKind::Unrecognized`].
+    Profile,
     Script,
     Human,
     Wait,
@@ -2102,6 +2078,22 @@ pub enum StepKind {
     Terminal,
     #[serde(other)]
     Unrecognized,
+}
+
+impl StepKind {
+    /// Whether the step runs an agent: an `agent` step, and a `profile`
+    /// step, whose agent profiles the others.
+    pub fn runs_agent(self) -> bool {
+        match self {
+            Self::Agent | Self::Profile => true,
+            Self::Script
+            | Self::Human
+            | Self::Wait
+            | Self::Decision
+            | Self::Terminal
+            | Self::Unrecognized => false,
+        }
+    }
 }
 
 /// One step of the workflow as the owner can choose it.
@@ -2267,6 +2259,39 @@ mod tests {
         TimelineResponse, ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType,
         WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowView, WorkspaceRequest,
     };
+
+    #[test]
+    fn a_profile_step_is_sent_as_profile_and_an_unknown_kind_falls_back() {
+        let profile = super::StepView {
+            id: "profile".to_string(),
+            label: "profile".to_string(),
+            kind: super::StepKind::Profile,
+        };
+        let value = serde_json::to_value(&profile).unwrap();
+        assert_eq!(value["kind"], "profile");
+        assert_eq!(
+            serde_json::from_value::<super::StepView>(value).unwrap(),
+            profile
+        );
+
+        // A client that predates a kind reads it as `Unrecognized`, the way a
+        // client older than `profile` reads a profile step.
+        let newer = serde_json::json!({ "id": "x", "label": "x", "kind": "a_kind_from_later" });
+        let step: super::StepView = serde_json::from_value(newer).unwrap();
+        assert_eq!(step.kind, super::StepKind::Unrecognized);
+    }
+
+    #[test]
+    fn a_conductor_view_with_the_removed_step_profile_still_decodes() {
+        let value = serde_json::json!({
+            "available": true,
+            "profile": [{ "step_id": "work", "unit": "1", "model": "large" }],
+        });
+
+        let view: super::ConductorView = serde_json::from_value(value).unwrap();
+
+        assert!(view.available);
+    }
 
     #[test]
     fn entry_limit_attention_kind_round_trips_and_unknown_kinds_fall_back() {

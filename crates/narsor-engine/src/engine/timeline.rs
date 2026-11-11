@@ -856,7 +856,7 @@ fn finalize(
     } else if draft.has_agent_event_missing_id {
         ConversationState::NoRecord
     } else if let Some(action_type) = &draft.action_type {
-        if action_type != "agent" {
+        if !matches!(action_type.as_str(), "agent" | "profile") {
             ConversationState::NotCreated {
                 reason: "this action does not use an agent conversation".to_string(),
             }

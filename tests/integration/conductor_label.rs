@@ -93,6 +93,7 @@ impl ActionExecutor for ScriptedAgent {
         self.calls.lock().unwrap().push(AgentCall {
             prompt: config.prompt.to_string(),
             resume_session: config
+                .harness_step
                 .parameters
                 .get("resume_session")
                 .and_then(Value::as_str)

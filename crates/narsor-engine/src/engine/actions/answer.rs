@@ -65,6 +65,10 @@ pub enum AnswerShape {
     /// The step has one `exit`: any object is the answer, and it needs no
     /// `choice` — the step's only label is [`EXIT_LABEL`].
     Exit,
+    /// The step is a `profile` step: the answer is an object with an array
+    /// under [`PROFILE_ENTRIES_KEY`], and the step's only label is
+    /// [`EXIT_LABEL`]. It has no question to ask.
+    Profile,
 }
 
 impl AnswerShape {
@@ -76,6 +80,55 @@ impl AnswerShape {
             Self::Choice
         }
     }
+
+    /// Whether a step of this shape may ask a person a question
+    /// (`awaiting_input`) instead of answering. A `profile` step asks
+    /// nobody: only its entries end it.
+    pub fn may_ask(self) -> bool {
+        match self {
+            Self::Choice | Self::Exit => true,
+            Self::Profile => false,
+        }
+    }
+
+    /// Whether `object` is an answer of this shape at all: a question or a
+    /// string `choice`; any object in a step with an `exit`; an object with
+    /// its entries in a `profile` step. Whether its fields are usable is
+    /// decided when it is read.
+    pub fn accepts(self, object: &Map<String, Value>) -> bool {
+        match self {
+            Self::Choice => is_question(object) || has_choice(object),
+            Self::Exit => true,
+            Self::Profile => has_profile_entries(object),
+        }
+    }
+
+    /// The answer among `objects`: the last one this shape accepts, because
+    /// an agent that restates its answer restates it at the end.
+    pub fn last_answer(self, objects: &[Value]) -> Option<&Map<String, Value>> {
+        objects
+            .iter()
+            .rev()
+            .filter_map(Value::as_object)
+            .find(|object| self.accepts(object))
+    }
+}
+
+/// The `status` of an answer that asks a person before the task continues.
+pub const AWAITING_INPUT: &str = "awaiting_input";
+
+/// Whether `object` asks a person before the task continues.
+pub fn is_question(object: &Map<String, Value>) -> bool {
+    object.get("status").and_then(Value::as_str) == Some(AWAITING_INPUT)
+}
+
+/// The key of the entries a `profile` step answers with.
+pub const PROFILE_ENTRIES_KEY: &str = "entries";
+
+/// Whether `object` carries an array of profile entries, which makes it the
+/// answer of a `profile` step.
+fn has_profile_entries(object: &Map<String, Value>) -> bool {
+    object.get(PROFILE_ENTRIES_KEY).is_some_and(Value::is_array)
 }
 
 /// Whether `object` carries a string `choice`, which makes it an answer.
@@ -109,6 +162,13 @@ pub fn read_answer(
                 .to_string();
             Some(answer_with(choice, object))
         }
+        AnswerShape::Profile => has_profile_entries(object).then(|| {
+            Ok(ChoiceAnswer {
+                choice: EXIT_LABEL.to_string(),
+                reason: reason(object)?,
+                ..ChoiceAnswer::default()
+            })
+        }),
     }
 }
 

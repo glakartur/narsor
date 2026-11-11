@@ -160,8 +160,8 @@ An optional section defining default behavior for the whole workflow.
     the cheapest; they do not depend on the harness. Each harness maps a tier to a model name (in
     `engine/actions/harness`); a harness without a name for a tier stops the daemon at its start.
     The efforts are `low`, `medium`, `high` and `max`.
-*   `ceiling`: The general ceiling `{ model, effort }`: the most the conductor or an escalation may
-    set for a step. A step's own `ceiling` wins field by field. Loading copies the three values into
+*   `ceiling`: The general ceiling `{ model, effort }`: the most a `profile` step (§3.7.10) or an
+    escalation may set for a step. A step's own `ceiling` wins field by field. Loading copies the three values into
     every agent step, so a step holds its effective values. A step with a ceiling (its own or the
     general one) must have a model and an effort, and its ceiling must name both; the validator
     reports what is missing when the workflow loads.
@@ -437,14 +437,9 @@ action:
   effort: <low|medium|high|max>       # Default effort (optional). Passed as `--effort` to claude-code and as
                                       # `-c model_reasoning_effort=…` to codex (`max` becomes `xhigh`). opencode and
                                       # the Copilot harnesses ignore it; the timeline notes that.
-  ceiling:                            # Optional upper bound for what the conductor or an escalation may set.
+  ceiling:                            # Optional upper bound for what a `profile` step (§3.7.10) or an escalation may set.
     model: <small|medium|large|max>   #   not lower than the step's own `model`
     effort: <low|medium|high|max>     #   not lower than the step's own `effort`
-  plan: <bool>                        # Marks the plan step. When it succeeds, the conductor chooses the model and
-                                      # effort of the agent steps that have not started (shown in the TUI, read-only).
-                                      # The step may report `complexity` (an object with the optional fields `files`,
-                                      # `modules`, `migration_or_contract`, `missing_tests`, `unit_dependencies`)
-                                      # in a step variable of that name; the engine only passes it on.
   workspace_access: <read-write|read-only> # schema v1 only; read-write by default (v2: step `workspaces`, §3.2.1).
   prompt: |                           # Instruction for the agent
     Analyze the code in the current directory.
@@ -1123,6 +1118,72 @@ it. Picking one of the declared exits of the current state never needs the field
     a `human` action with `type: decision` and `by: human`, and its `inputs` with `variables`. Write
     `terminal_states` as a mapping.
 
+#### 3.7.10. Profile steps (`type: profile`)
+
+A profile step runs an agent that chooses the model and the effort of the workflow's `agent` steps.
+The author puts it where the workflow knows enough to judge the work, for example after the plan.
+The prompt says where the agent finds that information.
+
+```yaml
+profile:
+  action:
+    type: profile
+    model: small                 # optional, as on an agent action
+    effort: low                  # optional, as on an agent action
+    prompt: |                    # required, a prompt text (§3.7.6)
+      Judge how hard each step is from the plan:
+
+      {{ steps.plan.reply }}
+  exit:
+    next: build
+```
+
+*   The action takes the harness fields of an agent action: `harness`, `model`, `effort`, `ceiling`,
+    `parameters` and `read_only_paths`. The same rules apply to them (§3.3.A). The step may have its
+    own `ceiling` and its own escalation. It has no `history` and no `workspace_access`. Any
+    other field is an error.
+*   The step has `exit` and no `choices`. It does not define `variables` or `artifacts`.
+*   The step is read-only when it has no `workspaces` section. A `workspaces` section (§3.2.1)
+    gives it other access.
+*   A profile step is allowed only in the unified shape.
+*   The engine adds the list of the steps to profile, the allowed tiers and efforts and the
+    defaults of each step to the prompt. The author does not write them.
+*   Only `agent` steps are on that list. An agent step is not on the list (it is pinned) when its
+    action names both `model` and `effort` and it has no `ceiling`. Values from
+    `globals.default_model` and `globals.default_effort` do not count as the step's own values. A
+    ceiling from `globals.ceiling` counts as a ceiling, so such a step stays on the list.
+*   The agent ends with one JSON object: `{"entries": [{"step", "model", "effort", "rationale",
+    "confident"}], "reason"}`. It has no `choice`. The engine checks each entry. It skips an entry
+    for a step that is not on the list, a second entry for the same step (the first entry counts)
+    and an entry with `confident: false`. It checks the model and the effort separately: a value
+    outside the tiers or the efforts keeps the step's default, and the other value still counts. A
+    value above the `ceiling` is clamped to the `ceiling`. Without a `ceiling`, a value above the
+    default is clamped to the default. An entry that changes nothing is skipped.
+*   The engine writes the checked entries to `executions/{id}/step-profile.json` before the step
+    takes its transition. Each run replaces the whole file, also with an empty list. The step's
+    conversation gets one Narsor entry with the requested value, the stored value, the clamp and
+    the rationale of each entry. The step's reason gives the number of stored and skipped entries.
+*   The engine reads `step-profile.json` at each attempt of an `agent` or `profile` step. A step
+    with an entry starts on the model and the effort of the entry. A step without an entry starts
+    on its own values, or else on the `globals` values. An entry written after the first entry into
+    a step applies from the next attempt. The escalation after failed attempts starts from this
+    value. A new file does not change the count of failed attempts. When the engine cannot read the
+    file, the steps start on their defaults and the execution records one warning. An execution
+    started on an older version can hold a profile of the conductor (`conductor/profile.json`).
+    The engine ignores that file.
+*   A profile step fails like an agent step. A failed attempt, for example a time-out, follows
+    `retry_policy`. For an unusable answer the engine asks the agent again once, in the same
+    session. When that answer is also unusable, the attempt fails and `retry_policy` applies. When
+    no attempts are left, the step fails. The conductor does not choose a label for it.
+*   A workflow can have more than one profile step, and a profile step can run more than once.
+    Each run replaces the file, so the last run counts.
+*   The profile step replaces the `plan` field of an agent action and the profile that the
+    conductor made after the plan step. An agent action does not take `plan` now: a workflow file
+    with `plan:` does not load and the error names the unknown field `plan`. Remove the field and
+    add a profile step after the plan step. The definition that an execution pinned on an older
+    version (`executions/{id}/definition.yaml`) still loads: the engine removes `plan` from its
+    agent actions. Other unknown fields in it are still errors.
+
 ---
 
 ## 4. Example Workflow
@@ -1470,6 +1531,7 @@ Before a workflow is run, the definition must pass validation:
     *   `exit` is a reserved label and cannot be a key in `choices`. Every exit object has `next`.
     *   `terminal_states` is a mapping. There is no `human` action. A `decision` action is not allowed in a legacy file.
     *   A `decision` step has a non-blank `message` and at least one choice. It may define `variables`, not `artifacts`.
+    *   A `profile` step has a non-blank `prompt` and `exit`, never `choices`. It defines no `variables` and no `artifacts`. A `profile` action is not allowed in a legacy file (§3.7.10).
     *   A script step with `exit` cannot have `exit_codes`.
     *   In the unified shape only an agent or a script step can declare a `timeout` choice; a `decision` or `wait` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
     *   `resume_comment_field` on a decision step names a variable of `type: text`.
