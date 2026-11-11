@@ -503,7 +503,7 @@ impl Engine {
             (target, label)
         };
         let target_state = self.state_of(definition, &execution, &target)?;
-        if is_agent(target_state) && target_state.max_entries.is_some() {
+        if runs_harness(target_state) && target_state.max_entries.is_some() {
             count_entry(&mut execution, &target_state.id)?;
         }
         step_memory::count_step_entry(&mut execution, &target_state.id)?;

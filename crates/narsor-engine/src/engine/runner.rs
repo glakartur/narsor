@@ -127,6 +127,7 @@ use crate::workflow::{
 mod conductor_decision;
 mod failure;
 mod gate_context;
+mod harness_attempt;
 mod operations;
 mod rescue;
 mod step_memory;
@@ -136,6 +137,7 @@ use crate::domain::WorkspaceField;
 use gate_context::{
     decision_fields, has_step_contract, holds_variables_to_declarations, local_values, GateContext,
 };
+use harness_attempt::AttemptProfile;
 use variable_rules::{Assignment, RenderedSet};
 
 pub use failure::{
@@ -274,6 +276,50 @@ impl ActionKind {
             Self::Human => "human",
             Self::Wait => "wait",
             Self::Decision => "decision",
+        }
+    }
+
+    // The capabilities below each spell out every kind rather than catch
+    // the rest with `_`, so that a new action kind has to decide what it
+    // can do instead of inheriting it.
+
+    /// Whether the action runs an agent session on a harness: it gets the
+    /// step's history, a pinned harness, the step profile and a waiting
+    /// answer, keeps a session a later step or gate may resume, and counts
+    /// its entries against `max_entries`.
+    pub fn runs_harness(self) -> bool {
+        match self {
+            Self::Agent => true,
+            Self::Script | Self::Human | Self::Wait | Self::Decision => false,
+        }
+    }
+
+    /// Whether an answer that breaks the step contract — a label the state
+    /// does not declare, a value outside its `options` — is rejected and
+    /// asked for again (KTD7) rather than failing the action.
+    pub fn reprompts_rejected_output(self) -> bool {
+        match self {
+            Self::Agent => true,
+            Self::Script | Self::Human | Self::Wait | Self::Decision => false,
+        }
+    }
+
+    /// Whether the action answers with the step contract: a label, a
+    /// reason and variables a gate after it shows.
+    pub fn answers_with_step_contract(self) -> bool {
+        match self {
+            Self::Agent | Self::Script => true,
+            Self::Human | Self::Wait | Self::Decision => false,
+        }
+    }
+
+    /// Whether the variables its result gives are held to the step's
+    /// declarations: a step answering with the step contract, and a
+    /// decision, whose answer the conductor may give with variables.
+    pub fn holds_variables_to_declarations(self) -> bool {
+        match self {
+            Self::Agent | Self::Script | Self::Decision => true,
+            Self::Human | Self::Wait => false,
         }
     }
 }
@@ -1057,17 +1103,6 @@ pub struct Engine {
     workspace_values: Option<Arc<dyn WorkspaceValues>>,
 }
 
-/// What [`Engine::apply_step_profile`] needs to know about the attempt.
-#[derive(Clone, Copy)]
-struct AttemptProfile {
-    /// Failed attempts of the step in a row.
-    failures: u32,
-    /// Whether a rejected or escalated profile is recorded as an event. A
-    /// reprompt of a rejected attempt resolves the same profile again and
-    /// stays quiet: the attempt itself already recorded it.
-    announce: bool,
-}
-
 /// The ticket and title `{{ task.ticket }}` and `{{ task.title }}` render.
 ///
 /// The operator's values come from the sealed launch spec. The title the
@@ -1478,7 +1513,7 @@ impl Engine {
         let mut execution = WorkflowExecution::new(definition, inputs, workspace);
 
         if let Some(initial) = definition.states.get(&definition.initial_state) {
-            if is_agent(initial) && initial.max_entries.is_some() {
+            if runs_harness(initial) && initial.max_entries.is_some() {
                 count_entry(&mut execution, &initial.id)?;
             }
         }
@@ -2715,12 +2750,8 @@ impl Engine {
         let unreadable_memory = |error: EngineError| AttemptFailure::permanent(error.to_string());
         let kept_locals =
             step_memory::step_locals(execution, &state.id).map_err(unreadable_memory)?;
-        let history = match action {
-            ActionConfig::Agent(config) if config.history => {
-                step_memory::history_block(execution, &state.id).map_err(unreadable_memory)?
-            }
-            _ => String::new(),
-        };
+        let history =
+            harness_attempt::step_history(execution, state, action).map_err(unreadable_memory)?;
         let step_labels = step_memory::last_choice_labels(execution).map_err(unreadable_memory)?;
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
@@ -2764,38 +2795,21 @@ impl Engine {
         // explicit recovery. It remains durable until this point, so a daemon
         // restart before the attempt begins cannot silently discard it.
         let mut resumed_input = None;
-        let mut author = match action {
-            ActionConfig::Agent(template) if template.prompt.texts().any(embeds_user_content) => {
-                PromptAuthor::EngineUser
-            }
-            _ => PromptAuthor::Engine,
-        };
+        let mut author = harness_attempt::prompt_author_of(action);
         if let (ActionConfig::Agent(config), ActionConfig::Agent(template)) =
             (&mut rendered, action)
         {
-            // Before a resumed session replaces the prompt: a session that
-            // goes on already knows its history (KTD9).
-            step_memory::add_history(config, &template.prompt, &history);
-            self.pin_harness(config, pinned_harness);
-            self.apply_step_profile(execution, state, config, profile);
-            if let Some(input) = self.take_agent_input(execution, state)? {
-                if let (Some(harness), Some(session)) =
-                    (input.harness.as_deref(), input.session.as_deref())
-                {
-                    *config = agent::continuation_config(config, harness, session, &input.answer);
-                } else {
-                    config
-                        .prompt
-                        .push_str("\n\nHuman answer to your question:\n");
-                    config.prompt.push_str(&input.answer);
-                }
-                config.permission_grants = input.permission_rules.clone();
+            resumed_input = self.prepare_harness_attempt(
+                execution,
+                state,
+                template,
+                config,
+                &history,
+                pinned_harness,
+                profile,
+            )?;
+            if let Some(input) = &resumed_input {
                 author = input.author;
-                resumed_input = Some(input);
-            }
-            if let Some(note) = self.take_operator_recovery_note(execution)? {
-                config.prompt.push_str("\n\nOperator recovery note:\n");
-                config.prompt.push_str(&note);
             }
         }
 
@@ -2818,7 +2832,7 @@ impl Engine {
                 // A label the state does not declare is a format error of an
                 // agent, answered with a reprompt (KTD7); for any other action
                 // it stays the permanent failure `record_completion` reports.
-                if kind == ActionKind::Agent {
+                if kind.reprompts_rejected_output() {
                     if let Some(rejection) = OutputRejection::from_result(
                         state,
                         action_execution_id,
@@ -2885,144 +2899,6 @@ impl Engine {
                 }
             },
         }
-    }
-
-    /// Sets the model and effort of a rendered agent `config` from the three
-    /// sources — the step's default, the conductor's profile, an escalation —
-    /// through [`step_profile::resolve`]. A step with none of them keeps the
-    /// arguments it always had.
-    fn apply_step_profile(
-        &self,
-        execution: &WorkflowExecution,
-        state: &State,
-        config: &mut AgentActionConfig,
-        attempt: AttemptProfile,
-    ) {
-        let default = Setting::default_of(config);
-        let ceiling = Setting::ceiling_of(config);
-        // A damaged or missing profile is "no profile" (R8).
-        let stored = ConductorStore::new(self.store.paths(), &execution.id)
-            .load_profile()
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "damaged step profile; running on the defaults");
-                Default::default()
-            });
-        // A profile decided after the step's first attempt is not used (D7).
-        let first_entry = first_entry_at(execution, &state.id);
-        let conductor = stored
-            .lookup(&state.id, None)
-            .filter(|entry| first_entry.is_none_or(|first| entry.decided_at <= first))
-            .map(|entry| entry.setting.clone());
-        if conductor.is_none() && ceiling.is_none() {
-            return;
-        }
-        let resolved = step_profile::resolve(ProfileInput {
-            default: &default,
-            ceiling: ceiling.as_ref(),
-            conductor: conductor.as_ref(),
-            failures: attempt.failures,
-            threshold: self.escalation_threshold,
-        });
-        if resolved.rejected && attempt.announce {
-            self.note_step_profile(
-                execution,
-                state,
-                "the conductor's profile named a model or effort that cannot be used; \
-                 the step's default stays",
-                &default,
-                &resolved.setting,
-            );
-        }
-        if !attempt.announce {
-            // Nothing more to record.
-        } else if resolved.source == step_profile::ProfileSource::Escalated {
-            self.note_step_profile(
-                execution,
-                state,
-                "the step failed repeatedly; its model or effort is raised",
-                &default,
-                &resolved.setting,
-            );
-        } else if resolved.limit_reached {
-            self.note_step_profile(
-                execution,
-                state,
-                "the step failed repeatedly and already runs on its ceiling",
-                &default,
-                &resolved.setting,
-            );
-        }
-        config.model = resolved.setting.model;
-        config.effort = resolved.setting.effort;
-    }
-
-    /// `template` with the conductor's profile applied, for a reprompt that
-    /// resumes a session: the reprompt runs on the model and effort of the
-    /// attempt it repairs, not on the workflow's default. An escalation is
-    /// not carried over — the count of failed attempts is not kept with the
-    /// rejection.
-    pub(super) fn profiled_template(
-        &self,
-        execution: &WorkflowExecution,
-        state: &State,
-        template: &AgentActionConfig,
-    ) -> AgentActionConfig {
-        let mut config = template.clone();
-        self.apply_step_profile(
-            execution,
-            state,
-            &mut config,
-            AttemptProfile {
-                failures: 0,
-                announce: false,
-            },
-        );
-        config
-    }
-
-    /// Records a profile decision as an event, best-effort.
-    fn note_step_profile(
-        &self,
-        execution: &WorkflowExecution,
-        state: &State,
-        message: &str,
-        from: &Setting,
-        to: &Setting,
-    ) {
-        if let Err(error) = self.emit(
-            &execution.id,
-            EventData::Error {
-                message: format!("Step '{}': {message}", state.id),
-                context: json!({
-                    "step_profile": { "step": state.id, "from": from, "to": to },
-                }),
-            },
-        ) {
-            tracing::warn!(%error, "could not record a step profile decision");
-        }
-    }
-
-    /// Writes the action's default harness into a rendered agent `config`
-    /// that names none (R16a, R16b).
-    ///
-    /// The default is read from the engine's source once, at the action's
-    /// first attempt, and kept in `pinned` for the rest: a default changed
-    /// while the action runs reaches the next action, never a retry of this
-    /// one. A harness the workflow names — templated ones included, since
-    /// `config` is already rendered — always wins. An action continuing a
-    /// session of its own (`resume_session`) is left alone: the executor
-    /// refuses it without an explicit harness, and a default cannot say
-    /// which harness that session belongs to.
-    fn pin_harness(&self, config: &mut AgentActionConfig, pinned: &mut Option<String>) {
-        if config.harness.is_some()
-            || config
-                .parameters
-                .contains_key(agent::RESUME_SESSION_PARAMETER)
-        {
-            return;
-        }
-        let harness = pinned.get_or_insert_with(|| self.default_harness.current_harness());
-        config.harness = Some(harness.clone());
     }
 
     /// Hands an already rendered action to its executor and closes the
@@ -3550,7 +3426,11 @@ impl Engine {
         let warnings = set_aside_undeclared_variables(state, &mut result);
         // A script cannot be asked again, so a value outside the declared
         // `options` ends its step; an agent was asked again before this.
-        if holds_variables_to_declarations(state) && !is_agent(state) {
+        let reprompts = state
+            .action
+            .as_ref()
+            .is_some_and(|action| ActionKind::of(action).reprompts_rejected_output());
+        if holds_variables_to_declarations(state) && !reprompts {
             if let Some(problem) = variable_rules::value_outside_options(state, &result.variables) {
                 self.fail_action(execution, &action_execution_id, problem)?;
                 return Ok(None);
@@ -3575,7 +3455,7 @@ impl Engine {
             result,
             artifacts,
         };
-        if is_agent(state) {
+        if runs_harness(state) {
             if let Some(provenance) = agent_session_provenance(&pending) {
                 let mut sessions: BTreeMap<String, AgentSessionProvenance> =
                     read_engine_record(execution, METADATA_AGENT_SESSIONS_KEY)?.unwrap_or_default();
@@ -3597,7 +3477,7 @@ impl Engine {
         state: &State,
         pending: PendingStep,
     ) -> Result<Flow, EngineError> {
-        if is_agent(state)
+        if runs_harness(state)
             && state.choices.iter().any(|output| {
                 output.label == pending.result.output_label && output.requires_human_approval
             })
@@ -3840,7 +3720,7 @@ impl Engine {
             .states
             .get(execution.current_state.as_deref().expect("target was set"))
             .expect("validated transition target exists");
-        if is_agent(target_state) && !continues_target_session {
+        if runs_harness(target_state) && !continues_target_session {
             if let Some(max_entries) = target_state.max_entries {
                 let entries = state_entry_count(execution, &target_state.id)?;
                 if entries >= max_entries {
@@ -4369,29 +4249,6 @@ impl Engine {
         clear_engine_metadata(execution, METADATA_PENDING_STEP_KEY);
     }
 
-    /// Removes and persists the note destined for the next agent attempt.
-    fn take_operator_recovery_note(
-        &self,
-        execution: &mut WorkflowExecution,
-    ) -> Result<Option<String>, AttemptFailure> {
-        let Some(engine) = execution
-            .metadata
-            .get_mut(METADATA_ENGINE_KEY)
-            .and_then(Value::as_object_mut)
-        else {
-            return Ok(None);
-        };
-        let note = engine
-            .remove(METADATA_OPERATOR_RECOVERY_NOTE_KEY)
-            .and_then(|value| value.as_str().map(ToString::to_string));
-        if note.is_some() {
-            self.store
-                .save_execution(execution)
-                .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
-        }
-        Ok(note)
-    }
-
     /// Stores an answer for one agent state needing input. It lives in engine metadata
     /// rather than workflow context: it is transient control data, not a
     /// variable a later workflow step should inherit.
@@ -4418,71 +4275,6 @@ impl Engine {
         );
         self.store.save_execution(execution)?;
         Ok(())
-    }
-
-    /// Consumes only an answer for the state currently executing. A mismatched
-    /// stale record is retained instead of leaking an answer into another
-    /// state after a manual transition.
-    fn take_agent_input(
-        &self,
-        execution: &mut WorkflowExecution,
-        state: &State,
-    ) -> Result<Option<AgentInput>, AttemptFailure> {
-        let Some(engine) = execution
-            .metadata
-            .get_mut("engine")
-            .and_then(Value::as_object_mut)
-        else {
-            return Ok(None);
-        };
-        let Some(record) = engine
-            .get(METADATA_AGENT_INPUT_KEY)
-            .and_then(Value::as_object)
-        else {
-            return Ok(None);
-        };
-        if record.get("state_id").and_then(Value::as_str) != Some(state.id.as_str()) {
-            return Ok(None);
-        }
-        let answer = record
-            .get("answer")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let input = answer.map(|answer| AgentInput {
-            answer,
-            harness: record
-                .get("harness")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            session: record
-                .get("session")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            author: record
-                .get("author")
-                .and_then(|author| serde_json::from_value(author.clone()).ok())
-                .unwrap_or(PromptAuthor::User),
-            // A record of an earlier version holds one rule.
-            permission_rules: match record.get("permission_rules") {
-                Some(Value::Array(rules)) => rules
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToString::to_string)
-                    .collect(),
-                _ => record
-                    .get("permission_rule")
-                    .and_then(Value::as_str)
-                    .map(|rule| vec![rule.to_string()])
-                    .unwrap_or_default(),
-            },
-        });
-        if input.is_some() {
-            engine.remove(METADATA_AGENT_INPUT_KEY);
-            self.store
-                .save_execution(execution)
-                .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
-        }
-        Ok(input)
     }
 
     /// Consumes a pending pause request, if there is one.
@@ -4838,18 +4630,6 @@ pub(crate) fn started_states(
         .collect())
 }
 
-/// When `state_id` was first entered, if it was.
-fn first_entry_at(
-    execution: &WorkflowExecution,
-    state_id: &str,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
-        read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)
-            .ok()
-            .flatten()?;
-    firsts.get(state_id).copied()
-}
-
 /// The entry counts of `execution` (R10), as a decision saves them for an
 /// undo to restore.
 fn state_entries_value(execution: &WorkflowExecution) -> Result<Value, EngineError> {
@@ -4939,9 +4719,12 @@ fn output_requirements(
         .collect()
 }
 
-/// Whether `state` runs an agent.
-fn is_agent(state: &State) -> bool {
-    matches!(state.action, Some(ActionConfig::Agent(_)))
+/// Whether `state` runs an action on a harness ([`ActionKind::runs_harness`]).
+fn runs_harness(state: &State) -> bool {
+    state
+        .action
+        .as_ref()
+        .is_some_and(|action| ActionKind::of(action).runs_harness())
 }
 
 fn agent_session_provenance(pending: &PendingStep) -> Option<AgentSessionProvenance> {
@@ -5039,7 +4822,7 @@ pub fn record_manual_transition(
                 &kept_locals,
             )
         }
-        None if is_agent(from) => pending_input
+        None if runs_harness(from) => pending_input
             .filter(|input| input.state_id == from.id)
             .and_then(|input| agent_input_record(from, to, input)),
         None => None,
@@ -5112,7 +4895,7 @@ fn step_templates(action: &ActionConfig) -> Vec<String> {
         ActionConfig::Agent(config) => config.prompt.template_pieces(),
         ActionConfig::Human(config) => vec![config.instruction.clone()],
         ActionConfig::Decision(config) => config.message.template_pieces(),
-        _ => Vec::new(),
+        ActionConfig::Script(_) | ActionConfig::Wait(_) => Vec::new(),
     }
 }
 
@@ -5218,5 +5001,59 @@ mod tests {
             terminal_status(&terminal("rejected_by_reviewer", None)),
             ExecutionStatus::Completed
         );
+    }
+
+    /// Every action kind, with what the runner checked before it asked the
+    /// kind's capabilities: `kind == Agent`, `is_agent`, `has_step_contract`
+    /// and `holds_variables_to_declarations` as they were.
+    const KINDS: [ActionKind; 5] = [
+        ActionKind::Agent,
+        ActionKind::Script,
+        ActionKind::Human,
+        ActionKind::Wait,
+        ActionKind::Decision,
+    ];
+
+    #[test]
+    fn only_an_agent_runs_on_a_harness() {
+        for kind in KINDS {
+            assert_eq!(kind.runs_harness(), kind == ActionKind::Agent, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn only_an_agent_is_asked_again_for_a_rejected_output() {
+        for kind in KINDS {
+            assert_eq!(
+                kind.reprompts_rejected_output(),
+                kind == ActionKind::Agent,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_and_a_script_answer_with_the_step_contract() {
+        for kind in KINDS {
+            assert_eq!(
+                kind.answers_with_step_contract(),
+                matches!(kind, ActionKind::Agent | ActionKind::Script),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decision_is_held_to_its_declarations_too() {
+        for kind in KINDS {
+            assert_eq!(
+                kind.holds_variables_to_declarations(),
+                matches!(
+                    kind,
+                    ActionKind::Agent | ActionKind::Script | ActionKind::Decision
+                ),
+                "{kind:?}"
+            );
+        }
     }
 }
