@@ -627,6 +627,23 @@ fn a_present_conversation_reads_as_recorded() {
     );
 }
 
+/// A `profile` step runs an agent session too: its conversation, with the
+/// step-profile report, reads as `Recorded` like an agent step's.
+#[test]
+fn a_profile_step_conversation_reads_as_recorded() {
+    let mut log = Log::new();
+    log.push(state_entered("profile"));
+    log.push(action_started("a1", "profile", "profile"));
+    log.push(action_completed("a1", "success"));
+
+    let timeline = build_timeline(&log.events, ExecutionStatus::Running, &presence(&["a1"]));
+
+    assert_eq!(
+        timeline.positions[0].conversation,
+        ConversationState::Recorded
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Sessions on a step
 // ---------------------------------------------------------------------------

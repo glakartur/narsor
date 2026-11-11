@@ -100,25 +100,10 @@ fn script_config(action: &ActionConfig) -> Result<&ScriptActionConfig, ActionErr
     match action {
         ActionConfig::Script(config) => Ok(config),
         other => Err(ActionError {
-            message: format!(
-                "ScriptExecutor received a {} action",
-                action_type_name(other)
-            ),
+            message: format!("ScriptExecutor received a {} action", other.type_name()),
             error_type: Some("wrong_action_type".to_string()),
             details: None,
         }),
-    }
-}
-
-/// The schema name of an action type, for error messages.
-fn action_type_name(action: &ActionConfig) -> &'static str {
-    match action {
-        ActionConfig::Agent(_) => "agent",
-        ActionConfig::Script(_) => "script",
-        ActionConfig::Human(_) => "human",
-        ActionConfig::Wait(_) => "wait",
-        ActionConfig::Decision(_) => "decision",
-        ActionConfig::Profile(_) => "profile",
     }
 }
 

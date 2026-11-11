@@ -16,10 +16,10 @@
 //!   "entries": [
 //!     {
 //!       "step_id": "implement",
-//!       "model": "strong",
+//!       "model": "large",
 //!       "effort": "high",
 //!       "rationale": "Touches the scheduler and its locking.",
-//!       "requested_model": "strongest",
+//!       "requested_model": "max",
 //!       "requested_effort": "high",
 //!       "profiled_by": "profile",
 //!       "decided_at": "2026-11-11T10:00:00Z"

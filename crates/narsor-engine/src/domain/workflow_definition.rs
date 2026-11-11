@@ -502,6 +502,18 @@ pub enum ActionConfig {
 }
 
 impl ActionConfig {
+    /// The name of this action type in the YAML contract and in events.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Agent(_) => "agent",
+            Self::Script(_) => "script",
+            Self::Human(_) => "human",
+            Self::Wait(_) => "wait",
+            Self::Decision(_) => "decision",
+            Self::Profile(_) => "profile",
+        }
+    }
+
     /// The harness session settings of a step that runs a harness, `None`
     /// for every other action.
     pub fn harness_step(&self) -> Option<&HarnessStepConfig> {

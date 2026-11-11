@@ -132,7 +132,7 @@ fn validate_step_contract(state: &State, errors: &mut Vec<ValidationError>) {
         _ if !defines_anything => {}
         other => errors.push(ValidationError::DefinitionsNotAllowed {
             state: state.id.clone(),
-            action_type: other.as_ref().map_or("terminal", action_type_name),
+            action_type: other.as_ref().map_or("terminal", ActionConfig::type_name),
         }),
     }
 
@@ -207,17 +207,6 @@ fn invalid_name(state: &State, kind: &'static str, name: &str) -> ValidationErro
         state: state.id.clone(),
         kind,
         name: name.to_string(),
-    }
-}
-
-fn action_type_name(action: &ActionConfig) -> &'static str {
-    match action {
-        ActionConfig::Agent(_) => "agent",
-        ActionConfig::Script(_) => "script",
-        ActionConfig::Human(_) => "human",
-        ActionConfig::Wait(_) => "wait",
-        ActionConfig::Decision(_) => "decision",
-        ActionConfig::Profile(_) => "profile",
     }
 }
 
