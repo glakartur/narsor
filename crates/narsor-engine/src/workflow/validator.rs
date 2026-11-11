@@ -28,6 +28,7 @@ use crate::domain::{
     VariableDefinition, VariableScope, VariableSource, VariableType, WorkflowDefinition,
     WorkspaceField, LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
+use crate::engine::step_profile::{effort_rank, tier_rank, EFFORT_SCALE, MODEL_TIERS};
 use crate::workspace::provisioner::is_usable_directory_name;
 
 use super::loader::{compile, LoadError};
@@ -59,6 +60,7 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_decision(state, &mut errors);
         validate_state_templates(definition, &declared, state, &mut errors);
         validate_state_image(state, &mut errors);
+        validate_step_profile(state, &mut errors);
         validate_step_workspace(definition, state, &mut errors);
     }
     validate_variable_consistency(definition, &mut errors);
@@ -844,6 +846,108 @@ fn validate_image(field: &str, image: &ImageSpec, errors: &mut Vec<ValidationErr
     }
 }
 
+/// The step profile fields, checked when the workflow loads (D8, D11).
+///
+/// `model` is a tier of [`MODEL_TIERS`] and `effort` a value of
+/// [`EFFORT_SCALE`]; so are the fields of `ceiling`, and a ceiling never sits
+/// below the step's own value. A step with a ceiling — its own or the general
+/// one, which loading has copied into the step already — must also have a
+/// model and an effort, and its ceiling must name both: the conductor and an
+/// escalation can then never meet a missing bound.
+fn validate_step_profile(state: &State, errors: &mut Vec<ValidationError>) {
+    let Some(ActionConfig::Agent(agent)) = &state.action else {
+        return;
+    };
+    let id = &state.id;
+    let mut invalid = |field: &str, reason: String| {
+        errors.push(ValidationError::InvalidGlobalsField {
+            field: format!("states.{id}.action.{field}"),
+            reason,
+        });
+    };
+    let tier = |value: &Option<String>, field: &str, bad: &mut dyn FnMut(&str, String)| {
+        let value = value.as_deref()?;
+        if value.contains("{{") {
+            return None;
+        }
+        let found = tier_rank(value);
+        if found.is_none() {
+            bad(
+                field,
+                format!("'{value}' is not one of {}", MODEL_TIERS.join(", ")),
+            );
+        }
+        found
+    };
+    let effort = |value: &Option<String>, field: &str, bad: &mut dyn FnMut(&str, String)| {
+        let value = value.as_deref()?;
+        let found = effort_rank(value);
+        if found.is_none() {
+            bad(
+                field,
+                format!("'{value}' is not one of {}", EFFORT_SCALE.join(", ")),
+            );
+        }
+        found
+    };
+    let default_model = tier(&agent.model, "model", &mut invalid);
+    let default_effort = effort(&agent.effort, "effort", &mut invalid);
+    if let Some(ceiling) = &agent.ceiling {
+        let cap_model = tier(&ceiling.model, "ceiling.model", &mut invalid);
+        let cap_effort = effort(&ceiling.effort, "ceiling.effort", &mut invalid);
+        if let (Some(default), Some(cap)) = (default_model, cap_model) {
+            if cap < default {
+                invalid(
+                    "ceiling.model",
+                    "is lower than the step's own model".to_string(),
+                );
+            }
+        }
+        if let (Some(default), Some(cap)) = (default_effort, cap_effort) {
+            if cap < default {
+                invalid(
+                    "ceiling.effort",
+                    "is lower than the step's own effort".to_string(),
+                );
+            }
+        }
+        // The step has a profile: both fields must be there, in the step
+        // (after `globals.default_model` and `default_effort`) and in the
+        // ceiling (after `globals.ceiling`).
+        if agent.model.is_none() {
+            invalid(
+                "model",
+                "a step with a ceiling needs a model: set it, or `globals.default_model`"
+                    .to_string(),
+            );
+        }
+        if agent.effort.is_none() {
+            invalid(
+                "effort",
+                "a step with a ceiling needs an effort: set it, or `globals.default_effort`"
+                    .to_string(),
+            );
+        }
+        if ceiling.model.is_none() && agent.model.is_some() {
+            invalid(
+                "ceiling.model",
+                "the ceiling needs a model: set it, or `globals.ceiling.model`".to_string(),
+            );
+        }
+        if ceiling.effort.is_none() && agent.effort.is_some() {
+            invalid(
+                "ceiling.effort",
+                "the ceiling needs an effort: set it, or `globals.ceiling.effort`".to_string(),
+            );
+        }
+    }
+    if let Some(effort) = &agent.effort {
+        if effort.contains("{{") {
+            invalid("effort", "cannot be templated".to_string());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Group 4: variable references
 // ---------------------------------------------------------------------------
@@ -1398,6 +1502,120 @@ globals:
     code: { primary: true, base_branch: main, repository: code-repo }
     docs: { base_branch: main, repository: docs-repo }
 "#;
+
+    const PROFILE_HEADER: &str = "schema: v2\nname: p\nversion: 1\n";
+
+    fn profile_errors(action: &str) -> Vec<ValidationError> {
+        let source = format!(
+            "{PROFILE_HEADER}states:\n  work:\n    action: {action}\n    choices: [success]\n    transitions: {{ success: done }}\n  done:\n    description: end\nterminal_states: [done]\n"
+        );
+        validate_source(&source).expect("the file must parse")
+    }
+
+    fn profile_field_rejected(errors: &[ValidationError], field: &str) -> bool {
+        errors.iter().any(|error| {
+            matches!(error, ValidationError::InvalidGlobalsField { field: f, .. } if f.ends_with(field))
+        })
+    }
+
+    #[test]
+    fn a_valid_profile_passes() {
+        let errors = profile_errors(
+            "{ type: agent, prompt: x, model: medium, effort: medium, ceiling: { model: large, effort: high } }",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidGlobalsField { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_effort_outside_the_scale_is_rejected() {
+        let errors = profile_errors("{ type: agent, prompt: x, effort: ultra }");
+        assert!(profile_field_rejected(&errors, "action.effort"));
+    }
+
+    #[test]
+    fn a_ceiling_below_the_default_is_rejected() {
+        let errors =
+            profile_errors("{ type: agent, prompt: x, effort: high, ceiling: { effort: low } }");
+        assert!(profile_field_rejected(&errors, "ceiling.effort"));
+    }
+
+    #[test]
+    fn a_ceiling_model_outside_the_tiers_is_rejected() {
+        let errors = profile_errors("{ type: agent, prompt: x, ceiling: { model: mystery } }");
+        assert!(profile_field_rejected(&errors, "ceiling.model"));
+    }
+
+    #[test]
+    fn a_ceiling_model_below_the_step_model_is_rejected() {
+        let errors =
+            profile_errors("{ type: agent, prompt: x, model: large, ceiling: { model: medium } }");
+        assert!(profile_field_rejected(&errors, "ceiling.model"));
+    }
+
+    #[test]
+    fn a_templated_effort_is_rejected() {
+        let errors = profile_errors("{ type: agent, prompt: x, effort: \"{{ vars.level }}\" }");
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidGlobalsField { field, reason, .. }
+                if field.ends_with("effort") && reason.contains("templated")
+        )));
+    }
+
+    #[test]
+    fn a_model_that_is_not_a_tier_is_rejected() {
+        let errors = profile_errors("{ type: agent, prompt: x, model: opus }");
+        assert!(profile_field_rejected(&errors, "action.model"));
+    }
+
+    #[test]
+    fn a_step_with_a_ceiling_needs_a_model_and_an_effort() {
+        let errors = profile_errors("{ type: agent, prompt: x, ceiling: { model: large } }");
+        assert!(profile_field_rejected(&errors, "action.model"));
+        assert!(profile_field_rejected(&errors, "action.effort"));
+    }
+
+    #[test]
+    fn a_ceiling_must_name_every_field_the_step_sets() {
+        let errors = profile_errors(
+            "{ type: agent, prompt: x, model: medium, effort: low, ceiling: { model: large } }",
+        );
+        assert!(profile_field_rejected(&errors, "ceiling.effort"));
+        assert!(!profile_field_rejected(&errors, "ceiling.model"));
+    }
+
+    #[test]
+    fn globals_supply_what_a_step_with_a_ceiling_needs() {
+        let source = "schema: v2\nname: p\nversion: 1\nglobals:\n  default_model: medium\n  default_effort: low\n  ceiling: { model: large, effort: high }\nstates:\n  work:\n    action: { type: agent, prompt: x }\n    choices: [success]\n    transitions: { success: done }\n  done:\n    description: end\nterminal_states: [done]\n";
+        let errors = validate_source(source).expect("the file must parse");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidGlobalsField { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_general_ceiling_without_a_default_model_and_effort_is_rejected() {
+        let source = "schema: v2\nname: p\nversion: 1\nglobals:\n  ceiling: { model: large, effort: high }\nstates:\n  work:\n    action: { type: agent, prompt: x }\n    choices: [success]\n    transitions: { success: done }\n  done:\n    description: end\nterminal_states: [done]\n";
+        let errors = validate_source(source).expect("the file must parse");
+        assert!(profile_field_rejected(&errors, "action.model"));
+        assert!(profile_field_rejected(&errors, "action.effort"));
+    }
+
+    #[test]
+    fn a_step_without_the_new_fields_is_unchanged() {
+        let errors = profile_errors("{ type: agent, prompt: x, model: medium }");
+        assert!(!errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidGlobalsField { .. })));
+    }
 
     fn workspace_errors(section: &str) -> Vec<ValidationError> {
         errors_of(REPOS, &format!("    workspaces: {section}\n"))

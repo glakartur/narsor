@@ -424,6 +424,33 @@ pub struct ConductorView {
     pub proposals: Vec<ProposalView>,
     #[serde(default)]
     pub decisions: Vec<DecisionView>,
+    /// What the conductor chose for each step's model and effort, with the
+    /// reason. Read-only: an older server leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile: Vec<StepProfileView>,
+}
+
+/// The conductor's profile of one step, for the terminal interface.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StepProfileView {
+    pub step_id: String,
+    /// The plan unit, when the profile is per unit.
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// What the step starts on.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Why, in the conductor's words.
+    #[serde(default)]
+    pub rationale: String,
+    /// The model the conductor asked for above the ceiling, if it did.
+    #[serde(default)]
+    pub requested_model: Option<String>,
+    /// The effort the conductor asked for above the ceiling, if it did.
+    #[serde(default)]
+    pub requested_effort: Option<String>,
 }
 
 impl ConductorView {

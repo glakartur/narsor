@@ -57,6 +57,7 @@ pub mod autopilot;
 pub mod chat;
 pub mod failure;
 pub mod invoke;
+pub mod profile;
 pub mod prompt;
 pub mod proposal;
 pub mod rescue;
@@ -77,7 +78,9 @@ pub use actor::{
 pub use autopilot::{Autopilot, CONDUCTOR_ANSWER_LIMIT};
 pub use chat::{annotation_of, ProposalContext, ProposalRecord};
 pub use failure::{active_failure_problem, agent_attempt_left_traces, PassLauncher};
-pub use invoke::{ConductorAccess, HarnessInvoker, LiveHarness, DEFAULT_CONDUCTOR_TIMEOUT};
+pub use invoke::{
+    ConductorAccess, ConductorProfile, HarnessInvoker, LiveHarness, DEFAULT_CONDUCTOR_TIMEOUT,
+};
 pub use proposal::{ConfirmedProposal, ProposalError, ProposalOutcome, ProposalStatus};
 pub use response::{
     allowed_decisions, proposals_allowed, ConductorResponse, Decision, DecisionKind, ProposalKind,

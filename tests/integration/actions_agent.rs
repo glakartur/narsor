@@ -392,6 +392,9 @@ fn agent_action(prompt: &str) -> AgentActionConfig {
         harness: Some("claude-code".to_string()),
         permission_grants: Vec::new(),
         model: None,
+        effort: None,
+        ceiling: None,
+        plan: false,
         workspace_access: Some(WorkspaceAccess::ReadWrite),
         prompt: prompt.into(),
         workspace: None,
@@ -1126,7 +1129,7 @@ async fn the_model_and_the_read_only_paths_reach_the_argv() {
     fake.answers(&envelope(r#"{"choice":"ready"}"#));
 
     let mut config = agent_action("look around");
-    config.model = Some("opus".to_string());
+    config.model = Some("large".to_string());
     config.read_only_paths = vec!["../other-repo/src".to_string()];
 
     complete(&executor(&fake), config, &root.workspace()).await;
@@ -1379,7 +1382,7 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
 
     let mut config = agent_action("look around");
     config.harness = Some("opencode".to_string());
-    config.model = Some("anthropic/claude-sonnet-4".to_string());
+    config.model = Some("medium".to_string());
     let result = complete(&executor, config, &root.workspace()).await;
 
     assert_eq!(result.output_label, "ready");
@@ -1392,12 +1395,123 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
     assert_eq!(args[0], "run");
     assert!(
         args.windows(2)
-            .any(|pair| pair[0] == "--model" && pair[1] == "anthropic/claude-sonnet-4"),
+            .any(|pair| pair[0] == "--model" && pair[1] == "anthropic/claude-sonnet-4-5"),
         "{args:?}"
     );
     assert!(args.contains(&"--auto".to_string()), "{args:?}");
     assert_eq!(args[args.len() - 3], "--format");
     assert_eq!(args[args.len() - 2], "json");
+}
+
+#[tokio::test]
+async fn the_effort_reaches_the_claude_argv_and_a_step_without_one_is_unchanged() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+
+    let mut config = agent_action("look around");
+    config.model = Some("large".to_string());
+    config.effort = Some("high".to_string());
+    complete(&executor(&fake), config, &root.workspace()).await;
+    let with_effort = fake.args(1);
+    assert!(
+        with_effort
+            .windows(2)
+            .any(|pair| pair == ["--effort", "high"]),
+        "{with_effort:?}"
+    );
+
+    let fake = FakeHarness::install(root.dir("bin2"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+    let mut config = agent_action("look around");
+    config.model = Some("large".to_string());
+    complete(&executor(&fake), config, &root.workspace()).await;
+    let without = fake.args(1);
+    assert!(
+        !without.iter().any(|arg| arg.contains("effort")),
+        "{without:?}"
+    );
+}
+
+/// The effort-ignored warnings a sink holds.
+fn effort_warnings(sink: &RecordingSink) -> Vec<String> {
+    sink.events()
+        .into_iter()
+        .filter_map(|(_, data)| match data {
+            EventData::Error { context, .. } => context
+                .get("effort_ignored")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_harness_without_effort_support_warns_that_the_effort_is_ignored() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&json!({ "sessionID": "ses_7", "text": "{\"choice\":\"ready\"}" }).to_string());
+    let sink = Arc::new(RecordingSink::default());
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
+    )
+    .with_event_sink(sink.clone());
+
+    let mut config = agent_action("look around");
+    config.harness = Some("opencode".to_string());
+    config.effort = Some("high".to_string());
+    complete(&executor, config, &root.workspace()).await;
+
+    assert_eq!(effort_warnings(&sink), ["opencode"]);
+}
+
+#[tokio::test]
+async fn a_harness_with_effort_support_does_not_warn() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+    let sink = Arc::new(RecordingSink::default());
+    let executor = executor(&fake).with_event_sink(sink.clone());
+
+    let mut config = agent_action("look around");
+    config.effort = Some("high".to_string());
+    complete(&executor, config, &root.workspace()).await;
+
+    assert!(effort_warnings(&sink).is_empty());
+}
+
+#[tokio::test]
+async fn the_effort_reaches_the_codex_argv_and_max_is_xhigh() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&codex_stream("thread-7", r#"{"choice":"ready"}"#));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("look around");
+    config.harness = Some("codex".to_string());
+    config.effort = Some("max".to_string());
+    complete(&executor, config, &root.workspace()).await;
+    let args = fake.args(1);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=\"xhigh\""]),
+        "{args:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_effort_that_looks_like_an_option_is_rejected() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+    let mut config = agent_action("look around");
+    config.effort = Some("--dangerous".to_string());
+    let error = fail(&executor(&fake), config, &root.workspace()).await;
+    assert!(error.message.contains("effort"), "{error:?}");
 }
 
 #[tokio::test]
@@ -1412,7 +1526,7 @@ async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thre
     );
     let mut config = agent_action("look around");
     config.harness = Some("codex".to_string());
-    config.model = Some("gpt-5-codex".to_string());
+    config.model = Some("medium".to_string());
     config.read_only_paths = vec!["../reference".to_string()];
 
     let result = complete(&executor, config, &root.workspace()).await;
@@ -1426,7 +1540,7 @@ async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thre
     assert_eq!(args[0], "exec");
     assert!(
         args.windows(2)
-            .any(|pair| pair == ["--model", "gpt-5-codex"]),
+            .any(|pair| pair == ["--model", "gpt-5.1-codex"]),
         "{args:?}"
     );
     assert!(
@@ -4404,7 +4518,7 @@ async fn the_real_claude_binary_answers_in_the_closing_json_of_its_text() {
          a tool. When the task has finished, read bg.txt with `cat` and finish with the label \
          'done'.",
     );
-    config.model = Some("haiku".to_string());
+    config.model = Some("small".to_string());
     let conversation = ConversationFixture::new(&root);
 
     let outcome = execute_with_choices(
@@ -4467,7 +4581,7 @@ async fn a_model_that_would_be_read_as_a_flag_is_refused() {
 
     let error = fail(&executor(&fake), config, &root.workspace()).await;
 
-    assert_eq!(error.error_type.as_deref(), Some("unsafe_harness_argument"));
+    assert_eq!(error.error_type.as_deref(), Some("unknown_model_tier"));
     assert!(
         error.message.contains("model"),
         "the error must name the offending field: {}",

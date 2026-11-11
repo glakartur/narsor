@@ -420,6 +420,7 @@ fn purpose_word(purpose: ConductorPurpose) -> &'static str {
         ConductorPurpose::SummarizeGate => "streszcza bramkę",
         ConductorPurpose::GenerateTitle => "nadaje tytuł zadaniu",
         ConductorPurpose::DecideFork => "rozstrzyga rozwidlenie",
+        ConductorPurpose::ProfileSteps => "dobiera model i effort kroków",
         ConductorPurpose::Unrecognized => "pracuje",
     }
 }
@@ -455,6 +456,11 @@ pub fn render(
                 format!("✗ nie udało się odświeżyć ({})", one_line(reason)),
                 styles.of(grey(Role::Problem)),
             ));
+        }
+        if let Some(view) = conductor.view() {
+            for text in profile_texts(&view.profile) {
+                top.push(Line::styled(text, styles.of(grey(Role::Calm))));
+            }
         }
     }
     let top_rows = rows(top.len(), area.height);
@@ -589,6 +595,52 @@ fn standing_line(
             Line::from(spans)
         }
     }
+}
+
+/// Most profile rows shown over the history.
+const PROFILE_ROWS: usize = 6;
+
+/// One row per step the conductor profiled: the model and effort the step
+/// starts on, why, and what was asked for above the ceiling. Read-only.
+fn profile_texts(profile: &[narsor_protocol::controller::StepProfileView]) -> Vec<String> {
+    let mut rows: Vec<String> = profile
+        .iter()
+        .take(PROFILE_ROWS)
+        .map(|entry| {
+            let step = match &entry.unit {
+                Some(unit) => format!("{} / {}", one_line(&entry.step_id), one_line(unit)),
+                None => one_line(&entry.step_id),
+            };
+            let value = |value: &Option<String>| match value {
+                Some(value) => one_line(value),
+                None => "domyślny".to_string(),
+            };
+            let mut text = format!(
+                "  profil {step}: {}/{} — {}",
+                value(&entry.model),
+                value(&entry.effort),
+                one_line(&entry.rationale)
+            );
+            if entry.requested_model.is_some() || entry.requested_effort.is_some() {
+                text.push_str(&format!(
+                    " [żądano {}/{}, ponad granicą: prośba otwarta]",
+                    entry
+                        .requested_model
+                        .as_deref()
+                        .map_or("–".into(), one_line),
+                    entry
+                        .requested_effort
+                        .as_deref()
+                        .map_or("–".into(), one_line),
+                ));
+            }
+            text
+        })
+        .collect();
+    if profile.len() > PROFILE_ROWS {
+        rows.push(format!("  … i {} dalszych", profile.len() - PROFILE_ROWS));
+    }
+    rows
 }
 
 fn working_text(work: &ConductorWork, task: &TaskSummary) -> String {
@@ -887,5 +939,55 @@ impl TaskApp {
         if let Some(view) = self.detail.views.get_mut(task_id) {
             view.conductor.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use narsor_protocol::controller::StepProfileView;
+
+    fn entry(step: &str) -> StepProfileView {
+        StepProfileView {
+            step_id: step.into(),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            rationale: "duża zmiana".into(),
+            ..StepProfileView::default()
+        }
+    }
+
+    #[test]
+    fn a_step_with_a_profile_shows_model_effort_and_reason() {
+        let rows = profile_texts(&[entry("work")]);
+        assert_eq!(rows, vec!["  profil work: opus/high — duża zmiana"]);
+    }
+
+    #[test]
+    fn no_profile_shows_nothing() {
+        assert!(profile_texts(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_clamped_step_shows_what_was_asked_for() {
+        let mut clamped = entry("work");
+        clamped.requested_effort = Some("max".into());
+        let rows = profile_texts(&[clamped]);
+        assert!(rows[0].contains("żądano –/max"), "{rows:?}");
+    }
+
+    #[test]
+    fn an_unknown_model_is_shown_as_text() {
+        let mut odd = entry("work");
+        odd.model = Some("mystery-9".into());
+        assert!(profile_texts(&[odd])[0].contains("mystery-9/high"));
+    }
+
+    #[test]
+    fn a_long_profile_is_cut_with_a_count() {
+        let many: Vec<_> = (0..9).map(|i| entry(&format!("s{i}"))).collect();
+        let rows = profile_texts(&many);
+        assert_eq!(rows.len(), PROFILE_ROWS + 1);
+        assert!(rows.last().unwrap().contains("3 dalszych"));
     }
 }

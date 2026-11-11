@@ -231,7 +231,7 @@ fn compile_definition(file: WorkflowFile) -> Result<WorkflowDefinition, LoadErro
         states.insert(id, compiled);
     }
 
-    Ok(WorkflowDefinition {
+    let mut definition = WorkflowDefinition {
         // The YAML contract has no id; the name is declared unique, so it is
         // the only stable identifier available at load time.
         id: file.name.clone(),
@@ -248,7 +248,9 @@ fn compile_definition(file: WorkflowFile) -> Result<WorkflowDefinition, LoadErro
         repositories,
         states,
         initial_state,
-    })
+    };
+    definition.inherit_global_defaults();
+    Ok(definition)
 }
 
 fn compile_globals(globals: &GlobalsSchema) -> GlobalsConfig {
@@ -256,6 +258,9 @@ fn compile_globals(globals: &GlobalsSchema) -> GlobalsConfig {
         timeout_secs: globals.timeout.map(|d| d.as_secs()),
         retry_policy: globals.retry_policy.as_ref().map(compile_retry_policy),
         image: globals.image.clone(),
+        default_model: globals.default_model.clone(),
+        default_effort: globals.default_effort.clone(),
+        ceiling: globals.ceiling.clone(),
     }
 }
 
@@ -502,6 +507,9 @@ fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
             harness: agent.harness,
             permission_grants: Vec::new(),
             model: agent.model,
+            effort: agent.effort,
+            ceiling: agent.ceiling,
+            plan: agent.plan,
             workspace_access: if keep_v1_access {
                 agent.workspace_access
             } else {
@@ -846,5 +854,91 @@ terminal_states: [done]
         assert_eq!(repository.source, RepositorySource::Chosen);
         assert_eq!(repository.base_branch.as_deref(), Some("jojo"));
         assert!(definition.primary_workspace_spec().is_none());
+    }
+
+    #[test]
+    fn the_plan_flag_and_the_step_profile_reach_the_definition() {
+        let definition = load_from_str(
+            r#"
+schema: v2
+name: profiled
+version: 1
+states:
+  plan:
+    action: { type: agent, prompt: x, plan: true, model: medium, effort: low, ceiling: { model: large, effort: high } }
+    choices: [success]
+    transitions: { success: work }
+  work:
+    action: { type: agent, prompt: y }
+    choices: [success]
+    transitions: { success: done }
+  done:
+    description: end
+terminal_states: [done]
+"#,
+        )
+        .expect("the workflow loads");
+
+        let Some(ActionConfig::Agent(plan)) = &definition.states["plan"].action else {
+            panic!("an agent step");
+        };
+        assert!(plan.plan);
+        assert_eq!(plan.model.as_deref(), Some("medium"));
+        assert_eq!(plan.effort.as_deref(), Some("low"));
+        assert_eq!(
+            plan.ceiling.as_ref().unwrap().model.as_deref(),
+            Some("large")
+        );
+        let Some(ActionConfig::Agent(work)) = &definition.states["work"].action else {
+            panic!("an agent step");
+        };
+        assert!(!work.plan);
+        assert!(work.model.is_none() && work.ceiling.is_none());
+    }
+
+    #[test]
+    fn a_step_inherits_the_global_defaults_and_its_own_fields_win() {
+        let definition = load_from_str(
+            r#"
+schema: v2
+name: inherited
+version: 1
+globals:
+  default_model: medium
+  default_effort: medium
+  ceiling: { model: large, effort: high }
+states:
+  plain:
+    action: { type: agent, prompt: x }
+    choices: [success]
+    transitions: { success: own }
+  own:
+    action: { type: agent, prompt: y, model: small, ceiling: { effort: max } }
+    choices: [success]
+    transitions: { success: done }
+  done:
+    description: end
+terminal_states: [done]
+"#,
+        )
+        .expect("the workflow loads");
+
+        let agent = |id: &str| match &definition.states[id].action {
+            Some(ActionConfig::Agent(agent)) => agent.clone(),
+            _ => panic!("an agent step"),
+        };
+        let plain = agent("plain");
+        assert_eq!(plain.model.as_deref(), Some("medium"));
+        assert_eq!(plain.effort.as_deref(), Some("medium"));
+        let ceiling = plain.ceiling.expect("the general ceiling is inherited");
+        assert_eq!(ceiling.model.as_deref(), Some("large"));
+        assert_eq!(ceiling.effort.as_deref(), Some("high"));
+
+        let own = agent("own");
+        assert_eq!(own.model.as_deref(), Some("small"));
+        assert_eq!(own.effort.as_deref(), Some("medium"));
+        let ceiling = own.ceiling.expect("a ceiling");
+        assert_eq!(ceiling.model.as_deref(), Some("large"));
+        assert_eq!(ceiling.effort.as_deref(), Some("max"));
     }
 }

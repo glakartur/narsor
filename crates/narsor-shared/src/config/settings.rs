@@ -63,6 +63,19 @@ pub const LOG_LEVELS: [&str; 6] = [LOG_OFF, "error", "warn", "info", "debug", "t
 /// Load-bearing rather than cosmetic: it is the value that decides whether a
 /// subscriber is installed at all, which is what keeps an unconfigured run
 /// silent (D-N).
+/// Model tiers from the cheapest to the strongest. A workflow and the
+/// conductor name a tier; each harness maps it to a model name.
+pub const MODEL_TIERS: [&str; 4] = ["small", "medium", "large", "max"];
+
+/// Efforts from the cheapest to the strongest.
+pub const EFFORT_SCALE: [&str; 4] = ["low", "medium", "high", "max"];
+
+/// Failed attempts after which a step is raised, unless configured.
+pub const DEFAULT_ESCALATION_THRESHOLD: u32 = 3;
+
+/// The largest `escalation_threshold` the configuration accepts.
+pub const MAX_ESCALATION_THRESHOLD: u32 = 100;
+
 pub const LOG_OFF: &str = "off";
 
 /// The variable that carries a full `tracing` filter directive.
@@ -149,6 +162,15 @@ pub enum SettingKey {
     AgentArgs,
     /// Most tasks processed at once, across all backends; `none` for no limit.
     MaxConcurrentTasks,
+    /// Consecutive failed attempts of an agent step after which its model or
+    /// effort is raised, within the step's ceiling; `0` turns it off.
+    EscalationThreshold,
+    /// The model tier (`small`, `medium`, `large`, `max`) the conductor runs
+    /// on; empty is the harness's own default.
+    ConductorModel,
+    /// The effort (`low`, `medium`, `high`, `max`) the conductor runs with;
+    /// empty is the harness's own default.
+    ConductorEffort,
     /// The logging level, when `RUST_LOG` does not say otherwise.
     LogLevel,
     /// How often the terminal interface re-reads the daemon on its own
@@ -201,7 +223,7 @@ pub enum SettingKey {
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 24] = [
+    pub const ALL: [SettingKey; 27] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
@@ -209,6 +231,9 @@ impl SettingKey {
         SettingKey::AgentTimeout,
         SettingKey::AgentArgs,
         SettingKey::MaxConcurrentTasks,
+        SettingKey::EscalationThreshold,
+        SettingKey::ConductorModel,
+        SettingKey::ConductorEffort,
         SettingKey::LogLevel,
         SettingKey::TuiRefreshInterval,
         SettingKey::DefaultBackend,
@@ -245,6 +270,9 @@ impl SettingKey {
             SettingKey::AgentTimeout => "agent_timeout",
             SettingKey::AgentArgs => "agent_args",
             SettingKey::MaxConcurrentTasks => "max_concurrent_tasks",
+            SettingKey::EscalationThreshold => "escalation_threshold",
+            SettingKey::ConductorModel => "conductor_model",
+            SettingKey::ConductorEffort => "conductor_effort",
             SettingKey::LogLevel => "log_level",
             SettingKey::TuiRefreshInterval => "tui_refresh_interval",
             SettingKey::DefaultBackend => "default_backend",
@@ -292,6 +320,9 @@ impl SettingKey {
             | SettingKey::AgentTimeout
             | SettingKey::AgentArgs
             | SettingKey::MaxConcurrentTasks
+            | SettingKey::EscalationThreshold
+            | SettingKey::ConductorModel
+            | SettingKey::ConductorEffort
             | SettingKey::LogLevel
             | SettingKey::TuiRefreshInterval
             | SettingKey::DefaultBackend
@@ -327,6 +358,9 @@ impl SettingKey {
             SettingKey::AgentHarness => SettingValue::Text(CLAUDE_CODE.to_string()),
             SettingKey::AgentTimeout => SettingValue::Duration(None),
             SettingKey::MaxConcurrentTasks => SettingValue::Text("1".to_string()),
+            SettingKey::EscalationThreshold => {
+                SettingValue::Text(DEFAULT_ESCALATION_THRESHOLD.to_string())
+            }
             SettingKey::LogLevel => SettingValue::Text(LOG_OFF.to_string()),
             SettingKey::TuiRefreshInterval => {
                 SettingValue::Duration(Some(DEFAULT_TUI_REFRESH_SECS))
@@ -343,6 +377,8 @@ impl SettingKey {
             | SettingKey::OidcAudience
             | SettingKey::OwnerSubject
             | SettingKey::AgentArgs
+            | SettingKey::ConductorModel
+            | SettingKey::ConductorEffort
             | SettingKey::TrustedProxies
             | SettingKey::CorsAllowedOrigins
             | SettingKey::LocalWorkspaceRoots
@@ -588,6 +624,9 @@ mod tests {
                 "agent_timeout",
                 "agent_args",
                 "max_concurrent_tasks",
+                "escalation_threshold",
+                "conductor_model",
+                "conductor_effort",
                 "log_level",
                 "tui_refresh_interval",
                 "default_backend",

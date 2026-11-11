@@ -293,6 +293,8 @@ pub struct RunnerConfig {
     pub harness_home: HarnessHome,
     /// Runner configuration's extra command-line arguments, keyed by harness.
     pub agent_args: narsor_engine::config::AgentArgs,
+    /// The model tier and effort the conductor runs with.
+    pub conductor_profile: narsor_engine::conductor::ConductorProfile,
     /// This incarnation's identity, the one its credential is bound to.
     pub incarnation: String,
     /// Control-channel timing.
@@ -442,6 +444,7 @@ pub async fn run(
                 harness,
                 definition,
                 config.agent_args.clone(),
+                config.conductor_profile.clone(),
             )
         },
     );

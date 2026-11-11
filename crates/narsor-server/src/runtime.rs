@@ -66,7 +66,7 @@ use narsor_engine::auth::{
     OidcVerifier, OwnerStore, SecurityPlan, SecuritySettings, StartupOwnership,
 };
 use narsor_engine::conductor::assembly::{assemble, restore_at_startup};
-use narsor_engine::conductor::{ConductorRegistry, HarnessInvoker, PassLauncher};
+use narsor_engine::conductor::{ConductorProfile, ConductorRegistry, HarnessInvoker, PassLauncher};
 use narsor_engine::config::Resolved;
 use narsor_engine::controller_protocol::{AutoResumePass, ProtocolService};
 use narsor_engine::domain::{ExecutionStatus, WorkflowDefinition, WorkflowExecution};
@@ -163,6 +163,11 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         refuse_declared_local_backend(config.catalog_dir())?;
     }
     let defaults = config.agent_defaults();
+    // A harness without a model for a tier is a configuration error found
+    // here, not a step that fails hours into a task.
+    HarnessRegistry::defaults()
+        .check_model_tiers()
+        .map_err(CliError::failure)?;
     let supported = HarnessRegistry::defaults()
         .supported()
         .into_iter()
@@ -226,6 +231,10 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     )
     .with_default_harness_source(selector.clone())
     .with_extra_args(defaults.args.clone())
+    .with_profile(ConductorProfile {
+        model: defaults.conductor_model.clone(),
+        effort: defaults.conductor_effort.clone(),
+    })
     .with_reading_sink(engine.reading_sink())
     .with_agent_timeout(agent_timeout_secs);
     // Held here for the daemon's whole life: the engine only holds it

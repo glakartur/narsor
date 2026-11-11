@@ -7,8 +7,8 @@
 use serde_json::Value;
 
 use super::{
-    not_classified, reject_option_like, resolve_read_only_path, string_parameter, tail,
-    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
+    model_for_tier, not_classified, reject_option_like, resolve_read_only_path, string_parameter,
+    tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -54,6 +54,19 @@ impl Default for CodexAdapter {
 }
 
 impl HarnessAdapter for CodexAdapter {
+    fn model_tiers(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("small", "gpt-5.1-codex-mini"),
+            ("medium", "gpt-5.1-codex"),
+            ("large", "gpt-5.1-codex-max"),
+            ("max", "gpt-5.2-codex"),
+        ]
+    }
+
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         CODEX
     }
@@ -68,9 +81,19 @@ impl HarnessAdapter for CodexAdapter {
         let prompt = message(request);
         let mut common = Vec::new();
 
-        if let Some(model) = &request.config.model {
-            reject_option_like(model, "model", CODEX)?;
-            common.extend(["--model".to_string(), model.clone()]);
+        if let Some(tier) = &request.config.model {
+            let model = model_for_tier(self, tier)?;
+            reject_option_like(&model, "model", CODEX)?;
+            common.extend(["--model".to_string(), model]);
+        }
+        if let Some(effort) = &request.config.effort {
+            reject_option_like(effort, "effort", CODEX)?;
+            // Codex names its strongest level `xhigh`.
+            let level = if effort == "max" { "xhigh" } else { effort };
+            common.extend([
+                "-c".to_string(),
+                format!("model_reasoning_effort=\"{level}\""),
+            ]);
         }
         if let Some(sandbox) = sandbox {
             common.extend(["--sandbox".to_string(), sandbox]);

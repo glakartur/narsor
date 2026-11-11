@@ -134,6 +134,7 @@ impl DefaultHarnessSource for LiveHarness {
 /// The conductor, run on the default harness (U9).
 #[derive(Debug, Clone)]
 pub struct HarnessInvoker {
+    profile: ConductorProfile,
     store: ExecutionStore,
     catalog_dir: PathBuf,
     work: WorkPaths,
@@ -144,6 +145,17 @@ pub struct HarnessInvoker {
     budget: SnapshotBudget,
     extra_args: AgentArgs,
     readings: Option<Arc<dyn ReadingSink>>,
+}
+
+/// The model tier and the effort the conductor runs with. Both come from the
+/// daemon's configuration (`conductor_model`, `conductor_effort`); a field
+/// that is not set leaves the choice to the harness.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConductorProfile {
+    /// One of [`crate::engine::step_profile::MODEL_TIERS`].
+    pub model: Option<String>,
+    /// One of [`crate::engine::step_profile::EFFORT_SCALE`].
+    pub effort: Option<String>,
 }
 
 /// Hands what the conductor's harness run reports on to the sink, as the
@@ -181,8 +193,16 @@ impl HarnessInvoker {
             timeout: DEFAULT_CONDUCTOR_TIMEOUT,
             budget: SnapshotBudget::default(),
             extra_args: AgentArgs::new(),
+            profile: ConductorProfile::default(),
             readings: None,
         }
+    }
+
+    /// Returns the invoker running the conductor on the model tier and the
+    /// effort of `profile` (D10); an unset field is the harness's default.
+    pub fn with_profile(mut self, profile: ConductorProfile) -> Self {
+        self.profile = profile;
+        self
     }
 
     /// Returns the invoker writing the tokens and cost of its runs to
@@ -319,7 +339,7 @@ impl HarnessInvoker {
             .iter()
             .map(|repository| PathBuf::from(&repository.path))
             .collect();
-        let config = conductor_config(&prompt);
+        let config = conductor_config(&prompt, &self.profile);
         let schema = answer_schema(invocation.request.purpose);
         let mut command = adapter
             .invocation(&HarnessRequest {
@@ -482,12 +502,16 @@ fn pinned_source(
 }
 
 /// The action configuration the adapters build the conductor's command line
-/// from: no model, no parameters, read-only.
-fn conductor_config(prompt: &str) -> AgentActionConfig {
+/// from: the configured model tier and effort (none means the harness's
+/// default), no parameters, read-only.
+fn conductor_config(prompt: &str, profile: &ConductorProfile) -> AgentActionConfig {
     AgentActionConfig {
         harness: None,
         permission_grants: Vec::new(),
-        model: None,
+        model: profile.model.clone(),
+        effort: profile.effort.clone(),
+        ceiling: None,
+        plan: false,
         workspace_access: Some(WorkspaceAccess::ReadOnly),
         prompt: prompt.into(),
         workspace: None,
@@ -495,5 +519,27 @@ fn conductor_config(prompt: &str) -> AgentActionConfig {
         read_only_paths: Vec::new(),
         // The conductor is not a step: it has no earlier attempts to show.
         history: false,
+    }
+}
+
+#[cfg(test)]
+mod conductor_profile_tests {
+    use super::*;
+
+    #[test]
+    fn the_conductor_runs_on_the_configured_tier_and_effort() {
+        let profile = ConductorProfile {
+            model: Some("small".into()),
+            effort: Some("low".into()),
+        };
+        let config = conductor_config("p", &profile);
+        assert_eq!(config.model.as_deref(), Some("small"));
+        assert_eq!(config.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn an_empty_profile_leaves_the_choice_to_the_harness() {
+        let config = conductor_config("p", &ConductorProfile::default());
+        assert!(config.model.is_none() && config.effort.is_none());
     }
 }

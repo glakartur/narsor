@@ -709,6 +709,8 @@ pub struct AgentCall {
     pub prompt: String,
     pub resume_session: Option<String>,
     pub action_execution_id: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// An `agent` executor that plays [`AgentTurn`]s in order and records every
@@ -752,6 +754,8 @@ impl ActionExecutor for ScriptedAgentExecutor {
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
             action_execution_id: action_execution_id.clone(),
+            model: config.model.clone(),
+            effort: config.effort.clone(),
         });
         let turn = self
             .turns

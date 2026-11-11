@@ -245,6 +245,10 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
             claude_profile_source: args.claude_profile_source,
         },
         agent_args: resolved.agent_args(),
+        conductor_profile: narsor_engine::conductor::ConductorProfile {
+            model: resolved.conductor_model(),
+            effort: resolved.conductor_effort(),
+        },
         incarnation: args.incarnation,
         timing: RunnerTiming {
             poll_wait: std::time::Duration::from_secs(args.poll_wait_secs),

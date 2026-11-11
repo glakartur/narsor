@@ -4,6 +4,7 @@
 
 pub mod action;
 pub mod artifact;
+pub mod complexity;
 pub mod context;
 pub mod decision;
 pub mod display;
@@ -17,6 +18,7 @@ pub mod workflow_execution;
 pub mod workspace;
 
 pub use artifact::*;
+pub use complexity::*;
 pub use context::*;
 pub use decision::*;
 pub use display::*;

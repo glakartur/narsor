@@ -15,6 +15,27 @@ globals:
     max_attempts: 2
     backoff: 0s
 
+# Model and effort per agent step (not used below, which has no agent step).
+# A model is a tier — small, medium, large, max — never a model name: each
+# harness maps the tier to its own model. Efforts are low, medium, high, max.
+#
+#   globals:
+#     default_model: medium                       # for a step that names none
+#     default_effort: medium
+#     ceiling: { model: large, effort: high }     # the most the conductor or an escalation may set
+#   states:
+#     plan:
+#       action: { type: agent, plan: true, prompt: "..." }
+#     work:
+#       action:
+#         type: agent
+#         model: small                            # a step's own value wins
+#         ceiling: { effort: max }                # and so does its own ceiling, field by field
+#         prompt: "..."
+#
+# A step with a ceiling needs a model and an effort, and the ceiling needs both too,
+# whether the step or `globals` gives them.
+
 states:
   demonstrate:
     description: Prints a structured result without changing files or calling external services.

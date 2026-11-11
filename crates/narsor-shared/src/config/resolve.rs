@@ -30,7 +30,10 @@ use crate::config::{AgentArgs, HarnessHome, HomeMode};
 
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
-use super::settings::{self, SettingKey, SettingValue, Source, ENV_PREFIX, LOG_OFF, RUST_LOG};
+use super::settings::{
+    self, SettingKey, SettingValue, Source, DEFAULT_ESCALATION_THRESHOLD, ENV_PREFIX, LOG_OFF,
+    RUST_LOG,
+};
 
 /// The environment, as a map read once rather than consulted repeatedly.
 pub type Environment = BTreeMap<String, String>;
@@ -83,6 +86,9 @@ impl Flags {
             | SettingKey::AgentTimeout
             | SettingKey::AgentArgs
             | SettingKey::MaxConcurrentTasks
+            | SettingKey::EscalationThreshold
+            | SettingKey::ConductorModel
+            | SettingKey::ConductorEffort
             | SettingKey::LogLevel
             | SettingKey::TuiRefreshInterval
             | SettingKey::DefaultBackend
@@ -321,12 +327,29 @@ impl Resolved {
             .unwrap_or_default()
     }
 
+    /// The model tier the conductor runs on; `None` is the harness's default.
+    pub fn conductor_model(&self) -> Option<String> {
+        self.text(SettingKey::ConductorModel)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The effort the conductor runs with; `None` is the harness's default.
+    pub fn conductor_effort(&self) -> Option<String> {
+        self.text(SettingKey::ConductorEffort)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    }
+
     /// What the engine needs from the configuration for an `agent` action.
     pub fn agent_defaults(&self) -> AgentDefaults {
         AgentDefaults {
             harness: self.agent_harness().to_string(),
             timeout_secs: self.agent_timeout(),
             args: self.agent_args(),
+            escalation_threshold: self.escalation_threshold(),
+            conductor_model: self.conductor_model(),
+            conductor_effort: self.conductor_effort(),
         }
     }
 
@@ -334,6 +357,13 @@ impl Resolved {
     pub fn max_concurrent_tasks(&self) -> Option<u32> {
         self.text(SettingKey::MaxConcurrentTasks)
             .and_then(|text| text.parse().ok())
+    }
+
+    /// Failed attempts after which a step is raised; `0` means never.
+    pub fn escalation_threshold(&self) -> u32 {
+        self.text(SettingKey::EscalationThreshold)
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(DEFAULT_ESCALATION_THRESHOLD)
     }
 
     /// The `tracing` filter to install, or `None` for "install nothing".
@@ -363,6 +393,13 @@ pub struct AgentDefaults {
     /// Extra arguments of the harness runs, by harness; those of the harness
     /// that runs win over Narsor's own.
     pub args: AgentArgs,
+    /// Consecutive failed attempts of a step after which its model or effort
+    /// is raised within its ceiling; `0` turns escalation off.
+    pub escalation_threshold: u32,
+    /// The model tier the conductor runs on; `None` is the harness's default.
+    pub conductor_model: Option<String>,
+    /// The effort the conductor runs with; `None` is the harness's default.
+    pub conductor_effort: Option<String>,
 }
 
 /// Works out every setting, reading the environment that was handed in.

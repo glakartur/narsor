@@ -557,6 +557,8 @@ pub enum ConductorTrigger {
     Title,
     /// A `decision` step declared `by: conductor` was entered.
     DecisionStep,
+    /// The plan step succeeded; the steps that have not started can be profiled.
+    Profile,
     /// A value this build does not know, written by a newer one.
     #[serde(other)]
     Unrecognized,
@@ -572,6 +574,7 @@ impl ConductorTrigger {
             Self::Annotation => "annotation",
             Self::Title => "title",
             Self::DecisionStep => "decision_step",
+            Self::Profile => "profile",
             Self::Unrecognized => "unrecognized",
         }
     }
@@ -624,6 +627,8 @@ pub enum ConductorPurpose {
     GenerateTitle,
     /// Pick the label of a `decision` step declared `by: conductor`.
     DecideFork,
+    /// Choose the model and effort of the steps that have not started.
+    ProfileSteps,
     /// A value this build does not know, written by a newer one.
     #[serde(other)]
     Unrecognized,
@@ -641,6 +646,7 @@ impl ConductorPurpose {
             Self::SummarizeGate => "summarize_gate",
             Self::GenerateTitle => "generate_title",
             Self::DecideFork => "decide_fork",
+            Self::ProfileSteps => "profile_steps",
             Self::Unrecognized => "unrecognized",
         }
     }
@@ -998,6 +1004,7 @@ impl From<ConductorPurpose> for ConductorPurposeDto {
             ConductorPurpose::SummarizeGate => Self::SummarizeGate,
             ConductorPurpose::GenerateTitle => Self::GenerateTitle,
             ConductorPurpose::DecideFork => Self::DecideFork,
+            ConductorPurpose::ProfileSteps => Self::ProfileSteps,
             ConductorPurpose::Unrecognized => Self::Unrecognized,
         }
     }
@@ -1012,6 +1019,7 @@ impl From<ConductorTrigger> for ConductorTriggerDto {
             ConductorTrigger::Annotation => Self::Annotation,
             ConductorTrigger::Title => Self::Title,
             ConductorTrigger::DecisionStep => Self::DecisionStep,
+            ConductorTrigger::Profile => Self::Profile,
             ConductorTrigger::Unrecognized => Self::Unrecognized,
         }
     }

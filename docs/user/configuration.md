@@ -54,6 +54,9 @@ agent_timeout: 30m           # for an agent action that declares none; `none` fo
 agent_args:                  # by harness (claude, codex, opencode, copilot); only the running harness's list is added to its command
   claude: [--dangerously-skip-permissions, --effort, high]  # one list entry is one argument, spaces included; win over Narsor's own values of the same flag
 max_concurrent_tasks: 10     # tasks processed at once across all backends; default 1; `none` removes the limit; `L` in the TUI changes it until the daemon restarts
+escalation_threshold: 3      # failed attempts of a step after which its effort, then its model, is raised within the step's `ceiling`; `0` turns it off
+conductor_model: medium      # the model tier the conductor runs on (small, medium, large, max); empty is the harness's default
+conductor_effort: low        # the effort the conductor runs with (low, medium, high, max); empty is the harness's default
 log_level: info              # off, error, warn, info, debug, trace
 tui_refresh_interval: 10s    # how often the TUI re-reads the daemon; `none` turns it off
 ```
@@ -67,6 +70,9 @@ Every one of them is available as an environment variable too, mechanically:
 | `agent_timeout` | `NARSOR_AGENT_TIMEOUT` | `none` |
 | `agent_args` | `NARSOR_AGENT_ARGS` (a mapping, e.g. `{claude: [--effort, high]}`) | empty |
 | `max_concurrent_tasks` | `NARSOR_MAX_CONCURRENT_TASKS` | `1` |
+| `escalation_threshold` | `NARSOR_ESCALATION_THRESHOLD` | `3` |
+| `conductor_model` | `NARSOR_CONDUCTOR_MODEL` | empty |
+| `conductor_effort` | `NARSOR_CONDUCTOR_EFFORT` | empty |
 | `log_level` | `NARSOR_LOG_LEVEL` | `off` |
 | `tui_refresh_interval` | `NARSOR_TUI_REFRESH_INTERVAL` | `10s` |
 

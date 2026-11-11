@@ -60,3 +60,7 @@ Wartości są hipotezą. Nie zostały zmierzone na zadaniach narsora.
 
 - Zbyt niskie ustawienia po planie zwiększają liczbę nieudanych prób. Późna eskalacja wydłuża ten koszt. Pomiar z poprzedniej sekcji ma to ocenić.
 - Dyrygent może źle ocenić trudność. Granica górna i eskalacja ograniczają skutki.
+
+## Realizacja
+
+Plan: `docs/plans/2026-11-11-1000-feat-dynamiczny-model-i-effort-kroku-plan.md`.

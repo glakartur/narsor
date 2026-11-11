@@ -70,6 +70,35 @@ pub struct WorkflowDefinition {
 }
 
 impl WorkflowDefinition {
+    /// Fills what an agent step leaves out from `globals` (D9): `model` from
+    /// `default_model`, `effort` from `default_effort`, and each field of
+    /// `ceiling` from the general ceiling. What the step names wins. After
+    /// this a step holds its effective values, so nothing downstream looks
+    /// at `globals` again.
+    pub fn inherit_global_defaults(&mut self) {
+        let globals = self.globals.clone();
+        for state in self.states.values_mut() {
+            let Some(ActionConfig::Agent(agent)) = &mut state.action else {
+                continue;
+            };
+            if agent.model.is_none() {
+                agent.model = globals.default_model.clone();
+            }
+            if agent.effort.is_none() {
+                agent.effort = globals.default_effort.clone();
+            }
+            if let Some(general) = &globals.ceiling {
+                let own = agent.ceiling.get_or_insert_with(StepCeiling::default);
+                if own.model.is_none() {
+                    own.model = general.model.clone();
+                }
+                if own.effort.is_none() {
+                    own.effort = general.effort.clone();
+                }
+            }
+        }
+    }
+
     /// The primary repository, if the workflow declares any.
     pub fn primary_repository(&self) -> Option<&RepositoryDefinition> {
         self.repositories
@@ -260,6 +289,18 @@ pub struct GlobalsConfig {
     /// override from a step override, so each keeps its own field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageSpec>,
+
+    /// The model tier of an agent step that names none (D9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+
+    /// The effort of an agent step that names none (D9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+
+    /// The general ceiling of the steps that name none, or only a part (D9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<StepCeiling>,
 }
 
 /// Single-repository workspace declaration: the shape of a `v1`
@@ -505,6 +546,18 @@ impl DecisionMaker {
     }
 }
 
+/// The most a step may be raised to (`ceiling` in YAML).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepCeiling {
+    /// Highest model tier: `small`, `medium`, `large` or `max`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Highest effort.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
 /// Agent action configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentActionConfig {
@@ -526,6 +579,19 @@ pub struct AgentActionConfig {
     /// Model specification (optional)
     #[serde(default)]
     pub model: Option<String>,
+
+    /// Default effort of the step, one of `low`, `medium`, `high`, `max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+
+    /// Upper bound for what the conductor and an escalation may set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<StepCeiling>,
+
+    /// Marks the step whose success makes the conductor profile the steps
+    /// that have not started (`plan: true` in YAML).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan: bool,
 
     /// Access the agent receives to its execution workspace.
     ///

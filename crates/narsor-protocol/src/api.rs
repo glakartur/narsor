@@ -436,6 +436,7 @@ pub enum ConductorTriggerDto {
     Annotation,
     Title,
     DecisionStep,
+    Profile,
     /// A value this build does not know, written by a newer one.
     #[serde(other)]
     Unrecognized,
@@ -450,6 +451,7 @@ impl ConductorTriggerDto {
             Self::Annotation => "annotation",
             Self::Title => "title",
             Self::DecisionStep => "decision_step",
+            Self::Profile => "profile",
             Self::Unrecognized => "unrecognized",
         }
     }
@@ -467,6 +469,7 @@ pub enum ConductorPurposeDto {
     SummarizeGate,
     GenerateTitle,
     DecideFork,
+    ProfileSteps,
     /// A value this build does not know, written by a newer one.
     #[serde(other)]
     Unrecognized,
@@ -483,6 +486,7 @@ impl ConductorPurposeDto {
             Self::SummarizeGate => "summarize_gate",
             Self::GenerateTitle => "generate_title",
             Self::DecideFork => "decide_fork",
+            Self::ProfileSteps => "profile_steps",
             Self::Unrecognized => "unrecognized",
         }
     }

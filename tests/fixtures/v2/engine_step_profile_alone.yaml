@@ -1,0 +1,19 @@
+# A plan step with no agent step after it: nothing to profile.
+schema: v2
+name: engine-step-profile-alone
+version: 1
+
+states:
+  plan:
+    action:
+      type: agent
+      plan: true
+      prompt: Plan it.
+    exit:
+      next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

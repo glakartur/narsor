@@ -249,6 +249,7 @@ fn answer_key(purpose: ConductorPurpose) -> &'static str {
         ConductorPurpose::ReplyToChat => "reply",
         ConductorPurpose::SummarizeGate => "annotate",
         ConductorPurpose::GenerateTitle => "title",
+        ConductorPurpose::ProfileSteps => "profile",
         ConductorPurpose::ChooseOutput
         | ConductorPurpose::ChooseOutputAfterReprompt
         | ConductorPurpose::DecideFork => "choose",
@@ -316,6 +317,7 @@ fn offline_config(root: &TempRoot, storage: &Path, incarnation: &str) -> RunnerC
         secrets_dir: None,
         harness_home: HarnessHome::default(),
         agent_args: Default::default(),
+        conductor_profile: Default::default(),
         incarnation: incarnation.to_string(),
         timing: RunnerTiming {
             problem_report_deadline: Duration::ZERO,

@@ -55,6 +55,7 @@ use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 use crate::conductor::chat::{chat_answer, conclude_annotation, still_pending, ProposalContext};
+use crate::conductor::profile::conclude_profile;
 use crate::conductor::store::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
@@ -742,6 +743,27 @@ impl ConductorActor {
 
         if invocation.request.trigger == ConductorTrigger::Title {
             conclude_title(&self.store, outcome)?;
+        }
+        if invocation.request.trigger == ConductorTrigger::Profile {
+            // Steps that began while the conductor was answering keep their
+            // defaults: the profile is decided once, before the step starts
+            // (D7). When the execution cannot be read nothing is written.
+            match self
+                .engine
+                .store()
+                .load_execution(&self.execution_id)
+                .map_err(|error| error.to_string())
+                .and_then(|execution| {
+                    crate::engine::runner::started_states(&execution)
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(started) => {
+                    conclude_profile(&self.store, &invocation.request, outcome, &started)?;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not tell which steps started; no profile written");
+                }
+            }
         }
 
         let mut next = inner.state.clone();

@@ -71,9 +71,9 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 use super::{
-    integer_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
-    FinalAnswer, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
-    HarnessStreamParser, PermissionDenial,
+    integer_parameter, model_for_tier, reject_option_like, resolve_read_only_path,
+    string_parameter, tail, FinalAnswer, HarnessAdapter, HarnessInvocation, HarnessRequest,
+    HarnessRun, HarnessStreamParser, PermissionDenial,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -130,6 +130,19 @@ impl Default for ClaudeCodeAdapter {
 }
 
 impl HarnessAdapter for ClaudeCodeAdapter {
+    fn model_tiers(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("small", "haiku"),
+            ("medium", "sonnet"),
+            ("large", "opus"),
+            ("max", "opus"),
+        ]
+    }
+
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         CLAUDE_CODE
     }
@@ -181,10 +194,17 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         args.push("--disallowedTools".to_string());
         args.extend(DEFERRING_TOOLS.iter().map(|tool| tool.to_string()));
 
-        if let Some(model) = &config.model {
-            reject_option_like(model, "model", CLAUDE_CODE)?;
+        if let Some(tier) = &config.model {
+            let model = model_for_tier(self, tier)?;
+            reject_option_like(&model, "model", CLAUDE_CODE)?;
             args.push("--model".to_string());
-            args.push(model.clone());
+            args.push(model);
+        }
+
+        if let Some(effort) = &config.effort {
+            reject_option_like(effort, "effort", CLAUDE_CODE)?;
+            args.push("--effort".to_string());
+            args.push(effort.clone());
         }
 
         if let Some(max_turns) = integer_parameter(config, "max_turns", CLAUDE_CODE)? {

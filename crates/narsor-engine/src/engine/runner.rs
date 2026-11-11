@@ -82,7 +82,11 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::conductor::actor::InvocationOutcome;
+use crate::conductor::profile;
 use crate::conductor::ConductorRegistry;
+use crate::conductor::ConductorStore;
+use crate::config::DEFAULT_ESCALATION_THRESHOLD;
 use crate::config::{AgentArgs, AgentDefaults};
 use crate::domain::{
     effective_title, ActionConfig, ActionError, ActionResult, AgentActionConfig, AnsweredBy,
@@ -91,6 +95,7 @@ use crate::domain::{
     InputCloseReason, ProblemKind, RepromptedBy, State, StateId, VariableSource,
     WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
 };
+use crate::domain::{ComplexityAssessment, COMPLEXITY_VARIABLE};
 use crate::engine::actions::agent::{
     self, DefaultHarnessSource, UsageReporter, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL,
     SESSION_DATA_KEY,
@@ -108,6 +113,7 @@ use crate::engine::actions::{
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
+use crate::engine::step_profile::{self, ProfileInput, Setting};
 use crate::engine::timeline_file::{FileReadingSink, ReadingSink};
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
 use crate::workflow::template::{
@@ -178,6 +184,9 @@ const METADATA_AGENT_SESSIONS_KEY: &str = "completed_agent_sessions";
 const METADATA_STEP_REPLIES_KEY: &str = "step_replies";
 const METADATA_STEP_STREAMS_KEY: &str = "step_streams";
 const METADATA_STATE_ENTRIES_KEY: &str = "state_entries";
+/// When each state was entered for the first time: a step profile decided
+/// later than that is not used (D7).
+const METADATA_STATE_FIRST_ENTRY_KEY: &str = "state_first_entry";
 
 /// The one-shot instruction delivered by an operator to an agent step.
 /// `harness` and `session` are optional for records written before
@@ -1034,6 +1043,8 @@ pub struct Engine {
     executors: HashMap<ActionKind, Arc<dyn ActionExecutor>>,
     agent_timeout_secs: Option<u64>,
     agent_args: AgentArgs,
+    escalation_threshold: u32,
+    profile_wait: Duration,
     usage_reporter: Option<Arc<dyn UsageReporter>>,
     reading_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     default_harness: Arc<dyn DefaultHarnessSource>,
@@ -1044,6 +1055,17 @@ pub struct Engine {
     conductor: OnceLock<Weak<ConductorRegistry>>,
     task_labels: TaskLabels,
     workspace_values: Option<Arc<dyn WorkspaceValues>>,
+}
+
+/// What [`Engine::apply_step_profile`] needs to know about the attempt.
+#[derive(Clone, Copy)]
+struct AttemptProfile {
+    /// Failed attempts of the step in a row.
+    failures: u32,
+    /// Whether a rejected or escalated profile is recorded as an event. A
+    /// reprompt of a rejected attempt resolves the same profile again and
+    /// stays quiet: the attempt itself already recorded it.
+    announce: bool,
 }
 
 /// The ticket and title `{{ task.ticket }}` and `{{ task.title }}` render.
@@ -1209,6 +1231,8 @@ impl Engine {
             executors,
             agent_timeout_secs: None,
             agent_args: AgentArgs::new(),
+            escalation_threshold: DEFAULT_ESCALATION_THRESHOLD,
+            profile_wait: profile::PROFILE_WAIT,
             usage_reporter: None,
             reading_notifier: None,
             default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
@@ -1280,7 +1304,22 @@ impl Engine {
     pub fn with_agent_defaults(self, defaults: AgentDefaults) -> Self {
         self.with_agent_timeout(defaults.timeout_secs)
             .with_agent_args(defaults.args)
+            .with_escalation_threshold(defaults.escalation_threshold)
             .with_default_harness_source(Arc::new(defaults.harness))
+    }
+
+    /// Returns the engine raising a step's model or effort after `threshold`
+    /// consecutive failed attempts; `0` turns escalation off.
+    pub fn with_escalation_threshold(mut self, threshold: u32) -> Self {
+        self.escalation_threshold = threshold;
+        self
+    }
+
+    /// Returns the engine waiting at most `wait` for the conductor's step
+    /// profile after the plan step (default [`profile::PROFILE_WAIT`]).
+    pub fn with_profile_wait(mut self, wait: Duration) -> Self {
+        self.profile_wait = wait;
+        self
     }
 
     /// Returns the engine adding `args` to every harness run of its agent
@@ -2337,7 +2376,100 @@ impl Engine {
             ActionUpshot::Completed {
                 action_execution_id,
                 result,
-            } => self.record_completion(definition, execution, state, action_execution_id, result),
+            } => {
+                self.profile_after_plan(definition, execution, state, &result)
+                    .await;
+                self.record_completion(definition, execution, state, action_execution_id, result)
+            }
+        }
+    }
+
+    /// After the plan step succeeded, has the conductor profile the steps
+    /// that have not started, and waits for it at most
+    /// [`profile::PROFILE_WAIT`] (`profile_wait`). Whatever goes wrong — no conductor, a
+    /// failure, an unsure answer, the wait running out — leaves the steps on
+    /// their defaults and the task unchanged (R8).
+    async fn profile_after_plan(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &WorkflowExecution,
+        state: &State,
+        result: &ActionResult,
+    ) {
+        let Some(ActionConfig::Agent(agent)) = &state.action else {
+            return;
+        };
+        if !agent.plan {
+            return;
+        }
+        let Some(registry) = self.conductor() else {
+            return;
+        };
+        let mut steps = Vec::new();
+        let mut ids: Vec<&String> = definition.states.keys().collect();
+        ids.sort();
+        for id in ids {
+            let candidate = &definition.states[id];
+            let Some(ActionConfig::Agent(config)) = &candidate.action else {
+                continue;
+            };
+            if candidate.id == state.id
+                || state_entry_count(execution, &candidate.id).unwrap_or(1) > 0
+            {
+                continue;
+            }
+            steps.push(profile::ProfileCandidate {
+                step_id: candidate.id.clone(),
+                default: Setting::default_of(config),
+                ceiling: Setting::ceiling_of(config),
+            });
+        }
+        if steps.is_empty() {
+            return;
+        }
+        let request = profile::ProfileRequest {
+            plan_step: state.id.clone(),
+            variables: Value::Object(result.variables.clone()),
+            artifacts: json!(result.artifacts),
+            complexity: result
+                .variables
+                .get(COMPLEXITY_VARIABLE)
+                .filter(|value| ComplexityAssessment::from_value(value).is_some())
+                .cloned(),
+            steps,
+        }
+        .into_queued();
+        let asked = match registry.actor(&execution.id) {
+            Ok(actor) => tokio::time::timeout(self.profile_wait, actor.invoke(request)).await,
+            Err(error) => {
+                tracing::warn!(%error, "no conductor to profile the steps");
+                return;
+            }
+        };
+        let note = match asked {
+            Ok(Ok(InvocationOutcome::Answered(_))) => return,
+            Ok(Ok(InvocationOutcome::Failed { error })) => error,
+            Ok(Ok(InvocationOutcome::Interrupted)) => "the conductor was interrupted".to_string(),
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "the conductor did not answer in time".to_string(),
+        };
+        self.note_step_profile_failure(execution, state, &note);
+    }
+
+    /// Records that the profile could not be made, best-effort (AE3).
+    fn note_step_profile_failure(&self, execution: &WorkflowExecution, state: &State, note: &str) {
+        if let Err(error) = self.emit(
+            &execution.id,
+            EventData::Error {
+                message: format!(
+                    "The conductor could not profile the steps after '{}': {note}; \
+                     they run on their defaults",
+                    state.id
+                ),
+                context: json!({ "step_profile": { "plan_step": state.id } }),
+            },
+        ) {
+            tracing::warn!(%error, "could not record a failed step profile");
         }
     }
 
@@ -2421,6 +2553,10 @@ impl Engine {
                     &action_execution_id,
                     timeout,
                     &mut pinned_harness,
+                    AttemptProfile {
+                        failures: attempt - 1,
+                        announce: true,
+                    },
                 )
                 .await;
 
@@ -2533,6 +2669,7 @@ impl Engine {
         action_execution_id: &str,
         timeout: Option<Duration>,
         pinned_harness: &mut Option<String>,
+        profile: AttemptProfile,
     ) -> Result<AttemptOutcome, AttemptFailure> {
         let location = format!("state '{}'", state.id);
 
@@ -2640,6 +2777,7 @@ impl Engine {
             // goes on already knows its history (KTD9).
             step_memory::add_history(config, &template.prompt, &history);
             self.pin_harness(config, pinned_harness);
+            self.apply_step_profile(execution, state, config, profile);
             if let Some(input) = self.take_agent_input(execution, state)? {
                 if let (Some(harness), Some(session)) =
                     (input.harness.as_deref(), input.session.as_deref())
@@ -2746,6 +2884,121 @@ impl Engine {
                     Err(AttemptFailure::of_action(error).side_effect_free_if(clean))
                 }
             },
+        }
+    }
+
+    /// Sets the model and effort of a rendered agent `config` from the three
+    /// sources — the step's default, the conductor's profile, an escalation —
+    /// through [`step_profile::resolve`]. A step with none of them keeps the
+    /// arguments it always had.
+    fn apply_step_profile(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        config: &mut AgentActionConfig,
+        attempt: AttemptProfile,
+    ) {
+        let default = Setting::default_of(config);
+        let ceiling = Setting::ceiling_of(config);
+        // A damaged or missing profile is "no profile" (R8).
+        let stored = ConductorStore::new(self.store.paths(), &execution.id)
+            .load_profile()
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "damaged step profile; running on the defaults");
+                Default::default()
+            });
+        // A profile decided after the step's first attempt is not used (D7).
+        let first_entry = first_entry_at(execution, &state.id);
+        let conductor = stored
+            .lookup(&state.id, None)
+            .filter(|entry| first_entry.is_none_or(|first| entry.decided_at <= first))
+            .map(|entry| entry.setting.clone());
+        if conductor.is_none() && ceiling.is_none() {
+            return;
+        }
+        let resolved = step_profile::resolve(ProfileInput {
+            default: &default,
+            ceiling: ceiling.as_ref(),
+            conductor: conductor.as_ref(),
+            failures: attempt.failures,
+            threshold: self.escalation_threshold,
+        });
+        if resolved.rejected && attempt.announce {
+            self.note_step_profile(
+                execution,
+                state,
+                "the conductor's profile named a model or effort that cannot be used; \
+                 the step's default stays",
+                &default,
+                &resolved.setting,
+            );
+        }
+        if !attempt.announce {
+            // Nothing more to record.
+        } else if resolved.source == step_profile::ProfileSource::Escalated {
+            self.note_step_profile(
+                execution,
+                state,
+                "the step failed repeatedly; its model or effort is raised",
+                &default,
+                &resolved.setting,
+            );
+        } else if resolved.limit_reached {
+            self.note_step_profile(
+                execution,
+                state,
+                "the step failed repeatedly and already runs on its ceiling",
+                &default,
+                &resolved.setting,
+            );
+        }
+        config.model = resolved.setting.model;
+        config.effort = resolved.setting.effort;
+    }
+
+    /// `template` with the conductor's profile applied, for a reprompt that
+    /// resumes a session: the reprompt runs on the model and effort of the
+    /// attempt it repairs, not on the workflow's default. An escalation is
+    /// not carried over — the count of failed attempts is not kept with the
+    /// rejection.
+    pub(super) fn profiled_template(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        template: &AgentActionConfig,
+    ) -> AgentActionConfig {
+        let mut config = template.clone();
+        self.apply_step_profile(
+            execution,
+            state,
+            &mut config,
+            AttemptProfile {
+                failures: 0,
+                announce: false,
+            },
+        );
+        config
+    }
+
+    /// Records a profile decision as an event, best-effort.
+    fn note_step_profile(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        message: &str,
+        from: &Setting,
+        to: &Setting,
+    ) {
+        if let Err(error) = self.emit(
+            &execution.id,
+            EventData::Error {
+                message: format!("Step '{}': {message}", state.id),
+                context: json!({
+                    "step_profile": { "step": state.id, "from": from, "to": to },
+                }),
+            },
+        ) {
+            tracing::warn!(%error, "could not record a step profile decision");
         }
     }
 
@@ -2938,9 +3191,15 @@ impl Engine {
     ) -> Result<ActionUpshot, EngineError> {
         let mut rescue = OutputRescue::after(&rejection);
         let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
-            (ActionConfig::Agent(config), Some(harness), Some(session)) => Some(
-                agent::reprompt_config(config, harness, session, &rejection.reason),
-            ),
+            (ActionConfig::Agent(config), Some(harness), Some(session)) => {
+                let profiled = self.profiled_template(execution, state, config);
+                Some(agent::reprompt_config(
+                    &profiled,
+                    harness,
+                    session,
+                    &rejection.reason,
+                ))
+            }
             _ => None,
         };
         let Some(config) = resumable else {
@@ -4553,8 +4812,42 @@ fn count_entry(execution: &mut WorkflowExecution, state_id: &str) -> Result<(), 
     let mut counts: BTreeMap<String, u32> =
         read_engine_record(execution, METADATA_STATE_ENTRIES_KEY)?.unwrap_or_default();
     let count = counts.entry(state_id.to_string()).or_default();
+    let first = *count == 0;
     *count = count.saturating_add(1);
-    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)
+    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)?;
+    if first {
+        let mut firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
+            read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)?.unwrap_or_default();
+        firsts.insert(state_id.to_string(), chrono::Utc::now());
+        write_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY, &firsts)?;
+    }
+    Ok(())
+}
+
+/// The states that were entered at least once (D7): their step profile is
+/// settled and is not written any more.
+pub(crate) fn started_states(
+    execution: &WorkflowExecution,
+) -> Result<std::collections::BTreeSet<String>, EngineError> {
+    let counts: BTreeMap<String, u32> =
+        read_engine_record(execution, METADATA_STATE_ENTRIES_KEY)?.unwrap_or_default();
+    Ok(counts
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(state, _)| state)
+        .collect())
+}
+
+/// When `state_id` was first entered, if it was.
+fn first_entry_at(
+    execution: &WorkflowExecution,
+    state_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
+        read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)
+            .ok()
+            .flatten()?;
+    firsts.get(state_id).copied()
 }
 
 /// The entry counts of `execution` (R10), as a decision saves them for an
@@ -4581,7 +4874,12 @@ fn restore_state_entries(
             message: format!("the entry counts saved with the decision are unreadable: {error}"),
         }
     })?;
-    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)
+    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)?;
+    // A state that is not entered any more has no first entry.
+    let mut firsts: BTreeMap<String, chrono::DateTime<chrono::Utc>> =
+        read_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY)?.unwrap_or_default();
+    firsts.retain(|state, _| counts.get(state).is_some_and(|count| *count > 0));
+    write_engine_record(execution, METADATA_STATE_FIRST_ENTRY_KEY, &firsts)
 }
 
 /// What choosing each label of `state` requires of an answer to a problem

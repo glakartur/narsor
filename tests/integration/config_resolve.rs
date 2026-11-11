@@ -522,3 +522,31 @@ fn a_relative_harness_directory_is_refused() {
         resolved.errors()[0]
     );
 }
+
+#[test]
+fn the_escalation_threshold_defaults_to_three_and_comes_from_the_file() {
+    let none = resolve_with(
+        &Flags::default(),
+        &environment(&[]),
+        &ConfigCascade::with_dirs(None, None, None),
+    );
+    assert_eq!(none.escalation_threshold(), 3);
+    assert_eq!(none.agent_defaults().escalation_threshold, 3);
+
+    let root = TempRoot::new();
+    root.user_config("escalation_threshold: 0\n");
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    assert_eq!(resolved.escalation_threshold(), 0);
+    assert_eq!(resolved.agent_defaults().escalation_threshold, 0);
+
+    root.user_config("escalation_threshold: 100\n");
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert_eq!(resolved.agent_defaults().escalation_threshold, 100);
+
+    for bad in ["101", "-1", "abc"] {
+        root.user_config(&format!("escalation_threshold: {bad}\n"));
+        let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+        assert!(!resolved.is_ok(), "'{bad}' was accepted");
+    }
+}
