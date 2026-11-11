@@ -31,7 +31,7 @@ Wniosek: sam dyrygent nie widzi wszystkich pętli. Część sygnałów ma tylko 
 ## Propozycja
 
 1. **Effort per wejście w krok, nie per próba.** Przy ponownym wejściu w krok agenta silnik może zastosować wyższy effort. Licznik wejść już istnieje (`max_entries`, `state_entries`).
-2. **Wniosek dyrygenta.** Przy wywołaniu dyrygenta (odpowiedź na pytanie agenta, decyzja, rescue) dyrygent może zapisać prośbę "podnieś effort kroku X". Silnik stosuje ją przy następnym wejściu lub wznowieniu sesji. To rozszerzenie profilu, który dyrygent już zapisuje po kroku planu.
+2. **Wniosek dyrygenta.** Przy wywołaniu dyrygenta (odpowiedź na pytanie agenta, decyzja, rescue) dyrygent może zapisać prośbę "podnieś effort kroku X". Silnik stosuje ją przy następnym wejściu lub wznowieniu sesji. Dyrygent nie zapisuje już profilu kroków. Robi to krok `profile` (plan `docs/plans/2026-11-11-002-feat-krok-profile-workflow-plan.md`), więc ta prośba potrzebuje własnego miejsca zapisu albo zapisu w `step-profile.json`.
 3. **Sufit.** Podniesienie nie przekracza `ceiling` kroku (zasady z PR #92 zostają).
 4. **Model stały.** Zmiana modelu jest poza zakresem. Wraca tylko jako świadoma decyzja operatora.
 5. **Wyzwalacz w silniku.** Dla pętli, które dyrygent nie widzi (reguła, skrypt), silnik może podnieść effort po N wejściach w ten sam krok. Wartość N jest do ustalenia.

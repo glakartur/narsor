@@ -160,8 +160,8 @@ An optional section defining default behavior for the whole workflow.
     the cheapest; they do not depend on the harness. Each harness maps a tier to a model name (in
     `engine/actions/harness`); a harness without a name for a tier stops the daemon at its start.
     The efforts are `low`, `medium`, `high` and `max`.
-*   `ceiling`: The general ceiling `{ model, effort }`: the most the conductor or an escalation may
-    set for a step. A step's own `ceiling` wins field by field. Loading copies the three values into
+*   `ceiling`: The general ceiling `{ model, effort }`: the most a `profile` step (§3.7.10) or an
+    escalation may set for a step. A step's own `ceiling` wins field by field. Loading copies the three values into
     every agent step, so a step holds its effective values. A step with a ceiling (its own or the
     general one) must have a model and an effort, and its ceiling must name both; the validator
     reports what is missing when the workflow loads.
@@ -437,14 +437,9 @@ action:
   effort: <low|medium|high|max>       # Default effort (optional). Passed as `--effort` to claude-code and as
                                       # `-c model_reasoning_effort=…` to codex (`max` becomes `xhigh`). opencode and
                                       # the Copilot harnesses ignore it; the timeline notes that.
-  ceiling:                            # Optional upper bound for what the conductor or an escalation may set.
+  ceiling:                            # Optional upper bound for what a `profile` step (§3.7.10) or an escalation may set.
     model: <small|medium|large|max>   #   not lower than the step's own `model`
     effort: <low|medium|high|max>     #   not lower than the step's own `effort`
-  plan: <bool>                        # Marks the plan step. When it succeeds, the conductor chooses the model and
-                                      # effort of the agent steps that have not started (shown in the TUI, read-only).
-                                      # The step may report `complexity` (an object with the optional fields `files`,
-                                      # `modules`, `migration_or_contract`, `missing_tests`, `unit_dependencies`)
-                                      # in a step variable of that name; the engine only passes it on.
   workspace_access: <read-write|read-only> # schema v1 only; read-write by default (v2: step `workspaces`, §3.2.1).
   prompt: |                           # Instruction for the agent
     Analyze the code in the current directory.
@@ -1145,8 +1140,8 @@ profile:
 
 *   The action takes the harness fields of an agent action: `harness`, `model`, `effort`, `ceiling`,
     `parameters` and `read_only_paths`. The same rules apply to them (§3.3.A). The step may have its
-    own `ceiling` and its own escalation. It has no `plan`, no `history` and no `workspace_access`.
-    Any other field is an error.
+    own `ceiling` and its own escalation. It has no `history` and no `workspace_access`. Any
+    other field is an error.
 *   The step has `exit` and no `choices`. It does not define `variables` or `artifacts`.
 *   The step is read-only when it has no `workspaces` section. A `workspaces` section (§3.2.1)
     gives it other access.
@@ -1173,12 +1168,21 @@ profile:
     on its own values, or else on the `globals` values. An entry written after the first entry into
     a step applies from the next attempt. The escalation after failed attempts starts from this
     value. A new file does not change the count of failed attempts. When the engine cannot read the
-    file, the steps start on their defaults and the execution records one warning. The engine does
-    not read the profile of the conductor (`conductor/profile.json`).
+    file, the steps start on their defaults and the execution records one warning. An execution
+    started on an older version can hold a profile of the conductor (`conductor/profile.json`).
+    The engine ignores that file.
 *   A profile step fails like an agent step. A failed attempt, for example a time-out, follows
     `retry_policy`. For an unusable answer the engine asks the agent again once, in the same
     session. When that answer is also unusable, the attempt fails and `retry_policy` applies. When
     no attempts are left, the step fails. The conductor does not choose a label for it.
+*   A workflow can have more than one profile step, and a profile step can run more than once.
+    Each run replaces the file, so the last run counts.
+*   The profile step replaces the `plan` field of an agent action and the profile that the
+    conductor made after the plan step. An agent action does not take `plan` now: a workflow file
+    with `plan:` does not load and the error names the unknown field `plan`. Remove the field and
+    add a profile step after the plan step. The definition that an execution pinned on an older
+    version (`executions/{id}/definition.yaml`) still loads: the engine removes `plan` from its
+    agent actions. Other unknown fields in it are still errors.
 
 ---
 

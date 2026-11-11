@@ -3,6 +3,10 @@
 Status: pomysł. Brak planu i brak decyzji o implementacji.
 Dotyczy: `workflows/compound-engineering.yaml` i dyrygenta.
 
+> **Aktualizacja 2026-11-11.** Profil po planie nie jest już zadaniem dyrygenta. Robi to krok
+> workflow `type: profile`. Zobacz plan `docs/plans/2026-11-11-002-feat-krok-profile-workflow-plan.md`
+> i `docs/dev/workflow-schema.md` §3.7.10. Punkt 2 propozycji opisuje stan sprzed tej zmiany.
+
 ## Cel
 
 Każdy krok workflow używa modelu i effortu dopasowanych do jego trudności.

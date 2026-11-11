@@ -693,7 +693,7 @@ fn step_list(task: &TaskSummary) -> Option<StepList> {
                     one_line(&step.label),
                     format!("Wznawia zadanie od kroku „{}”.", one_line(&step.id)),
                 );
-                if step.kind == StepKind::Agent {
+                if reads_a_comment(step.kind) {
                     item.with_field(ChooserField::multiline(COMMENT_FIELD).described(
                         "komentarz dla agenta, opcjonalny; nie zostaje na dalsze przebiegi",
                     ))
@@ -707,6 +707,12 @@ fn step_list(task: &TaskSummary) -> Option<StepList> {
         steps,
         chooser: Chooser::new(items),
     })
+}
+
+/// Whether the step's agent reads the operator's comment: an agent step and a
+/// `profile` step, which runs an agent too.
+fn reads_a_comment(kind: StepKind) -> bool {
+    matches!(kind, StepKind::Agent | StepKind::Profile)
 }
 
 fn link_list(task: &TaskSummary) -> LinkList {
@@ -1021,7 +1027,7 @@ impl TaskApp {
         let Some(step) = list.steps.get(submission.index) else {
             return Request::None;
         };
-        let note = (step.kind == StepKind::Agent)
+        let note = reads_a_comment(step.kind)
             .then(|| written_text(submission))
             .filter(|text| !text.is_empty());
         let summary = format!("wybór kroku „{}” wysłany do runnera", one_line(&step.id));

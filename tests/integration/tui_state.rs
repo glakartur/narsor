@@ -7933,6 +7933,53 @@ mod task_app_actions {
         }
     }
 
+    // -- choosing a step ------------------------------------------------------
+
+    mod step_choice {
+        use super::*;
+        use narsor_protocol::controller::{StepKind, StepView};
+
+        fn stopped_with_steps() -> TaskSummary {
+            let mut task = runner_state("paused");
+            let step = |id: &str, kind| StepView {
+                id: id.to_string(),
+                label: id.to_string(),
+                kind,
+            };
+            task.steps = Some(vec![
+                step("profile", StepKind::Profile),
+                step("work", StepKind::Agent),
+                step("check", StepKind::Script),
+            ]);
+            crate::task_app_support::offered(task)
+        }
+
+        #[test]
+        fn a_profile_step_takes_a_comment_like_an_agent_step() {
+            let mut app = loaded(stopped_with_steps());
+            assert_eq!(choose(&mut app, TaskAction::SelectStep), Request::None);
+            let Some(Overlay::Steps(_)) = app.overlay() else {
+                panic!("the list of steps");
+            };
+            let items = app.overlay().unwrap().chooser().unwrap().items();
+            let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+            assert_eq!(labels, ["profile", "work", "check"]);
+            assert_eq!(items[0].fields.len(), 1, "a profile step runs an agent");
+            assert_eq!(items[1].fields.len(), 1);
+            assert!(items[2].fields.is_empty(), "a script reads no comment");
+
+            ch(&mut app, '1');
+            let request = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::SelectStep {
+                    target: "profile".to_string(),
+                    note: None,
+                })
+            );
+        }
+    }
+
     // -- manual transitions --------------------------------------------------
 
     mod transitions {
@@ -9385,6 +9432,31 @@ mod task_app_conductor {
             assert!(text.contains("zadanie nie ma żywego runnera"), "{text}");
             ch(&mut app, 'c');
             assert!(!conductor(&app).is_typing());
+        }
+
+        #[test]
+        fn the_tab_has_no_step_profile_even_when_an_older_server_sends_one() {
+            let mut app = tab_app();
+            read(
+                &mut app,
+                conductor_view(
+                    vec![],
+                    json!({
+                        "profile": [{
+                            "step_id": "work",
+                            "model": "opus",
+                            "effort": "high",
+                            "rationale": "duża zmiana"
+                        }]
+                    }),
+                ),
+            );
+
+            let text = screen(&mut app, 120, 30);
+
+            assert!(text.contains("claude-code"), "the tab renders: {text}");
+            assert!(!text.contains("profil work"), "{text}");
+            assert!(!text.contains("duża zmiana"), "{text}");
         }
 
         #[test]

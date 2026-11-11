@@ -2613,11 +2613,8 @@ fn workflow_steps(record: &TaskRecord) -> Option<Vec<StepView>> {
             .filter_map(|id| {
                 let state = definition.states.get(id.as_str())?;
                 let kind = match &state.action {
-                    // A profiling step runs an agent; its own kind comes
-                    // with the protocol's profile views.
-                    Some(ActionConfig::Agent(_)) | Some(ActionConfig::Profile(_)) => {
-                        StepKind::Agent
-                    }
+                    Some(ActionConfig::Agent(_)) => StepKind::Agent,
+                    Some(ActionConfig::Profile(_)) => StepKind::Profile,
                     Some(ActionConfig::Script(_)) => StepKind::Script,
                     Some(ActionConfig::Human(_)) => StepKind::Human,
                     Some(ActionConfig::Wait(_)) => StepKind::Wait,
@@ -3100,6 +3097,37 @@ terminal_states: { completed: completed }
         assert_eq!(kind_of("work"), StepKind::Script);
         assert_eq!(kind_of("check"), StepKind::Script);
         assert_eq!(kind_of("completed"), StepKind::Terminal);
+    }
+
+    #[test]
+    fn a_profile_step_is_listed_with_its_own_kind() {
+        let yaml = r#"
+schema: v2
+name: steps
+version: 1
+states:
+  profile:
+    action:
+      type: profile
+      harness: claude-code
+      prompt: Decide the models of the later steps.
+    exit: { next: work }
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Do the work.
+    exit: { next: completed }
+  completed: {}
+terminal_states: { completed: completed }
+"#;
+        let record = record_of(Some(yaml), RunnerState::Stopped);
+
+        let steps = workflow_steps(&record).expect("a stopped task lists its steps");
+
+        let kind_of = |id: &str| steps.iter().find(|step| step.id == id).unwrap().kind;
+        assert_eq!(kind_of("profile"), StepKind::Profile);
+        assert_eq!(kind_of("work"), StepKind::Agent);
     }
 
     #[test]
