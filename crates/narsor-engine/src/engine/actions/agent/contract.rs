@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::{VariableDefinition, VariableSource};
+use crate::domain::{HarnessStepConfig, PromptText, VariableDefinition, VariableSource};
 use crate::persistence::DefaultHarnessSelector;
 
 /// Where the harness of an agent action that names none comes from.
@@ -251,24 +251,23 @@ pub fn conductor_reprompt_config(
     config
 }
 
-/// Configures the next normal attempt as a continuation of an operator-facing
+/// Turns the next normal attempt into a continuation of an operator-facing
 /// conversation. Unlike [`reprompt_config`], this preserves the action's
 /// workspace permission: the operator is explicitly asking the agent to keep
 /// working, not merely to repair an output envelope.
-pub fn continuation_config(
-    original: &AgentActionConfig,
+pub fn continue_session(
+    step: &mut HarnessStepConfig,
+    prompt: &mut PromptText,
     harness: &str,
     harness_session: &str,
     message: &str,
-) -> AgentActionConfig {
-    let mut config = original.clone();
-    config.harness_step.harness = Some(harness.to_string());
-    config.harness_step.parameters.insert(
+) {
+    step.harness = Some(harness.to_string());
+    step.parameters.insert(
         RESUME_SESSION_PARAMETER.to_string(),
         Value::String(harness_session.to_string()),
     );
-    config.prompt = message.into();
-    config
+    *prompt = message.into();
 }
 
 /// The variable the harness session id is published as, when there is one.

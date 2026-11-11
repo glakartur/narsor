@@ -498,6 +498,7 @@ pub enum ActionConfig {
     Human(HumanActionConfig),
     Wait(WaitActionConfig),
     Decision(DecisionActionConfig),
+    Profile(ProfileActionConfig),
 }
 
 impl ActionConfig {
@@ -506,6 +507,7 @@ impl ActionConfig {
     pub fn harness_step(&self) -> Option<&HarnessStepConfig> {
         match self {
             Self::Agent(config) => Some(&config.harness_step),
+            Self::Profile(config) => Some(&config.harness_step),
             Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
         }
     }
@@ -514,7 +516,45 @@ impl ActionConfig {
     pub fn harness_step_mut(&mut self) -> Option<&mut HarnessStepConfig> {
         match self {
             Self::Agent(config) => Some(&mut config.harness_step),
+            Self::Profile(config) => Some(&mut config.harness_step),
             Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+        }
+    }
+
+    /// The prompt the workflow author wrote for a step that runs a harness
+    /// (`agent` or `profile`), `None` for every other action.
+    pub fn harness_prompt(&self) -> Option<&PromptText> {
+        match self {
+            Self::Agent(config) => Some(&config.prompt),
+            Self::Profile(config) => Some(&config.prompt),
+            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+        }
+    }
+
+    /// The mutable harness settings and prompt of a step that runs a
+    /// harness, `None` for every other action.
+    pub fn harness_step_and_prompt_mut(
+        &mut self,
+    ) -> Option<(&mut HarnessStepConfig, &mut PromptText)> {
+        match self {
+            Self::Agent(config) => Some((&mut config.harness_step, &mut config.prompt)),
+            Self::Profile(config) => Some((&mut config.harness_step, &mut config.prompt)),
+            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+        }
+    }
+
+    /// Whether a `profile` step may propose a model and effort for this
+    /// step (R3): only an `agent` step that is not pinned
+    /// ([`HarnessStepConfig::is_pinned`]). A `profile` step never profiles
+    /// itself or another `profile` step.
+    pub fn is_profile_candidate(&self) -> bool {
+        match self {
+            Self::Agent(config) => !config.harness_step.is_pinned(),
+            Self::Profile(_)
+            | Self::Script(_)
+            | Self::Human(_)
+            | Self::Wait(_)
+            | Self::Decision(_) => false,
         }
     }
 }
@@ -622,9 +662,25 @@ pub struct HarnessStepConfig {
     /// Extra paths mounted read-only, relative to the workspace
     #[serde(default)]
     pub read_only_paths: Vec<String>,
+
+    /// Whether the step itself names both `model` and `effort`, recorded by
+    /// the loader before `globals.default_*` fill what the step leaves out
+    /// (R3). After [`Self::inherit_globals`] the two fields alone no longer
+    /// tell an own value from an inherited one. A definition saved before
+    /// the field existed reads it as `false`: the step is not pinned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_model_and_effort: bool,
 }
 
 impl HarnessStepConfig {
+    /// Whether the step keeps its own model and effort, so a `profile` step
+    /// leaves it alone (R3, AE1, AE2): it names both itself and has no
+    /// `ceiling`. A ceiling inherited from `globals.ceiling` counts, because
+    /// the author left room to raise the step.
+    pub fn is_pinned(&self) -> bool {
+        self.own_model_and_effort && self.ceiling.is_none()
+    }
+
     /// Fills what the step leaves out from `globals` (D9): `model` from
     /// `default_model`, `effort` from `default_effort`, and each field of
     /// `ceiling` from the general ceiling. What the step names wins.
@@ -670,6 +726,21 @@ pub struct AgentActionConfig {
 
 fn default_history() -> bool {
     true
+}
+
+/// Profile action configuration (`type: profile`): an agent that proposes a
+/// model and an effort for the workflow's `agent` steps. The engine adds the
+/// list of steps, the allowed tiers and efforts and the defaults to the
+/// author's prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileActionConfig {
+    /// The harness session the profiling agent runs in. Read-only unless
+    /// the step's `workspaces` section says otherwise.
+    #[serde(flatten)]
+    pub harness_step: HarnessStepConfig,
+
+    /// The author's prompt: where the agent finds what the work is about.
+    pub prompt: PromptText,
 }
 
 /// The workspace permission an agent action runs with, derived from the
@@ -1406,6 +1477,9 @@ pub enum ValidationError {
         state: StateId,
         action_type: &'static str,
     },
+
+    #[error("State '{state}' is a profile step and needs a single 'exit' instead of 'choices': it writes the step profile and the workflow goes on")]
+    ProfileNeedsExit { state: StateId },
 
     #[error("State '{state}' declares a 'timeout' choice, which only agent and script steps can produce")]
     TimeoutChoiceNotAllowed { state: StateId },

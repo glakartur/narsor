@@ -1123,6 +1123,45 @@ it. Picking one of the declared exits of the current state never needs the field
     a `human` action with `type: decision` and `by: human`, and its `inputs` with `variables`. Write
     `terminal_states` as a mapping.
 
+#### 3.7.10. Profile steps (`type: profile`)
+
+A profile step runs an agent that chooses the model and the effort of the workflow's `agent` steps.
+The author puts it where the workflow knows enough to judge the work, for example after the plan.
+The prompt says where the agent finds that information.
+
+```yaml
+profile:
+  action:
+    type: profile
+    model: small                 # optional, as on an agent action
+    effort: low                  # optional, as on an agent action
+    prompt: |                    # required, a prompt text (§3.7.6)
+      Judge how hard each step is from the plan:
+
+      {{ steps.plan.reply }}
+  exit:
+    next: build
+```
+
+*   The action takes the harness fields of an agent action: `harness`, `model`, `effort`, `ceiling`,
+    `parameters` and `read_only_paths`. The same rules apply to them (§3.3.A). The step may have its
+    own `ceiling` and its own escalation. It has no `plan`, no `history` and no `workspace_access`.
+    Any other field is an error.
+*   The step has `exit` and no `choices`. It does not define `variables` or `artifacts`.
+*   The step is read-only when it has no `workspaces` section. A `workspaces` section (§3.2.1)
+    gives it other access.
+*   A profile step is allowed only in the unified shape.
+*   The engine adds the list of the steps to profile, the allowed tiers and efforts and the
+    defaults of each step to the prompt. The author does not write them.
+*   Only `agent` steps are on that list. An agent step is not on the list (it is pinned) when its
+    action names both `model` and `effort` and it has no `ceiling`. Values from
+    `globals.default_model` and `globals.default_effort` do not count as the step's own values. A
+    ceiling from `globals.ceiling` counts as a ceiling, so such a step stays on the list.
+*   A profile step fails like an agent step. A failed attempt, for example a time-out, follows
+    `retry_policy`. For an unusable answer the engine asks the agent again once, in the same
+    session. An answer that is still unusable goes to the operator. The conductor does not choose
+    a label for it.
+
 ---
 
 ## 4. Example Workflow
@@ -1470,6 +1509,7 @@ Before a workflow is run, the definition must pass validation:
     *   `exit` is a reserved label and cannot be a key in `choices`. Every exit object has `next`.
     *   `terminal_states` is a mapping. There is no `human` action. A `decision` action is not allowed in a legacy file.
     *   A `decision` step has a non-blank `message` and at least one choice. It may define `variables`, not `artifacts`.
+    *   A `profile` step has a non-blank `prompt` and `exit`, never `choices`. It defines no `variables` and no `artifacts`. A `profile` action is not allowed in a legacy file (§3.7.10).
     *   A script step with `exit` cannot have `exit_codes`.
     *   In the unified shape only an agent or a script step can declare a `timeout` choice; a `decision` or `wait` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
     *   `resume_comment_field` on a decision step names a variable of `type: text`.

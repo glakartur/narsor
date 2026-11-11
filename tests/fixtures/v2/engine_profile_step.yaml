@@ -1,0 +1,74 @@
+# A `profile` step after the plan, then the steps it may profile: `build`
+# keeps its own model and effort (pinned, R3), `work` has a ceiling (a
+# candidate despite its own values), `review` takes the globals' defaults (a
+# candidate), and `check` is a script (never profiled).
+schema: v2
+name: engine-profile-step
+version: 1
+
+globals:
+  default_model: medium
+  default_effort: medium
+
+states:
+  plan:
+    action:
+      type: agent
+      prompt: Plan it.
+    exit:
+      next: profile
+
+  profile:
+    description: Choose a model and an effort for the steps after the plan.
+    action:
+      type: profile
+      model: small
+      effort: low
+      prompt: |
+        Judge how hard each step is from the plan:
+
+        {{ steps.plan.reply }}
+    exit:
+      next: build
+
+  build:
+    action:
+      type: agent
+      model: small
+      effort: low
+      prompt: Build it.
+    exit:
+      next: check
+
+  check:
+    action:
+      type: script
+      command: "true"
+    exit:
+      next: work
+
+  work:
+    action:
+      type: agent
+      model: medium
+      effort: low
+      ceiling: { model: large, effort: high }
+      prompt: Do it.
+    retry_policy:
+      max_attempts: 5
+      backoff: 0s
+    exit:
+      next: review
+
+  review:
+    action:
+      type: agent
+      prompt: Review it.
+    exit:
+      next: done
+
+  done:
+    description: Finished.
+
+terminal_states:
+  done: completed

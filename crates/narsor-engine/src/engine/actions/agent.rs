@@ -65,7 +65,7 @@ pub use super::session::{
 };
 use contract::AWAITING_INPUT;
 pub use contract::{
-    conductor_reprompt_config, continuation_config, output_contract, reprompt_config,
+    conductor_reprompt_config, continue_session, output_contract, reprompt_config,
     DefaultHarnessSource, CONDUCTOR_REPROMPT_GUARD, MISSING_OUTPUT_LABEL, OUTPUT_REPROMPT,
     SESSION_DATA_KEY, SESSION_ID_VARIABLE,
 };
@@ -265,5 +265,6 @@ fn action_type_name(action: &ActionConfig) -> &'static str {
         ActionConfig::Human(_) => "human",
         ActionConfig::Wait(_) => "wait",
         ActionConfig::Decision(_) => "decision",
+        ActionConfig::Profile(_) => "profile",
     }
 }

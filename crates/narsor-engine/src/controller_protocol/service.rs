@@ -2613,7 +2613,11 @@ fn workflow_steps(record: &TaskRecord) -> Option<Vec<StepView>> {
             .filter_map(|id| {
                 let state = definition.states.get(id.as_str())?;
                 let kind = match &state.action {
-                    Some(ActionConfig::Agent(_)) => StepKind::Agent,
+                    // A profiling step runs an agent; its own kind comes
+                    // with the protocol's profile views.
+                    Some(ActionConfig::Agent(_)) | Some(ActionConfig::Profile(_)) => {
+                        StepKind::Agent
+                    }
                     Some(ActionConfig::Script(_)) => StepKind::Script,
                     Some(ActionConfig::Human(_)) => StepKind::Human,
                     Some(ActionConfig::Wait(_)) => StepKind::Wait,

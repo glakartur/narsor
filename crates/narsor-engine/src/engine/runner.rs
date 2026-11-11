@@ -254,6 +254,8 @@ pub enum ActionKind {
     Wait,
     /// `DecisionAction` — no executor in this version.
     Decision,
+    /// `ProfileAction`: an agent that proposes the step profile.
+    Profile,
 }
 
 impl ActionKind {
@@ -265,6 +267,7 @@ impl ActionKind {
             ActionConfig::Human(_) => Self::Human,
             ActionConfig::Wait(_) => Self::Wait,
             ActionConfig::Decision(_) => Self::Decision,
+            ActionConfig::Profile(_) => Self::Profile,
         }
     }
 
@@ -276,6 +279,7 @@ impl ActionKind {
             Self::Human => "human",
             Self::Wait => "wait",
             Self::Decision => "decision",
+            Self::Profile => "profile",
         }
     }
 
@@ -289,7 +293,7 @@ impl ActionKind {
     /// its entries against `max_entries`.
     pub fn runs_harness(self) -> bool {
         match self {
-            Self::Agent => true,
+            Self::Agent | Self::Profile => true,
             Self::Script | Self::Human | Self::Wait | Self::Decision => false,
         }
     }
@@ -299,8 +303,19 @@ impl ActionKind {
     /// asked for again (KTD7) rather than failing the action.
     pub fn reprompts_rejected_output(self) -> bool {
         match self {
-            Self::Agent => true,
+            Self::Agent | Self::Profile => true,
             Self::Script | Self::Human | Self::Wait | Self::Decision => false,
+        }
+    }
+
+    /// Whether the conductor may settle an output the reprompt did not
+    /// repair, by choosing the step's label for it (F1, `rescue.rs`). A
+    /// `profile` step has no label to choose: its unusable output goes to
+    /// the operator.
+    pub fn rescues_output_label(self) -> bool {
+        match self {
+            Self::Agent => true,
+            Self::Profile | Self::Script | Self::Human | Self::Wait | Self::Decision => false,
         }
     }
 
@@ -309,7 +324,7 @@ impl ActionKind {
     pub fn answers_with_step_contract(self) -> bool {
         match self {
             Self::Agent | Self::Script => true,
-            Self::Human | Self::Wait | Self::Decision => false,
+            Self::Profile | Self::Human | Self::Wait | Self::Decision => false,
         }
     }
 
@@ -319,7 +334,7 @@ impl ActionKind {
     pub fn holds_variables_to_declarations(self) -> bool {
         match self {
             Self::Agent | Self::Script | Self::Decision => true,
-            Self::Human | Self::Wait => false,
+            Self::Profile | Self::Human | Self::Wait => false,
         }
     }
 }
@@ -2522,7 +2537,7 @@ impl Engine {
     ) -> Option<u64> {
         let declared = state.timeout_secs.or(definition.globals.timeout_secs);
         match kind {
-            ActionKind::Agent => declared.or(self.agent_timeout_secs),
+            ActionKind::Agent | ActionKind::Profile => declared.or(self.agent_timeout_secs),
             // Unchanged, bit for bit: a script or human state that declares no
             // limit still has none. Spelled out rather than caught by `_`, so
             // that a fifth action kind has to decide rather than inherit.
@@ -2796,14 +2811,12 @@ impl Engine {
         // restart before the attempt begins cannot silently discard it.
         let mut resumed_input = None;
         let mut author = harness_attempt::prompt_author_of(action);
-        if let (ActionConfig::Agent(config), ActionConfig::Agent(template)) =
-            (&mut rendered, action)
-        {
+        if let Some(template) = action.harness_prompt() {
             resumed_input = self.prepare_harness_attempt(
                 execution,
                 state,
                 template,
-                config,
+                &mut rendered,
                 &history,
                 pinned_harness,
                 profile,
@@ -2927,20 +2940,20 @@ impl Engine {
             ))
         })?;
 
-        // The access an agent runs with comes from the step's `workspace`
-        // section; a run that already carries one (a reprompt) keeps it.
+        // The access a harness session runs with comes from the step's
+        // `workspace` section; a run that already carries one (a reprompt,
+        // a `profile` step without a section) keeps it.
         let with_access;
-        let rendered = match rendered {
-            ActionConfig::Agent(config)
-                if config.harness_step.workspace_access.is_none()
-                    && state.workspace_access().is_some() =>
-            {
-                let mut config = config.clone();
-                config.harness_step.workspace_access = state.workspace_access();
-                with_access = ActionConfig::Agent(config);
+        let rendered = match (rendered.harness_step(), state.workspace_access()) {
+            (Some(step), Some(access)) if step.workspace_access.is_none() => {
+                let mut config = rendered.clone();
+                if let Some(step) = config.harness_step_mut() {
+                    step.workspace_access = Some(access);
+                }
+                with_access = config;
                 &with_access
             }
-            other => other,
+            _ => rendered,
         };
 
         let conversation_store = self.store.conversation_store(&execution.id);
@@ -3067,15 +3080,17 @@ impl Engine {
         timeout: Option<Duration>,
     ) -> Result<ActionUpshot, EngineError> {
         let mut rescue = OutputRescue::after(&rejection);
+        // A `profile` step has no reprompt of its own yet: its unusable
+        // output goes to the operator (see `rescue_output`).
         let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
             (ActionConfig::Agent(config), Some(harness), Some(session)) => {
                 let profiled = self.profiled_template(execution, state, config);
-                Some(agent::reprompt_config(
+                Some(ActionConfig::Agent(agent::reprompt_config(
                     &profiled,
                     harness,
                     session,
                     &rejection.reason,
-                ))
+                )))
             }
             _ => None,
         };
@@ -3143,7 +3158,7 @@ impl Engine {
         &self,
         execution: &mut WorkflowExecution,
         state: &State,
-        config: crate::domain::AgentActionConfig,
+        rendered: ActionConfig,
         previous_attempt: &str,
         previous_reply: Option<&str>,
         by: RepromptedBy,
@@ -3166,7 +3181,6 @@ impl Engine {
         clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
         self.store.save_execution(execution)?;
 
-        let rendered = ActionConfig::Agent(config);
         let outcome = match self
             .execute_rendered(
                 execution,
@@ -4512,6 +4526,11 @@ fn output_problem_instruction(state: &State) -> String {
              ends with, and the variables it needs.",
             state.id
         ),
+        Some(ActionConfig::Profile(_)) => format!(
+            "The profiling agent of state '{}' did not give a usable step profile. Choose \
+             the step's exit to go on without a new profile.",
+            state.id
+        ),
         _ => format!(
             "The agent of state '{}' did not give a usable output label. Choose the \
              label its step ends with, and the data and variables it would have given.",
@@ -4894,6 +4913,7 @@ fn step_reply_attempt<'a>(execution: &'a WorkflowExecution, state_id: &str) -> O
 fn step_templates(action: &ActionConfig) -> Vec<String> {
     match action {
         ActionConfig::Agent(config) => config.prompt.template_pieces(),
+        ActionConfig::Profile(config) => config.prompt.template_pieces(),
         ActionConfig::Human(config) => vec![config.instruction.clone()],
         ActionConfig::Decision(config) => config.message.template_pieces(),
         ActionConfig::Script(_) | ActionConfig::Wait(_) => Vec::new(),
@@ -5031,6 +5051,40 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_an_agent_has_its_label_rescued_by_the_conductor() {
+        for kind in KINDS {
+            assert_eq!(
+                kind.rescues_output_label(),
+                kind == ActionKind::Agent,
+                "{kind:?}"
+            );
+        }
+        assert!(!ActionKind::Profile.rescues_output_label());
+    }
+
+    /// A `profile` step runs on a harness like an agent and is asked again
+    /// for an unusable answer, but answers with no step contract: no label
+    /// to rescue, no variables to hold to declarations.
+    #[test]
+    fn a_profile_step_runs_a_harness_without_a_step_contract() {
+        let profile = ActionKind::Profile;
+        assert_eq!(profile.name(), "profile");
+        assert!(profile.runs_harness());
+        assert!(profile.reprompts_rejected_output());
+        assert!(!profile.rescues_output_label());
+        assert!(!profile.answers_with_step_contract());
+        assert!(!profile.holds_variables_to_declarations());
+    }
+
+    #[test]
+    fn a_profile_action_is_of_the_profile_kind() {
+        let action: ActionConfig =
+            serde_json::from_value(json!({ "type": "profile", "prompt": "judge" }))
+                .expect("a profile action reads");
+        assert_eq!(ActionKind::of(&action), ActionKind::Profile);
     }
 
     #[test]

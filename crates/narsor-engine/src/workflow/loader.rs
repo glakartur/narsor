@@ -37,9 +37,9 @@ use crate::domain::{
     ActionConfig, AgentActionConfig, AgentDecisionConfig, ArtifactDefinition, ChoiceDefinition,
     DecisionActionConfig, DecisionConfig, DefinitionShape, GlobalsConfig, HumanActionConfig,
     HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter, ParamType,
-    RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion, ScriptActionConfig, State,
-    StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig, WorkflowDefinition,
-    WorkspaceAccess, EXIT_LABEL,
+    ProfileActionConfig, RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion,
+    ScriptActionConfig, State, StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig,
+    WorkflowDefinition, WorkspaceAccess, EXIT_LABEL,
 };
 
 use super::schema::{
@@ -410,8 +410,9 @@ fn compile_state(
     };
 
     // A `v1` agent on a workflow with no repository has no section to carry
-    // its access, so the action keeps it.
-    let keeps_v1_access = workspace.is_none();
+    // its access, so the action keeps it; a `profile` step without one reads
+    // only.
+    let without_section = workspace.is_none();
 
     let (choices, transitions) = compile_exits(state.choices, state.exit, state.transitions);
 
@@ -421,7 +422,7 @@ fn compile_state(
         description: state.description,
         action: state
             .action
-            .map(|action| compile_action(action, keeps_v1_access)),
+            .map(|action| compile_action(action, without_section)),
         variables: state.variables.into_iter().map(compile_variable).collect(),
         artifacts: state
             .artifacts
@@ -501,11 +502,11 @@ fn non_blank(text: Option<String>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
+fn compile_action(action: ActionSchema, without_section: bool) -> ActionConfig {
     match action {
         ActionSchema::Agent(agent) => {
             let mut harness_step = agent.harness_step();
-            if !keep_v1_access {
+            if !without_section {
                 harness_step.workspace_access = None;
             }
             ActionConfig::Agent(AgentActionConfig {
@@ -542,6 +543,19 @@ fn compile_action(action: ActionSchema, keep_v1_access: bool) -> ActionConfig {
                 .collect(),
             input_schema: None,
         }),
+        ActionSchema::Profile(profile) => {
+            let mut harness_step = profile.harness_step();
+            // Profiling only reads (least privilege): without a `workspaces`
+            // section the step runs read-only; with one, the section decides
+            // when the action runs, as for an agent.
+            if without_section {
+                harness_step.workspace_access = Some(WorkspaceAccess::ReadOnly);
+            }
+            ActionConfig::Profile(ProfileActionConfig {
+                harness_step,
+                prompt: profile.prompt,
+            })
+        }
         ActionSchema::Decision(decision) => ActionConfig::Decision(DecisionActionConfig {
             by: decision.by,
             message: decision.message,

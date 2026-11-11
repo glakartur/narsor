@@ -400,6 +400,7 @@ fn agent_action(prompt: &str) -> AgentActionConfig {
             workspace: None,
             parameters: HashMap::new(),
             read_only_paths: Vec::new(),
+            own_model_and_effort: false,
         },
         plan: false,
         prompt: prompt.into(),

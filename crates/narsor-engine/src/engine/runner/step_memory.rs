@@ -254,12 +254,12 @@ pub(super) fn history_block(
 
 /// Adds `history` to a rendered agent `config` after the author's prompt,
 /// unless the prompt `template` placed it itself (R18).
-pub(super) fn add_history(config: &mut AgentActionConfig, template: &PromptText, history: &str) {
+pub(super) fn add_history(prompt: &mut PromptText, template: &PromptText, history: &str) {
     if history.is_empty() || template.texts().any(places_step_history) {
         return;
     }
-    config.prompt.push_str("\n\n---\n");
-    config.prompt.push_str(history);
+    prompt.push_str("\n\n---\n");
+    prompt.push_str(history);
 }
 
 /// Both records, as a decision saves them for an undo to restore.

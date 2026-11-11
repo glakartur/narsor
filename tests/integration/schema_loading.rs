@@ -1444,7 +1444,8 @@ fn a_sealed_definition_that_still_has_display_reads_back() {
     assert_eq!(definition.name, load_reference().name);
 }
 
-const UNIFIED_FIXTURES: [&str; 6] = [
+const UNIFIED_FIXTURES: [&str; 7] = [
+    "v2/engine_profile_step.yaml",
     "v2/prompt_parts.yaml",
     "v2/exit.yaml",
     "v2/set.yaml",
@@ -1924,6 +1925,8 @@ fn expected_persisted_actions() -> Vec<narsor_engine::domain::AgentActionConfig>
             )]
             .into(),
             read_only_paths: vec!["docs".into(), "specs/api".into()],
+            // Saved before the marker existed: not pinned.
+            own_model_and_effort: false,
         },
         plan: true,
         prompt: PromptText::from_parts(vec![
@@ -1987,4 +1990,225 @@ fn agent_actions_are_saved_in_the_shape_they_had_before_the_harness_step_type() 
         format!("{:?}", agent_configs(reread)),
         format!("{:?}", expected_persisted_actions())
     );
+}
+
+// --- `type: profile` (U4) -------------------------------------------------
+
+fn harness_step<'a>(
+    definition: &'a WorkflowDefinition,
+    id: &str,
+) -> &'a narsor_engine::domain::HarnessStepConfig {
+    state(definition, id)
+        .action
+        .as_ref()
+        .and_then(ActionConfig::harness_step)
+        .unwrap_or_else(|| panic!("'{id}' must run a harness"))
+}
+
+#[test]
+fn a_profile_step_with_an_exit_loads_read_only() {
+    let definition = load_fixture("v2/engine_profile_step.yaml");
+    let profile = state(&definition, "profile");
+
+    let Some(ActionConfig::Profile(config)) = &profile.action else {
+        panic!("'profile' must be a profile step, got {:?}", profile.action);
+    };
+    assert_eq!(labels(profile), [EXIT_LABEL]);
+    assert_eq!(
+        config.harness_step.workspace_access,
+        Some(WorkspaceAccess::ReadOnly)
+    );
+    assert_eq!(config.harness_step.model.as_deref(), Some("small"));
+    assert!(config.prompt.to_string().contains("{{ steps.plan.reply }}"));
+    // A profile step is never on the list it writes.
+    assert!(!profile.action.as_ref().unwrap().is_profile_candidate());
+}
+
+#[test]
+fn a_profile_step_with_a_workspaces_section_takes_its_access_from_it() {
+    let yaml = r#"
+schema: v2
+name: sectioned
+version: 1
+globals:
+  workspaces:
+    code: { primary: true, repository: code-repo }
+states:
+  profile:
+    action: { type: profile, prompt: judge }
+    workspaces: { root: code }
+    exit: { next: done }
+  done:
+    description: end
+terminal_states:
+  done: completed
+"#;
+    let definition = load_from_str(yaml).expect("the workflow loads");
+    let profile = state(&definition, "profile");
+    // Left to the section, which the engine reads when the action runs.
+    assert_eq!(harness_step(&definition, "profile").workspace_access, None);
+    assert_eq!(profile.workspace_access(), Some(WorkspaceAccess::ReadWrite));
+}
+
+#[test]
+fn a_step_with_its_own_model_and_effort_and_no_ceiling_is_pinned() {
+    // AE1.
+    let definition = load_fixture("v2/engine_profile_step.yaml");
+    let build = harness_step(&definition, "build");
+    assert!(build.own_model_and_effort);
+    assert!(build.is_pinned());
+    assert!(!state(&definition, "build")
+        .action
+        .as_ref()
+        .unwrap()
+        .is_profile_candidate());
+}
+
+#[test]
+fn a_step_with_a_ceiling_is_not_pinned() {
+    // AE2.
+    let definition = load_fixture("v2/engine_profile_step.yaml");
+    let work = harness_step(&definition, "work");
+    assert!(work.own_model_and_effort);
+    assert!(!work.is_pinned());
+    assert!(state(&definition, "work")
+        .action
+        .as_ref()
+        .unwrap()
+        .is_profile_candidate());
+}
+
+#[test]
+fn a_model_and_effort_from_the_globals_do_not_pin_a_step() {
+    let definition = load_fixture("v2/engine_profile_step.yaml");
+    let review = harness_step(&definition, "review");
+    assert_eq!(review.model.as_deref(), Some("medium"));
+    assert_eq!(review.effort.as_deref(), Some("medium"));
+    assert!(!review.own_model_and_effort);
+    assert!(!review.is_pinned());
+}
+
+#[test]
+fn a_step_with_only_one_own_value_is_not_pinned() {
+    let yaml = unified(
+        "  build:\n    action: { type: agent, prompt: b, model: small }\n    exit: { next: done }",
+    );
+    let definition = load_from_str(&yaml).expect("the workflow loads");
+    assert!(!harness_step(&definition, "build").is_pinned());
+}
+
+#[test]
+fn the_general_ceiling_unpins_a_step_with_its_own_values() {
+    let yaml = r#"
+schema: v2
+name: capped
+version: 1
+globals:
+  default_model: medium
+  default_effort: medium
+  ceiling: { model: large, effort: high }
+states:
+  build:
+    action: { type: agent, prompt: b, model: small, effort: low }
+    exit: { next: done }
+  done:
+    description: end
+terminal_states:
+  done: completed
+"#;
+    let definition = load_from_str(yaml).expect("the workflow loads");
+    let build = harness_step(&definition, "build");
+    assert!(build.own_model_and_effort);
+    assert!(build.ceiling.is_some(), "the general ceiling is inherited");
+    assert!(!build.is_pinned());
+}
+
+#[test]
+fn the_own_values_marker_survives_a_saved_definition() {
+    let definition = load_fixture("v2/engine_profile_step.yaml");
+    let saved = serde_json::to_string(&definition).expect("the definition serializes");
+    let reread: WorkflowDefinition = serde_json::from_str(&saved).expect("it reads back");
+    assert!(harness_step(&reread, "build").is_pinned());
+    assert!(!harness_step(&reread, "review").is_pinned());
+    assert!(matches!(
+        state(&reread, "profile").action,
+        Some(ActionConfig::Profile(_))
+    ));
+}
+
+#[test]
+fn a_definition_saved_before_the_marker_reads_as_not_pinned() {
+    let definition = load_fixture("v2/engine_profile_step.yaml");
+    let mut saved = serde_json::to_value(&definition).expect("the definition serializes");
+    let build = &mut saved["states"]["build"]["action"];
+    assert_eq!(build["own_model_and_effort"], serde_json::json!(true));
+    build
+        .as_object_mut()
+        .unwrap()
+        .remove("own_model_and_effort");
+
+    let reread: WorkflowDefinition = serde_json::from_value(saved).expect("it reads back");
+    let build = harness_step(&reread, "build");
+    assert_eq!(build.model.as_deref(), Some("small"));
+    assert!(!build.own_model_and_effort);
+    assert!(!build.is_pinned());
+}
+
+#[test]
+fn an_unknown_field_in_a_profile_action_is_rejected() {
+    let error = load_error(&unified(
+        "  profile:\n    action: { type: profile, prompt: judge, history: false }\n    exit: { next: done }",
+    ));
+    assert!(error.contains("history"), "{error}");
+}
+
+#[test]
+fn a_profile_step_needs_the_unified_shape() {
+    let error = load_error(
+        "schema: v2\nname: legacy\nversion: 1\nstates:\n  profile:\n    action: { type: profile, prompt: judge }\n    choices: [success]\n    transitions: { success: done }\n  done:\n    description: end\nterminal_states: [done]\n",
+    );
+    assert!(
+        error.contains("'profile'") && error.contains("unified state shape"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_profile_step_with_choices_is_rejected_when_validated() {
+    let yaml = unified(
+        "  profile:\n    action: { type: profile, prompt: judge }\n    choices:\n      easy: { next: done }\n      hard: { next: done }",
+    );
+    let errors = load_from_str(&yaml)
+        .expect("the workflow loads")
+        .validate()
+        .expect_err("a profile step has a single exit");
+    let messages: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("State 'profile' is a profile step and needs a single 'exit'")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn a_profile_step_with_variables_or_artifacts_is_rejected_when_validated() {
+    for definitions in [
+        "    variables:\n      - { name: size, type: text }",
+        "    artifacts:\n      - { name: report, description: a report }",
+    ] {
+        let yaml = unified(&format!(
+            "  profile:\n    action: {{ type: profile, prompt: judge }}\n{definitions}\n    exit: {{ next: done }}"
+        ));
+        let errors = load_from_str(&yaml)
+            .expect("the workflow loads")
+            .validate()
+            .expect_err("a profile step defines nothing");
+        assert!(
+            errors.iter().any(|e| e
+                .to_string()
+                .contains("is a profile step and cannot define variables or artifacts")),
+            "{errors:?}"
+        );
+    }
 }

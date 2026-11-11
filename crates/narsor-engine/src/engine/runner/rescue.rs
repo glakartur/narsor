@@ -73,7 +73,9 @@ impl Engine {
     /// it decides (see the module documentation).
     ///
     /// `rescue` is already persisted in the execution. Without a conductor
-    /// attached, the step becomes a problem straight away.
+    /// attached, or for a step whose label the conductor does not choose
+    /// ([`ActionKind::rescues_output_label`]), the step becomes a problem
+    /// straight away.
     pub(super) async fn rescue_output(
         &self,
         definition: &WorkflowDefinition,
@@ -82,8 +84,12 @@ impl Engine {
         mut rescue: OutputRescue,
         timeout: Option<Duration>,
     ) -> Result<Flow, EngineError> {
+        let rescued_by_conductor = state
+            .action
+            .as_ref()
+            .is_some_and(|action| ActionKind::of(action).rescues_output_label());
         loop {
-            let conductor = self.conductor();
+            let conductor = self.conductor().filter(|_| rescued_by_conductor);
 
             if let Some(conductor) = &conductor {
                 // Decided before a restart: applied, never asked again.
@@ -224,7 +230,9 @@ impl Engine {
                             if rescue.can_reprompt() =>
                         {
                             let profiled = self.profiled_template(execution, state, config);
-                            agent::conductor_reprompt_config(&profiled, harness, session, &prompt)
+                            ActionConfig::Agent(agent::conductor_reprompt_config(
+                                &profiled, harness, session, &prompt,
+                            ))
                         }
                         // The purpose did not offer (b): a response that
                         // takes it anyway was refused before it got here.

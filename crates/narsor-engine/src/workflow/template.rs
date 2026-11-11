@@ -34,8 +34,9 @@ use serde_json::{Map, Value};
 
 use crate::domain::{
     ActionConfig, AgentActionConfig, ArtifactReference, Context, DecisionActionConfig,
-    HumanActionConfig, PromptPart, PromptText, ScriptActionConfig, VariableDefinition,
-    WaitActionConfig, WorkflowDefinition, WorkspaceField, WorkspacePr, LOCAL_VARIABLE_PREFIX,
+    HumanActionConfig, ProfileActionConfig, PromptPart, PromptText, ScriptActionConfig,
+    VariableDefinition, WaitActionConfig, WorkflowDefinition, WorkspaceField, WorkspacePr,
+    LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -457,7 +458,7 @@ impl<'a> TemplateScope<'a> {
     /// Renders every templated field of an action configuration, returning a
     /// new configuration with the placeholders replaced.
     ///
-    /// Covered fields: the agent prompt, the script command, arguments,
+    /// Covered fields: the agent and profile prompt, the script command, arguments,
     /// working directory and environment values, the human instruction, and
     /// every string inside a wait filter. The definition itself is left
     /// untouched (D31).
@@ -468,6 +469,11 @@ impl<'a> TemplateScope<'a> {
     ) -> Result<ActionConfig, TemplateError> {
         match action {
             ActionConfig::Agent(config) => Ok(ActionConfig::Agent(AgentActionConfig {
+                prompt: self.render_text(&config.prompt, &format!("{location}, prompt"))?,
+                ..config.clone()
+            })),
+
+            ActionConfig::Profile(config) => Ok(ActionConfig::Profile(ProfileActionConfig {
                 prompt: self.render_text(&config.prompt, &format!("{location}, prompt"))?,
                 ..config.clone()
             })),
@@ -913,8 +919,9 @@ fn expressions(template: &str) -> Vec<&str> {
 pub fn action_context_references(action: &ActionConfig) -> Vec<String> {
     let mut names = Vec::new();
     match action {
-        ActionConfig::Agent(config) => {
-            for piece in config.prompt.template_pieces() {
+        ActionConfig::Agent(AgentActionConfig { prompt, .. })
+        | ActionConfig::Profile(ProfileActionConfig { prompt, .. }) => {
+            for piece in prompt.template_pieces() {
                 collect_context_references(&piece, &mut names);
             }
         }

@@ -133,6 +133,7 @@ fn action_type_name(action: &ActionConfig) -> &'static str {
         ActionConfig::Human(_) => "human",
         ActionConfig::Wait(_) => "wait",
         ActionConfig::Decision(_) => "decision",
+        ActionConfig::Profile(_) => "profile",
     }
 }
 

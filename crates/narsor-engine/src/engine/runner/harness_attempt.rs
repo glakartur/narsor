@@ -6,6 +6,7 @@
 //! note. Everything here works on an already rendered `config`.
 
 use super::*;
+use crate::domain::PromptText;
 
 /// What [`Engine::apply_step_profile`] needs to know about the attempt.
 #[derive(Clone, Copy)]
@@ -36,17 +37,16 @@ pub(super) fn step_history(
 /// Who the prompt of `action` comes from before any answer is added to it:
 /// the user, too, when it embeds what they wrote.
 pub(super) fn prompt_author_of(action: &ActionConfig) -> PromptAuthor {
-    match action {
-        ActionConfig::Agent(template) if template.prompt.texts().any(embeds_user_content) => {
-            PromptAuthor::EngineUser
-        }
+    match action.harness_prompt() {
+        Some(prompt) if prompt.texts().any(embeds_user_content) => PromptAuthor::EngineUser,
         _ => PromptAuthor::Engine,
     }
 }
 
 impl Engine {
-    /// Prepares the rendered harness `config` of one attempt;
-    /// `template` is the action as the workflow declares it, `history` the
+    /// Prepares the rendered harness action `config` of one attempt (an
+    /// `agent` or a `profile` step; any other action is left alone);
+    /// `template` is its prompt as the workflow declares it, `history` the
     /// step's history block.
     ///
     /// Returns the answer the attempt resumes with, consumed here, if one
@@ -56,34 +56,35 @@ impl Engine {
         &self,
         execution: &mut WorkflowExecution,
         state: &State,
-        template: &AgentActionConfig,
-        config: &mut AgentActionConfig,
+        template: &PromptText,
+        config: &mut ActionConfig,
         history: &str,
         pinned_harness: &mut Option<String>,
         profile: AttemptProfile,
     ) -> Result<Option<AgentInput>, AttemptFailure> {
+        let Some((step, prompt)) = config.harness_step_and_prompt_mut() else {
+            return Ok(None);
+        };
         // Before a resumed session replaces the prompt: a session that
         // goes on already knows its history (KTD9).
-        step_memory::add_history(config, &template.prompt, history);
-        self.pin_harness(&mut config.harness_step, pinned_harness);
-        self.apply_step_profile(execution, state, &mut config.harness_step, profile);
+        step_memory::add_history(prompt, template, history);
+        self.pin_harness(step, pinned_harness);
+        self.apply_step_profile(execution, state, step, profile);
         let input = self.take_agent_input(execution, state)?;
         if let Some(input) = &input {
             if let (Some(harness), Some(session)) =
                 (input.harness.as_deref(), input.session.as_deref())
             {
-                *config = agent::continuation_config(config, harness, session, &input.answer);
+                agent::continue_session(step, prompt, harness, session, &input.answer);
             } else {
-                config
-                    .prompt
-                    .push_str("\n\nHuman answer to your question:\n");
-                config.prompt.push_str(&input.answer);
+                prompt.push_str("\n\nHuman answer to your question:\n");
+                prompt.push_str(&input.answer);
             }
-            config.harness_step.permission_grants = input.permission_rules.clone();
+            step.permission_grants = input.permission_rules.clone();
         }
         if let Some(note) = self.take_operator_recovery_note(execution)? {
-            config.prompt.push_str("\n\nOperator recovery note:\n");
-            config.prompt.push_str(&note);
+            prompt.push_str("\n\nOperator recovery note:\n");
+            prompt.push_str(&note);
         }
         Ok(input)
     }
