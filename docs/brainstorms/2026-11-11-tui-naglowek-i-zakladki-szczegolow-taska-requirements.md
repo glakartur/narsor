@@ -7,7 +7,7 @@ topic: tui-naglowek-i-zakladki-szczegolow-taska
 
 ## Summary
 
-Nagłówek szczegółów taska traci tło i dostaje nową kolejność wierszy: pełny tytuł (tylko gdy ramka go skraca), wiersze workspace'ów, status, koszt. Wiersze workspace'ów mają separatory ` · ` i nie pokazują `—` bez PR. Status nie pokazuje `bez slotu`. Belka zakładek stoi między dwiema liniami w kolorze ramki, które łączą się z ramką. *Rozmowa* jest pierwszą zakładką. Znacznik śledzenia przechodzi z belki na linię nad listą kroków w *Rozmowie*, w krótkiej formie z `[f]`. Tekst w pigułkach na ramce ma zawsze kolor czarny.
+Nagłówek szczegółów taska traci tło i dostaje nową kolejność wierszy: pełny tytuł (tylko gdy ramka go skraca), wiersze workspace'ów, status, koszt. Wiersze workspace'ów mają separatory ` · ` i nie pokazują `—` bez PR. Status nie pokazuje `bez slotu`. Belka zakładek stoi między dwiema liniami w kolorze ramki, które łączą się z ramką. *Rozmowa* jest pierwszą zakładką. Znaczniki śledzenia *Rozmowy* i *Przebiegu* przechodzą z belki na linię nad listą kroków w danej zakładce, w krótkiej formie z `[f]`. Tekst w pigułkach na ramce ma zawsze kolor czarny.
 
 ---
 
@@ -21,7 +21,7 @@ Widok szczegółów taska rysuje dziś `src/tui/task_app/detail.rs` (funkcje `re
 - Wiersz workspace'u bez PR kończy się znakiem `—`. Ten znak nie niesie informacji. Kolumny w wierszu dzieli tylko spacja, więc repozytorium, gałąź, statystyki i PR zlewają się.
 - Status zakończonego taska pokazuje `bez slotu`. Ta informacja wynika ze stanu taska (zakończony, pauza, błąd, czeka na człowieka), więc jest zbędna.
 - Belkę zakładek od nagłówka oddziela czarna linia (`task_tabs_divider`), a pod belką jest wiersz z podkreśleniem tylko pod aktywną zakładką. Belka nie łączy się z ramką panelu.
-- Znacznik śledzenia (`↧ śledzi · f wyłącz` / `⏸ ręcznie · f śledź`) stoi na końcu belki zakładek. Ten znacznik dotyczy tylko *Rozmowy*, a zajmuje miejsce w belce wspólnej dla wszystkich zakładek.
+- Znacznik śledzenia (`↧ śledzi · f wyłącz` / `⏸ ręcznie · f śledź`) stoi na końcu belki zakładek. Ten znacznik dotyczy tylko *Rozmowy*, a zajmuje miejsce w belce wspólnej dla wszystkich zakładek. Znacznik `↧ podąża` / `· ręcznie` dotyczy tylko *Przebiegu* i też stoi na końcu belki.
 - *Rozmowa* jest drugą zakładką, a operator używa jej najczęściej.
 
 ---
@@ -62,13 +62,16 @@ Widok szczegółów taska rysuje dziś `src/tui/task_app/detail.rs` (funkcje `re
 - R21. Obie linie i łączniki mają kolor ramki w tej chwili: rola fokusu, gdy szczegóły mają klawiaturę, rola tła w innym przypadku, rola tła przy `stale`.
 - R22. Na dolnej linii odcinek pod aktywną zakładką ma inny kolor i jest pogrubiony (`━`), tak jak dzisiejsze podkreślenie aktywnej zakładki: rola fokusu przy fokusie, w innym przypadku rola tła z pogrubieniem.
 - R23. Górna linia zastępuje dzisiejszą czarną linię oddzielającą nagłówek od belki. Wiersz pod belką, w którym dziś stoi samo podkreślenie, staje się dolną linią z R19.
-- R24. Na końcu wiersza nazw zakładek nie ma znacznika śledzenia *Rozmowy*.
+- R24. Na końcu wiersza nazw zakładek nie ma znaczników śledzenia (ani *Rozmowy*, ani *Przebiegu*).
 
 **Znacznik śledzenia w *Rozmowie***
 - R25. W zakładce *Rozmowa* górna linia paska kroków (linia nad listą kroków) pokazuje znacznik śledzenia.
 - R26. Znacznik ma krótką formę: `↧ śledzi [f]`, gdy widok śledzi najnowszy krok, i `⏸ ręcznie [f]`, gdy nie śledzi. Kolory jak dziś: rola „live” dla śledzenia, rola „uwaga” dla trybu ręcznego.
 - R27. Znacznik stoi przy prawym końcu linii, w linii (np. `───── ↧ śledzi [f] ─`). Gdy linia jest za krótka na znacznik, znacznika nie ma, a linia jest cała.
 - R28. Klawisz `f` działa jak dziś (przełącza śledzenie).
+
+**Znacznik śledzenia w *Przebiegu***
+- R31. W zakładce *Przebieg* znacznik `↧ podąża` / `· ręcznie` stoi na linii nad osią kroków, przy jej prawym końcu, w krótkiej formie z `[f]`. Kolory i zasada „za krótka linia — brak znacznika” jak w R26–R27.
 
 **Bez zmian**
 - R29. Tryb `stale` szarzeje elementy jak dziś. Tryb `no_color` rysuje linie i łączniki w stylu roli bez koloru.
@@ -110,7 +113,7 @@ Widok szczegółów taska rysuje dziś `src/tui/task_app/detail.rs` (funkcje `re
 - Treść zakładek (*Przebieg*, *Zdarzenia*, *Dyrygent*, *Info*) bez zmian.
 - Lista tasków, panel odpowiedzi i formularze bez zmian.
 - Logika śledzenia w *Rozmowie* i klawisz `f` bez zmian. Zmienia się tylko miejsce i tekst znacznika.
-- Znacznik `↧ podąża` / `· ręcznie` zakładki *Przebieg* — patrz Pytania otwarte (Q1). Do decyzji zostaje tam, gdzie jest.
+- Logika śledzenia w *Przebiegu* i klawisz `f` bez zmian. Zmienia się tylko miejsce i tekst znacznika (R31).
 - Widok szczegółów taska w historii (`history.rs`) dostaje te same zmiany, gdy używa tego samego `render_view`. Nie ma osobnego projektu dla historii.
 
 ---
@@ -140,13 +143,7 @@ Widok szczegółów taska rysuje dziś `src/tui/task_app/detail.rs` (funkcje `re
 
 ## Pytania otwarte dla użytkownika
 
-- Q1. **Belka zakładek / Scope Boundaries.** Co robimy ze znacznikiem `↧ podąża` / `· ręcznie` zakładki *Przebieg* na końcu belki?
-  - (zalecane) Zostaje na końcu belki, tylko dla *Przebiegu*. Zmiana dotyczy tylko znacznika *Rozmowy*.
-  - Usuwamy go z belki i przenosimy na linię nad osią kroków w *Przebiegu*, w tej samej krótkiej formie z `[f]`.
-  - Usuwamy go całkiem.
-- Q2. **Znacznik śledzenia w *Rozmowie*.** Czy dolna linia belki zakładek i górna linia paska kroków w *Rozmowie* mają zostać osobno?
-  - (zalecane) Zostają osobno. Znacznik stoi na górnej linii paska kroków.
-  - Łączymy je w jedną linię: dolna linia belki jest linią nad listą kroków, a znacznik stoi przy jej prawym końcu.
+Brak. Decyzje Q1 (znacznik *Przebiegu* przechodzi na linię nad osią kroków, R31) i Q2 (linie zostają osobno, Z8) są wprowadzone do dokumentu.
 
 ---
 
