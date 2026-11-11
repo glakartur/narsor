@@ -43,7 +43,7 @@ use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{bar_prefix, PREFIX_WIDTH};
-use super::super::detail::{cells, step_name};
+use super::super::detail::{cells, rule_line, step_name};
 use super::super::layout::first_row;
 use super::READER_RETRY;
 use crate::tui::conversation::transcript_entries;
@@ -1300,9 +1300,19 @@ pub fn render_step_strip(
     styles: &Styles,
     conversation: &Conversation,
     focused: bool,
+    stale: bool,
 ) {
-    let rule = Line::styled("─".repeat(usize::from(area.width)), styles.of(Role::Done));
-    let rows = [rule.clone(), Line::default(), rule];
+    let done = styles.of(Role::Done);
+    let label = if conversation.follows() {
+        ("↧ śledzi [f]", styles.of(if stale { Role::Done } else { Role::Live }))
+    } else {
+        ("⏸ ręcznie [f]", styles.of(if stale { Role::Done } else { Role::Attention }))
+    };
+    let rows = [
+        rule_line(area.width, done, None, Some(label)),
+        Line::default(),
+        rule_line(area.width, done, None, None),
+    ];
     for (offset, line) in (0..area.height.min(STEP_STRIP_ROWS)).zip(rows) {
         frame.render_widget(
             Paragraph::new(line),

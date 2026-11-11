@@ -2,9 +2,13 @@
 //! columns aligned between the rows and cut to the width of the terminal.
 //!
 //! ```text
-//! code: orders-api  ⎇ feat/nar-12-orders → main +120 −34 #42 ↗
-//! docs: orders-docs ⎇ main                             —
+//! code: orders-api · ⎇ feat/nar-12-orders → main · +120 −34 · #42 ↗
+//! docs: orders-docs · ⎇ main
 //! ```
+//!
+//! A separator ` · ` stands before the branch, the changes and the pull
+//! request, only where the row has text for that column. A column that is empty
+//! in one row and not in another is kept as blanks, so the columns line up.
 //!
 //! A narrow terminal takes from the right of the rows what matters least: the
 //! base branch goes first, then the changes, then the branch is cut, then the
@@ -17,7 +21,8 @@ use super::detail::{cells, fit_cells};
 const GAP: &str = " ";
 /// Stands before the branch name.
 const BRANCH_MARK: &str = "⎇ ";
-const NO_PR: &str = "—";
+/// Stands before the branch, the changes and the pull request.
+const SEPARATOR: &str = " · ";
 /// The smallest a cut branch or repository gets: one character and `…`.
 const MIN_CUT_CELLS: usize = 2;
 
@@ -35,7 +40,8 @@ pub(super) enum Part {
     /// A pull request with an address to follow.
     PrLink,
     PrText,
-    NoPr,
+    /// ` · ` between the columns.
+    Separator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +81,6 @@ impl Entry {
         };
         let (branch, base_branch) = (known(&workspace.branch), known(&workspace.base_branch));
         let label = workspace.pr_label();
-        let branch_known = branch.is_some() || base_branch.is_some();
         let pr = match (&label.number, &label.url) {
             (number, Some(url)) => Some(Piece {
                 text: format!("{} ↗", number.as_deref().unwrap_or("PR")),
@@ -86,12 +91,6 @@ impl Entry {
             (Some(number), None) => Some(Piece {
                 text: number.clone(),
                 part: Part::PrText,
-                url: None,
-                joined: false,
-            }),
-            (None, None) if branch_known => Some(Piece {
-                text: NO_PR.to_string(),
-                part: Part::NoPr,
                 url: None,
                 joined: false,
             }),
@@ -194,34 +193,70 @@ impl Columns {
             self.changes,
             self.pr,
         ];
-        let shown = columns.iter().filter(|column| **column > 0).count();
-        let total = columns.iter().sum::<usize>() + cells(GAP) * shown.saturating_sub(1);
+        let separators: usize = [
+            (self.repo, cells(GAP)),
+            (self.branches + mark, cells(SEPARATOR)),
+            (self.changes, cells(SEPARATOR)),
+            (self.pr, cells(SEPARATOR)),
+        ]
+        .iter()
+        .filter(|(column, _)| *column > 0)
+        .map(|(_, separator)| separator)
+        .sum();
+        let total = columns.iter().sum::<usize>() + separators;
         total.saturating_sub(width)
     }
 
     fn row(&self, entry: &Entry) -> Vec<Piece> {
-        let mut pieces = vec![
-            self.piece(&entry.name, self.name, Part::Name),
-            self.piece(&entry.repo, self.repo, Part::Repo),
-            self.branch_piece(entry),
+        let pr = match &entry.pr {
+            Some(pr) => vec![pr.clone()],
+            None => vec![self.piece("", self.pr, Part::PrText)],
+        };
+        // Each column after the name: the separator before it, its pieces,
+        // its width with the mark, and whether this row has text in it.
+        let columns = [
+            (GAP, Part::Gap, vec![self.piece(&entry.repo, self.repo, Part::Repo)], self.repo),
+            (
+                SEPARATOR,
+                Part::Separator,
+                vec![self.branch_piece(entry)],
+                self.branches + cells(BRANCH_MARK) * usize::from(self.branches > 0),
+            ),
+            (SEPARATOR, Part::Separator, self.change_pieces(entry), self.changes),
+            (SEPARATOR, Part::Separator, pr, self.pr),
         ];
-        pieces.extend(self.change_pieces(entry));
-        pieces.push(match &entry.pr {
-            Some(pr) => pr.clone(),
-            None => self.piece("", self.pr, Part::PrText),
-        });
-        let mut row = Vec::new();
-        for piece in pieces.into_iter().filter(|piece| !piece.text.is_empty()) {
-            if !row.is_empty() && !piece.joined {
-                row.push(Piece {
-                    text: GAP.to_string(),
-                    part: Part::Gap,
-                    url: None,
-                    joined: false,
-                });
+        let has_text = |pieces: &[Piece]| pieces.iter().any(|piece| !piece.text.trim().is_empty());
+        let last = columns
+            .iter()
+            .rposition(|(_, _, pieces, width)| *width > 0 && has_text(pieces));
+        let mut row = vec![self.piece(&entry.name, self.name, Part::Name)];
+        let plain = |text: String, part| Piece {
+            text,
+            part,
+            url: None,
+            joined: false,
+        };
+        for (index, (separator, part, pieces, width)) in columns.into_iter().enumerate() {
+            if width == 0 {
+                continue;
             }
-            row.push(piece);
+            if last.is_none_or(|last| index > last) {
+                break;
+            }
+            if has_text(&pieces) {
+                row.push(plain(separator.to_string(), part));
+                row.extend(pieces);
+            } else {
+                row.push(plain(" ".repeat(cells(separator) + width), Part::Gap));
+            }
         }
+        // The text of the row ends where its last column does.
+        if let Some(last) = row.last_mut() {
+            if last.part == Part::Gap && last.text.trim().is_empty() {
+                row.pop();
+            }
+        }
+        row.retain(|piece| !piece.text.is_empty());
         row
     }
 

@@ -1066,6 +1066,7 @@ pub fn render_details(
         details_opened: true,
     };
     let options = ViewOptions {
+        frame_focused: focused,
         stale,
         keys,
         hyperlinks,

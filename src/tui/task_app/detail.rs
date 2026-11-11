@@ -1,16 +1,18 @@
 //! The details of the selected task: a header (the title when the frame's edge
-//! cuts it, the status line, a row for each workspace and — when a harness
-//! reported any — the task's usage) and an optional notice, a separator, the
-//! tabs, and what the active tab shows. The separator makes the tabs a
-//! distinct strip.
+//! cuts it, a row for each workspace, the status line and — when a harness
+//! reported any — the task's usage) and an optional notice, a rule, the tabs,
+//! a second rule, and what the active tab shows. The two rules, in the colour
+//! of the frame, join the frame's sides and make the tabs a distinct strip.
 //!
 //! ```text
+//! code: orders-api · ⎇ feat/nar-12-orders → main · +120 −34 · #42 ↗
+//! docs: orders-docs · ⎇ main
 //! ● running · krok 3 · implement · code-review v3 · 14m
-//! code: orders-api  ⎇ feat/nar-12-orders → main +120 −34 #42 ↗
-//! docs: orders-docs ⎇ main                             —
 //! razem $68.30 · ✨ $34.15 ↑304 ↓72k (◈ 2 $12 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k
-//! ────────────────────────────────────────────────────────────────────
-//!  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info          podąża
+//! ├──────────────────────────────────────────────────────────────────┤
+//! │  Rozmowa   Przebieg   Zdarzenia   Dyrygent   Info                │
+//! ├──━━━━━━━─────────────────────────────────────────────────────────┤
+//! ──────────────────────────────────────────── ↧ śledzi [f] ─
 //!   ✓ plan ok         …
 //! ────────────────
 //! │ ● review_api w toku
@@ -54,13 +56,13 @@ use std::num::NonZeroU16;
 
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::ClientError;
 pub use crate::cli::task_text::short_age;
-use crate::cli::task_text::without_slot;
 use crate::controller_protocol::{
     ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
     TimelineResponse,
@@ -503,11 +505,10 @@ pub const TASK_ID_CHARS: usize = 11;
 pub fn short_task_id(task_id: &str) -> String {
     task_id.chars().take(TASK_ID_CHARS).collect()
 }
-const QUIET_ROW: u16 = 1;
 const SEPARATOR_ROW: u16 = 1;
 
-/// Splits the details `area`: a header `header_lines` high — the quiet row,
-/// the lines of [`header`], the notice if there is one and the separator —
+/// Splits the details `area`: a header `header_lines` high — the lines of
+/// [`header`], the notice if there is one and the rule —
 /// the content and — when `panel_height` is not zero — a panel at
 /// the bottom. The content never goes below one row.
 pub fn areas(area: Rect, header_lines: u16, panel_height: u16) -> Areas {
@@ -1079,6 +1080,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     );
     let inner = styles.render_panel_edge(frame, area, &edge, frame_focused, stale);
     let options = ViewOptions {
+        frame_focused,
         stale,
         keys,
         hyperlinks,
@@ -1105,6 +1107,8 @@ pub(super) enum KeysAt {
 /// How the details are drawn, apart from what they show.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ViewOptions {
+    /// The frame of the panel has the keyboard: the rules take its colour.
+    pub(super) frame_focused: bool,
     /// No connection: everything is grey.
     pub(super) stale: bool,
     /// Where the keys are.
@@ -1133,6 +1137,7 @@ pub(super) fn render_view(
     options: ViewOptions,
 ) {
     let ViewOptions {
+        frame_focused,
         stale,
         keys,
         hyperlinks,
@@ -1167,7 +1172,7 @@ pub(super) fn render_view(
     );
     let base_lines = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(QUIET_ROW + SEPARATOR_ROW + u16::from(notice.is_some()));
+        .saturating_add(SEPARATOR_ROW + u16::from(notice.is_some()));
     let panel_height = view
         .detail
         .waiting
@@ -1179,12 +1184,7 @@ pub(super) fn render_view(
         parts.content.width.saturating_sub(3),
         parts.content.height.saturating_sub(2),
     );
-    lines.insert(0, Line::default());
     lines.extend(notice);
-    lines.push(Line::styled(
-        "─".repeat(usize::from(inner_width)),
-        styles.task_tabs_divider(),
-    ));
     let header_content = Rect::new(
         parts.header.x.saturating_add(2),
         parts.header.y,
@@ -1192,18 +1192,18 @@ pub(super) fn render_view(
         parts.header.height,
     );
     frame.render_widget(Paragraph::new(lines), header_content);
-    let header_background = styles.task_header_background().bg;
-    for y in parts.header.y..parts.header.y + parts.header.height {
-        for x in parts.header.x..parts.header.x + parts.header.width {
-            if let (Some(color), Some(cell)) =
-                (header_background, frame.buffer_mut().cell_mut((x, y)))
-            {
-                cell.bg = color;
-            }
-        }
-    }
     if hyperlinks {
         link_spots(frame.buffer_mut(), header_content, &spots);
+    }
+    let rule_role = if frame_focused && !stale {
+        Role::Focus
+    } else {
+        Role::Done
+    };
+    let rule_style = styles.of(rule_role);
+    if parts.header.height > 0 {
+        let y = parts.header.y + parts.header.height - 1;
+        draw_rule(frame.buffer_mut(), area, y, &rule_line(area.width, rule_style, None, None), rule_style);
     }
     if deferred {
         let message = Rect::new(
@@ -1221,40 +1221,41 @@ pub(super) fn render_view(
         );
         return;
     }
-    let header_background = styles.task_header_background().bg;
-    if let Some(color) = header_background {
-        for y in parts.tabs.y..parts.tabs.y.saturating_add(parts.tabs.height) {
-            for x in parts.tabs.x..parts.tabs.x.saturating_add(parts.tabs.width) {
-                if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-                    cell.bg = color;
-                }
-            }
-        }
-    }
     let tabs_content = Rect::new(
         parts.tabs.x.saturating_add(2),
         parts.tabs.y,
         parts.tabs.width.saturating_sub(3),
-        parts.tabs.height,
+        parts.tabs.height.min(1),
     );
-    frame.render_widget(
-        Paragraph::new(tab_bar(
-            view.tab,
-            &view.detail.progress,
-            view.detail.conversation.follows(),
-            focused,
-            styles,
-            tabs_content.width,
-        )),
-        tabs_content,
-    );
+    let (names, selected_start, selected_width) =
+        tab_bar(view.tab, focused, styles, tabs_content.width);
+    frame.render_widget(Paragraph::new(names), tabs_content);
     if parts.tabs.height > 1 {
-        let underline_y = parts.tabs.y + 1;
-        for x in parts.tabs.x..parts.tabs.x.saturating_add(parts.tabs.width) {
-            if let Some(cell) = frame.buffer_mut().cell_mut((x, underline_y)) {
-                cell.bg = ratatui::style::Color::Reset;
-            }
-        }
+        // The segment stays inside the names' room, as the names do.
+        let room = usize::from(tabs_content.width);
+        let start = (2 + selected_start).min(2 + room);
+        let end = (start + selected_width).min(2 + room);
+        let segment_role = if focused && !stale {
+            Role::Focus
+        } else {
+            Role::Done
+        };
+        let segment = (start, end.saturating_sub(start), styles.of(segment_role).add_modifier(Modifier::BOLD));
+        let label = (view.tab == DetailTab::Progress && !view.detail.progress.positions().is_empty())
+            .then(|| {
+                if view.detail.progress.follows() {
+                    ("↧ podąża [f]", styles.of(greyed(Role::Live, stale)))
+                } else {
+                    ("· ręcznie [f]", styles.of(Role::Done))
+                }
+            });
+        draw_rule(
+            frame.buffer_mut(),
+            area,
+            parts.tabs.y + 1,
+            &rule_line(area.width, rule_style, Some(segment), label),
+            rule_style,
+        );
     }
     if requires_explicit_open(view.task)
         && details_opened
@@ -1311,6 +1312,7 @@ pub(super) fn render_view(
                 styles,
                 &view.detail.conversation,
                 focused,
+                stale,
             );
             let below = strip.bottom().saturating_sub(content.y);
             let content = Rect::new(
@@ -1376,38 +1378,17 @@ pub(super) fn render_view(
 }
 
 /// The tab titles, the active one in the focus role while the details have
-/// the keyboard.
+/// the keyboard; and where the active one starts and how wide it is.
 fn tab_bar(
     active: DetailTab,
-    progress: &Progress,
-    conversation_follows: bool,
     focused: bool,
     styles: &Styles,
     width: u16,
-) -> Vec<Line<'static>> {
+) -> (Line<'static>, usize, usize) {
     let tabs = DetailTab::ALL;
-    let follow = if active == DetailTab::Progress && !progress.positions().is_empty() {
-        Some(if progress.follows() {
-            ("↧ podąża", Role::Live)
-        } else {
-            ("· ręcznie", Role::Done)
-        })
-    } else if active == DetailTab::Conversation {
-        Some(if conversation_follows {
-            ("↧ śledzi · f wyłącz", Role::Live)
-        } else {
-            ("⏸ ręcznie · f śledź", Role::Attention)
-        })
-    } else {
-        None
-    };
     let names_width: usize = tabs.iter().map(|tab| Span::raw(tab.title()).width()).sum();
     let padded_width = names_width + tabs.len() * 2 + tabs.len().saturating_sub(1);
     let pad = usize::from(padded_width <= usize::from(width));
-    let base_width =
-        names_width + tabs.len().saturating_mul(pad * 2) + tabs.len().saturating_sub(1);
-    let show_follow = follow
-        .is_some_and(|(text, _)| base_width + 1 + Span::raw(text).width() <= usize::from(width));
     let mut spans = Vec::new();
     let mut column = 0usize;
     let mut selected_start = 0usize;
@@ -1439,23 +1420,89 @@ fn tab_bar(
             column += 1;
         }
     }
-    if show_follow {
-        if let Some((text, role)) = follow {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(text, styles.of(role)));
+    (Line::from(spans), selected_start, selected_width)
+}
+
+/// A rule `width` cells wide in `style`. `segment` is `(start, width, style)`
+/// of a heavy stretch (`━`); `label` is a text with its style, written near
+/// the right end as `─── text ─`. The label is left out when it does not fit
+/// with a space and a cell of rule on both sides, or would touch the segment.
+pub(super) fn rule_line(
+    width: u16,
+    style: Style,
+    segment: Option<(usize, usize, Style)>,
+    label: Option<(&str, Style)>,
+) -> Line<'static> {
+    let width = usize::from(width);
+    let mut cells_of: Vec<(char, Style)> = vec![('─', style); width];
+    if let Some((start, length, segment_style)) = segment {
+        for cell in cells_of.iter_mut().skip(start).take(length) {
+            *cell = ('━', segment_style);
         }
     }
-    let marker = if focused { '━' } else { '─' };
-    vec![
-        Line::from(spans),
-        Line::from(vec![
-            Span::raw(" ".repeat(selected_start)),
-            Span::styled(
-                marker.to_string().repeat(selected_width),
-                styles.of(if focused { Role::Focus } else { Role::Done }),
-            ),
-        ]),
-    ]
+    if let Some((text, text_style)) = label {
+        let text_width = cells(text);
+        if width >= text_width + 4 {
+            let start = width - text_width - 3;
+            if segment.is_none_or(|(at, length, _)| at + length <= start) {
+                cells_of[start] = (' ', style);
+                let mut at = start + 1;
+                for ch in text.chars() {
+                    let glyph_width = cells(&ch.to_string());
+                    cells_of[at] = (ch, text_style);
+                    for filler in cells_of.iter_mut().skip(at + 1).take(glyph_width.saturating_sub(1)) {
+                        *filler = ('\u{200b}', text_style);
+                    }
+                    at += glyph_width.max(1);
+                }
+                cells_of[width - 2] = (' ', style);
+            }
+        }
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = style;
+    for (ch, cell_style) in cells_of {
+        if ch == '\u{200b}' {
+            continue;
+        }
+        if cell_style != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        }
+        run_style = cell_style;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
+    }
+    Line::from(spans)
+}
+
+/// Writes `line` over the row `y` of `area` and joins the frame's sides to it
+/// with `├` and `┤`, where the cells beside it hold the frame's `│`.
+pub(super) fn draw_rule(buffer: &mut Buffer, area: Rect, y: u16, line: &Line<'_>, style: Style) {
+    let mut x = area.x;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            if x < area.right() {
+                if let Some(cell) = buffer.cell_mut((x, y)) {
+                    cell.set_symbol(&ch.to_string());
+                    cell.set_style(span.style);
+                }
+                x += u16::try_from(cells(&ch.to_string())).unwrap_or(1);
+            }
+        }
+    }
+    let sides = [(area.x.checked_sub(1), "├"), (Some(area.right()), "┤")];
+    for (x, joint) in sides {
+        let Some(x) = x else { continue };
+        if let Some(cell) = buffer.cell_mut((x, y)) {
+            if cell.symbol() == "│" {
+                cell.set_symbol(joint);
+                cell.set_style(style);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1493,14 +1540,6 @@ fn header(
     if title_cut {
         lines.push(title_line(task, styles, greyed(Role::Calm, stale), width));
     }
-    lines.push(status_line(
-        task,
-        queue_place,
-        progress,
-        styles,
-        stale,
-        width,
-    ));
     let mut spots = Vec::new();
     for row in workspace_rows::rows(&task.workspaces, width) {
         let row_index = u16::try_from(lines.len()).unwrap_or(u16::MAX);
@@ -1513,6 +1552,15 @@ fn header(
         }));
         lines.push(line);
     }
+
+    lines.push(status_line(
+        task,
+        queue_place,
+        progress,
+        styles,
+        stale,
+        width,
+    ));
 
     if let Some(text) = usage.and_then(|usage| usage_text(usage, width)) {
         lines.push(Line::from(Span::styled(
@@ -1620,7 +1668,7 @@ fn workspace_line(
     for piece in row {
         let role = match piece.part {
             Part::Name | Part::Repo | Part::Branch | Part::PrText => Role::Calm,
-            Part::Gap | Part::NoPr => Role::Done,
+            Part::Gap | Part::Separator => Role::Done,
             Part::Added => Role::Added,
             Part::Removed => Role::Removed,
             Part::PrLink => Role::Link,
@@ -1736,9 +1784,6 @@ fn status_parts(
         parts.push(workflow);
         return parts;
     }
-    if without_slot(task) {
-        parts.push(("bez slotu".to_string(), Role::Calm));
-    }
     let named = task.runner.as_ref().and_then(|runner| {
         let cursor = &runner.execution_cursor;
         let name = one_line(cursor.current_state.as_deref()?);
@@ -1842,7 +1887,7 @@ fn is_safe_link_target(url: &str) -> bool {
 /// left as plain text.
 fn link_spots(buffer: &mut Buffer, header: Rect, spots: &[LinkSpot]) {
     for spot in spots {
-        let y = header.y.saturating_add(QUIET_ROW).saturating_add(spot.row);
+        let y = header.y.saturating_add(spot.row);
         if y >= header.y.saturating_add(header.height) {
             continue;
         }

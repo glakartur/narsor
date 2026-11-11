@@ -1641,7 +1641,6 @@ mod foundations {
             assert!(!choice.add_modifier.contains(Modifier::REVERSED));
             for other in [
                 colour.selection_fill(),
-                colour.task_header_background(),
                 colour.answer_panel_background(),
                 colour.field_editing(),
             ] {
@@ -2442,7 +2441,7 @@ mod task_app_list {
             app.detail_mut().set_draft("b", "Uwzględnij migrację");
             assert_eq!(app.list().selected_id(), Some("b"));
             assert_eq!(app.focus(), Focus::Details);
-            assert_eq!(app.detail().tab(), DetailTab::Events);
+            assert_eq!(app.detail().tab(), DetailTab::Progress);
 
             let mut moved = vec![
                 controlled("a", "local", "running", 1),
@@ -2454,7 +2453,7 @@ mod task_app_list {
 
             assert_eq!(app.list().selected_id(), Some("b"));
             assert_eq!(app.focus(), Focus::Details);
-            assert_eq!(app.detail().tab(), DetailTab::Events);
+            assert_eq!(app.detail().tab(), DetailTab::Progress);
             assert_eq!(app.detail().draft("b"), Some("Uwzględnij migrację"));
             assert_eq!(app.cursor(), Some("c2"));
         }
@@ -2898,7 +2897,7 @@ mod task_app_detail {
     /// [`details_app`] on *Przebieg*, the timeline.
     fn progress_app() -> TaskApp {
         let mut app = details_app();
-        press(&mut app, KeyCode::Char('['));
+        press(&mut app, KeyCode::Char(']'));
         assert_eq!(app.detail().tab(), DetailTab::Progress);
         app
     }
@@ -3027,7 +3026,6 @@ mod task_app_detail {
             ch(&mut app, 'k');
             assert_eq!(selected_step(&app, "a").as_deref(), Some("plan #1"));
             press(&mut app, KeyCode::Char(']'));
-            press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Events);
             app.on_detail_read(
                 "a",
@@ -3088,7 +3086,6 @@ mod task_app_detail {
             );
 
             // The other tabs still work.
-            press(&mut app, KeyCode::Char(']'));
             press(&mut app, KeyCode::Char(']'));
             press(&mut app, KeyCode::Char(']'));
             press(&mut app, KeyCode::Char(']'));
@@ -3440,10 +3437,10 @@ mod task_app_detail {
         fn switching_the_tab_leaves_the_conversation_for_the_axis() {
             let mut app = on_the_axis();
             press(&mut app, KeyCode::Enter);
-            press(&mut app, KeyCode::Char(']'));
+            press(&mut app, KeyCode::Char('['));
             assert_eq!(app.detail().tab(), DetailTab::Conversation);
             assert_eq!(layer(&app), Some(Context::AgentConversation));
-            press(&mut app, KeyCode::Char('['));
+            press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Progress);
             assert_eq!(app.step_focus(), StepFocus::Axis);
             assert_eq!(layer(&app), Some(Context::Axis));
@@ -5017,12 +5014,16 @@ mod task_app_detail {
             let mut app = details_app();
             assert_eq!(app.detail().tab(), DetailTab::Conversation);
             ch(&mut app, ']');
+            assert_eq!(app.detail().tab(), DetailTab::Progress);
+            ch(&mut app, ']');
             assert_eq!(app.detail().tab(), DetailTab::Events);
             ch(&mut app, '[');
             ch(&mut app, '[');
-            assert_eq!(app.detail().tab(), DetailTab::Progress);
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
             ch(&mut app, '[');
             assert_eq!(app.detail().tab(), DetailTab::Info, "wraps round");
+            ch(&mut app, ']');
+            assert_eq!(app.detail().tab(), DetailTab::Conversation, "wraps round");
         }
 
         #[test]
@@ -10995,10 +10996,10 @@ mod task_app_create {
         fn brackets_switch_the_tabs_from_the_history_list_and_its_details() {
             let mut app = opened();
             ch(&mut app, ']');
-            assert_eq!(app.history().unwrap().tab(), DetailTab::Conversation);
+            assert_eq!(app.history().unwrap().tab(), DetailTab::Events);
             press(&mut app, KeyCode::Enter);
             ch(&mut app, ']');
-            assert_eq!(app.history().unwrap().tab(), DetailTab::Events);
+            assert_eq!(app.history().unwrap().tab(), DetailTab::Conductor);
             assert_eq!(
                 app.key_context(),
                 Stack::layered(Context::Reading, Context::HistoryDetails)
