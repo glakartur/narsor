@@ -33,7 +33,7 @@ Plan realizuje wszystkie wymagania R1–R31 z dokumentu wymagań. Grupy:
 - Status: R17 → U3
 - Belka zakładek: R18–R24, R29 → U4 (R18 także U5)
 - Znacznik w *Rozmowie*: R25–R28 → U6
-- Znacznik w *Przebiegu*: R31 → U6 (z otwartym pytaniem P1)
+- Znacznik w *Przebiegu*: R31 → U6 (decyzja P1: dolna linia belki)
 - Przykłady akceptacji AE1–AE8 mają testy w U2, U3, U4, U6.
 
 ---
@@ -126,12 +126,7 @@ Plan realizuje wszystkie wymagania R1–R31 z dokumentu wymagań. Grupy:
 
 ## Pytania otwarte dla użytkownika
 
-- **P1 (R31, sekcja „Znacznik śledzenia w *Przebiegu*”).** W zakładce *Przebieg* nad osią kroków nie ma dziś osobnej linii: oś zaczyna się w pierwszym wierszu pod belką. Bezpośrednio nad osią stoi dolna linia belki zakładek. Gdzie ma stać znacznik `↧ podąża [f]` / `· ręcznie [f]`?
-  - (a) **Zalecane:** na dolnej linii belki zakładek, przy jej prawym końcu, tylko gdy aktywna jest zakładka *Przebieg*. Brak zmiany wysokości treści *Przebiegu*.
-  - (b) Na nowej linii `─` w pierwszym wierszu treści *Przebiegu*, nad osią (jak górna linia paska kroków w *Rozmowie*). Oś traci jeden wiersz.
-  - (c) Na nowej linii tylko nad kolumną osi (do szerokości osi), nie nad szczegółami kroku. Oś traci jeden wiersz.
-
-  Plan (U6) zakłada opcję (a). Gdy decyzja jest inna, zmienia się tylko część *Przebiegu* w U6.
+Brak. Decyzja P1 (Q3): znacznik *Przebiegu* stoi na dolnej linii belki zakładek, przy jej prawym końcu, tylko gdy aktywny jest *Przebieg* (opcja a). Ta linia stoi bezpośrednio nad osią kroków, więc R31 jest spełnione bez nowej linii i bez zmiany wysokości treści.
 
 ---
 
@@ -323,7 +318,7 @@ Plan realizuje wszystkie wymagania R1–R31 z dokumentu wymagań. Grupy:
 
 **Goal:** Krótki znacznik z `[f]` przy prawym końcu linii nad krokami w *Rozmowie* i w *Przebiegu*.
 
-**Requirements:** R25–R28, R31; AE7; Z8, Z9; P1
+**Requirements:** R25–R28, R31; AE7; Z8, Z9
 
 **Dependencies:** U3 (funkcja pomocnicza linii), U4 (usunięcie znaczników z belki)
 
