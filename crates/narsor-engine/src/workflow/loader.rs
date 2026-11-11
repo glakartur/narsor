@@ -511,7 +511,6 @@ fn compile_action(action: ActionSchema, without_section: bool) -> ActionConfig {
             }
             ActionConfig::Agent(AgentActionConfig {
                 harness_step,
-                plan: agent.plan,
                 prompt: agent.prompt,
                 history: agent.history,
             })
@@ -866,7 +865,30 @@ terminal_states: [done]
     }
 
     #[test]
-    fn the_plan_flag_and_the_step_profile_reach_the_definition() {
+    fn a_plan_flag_on_an_agent_step_is_an_unknown_field() {
+        let error = load_from_str(
+            r#"
+schema: v2
+name: planned
+version: 1
+states:
+  plan:
+    action: { type: agent, prompt: x, plan: true }
+    exit: { next: done }
+  done:
+    description: end
+terminal_states:
+  done: completed
+"#,
+        )
+        .expect_err("`plan` is no longer a field of an agent step");
+
+        let message = error.to_string();
+        assert!(message.contains("unknown field `plan`"), "{message}");
+    }
+
+    #[test]
+    fn the_step_profile_reaches_the_definition() {
         let definition = load_from_str(
             r#"
 schema: v2
@@ -874,7 +896,7 @@ name: profiled
 version: 1
 states:
   plan:
-    action: { type: agent, prompt: x, plan: true, model: medium, effort: low, ceiling: { model: large, effort: high } }
+    action: { type: agent, prompt: x, model: medium, effort: low, ceiling: { model: large, effort: high } }
     choices: [success]
     transitions: { success: work }
   work:
@@ -891,7 +913,6 @@ terminal_states: [done]
         let Some(ActionConfig::Agent(plan)) = &definition.states["plan"].action else {
             panic!("an agent step");
         };
-        assert!(plan.plan);
         assert_eq!(plan.harness_step.model.as_deref(), Some("medium"));
         assert_eq!(plan.harness_step.effort.as_deref(), Some("low"));
         assert_eq!(
@@ -901,7 +922,6 @@ terminal_states: [done]
         let Some(ActionConfig::Agent(work)) = &definition.states["work"].action else {
             panic!("an agent step");
         };
-        assert!(!work.plan);
         assert!(work.harness_step.model.is_none() && work.harness_step.ceiling.is_none());
     }
 

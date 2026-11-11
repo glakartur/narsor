@@ -50,7 +50,6 @@ use crate::conductor::response::ProposedAction;
 use crate::domain::{
     ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence, ExecutionId,
 };
-use crate::engine::step_profile::Setting;
 use crate::engine::RejectedAnswer;
 use crate::persistence::atomic::ensure_dir;
 use crate::persistence::{read_json, write_json_atomic, PersistenceError, Result, StatePaths};
@@ -64,12 +63,6 @@ pub const CHAT_FILE: &str = "chat.jsonl";
 
 /// The file holding the title the conductor generated.
 pub const TITLE_FILE: &str = "title.json";
-
-/// The profile of the agent steps, inside the conductor's directory.
-pub const PROFILE_FILE: &str = "profile.json";
-
-/// The version of `profile.json` this binary writes and reads.
-pub const PROFILE_VERSION: u32 = 1;
 
 /// The version of `state.json` this binary writes and reads.
 pub const CONDUCTOR_STATE_VERSION: u32 = 1;
@@ -413,58 +406,6 @@ struct GeneratedTitle {
     title: String,
 }
 
-/// What the conductor decided for one step (and optionally one unit of the
-/// plan), with the reason.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProfileEntry {
-    /// The step the entry is for.
-    pub step_id: String,
-    /// The plan unit, when the profile is per unit; `None` covers the step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit: Option<String>,
-    /// What the step starts on; clamped to the ceiling already.
-    #[serde(default)]
-    pub setting: Setting,
-    /// Why, in the conductor's words.
-    #[serde(default)]
-    pub rationale: String,
-    /// What the conductor asked for above the ceiling, if it did.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requested_over_ceiling: Option<Setting>,
-    /// When the entry was decided.
-    pub decided_at: DateTime<Utc>,
-}
-
-/// The conductor's profile of the steps, decided once after the plan.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StepProfile {
-    /// The format of the file; see [`PROFILE_VERSION`].
-    #[serde(default)]
-    pub version: u32,
-    /// The entries, in the order they were decided.
-    #[serde(default)]
-    pub entries: Vec<ProfileEntry>,
-}
-
-impl StepProfile {
-    /// The entry for `step_id` and `unit`: the unit's own, else the step's.
-    pub fn lookup(&self, step_id: &str, unit: Option<&str>) -> Option<&ProfileEntry> {
-        let of_step = |entry: &&ProfileEntry| entry.step_id == step_id;
-        unit.and_then(|unit| {
-            self.entries
-                .iter()
-                .filter(of_step)
-                .find(|entry| entry.unit.as_deref() == Some(unit))
-        })
-        .or_else(|| {
-            self.entries
-                .iter()
-                .filter(of_step)
-                .find(|entry| entry.unit.is_none())
-        })
-    }
-}
-
 /// The conductor's files of one execution.
 #[derive(Debug, Clone)]
 pub struct ConductorStore {
@@ -656,46 +597,6 @@ impl ConductorStore {
         }
     }
 
-    /// The profile of the steps; empty when none was written. A damaged file
-    /// is an error the caller treats as "no profile".
-    pub fn load_profile(&self) -> Result<StepProfile> {
-        match read_json::<StepProfile>(&self.dir.join(PROFILE_FILE)) {
-            Ok(profile) => Ok(profile),
-            Err(PersistenceError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
-                Ok(StepProfile::default())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Adds `entries` to the profile. The profile is decided once: an entry
-    /// for a step (and unit) that already has one, or for a step in
-    /// `started`, is dropped. Returns the entries that were kept.
-    pub fn add_profile_entries(
-        &self,
-        entries: Vec<ProfileEntry>,
-        started: &BTreeSet<String>,
-    ) -> Result<Vec<ProfileEntry>> {
-        let mut profile = self.load_profile()?;
-        let mut kept = Vec::new();
-        for entry in entries {
-            let taken = profile
-                .entries
-                .iter()
-                .any(|known| known.step_id == entry.step_id && known.unit == entry.unit);
-            if taken || started.contains(&entry.step_id) {
-                continue;
-            }
-            profile.entries.push(entry.clone());
-            kept.push(entry);
-        }
-        if !kept.is_empty() {
-            profile.version = PROFILE_VERSION;
-            write_json_atomic(&self.dir.join(PROFILE_FILE), &profile)?;
-        }
-        Ok(kept)
-    }
-
     /// The annotation of the gate `key`, if there is one.
     pub fn load_annotation(&self, key: &str) -> Result<Option<Annotation>> {
         match read_json(&self.annotation_file(key)) {
@@ -761,106 +662,4 @@ fn unanswered(entries: Vec<ChatEntry>) -> Vec<ChatEntry> {
         .cloned()
         .collect();
     open
-}
-
-#[cfg(test)]
-mod profile_tests {
-    use super::*;
-
-    fn entry(step: &str, unit: Option<&str>, effort: &str) -> ProfileEntry {
-        ProfileEntry {
-            step_id: step.into(),
-            unit: unit.map(str::to_string),
-            setting: Setting::new(None, Some(effort)),
-            rationale: "small change".into(),
-            requested_over_ceiling: None,
-            decided_at: Utc::now(),
-        }
-    }
-
-    struct Temp(PathBuf);
-
-    impl Temp {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("narsor-profile-{}", Uuid::new_v4()));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn store(dir: &Path) -> ConductorStore {
-        ConductorStore::new(&StatePaths::new(dir), "exec")
-    }
-
-    #[test]
-    fn a_missing_file_is_an_empty_profile() {
-        let dir = Temp::new();
-        assert!(store(dir.path()).load_profile().unwrap().entries.is_empty());
-    }
-
-    #[test]
-    fn a_saved_profile_reads_back_with_its_rationale() {
-        let dir = Temp::new();
-        let store = store(dir.path());
-        let kept = store
-            .add_profile_entries(vec![entry("work", None, "low")], &BTreeSet::new())
-            .unwrap();
-        assert_eq!(kept.len(), 1);
-        let profile = store.load_profile().unwrap();
-        assert_eq!(profile.entries[0].rationale, "small change");
-        assert_eq!(profile.version, PROFILE_VERSION);
-    }
-
-    #[test]
-    fn a_unit_entry_and_a_step_entry_live_together() {
-        let dir = Temp::new();
-        let store = store(dir.path());
-        store
-            .add_profile_entries(
-                vec![entry("work", None, "low"), entry("work", Some("3"), "high")],
-                &BTreeSet::new(),
-            )
-            .unwrap();
-        let profile = store.load_profile().unwrap();
-        let effort = |unit| profile.lookup("work", unit).unwrap().setting.effort.clone();
-        assert_eq!(effort(Some("3")).as_deref(), Some("high"));
-        assert_eq!(effort(Some("9")).as_deref(), Some("low"));
-        assert_eq!(effort(None).as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn a_started_step_and_a_decided_step_are_not_written_again() {
-        let dir = Temp::new();
-        let store = store(dir.path());
-        store
-            .add_profile_entries(vec![entry("work", None, "low")], &BTreeSet::new())
-            .unwrap();
-        let started = BTreeSet::from(["review".to_string()]);
-        let kept = store
-            .add_profile_entries(
-                vec![entry("work", None, "max"), entry("review", None, "max")],
-                &started,
-            )
-            .unwrap();
-        assert!(kept.is_empty());
-        assert_eq!(store.load_profile().unwrap().entries.len(), 1);
-    }
-
-    #[test]
-    fn a_damaged_file_is_an_error() {
-        let dir = Temp::new();
-        let store = store(dir.path());
-        fs::create_dir_all(store.dir()).unwrap();
-        fs::write(store.dir().join(PROFILE_FILE), "{ nope").unwrap();
-        assert!(store.load_profile().is_err());
-    }
 }

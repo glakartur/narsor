@@ -140,9 +140,6 @@ pub struct ConductorView {
     /// Every decision of the conductor's, oldest first.
     #[serde(default)]
     pub decisions: Vec<DecisionView>,
-    /// What the conductor chose for each step's model and effort.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub profile: Vec<narsor_protocol::controller::StepProfileView>,
 }
 
 impl ConductorView {
@@ -159,7 +156,6 @@ impl ConductorView {
             chat_has_more: false,
             proposals: Vec::new(),
             decisions: Vec::new(),
-            profile: Vec::new(),
         }
     }
 
@@ -214,8 +210,6 @@ impl ConductorView {
             chat_has_more,
             proposals,
             decisions,
-            // A damaged file is no profile.
-            profile: profile_of(&store),
         })
     }
 
@@ -348,29 +342,6 @@ fn decisions_of(chat: &[ChatEntry], execution_id: &str) -> Vec<DecisionView> {
                 undone,
                 decision_id,
             })
-        })
-        .collect()
-}
-
-/// The stored profile as the view shows it.
-fn profile_of(store: &ConductorStore) -> Vec<narsor_protocol::controller::StepProfileView> {
-    let Ok(profile) = store.load_profile() else {
-        return Vec::new();
-    };
-    profile
-        .entries
-        .into_iter()
-        .map(|entry| narsor_protocol::controller::StepProfileView {
-            step_id: entry.step_id,
-            unit: entry.unit,
-            model: entry.setting.model,
-            effort: entry.setting.effort,
-            rationale: entry.rationale,
-            requested_model: entry
-                .requested_over_ceiling
-                .as_ref()
-                .and_then(|s| s.model.clone()),
-            requested_effort: entry.requested_over_ceiling.and_then(|s| s.effort),
         })
         .collect()
 }

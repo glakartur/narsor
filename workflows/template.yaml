@@ -22,10 +22,10 @@ globals:
 #   globals:
 #     default_model: medium                       # for a step that names none
 #     default_effort: medium
-#     ceiling: { model: large, effort: high }     # the most the conductor or an escalation may set
+#     ceiling: { model: large, effort: high }     # the most a `profile` step or an escalation may set
 #   states:
 #     plan:
-#       action: { type: agent, plan: true, prompt: "..." }
+#       action: { type: agent, prompt: "..." }
 #     work:
 #       action:
 #         type: agent

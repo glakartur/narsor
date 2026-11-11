@@ -1892,7 +1892,9 @@ fn a_legacy_definition_serializes_without_the_new_fields() {
 
 /// The two agent actions in `tests/fixtures/persisted/`, written by the code
 /// from before `HarnessStepConfig` existed: one with every field set, one with
-/// none of the optional ones.
+/// none of the optional ones. The full one still carries `plan: true`, a field
+/// that is gone since the conductor no longer profiles the steps: it is read
+/// and ignored, and no longer written.
 const PERSISTED_AGENT_ACTIONS: &str = "persisted/agent_actions_before_harness_step";
 
 fn persisted_text(extension: &str) -> String {
@@ -1929,7 +1931,6 @@ fn expected_persisted_actions() -> Vec<narsor_engine::domain::AgentActionConfig>
             // Saved before the marker existed: not pinned.
             own_model_and_effort: false,
         },
-        plan: true,
         prompt: PromptText::from_parts(vec![
             PromptPart::always("Implement {{ task }}."),
             PromptPart::when("Mind {{ note }}.", vec!["note".into()]),
@@ -1938,7 +1939,6 @@ fn expected_persisted_actions() -> Vec<narsor_engine::domain::AgentActionConfig>
     };
     let minimal = AgentActionConfig {
         harness_step: HarnessStepConfig::default(),
-        plan: false,
         prompt: PromptText::plain("Do the thing."),
         history: true,
     };
@@ -1975,14 +1975,23 @@ fn agent_actions_are_saved_in_the_shape_they_had_before_the_harness_step_type() 
         .map(ActionConfig::Agent)
         .collect();
 
+    // The removed `plan` field is the one difference: it is no longer written.
     let json = serde_json::to_value(&actions).expect("the actions serialize to JSON");
-    let saved_json: serde_json::Value =
+    let mut saved_json: serde_json::Value =
         serde_json::from_str(&persisted_text("json")).expect("the fixture is JSON");
+    assert_eq!(
+        saved_json[0].as_object_mut().unwrap().remove("plan"),
+        Some(serde_json::json!(true))
+    );
     assert_eq!(json, saved_json);
 
     let yaml = serde_yaml::to_value(&actions).expect("the actions serialize to YAML");
-    let saved_yaml: serde_yaml::Value =
+    let mut saved_yaml: serde_yaml::Value =
         serde_yaml::from_str(&persisted_text("yaml")).expect("the fixture is YAML");
+    assert_eq!(
+        saved_yaml[0].as_mapping_mut().unwrap().remove("plan"),
+        Some(serde_yaml::Value::Bool(true))
+    );
     assert_eq!(yaml, saved_yaml);
 
     let reread: Vec<ActionConfig> =
@@ -1991,6 +2000,30 @@ fn agent_actions_are_saved_in_the_shape_they_had_before_the_harness_step_type() 
         format!("{:?}", agent_configs(reread)),
         format!("{:?}", expected_persisted_actions())
     );
+}
+
+#[test]
+fn a_saved_execution_definition_with_the_removed_plan_flag_still_reads() {
+    // The definition an execution carries (the launch spec's JSON snapshot),
+    // as a build that still had `plan: true` saved it.
+    let mut saved = serde_json::to_value(load_fixture("v2/engine_step_profile.yaml"))
+        .expect("the definition serializes");
+    saved["states"]["plan"]["action"]["plan"] = serde_json::json!(true);
+
+    let from_json: WorkflowDefinition =
+        serde_json::from_value(saved.clone()).expect("the saved JSON reads back");
+    let from_yaml: WorkflowDefinition =
+        serde_yaml::from_str(&serde_yaml::to_string(&saved).unwrap())
+            .expect("the saved YAML reads back");
+
+    for definition in [from_json, from_yaml] {
+        assert!(matches!(
+            state(&definition, "plan").action,
+            Some(ActionConfig::Agent(_))
+        ));
+        let again = serde_json::to_value(&definition).unwrap();
+        assert!(again["states"]["plan"]["action"].get("plan").is_none());
+    }
 }
 
 // --- `type: profile` (U4) -------------------------------------------------

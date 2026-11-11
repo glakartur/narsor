@@ -635,7 +635,7 @@ pub struct HarnessStepConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
 
-    /// Upper bound for what the conductor and an escalation may set.
+    /// Upper bound for what a `profile` step and an escalation may set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ceiling: Option<StepCeiling>,
 
@@ -709,11 +709,6 @@ pub struct AgentActionConfig {
     /// The harness session the agent runs in.
     #[serde(flatten)]
     pub harness_step: HarnessStepConfig,
-
-    /// Marks the step whose success makes the conductor profile the steps
-    /// that have not started (`plan: true` in YAML).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub plan: bool,
 
     /// Prompt to send to the agent
     pub prompt: PromptText,

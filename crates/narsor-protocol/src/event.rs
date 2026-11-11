@@ -557,9 +557,8 @@ pub enum ConductorTrigger {
     Title,
     /// A `decision` step declared `by: conductor` was entered.
     DecisionStep,
-    /// The plan step succeeded; the steps that have not started can be profiled.
-    Profile,
-    /// A value this build does not know, written by a newer one.
+    /// A value this build does not know: written by a newer one, or by an
+    /// older one that still had the conductor profile the steps (`profile`).
     #[serde(other)]
     Unrecognized,
 }
@@ -574,7 +573,6 @@ impl ConductorTrigger {
             Self::Annotation => "annotation",
             Self::Title => "title",
             Self::DecisionStep => "decision_step",
-            Self::Profile => "profile",
             Self::Unrecognized => "unrecognized",
         }
     }
@@ -627,9 +625,9 @@ pub enum ConductorPurpose {
     GenerateTitle,
     /// Pick the label of a `decision` step declared `by: conductor`.
     DecideFork,
-    /// Choose the model and effort of the steps that have not started.
-    ProfileSteps,
-    /// A value this build does not know, written by a newer one.
+    /// A value this build does not know: written by a newer one, or by an
+    /// older one that still had the conductor profile the steps
+    /// (`profile_steps`).
     #[serde(other)]
     Unrecognized,
 }
@@ -646,7 +644,6 @@ impl ConductorPurpose {
             Self::SummarizeGate => "summarize_gate",
             Self::GenerateTitle => "generate_title",
             Self::DecideFork => "decide_fork",
-            Self::ProfileSteps => "profile_steps",
             Self::Unrecognized => "unrecognized",
         }
     }
@@ -1004,7 +1001,6 @@ impl From<ConductorPurpose> for ConductorPurposeDto {
             ConductorPurpose::SummarizeGate => Self::SummarizeGate,
             ConductorPurpose::GenerateTitle => Self::GenerateTitle,
             ConductorPurpose::DecideFork => Self::DecideFork,
-            ConductorPurpose::ProfileSteps => Self::ProfileSteps,
             ConductorPurpose::Unrecognized => Self::Unrecognized,
         }
     }
@@ -1019,7 +1015,6 @@ impl From<ConductorTrigger> for ConductorTriggerDto {
             ConductorTrigger::Annotation => Self::Annotation,
             ConductorTrigger::Title => Self::Title,
             ConductorTrigger::DecisionStep => Self::DecisionStep,
-            ConductorTrigger::Profile => Self::Profile,
             ConductorTrigger::Unrecognized => Self::Unrecognized,
         }
     }
@@ -1138,6 +1133,43 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_value::<ConductorPurposeDto>(future).unwrap(),
+            ConductorPurposeDto::Unrecognized
+        );
+    }
+
+    #[test]
+    fn a_conductor_event_of_the_removed_step_profiling_still_decodes() {
+        let data: EventData = serde_json::from_value(serde_json::json!({
+            "type": "conductor_started",
+            "invocation_id": "inv-1",
+            "trigger": "profile",
+            "purpose": "profile_steps",
+        }))
+        .unwrap();
+
+        let EventData::ConductorStarted {
+            trigger, purpose, ..
+        } = data
+        else {
+            panic!("expected a conductor start, got {data:?}");
+        };
+        assert_eq!(trigger, ConductorTrigger::Unrecognized);
+        assert_eq!(purpose, ConductorPurpose::Unrecognized);
+        assert_eq!(
+            ConductorTriggerDto::from(trigger),
+            ConductorTriggerDto::Unrecognized
+        );
+        assert_eq!(
+            ConductorPurposeDto::from(purpose),
+            ConductorPurposeDto::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorTriggerDto>(serde_json::json!("profile")).unwrap(),
+            ConductorTriggerDto::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<ConductorPurposeDto>(serde_json::json!("profile_steps"))
+                .unwrap(),
             ConductorPurposeDto::Unrecognized
         );
     }

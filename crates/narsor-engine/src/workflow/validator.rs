@@ -875,7 +875,7 @@ fn validate_image(field: &str, image: &ImageSpec, errors: &mut Vec<ValidationErr
 /// [`EFFORT_SCALE`]; so are the fields of `ceiling`, and a ceiling never sits
 /// below the step's own value. A step with a ceiling — its own or the general
 /// one, which loading has copied into the step already — must also have a
-/// model and an effort, and its ceiling must name both: the conductor and an
+/// model and an effort, and its ceiling must name both: a `profile` step and an
 /// escalation can then never meet a missing bound.
 fn validate_step_profile(state: &State, errors: &mut Vec<ValidationError>) {
     let Some(step) = state.action.as_ref().and_then(ActionConfig::harness_step) else {

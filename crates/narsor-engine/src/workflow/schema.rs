@@ -1190,14 +1190,9 @@ pub struct AgentActionSchema {
     #[serde(default)]
     pub effort: Option<String>,
 
-    /// The most the conductor or an escalation may raise the step to.
+    /// The most a `profile` step or an escalation may raise the step to.
     #[serde(default)]
     pub ceiling: Option<crate::domain::StepCeiling>,
-
-    /// Marks the plan step: after it succeeds the conductor profiles the
-    /// steps that have not started.
-    #[serde(default)]
-    pub plan: bool,
 
     /// Workspace permission, translated to native harness permissions at run
     /// time. Omission leaves the harness's own configuration in effect.

@@ -82,8 +82,6 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::conductor::actor::InvocationOutcome;
-use crate::conductor::profile;
 use crate::conductor::ConductorRegistry;
 use crate::config::DEFAULT_ESCALATION_THRESHOLD;
 use crate::config::{AgentArgs, AgentDefaults};
@@ -94,7 +92,6 @@ use crate::domain::{
     HumanInputType, InputCloseReason, ProblemKind, RepromptedBy, State, StateId, VariableSource,
     WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
 };
-use crate::domain::{ComplexityAssessment, COMPLEXITY_VARIABLE};
 use crate::engine::actions::agent::{
     self, DefaultHarnessSource, UsageReporter, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL,
     SESSION_DATA_KEY,
@@ -1113,7 +1110,6 @@ pub struct Engine {
     agent_timeout_secs: Option<u64>,
     agent_args: AgentArgs,
     escalation_threshold: u32,
-    profile_wait: Duration,
     usage_reporter: Option<Arc<dyn UsageReporter>>,
     reading_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     default_harness: Arc<dyn DefaultHarnessSource>,
@@ -1291,7 +1287,6 @@ impl Engine {
             agent_timeout_secs: None,
             agent_args: AgentArgs::new(),
             escalation_threshold: DEFAULT_ESCALATION_THRESHOLD,
-            profile_wait: profile::PROFILE_WAIT,
             usage_reporter: None,
             reading_notifier: None,
             default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
@@ -1371,13 +1366,6 @@ impl Engine {
     /// consecutive failed attempts; `0` turns escalation off.
     pub fn with_escalation_threshold(mut self, threshold: u32) -> Self {
         self.escalation_threshold = threshold;
-        self
-    }
-
-    /// Returns the engine waiting at most `wait` for the conductor's step
-    /// profile after the plan step (default [`profile::PROFILE_WAIT`]).
-    pub fn with_profile_wait(mut self, wait: Duration) -> Self {
-        self.profile_wait = wait;
         self
     }
 
@@ -2437,100 +2425,7 @@ impl Engine {
             ActionUpshot::Completed {
                 action_execution_id,
                 result,
-            } => {
-                self.profile_after_plan(definition, execution, state, &result)
-                    .await;
-                self.record_completion(definition, execution, state, action_execution_id, result)
-            }
-        }
-    }
-
-    /// After the plan step succeeded, has the conductor profile the steps
-    /// that have not started, and waits for it at most
-    /// [`profile::PROFILE_WAIT`] (`profile_wait`). Whatever goes wrong — no conductor, a
-    /// failure, an unsure answer, the wait running out — leaves the steps on
-    /// their defaults and the task unchanged (R8).
-    async fn profile_after_plan(
-        &self,
-        definition: &WorkflowDefinition,
-        execution: &WorkflowExecution,
-        state: &State,
-        result: &ActionResult,
-    ) {
-        let Some(ActionConfig::Agent(agent)) = &state.action else {
-            return;
-        };
-        if !agent.plan {
-            return;
-        }
-        let Some(registry) = self.conductor() else {
-            return;
-        };
-        let mut steps = Vec::new();
-        let mut ids: Vec<&String> = definition.states.keys().collect();
-        ids.sort();
-        for id in ids {
-            let candidate = &definition.states[id];
-            let Some(ActionConfig::Agent(config)) = &candidate.action else {
-                continue;
-            };
-            if candidate.id == state.id
-                || state_entry_count(execution, &candidate.id).unwrap_or(1) > 0
-            {
-                continue;
-            }
-            steps.push(profile::ProfileCandidate {
-                step_id: candidate.id.clone(),
-                default: Setting::default_of(&config.harness_step),
-                ceiling: Setting::ceiling_of(&config.harness_step),
-            });
-        }
-        if steps.is_empty() {
-            return;
-        }
-        let request = profile::ProfileRequest {
-            plan_step: state.id.clone(),
-            variables: Value::Object(result.variables.clone()),
-            artifacts: json!(result.artifacts),
-            complexity: result
-                .variables
-                .get(COMPLEXITY_VARIABLE)
-                .filter(|value| ComplexityAssessment::from_value(value).is_some())
-                .cloned(),
-            steps,
-        }
-        .into_queued();
-        let asked = match registry.actor(&execution.id) {
-            Ok(actor) => tokio::time::timeout(self.profile_wait, actor.invoke(request)).await,
-            Err(error) => {
-                tracing::warn!(%error, "no conductor to profile the steps");
-                return;
-            }
-        };
-        let note = match asked {
-            Ok(Ok(InvocationOutcome::Answered(_))) => return,
-            Ok(Ok(InvocationOutcome::Failed { error })) => error,
-            Ok(Ok(InvocationOutcome::Interrupted)) => "the conductor was interrupted".to_string(),
-            Ok(Err(error)) => error.to_string(),
-            Err(_) => "the conductor did not answer in time".to_string(),
-        };
-        self.note_step_profile_failure(execution, state, &note);
-    }
-
-    /// Records that the profile could not be made, best-effort (AE3).
-    fn note_step_profile_failure(&self, execution: &WorkflowExecution, state: &State, note: &str) {
-        if let Err(error) = self.emit(
-            &execution.id,
-            EventData::Error {
-                message: format!(
-                    "The conductor could not profile the steps after '{}': {note}; \
-                     they run on their defaults",
-                    state.id
-                ),
-                context: json!({ "step_profile": { "plan_step": state.id } }),
-            },
-        ) {
-            tracing::warn!(%error, "could not record a failed step profile");
+            } => self.record_completion(definition, execution, state, action_execution_id, result),
         }
     }
 
@@ -4788,20 +4683,6 @@ fn count_entry(execution: &mut WorkflowExecution, state_id: &str) -> Result<(), 
     let count = counts.entry(state_id.to_string()).or_default();
     *count = count.saturating_add(1);
     write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)
-}
-
-/// The states that were entered at least once (D7): their step profile is
-/// settled and is not written any more.
-pub(crate) fn started_states(
-    execution: &WorkflowExecution,
-) -> Result<std::collections::BTreeSet<String>, EngineError> {
-    let counts: BTreeMap<String, u32> =
-        read_engine_record(execution, METADATA_STATE_ENTRIES_KEY)?.unwrap_or_default();
-    Ok(counts
-        .into_iter()
-        .filter(|(_, count)| *count > 0)
-        .map(|(state, _)| state)
-        .collect())
 }
 
 /// The entry counts of `execution` (R10), as a decision saves them for an
