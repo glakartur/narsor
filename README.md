@@ -53,7 +53,7 @@ steps — an agent harness (for example `claude`, `codex` or `opencode`) on
 `PATH`. Rust is not needed.
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.20.0/install.sh | bash
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.21.0/install.sh | bash
 ```
 
 Add `--progress` (`... | bash -s -- --progress`) to show a progress bar while
