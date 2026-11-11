@@ -85,7 +85,9 @@ use crate::domain::{
 use crate::engine::{Engine, EngineError};
 use crate::persistence::{write_atomic, ExecutionStore, PersistenceError, StatePaths};
 use crate::registry::{RegistryError, RepositoryRegistry};
-use crate::workflow::{load_from_file, validate_path, LoadError, TemplateError, TemplateScope};
+use crate::workflow::{
+    load_from_file, validate_path, without_retired_fields, LoadError, TemplateError, TemplateScope,
+};
 use crate::workflows::{ResolveError, ResolvedWorkflow, WorkflowOrigin, WorkflowResolver};
 use crate::workspace::{
     materialise, Base, CheckpointError, MaterialiseRequest, RepositorySpec, WorkspaceError,
@@ -608,6 +610,9 @@ pub fn resolve_definition(
             path: pinned.clone(),
             source,
         })?;
+        // A copy pinned by an older version may carry a field the schema has
+        // since retired; the execution must still resume.
+        let source = without_retired_fields(&source).into_owned();
         return Ok(ResolvedWorkflow {
             name: stored_definition_name(execution)
                 .unwrap_or_else(|| execution.workflow_id.clone()),
@@ -888,4 +893,72 @@ fn abandon_execution(store: &ExecutionStore, execution: &mut WorkflowExecution, 
         },
     );
     let _ = store.save_execution(execution);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::load_from_str;
+
+    const PINNED_WITH_PLAN: &str = r#"
+schema: v2
+name: planned
+version: 1
+states:
+  plan:
+    action: { type: agent, prompt: x, plan: true }
+    exit: { next: done }
+  done:
+    description: end
+terminal_states:
+  done: completed
+"#;
+
+    /// A store with `yaml` pinned as the definition of a new execution.
+    fn pinned(yaml: &str) -> (PathBuf, StatePaths, WorkflowExecution) {
+        let root = std::env::temp_dir().join(format!("narsor-tasks-{}", uuid::Uuid::new_v4()));
+        let paths = StatePaths::new(&root);
+        let definition =
+            load_from_str(&PINNED_WITH_PLAN.replace(", plan: true", "")).expect("a definition");
+        let execution = WorkflowExecution::new(
+            &definition,
+            json!({}),
+            Workspace::local_folder("/work".to_string()),
+        );
+        let file = paths.definition_file(&execution.id);
+        fs::create_dir_all(file.parent().expect("an execution directory"))
+            .expect("create the execution directory");
+        fs::write(&file, yaml).expect("pin the definition");
+        (root, paths, execution)
+    }
+
+    #[test]
+    fn a_pinned_definition_with_the_retired_plan_field_still_resolves() {
+        let (root, paths, execution) = pinned(PINNED_WITH_PLAN);
+
+        let resolved = resolve_definition(&root.join("catalog"), &paths, &execution)
+            .expect("the pinned copy is found");
+        let definition = resolved.load();
+        let _ = fs::remove_dir_all(&root);
+
+        let definition = definition.expect("a definition pinned by an older version loads");
+        assert!(definition.states.contains_key("plan"));
+    }
+
+    #[test]
+    fn a_pinned_definition_with_another_unknown_field_still_fails() {
+        let (root, paths, execution) =
+            pinned(&PINNED_WITH_PLAN.replace("plan: true", "plan: true, planned: true"));
+
+        let resolved = resolve_definition(&root.join("catalog"), &paths, &execution)
+            .expect("the pinned copy is found");
+        let error = resolved.load();
+        let _ = fs::remove_dir_all(&root);
+
+        let error = error.expect_err("only retired fields are removed");
+        assert!(
+            error.to_string().contains("unknown field `planned`"),
+            "{error}"
+        );
+    }
 }

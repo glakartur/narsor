@@ -7,6 +7,7 @@
 //! instead of Rust fields.
 
 pub mod loader;
+pub mod retired;
 pub mod schema;
 pub mod template;
 pub mod validator;
@@ -15,6 +16,7 @@ pub use loader::{
     compile, compile_with_diagnostics, load_from_file, load_from_str,
     load_from_str_with_diagnostics, LoadDiagnostic, LoadError, LoadedWorkflow,
 };
+pub use retired::without_retired_fields;
 pub use schema::{parse_duration, DurationParseError, DurationSecs, WorkflowFile};
 pub use template::{
     action_context_references, context_references, places_step_history,
