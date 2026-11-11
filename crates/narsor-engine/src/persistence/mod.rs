@@ -15,6 +15,7 @@
 //!     artifacts/{artifact_id}/    -- files produced by actions
 //!     conversations/{attempt_id}.jsonl        -- open attempt, see conversation
 //!     conversations/{attempt_id}.jsonl.zst    -- closed attempt, compressed
+//!     step-profile.json           -- the latest result of a `profile` step, see step_profile
 //!     conductor/                  -- the conductor's store, see crate::conductor
 //! ```
 //!
@@ -31,6 +32,7 @@ pub mod event_log;
 pub mod execution_store;
 pub use crate::config::paths;
 pub mod recovery;
+pub mod step_profile;
 
 pub use agent_harness::{DefaultHarnessSelector, HarnessSelectionError, HarnessSelectionSnapshot};
 pub use atomic::{
@@ -47,11 +49,14 @@ pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
 pub use paths::{
     CatalogPaths, StatePaths, WorkPaths, AGENT_HARNESS_SELECTION_FILE, CONTEXT_FILE, DEFAULT_ROOT,
-    STATE_FILE, TEMP_SUFFIX,
+    STATE_FILE, STEP_PROFILE_FILE, TEMP_SUFFIX,
 };
 pub use recovery::{
     compress_closed_conversations, reconcile, reconcile_all, recover, sweep_orphaned_workspaces,
     OrphanReason, OrphanedWorkspace, Reconciliation, ReconciliationOutcome, RecoveryReport,
+};
+pub use step_profile::{
+    StepProfileEntry, StepProfileResult, MAX_STEP_PROFILE_BYTES, STEP_PROFILE_VERSION,
 };
 
 use std::io;
@@ -143,6 +148,28 @@ pub enum PersistenceError {
         expected: u64,
         /// The sequence number stored inside the file.
         declared: u64,
+    },
+
+    /// A file is larger than the reader accepts.
+    #[error("file '{path}' has {size} bytes, more than the limit of {limit}")]
+    FileTooLarge {
+        /// The offending file.
+        path: PathBuf,
+        /// Its size in bytes.
+        size: u64,
+        /// The largest size the reader accepts.
+        limit: u64,
+    },
+
+    /// A file declares a format version this binary does not know.
+    #[error("file '{path}' has version {found}, this binary reads version {supported}")]
+    UnsupportedVersion {
+        /// The offending file.
+        path: PathBuf,
+        /// The version the file declares.
+        found: u32,
+        /// The version this binary writes and reads.
+        supported: u32,
     },
 }
 
