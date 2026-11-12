@@ -327,7 +327,7 @@ fn proposal_of(entries: &[ChatEntry]) -> (ChatEntry, ProposalRecord) {
 /// conductor's with its rationale and confidence.
 #[tokio::test]
 async fn a_proposal_to_answer_the_agent_is_carried_out_only_once_confirmed() {
-    let agent = Arc::new(QuestioningAgentExecutor::new());
+    let agent = Arc::new(QuestioningAgentExecutor::with_session());
     let fixture = Fixture::new(
         "agent_question",
         Some(agent.clone()),
@@ -391,6 +391,8 @@ async fn a_proposal_to_answer_the_agent_is_carried_out_only_once_confirmed() {
     let prompts = agent.prompts();
     assert_eq!(prompts.len(), 2);
     assert!(prompts[1].contains("Use variant B."), "{}", prompts[1]);
+    // A resumed session has the output contract; only the first prompt asks for it.
+    assert_eq!(agent.skips_contract(), vec![false, true]);
     let events = fixture.events(&execution.id);
     assert_eq!(
         answers_received(&events),

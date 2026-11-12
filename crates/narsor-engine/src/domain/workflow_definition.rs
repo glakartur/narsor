@@ -639,6 +639,13 @@ pub struct HarnessStepConfig {
     #[serde(skip)]
     pub permission_grants: Vec<String>,
 
+    /// Set when the engine resumes a session with the operator's own words:
+    /// the session already holds the output contract from its first prompt,
+    /// so the executor does not append it again. Never loaded from workflow
+    /// source or persisted definitions; off means the contract is appended.
+    #[serde(skip)]
+    pub skip_output_contract: bool,
+
     /// Model specification (optional)
     #[serde(default)]
     pub model: Option<String>,

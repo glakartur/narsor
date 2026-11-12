@@ -1914,6 +1914,7 @@ fn expected_persisted_actions() -> Vec<narsor_engine::domain::AgentActionConfig>
             harness: Some("claude-code".into()),
             // Never persisted: it reads back empty.
             permission_grants: Vec::new(),
+            skip_output_contract: false,
             model: Some("medium".into()),
             effort: Some("high".into()),
             ceiling: Some(StepCeiling {
