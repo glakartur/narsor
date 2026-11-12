@@ -1,7 +1,7 @@
 ---
 title: "feat: Panel akcji z menu z serwera i formularz wielokrokowy"
 type: feat
-status: active
+status: completed
 date: 2026-11-13
 origin: docs/brainstorms/2026-11-12-tui-panel-akcji-menu-z-serwera-i-formularz-wielokrokowy-requirements.md
 ---

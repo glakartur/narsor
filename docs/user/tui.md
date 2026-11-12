@@ -201,10 +201,34 @@ several waitings of one task. The header counts them (`? 1 · ! 1`).
 
 **The action panel** (`Ctrl+.`, or `.` where the terminal does not pass
 `Ctrl+.`) is the one place for everything that can be done to the selected
-task. The actions have no shortcut of their own. The panel greys out what
-cannot be done, with the reason. What can be done comes from the server (it
-checks the same rule when the command arrives); a server that does not say shows
-"niedostępne: brak danych". An action marked `!` asks `y` / `n` first.
+task. The actions have no shortcut of their own. The panel opens in the place
+of the conversation's form, at the bottom of the details (on every tab), and
+the keys go back where they were when it closes.
+
+The server gives the list. It holds only what can be done now: nothing is
+greyed out. The server also gives the name of each action, what it does, its
+risk and whether it opens a further list. The server checks the same rule when
+the command arrives: when the task changed in the meantime, the bar shows the
+reason and the list is read again. When the server gives no list, the panel
+says "Brak danych z serwera" and shows no action. An empty list says that no
+action is available.
+
+Each action goes through the same steps; the heading shows the path and the
+step (`Akcje › Wybierz krok · krok 2 z 3`):
+
+1. **Choose** the action. An action with further choices (*Przejście ręczne*,
+   *Wybierz krok*) opens them in the same panel.
+2. **Fill in** what it needs, when it needs something (a comment for the
+   agent, the reason of an override). This step is left out when there is
+   nothing to fill in.
+3. **Confirm**: the panel shows the name, what the action does, what you typed
+   and `! nieodwracalne` for an action that cannot be undone. `Enter` sends.
+
+`Esc` goes back one step or one level and keeps what you typed; on the first
+level it closes the panel. A refresh of the list does not close the panel and
+does not clear a field. When the chosen action is no longer available, the bar
+says so and the panel goes back one level. *Otwórz link* (the last entry, when
+the task has a pull request) opens at once, without a confirmation.
 
 *Pause* waits for the work to end its step, then the task stops at a safe point
 and gives its slot back. *Stop* cuts the work at once; the task ends stopped
@@ -217,13 +241,13 @@ itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
 | Key | Action | The CLI it stands for |
 |---|---|---|
 | `Ctrl+↑` / `Ctrl+↓` / `m` | move in the queue (a place preview, `Enter` confirms); not an entry of the panel | `narsor-cli task move` |
-| the panel: *pauza* | pause: the work ends its step | `narsor-cli task pause` |
-| the panel: *stop* (`!`) | stop: the work is cut at once | — |
-| the panel: *zwolnij slot* | a task that waits for you: stop it now, not after the wait time | `narsor-cli task pause` |
-| the panel: *przejście ręczne* | manual transition; with a reason, a forced jump (override) where the workflow allows it. A `schema: v2` workflow in the unified shape allows it from every state that is not terminal. A workflow in the older shape allows it only from a state with `allow_manual_override: true` | `narsor-cli task transition [--override --reason]` |
-| the panel: *wybierz krok* | go on from any step of the workflow, a finished workflow too; for an agent step you may add a comment | — |
-| the panel: *uruchom od nowa* | start again the script step of a stopped task, an interrupted task or a failed provisioning | `narsor-cli task start` |
-| the panel: *archiwizuj* (`!`) | archive | `narsor-cli task archive` |
+| the panel: *Pauza* | pause: the work ends its step | `narsor-cli task pause` |
+| the panel: *Stop* (`! nieodwracalne`) | stop: the work is cut at once | — |
+| the panel: *Zwolnij slot* | a task that waits for you: stop it now, not after the wait time | `narsor-cli task pause` |
+| the panel: *Przejście ręczne* | manual transition; with a reason, a forced jump (override) where the workflow allows it. A `schema: v2` workflow in the unified shape allows it from every state that is not terminal. A workflow in the older shape allows it only from a state with `allow_manual_override: true` | `narsor-cli task transition [--override --reason]` |
+| the panel: *Wybierz krok* | go on from any step of the workflow, a finished workflow too; for an agent step you may add a comment | — |
+| the panel: *Uruchom od nowa* | start again the script step of a stopped task, an interrupted task or a failed provisioning | `narsor-cli task start` |
+| the panel: *Archiwizuj* (`! nieodwracalne`) | archive | `narsor-cli task archive` |
 | `o` | open a pull request link of a workspace in the browser | — |
 | `c` | write to the agent, in one step; it is the conversation's, not the panel's: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a stop: the note goes to the agent and the task resumes. A text that was not sent stays as a draft of the task | — |
 | `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
@@ -238,7 +262,7 @@ itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
 | `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `max_concurrent_tasks` applies again) | `max_concurrent_tasks` in the configuration |
 | the header | what the connection offers | `narsor-cli task capabilities` |
 
-**A forced jump** (the panel's *przejście ręczne*, with a reason) leaves the declared exits of the step and goes
+**A forced jump** (the panel's *Przejście ręczne*, with a reason) leaves the declared exits of the step and goes
 to any other state. It always needs a reason, and the reason is saved in the audit
 trail. A workflow in the unified shape (`schema: v2` with `choices` as a map) allows
 it from every state that is not terminal. A workflow in the older shape honors the
