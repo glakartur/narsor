@@ -1,7 +1,7 @@
 ---
 title: "feat: Ikony kroków profile (⚖️) i script (💻) w TUI"
 type: feat
-status: active
+status: completed
 date: 2026-11-12
 origin: docs/brainstorms/2026-11-12-tui-ikony-typow-kroku-profile-i-script-requirements.md
 ---

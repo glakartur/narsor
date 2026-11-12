@@ -811,7 +811,9 @@ mod tests {
     fn step_icon_names_who_runs_the_step_and_what_it_is() {
         use super::step_icon;
         assert_eq!(step_icon(Some("agent"), None), Some("✨"));
-        assert_eq!(step_icon(Some("script"), None), Some("📜"));
+        assert_eq!(step_icon(Some("script"), None), Some("💻"));
+        assert_eq!(step_icon(Some("profile"), None), Some("⚖️"));
+        assert_eq!(step_icon(Some("profile"), Some("human")), Some("⚖️"));
         assert_eq!(step_icon(Some("wait"), None), Some("✋"));
         assert_eq!(step_icon(Some("decision"), Some("conductor")), Some("⚡🔀"));
         assert_eq!(step_icon(Some("decision"), Some("human")), Some("🧑🔀"));

@@ -3102,6 +3102,7 @@ mod task_app_detail_render {
     fn the_axis_shows_the_icon_of_each_kind_after_the_status() {
         let mut app = app_with_steps(&[
             ("test", "script", None),
+            ("rate", "profile", None),
             ("triage", "decision", Some("conductor")),
             ("work", "agent", None),
             ("hold", "wait", None),
@@ -3109,7 +3110,8 @@ mod task_app_detail_render {
         ]);
         let screen = screen(&render(&mut app, &Styles::new(false)));
         for expected in [
-            "✓ 📜 test #1",
+            "✓ 💻 test #1",
+            "✓ ⚖️ rate #1",
             "✓ ⚡🔀 triage #1",
             "✓ ✨ work #1",
             "✓ ✋ hold #1",
@@ -3184,6 +3186,22 @@ mod task_app_detail_render {
             rows.iter().any(|row| row.contains("● ⚡🔀 a…")
                 && row.contains('…')
                 && row.contains("w toku")),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_narrow_axis_keeps_the_scales_icon_of_a_profile_step() {
+        let mut app = app_with_steps(&[(
+            "a-very-long-profile-step-name-that-cannot-fit",
+            "profile",
+            None,
+        )]);
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("● ⚖️ a") && row.contains("w toku")),
             "{}",
             rows.join("\n")
         );

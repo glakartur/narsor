@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 pub fn step_icon(action_type: Option<&str>, decision_by: Option<&str>) -> Option<&'static str> {
     match (action_type?, decision_by) {
         ("agent", _) => Some("✨"),
-        ("script", _) => Some("📜"),
+        ("script", _) => Some("💻"),
+        ("profile", _) => Some("⚖️"),
         ("wait", _) => Some("✋"),
         ("decision", Some("conductor")) => Some("⚡🔀"),
         ("decision", Some("human")) => Some("🧑🔀"),

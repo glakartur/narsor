@@ -4154,7 +4154,24 @@ mod task_app_detail {
                 &Attempts::default(),
                 &[entered(1, "test")],
             );
-            assert_eq!(built.entries[0].header, "── 📜 test #1 ──");
+            assert_eq!(built.entries[0].header, "── 💻 test #1 ──");
+        }
+
+        #[test]
+        fn a_profile_step_heading_starts_with_the_scales_icon() {
+            use narsor::tui::task_app::tabs::conversation::{build_conversation, Scope};
+            let positions = vec![crate::task_app_support::of_kind(
+                position("profile", PositionStatus::Succeeded),
+                "profile",
+                None,
+            )];
+            let built = build_conversation(
+                Scope::Whole,
+                &positions,
+                &Attempts::default(),
+                &[entered(1, "profile")],
+            );
+            assert_eq!(built.entries[0].header, "── ⚖️ profile #1 ──");
         }
 
         #[test]
