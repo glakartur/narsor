@@ -3164,16 +3164,16 @@ mod task_app_detail_render {
         ]);
         let on_screen = screen(&render(&mut app, &Styles::new(false)));
         assert!(
-            on_screen.contains("🧑🔀 approval #1 · w toku · decision · human"),
+            on_screen.contains("🧑🔀 approval #1 · decision · human"),
             "{on_screen}"
         );
         let mut app = app_with_steps(&[("work", "agent", None)]);
         let text = screen(&render(&mut app, &Styles::new(false)));
-        assert!(text.contains("✨ work #1 · w toku · agent"), "{text}");
+        assert!(text.contains("✨ work #1 · agent"), "{text}");
     }
 
     #[test]
-    fn a_narrow_axis_cuts_the_name_and_keeps_the_status_and_the_icon() {
+    fn a_narrow_axis_cuts_the_name_and_keeps_the_times_and_the_icon() {
         let mut app = app_with_steps(&[(
             "a-very-long-step-name-that-cannot-fit",
             "decision",
@@ -3181,9 +3181,9 @@ mod task_app_detail_render {
         )]);
         let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
         assert!(
-            rows.iter().any(|row| row.contains("● ⚡🔀 a…")
-                && row.contains('…')
-                && row.contains("w toku")),
+            rows.iter().any(|row| row.contains("● ⚡🔀 a-ver…")
+                && row.contains("0s")
+                && !row.contains("w toku")),
             "{}",
             rows.join("\n")
         );
@@ -3239,7 +3239,7 @@ mod task_app_detail_render {
             .set_tab(narsor::tui::task_app::DetailTab::Progress);
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
-        for expected in ["✓ ✨ plan #1", "✓ ✨ edit #1", "● ✨ review #1 w toku"] {
+        for expected in ["✓ ✨ plan #1", "✓ ✨ edit #1", "● ✨ review #1  "] {
             assert!(screen.contains(expected), "{expected:?} in\n{screen}");
         }
         assert!(!below_the_frame_title(&buffer).contains('▸'), "{screen}");
@@ -3261,26 +3261,65 @@ mod task_app_detail_render {
                 && row("edit #1") < row("review #1")
                 && row("review #1") < row("test #1")
         );
-        assert_eq!(row("plan #1") + 2, row("edit #1"), "unselected steps stack");
+        assert_eq!(row("plan #1") + 1, row("edit #1"), "unselected steps stack");
         assert_eq!(
-            row("edit #1") + 3,
+            row("edit #1") + 2,
             row("review #1"),
             "the rule above the selected step"
         );
         assert_eq!(
-            row("review #1") + 3,
+            row("review #1") + 2,
             row("test #1"),
             "the rule below the selected step"
         );
         // The keys are on the axis: a bracket in the focus role.
-        assert_axis_bracket(&buffer, "● ✨ review #1 w toku", marks(true, false));
-        assert!(no_reversed_on_the_axis(&buffer, "● ✨ review #1 w toku"));
+        assert_axis_bracket(&buffer, "● ✨ review #1  ", marks(true, false));
+        assert!(no_reversed_on_the_axis(&buffer, "● ✨ review #1  "));
         // Without colour the same is said in words, glyphs and weight.
         let plain = render(&mut app, &Styles::new(true));
-        assert_axis_bracket(&plain, "● ✨ review #1 w toku", marks(true, true));
-        let (y, x) = spot(&plain, "● ✨ review #1 w toku");
+        assert_axis_bracket(&plain, "● ✨ review #1  ", marks(true, true));
+        let (y, x) = spot(&plain, "● ✨ review #1  ");
         assert!(bold_at(&plain, x - 2, y) && bold_at(&plain, x, y - 1));
-        assert!(no_reversed_on_the_axis(&plain, "● ✨ review #1 w toku"));
+        assert!(no_reversed_on_the_axis(&plain, "● ✨ review #1  "));
+    }
+
+    /// AE1: the axis brackets the selected step and does not fill it.
+    #[test]
+    fn the_axis_brackets_the_selected_step_without_a_fill() {
+        let mut app = running_app();
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
+        for no_color in [false, true] {
+            let styles = Styles::new(no_color);
+            let buffer = render(&mut app, &styles);
+            assert_axis_bracket(&buffer, "● ✨ review #1  ", marks(true, no_color));
+            let (y, x) = spot(&buffer, "● ✨ review #1  ");
+            for row in y - 1..=y + 1 {
+                assert!(
+                    row_cells(&buffer, row, x - 2..x + 30).all(|cell| cell.bg == Color::Reset),
+                    "no fill in row {row}:\n{}",
+                    screen(&buffer)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_axis_row_has_the_times_after_the_name_and_no_status_word() {
+        let mut app = running_app();
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
+        let buffer = render(&mut app, &Styles::new(false));
+        let screen = screen(&buffer);
+        for word in ["w toku", "przerwany", "czeka na decyzję"] {
+            assert!(!screen.contains(word), "{word:?} in\n{screen}");
+        }
+        let (y, x) = spot(&buffer, "✓ ✨ plan #1");
+        let row = &rows(&buffer)[usize::from(y)];
+        let axis: String = row.chars().skip(usize::from(x)).collect();
+        let name_at = axis.find("plan #1").unwrap();
+        let time_at = axis.find(':').unwrap();
+        assert!(name_at < time_at, "{axis}");
     }
 
     #[test]
@@ -3831,8 +3870,8 @@ mod task_app_detail_render {
     /// `marks`, the rules checked at its first column.
     fn assert_axis_bracket(buffer: &Buffer, needle: &str, marks: SelectionMarks) {
         let (y, x) = spot(buffer, needle);
-        // A step is two rows: its row and the row of when it ran.
-        assert_bracket(buffer, (x, y), 2, x + 1, marks);
+        // A step with no model, effort or harness is one row.
+        assert_bracket(buffer, (x, y), 1, x + 1, marks);
     }
 
     /// Whether no cell of the axis around the row of `needle` is in reverse
@@ -3925,7 +3964,7 @@ mod task_app_detail_render {
     fn the_bar_and_the_bracket_follow_the_level_of_the_focus() {
         let mut app = recorded_app(three_entries());
         let on_the_axis = render(&mut app, &Styles::new(false));
-        assert_axis_bracket(&on_the_axis, "● ✨ review #1 w toku", marks(true, false));
+        assert_axis_bracket(&on_the_axis, "● ✨ review #1  ", marks(true, false));
         assert_eq!(
             bar_of(&on_the_axis, "line 3"),
             ("│".to_string(), Color::DarkGray),
@@ -3939,15 +3978,15 @@ mod task_app_detail_render {
         let cell = spot(&reading, "line 2");
         assert_eq!(bar_of(&reading, "line 2"), ("│".to_string(), Color::Cyan));
         assert_eq!(bar_of(&reading, "line 3").0, " ");
-        assert_axis_bracket(&reading, "● ✨ review #1 w toku", marks(false, false));
-        assert!(no_reversed_on_the_axis(&reading, "● ✨ review #1 w toku"));
+        assert_axis_bracket(&reading, "● ✨ review #1  ", marks(false, false));
+        assert!(no_reversed_on_the_axis(&reading, "● ✨ review #1  "));
 
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.step_focus(), StepFocus::Axis);
         let back = render(&mut app, &Styles::new(false));
         assert_eq!(spot(&back, "line 2"), cell, "the entry stays where it was");
         assert_eq!(bar_of(&back, "line 2"), ("│".to_string(), Color::DarkGray));
-        assert_axis_bracket(&back, "● ✨ review #1 w toku", marks(true, false));
+        assert_axis_bracket(&back, "● ✨ review #1  ", marks(true, false));
     }
 
     /// AE6: without colour the weight tells the two levels apart.
@@ -3955,7 +3994,7 @@ mod task_app_detail_render {
     fn without_colour_the_weight_tells_the_levels_apart() {
         let mut app = recorded_app(three_entries());
         let on_the_axis = render(&mut app, &Styles::new(true));
-        let (y, x) = spot(&on_the_axis, "● ✨ review #1 w toku");
+        let (y, x) = spot(&on_the_axis, "● ✨ review #1  ");
         assert_eq!(cell_at(&on_the_axis, x - 2, y).0, "│");
         assert!(bold_at(&on_the_axis, x - 2, y));
         let (entry_bar_x, entry_y) = bar_position(&on_the_axis, "line 3");
@@ -3970,7 +4009,7 @@ mod task_app_detail_render {
         assert!(reading[(x - 2, y)].modifier.contains(Modifier::DIM));
         assert_eq!(cell_at(&reading, entry_bar_x, entry_y).0, "│");
         assert!(bold_at(&reading, entry_bar_x, entry_y));
-        assert!(no_reversed_on_the_axis(&reading, "● ✨ review #1 w toku"));
+        assert!(no_reversed_on_the_axis(&reading, "● ✨ review #1  "));
         assert!(none_reversed(row_cells(
             &reading,
             entry_y,
@@ -3986,7 +4025,7 @@ mod task_app_detail_render {
             .set_tab(narsor::tui::task_app::DetailTab::Progress);
         press(&mut app, KeyCode::Esc);
         let buffer = render(&mut app, &Styles::new(false));
-        assert_axis_bracket(&buffer, "● ✨ review #1 w toku", marks(false, false));
+        assert_axis_bracket(&buffer, "● ✨ review #1  ", marks(false, false));
     }
 
     /// `m` from the details moves the list's row: the keys are on the list,
@@ -4027,7 +4066,7 @@ mod task_app_detail_render {
                 .expect("the row on the list")
         };
         let details = render(&mut app, &Styles::new(false));
-        assert_axis_bracket(&details, "● ✨ review #1 w toku", marks(true, false));
+        assert_axis_bracket(&details, "● ✨ review #1  ", marks(true, false));
         let y = list_row(&details);
         for row in y..y + 2 {
             assert!(is_mark(&details[(1, row)], "│", marks(false, false)));
@@ -4040,11 +4079,11 @@ mod task_app_detail_render {
         for row in y..y + 2 {
             assert!(is_mark(&moving[(1, row)], "│", marks(true, false)));
         }
-        assert_axis_bracket(&moving, "● ✨ review #1 w toku", marks(false, false));
+        assert_axis_bracket(&moving, "● ✨ review #1  ", marks(false, false));
 
         press(&mut app, KeyCode::Esc);
         let back = render(&mut app, &Styles::new(false));
-        assert_axis_bracket(&back, "● ✨ review #1 w toku", marks(true, false));
+        assert_axis_bracket(&back, "● ✨ review #1  ", marks(true, false));
     }
 
     /// R11: at 60×20, with more steps than fit, the selected step is in
@@ -4078,10 +4117,10 @@ mod task_app_detail_render {
         };
         press(&mut app, KeyCode::Char('G'));
         let bottom = small(&mut app);
-        assert_axis_bracket(&bottom, "✓ ✨ s11 #1 ok", marks(true, false));
+        assert_axis_bracket(&bottom, "✓ ✨ s11 #1  ", marks(true, false));
         press(&mut app, KeyCode::Char('g'));
         let top = small(&mut app);
-        assert_axis_bracket(&top, "✓ ✨ s0 #1 ok", marks(true, false));
+        assert_axis_bracket(&top, "✓ ✨ s0 #1  ", marks(true, false));
         assert!(!screen(&top).contains("s11 #1"), "{}", screen(&top));
     }
 
@@ -7181,7 +7220,7 @@ mod task_app_harness_render {
 mod bracketed_list_render {
     use super::*;
 
-    use narsor::tui::selection::{bar_prefix, render_bracketed_list};
+    use narsor::tui::selection::{bar_prefix, render_bracketed_list, render_bracketed_list_plain};
     use narsor::tui::style::Role;
     use ratatui::text::{Line, Span};
 
@@ -7327,6 +7366,70 @@ mod bracketed_list_render {
                 screen(buffer)
             );
         }
+    }
+
+    /// AE1: the plain variant brackets like the filled one and draws no fill.
+    #[test]
+    fn the_plain_bracket_has_the_bar_and_the_rules_and_no_fill() {
+        for no_color in [false, true] {
+            let styles = Styles::new(no_color);
+            let fill = styles.selection_fill().bg;
+            let list = items(&styles, 3);
+            let (width, height) = (20, 10);
+            let area = Rect::new(0, 0, width, height);
+            for focused in [true, false] {
+                let mut top = 0;
+                let plain = draw(width, height, |frame| {
+                    render_bracketed_list_plain(
+                        frame,
+                        area,
+                        &styles,
+                        &list,
+                        Some(1),
+                        focused,
+                        &mut top,
+                    )
+                });
+                let filled = draw_list(width, height, &styles, &list, Some(1), focused, &mut 0);
+                let marks = styles.selection_marks(focused);
+                assert!(is_full_rule(&plain, 2, marks) && is_full_rule(&plain, 5, marks));
+                for y in [3, 4] {
+                    assert!(is_mark(&plain[(0, y)], "│", marks), "{}", screen(&plain));
+                }
+                assert_eq!(rule_rows(&plain), rule_rows(&filled));
+                assert!(
+                    plain.content().iter().all(|cell| cell.bg == Color::Reset),
+                    "{}",
+                    screen(&plain)
+                );
+                assert!(
+                    fill.is_none() || filled.content().iter().any(|cell| Some(cell.bg) == fill),
+                    "the filled list still fills"
+                );
+                assert!(none_reversed(plain.content()));
+            }
+        }
+    }
+
+    #[test]
+    fn an_area_lower_than_the_plain_bracket_keeps_the_bar_alone() {
+        let styles = Styles::new(false);
+        let list = items(&styles, 3);
+        let mut top = 0;
+        let buffer = draw(20, 2, |frame| {
+            render_bracketed_list_plain(
+                frame,
+                Rect::new(0, 0, 20, 2),
+                &styles,
+                &list,
+                Some(1),
+                true,
+                &mut top,
+            )
+        });
+        assert!(rule_rows(&buffer).is_empty(), "{}", screen(&buffer));
+        assert_eq!(buffer[(0, 0)].symbol(), "│");
+        assert_eq!(buffer[(0, 1)].symbol(), "│");
     }
 
     #[test]
