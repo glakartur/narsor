@@ -425,7 +425,12 @@ impl Column {
 }
 
 /// Spaces before each column of a table row.
-const COLUMN_GAP: usize = 2;
+const COLUMN_GAP: usize = 3;
+/// Spaces between the values of the detail row.
+const DETAIL_GAP: usize = 2;
+/// From this tab width the axis may take 75% and the step's content keeps 25%;
+/// below it the split stays 70% / 30%.
+const WIDE_TAB: usize = 100;
 /// Spaces before the detail row.
 const DETAIL_INDENT: usize = 3;
 
@@ -439,11 +444,17 @@ fn columns_width(columns: &[&Column]) -> usize {
         .sum()
 }
 
-/// The most columns the axis may take: the step's content keeps its 30%.
+/// The most columns the axis may take: the step's content keeps 25% of a wide
+/// tab and 30% of a narrow one.
 fn axis_cap(area_width: u16, today: u16) -> usize {
     let area = usize::from(area_width);
-    area.saturating_sub(usize::from(AXIS_GAP) + (area * 3).div_ceil(10))
-        .min(area * 7 / 10)
+    let (content_share, axis_share) = if area >= WIDE_TAB {
+        (area.div_ceil(4), area * 3 / 4)
+    } else {
+        ((area * 3).div_ceil(10), area * 7 / 10)
+    };
+    area.saturating_sub(usize::from(AXIS_GAP) + content_share)
+        .min(axis_share)
         .max(usize::from(today))
 }
 
@@ -488,10 +499,12 @@ impl AxisLayout {
                 .filter(|column| column.width() > 0)
                 .map(|column| column.text(index))
                 .collect::<Vec<_>>()
-                .join(&" ".repeat(COLUMN_GAP))
+                .join(&" ".repeat(DETAIL_GAP))
         };
         let agent_refs: Vec<&Column> = agent.iter().collect();
-        let agent_width = columns_width(&agent_refs).saturating_sub(COLUMN_GAP);
+        let agent_width = (columns_width(&agent_refs)
+            - agent_refs.iter().filter(|c| c.width() > 0).count() * (COLUMN_GAP - DETAIL_GAP))
+            .saturating_sub(DETAIL_GAP);
         let wanted = usize::from(PREFIX_WIDTH) + DETAIL_INDENT + agent_width;
         let today = self.width;
         let width = usize::from(self.width)
@@ -1001,7 +1014,7 @@ mod tests {
     fn values_of_a_kind_stand_in_one_column() {
         let axis = layout(&sample(), 200);
         let rows: Vec<String> = axis.rows.iter().map(|rows| text(&rows[0])).collect();
-        assert!(rows[0].contains("2×  ↑40k  ↓3k"), "{}", rows[0]);
+        assert!(rows[0].contains("2×   ↑40k   ↓3k"), "{}", rows[0]);
         for (a, b) in [("$0.42", "$0.03"), ("↑120k", "↑2.1k"), ("↓8k", "↓400")] {
             assert_eq!(column_of(&rows[0], a), column_of(&rows[1], b), "{rows:?}");
         }
@@ -1019,22 +1032,24 @@ mod tests {
     }
 
     #[test]
-    fn the_axis_stays_within_seventy_percent_and_leaves_the_rest_to_the_step() {
+    fn the_axis_stays_within_its_share_and_leaves_the_rest_to_the_step() {
         for width in 60..=220u16 {
             let axis = layout(&sample(), width);
             let today = (width / 3).clamp(18, AXIS_MAX_WIDTH);
+            let (axis_max, content_min) = if usize::from(width) >= WIDE_TAB {
+                (width * 3 / 4, width.div_ceil(4))
+            } else {
+                (width * 7 / 10, (width * 3).div_ceil(10))
+            };
+            assert!(axis.width <= axis_max.max(today), "{width}: {}", axis.width);
             assert!(
-                axis.width <= (width * 7 / 10).max(today),
-                "{width}: {}",
-                axis.width
-            );
-            assert!(
-                width - axis.width - AXIS_GAP >= (width * 3).div_ceil(10),
+                width - axis.width - AXIS_GAP >= content_min,
                 "{width}: {}",
                 axis.width
             );
         }
         assert!(layout(&sample(), 200).width > 34);
+        assert!(layout(&sample(), 200).width <= 150);
     }
 
     #[test]
@@ -1063,10 +1078,10 @@ mod tests {
     }
 
     #[test]
-    fn metric_columns_are_two_spaces_apart() {
+    fn metric_columns_are_three_spaces_apart() {
         let axis = layout(&sample(), 200);
         let row = text(&axis.rows[0][0]);
-        assert!(row.contains("$0.42  ↑120k   ↓8k"), "{row}");
+        assert!(row.contains("$0.42   ↑120k    ↓8k"), "{row}");
     }
 
     fn timed_steps() -> Vec<Position> {

@@ -122,8 +122,8 @@ with the subagents' count and tokens after them (`3× ↑40k ↓3k`, or `3× ↕
 the harness gave only their sum), in columns aligned across the steps; a second
 row, only for a step that has them, gives its model, effort and harness. The
 selected step has a bracket, no fill. On a narrow axis the name is cut first, then
-the duration goes, then the start time. The step list may take up to 70% of the
-tab, and a step that reported nothing leaves those fields empty),
+the duration goes, then the start time. The columns stand three spaces apart. The step list may take up to 75% of a
+tab at least 100 columns wide (70% of a narrower one), and a step that reported nothing leaves those fields empty),
 *Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
 chat and decisions; its status line names the harness the conductor runs on)
 and *Info* (the sealed inputs, the observations with their age, the runner and

@@ -3054,7 +3054,11 @@ mod task_app_detail_render {
                 .unwrap_or_else(|| panic!("{needle:?} in\n{}", rows.join("\n")))
         };
         let step0 = row(&wide, "$0.42");
-        assert!(wide[step0].contains("1×  ↑40k  ↓3k"), "{}", wide.join("\n"));
+        assert!(
+            wide[step0].contains("1×   ↑40k   ↓3k"),
+            "{}",
+            wide.join("\n")
+        );
         assert!(wide[row(&wide, "$0.03")].contains("↑2.1k"));
 
         let mut app = running_app_with_usage(steps());
@@ -3183,7 +3187,7 @@ mod task_app_detail_render {
         )]);
         let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
         assert!(
-            rows.iter().any(|row| row.contains("● ⚡🔀 a-ver…")
+            rows.iter().any(|row| row.contains("● ⚡🔀 a-v…")
                 && row.contains("0s")
                 && !row.contains("w toku")),
             "{}",
@@ -3201,7 +3205,7 @@ mod task_app_detail_render {
         let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 30));
         assert!(
             rows.iter()
-                .any(|row| row.contains("● ⚖️ a-very-…") && row.contains("0s")),
+                .any(|row| row.contains("● ⚖️ a-ver…") && row.contains("0s")),
             "{}",
             rows.join("\n")
         );
