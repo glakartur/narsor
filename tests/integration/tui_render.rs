@@ -3243,6 +3243,41 @@ mod task_app_detail_render {
     }
 
     #[test]
+    fn the_task_list_and_the_task_header_show_the_scale_for_a_profile_step() {
+        let mut app = app();
+        let running = in_step_of_kind(
+            with_runner(
+                with_controller(task("a", "local", "running", 1)),
+                ExecutionStatus::Running,
+                "review",
+            ),
+            "profile",
+            None,
+        );
+        app.load(listing(vec![titled(running, "NAR-12")], "c"));
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline(
+                "a",
+                vec![
+                    position("plan", PositionStatus::Succeeded),
+                    of_kind(
+                        position("review", PositionStatus::AwaitingDecision),
+                        "profile",
+                        None,
+                    ),
+                ],
+                Some("review #1"),
+            ))),
+        );
+        press(&mut app, KeyCode::Enter);
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(screen.contains("   ⚖️ review"), "list:\n{screen}");
+        assert!(screen.contains("krok 2 · ⚖️ review"), "header:\n{screen}");
+    }
+
+    #[test]
     fn a_task_whose_runner_names_no_kind_shows_the_step_name_alone() {
         let mut app = running_app();
         let screen = screen(&render(&mut app, &Styles::new(false)));
@@ -3711,6 +3746,44 @@ mod task_app_detail_render {
         }
         let oldest = strip(&conversation);
         assert!(oldest.contains("⚡🔀 step0 #1"), "{oldest}");
+        assert!(!oldest.contains("step11"), "{oldest}");
+    }
+
+    #[test]
+    fn a_strip_of_profile_steps_keeps_the_selected_step_in_view() {
+        use narsor::tui::task_app::tabs::conversation::{render_step_strip, Conversation};
+        let positions: Vec<_> = (0..12)
+            .map(|index| {
+                of_kind(
+                    position(&format!("step{index}"), PositionStatus::Succeeded),
+                    "profile",
+                    None,
+                )
+            })
+            .collect();
+        let mut conversation = Conversation::new("a");
+        conversation.rebuild(&positions, &Attempts::default());
+        let styles = Styles::new(false);
+        let strip = |conversation: &Conversation| {
+            let buffer = draw(40, 3, |frame| {
+                render_step_strip(
+                    frame,
+                    Rect::new(0, 0, 40, 3),
+                    &styles,
+                    conversation,
+                    true,
+                    false,
+                )
+            });
+            rows(&buffer)[1].clone()
+        };
+        let newest = strip(&conversation);
+        assert!(newest.contains("⚖️ step11 #1"), "{newest}");
+        for _ in 0..11 {
+            conversation.select_older();
+        }
+        let oldest = strip(&conversation);
+        assert!(oldest.contains("⚖️ step0 #1"), "{oldest}");
         assert!(!oldest.contains("step11"), "{oldest}");
     }
 
