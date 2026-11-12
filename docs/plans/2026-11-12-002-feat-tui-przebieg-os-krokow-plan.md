@@ -1,7 +1,7 @@
 ---
 title: "feat: Oś kroków w Przebiegu bez tła, z czasem przy nazwie i bez słowa stanu"
 type: feat
-status: active
+status: completed
 date: 2026-11-12
 origin: docs/brainstorms/2026-11-12-tui-przebieg-os-krokow-requirements.md
 ---

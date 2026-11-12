@@ -1403,7 +1403,7 @@ fn step_chip(
     focused: bool,
     styles: &Styles,
 ) -> [Span<'static>; 2] {
-    let (glyph, role, _) = super::progress::status_look(step.status);
+    let (glyph, role) = super::progress::status_look(step.status);
     let label = one_line(&step.label);
     let label_style = if selected {
         let role = if focused { Role::Focus } else { Role::Calm };

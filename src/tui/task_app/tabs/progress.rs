@@ -10,10 +10,13 @@
 //! step, the mode — is the state of [`Progress`]; what it replaces is the
 //! timeline.
 //!
-//! The axis is a bracketed list ([`render_bracketed_list`]): one row per step,
-//! stacked, the selected step bracketed — in the focus role while the keys
-//! are on the axis, in the background role while they read the step's
-//! conversation or are elsewhere. The conversation marks its selected entry
+//! The axis is a bracketed list ([`render_bracketed_list_plain`]): one row per
+//! step, stacked, the selected step bracketed without a background fill — in
+//! the focus role while the keys are on the axis, in the background role while
+//! they read the step's conversation or are elsewhere. A step's first row is
+//! its glyph, its name, when it started and how long it ran, then its usage;
+//! the second row is the model, the effort and the harness. The axis does not
+//! spell the status out: the glyph says it. The conversation marks its selected entry
 //! with the same bar, in the focus role only while the keys are in it.
 
 use ratatui::layout::Rect;
@@ -30,7 +33,7 @@ use crate::tui::style::{Role, Styles};
 use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
-use super::super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
+use super::super::super::selection::{render_bracketed_list_plain, PREFIX_WIDTH};
 use super::super::detail::{cells as width_of, fit_cells, fit_step_name, step_name};
 use super::super::layout::first_row;
 use super::super::StepFocus;
@@ -44,7 +47,7 @@ use crate::tui::transcript::{TranscriptId, TranscriptState};
 const AXIS_MAX_WIDTH: u16 = 34;
 /// Columns between the axis and the step's content.
 const AXIS_GAP: u16 = 3;
-/// Narrowest a step's label is cut to before the status word goes.
+/// Narrowest a step's label is cut to before its times go.
 const MIN_LABEL: usize = 8;
 
 /// One entry into a step as *Przebieg* reads it: the reader (cursor,
@@ -371,40 +374,22 @@ impl Progress {
     }
 }
 
-/// The glyph, the role and the word of a step's status: colour is never the
-/// only thing that says it.
-pub(super) fn status_look(status: PositionStatus) -> (&'static str, Role, &'static str) {
+/// The glyph and the role of a step's status: the shape of the glyph says it
+/// too, so colour is never the only thing that does.
+pub(super) fn status_look(status: PositionStatus) -> (&'static str, Role) {
     match status {
-        PositionStatus::Succeeded => ("✓", Role::Done, "ok"),
-        PositionStatus::Failed => ("✗", Role::Problem, "błąd"),
-        PositionStatus::Interrupted => ("✗", Role::Problem, "przerwany"),
-        PositionStatus::InProgress => ("●", Role::Live, "w toku"),
-        PositionStatus::AwaitingDecision => ("?", Role::Attention, "czeka na decyzję"),
+        PositionStatus::Succeeded => ("✓", Role::Done),
+        PositionStatus::Failed | PositionStatus::Interrupted => ("✗", Role::Problem),
+        PositionStatus::InProgress => ("●", Role::Live),
+        PositionStatus::AwaitingDecision => ("?", Role::Attention),
     }
 }
 
-/// One row of the axis, `width` columns wide. The selection is not drawn
-/// here: the bracketed list brackets the row (R13).
-fn axis_line(position: &Position, width: usize, styles: &Styles, stale: bool) -> Line<'static> {
-    let (glyph, role, word) = status_look(position.status);
-    let grey = |role: Role| if stale { Role::Done } else { role };
-    let label = fit_step_name(
-        position.icon(),
-        &one_line(&position.label),
-        width.saturating_sub(3 + word.chars().count()),
-    );
-    Line::from(vec![
-        Span::styled(glyph, styles.of(grey(role))),
-        Span::raw(" "),
-        Span::styled(label, styles.of(grey(Role::Calm))),
-        Span::styled(format!(" {word}"), styles.of(Role::Done)),
-    ])
-}
-
-/// The axis: its width and the lines of each step. While a step reports
-/// usage the axis is a table — status, label, cost, tokens in and out, the
-/// subagents — whose columns are as wide as their widest value, the axis as
-/// wide as the columns need within the share of the tab it may take.
+/// The axis: its width and the lines of each step. The first row of a step is
+/// a table — status, label, when it started, how long it ran, then the cost,
+/// the tokens in and out and the subagents while a step reports usage — whose
+/// columns are as wide as their widest value, the axis as wide as the columns
+/// need within the share of the tab it may take.
 struct AxisLayout {
     width: u16,
     rows: Vec<Vec<Line<'static>>>,
@@ -441,9 +426,8 @@ impl Column {
 
 /// Spaces before each column of a table row.
 const COLUMN_GAP: usize = 2;
-/// Spaces before the detail row, and between its times and its agent.
+/// Spaces before the detail row.
 const DETAIL_INDENT: usize = 3;
-const DETAIL_GAP: usize = 4;
 
 /// The columns of a table row, each after the gap; empty columns take none.
 fn columns_width(columns: &[&Column]) -> usize {
@@ -480,68 +464,35 @@ impl AxisLayout {
         styles: &Styles,
         stale: bool,
     ) -> Self {
-        let mut layout = Self::usage(positions, area_width, styles, stale);
-        layout.add_details(positions, area_width, now, styles);
+        let mut layout = Self::usage(positions, area_width, now, styles, stale);
+        layout.add_details(positions, area_width, styles);
         layout
     }
 
-    /// Under each step, one row: when it started and how long it ran, then,
-    /// further off, the model, effort and harness that ran it, each value in a
-    /// column of its own across the steps. The axis grows to fit the row
-    /// within its share of the tab; a longer row is cut.
-    fn add_details(
-        &mut self,
-        positions: &[Position],
-        area_width: u16,
-        now: chrono::DateTime<chrono::Utc>,
-        styles: &Styles,
-    ) {
+    /// Under a step that has a model, an effort or a harness, one row with
+    /// them, each value in a column of its own across the steps. The axis grows
+    /// to fit the row within its share of the tab; a longer row is cut.
+    fn add_details(&mut self, positions: &[Position], area_width: u16, styles: &Styles) {
         let text = |value: &Option<String>| value.as_deref().map(one_line).unwrap_or_default();
-        let when = [
-            Column::new(
-                false,
-                positions.iter().map(|p| clock(p.started_at)).collect(),
-            ),
-            Column::new(
-                true,
-                positions
-                    .iter()
-                    .map(|p| duration_of(p, now).unwrap_or_default())
-                    .collect(),
-            ),
-        ];
         let agent = [
             Column::new(false, positions.iter().map(|p| text(&p.model)).collect()),
             Column::new(false, positions.iter().map(|p| text(&p.effort)).collect()),
             Column::new(false, positions.iter().map(|p| text(&p.harness)).collect()),
         ];
-        let used = |columns: &[Column], index: usize| {
-            columns.iter().any(|column| !column.cells[index].is_empty())
-        };
         let has_row: Vec<bool> = (0..positions.len())
-            .map(|index| used(&when, index) || used(&agent, index))
+            .map(|index| agent.iter().any(|column| !column.cells[index].is_empty()))
             .collect();
-        let joined = |columns: &[Column], index: usize| {
-            columns
+        let joined = |index: usize| {
+            agent
                 .iter()
                 .filter(|column| column.width() > 0)
                 .map(|column| column.text(index))
                 .collect::<Vec<_>>()
                 .join(&" ".repeat(COLUMN_GAP))
         };
-        let width_of = |columns: &[Column]| {
-            let refs: Vec<&Column> = columns.iter().collect();
-            columns_width(&refs).saturating_sub(COLUMN_GAP)
-        };
-        let (when_width, agent_width) = (width_of(&when), width_of(&agent));
-        let wanted = usize::from(PREFIX_WIDTH)
-            + DETAIL_INDENT
-            + when_width
-            + if agent_width > 0 {
-                DETAIL_GAP + agent_width
-            } else {
-                0
-            };
+        let agent_refs: Vec<&Column> = agent.iter().collect();
+        let agent_width = columns_width(&agent_refs).saturating_sub(COLUMN_GAP);
+        let wanted = usize::from(PREFIX_WIDTH) + DETAIL_INDENT + agent_width;
         let today = self.width;
         let width = usize::from(self.width)
             .max(wanted.min(axis_cap(area_width, today)))
@@ -552,10 +503,7 @@ impl AxisLayout {
             if !has_row[index] {
                 continue;
             }
-            let mut row = format!("{:DETAIL_INDENT$}{:<when_width$}", "", joined(&when, index));
-            if agent_width > 0 {
-                row.push_str(&format!("{:DETAIL_GAP$}{}", "", joined(&agent, index)));
-            }
+            let row = format!("{:DETAIL_INDENT$}{}", "", joined(index));
             rows.push(Line::styled(
                 fit_cells(row.trim_end(), content),
                 styles.of(Role::Done),
@@ -563,26 +511,19 @@ impl AxisLayout {
         }
     }
 
-    fn usage(positions: &[Position], area_width: u16, styles: &Styles, stale: bool) -> Self {
+    fn usage(
+        positions: &[Position],
+        area_width: u16,
+        now: chrono::DateTime<chrono::Utc>,
+        styles: &Styles,
+        stale: bool,
+    ) -> Self {
         let today = (area_width / 3).clamp(18, AXIS_MAX_WIDTH).min(area_width);
         let cells: Vec<StepCells> = positions
             .iter()
             .map(|position| step_cells(position.usage.as_ref()))
             .collect();
-        if !cells
-            .iter()
-            .any(|cells| cells.has_main() || cells.has_subagents())
-        {
-            let line_width = usize::from(today.saturating_sub(PREFIX_WIDTH));
-            return Self {
-                width: today,
-                rows: positions
-                    .iter()
-                    .map(|position| vec![axis_line(position, line_width, styles, stale)])
-                    .collect(),
-            };
-        }
-        Self::table(positions, &cells, area_width, today, styles, stale)
+        Self::table(positions, &cells, area_width, today, now, styles, stale)
     }
 
     fn table(
@@ -590,6 +531,7 @@ impl AxisLayout {
         cells: &[StepCells],
         area_width: u16,
         today: u16,
+        now: chrono::DateTime<chrono::Utc>,
         styles: &Styles,
         stale: bool,
     ) -> Self {
@@ -605,11 +547,15 @@ impl AxisLayout {
             .map(|position| step_name(position.icon(), &one_line(&position.label)))
             .collect();
         let label = Column::new(false, labels);
-        let word = Column::new(
+        let start = Column::new(
             false,
+            positions.iter().map(|p| clock(p.started_at)).collect(),
+        );
+        let duration = Column::new(
+            true,
             positions
                 .iter()
-                .map(|position| status_look(position.status).2.to_string())
+                .map(|p| duration_of(p, now).unwrap_or_default())
                 .collect(),
         );
         let main = [
@@ -626,61 +572,83 @@ impl AxisLayout {
         ];
         let main_refs: Vec<&Column> = main.iter().collect();
         let sub_refs: Vec<&Column> = subs.iter().collect();
-        let columns_width = columns_width(&main_refs) + columns_width(&sub_refs);
+        let usage_width = columns_width(&main_refs) + columns_width(&sub_refs);
 
-        // 2: the glyph and its space; the label and the word are columns too.
+        // 2: the glyph and its space; the label and the times are columns too.
         let prefix = usize::from(PREFIX_WIDTH);
         let cap = axis_cap(area_width, today);
-        let (label_width, word_width) = (label.width(), word.width());
-        let needed = |label: usize, word: usize| {
-            prefix + 2 + label + if word > 0 { word + 1 } else { 0 } + columns_width
+        let label_width = label.width();
+        let times_width = |width: usize| if width > 0 { width + COLUMN_GAP } else { 0 };
+        let content_needed = |label: usize, start: usize, duration: usize| {
+            2 + label + times_width(start) + times_width(duration) + usage_width
         };
-        let target = needed(label_width, word_width)
+        let target = (prefix + content_needed(label_width, start.width(), duration.width()))
             .min(cap)
             .max(usize::from(today));
         let content = target.saturating_sub(prefix);
-        let content_needed = |label: usize, word: usize| needed(label, word).saturating_sub(prefix);
-        let shrink = |word: usize| {
-            let over = content_needed(label_width, word).saturating_sub(content);
+        // The label gives way first, down to `MIN_LABEL`; then the duration
+        // goes, then the start.
+        let shrink = |start: usize, duration: usize| {
+            let over = content_needed(label_width, start, duration).saturating_sub(content);
             label_width
                 .saturating_sub(over)
                 .max(MIN_LABEL.min(label_width))
         };
-        let mut shown_word = word_width;
-        let mut shown_label = shrink(word_width);
-        if content_needed(shown_label, shown_word) > content {
-            shown_word = 0;
-            shown_label = shrink(0);
+        let fits = |label: usize, start: usize, duration: usize| {
+            content_needed(label, start, duration) <= content
+        };
+        let (mut shown_start, mut shown_duration) = (start.width(), duration.width());
+        let mut shown_label = shrink(shown_start, shown_duration);
+        if !fits(shown_label, shown_start, shown_duration) {
+            shown_duration = 0;
+            shown_label = shrink(shown_start, 0);
+        }
+        if !fits(shown_label, shown_start, shown_duration) {
+            shown_start = 0;
+            shown_label = shrink(0, 0);
         }
 
         let rows = positions
             .iter()
             .enumerate()
             .map(|(index, position)| {
-                let (glyph, role, _) = status_look(position.status);
-                let text = fit_step_name(position.icon(), &one_line(&position.label), shown_label);
-                let padding = " ".repeat(shown_label.saturating_sub(width_of(&text)));
-                let mut spans = vec![
-                    Span::styled(glyph, styles.of(grey(role))),
-                    Span::raw(" "),
-                    Span::styled(format!("{text}{padding}"), styles.of(grey(Role::Calm))),
-                ];
-                if shown_word > 0 {
-                    spans.push(Span::styled(
-                        format!(" {}", word.text(index)),
-                        styles.of(Role::Done),
-                    ));
-                }
-                let mut push = |columns: &[Column]| {
+                let (glyph, role) = status_look(position.status);
+                let name = fit_step_name(position.icon(), &one_line(&position.label), shown_label);
+                let padding = " ".repeat(shown_label.saturating_sub(width_of(&name)));
+                let mut tail: Vec<String> = Vec::new();
+                let mut push = |columns: &[&Column]| {
                     for column in columns.iter().filter(|column| column.width() > 0) {
-                        spans.push(Span::styled(
-                            format!("{:COLUMN_GAP$}{}", "", column.text(index)),
-                            styles.of(Role::Done),
-                        ));
+                        tail.push(format!("{:COLUMN_GAP$}{}", "", column.text(index)));
                     }
                 };
-                push(&main);
-                push(&subs);
+                if shown_start > 0 {
+                    push(&[&start]);
+                }
+                if shown_duration > 0 {
+                    push(&[&duration]);
+                }
+                push(&main_refs);
+                push(&sub_refs);
+                // A row ends with its last value: no spaces trail after it.
+                let kept = tail.iter().rposition(|cell| !cell.trim().is_empty());
+                let mut spans = vec![Span::styled(glyph, styles.of(grey(role))), Span::raw(" ")];
+                match kept {
+                    None => spans.push(Span::styled(name, styles.of(grey(Role::Calm)))),
+                    Some(last) => {
+                        spans.push(Span::styled(
+                            format!("{name}{padding}"),
+                            styles.of(grey(Role::Calm)),
+                        ));
+                        tail.truncate(last + 1);
+                        if let Some(cell) = tail.last_mut() {
+                            *cell = cell.trim_end().to_string();
+                        }
+                        spans.extend(
+                            tail.into_iter()
+                                .map(|cell| Span::styled(cell, styles.of(Role::Done))),
+                        );
+                    }
+                }
                 vec![Line::from(spans)]
             })
             .collect();
@@ -706,14 +674,13 @@ fn step_lines(
     now: chrono::DateTime<chrono::Utc>,
     styles: &Styles,
 ) -> Vec<Line<'static>> {
-    let (glyph, role, word) = status_look(position.status);
+    let (glyph, role) = status_look(position.status);
     let mut head = vec![
         Span::styled(format!("{glyph} "), styles.of(role)),
         Span::styled(
             step_name(position.icon(), &one_line(&position.label)),
             styles.of(Role::Focus),
         ),
-        Span::styled(format!(" · {word}"), styles.of(role)),
     ];
     if let Some(action) = &position.action_type {
         head.push(Span::styled(
@@ -820,7 +787,7 @@ pub fn render(
 
     let items = layout.rows;
     let selected = progress.selected_index();
-    render_bracketed_list(
+    render_bracketed_list_plain(
         frame,
         axis,
         styles,
@@ -1043,11 +1010,8 @@ mod tests {
         steps.push(step("script", None));
         let axis = layout(&steps, 200);
         let row = text(&axis.rows[2][0]);
-        assert!(row.starts_with("✓ script"), "{row}");
-        assert!(
-            row.contains("ok") && !row.contains('$') && !row.contains('—'),
-            "{row}"
-        );
+        assert_eq!(row, "✓ script", "{row}");
+        assert!(!row.contains('$') && !row.contains('—'), "{row}");
     }
 
     #[test]
@@ -1082,17 +1046,14 @@ mod tests {
     }
 
     #[test]
-    fn without_a_report_the_axis_is_as_it_was() {
+    fn without_a_report_or_a_start_the_axis_is_the_glyph_and_the_name() {
         for usage in [None, Some(PositionUsage::default())] {
             let steps = [step("review #1", usage)];
             for width in [20, 60, 200] {
                 let axis = layout(&steps, width);
                 assert_eq!(axis.width, (width / 3).clamp(18, AXIS_MAX_WIDTH));
-                let line = usize::from(axis.width - PREFIX_WIDTH);
-                assert_eq!(
-                    text(&axis.rows[0][0]),
-                    text(&axis_line(&steps[0], line, &Styles::new(false), false))
-                );
+                assert_eq!(axis.rows[0].len(), 1);
+                assert_eq!(text(&axis.rows[0][0]), "✓ review #1");
             }
         }
     }
@@ -1104,27 +1065,143 @@ mod tests {
         assert!(row.contains("$0.42  ↑120k   ↓8k"), "{row}");
     }
 
-    #[test]
-    fn a_step_is_two_rows_the_second_with_the_start_the_duration_and_the_agent() {
+    fn timed_steps() -> Vec<Position> {
+        let now = chrono::Utc::now();
         let mut steps = sample();
-        steps[0].started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(90));
-        steps[0].ended_at = Some(chrono::Utc::now());
+        steps[0].started_at = Some(now - chrono::Duration::seconds(90));
+        steps[0].ended_at = Some(now);
         steps[0].harness = Some("claude-code".into());
         steps[0].model = Some("sonnet".into());
         steps[0].effort = Some("high".into());
         steps[1].harness = Some("codex".into());
+        steps
+    }
+
+    #[test]
+    fn the_first_row_has_the_times_and_the_second_the_agent() {
+        let steps = timed_steps();
         let axis = layout(&steps, 200);
         assert_eq!(axis.rows[0].len(), 2);
         assert_eq!(axis.rows[1].len(), 2);
-        let second = text(&axis.rows[0][1]);
+        let first = text(&axis.rows[0][0]);
+        assert!(first.starts_with("✓ "), "{first:?}");
+        assert!(first.contains("review_api"), "{first:?}");
+        let start = clock(steps[0].started_at);
+        assert!(first.contains(&start), "{first:?}");
+        assert!(first.contains("1m"), "{first:?}");
         assert!(
-            second.starts_with("   ") && !second.starts_with("    "),
-            "{second:?}"
+            first.find(&start) < first.find("$0.42"),
+            "times before usage: {first:?}"
         );
-        assert!(second.contains("1m"), "{second:?}");
-        assert!(second.ends_with("sonnet  high  claude-code"), "{second:?}");
-        assert!(second.contains("    sonnet"), "{second:?}");
-        assert!(text(&axis.rows[1][1]).trim() == "codex");
+        let second = text(&axis.rows[0][1]);
+        assert_eq!(second, "   sonnet  high  claude-code");
+        assert_eq!(text(&axis.rows[1][1]).trim(), "codex");
+    }
+
+    #[test]
+    fn a_step_without_a_start_has_empty_time_fields_and_no_trailing_separator() {
+        let mut steps = [step("lint", None), step("review", None)];
+        steps[1].started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+        let axis = layout(&steps, 200);
+        assert_eq!(text(&axis.rows[0][0]), "✓ lint");
+        assert!(text(&axis.rows[1][0]).starts_with("✓ review"));
+    }
+
+    #[test]
+    fn the_times_stand_in_the_same_columns_in_every_row() {
+        let now = chrono::Utc::now();
+        let mut steps = [
+            step("a", None),
+            step("a_longer_name", None),
+            step("mid", None),
+        ];
+        for (index, seconds) in [5, 700, 4_000].into_iter().enumerate() {
+            steps[index].started_at = Some(now - chrono::Duration::seconds(seconds));
+            steps[index].ended_at = Some(now);
+        }
+        let axis = layout(&steps, 200);
+        let rows: Vec<String> = axis.rows.iter().map(|rows| text(&rows[0])).collect();
+        let starts: Vec<usize> = steps
+            .iter()
+            .zip(&rows)
+            .map(|(step, row)| column_of(row, &clock(step.started_at)))
+            .collect();
+        assert!(starts.windows(2).all(|pair| pair[0] == pair[1]), "{rows:?}");
+        let ends: Vec<usize> = rows.iter().map(|row| row.chars().count()).collect();
+        assert!(ends.windows(2).all(|pair| pair[0] == pair[1]), "{rows:?}");
+    }
+
+    #[test]
+    fn a_running_step_counts_its_duration_up_to_now() {
+        let now = chrono::Utc::now();
+        let mut steps = [step("run", None)];
+        steps[0].status = PositionStatus::InProgress;
+        steps[0].started_at = Some(now - chrono::Duration::seconds(120));
+        let axis = AxisLayout::new(&steps, 200, now, &Styles::new(false), false);
+        let row = text(&axis.rows[0][0]);
+        assert!(row.starts_with("● run"), "{row:?}");
+        assert!(row.ends_with("2m"), "{row:?}");
+    }
+
+    #[test]
+    fn no_row_of_the_axis_spells_the_status_out() {
+        for status in [
+            PositionStatus::Succeeded,
+            PositionStatus::Failed,
+            PositionStatus::Interrupted,
+            PositionStatus::InProgress,
+            PositionStatus::AwaitingDecision,
+        ] {
+            let mut steps = timed_steps();
+            steps[0].status = status;
+            let axis = layout(&steps, 200);
+            for row in axis.rows.iter().flatten().map(text) {
+                for word in ["w toku", "ok", "błąd", "przerwany", "czeka na decyzję"] {
+                    assert!(
+                        !row.split_whitespace().any(|part| part == word)
+                            && !row.contains(" w toku"),
+                        "{status:?}: {row:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(status_look(PositionStatus::InProgress), ("●", Role::Live));
+    }
+
+    #[test]
+    fn a_narrow_axis_cuts_the_name_first_then_the_duration_then_the_start() {
+        let now = chrono::Utc::now();
+        let mut steps = [step("a_really_long_step_label", None)];
+        steps[0].started_at = Some(now - chrono::Duration::seconds(90));
+        steps[0].ended_at = Some(now);
+        let start = clock(steps[0].started_at);
+        let mut seen = (false, false, false);
+        for width in (0..=200u16).rev() {
+            let axis = AxisLayout::new(&steps, width, now, &Styles::new(false), false);
+            let row = text(&axis.rows[0][0]);
+            assert!(row.contains("✓ "), "{width}: {row:?}");
+            let (cut, has_start, has_duration) = (
+                row.contains('…'),
+                row.contains(&start),
+                row.trim_end().ends_with("1m"),
+            );
+            if cut && has_start && has_duration {
+                seen.0 = true;
+            }
+            if has_start && !has_duration {
+                seen.1 = true;
+                assert!(
+                    cut,
+                    "{width}: the name is cut before the duration goes: {row:?}"
+                );
+            }
+            if !has_start {
+                seen.2 = true;
+                assert!(!has_duration, "{width}: {row:?}");
+                assert!(row.starts_with("✓ "), "{width}: {row:?}");
+            }
+        }
+        assert!(seen.0 && seen.1 && seen.2, "{seen:?}");
     }
 
     #[test]
@@ -1159,5 +1236,53 @@ mod tests {
         }
         let row = text(&layout(&steps, 50).rows[0][0]);
         assert!(row.contains('…'), "{row}");
+        let mut timed = steps.clone();
+        timed[0].started_at = Some(chrono::Utc::now());
+        for width in 0..=60u16 {
+            assert_eq!(layout(&timed, width).rows.len(), 2);
+        }
+    }
+
+    fn header(position: &Position) -> Vec<String> {
+        step_lines(position, chrono::Utc::now(), &Styles::new(false))
+            .iter()
+            .map(text)
+            .collect()
+    }
+
+    #[test]
+    fn the_step_header_does_not_say_the_status() {
+        let mut running = step("work", None);
+        running.status = PositionStatus::InProgress;
+        running.action_type = Some("agent".into());
+        running.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+        let lines = header(&running);
+        assert!(
+            lines[0].starts_with("● ") && lines[0].contains("work"),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains("w toku"), "{lines:?}");
+        assert!(lines[0].contains(" · agent · "), "{lines:?}");
+
+        let mut decision = step("approval", None);
+        decision.action_type = Some("decision".into());
+        decision.decision_by = Some("human".into());
+        let head = header(&decision).remove(0);
+        assert!(
+            head.starts_with("✓ ") && head.ends_with("approval · decision · human"),
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn the_step_header_keeps_the_error_and_the_notes() {
+        let mut failed = step("work", None);
+        failed.status = PositionStatus::Failed;
+        failed.error = Some("boom".into());
+        failed.retry_pending = true;
+        let lines = header(&failed);
+        assert_eq!(lines[0], "✗ work");
+        assert_eq!(lines[1], "✗ boom");
+        assert_eq!(lines[2], "ponowienie oczekuje");
     }
 }
