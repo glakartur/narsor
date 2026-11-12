@@ -1,7 +1,7 @@
 ---
 title: "feat: Większe odstępy i szersza oś kroków w Przebiegu"
 type: feat
-status: active
+status: completed
 date: 2026-11-12
 origin: docs/brainstorms/2026-11-12-tui-przebieg-odstepy-i-szersza-os-requirements.md
 ---
