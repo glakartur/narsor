@@ -68,8 +68,8 @@ use crate::controller_protocol::{
     TimelineResponse,
 };
 use crate::task_usage_text::{self, TaskUsage};
-use narsor_protocol::api::ConversationState;
-use narsor_protocol::controller::{QueueReason, TaskState};
+use narsor_protocol::api::{ConversationState, Position};
+use narsor_protocol::controller::{ExecutionCursor, QueueReason, TaskState};
 
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
@@ -1710,6 +1710,40 @@ pub(super) fn cells(text: &str) -> usize {
     Span::raw(text).width()
 }
 
+/// The icon that shows who runs a step and what it is, from the step's action
+/// type and, for a `decision`, who decides.
+///
+/// `None` for a kind without an icon: the unsupported `human` type, an unknown
+/// type and the terminal state.
+fn step_icon(action_type: Option<&str>, decision_by: Option<&str>) -> Option<&'static str> {
+    match (action_type?, decision_by) {
+        ("agent", _) => Some("✨"),
+        ("script", _) => Some("💻"),
+        ("profile", _) => Some("⚖️"),
+        ("wait", _) => Some("✋"),
+        ("decision", Some("conductor")) => Some("⚡🔀"),
+        ("decision", Some("human")) => Some("🧑🔀"),
+        ("decision", _) => Some("🔀"),
+        _ => None,
+    }
+}
+
+/// The icon of the kind of a timeline entry's step, when it has one.
+pub(super) fn position_icon(position: &Position) -> Option<&'static str> {
+    step_icon(
+        position.action_type.as_deref(),
+        position.decision_by.as_deref(),
+    )
+}
+
+/// The icon of the kind of the step the runner cursor is in, when it has one.
+pub(super) fn cursor_icon(cursor: &ExecutionCursor) -> Option<&'static str> {
+    step_icon(
+        cursor.current_action_type.as_deref(),
+        cursor.current_decision_by.as_deref(),
+    )
+}
+
 pub(super) fn step_name(icon: Option<&str>, label: &str) -> String {
     icon.map_or_else(|| label.to_string(), |icon| format!("{icon} {label}"))
 }
@@ -1806,7 +1840,7 @@ fn status_parts(
     let named = task.runner.as_ref().and_then(|runner| {
         let cursor = &runner.execution_cursor;
         let name = one_line(cursor.current_state.as_deref()?);
-        (!name.trim().is_empty()).then(|| step_name(cursor.icon(), &name))
+        (!name.trim().is_empty()).then(|| step_name(cursor_icon(cursor), &name))
     });
     let step_number = progress.step_count().map(|(at, _)| at);
     match (step_number, named) {
@@ -1929,5 +1963,30 @@ fn link_spots(buffer: &mut Buffer, header: Rect, spots: &[LinkSpot]) {
         let cell = &mut buffer[(x, y)];
         cell.set_symbol(&format!("\x1b]8;;{}\x1b\\{text}\x1b]8;;\x1b\\", spot.url));
         cell.set_diff_option(CellDiffOption::ForcedWidth(width));
+    }
+}
+
+#[cfg(test)]
+mod step_icon_tests {
+    use super::step_icon;
+
+    #[test]
+    fn step_icon_names_who_runs_the_step_and_what_it_is() {
+        assert_eq!(step_icon(Some("agent"), None), Some("✨"));
+        assert_eq!(step_icon(Some("script"), None), Some("💻"));
+        assert_eq!(step_icon(Some("profile"), None), Some("⚖️"));
+        assert_eq!(step_icon(Some("profile"), Some("human")), Some("⚖️"));
+        assert_eq!(step_icon(Some("wait"), None), Some("✋"));
+        assert_eq!(step_icon(Some("decision"), Some("conductor")), Some("⚡🔀"));
+        assert_eq!(step_icon(Some("decision"), Some("human")), Some("🧑🔀"));
+        assert_eq!(step_icon(Some("decision"), None), Some("🔀"));
+    }
+
+    #[test]
+    fn step_icon_is_none_for_a_kind_without_an_icon() {
+        for kind in [Some("human"), Some("none"), Some("terminal"), None] {
+            assert_eq!(step_icon(kind, None), None);
+            assert_eq!(step_icon(kind, Some("human")), None);
+        }
     }
 }

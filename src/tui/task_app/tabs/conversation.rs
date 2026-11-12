@@ -43,7 +43,7 @@ use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{bar_prefix, PREFIX_WIDTH};
-use super::super::detail::{cells, rule_line, step_name};
+use super::super::detail::{cells, position_icon, rule_line, step_name};
 use super::super::layout::first_row;
 use super::READER_RETRY;
 use crate::tui::conversation::transcript_entries;
@@ -670,7 +670,7 @@ impl Conversation {
             .map(|position| StepChip {
                 label: position.label.clone(),
                 status: position.status,
-                icon: position.icon(),
+                icon: position_icon(position),
             })
             .collect();
         if self.follow || self.selected_index().is_none() {
@@ -815,7 +815,7 @@ pub fn build_conversation(
                 shown |= builder.push_position(position, attempts) != Pushed::Nothing;
             }
             if !shown {
-                let icon = at_visit.iter().find_map(|position| position.icon());
+                let icon = at_visit.iter().find_map(|position| position_icon(position));
                 builder.push_step_heading(&visit.state_id, visit.visit, icon);
             }
             until(
@@ -900,7 +900,7 @@ impl<'a> Builder<'a> {
         if self.headings && heading_wanted {
             built.entries.push(heading(
                 format!("{attempt_id}/step"),
-                &step_name(position.icon(), &position.label),
+                &step_name(position_icon(position), &position.label),
             ));
         }
         built.entries.extend(attempt.entries.iter().map(|entry| {

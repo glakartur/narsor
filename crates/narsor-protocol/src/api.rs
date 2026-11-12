@@ -808,32 +808,6 @@ mod tests {
     }
 
     #[test]
-    fn step_icon_names_who_runs_the_step_and_what_it_is() {
-        use super::step_icon;
-        assert_eq!(step_icon(Some("agent"), None), Some("✨"));
-        assert_eq!(step_icon(Some("script"), None), Some("💻"));
-        assert_eq!(step_icon(Some("profile"), None), Some("⚖️"));
-        assert_eq!(step_icon(Some("profile"), Some("human")), Some("⚖️"));
-        assert_eq!(step_icon(Some("wait"), None), Some("✋"));
-        assert_eq!(step_icon(Some("decision"), Some("conductor")), Some("⚡🔀"));
-        assert_eq!(step_icon(Some("decision"), Some("human")), Some("🧑🔀"));
-    }
-
-    #[test]
-    fn step_icon_of_a_decision_without_a_decider_does_not_name_one() {
-        assert_eq!(super::step_icon(Some("decision"), None), Some("🔀"));
-    }
-
-    #[test]
-    fn step_icon_is_none_for_a_kind_without_an_icon() {
-        use super::step_icon;
-        for kind in [Some("human"), Some("none"), Some("terminal"), None] {
-            assert_eq!(step_icon(kind, None), None);
-            assert_eq!(step_icon(kind, Some("human")), None);
-        }
-    }
-
-    #[test]
     fn an_event_and_a_cursor_of_an_older_version_still_read() {
         let started: crate::event::EventData = serde_json::from_value(serde_json::json!({
             "type": "action_started",

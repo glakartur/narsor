@@ -5,24 +5,6 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// The icon that shows who runs a step and what it is, from the step's action
-/// type and, for a `decision`, who decides.
-///
-/// `None` for a kind without an icon: the unsupported `human` type, an unknown
-/// type and the terminal state.
-pub fn step_icon(action_type: Option<&str>, decision_by: Option<&str>) -> Option<&'static str> {
-    match (action_type?, decision_by) {
-        ("agent", _) => Some("✨"),
-        ("script", _) => Some("💻"),
-        ("profile", _) => Some("⚖️"),
-        ("wait", _) => Some("✋"),
-        ("decision", Some("conductor")) => Some("⚡🔀"),
-        ("decision", Some("human")) => Some("🧑🔀"),
-        ("decision", _) => Some("🔀"),
-        _ => None,
-    }
-}
-
 /// One entry of an execution timeline: a workflow action attempt, or a run
 /// of one harness session on a step.
 ///
@@ -82,11 +64,6 @@ pub struct Position {
 }
 
 impl Position {
-    /// The icon of the step's kind, when it has one.
-    pub fn icon(&self) -> Option<&'static str> {
-        step_icon(self.action_type.as_deref(), self.decision_by.as_deref())
-    }
-
     /// Every attempt of the entry, oldest first.
     pub fn attempt_ids(&self) -> Vec<&str> {
         if self.attempts.is_empty() {
