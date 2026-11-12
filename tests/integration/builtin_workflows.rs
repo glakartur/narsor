@@ -138,8 +138,7 @@ fn every_example_workflow_in_the_repository_loads_and_validates() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read workflow");
-        load_from_str(&source)
-            .unwrap_or_else(|error| panic!("{} loads: {error}", path.display()));
+        load_from_str(&source).unwrap_or_else(|error| panic!("{} loads: {error}", path.display()));
         let violations = validate_source(&source)
             .unwrap_or_else(|error| panic!("{} parses: {error}", path.display()));
         assert!(

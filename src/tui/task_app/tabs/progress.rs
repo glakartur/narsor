@@ -34,7 +34,7 @@ use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{render_bracketed_list_plain, PREFIX_WIDTH};
-use super::super::detail::{cells as width_of, fit_cells, fit_step_name, step_name};
+use super::super::detail::{cells as width_of, fit_cells, fit_step_name, position_icon, step_name};
 use super::super::layout::first_row;
 use super::super::StepFocus;
 use super::conversation::Attempts;
@@ -544,7 +544,7 @@ impl AxisLayout {
         };
         let labels: Vec<String> = positions
             .iter()
-            .map(|position| step_name(position.icon(), &one_line(&position.label)))
+            .map(|position| step_name(position_icon(position), &one_line(&position.label)))
             .collect();
         let label = Column::new(false, labels);
         let start = Column::new(
@@ -613,7 +613,11 @@ impl AxisLayout {
             .enumerate()
             .map(|(index, position)| {
                 let (glyph, role) = status_look(position.status);
-                let name = fit_step_name(position.icon(), &one_line(&position.label), shown_label);
+                let name = fit_step_name(
+                    position_icon(position),
+                    &one_line(&position.label),
+                    shown_label,
+                );
                 let padding = " ".repeat(shown_label.saturating_sub(width_of(&name)));
                 let mut tail: Vec<String> = Vec::new();
                 let mut push = |columns: &[&Column]| {
@@ -678,7 +682,7 @@ fn step_lines(
     let mut head = vec![
         Span::styled(format!("{glyph} "), styles.of(role)),
         Span::styled(
-            step_name(position.icon(), &one_line(&position.label)),
+            step_name(position_icon(position), &one_line(&position.label)),
             styles.of(Role::Focus),
         ),
     ];

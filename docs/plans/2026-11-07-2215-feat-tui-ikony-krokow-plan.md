@@ -8,6 +8,8 @@ product_contract_source: ce-brainstorm
 execution: code
 ---
 
+> Zastąpione planem `2026-11-12-002-feat-tui-ikony-profile-i-script-plan.md` w zakresie ikony `📜`: krok `script` ma teraz `💻`, a krok `profile` ma `⚖️`. Zapisy `📜` poniżej zostają jako historia.
+
 # Ikony rodzaju kroku w widokach Rozmowa i Przebieg - Plan
 
 ## Goal Capsule

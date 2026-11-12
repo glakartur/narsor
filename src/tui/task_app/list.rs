@@ -62,7 +62,7 @@ use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFI
 use super::super::scroll::one_line;
 use super::super::selection::{render_barred_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
-use super::detail::{cells, fit_cells, short_task_id, step_name};
+use super::detail::{cells, cursor_icon, fit_cells, short_task_id, step_name};
 
 /// What a row asks of the operator, worked out for the CLI and as one source
 /// of the row's icon ([`state_icon`]).
@@ -358,7 +358,7 @@ pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
 fn current_step(task: &TaskSummary) -> Option<String> {
     let cursor = &task.runner.as_ref()?.execution_cursor;
     let step = one_line(cursor.current_state.as_deref()?);
-    (!step.trim().is_empty()).then(|| step_name(cursor.icon(), &step))
+    (!step.trim().is_empty()).then(|| step_name(cursor_icon(cursor), &step))
 }
 
 /// A task as the list shows it, for tests and the details placeholder.
