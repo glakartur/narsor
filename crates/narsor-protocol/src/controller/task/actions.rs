@@ -88,8 +88,14 @@ pub struct StepView {
     pub kind: StepKind,
 }
 
-/// One action of a task as the server offers it: whether it can be done now
-/// and, when it cannot, why.
+/// One action of a task as the server offers it, described whole: what it is
+/// called, what it does, whether it opens a submenu, what the owner fills in
+/// and what a client sends for it. A client draws it and does not need to
+/// know what the action means.
+///
+/// The server offers only the actions that can be done now, so `available`
+/// is `true` and `reason` is absent on every entry of a current server. The
+/// two fields stay for older clients, which read them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskActionOffer {
     pub id: TaskActionId,
@@ -105,6 +111,256 @@ pub struct TaskActionOffer {
     /// a question).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<TaskActionOption>,
+    /// The name of the action, in words for the owner. Absent from a server
+    /// that does not describe its actions: a client then has nothing to draw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// What the action does, in words for the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The action cannot be undone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub irreversible: bool,
+    /// Where the action stands in its list: lower first.
+    #[serde(default)]
+    pub order: u32,
+    /// Whether the action is done (a leaf) or opens a submenu.
+    #[serde(default)]
+    pub kind: TaskActionKind,
+    /// Where a client shows the action.
+    #[serde(default)]
+    pub surface: TaskActionSurface,
+    /// What the owner fills in before the action is done (a leaf only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<TaskActionField>,
+    /// The entries of a submenu: the same shape, the same id as their parent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<TaskActionOffer>,
+    /// What a client sends for a leaf; absent for a submenu and for an
+    /// action a client does its own way (an answer to a question).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send: Option<TaskActionSend>,
+}
+
+impl TaskActionOffer {
+    /// An entry `id`, available and described: a leaf of the panel with no
+    /// field, until the builders say otherwise.
+    pub fn described(
+        id: TaskActionId,
+        label: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            available: true,
+            reason: None,
+            effect: None,
+            options: Vec::new(),
+            label: Some(label.into()),
+            description: Some(description.into()),
+            irreversible: false,
+            order: 0,
+            kind: TaskActionKind::Execute,
+            surface: TaskActionSurface::Panel,
+            fields: Vec::new(),
+            children: Vec::new(),
+            send: None,
+        }
+    }
+
+    /// Whether the server described the entry, so a client can draw it.
+    pub fn is_described(&self) -> bool {
+        self.label.is_some()
+    }
+}
+
+/// Whether an action is done or opens a submenu.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskActionKind {
+    /// A final choice: done after its fields and a confirmation.
+    #[default]
+    Execute,
+    /// A list of further choices, in `children`.
+    Submenu,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// Where a client shows an action.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskActionSurface {
+    /// The action panel (`Ctrl+.`).
+    #[default]
+    Panel,
+    /// The conversation: a comment, an answer, an approval, a permission.
+    Conversation,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// What a field of an action accepts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskActionFieldKind {
+    /// One line of text.
+    Text,
+    /// Text of many lines.
+    Multiline,
+    /// One of `options`.
+    Select,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// One field the owner fills in before an action is done.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskActionField {
+    /// The name shown above the value; the placeholder in `send` names it.
+    pub name: String,
+    pub kind: TaskActionFieldKind,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
+    /// What the field is for, in words for the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// The values of a `select`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+impl TaskActionField {
+    /// A field `name` of `kind`, optional and without a hint.
+    pub fn new(name: impl Into<String>, kind: TaskActionFieldKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            required: false,
+            hint: None,
+            options: Vec::new(),
+        }
+    }
+
+    /// The same field, required.
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// The same field, with `hint`.
+    pub fn hinted(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// The same field, choosing from `options`.
+    pub fn with_options(mut self, options: Vec<String>) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+/// What a client sends for a leaf action: one of the commands it already
+/// knows how to send. A string of the command that is exactly
+/// [`placeholder`]`(name)` stands for the value of the field `name`; a blank
+/// optional field makes it `null`.
+///
+/// The command is kept as JSON, so a command a client does not know does not
+/// stop it from reading the rest of the summary; it only cannot send that
+/// action ([`TaskActionSend::resolve`]). A new kind of command still needs a
+/// new client.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskActionSend {
+    /// An owner command (`POST …/commands`): an [`super::OwnerCommand`].
+    Owner { command: serde_json::Value },
+    /// A command for the runner (`POST …/operator-commands`): an
+    /// [`super::OperatorCommand`].
+    Operator { command: serde_json::Value },
+    /// A comment (`POST …/comments`) whose text is the field `field`.
+    Comment { field: String },
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// What a leaf action sends once its fields are filled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedActionSend {
+    Owner(super::OwnerCommand),
+    Operator(super::OperatorCommand),
+    Comment(String),
+}
+
+/// The placeholder of the field `name` in the command of a [`TaskActionSend`].
+pub fn placeholder(name: &str) -> String {
+    format!("{{{{{name}}}}}")
+}
+
+impl TaskActionSend {
+    /// An owner command.
+    pub fn owner(command: super::OwnerCommand) -> Self {
+        Self::Owner {
+            command: serde_json::to_value(command).expect("an owner command is JSON"),
+        }
+    }
+
+    /// A command for the runner; its strings may hold [`placeholder`]s.
+    pub fn operator(command: &super::OperatorCommand) -> Self {
+        Self::Operator {
+            command: serde_json::to_value(command).expect("an operator command is JSON"),
+        }
+    }
+
+    /// The command with the values of the fields put in: `values` are
+    /// `(name, value)`, a blank optional field left out. `Err` says, in words
+    /// for the owner, why it cannot be sent.
+    pub fn resolve(&self, values: &[(String, String)]) -> Result<ResolvedActionSend, String> {
+        const NEWER: &str = "ta akcja wymaga nowszej wersji klienta";
+        let value_of = |name: &str| {
+            values
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        match self {
+            Self::Owner { command } => serde_json::from_value(fill(command, &value_of))
+                .map(ResolvedActionSend::Owner)
+                .map_err(|_| NEWER.to_string()),
+            Self::Operator { command } => serde_json::from_value(fill(command, &value_of))
+                .map(ResolvedActionSend::Operator)
+                .map_err(|_| NEWER.to_string()),
+            Self::Comment { field } => value_of(field)
+                .map(ResolvedActionSend::Comment)
+                .ok_or_else(|| format!("pole „{field}” jest puste")),
+            Self::Unrecognized => Err(NEWER.to_string()),
+        }
+    }
+}
+
+/// `value` with every string that is a [`placeholder`] replaced by the value
+/// of its field, or by `null` when the field is blank.
+fn fill(value: &serde_json::Value, value_of: &dyn Fn(&str) -> Option<String>) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => match text
+            .strip_prefix("{{")
+            .and_then(|rest| rest.strip_suffix("}}"))
+        {
+            Some(name) => value_of(name).map_or(Value::Null, Value::String),
+            None => value.clone(),
+        },
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| fill(item, value_of)).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), fill(item, value_of)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// One choice of a task action.
@@ -191,4 +447,133 @@ pub struct TransitionExit {
     pub target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::{OperatorCommand, OwnerCommand};
+    use serde_json::json;
+
+    fn select_step() -> TaskActionOffer {
+        let mut leaf = TaskActionOffer::described(TaskActionId::SelectStep, "work", "Wznawia.");
+        leaf.fields = vec![
+            TaskActionField::new("komentarz", TaskActionFieldKind::Multiline).hinted("dla agenta"),
+        ];
+        leaf.send = Some(TaskActionSend::operator(&OperatorCommand::SelectStep {
+            target: "work".to_string(),
+            note: Some(placeholder("komentarz")),
+        }));
+        let mut menu = TaskActionOffer::described(TaskActionId::SelectStep, "Wybierz krok", "…");
+        menu.kind = TaskActionKind::Submenu;
+        menu.order = 40;
+        menu.children = vec![leaf];
+        menu
+    }
+
+    #[test]
+    fn a_submenu_with_a_leaf_and_a_field_goes_both_ways() {
+        let offer = select_step();
+        let text = serde_json::to_value(&offer).unwrap();
+        let read: TaskActionOffer = serde_json::from_value(text).unwrap();
+        assert_eq!(read, offer);
+    }
+
+    #[test]
+    fn an_offer_of_an_older_server_reads_with_the_new_fields_empty() {
+        let read: TaskActionOffer = serde_json::from_value(json!({
+            "id": "pause",
+            "available": false,
+            "reason": "zadanie jest w kolejce"
+        }))
+        .unwrap();
+        assert!(!read.is_described());
+        assert_eq!(read.kind, TaskActionKind::Execute);
+        assert_eq!(read.surface, TaskActionSurface::Panel);
+        assert!(read.fields.is_empty() && read.children.is_empty() && read.send.is_none());
+    }
+
+    #[test]
+    fn unknown_kinds_read_as_unrecognized() {
+        let read: TaskActionOffer = serde_json::from_value(json!({
+            "id": "something_new",
+            "available": true,
+            "label": "X",
+            "kind": "wizard",
+            "surface": "sidebar",
+            "fields": [{"name": "a", "kind": "calendar"}],
+            "send": {"type": "webhook", "url": "x"}
+        }))
+        .unwrap();
+        assert_eq!(read.id, TaskActionId::Unrecognized);
+        assert_eq!(read.kind, TaskActionKind::Unrecognized);
+        assert_eq!(read.surface, TaskActionSurface::Unrecognized);
+        assert_eq!(read.fields[0].kind, TaskActionFieldKind::Unrecognized);
+        assert_eq!(read.send, Some(TaskActionSend::Unrecognized));
+    }
+
+    /// The shape an older client reads the offer with.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct OlderOffer {
+        id: TaskActionId,
+        available: bool,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        effect: Option<String>,
+        #[serde(default)]
+        options: Vec<TaskActionOption>,
+    }
+
+    #[test]
+    fn an_older_client_reads_the_new_offer() {
+        let text = serde_json::to_value(select_step()).unwrap();
+        let read: OlderOffer = serde_json::from_value(text).unwrap();
+        assert_eq!(read.id, TaskActionId::SelectStep);
+        assert!(read.available);
+    }
+
+    #[test]
+    fn a_command_unknown_to_the_client_still_reads_but_cannot_be_sent() {
+        let read: TaskActionSend =
+            serde_json::from_value(json!({"type": "operator", "command": {"kind": "teleport"}}))
+                .unwrap();
+        assert!(read.resolve(&[]).is_err());
+    }
+
+    #[test]
+    fn the_values_of_the_fields_fill_the_placeholders() {
+        let send = select_step().children[0].send.clone().unwrap();
+        let with_note = send
+            .resolve(&[("komentarz".to_string(), " popraw testy ".to_string())])
+            .unwrap();
+        assert_eq!(
+            with_note,
+            ResolvedActionSend::Operator(OperatorCommand::SelectStep {
+                target: "work".to_string(),
+                note: Some("popraw testy".to_string()),
+            })
+        );
+        let blank = send.resolve(&[]).unwrap();
+        assert_eq!(
+            blank,
+            ResolvedActionSend::Operator(OperatorCommand::SelectStep {
+                target: "work".to_string(),
+                note: None,
+            })
+        );
+        assert_eq!(
+            TaskActionSend::owner(OwnerCommand::Pause).resolve(&[]),
+            Ok(ResolvedActionSend::Owner(OwnerCommand::Pause))
+        );
+        let comment = TaskActionSend::Comment {
+            field: "tekst".to_string(),
+        };
+        assert!(comment.resolve(&[]).is_err());
+        assert_eq!(
+            comment.resolve(&[("tekst".to_string(), "hej".to_string())]),
+            Ok(ResolvedActionSend::Comment("hej".to_string()))
+        );
+    }
 }

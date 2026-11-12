@@ -6992,9 +6992,10 @@ mod task_app_actions {
 
     use narsor::api::{ApiClient, ClientError};
     use narsor::tui::keymap::{self, Action, Context};
+    use narsor::tui::stepped::Stage;
     use narsor::tui::task_app::actions::{
-        availability, refusal_reason, verb, ActionRequest, ActionSend, Availability, Confirmed,
-        Overlay, TaskAction,
+        availability, refusal_reason, verb, ActionPanel, ActionRequest, ActionSend, Availability,
+        Overlay, PanelContent, TaskAction, NOTHING_TEXT, NOT_OFFERED, NO_DATA_TEXT, NO_OFFER,
     };
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{Request, TaskApp};
@@ -7033,21 +7034,74 @@ mod task_app_actions {
         press(app, KeyCode::Char(character))
     }
 
-    /// An action of the panel, the only way to it: `Ctrl+.` opens the panel,
-    /// the digit of the entry picks it and `Enter` does it. A panel left open
-    /// by a refusal is closed first.
-    fn choose(app: &mut TaskApp, action: TaskAction) -> Request {
-        if app.overlay().is_some() {
+    /// The action panel, open over the screen.
+    fn panel(app: &TaskApp) -> &ActionPanel {
+        app.overlay()
+            .and_then(Overlay::actions)
+            .expect("the action panel")
+    }
+
+    /// The labels of the panel's level open now; none without a panel.
+    fn panel_labels(app: &TaskApp) -> Vec<String> {
+        app.overlay()
+            .and_then(Overlay::actions)
+            .map(ActionPanel::labels)
+            .unwrap_or_default()
+    }
+
+    /// The step of the panel's form, while the panel is open.
+    fn stage(app: &TaskApp) -> Option<Stage> {
+        app.overlay()
+            .and_then(Overlay::actions)
+            .map(|panel| panel.form().stage())
+    }
+
+    /// The labels of the panel `task` opens.
+    fn panel_of(task: TaskSummary) -> Vec<String> {
+        let mut app = loaded(task);
+        app.on_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL));
+        panel_labels(&app)
+    }
+
+    /// Closes what is open over the screen, level by level.
+    fn close_all(app: &mut TaskApp) {
+        for _ in 0..5 {
+            if app.overlay().is_none() {
+                return;
+            }
             press(app, KeyCode::Esc);
         }
-        let opened = app.on_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL));
-        assert_eq!(opened, Request::None);
-        let index = TaskAction::ALL
+    }
+
+    /// The entry `label` of the panel's level open now: its digit, then
+    /// `Enter`.
+    fn pick(app: &mut TaskApp, label: &str) -> Request {
+        let labels = panel_labels(app);
+        let index = labels
             .iter()
-            .position(|candidate| *candidate == action)
-            .expect("an action of the panel");
+            .position(|candidate| candidate == label)
+            .unwrap_or_else(|| panic!("no entry {label} in {labels:?}"));
         ch(app, char::from(b'1' + u8::try_from(index).unwrap()));
         press(app, KeyCode::Enter)
+    }
+
+    /// `Ctrl+.` opens the panel and the entry `label` of its first level is
+    /// chosen. A panel left open is closed first.
+    fn open_entry(app: &mut TaskApp, label: &str) -> Request {
+        close_all(app);
+        let opened = app.on_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL));
+        assert_eq!(opened, Request::None);
+        pick(app, label)
+    }
+
+    /// An action of the panel without fields, the only way to it: chosen,
+    /// then confirmed with the `Enter` of the confirmation step.
+    fn choose(app: &mut TaskApp, label: &str) -> Request {
+        let request = open_entry(app, label);
+        if request == Request::None && stage(app) == Some(Stage::Confirm) {
+            return press(app, KeyCode::Enter);
+        }
+        request
     }
 
     fn typed(app: &mut TaskApp, text: &str) {
@@ -7114,12 +7168,6 @@ mod task_app_actions {
         }
     }
 
-    fn confirmation(app: &TaskApp) -> &narsor::tui::task_app::actions::Confirmation {
-        app.overlay()
-            .and_then(Overlay::confirmation)
-            .expect("the confirmation window")
-    }
-
     fn unavailable(task: &TaskSummary, action: TaskAction) -> String {
         match availability(task, action) {
             Availability::Unavailable(reason) => reason,
@@ -7170,14 +7218,23 @@ mod task_app_actions {
         fn a_paused_task_offers_a_comment_and_no_resume_in_the_panel() {
             let paused = runner_state("paused");
             assert!(available(&paused, TaskAction::Comment));
-            assert!(!TaskAction::ALL.contains(&TaskAction::Comment));
+            let labels = panel_of(paused);
+            assert!(
+                labels
+                    .iter()
+                    .all(|label| !label.contains("Napisz")
+                        && !label.to_lowercase().contains("wznów")),
+                "{labels:?}"
+            );
             assert_eq!(verb(TaskAction::Comment), "komentarz");
         }
 
         #[test]
-        fn a_running_task_says_why_it_takes_no_comment() {
-            let reason = unavailable(&running("a", 1), TaskAction::Comment);
-            assert!(reason.contains("zadanie działa"), "{reason}");
+        fn a_running_task_is_not_offered_a_comment() {
+            assert_eq!(
+                unavailable(&running("a", 1), TaskAction::Comment),
+                NOT_OFFERED
+            );
         }
 
         #[test]
@@ -7309,160 +7366,164 @@ mod task_app_actions {
             }
         }
 
+        fn offers(task: TaskSummary, label: &str) -> bool {
+            panel_of(task).iter().any(|candidate| candidate == label)
+        }
+
         #[test]
         fn pause_for_a_running_task_and_nothing_else() {
-            let running = running("a", 1);
-            assert!(available(&running, TaskAction::Pause));
-            assert_eq!(verb(TaskAction::Pause), "pauza");
+            assert!(offers(running("a", 1), "Pauza"));
             // A stopped task is not paused again; it goes on by a comment,
             // a step chosen or a restart, never by a resume of the panel.
-            assert!(unavailable(&runner_state("paused"), TaskAction::Pause).contains("wstrzymane"));
-            assert_eq!(
-                unavailable(&queued("a", 1), TaskAction::Pause),
-                "zadanie jest w kolejce"
-            );
-            assert_eq!(
-                unavailable(&runner_state("provisioning"), TaskAction::Pause),
-                "zadanie jest w kolejce"
-            );
-            assert!(unavailable(&runner_state("interrupted"), TaskAction::Pause)
-                .contains("uruchom je od nowa"));
-            assert!(unavailable(&finished("a", 1), TaskAction::Pause).contains("zakończone"));
-            assert!(
-                unavailable(&runner_state("pause_requested"), TaskAction::Pause)
-                    .contains("wstrzymywane")
-            );
+            for task in [
+                runner_state("paused"),
+                queued("a", 1),
+                runner_state("provisioning"),
+                runner_state("interrupted"),
+                finished("a", 1),
+                runner_state("pause_requested"),
+            ] {
+                let state = task.runner_state;
+                assert!(!offers(task, "Pauza"), "{state:?}");
+            }
         }
 
         #[test]
         fn stop_needs_a_running_or_pausing_task_and_a_runner_that_answers() {
-            assert!(available(&running("a", 1), TaskAction::Stop));
-            assert_eq!(
-                unavailable(&queued("a", 1), TaskAction::Stop),
-                "zadanie jest w kolejce"
-            );
-            assert!(unavailable(&runner_state("paused"), TaskAction::Stop)
-                .contains("napisz komentarz albo wybierz krok"));
-            assert!(unavailable(&finished("a", 1), TaskAction::Stop).contains("zakończone"));
-            assert_eq!(
-                unavailable(&runner_state("running"), TaskAction::Stop),
-                "runner jeszcze się nie zgłosił"
-            );
+            assert!(offers(running("a", 1), "Stop"));
+            for task in [
+                queued("a", 1),
+                runner_state("paused"),
+                finished("a", 1),
+                // No runner has reported yet.
+                runner_state("running"),
+            ] {
+                let state = task.runner_state;
+                assert!(!offers(task, "Stop"), "{state:?}");
+            }
             let mut silent = running("a", 1);
             silent.runner.as_mut().unwrap().freshness =
                 narsor_engine::controller_protocol::Freshness::Stale;
-            let silent = offered(silent);
-            assert!(unavailable(&silent, TaskAction::Stop).contains("nie odpowiada"));
+            assert!(!offers(offered(silent), "Stop"));
         }
 
         #[test]
         fn a_transition_needs_exits_or_an_override() {
             let exits = [("approved", "ship", Some("Wypuszczamy."))];
-            assert!(available(
-                &with_transitions(running("a", 1), "review", &exits, None),
-                TaskAction::Transition
+            let transition = "Przejście ręczne";
+            assert!(offers(
+                with_transitions(running("a", 1), "review", &exits, None),
+                transition
             ));
-            assert!(available(
-                &with_transitions(running("a", 1), "review", &[], Some(&["plan"])),
-                TaskAction::Transition
+            assert!(offers(
+                with_transitions(running("a", 1), "review", &[], Some(&["plan"])),
+                transition
             ));
-            assert!(unavailable(
-                &with_transitions(running("a", 1), "review", &[], None),
-                TaskAction::Transition
-            )
-            .contains("nie ma wyjść"));
-            assert!(unavailable(&running("a", 1), TaskAction::Transition)
-                .contains("serwer nie podał wyjść"));
-            assert_eq!(
-                unavailable(&queued("a", 1), TaskAction::Transition),
-                "zadanie jest w kolejce"
-            );
+            assert!(!offers(
+                with_transitions(running("a", 1), "review", &[], None),
+                transition
+            ));
+            assert!(!offers(running("a", 1), transition));
+            assert!(!offers(queued("a", 1), transition));
         }
 
         #[test]
         fn start_again_is_for_interrupted_tasks_and_a_failed_provisioning() {
-            assert!(available(&runner_state("interrupted"), TaskAction::Restart));
-            assert!(available(&runner_state("unknown"), TaskAction::Restart));
+            let restart = "Uruchom od nowa";
+            assert!(offers(runner_state("interrupted"), restart));
+            assert!(offers(runner_state("unknown"), restart));
             let failed = waiting_on(
                 runner_state("provisioning"),
                 AttentionKind::ProvisioningFailed,
                 "p-1",
                 None,
             );
-            assert!(available(&failed, TaskAction::Restart));
-            assert!(unavailable(&running("a", 1), TaskAction::Restart).contains("działa"));
-            assert_eq!(
-                unavailable(&queued("a", 1), TaskAction::Restart),
-                "zadanie jest w kolejce"
-            );
-            assert!(unavailable(&runner_state("paused"), TaskAction::Restart)
-                .contains("nie jest skryptem"));
+            assert!(offers(failed, restart));
+            assert!(!offers(running("a", 1), restart));
+            assert!(!offers(queued("a", 1), restart));
+            assert!(!offers(runner_state("paused"), restart));
         }
 
         #[test]
         fn archive_is_offered_wherever_the_control_plane_takes_it() {
-            assert!(available(&finished("a", 1), TaskAction::Archive));
-            assert!(available(&runner_state("interrupted"), TaskAction::Archive));
             let failed = waiting_on(
                 runner_state("provisioning"),
                 AttentionKind::ProvisioningFailed,
                 "p-1",
                 None,
             );
-            assert!(available(&failed, TaskAction::Archive));
             // The control plane archives a running, queued or paused task too
-            // (it frees the slot), so the server offers it and the menu shows it.
-            for taken in [running("a", 1), queued("a", 1), runner_state("paused")] {
-                assert!(
-                    available(&taken, TaskAction::Archive),
-                    "{:?}",
-                    taken.runner_state
-                );
+            // (it frees the slot), so the server offers it and the panel shows it.
+            for task in [
+                finished("a", 1),
+                runner_state("interrupted"),
+                failed,
+                running("a", 1),
+                queued("a", 1),
+                runner_state("paused"),
+            ] {
+                let state = task.runner_state;
+                assert!(offers(task, "Archiwizuj"), "{state:?}");
             }
         }
 
         #[test]
         fn the_client_draws_the_offer_it_is_given_not_a_rule_of_its_own() {
-            // The server says archive is not possible now; no local rule
-            // overrides it.
+            // The server leaves archive out; no local rule puts it back.
             let mut task = running("a", 1);
-            for offer in task.actions.as_mut().unwrap() {
-                if offer.id == narsor_engine::controller_protocol::TaskActionId::Archive {
-                    offer.available = false;
-                    offer.reason = Some("zadanie działa — poczekaj".to_string());
-                }
-            }
-            assert_eq!(
-                unavailable(&task, TaskAction::Archive),
-                "zadanie działa — poczekaj"
-            );
+            task.actions.as_mut().unwrap().retain(|offer| {
+                offer.id != narsor_engine::controller_protocol::TaskActionId::Archive
+            });
+            let mut app = app();
+            app.load(listing(vec![titled_as_served(task)], "c"));
+            ch(&mut app, '.');
+            assert_eq!(panel_labels(&app), ["Pauza", "Stop"]);
         }
 
         #[test]
         fn a_task_without_an_offer_has_no_action_from_the_server() {
-            let mut task = running("a", 1);
+            // Covers AE6.
+            let mut task = with_pull_request(running("a", 1));
             task.actions = None;
-            for action in [
-                TaskAction::Pause,
-                TaskAction::Stop,
-                TaskAction::ReleaseSlot,
-                TaskAction::Transition,
-                TaskAction::SelectStep,
-                TaskAction::Restart,
-                TaskAction::Archive,
-                TaskAction::Comment,
-            ] {
-                assert_eq!(
-                    unavailable(&task, action),
-                    "niedostępne: brak danych z serwera",
-                    "{action:?}"
-                );
-            }
+            assert_eq!(unavailable(&task, TaskAction::Comment), NO_OFFER);
             // Moving and opening a link are the client's own.
             assert_eq!(
                 unavailable(&task, TaskAction::Move),
                 "zadanie nie jest w kolejce"
             );
+            let mut app = app();
+            app.load(listing(vec![titled_as_served(task)], "c"));
+            ch(&mut app, '.');
+            assert_eq!(panel(&app).content(), PanelContent::NoData);
+            assert!(panel_labels(&app).is_empty(), "no entry at all");
+            let text = screen(&mut app, 120, 40);
+            assert!(text.contains(NO_DATA_TEXT), "{text}");
+        }
+
+        #[test]
+        fn an_older_server_that_describes_nothing_gives_the_panel_no_data() {
+            let mut task = running("a", 1);
+            for offer in task.actions.as_mut().unwrap() {
+                offer.label = None;
+                offer.description = None;
+            }
+            let mut app = app();
+            app.load(listing(vec![titled_as_served(task)], "c"));
+            ch(&mut app, '.');
+            assert_eq!(panel(&app).content(), PanelContent::NoData);
+        }
+
+        #[test]
+        fn an_empty_offer_says_nothing_can_be_done() {
+            let mut task = running("a", 1);
+            task.actions = Some(Vec::new());
+            let mut app = app();
+            app.load(listing(vec![titled_as_served(task.clone())], "c"));
+            ch(&mut app, '.');
+            assert_eq!(panel(&app).content(), PanelContent::Nothing);
+            let text = screen(&mut app, 120, 40);
+            assert!(text.contains(NOTHING_TEXT), "{text}");
+            assert_eq!(unavailable(&task, TaskAction::Comment), NOT_OFFERED);
         }
 
         #[test]
@@ -7491,78 +7552,40 @@ mod task_app_actions {
                 &with_pull_request(running("a", 1)),
                 TaskAction::OpenLink
             ));
+            assert!(!TaskAction::OpenLink.changes_state());
         }
 
         #[test]
-        fn every_action_of_the_panel_has_a_rule() {
-            for action in [
-                TaskAction::Pause,
-                TaskAction::Stop,
-                TaskAction::ReleaseSlot,
-                TaskAction::Transition,
-                TaskAction::SelectStep,
-                TaskAction::Restart,
-                TaskAction::Archive,
-                TaskAction::OpenLink,
-            ] {
-                assert!(
-                    TaskAction::ALL.contains(&action),
-                    "{action:?} is in the panel"
-                );
-            }
-            // A comment is the conversation's and a move has its own keys.
-            assert!(!TaskAction::ALL.contains(&TaskAction::Comment));
-            assert!(!TaskAction::ALL.contains(&TaskAction::Move));
-            assert!(TaskAction::Stop.needs_confirmation());
-            assert!(TaskAction::Archive.needs_confirmation());
-            assert!(!TaskAction::Pause.needs_confirmation());
-            assert!(!TaskAction::OpenLink.changes_state());
+        fn the_link_is_the_last_entry_of_the_panel() {
+            assert_eq!(
+                panel_of(with_pull_request(running("a", 1))),
+                ["Pauza", "Stop", "Archiwizuj", "Otwórz link"]
+            );
         }
     }
 
-    // -- the menu ----------------------------------------------------------
+    // -- the panel ----------------------------------------------------------
 
     mod menu {
         use super::*;
+        use narsor_protocol::controller::{TaskActionId, TaskActionOffer, TaskActionSend};
 
         #[test]
-        fn dot_on_a_running_task_lists_the_actions_and_greys_out_the_move() {
+        fn dot_on_a_running_task_lists_only_what_can_be_done() {
+            // Covers AE1.
             let mut app = loaded(running("a", 1));
             ch(&mut app, '.');
-            let Some(Overlay::Menu(_)) = app.overlay() else {
-                panic!("the menu should be open");
-            };
+            assert_eq!(panel_labels(&app), ["Pauza", "Stop", "Archiwizuj"]);
             let chooser = app.overlay().unwrap().chooser().unwrap();
-            let by_label = |needle: &str| {
-                chooser
-                    .items()
-                    .iter()
-                    .find(|item| item.label.contains(needle))
-                    .unwrap_or_else(|| panic!("no entry {needle}"))
-            };
-            assert_eq!(by_label("pauza").unavailable, None);
-            assert_eq!(by_label("stop").unavailable, None);
-            assert!(by_label("stop").label.contains('!'));
-            assert_eq!(
-                by_label("zwolnij slot").unavailable.as_deref(),
-                Some("zadanie nie czeka na operatora")
-            );
-            assert!(by_label("wybierz krok").unavailable.is_some());
-            assert!(by_label("uruchom od nowa").unavailable.is_some());
-            assert_eq!(
-                by_label("przejście ręczne").unavailable.as_deref(),
-                Some("serwer nie podał wyjść bieżącego stanu"),
-                "no exits known, so the entry is greyed with the reason"
-            );
             assert!(
                 chooser
                     .items()
                     .iter()
-                    .all(|item| !item.label.contains("przesuń")),
-                "a move has its own keys, not an entry of the panel"
+                    .all(|item| item.unavailable.is_none()),
+                "nothing greyed out"
             );
-            assert_eq!(by_label("archiwizuj").unavailable, None);
-            assert!(by_label("otwórz link").unavailable.is_some());
+            assert!(chooser.items()[1].irreversible, "stop cannot be undone");
+            assert!(chooser.items()[0].description.contains("skończy krok"));
             assert_eq!(app.key_context().base, Context::Menu);
         }
 
@@ -7574,20 +7597,12 @@ mod task_app_actions {
                 &[("approved", "ship", None)],
                 None,
             );
-            let mut app = loaded(task);
-            ch(&mut app, '.');
-            let chooser = app.overlay().unwrap().chooser().unwrap();
-            let entry = chooser
-                .items()
-                .iter()
-                .find(|item| item.label.contains("przejście ręczne"))
-                .unwrap();
-            assert_eq!(entry.unavailable, None);
+            assert!(panel_of(task).contains(&"Przejście ręczne".to_string()));
         }
 
         #[test]
         fn the_menu_moves_picks_by_digit_and_closes_with_esc() {
-            let mut app = loaded(running("a", 1));
+            let mut app = loaded(with_pull_request(running("a", 1)));
             ch(&mut app, '.');
             assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 0);
             ch(&mut app, 'j');
@@ -7603,57 +7618,65 @@ mod task_app_actions {
         }
 
         #[test]
-        fn enter_on_a_greyed_entry_says_why_and_keeps_the_menu_open() {
+        fn every_action_waits_for_the_enter_of_its_confirmation() {
+            // Covers AE4.
             let mut app = loaded(running("a", 1));
-            ch(&mut app, '.');
-            // The release of the slot is the third entry; a task that works
-            // has no wait to cut short.
-            ch(&mut app, '3');
-            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
-            assert_eq!(
-                note(&app),
-                "zwolnienie slotu: zadanie nie czeka na operatora"
-            );
-            assert!(app.overlay().is_some(), "the menu stays");
-        }
+            assert_eq!(open_entry(&mut app, "Pauza"), Request::None);
+            assert_eq!(stage(&app), Some(Stage::Confirm));
+            assert_eq!(panel(&app).form().step_text(), "krok 2 z 2");
+            assert_eq!(app.key_context().base, Context::FormConfirm);
+            let text = screen(&mut app, 120, 40);
+            assert!(text.contains("skończy krok"), "the effect: {text}");
 
-        #[test]
-        fn a_shortcut_in_the_menu_runs_the_action_and_closes_it() {
-            let mut app = loaded(running("a", 1));
-            ch(&mut app, '.');
-            let request = act(choose(&mut app, TaskAction::Pause));
+            assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
+            assert_eq!(stage(&app), Some(Stage::Choice), "nothing was sent");
+
+            let request = act(press(&mut app, KeyCode::Enter).or_confirm(&mut app));
+            assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Pause));
             assert!(app.overlay().is_none());
-            assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Pause));
         }
 
         #[test]
-        fn enter_on_an_available_entry_runs_it() {
-            let mut app = loaded(running("a", 1));
-            ch(&mut app, '.');
-            ch(&mut app, '1');
-            let request = act(press(&mut app, KeyCode::Enter));
-            assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Pause));
-        }
-
-        #[test]
-        fn a_shortcut_to_an_unavailable_action_in_the_menu_gives_the_same_reason() {
+        fn an_action_the_client_does_not_know_is_drawn_confirmed_and_sent() {
+            // Covers AE8.
             let mut task = running("a", 1);
-            for offer in task.actions.as_mut().unwrap() {
-                if offer.id == narsor_engine::controller_protocol::TaskActionId::Archive {
-                    offer.available = false;
-                    offer.reason = Some("zadanie działa — poczekaj".to_string());
-                }
-            }
+            let mut unknown = TaskActionOffer::described(
+                TaskActionId::Unrecognized,
+                "Przerwij krok",
+                "Przerywa krok; wykonanie da się odtworzyć.",
+            );
+            // Between the pause (60) and the stop (70) of the server.
+            unknown.order = 65;
+            unknown.send = Some(TaskActionSend::operator(&OperatorCommand::Interrupt));
+            task.actions.as_mut().unwrap().push(unknown);
             let mut app = app();
             app.load(listing(vec![titled_as_served(task)], "c"));
             ch(&mut app, '.');
-            assert_eq!(choose(&mut app, TaskAction::Archive), Request::None);
-            assert!(
-                note(&app).starts_with("archiwizacja: zadanie działa"),
-                "{}",
-                note(&app)
+            assert_eq!(
+                panel_labels(&app),
+                ["Pauza", "Przerwij krok", "Stop", "Archiwizuj"],
+                "in the server's order"
             );
-            assert!(app.overlay().is_some());
+            let request = act(choose(&mut app, "Przerwij krok"));
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::Interrupt)
+            );
+            assert_eq!(request.summary, "„Przerwij krok” wysłane do runnera");
+        }
+
+        #[test]
+        fn an_action_whose_command_the_client_cannot_read_is_not_sent() {
+            let mut task = running("a", 1);
+            let mut unknown =
+                TaskActionOffer::described(TaskActionId::Unrecognized, "Teleport", "Nowe.");
+            unknown.send = Some(TaskActionSend::Unrecognized);
+            unknown.order = 100;
+            task.actions.as_mut().unwrap().push(unknown);
+            let mut app = app();
+            app.load(listing(vec![titled_as_served(task)], "c"));
+            assert_eq!(choose(&mut app, "Teleport"), Request::None);
+            assert!(note(&app).contains("nowszej wersji"), "{}", note(&app));
         }
 
         #[test]
@@ -7676,14 +7699,8 @@ mod task_app_actions {
             let mut app = loaded(running("a", 1));
             ch(&mut app, '.');
             app.load(listing(vec![titled(runner_state("paused"), "NAR-12")], "d"));
-            let chooser = app.overlay().unwrap().chooser().unwrap();
-            let pause = chooser
-                .items()
-                .iter()
-                .find(|item| item.label.contains("pauza"))
-                .expect("the pause entry");
             assert!(
-                pause.unavailable.is_some(),
+                !panel_labels(&app).contains(&"Pauza".to_string()),
                 "the task stopped: it cannot be paused again"
             );
             app.on_stream(event(
@@ -7709,37 +7726,81 @@ mod task_app_actions {
             let mut app = app();
             ch(&mut app, '.');
             assert!(app.overlay().is_none());
-            assert_eq!(choose(&mut app, TaskAction::Pause), Request::None);
+        }
+
+        /// The row of the first line that holds `needle`.
+        fn row_of(text: &str, needle: &str) -> usize {
+            text.lines()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in:\n{text}"))
+        }
+
+        #[test]
+        fn the_panel_takes_the_place_of_the_conversation_form() {
+            let mut app = loaded(running("a", 1));
+            press(&mut app, KeyCode::Enter);
+            ch(&mut app, '.');
+            let text = screen(&mut app, 140, 40);
+            let tabs = row_of(&text, "Przebieg");
+            let heading = row_of(&text, "krok 1 z 2");
+            assert!(heading > tabs, "under the tabs of the details:\n{text}");
+            assert!(text.contains("Pauza"), "{text}");
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::Details);
+            press(&mut app, KeyCode::Esc);
+            assert!(app.overlay().is_none());
+            assert_eq!(
+                app.focus(),
+                narsor::tui::task_app::Focus::Details,
+                "the focus is where it was"
+            );
+        }
+
+        #[test]
+        fn the_panel_fits_a_small_terminal() {
+            let mut app = loaded(with_pull_request(running("a", 1)));
+            ch(&mut app, '.');
+            let text = screen(&mut app, 80, 24);
+            assert!(text.contains("Pauza"), "{text}");
+            let last = text.lines().last().unwrap_or_default();
+            assert!(last.contains("zamknij"), "the bar stays: {text}");
         }
     }
 
-    // -- shortcuts ---------------------------------------------------------
+    /// `Enter` that answers the confirmation step when the panel asks for it.
+    trait OrConfirm {
+        fn or_confirm(self, app: &mut TaskApp) -> Request;
+    }
+
+    impl OrConfirm for Request {
+        fn or_confirm(self, app: &mut TaskApp) -> Request {
+            if self == Request::None && stage(app) == Some(Stage::Confirm) {
+                press(app, KeyCode::Enter)
+            } else {
+                self
+            }
+        }
+    }
+
+    // -- the actions -------------------------------------------------------
 
     mod shortcuts {
         use super::*;
 
         #[test]
-        fn p_on_a_queued_task_says_why_it_cannot() {
-            let mut app = app();
-            app.load(listing(vec![queued("a", 1)], "c"));
-            assert_eq!(choose(&mut app, TaskAction::Pause), Request::None);
-            assert_eq!(note(&app), "pauza: zadanie jest w kolejce");
-            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
+        fn a_queued_task_has_no_pause_to_choose() {
+            assert!(!panel_of(queued("a", 1)).contains(&"Pauza".to_string()));
         }
 
         #[test]
-        fn pause_of_a_running_task_goes_without_asking_and_a_stopped_one_is_not_paused() {
+        fn pause_of_a_running_task_goes_after_its_confirmation() {
             let mut app = loaded(running("a", 1));
-            let pause = act(choose(&mut app, TaskAction::Pause));
+            let pause = act(choose(&mut app, "Pauza"));
             assert_eq!(pause.send, ActionSend::Owner(OwnerCommand::Pause));
             assert_eq!(pause.generation, 1);
+            assert_eq!(pause.verb, "pauza");
+            assert_eq!(pause.summary, "„Pauza” zlecone");
             assert!(!pause.key.is_empty());
-            assert!(app.overlay().is_none(), "no window for a plain action");
-
-            // No resume in the panel: a stopped task has none to choose.
-            let mut app = loaded(runner_state("paused"));
-            assert_eq!(choose(&mut app, TaskAction::Pause), Request::None);
-            assert!(note(&app).starts_with("pauza:"), "{}", note(&app));
+            assert!(app.overlay().is_none());
         }
 
         #[test]
@@ -7751,7 +7812,7 @@ mod task_app_actions {
                 .execution_cursor
                 .current_action_type = Some("script".to_string());
             let mut app = loaded(offered(task));
-            let restart = act(choose(&mut app, TaskAction::Restart));
+            let restart = act(choose(&mut app, "Uruchom od nowa"));
             assert_eq!(
                 restart.send,
                 ActionSend::Operator(OperatorCommand::RestartStep {
@@ -7766,46 +7827,39 @@ mod task_app_actions {
             let mut task = running("a", 1);
             task.slot_release_pending = true;
             let mut app = loaded(offered(task));
-            let release = act(choose(&mut app, TaskAction::ReleaseSlot));
+            let release = act(choose(&mut app, "Zwolnij slot"));
             assert_eq!(release.send, ActionSend::Owner(OwnerCommand::ReleaseSlot));
-            assert_eq!(release.summary, "zwolnienie slotu zlecone");
+            assert_eq!(release.summary, "„Zwolnij slot” zlecone");
         }
 
         #[test]
-        fn s_starts_an_interrupted_task_again_and_says_why_for_a_running_one() {
+        fn an_interrupted_task_starts_again_and_a_running_one_has_no_restart() {
             let mut app = loaded(runner_state("interrupted"));
-            let start = act(choose(&mut app, TaskAction::Restart));
+            let start = act(choose(&mut app, "Uruchom od nowa"));
             assert_eq!(start.send, ActionSend::Owner(OwnerCommand::Start));
-
-            let mut app = loaded(running("a", 1));
-            assert_eq!(choose(&mut app, TaskAction::Restart), Request::None);
-            assert!(
-                note(&app).starts_with("uruchomienie od nowa:"),
-                "{}",
-                note(&app)
-            );
+            assert!(!panel_of(running("a", 1)).contains(&"Uruchom od nowa".to_string()));
         }
 
         #[test]
-        fn the_shortcuts_work_in_the_details_too() {
+        fn the_panel_works_in_the_details_too() {
             let mut app = loaded(running("a", 1));
             press(&mut app, KeyCode::Enter);
-            let pause = act(choose(&mut app, TaskAction::Pause));
+            let pause = act(choose(&mut app, "Pauza"));
             assert_eq!(pause.send, ActionSend::Owner(OwnerCommand::Pause));
         }
 
         #[test]
         fn a_retry_of_a_decision_that_got_no_answer_reuses_its_key() {
             let mut app = loaded(running("a", 1));
-            let first = act(choose(&mut app, TaskAction::Pause));
-            let again = act(choose(&mut app, TaskAction::Pause));
+            let first = act(choose(&mut app, "Pauza"));
+            let again = act(choose(&mut app, "Pauza"));
             assert_eq!(first.key, again.key, "the same decision, the same key");
         }
 
         #[tokio::test]
         async fn a_lost_connection_keeps_the_key_for_the_retry() {
             let mut app = loaded(running("a", 1));
-            let first = act(choose(&mut app, TaskAction::Pause));
+            let first = act(choose(&mut app, "Pauza"));
             app.perform(Request::Act(Box::new(first.clone()))).await;
             assert!(
                 app.notifier().latest().unwrap().severity == Severity::Error,
@@ -7814,33 +7868,34 @@ mod task_app_actions {
             );
             // The connection came back.
             app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
-            let again = act(choose(&mut app, TaskAction::Pause));
+            let again = act(choose(&mut app, "Pauza"));
             assert_eq!(first.key, again.key);
         }
     }
 
-    // -- the confirmation window -------------------------------------------
+    // -- the confirmation step ---------------------------------------------
 
     mod confirmation {
         use super::*;
 
         #[test]
-        fn stop_asks_with_the_effect_and_y_sends_the_stop() {
+        fn stop_shows_its_effect_and_risk_and_enter_sends_the_stop() {
             let mut app = loaded(running("a", 1));
-            assert_eq!(choose(&mut app, TaskAction::Stop), Request::None);
-            let window = confirmation(&app);
+            assert_eq!(open_entry(&mut app, "Stop"), Request::None);
+            assert_eq!(stage(&app), Some(Stage::Confirm));
+            let chosen = panel(&app).form().chosen().expect("the chosen action");
+            assert!(chosen.irreversible);
             assert!(
-                window.heading().contains("Zatrzymaj"),
-                "{}",
-                window.heading()
+                chosen.description.contains("„review”"),
+                "the step it cuts short: {}",
+                chosen.description
             );
-            let text = window.lines().join(" ");
-            assert!(text.contains("„review”"), "the step it cuts short: {text}");
-            assert!(text.contains("sesja agenta zostaje"), "{text}");
-            assert!(text.contains("NAR-12"), "{text}");
-            assert_eq!(app.key_context().base, Context::Confirm);
+            assert!(chosen.description.contains("Sesja agenta zostaje"));
+            assert_eq!(app.key_context().base, Context::FormConfirm);
+            let text = screen(&mut app, 120, 40);
+            assert!(text.contains("! nieodwracalne"), "{text}");
 
-            let request = act(ch(&mut app, 'y'));
+            let request = act(press(&mut app, KeyCode::Enter));
             assert_eq!(
                 request.send,
                 ActionSend::Operator(OperatorCommand::StopStep)
@@ -7853,63 +7908,61 @@ mod task_app_actions {
         }
 
         #[test]
-        fn n_and_esc_take_it_back_and_other_keys_do_nothing() {
+        fn esc_takes_it_back_and_other_keys_do_nothing() {
             let mut app = loaded(running("a", 1));
-            choose(&mut app, TaskAction::Stop);
+            open_entry(&mut app, "Stop");
             assert_eq!(ch(&mut app, 'j'), Request::None);
-            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
-            assert!(app.overlay().is_some(), "only y and n answer it");
-            assert_eq!(ch(&mut app, 'n'), Request::None);
-            assert!(app.overlay().is_none());
-
-            choose(&mut app, TaskAction::Stop);
+            assert_eq!(ch(&mut app, 'y'), Request::None);
+            assert_eq!(
+                app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+                Request::None
+            );
+            assert_eq!(stage(&app), Some(Stage::Confirm), "only Enter and Esc");
+            assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
+            assert_eq!(stage(&app), Some(Stage::Choice));
             assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
             assert!(app.overlay().is_none());
         }
 
         #[test]
-        fn a_on_a_finished_task_asks_and_y_archives() {
+        fn archive_says_it_cannot_be_undone_and_enter_archives() {
             let mut app = loaded(finished("a", 1));
-            assert_eq!(choose(&mut app, TaskAction::Archive), Request::None);
-            let window = confirmation(&app);
-            assert!(window.heading().contains("Archiwizuj"));
-            let text = window.lines().join(" ");
-            assert!(text.contains("Usuwa workload i storage"), "{text}");
-            assert!(text.contains("nie da się cofnąć"), "{text}");
-            let request = act(ch(&mut app, 'y'));
+            open_entry(&mut app, "Archiwizuj");
+            let chosen = panel(&app).form().chosen().expect("the chosen action");
+            assert!(chosen.description.contains("Usuwa workload i storage"));
+            assert!(chosen.description.contains("nie da się cofnąć"));
+            let request = act(press(&mut app, KeyCode::Enter));
             assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Archive));
         }
 
         #[test]
-        fn every_action_marked_with_a_bang_asks_the_same_way() {
-            for (action, task) in [
-                (TaskAction::Stop, running("a", 1)),
-                (TaskAction::Archive, finished("a", 1)),
+        fn every_action_asks_the_same_way() {
+            for (label, task) in [
+                ("Pauza", running("a", 1)),
+                ("Stop", running("a", 1)),
+                ("Archiwizuj", finished("a", 1)),
+                ("Uruchom od nowa", runner_state("interrupted")),
             ] {
                 let mut app = loaded(task);
-                choose(&mut app, action);
-                assert_eq!(app.key_context().base, Context::Confirm, "{action:?}");
-                assert!(matches!(
-                    app.overlay().unwrap().confirmation().unwrap().confirmed(),
-                    Confirmed::Act(_)
-                ));
+                open_entry(&mut app, label);
+                assert_eq!(stage(&app), Some(Stage::Confirm), "{label}");
+                assert_eq!(app.key_context().base, Context::FormConfirm, "{label}");
             }
         }
 
         #[test]
-        fn y_does_not_send_without_a_connection() {
+        fn enter_does_not_send_without_a_connection() {
             let mut app = loaded(running("a", 1));
-            choose(&mut app, TaskAction::Stop);
+            open_entry(&mut app, "Stop");
             app.on_stream(Some(Err(ClientError::Unavailable("down".into()))));
-            assert_eq!(ch(&mut app, 'y'), Request::None);
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             assert!(note(&app).contains("zablokowana"), "{}", note(&app));
-            assert!(app.overlay().is_none());
         }
 
         #[test]
-        fn the_window_closes_when_its_task_leaves_the_list() {
+        fn the_panel_closes_when_its_task_leaves_the_list() {
             let mut app = loaded(finished("a", 1));
-            choose(&mut app, TaskAction::Archive);
+            open_entry(&mut app, "Archiwizuj");
             app.on_stream(event(
                 "d",
                 "a",
@@ -7972,20 +8025,38 @@ mod task_app_actions {
         }
 
         #[test]
+        fn the_steps_are_a_submenu_in_the_same_panel() {
+            // Covers AE2.
+            let mut app = loaded(stopped_with_steps());
+            assert_eq!(open_entry(&mut app, "Wybierz krok"), Request::None);
+            assert_eq!(panel(&app).form().heading(), "Akcje › Wybierz krok");
+            assert_eq!(panel_labels(&app), ["profile", "work", "check"]);
+            let text = screen(&mut app, 120, 40);
+            assert!(text.contains("Akcje › Wybierz krok"), "{text}");
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(panel(&app).form().heading(), "Akcje");
+            assert!(panel_labels(&app).contains(&"Wybierz krok".to_string()));
+        }
+
+        #[test]
         fn a_profile_step_takes_a_comment_like_an_agent_step() {
             let mut app = loaded(stopped_with_steps());
-            assert_eq!(choose(&mut app, TaskAction::SelectStep), Request::None);
-            let Some(Overlay::Steps(_)) = app.overlay() else {
-                panic!("the list of steps");
-            };
-            let items = app.overlay().unwrap().chooser().unwrap().items();
-            let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
-            assert_eq!(labels, ["profile", "work", "check"]);
-            assert_eq!(items[0].fields.len(), 1, "a profile step runs an agent");
-            assert_eq!(items[1].fields.len(), 1);
-            assert!(items[2].fields.is_empty(), "a script reads no comment");
-
-            ch(&mut app, '1');
+            open_entry(&mut app, "Wybierz krok");
+            pick(&mut app, "check");
+            assert_eq!(
+                stage(&app),
+                Some(Stage::Confirm),
+                "a script reads no comment"
+            );
+            press(&mut app, KeyCode::Esc);
+            pick(&mut app, "profile");
+            assert_eq!(
+                stage(&app),
+                Some(Stage::Fields),
+                "a profile step runs an agent"
+            );
+            // The comment is optional: Enter goes on without it.
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             let request = act(press(&mut app, KeyCode::Enter));
             assert_eq!(
                 request.send,
@@ -7995,12 +8066,74 @@ mod task_app_actions {
                 })
             );
         }
+
+        #[test]
+        fn the_comment_is_its_own_step_and_survives_going_back() {
+            // Covers AE3.
+            let mut app = loaded(stopped_with_steps());
+            open_entry(&mut app, "Wybierz krok");
+            pick(&mut app, "work");
+            assert_eq!(panel(&app).form().step_text(), "krok 2 z 3");
+            typed(&mut app, "popraw testy");
+            assert_eq!(app.key_context().base, Context::Form, "q and ? are text");
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(panel(&app).form().step_text(), "krok 3 z 3");
+            let text = screen(&mut app, 120, 40);
+            assert!(text.contains("komentarz: popraw testy"), "{text}");
+
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(stage(&app), Some(Stage::Fields));
+            let fields = panel(&app).form().fields().expect("the fields");
+            assert_eq!(fields.fields_of(0)[0].value(), "popraw testy");
+
+            press(&mut app, KeyCode::Enter);
+            let request = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::SelectStep {
+                    target: "work".to_string(),
+                    note: Some("popraw testy".to_string()),
+                })
+            );
+        }
+
+        #[test]
+        fn a_refresh_keeps_the_field_its_text_and_the_focus() {
+            // Covers AE7.
+            let mut app = loaded(stopped_with_steps());
+            open_entry(&mut app, "Wybierz krok");
+            pick(&mut app, "work");
+            typed(&mut app, "popraw");
+            app.load(listing(vec![titled(stopped_with_steps(), "NAR-12")], "d"));
+            assert_eq!(stage(&app), Some(Stage::Fields));
+            assert_eq!(app.key_context().base, Context::Form);
+            typed(&mut app, " to");
+            let fields = panel(&app).form().fields().expect("the fields");
+            assert_eq!(fields.fields_of(0)[0].value(), "popraw to");
+        }
+
+        #[test]
+        fn an_action_gone_on_a_refresh_says_so_and_goes_back_a_level() {
+            let mut app = loaded(stopped_with_steps());
+            open_entry(&mut app, "Wybierz krok");
+            app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
+            assert!(
+                note(&app).contains("nie jest już dostępna"),
+                "{}",
+                note(&app)
+            );
+            assert_eq!(panel(&app).form().heading(), "Akcje");
+            assert_eq!(stage(&app), Some(Stage::Choice));
+        }
     }
 
     // -- manual transitions --------------------------------------------------
 
     mod transitions {
         use super::*;
+
+        const TRANSITION: &str = "Przejście ręczne";
+        const OVERRIDE: &str = "Override: dowolny stan";
 
         fn offered(override_targets: Option<&[&str]>) -> TaskSummary {
             with_transitions(
@@ -8015,12 +8148,9 @@ mod task_app_actions {
         }
 
         #[test]
-        fn t_lists_the_exits_with_their_descriptions_and_a_choice_sends_the_transition() {
+        fn the_exits_are_a_submenu_with_their_descriptions_and_a_choice_sends_the_transition() {
             let mut app = loaded(offered(None));
-            assert_eq!(choose(&mut app, TaskAction::Transition), Request::None);
-            let Some(Overlay::Transitions(_)) = app.overlay() else {
-                panic!("the list of exits");
-            };
+            assert_eq!(open_entry(&mut app, TRANSITION), Request::None);
             let chooser = app.overlay().unwrap().chooser().unwrap();
             assert_eq!(chooser.items().len(), 2, "no override: only the exits");
             assert!(chooser.items()[0].label.contains("approved"));
@@ -8036,8 +8166,7 @@ mod task_app_actions {
             assert!(text.contains("approved → ship"), "{text}");
             assert!(text.contains("Zatwierdza i wypuszcza"), "{text}");
 
-            ch(&mut app, '2');
-            let request = act(press(&mut app, KeyCode::Enter));
+            let request = act(pick(&mut app, "revise → implement").or_confirm(&mut app));
             assert_eq!(
                 request.send,
                 ActionSend::Operator(OperatorCommand::Transition {
@@ -8046,13 +8175,15 @@ mod task_app_actions {
                     reason: None,
                 })
             );
-            assert!(app.overlay().is_none(), "an exit is sent at once");
+            assert!(app.overlay().is_none());
         }
 
         #[test]
-        fn esc_leaves_the_list_of_exits() {
+        fn esc_leaves_the_list_of_exits_for_the_panel() {
             let mut app = loaded(offered(None));
-            choose(&mut app, TaskAction::Transition);
+            open_entry(&mut app, TRANSITION);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(panel(&app).form().heading(), "Akcje");
             press(&mut app, KeyCode::Esc);
             assert!(app.overlay().is_none());
         }
@@ -8060,42 +8191,37 @@ mod task_app_actions {
         #[test]
         fn the_override_is_only_there_when_the_state_allows_it() {
             let mut app = loaded(offered(None));
-            choose(&mut app, TaskAction::Transition);
-            assert!(app
-                .overlay()
-                .unwrap()
-                .chooser()
-                .unwrap()
-                .items()
-                .iter()
-                .all(|item| !item.label.contains("override")));
+            open_entry(&mut app, TRANSITION);
+            assert!(!panel_labels(&app).contains(&OVERRIDE.to_string()));
 
             let mut app = loaded(offered(Some(&["plan", "ship"])));
-            choose(&mut app, TaskAction::Transition);
+            open_entry(&mut app, TRANSITION);
             let chooser = app.overlay().unwrap().chooser().unwrap();
             assert_eq!(chooser.items().len(), 3);
-            assert!(chooser.items()[2].label.contains("override"));
-            assert!(chooser.items()[2].label.starts_with('!'));
+            assert_eq!(chooser.items()[2].label, OVERRIDE);
+            assert!(chooser.items()[2].irreversible);
         }
 
         #[test]
         fn the_override_needs_a_reason_and_asks_before_it_sends() {
             let mut app = loaded(offered(Some(&["plan", "ship"])));
-            choose(&mut app, TaskAction::Transition);
-            ch(&mut app, '3');
-            // Enter goes to the fields, then the reason, then validation runs.
+            open_entry(&mut app, TRANSITION);
+            assert_eq!(pick(&mut app, OVERRIDE), Request::None);
+            assert_eq!(stage(&app), Some(Stage::Fields));
+            // Enter goes from the target to the reason, then validation runs.
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
-            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
-            assert!(app.overlay().is_some(), "no reason, nothing to confirm");
-            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert_eq!(
+                stage(&app),
+                Some(Stage::Fields),
+                "no reason, nothing to confirm"
+            );
+            let fields = panel(&app).form().fields().expect("the fields");
             assert!(
-                chooser.fields_of(2)[1].error().is_some(),
+                fields.fields_of(0)[1].error().is_some(),
                 "the reason is what is missing"
             );
 
-            // Down to the reason, type it, send.
-            press(&mut app, KeyCode::Down);
             typed(&mut app, "CI nie ruszy bez tego");
             assert_eq!(
                 app.key_context().base,
@@ -8103,17 +8229,20 @@ mod task_app_actions {
                 "typing: q and ? are text"
             );
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
-            let window = confirmation(&app);
-            assert!(window.heading().contains("Override"));
-            let text = window.lines().join(" ");
+            assert_eq!(stage(&app), Some(Stage::Confirm));
+            let chosen = panel(&app).form().chosen().expect("the chosen action");
             assert!(
-                text.contains("„review”") && text.contains("„plan”"),
-                "{text}"
+                chosen.description.contains("„review”"),
+                "{}",
+                chosen.description
             );
-            assert!(text.contains("CI nie ruszy bez tego"), "{text}");
-            assert!(text.contains("audytu"), "{text}");
+            assert!(chosen.description.contains("audytu"));
+            let text = screen(&mut app, 120, 40);
+            assert!(text.contains("stan docelowy: plan"), "{text}");
+            assert!(text.contains("powód: CI nie ruszy bez tego"), "{text}");
+            assert!(text.contains("! nieodwracalne"), "{text}");
 
-            let request = act(ch(&mut app, 'y'));
+            let request = act(press(&mut app, KeyCode::Enter));
             assert_eq!(
                 request.send,
                 ActionSend::Operator(OperatorCommand::Transition {
@@ -8127,68 +8256,40 @@ mod task_app_actions {
         #[test]
         fn a_paste_fills_the_override_reason_and_sends_nothing() {
             let mut app = loaded(offered(Some(&["plan", "ship"])));
-            choose(&mut app, TaskAction::Transition);
+            open_entry(&mut app, TRANSITION);
             app.on_paste("z listy");
-            let chooser = app.overlay().unwrap().chooser().unwrap();
-            assert!(
-                chooser.fields_of(2)[1].value().is_empty(),
-                "with the keys on the list a paste goes nowhere"
-            );
+            assert_eq!(stage(&app), Some(Stage::Choice), "a paste picks nothing");
 
-            ch(&mut app, '3');
-            press(&mut app, KeyCode::Enter);
+            pick(&mut app, OVERRIDE);
             press(&mut app, KeyCode::Down);
             app.on_paste("CI nie ruszy\r\nbez tego\n");
-            let Some(Overlay::Transitions(_)) = app.overlay() else {
-                panic!("a paste neither sends nor closes the list");
-            };
-            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert_eq!(stage(&app), Some(Stage::Fields), "a paste does not send");
+            let fields = panel(&app).form().fields().expect("the fields");
             assert_eq!(
-                chooser.fields_of(2)[1].value(),
+                fields.fields_of(0)[1].value(),
                 "CI nie ruszy bez tego ",
                 "the one-line reason gets the paste, its line breaks as spaces"
             );
         }
 
         #[test]
-        fn n_in_the_override_window_sends_nothing() {
+        fn esc_in_the_override_confirmation_sends_nothing() {
             let mut app = loaded(offered(Some(&["plan"])));
-            choose(&mut app, TaskAction::Transition);
-            ch(&mut app, '3');
-            press(&mut app, KeyCode::Enter);
-            assert_eq!(
-                app.overlay().unwrap().chooser().unwrap().focus(),
-                narsor::tui::chooser::ChooserFocus::Fields
-            );
-            press(&mut app, KeyCode::Tab);
-            assert_eq!(
-                app.overlay().unwrap().chooser().unwrap().focus(),
-                narsor::tui::chooser::ChooserFocus::Actions
-            );
-            press(&mut app, KeyCode::Tab);
-            assert_eq!(
-                app.overlay().unwrap().chooser().unwrap().focus(),
-                narsor::tui::chooser::ChooserFocus::Fields
-            );
+            open_entry(&mut app, TRANSITION);
+            pick(&mut app, OVERRIDE);
             press(&mut app, KeyCode::Down);
             typed(&mut app, "powód");
             press(&mut app, KeyCode::Enter);
-            assert_eq!(ch(&mut app, 'n'), Request::None);
-            assert!(app.overlay().is_none());
+            assert_eq!(stage(&app), Some(Stage::Confirm));
+            assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
+            assert_eq!(stage(&app), Some(Stage::Fields));
+            assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
+            assert_eq!(stage(&app), Some(Stage::Choice));
         }
 
         #[test]
-        fn t_where_the_state_has_no_exits_says_why() {
-            let mut app = loaded(running("a", 1));
-            assert_eq!(choose(&mut app, TaskAction::Transition), Request::None);
-            assert_eq!(
-                note(&app),
-                "przejście: serwer nie podał wyjść bieżącego stanu"
-            );
-            assert!(
-                matches!(app.overlay(), Some(Overlay::Menu(_))),
-                "the panel stays, no list of exits opens"
-            );
+        fn a_state_without_exits_has_no_transition() {
+            assert!(!panel_of(running("a", 1)).contains(&TRANSITION.to_string()));
         }
 
         #[test]
@@ -8200,7 +8301,7 @@ mod task_app_actions {
                 None,
             );
             let mut app = loaded(task);
-            choose(&mut app, TaskAction::Transition);
+            open_entry(&mut app, TRANSITION);
             let text = screen(&mut app, 120, 40);
             assert!(!text.contains('\u{1b}'));
             assert!(text.contains("Dobrze"));
@@ -8323,26 +8424,23 @@ mod task_app_actions {
 
         #[test]
         fn every_mutation_is_blocked_with_the_reason() {
-            for (action, task) in [
-                (TaskAction::Pause, running("a", 1)),
-                (TaskAction::Stop, running("a", 1)),
-                (TaskAction::Archive, finished("a", 1)),
-                (TaskAction::Restart, runner_state("interrupted")),
-                (
-                    TaskAction::Transition,
-                    with_transitions(running("a", 1), "review", &[("ok", "ship", None)], None),
-                ),
+            for (label, task) in [
+                ("Pauza", running("a", 1)),
+                ("Stop", running("a", 1)),
+                ("Archiwizuj", finished("a", 1)),
+                ("Uruchom od nowa", runner_state("interrupted")),
             ] {
                 let mut app = disconnected(task);
-                assert_eq!(choose(&mut app, action), Request::None, "{action:?}");
+                assert_eq!(open_entry(&mut app, label), Request::None, "{label}");
                 assert!(
                     note(&app).contains("zablokowana"),
-                    "{action:?}: {}",
+                    "{label}: {}",
                     note(&app)
                 );
-                assert!(
-                    matches!(app.overlay(), Some(Overlay::Menu(_))),
-                    "{action:?}: only the panel stays, nothing else opens"
+                assert_eq!(
+                    stage(&app),
+                    Some(Stage::Choice),
+                    "{label}: only the panel stays, nothing else opens"
                 );
             }
         }
@@ -8356,7 +8454,7 @@ mod task_app_actions {
             let pause = chooser
                 .items()
                 .iter()
-                .find(|item| item.label.contains("pauza"))
+                .find(|item| item.label == "Pauza")
                 .unwrap();
             assert!(
                 pause
@@ -8369,7 +8467,7 @@ mod task_app_actions {
             let link = chooser
                 .items()
                 .iter()
-                .find(|item| item.label.contains("otwórz link"))
+                .find(|item| item.label == "Otwórz link")
                 .unwrap();
             assert_eq!(link.unavailable, None, "opening a link changes nothing");
 
@@ -8385,17 +8483,10 @@ mod task_app_actions {
             assert!(chooser
                 .items()
                 .iter()
-                .find(|item| item.label.contains("pauza"))
+                .find(|item| item.label == "Pauza")
                 .unwrap()
                 .unavailable
                 .is_none());
-        }
-
-        #[test]
-        fn a_task_that_cannot_be_acted_on_says_so_before_the_connection_does() {
-            let mut app = disconnected(queued("a", 1));
-            assert_eq!(choose(&mut app, TaskAction::Pause), Request::None);
-            assert_eq!(note(&app), "pauza: zadanie jest w kolejce");
         }
     }
 
@@ -8904,12 +8995,12 @@ mod task_app_conductor {
             let mut app = app();
             app.load(listing(vec![titled(running("a", 1), "NAR-12")], "c"));
             ch(&mut app, '.');
-            let Some(Overlay::Menu(_)) = app.overlay() else {
+            let Some(Overlay::Actions(_)) = app.overlay() else {
                 panic!("the menu should be open");
             };
             let before = app.overlay().unwrap().chooser().unwrap().selected();
             app.on_paste("2\n");
-            let Some(Overlay::Menu(_)) = app.overlay() else {
+            let Some(Overlay::Actions(_)) = app.overlay() else {
                 panic!("the menu is still open");
             };
             assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), before);
@@ -12123,7 +12214,6 @@ mod task_app_auto_resume {
 
     use narsor::api::ApiClient;
     use narsor::cli::task_text::RecordAge;
-    use narsor::tui::task_app::actions::{availability, TaskAction};
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::list::{attention_of, Attention};
     use narsor::tui::task_app::notify::Severity;
@@ -12313,21 +12403,24 @@ mod task_app_auto_resume {
         assert_eq!(attention_of(&given_up), Attention::Problem);
     }
 
-    /// The menu's reason for an interrupted task mentions a planned resume.
+    /// A task that resumes on its own is offered a start anew, not a stop or
+    /// a pause: the server says why at the send.
     #[test]
-    fn an_action_of_a_task_resuming_on_its_own_says_so() {
+    fn a_task_resuming_on_its_own_is_offered_a_start_anew() {
+        use narsor_protocol::controller::TaskActionSurface;
+        let labels = |task: &TaskSummary| -> Vec<String> {
+            task.actions
+                .iter()
+                .flatten()
+                .filter(|offer| offer.surface == TaskActionSurface::Panel)
+                .filter_map(|offer| offer.label.clone())
+                .collect()
+        };
         let planned = interrupted("a", RunnerState::Running, 2, true);
-        let reason = availability(&planned, TaskAction::Stop);
-        assert_eq!(
-            reason.reason(),
-            Some("zadanie jest przerwane — wznowi się samo (próba 2/5) albo uruchom je od nowa")
-        );
+        assert!(!labels(&planned).contains(&"Stop".to_string()));
+        assert!(labels(&planned).contains(&"Uruchom od nowa".to_string()));
         let pausing = interrupted("a", RunnerState::PauseRequested, 0, false);
-        assert_eq!(
-            availability(&pausing, TaskAction::Pause).reason(),
-            Some("zadanie jest przerwane — uruchom je od nowa")
-        );
-        assert!(availability(&planned, TaskAction::Restart).is_available());
+        assert!(!labels(&pausing).contains(&"Pauza".to_string()));
     }
 
     #[test]

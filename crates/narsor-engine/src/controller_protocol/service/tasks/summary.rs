@@ -117,16 +117,7 @@ impl ProtocolService {
         // One comment waits on a pause at a time: another is refused until a
         // runner takes it (`comment_pending`), so the offer does not promise it.
         if record.resume_message.is_some() {
-            if let Some(comment) = actions
-                .iter_mut()
-                .find(|offer| offer.id == TaskActionId::Comment)
-            {
-                comment.available = false;
-                comment.options = Vec::new();
-                comment.effect = None;
-                comment.reason =
-                    Some("poprzedni komentarz czeka na wznowienie zadania".to_string());
-            }
+            actions.retain(|offer| offer.id != TaskActionId::Comment);
         }
         summary.actions = Some(actions);
         // After the actions: the panel reads the same summary and the offer.

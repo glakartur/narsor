@@ -1076,5 +1076,5 @@ pub fn render_details(
         loading: false,
         title_cut: title_is_cut(task, &edge),
     };
-    render_view(frame, inner, view, styles, options);
+    render_view(frame, inner, view, styles, options, None);
 }
