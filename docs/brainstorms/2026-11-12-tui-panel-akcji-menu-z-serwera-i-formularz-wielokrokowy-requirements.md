@@ -81,7 +81,7 @@ Drugi problem to forma. Akcje używają osobnych okien (`Overlay::Menu`, `Transi
 
 **Miejsce i wygląd**
 
-- R12. Panel akcji pokazuje się w miejscu formularza dodawania treści (panel rozmowy na dole szczegółów taska), a nie jako okno na środku ekranu. Założenie: to propozycja operatora, nie wymóg (patrz Q1). Gdy panel rozmowy nie jest widoczny (inna zakładka), panel akcji zajmuje to samo miejsce w układzie szczegółów.
+- R12. Panel akcji pokazuje się w miejscu formularza dodawania treści (panel rozmowy na dole szczegółów taska), a nie jako okno na środku ekranu. Potwierdzone przez operatora (Q1, odpowiedź 1). Gdy panel rozmowy nie jest widoczny (inna zakładka), panel akcji zajmuje to samo miejsce w układzie szczegółów.
 - R13. Panel nie zmienia znaczenia skrótu `Ctrl+.` (ani zapasowego `.`). Po wykonaniu akcji, po odmowie serwera albo po `Esc` focus wraca tam, gdzie był przed otwarciem panelu. (Spójne z `docs/brainstorms/2026-10-19-focus-po-zatwierdzeniu-akcji-requirements.md`.)
 - R14. Podczas otwartego panelu odświeżenie listy z serwera nie zamyka panelu, nie zabiera focusa i nie kasuje wpisanych danych, dopóki wybrana akcja nadal jest dostępna. Gdy znika, operator widzi komunikat z powodem i wraca na poprzedni poziom. (Ta sama zasada co R5 w `docs/brainstorms/2026-10-26-formularz-akcji-workflow-enter-requirements.md`.)
 
@@ -131,7 +131,7 @@ Drugi problem to forma. Akcje używają osobnych okien (`Overlay::Menu`, `Transi
 
 - Serwer zwraca tylko dostępne akcje: Dlaczego: operator nie czyta nieaktualnych pozycji, a klient nie ma czego filtrować. Powód niedostępności przy próbie wysłania zostaje w odpowiedzi serwera (R5).
 - Serwer opisuje akcje całkowicie (nazwa, opis, rodzaj, pola, ryzyko): Dlaczego: klient nie musi znać znaczenia akcji. Kontrakt jest jedynym miejscem, które zmienia się z nową akcją.
-- Wszystkie akcje mają krok potwierdzenia: Dlaczego: jeden wzorzec jest łatwiejszy do nauczenia niż wybór „ta pyta, ta nie". To ta sama zasada co przy wysyłce komunikatu do agenta. Koszt: jeden `Enter` więcej przy akcjach bezpiecznych. Przyjęto jako bezpieczniejsze założenie (Q2).
+- Wszystkie akcje mają krok potwierdzenia: Dlaczego: jeden wzorzec jest łatwiejszy do nauczenia niż wybór „ta pyta, ta nie". To ta sama zasada co przy wysyłce komunikatu do agenta. Koszt: jeden `Enter` więcej przy akcjach bezpiecznych. Potwierdzone przez operatora (Q2, odpowiedź 1).
 - Formularz wielokrokowy jest kontrolką wspólną, a nie kodem panelu akcji: Dlaczego: ta sama potrzeba jest przy pytaniach agenta i nowym tasku. Kontrolka opisana listą kroków nie wie, czym jest akcja.
 - Wyjątek dla akcji lokalnych klienta (przesuwanie w kolejce, otwarcie linku) zostaje: Dlaczego: serwer nie zna kolejki widzianej przez klienta ani przeglądarki operatora. Przesuwanie nie jest w panelu.
 
@@ -152,8 +152,7 @@ Drugi problem to forma. Akcje używają osobnych okien (`Overlay::Menu`, `Transi
 
 ### Resolve Before Planning
 
-- Q1. [Affects R12] Czy panel akcji ma zastąpić formularz dodawania treści w układzie (zalecane), czy zostać oknem nad ekranem? Przyjęte założenie na czas pracy: zastępuje formularz, bo operator zaproponował takie miejsce.
-- Q2. [Affects R10] Czy każda akcja wymaga potwierdzenia (zalecane), czy tylko akcje oznaczone przez serwer jako ryzykowne? Przyjęte założenie: każda wymaga.
+Brak. Q1 i Q2 rozstrzygnięte przez operatora: panel akcji w miejscu formularza dodawania treści (R12), potwierdzenie dla wszystkich akcji (R10).
 
 ### Deferred to Planning
 
