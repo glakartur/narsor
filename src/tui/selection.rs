@@ -19,6 +19,10 @@
 //!   ? ◆  Add docs
 //! ```
 //!
+//! The history and the choosers also fill the selected item with a low
+//! contrast background; the step axis of *Przebieg* does not
+//! ([`render_bracketed_list_plain`]): the bracket alone marks the step.
+//!
 //! Bracketed selection adds two rule rows, so moving it shifts neighbours;
 //! bar-only selection adds no rows. Without a bracketed selection there are
 //! no rules.
@@ -44,11 +48,16 @@ pub const PREFIX_WIDTH: u16 = 2;
 #[derive(Clone, Copy)]
 enum SelectionDecoration {
     Bracketed,
+    BracketedPlain,
     Barred,
 }
 
 impl SelectionDecoration {
     const fn has_rules(self) -> bool {
+        matches!(self, Self::Bracketed | Self::BracketedPlain)
+    }
+
+    const fn fills_row(self) -> bool {
         matches!(self, Self::Bracketed)
     }
 }
@@ -118,6 +127,33 @@ pub fn render_bracketed_list(
         list,
         top,
         SelectionDecoration::Bracketed,
+    );
+}
+
+/// Draws `items` like [`render_bracketed_list`], with the same bar and rules
+/// around `selected`, but without the background fill of the selected item.
+/// The step axis of *Przebieg* uses it: the bracket alone marks the step.
+pub fn render_bracketed_list_plain(
+    frame: &mut Frame,
+    area: Rect,
+    styles: &Styles,
+    items: &[Vec<Line<'_>>],
+    selected: Option<usize>,
+    focused: bool,
+    top: &mut usize,
+) {
+    let list = List {
+        items,
+        selected,
+        focused,
+    };
+    render_list(
+        frame,
+        area,
+        styles,
+        list,
+        top,
+        SelectionDecoration::BracketedPlain,
     );
 }
 
@@ -298,7 +334,7 @@ fn draw_line(
             Rect::new(area.x + prefix_width, y, content_width, 1),
         );
     }
-    if selected && decoration.has_rules() {
+    if selected && decoration.fills_row() {
         // A low contrast fill makes the selected row easier to track while
         // leaving each label's semantic foreground colour intact.
         let background = styles.selection_fill();

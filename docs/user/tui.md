@@ -113,14 +113,17 @@ terminal cuts the rows in this order: the base branch, the changed lines, the
 branch, the repository; the workspace name and the pull request stay. Once a
 harness reported any usage, a last row shows it: `razem $1.25 · agenci $1.20
 ↑120k ↓8k (subagenci ↑40k ↓3k ×2) · dyrygent $0.05 ↑9k ↓1k`, where `↑` is the
-tokens in and `↓` the tokens out; a part nobody reported reads `—`. and five tabs: *Przebieg* (the steps and the selected one; once a harness reported usage,
-each step's row also shows its cost (and, when the conductor decided in it, its own
-cost as `dyr. $…`) and its tokens `↑in ↓out`, with the
-subagents' count and tokens after them (`3× ↑40k ↓3k`, or `3× ↕45k` when the
-harness gave only their sum), in columns aligned across the steps; a second row
-under each step gives its start time and duration, then its model, effort and
-harness. The step list may take up to 70% of the tab, and a step that reported
-nothing leaves those fields empty),
+tokens in and `↓` the tokens out; a part nobody reported reads `—`. and five tabs: *Przebieg* (the steps and the selected one; each step's first row is its glyph
+(`✓` done, `✗` failed or interrupted, `●` running, `?` waiting for a decision),
+its name, when it started and how long it ran; the axis never spells the status
+out. Once a harness reported usage, the row also shows the step's cost (and, when
+the conductor decided in it, its own cost as `dyr. $…`) and its tokens `↑in ↓out`,
+with the subagents' count and tokens after them (`3× ↑40k ↓3k`, or `3× ↕45k` when
+the harness gave only their sum), in columns aligned across the steps; a second
+row, only for a step that has them, gives its model, effort and harness. The
+selected step has a bracket, no fill. On a narrow axis the name is cut first, then
+the duration goes, then the start time. The step list may take up to 70% of the
+tab, and a step that reported nothing leaves those fields empty),
 *Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
 chat and decisions; its status line names the harness the conductor runs on)
 and *Info* (the sealed inputs, the observations with their age, the runner and
