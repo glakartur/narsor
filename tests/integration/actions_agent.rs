@@ -275,6 +275,7 @@ fn agent_action(prompt: &str) -> AgentActionConfig {
         harness_step: HarnessStepConfig {
             harness: Some("claude-code".to_string()),
             permission_grants: Vec::new(),
+            skip_output_contract: false,
             model: None,
             effort: None,
             ceiling: None,
@@ -1002,6 +1003,69 @@ async fn a_session_to_resume_reaches_the_argv() {
         panic!("the first event is the session start: {started:?}");
     };
     assert_eq!(resumed_session.as_deref(), Some("session-42"));
+}
+
+/// The prompt the fake harness received for `config`.
+async fn prompt_sent_for(config: AgentActionConfig) -> String {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"choice":"ready"}"#));
+    complete(&executor(&fake), config, &root.workspace()).await;
+    fake.args(1).last().expect("a prompt").clone()
+}
+
+#[tokio::test]
+async fn covers_ae2_a_first_prompt_carries_the_output_contract() {
+    let prompt = prompt_sent_for(agent_action("do the thing")).await;
+    assert!(prompt.contains("When you are done"), "{prompt}");
+}
+
+#[tokio::test]
+async fn covers_ae4_a_workflow_resume_session_still_carries_the_output_contract() {
+    let mut config = agent_action("carry on");
+    config
+        .harness_step
+        .parameters
+        .insert("resume_session".to_string(), json!("session-42"));
+    let prompt = prompt_sent_for(config).await;
+    assert!(prompt.contains("When you are done"), "{prompt}");
+}
+
+#[tokio::test]
+async fn covers_ae1_an_operator_resume_sends_only_the_operator_words() {
+    let mut config = agent_action("variant B");
+    config.harness_step.skip_output_contract = true;
+    config
+        .harness_step
+        .parameters
+        .insert("resume_session".to_string(), json!("session-42"));
+    let prompt = prompt_sent_for(config).await;
+    assert_eq!(prompt, "variant B");
+}
+
+#[test]
+fn covers_ae3_a_format_repair_restores_the_output_contract() {
+    let mut action = agent_action("variant B");
+    action.harness_step.skip_output_contract = true;
+    let repaired = narsor_engine::engine::actions::agent::reprompt_config(
+        ActionConfig::Agent(action),
+        "claude-code",
+        "session-42",
+        "reply with the JSON object",
+    )
+    .expect("an agent action");
+    let ActionConfig::Agent(repaired) = repaired else {
+        panic!("still an agent action");
+    };
+    assert!(!repaired.harness_step.skip_output_contract);
+}
+
+#[test]
+fn the_contract_marker_is_never_serialized() {
+    let mut action = agent_action("p");
+    action.harness_step.skip_output_contract = true;
+    let text = serde_json::to_string(&action).expect("serializes");
+    assert!(!text.contains("skip_output_contract"), "{text}");
 }
 
 // ---------------------------------------------------------------------------

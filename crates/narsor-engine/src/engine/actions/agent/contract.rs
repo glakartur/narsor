@@ -220,6 +220,8 @@ pub fn reprompt_config(
 ) -> Option<ActionConfig> {
     let (step, prompt) = action.harness_step_and_prompt_mut()?;
     continue_session(step, prompt, harness, harness_session, message);
+    // A repair of the format needs the contract, whatever the action had.
+    step.skip_output_contract = false;
     step.workspace_access = Some(WorkspaceAccess::ReadOnly);
     Some(action)
 }

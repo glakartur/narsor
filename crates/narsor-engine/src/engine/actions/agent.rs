@@ -178,12 +178,13 @@ impl AgentExecutor {
         } else {
             String::new()
         };
-        let prompt = format!(
-            "{}{}{}",
-            config.prompt,
-            repositories,
+        // A session resumed with the operator's words has the contract already.
+        let contract = if config.harness_step.skip_output_contract {
+            String::new()
+        } else {
             output_contract(&request.contract, harness.contract_note())
-        );
+        };
+        let prompt = format!("{}{}{}", config.prompt, repositories, contract);
 
         let session = match self
             .sessions

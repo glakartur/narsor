@@ -77,6 +77,7 @@ impl Engine {
                 (input.harness.as_deref(), input.session.as_deref())
             {
                 agent::continue_session(step, prompt, harness, session, &input.answer);
+                step.skip_output_contract = true;
             } else {
                 prompt.push_str("\n\nHuman answer to your question:\n");
                 prompt.push_str(&input.answer);

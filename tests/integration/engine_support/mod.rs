@@ -373,6 +373,8 @@ impl ActionExecutor for AnsweringAgentExecutor {
 pub struct QuestioningAgentExecutor {
     calls: Mutex<usize>,
     prompts: Mutex<Vec<String>>,
+    skips: Mutex<Vec<bool>>,
+    session: Option<(String, String)>,
 }
 
 /// Asks once, then reports that its recorded session is gone; the next fresh
@@ -442,7 +444,23 @@ impl QuestioningAgentExecutor {
         Self {
             calls: Mutex::new(0),
             prompts: Mutex::new(Vec::new()),
+            skips: Mutex::new(Vec::new()),
+            session: None,
         }
+    }
+
+    /// An executor whose question names a harness session to resume.
+    pub fn with_session() -> Self {
+        Self {
+            session: Some(("fake".to_string(), "session-1".to_string())),
+            ..Self::new()
+        }
+    }
+
+    /// Per call: whether the step config told the executor to leave out the
+    /// output contract.
+    pub fn skips_contract(&self) -> Vec<bool> {
+        self.skips.lock().expect("skips").clone()
     }
 
     pub fn prompts(&self) -> Vec<String> {
@@ -455,6 +473,13 @@ impl ActionExecutor for QuestioningAgentExecutor {
         &'a self,
         request: ActionRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
+        if let ActionConfig::Agent(config) = request.action {
+            self.skips
+                .lock()
+                .expect("skips")
+                .push(config.harness_step.skip_output_contract);
+        }
+        let session = self.session.clone();
         let prompt = match request.action {
             ActionConfig::Agent(config) => config.prompt.to_string(),
             _ => {
@@ -490,8 +515,8 @@ impl ActionExecutor for QuestioningAgentExecutor {
                         reason: None,
                         required_values: Vec::new(),
                         answer_tail: None,
-                        agent_harness: None,
-                        agent_session_id: None,
+                        agent_harness: session.as_ref().map(|(harness, _)| harness.clone()),
+                        agent_session_id: session.as_ref().map(|(_, id)| id.clone()),
                         prefilled_answer: None,
                         permission: None,
                     }),
