@@ -28,6 +28,7 @@ members = [
     "crates/narsor-shared",
     "crates/narsor-runner",
     "crates/narsor-server",
+    "crates/narsor-web",
 ]
 resolver = "2"
 

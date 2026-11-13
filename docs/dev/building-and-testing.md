@@ -35,6 +35,26 @@ need a live Kubernetes cluster (the smoke test also requires its documented
 not run them; run `cargo test -p narsor --test integration backend_contract --
 --include-ignored` after a change to the local backend.
 
+### The browser interface (`crates/narsor-web`)
+
+The files of the browser interface are in `crates/narsor-web/ui/` and are
+compiled into `narsor-server` (`include_dir`); `build.rs` rebuilds the crate
+when a file there changes. The application is plain ES modules with one
+vendored library (`ui/vendor/preact-htm.js`, licences in
+`crates/narsor-web/VENDOR-LICENSES.md`), so neither the build nor a release
+needs Node.
+
+The rules of the interface (state icons, panel deliveries, the new-task form,
+texts) are pure modules with tests for Node 22 or newer:
+
+```bash
+node --test crates/narsor-web/ui-tests/*.mjs
+```
+
+These tests are not part of `cargo test`. In a view, never use `innerHTML`
+or `dangerouslySetInnerHTML`, and never add inline scripts or styles: the
+content security policy refuses them.
+
 ### Test layout
 
 The integration tests of the `narsor` package are one test crate,

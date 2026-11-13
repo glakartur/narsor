@@ -213,6 +213,17 @@ impl ApiClient {
         }
     }
 
+    /// The address that opens the browser interface of this server, already
+    /// signed in: the token goes in the fragment, which a browser keeps to
+    /// itself and never sends to a server.
+    ///
+    /// The address is a credential. Hand it to the operator's own browser
+    /// only; never log it.
+    pub async fn browser_url(&self) -> Result<String, ClientError> {
+        let token = self.token.current().await?;
+        Ok(format!("{}/ui/#token={token}", self.base_url))
+    }
+
     /// The server's base URL, without a trailing slash.
     pub fn base_url(&self) -> &str {
         &self.base_url

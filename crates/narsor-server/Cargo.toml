@@ -9,6 +9,7 @@ narsor-shared = { path = "../narsor-shared" }
 narsor-api-client = { path = "../narsor-api-client" }
 narsor-protocol = { path = "../narsor-protocol" }
 narsor-controller-runtime = { path = "../narsor-controller-runtime" }
+narsor-web = { path = "../narsor-web" }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 axum = { version = "0.8", features = ["macros"] }

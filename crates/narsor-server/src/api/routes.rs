@@ -406,6 +406,9 @@ pub fn router(
             .merge(protocol_http::controller_routes(Arc::clone(&control)))
             .merge(protocol_http::runner_routes(control));
     }
+    // The browser interface: public files with no data of the installation.
+    // Its calls come back through the owner gate above like any client's.
+    router = router.merge(narsor_web::routes());
     router.with_state(state)
 }
 
