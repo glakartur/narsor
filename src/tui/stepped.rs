@@ -30,7 +30,9 @@
 //!
 //! [`SteppedForm::rebuilt`] takes a new tree, as when what is offered was
 //! read again, and keeps the level, the step and every typed value as long as
-//! the chosen entries are still in it.
+//! the chosen entries are still in it. When a chosen entry is gone, the form
+//! goes back to the first entry of the last level still there, and takes no
+//! key that chooses until the operator moves on the list or goes back.
 
 use std::collections::BTreeMap;
 
@@ -170,6 +172,11 @@ pub struct SteppedForm {
     leaf: Option<ChosenLeaf>,
     /// The fields of the leaves the operator left, by their label path.
     drafts: BTreeMap<Vec<String>, Chooser>,
+    /// A refresh took away what the operator chose, and the form fell back
+    /// to a choice they did not make. Until they move on it or go back, a
+    /// key that chooses does nothing: the keys meant for the entry that is
+    /// gone must not choose another one.
+    disarmed: bool,
 }
 
 /// The entries of a level as the choice step lists them: without fields,
@@ -193,6 +200,7 @@ impl SteppedForm {
             stage: Stage::Choice,
             leaf: None,
             drafts: BTreeMap::new(),
+            disarmed: false,
         }
     }
 
@@ -305,6 +313,13 @@ impl SteppedForm {
         }
     }
 
+    /// Whether a refresh took away what the operator chose and the choice
+    /// takes no key that chooses yet: the owner must not take its own
+    /// shortcuts on the choice either.
+    pub fn is_disarmed(&self) -> bool {
+        self.disarmed
+    }
+
     /// Whether keys are typed into a field, so the owner must not take `q`
     /// or `?` as commands.
     pub fn is_typing(&self) -> bool {
@@ -345,6 +360,7 @@ impl SteppedForm {
         if index >= self.level().entries.len() {
             return SteppedOutcome::None;
         }
+        self.disarmed = false;
         self.level_mut().chooser.select(index);
         if let Some(reason) = self.level().entries[index].item.unavailable.clone() {
             return SteppedOutcome::Blocked(reason);
@@ -353,6 +369,13 @@ impl SteppedForm {
     }
 
     fn on_choice_key(&mut self, key: KeyEvent) -> SteppedOutcome {
+        if self.disarmed {
+            match keymap::lookup(Context::Panel, &key) {
+                Some(Action::Up | Action::Down | Action::Cancel) => self.disarmed = false,
+                Some(Action::PageUp | Action::PageDown) => {}
+                _ => return SteppedOutcome::None,
+            }
+        }
         match self.level_mut().chooser.on_key(key) {
             ChooserAction::None => SteppedOutcome::None,
             ChooserAction::Blocked(reason) => SteppedOutcome::Blocked(reason),
@@ -609,6 +632,12 @@ impl SteppedForm {
             }
         } else {
             self.stage = Stage::Choice;
+        }
+        if lost.is_some() {
+            // The highlight would be where the gone entry was, on another
+            // entry: the operator starts again from the top.
+            self.level_mut().chooser.select(0);
+            self.disarmed = true;
         }
         (self, lost)
     }
@@ -970,6 +999,66 @@ mod tests {
         assert_eq!(lost.as_deref(), Some("Wybierz krok"));
         assert_eq!(form.stage(), Stage::Choice);
         assert_eq!(form.heading(), "Akcje");
+    }
+
+    #[test]
+    fn keys_meant_for_a_lost_leaf_choose_nothing_until_the_operator_moves() {
+        // "Override" is open; the refresh takes it, and the highlight would
+        // be on "Otwórz link", done at once.
+        let mut form = form();
+        form.on_key(key(KeyCode::Char('3')));
+        form.on_key(key(KeyCode::Enter));
+        assert_eq!(form.stage(), Stage::Fields);
+
+        let mut smaller = tree();
+        smaller.remove(2);
+        let (mut form, lost) = form.rebuilt(smaller);
+        assert_eq!(lost.as_deref(), Some("Override"));
+        assert_eq!(form.chooser().selected(), 0, "back to the top");
+        assert!(form.is_disarmed());
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('3'),
+            KeyCode::Tab,
+            KeyCode::Enter,
+        ] {
+            assert_eq!(form.on_key(key(code)), SteppedOutcome::None, "{code:?}");
+        }
+        assert_eq!(form.stage(), Stage::Choice);
+        assert_eq!(form.chooser().selected(), 0);
+
+        // A move on the list: the keys choose again.
+        form.on_key(key(KeyCode::Down));
+        assert!(!form.is_disarmed());
+        assert_eq!(form.chooser().selected(), 1);
+        form.on_key(key(KeyCode::Char('3')));
+        let submission = submitted(form.on_key(key(KeyCode::Enter)));
+        assert_eq!(submission.labels, ["Otwórz link"]);
+    }
+
+    #[test]
+    fn esc_after_a_lost_submenu_gives_the_form_up_as_always() {
+        let mut form = form();
+        form.on_key(key(KeyCode::Char('2')));
+        form.on_key(key(KeyCode::Enter));
+        let mut smaller = tree();
+        smaller.remove(1);
+        let (mut form, lost) = form.rebuilt(smaller);
+        assert_eq!(lost.as_deref(), Some("Wybierz krok"));
+        assert!(form.is_disarmed());
+        assert_eq!(form.on_key(key(KeyCode::Esc)), SteppedOutcome::Cancelled);
+    }
+
+    #[test]
+    fn a_rebuild_that_loses_nothing_leaves_the_keys_as_they_are() {
+        let mut form = form();
+        form.on_key(key(KeyCode::Char('2')));
+        let (mut form, lost) = form.rebuilt(tree());
+        assert_eq!(lost, None);
+        assert!(!form.is_disarmed());
+        assert_eq!(form.chooser().selected(), 1);
+        assert_eq!(form.on_key(key(KeyCode::Enter)), SteppedOutcome::None);
+        assert_eq!(form.heading(), "Akcje › Wybierz krok");
     }
 
     #[test]

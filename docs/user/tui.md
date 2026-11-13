@@ -227,7 +227,10 @@ step (`Akcje › Wybierz krok · krok 2 z 3`):
 `Esc` goes back one step or one level and keeps what you typed; on the first
 level it closes the panel. A refresh of the list does not close the panel and
 does not clear a field. When the chosen action is no longer available, the bar
-says so and the panel goes back one level. *Otwórz link* (the last entry, when
+says so and the panel goes back one level, to its first entry. The keys you
+typed for the action that is gone do nothing there: `Enter`, the digits, `o`
+and `m` wait until you move on the list (`j` / `k`, `↓` / `↑`) or press `Esc`.
+*Otwórz link* (the last entry, when
 the task has a pull request) opens at once, without a confirmation.
 
 *Pause* waits for the work to end its step, then the task stops at a safe point

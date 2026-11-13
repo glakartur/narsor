@@ -371,11 +371,6 @@ impl ActionPanel {
         }
     }
 
-    /// The task the panel is for.
-    pub fn task_id(&self) -> &str {
-        &self.task_id
-    }
-
     /// What the server gave the panel to draw.
     pub fn content(&self) -> PanelContent {
         self.content
@@ -880,11 +875,13 @@ impl TaskApp {
     }
 
     /// A key in the action panel: on a choice, the menu's own shortcuts
-    /// first (moving in the queue, the link); otherwise the form's.
+    /// first (moving in the queue, the link); otherwise the form's. After a
+    /// refresh took away what the operator chose, the shortcuts wait like
+    /// the choice does: the keys were meant for the entry that is gone.
     fn on_actions_key(&mut self, key: KeyEvent) -> Request {
         let choosing = matches!(
             self.overlay.as_ref().and_then(Overlay::actions),
-            Some(panel) if panel.form.stage() == Stage::Choice
+            Some(panel) if panel.form.stage() == Stage::Choice && !panel.form.is_disarmed()
         );
         if choosing {
             match keymap::lookup(Context::Menu, &key) {

@@ -8374,6 +8374,99 @@ mod task_app_actions {
             assert!(!text.contains('\u{1b}'));
             assert!(text.contains("Dobrze"));
         }
+
+        /// A task with a link, whose panel offers the transitions; the same
+        /// task without them when `exits` is false.
+        fn linked(exits: bool) -> TaskSummary {
+            let task = if exits {
+                offered(None)
+            } else {
+                running("a", 1)
+            };
+            with_header_workspaces(
+                task,
+                vec![with_pr(
+                    header_workspace("code", "orders-api", "feat/x"),
+                    "https://gitlab.example/g/api/-/merge_requests/42",
+                )],
+            )
+        }
+
+        /// The exits are open, then a refresh takes the transition away.
+        fn exits_gone() -> TaskApp {
+            let mut app = loaded(linked(true));
+            open_entry(&mut app, TRANSITION);
+            assert!(panel(&app).form().heading().contains(TRANSITION));
+            app.load(listing(vec![titled(linked(false), "NAR-12")], "d"));
+            assert!(
+                note(&app).contains("nie jest już dostępna"),
+                "{}",
+                note(&app)
+            );
+            assert_eq!(panel(&app).form().heading(), "Akcje");
+            assert!(!panel_labels(&app).contains(&TRANSITION.to_string()));
+            app
+        }
+
+        #[test]
+        fn enters_meant_for_a_transition_gone_on_a_refresh_send_nothing() {
+            let mut app = exits_gone();
+            assert_eq!(
+                panel(&app).form().chooser().selected(),
+                0,
+                "the highlight starts again from the top, not where the transition was"
+            );
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(stage(&app), Some(Stage::Choice), "nothing was chosen");
+            assert!(app.overlay().and_then(Overlay::actions).is_some());
+            assert_eq!(ch(&mut app, '2'), Request::None);
+            assert_eq!(
+                panel(&app).form().chooser().selected(),
+                0,
+                "a digit picks nothing"
+            );
+        }
+
+        #[test]
+        fn menu_shortcuts_meant_for_a_field_wait_after_a_refresh_takes_the_entry() {
+            let mut app = exits_gone();
+            assert_eq!(ch(&mut app, 'o'), Request::None);
+            assert!(
+                app.overlay().and_then(Overlay::actions).is_some(),
+                "o does not replace the panel with the links"
+            );
+            assert_eq!(ch(&mut app, 'm'), Request::None);
+            assert!(app.list().moving().is_none(), "m starts no move");
+            assert!(app.overlay().and_then(Overlay::actions).is_some());
+        }
+
+        #[test]
+        fn moving_on_the_list_after_a_refresh_lets_the_operator_choose_again() {
+            let mut app = exits_gone();
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Up);
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_ne!(
+                stage(&app),
+                Some(Stage::Choice),
+                "Enter chooses again once the operator moved: {:?}",
+                panel(&app).form().heading()
+            );
+            close_all(&mut app);
+            let mut app = exits_gone();
+            ch(&mut app, 'o');
+            assert!(
+                matches!(app.overlay(), Some(Overlay::Actions(_))),
+                "still waiting"
+            );
+            press(&mut app, KeyCode::Down);
+            ch(&mut app, 'o');
+            assert!(
+                matches!(app.overlay(), Some(Overlay::Links(_))),
+                "o is the link again after a move"
+            );
+        }
     }
 
     // -- links -----------------------------------------------------------------
