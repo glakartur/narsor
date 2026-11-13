@@ -66,9 +66,13 @@ pub use narsor_protocol::controller::{
     UsageStatus, MAX_USAGE_LIMITS, USAGE_STATE_LIFETIME,
 };
 pub use narsor_protocol::controller::{
-    CreateObserverWorkerRequest, ObserverClaimResponse, ObserverRunOutcome, ObserverRunReport,
-    ObserverRunResultResponse, ObserverSecretRef, ObserverWorkerCreated,
-    ObserverWorkerListResponse, ObserverWorkerRun, ObserverWorkerView,
+    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
+    CreateObserverWorkerRequest, ObserverClaimResponse, ObserverDetailView, ObserverDryRunRequest,
+    ObserverDryRunView, ObserverEffectRequest, ObserverLastRunView, ObserverListResponse,
+    ObserverPlannedEffectView, ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse,
+    ObserverRunView, ObserverScriptView, ObserverSecretRef, ObserverView,
+    ObserverWatchListResponse, ObserverWatchView, ObserverWorkerCreated,
+    ObserverWorkerListResponse, ObserverWorkerRun, ObserverWorkerView, SetObserverScriptRequest,
 };
 pub use narsor_protocol::controller::{
     TaskDefaultHarness, WORKSTATION_RISK, WORKSTATION_RISK_NOT_ACCEPTED,

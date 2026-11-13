@@ -216,7 +216,7 @@ pub enum TaskCommand {
         /// Workflow to run (its id in the control plane's catalogue).
         #[arg(
             value_name = "WORKFLOW",
-            required_unless_present = "file",
+            required_unless_present_any = ["file", "effect_key"],
             conflicts_with = "file"
         )]
         workflow: Option<String>,
@@ -265,6 +265,33 @@ pub enum TaskCommand {
         /// safe and returns the same task.
         #[arg(long = "task-id", value_name = "ID")]
         task_id: Option<String>,
+        /// In an observer's script only (`NARSOR_OBSERVER_RUN` set): the
+        /// effect key, one task per key and observer, ever. The observer's
+        /// record decides the workflow, repositories, backend and profile;
+        /// WORKFLOW and the other options are refused.
+        #[arg(long = "effect-key", value_name = "KEY")]
+        effect_key: Option<String>,
+        /// With --effect-key: the effect data, a JSON object of the fields
+        /// the observer maps to workflow inputs.
+        #[arg(long, value_name = "JSON", requires = "effect_key")]
+        data: Option<String>,
+    },
+    /// In an observer's script only (`NARSOR_OBSERVER_RUN` set): delivers
+    /// an event to a task on the observer's watch list. It goes to the
+    /// task's history, and to its waiting `wait` step when it matches.
+    Event {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+        /// The event type (`approved`, say).
+        #[arg(long = "type", value_name = "TYPE")]
+        event_type: String,
+        /// The effect key: one event per key and task, ever.
+        #[arg(long = "key", value_name = "KEY")]
+        effect_key: String,
+        /// The event's data, as JSON.
+        #[arg(long, value_name = "JSON")]
+        data: Option<String>,
     },
     /// Lists your tasks with backend, runner state and queue state, the
     /// attention mark (`?` asks, `!` is wrong) and the title.
@@ -932,9 +959,20 @@ pub fn create_request(command: &TaskCommand) -> Result<Option<(CreateTaskRequest
 pub async fn task(
     command: TaskCommand,
     target: &ServerTarget,
+    observer_run: Option<&str>,
     state: &Path,
     flags: &Flags,
 ) -> Result<()> {
+    // An observer's script: the effect routes of its run, nothing else.
+    if let Some(call) = super::observer_effect::effect_call(&command, observer_run)? {
+        let run_id = observer_run.unwrap_or_default();
+        let client = super::observer_effect::effect_client(target)?;
+        print!(
+            "{}",
+            super::observer_effect::perform(&client, run_id, &call).await?
+        );
+        return Ok(());
+    }
     // Parse everything local before connecting: a usage error never needs
     // the control plane.
     let create = create_request(&command)?;
@@ -967,6 +1005,11 @@ pub async fn task(
     let client = client(target, state, flags).await?;
 
     match command {
+        // Answered by `effect_call` above, a run or a usage error.
+        TaskCommand::Event { .. } => Err(CliError::usage(format!(
+            "narsor-cli task event is for the script of an observer run only: {} is not set",
+            super::observer_effect::OBSERVER_RUN_ENV
+        ))),
         TaskCommand::Create {
             file: Some(file),
             inputs,
@@ -1728,7 +1771,7 @@ fn parse_pairs(flag: &str, pairs: &[String]) -> Result<Map<String, Value>> {
 
 /// What `--repository`, `--branch` and `--commit` chose, by workspace name;
 /// every value is text.
-fn parse_workspaces(
+pub(super) fn parse_workspaces(
     repositories: &[String],
     branches: &[String],
     commits: &[String],
@@ -1757,7 +1800,7 @@ fn parse_workspaces(
 }
 
 /// `name=value` of `--{flag}`, the name trimmed; a usage error otherwise.
-fn split_pair<'a>(flag: &str, pair: &'a str) -> Result<(&'a str, &'a str)> {
+pub(super) fn split_pair<'a>(flag: &str, pair: &'a str) -> Result<(&'a str, &'a str)> {
     pair.split_once('=')
         .map(|(name, raw)| (name.trim(), raw))
         .filter(|(name, _)| !name.is_empty())

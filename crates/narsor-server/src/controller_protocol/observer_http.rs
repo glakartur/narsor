@@ -33,6 +33,28 @@
 //! | `POST /control/v1/observer-workers` | [`CreateObserverWorkerRequest`] | `201` [`ObserverWorkerCreated`] |
 //! | `POST /control/v1/observer-workers/{worker_id}/revoke` | none | [`ObserverWorkerView`] |
 //!
+//! The owner's routes for the observers themselves (U7, R21), behind the
+//! owner gate as well; `{observer}` is a name or an id, and another owner's
+//! observer is a bare `404`:
+//!
+//! | route | body | answer |
+//! | --- | --- | --- |
+//! | `GET /control/v1/observers` | none | [`ObserverListResponse`] |
+//! | `POST /control/v1/observers` | [`CreateObserverRequest`] | `201` [`ObserverView`] |
+//! | `GET /control/v1/observers/{observer}` | none | [`ObserverDetailView`] |
+//! | `DELETE /control/v1/observers/{observer}` | none | [`ObserverView`] |
+//! | `POST /control/v1/observers/{observer}/scripts` | [`SetObserverScriptRequest`] | `201` [`ObserverScriptView`] |
+//! | `POST /control/v1/observers/{observer}/dry-run` | [`ObserverDryRunRequest`] | `202` [`ObserverDryRunView`] |
+//! | `POST /control/v1/observers/{observer}/approve` | [`ApproveObserverRequest`] | [`ObserverView`] |
+//! | `POST /control/v1/observers/{observer}/pause` | none | [`ObserverView`] |
+//! | `POST /control/v1/observers/{observer}/resume` | none | [`ObserverView`] |
+//! | `GET /control/v1/observers/{observer}/watches` | none | [`ObserverWatchListResponse`] |
+//! | `POST /control/v1/observers/{observer}/watches` | [`AddObserverWatchRequest`] | `201` new, `200` existing [`ObserverWatchView`] |
+//! | `DELETE /control/v1/observers/{observer}/watches/{entry_id}` | none | [`ObserverWatchView`] |
+//!
+//! Like the worker credential routes, they need the owner gate's
+//! [`OwnerRef`] and [`Operator`]: anyone else gets a bare `403`.
+//!
 //! Each credential opens its own routes only: a run token is refused on the
 //! worker routes, a worker credential on the effect routes and the owner's.
 
@@ -42,7 +64,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use serde::de::DeserializeOwned;
 
@@ -53,11 +75,15 @@ use narsor_engine::controller_protocol::service::{
     ProtocolService, MAX_EFFECT_DATA_BYTES, MAX_STORED_LOG_BYTES,
 };
 use narsor_engine::controller_protocol::wire::{
+    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
     CreateObserverWorkerRequest, ObserverClaimResponse, ObserverCreateTaskRequest,
-    ObserverEffectOutcome, ObserverEffectResponse, ObserverEventRequest, ObserverRunReport,
-    ObserverRunResultResponse, ObserverWorkerCreated, ObserverWorkerListResponse,
-    ObserverWorkerView,
+    ObserverDetailView, ObserverDryRunRequest, ObserverDryRunView, ObserverEffectOutcome,
+    ObserverEffectResponse, ObserverEventRequest, ObserverListResponse, ObserverRunReport,
+    ObserverRunResultResponse, ObserverScriptView, ObserverView, ObserverWatchListResponse,
+    ObserverWatchView, ObserverWorkerCreated, ObserverWorkerListResponse, ObserverWorkerView,
+    SetObserverScriptRequest,
 };
+use narsor_engine::observers::MAX_SCRIPT_BYTES;
 use narsor_engine::observers::{RunId, MAX_SCRIPT_OUTPUT_BYTES};
 use narsor_engine::orchestration::OwnerRef;
 
@@ -71,6 +97,10 @@ const MAX_EFFECT_BODY: usize = MAX_EFFECT_DATA_BYTES + 16 * 1024;
 /// stored stderr, each of which JSON escaping may double, and room for the
 /// outcome.
 const MAX_RESULT_BODY: usize = 2 * (MAX_SCRIPT_OUTPUT_BYTES + MAX_STORED_LOG_BYTES) + 16 * 1024;
+
+/// Largest owner request body: a script, which JSON escaping may double,
+/// and room for the rest.
+const MAX_OWNER_BODY: usize = 2 * MAX_SCRIPT_BYTES + 64 * 1024;
 
 /// The routes outside the owner gate: the effect routes behind the observer
 /// run gate, the worker routes behind the observer worker gate.
@@ -112,6 +142,37 @@ where
             "/control/v1/observer-workers/{worker_id}/revoke",
             post(post_revoke_worker),
         )
+        .route(
+            "/control/v1/observers",
+            get(list_observers).post(post_observer),
+        )
+        .route(
+            "/control/v1/observers/{observer}",
+            get(get_observer).delete(delete_observer),
+        )
+        .route(
+            "/control/v1/observers/{observer}/scripts",
+            post(post_script),
+        )
+        .route(
+            "/control/v1/observers/{observer}/dry-run",
+            post(post_dry_run),
+        )
+        .route(
+            "/control/v1/observers/{observer}/approve",
+            post(post_approve),
+        )
+        .route("/control/v1/observers/{observer}/pause", post(post_pause))
+        .route("/control/v1/observers/{observer}/resume", post(post_resume))
+        .route(
+            "/control/v1/observers/{observer}/watches",
+            get(list_watches).post(post_watch),
+        )
+        .route(
+            "/control/v1/observers/{observer}/watches/{entry_id}",
+            delete(delete_watch),
+        )
+        .layer(DefaultBodyLimit::max(MAX_OWNER_BODY))
         .with_state(service)
 }
 
@@ -285,6 +346,193 @@ async fn post_revoke_worker(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// The owner's observer routes
+// ---------------------------------------------------------------------------
+
+/// Parses an owner's request body, refusing a malformed one with a coded
+/// `400`.
+fn parse_owner_body<T: DeserializeOwned>(body: &Bytes) -> ProtocolResult<T> {
+    serde_json::from_slice(body).map_err(|error| {
+        HttpProtocolError(ProtocolError::bad_request(
+            "invalid_request",
+            format!("invalid observer request: {error}"),
+        ))
+    })
+}
+
+async fn list_observers(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+) -> ProtocolResult<Json<ObserverListResponse>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| s.observers_of(&owner)).await?,
+    ))
+}
+
+async fn post_observer(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    body: Bytes,
+) -> ProtocolResult<(StatusCode, Json<ObserverView>)> {
+    let owner = require_owner_operator(owner, operator)?;
+    let request: CreateObserverRequest = parse_owner_body(&body)?;
+    let created = blocking(&service, move |s| s.create_observer(&owner, request)).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn get_observer(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+) -> ProtocolResult<Json<ObserverDetailView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| s.observer_detail(&owner, &observer)).await?,
+    ))
+}
+
+async fn delete_observer(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+) -> ProtocolResult<Json<ObserverView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| s.delete_observer(&owner, &observer)).await?,
+    ))
+}
+
+async fn post_script(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+    body: Bytes,
+) -> ProtocolResult<(StatusCode, Json<ObserverScriptView>)> {
+    let owner = require_owner_operator(owner, operator)?;
+    let request: SetObserverScriptRequest = parse_owner_body(&body)?;
+    let saved = blocking(&service, move |s| {
+        s.add_observer_script(&owner, &observer, &request.script)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(saved)))
+}
+
+async fn post_dry_run(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+    body: Bytes,
+) -> ProtocolResult<(StatusCode, Json<ObserverDryRunView>)> {
+    let owner = require_owner_operator(owner, operator)?;
+    let request: ObserverDryRunRequest = if body.is_empty() {
+        ObserverDryRunRequest::default()
+    } else {
+        parse_owner_body(&body)?
+    };
+    let requested = blocking(&service, move |s| {
+        s.request_observer_dry_run_for(&owner, &observer, request)
+    })
+    .await?;
+    Ok((StatusCode::ACCEPTED, Json(requested)))
+}
+
+async fn post_approve(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+    body: Bytes,
+) -> ProtocolResult<Json<ObserverView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    let request: ApproveObserverRequest = parse_owner_body(&body)?;
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.approve_observer_version_for(&owner, &observer, request.version)
+        })
+        .await?,
+    ))
+}
+
+async fn post_pause(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+) -> ProtocolResult<Json<ObserverView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| s.pause_observer_for(&owner, &observer)).await?,
+    ))
+}
+
+async fn post_resume(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+) -> ProtocolResult<Json<ObserverView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| s.resume_observer_for(&owner, &observer)).await?,
+    ))
+}
+
+async fn list_watches(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+) -> ProtocolResult<Json<ObserverWatchListResponse>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| s.observer_watches(&owner, &observer)).await?,
+    ))
+}
+
+async fn post_watch(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+    body: Bytes,
+) -> ProtocolResult<(StatusCode, Json<ObserverWatchView>)> {
+    let owner = require_owner_operator(owner, operator)?;
+    let request: AddObserverWatchRequest = parse_owner_body(&body)?;
+    let (entry, created) = blocking(&service, move |s| {
+        s.add_observer_watch(&owner, &observer, request)
+    })
+    .await?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(entry)))
+}
+
+async fn delete_watch(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path((observer, entry_id)): Path<(String, String)>,
+) -> ProtocolResult<Json<ObserverWatchView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.remove_observer_watch(&owner, &observer, &entry_id)
+        })
+        .await?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -358,6 +606,33 @@ mod tests {
         ) -> Result<Option<BackendRecord>, LaunchError> {
             Ok(None)
         }
+
+        fn workflow_definition(
+            &self,
+            workflow_id: &str,
+        ) -> Result<WorkflowDefinition, LaunchError> {
+            if workflow_id == "triage" {
+                Ok(triage())
+            } else {
+                Err(LaunchError::UnknownWorkflow {
+                    workflow: workflow_id.to_string(),
+                    message: "not in the catalogue".to_string(),
+                })
+            }
+        }
+    }
+
+    /// The `triage` workflow observers create tasks of.
+    fn triage() -> WorkflowDefinition {
+        serde_json::from_value(json!({
+            "id": "triage",
+            "name": "triage",
+            "version": 1,
+            "inputs": [{"name": "ticket", "required": true}],
+            "states": {},
+            "initial_state": "start",
+        }))
+        .unwrap()
     }
 
     /// The daemon's arrangement of the two gates: owner routes behind the
@@ -421,15 +696,7 @@ mod tests {
                 allowed_prefixes: vec![PREFIX.into()],
                 ..WatchObjectPolicy::default()
             };
-            let workflow: WorkflowDefinition = serde_json::from_value(json!({
-                "id": "triage",
-                "name": "triage",
-                "version": 1,
-                "inputs": [{"name": "ticket", "required": true}],
-                "states": {},
-                "initial_state": "start",
-            }))
-            .unwrap();
+            let workflow = triage();
             let store = self.service.observers();
             let id = store
                 .create(owner(), config, Some(&workflow), self.now())
@@ -836,6 +1103,9 @@ mod tests {
             ("GET", "/control/v1/tasks"),
             ("GET", "/control/v1/observer-workers"),
             ("POST", "/control/v1/observer-workers"),
+            ("GET", "/control/v1/observers"),
+            ("POST", "/control/v1/observers"),
+            ("POST", "/control/v1/observers/mr-review/approve"),
         ] {
             let refused = fx.send(method, uri, &credential, json!({})).await;
             assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{uri}");
@@ -958,5 +1228,340 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // -- the owner's observer routes ----------------------------------------
+
+    /// The body of a "deliver events" observer named `name`.
+    fn event_observer_body(name: &str) -> Value {
+        json!({
+            "name": name,
+            "source": "gitlab",
+            "effect": {"kind": "deliver_event"},
+            "watch_list": true,
+            "allowed_object_prefixes": [PREFIX],
+        })
+    }
+
+    #[tokio::test]
+    async fn the_owner_creates_scripts_approves_and_deletes_an_observer() {
+        let fx = Fixture::new();
+
+        let created = fx
+            .send(
+                "POST",
+                "/control/v1/observers",
+                OWNER_TOKEN,
+                event_observer_body("mr-review"),
+            )
+            .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = json_body(created).await;
+        assert_eq!(created["state"], "draft");
+        assert_eq!(created["effect"], "deliver_event");
+
+        let script = fx
+            .send(
+                "POST",
+                "/control/v1/observers/mr-review/scripts",
+                OWNER_TOKEN,
+                json!({"script": "echo '{\"state\": {}}'\n"}),
+            )
+            .await;
+        assert_eq!(script.status(), StatusCode::CREATED);
+        assert_eq!(json_body(script).await["version"], 1);
+        let approved = fx
+            .send(
+                "POST",
+                "/control/v1/observers/mr-review/approve",
+                OWNER_TOKEN,
+                json!({"version": 1}),
+            )
+            .await;
+        assert_eq!(approved.status(), StatusCode::OK);
+        assert_eq!(json_body(approved).await["state"], "active");
+
+        // Covers AE6: a new version is a draft; version 1 still runs.
+        fx.send(
+            "POST",
+            "/control/v1/observers/mr-review/scripts",
+            OWNER_TOKEN,
+            json!({"script": "echo '{\"state\": {\"v\": 2}}'\n"}),
+        )
+        .await;
+        let id = created["observer_id"].as_str().unwrap();
+        let shown = fx
+            .send(
+                "GET",
+                &format!("/control/v1/observers/{id}"),
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(shown.status(), StatusCode::OK);
+        let shown = json_body(shown).await;
+        assert_eq!(shown["observer"]["approved_version"], 1);
+        assert_eq!(shown["observer"]["latest_version"], 2);
+        assert_eq!(shown["scripts"].as_array().unwrap().len(), 2);
+
+        let paused = fx
+            .send(
+                "POST",
+                "/control/v1/observers/mr-review/pause",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(json_body(paused).await["state"], "paused");
+        let resumed = fx
+            .send(
+                "POST",
+                "/control/v1/observers/mr-review/resume",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(json_body(resumed).await["state"], "active");
+
+        let listed = fx
+            .send("GET", "/control/v1/observers", OWNER_TOKEN, Value::Null)
+            .await;
+        assert_eq!(json_body(listed).await["observers"][0]["name"], "mr-review");
+
+        let deleted = fx
+            .send(
+                "DELETE",
+                "/control/v1/observers/mr-review",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let gone = fx
+            .send(
+                "GET",
+                "/control/v1/observers/mr-review",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_create_task_observer_takes_the_catalogue_version_and_refuses_an_unknown_workflow() {
+        let fx = Fixture::new();
+        let body = |workflow: &str| {
+            json!({
+                "name": "jira-new",
+                "source": "jira",
+                "effect": {"kind": "create_task", "workflow_id": workflow, "mapping": {"ticket": "key"}},
+            })
+        };
+
+        let unknown = fx
+            .send("POST", "/control/v1/observers", OWNER_TOKEN, body("nope"))
+            .await;
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(unknown).await["code"], "unknown_workflow");
+
+        let created = fx
+            .send("POST", "/control/v1/observers", OWNER_TOKEN, body("triage"))
+            .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(json_body(created).await["workflow_id"], "triage");
+        let record = fx
+            .service
+            .observers()
+            .find_by_name("jira-new")
+            .unwrap()
+            .unwrap();
+        let ObserverEffect::CreateTask(effect) = record.config.effect else {
+            panic!("a create-task observer");
+        };
+        assert_eq!(effect.workflow_version, 1);
+
+        let taken = fx
+            .send("POST", "/control/v1/observers", OWNER_TOKEN, body("triage"))
+            .await;
+        assert_eq!(taken.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_request_is_pending_until_a_worker_claims_it() {
+        let fx = Fixture::new();
+        fx.observer(
+            "mr-review",
+            ObserverEffect::DeliverEvent,
+            WatchMode::WatchList,
+        );
+
+        let requested = fx
+            .send(
+                "POST",
+                "/control/v1/observers/mr-review/dry-run",
+                OWNER_TOKEN,
+                json!({"with_secrets": true}),
+            )
+            .await;
+
+        assert_eq!(requested.status(), StatusCode::ACCEPTED);
+        let requested = json_body(requested).await;
+        assert_eq!(requested["version"], 1);
+        assert_eq!(requested["with_secrets"], true);
+        let shown = fx
+            .send(
+                "GET",
+                "/control/v1/observers/mr-review",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        let shown = json_body(shown).await;
+        assert_eq!(shown["observer"]["pending_dry_run"]["version"], 1);
+        let run = fx.service.claim_observer_run().unwrap().unwrap();
+        assert!(run.dry_run);
+    }
+
+    #[tokio::test]
+    async fn the_owner_adds_lists_and_removes_a_watch_entry() {
+        let fx = Fixture::new();
+        fx.observer(
+            "mr-review",
+            ObserverEffect::DeliverEvent,
+            WatchMode::WatchList,
+        );
+        let task = fx.task("task-1");
+        let body = |object: &str| json!({"task_id": task.to_string(), "object": object, "event_types": ["approved"]});
+        let uri = "/control/v1/observers/mr-review/watches";
+        let object = format!("{PREFIX}a/-/merge_requests/17");
+
+        let added = fx.send("POST", uri, OWNER_TOKEN, body(&object)).await;
+        assert_eq!(added.status(), StatusCode::CREATED);
+        let entry = json_body(added).await;
+        assert_eq!(entry["origin"], "operator");
+        let again = fx.send("POST", uri, OWNER_TOKEN, body(&object)).await;
+        assert_eq!(again.status(), StatusCode::OK);
+
+        let foreign = fx
+            .send("POST", uri, OWNER_TOKEN, body("https://evil.example.org/x"))
+            .await;
+        assert_eq!(foreign.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(foreign).await["code"], "invalid_watch_entry");
+        let unknown_task = fx
+            .send(
+                "POST",
+                uri,
+                OWNER_TOKEN,
+                json!({"task_id": "task-9", "object": object, "event_types": ["approved"]}),
+            )
+            .await;
+        assert_eq!(json_body(unknown_task).await["code"], "unknown_task");
+
+        let listed = fx.send("GET", uri, OWNER_TOKEN, Value::Null).await;
+        let listed = json_body(listed).await;
+        assert_eq!(listed["watches"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["watches"][0]["object"], object.as_str());
+
+        let entry_id = entry["entry_id"].as_str().unwrap();
+        let removed = fx
+            .send(
+                "DELETE",
+                &format!("{uri}/{entry_id}"),
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(removed.status(), StatusCode::OK);
+        let listed = fx.send("GET", uri, OWNER_TOKEN, Value::Null).await;
+        assert!(json_body(listed).await["watches"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A router whose gate let `owner` through, as the owner (`operator`)
+    /// or not: what the network gate hands on for a signed-in user.
+    fn router_for(fx: &Fixture, owner: &str, operator: bool) -> Router {
+        let owner = OwnerRef::new(owner);
+        owner_routes(Arc::clone(&fx.service)).layer(middleware::from_fn(
+            move |mut request: Request, next: middleware::Next| {
+                let owner = owner.clone();
+                async move {
+                    request.extensions_mut().insert(owner);
+                    if operator {
+                        request.extensions_mut().insert(Operator);
+                    }
+                    next.run(request).await
+                }
+            },
+        ))
+    }
+
+    async fn call(router: Router, method: &str, uri: &str, body: Value) -> Response {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_manages_observers() {
+        // R21: a user who is not the installation's owner is refused with
+        // a bare 403; another owner's observer is not found.
+        let fx = Fixture::new();
+        fx.observer(
+            "mr-review",
+            ObserverEffect::DeliverEvent,
+            WatchMode::WatchList,
+        );
+
+        let stranger = router_for(&fx, "someone-else", false);
+        let create = call(
+            stranger.clone(),
+            "POST",
+            "/control/v1/observers",
+            event_observer_body("mine"),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::FORBIDDEN);
+        assert!(json_body_is_empty(create).await);
+        let list = call(stranger, "GET", "/control/v1/observers", Value::Null).await;
+        assert_eq!(list.status(), StatusCode::FORBIDDEN);
+
+        let other_owner = router_for(&fx, "someone-else", true);
+        let listed = call(
+            other_owner.clone(),
+            "GET",
+            "/control/v1/observers",
+            Value::Null,
+        )
+        .await;
+        assert!(json_body(listed).await["observers"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        for (method, uri, body) in [
+            ("GET", "/control/v1/observers/mr-review", Value::Null),
+            (
+                "POST",
+                "/control/v1/observers/mr-review/approve",
+                json!({"version": 1}),
+            ),
+            ("POST", "/control/v1/observers/mr-review/pause", Value::Null),
+            ("DELETE", "/control/v1/observers/mr-review", Value::Null),
+        ] {
+            let refused = call(other_owner.clone(), method, uri, body).await;
+            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+        assert!(fx
+            .service
+            .observers()
+            .find_by_name("mr-review")
+            .unwrap()
+            .is_some());
     }
 }

@@ -34,6 +34,8 @@ pub mod control_text;
 pub mod daemon;
 pub mod init;
 pub mod observer;
+pub mod observer_effect;
+pub mod observer_text;
 pub mod observer_worker;
 mod prompt;
 pub mod remote;
@@ -325,8 +327,8 @@ pub enum Command {
         command: remote::TaskCommand,
     },
 
-    /// Observers of external sources: the worker that runs their scripts
-    /// and its credential.
+    /// Observers of external sources: create, script, dry-run, approve and
+    /// watch them; the worker that runs their scripts and its credential.
     Observer {
         /// What to do.
         #[command(subcommand)]
@@ -738,7 +740,10 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         },
         Command::Init(options) => init::run(options, config_file.as_deref()),
         Command::Purge(options) => init::purge(options, config_file.as_deref()),
-        Command::Task { command } => remote::task(command, &target, &state, &flags).await,
+        Command::Task { command } => {
+            let observer_run = std::env::var(observer_effect::OBSERVER_RUN_ENV).ok();
+            remote::task(command, &target, observer_run.as_deref(), &state, &flags).await
+        }
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
         Command::Observer { command } => observer::observer(command, &target, &state, &flags).await,
         Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,

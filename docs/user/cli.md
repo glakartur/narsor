@@ -382,6 +382,110 @@ $ narsor-cli run pipeline.yaml --input repository=acme-api   # clones /srv/git/a
 $ narsor-cli run pipeline.yaml --input repository=/srv/git/other   # raw remote
 ```
 
+### `observer`
+
+Observers poll an external source (Jira, GitHub, GitLab) on a schedule with a
+shell script, and create tasks or deliver events to waiting tasks. The control
+plane keeps the schedule; `narsor-cli observer worker` runs the scripts (see
+[installation](../operations/installation.md)). Every command below is the
+owner's: in network mode a user who is not the installation's owner gets
+`403`, and another owner's observer is not found. An observer is named by its
+name or its id.
+
+| Command | What it does |
+|---|---|
+| `observer create NAME --source TEXT (--workflow ID [--map INPUT=FIELD]… \| --deliver-events) [options]` | Creates a draft observer. Nothing runs until a script version is approved. |
+| `observer list` | One line per observer: state, script versions, last run, next run; then the last error and a `no worker` warning. |
+| `observer show OBSERVER` | The configuration (secret references, never values), script versions, a pending dry run and the latest runs. |
+| `observer script set OBSERVER --file FILE` | Saves the next, immutable script version. Saving never approves it. |
+| `observer dry-run OBSERVER [--version N] [--with-secrets] [--wait SECONDS]` | Runs a version once with its effects recorded, not performed, and prints what it would have done. |
+| `observer approve OBSERVER --version N` | The schedule runs this version, and only it. A draft observer becomes active; a paused one stays paused. |
+| `observer pause OBSERVER`, `observer resume OBSERVER` | Stops the schedule; puts a paused observer, or one in `needs_attention` or `error`, back on it. |
+| `observer delete OBSERVER` | Deletes the observer with its scripts, runs, effect keys and watch entries. The tasks it created stay. |
+| `observer watch add OBSERVER --task TASK_ID --object URL --events TYPE[,TYPE…]` | Watches a PR/MR for one of your tasks. The object must start with one of the observer's `--allow-prefix` values. |
+| `observer watch list OBSERVER`, `observer watch remove OBSERVER ENTRY` | Lists the watch entries; removes one by its id or the start of it that `list` shows. |
+| `observer worker-token create\|list\|revoke` | The credential of the worker (see [installation](../operations/installation.md)). |
+
+Options of `observer create`:
+
+| Option | Meaning |
+|---|---|
+| `--workflow ID [--workflow-version N]` | Create a task of this catalogue workflow per effect key. The version is the catalogue's when omitted. |
+| `--map INPUT=FIELD` | A workflow input taken from a field of the effect data (repeatable). Only mapped fields reach the task. |
+| `--repository WS=ID`, `--branch WS=BRANCH`, `--backend ID`, `--profile NAME` | What every task of the observer runs on, as in `task create`. The script cannot change it. |
+| `--deliver-events` | Deliver events to the tasks on the watch list instead of creating tasks. Implies `--watch-list`. |
+| `--watch-list`, `--allow-prefix PREFIX`, `--max-object-len N` | Look only at the objects of the watch entries; which objects an entry may name. A URL prefix must end with the `/` after its host. |
+| `--interval SECONDS` | Time between runs (at least 60). |
+| `--condition JSON` | Parameters handed to the script as they are (a JSON object). |
+| `--secret NAME=ENV` | A file of the worker's secrets directory handed to the script as variable `ENV` (repeatable). |
+| `--task-limit N` | Most tasks one run may create. Past it the observer goes to `needs_attention`. |
+| `--import-backlog` | The first run imports what already matches the condition instead of only remembering where to start. |
+
+A typical start, all through the CLI:
+
+```console
+$ narsor-cli observer create jira-new --source jira --workflow triage --map ticket=key \
+      --secret jira-token=JIRA_TOKEN --condition '{"project": "ABC"}'
+$ narsor-cli observer script set jira-new --file jira-new-issues.sh
+Saved version 1 of 'jira-new' (sha256:…). It is not approved: try it with …
+$ narsor-cli observer dry-run jira-new
+Asked for a dry run of version 1 of 'jira-new'; waiting for a worker to run it.
+Dry run of version 1 (run obs-….1): succeeded
+Nothing was created. It would have:
+  created task obs-…-… (key ABC-12) {"key":"ABC-12"}
+$ narsor-cli observer approve jira-new --version 1
+$ narsor-cli observer list
+NAME                     STATE            SCRIPT           LAST RUN               NEXT RUN
+jira-new                 active           v1               succeeded 2m ago       in 3m
+```
+
+`observer dry-run` waits `--wait` seconds (60 by default) for a worker. When
+none claims the run in that time it ends with `No worker: …` and exit code
+`1`; the dry run stays asked for, and `observer show` gives its result once a
+worker runs it. A version that is not the approved one gets no secret values
+unless `--with-secrets` is given: a dry run blocks only the script's effects in
+Narsor, not what the script itself sends to the source. A dry run whose script
+fails prints its error and stderr and exits `1`.
+
+After `observer script set` on an active observer, `observer show` gives
+`Script: approved version 1; draft version 2 (not approved)` and `observer
+list` gives `v1 (draft v2)`: the schedule keeps running version 1 until
+`observer approve --version 2`.
+
+#### Commands for an observer's script
+
+The worker runs a script with `NARSOR_OBSERVER_RUN` (the run's id),
+`NARSOR_SERVER` and `NARSOR_TOKEN` (a token of that run only) set. Two task
+commands then go to the effect routes of the run:
+
+```sh
+narsor-cli task create --effect-key "$KEY" --data "$JSON"
+narsor-cli task event TASK_ID --type approved --key "MR!17:approved:$EPISODE" [--data JSON]
+```
+
+- `task create --effect-key KEY --data JSON` creates one task per key and
+  observer, ever. The observer's record decides the workflow, repositories,
+  backend and profile: in a script, `WORKFLOW`, `--input`, `--backend`,
+  `--repository` and the other options of `task create` are a usage error.
+  The data is a JSON object of the fields the observer maps to workflow
+  inputs; a field it does not map is refused.
+- `task event TASK_ID --type TYPE --key KEY [--data JSON]` delivers an event to
+  a task on the observer's watch list. It goes to the task's history, and to
+  its waiting `wait` step when it matches.
+
+Without `NARSOR_OBSERVER_RUN`, `--effect-key` and `task event` are usage errors
+(exit code `2`). In a script:
+
+| Answer | Prints | Exit code |
+|---|---|---|
+| created, delivered, recorded | the server's line | `0` |
+| the key was used before | `skipped: duplicate (effect key KEY)` | `0` |
+| a dry run | `dry run: would create task …` or `dry run: would deliver …` | `0` |
+| the run's task limit is reached, the data is refused, the token is not valid | the reason, on stderr | `1` |
+
+Text that came from a script or a source (keys, event data, stderr) is printed
+without control characters.
+
 ## Exit codes
 
 The exit codes are a contract for CI:

@@ -1,5 +1,6 @@
 //! The control plane's side of observers: what the owner decides about an
-//! observer (approval, dry runs, pause and resume), the schedule that
+//! observer (approval, dry runs, pause and resume; the rest of the owner's
+//! commands, by name and owner, in [`owner`]), the schedule that
 //! hands runs to the worker ([`schedule`]) and the effects a run's script
 //! has through its token ([`effects`]), and the credential of the worker
 //! that claims runs ([`workers`]).
@@ -25,12 +26,14 @@
 mod effects;
 #[cfg(test)]
 mod effects_tests;
+mod owner;
 mod schedule;
 #[cfg(test)]
 mod tests;
 mod workers;
 
 pub use effects::{MAX_EFFECT_DATA_BYTES, MAX_EVENT_DATA_BYTES};
+pub use owner::SHOWN_RUNS;
 pub use schedule::{
     retry_delay_secs, ClaimedObserverRun, ObserverPass, RunOutcome, RunReport,
     MAX_CONSECUTIVE_FAILURES, MAX_RETRY_DELAY_SECS, MAX_STORED_LOG_BYTES, RUN_DEADLINE_MARGIN_SECS,
