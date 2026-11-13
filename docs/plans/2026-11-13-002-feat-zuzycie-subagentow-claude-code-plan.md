@@ -65,7 +65,7 @@ Wniosek: dane z harnessu wystarczą do liczby subagentów i do jednej liczby tok
 - A4. Subagent zagnieżdżony ma własny `tool_use_result` (z `parent_tool_use_id` subagenta-rodzica na linii). Na podstawie F-b `totalTokens` rodzica nie zawiera tokenów dziecka (dziecko wraca do rodzica tylko jako tekst wyniku). Dlatego każdy subagent jest liczony osobno, a suma nie dubluje (R3).
 - A5. `stream-json` po `--resume` nie powtarza starych linii `tool_use_result`. Licznik w parserze jest per proces, tak jak `subagent_stats`, więc AE5 jest spełnione bez nowych reguł w `apply_usage`.
 - A6. Liczba subagentów w nagłówku i w Przebiegu (R11, dosłownie): `subagent_count`, gdy jest podane i większe od 0, w innym wypadku `subagent_stats.spawned`, gdy większe od 0. Ta sama funkcja daje liczbę w obu widokach, więc suma w nagłówku jest równa sumie wierszy (kryterium sukcesu).
-- A7. Opis grupy `✨` w komentarzu `task_usage_text::line` („ich liczby zawierają subagentów”) zostaje bez zmian, dopóki U1 nie sprawdzi Z3. Zmiana liczb `✨` jest poza zakresem (origin, Scope Boundaries). Pytanie P2.
+- A7. Decyzja Q2 (opcja 2): gdy U1 pokaże, że `usage` z linii `result` nie zawiera tokenów subagentów, tokeny subagentów (suma `totalTokens`/`subagent_tokens`) wchodzą do liczb `✨` (`↑`/`↓` nie da się z nich zrobić, więc dodajemy je do łącznej liczby tokenów `✨` w sposób ustalony po U1). Opis grupy `✨` zostaje „liczby zawierają subagentów” tylko wtedy, gdy U1 potwierdzi, że liczby je już zawierają; wtedy liczb nie zmieniamy. To zmiana zakresu względem origin (Scope Boundaries): wymaga U1 i ponownej recenzji.
 
 ---
 
@@ -93,7 +93,7 @@ Wniosek: dane z harnessu wystarczą do liczby subagentów i do jednej liczby tok
 - Widok zużycia subagentów podczas pracy kroku (przed linią `result`). Dziś `subagent_stats` przychodzi tylko z `result`, więc `👥` pojawia się po końcu uruchomienia — tak samo jak koszt i tokeny `✨`.
 
 - Dodanie pola kosztu subagentów do protokołu, gdy jakiś harness zacznie go podawać (A2).
-- Ewentualna korekta `✨` o tokeny subagentów, jeśli U1 pokaże, że `usage` z `result` ich nie zawiera i użytkownik tak zdecyduje (P2).
+- Korekta `✨` o tokeny subagentów jest w zakresie, ale warunkowo: tylko gdy U1 pokaże, że `usage` z `result` ich nie zawiera (decyzja Q2, A7). Sposób dodania ustala się po U1, bez podwójnego liczenia z `👥`.
 
 ---
 
@@ -258,7 +258,7 @@ Wniosek: dane z harnessu wystarczą do liczby subagentów i do jednej liczby tok
   - (zalecane) `↕` z sumą `totalTokens` / `subagent_tokens` (jak GitHub Copilot, R8). Legenda z opisem tej liczby — osobne zadanie (Deferred to Follow-Up Work).
   - `↑`/`↓` z `usage` ostatniej wiadomości (dokładne pola, ale bardzo małe i mylące liczby).
   - Tylko liczba subagentów, bez tokenów, dopóki harness nie poda pełnego zużycia.
-- P2 (sekcja „Assumptions” A7, Z3). Jeśli U1 pokaże, że `usage` z linii `result` nie zawiera tokenów subagentów, co zrobić z opisem grupy `✨` („liczby zawierają subagentów”)?
+- P2 — ROZSTRZYGNIĘTE opcją 2 (wątek Q2, A7). (sekcja „Assumptions” A7, Z3). Jeśli U1 pokaże, że `usage` z linii `result` nie zawiera tokenów subagentów, co zrobić z opisem grupy `✨` („liczby zawierają subagentów”)?
   - (zalecane) Zmienić tylko opis: `✨` to główny agent, subagenci są w `👥`. Liczby `✨` bez zmian (zgodnie z Scope Boundaries).
   - Dodać tokeny subagentów do `✨` (zmiana liczenia `✨`, poza obecnym zakresem).
 - P3 (sekcja „Assumptions” A2, Z2, AE2). Claude Code nie podaje kosztu per subagent w `tool_use_result`. Czy to akceptowalne, że AE2 nie jest realizowane dla Claude Code?
