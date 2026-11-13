@@ -49,6 +49,7 @@ mod engine_unified_schema;
 mod environment;
 mod kubernetes_adapter;
 mod launch_spec_contract;
+mod observers_store;
 mod orchestration;
 mod persistence;
 mod profile_step_flow;

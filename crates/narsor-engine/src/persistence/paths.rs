@@ -22,6 +22,8 @@
 //! {state}/launch-specs/{task}.json    -- immutable launch input (task storage)
 //! {state}/materials/…                 -- bounded task materials (U9): manifests
 //!                                        and blobs, outside any workspace
+//! {state}/observers/{id}/…            -- observers of external sources: record,
+//!                                        script versions, runs, effects, watches
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
 //! ```
@@ -238,6 +240,36 @@ pub const MATERIAL_RECORD_FILE: &str = "material.json";
 
 /// Directory of one material's content-addressed blobs.
 pub const MATERIAL_BLOBS_DIR: &str = "blobs";
+
+/// Observers of external sources, directly under the state root: one
+/// sub-directory per observer (see `crate::observers::store`).
+///
+/// A sibling of [`ORCHESTRATION_DIR`], not inside it: nothing that walks task
+/// records should ever come across an observer's scripts or effect files.
+pub const OBSERVERS_DIR: &str = "observers";
+
+/// Advisory lock serializing observer creation and deletion (unique names),
+/// inside [`OBSERVERS_DIR`]. Observer ids never contain `.`, so it can never
+/// collide with an observer directory.
+pub const OBSERVERS_CREATE_LOCK_FILE: &str = "create.lock";
+
+/// The record of one observer.
+pub const OBSERVER_RECORD_FILE: &str = "observer.json";
+
+/// Advisory lock serializing every mutation of one observer.
+pub const OBSERVER_LOCK_FILE: &str = "observer.lock";
+
+/// Directory of an observer's immutable script versions.
+pub const OBSERVER_SCRIPTS_DIR: &str = "scripts";
+
+/// Directory of an observer's run records.
+pub const OBSERVER_RUNS_DIR: &str = "runs";
+
+/// Directory of an observer's effect files, one per effect key.
+pub const OBSERVER_EFFECTS_DIR: &str = "effects";
+
+/// Directory of an observer's watch entries.
+pub const OBSERVER_WATCHES_DIR: &str = "watches";
 
 /// Suffix of a not-yet-renamed atomic write. Never a file to read from.
 pub const TEMP_SUFFIX: &str = ".tmp";
@@ -495,6 +527,75 @@ impl StatePaths {
         self.material_dir(task_id, material_id)
             .join(MATERIAL_BLOBS_DIR)
             .join(sha256)
+    }
+
+    /// `{root}/observers`
+    pub fn observers_dir(&self) -> PathBuf {
+        self.root.join(OBSERVERS_DIR)
+    }
+
+    /// `{root}/observers/create.lock`
+    pub fn observers_create_lock_file(&self) -> PathBuf {
+        self.observers_dir().join(OBSERVERS_CREATE_LOCK_FILE)
+    }
+
+    /// `{root}/observers/{observer_id}`
+    pub fn observer_dir(&self, observer_id: &str) -> PathBuf {
+        self.observers_dir().join(observer_id)
+    }
+
+    /// `{root}/observers/{observer_id}/observer.json`
+    pub fn observer_record_file(&self, observer_id: &str) -> PathBuf {
+        self.observer_dir(observer_id).join(OBSERVER_RECORD_FILE)
+    }
+
+    /// `{root}/observers/{observer_id}/observer.lock`
+    pub fn observer_lock_file(&self, observer_id: &str) -> PathBuf {
+        self.observer_dir(observer_id).join(OBSERVER_LOCK_FILE)
+    }
+
+    /// `{root}/observers/{observer_id}/scripts`
+    pub fn observer_scripts_dir(&self, observer_id: &str) -> PathBuf {
+        self.observer_dir(observer_id).join(OBSERVER_SCRIPTS_DIR)
+    }
+
+    /// `{root}/observers/{observer_id}/scripts/{version}.sh`
+    pub fn observer_script_file(&self, observer_id: &str, version: u32) -> PathBuf {
+        self.observer_scripts_dir(observer_id)
+            .join(format!("{version}.sh"))
+    }
+
+    /// `{root}/observers/{observer_id}/runs`
+    pub fn observer_runs_dir(&self, observer_id: &str) -> PathBuf {
+        self.observer_dir(observer_id).join(OBSERVER_RUNS_DIR)
+    }
+
+    /// `{root}/observers/{observer_id}/runs/{sequence:08}.json`
+    pub fn observer_run_file(&self, observer_id: &str, sequence: u64) -> PathBuf {
+        self.observer_runs_dir(observer_id)
+            .join(event_file_name(sequence))
+    }
+
+    /// `{root}/observers/{observer_id}/effects`
+    pub fn observer_effects_dir(&self, observer_id: &str) -> PathBuf {
+        self.observer_dir(observer_id).join(OBSERVER_EFFECTS_DIR)
+    }
+
+    /// `{root}/observers/{observer_id}/effects/{key_digest}.json`
+    pub fn observer_effect_file(&self, observer_id: &str, key_digest: &str) -> PathBuf {
+        self.observer_effects_dir(observer_id)
+            .join(format!("{key_digest}.json"))
+    }
+
+    /// `{root}/observers/{observer_id}/watches`
+    pub fn observer_watches_dir(&self, observer_id: &str) -> PathBuf {
+        self.observer_dir(observer_id).join(OBSERVER_WATCHES_DIR)
+    }
+
+    /// `{root}/observers/{observer_id}/watches/{entry_id}.json`
+    pub fn observer_watch_file(&self, observer_id: &str, entry_id: &str) -> PathBuf {
+        self.observer_watches_dir(observer_id)
+            .join(format!("{entry_id}.json"))
     }
 
     /// `{root}/orchestration/controllers`
