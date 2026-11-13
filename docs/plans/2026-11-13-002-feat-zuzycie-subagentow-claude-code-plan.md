@@ -24,19 +24,24 @@ Dziś parser Claude Code czyta tylko `subagent_stats` z linii `result`, a tam `t
 
 Sprawdziłem lokalne zapisy sesji Claude Code (`~/.claude/projects/*/*.jsonl`): 11 wyników narzędzia `Agent` ze `status: completed` i (wg recenzji wykonalności) 238 wyników ze `status: async_launched`. Dane nie są z `stream-json`, ale obiekt `toolUseResult` w zapisie sesji to ten sam obiekt, który `stream-json` wysyła jako `tool_use_result` na linii `user` z blokiem `tool_result`. To trzeba potwierdzić nagraniem (U1).
 
+Oznaczenia: F-… to fakty z tego badania; Q1–Q4 to wątki pytań na merge request (odpowiedzi użytkownika); P… to pytania w sekcji „Pytania otwarte dla użytkownika”.
+
+- F-b. `totalTokens` w `toolUseResult` to rozmiar kontekstu na końcu pracy subagenta (plus ostatnie wyjście), nie suma zużycia.
+- F-c. `toolUseResult` nie ma kosztu subagenta.
+
 Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagenta, nie zużycie (F-b), a harness nie podaje kosztu (F-c). Nie pokazujemy takiej liczby jako tokenów. Parser Claude Code zostaje bez zmian. Znane fakty o `toolUseResult` (`totalTokens`, `usage` ostatniej wiadomości, subagent w tle `async_launched` bez tokenów) zostają dla przyszłej decyzji, gdy harness poda pełne zużycie.
 
-- F-e. Linia `result` ma `modelUsage` (per model, z `costUSD`). Nie wiem, czy `usage` z `result` zawiera subagentów. Z3 zostaje niepotwierdzone; sprawdza to U1 tylko po to, by opis grupy `✨` był zgodny z faktem (A7).
+- F-e. Linia `result` ma `modelUsage` (per model, z `costUSD`). Komentarz w `crates/narsor-engine/src/engine/timeline_file.rs` (`reading_from_element`) mówi, że `usage` Claude to zużycie całego uruchomienia, ale nikt tego nie sprawdził na nagraniu z subagentami. Z3 zostaje niepotwierdzone; sprawdza to U1 tylko po to, by opis grupy `✨` był zgodny z faktem (A7).
 
 ---
 
 ## Requirements
 
 - R1–R6 (zbieranie tokenów subagentów w parserze) **wypadają** dla Claude Code (decyzja Q1). Liczba subagentów pochodzi z `subagent_stats.spawned` linii `result`, już czytanej przez parser.
-- R7, R8. Wiersz kroku: `👥 N`, potem koszt (gdy znany), `↑`/`↓` albo `↕` (gdy harness poda tokeny). Dla Claude Code tylko `👥 N`. (U2, U3)
-- R9, R10, R11, R12. Nagłówek: blok `👥` z sumą po krokach, także bez tokenów; skracanie zostaje. (U2, U3)
+- R7, R8. Wiersz kroku: `👥 N`, potem `↑`/`↓` albo `↕` (gdy harness poda tokeny). Dla Claude Code tylko `👥 N`. Koszt subagentów w wierszu kroku jest odroczony (A2): `PositionUsage` nie ma pola kosztu subagentów. (U2)
+- R9, R10, R11, R12. Nagłówek: blok `👥` z sumą po krokach, także bez tokenów; skracanie zostaje. Koszt w bloku `👥` działa tylko przez istniejące pole `TaskUsage.subagent_cost_usd`, które `sum` dziś zawsze ustawia na `None` (A2). (U2, U3)
 - R13. Jedna stała z ikoną dla nagłówka i Przebiegu. (U2)
-- AE1, AE2 nie dotyczą Claude Code (brak tokenów i kosztu); AE1 i `↕` są pokryte testami dla Copilota i dla ręcznych danych. AE3 (liczba bez tokenów), AE4, AE5 (wznowienie: reguły `apply_usage` bez zmian) pokryte w U2/U3.
+- Odpowiedź Q1 zastępuje część origin: AE1, AE2 i kryterium sukcesu „operator widzi … ich tokeny” nie dotyczą Claude Code (brak tokenów i kosztu). Format AE1 (`👥 2 ↑80k ↓6k`) jest pokryty testem U2 na ręcznych danych. AE3 i AE4 są pokryte w U2/U3. AE5 (wznowienie) nie ma nowego testu: parser i `apply_usage` się nie zmieniają, a istniejące testy `apply_usage` pokrywają regułę prób.
 
 ---
 
@@ -47,6 +52,7 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 - A1. Claude Code: tylko liczba subagentów, bez tokenów (Q1, odpowiedź użytkownika: „przewidujemy w komunikatach, ale nie uzupełniamy, jeśli claude code ich nie zwraca”). Pola tokenów w protokole i TUI zostają dla harnessów, które je podają.
 - A2. Koszt subagentów jest pusty (F-c, Q3 opcja 1). Plan nie dodaje pola kosztu, dopóki harness go nie poda.
 - A6. Liczba subagentów w nagłówku i w Przebiegu (R11): `subagent_count`, gdy jest podane i większe od 0, w innym wypadku `subagent_stats.spawned`, gdy większe od 0. Jedna funkcja daje liczbę w obu widokach.
+- Luki w numeracji (A3–A5, KTD2, KTD3, KTD6, U4) są celowe: te pozycje wypadły po odpowiedzi Q1, a pozostałe ID zostają bez zmian.
 - A7. Decyzja Q2 opcja 2 jest **wycofana** przez odpowiedź Q1 (nie uzupełniamy tokenów subagentów). `✨` bez zmian (zgodnie z origin). Gdy U1 pokaże, że `usage` z `result` nie zawiera subagentów, zmieniamy tylko opis grupy `✨` (✨ = główny agent, subagenci w `👥`). To założenie agenta; potwierdź w wątku Q4.
 
 ---
@@ -55,8 +61,8 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 
 - KTD1. Parser Claude Code bez zmian: `subagent_stats` z `result` (`spawned`) już trafia do `RunResult`, `UsageReading` i `PositionUsage`. Pliki timeline się nie zmieniają.
 - KTD4. Ikona i liczba subagentów mają jedno miejsce w kodzie: `src/client/task_usage_text.rs` (stała ikony i funkcja liczby). `step_cells`, `subagents_block` i Przebieg (`src/tui/task_app/tabs/progress.rs`) ich używają (R13).
-- KTD5. Nagłówek dostaje sumę liczby subagentów po krokach (`spawned`). Tokeny w nagłówku działają jak dziś (z `subagents` i `subagent_stats.tokens`, gdy harness poda); nowe pole `TaskUsage` tylko na liczbę, jeśli brakuje.
-- Zasada `↕` w nagłówku przy mieszanych krokach (dawne KTD6) wypada: dziś tylko Copilot podaje `subagent_stats.tokens`, a `subagents` nie wypełnia żaden harness. Zostaje obecna logika.
+- KTD5. Nagłówek sumuje liczbę subagentów po krokach tą samą funkcją co Przebieg (U2), nie surowe `subagent_count`. Dzięki temu suma w nagłówku jest równa sumie wierszy (kryterium sukcesu). `TaskUsage` ma już `subagent_count`; dostaje nowe pole na łączne tokeny subagentów bez podziału (suma `subagent_stats.tokens`), bo dziś `sum` nie czyta `subagent_stats` i `↕` z Copilota nie trafia do nagłówka. Nazwa pola to decyzja implementacji.
+- KTD7. Blok `👥` w nagłówku: `↑`/`↓`, gdy suma `subagents` jest niepusta; w innym wypadku `↕` z nowego pola. Mieszanych kroków (jeden z podziałem, drugi tylko z `↕`) dziś nie ma, bo żaden harness nie wypełnia `subagents` (patrz Risks).
 
 ---
 
@@ -89,10 +95,15 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 **Files:**
 - Nowy: `tests/fixtures/claude-code/subagents.ndjson`
 - Zmiana: `tests/fixtures/claude-code/README.md` (wiersz scenariusza i odpowiedzi)
+- Test: `tests/integration/claude_code_classification.rs`
+
+**Context:** dziś żadna fixture Claude Code nie ma `spawned > 0` (`subagent_denial.ndjson` jest napisana ręcznie). Nagranie spełnia kryterium sukcesu origin „fixture z prawdziwego zapisu z co najmniej dwoma subagentami”.
 
 **Approach:** Nagrać `claude --print --output-format stream-json --verbose --strict-mcp-config` z promptem uruchamiającym co najmniej dwóch subagentów (jeden w tle) w pustym projekcie testowym. Zapisać w README: czy `result.subagent_stats.spawned` liczy wszystkich; czy `usage`/`modelUsage` z `result` zawierają subagentów. Zamaskować treść (bez danych klientów i ścieżek użytkownika).
 
-**Test expectation:** none — nagranie danych. Test parsera na fixture: `spawned` zgodne z liczbą subagentów (obok istniejących testów fixture).
+**Test scenarios:**
+- Happy path: fixture `subagents.ndjson` → `RunResult.subagent_stats.spawned` jest równe liczbie uruchomionych subagentów (w tym w tle), `tokens == 0`. Test obok istniejących testów fixture w `tests/integration/claude_code_classification.rs`.
+- Edge: subagent w tle — gdy `spawned` go nie liczy, test zapisuje faktyczną wartość, a ryzyko z sekcji Risks wraca do użytkownika.
 
 **Verification:** README odpowiada na oba pytania. Jeśli `usage` nie zawiera subagentów, dodać zmianę opisu grupy `✨` (A7) do U3.
 
@@ -107,11 +118,11 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 **Files:**
 - Zmiana: `src/client/task_usage_text.rs` (stała ikony, funkcja liczby subagentów kroku, `step_cells`)
 - Zmiana: `src/tui/task_app/tabs/progress.rs` (kolumny subagentów, szerokość komórki z emoji)
-- Test: `src/client/task_usage_text.rs` (moduł `tests`), `src/tui/task_app/tabs/progress.rs` (moduł `tests`), `tests/integration/tui_render.rs` (gdy test sprawdza tekst `N×`)
+- Test: `src/client/task_usage_text.rs` (moduł `tests`), `src/tui/task_app/tabs/progress.rs` (moduł `tests`), `tests/integration/tui_render.rs` (asercje `1×   ↑40k   ↓3k` i brak `×` w wąskim widoku — test Przebiegu; trzeba je zmienić)
 
 **Approach:**
 - Stała ikony (np. `SUBAGENTS_ICON = "👥"`) w `task_usage_text.rs`, publiczna dla TUI.
-- Funkcja „liczba subagentów kroku” z `PositionUsage`: `subagent_stats.spawned` > 0, w innym wypadku `subagent_count` > 0, w innym wypadku brak (A6).
+- Funkcja „liczba subagentów kroku” z `PositionUsage`: `subagent_count` > 0, w innym wypadku `subagent_stats.spawned` > 0, w innym wypadku brak (A6, R11). Uwaga: dziś `step_cells` robi odwrotnie (`subagent_stats` nadpisuje liczbę z `subagent_count`); po zmianie kolejność jest zgodna z R11.
 - `step_cells.subagent_count` = `👥 N` zamiast `N×` (Z5). Liczba jest widoczna także bez tokenów (AE3). Dziś liczba z `subagent_count` jest widoczna tylko z tokenami — po zmianie warunek to tylko „liczba > 0”.
 - `↕` z `subagent_stats.tokens`, gdy brak podziału `↑`/`↓` (bez zmiany logiki R8).
 - Przebieg: sprawdzić, że wyrównanie kolumn liczy szerokość w komórkach terminala (emoji = 2 komórki). Wzorzec: ikony kroków `⚖️`/`💻` z planu `docs/plans/2026-11-12-002-feat-tui-ikony-profile-i-script-plan.md`.
@@ -121,10 +132,10 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 **Test scenarios:**
 - Covers AE3: `subagent_stats.spawned = 3`, `tokens = 0` → komórka `👥 3`, brak `↕`, brak `↑`/`↓`.
 - Tokeny od harnessu (Copilot, ręczne dane): `spawned = 2`, `tokens = 86k` → `👥 2` i `↕86k`.
-- Podział tokenów (dziś bez producenta): `subagents` = (40k, 3k), `subagent_count = 2` → `👥 2 ↑40k ↓3k` (aktualizacja testu z `2×   ↑40k   ↓3k`).
+- Format AE1 (dziś bez producenta): `subagents` = (80k, 6k), `subagent_count = 2` → `👥 2 ↑80k ↓6k` (aktualizacja testu z `N×   ↑…   ↓…`).
 - GitHub Copilot (R8): `subagent_stats` `spawned = 2`, `tokens = 7978`, bez podziału → `👥 2 ↕8k`.
 - Edge: `subagent_count = Some(0)` i brak stats → brak komórek subagentów.
-- Edge: `subagent_count = 5` i `spawned = 2` → liczba 5 (R11, A6); `subagent_count` brak i `spawned = 2` → liczba 2.
+- Edge: `subagent_count = 5` i `spawned = 2` → liczba 5 (R11, A6); `subagent_count` brak i `spawned = 2` → liczba 2; `subagent_count = Some(0)` i `spawned = 2` → liczba 2.
 - Integration: wiersz z `👥` w wąskiej zakładce zostaje w pierwszym wierszu i kolumny są wyrównane (szerokość 2 komórek).
 
 **Verification:** W kodzie TUI nie ma już `×` dla subagentów ani innego literału `👥` poza stałą (R13).
@@ -135,17 +146,17 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 
 **Requirements:** R9, R10, R11, R12.
 
-**Dependencies:** U2.
+**Dependencies:** U2; U1 warunkowo (zmiana opisu `✨`, gdy U1 pokaże, że `usage` nie zawiera subagentów, i P2 da zgodę).
 
 **Files:**
 - Zmiana: `src/client/task_usage_text.rs` (`TaskUsage`, `sum`, `subagents_block`, `line`, komentarze)
 - Zmiana (gdy trzeba): `src/tui/task_app/detail.rs` (`usage_text` — bez zmiany logiki skracania)
-- Test: `src/client/task_usage_text.rs` (moduł `tests`), `tests/integration/tui_render.rs`
+- Test: `src/client/task_usage_text.rs` (moduł `tests`), `tests/integration/tui_render.rs` (asercje nagłówka z `◈`)
 
 **Approach:**
-- `sum` dodaje liczbę z funkcji U3 dla każdego kroku (R11) i sumę `subagent_stats.tokens` do nowego pola łącznych tokenów (KTD5).
+- `sum` dodaje liczbę z funkcji U2 dla każdego kroku (R11, KTD5) i sumę `subagent_stats.tokens` do nowego pola łącznych tokenów (KTD5).
 - `sum` nie odrzuca wyniku, który ma tylko liczbę subagentów (R10); dziś filtr na końcu `sum` wymaga tokenów lub kosztu.
-- `subagents_block`: `👥 N`, potem koszt (gdy znany), potem tokeny (gdy harness poda). Blok jest widoczny, gdy liczba > 0 albo są tokeny/koszt.
+- `subagents_block`: `👥 N`, potem koszt (gdy znany), potem tokeny wg KTD7. Blok jest widoczny, gdy liczba > 0 albo są tokeny/koszt.
 - `line`: bez zmian w kolejności grup; blok `👥` w nawiasie po `✨` albo sam `(👥 3)` (istniejąca gałąź `(true, Some)`).
 - R12: `usage_text` w `detail.rs` już najpierw usuwa blok subagentów, potem ucina `…`. Test potwierdza to z nowym blokiem.
 
@@ -153,7 +164,7 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 - Covers AE3: jeden krok `spawned = 3`, bez tokenów, `✨ $1.20 ↑120k ↓8k` → `… ✨ $1.20 ↑120k ↓8k (👥 3)`.
 - Covers AE4: kroki z `spawned` 2 i 1 oraz `tokens` 50k i 36k → `(👥 3 ↕86k)`.
 - Tokeny od harnessu: `✨ $1.20 ↑120k ↓8k (👥 2 ↕86k)`.
-- Covers AE2 (tylko gdy harness poda koszt): `(👥 2 $0.40 ↕86k)`.
+- Covers AE2 (tylko test `subagents_block` z ręcznie ustawionym `subagent_cost_usd`; żaden harness dziś go nie podaje): `(👥 2 $0.40 ↕86k)`.
 - Podział tokenów (dziś bez producenta): `subagents` = (100, 20k), `subagent_count = 2` → `(👥 2 ↑100 ↓20k)` (aktualizacja testu z `◈`).
 - GitHub Copilot: `subagent_stats` `spawned = 2`, `tokens = 7978` → `(👥 2 ↕8k)`.
 - Edge (R10): tylko subagenci, bez `✨` → `(👥 3)`; `sum` zwraca `Some`.
@@ -175,14 +186,22 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 
 - Ryzyko: `spawned` z `result` nie liczy subagentów w tle. Mitygacja: U1 to sprawdza; wtedy liczba będzie niższa i trzeba zdecydować osobno.
 - Ryzyko: opis `✨` („liczby zawierają subagentów”) jest błędny dla Claude Code. Mitygacja: U1 i A7 (zmiana opisu).
+- Ryzyko: przyszły harness poda podział `↑`/`↓` w jednych krokach i tylko `↕` w innych; wtedy nagłówek wg KTD7 pokaże tylko `↑`/`↓` i zgubi `↕`. Mitygacja: dziś żaden harness nie wypełnia `subagents`; decyzja przy dodaniu takiego harnessu.
+- Ryzyko: zmiana kolejności źródła liczby w `step_cells` (A6) zmienia wynik dla kroku z oboma polami. Mitygacja: dziś żaden harness nie podaje obu; test U2 to pokrywa.
 
 ---
 
 ## Pytania otwarte dla użytkownika
 
-- P1 — ROZSTRZYGNIĘTE (Q1): tokeny przewidziane w komunikatach, Claude Code ich nie uzupełnia; tylko liczba.
-- P2 — Q2 opcja 2 wycofana odpowiedzią Q1 (A7); potwierdzenie w wątku Q4.
-- P3 — ROZSTRZYGNIĘTE (Q3 opcja 1): bez kosztu subagentów.
+- P2 (sekcja „Assumptions” A7, Z3; nie blokuje U1–U3). Jeśli U1 pokaże, że `usage` z linii `result` nie zawiera tokenów subagentów, co zrobić z opisem grupy `✨` w komentarzu `task_usage_text::line` („liczby zawierają subagentów”)?
+  - (zalecane) Zmienić tylko opis: `✨` to główny agent, subagenci są w `👥` (liczba). Liczby `✨` bez zmian (origin, Scope Boundaries; odpowiedź Q1).
+  - Zostawić opis bez zmian (opis będzie nieprawdziwy dla Claude Code).
+
+### Rozstrzygnięte
+
+- P1 (Q1): tokeny są przewidziane w komunikatach, ale Claude Code ich nie uzupełnia; dla Claude Code tylko liczba.
+- P3 (Q3 opcja 1): bez kosztu subagentów; AE2 nie dotyczy Claude Code.
+- Q2 opcja 2 (dodanie tokenów subagentów do `✨`) jest wycofana odpowiedzią Q1.
 
 ---
 
