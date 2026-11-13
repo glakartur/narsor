@@ -53,7 +53,7 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 - A2. Koszt subagentów jest pusty (F-c, Q3 opcja 1). Plan nie dodaje pola kosztu, dopóki harness go nie poda.
 - A6. Liczba subagentów w nagłówku i w Przebiegu (R11): `subagent_count`, gdy jest podane i większe od 0, w innym wypadku `subagent_stats.spawned`, gdy większe od 0. Jedna funkcja daje liczbę w obu widokach.
 - Luki w numeracji (A3–A5, KTD2, KTD3, KTD6, U4) są celowe: te pozycje wypadły po odpowiedzi Q1, a pozostałe ID zostają bez zmian.
-- A7. Decyzja Q2 opcja 2 jest **wycofana** przez odpowiedź Q1 (nie uzupełniamy tokenów subagentów). `✨` bez zmian (zgodnie z origin). Gdy U1 pokaże, że `usage` z `result` nie zawiera subagentów, zmieniamy tylko opis grupy `✨` (✨ = główny agent, subagenci w `👥`). To założenie agenta; potwierdź w wątku Q4.
+- A7. Decyzja Q2 opcja 2 jest **wycofana** przez odpowiedź Q1 (nie uzupełniamy tokenów subagentów). `✨` bez zmian (zgodnie z origin). Opis grupy `✨` się nie zmienia (Q5, odpowiedź użytkownika: „zmianę pokazywania wycofujemy … ograniczamy się do kolekcjonowania tych danych”). Plan tylko zbiera dane i zapisuje w README fixture, czy `usage` z `result` zawiera subagentów; nic w TUI się z tego nie zmienia.
 
 ---
 
@@ -86,7 +86,7 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 
 ### U1. Sprawdzenie nagrania Claude Code z subagentami (tylko liczba)
 
-**Goal:** Potwierdzić, że `result` ma `subagent_stats.spawned` dla subagentów (w tym w tle) i czy `usage` z `result` zawiera subagentów (A7).
+**Goal:** Potwierdzić, że `result` ma `subagent_stats.spawned` dla subagentów (w tym w tle), i zapisać pełny testowy zrzut logów Claude Code z subagentami jako wzorzec na przyszłość (Q5). Zapisać też, czy `usage` z `result` zawiera subagentów (A7), bez zmiany TUI.
 
 **Requirements:** R11; A7.
 
@@ -99,13 +99,13 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 
 **Context:** dziś żadna fixture Claude Code nie ma `spawned > 0` (`subagent_denial.ndjson` jest napisana ręcznie). Nagranie spełnia kryterium sukcesu origin „fixture z prawdziwego zapisu z co najmniej dwoma subagentami”.
 
-**Approach:** Nagrać `claude --print --output-format stream-json --verbose --strict-mcp-config` z promptem uruchamiającym co najmniej dwóch subagentów (jeden w tle) w pustym projekcie testowym. Zapisać w README: czy `result.subagent_stats.spawned` liczy wszystkich; czy `usage`/`modelUsage` z `result` zawierają subagentów. Zamaskować treść (bez danych klientów i ścieżek użytkownika).
+**Approach:** Nagrać `claude --print --output-format stream-json --verbose --strict-mcp-config` z promptem uruchamiającym co najmniej dwóch subagentów (jeden w tle) w pustym projekcie testowym. Zapisać w README: czy `result.subagent_stats.spawned` liczy wszystkich; czy `usage`/`modelUsage` z `result` zawierają subagentów. Zapisać cały zrzut bez skracania linii (w tym `tool_use_result` subagentów, `async_launched`, powiadomienia o końcu zadania, `usage`, `modelUsage`, `subagent_stats`), żeby przyszłe prace mogły się na nim oprzeć. Zamaskować treść (bez danych klientów i ścieżek użytkownika). README opisuje, które pola dotyczą subagentów i które z nich są dostępne (np. `totalTokens`), ale ich nie używamy w kodzie.
 
 **Test scenarios:**
 - Happy path: fixture `subagents.ndjson` → `RunResult.subagent_stats.spawned` jest równe liczbie uruchomionych subagentów (w tym w tle), `tokens == 0`. Test obok istniejących testów fixture w `tests/integration/claude_code_classification.rs`.
 - Edge: subagent w tle — gdy `spawned` go nie liczy, test zapisuje faktyczną wartość, a ryzyko z sekcji Risks wraca do użytkownika.
 
-**Verification:** README odpowiada na oba pytania. Jeśli `usage` nie zawiera subagentów, dodać zmianę opisu grupy `✨` (A7) do U3.
+**Verification:** README odpowiada na oba pytania i opisuje pola subagentów w zrzucie. Zmiany opisu grupy `✨` nie ma.
 
 ### U2. Wspólna ikona i liczba subagentów; Przebieg
 
@@ -146,7 +146,7 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 
 **Requirements:** R9, R10, R11, R12.
 
-**Dependencies:** U2; U1 warunkowo (zmiana opisu `✨`, gdy U1 pokaże, że `usage` nie zawiera subagentów, i P2 da zgodę).
+**Dependencies:** U2.
 
 **Files:**
 - Zmiana: `src/client/task_usage_text.rs` (`TaskUsage`, `sum`, `subagents_block`, `line`, komentarze)
@@ -185,7 +185,7 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 ## Risks
 
 - Ryzyko: `spawned` z `result` nie liczy subagentów w tle. Mitygacja: U1 to sprawdza; wtedy liczba będzie niższa i trzeba zdecydować osobno.
-- Ryzyko: opis `✨` („liczby zawierają subagentów”) jest błędny dla Claude Code. Mitygacja: U1 i A7 (zmiana opisu).
+- Ryzyko: opis `✨` („liczby zawierają subagentów”) może być nieprawdziwy dla Claude Code. Mitygacja: świadomie nie zmieniamy opisu (Q5); U1 zapisuje w README, co pokazał zrzut.
 - Ryzyko: przyszły harness poda podział `↑`/`↓` w jednych krokach i tylko `↕` w innych; wtedy nagłówek wg KTD7 pokaże tylko `↑`/`↓` i zgubi `↕`. Mitygacja: dziś żaden harness nie wypełnia `subagents`; decyzja przy dodaniu takiego harnessu.
 - Ryzyko: zmiana kolejności źródła liczby w `step_cells` (A6) zmienia wynik dla kroku z oboma polami. Mitygacja: dziś żaden harness nie podaje obu; test U2 to pokrywa.
 
@@ -193,15 +193,14 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 
 ## Pytania otwarte dla użytkownika
 
-- P2 (sekcja „Assumptions” A7, Z3; nie blokuje U1–U3). Jeśli U1 pokaże, że `usage` z linii `result` nie zawiera tokenów subagentów, co zrobić z opisem grupy `✨` w komentarzu `task_usage_text::line` („liczby zawierają subagentów”)?
-  - (zalecane) Zmienić tylko opis: `✨` to główny agent, subagenci są w `👥` (liczba). Liczby `✨` bez zmian (origin, Scope Boundaries; odpowiedź Q1).
-  - Zostawić opis bez zmian (opis będzie nieprawdziwy dla Claude Code).
+Brak otwartych pytań. P2 rozstrzygnięte w Q5 (patrz niżej).
 
 ### Rozstrzygnięte
 
 - P1 (Q1): tokeny są przewidziane w komunikatach, ale Claude Code ich nie uzupełnia; dla Claude Code tylko liczba.
 - P3 (Q3 opcja 1): bez kosztu subagentów; AE2 nie dotyczy Claude Code.
 - Q2 opcja 2 (dodanie tokenów subagentów do `✨`) jest wycofana odpowiedzią Q1.
+- P2 (Q5): opis `✨` bez zmian; plan tylko zbiera dane, a U1 zapisuje pełny testowy zrzut logów Claude Code z subagentami jako wzorzec.
 
 ---
 
