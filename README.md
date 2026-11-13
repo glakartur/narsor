@@ -67,7 +67,7 @@ overwrites an existing configuration file.
 Unattended install, for example in a container build:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.21.1/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.23.0/install.sh |
   bash -s -- --role frontend --non-interactive \
     --bin-dir /usr/local/bin --data-dir /var/lib/narsor
 ```
@@ -75,7 +75,7 @@ curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.21.1/install
 Uninstall (add `--purge` to delete configuration and data as well):
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.21.1/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.23.0/install.sh |
   bash -s -- --uninstall
 ```
 
