@@ -7984,6 +7984,26 @@ mod task_app_actions {
         }
 
         #[test]
+        fn a_new_choice_after_esc_takes_the_generation_of_the_last_refresh() {
+            let mut app = loaded(finished("a", 1));
+            open_entry(&mut app, "Archiwizuj");
+            assert_eq!(stage(&app), Some(Stage::Confirm));
+
+            let mut changed = finished("a", 1);
+            changed.generation = 2;
+            app.load(listing(vec![titled(changed, "NAR-12")], "d"));
+            assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
+            assert_eq!(stage(&app), Some(Stage::Choice));
+
+            let request = act(pick(&mut app, "Archiwizuj").or_confirm(&mut app));
+            assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Archive));
+            assert_eq!(
+                request.generation, 2,
+                "the operator chose again on the offer of generation 2"
+            );
+        }
+
+        #[test]
         fn every_action_asks_the_same_way() {
             for (label, task) in [
                 ("Pauza", running("a", 1)),

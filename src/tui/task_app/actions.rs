@@ -345,6 +345,9 @@ pub struct ActionPanel {
     /// not change it, so an action confirmed on a task that changed since
     /// is refused as stale.
     generation: u64,
+    /// The generation of the last refresh. Back on the choice, the operator
+    /// sees the offer of this generation, so `generation` takes it again.
+    latest_generation: u64,
     /// Whether the last frame drew the panel in the details.
     pub(super) in_details: bool,
 }
@@ -363,6 +366,7 @@ impl ActionPanel {
             content: if link { PanelContent::Entries } else { content },
             form: SteppedForm::new("Akcje", entries),
             generation: task.generation,
+            latest_generation: task.generation,
             in_details: false,
         }
     }
@@ -407,20 +411,22 @@ impl ActionPanel {
         let fresh = Self::new(task, blocked);
         let entries = panel_entries(&fresh.offers, fresh.link, blocked);
         let (form, lost) = self.form.rebuilt(entries);
-        let generation = if form.stage() == Stage::Choice {
-            fresh.generation
-        } else {
-            self.generation
+        let mut panel = Self {
+            form,
+            generation: self.generation,
+            in_details: self.in_details,
+            ..fresh
         };
-        (
-            Self {
-                form,
-                generation,
-                in_details: self.in_details,
-                ..fresh
-            },
-            lost,
-        )
+        panel.sync_generation();
+        (panel, lost)
+    }
+
+    /// On a choice, the operator sees the offer of the last refresh: the
+    /// action chosen from it is sent with that generation.
+    fn sync_generation(&mut self) {
+        if self.form.stage() == Stage::Choice {
+            self.generation = self.latest_generation;
+        }
     }
 
     /// The offer the entry at `path` stands for; `None` for the link.
@@ -895,6 +901,7 @@ impl TaskApp {
         let Some(Overlay::Actions(panel)) = self.overlay.as_mut() else {
             return Request::None;
         };
+        panel.sync_generation();
         let outcome = panel.form.on_key(key);
         self.on_panel_outcome(outcome)
     }
