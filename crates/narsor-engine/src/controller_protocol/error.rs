@@ -163,5 +163,26 @@ impl From<crate::materials::MaterialError> for ProtocolError {
     }
 }
 
+impl From<crate::observers::ObserverError> for ProtocolError {
+    fn from(error: crate::observers::ObserverError) -> Self {
+        use crate::observers::ObserverError as E;
+        let message = error.to_string();
+        match error {
+            E::NotFound(_) | E::RunNotFound(_) => Self::NotFound,
+            E::Invalid { .. } => Self::bad_request("invalid_observer", message),
+            E::ScriptNotFound { .. } => Self::bad_request("script_version_not_found", message),
+            E::WorkflowNotFound(_) => Self::bad_request("workflow_not_found", message),
+            E::NameTaken(_) => Self::conflict("observer_name_taken", message),
+            E::RunExists(_) => Self::conflict("observer_run_exists", message),
+            E::EffectNotFound { .. } => Self::conflict("effect_not_found", message),
+            E::Persistence(_)
+            | E::Lock { .. }
+            | E::ScriptCorrupt { .. }
+            | E::UnsupportedRecordVersion { .. }
+            | E::LockMismatch { .. } => Self::Internal(message),
+        }
+    }
+}
+
 /// Result type of the protocol service.
 pub type ProtocolResult<T> = Result<T, ProtocolError>;

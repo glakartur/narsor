@@ -1,0 +1,154 @@
+//! The control plane's side of observers: what the owner decides about an
+//! observer (approval, dry runs, pause and resume) and the schedule that
+//! hands runs to the worker ([`schedule`]).
+//!
+//! Every mutation runs under the observer's lock and saves the record once;
+//! the record is the commit point (see [`crate::observers::store`]). Who may
+//! call these methods is the HTTP layer's business: they are the owner's
+//! (R21), the claim and the result the worker's.
+
+mod schedule;
+#[cfg(test)]
+mod tests;
+
+pub use schedule::{
+    retry_delay_secs, ClaimedObserverRun, ObserverPass, RunOutcome, RunReport,
+    MAX_CONSECUTIVE_FAILURES, MAX_RETRY_DELAY_SECS, MAX_STORED_LOG_BYTES, RUN_DEADLINE_MARGIN_SECS,
+    SCRIPT_TIMEOUT_SECS,
+};
+
+use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
+use crate::controller_protocol::service::ProtocolService;
+use crate::observers::{DryRunRequest, ObserverId, ObserverRecord, ObserverState};
+
+impl ProtocolService {
+    /// Approves script version `version`: from now on the schedule runs it,
+    /// and only it (R11).
+    ///
+    /// A draft observer becomes active and is due at once; an observer in
+    /// any other state keeps its state, so approving a new version of a
+    /// paused observer leaves it paused. Saving a script never approves it
+    /// (AE6). The version must be readable and match its digest.
+    pub fn approve_observer_version(
+        &self,
+        observer_id: &ObserverId,
+        version: u32,
+    ) -> ProtocolResult<ObserverRecord> {
+        let lock = self.observers.lock(observer_id)?;
+        let mut record = self.observers.load(observer_id)?;
+        self.observers.load_script(observer_id, version)?;
+        let now = self.control.now();
+        record.approved_version = Some(version);
+        if record.state == ObserverState::Draft {
+            record.state = ObserverState::Active;
+            record.next_run_at.get_or_insert(now);
+        }
+        self.observers.save(&lock, &mut record, now)?;
+        Ok(record)
+    }
+
+    /// Asks for a dry run of script version `version` (the newest when
+    /// `None`), approved or not (R10). The next claim hands it to a worker
+    /// before any scheduled run; its effects are recorded, not performed,
+    /// and its result leaves the observer's state alone.
+    ///
+    /// A version that is not the approved one gets no secret values unless
+    /// `with_secrets` says the owner allows them (PO6). A dry run asked for
+    /// before an earlier one was claimed replaces it.
+    pub fn request_observer_dry_run(
+        &self,
+        observer_id: &ObserverId,
+        version: Option<u32>,
+        with_secrets: bool,
+    ) -> ProtocolResult<DryRunRequest> {
+        let lock = self.observers.lock(observer_id)?;
+        let mut record = self.observers.load(observer_id)?;
+        let version = version
+            .or_else(|| record.latest_script_version())
+            .ok_or_else(|| {
+                ProtocolError::conflict(
+                    "observer_has_no_script",
+                    format!("observer '{}' has no script yet", record.config.name),
+                )
+            })?;
+        self.observers.load_script(observer_id, version)?;
+        let now = self.control.now();
+        let request = DryRunRequest {
+            version,
+            with_secrets,
+            requested_at: now,
+        };
+        record.pending_dry_run = Some(request.clone());
+        self.observers.save(&lock, &mut record, now)?;
+        Ok(request)
+    }
+
+    /// Stops the schedule of an observer (R18). A run in progress finishes;
+    /// a scheduled run not claimed yet is dropped. Pausing a paused
+    /// observer changes nothing.
+    pub fn pause_observer(&self, observer_id: &ObserverId) -> ProtocolResult<ObserverRecord> {
+        let lock = self.observers.lock(observer_id)?;
+        let mut record = self.observers.load(observer_id)?;
+        match record.state {
+            ObserverState::Paused => return Ok(record),
+            ObserverState::Active | ObserverState::NeedsAttention | ObserverState::Error => {}
+            ObserverState::Draft | ObserverState::Unrecognized => {
+                return Err(not_schedulable(&record));
+            }
+        }
+        record.state = ObserverState::Paused;
+        record.run_due_since = None;
+        self.observers
+            .save(&lock, &mut record, self.control.now())?;
+        Ok(record)
+    }
+
+    /// Puts a paused observer, or one waiting for its owner
+    /// (`needs_attention`, `error`), back on its schedule, and clears its
+    /// count of failed runs.
+    ///
+    /// An observer the owner had to look at is due at once; a paused one
+    /// keeps its next deadline, so a resume right after a pause does not
+    /// run it early. Resuming an active observer changes nothing.
+    pub fn resume_observer(&self, observer_id: &ObserverId) -> ProtocolResult<ObserverRecord> {
+        let lock = self.observers.lock(observer_id)?;
+        let mut record = self.observers.load(observer_id)?;
+        let now = self.control.now();
+        match record.state {
+            ObserverState::Active => return Ok(record),
+            ObserverState::Paused => {
+                record.next_run_at.get_or_insert(now);
+            }
+            ObserverState::NeedsAttention | ObserverState::Error => {
+                record.next_run_at = Some(now);
+            }
+            ObserverState::Draft | ObserverState::Unrecognized => {
+                return Err(not_schedulable(&record));
+            }
+        }
+        record.state = if record.approved_version.is_some() {
+            ObserverState::Active
+        } else {
+            ObserverState::Draft
+        };
+        record.consecutive_failures = 0;
+        self.observers.save(&lock, &mut record, now)?;
+        Ok(record)
+    }
+}
+
+/// The refusal of a schedule command for an observer that has no schedule
+/// to stop or resume: a draft, or a state from a newer build.
+fn not_schedulable(record: &ObserverRecord) -> ProtocolError {
+    let name = &record.config.name;
+    if record.state == ObserverState::Unrecognized {
+        return ProtocolError::conflict(
+            "observer_state_unrecognized",
+            format!("observer '{name}' is in a state this server does not know"),
+        );
+    }
+    ProtocolError::conflict(
+        "observer_not_approved",
+        format!("observer '{name}' has no approved script version: approve one first"),
+    )
+}

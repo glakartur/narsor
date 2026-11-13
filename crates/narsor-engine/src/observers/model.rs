@@ -191,8 +191,10 @@ impl fmt::Display for ObserverName {
     }
 }
 
-/// One run of one observer: `{observer_id}.{sequence}`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// One run of one observer: `{observer_id}.{sequence}`, on the wire as that
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct RunId {
     /// The observer.
     pub observer_id: ObserverId,
@@ -222,6 +224,20 @@ impl RunId {
     }
 }
 
+impl TryFrom<String> for RunId {
+    type Error = ObserverError;
+
+    fn try_from(value: String) -> Result<Self> {
+        Self::parse(&value)
+    }
+}
+
+impl From<RunId> for String {
+    fn from(value: RunId) -> Self {
+        value.to_string()
+    }
+}
+
 impl fmt::Display for RunId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}", self.observer_id, self.sequence)
@@ -240,6 +256,14 @@ pub struct ScheduleConfig {
     pub interval_secs: u64,
 }
 
+/// `secs` seconds; a count too large for a duration is the largest one.
+pub fn secs_duration(secs: u64) -> chrono::Duration {
+    i64::try_from(secs)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+        .unwrap_or(chrono::Duration::MAX)
+}
+
 fn default_interval_secs() -> u64 {
     DEFAULT_INTERVAL_SECS
 }
@@ -253,6 +277,11 @@ impl Default for ScheduleConfig {
 }
 
 impl ScheduleConfig {
+    /// The interval as a duration.
+    pub fn interval(&self) -> chrono::Duration {
+        secs_duration(self.interval_secs)
+    }
+
     /// Refuses an interval outside [`MIN_INTERVAL_SECS`]..=[`MAX_INTERVAL_SECS`].
     pub fn validate(&self) -> Result<()> {
         if self.interval_secs < MIN_INTERVAL_SECS {
@@ -878,6 +907,28 @@ impl ObserverRecord {
     pub fn script_version(&self, version: u32) -> Option<&ScriptVersion> {
         self.scripts.iter().find(|script| script.version == version)
     }
+
+    /// Since when a run (scheduled or dry) waits for a worker to claim it;
+    /// `None` when none waits.
+    pub fn waiting_for_claim_since(&self) -> Option<DateTime<Utc>> {
+        let dry_run = self
+            .pending_dry_run
+            .as_ref()
+            .map(|request| request.requested_at);
+        match (self.run_due_since, dry_run) {
+            (Some(due), Some(dry)) => Some(due.min(dry)),
+            (due, dry) => due.or(dry),
+        }
+    }
+
+    /// Whether a run waited for a claim longer than one interval at `now`:
+    /// no worker seems to be polling, which `observer list` and `observer
+    /// show` warn about.
+    pub fn worker_missing(&self, now: DateTime<Utc>) -> bool {
+        let interval = self.config.schedule.interval();
+        self.waiting_for_claim_since()
+            .is_some_and(|since| now - since > interval)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,6 +1285,14 @@ mod tests {
         for value in ["obs-1", "obs-1.", "obs-1.x", ".1", "obs-1.+4", "a.b.1"] {
             assert!(RunId::parse(value).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn a_run_id_serializes_as_its_string() {
+        let run = RunId::new(ObserverId::parse("obs-1").unwrap(), 7);
+        assert_eq!(serde_json::to_value(&run).unwrap(), "obs-1.7");
+        assert_eq!(serde_json::from_str::<RunId>("\"obs-1.7\"").unwrap(), run);
+        assert!(serde_json::from_str::<RunId>("\"obs-1\"").is_err());
     }
 
     #[test]

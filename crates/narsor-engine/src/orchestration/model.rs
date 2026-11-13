@@ -356,10 +356,34 @@ pub struct TaskRecord {
     /// retry of any of them still reads as a replay.
     #[serde(default)]
     pub resume_message_taken: Vec<String>,
+    /// The external event the task's `wait` step waits for, as its runner
+    /// reported it; `None` while the task waits for none. Observers hand
+    /// [`EventWait::episode_id`] to their scripts, so an event key built
+    /// from it is new in every episode of a review loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_wait: Option<EventWait>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
     pub last_event: TaskEvent,
+}
+
+/// One episode of a task waiting in a `wait` step for an external event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventWait {
+    /// Identifies this episode: a step that waits again (a review loop)
+    /// starts a new one.
+    pub episode_id: String,
+    /// The event type the step waits for.
+    pub event_type: String,
+    /// The step's filter, its templates rendered.
+    #[serde(default)]
+    pub filter: serde_json::Value,
+    /// When the wait began; only events from then on reach the step.
+    pub since: DateTime<Utc>,
+    /// When the wait times out, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTime<Utc>>,
 }
 
 impl TaskRecord {

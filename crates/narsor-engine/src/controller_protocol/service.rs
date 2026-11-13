@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 
 mod enrollment;
 mod lease;
+mod observers;
 mod operator;
 mod reads;
 mod runner_channel;
@@ -30,6 +31,7 @@ use super::wire::*;
 use crate::domain::TaskId;
 use crate::environment::LaunchResolver;
 use crate::materials::{MaterialLimits, MaterialStore};
+use crate::observers::ObserverStore;
 use crate::orchestration::{ControlPlane, ResumePolicy};
 use reads::Relay;
 
@@ -39,6 +41,11 @@ fn chrono_duration(period: StdDuration) -> Duration {
     Duration::from_std(period).unwrap_or(Duration::MAX)
 }
 
+pub use observers::{
+    retry_delay_secs, ClaimedObserverRun, ObserverPass, RunOutcome, RunReport,
+    MAX_CONSECUTIVE_FAILURES, MAX_RETRY_DELAY_SECS, MAX_STORED_LOG_BYTES, RUN_DEADLINE_MARGIN_SECS,
+    SCRIPT_TIMEOUT_SECS,
+};
 pub use reads::ReaderLeasePass;
 pub use scheduling::{AutoResumePass, SlotReleasePass};
 pub use tasks::{task_actions, task_panel, task_workspaces};
@@ -146,6 +153,7 @@ pub struct ProtocolService {
     event_reads: Mutex<EventsRelay>,
     conductor_reads: Mutex<ConductorRelay>,
     materials: MaterialStore,
+    observers: ObserverStore,
     harness_usages: scheduling::HarnessUsages,
     /// Most tasks processed at once across all backends; `None` for no limit.
     max_concurrent_tasks: Mutex<Option<u32>>,
@@ -187,8 +195,10 @@ impl ProtocolService {
         let credentials = CredentialStore::new(control.clone());
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
         let materials = MaterialStore::new(control.store().paths(), MaterialLimits::default());
+        let observers = ObserverStore::new(control.store().paths().clone());
         Self {
             materials,
+            observers,
             controller_auth: Arc::new(credentials.clone()),
             runner_auth: Arc::new(credentials.clone()),
             control,
@@ -233,6 +243,11 @@ impl ProtocolService {
     /// The control plane.
     pub fn control_plane(&self) -> &ControlPlane {
         &self.control
+    }
+
+    /// The observers' file store, on the control plane's state root.
+    pub fn observers(&self) -> &ObserverStore {
+        &self.observers
     }
 
     /// The credential store.

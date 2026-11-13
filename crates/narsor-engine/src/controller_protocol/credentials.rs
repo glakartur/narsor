@@ -53,6 +53,9 @@ const RUNNER_PREFIX: &str = "nsr";
 /// The prefix of a read-only runner's credential. Not `nsr.`: a reader's
 /// token is never mistaken for a working runner's, nor the other way round.
 const READER_PREFIX: &str = "nsrr";
+/// The prefix of an observer run's token (`nso.{observer}.{sequence}.{secret}`):
+/// valid only on the effect routes of that one run, and only while it runs.
+const OBSERVER_RUN_PREFIX: &str = "nso";
 
 /// Mode of every file holding a credential digest.
 const CREDENTIAL_FILE_MODE: u32 = 0o600;
@@ -95,7 +98,14 @@ impl BearerToken {
         &self.0
     }
 
-    fn digest(&self) -> String {
+    /// A fresh token for one observer run, naming the run's id
+    /// (`{observer}.{sequence}`) so verifying it reads exactly one record.
+    pub fn issue_observer_run(run_id: &str) -> Self {
+        Self::issue(OBSERVER_RUN_PREFIX, run_id)
+    }
+
+    /// The `sha256:` digest a record stores instead of the token.
+    pub fn digest(&self) -> String {
         digest(&self.0)
     }
 }
@@ -127,6 +137,18 @@ fn token_id<'a>(prefix: &str, token: &'a str) -> Option<&'a str> {
 
 fn matches_digest(token: &str, stored: &str) -> bool {
     constant_time_eq(digest(token).as_bytes(), stored.as_bytes())
+}
+
+/// The run id (`{observer}.{sequence}`) an observer run token names; `None`
+/// for any other kind of token.
+pub fn observer_run_token_id(token: &str) -> Option<&str> {
+    token_id(OBSERVER_RUN_PREFIX, token)
+}
+
+/// Whether `token` hashes to the stored `sha256:` digest, compared in
+/// constant time ([`constant_time_eq`]).
+pub fn token_matches_digest(token: &str, stored: &str) -> bool {
+    matches_digest(token, stored)
 }
 
 /// Who a controller credential proves: one identity, one backend (R37).

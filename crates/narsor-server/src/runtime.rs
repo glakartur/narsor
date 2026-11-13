@@ -433,8 +433,8 @@ const ADMISSION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 /// lease running out (its capacity is then withheld and waiting tasks say
 /// `controller_offline`) and an operator editing a backend's limit in the
 /// catalogue. The resume policy resumes tasks whose workload was lost once
-/// their attempt is due, and task materials whose time to live ran out are
-/// swept (U9), on the same tick. The handle is dropped with the daemon's
+/// their attempt is due, task materials whose time to live ran out are
+/// swept (U9), and observers whose run is due are flagged, on the same tick. The handle is dropped with the daemon's
 /// runtime.
 fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -456,7 +456,8 @@ fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinH
 
 /// One tick of the daemon's periodic pass: admission, then the resume
 /// policy, then the slot-release policy (D62), then task materials whose
-/// time to live ran out (U9), and the reader leases that ran idle (D63). Returns what the resume policy did.
+/// time to live ran out (U9), the reader leases that ran idle (D63), and the
+/// observers' schedule. Returns what the resume policy did.
 pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     control.reschedule_all();
     // Asks running tasks to stop while a backend holds more slots than its
@@ -470,6 +471,9 @@ pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     // state stops asking the controller for them.
     control.reader_lease_pass();
     control.sweep_materials();
+    // Flags the observers whose run is due for the worker's claim, and
+    // records the runs no worker finished in time as lost.
+    control.observer_pass();
     resumed
 }
 
