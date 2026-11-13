@@ -54,7 +54,7 @@ Stan w repozytorium (zweryfikowany):
   - **Trigger:** Harmonogram obserwatora Jira.
   - **Actors:** A3, A4, A6
   - **Steps:** A3 uruchamia skrypt. Skrypt znajduje nowe zadania, które spełniają warunek, i sam wywołuje `narsor-cli task create` (z jednego zadania może utworzyć wiele tasków). Skrypt przekazuje klucz skutku. A4 pomija skutek, którego klucz już wykonał.
-  - **Outcome:** Jedno zadanie w Jirze daje dokładnie jeden task.
+  - **Outcome:** Jedno zadanie w Jirze może dać wiele tasków. Każdy klucz skutku daje dokładnie jeden task.
   - **Covered by:** R3, R12, R13, R14, R15
 
 - F3. Koniec review na PR/MR → zdarzenie w tasku
