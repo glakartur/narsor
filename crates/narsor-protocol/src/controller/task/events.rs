@@ -103,8 +103,46 @@ pub enum TaskEventKind {
     /// The read-only runner's lease ended, because it ran idle: the control
     /// plane no longer asks for it.
     ReaderLeaseEnded,
+    /// An observer created the task (R19): the first event of such a task,
+    /// in place of [`TaskEventKind::Created`]. A client from before
+    /// observers reads it as [`TaskEventKind::Unrecognized`].
+    CreatedByObserver {
+        /// The observer, its effect key and its run.
+        provenance: TaskProvenance,
+    },
+    /// An observer delivered an external event to the task (R4): recorded
+    /// once per effect key, whether or not the task waits for it.
+    ExternalEventReceived {
+        /// The event type (`review.approved`, say).
+        event_type: String,
+        /// The observer's source (`gitlab`, say).
+        source: String,
+        /// The observer, its effect key and its run (R19).
+        provenance: TaskProvenance,
+        /// The event's data, as the observer's script sent it. Untrusted:
+        /// a client strips control characters before printing it.
+        #[serde(default)]
+        data: serde_json::Value,
+        /// The input queued for the task's waiting `wait` step, when the
+        /// event matched it; `None` when it only went to the history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_id: Option<String>,
+    },
     #[serde(other)]
     Unrecognized,
+}
+
+/// Where a task or an event came from when an observer caused it (R19).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskProvenance {
+    /// The observer's id, never reused.
+    pub observer_id: String,
+    /// The observer's name when it acted.
+    pub observer_name: String,
+    /// The effect key the observer's script gave.
+    pub effect_key: String,
+    /// The observer run that acted (`{observer_id}.{sequence}`).
+    pub run_id: String,
 }
 
 /// Why the control plane freed a task's slot.

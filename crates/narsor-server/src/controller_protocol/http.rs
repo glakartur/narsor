@@ -1,12 +1,13 @@
 //! HTTP binding of the protocol: routers, credential gates and handlers.
 //!
-//! Three routers, merged into the daemon's API by `narsor_engine::api::routes`:
+//! Four routers, merged into the daemon's API by `narsor_engine::api::routes`:
 //!
 //! | router | gate | prefix |
 //! | --- | --- | --- |
 //! | [`owner_routes`] | the API's own owner gate (it inserts the caller's [`OwnerRef`]) | `/control/v1` |
 //! | [`controller_routes`] | controller credential → [`ControllerIdentity`] | `/controller/v1` |
 //! | [`runner_routes`] | runner credential → [`RunnerIdentity`] | `/runner/v1` |
+//! | [`observer_routes`] | observer run token → `Principal::ObserverRun` | `/observer/v1` |
 //!
 //! Each gate answers every refusal with a bare `401` — the same rule as the
 //! API's token gate, so a credential is never confirmed or denied by
@@ -54,15 +55,18 @@ use narsor_engine::materials::{
 };
 use narsor_engine::orchestration::{OwnerRef, TaskEvent};
 
-type Service = Arc<ProtocolService>;
-type ProtocolResult<T> = Result<T, HttpProtocolError>;
+pub use super::observer_http::observer_routes;
 
+type Service = Arc<ProtocolService>;
+pub(super) type ProtocolResult<T> = Result<T, HttpProtocolError>;
+
+/// A protocol refusal as an HTTP response (see its `IntoResponse`).
 #[derive(Debug)]
-struct HttpProtocolError(ProtocolError);
+pub(super) struct HttpProtocolError(pub(super) ProtocolError);
 
 /// Runs a synchronous service call (file I/O under advisory locks) on the
 /// blocking pool, so a loaded machine cannot starve the async workers.
-async fn blocking<T, F>(service: &Service, work: F) -> ProtocolResult<T>
+pub(super) async fn blocking<T, F>(service: &Service, work: F) -> ProtocolResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&ProtocolService) -> Result<T, ProtocolError> + Send + 'static,

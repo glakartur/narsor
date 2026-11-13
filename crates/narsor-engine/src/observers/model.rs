@@ -14,7 +14,7 @@ use super::contract::ScriptInput;
 use super::{ObserverError, Result};
 use crate::domain::{BackendId, TaskId, WorkflowDefinition};
 use chrono::{DateTime, Utc};
-use narsor_protocol::controller::{CreateTaskRequest, OwnerRef, WorkspaceRequest};
+use narsor_protocol::controller::{CreateTaskRequest, LaunchRequest, OwnerRef, WorkspaceRequest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -367,6 +367,72 @@ impl CreateTaskEffect {
             }
         }
         Ok(())
+    }
+
+    /// The create request of the task that effect key `key` of observer
+    /// `observer_id` yields from the effect `data` (R3): this effect's
+    /// workflow, repositories, backend and profile, the task id
+    /// [`effect_task_id`], and as inputs the data fields the mapping names.
+    ///
+    /// The data must be a JSON object (or absent) holding no field the
+    /// mapping does not name: the script cannot smuggle in inputs. A mapped
+    /// field missing from the data is left out of the inputs.
+    pub fn task_request(
+        &self,
+        observer_id: &ObserverId,
+        key: &str,
+        data: &serde_json::Value,
+    ) -> Result<CreateTaskRequest> {
+        let empty = serde_json::Map::new();
+        let fields = match data {
+            serde_json::Value::Null => &empty,
+            serde_json::Value::Object(fields) => fields,
+            _ => {
+                return Err(ObserverError::invalid(
+                    "effect data",
+                    "must be a JSON object of the fields the observer's mapping names",
+                ))
+            }
+        };
+        let mapped: BTreeSet<&str> = self.mapping.values().map(String::as_str).collect();
+        let unmapped: Vec<String> = fields
+            .keys()
+            .filter(|field| !mapped.contains(field.as_str()))
+            .map(|field| format!("'{field}'"))
+            .collect();
+        if !unmapped.is_empty() {
+            return Err(ObserverError::invalid(
+                "effect data",
+                format!(
+                    "field {} is not in the observer's mapping",
+                    unmapped.join(", ")
+                ),
+            ));
+        }
+        let inputs: serde_json::Map<String, serde_json::Value> = self
+            .mapping
+            .iter()
+            .filter_map(|(input, field)| {
+                fields
+                    .get(field)
+                    .map(|value| (input.clone(), value.clone()))
+            })
+            .collect();
+        Ok(CreateTaskRequest {
+            task_id: Some(effect_task_id(observer_id, key).to_string()),
+            backend_id: self.backend_id.clone(),
+            launch: LaunchRequest {
+                workflow_id: self.workflow_id.clone(),
+                workflow_version: self.workflow_version,
+                inputs: serde_json::Value::Object(inputs),
+                workspaces: self.workspaces.clone(),
+                profile: self.profile.clone(),
+                harness: None,
+                resources: None,
+                ticket: None,
+                title: None,
+            },
+        })
     }
 
     /// Checks the effect against the workflow it names: same id and version,

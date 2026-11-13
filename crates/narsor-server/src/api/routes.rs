@@ -404,6 +404,7 @@ pub fn router(
     if let Some(control) = control {
         router = router
             .merge(protocol_http::controller_routes(Arc::clone(&control)))
+            .merge(protocol_http::observer_routes(Arc::clone(&control)))
             .merge(protocol_http::runner_routes(control));
     }
     router.with_state(state)

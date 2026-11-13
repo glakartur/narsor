@@ -73,9 +73,22 @@ pub fn limit_requeue_key(generation: u64) -> String {
 /// [`AUTO_RESUME_KEY_PREFIX`]: a retry of the work resumes the task once.
 pub const WORK_RESUME_KEY_PREFIX: &str = "work-resume:";
 
+/// The prefix of the idempotency keys of what observers send to a task
+/// (`observer:<observer id>:<effect key>`), reserved like
+/// [`AUTO_RESUME_KEY_PREFIX`]: an owner's key never collides with an
+/// observer's, nor the resume either causes.
+pub const OBSERVER_KEY_PREFIX: &str = "observer:";
+
+/// The idempotency key of the external event an observer sends with
+/// `effect_key`: one per observer and key. The observer id holds no `:`.
+pub fn observer_event_key(observer_id: &str, effect_key: &str) -> String {
+    format!("{OBSERVER_KEY_PREFIX}{observer_id}:{effect_key}")
+}
+
 /// The idempotency key prefixes only a policy may use, each with what it is
-/// reserved for: an owner's command may not carry one.
-pub const RESERVED_KEY_PREFIXES: [(&str, &str); 4] = [
+/// reserved for: an owner's command, answer or operator command may not
+/// carry one.
+pub const RESERVED_KEY_PREFIXES: [(&str, &str); 5] = [
     (AUTO_RESUME_KEY_PREFIX, "the resume policy"),
     (SLOT_RELEASE_KEY_PREFIX, "the slot-release policy"),
     (LIMIT_STOP_KEY_PREFIX, "the limit of concurrent tasks"),
@@ -83,6 +96,7 @@ pub const RESERVED_KEY_PREFIXES: [(&str, &str); 4] = [
         WORK_RESUME_KEY_PREFIX,
         "the resume that work sent to a paused task causes",
     ),
+    (OBSERVER_KEY_PREFIX, "observers"),
 ];
 
 /// The idempotency key of the resume caused by the work with `work_key`.

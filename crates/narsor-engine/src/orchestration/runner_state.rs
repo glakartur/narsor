@@ -15,8 +15,9 @@
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    InputOutcome, InputRequest, InputStatus, InputUpdate, QueuedInput, RunnerObservation,
-    RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
+    ExternalEvent, ExternalEventOutcome, InputOutcome, InputRequest, InputStatus, InputUpdate,
+    QueuedEventInput, QueuedInput, RunnerObservation, RunnerReportOutcome, RunnerSnapshot,
+    RunnerState, TaskEventKind, TaskRecord,
 };
 use crate::domain::display::bounded_detail;
 use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
@@ -247,6 +248,84 @@ impl ControlPlane {
             ))
         })?;
         Ok(InputOutcome { input, replayed })
+    }
+
+    /// Records an external event an observer delivers to the task (R4), once
+    /// per idempotency key, under the task's lock: a retry, or a second
+    /// call racing the first, finds the key and changes nothing (R13).
+    ///
+    /// The event always goes to the task's history, as one
+    /// [`TaskEventKind::ExternalEventReceived`]. When the task waits in a
+    /// `wait` step ([`TaskRecord::event_wait`]) for this type and the
+    /// filter matches ([`super::EventWait::matches`]), the same mutation
+    /// queues it for the runner as a [`QueuedEventInput`] of that episode;
+    /// otherwise nothing else changes, so an event for a task that does
+    /// not wait never changes its state, and a `wait` that starts later
+    /// never sees it (AE7). An archived task takes no events.
+    pub fn record_external_event(
+        &self,
+        task_id: &TaskId,
+        event: ExternalEvent,
+    ) -> Result<ExternalEventOutcome> {
+        let (task, (input, replayed)) = self.mutate(task_id, |record, now| {
+            if record
+                .external_event_keys
+                .iter()
+                .any(|key| key == &event.idempotency_key)
+            {
+                let input = record
+                    .event_inputs
+                    .iter()
+                    .find(|input| input.idempotency_key == event.idempotency_key)
+                    .cloned();
+                return Ok(Mutation::Unchanged((input, true)));
+            }
+            if record.runner_state.is_archival() {
+                return Err(OrchestrationError::TaskNotAcceptingInput {
+                    task_id: record.task_id.clone(),
+                    runner_state: record.runner_state,
+                });
+            }
+            let episode = record
+                .event_wait
+                .as_ref()
+                .filter(|wait| wait.matches(&event.event_type, &event.data))
+                .map(|wait| wait.episode_id.clone());
+            let input = episode.map(|episode_id| QueuedEventInput {
+                input_id: format!("event-{}", record.event_inputs.len() + 1),
+                idempotency_key: event.idempotency_key.clone(),
+                episode_id,
+                event_type: event.event_type.clone(),
+                source: event.source.clone(),
+                data: Some(event.data.clone()),
+                provenance: event.provenance.clone(),
+                status: InputStatus::Queued,
+                submitted_at: now,
+                updated_at: now,
+                detail: None,
+            });
+            if let Some(input) = &input {
+                record.event_inputs.push(input.clone());
+            }
+            record
+                .external_event_keys
+                .push(event.idempotency_key.clone());
+            Ok(Mutation::Changed(
+                TaskEventKind::ExternalEventReceived {
+                    event_type: event.event_type.clone(),
+                    source: event.source.clone(),
+                    provenance: event.provenance.clone(),
+                    data: event.data.clone(),
+                    input_id: input.as_ref().map(|input| input.input_id.clone()),
+                },
+                (input, false),
+            ))
+        })?;
+        Ok(ExternalEventOutcome {
+            task,
+            input,
+            replayed,
+        })
     }
 
     /// Drops the comment on the pause from the record once the runner says it

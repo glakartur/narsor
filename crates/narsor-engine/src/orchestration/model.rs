@@ -15,7 +15,7 @@ pub use narsor_protocol::controller::{
     InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary, OperatorCommand,
     OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion,
     ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason, TaskEvent,
-    TaskEventKind, TaskState, WorkloadLoss,
+    TaskEventKind, TaskProvenance, TaskState, WorkloadLoss,
 };
 
 /// Current schema version of [`TaskRecord`].
@@ -362,6 +362,21 @@ pub struct TaskRecord {
     /// from it is new in every episode of a review loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_wait: Option<EventWait>,
+    /// The observer, effect key and run that created the task (R19);
+    /// `None` for a task its owner created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<TaskProvenance>,
+    /// The idempotency key of every external event the task received
+    /// ([`super::observer_event_key`]), so a retry or a concurrent call
+    /// with the same key records nothing a second time (R13). Never
+    /// trimmed: a task receives a handful of events in its life.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_event_keys: Vec<String>,
+    /// External events queued for the task's waiting `wait` step, oldest
+    /// first; the audit trail of every such delivery, whose data is dropped
+    /// once it is settled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_inputs: Vec<QueuedEventInput>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
@@ -384,6 +399,49 @@ pub struct EventWait {
     /// When the wait times out, if it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<DateTime<Utc>>,
+}
+
+impl EventWait {
+    /// Whether an event of `event_type` with `data` is what this wait waits
+    /// for: the same type, and every field of the filter equal to the field
+    /// of the same name in the data (R4).
+    ///
+    /// The comparison is flat, without expressions. Scalars (text, number,
+    /// boolean) compare as text on both sides, because a filter rendered
+    /// from a template is always text: filter `{"mr": "17"}` matches data
+    /// `{"mr": 17}`. Other values compare as JSON. An empty or absent filter
+    /// matches every event of the type; a filter that is not an object
+    /// matches none.
+    pub fn matches(&self, event_type: &str, data: &serde_json::Value) -> bool {
+        if self.event_type != event_type {
+            return false;
+        }
+        match &self.filter {
+            serde_json::Value::Null => true,
+            serde_json::Value::Object(filter) => filter.iter().all(|(field, expected)| {
+                data.get(field)
+                    .is_some_and(|actual| same_filter_value(expected, actual))
+            }),
+            _ => false,
+        }
+    }
+}
+
+/// Scalars as text, so `"17"` and `17` are the same filter value.
+fn filter_scalar_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+fn same_filter_value(expected: &serde_json::Value, actual: &serde_json::Value) -> bool {
+    match (filter_scalar_text(expected), filter_scalar_text(actual)) {
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => expected == actual,
+    }
 }
 
 impl TaskRecord {
@@ -467,6 +525,10 @@ impl TaskRecord {
     pub fn owner_work_pending(&self) -> bool {
         self.inputs.iter().any(|input| !input.status.is_settled())
             || self
+                .event_inputs
+                .iter()
+                .any(|input| !input.status.is_settled())
+            || self
                 .operator_commands
                 .iter()
                 .any(|command| command.status == OperatorCommandStatus::Queued)
@@ -480,6 +542,12 @@ impl TaskRecord {
             .iter()
             .find(|input| !input.status.is_settled())
             .map(|input| input.idempotency_key.as_str())
+            .or_else(|| {
+                self.event_inputs
+                    .iter()
+                    .find(|input| !input.status.is_settled())
+                    .map(|input| input.idempotency_key.as_str())
+            })
             .or_else(|| {
                 self.operator_commands
                     .iter()
@@ -969,6 +1037,69 @@ pub struct InputRequest {
     pub delivery: HumanInputDelivery,
 }
 
+/// An external event an observer delivered, queued for the task's
+/// waiting `wait` step (U3); the runner side consumes it (U4).
+///
+/// Kept apart from [`QueuedInput`]: an owner answer is bound to the
+/// runner's pending input request and made obsolete by any snapshot that
+/// shows another, while an event is bound to the wait episode
+/// ([`EventWait::episode_id`]) the control plane matched it against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueuedEventInput {
+    /// Control-plane id, unique within the task (`event-<n>`).
+    pub input_id: String,
+    /// [`super::observer_event_key`] of the observer and its effect key.
+    pub idempotency_key: String,
+    /// The wait episode it was matched against; a runner in another
+    /// episode never takes it.
+    pub episode_id: String,
+    /// The event type.
+    pub event_type: String,
+    /// The observer's source.
+    pub source: String,
+    /// The event's data, dropped once settled.
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    /// The observer, effect key and run it came from (R19).
+    pub provenance: TaskProvenance,
+    /// Its status, as for an owner answer.
+    pub status: InputStatus,
+    /// When the control plane accepted it.
+    pub submitted_at: DateTime<Utc>,
+    /// When its status last changed.
+    pub updated_at: DateTime<Utc>,
+    /// The runner's reason, when it rejected the event.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// An external event as an observer delivers it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalEvent {
+    /// [`super::observer_event_key`]: one event per key and task, ever.
+    pub idempotency_key: String,
+    /// The event type.
+    pub event_type: String,
+    /// The observer's source.
+    pub source: String,
+    /// The event's data.
+    pub data: serde_json::Value,
+    /// The observer, effect key and run it came from (R19).
+    pub provenance: TaskProvenance,
+}
+
+/// The result of recording an external event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalEventOutcome {
+    /// The task as it is now.
+    pub task: TaskRecord,
+    /// The input queued for the waiting step: new, or for a retry the one
+    /// the first call queued. `None` when the event only went to history.
+    pub input: Option<QueuedEventInput>,
+    /// True when the key was recorded before and nothing changed.
+    pub replayed: bool,
+}
+
 /// The result of queueing an owner input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputOutcome {
@@ -1067,6 +1198,8 @@ pub struct NewTask {
     /// Digest of the owner request it came from, if any (see
     /// [`TaskRecord::request_digest`]).
     pub request_digest: Option<String>,
+    /// The observer that creates it, if one does (R19).
+    pub provenance: Option<TaskProvenance>,
 }
 
 impl NewTask {
@@ -1083,12 +1216,19 @@ impl NewTask {
             backend_id,
             launch_spec,
             request_digest: None,
+            provenance: None,
         }
     }
 
     /// Records the digest of the owner request.
     pub fn with_request_digest(mut self, digest: impl Into<String>) -> Self {
         self.request_digest = Some(digest.into());
+        self
+    }
+
+    /// Records the observer that creates the task.
+    pub fn with_provenance(mut self, provenance: Option<TaskProvenance>) -> Self {
+        self.provenance = provenance;
         self
     }
 }

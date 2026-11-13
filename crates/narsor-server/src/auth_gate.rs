@@ -1,5 +1,6 @@
-//! The HTTP side of authentication: the owner gate, the claim and identity
-//! endpoints, the trusted-proxy policy, CORS and the stream guard.
+//! The HTTP side of authentication: the owner gate, the observer run gate,
+//! the claim and identity endpoints, the trusted-proxy policy, CORS and the
+//! stream guard.
 //!
 //! # Refusals
 //!
@@ -36,7 +37,9 @@ use futures::Stream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use narsor_engine::controller_protocol::credentials::constant_time_eq;
+use narsor_engine::controller_protocol::service::ProtocolService;
 use narsor_engine::controller_protocol::LOCAL_OWNER;
+use narsor_engine::observers::RunId;
 use narsor_engine::orchestration::OwnerRef;
 
 use narsor_engine::auth::oidc::{OidcIdentity, OidcVerifier, VerifiedToken};
@@ -58,7 +61,7 @@ const FORWARDED_PROTO: &str = "x-forwarded-proto";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Operator;
 
-/// Who the owner gate let through.
+/// Who a gate let through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
     /// Trusted mode's local token holder.
@@ -69,6 +72,13 @@ pub enum Principal {
         identity: OidcIdentity,
         /// When the token it presented expires.
         expires_at: DateTime<Utc>,
+    },
+    /// The script of one observer run, by the run's token: only the effect
+    /// routes of that run ([`require_observer_run`]). The owner gate never
+    /// lets it through.
+    ObserverRun {
+        /// The run the token belongs to.
+        run_id: RunId,
     },
 }
 
@@ -196,6 +206,28 @@ pub async fn require_owner(
                 response
             }
         }
+    }
+}
+
+/// The observer run gate, in front of the effect routes
+/// (`/observer/v1/runs/{run}/…`): a bare `401` for anything but the token
+/// of a run in progress before its deadline
+/// ([`ProtocolService::authenticate_observer_run`]). An accepted request
+/// carries [`Principal::ObserverRun`]; the handler still checks that the
+/// run in the path is the token's.
+pub async fn require_observer_run(
+    State(service): State<Arc<ProtocolService>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    match bearer(&request).and_then(|token| service.authenticate_observer_run(token)) {
+        Some(run_id) => {
+            request
+                .extensions_mut()
+                .insert(Principal::ObserverRun { run_id });
+            next.run(request).await
+        }
+        None => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 

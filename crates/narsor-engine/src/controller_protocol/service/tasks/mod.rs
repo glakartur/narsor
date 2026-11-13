@@ -11,6 +11,7 @@ mod panel;
 mod summary;
 mod view;
 
+pub(crate) use commands::refuse_reserved_key;
 pub(crate) use create::launch_refusal;
 pub use view::task_workspaces;
 #[cfg(test)]

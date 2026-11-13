@@ -1,16 +1,21 @@
 //! The control plane's side of observers: what the owner decides about an
-//! observer (approval, dry runs, pause and resume) and the schedule that
-//! hands runs to the worker ([`schedule`]).
+//! observer (approval, dry runs, pause and resume), the schedule that
+//! hands runs to the worker ([`schedule`]) and the effects a run's script
+//! has through its token ([`effects`]).
 //!
 //! Every mutation runs under the observer's lock and saves the record once;
 //! the record is the commit point (see [`crate::observers::store`]). Who may
 //! call these methods is the HTTP layer's business: they are the owner's
 //! (R21), the claim and the result the worker's.
 
+mod effects;
+#[cfg(test)]
+mod effects_tests;
 mod schedule;
 #[cfg(test)]
 mod tests;
 
+pub use effects::{MAX_EFFECT_DATA_BYTES, MAX_EVENT_DATA_BYTES};
 pub use schedule::{
     retry_delay_secs, ClaimedObserverRun, ObserverPass, RunOutcome, RunReport,
     MAX_CONSECUTIVE_FAILURES, MAX_RETRY_DELAY_SECS, MAX_STORED_LOG_BYTES, RUN_DEADLINE_MARGIN_SECS,

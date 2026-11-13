@@ -24,7 +24,7 @@ use crate::persistence::StatePaths;
 
 /// A clock the test moves by hand.
 #[derive(Debug)]
-struct ManualClock(Mutex<DateTime<Utc>>);
+pub(super) struct ManualClock(Mutex<DateTime<Utc>>);
 
 impl Clock for ManualClock {
     fn now(&self) -> DateTime<Utc> {
@@ -73,13 +73,13 @@ impl crate::environment::LaunchResolver for NoLaunches {
 }
 
 const INTERVAL: u64 = 300;
-const PREFIX: &str = "https://git.example.com/";
+pub(super) const PREFIX: &str = "https://git.example.com/";
 
 /// A service over a temporary state root and a manual clock.
-struct Fixture {
-    root: PathBuf,
-    clock: Arc<ManualClock>,
-    service: ProtocolService,
+pub(super) struct Fixture {
+    pub(super) root: PathBuf,
+    pub(super) clock: Arc<ManualClock>,
+    pub(super) service: ProtocolService,
 }
 
 impl Drop for Fixture {
@@ -89,7 +89,7 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = std::env::temp_dir().join(format!("narsor-schedule-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let clock = Arc::new(ManualClock(Mutex::new(
@@ -104,16 +104,16 @@ impl Fixture {
         }
     }
 
-    fn now(&self) -> DateTime<Utc> {
+    pub(super) fn now(&self) -> DateTime<Utc> {
         self.clock.now()
     }
 
-    fn advance(&self, secs: i64) {
+    pub(super) fn advance(&self, secs: i64) {
         *self.clock.0.lock().unwrap() += Duration::seconds(secs);
     }
 
     /// A draft observer with one secret and script version 1.
-    fn draft(&self, name: &str, mode: WatchMode) -> ObserverId {
+    pub(super) fn draft(&self, name: &str, mode: WatchMode) -> ObserverId {
         let effect = match mode {
             WatchMode::WatchList => ObserverEffect::DeliverEvent,
             WatchMode::All => ObserverEffect::CreateTask(CreateTaskEffect {
@@ -149,28 +149,28 @@ impl Fixture {
     }
 
     /// An active observer running version 1, due now.
-    fn active(&self, name: &str, mode: WatchMode) -> ObserverId {
+    pub(super) fn active(&self, name: &str, mode: WatchMode) -> ObserverId {
         let id = self.draft(name, mode);
         self.service.approve_observer_version(&id, 1).unwrap();
         id
     }
 
-    fn record(&self, id: &ObserverId) -> ObserverRecord {
+    pub(super) fn record(&self, id: &ObserverId) -> ObserverRecord {
         self.service.observers().load(id).unwrap()
     }
 
-    fn claim(&self) -> Option<ClaimedObserverRun> {
+    pub(super) fn claim(&self) -> Option<ClaimedObserverRun> {
         self.service.claim_observer_run().unwrap()
     }
 
-    fn finish(&self, claimed: &ClaimedObserverRun, report: RunReport) -> ObserverRun {
+    pub(super) fn finish(&self, claimed: &ClaimedObserverRun, report: RunReport) -> ObserverRun {
         self.service
             .finish_observer_run(&claimed.run_id, report)
             .unwrap()
     }
 
     /// A queued task the observer's entries can point at.
-    fn task(&self, id: &str) -> TaskId {
+    pub(super) fn task(&self, id: &str) -> TaskId {
         let workspace = TaskWorkspace::single(TaskRepository::new(
             "narsor",
             TaskRepositorySource::Git(Box::new(GitIdentity {
@@ -203,7 +203,7 @@ impl Fixture {
         task_id
     }
 
-    fn watch(&self, id: &ObserverId, task_id: &TaskId, object: &str) -> WatchEntry {
+    pub(super) fn watch(&self, id: &ObserverId, task_id: &TaskId, object: &str) -> WatchEntry {
         let entry = WatchEntry::new(
             task_id.clone(),
             Some("review".into()),
@@ -221,7 +221,7 @@ impl Fixture {
     }
 }
 
-fn owner() -> OwnerRef {
+pub(super) fn owner() -> OwnerRef {
     OwnerRef::new("owner")
 }
 

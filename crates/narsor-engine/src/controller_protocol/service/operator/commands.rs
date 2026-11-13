@@ -36,6 +36,7 @@ impl ProtocolService {
                 "an operator command needs an idempotency key",
             ));
         }
+        crate::controller_protocol::service::tasks::refuse_reserved_key(&request.idempotency_key)?;
         let is_retry = record
             .operator_commands
             .iter()

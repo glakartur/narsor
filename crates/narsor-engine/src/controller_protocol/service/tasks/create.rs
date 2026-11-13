@@ -7,7 +7,7 @@ use crate::domain::{
     normalize_label, LabelError, ResourceProfile, TaskId, TICKET_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use crate::environment::{LaunchError, LaunchIntent};
-use crate::orchestration::{NewTask, OwnerRef};
+use crate::orchestration::{NewTask, OwnerRef, TaskProvenance};
 
 impl ProtocolService {
     /// Creates a queued task for `owner`, idempotently by task id.
@@ -19,6 +19,18 @@ impl ProtocolService {
         &self,
         owner: &OwnerRef,
         request: CreateTaskRequest,
+    ) -> ProtocolResult<TaskSummary> {
+        self.create_task_from(owner, request, None)
+    }
+
+    /// [`Self::create_task`] for an observer, whose task records where it
+    /// came from (R19). The provenance is not part of the request digest:
+    /// a retry from another run of the observer is the same request.
+    pub(crate) fn create_task_from(
+        &self,
+        owner: &OwnerRef,
+        request: CreateTaskRequest,
+        provenance: Option<TaskProvenance>,
     ) -> ProtocolResult<TaskSummary> {
         let request_digest = request_digest(&request)?;
         let task_id = match request.task_id {
@@ -75,7 +87,7 @@ impl ProtocolService {
                 title,
             })
             .map_err(launch_refusal)?;
-        self.create_sealed_task(owner, task_id, request_digest, resolved)
+        self.create_sealed_task_from(owner, task_id, request_digest, resolved, provenance)
     }
 
     /// Persists an already-resolved task through the same idempotent
@@ -94,6 +106,17 @@ impl ProtocolService {
         request_digest: String,
         resolved: crate::environment::ResolvedLaunch,
     ) -> ProtocolResult<TaskSummary> {
+        self.create_sealed_task_from(owner, task_id, request_digest, resolved, None)
+    }
+
+    fn create_sealed_task_from(
+        &self,
+        owner: &OwnerRef,
+        task_id: TaskId,
+        request_digest: String,
+        resolved: crate::environment::ResolvedLaunch,
+        provenance: Option<TaskProvenance>,
+    ) -> ProtocolResult<TaskSummary> {
         match self.control.task(&task_id) {
             Ok(existing) if existing.owner != *owner => return Err(ProtocolError::NotFound),
             Ok(existing) if existing.request_digest.as_deref() == Some(&request_digest) => {
@@ -111,7 +134,8 @@ impl ProtocolService {
                     resolved.backend_id,
                     resolved.spec,
                 )
-                .with_request_digest(request_digest),
+                .with_request_digest(request_digest)
+                .with_provenance(provenance),
             )
             .map_err(|error| match error {
                 // Created by another owner between the check above and now.

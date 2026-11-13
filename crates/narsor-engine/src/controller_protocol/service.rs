@@ -43,8 +43,8 @@ fn chrono_duration(period: StdDuration) -> Duration {
 
 pub use observers::{
     retry_delay_secs, ClaimedObserverRun, ObserverPass, RunOutcome, RunReport,
-    MAX_CONSECUTIVE_FAILURES, MAX_RETRY_DELAY_SECS, MAX_STORED_LOG_BYTES, RUN_DEADLINE_MARGIN_SECS,
-    SCRIPT_TIMEOUT_SECS,
+    MAX_CONSECUTIVE_FAILURES, MAX_EFFECT_DATA_BYTES, MAX_EVENT_DATA_BYTES, MAX_RETRY_DELAY_SECS,
+    MAX_STORED_LOG_BYTES, RUN_DEADLINE_MARGIN_SECS, SCRIPT_TIMEOUT_SECS,
 };
 pub use reads::ReaderLeasePass;
 pub use scheduling::{AutoResumePass, SlotReleasePass};
