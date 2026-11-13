@@ -6,7 +6,7 @@ target="x86_64-unknown-linux-gnu"
 target_dir="${CARGO_TARGET_DIR:-"$repo_root/target"}/$target/release"
 output_dir="${NARSOR_DIST_DIR:-"$repo_root/dist/release"}"
 archive_name="narsor-linux-x86_64-gnu.tar.gz"
-binaries=(narsor narsor-cli narsor-server narsor-controller narsor-runner)
+binaries=(narsor narsor-cli narsor-web narsor-server narsor-controller narsor-runner)
 
 fail() {
     printf 'package-linux: %s\n' "$*" >&2

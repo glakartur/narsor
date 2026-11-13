@@ -38,7 +38,6 @@ pub mod remote;
 pub mod task_history;
 pub mod task_registry;
 pub mod task_text;
-pub mod web;
 
 use std::path::PathBuf;
 
@@ -347,13 +346,6 @@ pub enum Command {
         json: bool,
     },
 
-    /// Opens the browser interface of the server, already signed in.
-    Web {
-        /// Prints the address instead of opening a browser.
-        #[arg(long)]
-        no_open: bool,
-    },
-
     /// Network-mode identity: claim the installation, see who you are.
     Auth {
         /// What to do.
@@ -580,7 +572,6 @@ impl Command {
             | Command::Backend { .. }
             | Command::Harness { .. }
             | Command::Usage { .. }
-            | Command::Web { .. }
             | Command::Auth { .. }
             | Command::Daemon { .. } => false,
             // Configured by its own flags and environment only, like the
@@ -740,7 +731,6 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
         Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,
         Command::Usage { json } => remote::usage(json, &target, &state, &flags).await,
-        Command::Web { no_open } => web::open(no_open, &target, &state, &flags).await,
         Command::Auth { command } => remote::auth(command, &target, &state, &flags).await,
         Command::Controller(ControllerCli { admin, .. }) => match admin {
             Some(command) => remote::controller_admin(command, &target, &state, &flags).await,

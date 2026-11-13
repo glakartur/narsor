@@ -3,47 +3,72 @@
 The browser interface does what the [TUI](tui.md) does, in a web browser:
 the task queue, the details of a task, answers to what waits for you, the
 actions of a task, new tasks, history, repositories, the default harness and
-the task limit. It is a client of the same owner API (`/control/v1`) as the
-TUI and the CLI.
+the task limit.
 
-The API server serves it itself, under `/ui/` on its own address. Nothing
-is installed apart from the server, and the build needs no Node toolchain:
-the application is plain ES modules compiled into the `narsor-server`
-binary (`crates/narsor-web`).
+It is served by **`narsor-web`**, a separate program. `narsor-web` serves
+the files of the interface and passes the owner API (`/control/v1`) on to a
+`narsor-server`, the same API the TUI and the CLI use. `narsor-server`
+itself serves no interface. The files are compiled into the `narsor-web`
+binary; nothing else is installed and the build needs no Node toolchain.
 
-## Opening it
+## Setups
 
-| Server | How |
-|---|---|
-| The local daemon (trusted mode) | `narsor-cli web` — opens the browser with the token already in the address. `--no-open` prints the address instead. |
-| A remote server (network mode) | `narsor-cli --server <URL> web`, when the CLI has a token for that server (`NARSOR_TOKEN`, `NARSOR_TOKEN_FILE` or `NARSOR_TOKEN_COMMAND`, see [CLI](cli.md#global-options)). |
-| Any server, without the CLI | Open `<server address>/ui/` and paste a token in the sign-in form. |
+| Setup | `narsor-web` runs | `web_upstream` | `web_token` |
+|---|---|---|---|
+| Everything on your computer | on your computer | `local` (default): the local daemon, discovered or launched like the CLI and TUI do | `server` (default) |
+| Your computer in front of a remote server | on your computer | `https://narsor.example.com` | `server`, with the server's token from `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND` or `NARSOR_TOKEN` |
+| Everything on the remote side | next to the server, behind a TLS proxy | the server's address | `passthrough`: every browser presents its own token |
 
-`GET /` on the server redirects to `/ui/`.
+```bash
+narsor-web --open          # the default setup: the local daemon, browser opened
+NARSOR_WEB_UPSTREAM=https://narsor.example.com \
+NARSOR_TOKEN_COMMAND='my-oidc-token' narsor-web --open
+```
 
-### Where the token comes from
+The settings (`web_bind`, `web_upstream`, `web_token`) are in the shared
+[configuration](configuration.md); `narsor-cli config show` lists them.
+`narsor-web` accepts `--root` and `--config` like the other programs.
 
-- **Local daemon:** the `token` field of `daemon.json` in the state directory
-  (by default `~/.narsor/daemon.json`). The daemon makes a new token each
-  time it starts, so after a restart open the interface again with
-  `narsor-cli web`, or paste the new token.
-- **Remote server:** an OIDC access token of the installation owner, issued
-  by your identity provider. The browser interface has no OIDC sign-in of its
-  own yet. When the token expires the interface returns to the sign-in form.
+`web_bind` must be a loopback address (default `127.0.0.1:8484`).
+`narsor-web` does not serve TLS yet, and a browser treats plain HTTP as a
+secure context only on loopback. To reach the interface from other machines,
+put a TLS proxy in front of a loopback `narsor-web`. A server in network mode
+then lists the address of `narsor-web` in `trusted_proxies`; `narsor-web`
+passes the proxy's `X-Forwarded-Proto` on in the `passthrough` mode.
 
-The sign-in form has the same instructions under *Skąd wziąć token?*.
+## Tokens
 
-### What happens to the token
+- **`server` mode:** `narsor-web` holds the server's token (the local
+  daemon's from its discovery file, or a remote server's from the token
+  sources above, read again after a `401`). The browser gets a **session
+  token** of `narsor-web`, new at each start: `narsor-web --open` puts it in
+  the address, and it is in the file `web-session` (mode `0600`) of the
+  state directory. The server's token never reaches the browser. If the
+  local daemon restarts on another port with another token, `narsor-web`
+  finds it again by itself.
+- **`passthrough` mode:** the browser presents the server's own token (an
+  OIDC access token of the installation owner; there is no OIDC sign-in in
+  the browser yet). When it expires, the interface returns to the sign-in
+  form.
 
-- `narsor-cli web` never puts the token in a process argument: the browser
-  opener gets a page in the state directory (`web-open.html`, mode `0600`),
-  and that page sends the browser on to `/ui/#token=…`.
-- A browser never sends the fragment (`#…`) of an address to a server. The
-  interface moves the token to the session storage of the tab and removes it
-  from the address bar at once. Closing the tab removes the token; the ⏻
-  button in the header removes it too.
-- Every call carries `Authorization: Bearer <token>`, as for any client. The
-  files of the interface are public; they hold no data of the installation.
+The sign-in form says which token it needs (*Skąd wziąć token?*).
+
+### Security
+
+- In the `server` mode anyone who reaches `narsor-web` acts as the owner of
+  the server. Therefore: loopback only; every API call must carry the
+  session token (compared in constant time); a request whose `Host` is not
+  `127.0.0.1`, `localhost` or `[::1]` with the right port, or whose
+  `Origin` is another site, is refused with `403` (other sites and DNS
+  rebinding).
+- Only the routes the interface uses go through (`/control/v1/…`,
+  `/settings/…`, `/auth/v1/whoami`, `POST /tasks`); anything else is a
+  `404`, so `narsor-web` is no open relay.
+- `--open` never puts the session token in a process argument: the browser
+  opener gets a page in the state directory (`web-open.html`, mode `0600`)
+  that sends the browser on to `/ui/#token=…`. A browser never sends the
+  fragment to a server; the interface moves the token to the session storage
+  of the tab and removes it from the address bar at once.
 - The pages go out with a strict content security policy (scripts, styles
   and connections only from the same origin, no inline code, no framing),
   without a referrer and with `nosniff`. Text from agents, runners and

@@ -40,7 +40,7 @@ jobs:
           tar -xzf "$archive" -C "$temp_dir"
           "$temp_dir/narsor-cli" --version
           "$temp_dir/narsor-cli" validate tests/fixtures/cli/greet.yaml
-          for binary in narsor narsor-server narsor-controller narsor-runner; do
+          for binary in narsor narsor-web narsor-server narsor-controller narsor-runner; do
             "$temp_dir/$binary" --help >/dev/null
           done
 

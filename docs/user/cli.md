@@ -273,20 +273,6 @@ output, and `status <ID>` prints what it is doing and what it kept: the
 invocation under way, the queue, the attempts counted per episode, the latest
 failure it took up.
 
-### `web [--no-open]`
-
-Opens the [browser interface](web.md) of the server in the operator's
-browser, with the token in the fragment of the address. The token is never a
-process argument: the opener gets a page in the state directory
-(`web-open.html`, mode `0600`) that sends the browser on. `--no-open` prints
-the address instead (the address is a credential). With `--server <URL>` it
-opens the interface of that server, with the token from the usual sources.
-
-```bash
-narsor-cli web
-narsor-cli --server https://narsor.example.com web
-```
-
 ### `config show [--format table|json]`
 
 Every setting, its effective value and where that value came from. See

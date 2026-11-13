@@ -2133,6 +2133,7 @@ dependencies = [
  "narsor-runner",
  "narsor-server",
  "narsor-shared",
+ "narsor-web",
  "p256 0.14.0",
  "rand 0.10.3",
  "ratatui",
@@ -2281,7 +2282,6 @@ dependencies = [
  "narsor-engine",
  "narsor-protocol",
  "narsor-shared",
- "narsor-web",
  "serde",
  "serde_json",
  "tokio",
@@ -2311,9 +2311,19 @@ name = "narsor-web"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
+ "clap",
+ "futures",
  "include_dir",
+ "narsor-api-client",
+ "narsor-shared",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

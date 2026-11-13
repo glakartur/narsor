@@ -213,15 +213,42 @@ impl ApiClient {
         }
     }
 
-    /// The address that opens the browser interface of this server, already
-    /// signed in: the token goes in the fragment, which a browser keeps to
-    /// itself and never sends to a server.
+    /// Sends one request of another client on to this server (the proxy of
+    /// `narsor-web`): `method` on `path_and_query` (which starts with `/`),
+    /// with `headers` and `body` as they came, and returns the answer
+    /// unread, so a stream (SSE) flows through as it arrives.
     ///
-    /// The address is a credential. Hand it to the operator's own browser
-    /// only; never log it.
-    pub async fn browser_url(&self) -> Result<String, ClientError> {
-        let token = self.token.current().await?;
-        Ok(format!("{}/ui/#token={token}", self.base_url))
+    /// `authorization` is the browser's own `Authorization` header in the
+    /// pass-through mode. Without it the request carries this client's token
+    /// and is sent once more after a `401` with a re-read token, like every
+    /// other call of this client.
+    pub async fn forward(
+        &self,
+        method: reqwest::Method,
+        path_and_query: &str,
+        headers: reqwest::header::HeaderMap,
+        body: Bytes,
+        authorization: Option<reqwest::header::HeaderValue>,
+    ) -> Result<reqwest::Response, ClientError> {
+        let url = format!("{}{path_and_query}", self.base_url);
+        let build = |http: &reqwest::Client| {
+            http.request(method.clone(), &url)
+                .headers(headers.clone())
+                .body(body.clone())
+        };
+        match authorization {
+            Some(value) => build(&self.stream_http)
+                .header(reqwest::header::AUTHORIZATION, value)
+                .send()
+                .await
+                .map_err(|error| ClientError::Unavailable(error.to_string())),
+            None => {
+                self.send(&self.stream_http, |http, token| {
+                    build(http).bearer_auth(token)
+                })
+                .await
+            }
+        }
     }
 
     /// The server's base URL, without a trailing slash.

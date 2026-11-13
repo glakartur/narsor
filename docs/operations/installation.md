@@ -46,9 +46,9 @@ Choose one role:
 
 | Role | Installed programs | Intended use |
 | --- | --- | --- |
-| `local` | `narsor`, `narsor-cli`, `narsor-server`, `narsor-controller`, `narsor-runner` | Run the TUI and CLI with the local server and controller. |
-| `frontend` | `narsor`, `narsor-cli` | Connect a TUI/CLI to a separately operated server. |
-| `server` | `narsor-server`, `narsor-controller`, `narsor-runner` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI and CLI too. |
+| `local` | `narsor`, `narsor-cli`, `narsor-web`, `narsor-server`, `narsor-controller`, `narsor-runner` | Run the TUI, CLI and browser interface with the local server and controller. |
+| `frontend` | `narsor`, `narsor-cli`, `narsor-web` | Connect a TUI/CLI or the browser interface ([`narsor-web`](../user/web.md)) to a separately operated server. |
+| `server` | `narsor-server`, `narsor-controller`, `narsor-runner` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI, CLI and `narsor-web` too. |
 
 The installer script downloads and verifies the archive, copies the binaries,
 and, only after consent, adds the binary directory to `~/.bashrc`. It then

@@ -1,55 +1,18 @@
-//! `narsor-cli web`: opens the browser interface of the server.
+//! The launch page `narsor-web --open` hands to the browser opener.
 //!
-//! The interface is served by the API server itself under `/ui/`
-//! (`narsor-web`). It needs the same bearer token as every other client, and
-//! a trusted daemon makes a new one each time it starts. So this command
-//! builds the address with the token in its fragment
-//! ([`ApiClient::browser_url`](crate::api::ApiClient::browser_url)) and hands
-//! it to the operator's browser. A browser does not send a fragment to any
-//! server, and the interface removes it from the address bar at once.
-//!
-//! The address is a credential. It is printed only with `--no-open`, or when
-//! no browser could be started, because then the operator has no other way
-//! to get it. It is also never an argument of the opener: every user of the
-//! machine can read the arguments of a process. The opener gets the path of
-//! a page in the state directory, readable by the operator only, and that
-//! page sends the browser on to the address.
+//! The address of the interface carries the session token in its fragment,
+//! so it is a credential. It is never an argument of the opener (every user
+//! of the machine can read the arguments of a process): the opener gets the
+//! path of a page in the state directory, readable by the operator only, and
+//! that page sends the browser on to the address.
 
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::commands::Result;
-use super::remote::{client, failure};
-use crate::api::ServerTarget;
-use crate::config::Flags;
-
 /// The program that opens an address in the operator's browser.
-const OPENER: &str = "xdg-open";
-
-/// Opens the browser interface, or prints its address when `no_open`.
-pub async fn open(no_open: bool, target: &ServerTarget, state: &Path, flags: &Flags) -> Result<()> {
-    let client = client(target, state, flags).await?;
-    let url = client
-        .browser_url()
-        .await
-        .map_err(|error| failure("Could not read the token", error))?;
-    if no_open {
-        println!("{url}");
-        return Ok(());
-    }
-    match write_launch_page(state, &url).and_then(|page| start_browser(&page)) {
-        Ok(()) => println!("Opened {}/ui/ in the browser.", client.base_url()),
-        Err(error) => {
-            eprintln!(
-                "Could not open a browser with {OPENER} ({error}). Open this address yourself:"
-            );
-            println!("{url}");
-        }
-    }
-    Ok(())
-}
+pub const OPENER: &str = "xdg-open";
 
 /// The name of the launch page in the state directory.
 const LAUNCH_PAGE: &str = "web-open.html";
@@ -58,7 +21,7 @@ const LAUNCH_PAGE: &str = "web-open.html";
 ///
 /// The file is made afresh each time, so its mode is always the one set
 /// here and a leftover from an earlier run never stays readable by others.
-fn write_launch_page(state: &Path, url: &str) -> std::io::Result<PathBuf> {
+pub fn write_launch_page(state: &Path, url: &str) -> std::io::Result<PathBuf> {
     let path = state.join(LAUNCH_PAGE);
     match std::fs::remove_file(&path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
@@ -88,7 +51,7 @@ fn launch_page(url: &str) -> String {
 }
 
 /// Starts the opener on `page` and does not wait for the browser to close.
-fn start_browser(page: &Path) -> std::io::Result<()> {
+pub fn start_browser(page: &Path) -> std::io::Result<()> {
     Command::new(OPENER)
         .arg(page)
         .stdin(Stdio::null())

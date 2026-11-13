@@ -32,6 +32,10 @@
 //! site. `Cache-Control: no-cache` makes a browser revalidate after an
 //! upgrade of the binary.
 
+pub mod gateway;
+pub mod launch;
+pub mod settings;
+
 use axum::extract::Path;
 use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};

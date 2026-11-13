@@ -95,6 +95,24 @@ Różnice wobec planu: wiersz „wysyłanie… / nie wysłano" jest w oknie nowe
 | Wydanie: `dist/package-linux.sh` i CI budują `--workspace`, pliki są w binarce — bez zmian | — | sprawdzone |
 | Długa rozmowa: ostatnie 200 pozycji na próbę, „pokaż wcześniejsze" | `tabs/conversation.js` | gotowe |
 
+### Zmiana architektury (sesja 7, decyzja Artura 2026-11-14)
+
+Interfejs nie jest już częścią `narsor-server`, a `narsor-cli web` nie istnieje. Powód: `narsor-cli` i TUI są tylko klientami API; serwer wystawia tylko API.
+
+| Element | Plik | Stan |
+|---|---|---|
+| Binarka `narsor-web`: serwer HTTP plików interfejsu i proxy API do `narsor-server` | `crates/narsor-web/src/main.rs`, `gateway.rs` | gotowe |
+| Ustawienia `web_bind` (domyślnie `127.0.0.1:8484`, tylko loopback do czasu TLS), `web_upstream` (`local` albo URL), `web_token` (`server` albo `passthrough`) | `narsor-shared` `config/settings.rs`, `file.rs`; `crates/narsor-web/src/settings.rs` | gotowe, 4 testy |
+| Tryb `server`: token sesji przy każdym starcie (plik `web-session` 0600, `--open`), token serwera tylko w `narsor-web`, sprawdzanie `Host`/`Origin`, tylko trasy interfejsu | `gateway.rs` | gotowe |
+| `web_upstream: local`: lokalny daemon znajdowany albo uruchamiany; po restarcie daemona ponowne połączenie | `main.rs` | sprawdzone ręcznie |
+| `ApiClient::forward` (przekazanie żądania, ponowienie po 401); usunięte `browser_url` | `narsor-api-client` | gotowe |
+| Ekran logowania według trybu (`GET /gateway/v1/info`) | `ui/js/ui/signin.js` | gotowe |
+| Test integracyjny: serwer + `narsor-web` w obu trybach | `tests/integration/web_ui.rs` | 5 testów |
+| Wydanie: `narsor-web` w `package-linux.sh`, `install.sh` (role `local`, `frontend`, `server --with-frontend`), smoke-test CI i release | `dist/`, `.github/workflows/` | gotowe |
+| Dokumentacja: `web.md`, `configuration.md`, `installation.md`, D36, `building-and-testing.md`; komenda `web` usunięta z `cli.md` | `docs/` | gotowe |
+
+Odłożone: TLS w `narsor-web`, funkcje lokalne (`/local/v1`: klonowanie, IDE).
+
 ### Nie zrobione
 
 - Test trybu `network` (reguła zaufanego proxy dla `/ui/`).

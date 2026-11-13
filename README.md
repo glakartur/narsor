@@ -28,7 +28,7 @@ audited).
 - **CLI and full-screen TUI** — `narsor-cli` for scripting, `narsor` for an
   interactive view of tasks, events and conversations.
 - **Browser interface** — the functions of the TUI in a web browser, served by
-  the server itself under `/ui/` (`narsor-cli web` opens it).
+  `narsor-web`, which passes the API on to the local daemon or a remote server.
 - **Resume and recover** — interrupted or failed executions can be resumed or
   recovered, and every event is kept for audit.
 - **Agent conversation** — read and continue the conversation with an agent at

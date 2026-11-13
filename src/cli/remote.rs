@@ -742,11 +742,7 @@ pub fn server_target(
     }
 }
 
-pub(super) async fn client(
-    target: &ServerTarget,
-    state: &Path,
-    flags: &Flags,
-) -> Result<ApiClient> {
+async fn client(target: &ServerTarget, state: &Path, flags: &Flags) -> Result<ApiClient> {
     crate::api::connect(target, state, flags)
         .await
         .map_err(CliError::failure)

@@ -37,9 +37,12 @@ not run them; run `cargo test -p narsor --test integration backend_contract --
 
 ### The browser interface (`crates/narsor-web`)
 
-The files of the browser interface are in `crates/narsor-web/ui/` and are
-compiled into `narsor-server` (`include_dir`); `build.rs` rebuilds the crate
-when a file there changes. The application is plain ES modules with one
+`crates/narsor-web` builds the `narsor-web` binary: the HTTP server of the
+browser interface and a proxy of the owner API to a `narsor-server`
+(`src/gateway.rs`, settings and their rules in `src/settings.rs`). The files
+of the interface are in `crates/narsor-web/ui/` and are compiled into the
+binary (`include_dir`); `build.rs` rebuilds the crate when a file there
+changes. `narsor-server` itself serves no interface. The application is plain ES modules with one
 vendored library (`ui/vendor/preact-htm.js`, licences in
 `crates/narsor-web/VENDOR-LICENSES.md`), so neither the build nor a release
 needs Node.
