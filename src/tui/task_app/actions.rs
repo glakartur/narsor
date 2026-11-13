@@ -340,6 +340,11 @@ pub struct ActionPanel {
     link: bool,
     content: PanelContent,
     form: SteppedForm,
+    /// The generation of the task the operator decides on: the one of the
+    /// refresh before the operator chose an action. A later refresh does
+    /// not change it, so an action confirmed on a task that changed since
+    /// is refused as stale.
+    generation: u64,
     /// Whether the last frame drew the panel in the details.
     pub(super) in_details: bool,
 }
@@ -357,6 +362,7 @@ impl ActionPanel {
             link,
             content: if link { PanelContent::Entries } else { content },
             form: SteppedForm::new("Akcje", entries),
+            generation: task.generation,
             in_details: false,
         }
     }
@@ -401,9 +407,15 @@ impl ActionPanel {
         let fresh = Self::new(task, blocked);
         let entries = panel_entries(&fresh.offers, fresh.link, blocked);
         let (form, lost) = self.form.rebuilt(entries);
+        let generation = if form.stage() == Stage::Choice {
+            fresh.generation
+        } else {
+            self.generation
+        };
         (
             Self {
                 form,
+                generation,
                 in_details: self.in_details,
                 ..fresh
             },
@@ -933,11 +945,11 @@ impl TaskApp {
         if !self.mutation_allowed() {
             return Request::None;
         }
-        let Some(task_id) = self
+        let Some((task_id, generation)) = self
             .overlay
             .as_ref()
-            .and_then(Overlay::task_id)
-            .map(str::to_string)
+            .and_then(Overlay::actions)
+            .map(|panel| (panel.task_id.clone(), panel.generation))
         else {
             return Request::None;
         };
@@ -954,6 +966,7 @@ impl TaskApp {
         let summary = accepted_summary(&label, &send);
         Request::Act(Box::new(self.action_request(
             &task,
+            generation,
             &label.to_lowercase(),
             summary,
             send,
@@ -1067,6 +1080,7 @@ impl TaskApp {
             .insert(form.task_id.clone(), text.clone());
         Request::Act(Box::new(self.action_request(
             &task,
+            task.generation,
             "komentarz",
             "komentarz wysłany".to_string(),
             ActionSend::Comment(text),
@@ -1121,12 +1135,14 @@ impl TaskApp {
         )));
     }
 
-    /// The request for `send` to `task`. A retry of the same decision — the
-    /// same command to the same task, after one that got no answer — reuses
-    /// its key; an answer, or a refusal, forgets it.
+    /// The request for `send` to `task`, as the operator saw it at
+    /// `generation`. A retry of the same decision — the same command to the
+    /// same task, after one that got no answer — reuses its key; an answer,
+    /// or a refusal, forgets it.
     pub(super) fn action_request(
         &mut self,
         task: &TaskSummary,
+        generation: u64,
         verb: &str,
         summary: String,
         send: ActionSend,
@@ -1139,7 +1155,7 @@ impl TaskApp {
         ActionRequest {
             task_id: task.task_id.to_string(),
             title: title_of(task),
-            generation: task.generation,
+            generation,
             key,
             verb: verb.to_string(),
             summary,

@@ -7849,6 +7849,23 @@ mod task_app_actions {
         }
 
         #[test]
+        fn the_focus_comes_back_where_it_was_after_an_action() {
+            // R13.
+            use narsor::tui::task_app::Focus;
+            for (open_details, focus) in [(false, Focus::List), (true, Focus::Details)] {
+                let mut app = loaded(running("a", 1));
+                if open_details {
+                    press(&mut app, KeyCode::Enter);
+                }
+                assert_eq!(app.focus(), focus);
+                let pause = act(choose(&mut app, "Pauza"));
+                assert_eq!(pause.send, ActionSend::Owner(OwnerCommand::Pause));
+                assert!(app.overlay().is_none());
+                assert_eq!(app.focus(), focus, "the focus is where it was");
+            }
+        }
+
+        #[test]
         fn a_retry_of_a_decision_that_got_no_answer_reuses_its_key() {
             let mut app = loaded(running("a", 1));
             let first = act(choose(&mut app, "Pauza"));
@@ -7933,6 +7950,37 @@ mod task_app_actions {
             assert!(chosen.description.contains("nie da się cofnąć"));
             let request = act(press(&mut app, KeyCode::Enter));
             assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Archive));
+        }
+
+        #[test]
+        fn a_refresh_during_the_confirmation_keeps_the_generation_the_operator_saw() {
+            let mut app = loaded(finished("a", 1));
+            open_entry(&mut app, "Archiwizuj");
+            assert_eq!(stage(&app), Some(Stage::Confirm));
+
+            let mut changed = finished("a", 1);
+            changed.generation = 2;
+            app.load(listing(vec![titled(changed, "NAR-12")], "d"));
+            assert_eq!(stage(&app), Some(Stage::Confirm), "the panel stays");
+
+            let request = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Archive));
+            assert_eq!(
+                request.generation, 1,
+                "the server refuses a task that changed since"
+            );
+        }
+
+        #[test]
+        fn a_refresh_before_the_choice_takes_the_new_generation() {
+            let mut app = loaded(finished("a", 1));
+            ch(&mut app, '.');
+            let mut changed = finished("a", 1);
+            changed.generation = 2;
+            app.load(listing(vec![titled(changed, "NAR-12")], "d"));
+
+            let request = act(pick(&mut app, "Archiwizuj").or_confirm(&mut app));
+            assert_eq!(request.generation, 2);
         }
 
         #[test]

@@ -6047,6 +6047,46 @@ mod task_app_actions_render {
             "{screen}"
         );
     }
+
+    /// The row and column of the panel's step line, with the panel open
+    /// over the details on `tab`.
+    fn panel_place_on(tab: narsor::tui::task_app::DetailTab) -> (usize, usize, String) {
+        let mut app = opened(running(), "");
+        press(&mut app, KeyCode::Enter);
+        app.detail_mut().set_tab(tab);
+        press(&mut app, KeyCode::Char('.'));
+        let screen = draw_app(&mut app, 140, 40, false);
+        let (row, column) = screen
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find("krok 1 z 2")
+                    .map(|byte| (row, line[..byte].chars().count()))
+            })
+            .unwrap_or_else(|| panic!("no panel on {tab:?}:\n{screen}"));
+        (row, column, screen)
+    }
+
+    #[test]
+    fn the_panel_takes_the_same_place_on_every_tab_of_the_details() {
+        // R13: where the conversation's form is, on every tab.
+        use narsor::tui::task_app::DetailTab;
+        let (row, column, conversation) = panel_place_on(DetailTab::Conversation);
+        let tabs = conversation
+            .lines()
+            .position(|line| line.contains("Przebieg"))
+            .expect("the tabs of the details");
+        assert!(row > tabs, "under the tabs:\n{conversation}");
+        for tab in DetailTab::ALL {
+            let (other_row, other_column, screen) = panel_place_on(tab);
+            assert_eq!(
+                (other_row, other_column),
+                (row, column),
+                "{tab:?}:\n{screen}"
+            );
+            assert!(screen.contains("Pauza"), "{tab:?}:\n{screen}");
+        }
+    }
 }
 
 mod task_app_conductor_render {
