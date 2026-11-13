@@ -373,9 +373,12 @@ impl SteppedForm {
             }
             EntryKind::Leaf { confirm } => {
                 let key = self.label_path(&entry.item.label);
-                let mut fields = self.drafts.remove(&key).unwrap_or_else(|| {
-                    Chooser::new(vec![entry.item.clone()]).enter_fields_on_activate()
-                });
+                // A kept draft takes the entry as it is now: its options,
+                // whether a field is required, why it cannot be chosen.
+                let mut fields = self.drafts.remove(&key).map_or_else(
+                    || Chooser::new(vec![entry.item.clone()]).enter_fields_on_activate(),
+                    |draft| draft.rebuilt(vec![entry.item.clone()]),
+                );
                 fields.enter_fields();
                 let has_fields = !entry.item.fields.is_empty();
                 self.leaf = Some(ChosenLeaf {
@@ -439,9 +442,9 @@ impl SteppedForm {
                     .as_ref()
                     .is_some_and(|leaf| !leaf.item.fields.is_empty());
                 if has_fields {
-                    self.stage = Stage::Fields;
-                    if let Some(leaf) = self.leaf.as_mut() {
-                        leaf.fields.enter_fields();
+                    if let Some(mut leaf) = self.leaf.take() {
+                        self.back_to_fields(&mut leaf);
+                        self.leaf = Some(leaf);
                     }
                 } else {
                     self.leave_leaf();
@@ -462,15 +465,29 @@ impl SteppedForm {
         }
     }
 
+    /// Back to the fields of `leaf`, with the keys in them. A leaf without
+    /// fields has no such step: it stays where it is.
+    fn back_to_fields(&mut self, leaf: &mut ChosenLeaf) {
+        if leaf.item.fields.is_empty() {
+            return;
+        }
+        self.stage = Stage::Fields;
+        leaf.fields.enter_fields();
+    }
+
     /// Back to the choice; what was typed is kept for the leaf.
     fn leave_leaf(&mut self) {
         self.stage = Stage::Choice;
         if let Some(leaf) = self.leaf.take() {
             let key = self.label_path(&leaf.item.label);
-            let mut fields = leaf.fields;
-            fields.leave_fields();
-            self.drafts.insert(key, fields);
+            self.keep_draft(key, leaf.fields);
         }
+    }
+
+    /// Keeps what was typed in `fields` for the leaf at the label path `key`.
+    fn keep_draft(&mut self, key: Vec<String>, mut fields: Chooser) {
+        fields.leave_fields();
+        self.drafts.insert(key, fields);
     }
 
     fn submitted(&mut self) -> SteppedOutcome {
@@ -512,6 +529,12 @@ impl SteppedForm {
     /// of the entry that is gone comes back, for the operator.
     pub fn rebuilt(mut self, entries: Vec<StepEntry>) -> (Self, Option<String>) {
         let mut lost = None;
+        // The key of what was typed in the open leaf, from the levels before
+        // the rebuild: the leaf can be gone after it.
+        let leaf_key = self
+            .leaf
+            .as_ref()
+            .map(|leaf| self.label_path(&leaf.item.label));
         let old_levels = std::mem::take(&mut self.levels);
         let mut entries = entries;
         let mut levels = Vec::with_capacity(old_levels.len());
@@ -555,15 +578,25 @@ impl SteppedForm {
                 Some(index) => {
                     let entry = self.level().entries[index].clone();
                     if let EntryKind::Leaf { confirm } = entry.kind {
+                        // What was sent on from the fields was checked against
+                        // the fields as they were; other fields ask for it again.
+                        let fields_changed = !leaf.item.same_fields(&entry.item);
                         leaf.index = index;
                         leaf.confirm = confirm;
                         leaf.fields = leaf.fields.rebuilt(vec![entry.item.clone()]);
                         leaf.item = entry.item;
+                        if fields_changed {
+                            leaf.values.clear();
+                            if self.stage == Stage::Confirm {
+                                self.back_to_fields(&mut leaf);
+                            }
+                        }
                         self.level_mut().chooser.select(index);
                         self.leaf = Some(leaf);
                     } else {
                         lost = Some(leaf.item.label);
                         self.stage = Stage::Choice;
+                        self.keep_draft(leaf_key.expect("the key of the leaf"), leaf.fields);
                     }
                 }
                 None => {
@@ -571,6 +604,7 @@ impl SteppedForm {
                         lost = Some(leaf.item.label.clone());
                     }
                     self.stage = Stage::Choice;
+                    self.keep_draft(leaf_key.expect("the key of the leaf"), leaf.fields);
                 }
             }
         } else {
@@ -936,5 +970,101 @@ mod tests {
         assert_eq!(lost.as_deref(), Some("Wybierz krok"));
         assert_eq!(form.stage(), Stage::Choice);
         assert_eq!(form.heading(), "Akcje");
+    }
+
+    #[test]
+    fn what_was_typed_comes_back_when_a_lost_entry_comes_back() {
+        let mut form = form();
+        form.on_key(key(KeyCode::Char('3')));
+        form.on_key(key(KeyCode::Enter));
+        assert_eq!(form.stage(), Stage::Fields);
+        typed(&mut form, "pilne");
+
+        let mut smaller = tree();
+        smaller.remove(2);
+        let (form, lost) = form.rebuilt(smaller);
+        assert_eq!(lost.as_deref(), Some("Override"));
+        assert_eq!(form.stage(), Stage::Choice);
+
+        let (mut form, lost) = form.rebuilt(tree());
+        assert_eq!(lost, None);
+        assert_eq!(form.open(2), SteppedOutcome::None);
+        assert_eq!(form.stage(), Stage::Fields);
+        assert_eq!(form.fields().unwrap().fields_of(0)[0].value(), "pilne");
+    }
+
+    /// `tree()` with the fields of "Override" put in place of its own.
+    fn tree_with_override_fields(fields: Vec<ChooserField>) -> Vec<StepEntry> {
+        let mut entries = tree();
+        let mut item = ChooserItem::new("Override", "Wymusza przejście.").irreversible();
+        for field in fields {
+            item = item.with_field(field);
+        }
+        entries[2] = StepEntry::leaf(item);
+        entries
+    }
+
+    /// The form at the confirmation of "Override", with `reason` typed.
+    fn confirming_override(reason: &str) -> SteppedForm {
+        let mut form = form();
+        assert_eq!(form.open(2), SteppedOutcome::None);
+        typed(&mut form, reason);
+        form.on_key(key(KeyCode::Enter));
+        assert_eq!(form.stage(), Stage::Confirm);
+        form
+    }
+
+    #[test]
+    fn a_rebuild_with_the_same_fields_keeps_the_confirmation() {
+        let form = confirming_override("pilne");
+
+        let (form, lost) = form.rebuilt(tree());
+        assert_eq!(lost, None);
+        assert_eq!(form.stage(), Stage::Confirm);
+        assert_eq!(form.values(), [("powód".to_string(), "pilne".to_string())]);
+    }
+
+    #[test]
+    fn a_rebuild_with_other_fields_asks_for_them_again() {
+        let form = confirming_override("pilne");
+
+        let changed = tree_with_override_fields(vec![ChooserField::select(
+            "powód",
+            vec!["awaria".to_string()],
+        )]);
+        let (mut form, lost) = form.rebuilt(changed);
+        assert_eq!(lost, None);
+        assert_eq!(form.stage(), Stage::Fields);
+        assert!(form.values().is_empty(), "the old values are not sent");
+        // Enter does not send what the new fields no longer allow.
+        if let SteppedOutcome::Submitted(submission) = form.on_key(key(KeyCode::Enter)) {
+            assert!(
+                !submission
+                    .values
+                    .contains(&("powód".to_string(), "pilne".to_string())),
+                "{submission:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kept_draft_takes_the_entry_as_it_is_now() {
+        let mut form = form();
+        assert_eq!(form.open(2), SteppedOutcome::None);
+        typed(&mut form, "pilne");
+        form.on_key(key(KeyCode::Esc));
+        assert_eq!(form.stage(), Stage::Choice);
+
+        let changed = tree_with_override_fields(vec![
+            ChooserField::text("powód"),
+            ChooserField::text("uwagi"),
+        ]);
+        let (mut form, lost) = form.rebuilt(changed);
+        assert_eq!(lost, None);
+        assert_eq!(form.open(2), SteppedOutcome::None);
+        let fields = form.fields().unwrap().fields_of(0);
+        assert_eq!(fields.len(), 2, "the field the server added is there");
+        assert_eq!(fields[0].value(), "pilne", "what was typed is kept");
+        assert!(!fields[0].required, "the field is no longer required");
     }
 }
