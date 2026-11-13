@@ -1370,4 +1370,158 @@ mod tests {
         let unknown: TaskActionId = serde_json::from_value(json!("something_new")).unwrap();
         assert_eq!(unknown, TaskActionId::Unrecognized);
     }
+
+    /// A launch resolver for a service that creates no task through it.
+    struct NoLaunches;
+
+    impl crate::environment::LaunchResolver for NoLaunches {
+        fn resolve(
+            &self,
+            _intent: &crate::environment::LaunchIntent,
+        ) -> Result<crate::environment::ResolvedLaunch, crate::environment::LaunchError> {
+            Err(crate::environment::LaunchError::UnknownBackend(
+                "k8s".to_string(),
+            ))
+        }
+
+        fn check_backend(
+            &self,
+            backend: &crate::domain::BackendId,
+        ) -> Result<(), crate::environment::LaunchError> {
+            Err(crate::environment::LaunchError::UnknownBackend(
+                backend.to_string(),
+            ))
+        }
+
+        fn slot_release_timings(
+            &self,
+            backend: &crate::domain::BackendId,
+        ) -> Result<crate::environment::SlotReleaseTimings, crate::environment::LaunchError>
+        {
+            Err(crate::environment::LaunchError::UnknownBackend(
+                backend.to_string(),
+            ))
+        }
+
+        fn configured_default_backend(&self) -> String {
+            "k8s".to_string()
+        }
+
+        fn backend_record(
+            &self,
+            _backend: &crate::domain::BackendId,
+        ) -> Result<Option<crate::environment::BackendRecord>, crate::environment::LaunchError>
+        {
+            Ok(None)
+        }
+    }
+
+    /// A service over a real control plane in `root`, and a task of it in
+    /// `runner_state`, without a runner.
+    fn service_and_record(
+        root: &std::path::Path,
+        runner_state: RunnerState,
+    ) -> (ProtocolService, TaskRecord) {
+        use crate::domain::{
+            BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
+            TaskRepository, TaskRepositorySource, TaskWorkspace,
+        };
+        use crate::orchestration::{ControlPlane, NewTask, OwnerRef};
+        let workspace = TaskWorkspace::single(TaskRepository::new(
+            "narsor",
+            TaskRepositorySource::Git(Box::new(GitIdentity {
+                repository: Some("narsor".to_string()),
+                remote_url: "https://example.com/narsor.git".to_string(),
+                commit: "614c3a8".repeat(5) + "abcde",
+                git_ref: None,
+                ref_origin: None,
+                credential: None,
+            })),
+        ));
+        let spec = TaskLaunchSpec::new(
+            "steps",
+            1,
+            json!({}),
+            workspace,
+            ResolvedEnvironment::harness_only("claude-code"),
+            ResourceProfile::new(1000, 2048),
+        );
+        let control = ControlPlane::new(crate::persistence::StatePaths::new(root));
+        let mut record = control
+            .create_task(NewTask::new(
+                TaskId::parse("task-1").unwrap(),
+                OwnerRef::new("oidc:https://issuer|owner"),
+                BackendId::parse("k8s").unwrap(),
+                spec,
+            ))
+            .unwrap();
+        record.runner_state = runner_state;
+        let service = ProtocolService::new(control, std::sync::Arc::new(NoLaunches));
+        (service, record)
+    }
+
+    /// The code and the message of a conflict; panics on anything else.
+    fn conflict(result: ProtocolResult<()>) -> (&'static str, String) {
+        match result {
+            Err(ProtocolError::Conflict { code, message }) => (code, message),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_send_of_an_action_no_longer_allowed_is_refused_with_its_reason() {
+        // Covers AE5: the offer hides what cannot be done, so this check is
+        // what stops a client that drew an older offer.
+        let root = std::env::temp_dir().join(format!("narsor-actions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (service, record) = service_and_record(&root, RunnerState::Queued);
+        let summary = service.summarize(&record).unwrap();
+        let expected = unavailable_reason(&summary, TaskActionId::Pause).expect("a reason");
+
+        let (code, message) = conflict(service.require_available(
+            &record,
+            TaskActionId::Pause,
+            Some(record.generation),
+        ));
+        assert_eq!(code, "action_unavailable");
+        assert_eq!(message, expected);
+        assert!(!message.is_empty());
+
+        // A task that moved on is the control plane's `stale_generation`.
+        assert!(service
+            .require_available(&record, TaskActionId::Pause, Some(record.generation + 1))
+            .is_ok());
+        // What can be done passes.
+        assert!(service
+            .require_available(&record, TaskActionId::Archive, None)
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_owner_command_no_longer_allowed_is_refused_with_its_reason() {
+        let root = std::env::temp_dir().join(format!("narsor-actions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        // A running task that does not wait for the operator: the lifecycle
+        // takes the release, the offer does not.
+        let (service, record) = service_and_record(&root, RunnerState::Running);
+        let summary = service.summarize(&record).unwrap();
+        let expected = unavailable_reason(&summary, TaskActionId::ReleaseSlot).expect("a reason");
+
+        let (code, message) = conflict(service.require_owner_command_available(
+            &record,
+            OwnerCommand::ReleaseSlot,
+            None,
+        ));
+        assert_eq!(code, "action_unavailable");
+        assert_eq!(message, expected);
+
+        // A command the lifecycle refuses is left to the control plane.
+        let mut queued = record.clone();
+        queued.runner_state = RunnerState::Queued;
+        assert!(service
+            .require_owner_command_available(&queued, OwnerCommand::Pause, None)
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
