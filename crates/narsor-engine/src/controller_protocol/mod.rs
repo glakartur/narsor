@@ -81,8 +81,8 @@ pub mod wire;
 
 pub use client::{ClientOptions, ControllerClient, RunnerClient};
 pub use credentials::{
-    ControllerAuthenticator, ControllerIdentity, CredentialStore, RunnerAuthenticator,
-    RunnerIdentity, RunnerRole,
+    ControllerAuthenticator, ControllerIdentity, CredentialStore, ObserverWorkerIdentity,
+    RunnerAuthenticator, RunnerIdentity, RunnerRole,
 };
 pub use error::{ProtocolError, ProtocolResult};
 pub use service::{

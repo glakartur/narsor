@@ -1,5 +1,5 @@
-//! The HTTP side of authentication: the owner gate, the observer run gate,
-//! the claim and identity endpoints, the trusted-proxy policy, CORS and the
+//! The HTTP side of authentication: the owner gate, the observer run and
+//! observer worker gates, the claim and identity endpoints, the trusted-proxy policy, CORS and the
 //! stream guard.
 //!
 //! # Refusals
@@ -79,6 +79,15 @@ pub enum Principal {
     ObserverRun {
         /// The run the token belongs to.
         run_id: RunId,
+    },
+    /// An observer worker, by its credential: only the claim of a run and
+    /// its result ([`require_observer_worker`]), for the observers of one
+    /// owner. Neither the owner gate nor the run gate lets it through.
+    ObserverWorker {
+        /// The credential's id.
+        worker_id: String,
+        /// The owner whose observers' runs it may claim.
+        owner: OwnerRef,
     },
 }
 
@@ -225,6 +234,27 @@ pub async fn require_observer_run(
             request
                 .extensions_mut()
                 .insert(Principal::ObserverRun { run_id });
+            next.run(request).await
+        }
+        None => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// The observer worker gate, in front of the worker routes
+/// (`/observer/v1/worker/…`): a bare `401` for anything but an unrevoked
+/// worker credential ([`ProtocolService::authenticate_observer_worker`]).
+/// An accepted request carries [`Principal::ObserverWorker`].
+pub async fn require_observer_worker(
+    State(service): State<Arc<ProtocolService>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    match bearer(&request).and_then(|token| service.authenticate_observer_worker(token)) {
+        Some(identity) => {
+            request.extensions_mut().insert(Principal::ObserverWorker {
+                worker_id: identity.worker_id,
+                owner: identity.owner,
+            });
             next.run(request).await
         }
         None => StatusCode::UNAUTHORIZED.into_response(),

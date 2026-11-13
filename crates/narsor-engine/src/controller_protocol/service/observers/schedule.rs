@@ -25,7 +25,8 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use narsor_protocol::controller::{ObserverSecretRef, ObserverWorkerRun};
+use serde::Serialize;
 
 use crate::controller_protocol::credentials::{
     observer_run_token_id, token_matches_digest, BearerToken,
@@ -36,10 +37,10 @@ use crate::domain::TaskId;
 use crate::observers::{
     parse_script_output, secs_duration, LastRun, ObserverError, ObserverId, ObserverLock,
     ObserverRecord, ObserverRun, ObserverState, RunId, RunStatus, ScriptInput, ScriptObserver,
-    ScriptOutput, ScriptWatch, SecretRef, WatchEntry, WatchMode, OBSERVER_RUN_VERSION,
-    SCRIPT_CONTRACT_VERSION,
+    ScriptOutput, ScriptWatch, SecretRef, WatchEntry, WatchMode, MAX_SCRIPT_OUTPUT_BYTES,
+    OBSERVER_RUN_VERSION, SCRIPT_CONTRACT_VERSION,
 };
-use crate::orchestration::{OrchestrationError, TaskState};
+use crate::orchestration::{OrchestrationError, OwnerRef, TaskState};
 
 /// Failed runs in a row after which an observer goes to `error` and waits
 /// for its owner (R16).
@@ -117,39 +118,36 @@ pub struct ClaimedObserverRun {
     pub deadline: DateTime<Utc>,
 }
 
-/// How a run ended, as the worker saw it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RunOutcome {
-    /// The script exited with this code.
-    Exited {
-        /// Its exit code.
-        exit_code: i32,
-    },
-    /// The script ran past its time limit and was killed.
-    TimedOut,
-    /// The worker could not run the script (a missing secret, say).
-    WorkerError {
-        /// What went wrong, without secrets.
-        message: String,
-    },
-    /// An outcome from a newer worker; counts as a worker error.
-    #[serde(other)]
-    Unrecognized,
+impl ClaimedObserverRun {
+    /// The claim as the worker route answers it.
+    pub fn into_wire(self) -> ObserverWorkerRun {
+        ObserverWorkerRun {
+            run_id: self.run_id.to_string(),
+            token: self.token.expose().to_string(),
+            dry_run: self.dry_run,
+            script_version: self.script_version,
+            script: self.script,
+            // A `ScriptInput` is plain data: it always serializes.
+            input: serde_json::to_value(&self.input).unwrap_or_default(),
+            secrets: self
+                .secrets
+                .into_iter()
+                .map(|secret| ObserverSecretRef {
+                    name: secret.name,
+                    env: secret.env,
+                })
+                .collect(),
+            timeout_secs: self.timeout_secs,
+            deadline: self.deadline,
+        }
+    }
 }
 
-/// The worker's result of a run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunReport {
-    /// How it ended.
-    pub outcome: RunOutcome,
-    /// The script's stdout, secrets masked: the contract's document.
-    #[serde(default)]
-    pub stdout: String,
-    /// The script's stderr, secrets masked.
-    #[serde(default)]
-    pub stderr: String,
-}
+/// How a run ended, as the worker saw it (the wire type of the worker's
+/// result route).
+pub use narsor_protocol::controller::ObserverRunOutcome as RunOutcome;
+/// The worker's result of a run, secrets masked.
+pub use narsor_protocol::controller::ObserverRunReport as RunReport;
 
 /// Which kind of run a claim would take from an observer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -226,6 +224,14 @@ fn judge(report: &RunReport) -> (RunStatus, Option<i32>, Option<String>, Option<
             Some(format!("the script exited with code {exit_code}")),
             None,
         ),
+        RunOutcome::OutputTooLarge { exit_code } => (
+            RunStatus::InvalidOutput,
+            Some(*exit_code),
+            Some(format!(
+                "the script printed more than {MAX_SCRIPT_OUTPUT_BYTES} bytes on stdout"
+            )),
+            None,
+        ),
         RunOutcome::TimedOut => (
             RunStatus::TimedOut,
             None,
@@ -286,10 +292,45 @@ impl ProtocolService {
     /// observer never has two runs at once. An observer that fails to
     /// yield its run is logged and skipped, so it does not block the rest.
     pub fn claim_observer_run(&self) -> ProtocolResult<Option<ClaimedObserverRun>> {
+        self.claim_next_run(None)
+    }
+
+    /// Like [`Self::claim_observer_run`], for a worker of `owner`: only the
+    /// runs of `owner`'s observers.
+    pub fn claim_observer_run_for(
+        &self,
+        owner: &OwnerRef,
+    ) -> ProtocolResult<Option<ClaimedObserverRun>> {
+        self.claim_next_run(Some(owner))
+    }
+
+    /// Like [`Self::finish_observer_run`], for a worker of `owner`: the run
+    /// of an observer of anyone else is not found.
+    pub fn finish_observer_run_for(
+        &self,
+        owner: &OwnerRef,
+        run_id: &RunId,
+        report: RunReport,
+    ) -> ProtocolResult<ObserverRun> {
+        match self.observers.load(&run_id.observer_id) {
+            Ok(record) if &record.owner == owner => {}
+            Ok(_) | Err(ObserverError::NotFound(_)) => return Err(ProtocolError::NotFound),
+            Err(error) => return Err(error.into()),
+        }
+        self.finish_observer_run(run_id, report)
+    }
+
+    /// The claim of [`Self::claim_observer_run`], among the observers of
+    /// `owner` when given.
+    fn claim_next_run(
+        &self,
+        owner: Option<&OwnerRef>,
+    ) -> ProtocolResult<Option<ClaimedObserverRun>> {
         let mut candidates: Vec<(ClaimKind, DateTime<Utc>, ObserverId)> = self
             .observers
             .list()?
             .into_iter()
+            .filter(|record| owner.is_none_or(|owner| &record.owner == owner))
             .filter_map(|record| {
                 claim_candidate(&record).map(|(kind, since)| (kind, since, record.observer_id))
             })

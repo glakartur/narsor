@@ -33,6 +33,8 @@ pub mod connection_profile;
 pub mod control_text;
 pub mod daemon;
 pub mod init;
+pub mod observer;
+pub mod observer_worker;
 mod prompt;
 pub mod remote;
 pub mod task_history;
@@ -323,6 +325,14 @@ pub enum Command {
         command: remote::TaskCommand,
     },
 
+    /// Observers of external sources: the worker that runs their scripts
+    /// and its credential.
+    Observer {
+        /// What to do.
+        #[command(subcommand)]
+        command: observer::ObserverCommand,
+    },
+
     /// The backends of remote tasks: the default backend of new tasks.
     Backend {
         /// What to do.
@@ -574,6 +584,7 @@ impl Command {
             | Command::Usage { .. }
             | Command::Auth { .. }
             | Command::Daemon { .. } => false,
+            Command::Observer { command } => command.runs_on_broken_config(),
             // Configured by its own flags and environment only, like the
             // runner: it reads no Narsor configuration file. Its operator
             // subcommands talk to a control plane and need none either.
@@ -729,6 +740,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Purge(options) => init::purge(options, config_file.as_deref()),
         Command::Task { command } => remote::task(command, &target, &state, &flags).await,
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
+        Command::Observer { command } => observer::observer(command, &target, &state, &flags).await,
         Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,
         Command::Usage { json } => remote::usage(json, &target, &state, &flags).await,
         Command::Auth { command } => remote::auth(command, &target, &state, &flags).await,
@@ -867,6 +879,20 @@ mod tests {
         }
         .runs_on_broken_config());
         assert!(Command::Init(init::InitOptions::default()).runs_on_broken_config());
+        // The observer worker reads its flags only; the owner's credential
+        // commands talk to the configured control plane.
+        let worker = Cli::try_parse_from([
+            "narsor-cli",
+            "observer",
+            "worker",
+            "--credential-file",
+            "/etc/narsor/credential",
+        ])
+        .unwrap();
+        assert!(worker.command.runs_on_broken_config());
+        let token =
+            Cli::try_parse_from(["narsor-cli", "observer", "worker-token", "list"]).unwrap();
+        assert!(!token.command.runs_on_broken_config());
 
         for command in [
             Command::List,

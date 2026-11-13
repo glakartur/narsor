@@ -190,6 +190,32 @@ fn observer_effect_requests_refuse_fields_a_script_may_not_choose() {
 }
 
 #[test]
+fn a_worker_run_hides_its_token_and_an_unknown_outcome_is_unrecognized() {
+    let run = super::ObserverWorkerRun {
+        run_id: "obs-1.1".into(),
+        token: "nso.obs-1.1.secret-part".into(),
+        dry_run: false,
+        script_version: 1,
+        script: "true".into(),
+        input: serde_json::json!({}),
+        secrets: Vec::new(),
+        timeout_secs: 300,
+        deadline: Utc::now(),
+    };
+    assert!(!format!("{run:?}").contains("secret-part"));
+
+    let outcome: super::ObserverRunOutcome =
+        serde_json::from_value(serde_json::json!({"kind": "exploded", "why": "newer"})).unwrap();
+    assert_eq!(outcome, super::ObserverRunOutcome::Unrecognized);
+    let too_large =
+        serde_json::to_value(super::ObserverRunOutcome::OutputTooLarge { exit_code: 0 }).unwrap();
+    assert_eq!(
+        too_large,
+        serde_json::json!({"kind": "output_too_large", "exit_code": 0})
+    );
+}
+
+#[test]
 fn owner_conversation_response_keeps_summary_only_wire_fields() {
     let now = Utc::now();
     let response = super::ConversationResponse::Available {

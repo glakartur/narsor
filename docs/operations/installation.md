@@ -229,3 +229,92 @@ enrollment code through `NARSOR_ENROLLMENT_CODE` or a protected file, never as
 a command-line argument. See [Remote execution backends](remote-backends.md)
 for proxy requirements, token handling, controller credentials, and the full
 workstation security boundary.
+
+## Run the observer worker
+
+Observers poll external sources (Jira, GitHub, GitLab) with a shell script
+on a schedule. The control plane keeps the schedule; a separate worker
+process, `narsor-cli observer worker`, claims the runs that are due, runs
+their scripts and reports the results. Run it on a host that can reach both
+the control plane and the sources, under its own system user.
+
+**Create the worker credential.** The worker does not use the owner's token.
+It has a credential of its own, which can only claim the runs of the owner's
+observers and report their results. As the owner:
+
+```bash
+narsor-cli observer worker-token create --name "$(hostname)" \
+  --output /etc/narsor/observer-worker/credential
+chown narsor-observer: /etc/narsor/observer-worker/credential
+```
+
+The credential is shown or written once; the server keeps only its SHA-256
+digest. `--output` creates a new file of mode `0600`. The worker refuses to
+start when the file can be read by any other user. `narsor-cli observer
+worker-token list` shows the credentials, and `narsor-cli observer
+worker-token revoke WORKER_ID` stops one at once: the worker then exits with
+an error. A run it claimed and did not report is recorded as lost at the
+run's deadline (script limit plus one minute) and does not count as a failed
+run of the script.
+
+**Provide the secrets.** An observer names the secrets it needs (a name and
+an environment variable); their values never reach the control plane. Put
+one file per secret name in the worker's secrets directory, which must be
+accessible to the worker's user only (`0700`):
+
+```bash
+install -d -m 0700 -o narsor-observer /etc/narsor/observer-worker/secrets
+install -m 0600 -o narsor-observer /dev/stdin \
+  /etc/narsor/observer-worker/secrets/jira-token <<<"$JIRA_TOKEN"
+```
+
+A run whose secret file is missing fails before its script starts. A dry run
+of a script version that is not approved gets no secrets unless the owner
+asked for them (`--with-secrets`).
+
+**Start the worker.** The unit
+[`deploy/observer-worker/narsor-observer-worker.service`](../../deploy/observer-worker/narsor-observer-worker.service)
+runs the worker as `narsor-observer` and every script as a second system
+user, `narsor-observer-script`, which cannot read the credential or the
+secrets directory. It grants the worker only the capabilities needed to
+switch to that user and end its processes (`CAP_SETUID`, `CAP_SETGID`,
+`CAP_CHOWN`, `CAP_KILL`), and bounds the worker and all its scripts together
+with `MemoryMax` and `TasksMax`. Create both users, set `NARSOR_SERVER` in
+`/etc/narsor/observer-worker.env`, then enable the unit as its header
+describes. Without systemd, start the worker the same way:
+
+```bash
+NARSOR_SERVER=https://narsor.example.com narsor-cli observer worker \
+  --credential-file /etc/narsor/observer-worker/credential \
+  --secrets-dir /etc/narsor/observer-worker/secrets \
+  --script-user narsor-observer-script
+```
+
+`--once` claims once and exits, for a cron job. `--work-dir` moves the run
+directories out of the system's temporary directory; `--script-path` sets
+the scripts' `PATH`.
+
+**What a script gets.** The worker asks for a due run every 10 seconds. For
+each run it makes a temporary directory (mode `0700`, owned by the script
+user, removed afterwards) and runs `sh` there with an empty environment plus
+exactly these variables:
+
+| variable | value |
+| --- | --- |
+| `PATH` | the directory of `narsor-cli`, then `/usr/local/bin:/usr/bin:/bin` |
+| `HOME` | the run directory |
+| `NARSOR_SERVER` | the control plane's URL |
+| `NARSOR_TOKEN` | the run's token: valid on this run's effect routes only, until its result or deadline |
+| `NARSOR_OBSERVER_RUN` | the run's id |
+| one per secret | the value of the observer's secret |
+
+Nothing of the worker's own environment is passed on. The script reads the
+run's input as JSON on stdin and prints its result on stdout. It runs in a
+process group of its own: at its time limit (5 minutes) the group gets
+`SIGTERM`, then `SIGKILL` 5 seconds later; when the script exits, anything it
+left running is killed. stdout may hold at most 1 MiB (more is a format
+error that leaves the observer's state unchanged); the first 64 KiB of stderr
+are kept. Before the result leaves the worker, control characters are
+removed and every occurrence of a secret value or of the run's token is
+replaced by `[masked]`, error messages included. Masking is a second line of
+defence: scripts should not print secrets in the first place.

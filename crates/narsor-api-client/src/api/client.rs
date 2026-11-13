@@ -84,12 +84,15 @@ use crate::controller_protocol::{
 };
 use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
-    ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
-    CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
-    ExecutionEventsResponse, HarnessUsageResponse, OwnerCommandRequest, RepositoryBranchesResponse,
-    RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
-    SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
-    ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
+    ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateObserverWorkerRequest,
+    CreateRepositoryRequest, CreateTaskRequest, DefaultBackendView, EnrollmentResponse,
+    ExecutionEventsQuery, ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
+    ObserverRunReport, ObserverRunResultResponse, ObserverWorkerCreated,
+    ObserverWorkerListResponse, ObserverWorkerRun, ObserverWorkerView, OwnerCommandRequest,
+    RepositoryBranchesResponse, RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest,
+    SetDefaultBackendRequest, SubmitInputRequest, SubmitOperatorCommandRequest,
+    ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest,
+    WorkflowSourceResponse,
 };
 
 use super::token::{TokenCell, TokenSource};
@@ -1017,6 +1020,58 @@ impl ApiClient {
             self.base_url
         );
         self.post_empty(&url).await
+    }
+
+    // -----------------------------------------------------------------
+    // Observer workers (U6)
+    // -----------------------------------------------------------------
+
+    /// Creates an observer worker credential, returned this once —
+    /// `POST /control/v1/observer-workers`.
+    pub async fn create_observer_worker(
+        &self,
+        request: &CreateObserverWorkerRequest,
+    ) -> Result<ObserverWorkerCreated, ClientError> {
+        let url = format!("{}/control/v1/observer-workers", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// The owner's observer worker credentials, revoked ones included.
+    pub async fn observer_workers(&self) -> Result<ObserverWorkerListResponse, ClientError> {
+        let url = format!("{}/control/v1/observer-workers", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Revokes an observer worker credential.
+    pub async fn revoke_observer_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<ObserverWorkerView, ClientError> {
+        let url = format!(
+            "{}/control/v1/observer-workers/{worker_id}/revoke",
+            self.base_url
+        );
+        self.post_empty(&url).await
+    }
+
+    /// Claims the next due observer run, for a client holding a worker
+    /// credential — `POST /observer/v1/worker/claim`. `None` when no run is
+    /// due.
+    pub async fn claim_observer_run(&self) -> Result<Option<ObserverWorkerRun>, ClientError> {
+        let url = format!("{}/observer/v1/worker/claim", self.base_url);
+        let response: ObserverClaimResponse = self.post_empty(&url).await?;
+        Ok(response.run)
+    }
+
+    /// Reports the result of a claimed observer run —
+    /// `POST /observer/v1/worker/runs/{run}/result`.
+    pub async fn report_observer_run(
+        &self,
+        run_id: &str,
+        report: &ObserverRunReport,
+    ) -> Result<ObserverRunResultResponse, ClientError> {
+        let url = format!("{}/observer/v1/worker/runs/{run_id}/result", self.base_url);
+        self.post_json(&url, report).await
     }
 
     // -----------------------------------------------------------------

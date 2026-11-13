@@ -1,0 +1,68 @@
+# The stage-1 observer worker: claims the observer runs the control plane
+# has due and runs their scripts. See docs/operations/installation.md,
+# "Run the observer worker".
+#
+# Two system users, neither of them root nor a person's account:
+#
+#   narsor-observer         runs this worker; owns the credential file and
+#                           the secrets directory (both readable by it only)
+#   narsor-observer-script  runs the scripts (--script-user); cannot read
+#                           either of them
+#
+#   useradd --system --home-dir /var/lib/narsor-observer --shell /usr/sbin/nologin narsor-observer
+#   useradd --system --no-create-home --shell /usr/sbin/nologin narsor-observer-script
+#
+# Install as /etc/systemd/system/narsor-observer-worker.service, set the
+# server URL in /etc/narsor/observer-worker.env (NARSOR_SERVER=https://…),
+# then: systemctl daemon-reload && systemctl enable --now narsor-observer-worker
+
+[Unit]
+Description=Narsor observer worker (stage 1)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=narsor-observer
+Group=narsor-observer
+EnvironmentFile=/etc/narsor/observer-worker.env
+ExecStart=/usr/local/bin/narsor-cli observer worker \
+    --credential-file /etc/narsor/observer-worker/credential \
+    --secrets-dir /etc/narsor/observer-worker/secrets \
+    --script-user narsor-observer-script
+
+# Switching to the script user, handing it its run directory and ending its
+# processes need these capabilities, and only these. The worker clears the
+# ambient set and sets no_new_privs in each script process before exec, so
+# a script holds none of them.
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL
+
+# Run directories live in a private /tmp, removed with the service.
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/narsor/observer-worker
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+
+# Every script runs inside this unit's cgroup: these bound all of them
+# together, the worker included.
+MemoryMax=512M
+TasksMax=128
+CPUQuota=100%
+
+# A revoked credential stops the worker with an error; it is restarted
+# after a pause, so a new credential in the file is picked up.
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

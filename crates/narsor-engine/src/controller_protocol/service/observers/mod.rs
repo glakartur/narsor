@@ -1,7 +1,8 @@
 //! The control plane's side of observers: what the owner decides about an
 //! observer (approval, dry runs, pause and resume), the schedule that
 //! hands runs to the worker ([`schedule`]) and the effects a run's script
-//! has through its token ([`effects`]).
+//! has through its token ([`effects`]), and the credential of the worker
+//! that claims runs ([`workers`]).
 //!
 //! Every mutation runs under the observer's lock and saves the record once;
 //! the record is the commit point (see [`crate::observers::store`]). Who may
@@ -27,6 +28,7 @@ mod effects_tests;
 mod schedule;
 #[cfg(test)]
 mod tests;
+mod workers;
 
 pub use effects::{MAX_EFFECT_DATA_BYTES, MAX_EVENT_DATA_BYTES};
 pub use schedule::{

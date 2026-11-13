@@ -1,3 +1,6 @@
+//! The observers' HTTP routes outside the owner gate, and the owner's routes
+//! for the worker credential.
+//!
 //! The effect routes of an observer run's script (U3), behind the observer
 //! run gate ([`crate::auth_gate::require_observer_run`]):
 //!
@@ -11,6 +14,27 @@
 //! accepts nothing but the token of a run in progress before its deadline,
 //! and only for that run's own path. Refusals of the gate are a bare `401`;
 //! a refused effect is a coded `400` or `409` the script can print.
+//!
+//! The worker routes (U6), behind the observer worker gate
+//! ([`crate::auth_gate::require_observer_worker`]), for the observers of
+//! the credential's owner only:
+//!
+//! | route | body | answer |
+//! | --- | --- | --- |
+//! | `POST /observer/v1/worker/claim` | none | `200` [`ObserverClaimResponse`] |
+//! | `POST /observer/v1/worker/runs/{run}/result` | [`ObserverRunReport`] | `200` [`ObserverRunResultResponse`], `404` another owner's run, `409` ended |
+//!
+//! The owner's routes for the worker credential ([`observer_owner_routes`],
+//! behind the owner gate):
+//!
+//! | route | body | answer |
+//! | --- | --- | --- |
+//! | `GET /control/v1/observer-workers` | none | [`ObserverWorkerListResponse`] |
+//! | `POST /control/v1/observer-workers` | [`CreateObserverWorkerRequest`] | `201` [`ObserverWorkerCreated`] |
+//! | `POST /control/v1/observer-workers/{worker_id}/revoke` | none | [`ObserverWorkerView`] |
+//!
+//! Each credential opens its own routes only: a run token is refused on the
+//! worker routes, a worker credential on the effect routes and the owner's.
 
 use std::sync::Arc;
 
@@ -18,18 +42,24 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::de::DeserializeOwned;
 
 use super::http::{blocking, HttpProtocolError, ProtocolResult};
-use crate::auth_gate::{require_observer_run, Principal};
+use crate::auth_gate::{require_observer_run, require_observer_worker, Operator, Principal};
 use narsor_engine::controller_protocol::error::ProtocolError;
-use narsor_engine::controller_protocol::service::{ProtocolService, MAX_EFFECT_DATA_BYTES};
-use narsor_engine::controller_protocol::wire::{
-    ObserverCreateTaskRequest, ObserverEffectOutcome, ObserverEffectResponse, ObserverEventRequest,
+use narsor_engine::controller_protocol::service::{
+    ProtocolService, MAX_EFFECT_DATA_BYTES, MAX_STORED_LOG_BYTES,
 };
-use narsor_engine::observers::RunId;
+use narsor_engine::controller_protocol::wire::{
+    CreateObserverWorkerRequest, ObserverClaimResponse, ObserverCreateTaskRequest,
+    ObserverEffectOutcome, ObserverEffectResponse, ObserverEventRequest, ObserverRunReport,
+    ObserverRunResultResponse, ObserverWorkerCreated, ObserverWorkerListResponse,
+    ObserverWorkerView,
+};
+use narsor_engine::observers::{RunId, MAX_SCRIPT_OUTPUT_BYTES};
+use narsor_engine::orchestration::OwnerRef;
 
 type Service = Arc<ProtocolService>;
 
@@ -37,8 +67,56 @@ type Service = Arc<ProtocolService>;
 /// and the type. Anything larger is refused before it is read.
 const MAX_EFFECT_BODY: usize = MAX_EFFECT_DATA_BYTES + 16 * 1024;
 
-/// The effect routes, behind the observer run gate.
+/// Largest result body a worker may send: the contract's stdout, the
+/// stored stderr, each of which JSON escaping may double, and room for the
+/// outcome.
+const MAX_RESULT_BODY: usize = 2 * (MAX_SCRIPT_OUTPUT_BYTES + MAX_STORED_LOG_BYTES) + 16 * 1024;
+
+/// The routes outside the owner gate: the effect routes behind the observer
+/// run gate, the worker routes behind the observer worker gate.
 pub fn observer_routes<S>(service: Service) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    effect_routes(Arc::clone(&service)).merge(worker_routes(service))
+}
+
+/// The worker routes, behind the observer worker gate.
+fn worker_routes<S>(service: Service) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/observer/v1/worker/claim", post(post_claim))
+        .route("/observer/v1/worker/runs/{run}/result", post(post_result))
+        .layer(DefaultBodyLimit::max(MAX_RESULT_BODY))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&service),
+            require_observer_worker,
+        ))
+        .with_state(service)
+}
+
+/// The owner's routes for the worker credential; they expect the owner
+/// gate's [`OwnerRef`] and [`Operator`] in the request extensions.
+pub fn observer_owner_routes<S>(service: Service) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route(
+            "/control/v1/observer-workers",
+            get(list_workers).post(post_worker),
+        )
+        .route(
+            "/control/v1/observer-workers/{worker_id}/revoke",
+            post(post_revoke_worker),
+        )
+        .with_state(service)
+}
+
+/// The effect routes, behind the observer run gate.
+fn effect_routes<S>(service: Service) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -104,6 +182,104 @@ async fn post_event(
     Ok(Json(
         blocking(&service, move |s| {
             s.observer_deliver_event(&run_id, &task_id, request)
+        })
+        .await?,
+    ))
+}
+
+/// The owner a worker credential acts for (a bare `401` for any other
+/// principal, which the worker gate never lets through anyway).
+fn worker_owner(principal: &Principal) -> ProtocolResult<OwnerRef> {
+    match principal {
+        Principal::ObserverWorker { owner, .. } => Ok(owner.clone()),
+        _ => Err(HttpProtocolError(ProtocolError::Unauthorized)),
+    }
+}
+
+async fn post_claim(
+    State(service): State<Service>,
+    Extension(principal): Extension<Principal>,
+) -> ProtocolResult<Json<ObserverClaimResponse>> {
+    let owner = worker_owner(&principal)?;
+    let claimed = blocking(&service, move |s| s.claim_observer_run_for(&owner)).await?;
+    Ok(Json(ObserverClaimResponse {
+        run: claimed.map(|claimed| claimed.into_wire()),
+    }))
+}
+
+async fn post_result(
+    State(service): State<Service>,
+    Extension(principal): Extension<Principal>,
+    Path(run): Path<String>,
+    body: Bytes,
+) -> ProtocolResult<Json<ObserverRunResultResponse>> {
+    let owner = worker_owner(&principal)?;
+    let run_id = RunId::parse(&run).map_err(|_| HttpProtocolError(ProtocolError::NotFound))?;
+    let report: ObserverRunReport = parse_body(&body)?;
+    let run = blocking(&service, move |s| {
+        s.finish_observer_run_for(&owner, &run_id, report)
+    })
+    .await?;
+    let status = serde_json::to_value(run.status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default();
+    Ok(Json(ObserverRunResultResponse {
+        run_id: run.run_id().to_string(),
+        status,
+        error: run.error,
+    }))
+}
+
+/// The owner and operator a worker credential route needs (a bare `403`
+/// without them).
+fn require_owner_operator(
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+) -> ProtocolResult<OwnerRef> {
+    match (owner, operator) {
+        (Some(Extension(owner)), Some(_)) => Ok(owner),
+        _ => Err(HttpProtocolError(ProtocolError::Forbidden)),
+    }
+}
+
+async fn list_workers(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+) -> ProtocolResult<Json<ObserverWorkerListResponse>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| s.observer_workers(&owner)).await?,
+    ))
+}
+
+async fn post_worker(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    body: Bytes,
+) -> ProtocolResult<(StatusCode, Json<ObserverWorkerCreated>)> {
+    let owner = require_owner_operator(owner, operator)?;
+    let request: CreateObserverWorkerRequest = if body.is_empty() {
+        CreateObserverWorkerRequest::default()
+    } else {
+        parse_body(&body)?
+    };
+    let created = blocking(&service, move |s| s.create_observer_worker(&owner, request)).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn post_revoke_worker(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(worker_id): Path<String>,
+) -> ProtocolResult<Json<ObserverWorkerView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.revoke_observer_worker(&owner, &worker_id)
         })
         .await?,
     ))
@@ -554,5 +730,233 @@ mod tests {
             .await;
 
         assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// An active "create a task" observer, due once the pass runs.
+    fn jira_observer(fx: &Fixture) -> ObserverId {
+        fx.observer(
+            "jira-all",
+            ObserverEffect::CreateTask(CreateTaskEffect {
+                workflow_id: "triage".into(),
+                workflow_version: 1,
+                workspaces: Default::default(),
+                backend_id: None,
+                profile: None,
+                mapping: [("ticket".to_string(), "key".to_string())].into(),
+            }),
+            WatchMode::All,
+        )
+    }
+
+    /// A worker credential of the owner, created through the owner route.
+    async fn worker_credential(fx: &Fixture) -> (String, String) {
+        let created = fx
+            .send(
+                "POST",
+                "/control/v1/observer-workers",
+                OWNER_TOKEN,
+                json!({"name": "host-1"}),
+            )
+            .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body = json_body(created).await;
+        assert_eq!(body["worker"]["name"], "host-1");
+        (
+            body["worker"]["worker_id"].as_str().unwrap().to_string(),
+            body["credential"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_worker_claims_a_run_and_reports_its_result() {
+        let fx = Fixture::new();
+        let (_worker_id, credential) = worker_credential(&fx).await;
+        let id = jira_observer(&fx);
+        fx.service.observer_pass();
+
+        let claim = fx
+            .send(
+                "POST",
+                "/observer/v1/worker/claim",
+                &credential,
+                Value::Null,
+            )
+            .await;
+
+        assert_eq!(claim.status(), StatusCode::OK);
+        let run = json_body(claim).await["run"].clone();
+        let run_id = run["run_id"].as_str().unwrap().to_string();
+        assert!(run_id.starts_with(id.as_str()), "{run_id}");
+        assert!(run["token"].as_str().unwrap().starts_with("nso."));
+        assert_eq!(run["input"]["observer"]["name"], "jira-all");
+        assert_eq!(run["script"], "echo '{\"state\": {}}'\n");
+        let empty = fx
+            .send(
+                "POST",
+                "/observer/v1/worker/claim",
+                &credential,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(json_body(empty).await["run"], Value::Null);
+
+        let result = fx
+            .send(
+                "POST",
+                &format!("/observer/v1/worker/runs/{run_id}/result"),
+                &credential,
+                json!({"outcome": {"kind": "exited", "exit_code": 0}, "stdout": "{\"state\": {\"cursor\": 5}}"}),
+            )
+            .await;
+        assert_eq!(result.status(), StatusCode::OK);
+        let body = json_body(result).await;
+        assert_eq!(body["status"], "succeeded");
+        assert_eq!(body["run_id"], run_id.as_str());
+        let record = fx.service.observers().load(&id).unwrap();
+        assert_eq!(record.script_state, Some(json!({"cursor": 5})));
+
+        let again = fx
+            .send(
+                "POST",
+                &format!("/observer/v1/worker/runs/{run_id}/result"),
+                &credential,
+                json!({"outcome": {"kind": "exited", "exit_code": 0}, "stdout": ""}),
+            )
+            .await;
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn each_credential_opens_only_its_own_routes() {
+        let fx = Fixture::new();
+        let (_worker_id, credential) = worker_credential(&fx).await;
+        let (run, task) = fx.event_run();
+
+        for (method, uri) in [
+            ("GET", "/control/v1/tasks"),
+            ("GET", "/control/v1/observer-workers"),
+            ("POST", "/control/v1/observer-workers"),
+        ] {
+            let refused = fx.send(method, uri, &credential, json!({})).await;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        let effect = fx
+            .send("POST", &events_uri(&run, &task), &credential, event("k"))
+            .await;
+        assert_eq!(effect.status(), StatusCode::UNAUTHORIZED);
+
+        let result_uri = format!("/observer/v1/worker/runs/{}/result", run.run_id);
+        for token in [run.token.expose(), OWNER_TOKEN, "nsw.wkr-1.forged"] {
+            let claim = fx
+                .send("POST", "/observer/v1/worker/claim", token, Value::Null)
+                .await;
+            assert_eq!(claim.status(), StatusCode::UNAUTHORIZED);
+            assert!(json_body_is_empty(claim).await);
+            let result = fx
+                .send(
+                    "POST",
+                    &result_uri,
+                    token,
+                    json!({"outcome": {"kind": "timed_out"}}),
+                )
+                .await;
+            assert_eq!(result.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_revoked_worker_credential_is_refused() {
+        let fx = Fixture::new();
+        let (worker_id, credential) = worker_credential(&fx).await;
+        let listed = fx
+            .send(
+                "GET",
+                "/control/v1/observer-workers",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(
+            json_body(listed).await["workers"][0]["worker_id"],
+            worker_id.as_str()
+        );
+
+        let revoked = fx
+            .send(
+                "POST",
+                &format!("/control/v1/observer-workers/{worker_id}/revoke"),
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+
+        assert_eq!(revoked.status(), StatusCode::OK);
+        assert!(json_body(revoked).await["revoked_at"].is_string());
+        let claim = fx
+            .send(
+                "POST",
+                "/observer/v1/worker/claim",
+                &credential,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(claim.status(), StatusCode::UNAUTHORIZED);
+        let unknown = fx
+            .send(
+                "POST",
+                "/control/v1/observer-workers/wkr-0/revoke",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_worker_of_another_owner_neither_claims_nor_reports_the_run() {
+        let fx = Fixture::new();
+        let stranger = fx
+            .service
+            .create_observer_worker(&OwnerRef::new("someone-else"), Default::default())
+            .unwrap()
+            .credential;
+        jira_observer(&fx);
+        fx.service.observer_pass();
+
+        let claim = fx
+            .send("POST", "/observer/v1/worker/claim", &stranger, Value::Null)
+            .await;
+        assert_eq!(json_body(claim).await["run"], Value::Null);
+
+        let run = fx.service.claim_observer_run().unwrap().unwrap();
+        let result = fx
+            .send(
+                "POST",
+                &format!("/observer/v1/worker/runs/{}/result", run.run_id),
+                &stranger,
+                json!({"outcome": {"kind": "exited", "exit_code": 0}, "stdout": "{\"state\": {}}"}),
+            )
+            .await;
+        assert_eq!(result.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            fx.service.observers().load_run(&run.run_id).unwrap().status,
+            narsor_engine::observers::RunStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn the_credential_record_keeps_only_a_digest() {
+        let fx = Fixture::new();
+        let (worker_id, credential) = worker_credential(&fx).await;
+        let path = StatePaths::new(&fx.root).observer_worker_file(&worker_id);
+
+        let stored = std::fs::read_to_string(&path).unwrap();
+
+        let secret = credential.rsplit_once('.').unwrap().1;
+        assert!(!stored.contains(secret), "{stored}");
+        assert!(stored.contains("sha256:"), "{stored}");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

@@ -54,6 +54,7 @@ mod observers_effects;
 mod observers_schedule;
 mod observers_store;
 mod observers_watch;
+mod observers_worker;
 mod orchestration;
 mod persistence;
 mod profile_step_flow;

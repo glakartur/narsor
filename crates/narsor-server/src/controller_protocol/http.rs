@@ -7,7 +7,7 @@
 //! | [`owner_routes`] | the API's own owner gate (it inserts the caller's [`OwnerRef`]) | `/control/v1` |
 //! | [`controller_routes`] | controller credential → [`ControllerIdentity`] | `/controller/v1` |
 //! | [`runner_routes`] | runner credential → [`RunnerIdentity`] | `/runner/v1` |
-//! | [`observer_routes`] | observer run token → `Principal::ObserverRun` | `/observer/v1` |
+//! | [`observer_routes`] | observer run token → `Principal::ObserverRun`; observer worker credential → `Principal::ObserverWorker` | `/observer/v1` |
 //!
 //! Each gate answers every refusal with a bare `401` — the same rule as the
 //! API's token gate, so a credential is never confirmed or denied by
@@ -201,6 +201,9 @@ where
             "/control/v1/controllers/{controller_id}/revoke",
             post(post_revoke_controller),
         )
+        .merge(super::observer_http::observer_owner_routes(Arc::clone(
+            &service,
+        )))
         .with_state(service)
 }
 
