@@ -53,14 +53,14 @@ Stan w repozytorium (zweryfikowany):
 - F2. Jira → nowy task
   - **Trigger:** Harmonogram obserwatora Jira.
   - **Actors:** A3, A4, A6
-  - **Steps:** A3 uruchamia skrypt. Skrypt zwraca nowe zadania, które spełniają warunek. A4 pomija zadania, dla których task już istnieje. A4 tworzy task wskazanego workflow z danymi zadania jako wejściem.
+  - **Steps:** A3 uruchamia skrypt. Skrypt znajduje nowe zadania, które spełniają warunek, i sam wywołuje `narsor-cli task create` (z jednego zadania może utworzyć wiele tasków). Skrypt przekazuje klucz skutku. A4 pomija skutek, którego klucz już wykonał.
   - **Outcome:** Jedno zadanie w Jirze daje dokładnie jeden task.
   - **Covered by:** R3, R12, R13, R14, R15
 
 - F3. Koniec review na PR/MR → zdarzenie w tasku
   - **Trigger:** Task lub A1 wskazuje PR/MR do obserwacji i typy zdarzeń, na przykład „review zatwierdzone" albo „zmiany wymagane".
   - **Actors:** A1, A3, A4, A5, A6
-  - **Steps:** A3 uruchamia skrypt tylko dla wskazanych PR/MR. Skrypt zwraca zdarzenia wybranego typu. A4 dostarcza każde zdarzenie do taska powiązanego z danym PR/MR. Task w kroku `wait` z pasującym zdarzeniem idzie dalej.
+  - **Steps:** A3 uruchamia skrypt tylko dla wskazanych PR/MR. Skrypt sam wywołuje `narsor-cli task input` dla zdarzeń wybranego typu. A4 zapisuje zdarzenie w historii taska powiązanego z danym PR/MR. Task, który w chwili zdarzenia czeka w kroku `wait` z pasującym zdarzeniem, idzie dalej.
   - **Outcome:** Task wie o końcu review bez udziału operatora.
   - **Escape:** PR/MR jest zamknięty lub scalony, albo task jest zarchiwizowany. Obserwacja tego PR/MR kończy się.
   - **Covered by:** R4, R5, R6, R7, R8, R16, R17
@@ -73,31 +73,31 @@ Stan w repozytorium (zweryfikowany):
 - R1. Obserwator ma: nazwę, źródło, skrypt, warunek (parametry przekazane do skryptu), harmonogram, skutek i stan (aktywny, wstrzymany, w błędzie).
 - R2. Skrypt jest skryptem shellowym. Narsor nie ma wbudowanych integracji z Jirą, GitHub ani GitLab. Narsor może dostarczyć przykładowe skrypty jako punkt startowy.
 - R3. Skutek „utwórz task": obserwator wskazuje workflow i mapowanie danych zdarzenia na wejście workflow (na przykład klucz zadania → `ticket`).
-- R4. Skutek „przekaż zdarzenie": obserwator dostarcza zdarzenie do taska powiązanego z obserwowanym obiektem (PR/MR). Zdarzenie ma typ, źródło i dane.
+- R4. Skutek „przekaż zdarzenie": skrypt dostarcza zdarzenie do taska powiązanego z obserwowanym obiektem (PR/MR). Zdarzenie ma typ, źródło i dane. Narsor zapisuje zdarzenie w historii taska. Krok `wait` widzi tylko zdarzenia, które nadeszły w czasie czekania. Zdarzenie dla taska, który nie czeka, nie zmienia stanu taska.
 
 **Obserwacja wskazanych obiektów (PR/MR)**
 - R5. Obserwator PR/MR obserwuje tylko obiekty z jawnej listy. Każdy wpis listy wskazuje PR/MR, task-adresata i typy zdarzeń do wyłapania.
 - R6. Gdy lista jest pusta, silnik nie uruchamia skryptu.
 - R7. Wpis znika z listy, gdy PR/MR jest zamknięty lub scalony, gdy task-adresat jest zakończony lub zarchiwizowany, albo gdy A1 usunie wpis.
-- R8. Workflow może dodać wpis do listy w trakcie działania taska (na przykład krok, który otworzył PR). Operator może też dodać wpis ręcznie.
+- R8. Wpis do listy dodaje krok workflow (jawna deklaracja w YAML, na przykład krok, który otworzył PR i czeka na review) albo operator ręcznie przez CLI. Narsor nie dodaje wpisów automatycznie.
 
 **Tworzenie skryptu z agentem**
 - R9. A1 może poprosić agenta o skrypt na podstawie opisu warunku. Agent zna kontrakt skryptu (R12) i przykładowe skrypty.
-- R10. Przebieg próbny uruchamia skrypt i pokazuje wykryte zmiany. Przebieg próbny nie tworzy tasków i nie dostarcza zdarzeń.
+- R10. Przebieg próbny uruchamia skrypt i pokazuje wykryte zmiany. W przebiegu próbnym `narsor-cli` nie tworzy tasków i nie dostarcza zdarzeń, tylko zapisuje, co zrobiłby.
 - R11. Nowy lub zmieniony skrypt nie działa według harmonogramu, dopóki człowiek go nie zatwierdzi. Dotyczy to także skryptu napisanego przez agenta.
 
 **Wykonanie i niezawodność**
-- R12. Skrypt ma stały kontrakt: dostaje warunek i zapamiętany stan z poprzedniego uruchomienia, zwraca listę wykrytych zmian i nowy stan. Każda zmiana ma stały klucz (na przykład `ABC-123` albo `PR#42:review:1234`).
-- R13. Narsor nie wykonuje skutku dwa razy dla tego samego klucza zmiany w jednym obserwatorze. Dotyczy to też ponownego uruchomienia po awarii.
-- R14. Uruchomienie skryptu ma limit czasu. Błąd, przekroczenie czasu lub zły format wyniku nie wykonuje żadnego skutku i nie zmienia stanu obserwatora.
-- R15. Jedno uruchomienie ma limit liczby nowych tasków. Nadwyżka nie tworzy tasków, a obserwator przechodzi w stan wymagający uwagi operatora.
+- R12. Skrypt ma stały kontrakt: dostaje warunek i zapamiętany stan z poprzedniego uruchomienia, wykonuje skutki przez `narsor-cli` (`task create`, `task input`) i zwraca nowy stan. Każdy skutek ma stały klucz (na przykład `ABC-123` albo `PR#42:review:1234`), który skrypt przekazuje do `narsor-cli`.
+- R13. Narsor odrzuca drugie wywołanie skutku z tym samym kluczem w jednym obserwatorze. Dotyczy to też ponownego uruchomienia po awarii.
+- R14. Uruchomienie skryptu ma limit czasu. Błąd, przekroczenie czasu lub zły format stanu nie zmienia zapamiętanego stanu obserwatora. Skutki, które skrypt wykonał przed błędem, zostają; deduplikacja z R13 chroni przed ich powtórzeniem w kolejnym uruchomieniu.
+- R15. Jedno uruchomienie ma limit liczby nowych tasków. Narsor odrzuca wywołania `task create` ponad limit, a obserwator przechodzi w stan wymagający uwagi operatora.
 - R16. Kolejne błędy uruchomień zwiększają odstęp między próbami. Po ustalonej liczbie błędów obserwator przechodzi w stan „w błędzie" i operator to widzi.
 - R17. Harmonogram ma dolną granicę odstępu między uruchomieniami (ochrona limitów API źródeł).
 
 **Widoczność i bezpieczeństwo**
 - R18. Operator widzi listę obserwatorów, ich stan, czas ostatniego uruchomienia, wynik i błąd. Operator może wstrzymać, wznowić i usunąć obserwator przez CLI. TUI w późniejszej wersji.
 - R19. Task utworzony przez obserwator i zdarzenie przekazane do taska mają ślad pochodzenia: nazwa obserwatora i klucz zmiany.
-- R20. Dane dostępowe do źródeł pochodzą z rejestru sekretów control plane. Skrypt nie zawiera sekretów. Wynik przebiegu próbnego i logi nie pokazują sekretów.
+- R20. Dane dostępowe do źródeł pochodzą z rejestru sekretów control plane. Skrypt nie zawiera sekretów. Wynik przebiegu próbnego i logi nie pokazują sekretów. Skrypt używa tokenu Narsora ograniczonego do jego obserwatora (tylko `task create` i `task input`, ważnego w czasie uruchomienia).
 - R21. W trybie sieciowym tylko właściciel instalacji tworzy, zmienia i zatwierdza obserwatory.
 
 ---
@@ -106,9 +106,10 @@ Stan w repozytorium (zweryfikowany):
 
 - AE1. **Covers R5, R6.** Given obserwator PR bez wpisów, when nadchodzi czas harmonogramu, then skrypt nie startuje i nie ma wpisu o uruchomieniu.
 - AE2. **Covers R12, R13.** Given zadanie `ABC-123` dało już task, when skrypt w kolejnym uruchomieniu znowu zwraca `ABC-123`, then Narsor nie tworzy drugiego taska.
-- AE3. **Covers R14.** Given skrypt kończy się kodem błędu po zwróceniu części zmian, when silnik czyta wynik, then nie występuje żaden skutek, a stan obserwatora zostaje bez zmian.
-- AE4. **Covers R15.** Given limit 10 tasków na uruchomienie, when skrypt zwraca 250 zadań (na przykład błędny JQL), then Narsor nie tworzy tasków, a obserwator czeka na decyzję operatora.
+- AE3. **Covers R13, R14.** Given skrypt utworzył 3 z 5 tasków i skończył się kodem błędu, when silnik czyta wynik, then stan obserwatora zostaje bez zmian, a w kolejnym uruchomieniu Narsor odrzuca powtórzone klucze i tworzy tylko brakujące 2 taski.
+- AE4. **Covers R15.** Given limit 10 tasków na uruchomienie, when skrypt zwraca 250 zadań (na przykład błędny JQL), then Narsor odrzuca wywołania ponad limit (tworzy najwyżej 10 tasków), a obserwator czeka na decyzję operatora.
 - AE5. **Covers R4, R7.** Given task obserwuje MR !17 na zdarzenie „approved", when recenzent zatwierdza MR, then task dostaje zdarzenie; when MR zostaje scalony, then wpis znika z listy.
+- AE7. **Covers R4.** Given task nie czeka w kroku `wait`, when nadchodzi zdarzenie „approved", then zdarzenie trafia do historii, a task nie zmienia stanu; when task później wejdzie w krok `wait`, then nie widzi tego zdarzenia.
 - AE6. **Covers R11.** Given agent zmienił skrypt aktywnego obserwatora, when nikt nie zatwierdził zmiany, then harmonogram dalej uruchamia poprzednią zatwierdzoną wersję.
 
 ---
@@ -135,7 +136,9 @@ Stan w repozytorium (zweryfikowany):
 ## Key Decisions
 
 - Silnik oparty o skrypty, nie o wbudowane integracje: zespoły różnią się warunkami i polami. Skrypt daje elastyczność bez zmian w kodzie Narsora.
-- Skrypt wykrywa, Narsor działa (rekomendacja): skrypt zwraca listę zmian, a skutek wykonuje Narsor. Dzięki temu deduplikacja, limity, ślad pochodzenia i uprawnienia są w jednym miejscu. Skrypt nie potrzebuje tokenu Narsora. Alternatywa użytkownika (skrypt wywołuje `narsor-cli`) jest w pytaniach otwartych.
+- Skrypt sam wykonuje skutki przez `narsor-cli` (decyzja użytkownika, Q1): daje to elastyczność, na przykład wiele tasków z jednego zadania Jira. Cena: Narsor nie widzi zamiaru skryptu z góry. Dlatego deduplikację po kluczu (R13), limit tasków (R15) i ślad pochodzenia (R19) egzekwuje Narsor przy wywołaniu `narsor-cli`, a skrypt dostaje token o ograniczonym zakresie (R20).
+- Zdarzenie dla taska, który nie czeka, tylko trafia do historii (decyzja użytkownika, Q3): `wait` widzi wyłącznie zdarzenia z czasu czekania.
+- Wpis obserwacji PR/MR dodaje krok workflow (YAML) albo operator (decyzja użytkownika, Q4): obserwacja jest zwykle powiązana z krokami, które czekają na ocenę, decyzję lub review użytkownika.
 - Obserwacja PR/MR jako lista wpisów powiązanych z taskami: spełnia wymaganie „tylko wskazane PR" i „bez PR skrypt nie startuje".
 - Dostarczenie zdarzenia używa istniejących pojęć: `ExternalEventReceived` jako zapis w tasku i `WaitAction` jako krok, który czeka. Szczegóły w planowaniu.
 - Człowiek zatwierdza każdy skrypt przed pracą według harmonogramu: skrypt agenta to kod wykonywany cyklicznie z dostępem do sekretów.
@@ -145,6 +148,7 @@ Stan w repozytorium (zweryfikowany):
 ## Dependencies / Assumptions
 
 - Działający wykonawca `WaitAction` jest warunkiem skutku „przekaż zdarzenie" z ciągiem dalszym w workflow. Dziś go nie ma.
+- `narsor-cli task create` i `task input` są wywoływalne ze skryptu obserwatora z tokenem o ograniczonym zakresie. Niezweryfikowane.
 - Rejestr sekretów control plane daje sekrety także poza taskami (dla obserwatorów). Niezweryfikowane.
 - Środowisko uruchomienia skryptów ma `curl`, `jq` i dostęp sieciowy do źródeł.
 
@@ -152,9 +156,9 @@ Stan w repozytorium (zweryfikowany):
 
 ## Założenia do potwierdzenia
 
-- Z1. Skrypt zwraca wykryte zmiany na standardowe wyjście w stałym formacie. Narsor wykonuje skutek. Skrypt nie wywołuje `narsor-cli`. (Najbezpieczniej: jedno miejsce kontroli deduplikacji, limitów i uprawnień.)
+- Z1. Skrypt wywołuje `narsor-cli` sam (decyzja Q1). Do potwierdzenia w planowaniu: czy `narsor-cli task create` przyjmuje klucz skutku i czy Narsor może pilnować limitu R15 na wywołaniach.
 - Z2. W konfiguracji lokalnej skrypty działają na tej samej maszynie co `narsor-server`.
-- Z3. Zdarzenie dostarczone do taska, który nie czeka w kroku `wait`, zostaje zapisane i czeka na pierwszy pasujący krok `wait`. Zdarzenie nie zmienia stanu taska samo z siebie.
+- Z3. Zdarzenie dostarczone do taska, który nie czeka w kroku `wait`, zostaje zapisane w historii i nie zmienia stanu taska (decyzja Q3).
 - Z4. Każdy skrypt (także agenta) wymaga zatwierdzenia przez człowieka przed pracą według harmonogramu (R11).
 - Z5. Domyślny odstęp harmonogramu to 5 minut. Dolna granica to 1 minuta.
 - Z6. Domyślny limit nowych tasków na jedno uruchomienie to 10.
@@ -167,22 +171,13 @@ Stan w repozytorium (zweryfikowany):
 
 ## Pytania otwarte dla użytkownika
 
-- P1. [Affects R12, Z1] Jak skrypt przekazuje wynik do Narsora?
-  - (a) Rekomendowane: skrypt zwraca listę zmian na wyjście; Narsor wykonuje skutek, deduplikację i limity.
-  - (b) Skrypt sam wywołuje `narsor-cli` (`task create`, `task input`); Narsor nie kontroluje skutków.
-  - (c) Oba tryby; (b) tylko dla zaawansowanych.
+- P1. Rozstrzygnięte (Q1): skrypt sam wywołuje `narsor-cli`. Patrz Key Decisions.
 - P2. [Affects R14, R20, Z2] Gdzie działają skrypty w konfiguracji Kubernetes?
   - (a) Rekomendowane: osobny pod (lub Job według harmonogramu), odizolowany od `narsor-server`, z dostępem tylko do sekretów obserwatora.
   - (b) W procesie lub kontenerze `narsor-server`.
   - (c) Na backendzie taska (runner), obok workspace.
-- P3. [Affects R4, Z3] Co robi zdarzenie, gdy task nie czeka w kroku `wait`?
-  - (a) Rekomendowane: zdarzenie czeka w tasku na pierwszy pasujący krok `wait`.
-  - (b) Zdarzenie jest tylko zapisane w historii; krok `wait` widzi wyłącznie zdarzenia, które nadeszły w czasie czekania.
-  - (c) Zdarzenie budzi task i przekazuje informację dyrygentowi (conductor) do decyzji.
-- P4. [Affects R8] Kto dodaje PR/MR do obserwacji?
-  - (a) Rekomendowane: krok workflow (jawna deklaracja w YAML) oraz operator ręcznie przez CLI.
-  - (b) Tylko operator ręcznie.
-  - (c) Narsor automatycznie dla każdego PR/MR, który utworzył task.
+- P3. Rozstrzygnięte (Q3): zdarzenie tylko w historii; `wait` widzi zdarzenia z czasu czekania.
+- P4. Rozstrzygnięte (Q4): krok workflow (YAML) i operator przez CLI.
 
 ---
 
@@ -190,7 +185,7 @@ Stan w repozytorium (zweryfikowany):
 
 ### Resolve Before Planning
 
-- P1–P4 z sekcji „Pytania otwarte dla użytkownika".
+- P2 z sekcji „Pytania otwarte dla użytkownika" (P1, P3, P4 rozstrzygnięte).
 
 ### Deferred to Planning
 
