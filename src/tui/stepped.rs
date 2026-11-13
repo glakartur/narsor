@@ -36,7 +36,7 @@
 
 use std::collections::BTreeMap;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -173,9 +173,10 @@ pub struct SteppedForm {
     /// The fields of the leaves the operator left, by their label path.
     drafts: BTreeMap<Vec<String>, Chooser>,
     /// A refresh took away what the operator chose, and the form fell back
-    /// to a choice they did not make. Until they move on it or go back, a
+    /// to a choice they did not make. Until they press `↓` / `↑` or `Esc`, a
     /// key that chooses does nothing: the keys meant for the entry that is
-    /// gone must not choose another one.
+    /// gone must not choose another one. `j` / `k` do not count: they can be
+    /// letters of the text typed for the gone field.
     disarmed: bool,
 }
 
@@ -370,8 +371,12 @@ impl SteppedForm {
 
     fn on_choice_key(&mut self, key: KeyEvent) -> SteppedOutcome {
         if self.disarmed {
+            // Only an arrow or `Esc` re-arms: `j` / `k` are letters of the
+            // text the operator may still be typing for the gone field.
+            let arrow = key.modifiers.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down);
             match keymap::lookup(Context::Panel, &key) {
-                Some(Action::Up | Action::Down | Action::Cancel) => self.disarmed = false,
+                Some(Action::Cancel) => self.disarmed = false,
+                Some(Action::Up | Action::Down) if arrow => self.disarmed = false,
                 Some(Action::PageUp | Action::PageDown) => {}
                 _ => return SteppedOutcome::None,
             }
@@ -1034,6 +1039,40 @@ mod tests {
         form.on_key(key(KeyCode::Char('3')));
         let submission = submitted(form.on_key(key(KeyCode::Enter)));
         assert_eq!(submission.labels, ["Otwórz link"]);
+    }
+
+    #[test]
+    fn j_and_k_typed_for_a_lost_leaf_do_not_re_arm_the_choice() {
+        // The operator was typing "jutro" into the field of "Override"
+        // when the refresh took it: the letters go on arriving.
+        let mut form = form();
+        form.on_key(key(KeyCode::Char('3')));
+        form.on_key(key(KeyCode::Enter));
+        let mut smaller = tree();
+        smaller.remove(2);
+        let (mut form, lost) = form.rebuilt(smaller);
+        assert_eq!(lost.as_deref(), Some("Override"));
+
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('3'),
+            KeyCode::Enter,
+            KeyCode::Char('k'),
+            KeyCode::Enter,
+        ] {
+            assert_eq!(form.on_key(key(code)), SteppedOutcome::None, "{code:?}");
+            assert!(form.is_disarmed(), "{code:?}");
+        }
+        assert_eq!(form.stage(), Stage::Choice);
+        assert_eq!(form.chooser().selected(), 0);
+
+        // A modified arrow is not a move on the list either.
+        let ctrl_down = KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(form.on_key(ctrl_down), SteppedOutcome::None);
+        assert!(form.is_disarmed());
+
+        form.on_key(key(KeyCode::Up));
+        assert!(!form.is_disarmed());
     }
 
     #[test]

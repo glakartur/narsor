@@ -8442,6 +8442,66 @@ mod task_app_actions {
         }
 
         #[test]
+        fn j_and_k_typed_for_a_gone_field_do_not_open_the_shortcuts_again() {
+            // "jutro o 2": the `j` must not let the `o` open the links.
+            let mut app = exits_gone();
+            assert_eq!(ch(&mut app, 'j'), Request::None);
+            assert_eq!(ch(&mut app, 'o'), Request::None);
+            assert!(
+                matches!(app.overlay(), Some(Overlay::Actions(_))),
+                "o after j does not replace the panel with the links"
+            );
+            assert_eq!(ch(&mut app, 'k'), Request::None);
+            assert_eq!(ch(&mut app, 'm'), Request::None);
+            assert!(app.list().moving().is_none(), "m after k starts no move");
+
+            let mut app = exits_gone();
+            assert_eq!(ch(&mut app, 'j'), Request::None);
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(
+                stage(&app),
+                Some(Stage::Choice),
+                "Enter after j chose nothing"
+            );
+            assert!(panel(&app).form().is_disarmed());
+        }
+
+        #[test]
+        fn the_queue_moves_wait_after_a_refresh_takes_the_entry() {
+            let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+            let mut app = app();
+            // The server offers a queued task no transition: the test lends
+            // it the one of a running task, so a refresh can take it away.
+            let transition =
+                with_transitions(running("a", 1), "review", &[("ok", "ship", None)], None)
+                    .actions
+                    .unwrap()
+                    .into_iter()
+                    .find(|offer| offer.label.as_deref() == Some(TRANSITION))
+                    .expect("the transition of a running task");
+            let mut first = queued("a", 1);
+            first.actions.as_mut().unwrap().push(transition);
+            app.load(listing(vec![first, queued("b", 2)], "c"));
+            open_entry(&mut app, TRANSITION);
+            assert!(panel(&app).form().heading().contains(TRANSITION));
+            app.load(listing(vec![queued("a", 1), queued("b", 2)], "d"));
+            assert!(panel(&app).form().is_disarmed());
+
+            for code in [KeyCode::Down, KeyCode::Up] {
+                assert_eq!(app.on_key(ctrl(code)), Request::None, "Ctrl+{code:?}");
+                assert!(
+                    matches!(app.overlay(), Some(Overlay::Actions(_))),
+                    "Ctrl+{code:?} keeps the panel"
+                );
+            }
+            assert!(app.list().moving().is_none());
+
+            press(&mut app, KeyCode::Down);
+            let request = app.on_key(ctrl(KeyCode::Down));
+            assert!(matches!(request, Request::Move(_)), "{request:?}");
+        }
+
+        #[test]
         fn moving_on_the_list_after_a_refresh_lets_the_operator_choose_again() {
             let mut app = exits_gone();
             press(&mut app, KeyCode::Down);

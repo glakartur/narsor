@@ -228,8 +228,9 @@ step (`Akcje › Wybierz krok · krok 2 z 3`):
 level it closes the panel. A refresh of the list does not close the panel and
 does not clear a field. When the chosen action is no longer available, the bar
 says so and the panel goes back one level, to its first entry. The keys you
-typed for the action that is gone do nothing there: `Enter`, the digits, `o`
-and `m` wait until you move on the list (`j` / `k`, `↓` / `↑`) or press `Esc`.
+typed for the action that is gone do nothing there: `Enter`, the digits, `o`,
+`m`, `Ctrl+↑` / `Ctrl+↓`, and also `j` / `k` (they can be letters of your text),
+wait until you press `↓` / `↑` or `Esc`.
 *Otwórz link* (the last entry, when
 the task has a pull request) opens at once, without a confirmation.
 
