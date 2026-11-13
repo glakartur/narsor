@@ -252,11 +252,13 @@ pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
     if let Some(count) = subagent_count_of(usage) {
         cells.subagent_count = format!("{SUBAGENTS_ICON} {count}");
     }
-    let stats = usage
-        .subagent_stats
-        .filter(|stats| stats.spawned > 0 && stats.tokens > 0);
-    if let (Some(stats), true) = (stats, cells.subagent_input.is_empty()) {
-        cells.subagent_total = format!("↕{}", scaled(stats.tokens));
+    if cells.subagent_input.is_empty() {
+        let stats = usage
+            .subagent_stats
+            .filter(|stats| stats.spawned > 0 && stats.tokens > 0);
+        if let Some(stats) = stats {
+            cells.subagent_total = format!("↕{}", scaled(stats.tokens));
+        }
     }
     cells
 }
