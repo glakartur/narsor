@@ -11,6 +11,9 @@
 
 use narsor_protocol::api::{Position, PositionUsage, TokenCounts};
 
+/// The icon of the subagents, in the task header and in every step row.
+pub const SUBAGENTS_ICON: &str = "👥";
+
 const THOUSAND: u64 = 1_000;
 const MILLION: u64 = 1_000_000;
 /// Below this a count still rounds to a thousand, not to a million.
@@ -23,6 +26,8 @@ pub struct TaskUsage {
     pub total: Option<TokenCounts>,
     pub subagents: Option<TokenCounts>,
     pub subagent_count: Option<u32>,
+    /// The tokens of the subagents together, without a split in and out.
+    pub subagent_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     /// What the subagents cost, when the harness says. It never does today,
     /// so it stays `None` and the line shows no cost for them.
@@ -45,6 +50,18 @@ impl TaskUsage {
     }
 }
 
+/// How many subagents one step started: the count the harness gave, else
+/// the number of subagents in its stats; `None` when neither is above zero.
+/// The task header and the step rows both read the count here.
+pub fn subagent_count_of(usage: &PositionUsage) -> Option<u32> {
+    usage.subagent_count.filter(|count| *count > 0).or_else(|| {
+        usage
+            .subagent_stats
+            .map(|stats| stats.spawned)
+            .filter(|spawned| *spawned > 0)
+    })
+}
+
 /// The sum of the usage of `positions`; `None` when no position reported any.
 pub fn sum(positions: &[Position]) -> Option<TaskUsage> {
     let mut sum: Option<TaskUsage> = None;
@@ -55,8 +72,16 @@ pub fn sum(positions: &[Position]) -> Option<TaskUsage> {
             subagents: add(so_far.subagents, usage.subagents, TokenCounts::plus),
             subagent_count: add(
                 so_far.subagent_count,
-                usage.subagent_count,
+                subagent_count_of(&usage),
                 u32::saturating_add,
+            ),
+            subagent_tokens: add(
+                so_far.subagent_tokens,
+                usage
+                    .subagent_stats
+                    .filter(|stats| stats.spawned > 0 && stats.tokens > 0)
+                    .map(|stats| stats.tokens),
+                u64::saturating_add,
             ),
             cost_usd: add(so_far.cost_usd, usage.cost_usd, |a, b| a + b),
             subagent_cost_usd: None,
@@ -75,6 +100,8 @@ pub fn sum(positions: &[Position]) -> Option<TaskUsage> {
     sum.filter(|usage| {
         usage.total.is_some()
             || usage.subagents.is_some()
+            || usage.subagent_count.is_some()
+            || usage.subagent_tokens.is_some()
             || usage.cost_usd.is_some()
             || usage.has_conductor()
     })
@@ -87,10 +114,11 @@ fn add<T: Copy>(a: Option<T>, b: Option<T>, plus: impl Fn(T, T) -> T) -> Option<
     }
 }
 
-/// `razem $68.30 · ✨ $34.15 ↑304 ↓72k (◈ 2 $12 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k`:
+/// `razem $68.30 · ✨ $34.15 ↑304 ↓72k (👥 2 $12 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k`:
 /// the cost of all, then each group with its cost and its tokens in (`↑`) and
-/// out (`↓`): `✨` the agents (their numbers include the subagents'), `◈` the
-/// subagents in brackets after them — their count first — and `⚡` the
+/// out (`↓`): `✨` the agents (their numbers include the subagents'), `👥` the
+/// subagents in brackets after them — their count first, then their tokens in
+/// and out (`↑` `↓`) or together (`↕`) — and `⚡` the
 /// conductor. A group or a part nobody reported is left out, so the line has
 /// no placeholder; `None` when there is nothing to say. The subagents are
 /// left out when not `with_subagents`.
@@ -117,22 +145,36 @@ pub fn line(usage: &TaskUsage, with_subagents: bool) -> Option<String> {
     (!groups.is_empty()).then(|| groups.join(" · "))
 }
 
-/// `◈ 2 $12 ↑100 ↓20k`: the subagents' count, cost and tokens, each part
-/// only when known. Subagents that used nothing and cost nothing are not a
-/// block, whatever their count.
+/// `👥 2 $12 ↑100 ↓20k`: the subagents' count, cost and tokens, each part
+/// only when known. Tokens are `↑` `↓` when the harness split them, else `↕`
+/// for their sum. A count alone is a block; subagents without a count, a cost
+/// or tokens are not.
 fn subagents_block(usage: &TaskUsage) -> Option<String> {
-    let counts = usage
+    let split = usage
         .subagents
         .filter(|counts| counts.input + counts.output > 0);
-    let used = parts_of(usage.subagent_cost_usd, counts);
-    if used.is_empty() {
-        return None;
-    }
+    let used = match split {
+        Some(_) => parts_of(usage.subagent_cost_usd, split),
+        None => [
+            usage.subagent_cost_usd.map(money),
+            usage
+                .subagent_tokens
+                .map(|tokens| format!("↕{}", scaled(tokens))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" "),
+    };
     let count = usage
         .subagent_count
         .filter(|count| *count > 0)
-        .map(|count| format!("{count} "));
-    Some(format!("◈ {}{used}", count.unwrap_or_default()))
+        .map(|count| count.to_string());
+    let parts: Vec<String> = count
+        .into_iter()
+        .chain((!used.is_empty()).then_some(used))
+        .collect();
+    (!parts.is_empty()).then(|| format!("{SUBAGENTS_ICON} {}", parts.join(" ")))
 }
 
 /// The cost, then the tokens, those known, separated by a space; empty when
@@ -181,7 +223,7 @@ impl StepCells {
 
 /// The cells of the usage of one step; all empty for a step without a report.
 /// Subagents come from what the harness said: their tokens in and out when it
-/// split them, else their tokens together; the count is those it started.
+/// split them, else their tokens together; the count is [`subagent_count_of`].
 /// Subagents that used nothing and were not counted are empty.
 pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
     let Some(usage) = usage else {
@@ -206,16 +248,15 @@ pub fn step_cells(usage: Option<&PositionUsage>) -> StepCells {
     {
         cells.subagent_input = format!("↑{}", scaled(counts.input));
         cells.subagent_output = format!("↓{}", scaled(counts.output));
-        if let Some(count) = usage.subagent_count.filter(|count| *count > 0) {
-            cells.subagent_count = format!("{count}×");
-        }
     }
-    let stats = usage.subagent_stats.filter(|stats| stats.spawned > 0);
-    if let Some(stats) = stats {
-        cells.subagent_count = format!("{}×", stats.spawned);
-        if cells.subagent_input.is_empty() && stats.tokens > 0 {
-            cells.subagent_total = format!("↕{}", scaled(stats.tokens));
-        }
+    if let Some(count) = subagent_count_of(usage) {
+        cells.subagent_count = format!("{SUBAGENTS_ICON} {count}");
+    }
+    let stats = usage
+        .subagent_stats
+        .filter(|stats| stats.spawned > 0 && stats.tokens > 0);
+    if let (Some(stats), true) = (stats, cells.subagent_input.is_empty()) {
+        cells.subagent_total = format!("↕{}", scaled(stats.tokens));
     }
     cells
 }
@@ -308,6 +349,7 @@ mod tests {
             total: Some(counts(304, 72_000)),
             subagents: Some(counts(100, 20_000)),
             subagent_count: Some(2),
+            subagent_tokens: None,
             cost_usd: Some(34.15),
             subagent_cost_usd: Some(12.0),
             conductor_total: Some(counts(304, 72_000)),
@@ -319,7 +361,7 @@ mod tests {
     fn the_full_line_has_the_icons_and_the_subagents_in_brackets() {
         assert_eq!(
             text(&full_usage(), true),
-            "razem $68.30 · ✨ $34.15 ↑304 ↓72k (◈ 2 $12.00 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k"
+            "razem $68.30 · ✨ $34.15 ↑304 ↓72k (👥 2 $12.00 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k"
         );
         assert_eq!(
             text(&full_usage(), false),
@@ -347,7 +389,7 @@ mod tests {
             subagent_count: Some(2),
             ..TaskUsage::default()
         };
-        assert_eq!(text(&usage, true), "✨ ↑304 ↓72k (◈ 2 ↑304 ↓72k)");
+        assert_eq!(text(&usage, true), "✨ ↑304 ↓72k (👥 2 ↑304 ↓72k)");
         assert!(!text(&usage, true).contains('—'));
     }
 
@@ -358,15 +400,21 @@ mod tests {
             subagent_count: Some(2),
             ..TaskUsage::default()
         };
-        assert_eq!(text(&only_subagents, true), "(◈ 2 ↑100 ↓20k)");
+        assert_eq!(text(&only_subagents, true), "(👥 2 ↑100 ↓20k)");
         assert_eq!(line(&only_subagents, false), None);
         assert_eq!(line(&TaskUsage::default(), true), None);
+        // Covers R10: a count alone is a block.
         let zero = TaskUsage {
             subagents: Some(counts(0, 0)),
             subagent_count: Some(2),
             ..TaskUsage::default()
         };
-        assert_eq!(line(&zero, true), None);
+        assert_eq!(text(&zero, true), "(👥 2)");
+        let no_count = TaskUsage {
+            subagents: Some(counts(0, 0)),
+            ..TaskUsage::default()
+        };
+        assert_eq!(line(&no_count, true), None);
     }
 
     #[test]
@@ -376,7 +424,7 @@ mod tests {
             subagents: Some(counts(100, 20_000)),
             ..TaskUsage::default()
         };
-        assert_eq!(text(&usage, true), "✨ ↑304 ↓72k (◈ ↑100 ↓20k)");
+        assert_eq!(text(&usage, true), "✨ ↑304 ↓72k (👥 ↑100 ↓20k)");
     }
 
     #[test]
@@ -389,7 +437,7 @@ mod tests {
         let usage = sum(&positions).unwrap();
         assert_eq!(
             text(&usage, true),
-            "razem $1.20 · ✨ $1.20 ↑120k ↓8k (◈ 2 ↑40k ↓3k)"
+            "razem $1.20 · ✨ $1.20 ↑120k ↓8k (👥 2 ↑40k ↓3k)"
         );
         assert_eq!(text(&usage, false), "razem $1.20 · ✨ $1.20 ↑120k ↓8k");
     }
@@ -422,13 +470,79 @@ mod tests {
     }
 
     #[test]
-    fn subagents_that_used_nothing_are_not_shown() {
+    fn subagents_that_used_nothing_show_their_count_only() {
         let none = used((1_000, 100), None, 0.1);
         let zero = used((1_000, 100), Some((0, 0)), 0.1);
-        for usage in [none, zero] {
-            let usage = sum(&[position(Some(usage))]).unwrap();
-            assert_eq!(text(&usage, true), "razem $0.10 · ✨ $0.10 ↑1k ↓100");
+        let usage = sum(&[position(Some(none))]).unwrap();
+        assert_eq!(text(&usage, true), "razem $0.10 · ✨ $0.10 ↑1k ↓100");
+        let usage = sum(&[position(Some(zero))]).unwrap();
+        assert_eq!(text(&usage, true), "razem $0.10 · ✨ $0.10 ↑1k ↓100 (👥 1)");
+    }
+
+    fn stats_usage(spawned: u32, tokens: u64) -> PositionUsage {
+        PositionUsage {
+            subagent_stats: Some(SubagentStats {
+                spawned,
+                tokens,
+                ..SubagentStats::default()
+            }),
+            ..PositionUsage::default()
         }
+    }
+
+    /// Covers AE3: subagents without tokens still show their count.
+    #[test]
+    fn subagents_without_tokens_show_their_count_in_the_header() {
+        let mut step = used((120_000, 8_000), None, 1.2);
+        step.subagent_stats = Some(SubagentStats {
+            spawned: 3,
+            ..SubagentStats::default()
+        });
+        let usage = sum(&[position(Some(step))]).unwrap();
+        assert_eq!(
+            text(&usage, true),
+            "razem $1.20 · ✨ $1.20 ↑120k ↓8k (👥 3)"
+        );
+        let only = sum(&[position(Some(stats_usage(3, 0)))]).unwrap();
+        assert_eq!(text(&only, true), "(👥 3)");
+        assert!(sum(&[position(Some(stats_usage(0, 0)))]).is_none());
+    }
+
+    /// Covers AE4 and the header of a harness that gives tokens together.
+    #[test]
+    fn the_tokens_of_subagents_together_are_added_up_in_the_header() {
+        let usage = sum(&[
+            position(Some(stats_usage(2, 50_000))),
+            position(Some(stats_usage(1, 36_000))),
+        ])
+        .unwrap();
+        assert_eq!(text(&usage, true), "(👥 3 ↕86k)");
+        let copilot = sum(&[position(Some(stats_usage(2, 7_978)))]).unwrap();
+        assert_eq!(text(&copilot, true), "(👥 2 ↕8k)");
+    }
+
+    /// Covers AE2: the cost, when a harness gives one, stands before the tokens.
+    #[test]
+    fn the_cost_of_subagents_stands_before_their_tokens() {
+        let usage = TaskUsage {
+            subagent_count: Some(2),
+            subagent_tokens: Some(86_000),
+            subagent_cost_usd: Some(0.4),
+            ..TaskUsage::default()
+        };
+        assert_eq!(text(&usage, true), "(👥 2 $0.40 ↕86k)");
+    }
+
+    /// The success criterion: the header and the rows tell the same.
+    #[test]
+    fn the_header_is_the_sum_of_the_rows() {
+        let steps = [stats_usage(2, 50_000), stats_usage(1, 36_000)];
+        let usage = sum(&steps.map(|step| position(Some(step)))).unwrap();
+        let cells: Vec<StepCells> = steps.iter().map(|step| step_cells(Some(step))).collect();
+        assert_eq!(cells[0].subagent_count, "👥 2");
+        assert_eq!(cells[1].subagent_total, "↕36k");
+        assert_eq!(usage.subagent_count, Some(3));
+        assert_eq!(usage.subagent_tokens, Some(86_000));
     }
 
     #[test]
@@ -486,7 +600,7 @@ mod tests {
                 cells.subagent_input.as_str(),
                 cells.subagent_output.as_str(),
             ),
-            ("$0.42", "↑120k", "↓8k", "1×", "↑40k", "↓3k")
+            ("$0.42", "↑120k", "↓8k", "👥 1", "↑40k", "↓3k")
         );
         assert!(cells.has_main() && cells.has_subagents());
     }
@@ -533,11 +647,11 @@ mod tests {
                 cells.subagent_input.as_str(),
                 cells.subagent_total.as_str()
             ),
-            ("3×", "", "↕45k")
+            ("👥 3", "", "↕45k")
         );
         assert!(cells.has_subagents());
         let cells = step_cells(Some(&stats(2, 0)));
-        assert_eq!(cells.subagent_count, "2×");
+        assert_eq!(cells.subagent_count, "👥 2");
         assert!(cells.subagent_total.is_empty() && cells.has_subagents());
         assert!(!step_cells(Some(&stats(0, 0))).has_subagents());
     }
@@ -550,6 +664,7 @@ mod tests {
             tokens: 43_000,
             ..SubagentStats::default()
         });
+        // The count of the harness (1) wins over the stats (4), R11.
         let cells = step_cells(Some(&usage));
         assert_eq!(
             (
@@ -557,16 +672,17 @@ mod tests {
                 cells.subagent_input.as_str(),
                 cells.subagent_total.as_str()
             ),
-            ("4×", "↑40k", "")
+            ("👥 1", "↑40k", "")
         );
     }
 
     #[test]
-    fn subagents_that_used_nothing_are_no_cells() {
-        for subagents in [None, Some((0, 0))] {
-            let cells = step_cells(Some(&used((1_000, 100), subagents, 0.1)));
-            assert!(!cells.has_subagents() && cells.subagent_count.is_empty());
-        }
+    fn subagents_that_used_nothing_are_no_cells_but_a_counted_one_shows_its_count() {
+        let cells = step_cells(Some(&used((1_000, 100), None, 0.1)));
+        assert!(!cells.has_subagents() && cells.subagent_count.is_empty());
+        let cells = step_cells(Some(&used((1_000, 100), Some((0, 0)), 0.1)));
+        assert!(cells.has_subagents() && cells.subagent_input.is_empty());
+        assert_eq!(cells.subagent_count, "👥 1");
     }
 
     #[test]
@@ -662,6 +778,48 @@ mod tests {
         assert_eq!(
             (usage.conductor_total, usage.conductor_cost_usd),
             (None, None)
+        );
+    }
+
+    /// R11: the count of the harness wins; zero or none falls back to the stats.
+    #[test]
+    fn the_count_of_a_step_comes_from_the_harness_then_from_the_stats() {
+        let with = |count: Option<u32>, spawned: Option<u32>| PositionUsage {
+            subagent_count: count,
+            subagent_stats: spawned.map(|spawned| SubagentStats {
+                spawned,
+                ..SubagentStats::default()
+            }),
+            ..PositionUsage::default()
+        };
+        for (usage, expected) in [
+            (with(Some(5), Some(2)), Some(5)),
+            (with(None, Some(2)), Some(2)),
+            (with(Some(0), Some(2)), Some(2)),
+            (with(Some(0), None), None),
+            (with(None, None), None),
+        ] {
+            assert_eq!(subagent_count_of(&usage), expected);
+            assert_eq!(
+                step_cells(Some(&usage)).subagent_count,
+                expected.map_or_else(String::new, |count| format!("{SUBAGENTS_ICON} {count}"))
+            );
+        }
+    }
+
+    /// The tokens of the harness stay: 80k in and 6k out, 2 subagents.
+    #[test]
+    fn a_split_with_a_count_reads_as_cells() {
+        let mut usage = used((1_000, 100), Some((80_000, 6_000)), 0.1);
+        usage.subagent_count = Some(2);
+        let cells = step_cells(Some(&usage));
+        assert_eq!(
+            (
+                cells.subagent_count.as_str(),
+                cells.subagent_input.as_str(),
+                cells.subagent_output.as_str()
+            ),
+            ("👥 2", "↑80k", "↓6k")
         );
     }
 }

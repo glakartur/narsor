@@ -54,6 +54,7 @@ albo `awaiting_input`).
 | `noschema_background.ndjson` | to samo | zadanie w tle (`Bash` z `run_in_background`), komentarz tekstowy i koniec tury: pierwsza linia `result` to sam tekst, proces żyje; po `task_notification` druga tura (`system/init`) i druga linia `result` z JSON |
 | `schema_mismatch.ndjson` | `--json-schema <schemat> --permission-mode acceptEdits` | prompt żąda labela spoza `enum`; CLI odrzuca wywołanie `StructuredOutput` i model poprawia odpowiedź |
 | `subagent_denial.ndjson` | *(ręcznie napisane, nie nagranie)* | główny agent, dwóch subagentów (jeden w tle, jeden na pierwszym planie, ten drugi z zagnieżdżonym), `parent_tool_use_id` na liniach subagentów, odmowa `Bash` w subagencie, dwie linie `result` z tą samą odmową w `permission_denials`, odpowiedź końcowa w ostatniej. Treść zmyślona. |
+| `subagents.ndjson` | `--permission-mode default` | nagranie z 2026-11-13: dwóch subagentów (jeden na pierwszym planie, jeden w tle: `tool_use_result` ze `status: async_launched`), dwie linie `result` (druga po powiadomieniu o końcu zadania w tle). Ścieżki użytkownika zamaskowane (`/home/user`, `/tmp/project`), reszta bez skracania. |
 
 ## Odpowiedzi na pytania odłożone do implementacji
 
@@ -129,3 +130,20 @@ Skrypt maskowania zmienił tylko wartości, nie kształt linii:
 
 Pliki nie zawierają danych klientów ani sekretów. Przed ponownym nagraniem trzeba powtórzyć
 maskowanie i sprawdzić pliki.
+
+## Subagenci w linii `result` (`subagents.ndjson`)
+
+Zapis tylko dla przyszłych prac. Kod tych pól nie czyta poza `subagent_stats`.
+
+- `subagent_stats.spawned` liczy wszystkich subagentów, także tego w tle (`spawned: 2`,
+  `requested.background: 1`, `started_in_background: 1`). `tokens` w `subagent_stats` nie ma,
+  parser daje `0`. Obie linie `result` mają te same `spawned`.
+- `tool_use_result` subagenta na pierwszym planie (`status: completed`) ma `agentId`, `agentType`,
+  `toolsUsed` i `content`. Subagent w tle ma tylko `status: async_launched`, `agentId`, `outputFile`
+  i `prompt`, bez zużycia.
+- `modelUsage` (per model, z `costUSD`) rośnie między pierwszą a drugą linią `result`
+  (`outputTokens` 591, potem 625), czyli liczy sumę całego uruchomienia z pracą subagentów.
+- `usage` na linii `result` nie jest tą sumą: `output_tokens` to 323 i 34 w kolejnych liniach, czyli
+  tylko ostatnia tura (pole `iterations` ma jeden wpis). Wniosek: opis grupy `✨` („liczby zawierają
+  subagentów”) nie jest potwierdzony dla Claude Code. Opis się nie zmienia (decyzja Q5), to
+  tylko zapis faktu z jednego nagrania; trzeba go potwierdzić na większej próbie.

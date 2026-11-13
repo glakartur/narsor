@@ -730,6 +730,24 @@ fn a_result_sums_the_killed_and_refused_subagents() {
     );
 }
 
+/// The recording of two subagents, one of them in the background (U1): every
+/// `result` line counts both, and the harness gives no tokens for them.
+#[test]
+fn a_recording_with_subagents_counts_the_background_one_and_no_tokens() {
+    let elements = classify_all(&recording("subagents.ndjson"));
+    let stats: Vec<_> = elements
+        .iter()
+        .filter_map(|element| match element {
+            ChatElement::RunResult { subagent_stats, .. } => Some(subagent_stats.expect("stats")),
+            _ => None,
+        })
+        .collect();
+    assert!(!stats.is_empty(), "no result line in {elements:?}");
+    for stats in stats {
+        assert_eq!((stats.spawned, stats.tokens), (2, 0));
+    }
+}
+
 #[test]
 fn a_successful_result_carries_the_run_metadata() {
     let elements = classify_all(&recording("tools.ndjson"));
