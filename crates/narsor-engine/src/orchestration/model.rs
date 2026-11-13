@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub use narsor_protocol::controller::{
     ArchiveTombstone, AttentionItem, AttentionKind, CommandActor, CommandReceipt,
-    ConversationAttemptSummary, ConversationAvailability, EventWait, ExecutionCursor,
+    ConversationAttemptSummary, ConversationAvailability, EventWait, EventWatch, ExecutionCursor,
     HarnessUnavailable, InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary,
     OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
     ResumeExhaustion, ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason,
@@ -1152,6 +1152,10 @@ pub struct RunnerReportOutcome {
     pub task: TaskRecord,
     /// False when the snapshot was a duplicate and changed nothing.
     pub applied: bool,
+    /// The `wait` episode this snapshot began: one the record did not hold
+    /// before. `None` when the task waits for no event, or still waits in
+    /// the episode it was already known to wait in.
+    pub began_wait: Option<EventWait>,
 }
 
 /// Everything needed to create a task.

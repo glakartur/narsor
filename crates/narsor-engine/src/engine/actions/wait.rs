@@ -54,9 +54,10 @@ use thiserror::Error;
 use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction};
 use crate::domain::{
     ActionConfig, ActionError, ActionExecutionId, ActionResult, EventData, ExecutionId,
-    ExecutionStatus, OutputLabel, StateId, WaitActionConfig, WorkflowExecution, TIMEOUT_LABEL,
+    ExecutionStatus, OutputLabel, StateId, WaitActionConfig, WaitWatchConfig, WorkflowExecution,
+    TIMEOUT_LABEL,
 };
-use crate::orchestration::EventWait;
+use crate::orchestration::{EventWait, EventWatch};
 use crate::persistence::{ExecutionStore, PersistenceError};
 use narsor_protocol::controller::filter_matches;
 
@@ -92,6 +93,7 @@ impl ActionExecutor for WaitExecutor {
                     event_type: config.event.clone(),
                     filter: config.filter.clone().unwrap_or(Value::Null),
                     timeout_secs: config.timeout_secs,
+                    watch: config.watch.clone(),
                 }),
             ))
         })
@@ -124,6 +126,9 @@ pub struct ExternalEventRequest {
     /// The step's `timeout`, in seconds; `None` waits for ever.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// The step's rendered `watch` block, if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WaitWatchConfig>,
 }
 
 /// The durable record of a wait — `pending_event.json`.
@@ -179,6 +184,12 @@ impl PendingExternalEvent {
             filter: self.request.filter.clone(),
             since: self.since,
             deadline: self.deadline,
+            watch: self.request.watch.as_ref().map(|watch| EventWatch {
+                step: self.state_id.to_string(),
+                observer: watch.observer.clone(),
+                object: watch.object.clone(),
+                event_types: watch.event_types.clone(),
+            }),
         }
     }
 }
@@ -426,6 +437,7 @@ mod tests {
                 event_type: "review.approved".into(),
                 filter: json!({"mr": "17"}),
                 timeout_secs,
+                watch: None,
             },
         )
     }

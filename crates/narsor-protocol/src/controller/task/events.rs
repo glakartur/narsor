@@ -138,6 +138,21 @@ pub enum TaskEventKind {
         /// The delivery queued for the runner.
         input_id: String,
     },
+    /// A warning: the task's `wait` step asked an observer to watch an
+    /// object (its `watch` block), and the control plane added no watch
+    /// entry. The task keeps waiting; the owner may add the entry by hand.
+    /// A client from before watch entries reads it as
+    /// [`TaskEventKind::Unrecognized`].
+    WatchRefused {
+        /// The workflow state whose `wait` asked for the entry.
+        step: String,
+        /// The observer it named.
+        observer: String,
+        /// The object it named, without unsafe characters and bounded.
+        object: String,
+        /// Why no entry was added.
+        reason: String,
+    },
     #[serde(other)]
     Unrecognized,
 }

@@ -570,6 +570,7 @@ fn the_claim_input_carries_the_wait_episode_of_each_entrys_task() {
             filter: json!({"mr": "17"}),
             since: fx.now(),
             deadline: None,
+            watch: None,
         });
         control.store().save_task(&mut record).unwrap();
     }

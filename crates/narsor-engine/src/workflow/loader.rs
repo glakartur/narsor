@@ -39,7 +39,7 @@ use crate::domain::{
     HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter, ParamType,
     ProfileActionConfig, RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion,
     ScriptActionConfig, State, StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig,
-    WorkflowDefinition, WorkspaceAccess, EXIT_LABEL,
+    WaitWatchConfig, WorkflowDefinition, WorkspaceAccess, EXIT_LABEL,
 };
 
 use super::schema::{
@@ -564,6 +564,11 @@ fn compile_action(action: ActionSchema, without_section: bool) -> ActionConfig {
             event: wait.event_type,
             filter: wait.filter,
             timeout_secs: wait.timeout.map(|d| d.as_secs()),
+            watch: wait.watch.map(|watch| WaitWatchConfig {
+                observer: watch.observer,
+                object: watch.object,
+                event_types: watch.event_types,
+            }),
         }),
     }
 }

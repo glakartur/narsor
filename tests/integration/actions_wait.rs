@@ -167,7 +167,7 @@ terminal_states:
   done: completed
 "#;
 
-fn load(yaml: &str) -> WorkflowDefinition {
+pub(crate) fn load(yaml: &str) -> WorkflowDefinition {
     load_from_str(yaml).unwrap_or_else(|error| panic!("the workflow loads: {error}"))
 }
 
@@ -177,20 +177,20 @@ fn load(yaml: &str) -> WorkflowDefinition {
 
 /// Answers every script step with the next label of its list (`exit` once
 /// spent) and keeps the rendered command line of each call.
-struct Recorder {
+pub(crate) struct Recorder {
     labels: Mutex<VecDeque<&'static str>>,
     calls: Mutex<Vec<Vec<String>>>,
 }
 
 impl Recorder {
-    fn new(labels: &[&'static str]) -> Arc<Self> {
+    pub(crate) fn new(labels: &[&'static str]) -> Arc<Self> {
         Arc::new(Self {
             labels: Mutex::new(labels.iter().copied().collect()),
             calls: Mutex::new(Vec::new()),
         })
     }
 
-    fn calls(&self) -> Vec<Vec<String>> {
+    pub(crate) fn calls(&self) -> Vec<Vec<String>> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -217,7 +217,7 @@ impl ActionExecutor for Recorder {
 
 /// A clock the test moves by hand.
 #[derive(Debug)]
-struct ManualClock(Mutex<DateTime<Utc>>);
+pub(crate) struct ManualClock(pub(crate) Mutex<DateTime<Utc>>);
 
 impl Clock for ManualClock {
     fn now(&self) -> DateTime<Utc> {
@@ -576,7 +576,7 @@ fn active_watch_list(service: &ProtocolService, now: DateTime<Utc>) -> ObserverI
 }
 
 /// A task of the observer's owner on backend `k8s`.
-fn create_task(service: &ProtocolService, id: &str) -> TaskId {
+pub(crate) fn create_task(service: &ProtocolService, id: &str) -> TaskId {
     let workspace = TaskWorkspace::single(TaskRepository::new(
         "narsor",
         TaskRepositorySource::Git(Box::new(GitIdentity {
@@ -609,12 +609,12 @@ fn create_task(service: &ProtocolService, id: &str) -> TaskId {
     task_id
 }
 
-fn k8s() -> BackendId {
+pub(crate) fn k8s() -> BackendId {
     BackendId::parse("k8s").unwrap()
 }
 
 /// The generation the task's current runner was launched at.
-fn launch_generation(record: &TaskRecord) -> u64 {
+pub(crate) fn launch_generation(record: &TaskRecord) -> u64 {
     record
         .commands
         .iter()
@@ -626,7 +626,7 @@ fn launch_generation(record: &TaskRecord) -> u64 {
 
 /// The credential of the task's working runner `incarnation`, launched at
 /// `launch_generation`, and the identity it proves.
-fn issue_runner(
+pub(crate) fn issue_runner(
     service: &ProtocolService,
     task: &TaskId,
     incarnation: &str,

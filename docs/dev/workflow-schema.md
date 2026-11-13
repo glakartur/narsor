@@ -661,6 +661,10 @@ action:
   filter:                                   # Event filter (optional)
     mr: "{{ inputs.mr_id }}"                # Templates are rendered when the step starts
   timeout: 24h                              # Maximum wait time (optional)
+  watch:                                    # Watch entry for an observer (optional)
+    observer: mr-review                     # Observer name, no template
+    object: "{{ inputs.mr_url }}"           # Object to watch, rendered when the step starts
+    event_types: [review.approved]          # Must include event_type
 choices:
   received:
     next: merge
@@ -715,10 +719,96 @@ when the task has no compute. It hands the end of the wait to the runner once pe
 The `timeout` of a `wait` step is the wait time only. The time limit of a state or of the workflow
 for a running action does not apply to a `wait` step.
 
+**Watch entry (`watch`).** A watch-list observer runs its script only for the objects on its
+watch list (for example, merge requests). The optional `watch` block puts the object of the step on
+that list while the step waits:
+
+*   `observer` is the name of the observer. It is a plain name, not a template. It is required;
+*   `object` is the object to watch, for example the URL of a merge request. The engine renders
+    its templates when the step starts;
+*   `event_types` lists the event types that the script reports for the object. The list must
+    include the `event_type` of the step. The engine renders the templates of each type, so a
+    templated `event_type` is written the same way in the list.
+
+When the step starts to wait, the runner reports the rendered `watch` with the wait. The control
+plane adds the watch entry once per wait episode, with the key (task, step, object). When the step
+waits again (for example, in a review loop), the entry stays one entry. The control plane does not
+add the entry when:
+
+*   no observer with this name belongs to the owner of the task. An observer of another owner is
+    reported the same way as a missing observer, because its events can never reach the task;
+*   the observer has no watch list (its watch mode is not `watch_list`);
+*   the object is empty, is longer than the limit of the observer, or does not start with an
+    allowed prefix of the observer. A URL prefix includes the host, so an object on another host is
+    refused. This keeps the token of the source away from other hosts.
+
+Then the control plane writes the warning `watch_refused` (step, observer, object, reason) to the
+task history. The task continues to wait: the owner can add the entry manually. The entry goes away
+when the script reports the object in `closed_watches`, when the task is finished or archived, or
+when the owner removes it. When the script closes an entry while the task waits in the same
+episode, the control plane does not add the entry again.
+
+A workflow that waits for the approval of a merge request and watches it:
+
+```yaml
+schema: v2
+name: review-merge-request
+version: 1
+inputs:
+  - name: mr_url
+    type: string
+    required: true
+states:
+  await_review:
+    action:
+      type: wait
+      event_type: review.approved
+      filter:
+        mr_url: "{{ inputs.mr_url }}"
+      timeout: 24h
+      watch:
+        observer: mr-review                 # A watch_list observer of the task's owner
+        object: "{{ inputs.mr_url }}"       # Rendered when the step starts
+        event_types: [review.approved, review.changes_requested]
+    choices:
+      received:
+        next: merge
+      timeout:
+        next: remind
+  merge:
+    action:
+      type: script
+      command: merge
+      args: ["{{ context.event.data.mr_url }}"]
+    exit:
+      next: done
+  remind:
+    action:
+      type: script
+      command: remind
+      args: ["{{ inputs.mr_url }}"]
+    exit:
+      next: reminded
+  done:
+    description: Merged.
+  reminded:
+    description: Nobody approved in time.
+terminal_states:
+  done: completed
+  reminded: completed
+```
+
+The validator refuses a `watch` without `observer`, with an observer name that is not valid (for
+example, a template), without `object`, without `event_types`, or with `event_types` that do not
+include the `event_type` of the step. It does not check that the observer exists: the control
+plane checks this when the step waits.
+
 **Runner and control plane versions.** The runner protocol has a new kind of delivery for the
 `wait` step (`events` in the poll answer, `POST /runner/v1/events/{id}/ack`), and the runner
-snapshot reports the wait (`event_wait`). An older runner does not know them, and there is no
-fallback. Update the runner and the control plane together, before a workflow uses a `wait` step.
+snapshot reports the wait (`event_wait`). The reported wait carries the rendered `watch` (`step`,
+`observer`, `object`, `event_types`). An older runner does not know them, and there is no fallback.
+Update the runner and the control plane together, before a workflow uses a `wait` step. A client
+from before watch entries shows the warning `watch_refused` as an unknown event.
 
 #### Scope of `{{ }}` templates
 
@@ -1562,6 +1652,7 @@ Before a workflow is run, the definition must pass validation:
     *   Every name in `requires_variables` must be defined in that step's `variables`, and every name in `requires_artifacts` in that step's `artifacts`.
     *   `requires_human_approval` is allowed only on a choice of an `agent` step.
     *   `resume_comment_field` requires a `text` field of that name in the `inputs` of a `human` gate and a transition to an `agent` step.
+    *   The `watch` of a `wait` step names an observer (a valid observer name, not a template) and an object, and its `event_types` include the `event_type` of the step (§3.3.D).
 
 3.  **Decision Correctness:**
     *   The decision provider type must be valid.

@@ -31,6 +31,29 @@ pub struct EventWait {
     /// When the wait times out, if it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<DateTime<Utc>>,
+    /// The watch entry the step's `watch` block asks for, if it has one.
+    /// The control plane registers it when the episode begins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<EventWatch>,
+}
+
+/// What a `wait` step's `watch` block asks an observer to watch, its
+/// templates rendered (`docs/dev/workflow-schema.md` §3.3.D).
+///
+/// The control plane checks it against the observer before it adds the
+/// watch entry; nothing here is trusted yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventWatch {
+    /// The workflow state whose `wait` asks for it: with the task and the
+    /// object, the key of the watch entry.
+    pub step: String,
+    /// The name of the observer.
+    pub observer: String,
+    /// The object to watch (the URL of a merge request, say).
+    pub object: String,
+    /// The event types the observer's script is to report for it.
+    #[serde(default)]
+    pub event_types: Vec<String>,
 }
 
 impl EventWait {

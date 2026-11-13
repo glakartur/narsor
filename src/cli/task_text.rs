@@ -897,6 +897,14 @@ pub fn event_line(event: &TaskEvent) -> String {
         } => format!(
             "the wait {episode_id} timed out; {input_id} queued for the waiting step"
         ),
+        TaskEventKind::WatchRefused {
+            step,
+            observer,
+            object,
+            reason,
+        } => format!(
+            "warning: step {step} asked observer {observer} to watch {object}; no watch entry: {reason}"
+        ),
         TaskEventKind::OwnerCommandAccepted { command, .. } => {
             format!("owner command {command:?}")
         }

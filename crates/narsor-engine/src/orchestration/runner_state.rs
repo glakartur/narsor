@@ -15,9 +15,9 @@
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    EventInputKind, ExternalEvent, ExternalEventOutcome, InputOutcome, InputRequest, InputStatus,
-    InputUpdate, QueuedEventInput, QueuedInput, RunnerObservation, RunnerReportOutcome,
-    RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
+    EventInputKind, EventWatch, ExternalEvent, ExternalEventOutcome, InputOutcome, InputRequest,
+    InputStatus, InputUpdate, QueuedEventInput, QueuedInput, RunnerObservation,
+    RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
 };
 use super::resume::wait_timeout_key;
 use crate::domain::display::bounded_detail;
@@ -103,7 +103,7 @@ impl ControlPlane {
             .generated_title
             .as_deref()
             .and_then(|title| one_line_label(title, GENERATED_TITLE_MAX_CHARS));
-        let (task, applied) = self.mutate(task_id, |record, now| {
+        let (task, (applied, began_wait)) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             // A report without a title does not take back one already shown.
             if snapshot.generated_title.is_none() {
@@ -117,7 +117,7 @@ impl ControlPlane {
                     && previous.snapshot.snapshot_sequence == snapshot.snapshot_sequence
                 {
                     if previous.snapshot == snapshot {
-                        return Ok(Mutation::Unchanged(false));
+                        return Ok(Mutation::Unchanged((false, None)));
                     }
                     return Err(stale_snapshot(record, previous, &snapshot));
                 }
@@ -137,12 +137,17 @@ impl ControlPlane {
             // nothing of a wait; one with an execution says where it waits,
             // or that it waits for no event, and what was queued for any
             // other episode can never reach it.
+            let mut began_wait = None;
             if snapshot.execution_cursor.execution_id.is_some() {
                 let episode = snapshot
                     .event_wait
                     .as_ref()
                     .map(|wait| wait.episode_id.clone());
                 obsolete_undelivered_events(record, episode.as_deref(), now);
+                let known = record.event_wait.as_ref().map(|wait| &wait.episode_id);
+                if episode.is_some() && episode.as_ref() != known {
+                    began_wait = snapshot.event_wait.clone();
+                }
                 record.event_wait = snapshot.event_wait.clone();
             }
             let safe_point_generation = if snapshot.safe_point {
@@ -173,9 +178,13 @@ impl ControlPlane {
                 safe_point_generation,
             });
             refresh_slot_release_due(record, now, grace);
-            Ok(Mutation::Changed(kind, true))
+            Ok(Mutation::Changed(kind, (true, began_wait)))
         })?;
-        Ok(RunnerReportOutcome { task, applied })
+        Ok(RunnerReportOutcome {
+            task,
+            applied,
+            began_wait,
+        })
     }
 
     /// Queues an owner answer for the request the runner waits on.
@@ -699,6 +708,39 @@ impl ControlPlane {
         })?;
         Ok(queued)
     }
+
+    /// Writes the warning that the `watch` of the task's `wait` step got no
+    /// watch entry (U5) to the task's history. The step keeps waiting; the
+    /// record changes only by the event. What the runner asked for is
+    /// untrusted text, so it is cleaned and bounded first.
+    pub fn record_watch_refused(
+        &self,
+        task_id: &TaskId,
+        watch: &EventWatch,
+        reason: &str,
+    ) -> Result<()> {
+        let kind = TaskEventKind::WatchRefused {
+            step: bounded_name(&watch.step),
+            observer: bounded_name(&watch.observer),
+            object: bounded_name(&watch.object),
+            reason: bounded_detail(reason),
+        };
+        self.mutate(task_id, |_, _| Ok(Mutation::Changed(kind, ())))?;
+        Ok(())
+    }
+}
+
+/// The longest step, observer or object a [`TaskEventKind::WatchRefused`]
+/// warning keeps, in characters.
+const MAX_WATCH_WARNING_FIELD_CHARS: usize = 512;
+
+/// One-line `text` without unsafe characters, cut to
+/// [`MAX_WATCH_WARNING_FIELD_CHARS`] characters.
+fn bounded_name(text: &str) -> String {
+    without_unsafe_chars(text)
+        .chars()
+        .take(MAX_WATCH_WARNING_FIELD_CHARS)
+        .collect()
 }
 
 /// Refuses a runner whose launch is no longer current.

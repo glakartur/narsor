@@ -1387,6 +1387,20 @@ pub struct WaitActionSchema {
 
     #[serde(default)]
     pub timeout: Option<DurationSecs>,
+
+    #[serde(default)]
+    pub watch: Option<WaitWatchSchema>,
+}
+
+/// The `watch` block of a `wait` step (§3.3.D).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitWatchSchema {
+    pub observer: String,
+
+    pub object: String,
+
+    pub event_types: Vec<String>,
 }
 
 /// Decision provider configuration (§3.4).

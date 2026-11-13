@@ -112,6 +112,7 @@ impl Delivery {
             filter,
             since: self.fx.now(),
             deadline: None,
+            watch: None,
         });
         control.store().save_task(&mut record).unwrap();
     }
@@ -482,6 +483,7 @@ fn a_wait_filter_compares_fields_flat_and_scalars_as_text() {
         filter,
         since: chrono::Utc::now(),
         deadline: None,
+        watch: None,
     };
     let data = json!({"mr": 17, "draft": false, "labels": ["a"], "by": "alice"});
 

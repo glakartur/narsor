@@ -26,10 +26,11 @@ use crate::domain::{
     ActionConfig, AgentActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel,
     ProfileActionConfig, PromptPart, PromptText, RepositoryDefinition, RepositorySource,
     SchemaVersion, State, StateId, ValidationError, VariableDefinition, VariableScope,
-    VariableSource, VariableType, WorkflowDefinition, WorkspaceField, LOCAL_VARIABLE_PREFIX,
-    TIMEOUT_LABEL, WORKSPACE_ROOT,
+    VariableSource, VariableType, WaitWatchConfig, WorkflowDefinition, WorkspaceField,
+    LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
 use crate::engine::step_profile::{effort_rank, tier_rank, EFFORT_SCALE, MODEL_TIERS};
+use crate::observers::ObserverName;
 use crate::workspace::provisioner::is_usable_directory_name;
 
 use super::loader::{compile, LoadError};
@@ -514,6 +515,9 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             if wait.event.trim().is_empty() {
                 errors.push(missing_field(state, "wait", "event_type"));
             }
+            if let Some(watch) = &wait.watch {
+                validate_wait_watch(state, &wait.event, watch, errors);
+            }
         }
         ActionConfig::Decision(decision) => {
             if decision.message.is_blank() {
@@ -526,6 +530,50 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
                 });
             }
         }
+    }
+}
+
+/// A `wait` step's `watch` block (§3.3.D): an observer named explicitly
+/// (a plain observer name, no template), an object, and event types that
+/// include the step's own `event_type`. Whether the observer exists and
+/// accepts the object is the control plane's check, when the step waits.
+fn validate_wait_watch(
+    state: &State,
+    event_type: &str,
+    watch: &WaitWatchConfig,
+    errors: &mut Vec<ValidationError>,
+) {
+    let invalid = |reason: String| ValidationError::InvalidWaitWatch {
+        state: state.id.clone(),
+        reason,
+    };
+    if watch.observer.trim().is_empty() {
+        errors.push(missing_field(state, "wait", "watch.observer"));
+    } else if let Err(error) = ObserverName::parse(watch.observer.as_str()) {
+        errors.push(invalid(format!(
+            "'observer' must name an observer explicitly: {error}"
+        )));
+    }
+    if watch.object.trim().is_empty() {
+        errors.push(missing_field(state, "wait", "watch.object"));
+    }
+    if watch.event_types.is_empty() {
+        errors.push(invalid("'event_types' lists no event type".to_string()));
+        return;
+    }
+    if let Some(blank) = watch
+        .event_types
+        .iter()
+        .find(|event_type| event_type.trim().is_empty() || event_type.contains(char::is_whitespace))
+    {
+        errors.push(invalid(format!(
+            "event type '{blank}' is blank or contains whitespace"
+        )));
+    }
+    if !watch.event_types.iter().any(|listed| listed == event_type) {
+        errors.push(invalid(format!(
+            "'event_types' must include the step's event_type '{event_type}'"
+        )));
     }
 }
 
@@ -1017,6 +1065,15 @@ fn validate_state_templates(
         }
         Some(ActionConfig::Wait(wait)) => {
             templated.push(("action.event_type".to_string(), wait.event.clone()));
+            if let Some(watch) = &wait.watch {
+                templated.push(("action.watch.object".to_string(), watch.object.clone()));
+                for (index, event_type) in watch.event_types.iter().enumerate() {
+                    templated.push((
+                        format!("action.watch.event_types[{index}]"),
+                        event_type.clone(),
+                    ));
+                }
+            }
         }
         None => {}
     }
