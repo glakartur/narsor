@@ -46,9 +46,9 @@ Choose one role:
 
 | Role | Installed programs | Intended use |
 | --- | --- | --- |
-| `local` | `narsor`, `narsor-cli`, `narsor-server`, `narsor-controller`, `narsor-runner` | Run the TUI and CLI with the local server and controller. |
-| `frontend` | `narsor`, `narsor-cli` | Connect a TUI/CLI to a separately operated server. |
-| `server` | `narsor-server`, `narsor-controller`, `narsor-runner` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI and CLI too. |
+| `local` | `narsor`, `narsor-cli`, `narsor-web`, `narsor-server`, `narsor-controller`, `narsor-runner` | Run the TUI, CLI and browser interface with the local server and controller. |
+| `frontend` | `narsor`, `narsor-cli`, `narsor-web` | Connect a TUI/CLI or the browser interface ([`narsor-web`](../user/web.md)) to a separately operated server. |
+| `server` | `narsor-server`, `narsor-controller`, `narsor-runner` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI, CLI and `narsor-web` too. |
 
 The installer script downloads and verifies the archive, copies the binaries,
 and, only after consent, adds the binary directory to `~/.bashrc`. It then
@@ -56,7 +56,14 @@ runs `narsor-cli init`, which only creates or updates the configuration. The
 script asks for the role (arrow keys and Enter) and the binary directory
 (default `~/.local/bin`, Tab completes); `narsor-cli init` asks for the Narsor
 data directory (default `~/.narsor`). The prompts read from the terminal, so
-they also work with `curl ... | bash`.
+they also work with `curl ... | bash`. Each step (download, verification,
+role, binary directory, configuration, installation, `PATH`) starts with its
+own `==>` heading, and the last line names the installed version.
+
+Every program reports the version of its release: `narsor-cli --version`
+prints `narsor-cli 1.2.3` for the release tagged `v1.2.3`. The archive's
+`manifest.json` carries the same version, and the installer refuses an
+archive whose version does not match the tag it asked for.
 
 The data directory is a root: the configuration gets
 `catalog_dir: ROOT/catalog`, `state_dir: ROOT/state` and `work_dir: ROOT/work`,

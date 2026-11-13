@@ -7,7 +7,11 @@ use narsor_server::runtime::run_daemon;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[derive(Debug, Parser)]
-#[command(name = "narsor-server", about = "Run the Narsor API server")]
+#[command(
+    name = "narsor-server",
+    version = narsor_protocol::VERSION,
+    about = "Run the Narsor API server"
+)]
 struct Args {
     /// Narsor data directory (executions and workspaces).
     #[arg(long, value_name = "DIRECTORY", global = true)]

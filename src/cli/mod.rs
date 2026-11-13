@@ -58,7 +58,7 @@ pub const EXIT_USAGE: i32 = 2;
 #[derive(Debug, Parser)]
 #[command(
     name = "narsor-cli",
-    version,
+    version = narsor_protocol::VERSION,
     about = "Narsor — an AI workflow orchestrator: validate definitions, run them, and inspect executions",
     disable_help_subcommand = true
 )]

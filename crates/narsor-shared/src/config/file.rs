@@ -565,8 +565,32 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             ],
         ),
 
-        SettingKey::ServerBind => super::security_validation::parse_bind(text)
-            .map(|_| SettingValue::Text(text.trim().to_string())),
+        SettingKey::ServerBind | SettingKey::WebBind => {
+            super::security_validation::parse_bind(text)
+                .map(|_| SettingValue::Text(text.trim().to_string()))
+        }
+
+        SettingKey::WebUpstream => {
+            let upstream = text.trim();
+            if upstream == settings::WEB_UPSTREAM_LOCAL
+                || upstream.starts_with("https://")
+                || upstream.starts_with("http://")
+            {
+                Ok(SettingValue::Text(upstream.to_string()))
+            } else {
+                Err(format!(
+                    "'{}' (the local daemon) or the server's URL (https://…) was expected, but \
+                     '{upstream}' was found",
+                    settings::WEB_UPSTREAM_LOCAL
+                ))
+            }
+        }
+
+        SettingKey::WebToken => one_of(
+            text,
+            "web token mode",
+            &[settings::WEB_TOKEN_SERVER, settings::WEB_TOKEN_PASSTHROUGH],
+        ),
 
         SettingKey::OidcIssuer => {
             if text.trim().is_empty() {

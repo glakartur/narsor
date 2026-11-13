@@ -9,7 +9,11 @@ use narsor::config::{self, Flags};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[derive(Debug, Parser)]
-#[command(name = "narsor", about = "Narsor terminal interface")]
+#[command(
+    name = "narsor",
+    version = narsor_protocol::VERSION,
+    about = "Narsor terminal interface"
+)]
 struct Args {
     /// Narsor data directory (executions and workspaces).
     #[arg(long, global = true, value_name = "DIRECTORY")]

@@ -27,6 +27,8 @@ audited).
   input, an approval or a decision.
 - **CLI and full-screen TUI** — `narsor-cli` for scripting, `narsor` for an
   interactive view of tasks, events and conversations.
+- **Browser interface** — the functions of the TUI in a web browser, served by
+  `narsor-web`, which passes the API on to the local daemon or a remote server.
 - **Resume and recover** — interrupted or failed executions can be resumed or
   recovered, and every event is kept for audit.
 - **Agent conversation** — read and continue the conversation with an agent at
@@ -102,6 +104,7 @@ example_text="Hello"` runs the built-in workflow from anywhere.
 The full index is in [`docs/README.md`](docs/README.md).
 
 - **Using Narsor** — [CLI](docs/user/cli.md), [TUI](docs/user/tui.md),
+  [browser interface](docs/user/web.md),
   [workflows](docs/user/workflows.md), [AI agents](docs/user/agents.md),
   [conductor](docs/user/conductor.md), [remote tasks](docs/user/remote.md),
   [configuration](docs/user/configuration.md).

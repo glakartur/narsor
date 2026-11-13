@@ -105,7 +105,10 @@ impl Flags {
             | SettingKey::LocalHome
             | SettingKey::LocalCodexHome
             | SettingKey::LocalClaudeConfigDir
-            | SettingKey::LocalClaudeProfileSource => None,
+            | SettingKey::LocalClaudeProfileSource
+            | SettingKey::WebBind
+            | SettingKey::WebUpstream
+            | SettingKey::WebToken => None,
         }
     }
 }

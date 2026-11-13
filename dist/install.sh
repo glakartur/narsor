@@ -20,12 +20,27 @@ repository="glakartur/narsor"
 target="x86_64-unknown-linux-gnu"
 archive="narsor-linux-x86_64-gnu.tar.gz"
 version="${NARSOR_VERSION:-latest}"
-all_binaries=(narsor narsor-cli narsor-server narsor-controller narsor-runner)
+all_binaries=(narsor narsor-cli narsor-web narsor-server narsor-controller narsor-runner)
 bashrc_marker="# narsor-installer"
 
 fail() {
     printf 'narsor installer: %s\n' "$*" >&2
     exit 1
+}
+
+# Nagłówek kroku: pusta linia i tytuł, pogrubiony na terminalu, żeby kroki
+# instalacji (i pytania `narsor-cli init`) nie zlewały się w jeden blok.
+step() {
+    if [[ -t 1 ]]; then
+        printf '\n\033[1m==> %s\033[0m\n' "$*"
+    else
+        printf '\n==> %s\n' "$*"
+    fi
+}
+
+# Wersja z manifestu archiwum (pole "version"); pusta dla starszych wydań.
+manifest_version() {
+    sed -n 's/^  "version": "\(.*\)",$/\1/p' "$1"
 }
 
 usage() {
@@ -116,7 +131,7 @@ ask_path() {
 binaries_for_role() {
     case "$role" in
         local) printf '%s\n' "${all_binaries[@]}" ;;
-        frontend) printf '%s\n' narsor narsor-cli ;;
+        frontend) printf '%s\n' narsor narsor-cli narsor-web ;;
         server)
             if ((with_frontend)); then
                 printf '%s\n' "${all_binaries[@]}"
@@ -248,6 +263,7 @@ install_binaries() {
 
 uninstall() {
     local name cli
+    step "Uninstalling Narsor"
     if ((purge)); then
         cli="$bin_dir/narsor-cli"
         [[ -x "$cli" ]] || fail "narsor-cli is not in '$bin_dir'; it is needed for --purge (use --bin-dir)"
@@ -304,14 +320,16 @@ install() {
     work_dir="$(mktemp -d)"
     # Zmienna lokalna znika przed EXIT, więc ścieżka jest wstawiana od razu.
     trap "rm -rf -- $(shell_quote "$work_dir")" EXIT
+    step "Downloading Narsor ($version)"
     download "$base_url/$archive" "$work_dir/$archive" "$( ((show_progress)) && printf progress)"
     download "$base_url/$archive.sha256" "$work_dir/$archive.sha256"
 
+    step "Verifying the archive"
     (cd "$work_dir" && sha256sum --check "$archive.sha256") || fail "release archive checksum verification failed"
 
     while IFS= read -r entry; do
         case "$entry" in
-            manifest.json|narsor|narsor-cli|narsor-server|narsor-controller|narsor-runner) ;;
+            manifest.json|narsor|narsor-cli|narsor-web|narsor-server|narsor-controller|narsor-runner) ;;
             *) fail "unexpected path in release archive: $entry" ;;
         esac
     done < <(tar -tzf "$work_dir/$archive")
@@ -323,15 +341,25 @@ install() {
         [[ -f "$work_dir/$binary" && ! -L "$work_dir/$binary" && -x "$work_dir/$binary" ]] \
             || fail "release archive is missing a regular executable: $binary"
     done
+    local release_version
+    release_version="$(manifest_version "$work_dir/manifest.json")"
+    if [[ "$version" != "latest" && -n "$release_version" && "v$release_version" != "$version" ]]; then
+        fail "release archive is version $release_version, not $version"
+    fi
+    printf 'Narsor %s, %s: archive verified.\n' "${release_version:-?}" "$target"
 
+    step "Role"
     if [[ -z "$role" ]]; then
         ((interactive)) || fail "non-interactive installation requires --role local, frontend, or server"
         select_role
+    else
+        printf 'Role: %s\n' "$role"
     fi
     case "$role" in
         local|frontend|server) ;;
         *) fail "role must be local, frontend, or server" ;;
     esac
+    step "Binary directory"
     if [[ -z "$bin_dir" ]]; then
         ((interactive)) || fail "non-interactive installation requires --bin-dir"
         bin_dir="$(ask_path 'Binary installation directory (Tab completes, Enter accepts)' "$HOME/.local/bin")"
@@ -342,8 +370,10 @@ install() {
         esac
     fi
     bin_dir="$(absolute "$bin_dir")"
+    printf 'Binaries: %s\n' "$bin_dir"
 
     # Konfiguracja najpierw: błąd walidacji nie zostawia po sobie binariów.
+    step "Configuration"
     local init_args=(init --role "$role")
     ((non_interactive)) && init_args+=(--non-interactive)
     if ((interactive)); then
@@ -352,12 +382,15 @@ install() {
         "$work_dir/narsor-cli" "${init_args[@]}" "${passthrough[@]}"
     fi
 
+    step "Installing binaries"
     local -a binaries
     mapfile -t binaries < <(binaries_for_role)
     handle_running_processes
     install_binaries "$work_dir" "$bin_dir" "${binaries[@]}"
+    printf 'Installed: %s\n' "${binaries[*]}"
 
     if ! path_contains "$bin_dir"; then
+        step "PATH"
         local consent=0 answer
         if ((update_bashrc)); then
             consent=1
@@ -371,7 +404,8 @@ install() {
             printf "Add '%s' to PATH in your shell configuration to run Narsor by name.\n" "$bin_dir"
         fi
     fi
-    printf "Installed the %s role in '%s'.\n" "$role" "$bin_dir"
+    step "Done"
+    printf "Installed Narsor %s (%s role) in '%s'.\n" "${release_version:-$version}" "$role" "$bin_dir"
 }
 
 main() {
