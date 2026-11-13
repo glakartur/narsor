@@ -74,6 +74,7 @@ use narsor_protocol::controller::{ExecutionCursor, QueueReason, TaskState};
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
 use super::super::style::{PanelEdge, Role, Styles};
+use super::actions::{self, ActionPanel};
 use super::background::{DetailJob, JobKey, Outcome};
 use super::list::{describe_loss, state_icon, title_of, StateIcon};
 use super::notify::Severity;
@@ -1060,7 +1061,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         );
         return;
     }
+    // The action panel of the selected task takes the place of the
+    // conversation's form (R12); it goes back over the screen after the draw.
+    let mut panel = app.take_action_panel();
     let Some(view) = app.detail_view() else {
+        app.restore_action_panel(panel);
         let inner = styles.render_panel(frame, area, " Szczegóły ", frame_focused);
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -1090,7 +1095,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         loading,
         title_cut: title_is_cut(view.task, &edge),
     };
-    render_view(frame, inner, view, styles, options);
+    render_view(frame, inner, view, styles, options, panel.as_deref_mut());
+    app.restore_action_panel(panel);
 }
 
 /// Where the keys are, as the details draw it.
@@ -1135,6 +1141,7 @@ pub(super) fn render_view(
     view: DetailView<'_>,
     styles: &Styles,
     options: ViewOptions,
+    actions: Option<&mut ActionPanel>,
 ) {
     let ViewOptions {
         frame_focused,
@@ -1173,10 +1180,13 @@ pub(super) fn render_view(
     let base_lines = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(SEPARATOR_ROW + u16::from(notice.is_some()));
-    let panel_height = view
-        .detail
-        .waiting
-        .preferred_height(inner_width, area.height, base_lines);
+    let panel_height = match actions.as_deref() {
+        Some(panel) => actions::panel_height(panel, area.width),
+        None => view
+            .detail
+            .waiting
+            .preferred_height(inner_width, area.height, base_lines),
+    };
     let parts = areas(area, base_lines, panel_height);
     let content = Rect::new(
         parts.content.x.saturating_add(2),
@@ -1378,7 +1388,10 @@ pub(super) fn render_view(
             );
         }
     }
-    if let Some(panel) = parts.panel {
+    if let (Some(place), Some(panel)) = (parts.panel, actions) {
+        actions::render_panel(frame, place, "", panel, styles);
+        panel.in_details = true;
+    } else if let Some(panel) = parts.panel {
         view.detail.waiting.render(
             frame,
             panel,

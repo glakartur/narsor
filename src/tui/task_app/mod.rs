@@ -63,15 +63,16 @@
 //!   height from [`detail::render`] and the tab content gives up the rows; the
 //!   keys of [`keymap::Context::Panel`] apply while it has the focus (`Tab` is
 //!   [`Action::SwitchFocus`], ignored until then).
-//! * **The action menu (U11)** is in: [`actions`]. `Ctrl+.` (or `.`) opens it, no action
-//!   has its own shortcut, and [`actions::availability`] decides — for the menu, the
-//!   shortcuts and the bar — whether an action can be done and why not. What
-//!   sits over the screen is an [`Overlay`] in the field next to `help_open`;
-//!   it takes the keys first ([`TaskApp::key_context`], [`TaskApp::on_key`]).
-//!   An action `!` waits in the `y` / `n` [`actions::Confirmation`]. A new
-//!   mutation must first pass [`TaskApp::mutation_allowed`], and send its own
-//!   [`idempotency_key`]; the verdict of an operator command comes back as an
-//!   event and ends on the bar ([`list::CommandResolved`]).
+//! * **The action panel (U11)** is in: [`actions`]. `Ctrl+.` (or `.`) opens it, no action
+//!   has its own shortcut. The server's offer is the list: only what can be
+//!   done now, each action described whole; the panel draws it on the
+//!   multi-step form ([`super::stepped`]) in the place of the conversation's
+//!   form. What sits over the screen is an [`Overlay`] in the field next to
+//!   `help_open`; it takes the keys first ([`TaskApp::key_context`],
+//!   [`TaskApp::on_key`]). A new mutation must first pass
+//!   [`TaskApp::mutation_allowed`], and send its own [`idempotency_key`]; the
+//!   verdict of an operator command comes back as an event and ends on the
+//!   bar ([`list::CommandResolved`]).
 //! * **The *Dyrygent* tab (U12)** is in: [`tabs::conductor`]. Its chat, its
 //!   decisions and its harness go through [`Request::Act`] like any operator
 //!   command (a message is [`actions::ActionSend::Operator`] with

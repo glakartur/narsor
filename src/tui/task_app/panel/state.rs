@@ -49,7 +49,7 @@ use crate::tui::keymap::{self, Action, Context};
 use crate::tui::scroll::one_line;
 use crate::tui::scroll::{wrap_line, ScrollState};
 use crate::tui::style::{Role, Styles};
-use crate::tui::task_app::actions::{write_to_agent_item, written_text, TaskAction, COMMENT_FIELD};
+use crate::tui::task_app::actions::{write_to_agent_item, written_text, COMMENT_FIELD};
 use crate::tui::task_app::detail::short_age;
 use crate::tui::task_app::idempotency_key;
 use crate::tui::task_app::list::title_of;
@@ -408,19 +408,6 @@ impl Entry {
             notices.push((Role::Problem, format!("✗ {}", one_line(error))));
         }
         notices
-    }
-}
-
-/// The action of the menu a choice of the task's own actions does.
-pub(super) fn panel_action(id: TaskActionId) -> Option<TaskAction> {
-    match id {
-        TaskActionId::Transition => Some(TaskAction::Transition),
-        TaskActionId::Pause => Some(TaskAction::Pause),
-        TaskActionId::Stop => Some(TaskAction::Stop),
-        TaskActionId::ReleaseSlot => Some(TaskAction::ReleaseSlot),
-        TaskActionId::SelectStep => Some(TaskAction::SelectStep),
-        TaskActionId::Restart => Some(TaskAction::Restart),
-        _ => None,
     }
 }
 

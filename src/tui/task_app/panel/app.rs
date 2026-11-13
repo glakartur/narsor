@@ -18,7 +18,7 @@ use crate::tui::task_app::tabs::conductor;
 use crate::tui::task_app::{failure_reason, Request, TaskApp};
 
 use super::request::{AnswerRequest, PanelEffect, Submit};
-use super::state::{one_line_per_row, panel_action, WaitingPanel};
+use super::state::{one_line_per_row, WaitingPanel};
 
 // ---------------------------------------------------------------------
 // The application's part
@@ -183,10 +183,7 @@ impl TaskApp {
             PanelEffect::Submit(submission) => self.submit_answer(&id, &submission),
             PanelEffect::Confirm(submission) => self.ask_to_confirm(&id, &submission),
             PanelEffect::Comment(text) => self.submit_comment_text(&id, text),
-            PanelEffect::Action(action) => match panel_action(action) {
-                Some(action) => self.invoke(action),
-                None => Request::None,
-            },
+            PanelEffect::Action(action) => self.open_action(action),
         };
         self.sync_draft(&id);
         request

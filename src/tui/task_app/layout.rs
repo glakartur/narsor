@@ -189,6 +189,7 @@ pub fn render_at(
             }
         }
     }
+    app.unplace_action_panel();
     if let Some(detail_area) = areas.detail {
         render_view(frame, detail_area, app, styles, stale);
     }

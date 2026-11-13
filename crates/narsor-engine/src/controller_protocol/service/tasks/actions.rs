@@ -1,10 +1,13 @@
 //! What the owner can do to a task now, and why not (R1, R2, R4).
 //!
-//! One pure function of the task's summary, [`offer`], says for every action
-//! whether it can be done and, when it cannot, why in words for the owner. It
-//! fills [`TaskSummary::actions`], and the paths that send a command ask it
-//! again at the moment of sending ([`ProtocolService::require_available`]),
-//! so what a client was shown and what the server accepts cannot disagree.
+//! One pure function of the task's summary, [`unavailable_reason`], says for
+//! every action whether it can be done and, when it cannot, why in words for
+//! the owner. [`offer`] fills [`TaskSummary::actions`] with the actions it
+//! allows, each described whole (name, effect, risk, submenu, fields and the
+//! command to send), so a client draws them without knowing what they mean.
+//! The paths that send a command ask it again at the moment of sending
+//! ([`ProtocolService::require_available`]), so what a client was shown and
+//! what the server accepts cannot disagree.
 //!
 //! The reasons are the ones the TUI gave before the server took over the
 //! decision; their words are kept.
@@ -14,9 +17,10 @@ use narsor_protocol::api::{
     PermissionDecisionDto, PermissionDecisionKindDto,
 };
 use narsor_protocol::controller::{
-    AttentionKind, Freshness, RunnerState, StepKind, SubmitCommentRequest, SubmitCommentResponse,
-    SubmitInputRequest, TaskActionId, TaskActionOffer, TaskActionOption, TaskState, TaskSummary,
-    TransitionOffer,
+    placeholder, AttentionKind, Freshness, OperatorCommand, RunnerState, StepKind,
+    SubmitCommentRequest, SubmitCommentResponse, SubmitInputRequest, TaskActionField,
+    TaskActionFieldKind, TaskActionId, TaskActionKind, TaskActionOffer, TaskActionOption,
+    TaskActionSend, TaskActionSurface, TaskState, TaskSummary, TransitionOffer,
 };
 use narsor_protocol::display::{loss_state, LossState};
 
@@ -41,29 +45,243 @@ const OFFERED: [TaskActionId; 13] = [
     TaskActionId::Archive,
 ];
 
-/// The offer of `task`: every action, the unavailable ones with their reason.
+/// The offer of `task`: the actions that can be done now, each described
+/// whole (R1–R4 of the panel of actions). An action that cannot be done is
+/// not in it; its reason is the server's answer when it is sent anyway.
 pub(super) fn offer(task: &TaskSummary) -> Vec<TaskActionOffer> {
     OFFERED
         .into_iter()
-        .map(|id| {
-            let reason = unavailable_reason(task, id);
-            TaskActionOffer {
-                id,
-                available: reason.is_none(),
-                options: if reason.is_none() {
-                    options(task, id)
-                } else {
-                    Vec::new()
-                },
-                effect: if reason.is_none() && id == TaskActionId::Comment {
-                    Some(comment_effect(task).to_string())
-                } else {
-                    None
-                },
-                reason,
-            }
+        .enumerate()
+        .filter(|(_, id)| unavailable_reason(task, *id).is_none())
+        .map(|(position, id)| {
+            let mut offer = describe(task, id);
+            offer.order = u32::try_from(position).unwrap_or(u32::MAX) * 10;
+            offer.options = options(task, id);
+            offer
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------
+// What an action is, in words
+// ---------------------------------------------------------------------
+
+/// The name of the field of a comment for the agent.
+const COMMENT_FIELD: &str = narsor_protocol::panel::COMMENT_FIELD;
+/// The fields of an override.
+const TARGET_FIELD: &str = "stan docelowy";
+const REASON_FIELD: &str = "powód";
+
+/// `id` described for `task`, as a client draws it. Only for an available
+/// action: the words say what it does now.
+fn describe(task: &TaskSummary, id: TaskActionId) -> TaskActionOffer {
+    let leaf = |label: &str, description: String, send: TaskActionSend| {
+        let mut offer = TaskActionOffer::described(id, label, description);
+        offer.send = Some(send);
+        offer
+    };
+    let conversation = |label: &str, description: &str| {
+        let mut offer = TaskActionOffer::described(id, label, description);
+        offer.surface = TaskActionSurface::Conversation;
+        offer
+    };
+    match id {
+        TaskActionId::Pause => leaf(
+            "Pauza",
+            "Czeka, aż trwająca praca skończy krok. Potem zadanie staje w bezpiecznym punkcie i \
+             oddaje zasoby obliczeniowe. Storage zostaje."
+                .to_string(),
+            TaskActionSend::owner(OwnerCommand::Pause),
+        ),
+        TaskActionId::Stop => {
+            let mut offer = leaf(
+                "Stop",
+                stop_description(task),
+                TaskActionSend::operator(&OperatorCommand::StopStep),
+            );
+            offer.irreversible = true;
+            offer
+        }
+        TaskActionId::ReleaseSlot => leaf(
+            "Zwolnij slot",
+            "Zadanie czeka na Ciebie. Ta akcja zatrzymuje je teraz, a nie po czasie oczekiwania. \
+             Slot staje się wolny. Zadanie można potem wznowić."
+                .to_string(),
+            TaskActionSend::owner(OwnerCommand::ReleaseSlot),
+        ),
+        TaskActionId::Transition => transition_menu(task),
+        TaskActionId::SelectStep => step_menu(task),
+        // A stopped task starts its script step again through the runner; an
+        // interrupted one starts anew through the owner's command.
+        TaskActionId::Restart if task.runner_state == RunnerState::Stopped => leaf(
+            "Uruchom od nowa",
+            "Uruchamia od początku krok skryptu zatrzymanego zadania.".to_string(),
+            TaskActionSend::operator(&OperatorCommand::RestartStep {
+                note: None,
+                failure_key: None,
+            }),
+        ),
+        TaskActionId::Restart => leaf(
+            "Uruchom od nowa",
+            "Uruchamia od nowa przerwane zadanie albo ponawia nieudany provisioning na tym samym \
+             storage."
+                .to_string(),
+            TaskActionSend::owner(OwnerCommand::Start),
+        ),
+        TaskActionId::Archive => {
+            let mut offer = leaf(
+                "Archiwizuj",
+                "Usuwa workload i storage zadania. Zadanie trafia do Historii. Tego nie da się \
+                 cofnąć."
+                    .to_string(),
+                TaskActionSend::owner(OwnerCommand::Archive),
+            );
+            offer.irreversible = true;
+            offer
+        }
+        TaskActionId::Comment => {
+            let effect = comment_effect(task);
+            let mut offer = conversation("Napisz do agenta", effect);
+            offer.effect = Some(effect.to_string());
+            offer.fields =
+                vec![
+                    TaskActionField::new(COMMENT_FIELD, TaskActionFieldKind::Multiline).required(),
+                ];
+            offer.send = Some(TaskActionSend::Comment {
+                field: COMMENT_FIELD.to_string(),
+            });
+            offer
+        }
+        TaskActionId::Answer => conversation("Odpowiedz", "Odpowiada na prośbę zadania."),
+        TaskActionId::Approve => conversation("Zatwierdź", "Zatwierdza wynik agenta."),
+        TaskActionId::Reject => conversation("Odrzuć", "Odrzuca wynik agenta."),
+        TaskActionId::AllowPermission => {
+            conversation("Zezwól", "Udziela agentowi zgody, o którą prosi.")
+        }
+        TaskActionId::DenyPermission => {
+            conversation("Odmów", "Odmawia agentowi zgody, o którą prosi.")
+        }
+        TaskActionId::Resume | TaskActionId::Interrupt | TaskActionId::Unrecognized => {
+            conversation("Akcja", "Akcja spoza oferty.")
+        }
+    }
+}
+
+/// What a stop of `task` does, naming the step it cuts.
+fn stop_description(task: &TaskSummary) -> String {
+    let step = task
+        .runner
+        .as_ref()
+        .and_then(|runner| runner.execution_cursor.current_state.as_deref())
+        .map(one_line)
+        .filter(|step| !step.trim().is_empty());
+    let first = match step {
+        Some(step) => format!("Zrywa pracę w kroku „{step}” od razu."),
+        None => "Zrywa trwającą pracę od razu.".to_string(),
+    };
+    format!(
+        "{first} Zadanie staje w bezpiecznym punkcie i oddaje zasoby obliczeniowe. Sesja agenta \
+         zostaje. Skrypt zacznie od początku kroku. Polecenie trafia do runnera, a wynik pojawi \
+         się na pasku."
+    )
+}
+
+/// The manual transition: a submenu of the exits of the current state and,
+/// when the state allows it, the override.
+fn transition_menu(task: &TaskSummary) -> TaskActionOffer {
+    let mut menu = TaskActionOffer::described(
+        TaskActionId::Transition,
+        "Przejście ręczne",
+        "Przenosi execution do innego stanu. Lista pokazuje wyjścia bieżącego stanu. Override \
+         (przejście do dowolnego stanu) wymaga powodu i trafia do audytu.",
+    );
+    menu.kind = TaskActionKind::Submenu;
+    let Some(offer) = task.manual_transitions.as_ref() else {
+        return menu;
+    };
+    for exit in &offer.exits {
+        let said = exit
+            .description
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("Workflow nie opisuje tego wyjścia.");
+        let mut child = TaskActionOffer::described(
+            TaskActionId::Transition,
+            format!("{} → {}", one_line(&exit.label), one_line(&exit.target)),
+            format!("{said}\nPrzechodzi do stanu „{}”.", one_line(&exit.target)),
+        );
+        child.send = Some(TaskActionSend::operator(&OperatorCommand::Transition {
+            target: exit.target.clone(),
+            forced: false,
+            reason: None,
+        }));
+        menu.children.push(child);
+    }
+    if offer.has_override() {
+        let mut child = TaskActionOffer::described(
+            TaskActionId::Transition,
+            "Override: dowolny stan",
+            format!(
+                "Wymusza przejście ze stanu „{}” do dowolnego stanu workflow, także poza \
+                 deklarowanymi wyjściami. Powód i autor trafiają do audytu zadania.",
+                one_line(&offer.from_state)
+            ),
+        );
+        child.irreversible = true;
+        child.fields = vec![
+            TaskActionField::new(TARGET_FIELD, TaskActionFieldKind::Select)
+                .required()
+                .with_options(offer.override_targets.clone()),
+            TaskActionField::new(REASON_FIELD, TaskActionFieldKind::Text)
+                .required()
+                .hinted("trafia do audytu"),
+        ];
+        child.send = Some(TaskActionSend::operator(&OperatorCommand::Transition {
+            target: placeholder(TARGET_FIELD),
+            forced: true,
+            reason: Some(placeholder(REASON_FIELD)),
+        }));
+        menu.children.push(child);
+    }
+    menu
+}
+
+/// The choice of a step: a submenu of every step of the workflow, an agent's
+/// step with the field of a comment for its agent.
+fn step_menu(task: &TaskSummary) -> TaskActionOffer {
+    let mut menu = TaskActionOffer::described(
+        TaskActionId::SelectStep,
+        "Wybierz krok",
+        "Wznawia zadanie od dowolnego kroku workflow, także po jego zakończeniu. Dla kroku \
+         agenta można dopisać komentarz.",
+    );
+    menu.kind = TaskActionKind::Submenu;
+    for step in task.steps.iter().flatten() {
+        let mut child = TaskActionOffer::described(
+            TaskActionId::SelectStep,
+            one_line(&step.label),
+            format!(
+                "Wznawia zadanie od kroku „{}” ({}).",
+                one_line(&step.id),
+                step_kind_name(step.kind)
+            ),
+        );
+        let note = step.kind.runs_agent().then(|| {
+            child.fields =
+                vec![
+                    TaskActionField::new(COMMENT_FIELD, TaskActionFieldKind::Multiline).hinted(
+                        "komentarz dla agenta, opcjonalny; nie zostaje na dalsze przebiegi",
+                    ),
+                ];
+            placeholder(COMMENT_FIELD)
+        });
+        child.send = Some(TaskActionSend::operator(&OperatorCommand::SelectStep {
+            target: step.id.clone(),
+            note,
+        }));
+        menu.children.push(child);
+    }
+    menu
 }
 
 /// Why `id` cannot be done to `task` now; `None` when it can.
@@ -801,11 +1019,42 @@ mod tests {
         }
     }
 
-    fn offered(task: &TaskSummary, id: TaskActionId) -> TaskActionOffer {
+    fn offered(task: &TaskSummary, id: TaskActionId) -> Option<TaskActionOffer> {
+        offer(task).into_iter().find(|offer| offer.id == id)
+    }
+
+    fn ids(task: &TaskSummary, surface: TaskActionSurface) -> Vec<TaskActionId> {
         offer(task)
             .into_iter()
-            .find(|offer| offer.id == id)
-            .expect("in the offer")
+            .filter(|offer| offer.surface == surface)
+            .map(|offer| offer.id)
+            .collect()
+    }
+
+    fn reason(task: &TaskSummary, id: TaskActionId) -> Option<String> {
+        unavailable_reason(task, id)
+    }
+
+    /// A runner of a live task, in step `current` of `action_type`.
+    fn runner(current: &str, action_type: &str) -> narsor_protocol::controller::RunnerView {
+        serde_json::from_value(json!({
+            "incarnation": "pod-1",
+            "execution_status": "running",
+            "execution_cursor": {
+                "execution_id": "e",
+                "current_state": current,
+                "action_execution_id": null,
+                "current_action_type": action_type
+            },
+            "event_cursor": 0,
+            "pending_input": null,
+            "safe_point": true,
+            "observed_at": "2026-11-11T10:00:00Z",
+            "received_at": "2026-11-11T10:00:00Z",
+            "last_contact_at": null,
+            "freshness": "live"
+        }))
+        .expect("a runner view")
     }
 
     #[test]
@@ -814,33 +1063,100 @@ mod tests {
         let ids: Vec<_> = offer(&task).into_iter().map(|offer| offer.id).collect();
         assert!(!ids.contains(&TaskActionId::Resume));
         assert!(!ids.contains(&TaskActionId::Interrupt));
-        assert!(ids.contains(&TaskActionId::Stop));
         assert!(unavailable_reason(&task, TaskActionId::Resume).is_none());
+    }
+
+    #[test]
+    fn a_running_task_offers_exactly_pause_stop_and_archive_in_the_panel() {
+        // Covers AE1.
+        let mut task = summary("running", "running", true);
+        task.runner = Some(runner("review", "agent"));
+        assert_eq!(
+            ids(&task, TaskActionSurface::Panel),
+            [
+                TaskActionId::Pause,
+                TaskActionId::Stop,
+                TaskActionId::Archive
+            ]
+        );
+        for offer in offer(&task) {
+            assert!(offer.available && offer.reason.is_none(), "{offer:?}");
+        }
+    }
+
+    #[test]
+    fn every_entry_is_described_and_every_leaf_sends_something() {
+        let mut task = summary("stopped", "paused", true);
+        task.steps = Some(vec![
+            step("work", StepKind::Agent),
+            step("lint", StepKind::Script),
+        ]);
+        fn check(offer: &TaskActionOffer) {
+            assert!(
+                offer.label.as_deref().is_some_and(|text| !text.is_empty()),
+                "{offer:?}"
+            );
+            assert!(
+                offer
+                    .description
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty()),
+                "{offer:?}"
+            );
+            match offer.kind {
+                TaskActionKind::Submenu => {
+                    assert!(!offer.children.is_empty(), "{offer:?}");
+                    offer.children.iter().for_each(check);
+                }
+                _ if offer.surface == TaskActionSurface::Panel => {
+                    let send = offer.send.as_ref().expect("a leaf of the panel sends");
+                    let values: Vec<_> = offer
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            let value = field.options.first().cloned().unwrap_or("x".into());
+                            (field.name.clone(), value)
+                        })
+                        .collect();
+                    send.resolve(&values).expect("a command this server knows");
+                }
+                _ => {}
+            }
+        }
+        let offers = offer(&task);
+        assert!(!offers.is_empty());
+        offers.iter().for_each(check);
+        let orders: Vec<_> = offers.iter().map(|offer| offer.order).collect();
+        let mut sorted = orders.clone();
+        sorted.sort_unstable();
+        assert_eq!(orders, sorted, "in the order a client lists them");
     }
 
     #[test]
     fn a_stopped_task_holds_no_slot_to_release() {
         let task = summary("stopped", "paused", false);
-        let release = offered(&task, TaskActionId::ReleaseSlot);
-        assert!(!release.available);
-        assert_eq!(release.reason.as_deref(), Some("zadanie nie trzyma slotu"));
+        assert!(offered(&task, TaskActionId::ReleaseSlot).is_none());
+        assert_eq!(
+            reason(&task, TaskActionId::ReleaseSlot).as_deref(),
+            Some("zadanie nie trzyma slotu")
+        );
     }
 
     #[test]
     fn a_stopped_task_that_still_holds_its_slot_offers_the_release() {
         let task = summary("stopped", "paused", true);
-        assert!(offered(&task, TaskActionId::ReleaseSlot).available);
-        assert!(!offered(&task, TaskActionId::Pause).available);
-        assert!(!offered(&task, TaskActionId::Stop).available);
+        let release = offered(&task, TaskActionId::ReleaseSlot).expect("offered");
+        assert_eq!(release.label.as_deref(), Some("Zwolnij slot"));
+        assert!(offered(&task, TaskActionId::Pause).is_none());
+        assert!(offered(&task, TaskActionId::Stop).is_none());
     }
 
     #[test]
     fn a_working_task_has_no_wait_to_cut_short() {
         let task = summary("running", "running", true);
-        let release = offered(&task, TaskActionId::ReleaseSlot);
-        assert!(!release.available);
+        assert!(offered(&task, TaskActionId::ReleaseSlot).is_none());
         assert_eq!(
-            release.reason.as_deref(),
+            reason(&task, TaskActionId::ReleaseSlot).as_deref(),
             Some("zadanie nie czeka na operatora")
         );
     }
@@ -849,32 +1165,47 @@ mod tests {
     fn a_task_that_waits_for_the_owner_offers_the_release_when_the_server_says_so() {
         let mut task = summary("running", "human_needed", true);
         task.slot_release_pending = true;
-        assert!(offered(&task, TaskActionId::ReleaseSlot).available);
+        assert!(offered(&task, TaskActionId::ReleaseSlot).is_some());
     }
 
     #[test]
-    fn selecting_a_step_needs_a_stopped_task_with_the_steps_of_the_workflow() {
+    fn selecting_a_step_is_a_submenu_of_the_steps_of_the_workflow() {
+        // Covers AE2, AE3.
         let mut task = summary("stopped", "paused", false);
-        let reason = offered(&task, TaskActionId::SelectStep).reason;
-        assert_eq!(reason.as_deref(), Some("serwer nie podał kroków workflow"));
+        assert!(offered(&task, TaskActionId::SelectStep).is_none());
+        assert_eq!(
+            reason(&task, TaskActionId::SelectStep).as_deref(),
+            Some("serwer nie podał kroków workflow")
+        );
 
         task.steps = Some(vec![
             step("work", StepKind::Agent),
+            step("lint", StepKind::Script),
             step("end", StepKind::Terminal),
         ]);
-        let select = offered(&task, TaskActionId::SelectStep);
-        assert!(select.available);
+        let select = offered(&task, TaskActionId::SelectStep).expect("offered");
+        assert_eq!(select.kind, TaskActionKind::Submenu);
+        assert_eq!(select.label.as_deref(), Some("Wybierz krok"));
         let labels: Vec<_> = select
-            .options
+            .children
             .iter()
-            .map(|option| option.label.as_str())
+            .map(|child| child.label.as_deref().unwrap_or_default())
             .collect();
-        assert_eq!(labels, ["work", "end"], "every step, none left out");
+        assert_eq!(labels, ["work", "lint", "end"], "every step, none left out");
+
+        let agent = &select.children[0];
+        assert_eq!(agent.fields.len(), 1);
+        assert_eq!(agent.fields[0].name, COMMENT_FIELD);
+        assert!(!agent.fields[0].required, "the comment is optional");
+        assert!(
+            select.children[1].fields.is_empty(),
+            "a script has no field"
+        );
 
         let running = summary("running", "running", true);
-        assert!(!offered(&running, TaskActionId::SelectStep).available);
+        assert!(offered(&running, TaskActionId::SelectStep).is_none());
         let queued = summary("queued", "queued", false);
-        assert!(!offered(&queued, TaskActionId::SelectStep).available);
+        assert!(offered(&queued, TaskActionId::SelectStep).is_none());
     }
 
     #[test]
@@ -885,7 +1216,7 @@ mod tests {
             step("work", StepKind::Agent),
         ]);
 
-        let select = offered(&task, TaskActionId::SelectStep);
+        let select = offered(&task, TaskActionId::SelectStep).expect("offered");
 
         let options: Vec<_> = select
             .options
@@ -896,50 +1227,49 @@ mod tests {
             options,
             [("profile", Some("profile")), ("work", Some("agent"))]
         );
+        assert!(select.children.iter().all(|child| child.fields.len() == 1));
     }
 
     #[test]
     fn a_restart_of_a_stopped_task_is_for_a_script_step_only() {
         let mut task = summary("stopped", "paused", false);
         task.steps = Some(vec![step("work", StepKind::Script)]);
-        let runner = |current: &str, action_type: &str| {
-            serde_json::from_value(json!({
-                "incarnation": "pod-1",
-                "execution_status": "paused",
-                "execution_cursor": {
-                    "execution_id": "e",
-                    "current_state": current,
-                    "action_execution_id": null,
-                    "current_action_type": action_type
-                },
-                "event_cursor": 0,
-                "pending_input": null,
-                "safe_point": true,
-                "observed_at": "2026-11-11T10:00:00Z",
-                "received_at": "2026-11-11T10:00:00Z",
-                "last_contact_at": null,
-                "freshness": "live"
-            }))
-            .expect("a runner view")
-        };
         task.runner = Some(runner("work", "script"));
-        assert!(offered(&task, TaskActionId::Restart).available);
+        let restart = offered(&task, TaskActionId::Restart).expect("offered");
+        assert_eq!(
+            restart.send.unwrap().resolve(&[]),
+            Ok(narsor_protocol::controller::ResolvedActionSend::Operator(
+                OperatorCommand::RestartStep {
+                    note: None,
+                    failure_key: None
+                }
+            ))
+        );
 
         task.steps = Some(vec![step("work", StepKind::Agent)]);
         task.runner = Some(runner("work", "agent"));
-        assert!(!offered(&task, TaskActionId::Restart).available);
+        assert!(offered(&task, TaskActionId::Restart).is_none());
+
+        let interrupted = summary("interrupted", "error", false);
+        let restart = offered(&interrupted, TaskActionId::Restart).expect("offered");
+        assert_eq!(
+            restart.send.unwrap().resolve(&[]),
+            Ok(narsor_protocol::controller::ResolvedActionSend::Owner(
+                OwnerCommand::Start
+            ))
+        );
     }
 
     #[test]
     fn a_pausing_task_cannot_be_paused_again_but_can_be_stopped() {
         let task = summary("pause_requested", "paused", true);
         assert_eq!(
-            offered(&task, TaskActionId::Pause).reason.as_deref(),
+            reason(&task, TaskActionId::Pause).as_deref(),
             Some("zadanie jest już wstrzymywane")
         );
         // No runner reported in this summary, so only that stops the offer.
         assert_eq!(
-            offered(&task, TaskActionId::Stop).reason.as_deref(),
+            reason(&task, TaskActionId::Stop).as_deref(),
             Some("runner jeszcze się nie zgłosił")
         );
     }
@@ -952,9 +1282,84 @@ mod tests {
             TaskActionId::Stop,
             TaskActionId::SelectStep,
         ] {
-            assert!(!offered(&task, id).available, "{id:?}");
+            assert!(offered(&task, id).is_none(), "{id:?}");
         }
-        assert!(offered(&task, TaskActionId::Archive).available);
+        assert!(offered(&task, TaskActionId::Archive).is_some());
+    }
+
+    #[test]
+    fn stop_and_archive_are_marked_irreversible() {
+        let mut task = summary("running", "running", true);
+        task.runner = Some(runner("review", "agent"));
+        let stop = offered(&task, TaskActionId::Stop).expect("offered");
+        assert!(stop.irreversible);
+        assert!(stop
+            .description
+            .as_deref()
+            .is_some_and(|text| text.contains("„review”")));
+        assert!(offered(&task, TaskActionId::Archive).unwrap().irreversible);
+        assert!(!offered(&task, TaskActionId::Pause).unwrap().irreversible);
+    }
+
+    #[test]
+    fn the_conversation_actions_are_offered_apart_from_the_panel() {
+        let task = summary("stopped", "paused", false);
+        let comment = offered(&task, TaskActionId::Comment).expect("a comment in a pause");
+        assert_eq!(comment.surface, TaskActionSurface::Conversation);
+        assert!(comment.effect.is_some());
+        assert!(!ids(&task, TaskActionSurface::Panel).contains(&TaskActionId::Comment));
+    }
+
+    #[test]
+    fn the_override_fills_its_target_and_reason_from_the_fields() {
+        let mut task = summary("running", "running", true);
+        task.runner = Some(runner("review", "agent"));
+        task.manual_transitions = Some(TransitionOffer {
+            from_state: "review".to_string(),
+            exits: vec![narsor_protocol::controller::TransitionExit {
+                label: "approve".to_string(),
+                target: "merge".to_string(),
+                description: None,
+            }],
+            override_allowed: true,
+            override_targets: vec!["plan".to_string(), "merge".to_string()],
+        });
+        let menu = offered(&task, TaskActionId::Transition).expect("offered");
+        assert_eq!(menu.kind, TaskActionKind::Submenu);
+        assert_eq!(menu.children.len(), 2);
+        let forced = &menu.children[1];
+        assert!(forced.irreversible);
+        let sent = forced
+            .send
+            .as_ref()
+            .unwrap()
+            .resolve(&[
+                (TARGET_FIELD.to_string(), "plan".to_string()),
+                (REASON_FIELD.to_string(), "pilne".to_string()),
+            ])
+            .unwrap();
+        assert_eq!(
+            sent,
+            narsor_protocol::controller::ResolvedActionSend::Operator(
+                OperatorCommand::Transition {
+                    target: "plan".to_string(),
+                    forced: true,
+                    reason: Some("pilne".to_string()),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn an_empty_offer_is_a_list_not_nothing() {
+        let task = summary("archived", "archived", false);
+        let offers = offer(&task);
+        assert!(
+            offers
+                .iter()
+                .all(|offer| offer.surface != TaskActionSurface::Panel),
+            "{offers:?}"
+        );
     }
 
     #[test]
@@ -964,5 +1369,159 @@ mod tests {
         assert!(task.steps.is_none());
         let unknown: TaskActionId = serde_json::from_value(json!("something_new")).unwrap();
         assert_eq!(unknown, TaskActionId::Unrecognized);
+    }
+
+    /// A launch resolver for a service that creates no task through it.
+    struct NoLaunches;
+
+    impl crate::environment::LaunchResolver for NoLaunches {
+        fn resolve(
+            &self,
+            _intent: &crate::environment::LaunchIntent,
+        ) -> Result<crate::environment::ResolvedLaunch, crate::environment::LaunchError> {
+            Err(crate::environment::LaunchError::UnknownBackend(
+                "k8s".to_string(),
+            ))
+        }
+
+        fn check_backend(
+            &self,
+            backend: &crate::domain::BackendId,
+        ) -> Result<(), crate::environment::LaunchError> {
+            Err(crate::environment::LaunchError::UnknownBackend(
+                backend.to_string(),
+            ))
+        }
+
+        fn slot_release_timings(
+            &self,
+            backend: &crate::domain::BackendId,
+        ) -> Result<crate::environment::SlotReleaseTimings, crate::environment::LaunchError>
+        {
+            Err(crate::environment::LaunchError::UnknownBackend(
+                backend.to_string(),
+            ))
+        }
+
+        fn configured_default_backend(&self) -> String {
+            "k8s".to_string()
+        }
+
+        fn backend_record(
+            &self,
+            _backend: &crate::domain::BackendId,
+        ) -> Result<Option<crate::environment::BackendRecord>, crate::environment::LaunchError>
+        {
+            Ok(None)
+        }
+    }
+
+    /// A service over a real control plane in `root`, and a task of it in
+    /// `runner_state`, without a runner.
+    fn service_and_record(
+        root: &std::path::Path,
+        runner_state: RunnerState,
+    ) -> (ProtocolService, TaskRecord) {
+        use crate::domain::{
+            BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
+            TaskRepository, TaskRepositorySource, TaskWorkspace,
+        };
+        use crate::orchestration::{ControlPlane, NewTask, OwnerRef};
+        let workspace = TaskWorkspace::single(TaskRepository::new(
+            "narsor",
+            TaskRepositorySource::Git(Box::new(GitIdentity {
+                repository: Some("narsor".to_string()),
+                remote_url: "https://example.com/narsor.git".to_string(),
+                commit: "614c3a8".repeat(5) + "abcde",
+                git_ref: None,
+                ref_origin: None,
+                credential: None,
+            })),
+        ));
+        let spec = TaskLaunchSpec::new(
+            "steps",
+            1,
+            json!({}),
+            workspace,
+            ResolvedEnvironment::harness_only("claude-code"),
+            ResourceProfile::new(1000, 2048),
+        );
+        let control = ControlPlane::new(crate::persistence::StatePaths::new(root));
+        let mut record = control
+            .create_task(NewTask::new(
+                TaskId::parse("task-1").unwrap(),
+                OwnerRef::new("oidc:https://issuer|owner"),
+                BackendId::parse("k8s").unwrap(),
+                spec,
+            ))
+            .unwrap();
+        record.runner_state = runner_state;
+        let service = ProtocolService::new(control, std::sync::Arc::new(NoLaunches));
+        (service, record)
+    }
+
+    /// The code and the message of a conflict; panics on anything else.
+    fn conflict(result: ProtocolResult<()>) -> (&'static str, String) {
+        match result {
+            Err(ProtocolError::Conflict { code, message }) => (code, message),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_send_of_an_action_no_longer_allowed_is_refused_with_its_reason() {
+        // Covers AE5: the offer hides what cannot be done, so this check is
+        // what stops a client that drew an older offer.
+        let root = std::env::temp_dir().join(format!("narsor-actions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (service, record) = service_and_record(&root, RunnerState::Queued);
+        let summary = service.summarize(&record).unwrap();
+        let expected = unavailable_reason(&summary, TaskActionId::Pause).expect("a reason");
+
+        let (code, message) = conflict(service.require_available(
+            &record,
+            TaskActionId::Pause,
+            Some(record.generation),
+        ));
+        assert_eq!(code, "action_unavailable");
+        assert_eq!(message, expected);
+        assert!(!message.is_empty());
+
+        // A task that moved on is the control plane's `stale_generation`.
+        assert!(service
+            .require_available(&record, TaskActionId::Pause, Some(record.generation + 1))
+            .is_ok());
+        // What can be done passes.
+        assert!(service
+            .require_available(&record, TaskActionId::Archive, None)
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_owner_command_no_longer_allowed_is_refused_with_its_reason() {
+        let root = std::env::temp_dir().join(format!("narsor-actions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        // A running task that does not wait for the operator: the lifecycle
+        // takes the release, the offer does not.
+        let (service, record) = service_and_record(&root, RunnerState::Running);
+        let summary = service.summarize(&record).unwrap();
+        let expected = unavailable_reason(&summary, TaskActionId::ReleaseSlot).expect("a reason");
+
+        let (code, message) = conflict(service.require_owner_command_available(
+            &record,
+            OwnerCommand::ReleaseSlot,
+            None,
+        ));
+        assert_eq!(code, "action_unavailable");
+        assert_eq!(message, expected);
+
+        // A command the lifecycle refuses is left to the control plane.
+        let mut queued = record.clone();
+        queued.runner_state = RunnerState::Queued;
+        assert!(service
+            .require_owner_command_available(&queued, OwnerCommand::Pause, None)
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

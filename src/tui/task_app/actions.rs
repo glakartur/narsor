@@ -1,58 +1,44 @@
 //! The action panel and the operator's actions (U11, origin §3).
 //!
 //! `Ctrl+.` (and `.`, for a terminal that does not pass it) opens one panel of
-//! everything the operator can do to the selected task. It is the only way to
-//! those actions: they have no shortcut of their own. One function,
-//! [`availability`], says whether an action can be done to a task *now* and,
-//! when it cannot, why — and it only reads what the server offered. The panel
-//! greys the entry out and shows the reason; nothing else decides.
+//! everything the operator can do to the selected task. The server says what
+//! that is: [`TaskSummary::actions`] holds only the actions that can be done
+//! now, each described whole — its name, what it does, whether it cannot be
+//! undone, whether it opens a submenu, the fields it needs and the command to
+//! send. The panel draws that on the multi-step form ([`SteppedForm`]):
+//! choose, fill in, confirm. It has no list of its own and no `match` on the
+//! id of an action: an action it does not know is shown, confirmed and sent
+//! like any other (R15, R16).
 //!
-//! | action | available when the server says |
-//! |---|---|
-//! | pause | the task runs: it waits for the end of the step |
-//! | stop `!` | the task runs or pauses: the work is cut at once |
-//! | free the slot | the task waits for the operator, before the policy stops it |
-//! | transition; override `!` | the state has exits (override: see the workflow) |
-//! | choose a step | the task is stopped or finished: any step of the workflow |
-//! | start again | a script step of a stopped task, an interrupted task, failed provisioning |
-//! | archive `!` | not archived yet |
-//! | open a link (`o`) | a workspace has a pull request link |
+//! The panel takes the place of the conversation's form at the bottom of the
+//! details ([`super::detail::render`]); where the details are not drawn it
+//! sits in the middle of the screen.
 //!
-//! A comment is the conversation's, and moving a queued task is `Ctrl+↑` /
-//! `Ctrl+↓` (or `m`): neither is in the panel.
+//! Two actions are the client's own: moving a queued task (`Ctrl+↑` /
+//! `Ctrl+↓`, `m`) is not in the panel, and opening a link of the task is its
+//! last entry, done without a confirmation. A comment is the conversation's.
 //!
 //! # Confirmation
 //!
-//! An action marked `!` always asks first, in the same window: what will
-//! happen, then `y` to do it and `n` (or `Esc`) to take it back
-//! ([`Confirmation`], keys of [`Context::Confirm`]). The archive of the answer
-//! panel (U10) uses the same window, not a second `Enter` of its own.
+//! Every action of the server ends in the confirmation step of the panel:
+//! what will happen, what was typed, `!` for an action that cannot be undone,
+//! then `Enter` to do it and `Esc` to go back. The `y` / `n` window
+//! ([`Confirmation`], keys of [`Context::Confirm`]) stays for the answer panel
+//! (U10) and the repositories.
 //!
 //! # What goes where
 //!
-//! * pause, free the slot, start and archive are owner commands
-//!   (`POST …/commands`) — the answer is the new runner state, which the stream
-//!   shows in the row. Freeing the slot is the pause the wait policy sends,
-//!   sent before its time;
-//! * stop, the transitions, a step chosen and a script step started again are
-//!   operator commands
-//!   (`POST …/operator-commands`): the control plane queues them and the
-//!   *runner* carries them out, so the answer only says "queued". The verdict
-//!   comes as `OperatorCommandResolved` ([`CommandResolved`]) and ends on the
-//!   bar, a rejection with the reason the runner gave. After a transition that
-//!   does not end the execution the runner goes on by itself; nothing is sent
-//!   to resume it.
+//! The server names the command: an owner command (`POST …/commands`, the
+//! answer is the new runner state), a command for the runner
+//! (`POST …/operator-commands`, the answer only says "queued" and the verdict
+//! comes as `OperatorCommandResolved`, [`CommandResolved`]) or a comment.
+//! What was typed goes into it where the server put the field's placeholder
+//! ([`TaskActionSend::resolve`]).
 //!
 //! Every send passes [`TaskApp::mutation_allowed`] and carries an
-//! [`idempotency_key`] that a retry of the same decision reuses.
-//!
-//! # For U12 and U13
-//!
-//! [`Overlay`] is what sits over the screen (menu, a list of exits or links,
-//! the confirmation) and [`TaskApp::overlay`] says which. A new confirmation
-//! is [`Confirmation::new`] plus [`Confirmed`]; a new action is a
-//! [`TaskAction`], an arm of [`availability`] and one of
-//! [`TaskApp::invoke`].
+//! [`idempotency_key`] that a retry of the same decision reuses. A refusal of
+//! the server (`action_unavailable`) says why on the bar and reads the tasks
+//! again.
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
@@ -63,17 +49,17 @@ use ratatui::Frame;
 use crate::api::ClientError;
 use crate::controller_protocol::{
     OwnerCommandRequest, SubmitCommentRequest, SubmitOperatorCommandRequest, TaskSummary,
-    TransitionExit,
 };
 use crate::domain::display::safe_link_url;
 use narsor_protocol::controller::{
-    OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, StepView, TaskActionId,
-    TaskActionOffer, TaskState,
+    OperatorCommand, OperatorCommandStatus, ResolvedActionSend, RunnerState, TaskActionFieldKind,
+    TaskActionId, TaskActionKind, TaskActionOffer, TaskActionSend, TaskActionSurface, TaskState,
 };
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
 use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
+use super::super::stepped::{self, Stage, StepEntry, SteppedForm, SteppedOutcome};
 use super::super::style::{Role, Styles};
 use super::harness::HarnessList;
 use super::limit::LimitList;
@@ -86,25 +72,12 @@ use super::{failure_reason, idempotency_key, is_transport, Request, TaskApp};
 // What can be done, and when
 // ---------------------------------------------------------------------
 
-/// An action of the menu (origin §3).
+/// An action of the client's own, or the conversation's comment: the actions
+/// of the panel are the server's ([`ActionPanel`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskAction {
     /// `Ctrl+↑` / `Ctrl+↓` / `m`: another place in the queue.
     Move,
-    /// Pause: the work comes to the end of its step, then the task stops.
-    Pause,
-    /// Stop: the work is cut at once; the task ends stopped. `!`
-    Stop,
-    /// Free the slot of a task that waits for the operator.
-    ReleaseSlot,
-    /// A manual transition, an override among them.
-    Transition,
-    /// Go on from any step of the workflow.
-    SelectStep,
-    /// Start a script step or an interrupted task again.
-    Restart,
-    /// Delete the workload and the storage. `!`
-    Archive,
     /// `o`: open a link of the task.
     OpenLink,
     /// `c`: a comment to the agent; the server picks what it does by the
@@ -113,19 +86,6 @@ pub enum TaskAction {
 }
 
 impl TaskAction {
-    /// Every action of the panel, in its order. A comment and a move in the
-    /// queue are not in it: the conversation writes, `Ctrl+↑` / `Ctrl+↓` move.
-    pub const ALL: [TaskAction; 8] = [
-        TaskAction::Pause,
-        TaskAction::Stop,
-        TaskAction::ReleaseSlot,
-        TaskAction::Transition,
-        TaskAction::SelectStep,
-        TaskAction::Restart,
-        TaskAction::Archive,
-        TaskAction::OpenLink,
-    ];
-
     /// The action a key of the map asks for.
     pub fn of_key(action: Action) -> Option<Self> {
         match action {
@@ -140,11 +100,6 @@ impl TaskAction {
     /// connection). Opening a link does not.
     pub fn changes_state(self) -> bool {
         self != Self::OpenLink
-    }
-
-    /// Whether it always asks `y` / `n` first.
-    pub fn needs_confirmation(self) -> bool {
-        matches!(self, Self::Stop | Self::Archive)
     }
 }
 
@@ -176,35 +131,41 @@ impl Availability {
     }
 }
 
-/// Said of an action the server's offer does not cover.
-const NO_OFFER: &str = "niedostępne: brak danych z serwera";
+/// Said when the server gave no list of actions (a server from before the
+/// offer, or no data).
+pub const NO_OFFER: &str = "niedostępne: brak danych z serwera";
+/// Said of an action the server does not offer now: it offers only what can
+/// be done.
+pub const NOT_OFFERED: &str = "niedostępne teraz";
+/// What the panel says when the server gave no list of actions (R6).
+pub const NO_DATA_TEXT: &str = "Brak danych z serwera: serwer nie podał listy akcji.";
+/// What the panel says when the list of actions is empty.
+pub const NOTHING_TEXT: &str = "Brak dostępnych akcji dla tego zadania.";
 
 /// The offer of the server for `id`, if it made one.
 fn offer_of(task: &TaskSummary, id: TaskActionId) -> Option<&TaskActionOffer> {
     task.actions.as_ref()?.iter().find(|offer| offer.id == id)
 }
 
-/// What the server says of `id` for `task`: its offer, or that it said
-/// nothing (a server from before the offer, or one that does not know the
-/// action).
+/// What the server says of `id` for `task`: it is in the offer, or it is
+/// not. An older server still lists what is not available, with its reason.
 fn offered(task: &TaskSummary, id: TaskActionId) -> Availability {
-    let Some(offer) = offer_of(task, id) else {
+    if task.actions.is_none() {
         return Availability::because(NO_OFFER);
-    };
-    if offer.available {
-        Availability::Available
-    } else {
-        Availability::because(offer.reason.as_deref().unwrap_or("niedostępne"))
+    }
+    match offer_of(task, id) {
+        None => Availability::because(NOT_OFFERED),
+        Some(offer) if offer.available => Availability::Available,
+        Some(offer) => Availability::because(offer.reason.as_deref().unwrap_or("niedostępne")),
     }
 }
 
 /// Whether `action` can be done to `task` now, and if not, why.
 ///
-/// The server decides, on the same rule it checks at the send (R3, R4): this
-/// only reads what it offered. Moving and opening a link are the client's own.
-/// A pure function of the summary: the menu, the shortcuts and the
-/// notifications all ask it, so they cannot disagree. It knows nothing of the
-/// connection — that gate is [`TaskApp::mutation_allowed`].
+/// A comment is the server's to allow (it offers it, or it does not);
+/// moving and opening a link are the client's own. A pure function of the
+/// summary, so the shortcuts and the notifications cannot disagree. It knows
+/// nothing of the connection — that gate is [`TaskApp::mutation_allowed`].
 pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
     match action {
         // Moving is an operation on the queue itself: only a task that waits
@@ -220,13 +181,6 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
                 Availability::because("zadanie nie ma jeszcze linku do PR")
             }
         }
-        TaskAction::Pause => offered(task, TaskActionId::Pause),
-        TaskAction::Stop => offered(task, TaskActionId::Stop),
-        TaskAction::ReleaseSlot => offered(task, TaskActionId::ReleaseSlot),
-        TaskAction::SelectStep => offered(task, TaskActionId::SelectStep),
-        TaskAction::Transition => offered(task, TaskActionId::Transition),
-        TaskAction::Restart => offered(task, TaskActionId::Restart),
-        TaskAction::Archive => offered(task, TaskActionId::Archive),
         TaskAction::Comment => offered(task, TaskActionId::Comment),
     }
 }
@@ -242,17 +196,10 @@ fn openable_links(task: &TaskSummary) -> impl Iterator<Item = (&str, String, Str
 }
 
 /// The word that opens a notification about `action`
-/// ("pauza: zadanie jest w kolejce").
+/// ("przesuń: zadanie nie jest w kolejce").
 pub fn verb(action: TaskAction) -> &'static str {
     match action {
         TaskAction::Move => "przesuń",
-        TaskAction::Pause => "pauza",
-        TaskAction::Stop => "zatrzymanie",
-        TaskAction::ReleaseSlot => "zwolnienie slotu",
-        TaskAction::SelectStep => "wybór kroku",
-        TaskAction::Transition => "przejście",
-        TaskAction::Restart => "uruchomienie od nowa",
-        TaskAction::Archive => "archiwizacja",
         TaskAction::OpenLink => "link",
         TaskAction::Comment => "komentarz",
     }
@@ -266,11 +213,21 @@ pub fn verb(action: TaskAction) -> &'static str {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionSend {
     /// A runner state command of the owner: pause, resume, start, archive.
-    Owner(OwnerCommand),
+    Owner(narsor_protocol::controller::OwnerCommand),
     /// A command for the runner: interrupt, a transition.
     Operator(OperatorCommand),
     /// A comment to the agent: what it does, the server decides.
     Comment(String),
+}
+
+impl From<ResolvedActionSend> for ActionSend {
+    fn from(send: ResolvedActionSend) -> Self {
+        match send {
+            ResolvedActionSend::Owner(command) => Self::Owner(command),
+            ResolvedActionSend::Operator(command) => Self::Operator(command),
+            ResolvedActionSend::Comment(text) => Self::Comment(text),
+        }
+    }
 }
 
 /// An action chosen and confirmed, ready to be sent: [`TaskApp::perform`]
@@ -286,7 +243,7 @@ pub struct ActionRequest {
     pub generation: u64,
     /// The key a retry of this decision reuses.
     pub key: String,
-    /// What the action is called, for a refusal ("przerwanie").
+    /// What the action is called, for a refusal ("pauza").
     pub verb: String,
     /// What the notification says when it was accepted.
     pub summary: String,
@@ -306,7 +263,7 @@ pub struct LinkRequest {
 /// What a confirmed window sends.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Confirmed {
-    /// An action of the menu.
+    /// An action of the client.
     Act(Box<ActionRequest>),
     /// A chosen action of the answer panel.
     Answer(Box<AnswerRequest>),
@@ -360,28 +317,223 @@ impl Confirmation {
     }
 }
 
-/// The menu: an entry per action, over the task it was opened for.
-#[derive(Debug, Clone)]
-pub struct Menu {
-    task_id: String,
-    chooser: Chooser,
+/// What the server gave the panel to draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelContent {
+    /// Actions, or the client's own link.
+    Entries,
+    /// An empty list: nothing can be done now.
+    Nothing,
+    /// No list at all (R6): nothing is drawn in place of it.
+    NoData,
 }
 
-/// The exits of the state, and the override.
+/// The action panel of one task: the server's actions on the multi-step
+/// form, and the client's link at the end.
 #[derive(Debug, Clone)]
-pub struct TransitionList {
+pub struct ActionPanel {
     task_id: String,
-    from_state: String,
-    exits: Vec<TransitionExit>,
-    chooser: Chooser,
+    /// The actions of the panel as the server offered them, in their order:
+    /// what the form's entries stand for, at the same indices.
+    offers: Vec<TaskActionOffer>,
+    /// Whether the last entry is the client's link.
+    link: bool,
+    content: PanelContent,
+    form: SteppedForm,
+    /// The generation of the task the operator decides on: the one of the
+    /// refresh before the operator chose an action. A later refresh does
+    /// not change it, so an action confirmed on a task that changed since
+    /// is refused as stale.
+    generation: u64,
+    /// The generation of the last refresh. Back on the choice, the operator
+    /// sees the offer of this generation, so `generation` takes it again.
+    latest_generation: u64,
+    /// Whether the last frame drew the panel in the details.
+    pub(super) in_details: bool,
 }
 
-/// The steps of the workflow, to go on from one of them.
-#[derive(Debug, Clone)]
-pub struct StepList {
-    task_id: String,
-    steps: Vec<StepView>,
-    chooser: Chooser,
+impl ActionPanel {
+    /// The panel of `task`. `blocked` is why nothing that changes state can
+    /// be done right now (no connection), if that is so.
+    fn new(task: &TaskSummary, blocked: Option<&str>) -> Self {
+        let (offers, content) = panel_offers(task);
+        let link = content != PanelContent::NoData && openable_links(task).next().is_some();
+        let entries = panel_entries(&offers, link, blocked);
+        Self {
+            task_id: task.task_id.to_string(),
+            offers,
+            link,
+            content: if link { PanelContent::Entries } else { content },
+            form: SteppedForm::new("Akcje", entries),
+            generation: task.generation,
+            latest_generation: task.generation,
+            in_details: false,
+        }
+    }
+
+    /// What the server gave the panel to draw.
+    pub fn content(&self) -> PanelContent {
+        self.content
+    }
+
+    /// The form of the panel.
+    pub fn form(&self) -> &SteppedForm {
+        &self.form
+    }
+
+    /// The labels of the entries of the level open now, as drawn.
+    pub fn labels(&self) -> Vec<String> {
+        self.form
+            .chooser()
+            .items()
+            .iter()
+            .map(|item| item.label.clone())
+            .collect()
+    }
+
+    /// The keys that apply now: the menu's on a choice.
+    fn context(&self) -> Context {
+        match self.form.stage() {
+            Stage::Choice => Context::Menu,
+            _ => self.form.context(),
+        }
+    }
+
+    /// The same panel over what `task` offers now, keeping the level, the
+    /// step and what was typed. The label of a chosen entry that is gone
+    /// comes back, for the bar.
+    fn rebuilt(self, task: &TaskSummary, blocked: Option<&str>) -> (Self, Option<String>) {
+        let fresh = Self::new(task, blocked);
+        let entries = panel_entries(&fresh.offers, fresh.link, blocked);
+        let (form, lost) = self.form.rebuilt(entries);
+        let mut panel = Self {
+            form,
+            generation: self.generation,
+            in_details: self.in_details,
+            ..fresh
+        };
+        panel.sync_generation();
+        (panel, lost)
+    }
+
+    /// On a choice, the operator sees the offer of the last refresh: the
+    /// action chosen from it is sent with that generation.
+    fn sync_generation(&mut self) {
+        if self.form.stage() == Stage::Choice {
+            self.generation = self.latest_generation;
+        }
+    }
+
+    /// The offer the entry at `path` stands for; `None` for the link.
+    fn offer_at(&self, path: &[usize]) -> Option<&TaskActionOffer> {
+        let (first, rest) = path.split_first()?;
+        let mut offer = self.offers.get(*first)?;
+        for index in rest {
+            offer = drawn(&offer.children).nth(*index)?;
+        }
+        Some(offer)
+    }
+
+    /// Whether `path` is the client's link.
+    fn is_link(&self, path: &[usize]) -> bool {
+        self.link && path == [self.offers.len()]
+    }
+}
+
+/// The offers a client can draw, in their order: described, of a kind it
+/// knows. An older server describes none.
+fn drawn(offers: &[TaskActionOffer]) -> impl Iterator<Item = &TaskActionOffer> {
+    offers
+        .iter()
+        .filter(|offer| offer.is_described() && offer.kind != TaskActionKind::Unrecognized)
+}
+
+/// The actions of the panel in `task`'s offer, and what the panel shows.
+fn panel_offers(task: &TaskSummary) -> (Vec<TaskActionOffer>, PanelContent) {
+    let Some(actions) = task.actions.as_ref() else {
+        return (Vec::new(), PanelContent::NoData);
+    };
+    // A server from before the descriptions lists actions it does not
+    // describe: the panel has nothing to draw them with.
+    if !actions.is_empty() && !actions.iter().any(TaskActionOffer::is_described) {
+        return (Vec::new(), PanelContent::NoData);
+    }
+    let mut offers: Vec<TaskActionOffer> = drawn(actions)
+        .filter(|offer| offer.surface == TaskActionSurface::Panel)
+        .cloned()
+        .collect();
+    offers.sort_by_key(|offer| offer.order);
+    let content = if offers.is_empty() {
+        PanelContent::Nothing
+    } else {
+        PanelContent::Entries
+    };
+    (offers, content)
+}
+
+/// The entries of the form for `offers`, and the link at the end.
+fn panel_entries(offers: &[TaskActionOffer], link: bool, blocked: Option<&str>) -> Vec<StepEntry> {
+    let mut entries: Vec<StepEntry> = offers
+        .iter()
+        .map(|offer| entry_of(offer, blocked))
+        .collect();
+    if link {
+        entries.push(StepEntry::immediate(ChooserItem::new(
+            "Otwórz link",
+            "Otwiera w przeglądarce link do PR zadania.",
+        )));
+    }
+    entries
+}
+
+/// One entry of the form, as the server described it.
+fn entry_of(offer: &TaskActionOffer, blocked: Option<&str>) -> StepEntry {
+    let mut item = ChooserItem::new(
+        offer.label.clone().unwrap_or_default(),
+        offer.description.clone().unwrap_or_default(),
+    );
+    if offer.irreversible {
+        item = item.irreversible();
+    }
+    for field in &offer.fields {
+        item = item.with_field(field_of(field));
+    }
+    match offer.kind {
+        TaskActionKind::Submenu => StepEntry::submenu(
+            item,
+            drawn(&offer.children)
+                .map(|child| entry_of(child, blocked))
+                .collect(),
+        ),
+        _ => {
+            if let Some(reason) = blocked {
+                item = item.unavailable(reason);
+            }
+            StepEntry::leaf(item)
+        }
+    }
+}
+
+/// A field of the form, as the server described it.
+fn field_of(field: &narsor_protocol::controller::TaskActionField) -> ChooserField {
+    let made = match field.kind {
+        TaskActionFieldKind::Multiline => ChooserField::multiline(field.name.clone()),
+        TaskActionFieldKind::Select => {
+            ChooserField::select(field.name.clone(), field.options.clone())
+        }
+        TaskActionFieldKind::Text | TaskActionFieldKind::Unrecognized => {
+            ChooserField::text(field.name.clone())
+        }
+    };
+    let made = match &field.hint {
+        Some(hint) => made.described(hint.clone()),
+        None => made,
+    };
+    if field.required {
+        made.required()
+    } else {
+        made
+    }
 }
 
 /// The links of the task that have an address.
@@ -402,12 +554,8 @@ pub struct CommentForm {
 /// What sits over the screen, taking the keys.
 #[derive(Debug, Clone)]
 pub enum Overlay {
-    /// The menu of actions (`.`).
-    Menu(Menu),
-    /// The exits of the current state, and the override (`t`).
-    Transitions(TransitionList),
-    /// The steps of the workflow, to choose one (the panel's "wybierz krok").
-    Steps(StepList),
+    /// The action panel (`Ctrl+.`).
+    Actions(Box<ActionPanel>),
     /// The links of the task (`o`).
     Links(LinkList),
     /// The installation's default harness (`h`); about no task.
@@ -436,9 +584,7 @@ impl Overlay {
     /// The task it is about; the harness list is about none.
     pub fn task_id(&self) -> Option<&str> {
         match self {
-            Self::Menu(menu) => Some(&menu.task_id),
-            Self::Transitions(list) => Some(&list.task_id),
-            Self::Steps(list) => Some(&list.task_id),
+            Self::Actions(panel) => Some(&panel.task_id),
             Self::Links(list) => Some(&list.task_id),
             Self::Comment(form) => Some(&form.task_id),
             Self::Harness(_) | Self::Limit(_) => None,
@@ -446,17 +592,23 @@ impl Overlay {
         }
     }
 
-    /// The list it shows, when it is one.
+    /// The list it shows, when it is one; the action panel's open level.
     pub fn chooser(&self) -> Option<&Chooser> {
         match self {
-            Self::Menu(menu) => Some(&menu.chooser),
-            Self::Transitions(list) => Some(&list.chooser),
-            Self::Steps(list) => Some(&list.chooser),
+            Self::Actions(panel) => Some(panel.form.chooser()),
             Self::Links(list) => Some(&list.chooser),
             Self::Comment(form) => Some(&form.chooser),
             Self::Harness(list) => Some(list.chooser()),
             Self::Limit(list) => Some(list.chooser()),
             Self::Confirm(_) => None,
+        }
+    }
+
+    /// The action panel, when it is open.
+    pub fn actions(&self) -> Option<&ActionPanel> {
+        match self {
+            Self::Actions(panel) => Some(panel),
+            _ => None,
         }
     }
 
@@ -471,10 +623,8 @@ impl Overlay {
     /// The keys that apply while it is open.
     pub fn context(&self) -> Context {
         match self {
-            Self::Menu(_) => Context::Menu,
+            Self::Actions(panel) => panel.context(),
             Self::Confirm(_) => Context::Confirm,
-            Self::Transitions(list) => chooser_context(&list.chooser),
-            Self::Steps(list) => chooser_context(&list.chooser),
             Self::Links(list) => chooser_context(&list.chooser),
             Self::Comment(form) => chooser_context(&form.chooser),
             Self::Harness(list) => chooser_context(list.chooser()),
@@ -499,68 +649,6 @@ pub(super) fn chooser_context(chooser: &Chooser) -> Context {
 // Building the lists
 // ---------------------------------------------------------------------
 
-/// What the menu says an action does.
-fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
-    let (name, effect) = match action {
-        TaskAction::Move => (
-            "przesuń w kolejce".to_string(),
-            "Zmienia miejsce zadania w kolejce. `Ctrl+↑` / `Ctrl+↓` przesuwają o jedno miejsce wyżej / \
-             niżej, `m` włącza tryb przesuwania: `j` / `k` wybiera miejsce z podglądem, `Enter` \
-             zatwierdza, `Esc` anuluje."
-                .to_string(),
-        ),
-        TaskAction::Pause => (
-            "pauza".to_string(),
-            "Czeka, aż trwająca praca skończy krok. Potem zadanie staje w bezpiecznym punkcie \
-             i oddaje zasoby obliczeniowe; storage zostaje."
-                .to_string(),
-        ),
-        TaskAction::Stop => (
-            "stop !".to_string(),
-            "Zrywa trwającą pracę od razu. Zadanie staje w bezpiecznym punkcie i oddaje zasoby \
-             obliczeniowe; sesja agenta zostaje. Wymaga potwierdzenia."
-                .to_string(),
-        ),
-        TaskAction::ReleaseSlot => (
-            "zwolnij slot".to_string(),
-            "Zadanie czeka na Ciebie. Ta akcja zatrzymuje je teraz, a nie po czasie \
-             oczekiwania. Slot staje się wolny, a zadanie można potem wznowić."
-                .to_string(),
-        ),
-        TaskAction::SelectStep => (
-            "wybierz krok".to_string(),
-            "Wznawia zadanie od dowolnego kroku workflow, także po jego zakończeniu. Dla kroku \
-             agenta można dopisać komentarz."
-                .to_string(),
-        ),
-        TaskAction::Transition => (
-            "przejście ręczne".to_string(),
-            "Przenosi execution do innego stanu. Lista pokazuje wyjścia bieżącego stanu z \
-             opisami; override — przejście do dowolnego stanu — jest osobną pozycją `!`, wymaga \
-             powodu i trafia do audytu."
-                .to_string(),
-        ),
-        TaskAction::Restart => (
-            "uruchom od nowa".to_string(),
-            "Uruchamia od początku krok skryptu zatrzymanego zadania, przerwane zadanie albo \
-             ponawia nieudany provisioning na tym samym storage."
-                .to_string(),
-        ),
-        TaskAction::Archive => (
-            "archiwizuj !".to_string(),
-            "Usuwa workload i storage zadania; zadanie trafia do Historii. Tego nie da się \
-             cofnąć. Wymaga potwierdzenia."
-                .to_string(),
-        ),
-        TaskAction::OpenLink => (
-            "otwórz link".to_string(),
-            "Otwiera w przeglądarce link do PR zadania.".to_string(),
-        ),
-        TaskAction::Comment => (WRITE_TO_AGENT.to_lowercase(), comment_effect(task)),
-    };
-    (name, effect)
-}
-
 /// What a comment does to `task`, in words: the server says, by the way the
 /// task is stopped.
 fn comment_effect(task: &TaskSummary) -> String {
@@ -574,9 +662,9 @@ pub(super) const WRITE_TO_AGENT: &str = "Napisz do agenta";
 
 /// Action 0, as an entry of a list that stands alone of any panel (KTD3).
 ///
-/// The server says whether it is available, why not, and what it does. With
-/// `field`, the entry holds the field the text is typed into; without it, the
-/// caller has a field of its own for the text.
+/// The server says whether it is available and what it does. With `field`,
+/// the entry holds the field the text is typed into; without it, the caller
+/// has a field of its own for the text.
 pub(super) fn write_to_agent_item(task: &TaskSummary, field: bool) -> ChooserItem {
     let item = ChooserItem::new(WRITE_TO_AGENT, comment_effect(task));
     let item = match availability(task, TaskAction::Comment) {
@@ -616,99 +704,6 @@ fn comment_form(task: &TaskSummary, unsent: Option<&str>) -> CommentForm {
 /// action form, so the two chooser forms agree.
 pub(super) use super::panel::input::COMMENT_FIELD;
 
-/// The entries of the menu for `task`. `blocked` is why nothing that changes
-/// state can be done right now (no connection), if that is so.
-fn menu_items(task: &TaskSummary, blocked: Option<&str>) -> Vec<ChooserItem> {
-    TaskAction::ALL
-        .into_iter()
-        .map(|action| {
-            let (label, description) = menu_text(task, action);
-            let item = ChooserItem::new(label, description);
-            match availability(task, action) {
-                Availability::Unavailable(reason) => item.unavailable(reason),
-                Availability::Available => match blocked {
-                    Some(reason) if action.changes_state() => item.unavailable(reason),
-                    _ => item,
-                },
-            }
-        })
-        .collect()
-}
-
-fn transition_list(task: &TaskSummary) -> Option<TransitionList> {
-    let offer = task.manual_transitions.as_ref()?;
-    let mut items: Vec<ChooserItem> = offer
-        .exits
-        .iter()
-        .map(|exit| {
-            let description = match &exit.description {
-                Some(text) if !text.trim().is_empty() => text.clone(),
-                _ => "Workflow nie opisuje tego wyjścia.".to_string(),
-            };
-            ChooserItem::new(
-                format!("{} → {}", exit.label, exit.target),
-                format!("{description}\nPrzechodzi do stanu „{}”.", exit.target),
-            )
-        })
-        .collect();
-    if offer.has_override() {
-        items.push(
-            ChooserItem::new(
-                "! override — dowolny stan",
-                format!(
-                    "Wymusza przejście ze stanu „{}” do dowolnego stanu workflow, także poza \
-                     deklarowanymi wyjściami. Wymaga powodu; powód i autor trafiają do audytu \
-                     zadania. Wymaga potwierdzenia.",
-                    offer.from_state
-                ),
-            )
-            .with_field(
-                ChooserField::select("stan docelowy", offer.override_targets.clone()).required(),
-            )
-            .with_field(
-                ChooserField::text("powód")
-                    .required()
-                    .described("trafia do audytu"),
-            ),
-        );
-    }
-    Some(TransitionList {
-        task_id: task.task_id.to_string(),
-        from_state: offer.from_state.clone(),
-        exits: offer.exits.clone(),
-        chooser: Chooser::new(items),
-    })
-}
-
-/// The steps the server gave, each with the field of a comment when the step
-/// is the agent's. The client does not read the workflow: the kind is the
-/// server's word.
-fn step_list(task: &TaskSummary) -> Option<StepList> {
-    let steps = task.steps.clone()?;
-    let items =
-        steps
-            .iter()
-            .map(|step| {
-                let item = ChooserItem::new(
-                    one_line(&step.label),
-                    format!("Wznawia zadanie od kroku „{}”.", one_line(&step.id)),
-                );
-                if step.kind.runs_agent() {
-                    item.with_field(ChooserField::multiline(COMMENT_FIELD).described(
-                        "komentarz dla agenta, opcjonalny; nie zostaje na dalsze przebiegi",
-                    ))
-                } else {
-                    item
-                }
-            })
-            .collect();
-    Some(StepList {
-        task_id: task.task_id.to_string(),
-        steps,
-        chooser: Chooser::new(items),
-    })
-}
-
 fn link_list(task: &TaskSummary) -> LinkList {
     let mut links = Vec::new();
     let mut items = Vec::new();
@@ -729,35 +724,14 @@ fn link_list(task: &TaskSummary) -> LinkList {
     }
 }
 
-/// What a confirmed interrupt or archive of `task` does, in words.
-fn effect_lines(task: &TaskSummary, action: TaskAction) -> Vec<String> {
-    let title = title_of(task);
-    match action {
-        TaskAction::Stop => {
-            let step = task
-                .runner
-                .as_ref()
-                .and_then(|runner| runner.execution_cursor.current_state.as_deref())
-                .map(one_line)
-                .filter(|step| !step.is_empty());
-            vec![
-                match step {
-                    Some(step) => format!("Zrywa pracę w kroku „{step}” zadania {title}."),
-                    None => format!("Zrywa pracę zadania {title}."),
-                },
-                "Zadanie staje w bezpiecznym punkcie i oddaje slot; sesja agenta zostaje."
-                    .to_string(),
-                "Skrypt zacznie od początku kroku. Polecenie trafia do runnera; wynik pojawi się \
-                 na pasku."
-                    .to_string(),
-            ]
-        }
-        TaskAction::Archive => vec![
-            format!("Usuwa workload i storage zadania {title}."),
-            "Zadanie trafia do Historii.".to_string(),
-            "! Tego nie da się cofnąć.".to_string(),
-        ],
-        _ => Vec::new(),
+/// What the bar says when the server accepted `send` for the action
+/// `label`.
+fn accepted_summary(label: &str, send: &ActionSend) -> String {
+    let label = one_line(label);
+    match send {
+        ActionSend::Owner(_) => format!("„{label}” zlecone"),
+        ActionSend::Operator(_) => format!("„{label}” wysłane do runnera"),
+        ActionSend::Comment(_) => "komentarz wysłany".to_string(),
     }
 }
 
@@ -771,7 +745,7 @@ impl TaskApp {
         self.overlay.as_ref()
     }
 
-    /// Why nothing that changes state can be done now, for the menu.
+    /// Why nothing that changes state can be done now, for the panel.
     fn mutation_block(&self) -> Option<String> {
         self.connection
             .mutation_gate(std::time::Instant::now())
@@ -779,20 +753,68 @@ impl TaskApp {
             .map(|blocked| blocked.reason)
     }
 
-    /// `.`: the menu of the selected task.
+    /// Takes the action panel of the selected task out from over the screen,
+    /// for the details to draw it in the place of the conversation's form.
+    pub(super) fn take_action_panel(&mut self) -> Option<Box<ActionPanel>> {
+        let selected = self.list.selected_id()?.to_string();
+        match self.overlay.take() {
+            Some(Overlay::Actions(mut panel)) if panel.task_id == selected => {
+                panel.in_details = false;
+                Some(panel)
+            }
+            other => {
+                self.overlay = other;
+                None
+            }
+        }
+    }
+
+    /// Puts the panel [`Self::take_action_panel`] took back over the screen.
+    pub(super) fn restore_action_panel(&mut self, panel: Option<Box<ActionPanel>>) {
+        if let Some(panel) = panel {
+            self.overlay = Some(Overlay::Actions(panel));
+        }
+    }
+
+    /// Marks the action panel as not drawn yet in this frame.
+    pub(super) fn unplace_action_panel(&mut self) {
+        if let Some(Overlay::Actions(panel)) = self.overlay.as_mut() {
+            panel.in_details = false;
+        }
+    }
+
+    /// `Ctrl+.`: the action panel of the selected task.
     pub(super) fn open_menu(&mut self) {
         let Some(task) = self.list.selected() else {
             return;
         };
         let blocked = self.mutation_block();
-        self.overlay = Some(Overlay::Menu(Menu {
-            task_id: task.task_id.to_string(),
-            chooser: Chooser::new(menu_items(task, blocked.as_deref())),
-        }));
+        self.overlay = Some(Overlay::Actions(Box::new(ActionPanel::new(
+            task,
+            blocked.as_deref(),
+        ))));
+    }
+
+    /// The action `id` of the server, chosen outside the panel (the answer
+    /// panel's form of the task's own actions): the panel opens on it, at
+    /// its submenu, its fields or its confirmation.
+    pub(super) fn open_action(&mut self, id: TaskActionId) -> Request {
+        self.open_menu();
+        let Some(Overlay::Actions(panel)) = self.overlay.as_mut() else {
+            return Request::None;
+        };
+        let Some(index) = panel.offers.iter().position(|offer| offer.id == id) else {
+            self.overlay = None;
+            self.notify(Severity::Warning, format!("akcja: {NOT_OFFERED}"));
+            return Request::None;
+        };
+        let outcome = panel.form.open(index);
+        self.on_panel_outcome(outcome)
     }
 
     /// Keeps what sits over the screen true to the list: a task that left it
-    /// takes its window with it, the menu is rebuilt for the task's new state.
+    /// takes its window with it; the action panel takes the task's new offer
+    /// and keeps where the operator is (R14).
     pub(super) fn sync_overlay(&mut self) {
         let Some(overlay) = &self.overlay else {
             return;
@@ -805,14 +827,21 @@ impl TaskApp {
             .tasks()
             .iter()
             .find(|task| Some(task.task_id.as_str()) == overlay.task_id())
+            .cloned()
         else {
             self.overlay = None;
             return;
         };
         let blocked = self.mutation_block();
-        if let Some(Overlay::Menu(menu)) = &mut self.overlay {
-            let selected = menu.chooser.selected();
-            menu.chooser = Chooser::new(menu_items(task, blocked.as_deref())).selecting(selected);
+        if let Some(Overlay::Actions(panel)) = self.overlay.take() {
+            let (panel, lost) = panel.rebuilt(&task, blocked.as_deref());
+            self.overlay = Some(Overlay::Actions(Box::new(panel)));
+            if let Some(label) = lost {
+                self.notify(
+                    Severity::Warning,
+                    format!("„{}”: akcja nie jest już dostępna", one_line(&label)),
+                );
+            }
         }
     }
 
@@ -837,54 +866,119 @@ impl TaskApp {
             }
         }
         match overlay {
-            Overlay::Menu(_) => self.on_menu_key(&key),
+            Overlay::Actions(_) => self.on_actions_key(key),
             Overlay::Confirm(_) => self.on_confirm_key(&key),
-            Overlay::Transitions(_)
-            | Overlay::Steps(_)
-            | Overlay::Links(_)
-            | Overlay::Comment(_) => self.on_list_key(key),
+            Overlay::Links(_) | Overlay::Comment(_) => self.on_list_key(key),
             Overlay::Harness(_) => self.on_harness_key(key),
             Overlay::Limit(_) => self.on_limit_key(key),
         }
     }
 
-    fn on_menu_key(&mut self, key: &KeyEvent) -> Request {
-        let Some(action) = keymap::lookup(Context::Menu, key) else {
-            return Request::None;
-        };
-        let Some(Overlay::Menu(menu)) = &mut self.overlay else {
-            return Request::None;
-        };
-        match action {
-            Action::Cancel => self.overlay = None,
-            Action::Down => menu.chooser.select(menu.chooser.selected() + 1),
-            Action::Up => menu
-                .chooser
-                .select(menu.chooser.selected().saturating_sub(1)),
-            Action::Pick => {
-                if let Some(digit) = keymap::digit_of(key) {
-                    menu.chooser.select(usize::from(digit) - 1);
+    /// A key in the action panel: on a choice, the menu's own shortcuts
+    /// first (moving in the queue, the link); otherwise the form's. After a
+    /// refresh took away what the operator chose, the shortcuts wait like
+    /// the choice does: the keys were meant for the entry that is gone.
+    fn on_actions_key(&mut self, key: KeyEvent) -> Request {
+        let choosing = matches!(
+            self.overlay.as_ref().and_then(Overlay::actions),
+            Some(panel) if panel.form.stage() == Stage::Choice && !panel.form.is_disarmed()
+        );
+        if choosing {
+            match keymap::lookup(Context::Menu, &key) {
+                Some(Action::MoveUp) => return self.on_move_shortcut(true),
+                Some(Action::MoveDown) => return self.on_move_shortcut(false),
+                Some(other @ (Action::MoveMode | Action::OpenLink)) => {
+                    if let Some(action) = TaskAction::of_key(other) {
+                        return self.invoke(action);
+                    }
                 }
-            }
-            Action::Confirm => {
-                let chosen = TaskAction::ALL.get(menu.chooser.selected()).copied();
-                if let Some(action) = chosen {
-                    return self.invoke(action);
-                }
-            }
-            Action::MoveUp => return self.on_move_shortcut(true),
-            Action::MoveDown => return self.on_move_shortcut(false),
-            other => {
-                if let Some(action) = TaskAction::of_key(other) {
-                    return self.invoke(action);
-                }
+                _ => {}
             }
         }
-        Request::None
+        let Some(Overlay::Actions(panel)) = self.overlay.as_mut() else {
+            return Request::None;
+        };
+        panel.sync_generation();
+        let outcome = panel.form.on_key(key);
+        self.on_panel_outcome(outcome)
     }
 
-    /// `Ctrl+↑` / `Ctrl+↓` inside the menu: moves one place, and closes the menu once
-    /// there is a move to make.
+    /// What the panel's form said after a key.
+    fn on_panel_outcome(&mut self, outcome: SteppedOutcome) -> Request {
+        match outcome {
+            SteppedOutcome::None => Request::None,
+            SteppedOutcome::Blocked(reason) => {
+                self.notify(Severity::Warning, reason);
+                Request::None
+            }
+            SteppedOutcome::Cancelled => {
+                self.overlay = None;
+                Request::None
+            }
+            SteppedOutcome::Submitted(submission) => {
+                let Some(Overlay::Actions(panel)) = self.overlay.as_ref() else {
+                    return Request::None;
+                };
+                if panel.is_link(&submission.path) {
+                    return self.invoke(TaskAction::OpenLink);
+                }
+                let Some(offer) = panel.offer_at(&submission.path).cloned() else {
+                    return Request::None;
+                };
+                self.chosen_action(&offer, &submission.values)
+            }
+        }
+    }
+
+    /// The operator confirmed `offer` with `values`: the command the server
+    /// described, sent. The panel closes; a refusal says why on the bar.
+    fn chosen_action(&mut self, offer: &TaskActionOffer, values: &[(String, String)]) -> Request {
+        let label = offer.label.clone().unwrap_or_default();
+        let send = offer
+            .send
+            .as_ref()
+            .unwrap_or(&TaskActionSend::Unrecognized)
+            .resolve(values);
+        let send = match send {
+            Ok(send) => ActionSend::from(send),
+            Err(reason) => {
+                self.notify(Severity::Warning, format!("{}: {reason}", one_line(&label)));
+                return Request::None;
+            }
+        };
+        if !self.mutation_allowed() {
+            return Request::None;
+        }
+        let Some((task_id, generation)) = self
+            .overlay
+            .as_ref()
+            .and_then(Overlay::actions)
+            .map(|panel| (panel.task_id.clone(), panel.generation))
+        else {
+            return Request::None;
+        };
+        let Some(task) = self
+            .list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == task_id)
+            .cloned()
+        else {
+            return Request::None;
+        };
+        self.overlay = None;
+        let summary = accepted_summary(&label, &send);
+        Request::Act(Box::new(self.action_request(
+            &task,
+            generation,
+            &label.to_lowercase(),
+            summary,
+            send,
+        )))
+    }
+
+    /// `Ctrl+↑` / `Ctrl+↓` inside the panel: moves one place, and closes the
+    /// panel once there is a move to make.
     fn on_move_shortcut(&mut self, up: bool) -> Request {
         let request = self.step_move(up);
         if request != Request::None {
@@ -916,16 +1010,13 @@ impl TaskApp {
         }
     }
 
-    /// A paste while something sits over the screen: only a text field of a
-    /// list (the override's reason) takes it, as [`Self::on_list_key`] gives
-    /// it the keys. A menu, a harness list or a `y` / `n` window ignores it.
+    /// A paste while something sits over the screen: only a text field (of
+    /// the panel's fields step, of a list) takes it. A choice, a harness list
+    /// or a `y` / `n` window ignores it.
     pub(super) fn on_overlay_paste(&mut self, pasted: &str) {
         match &mut self.overlay {
-            Some(Overlay::Transitions(list)) => {
-                list.chooser.paste(pasted);
-            }
-            Some(Overlay::Steps(list)) => {
-                list.chooser.paste(pasted);
+            Some(Overlay::Actions(panel)) => {
+                panel.form.paste(pasted);
             }
             Some(Overlay::Links(list)) => {
                 list.chooser.paste(pasted);
@@ -937,11 +1028,10 @@ impl TaskApp {
         }
     }
 
-    /// A key in the list of exits or the list of links: the list's own keys.
+    /// A key in the list of links or the field of a comment: the list's own
+    /// keys.
     fn on_list_key(&mut self, key: KeyEvent) -> Request {
         let chooser = match &mut self.overlay {
-            Some(Overlay::Transitions(list)) => &mut list.chooser,
-            Some(Overlay::Steps(list)) => &mut list.chooser,
             Some(Overlay::Links(list)) => &mut list.chooser,
             Some(Overlay::Comment(form)) => &mut form.chooser,
             _ => return Request::None,
@@ -957,14 +1047,11 @@ impl TaskApp {
                 Request::None
             }
             ChooserAction::Submit(submission) => match self.overlay.take() {
-                Some(Overlay::Transitions(list)) => self.chosen_transition(list, &submission),
-                Some(Overlay::Steps(list)) => self.chosen_step(list, &submission),
                 Some(Overlay::Links(list)) => match list.links.get(submission.index) {
                     Some(link) => Request::OpenLink(link.clone()),
                     None => Request::None,
                 },
                 Some(Overlay::Comment(form)) => self.chosen_comment(form, &submission),
-
                 _ => Request::None,
             },
         }
@@ -997,118 +1084,15 @@ impl TaskApp {
             .insert(form.task_id.clone(), text.clone());
         Request::Act(Box::new(self.action_request(
             &task,
+            task.generation,
             "komentarz",
             "komentarz wysłany".to_string(),
             ActionSend::Comment(text),
         )))
     }
 
-    /// The operator chose a step: sent at once, with the comment when the
-    /// step is the agent's and one was written.
-    fn chosen_step(&mut self, list: StepList, submission: &Submission) -> Request {
-        if !self.mutation_allowed() {
-            return Request::None;
-        }
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == list.task_id)
-            .cloned()
-        else {
-            return Request::None;
-        };
-        let Some(step) = list.steps.get(submission.index) else {
-            return Request::None;
-        };
-        let note = step
-            .kind
-            .runs_agent()
-            .then(|| written_text(submission))
-            .filter(|text| !text.is_empty());
-        let summary = format!("wybór kroku „{}” wysłany do runnera", one_line(&step.id));
-        Request::Act(Box::new(self.action_request(
-            &task,
-            "wybór kroku",
-            summary,
-            ActionSend::Operator(OperatorCommand::SelectStep {
-                target: step.id.clone(),
-                note,
-            }),
-        )))
-    }
-
-    /// The operator chose an exit (sent at once) or the override (asks first).
-    fn chosen_transition(&mut self, list: TransitionList, submission: &Submission) -> Request {
-        if !self.mutation_allowed() {
-            return Request::None;
-        }
-        let Some(task) = self
-            .list
-            .tasks()
-            .iter()
-            .find(|task| task.task_id.as_str() == list.task_id)
-        else {
-            return Request::None;
-        };
-        let task = task.clone();
-        if let Some(exit) = list.exits.get(submission.index) {
-            let send = ActionSend::Operator(OperatorCommand::Transition {
-                target: exit.target.clone(),
-                forced: false,
-                reason: None,
-            });
-            let summary = format!(
-                "przejście do „{}” wysłane do runnera",
-                one_line(&exit.target)
-            );
-            return Request::Act(Box::new(self.action_request(
-                &task,
-                "przejście",
-                summary,
-                send,
-            )));
-        }
-        // The override: a target and a reason, then the window.
-        let value = |name: &str| {
-            submission
-                .values
-                .iter()
-                .find(|(field, _)| field == name)
-                .map(|(_, value)| value.trim().to_string())
-        };
-        let (Some(target), Some(reason)) = (value("stan docelowy"), value("powód")) else {
-            return Request::None;
-        };
-        let send = ActionSend::Operator(OperatorCommand::Transition {
-            target: target.clone(),
-            forced: true,
-            reason: Some(reason.clone()),
-        });
-        let summary = format!("override do „{}” wysłany do runnera", one_line(&target));
-        let request = self.action_request(&task, "override", summary, send);
-        let lines = vec![
-            format!(
-                "Wymusza przejście zadania {} ze stanu „{}” do „{}”, poza deklarowanymi wyjściami.",
-                title_of(&task),
-                one_line(&list.from_state),
-                one_line(&target)
-            ),
-            format!("Powód: {}", one_line(&reason)),
-            "Powód i autor trafiają do audytu zadania.".to_string(),
-        ];
-        self.overlay = Some(Overlay::Confirm(Confirmation::new(
-            list.task_id,
-            "Override przejścia !",
-            lines,
-            Confirmed::Act(Box::new(request)),
-        )));
-        Request::None
-    }
-
-    /// An action chosen from the list, the details or the menu. Says why on
-    /// the bar when it cannot be done; otherwise does it — or opens the list
-    /// or the window it needs first.
+    /// An action of the client's own or the comment, from a key. Says why on
+    /// the bar when it cannot be done; otherwise opens what it needs.
     pub(super) fn invoke(&mut self, action: TaskAction) -> Request {
         let Some(task) = self.list.selected().cloned() else {
             return Request::None;
@@ -1124,82 +1108,9 @@ impl TaskApp {
         match action {
             TaskAction::Move => {
                 self.begin_move();
-                Request::None
-            }
-            TaskAction::Pause => self.owner_request(
-                &task,
-                verb(action),
-                "wstrzymanie zlecone",
-                OwnerCommand::Pause,
-            ),
-            // The pause the wait policy sends, sent before its time; the server
-            // checks that the task still waits.
-            TaskAction::ReleaseSlot => self.owner_request(
-                &task,
-                verb(action),
-                "zwolnienie slotu zlecone",
-                OwnerCommand::ReleaseSlot,
-            ),
-            // A stopped task starts its script step again through the runner;
-            // an interrupted one starts anew through the owner's command.
-            TaskAction::Restart if task.runner_state == RunnerState::Stopped => {
-                Request::Act(Box::new(self.action_request(
-                    &task,
-                    "uruchomienie od nowa",
-                    "uruchomienie kroku od nowa zlecone".to_string(),
-                    ActionSend::Operator(OperatorCommand::RestartStep {
-                        note: None,
-                        failure_key: None,
-                    }),
-                )))
-            }
-            TaskAction::Restart => self.owner_request(
-                &task,
-                "uruchomienie od nowa",
-                "uruchomienie od nowa zlecone",
-                OwnerCommand::Start,
-            ),
-            TaskAction::Stop => {
-                let request = self.action_request(
-                    &task,
-                    verb(action),
-                    "zatrzymanie wysłane do runnera".to_string(),
-                    ActionSend::Operator(OperatorCommand::StopStep),
-                );
-                self.ask(
-                    &task,
-                    "Zatrzymaj zadanie !",
-                    action,
-                    Confirmed::Act(Box::new(request)),
-                );
-                Request::None
-            }
-            TaskAction::SelectStep => {
-                self.overlay = step_list(&task).map(Overlay::Steps);
-                Request::None
-            }
-            TaskAction::Archive => {
-                let request = self.action_request(
-                    &task,
-                    "archiwizacja",
-                    "archiwizacja rozpoczęta".to_string(),
-                    ActionSend::Owner(OwnerCommand::Archive),
-                );
-                self.ask(
-                    &task,
-                    "Archiwizuj zadanie !",
-                    action,
-                    Confirmed::Act(Box::new(request)),
-                );
-                Request::None
-            }
-            TaskAction::Transition => {
-                self.overlay = transition_list(&task).map(Overlay::Transitions);
-                Request::None
             }
             TaskAction::OpenLink => {
                 self.overlay = Some(Overlay::Links(link_list(&task)));
-                Request::None
             }
             TaskAction::Comment => {
                 let unsent = self.unsent_messages.get(task.task_id.as_str());
@@ -1207,34 +1118,9 @@ impl TaskApp {
                     &task,
                     unsent.map(String::as_str),
                 )));
-                Request::None
             }
         }
-    }
-
-    fn owner_request(
-        &mut self,
-        task: &TaskSummary,
-        verb: &str,
-        summary: &str,
-        command: OwnerCommand,
-    ) -> Request {
-        Request::Act(Box::new(self.action_request(
-            task,
-            verb,
-            summary.to_string(),
-            ActionSend::Owner(command),
-        )))
-    }
-
-    /// Opens the window for `confirmed`, with what `action` does.
-    fn ask(&mut self, task: &TaskSummary, heading: &str, action: TaskAction, confirmed: Confirmed) {
-        self.overlay = Some(Overlay::Confirm(Confirmation::new(
-            task.task_id.to_string(),
-            heading,
-            effect_lines(task, action),
-            confirmed,
-        )));
+        Request::None
     }
 
     /// Opens the window for a chosen action of the answer panel that cannot
@@ -1253,12 +1139,14 @@ impl TaskApp {
         )));
     }
 
-    /// The request for `send` to `task`. A retry of the same decision — the
-    /// same command to the same task, after one that got no answer — reuses
-    /// its key; an answer, or a refusal, forgets it.
+    /// The request for `send` to `task`, as the operator saw it at
+    /// `generation`. A retry of the same decision — the same command to the
+    /// same task, after one that got no answer — reuses its key; an answer,
+    /// or a refusal, forgets it.
     pub(super) fn action_request(
         &mut self,
         task: &TaskSummary,
+        generation: u64,
         verb: &str,
         summary: String,
         send: ActionSend,
@@ -1271,7 +1159,7 @@ impl TaskApp {
         ActionRequest {
             task_id: task.task_id.to_string(),
             title: title_of(task),
-            generation: task.generation,
+            generation,
             key,
             verb: verb.to_string(),
             summary,
@@ -1645,30 +1533,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
             Overlay::Confirm(confirmation) => {
                 render_confirmation(frame, area, confirmation, styles)
             }
-            Overlay::Menu(menu) => render_list(
-                frame,
-                area,
-                &format!("Akcje · {title}"),
-                &mut menu.chooser,
-                styles,
-            ),
-            Overlay::Transitions(list) => render_list(
-                frame,
-                area,
-                &format!(
-                    "Przejście ręczne · {title} · z „{}”",
-                    one_line(&list.from_state)
-                ),
-                &mut list.chooser,
-                styles,
-            ),
-            Overlay::Steps(list) => render_list(
-                frame,
-                area,
-                &format!("Wybór kroku · {title}"),
-                &mut list.chooser,
-                styles,
-            ),
+            Overlay::Actions(panel) => {
+                // Drawn in the details, in the place of the conversation's
+                // form, when the details were drawn; here otherwise.
+                if !panel.in_details {
+                    render_panel_popup(frame, area, &title, panel, styles);
+                }
+            }
             Overlay::Links(list) => {
                 render_list(
                     frame,
@@ -1747,6 +1618,85 @@ fn framed(frame: &mut Frame, place: Rect, role: Role, title: &str, styles: &Styl
     frame.render_widget(Clear, place);
     frame.render_widget(block, place);
     inner
+}
+
+/// The rows of the action panel's frame and its gap: the panel's own rows
+/// come on top.
+const PANEL_FRAME_ROWS: u16 = 2;
+
+/// The fewest rows the action panel takes: its heading and two entries, or
+/// the message that it has none (R7). Below it, the list scrolls.
+pub const PANEL_MIN_ROWS: u16 = 6;
+
+/// The rows the action panel would like for an area `width` columns wide,
+/// inside its frame.
+pub fn panel_height(panel: &ActionPanel, width: u16) -> u16 {
+    let inner = match panel.content {
+        PanelContent::Entries => panel.form.preferred_height(width.saturating_sub(4)),
+        PanelContent::Nothing | PanelContent::NoData => 3,
+    };
+    inner.max(PANEL_MIN_ROWS) + PANEL_FRAME_ROWS
+}
+
+/// Draws the action panel into `place`: a frame titled with the task, and
+/// the form, or the message that there is nothing to choose (R6).
+pub fn render_panel(
+    frame: &mut Frame,
+    place: Rect,
+    title: &str,
+    panel: &mut ActionPanel,
+    styles: &Styles,
+) {
+    let heading = if title.is_empty() {
+        "Akcje".to_string()
+    } else {
+        format!("Akcje · {title}")
+    };
+    let inner = framed(frame, place, Role::Focus, &heading, styles);
+    let padded = Rect::new(
+        inner.x.saturating_add(1),
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    );
+    let message = match panel.content {
+        PanelContent::Entries => None,
+        PanelContent::Nothing => Some(NOTHING_TEXT),
+        PanelContent::NoData => Some(NO_DATA_TEXT),
+    };
+    match message {
+        Some(text) => {
+            let mut keys = Vec::new();
+            for (key, label) in keymap::hints(Context::Menu)
+                .into_iter()
+                .filter(|(_, label)| *label == "zamknij")
+            {
+                keys.push(Span::styled(format!(" {key} "), styles.key_cap()));
+                keys.push(Span::raw(format!("{label} ")));
+            }
+            let lines = vec![
+                Line::styled(text, styles.of(Role::Attention)),
+                Line::raw(""),
+                Line::from(keys),
+            ];
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
+        }
+        None => stepped::render(frame, padded, &mut panel.form, styles, true),
+    }
+}
+
+/// The action panel in the middle of `area`, where the details are not drawn.
+fn render_panel_popup(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    panel: &mut ActionPanel,
+    styles: &Styles,
+) {
+    let width = area.width.saturating_sub(4).min(100);
+    let height = panel_height(panel, width).min(area.height.saturating_sub(2));
+    let place = popup(area, width, height);
+    render_panel(frame, place, title, panel, styles);
 }
 
 fn render_list(frame: &mut Frame, area: Rect, title: &str, chooser: &mut Chooser, styles: &Styles) {

@@ -765,6 +765,7 @@ impl TaskApp {
         let send = ActionSend::Operator(OperatorCommand::ConductorChat { text });
         Request::Act(Box::new(self.action_request(
             &task,
+            task.generation,
             "wiadomość do dyrygenta",
             "wiadomość wysłana do dyrygenta".to_string(),
             send,
@@ -851,6 +852,7 @@ impl TaskApp {
         }
         let request = self.action_request(
             &task,
+            task.generation,
             "cofnięcie decyzji",
             "cofnięcie decyzji wysłane do runnera".to_string(),
             ActionSend::Operator(OperatorCommand::UndoDecision { decision_id }),

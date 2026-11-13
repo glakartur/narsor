@@ -543,7 +543,13 @@ impl ChooserItem {
             && self.recommended == other.recommended
             && self.irreversible == other.irreversible
             && self.unavailable == other.unavailable
-            && self.fields.len() == other.fields.len()
+            && self.same_fields(other)
+    }
+
+    /// Whether `other` asks for the same fields: the definition of each
+    /// field — the typed values are not compared.
+    pub fn same_fields(&self, other: &ChooserItem) -> bool {
+        self.fields.len() == other.fields.len()
             && self
                 .fields
                 .iter()

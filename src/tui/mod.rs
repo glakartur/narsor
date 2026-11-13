@@ -48,6 +48,7 @@ pub mod refresh;
 pub mod scroll;
 pub mod selection;
 pub mod spinner;
+pub mod stepped;
 pub mod style;
 pub mod task_app;
 pub mod transcript;
