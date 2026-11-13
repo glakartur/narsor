@@ -13,7 +13,19 @@ fail() {
     exit 1
 }
 
+# The version every binary reports (`--version`): NARSOR_BUILD_VERSION when the
+# release workflow sets it from the tag, else the version of the crate.
+if [[ -n "${NARSOR_BUILD_VERSION:-}" ]]; then
+    [[ "$NARSOR_BUILD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] \
+        || fail "NARSOR_BUILD_VERSION must be MAJOR.MINOR.PATCH without a leading v: $NARSOR_BUILD_VERSION"
+    export NARSOR_BUILD_VERSION
+fi
+
 cargo build --workspace --bins --release --locked --target "$target"
+version="$("$target_dir/narsor-cli" --version)"
+version="${version#narsor-cli }"
+[[ -z "${NARSOR_BUILD_VERSION:-}" || "$version" == "$NARSOR_BUILD_VERSION" ]] \
+    || fail "narsor-cli reports $version, expected $NARSOR_BUILD_VERSION"
 
 for name in "${binaries[@]}"; do
     binary="$target_dir/$name"
@@ -34,7 +46,7 @@ for name in "${binaries[@]}"; do
 done
 
 {
-    printf '{\n  "target": "%s",\n  "binaries": [\n' "$target"
+    printf '{\n  "target": "%s",\n  "version": "%s",\n  "binaries": [\n' "$target" "$version"
     for index in "${!binaries[@]}"; do
         separator=","
         [[ "$index" -eq "$((${#binaries[@]} - 1))" ]] && separator=""
@@ -53,4 +65,4 @@ sha256sum "$archive_tmp" | sed "s#  .*#  $archive_name#" > "$checksum_tmp"
 mv "$archive_tmp" "$output_dir/$archive_name"
 mv "$checksum_tmp" "$output_dir/$archive_name.sha256"
 
-printf 'Packaged %s and checksum in %s\n' "$archive_name" "$output_dir"
+printf 'Packaged %s (version %s) and checksum in %s\n' "$archive_name" "$version" "$output_dir"

@@ -58,6 +58,22 @@ These tests are not part of `cargo test`. In a view, never use `innerHTML`
 or `dangerouslySetInnerHTML`, and never add inline scripts or styles: the
 content security policy refuses them.
 
+### The version of a build
+
+Every binary reports `narsor_protocol::VERSION` (`--version`). It is the
+version of the crate (`Cargo.toml`), unless the build sets
+`NARSOR_BUILD_VERSION`: the release workflow sets it from the release tag
+without the leading `v` (`v1.2.3` → `1.2.3`), and `dist/package-linux.sh`
+checks that `narsor-cli --version` reports it and writes it into
+`manifest.json`. To build a binary with a version locally:
+
+```bash
+NARSOR_BUILD_VERSION=1.2.3 cargo build --workspace --bins --release
+```
+
+(`NARSOR_VERSION` is a different variable: the release tag `dist/install.sh`
+downloads.)
+
 ### Test layout
 
 The integration tests of the `narsor` package are one test crate,

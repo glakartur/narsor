@@ -56,7 +56,14 @@ runs `narsor-cli init`, which only creates or updates the configuration. The
 script asks for the role (arrow keys and Enter) and the binary directory
 (default `~/.local/bin`, Tab completes); `narsor-cli init` asks for the Narsor
 data directory (default `~/.narsor`). The prompts read from the terminal, so
-they also work with `curl ... | bash`.
+they also work with `curl ... | bash`. Each step (download, verification,
+role, binary directory, configuration, installation, `PATH`) starts with its
+own `==>` heading, and the last line names the installed version.
+
+Every program reports the version of its release: `narsor-cli --version`
+prints `narsor-cli 1.2.3` for the release tagged `v1.2.3`. The archive's
+`manifest.json` carries the same version, and the installer refuses an
+archive whose version does not match the tag it asked for.
 
 The data directory is a root: the configuration gets
 `catalog_dir: ROOT/catalog`, `state_dir: ROOT/state` and `work_dir: ROOT/work`,

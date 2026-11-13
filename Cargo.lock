@@ -2316,6 +2316,7 @@ dependencies = [
  "futures",
  "include_dir",
  "narsor-api-client",
+ "narsor-protocol",
  "narsor-shared",
  "reqwest",
  "serde_json",

@@ -25,7 +25,7 @@ const SESSION_FILE: &str = "web-session";
 
 /// The browser interface of Narsor.
 #[derive(Debug, Parser)]
-#[command(name = "narsor-web", version)]
+#[command(name = "narsor-web", version = narsor_protocol::VERSION)]
 struct Cli {
     /// One directory for the catalogue, the state and the work.
     #[arg(long, global = true, value_name = "DIR")]

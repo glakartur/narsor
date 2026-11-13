@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 narsor-api-client = { path = "../narsor-api-client" }
+narsor-protocol = { path = "../narsor-protocol" }
 narsor-shared = { path = "../narsor-shared" }
 axum = { version = "0.8" }
 bytes = "1"
