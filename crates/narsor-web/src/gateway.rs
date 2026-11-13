@@ -37,7 +37,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures::future::BoxFuture;
-use narsor_api_client::api::{ApiClient, ClientError};
+use narsor_api_client::api::{ApiClient, ClientError, ForwardAuth};
 use tokio::sync::RwLock;
 
 use crate::settings::TokenMode;
@@ -104,7 +104,7 @@ struct Forwarded {
     path_and_query: String,
     headers: reqwest::header::HeaderMap,
     body: bytes::Bytes,
-    authorization: Option<reqwest::header::HeaderValue>,
+    auth: ForwardAuth,
 }
 
 async fn send(client: ApiClient, request: &Forwarded) -> Result<reqwest::Response, ClientError> {
@@ -114,7 +114,7 @@ async fn send(client: ApiClient, request: &Forwarded) -> Result<reqwest::Respons
             &request.path_and_query,
             request.headers.clone(),
             request.body.clone(),
-            request.authorization.clone(),
+            request.auth.clone(),
         )
         .await
 }
@@ -243,14 +243,18 @@ async fn proxy(State(gateway): State<Arc<Gateway>>, request: Request) -> Respons
     let Some(path_and_query) = checked_path(&raw) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let authorization = match gateway.mode {
+    let auth = match gateway.mode {
         TokenMode::Server => {
             if !gateway.session_matches(request.headers()) {
                 return StatusCode::UNAUTHORIZED.into_response();
             }
-            None
+            ForwardAuth::Own
         }
-        TokenMode::Passthrough => request.headers().get(header::AUTHORIZATION).cloned(),
+        // The browser's own token or nothing: never narsor-web's.
+        TokenMode::Passthrough => match request.headers().get(header::AUTHORIZATION) {
+            Some(value) => ForwardAuth::Header(value.clone()),
+            None => return StatusCode::UNAUTHORIZED.into_response(),
+        },
     };
     let mut headers = reqwest::header::HeaderMap::new();
     for name in REQUEST_HEADERS {
@@ -273,7 +277,7 @@ async fn proxy(State(gateway): State<Arc<Gateway>>, request: Request) -> Respons
         path_and_query,
         headers,
         body,
-        authorization,
+        auth,
     };
     match gateway.upstream.forward(&forwarded).await {
         Ok(answer) => relay(answer),

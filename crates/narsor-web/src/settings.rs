@@ -96,6 +96,13 @@ impl WebSettings {
                 TokenMode::Server
             }
         };
+        if token == TokenMode::Passthrough && upstream == Upstream::Local {
+            problems.push(
+                "web_token: 'passthrough' with web_upstream: 'local' would hand the local \
+                 daemon's token to the browser; use web_token: 'server'"
+                    .to_string(),
+            );
+        }
         match bind {
             Some(bind) if problems.is_empty() => Ok(Self {
                 bind,
@@ -161,6 +168,12 @@ mod tests {
                 "{bind}: {problems:?}"
             );
         }
+    }
+
+    #[test]
+    fn passthrough_to_the_local_daemon_is_refused() {
+        let problems = WebSettings::parse("127.0.0.1:1", "local", "passthrough").unwrap_err();
+        assert!(problems[0].contains("web_token"), "{problems:?}");
     }
 
     #[test]

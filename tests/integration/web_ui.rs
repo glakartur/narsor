@@ -60,10 +60,9 @@ async fn server(root: &TempRoot) -> ApiHandle {
 
 /// `narsor-web` on an ephemeral loopback port in front of `server`.
 async fn web(server: &ApiHandle, mode: TokenMode) -> SocketAddr {
-    let token = match mode {
-        TokenMode::Server => server.token().to_string(),
-        TokenMode::Passthrough => String::new(),
-    };
+    // The client holds the server's real token in both modes, so the test
+    // of the passthrough mode proves this token is never lent to a browser.
+    let token = server.token().to_string();
     let client = ApiClient::remote(
         &format!("http://{}", server.addr()),
         TokenSource::Static(token),
@@ -204,8 +203,18 @@ async fn the_passthrough_mode_sends_the_browsers_token_unchanged() {
         web(&server, TokenMode::Passthrough).await
     );
 
+    // No header of its own: refused, although the client of narsor-web
+    // holds the server's token.
     let anonymous = http().get(&tasks).send().await.unwrap();
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong = http()
+        .get(&tasks)
+        .bearer_auth("not-the-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
     let owner = http()
         .get(&tasks)
