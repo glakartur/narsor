@@ -125,7 +125,7 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 - Funkcja „liczba subagentów kroku” z `PositionUsage`: `subagent_count` > 0, w innym wypadku `subagent_stats.spawned` > 0, w innym wypadku brak (A6, R11). Uwaga: dziś `step_cells` robi odwrotnie (`subagent_stats` nadpisuje liczbę z `subagent_count`); po zmianie kolejność jest zgodna z R11.
 - `step_cells.subagent_count` = `👥 N` zamiast `N×` (Z5). Liczba jest widoczna także bez tokenów (AE3). Dziś liczba z `subagent_count` jest widoczna tylko z tokenami — po zmianie warunek to tylko „liczba > 0”.
 - `↕` z `subagent_stats.tokens`, gdy brak podziału `↑`/`↓` (bez zmiany logiki R8).
-- Przebieg: sprawdzić, że wyrównanie kolumn liczy szerokość w komórkach terminala (emoji = 2 komórki). Wzorzec: ikony kroków `⚖️`/`💻` z planu `docs/plans/2026-11-12-002-feat-tui-ikony-profile-i-script-plan.md`.
+- Przebieg: `Column::width` w `progress.rs` liczy szerokość przez `detail::cells` (komórki terminala, emoji = 2 komórki), więc kod wyrównania nie wymaga zmiany. Test integracyjny to potwierdza. Wzorzec: ikony kroków `⚖️`/`💻` z planu `docs/plans/2026-11-12-002-feat-tui-ikony-profile-i-script-plan.md`.
 
 **Patterns to follow:** istniejące `step_cells` i testy `the_subagent_stats_stand_in_the_first_row`, `the_subagents_stay_in_the_first_row_even_on_a_narrow_tab` w `progress.rs`.
 
@@ -150,13 +150,14 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 
 **Files:**
 - Zmiana: `src/client/task_usage_text.rs` (`TaskUsage`, `sum`, `subagents_block`, `line`, komentarze)
-- Zmiana (gdy trzeba): `src/tui/task_app/detail.rs` (`usage_text` — bez zmiany logiki skracania)
+- Zmiana: `src/tui/task_app/detail.rs` (komentarz modułu z przykładem `◈`; `usage_text` bez zmiany logiki skracania)
 - Test: `src/client/task_usage_text.rs` (moduł `tests`), `tests/integration/tui_render.rs` (asercje nagłówka z `◈`)
 
 **Approach:**
 - `sum` dodaje liczbę z funkcji U2 dla każdego kroku (R11, KTD5) i sumę `subagent_stats.tokens` do nowego pola łącznych tokenów (KTD5).
 - `sum` nie odrzuca wyniku, który ma tylko liczbę subagentów (R10); dziś filtr na końcu `sum` wymaga tokenów lub kosztu.
-- `subagents_block`: `👥 N`, potem koszt (gdy znany), potem tokeny wg KTD7. Blok jest widoczny, gdy liczba > 0 albo są tokeny/koszt.
+- `subagents_block`: `👥 N`, potem koszt (gdy znany), potem tokeny wg KTD7. Blok jest widoczny, gdy liczba > 0 albo są tokeny/koszt. Dziś komentarz i kod mówią odwrotnie („Subagents that used nothing and cost nothing are not a block, whatever their count”). Ten komentarz i komentarz modułu w `src/tui/task_app/detail.rs` (przykład z `◈`) trzeba zmienić.
+- Istniejące testy sprzeczne z R10 trzeba zmienić, nie usunąć: w `subagents_alone_stand_in_brackets_and_a_task_with_nothing_has_no_line` przypadek `subagents = (0, 0)`, `subagent_count = 2` daje teraz `(👥 2)`, nie `None`. W `subagents_that_used_nothing_are_not_shown` przypadek `Some((0, 0))` ma `subagent_count = 1` (helper `used`), więc daje teraz `… ✨ $0.10 ↑1k ↓100 (👥 1)`; przypadek `None` zostaje bez bloku. Nazwę testu trzeba dopasować do nowego zachowania.
 - `line`: bez zmian w kolejności grup; blok `👥` w nawiasie po `✨` albo sam `(👥 3)` (istniejąca gałąź `(true, Some)`).
 - R12: `usage_text` w `detail.rs` już najpierw usuwa blok subagentów, potem ucina `…`. Test potwierdza to z nowym blokiem.
 
@@ -168,6 +169,7 @@ Wniosek (decyzja Q1): `totalTokens` to rozmiar kontekstu na końcu pracy subagen
 - Podział tokenów (dziś bez producenta): `subagents` = (100, 20k), `subagent_count = 2` → `(👥 2 ↑100 ↓20k)` (aktualizacja testu z `◈`).
 - GitHub Copilot: `subagent_stats` `spawned = 2`, `tokens = 7978` → `(👥 2 ↕8k)`.
 - Edge (R10): tylko subagenci, bez `✨` → `(👥 3)`; `sum` zwraca `Some`.
+- Edge (R10, R6): subagenci z liczbą i tokenami `(0, 0)` → `(👥 N)` bez `↑`/`↓`; krok bez liczby i bez tokenów → brak bloku.
 - Edge (R12): wąski terminal → najpierw znika `(👥 …)`, potem `…`.
 - Kryterium sukcesu: suma liczby i `↕` w nagłówku = suma wartości z `step_cells` wszystkich kroków (test na tych samych danych).
 
