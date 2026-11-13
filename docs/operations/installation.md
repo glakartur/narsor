@@ -290,6 +290,11 @@ NARSOR_SERVER=https://narsor.example.com narsor-cli observer worker \
   --script-user narsor-observer-script
 ```
 
+The worker refuses to start without `--script-user`. For a trial on a
+developer machine only, `--insecure-same-user` runs scripts as the worker's
+own user; a script can then read the worker credential and every observer's
+secrets, and the worker warns about it at start.
+
 `--once` claims once and exits, for a cron job. `--work-dir` moves the run
 directories out of the system's temporary directory; `--script-path` sets
 the scripts' `PATH`.

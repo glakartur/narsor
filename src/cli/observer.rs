@@ -65,9 +65,20 @@ pub struct WorkerArgs {
     pub secrets_dir: Option<PathBuf>,
 
     /// Run scripts as this system user, which must not be able to read the
-    /// credential file or the secrets directory.
-    #[arg(long, value_name = "USER")]
+    /// credential file or the secrets directory. Required unless
+    /// `--insecure-same-user` is given: isolation is the default.
+    #[arg(
+        long,
+        value_name = "USER",
+        required_unless_present = "insecure_same_user"
+    )]
     pub script_user: Option<String>,
+
+    /// Run scripts as the worker's own user. A script can then read the
+    /// worker credential and every observer's secrets: for a trial on a
+    /// developer machine only, never in production.
+    #[arg(long, conflicts_with = "script_user")]
+    pub insecure_same_user: bool,
 
     /// Where to make the run directories (the system's temporary directory
     /// by default).
@@ -231,6 +242,22 @@ async fn worker(args: WorkerArgs, target: &ServerTarget) -> Result<()> {
             )));
         }
         options.script_user = Some(user);
+    } else if args.insecure_same_user {
+        tracing::warn!(
+            "observer worker: --insecure-same-user: scripts run as the worker's own user and \
+             can read the worker credential and every observer's secrets; use --script-user \
+             outside a trial"
+        );
+        eprintln!(
+            "Warning: scripts run as the worker's own user (--insecure-same-user) and can read \
+             the worker credential and the secrets. Use --script-user in production."
+        );
+    } else {
+        // clap requires one of the two; refuse rather than run unisolated.
+        return Err(CliError::usage(
+            "narsor-cli observer worker needs --script-user USER (or --insecure-same-user for a \
+             trial)",
+        ));
     }
     if let Some(dir) = args.work_dir {
         options.work_dir = dir;

@@ -869,6 +869,28 @@ mod tests {
     }
 
     #[test]
+    fn the_observer_worker_needs_a_script_user_unless_isolation_is_waived() {
+        let base = [
+            "narsor-cli",
+            "observer",
+            "worker",
+            "--credential-file",
+            "/etc/narsor/credential",
+        ];
+        // Isolation is the default: no script user and no waiver is refused.
+        assert!(Cli::try_parse_from(base).is_err());
+        let insecure = Cli::try_parse_from(base.iter().copied().chain(["--insecure-same-user"]));
+        assert!(insecure.is_ok());
+        // The waiver and a script user contradict each other.
+        let both = Cli::try_parse_from(base.iter().copied().chain([
+            "--insecure-same-user",
+            "--script-user",
+            "narsor-observer-script",
+        ]));
+        assert!(both.is_err());
+    }
+
+    #[test]
     fn diagnostics_profiles_and_installer_run_on_a_broken_configuration() {
         // D-D. Asserted here rather than by spawning the binary, which is the
         // point of the policy living beside the commands.
@@ -887,6 +909,8 @@ mod tests {
             "worker",
             "--credential-file",
             "/etc/narsor/credential",
+            "--script-user",
+            "narsor-observer-script",
         ])
         .unwrap();
         assert!(worker.command.runs_on_broken_config());
