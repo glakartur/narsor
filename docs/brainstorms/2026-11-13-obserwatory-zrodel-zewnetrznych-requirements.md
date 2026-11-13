@@ -183,7 +183,7 @@ Stan w repozytorium (zweryfikowany):
 
 ### Resolve Before Planning
 
-- P2 z sekcji „Pytania otwarte dla użytkownika" (P1, P3, P4 rozstrzygnięte).
+Brak.
 
 ### Deferred to Planning
 
