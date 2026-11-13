@@ -40,6 +40,7 @@ pub mod profile;
 pub mod scope;
 pub mod script;
 pub(crate) mod session;
+pub mod wait;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -69,6 +70,10 @@ pub use profile::ProfileExecutor;
 pub use scope::{ScopedRepository, StepScope};
 pub use script::ScriptExecutor;
 pub use session::{AgentEventSink, LoggingEventSink, UsageReporter};
+pub use wait::{
+    ExternalEventDelivery, ExternalEventRequest, PendingExternalEvent, WaitActionError, WaitEnding,
+    WaitExecutor,
+};
 
 /// Environment variable carrying the [`crate::domain::ActionExecution`] id into
 /// the child process.
@@ -319,8 +324,7 @@ impl ActionOutcome {
 
 /// What an attempt suspended on.
 ///
-/// One variant per thing narsor can wait for. `HumanAction` is the
-/// only one in U6; `WaitAction` adds its own later.
+/// One variant per thing narsor can wait for.
 #[derive(Debug, Clone)]
 pub enum SuspendedAction {
     /// A person has to fill in the form described by the request (§3.3.C).
@@ -329,6 +333,9 @@ pub enum SuspendedAction {
     /// same workflow state can continue. This is not a workflow output and
     /// must therefore never select a transition.
     AwaitingAgentInput(HumanInputRequest),
+    /// A `wait` step waits for an external event (§3.3.D); see
+    /// [`wait::suspend`].
+    AwaitingExternalEvent(ExternalEventRequest),
 }
 
 /// An attempt that was stopped because it ran out of time.

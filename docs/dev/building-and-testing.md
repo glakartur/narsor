@@ -161,9 +161,6 @@ see [Linux installation and server operation](../operations/installation.md).
 Deliberately deferred, and verified against the code — each item needs a plan
 of its own:
 
-- **`WaitAction`** and the service that polls for external events: the action
-  type parses, but no executor is registered, so entering such a state fails
-  with "not available in this version".
 - **Agent decisions** (`decision: { type: agent }`) — they return an explicit
   "not available" error instead of quietly behaving like a rule-based decision.
 - **Containerisation of local tasks** — a task started by `narsor-controller

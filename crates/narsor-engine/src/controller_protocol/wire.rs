@@ -30,8 +30,9 @@ pub use narsor_protocol::controller::{
     ControllerPresence, ControllerView, ConversationAttemptSummary, ConversationPageAccepted,
     ConversationPageQuery, ConversationPageRequest, ConversationResponse,
     ConversationUnavailableReason, CreateEnrollmentRequest, CreateRepositoryRequest,
-    CreateTaskRequest, DefaultBackendView, DeliveredInput, DeliveredOperatorCommand, DesiredAction,
-    DesiredCommand, EnrollRequest, EnrollResponse, EnrollmentResponse, ExecutionCursor,
+    CreateTaskRequest, DefaultBackendView, DeliveredEvent, DeliveredInput,
+    DeliveredOperatorCommand, DesiredAction, DesiredCommand, EnrollRequest, EnrollResponse,
+    EnrollmentResponse, EventAckResponse, EventDelivery, EventWait, ExecutionCursor,
     ExecutionEventsPage, ExecutionEventsQuery, ExecutionEventsRequest, ExecutionEventsResponse,
     ExecutionEventsSource, Freshness, HarnessUnavailable, HeartbeatResponse, InputAckRequest,
     InputAckResponse, InputUpdate, InputView, LaunchRequest, LeaseEpochRequest, LeaseView,
@@ -87,6 +88,7 @@ pub(super) fn runner_snapshot_request(
                 })
             })
             .transpose()?,
+        event_wait: snapshot.event_wait.clone(),
         conversation: snapshot.conversation.clone(),
         timeline: snapshot.timeline.clone(),
         safe_point: snapshot.safe_point,
@@ -119,6 +121,7 @@ pub(super) fn runner_snapshot_from_request(
                 })
             })
             .transpose()?,
+        event_wait: request.event_wait,
         conversation: request.conversation,
         timeline: request.timeline,
         safe_point: request.safe_point,

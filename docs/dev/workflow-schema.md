@@ -651,20 +651,74 @@ The engine strips control characters from `reason` and from the values and short
 
 ##### D. WaitAction
 
-Pauses the workflow until an external event occurs.
+Pauses the workflow until a matching external event occurs, or until the wait time ends.
+An observer of the control plane sends the events.
 
 ```yaml
 action:
   type: wait
-  event_type: github.pull_request.reviewed  # Event type
+  event_type: review.approved               # Event type
   filter:                                   # Event filter (optional)
-    pr_number: "{{ context.pr_number }}"    # Template of a context variable
-  timeout: 24h                              # Maximum wait time
+    mr: "{{ inputs.mr_id }}"                # Templates are rendered when the step starts
+  timeout: 24h                              # Maximum wait time (optional)
+choices:
+  received:
+    next: merge
+  timeout:
+    next: remind
 ```
 
-**Choices:** the labels the state declares, typically `received` (when the event occurred). The
-engine creates a `timeout` result only for an agent or script step. In the unified shape, a
-`timeout` choice on a `wait` step is a validation error (§5).
+**How the step waits.** When the step starts, the engine renders the templates of `event_type` and
+`filter`. Then it records the wait durably (`pending_event.json`) and sets the execution status to
+`waiting_for_event`. The pass stops. Each wait has a new id, the *wait episode*. When the step runs
+again (for example, in a review loop), it starts a new episode. While the task waits:
+
+*   the task state is `running`, not `human_needed`, because the task continues without the
+    operator;
+*   the task frees its slot after the same grace as a task that waits for its owner. A matching
+    event or the end of the wait time starts the task again;
+*   a restart of the runner does not end the wait. The new runner reads the wait from disk and
+    reports the same episode.
+
+**Which event ends the step.** The control plane writes each external event to the task history
+once. It hands the event to the step only when all of these are true:
+
+*   the task waits in a `wait` step now. An event that came before the step started stays in the
+    history only. The step does not see it;
+*   the event type is equal to `event_type`;
+*   the event data passes the filter. The filter is a flat JSON object. Each key of the filter must
+    have an equal value under the same key in the event data. There are no expressions. A text, a
+    number and a boolean are compared as text on both sides, because a rendered template is always
+    text: the filter `{mr: "17"}` matches the data `{"mr": 17}`. Lists and objects are compared as
+    JSON. A missing or empty filter matches each event of the type.
+
+The engine checks the episode and the filter again. It refuses an event for an earlier episode, so
+an event for a wait that the task left never ends a later wait.
+
+**Result.** A matching event ends the step. The engine writes `ExternalEventReceived` to the
+execution log once. The step ends with the label `received`. When the step declares only one label
+other than `timeout` (for example `exit`), the step ends with that label. The engine writes the
+event to the context variable `event`: `{"type": ..., "source": ..., "data": ...}`. A later step
+reads it as `{{ context.event.data.mr }}` or `{{ context.event.source }}`. The next event overwrites
+the variable. The event data comes from outside narsor: treat it as untrusted input in an agent
+prompt.
+
+**Timeout.** `timeout` sets the deadline: the start of the wait plus the time. Without `timeout`,
+the step waits until an event comes. The control plane checks the deadline in its periodic pass, also
+when the task has no compute. It hands the end of the wait to the runner once per episode. Then:
+
+*   when the step declares the `timeout` choice, the step ends with the label `timeout`;
+*   when the step does not declare it, the step fails with the error type `timeout`, like a failed
+    step of any other type. The validator does not warn about a `wait` step with `timeout` and
+    without the `timeout` choice.
+
+The `timeout` of a `wait` step is the wait time only. The time limit of a state or of the workflow
+for a running action does not apply to a `wait` step.
+
+**Runner and control plane versions.** The runner protocol has a new kind of delivery for the
+`wait` step (`events` in the poll answer, `POST /runner/v1/events/{id}/ack`), and the runner
+snapshot reports the wait (`event_wait`). An older runner does not know them, and there is no
+fallback. Update the runner and the control plane together, before a workflow uses a `wait` step.
 
 #### Scope of `{{ }}` templates
 
@@ -1533,7 +1587,7 @@ Before a workflow is run, the definition must pass validation:
     *   A `decision` step has a non-blank `message` and at least one choice. It may define `variables`, not `artifacts`.
     *   A `profile` step has a non-blank `prompt` and `exit`, never `choices`. It defines no `variables` and no `artifacts`. A `profile` action is not allowed in a legacy file (§3.7.10).
     *   A script step with `exit` cannot have `exit_codes`.
-    *   In the unified shape only an agent or a script step can declare a `timeout` choice; a `decision` or `wait` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
+    *   In the unified shape only an agent, a script or a `wait` step can declare a `timeout` choice; a `decision` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
     *   `resume_comment_field` on a decision step names a variable of `type: text`.
 
 8.  **Variable declarations (§3.7.4):**

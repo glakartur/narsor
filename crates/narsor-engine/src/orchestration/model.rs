@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 
 pub use narsor_protocol::controller::{
     ArchiveTombstone, AttentionItem, AttentionKind, CommandActor, CommandReceipt,
-    ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
-    InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary, OperatorCommand,
-    OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion,
-    ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason, TaskEvent,
-    TaskEventKind, TaskProvenance, TaskState, WorkloadLoss,
+    ConversationAttemptSummary, ConversationAvailability, EventWait, ExecutionCursor,
+    HarnessUnavailable, InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary,
+    OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
+    ResumeExhaustion, ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason,
+    TaskEvent, TaskEventKind, TaskProvenance, TaskState, WorkloadLoss,
 };
 
 /// Current schema version of [`TaskRecord`].
@@ -50,8 +50,10 @@ pub enum SlotReleaseClass {
     /// once. Not [`ExecutionStatus::is_terminal`], which also counts
     /// `Failed`.
     Final,
-    /// The execution waits for its owner (`InputNeeded`, `Failed`): the slot
-    /// is freed after a wait.
+    /// The execution waits for its owner (`InputNeeded`, `Failed`) or for an
+    /// external event (`WaitingForEvent`, a `wait` step): the slot is freed
+    /// after a wait. A matching event, or the wait's timeout, resumes the
+    /// task like an owner's answer does.
     Transient,
 }
 
@@ -61,7 +63,9 @@ impl SlotReleaseClass {
     pub fn of(status: ExecutionStatus) -> Option<Self> {
         match status {
             ExecutionStatus::Completed | ExecutionStatus::Cancelled => Some(Self::Final),
-            ExecutionStatus::InputNeeded | ExecutionStatus::Failed => Some(Self::Transient),
+            ExecutionStatus::InputNeeded
+            | ExecutionStatus::Failed
+            | ExecutionStatus::WaitingForEvent => Some(Self::Transient),
             _ => None,
         }
     }
@@ -85,15 +89,18 @@ impl SlotReleaseClass {
 /// 5. execution `Completed` or `Cancelled` is `Finished`;
 /// 6. execution `Failed` is `Error`;
 /// 7. execution `InputNeeded` is `HumanNeeded`;
-/// 8. `Stopped` or `PauseRequested` is `Paused`;
-/// 9. `Provisioning` without a snapshot is `Queued`;
-/// 10. `Interrupted` with no attempt planned (lost while a pause was
+/// 8. execution `WaitingForEvent` (a `wait` step) is `Running`: the work
+///    goes on by itself when the event or the timeout comes, so the owner
+///    is not told that it waits for them;
+/// 9. `Stopped` or `PauseRequested` is `Paused`;
+/// 10. `Provisioning` without a snapshot is `Queued`;
+/// 11. `Interrupted` with no attempt planned (lost while a pause was
 ///     requested, which the resume policy leaves to the owner) is `Paused`;
-/// 11. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
+/// 12. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
 ///     `Interrupted` while the resume policy still waits to try again.
 ///
-/// Rules 5 to 7 come before 8, so a task stopped to free its slot keeps the
-/// state its work reached. Rule 8 reads `PauseRequested` as the owner's
+/// Rules 5 to 8 come before 9, so a task stopped to free its slot keeps the
+/// state its work reached. Rule 9 reads `PauseRequested` as the owner's
 /// pause only when `pause_by_policy` is false: a stop the slot-release
 /// policy asked for is no decision of the owner, so a task whose work moved
 /// on meanwhile (execution `Running`) stays `Running`.
@@ -115,6 +122,7 @@ pub fn derive_task_state(
         Some(ExecutionStatus::Completed | ExecutionStatus::Cancelled) => TaskState::Finished,
         Some(ExecutionStatus::Failed) => TaskState::Error,
         Some(ExecutionStatus::InputNeeded) => TaskState::HumanNeeded,
+        Some(ExecutionStatus::WaitingForEvent) => TaskState::Running,
         _ => match runner_state {
             RunnerState::PauseRequested if pause_by_policy => TaskState::Running,
             RunnerState::Stopped | RunnerState::PauseRequested => TaskState::Paused,
@@ -381,67 +389,6 @@ pub struct TaskRecord {
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
     pub last_event: TaskEvent,
-}
-
-/// One episode of a task waiting in a `wait` step for an external event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EventWait {
-    /// Identifies this episode: a step that waits again (a review loop)
-    /// starts a new one.
-    pub episode_id: String,
-    /// The event type the step waits for.
-    pub event_type: String,
-    /// The step's filter, its templates rendered.
-    #[serde(default)]
-    pub filter: serde_json::Value,
-    /// When the wait began; only events from then on reach the step.
-    pub since: DateTime<Utc>,
-    /// When the wait times out, if it does.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<DateTime<Utc>>,
-}
-
-impl EventWait {
-    /// Whether an event of `event_type` with `data` is what this wait waits
-    /// for: the same type, and every field of the filter equal to the field
-    /// of the same name in the data (R4).
-    ///
-    /// The comparison is flat, without expressions. Scalars (text, number,
-    /// boolean) compare as text on both sides, because a filter rendered
-    /// from a template is always text: filter `{"mr": "17"}` matches data
-    /// `{"mr": 17}`. Other values compare as JSON. An empty or absent filter
-    /// matches every event of the type; a filter that is not an object
-    /// matches none.
-    pub fn matches(&self, event_type: &str, data: &serde_json::Value) -> bool {
-        if self.event_type != event_type {
-            return false;
-        }
-        match &self.filter {
-            serde_json::Value::Null => true,
-            serde_json::Value::Object(filter) => filter.iter().all(|(field, expected)| {
-                data.get(field)
-                    .is_some_and(|actual| same_filter_value(expected, actual))
-            }),
-            _ => false,
-        }
-    }
-}
-
-/// Scalars as text, so `"17"` and `17` are the same filter value.
-fn filter_scalar_text(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(text) => Some(text.clone()),
-        serde_json::Value::Number(number) => Some(number.to_string()),
-        serde_json::Value::Bool(flag) => Some(flag.to_string()),
-        _ => None,
-    }
-}
-
-fn same_filter_value(expected: &serde_json::Value, actual: &serde_json::Value) -> bool {
-    match (filter_scalar_text(expected), filter_scalar_text(actual)) {
-        (Some(expected), Some(actual)) => expected == actual,
-        _ => expected == actual,
-    }
 }
 
 impl TaskRecord {
@@ -936,6 +883,10 @@ pub struct RunnerSnapshot {
     /// The input request it waits on.
     #[serde(default)]
     pub pending_input: Option<PendingInputRef>,
+    /// The external event its `wait` step waits for, while it waits; the
+    /// control plane keeps it as [`TaskRecord::event_wait`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_wait: Option<EventWait>,
     /// Its conversation's availability and summary.
     #[serde(default)]
     pub conversation: ConversationAvailability,
@@ -1037,8 +988,9 @@ pub struct InputRequest {
     pub delivery: HumanInputDelivery,
 }
 
-/// An external event an observer delivered, queued for the task's
-/// waiting `wait` step (U3); the runner side consumes it (U4).
+/// What ends the task's waiting `wait` step, queued for its runner: an
+/// external event an observer delivered (U3), or the end of the wait's
+/// time the periodic pass found (U4). The runner's engine consumes it.
 ///
 /// Kept apart from [`QueuedInput`]: an owner answer is bound to the
 /// runner's pending input request and made obsolete by any snapshot that
@@ -1048,20 +1000,27 @@ pub struct InputRequest {
 pub struct QueuedEventInput {
     /// Control-plane id, unique within the task (`event-<n>`).
     pub input_id: String,
-    /// [`super::observer_event_key`] of the observer and its effect key.
+    /// [`super::observer_event_key`] of the observer and its effect key;
+    /// [`super::wait_timeout_key`] for a timeout.
     pub idempotency_key: String,
+    /// What it is: an event, or the wait's timeout. Records from before
+    /// timeouts were queued are all events.
+    #[serde(default)]
+    pub kind: EventInputKind,
     /// The wait episode it was matched against; a runner in another
     /// episode never takes it.
     pub episode_id: String,
-    /// The event type.
+    /// The event type (for a timeout: the type the step waited for).
     pub event_type: String,
-    /// The observer's source.
+    /// The observer's source (for a timeout: empty).
     pub source: String,
     /// The event's data, dropped once settled.
     #[serde(default)]
     pub data: Option<serde_json::Value>,
-    /// The observer, effect key and run it came from (R19).
-    pub provenance: TaskProvenance,
+    /// The observer, effect key and run it came from (R19); `None` for a
+    /// timeout, which no observer caused.
+    #[serde(default)]
+    pub provenance: Option<TaskProvenance>,
     /// Its status, as for an owner answer.
     pub status: InputStatus,
     /// When the control plane accepted it.
@@ -1071,6 +1030,17 @@ pub struct QueuedEventInput {
     /// The runner's reason, when it rejected the event.
     #[serde(default)]
     pub detail: Option<String>,
+}
+
+/// What a [`QueuedEventInput`] carries to the waiting step.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventInputKind {
+    /// An external event that matched the wait.
+    #[default]
+    Event,
+    /// The wait's deadline passed without one.
+    Timeout,
 }
 
 /// An external event as an observer delivers it.
@@ -1378,6 +1348,17 @@ mod tests {
     }
 
     #[test]
+    fn a_run_waiting_for_an_external_event_runs_and_never_needs_a_human() {
+        // Running, stopped to free its slot, or stopping for it: the task
+        // waits for the event by itself, not for its owner (U4).
+        for runner in [R::Running, R::Stopped, R::PauseRequested] {
+            let state = derive(runner, Some(ExecutionStatus::WaitingForEvent));
+            assert_eq!(state, T::Running, "{runner:?}");
+            assert_ne!(state, T::HumanNeeded);
+        }
+    }
+
+    #[test]
     fn a_stopped_task_with_work_left_is_paused() {
         assert_eq!(
             derive(R::Stopped, Some(ExecutionStatus::Running)),
@@ -1482,10 +1463,11 @@ mod tests {
         assert_eq!(C::of(ExecutionStatus::Cancelled), Some(C::Final));
         assert_eq!(C::of(ExecutionStatus::InputNeeded), Some(C::Transient));
         assert_eq!(C::of(ExecutionStatus::Failed), Some(C::Transient));
+        // A `wait` step frees its slot like a wait for the owner (U4).
+        assert_eq!(C::of(ExecutionStatus::WaitingForEvent), Some(C::Transient));
         for other in [
             ExecutionStatus::Running,
             ExecutionStatus::Paused,
-            ExecutionStatus::WaitingForEvent,
             ExecutionStatus::Unknown,
         ] {
             assert_eq!(C::of(other), None);

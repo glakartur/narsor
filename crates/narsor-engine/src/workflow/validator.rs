@@ -782,9 +782,10 @@ fn validate_exit_and_timeout(
             });
         }
     }
+    // A `wait` step times out at its own deadline (§3.3.D, PO4).
     let can_time_out = matches!(
         state.action,
-        Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_))
+        Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_)) | Some(ActionConfig::Wait(_))
     );
     let declares_timeout = state
         .choices

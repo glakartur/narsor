@@ -467,6 +467,9 @@ pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     // Stops tasks whose deadline came; the slot itself goes on once the
     // runner reached its safe point, and that report re-runs admission.
     control.slot_release_pass();
+    // Ends the waits of `wait` steps whose deadline passed: queues the
+    // timeout for the runner and resumes a task stopped while it waited.
+    control.wait_deadline_pass();
     // Ends the leases of read-only runners that ran idle, so the desired
     // state stops asking the controller for them.
     control.reader_lease_pass();

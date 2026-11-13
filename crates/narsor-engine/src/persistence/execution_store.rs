@@ -24,6 +24,12 @@ use std::path::PathBuf;
 /// why the request lives in its own file rather than inside the execution.
 pub const PENDING_INPUT_FILE: &str = "pending_input.json";
 
+/// File holding the external event a `wait` step is waiting for.
+///
+/// A hint like [`PENDING_INPUT_FILE`]: the authority is `status ==
+/// WaitingForEvent` in `state.json`. See `engine::actions::wait`.
+pub const PENDING_EVENT_FILE: &str = "pending_event.json";
+
 /// Filesystem store for workflow executions.
 ///
 /// A concrete struct rather than a trait: the engine only ever writes to the
@@ -192,6 +198,39 @@ impl ExecutionStore {
     /// Removes the pending request. Returns whether there was one to remove.
     pub fn clear_pending_input(&self, execution_id: &str) -> Result<bool> {
         let path = self.pending_input_file(execution_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(PersistenceError::io(&path, source)),
+        }
+    }
+
+    /// `{root}/executions/{execution_id}/pending_event.json`.
+    pub fn pending_event_file(&self, execution_id: &str) -> PathBuf {
+        self.paths
+            .execution_dir(execution_id)
+            .join(PENDING_EVENT_FILE)
+    }
+
+    /// Persists the external event a `wait` step waits for; generic for the
+    /// same reason as [`Self::save_pending_input`].
+    pub fn save_pending_event<T: Serialize>(&self, execution_id: &str, pending: &T) -> Result<()> {
+        self.create_execution_dirs(execution_id)?;
+        write_json_atomic(&self.pending_event_file(execution_id), pending)
+    }
+
+    /// Loads the awaited event, or `None` when there is none.
+    pub fn load_pending_event<T: DeserializeOwned>(&self, execution_id: &str) -> Result<Option<T>> {
+        let path = self.pending_event_file(execution_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
+    }
+
+    /// Removes the awaited event. Returns whether there was one to remove.
+    pub fn clear_pending_event(&self, execution_id: &str) -> Result<bool> {
+        let path = self.pending_event_file(execution_id);
         match fs::remove_file(&path) {
             Ok(()) => Ok(true),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),

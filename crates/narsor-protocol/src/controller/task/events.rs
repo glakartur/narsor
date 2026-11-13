@@ -128,6 +128,16 @@ pub enum TaskEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_id: Option<String>,
     },
+    /// The task's `wait` step waited past its deadline: the control plane
+    /// queued the end of the wait for the runner (`input_id`). A client
+    /// from before `wait` steps reads it as
+    /// [`TaskEventKind::Unrecognized`].
+    WaitTimedOut {
+        /// The wait episode that timed out.
+        episode_id: String,
+        /// The delivery queued for the runner.
+        input_id: String,
+    },
     #[serde(other)]
     Unrecognized,
 }

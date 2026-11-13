@@ -1495,7 +1495,7 @@ pub enum ValidationError {
     #[error("State '{state}' is a profile step and needs a single 'exit' instead of 'choices': it writes the step profile and the workflow goes on")]
     ProfileNeedsExit { state: StateId },
 
-    #[error("State '{state}' declares a 'timeout' choice, which only agent and script steps can produce")]
+    #[error("State '{state}' declares a 'timeout' choice, which only agent, script and wait steps can produce")]
     TimeoutChoiceNotAllowed { state: StateId },
 
     #[error("Choice '{label}' in state '{state}' has invalid approval/resume behavior: {reason}")]

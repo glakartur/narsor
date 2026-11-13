@@ -14,7 +14,7 @@ pub enum ActionKind {
     Script,
     /// `HumanAction`.
     Human,
-    /// `WaitAction` — no executor in this version.
+    /// `WaitAction`: waits for an external event (§3.3.D).
     Wait,
     /// `DecisionAction` — no executor in this version.
     Decision,

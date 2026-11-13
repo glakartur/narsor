@@ -11,6 +11,7 @@
 //!     state.json                  -- the serialized WorkflowExecution
 //!     context.json                -- projection of the execution context
 //!     pending_input.json          -- the input request an input-needed execution awaits
+//!     pending_event.json          -- the external event a `wait` step awaits
 //!     events/{sequence:08}.json   -- append-only event log
 //!     artifacts/{artifact_id}/    -- files produced by actions
 //!     conversations/{attempt_id}.jsonl        -- open attempt, see conversation
@@ -46,7 +47,7 @@ pub use conversation::{
 };
 pub use daemon_info::{pid_is_alive, DaemonInfo};
 pub use event_log::EventLog;
-pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
+pub use execution_store::{ExecutionStore, PENDING_EVENT_FILE, PENDING_INPUT_FILE};
 pub use paths::{
     CatalogPaths, StatePaths, WorkPaths, AGENT_HARNESS_SELECTION_FILE, CONTEXT_FILE, DEFAULT_ROOT,
     STATE_FILE, STEP_PROFILE_FILE, TEMP_SUFFIX,

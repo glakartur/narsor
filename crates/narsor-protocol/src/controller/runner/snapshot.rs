@@ -6,8 +6,9 @@ use serde_json::Value;
 
 use crate::api::{ExecutionStatusDto, Timeline};
 use crate::controller::{
-    AttentionItem, CommandActor, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
-    OwnerCommand, RunnerDirective, RunnerProblem, RunnerState, TaskDefaultHarness,
+    AttentionItem, CommandActor, ConversationAvailability, EventWait, ExecutionCursor,
+    HarnessUnavailable, OwnerCommand, RunnerDirective, RunnerProblem, RunnerState,
+    TaskDefaultHarness,
 };
 use crate::display::WorkspaceHeader;
 
@@ -33,6 +34,10 @@ pub struct RunnerSnapshotRequest {
     pub event_cursor: u64,
     #[serde(default)]
     pub pending_input: Option<PendingInputRefView>,
+    /// The external event the execution's `wait` step waits for, while it
+    /// waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_wait: Option<EventWait>,
     #[serde(default)]
     pub conversation: ConversationAvailability,
     #[serde(default)]

@@ -301,6 +301,15 @@ impl Engine {
                     &request.instruction,
                 ))
             }
+            // Only an agent is reprompted, and an agent never waits for an
+            // external event: an executor that did is broken.
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingExternalEvent(_))) => {
+                RepromptFailure::Failed(
+                    "the reprompted action waited for an external event, which only a \
+                     `wait` step can do"
+                        .to_string(),
+                )
+            }
             Err(error) => match OutputRejection::from_error(state, &action_execution_id, &error) {
                 Some(rejection) => RepromptFailure::Rejected(rejection),
                 None => RepromptFailure::Failed(error.message),

@@ -524,7 +524,10 @@ impl<'a> TemplateScope<'a> {
                     None => None,
                 };
 
+                // The validator checks `event_type` as a template, so it is
+                // rendered like the filter.
                 Ok(ActionConfig::Wait(WaitActionConfig {
+                    event: self.render(&config.event, &format!("{location}, event_type"))?,
                     filter,
                     ..config.clone()
                 }))

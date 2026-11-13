@@ -21,9 +21,11 @@ impl Engine {
             // Unchanged, bit for bit: a script or human state that declares no
             // limit still has none. Spelled out rather than caught by `_`, so
             // that a fifth action kind has to decide rather than inherit.
-            ActionKind::Script | ActionKind::Human | ActionKind::Wait | ActionKind::Decision => {
-                declared
-            }
+            ActionKind::Script | ActionKind::Human | ActionKind::Decision => declared,
+            // A `wait` step's limit is its own `timeout` (§3.3.D), a
+            // deadline the control plane enforces; a state's or the
+            // workflow's limit for running actions does not apply.
+            ActionKind::Wait => None,
         }
     }
 
@@ -142,6 +144,10 @@ impl Engine {
                 Ok(AttemptOutcome::AwaitingAgentInput(request)) => {
                     let flow = self.route_agent_question(execution, state, request).await?;
                     return Ok(ActionUpshot::settled(flow));
+                }
+                Ok(AttemptOutcome::AwaitingExternalEvent(request)) => {
+                    self.suspend_for_event(execution, state, request)?;
+                    return Ok(ActionUpshot::Stopped);
                 }
                 Ok(AttemptOutcome::AwaitingConductor(message)) => {
                     let flow = self

@@ -15,10 +15,11 @@
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    ExternalEvent, ExternalEventOutcome, InputOutcome, InputRequest, InputStatus, InputUpdate,
-    QueuedEventInput, QueuedInput, RunnerObservation, RunnerReportOutcome, RunnerSnapshot,
-    RunnerState, TaskEventKind, TaskRecord,
+    EventInputKind, ExternalEvent, ExternalEventOutcome, InputOutcome, InputRequest, InputStatus,
+    InputUpdate, QueuedEventInput, QueuedInput, RunnerObservation, RunnerReportOutcome,
+    RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
 };
+use super::resume::wait_timeout_key;
 use crate::domain::display::bounded_detail;
 use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
 use crate::engine::{ConversationState, EventLink, Timeline};
@@ -86,6 +87,12 @@ impl ControlPlane {
         if let Some(reason) = &mut snapshot.conductor_unavailable_reason {
             *reason = without_unsafe_chars(reason);
         }
+        // Observers hand the episode to their scripts, and clients show the
+        // event type.
+        if let Some(wait) = &mut snapshot.event_wait {
+            wait.episode_id = without_unsafe_chars(&wait.episode_id);
+            wait.event_type = without_unsafe_chars(&wait.event_type);
+        }
         if let Some(unavailable) = &mut snapshot.default_harness_unavailable {
             unavailable.harness = without_unsafe_chars(&unavailable.harness);
             unavailable.kept = without_unsafe_chars(&unavailable.kept);
@@ -126,6 +133,18 @@ impl ControlPlane {
             // says what the runner reported, and the input statuses that
             // follow from it are on the record that event points at.
             obsolete_undelivered(record, pending.as_deref(), now);
+            // A runner without an execution yet (it is still starting) says
+            // nothing of a wait; one with an execution says where it waits,
+            // or that it waits for no event, and what was queued for any
+            // other episode can never reach it.
+            if snapshot.execution_cursor.execution_id.is_some() {
+                let episode = snapshot
+                    .event_wait
+                    .as_ref()
+                    .map(|wait| wait.episode_id.clone());
+                obsolete_undelivered_events(record, episode.as_deref(), now);
+                record.event_wait = snapshot.event_wait.clone();
+            }
             let safe_point_generation = if snapshot.safe_point {
                 if record.runner_state == RunnerState::PauseRequested {
                     Some(record.generation)
@@ -294,11 +313,12 @@ impl ControlPlane {
             let input = episode.map(|episode_id| QueuedEventInput {
                 input_id: format!("event-{}", record.event_inputs.len() + 1),
                 idempotency_key: event.idempotency_key.clone(),
+                kind: EventInputKind::Event,
                 episode_id,
                 event_type: event.event_type.clone(),
                 source: event.source.clone(),
                 data: Some(event.data.clone()),
-                provenance: event.provenance.clone(),
+                provenance: Some(event.provenance.clone()),
                 status: InputStatus::Queued,
                 submitted_at: now,
                 updated_at: now,
@@ -511,6 +531,176 @@ impl ControlPlane {
     }
 }
 
+impl ControlPlane {
+    /// What ends the `wait` step a polling runner waits in
+    /// (`event_wait_id`, its episode): the queued events and timeout for
+    /// that episode (queued, or delivered and not yet acknowledged —
+    /// at-least-once; the runner's engine deduplicates by the episode).
+    /// Queued ones for any other episode become obsolete, as owner answers
+    /// to another request do in [`Self::deliver_inputs`].
+    ///
+    /// Returns them and whether the record changed.
+    pub fn deliver_event_inputs(
+        &self,
+        task_id: &TaskId,
+        incarnation: &str,
+        launch_generation: u64,
+        event_wait_id: Option<&str>,
+    ) -> Result<(Vec<QueuedEventInput>, bool)> {
+        let (_, delivered) = self.mutate(task_id, |record, now| {
+            fence_runner(record, incarnation, launch_generation)?;
+            let mut updates = obsolete_undelivered_events(record, event_wait_id, now);
+            let mut deliverable = Vec::new();
+            for input in record.event_inputs.iter_mut() {
+                if Some(input.episode_id.as_str()) != event_wait_id {
+                    continue;
+                }
+                match input.status {
+                    InputStatus::Queued => {
+                        input.status = InputStatus::Delivered;
+                        input.updated_at = now;
+                        updates.push(InputUpdate {
+                            input_id: input.input_id.clone(),
+                            status: InputStatus::Delivered,
+                        });
+                        deliverable.push(input.clone());
+                    }
+                    InputStatus::Delivered => deliverable.push(input.clone()),
+                    _ => {}
+                }
+            }
+            if updates.is_empty() {
+                Ok(Mutation::Unchanged((deliverable, false)))
+            } else {
+                Ok(Mutation::Changed(
+                    TaskEventKind::InputsUpdated { updates },
+                    (deliverable, true),
+                ))
+            }
+        })?;
+        Ok(delivered)
+    }
+
+    /// The runner's verdict on a delivered event or timeout. Repeating the
+    /// same verdict is harmless (`changed: false`); contradicting a settled
+    /// one is refused. An accepted one ended the wait of its episode, so
+    /// the task no longer waits for an event from the same mutation on:
+    /// nothing more is queued for it, and no timeout is.
+    pub fn settle_event_input(
+        &self,
+        task_id: &TaskId,
+        incarnation: &str,
+        launch_generation: u64,
+        input_id: &str,
+        accepted: bool,
+        detail: Option<String>,
+    ) -> Result<(QueuedEventInput, bool)> {
+        let detail = detail.map(|detail| bounded_detail(&detail));
+        let (_, settled) = self.mutate(task_id, |record, now| {
+            fence_runner(record, incarnation, launch_generation)?;
+            let target = if accepted {
+                InputStatus::Consumed
+            } else {
+                InputStatus::Rejected
+            };
+            let task_id = record.task_id.clone();
+            let input = record
+                .event_inputs
+                .iter_mut()
+                .find(|input| input.input_id == input_id)
+                .ok_or_else(|| OrchestrationError::InputNotFound {
+                    task_id: task_id.clone(),
+                    input_id: input_id.to_string(),
+                })?;
+            if input.status == target {
+                return Ok(Mutation::Unchanged((input.clone(), false)));
+            }
+            if input.status != InputStatus::Delivered {
+                return Err(OrchestrationError::InputAlreadySettled {
+                    task_id,
+                    input_id: input_id.to_string(),
+                    status: input.status,
+                });
+            }
+            input.status = target;
+            input.updated_at = now;
+            input.detail = detail.clone();
+            input.data = None;
+            let settled = input.clone();
+            if accepted
+                && record
+                    .event_wait
+                    .as_ref()
+                    .is_some_and(|wait| wait.episode_id == settled.episode_id)
+            {
+                record.event_wait = None;
+            }
+            Ok(Mutation::Changed(
+                TaskEventKind::InputsUpdated {
+                    updates: vec![InputUpdate {
+                        input_id: settled.input_id.clone(),
+                        status: target,
+                    }],
+                },
+                (settled, true),
+            ))
+        })?;
+        Ok(settled)
+    }
+
+    /// Queues the end of the task's wait for its runner when the wait ran
+    /// past its deadline (U4, PO4): once per episode, and not while an
+    /// event for it is on its way or after one ended it. Returns the
+    /// queued timeout — `None` when there is nothing to queue, the task
+    /// being archived, waiting for no event, or not past its deadline.
+    pub fn queue_wait_timeout(&self, task_id: &TaskId) -> Result<Option<QueuedEventInput>> {
+        let (_, queued) = self.mutate(task_id, |record, now| {
+            if record.runner_state.is_archival() {
+                return Ok(Mutation::Unchanged(None));
+            }
+            let Some(wait) = record
+                .event_wait
+                .as_ref()
+                .filter(|wait| wait.is_past_deadline(now))
+            else {
+                return Ok(Mutation::Unchanged(None));
+            };
+            let settled_or_due = record.event_inputs.iter().any(|input| {
+                input.episode_id == wait.episode_id
+                    && (input.kind == EventInputKind::Timeout
+                        || !input.status.is_settled()
+                        || input.status == InputStatus::Consumed)
+            });
+            if settled_or_due {
+                return Ok(Mutation::Unchanged(None));
+            }
+            let input = QueuedEventInput {
+                input_id: format!("event-{}", record.event_inputs.len() + 1),
+                idempotency_key: wait_timeout_key(&wait.episode_id),
+                kind: EventInputKind::Timeout,
+                episode_id: wait.episode_id.clone(),
+                event_type: wait.event_type.clone(),
+                source: String::new(),
+                data: None,
+                provenance: None,
+                status: InputStatus::Queued,
+                submitted_at: now,
+                updated_at: now,
+                detail: None,
+            };
+            record.event_inputs.push(input.clone());
+            Ok(Mutation::Changed(
+                TaskEventKind::WaitTimedOut {
+                    episode_id: input.episode_id.clone(),
+                    input_id: input.input_id.clone(),
+                },
+                Some(input),
+            ))
+        })?;
+        Ok(queued)
+    }
+}
+
 /// Refuses a runner whose launch is no longer current.
 pub(super) fn fence_runner(
     record: &TaskRecord,
@@ -540,6 +730,29 @@ fn obsolete_undelivered(
             input.status = InputStatus::Obsolete;
             input.updated_at = now;
             input.delivery = None;
+            updates.push(InputUpdate {
+                input_id: input.input_id.clone(),
+                status: InputStatus::Obsolete,
+            });
+        }
+    }
+    updates
+}
+
+/// Marks every still-queued event or timeout for another wait episode than
+/// `episode` (none: the runner waits for no event) as obsolete and drops
+/// its data. Delivered ones are left to the runner's acknowledgement.
+fn obsolete_undelivered_events(
+    record: &mut TaskRecord,
+    episode: Option<&str>,
+    now: DateTime<Utc>,
+) -> Vec<InputUpdate> {
+    let mut updates = Vec::new();
+    for input in record.event_inputs.iter_mut() {
+        if input.status == InputStatus::Queued && Some(input.episode_id.as_str()) != episode {
+            input.status = InputStatus::Obsolete;
+            input.updated_at = now;
+            input.data = None;
             updates.push(InputUpdate {
                 input_id: input.input_id.clone(),
                 status: InputStatus::Obsolete,

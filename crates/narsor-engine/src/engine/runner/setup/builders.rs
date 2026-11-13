@@ -18,12 +18,9 @@ fn agent_executor(
 }
 
 impl Engine {
-    /// Creates an engine with the executors of this version: `script`, `human`
-    /// and `agent`.
-    ///
-    /// `wait` is deliberately unregistered — it is Phase 3 — so a workflow that
-    /// uses one fails with a clear message instead of behaving like something
-    /// it is not. [`Engine::with_executor`] fills it in.
+    /// Creates an engine with the executors of this version: `script`,
+    /// `human`, `agent`, `profile` and `wait`. [`Engine::with_executor`]
+    /// replaces one.
     ///
     /// The agent executor is given a [`LoggingEventSink`] over this engine's
     /// own store and live channel, so the agent-session events it emits land in
@@ -36,6 +33,7 @@ impl Engine {
         let mut executors: HashMap<ActionKind, Arc<dyn ActionExecutor>> = HashMap::new();
         executors.insert(ActionKind::Script, Arc::new(ScriptExecutor::new()));
         executors.insert(ActionKind::Human, Arc::new(HumanExecutor::new()));
+        executors.insert(ActionKind::Wait, Arc::new(WaitExecutor::new()));
         executors.insert(ActionKind::Profile, Arc::new(ProfileExecutor::like(&agent)));
         executors.insert(ActionKind::Agent, Arc::new(agent));
 
