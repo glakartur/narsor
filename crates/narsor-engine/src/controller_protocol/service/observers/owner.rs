@@ -336,19 +336,22 @@ impl ProtocolService {
         Ok(watch_view(&entry))
     }
 
-    /// The observer `observer` (a name, else an id) of `owner`; not found
-    /// for one of another owner.
+    /// The observer `observer` (an id when it has the id's form, else a
+    /// name) of `owner`; not found for one of another owner. Names never
+    /// have the id's form ([`ObserverName::parse`]), so no name shadows an
+    /// id.
     fn owned_observer(&self, owner: &OwnerRef, observer: &str) -> ProtocolResult<ObserverRecord> {
-        let found = match self.observers.find_by_name(observer)? {
-            Some(record) => Some(record),
-            None => match ObserverId::parse(observer) {
+        let found = if ObserverName::looks_like_id(observer) {
+            match ObserverId::parse(observer) {
                 Ok(observer_id) => match self.observers.load(&observer_id) {
                     Ok(record) => Some(record),
                     Err(ObserverError::NotFound(_)) => None,
                     Err(error) => return Err(error.into()),
                 },
                 Err(_) => None,
-            },
+            }
+        } else {
+            self.observers.find_by_name(observer)?
         };
         match found {
             Some(record) if &record.owner == owner => Ok(record),

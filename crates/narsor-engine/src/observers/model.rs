@@ -162,7 +162,20 @@ impl ObserverName {
     pub fn parse(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         validate_name_like("name", &value, true)?;
+        // A name that looks like an id could shadow another owner's
+        // observer where a name or an id is accepted.
+        if value.starts_with(OBSERVER_ID_PREFIX) {
+            return Err(ObserverError::invalid(
+                "name",
+                format!("'{value}' is not valid: a name may not start with '{OBSERVER_ID_PREFIX}', the prefix of observer ids"),
+            ));
+        }
         Ok(Self(value))
+    }
+
+    /// Whether `value` has the form of an observer id rather than a name.
+    pub fn looks_like_id(value: &str) -> bool {
+        value.starts_with(OBSERVER_ID_PREFIX)
     }
 
     /// The name as a string slice.
@@ -1341,6 +1354,16 @@ mod tests {
         assert!(ObserverName::parse("jira.abc").is_ok());
         assert!(ObserverName::parse("../etc").is_err());
         assert!(serde_json::from_str::<ObserverName>("\"a b\"").is_err());
+    }
+
+    #[test]
+    fn a_name_may_not_take_the_form_of_an_observer_id() {
+        // Otherwise another owner could shadow an observer reached by id.
+        let id = ObserverId::generate();
+        assert!(ObserverName::parse(id.as_str()).is_err());
+        assert!(ObserverName::looks_like_id(id.as_str()));
+        assert!(ObserverName::parse("observer-jira").is_ok());
+        assert!(!ObserverName::looks_like_id("observer-jira"));
     }
 
     #[test]
