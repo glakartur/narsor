@@ -141,6 +141,7 @@ Stan w repozytorium (zweryfikowany):
 - Wpis obserwacji PR/MR dodaje krok workflow (YAML) albo operator (decyzja użytkownika, Q4): obserwacja jest zwykle powiązana z krokami, które czekają na ocenę, decyzję lub review użytkownika.
 - Obserwacja PR/MR jako lista wpisów powiązanych z taskami: spełnia wymaganie „tylko wskazane PR" i „bez PR skrypt nie startuje".
 - Dostarczenie zdarzenia używa istniejących pojęć: `ExternalEventReceived` jako zapis w tasku i `WaitAction` jako krok, który czeka. Szczegóły w planowaniu.
+- Miejsce uruchamiania skryptów w etapach (decyzja użytkownika, Q2): etap 1 to osobny proces systemowy obok `narsor-server`, etap 2 to CronJob w Kubernetes. Kontrakt skryptu jest ten sam w obu etapach: skrypt wywołuje `narsor-cli`, używa tokenu o ograniczonym zakresie (R20) i trzyma stan w Narsorze. Zmiana miejsca nie zmienia skryptów. Ryzyko etapu 1: słabsza izolacja niż w osobnym podzie. Wymaga weryfikacji architekta.
 - Człowiek zatwierdza każdy skrypt przed pracą według harmonogramu: skrypt agenta to kod wykonywany cyklicznie z dostępem do sekretów.
 
 ---
@@ -157,7 +158,7 @@ Stan w repozytorium (zweryfikowany):
 ## Założenia do potwierdzenia
 
 - Z1. Skrypt wywołuje `narsor-cli` sam (decyzja Q1). Do potwierdzenia w planowaniu: czy `narsor-cli task create` przyjmuje klucz skutku i czy Narsor może pilnować limitu R15 na wywołaniach.
-- Z2. W konfiguracji lokalnej skrypty działają na tej samej maszynie co `narsor-server`.
+- Z2. W konfiguracji lokalnej skrypty działają na tej samej maszynie co `narsor-server`. W etapie 1 (decyzja Q2) działają jako osobny proces systemowy obok `narsor-server`: inny użytkownik, własny token, limity czasu i pamięci, tylko sekrety obserwatora. Etap 1 służy tylko zaufanym skryptom operatora. Skryptów z niezaufanych źródeł nie uruchamia się, dopóki nie ma etapu 2.
 - Z3. Zdarzenie dostarczone do taska, który nie czeka w kroku `wait`, zostaje zapisane w historii i nie zmienia stanu taska (decyzja Q3).
 - Z4. Każdy skrypt (także agenta) wymaga zatwierdzenia przez człowieka przed pracą według harmonogramu (R11).
 - Z5. Domyślny odstęp harmonogramu to 5 minut. Dolna granica to 1 minuta.
@@ -172,10 +173,7 @@ Stan w repozytorium (zweryfikowany):
 ## Pytania otwarte dla użytkownika
 
 - P1. Rozstrzygnięte (Q1): skrypt sam wywołuje `narsor-cli`. Patrz Key Decisions.
-- P2. [Affects R14, R20, Z2] Gdzie działają skrypty w konfiguracji Kubernetes?
-  - (a) Rekomendowane: osobny pod (lub Job według harmonogramu), odizolowany od `narsor-server`, z dostępem tylko do sekretów obserwatora.
-  - (b) W procesie lub kontenerze `narsor-server`.
-  - (c) Na backendzie taska (runner), obok workspace.
+- P2. Rozstrzygnięte (Q2): etapy. Etap 1: osobny proces systemowy obok `narsor-server`. Etap 2: CronJob w Kubernetes z tym samym kontraktem skryptu. Patrz Key Decisions.
 - P3. Rozstrzygnięte (Q3): zdarzenie tylko w historii; `wait` widzi zdarzenia z czasu czekania.
 - P4. Rozstrzygnięte (Q4): krok workflow (YAML) i operator przez CLI.
 
