@@ -492,13 +492,11 @@ impl WatchObjectPolicy {
                     format!("'{prefix}' contains whitespace or control characters"),
                 ));
             }
-            if let Some((_, rest)) = prefix.split_once("://") {
-                if !rest.contains('/') {
-                    return Err(ObserverError::invalid(
-                        field,
-                        format!("'{prefix}' must end its host with '/'"),
-                    ));
-                }
+            if let Some(reason) = url_prefix_refusal(prefix) {
+                return Err(ObserverError::invalid(
+                    field,
+                    format!("'{prefix}' {reason}"),
+                ));
             }
         }
         Ok(())
@@ -534,6 +532,40 @@ impl WatchObjectPolicy {
             )))
         }
     }
+}
+
+/// Why `prefix` does not pin one host, `None` when it does or when it is
+/// not URL-like at all (`MR!`, `PROJ-`).
+///
+/// A URL-like prefix (one with `://`, or starting with `//`) must name a
+/// scheme of letters, digits, `+`, `-` or `.`, and an authority without
+/// userinfo that is ended by `/`: an object that starts with such a prefix
+/// then has exactly the prefix's scheme, host and port, whatever follows.
+fn url_prefix_refusal(prefix: &str) -> Option<&'static str> {
+    let rest = if let Some(rest) = prefix.strip_prefix("//") {
+        rest
+    } else if let Some((scheme, rest)) = prefix.split_once("://") {
+        let scheme_valid = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if !scheme_valid {
+            return Some("has no valid URL scheme");
+        }
+        rest
+    } else {
+        return None;
+    };
+    let Some((authority, _path)) = rest.split_once('/') else {
+        return Some("must end its host with '/'");
+    };
+    if authority.is_empty() {
+        return Some("names no host");
+    }
+    if authority.contains(['@', '\\', '?', '#']) {
+        return Some("must not carry userinfo, '\\', '?' or '#' in its host");
+    }
+    None
 }
 
 /// What the owner configures: everything about an observer except its
@@ -1263,10 +1295,23 @@ mod tests {
             ..WatchObjectPolicy::default()
         };
         assert!(policy.validate().is_err());
-        let policy = WatchObjectPolicy {
-            allowed_prefixes: vec!["MR!".into()],
-            ..WatchObjectPolicy::default()
-        };
-        assert!(policy.validate().is_ok());
+        for (prefix, valid) in [
+            ("MR!", true),
+            ("https://git.example.com/", true),
+            ("https://git.example.com:8443/group/", true),
+            ("https://user@evil.org/", false),
+            ("https://git.example.com@evil.org/", false),
+            ("https:///path/", false),
+            ("//evil.org", false),
+            ("//git.example.com/", true),
+            ("1http://git.example.com/", false),
+            ("https://git.example.com\\@evil.org/", false),
+        ] {
+            let policy = WatchObjectPolicy {
+                allowed_prefixes: vec![prefix.into()],
+                ..WatchObjectPolicy::default()
+            };
+            assert_eq!(policy.validate().is_ok(), valid, "{prefix}");
+        }
     }
 }
