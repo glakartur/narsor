@@ -387,7 +387,8 @@ $ narsor-cli run pipeline.yaml --input repository=/srv/git/other   # raw remote
 Observers poll an external source (Jira, GitHub, GitLab) on a schedule with a
 shell script, and create tasks or deliver events to waiting tasks. The control
 plane keeps the schedule; `narsor-cli observer worker` runs the scripts (see
-[installation](../operations/installation.md)). Every command below is the
+[installation](../operations/installation.md)). How to write an observer and
+its script is in [Observers](observers.md). Every command below is the
 owner's: in network mode a user who is not the installation's owner gets
 `403`, and another owner's observer is not found. An observer is named by its
 name or its id.

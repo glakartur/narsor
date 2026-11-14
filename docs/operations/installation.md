@@ -236,7 +236,8 @@ Observers poll external sources (Jira, GitHub, GitLab) with a shell script
 on a schedule. The control plane keeps the schedule; a separate worker
 process, `narsor-cli observer worker`, claims the runs that are due, runs
 their scripts and reports the results. Run it on a host that can reach both
-the control plane and the sources, under its own system user.
+the control plane and the sources, under its own system user. How to write
+an observer and its script is in [Observers](../user/observers.md).
 
 **Create the worker credential.** The worker does not use the owner's token.
 It has a credential of its own, which can only claim the runs of the owner's

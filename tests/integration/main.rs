@@ -52,6 +52,7 @@ mod environment;
 mod kubernetes_adapter;
 mod launch_spec_contract;
 mod observers_effects;
+mod observers_examples;
 mod observers_schedule;
 mod observers_store;
 mod observers_watch;

@@ -104,7 +104,7 @@ The full index is in [`docs/README.md`](docs/README.md).
 - **Using Narsor** — [CLI](docs/user/cli.md), [TUI](docs/user/tui.md),
   [workflows](docs/user/workflows.md), [AI agents](docs/user/agents.md),
   [conductor](docs/user/conductor.md), [remote tasks](docs/user/remote.md),
-  [configuration](docs/user/configuration.md).
+  [observers](docs/user/observers.md), [configuration](docs/user/configuration.md).
 - **Operating** — [installation and server](docs/operations/installation.md),
   [remote backends](docs/operations/remote-backends.md).
 - **Developing** — [CONTRIBUTING.md](CONTRIBUTING.md),

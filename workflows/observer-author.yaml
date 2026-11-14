@@ -1,0 +1,166 @@
+# An agent writes the script of an observer, and a person reads the draft.
+#
+#   draft -> review -> accepted
+#     ^        |
+#     +--------+ revise, with a comment
+#
+# * draft: an agent writes the script (POSIX sh with curl and jq) and a
+#   description of the observer, from the script contract and the example
+#   scripts, as two files in the repository of the task.
+# * review: the person accepts the draft for a dry run, or sends it back
+#   to the agent with a comment.
+#
+# The workflow does not save, dry-run or approve anything. The task gets no
+# rights on observers. After `accept`, the owner does the rest with the CLI:
+#
+#   narsor-cli observer create NAME …          (the command in the description)
+#   narsor-cli observer script set NAME --file SCRIPT
+#   narsor-cli observer dry-run NAME
+#   narsor-cli observer approve NAME --version N   (the owner only)
+#
+# The repository of the task should be a checkout of Narsor, or hold a copy
+# of docs/user/observers.md and workflows/observers/examples/: the agent
+# reads them there. Run it by its path from a checkout of this repository:
+#   narsor-cli validate workflows/observer-author.yaml
+#   narsor-cli run workflows/observer-author.yaml --input name=jira-new \
+#     --input source=jira --input goal="A triage task for every new bug in project ABC"
+schema: v2
+name: observer-author
+version: 1
+description: >
+  An agent writes the script and the description of an observer from the
+  script contract and the examples; a person accepts the draft for a dry
+  run or asks for changes. Saving, the dry run and the approval stay with
+  the owner, through the CLI.
+
+inputs:
+  - name: name
+    type: string
+    required: true
+    description: Name of the observer, for example jira-new.
+  - name: source
+    type: string
+    required: true
+    description: The source it watches, for example jira, github.com or gitlab.example.com.
+  - name: goal
+    type: text
+    required: true
+    description: >
+      What the observer looks for and what it does in Narsor: create a task
+      (of which workflow, with which inputs) or deliver events to waiting
+      tasks (which events). No tokens or other secrets here.
+
+globals:
+  timeout: 30m
+  workspaces:
+    code:
+      primary: true
+      description: >-
+        The repository the script is written in: a checkout of Narsor, or
+        your own repository with a copy of docs/user/observers.md and
+        workflows/observers/examples/.
+
+states:
+  draft:
+    description: >
+      The agent writes the script and the description of the observer as
+      two files. It does not run the script against the real source.
+    initial: true
+    action:
+      type: agent
+      prompt:
+        - |
+          Write the script of a Narsor observer, and a description of that observer.
+
+          Observer name: {{ inputs.name }}
+          Source: {{ inputs.source }}
+          What the observer must do:
+
+          {{ inputs.goal }}
+
+          First read `docs/user/observers.md` (the script contract, the limits, the secrets, the watch entries) and the example scripts in `workflows/observers/examples/`. Start from the example that is nearest to the source. When these files are not in the repository, follow the contract below and say so in the description.
+
+          The contract, in brief:
+          - The script is POSIX `sh`. It may use `curl`, `jq` and `narsor-cli`; nothing else that is not in a base system.
+          - It reads one JSON document on stdin: `contract_version`, `observer` (`id`, `name`, `source`), `condition` (the owner's JSON object), `state` (what the last successful run printed, `null` before the first), `watches` (`object`, `task_id`, `event_types`, `wait_episode`), `dry_run`, `first_run`, `import_backlog`.
+          - It prints exactly one JSON document on stdout and nothing else: `{"state": …, "closed_watches": […]}`. All other output goes to stderr, including the output of `narsor-cli`.
+          - Exit code 0 with that document saves the new state. Any other result keeps the old state, so the next run sees the same objects again.
+          - It creates a task with `narsor-cli task create --effect-key KEY --data JSON`, where the data holds only the fields the observer maps to workflow inputs; one task per key, ever. It delivers an event with `narsor-cli task event TASK_ID --type TYPE --key KEY --data JSON`, with a key that holds the `wait_episode` of the entry.
+          - On the first run without `import_backlog` it only records where to start and creates nothing.
+          - Secrets come as environment variables that the owner names (`--secret NAME=ENV`). Never print them, never put them on a command line: give them to curl with `--config -` on stdin.
+          - Before a request with a token, check the host of every watched object; refuse the whole run when one is not on the expected host.
+          - Quote every variable. Data from the source is untrusted: never run it, never use it in a path or an option without a check.
+          - Send only the fields the workflow needs. Do not send personal data (names, e-mail addresses, the reporter or assignee of an issue).
+          - Let the tests of a fake source work: when `FAKE_SOURCE_DIR` is set, read each answer from a file in that directory instead of the network, as the examples do.
+
+          Do not run the script against the real source, and do not ask for tokens. You may run it with `FAKE_SOURCE_DIR` and a stand-in `narsor-cli` on `PATH` to check it.
+
+          Write two files under `observers/{{ inputs.name }}/` in the repository:
+          - `observer.sh`: the script.
+          - `README.md`: what the observer does; the `condition` as a JSON object with each field explained; the secrets (name and variable, never a value); the effect (the workflow and each `--map INPUT=FIELD`, or `--deliver-events`) and, for watched objects, the `--allow-prefix`; the full `narsor-cli observer create` command; what a dry run should show; and the risks you see.
+
+          Return the paths of the two files as artifacts.
+        - when: artifacts.observer_script
+          text: "Revise your files rather than start over: {{ artifacts.observer_script }} and {{ artifacts.observer_description }}"
+    artifacts:
+      - name: observer_script
+        description: Repo-relative path of the observer's script.
+      - name: observer_description
+        description: Repo-relative path of the description of the observer.
+    exit:
+      description: The script and its description are written.
+      requires_artifacts: [observer_script, observer_description]
+      next: review
+
+  review:
+    description: >
+      The person reads the draft and accepts it for a dry run, or sends it
+      back to the agent with a comment. Accepting does not approve the
+      script.
+    action:
+      type: decision
+      by: human
+      message: |
+        The agent wrote the script of observer {{ inputs.name }}:
+          script:      {{ artifacts.observer_script }}
+          description: {{ artifacts.observer_description }}
+
+        Read both files in the repository of this task. Check that the script sends only the fields the workflow needs, uses its secrets only for the expected host, and prints only its result on stdout.
+
+        Choose accept to take the draft to a dry run. That does not approve it: nothing runs until the owner approves a version. Then, with the CLI:
+          narsor-cli observer create …   (the command in the description)
+          narsor-cli observer script set {{ inputs.name }} --file SCRIPT
+          narsor-cli observer dry-run {{ inputs.name }}
+          narsor-cli observer approve {{ inputs.name }} --version N   (the owner only)
+
+        Choose revise to send the draft back to the agent with your comment.
+    variables:
+      - name: comment
+        type: text
+        description: What the agent must change. Required for revise.
+    choices:
+      accept:
+        description: The draft goes to a dry run, which the owner starts with the CLI.
+        next: accepted
+      revise:
+        description: The agent revises the draft from the comment.
+        requires_variables: [comment]
+        resume_comment_field: comment
+        next: draft
+      abandon:
+        description: Stop here; no observer is made.
+        next: abandoned
+
+  accepted:
+    description: >
+      The draft is accepted for a dry run. It is not approved. The owner
+      saves it with `narsor-cli observer script set`, tries it with
+      `narsor-cli observer dry-run` and approves it with `narsor-cli observer
+      approve`.
+
+  abandoned:
+    description: The draft was abandoned.
+
+terminal_states:
+  accepted: completed
+  abandoned: cancelled
