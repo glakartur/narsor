@@ -80,6 +80,7 @@ Narsor reaguje dziś tylko na polecenia operatora. Operator ręcznie tworzy task
 - Etap 2: worker jako Kubernetes CronJob z tym samym kontraktem skryptu i tym samym API workera (osobny plan).
 - Widok obserwatorów w TUI (stan, ostatnie uruchomienie, błąd).
 - Bogatszy język filtrów kroku `wait` (wyrażenia, listy wartości).
+- Izolacja workera obserwatorów od lokalnych agentów (D19, Q19). Po D5 serwer uruchamia worker pod uid serwera. To ten sam uid co lokalni runnerzy i agenci (backend lokalny). Ryzyko: lokalny agent może czytać sekrety obserwatorów wszystkich właścicieli z katalogu sekretów oraz klucz workera (`NARSOR_OBSERVER_WORKER_KEY`) z `/proc/<pid workera>/environ`. Opcja do rozważenia: serwer uruchamia worker pod dedykowanym uid i gid (nowe ustawienie, na przykład `observer_worker_user`, przez `Command::uid/gid`); ten użytkownik jest właścicielem katalogu sekretów, a serwer odmawia startu, gdy uid workera jest równy uid serwera lub uid skryptu. W tym zadaniu bez zmiany kodu.
 - Przegląd bezpieczeństwa przez specjalistę przed wydaniem (token uruchomienia, poświadczenie workera, środowisko skryptu, maskowanie sekretów). To jest warunek wydania, nie część implementacji.
 
 ---
@@ -132,15 +133,18 @@ Narsor reaguje dziś tylko na polecenia operatora. Operator ręcznie tworzy task
 - **Brak deduplikacji na serwerze (R13, AE2, AE3, D17):** trasy skutków nie mają klucza skutku ani plików skutków i nie odpowiadają „duplikat". Każde wywołanie `task create` tworzy nowy task z losowym id. Skrypt i tak musi pamiętać w swoim stanie, co już zgłosił, aby nie tworzyć taska co uruchomienie. Ryzyko: gdy zapis stanu nie uda się po utworzeniu taska, następne uruchomienie może utworzyć duplikat; `docs/user/observers.md` opisuje to ryzyko, a przykład Jira zapisuje stan do ostatniego utworzonego taska także po odmowie.
 - **Limit tasków liczony na serwerze (R15, AE4):** licznik tasków uruchomienia jest w aktywnym uruchomieniu w `observer.json` pod blokadą obserwatora. Wywołanie ponad limit dostaje odmowę, a obserwator przechodzi w stan `needs_attention`. Wznowienie wykonuje operator.
 - **Wersje skryptu i zatwierdzenie (R11, AE6):** każdy zapis skryptu tworzy nową, niezmienną wersję. Rekord ma `approved_version`. Harmonogram uruchamia tylko `approved_version`. Plan nie ma przebiegu próbnego (D6): zatwierdzenie jest jedyną bramką przed pierwszym uruchomieniem. Zatwierdzenie to trasa właściciela (R21). Zatwierdzenie zmienia stan na `active` tylko dla obserwatora w stanie `draft`; w innych stanach stan zostaje bez zmian (wstrzymany obserwator zostaje wstrzymany).
-- **Kontrakt skryptu (odpowiedź na „[Affects R12]"):** wejście na stdin jako jeden dokument JSON (obserwator, warunek, zapamiętany stan, lista wpisów, `first_run`, `import_backlog`). Wyjście na stdout: jeden dokument JSON z polami `state` i opcjonalnym `closed_watches`. Limit rozmiaru stdout i stderr. Kod 0 + poprawny dokument → nowy stan zapisany. Każdy inny wynik → stan bez zmian (R14).
+- **Kontrakt skryptu (odpowiedź na „[Affects R12]"):** wejście na stdin jako jeden dokument JSON (obserwator, warunek, zapamiętany stan, jeden wpis obserwacji `watch` albo `null`, `first_run`, `import_backlog`). Limit rozmiaru stdout i stderr. Dwa rodzaje skryptu:
+  - Obserwator, który tworzy taski (bez listy obserwacji): wyjście na stdout to jeden dokument JSON z polem `state`. Kod 0 + poprawny dokument → nowy stan zapisany. Każdy inny wynik → stan bez zmian, błąd zapisany i liczony do backoff (R14, R16).
+  - Obserwator z listą obserwacji (D18): jedno uruchomienie sprawdza jeden wpis (single-watch). Serwer nie czyta stdout. Kod 0 → gotowe, serwer usuwa wpis. Kod 1 → wpis zostaje i jest sprawdzony ponownie w następnej rundzie. Inny kod (albo przekroczenie czasu) → błąd: serwer zapisuje błąd, zostawia wpis i sprawdza go w następnej rundzie. Nowy błąd tego samego obiektu nadpisuje stary. Błąd wpisu nie liczy się do backoff ani do stanu `error`.
+  - Runda obserwatora z listą: przebieg zapisuje w rekordzie listę wpisów rundy (`watch_round`). Każdy claim bierze następny wpis z rundy, który nadal istnieje. Obserwator zostaje należny, dopóki runda ma wpisy. Następna runda zaczyna się jeden odstęp po ostatnim uruchomieniu. Wpis dodany w czasie rundy czeka na następną rundę.
 - **Wykonawca `wait` jak bramka `human` (odpowiedź na „[Affects R4]"):** wykonawca zwraca nowy wariant `SuspendedAction::AwaitingExternalEvent`. Engine zapisuje oczekiwanie trwale (id epizodu oczekiwania, typ zdarzenia, filtr po renderowaniu szablonów, chwila startu) i raportuje istniejący status `ExecutionStatus::WaitingForEvent`. Dziś `SlotReleaseClass::of` (`crates/narsor-engine/src/orchestration/model.rs`) zwraca dla niego `None`, a `derive_task_state` mapuje go na `Running`; plan zmienia `SlotReleaseClass::of` na `Transient` (slot zwalniany jak przy czekaniu na właściciela) i mapuje status na stan taska inny niż `HumanNeeded`, aby operator nie dostał fałszywego sygnału. **Jeden zapis historii na zdarzenie:** control plane zapisuje zdarzenie zawsze, raz, jako nowy `TaskEventKind` w historii taska przy przyjęciu. Do runnera zdarzenie trafia tylko wtedy, gdy task czeka na pasujące zdarzenie; wtedy engine dopisuje `ExternalEventReceived` do logu wykonania (to jest wynik kroku, nie drugi wpis historii taska) i kończy krok z danymi zdarzenia jako wynikiem.
 - **`task event` jak wybór akcji wyjścia (D1, PO1):** dla serwera zdarzenie, na które task czeka, jest odpowiednikiem wyboru akcji wyjścia kroku przez użytkownika (bramka `human`, `submit_input`). Serwer zapisuje zdarzenie w rekordzie taska pod blokadą taska jako wejście w kolejce i wznawia task (`resume_for_work`). Gdy runner chwilowo nie działa (restart, brak mocy obliczeniowej, wstrzymany task), zdarzenie czeka na serwerze w kolejce wejść i runner pobiera je po powrocie, tak jak odpowiedź właściciela. Wejście w kolejce należy do epizodu `wait`, więc nie kończy późniejszego epizodu.
 - **Termin kroku `wait`: poza zakresem (D4, PO4).** Plan nie dodaje limitu czasu kroku `wait`, przebiegu terminów ani etykiety `timeout` dla `wait`. Zachowanie kroków workflow poza dostarczaniem zdarzeń nie jest częścią tego planu.
-- **Epizod oczekiwania w wejściu skryptu:** dla każdego wpisu obserwacji wejście skryptu zawiera id bieżącego epizodu `wait` taska-adresata (albo brak, gdy task nie czeka). Skrypt wysyła zdarzenie tylko wtedy, gdy task czeka. Przykłady PR/MR po wysłaniu zdarzenia `review.*` zgłaszają obiekt w `closed_watches`, więc wpis znika i task dostaje jedno zdarzenie na epizod (D12). Gdy task znów czeka na ten sam PR, krok `wait` dodaje wpis ponownie; znakowanie PR przed ponownym dodaniem (na przykład etykietą) jest poza zakresem i opisane w `docs/user/observers.md`.
+- **Epizod oczekiwania w wejściu skryptu:** dla każdego wpisu obserwacji wejście skryptu zawiera id bieżącego epizodu `wait` taska-adresata (albo brak, gdy task nie czeka). Skrypt wysyła zdarzenie tylko wtedy, gdy task czeka. Przykłady PR/MR kończą się kodem 0 tylko wtedy, gdy `narsor-cli task event` zgłosi, że zdarzenie `review.*` dotarło do czekającego kroku (`delivered`). Wtedy wpis znika i task dostaje jedno zdarzenie na epizod (D12, D18). Gdy serwer tylko zapisał zdarzenie w historii (`recorded`), skrypt kończy się kodem 1 i wpis zostaje, więc późniejsza akceptacja nadal dotrze do taska (Q18). Gdy task znów czeka na ten sam PR, krok `wait` dodaje wpis ponownie; znakowanie PR przed ponownym dodaniem (na przykład etykietą) jest poza zakresem i opisane w `docs/user/observers.md`.
 - **Skutek „utwórz task" związany z rekordem (R3, R11):** w trybie obserwatora `task create` przyjmuje tylko `--data` (dane skutku jako JSON). Serwer bierze workflow, repozytoria, backend i profil z rekordu obserwatora i stosuje mapowanie. Pola spoza mapowania są odrzucane. Skrypt nie może wybrać innego workflow ani backendu.
 - **Właściciel tasków z obserwatora:** rekord obserwatora zapisuje `OwnerRef` twórcy. Trasy skutków tworzą taski z tym właścicielem i sprawdzają taski zdarzeń względem niego.
 - **Dane ze źródeł są nieufne:** dane z Jira i PR/MR trafiają do tasków jako wejścia oznaczone pochodzeniem. `docs/user/observers.md` ostrzega przed wstrzyknięciem poleceń do kroków `agent` i zaleca wąskie uprawnienia agenta w workflow uruchamianych przez obserwatory.
-- **Wpis obserwacji z YAML (R8):** krok `wait` dostaje opcjonalny blok `watch` (obserwator, obiekt, typy zdarzeń). Rekord obserwatora ma wzorzec dozwolonych obiektów (na przykład prefiks URL) i limit długości obiektu; control plane odrzuca wpis spoza wzorca. To chroni token źródła przed wysłaniem na obcy host. Wpis powstaje w chwili zawieszenia kroku, idempotentnie po (task, krok, obiekt). Wpis znika, gdy skrypt zgłosi obiekt jako zamknięty (`closed_watches`), gdy task jest zakończony lub zarchiwizowany (sprawdza `observer_pass`), albo gdy operator go usunie.
+- **Wpis obserwacji z YAML (R8):** krok `wait` dostaje opcjonalny blok `watch` (obserwator, obiekt, typy zdarzeń). Rekord obserwatora ma wzorzec dozwolonych obiektów (na przykład prefiks URL) i limit długości obiektu; control plane odrzuca wpis spoza wzorca. To chroni token źródła przed wysłaniem na obcy host. Wpis powstaje w chwili zawieszenia kroku, idempotentnie po (task, krok, obiekt). Wpis znika, gdy skrypt zakończy się dla niego kodem 0 (D18), gdy task jest zakończony lub zarchiwizowany (sprawdza `observer_pass`), albo gdy operator go usunie.
 - **Nowe warianty enumów na wire:** `TaskEventKind` (zdarzenie zewnętrzne, utworzenie przez obserwator), `SuspendedAction`, `Principal`, typ wejścia runnera. Dla wariantów czytanych przez starsze klienty (TUI, CLI): `#[serde(other)] Unrecognized`. Dla wejścia runnera: wspólna aktualizacja runnera i serwera (runner jest wdrażany razem z control plane), zapisana jawnie w docs.
 - **Ślad pochodzenia (R19):** `TaskRecord` dostaje opcjonalne pole pochodzenia (nazwa obserwatora, id uruchomienia) z `#[serde(default)]`. Zdarzenie zewnętrzne w historii ma te same pola.
 - **Izolacja skryptu (R20, Z2):** worker uruchamia skrypt jako osobny użytkownik systemowy (`--script-user`). Ten użytkownik nie ma prawa odczytu klucza workera (zmienna środowiska procesu workera) ani katalogu sekretów. Worker kopiuje do katalogu uruchomienia (0700, właściciel: użytkownik skryptu) tylko sekrety z referencji tego obserwatora. Maskowanie w logach jest drugą linią obrony, nie główną kontrolą.
@@ -246,9 +250,10 @@ sequenceDiagram
     S->>E: narsor-cli task event TASK --type T --data D
     E->>T: historia taska; jeśli wait pasuje → wejście w kolejce na serwerze → runner
     T->>T: ExternalEventReceived, krok wait kończy się
-    S-->>W: stdout {state, closed_watches}, kod wyjścia
+    S-->>W: kod wyjścia (stdout {state} tylko dla tworzenia tasków)
     W->>P: wynik (zamaskowane logi)
-    P->>P: kod 0 i poprawny stan → zapisz stan; inaczej plik błędu i backoff
+    P->>P: tworzenie tasków: kod 0 i poprawny stan → zapisz stan; inaczej plik błędu i backoff
+    P->>P: wpis (D18): 0 → usuń wpis; 1 → zostaw; inny → plik błędu, wpis zostaje
 ```
 
 Stany obserwatora (kierunkowo): `draft` (brak zatwierdzonej wersji) → `active` ⇄ `paused`; `active` → `needs_attention` (limit tasków, wymaga operatora); `active` → `error` (N kolejnych błędów, wymaga operatora). Wznowienie z `needs_attention` lub `error` zeruje licznik błędów.
@@ -331,9 +336,10 @@ graph TD
 **Approach:**
 - `observer_pass(now)`: dla obserwatorów `active` z `next_run_at <= now` i bez aktywnego uruchomienia ustawia flagę należnego uruchomienia w rekordzie obserwatora. Dla rodzaju `watch_list` przy pustej liście nie tworzy uruchomienia i przesuwa `next_run_at` (R6, AE1). Usuwa wpisy, których task jest zakończony lub zarchiwizowany (R7). Wygasza aktywne uruchomienia po terminie (wykrycie w `observer.json`).
 - `observer_pass` i claim używają łagodnego listowania obserwatorów: nieczytelny rekord (uszkodzony albo z nowszą wersją) jest logowany i pomijany, a zdrowe obserwatory działają dalej. Widoki właściciela i `create()` używają ścisłego `list()` (D7).
-- Claim: pod `observer.lock` wybiera najstarsze należne uruchomienie, zapisuje aktywne uruchomienie w `observer.json` (numer, wersja skryptu, termin, skrót tokenu, licznik tasków 0) i czas claimu, i zwraca token jeden raz razem z wejściem skryptu (stan, wpisy z id epizodów `wait`). Serwer nie zapisuje wejścia na dysku (D15).
+- Claim: pod `observer.lock` wybiera najstarsze należne uruchomienie, zapisuje aktywne uruchomienie w `observer.json` (numer, wersja skryptu, termin, skrót tokenu, licznik tasków 0, sprawdzany wpis) i czas claimu, i zwraca token jeden raz razem z wejściem skryptu (stan albo jeden wpis z id epizodu `wait`, D18). Serwer nie zapisuje wejścia na dysku (D15).
 - Uruchomienie po terminie bez wyniku: powód „utracone przez workera", plik błędu, aktywne uruchomienie usunięte, stan i licznik błędów bez zmian.
-- Wynik: kod 0 + poprawne wyjście → zapis stanu, `first_run_done`, zerowanie licznika błędów, usunięcie `closed_watches`, bez pliku. Inaczej plik błędu, stan bez zmian, licznik +1, `next_run_at` = odstęp × 2^n (maksimum 1 h); po N błędach stan `error` (R16).
+- Wynik obserwatora, który tworzy taski: kod 0 + poprawne wyjście → zapis stanu, `first_run_done`, zerowanie licznika błędów, bez pliku. Inaczej plik błędu, stan bez zmian, licznik +1, `next_run_at` = odstęp × 2^n (maksimum 1 h); po N błędach stan `error` (R16).
+- Wynik uruchomienia wpisu (D18): kod 0 → wpis usunięty; kod 1 → wpis zostaje; inny wynik → plik błędu z obiektem wpisu (nadpisuje starszy błąd tego obiektu), wpis zostaje. Bez backoff i bez licznika błędów.
 - Zatwierdzenie wersji ustawia `approved_version`; stan `active` ustawia tylko dla obserwatora w stanie `draft`. Zmiana skryptu nie zmienia `approved_version` (AE6).
 - Restart: `next_run_at` w przeszłości daje jedno należne uruchomienie, nie wiele.
 - Czas jako parametr przebiegu (`ManualClock` w testach).
@@ -357,7 +363,10 @@ graph TD
 - Edge case: zatwierdzenie wersji 2 dla obserwatora `paused` → obserwator zostaje `paused`.
 - Happy path: wejście claimu zawiera id bieżącego epizodu `wait` taska-adresata wpisu.
 - Error path: poprawny kod, ale wyjście nie jest JSON → stan bez zmian (R14).
-- Happy path: `closed_watches` w wyniku → wpisy usunięte (R7).
+- Happy path: runda sprawdza każdy wpis w osobnym uruchomieniu, po kolei, z epizodem `wait` jego taska (D18).
+- Happy path: kod 0 → wpis usunięty; kod 1 → wpis zostaje (R7, D18).
+- Error path: kod 3 → plik błędu z obiektem, wpis zostaje, licznik błędów 0; nowy błąd tego obiektu w następnej rundzie nadpisuje stary (D18).
+- Edge case: wpis rundy usunięty przed claimem → claim go pomija.
 - Integration: task-adresat wpisu zarchiwizowany → przebieg usuwa wpis.
 
 **Verification:** Przebieg jest tani, gdy nic nie jest należne (tylko odczyt terminów), i nie dubluje uruchomień po restarcie.
@@ -459,11 +468,11 @@ graph TD
 **Approach:**
 - `watch`: nazwa obserwatora, obiekt (tekst z szablonem, na przykład URL MR), typy zdarzeń. Walidator: obserwator nazwany jawnie; typy zdarzeń zawierają typ `wait.event_type`. Control plane sprawdza obiekt po renderowaniu względem wzorca dozwolonych obiektów i limitu długości obserwatora.
 - Raport oczekiwania z U4 niesie wpis; control plane tworzy wpis idempotentnie po (task, krok, obiekt). Nieistniejący obserwator → ostrzeżenie w historii taska, krok dalej czeka (operator może dodać wpis ręcznie).
-- Zakończenie wpisu: U2 (task zakończony, `closed_watches`), U7 (operator).
+- Zakończenie wpisu: U2 (task zakończony, kod 0 skryptu dla wpisu, D18), U7 (operator).
 
 **Test scenarios:**
 - Happy path: krok `wait` z `watch` zawiesza się → jeden wpis z task id, obiektem i typami.
-- Covers AE5 (część końca). Skrypt zwraca `closed_watches` dla MR 17 po scaleniu → wpis usunięty.
+- Covers AE5 (część końca). Skrypt kończy się kodem 0 dla MR 17 po scaleniu → wpis usunięty (D18).
 - Edge case: krok `wait` wykonany drugi raz (pętla review) → nadal jeden wpis.
 - Error path: YAML z `watch` bez nazwy obserwatora → błąd walidacji.
 - Error path: obserwator z `watch` nie istnieje → ostrzeżenie w historii, task czeka.
@@ -564,12 +573,12 @@ graph TD
 **Approach:**
 - Przykłady używają `curl` i `jq`, kontraktu z U1 i `narsor-cli`. Przykład Jira przy `first_run` bez `import_backlog` zapisuje tylko punkt startowy (Z10) i przenosi tylko pola z mapowania; komentarz o danych osobowych (Z8).
 - Brak workflow autorskiego (D11): użytkownik pisze skrypt z pomocą agenta poza Narsorem, na podstawie przykładów i `docs/user/observers.md`. Kroki CLI dla operatora: `observer script set`, `observer approve`.
-- Przykłady cytują zmienne i sprawdzają host obiektu przed użyciem tokenu źródła. Przykłady PR/MR wysyłają zdarzenie tylko do czekającego taska i po wysłaniu `review.*` zgłaszają obiekt w `closed_watches` (D12). Przykład Jira przy odmowie `task create` przerywa tworzenie i zapisuje stan do ostatniego utworzonego taska.
+- Przykłady cytują zmienne i sprawdzają host obiektu przed użyciem tokenu źródła. Przykłady PR/MR sprawdzają jeden wpis na uruchomienie i wysyłają zdarzenie tylko do czekającego taska. Kod 0: zdarzenie `review.*` dotarło do czekającego kroku, PR/MR scalony lub zamknięty, obiekt spoza hosta albo niedostępny. Kod 1: brak decyzji, task nie czeka albo zdarzenie tylko zapisane. Kod 2: błąd (D12, D18). Przykład Jira przy odmowie `task create` przerywa tworzenie i zapisuje stan do ostatniego utworzonego taska.
 - `docs/user/observers.md`: kontrakt skryptu, stany, limity, zatwierdzenie, wpisy, sekrety, worker etapu 1, ograniczenie do zaufanych skryptów, ryzyko duplikatu taska przy nieudanym zapisie stanu (D17), znakowanie PR przed ponownym dodaniem do obserwacji jako zadanie poza Narsorem (D12), błędy wykonania w `observer show` (D15).
 
 **Test scenarios:**
 - Integration (`#[ignore]`): każdy przykład z fałszywym źródłem (lokalny plik odpowiedzi) daje poprawny wynik kontraktu.
-- Integration (`#[ignore]`): przykład PR/MR po wysłaniu `review.*` zgłasza obiekt w `closed_watches`; przykład Jira przy odmowie zapisuje stan do ostatniego utworzonego taska.
+- Integration (`#[ignore]`): przykład PR/MR kończy się kodem 0 po zdarzeniu `delivered`, kodem 1 po zdarzeniu `recorded` albo bez decyzji, kodem 2 przy błędzie źródła lub odmowie zdarzenia (D18); przykład Jira przy odmowie zapisuje stan do ostatniego utworzonego taska.
 
 **Verification:** Twórca automatyzacji tworzy obserwator Jira z przykładu bez czytania kodu Narsora.
 
