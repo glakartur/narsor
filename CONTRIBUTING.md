@@ -30,9 +30,14 @@ them with `-- --ignored` or `--include-ignored`.
 
 Start with [`docs/dev/architecture.md`](docs/dev/architecture.md), then the
 [domain model](docs/dev/domain-model.md) and the
-[workflow schema](docs/dev/workflow-schema.md). Plans, brainstorms and
-solution notes under `docs/` are Polish working artifacts and are kept as
-history.
+[workflow schema](docs/dev/workflow-schema.md).
+
+## Language
+
+Write everything in this repository in English: code, comments,
+documentation, commit messages and PR descriptions. Older plans, brainstorms
+and solution notes under `docs/` are in Polish; they are kept as history and
+are not translated. New documents and edits are in English.
 
 ## Release checklist
 
