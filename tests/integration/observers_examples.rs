@@ -254,6 +254,42 @@ fn jira_stops_at_a_task_not_created_and_keeps_the_state_of_the_tasks_before_it()
     assert!(run.stderr.contains("ABC-102"), "{}", run.stderr);
 }
 
+/// A run in which no task is created fails: the error is recorded and
+/// counted, so a refusal that does not go away brings the observer to
+/// `error`, not to the same issue on every run with no trace.
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn jira_fails_the_run_when_no_task_is_created() {
+    let sandbox = Sandbox::new();
+    sandbox.answer(
+        "search",
+        &json!({"issues": [
+            jira_issue(101, "ABC-101"),
+            jira_issue(102, "ABC-102"),
+        ]}),
+    );
+    sandbox.fail_from(1);
+
+    let run = sandbox.run(
+        "jira-new-issues.sh",
+        &input("jira", jira_condition(), json!({"last_id": 100}), json!([])),
+    );
+
+    assert_eq!(run.code, Some(1), "stderr: {}", run.stderr);
+    assert!(run.stdout.is_empty(), "no state: {:?}", run.stdout);
+    assert_eq!(
+        run.calls.len(),
+        1,
+        "no create after the refused one: {:?}",
+        run.calls
+    );
+    assert!(
+        run.stderr.contains("the task of ABC-101 was not created"),
+        "{}",
+        run.stderr
+    );
+}
+
 #[test]
 #[ignore = "runs the example scripts with a real sh and jq"]
 fn jira_keeps_the_old_state_when_the_answer_is_not_a_list_of_issues() {

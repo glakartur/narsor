@@ -181,6 +181,9 @@ that it does not create a task on each run.
 > from the old state and can create the same task again. Keep the window
 > small: when a task is not created, stop creating tasks and still print
 > the state up to the last task you created, as `jira-new-issues.sh` does.
+> When the run created no task at all, exit with an error instead: the
+> error is then recorded and counted, and a refusal that does not go away
+> brings the observer to `error` and `needs_attention`.
 
 ### Limits
 

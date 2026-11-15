@@ -44,11 +44,16 @@
 #    each matching issue with an id above last_id, oldest first, at most
 #    max_results per run; the next run continues from there.
 # Narsor does not stop a second task for the same issue: the state does.
-# When a task is not created, the script stops creating tasks, logs the
-# reason on stderr and still prints the state up to the last task it
-# created, so the next run continues from there and repeats no task. Only
-# when the state of a successful run is not saved can an issue get a second
-# task (docs/user/observers.md).
+# When a task is not created, the script stops creating tasks and logs the
+# reason on stderr. When the run created a task before that, it prints the
+# state up to the last task it created and exits 0, so the next run
+# continues from there and repeats no task. When the run created no task,
+# it exits 1: Narsor records the error, the observer counts it, and a
+# refusal that does not go away (an unmapped field, a limit, a policy)
+# brings the observer to error and then needs_attention instead of
+# repeating the same issue for ever. The run created nothing, so its
+# failure gives no second task. Only when the state of a successful run is
+# not saved can an issue get a second task (docs/user/observers.md).
 #
 # Tests: when FAKE_SOURCE_DIR is set, the script reads the answer of Jira
 # from "$FAKE_SOURCE_DIR/search.json" and does not use the network.
@@ -176,18 +181,25 @@ issues=$(printf '%s' "$response" | jq -c \
       } | with_entries(select(.key as $name | $fields | index([$name]) != null)))}')
 
 newest=$last_id
+refused=
 while IFS= read -r issue; do
     [ -n "$issue" ] || continue
     key=$(printf '%s' "$issue" | jq -r '.key')
     data=$(printf '%s' "$issue" | jq -c '.data')
     # stdout is the result document: the messages of narsor-cli go to stderr.
     if ! narsor-cli task create --data "$data" </dev/null >&2; then
-        printf '%s: the task of %s was not created; the next run tries again\n' "$me" "$key" >&2
+        refused=$key
         break
     fi
     newest=$(printf '%s' "$issue" | jq -r '.id')
 done <<EOF
 $issues
 EOF
+
+if [ -n "$refused" ]; then
+    # No task in this run: fail, so the error is recorded and counted.
+    [ "$newest" != "$last_id" ] || fail "the task of $refused was not created"
+    printf '%s: the task of %s was not created; the next run tries again\n' "$me" "$refused" >&2
+fi
 
 jq -n -c --argjson last_id "$newest" '{state: {last_id: $last_id}}'
