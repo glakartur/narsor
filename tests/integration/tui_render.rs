@@ -2820,7 +2820,7 @@ mod task_app_detail_render {
             rows[WORKSPACE_ROW]
         );
         assert!(
-            rows[USAGE_ROW].contains("razem $1.20 · ✨ $1.20 ↑120k ↓8k (◈ 2 ↑40k ↓3k)"),
+            rows[USAGE_ROW].contains("razem $1.20 · ✨ $1.20 ↑120k ↓8k (👥 2 ↑40k ↓3k)"),
             "{}",
             rows[USAGE_ROW]
         );
@@ -2842,7 +2842,7 @@ mod task_app_detail_render {
     fn a_narrow_header_drops_the_subagents_part_first() {
         let mut app = running_app_with_usage(vec![reported(120_000, 8_000, (40_000, 3_000), 1.2)]);
         let wide = rows(&render_at(&mut app, &Styles::new(false), 120, 30));
-        assert!(wide[USAGE_ROW].contains("(◈ 1 ↑40k ↓3k)"));
+        assert!(wide[USAGE_ROW].contains("(👥 1 ↑40k ↓3k)"));
 
         // 60 columns leave 56 cells for the line: this one needs 57 with the
         // subagents and 41 without them.
@@ -2854,7 +2854,7 @@ mod task_app_detail_render {
         )]);
         let wide = rows(&render_at(&mut app, &Styles::new(false), 120, 30));
         assert!(
-            wide[USAGE_ROW].contains("(◈ 1 ↑40M ↓30M)"),
+            wide[USAGE_ROW].contains("(👥 1 ↑40M ↓30M)"),
             "{}",
             wide[USAGE_ROW]
         );
@@ -2864,7 +2864,7 @@ mod task_app_detail_render {
             row.contains("razem $123456.50 · ✨ $123456.50 ↑120M ↓80M"),
             "{row}"
         );
-        assert!(!row.contains('◈'), "{row}");
+        assert!(!row.contains("👥"), "{row}");
     }
 
     #[test]
@@ -2879,7 +2879,7 @@ mod task_app_detail_render {
         let row = &rows[USAGE_ROW];
         assert!(row.contains("razem $1000000000000000.00"), "{row}");
         assert!(
-            row.contains('…') && !row.contains('◈') && !row.contains('—'),
+            row.contains('…') && !row.contains("👥") && !row.contains('—'),
             "{row}"
         );
     }
@@ -3055,7 +3055,7 @@ mod task_app_detail_render {
         };
         let step0 = row(&wide, "$0.42");
         assert!(
-            wide[step0].contains("1×   ↑40k   ↓3k"),
+            wide[step0].contains("👥 1   ↑40k   ↓3k"),
             "{}",
             wide.join("\n")
         );
@@ -3067,7 +3067,7 @@ mod task_app_detail_render {
         let narrow = rows(&render_at(&mut app, &Styles::new(false), 62, 30));
         let step0 = row(&narrow, "$0.42");
         assert!(narrow[step0].contains("↑120k"), "{}", narrow.join("\n"));
-        assert!(!narrow[row(&narrow, "$0.03")].contains('×'));
+        assert!(!narrow[row(&narrow, "$0.03")].contains('👥'));
     }
 
     fn app_with_steps(steps: &[(&str, &str, Option<&str>)]) -> TaskApp {

@@ -1014,7 +1014,7 @@ mod tests {
     fn values_of_a_kind_stand_in_one_column() {
         let axis = layout(&sample(), 200);
         let rows: Vec<String> = axis.rows.iter().map(|rows| text(&rows[0])).collect();
-        assert!(rows[0].contains("2×   ↑40k   ↓3k"), "{}", rows[0]);
+        assert!(rows[0].contains("👥 2   ↑40k   ↓3k"), "{}", rows[0]);
         for (a, b) in [("$0.42", "$0.03"), ("↑120k", "↑2.1k"), ("↓8k", "↓400")] {
             assert_eq!(column_of(&rows[0], a), column_of(&rows[1], b), "{rows:?}");
         }
@@ -1236,7 +1236,7 @@ mod tests {
         let axis = layout(&steps, 200);
         assert_eq!(axis.rows[0].len(), 1);
         let first = text(&axis.rows[0][0]);
-        assert!(first.contains("3×") && first.contains("↕45k"), "{first}");
+        assert!(first.contains("👥 3") && first.contains("↕45k"), "{first}");
         assert!(!first.contains("✗") && !first.contains("sub 3"), "{first}");
     }
 
