@@ -386,8 +386,9 @@ $ narsor-cli run pipeline.yaml --input repository=/srv/git/other   # raw remote
 
 Observers poll an external source (Jira, GitHub, GitLab) on a schedule with a
 shell script, and create tasks or deliver events to waiting tasks. The control
-plane keeps the schedule; `narsor-cli observer worker` runs the scripts (see
-[installation](../operations/installation.md)). How to write an observer and
+plane keeps the schedule; `narsor-cli observer worker`, which the server
+starts when its configuration enables it, runs the scripts (see
+[installation](../operations/installation.md#run-the-observer-worker)). How to write an observer and
 its script is in [Observers](observers.md). Every command below is the
 owner's: in network mode a user who is not the installation's owner gets
 `403`, and another owner's observer is not found. An observer is named by its
@@ -404,7 +405,6 @@ name or its id.
 | `observer delete OBSERVER` | Deletes the observer with its scripts, run errors and watch entries. The tasks it created stay. |
 | `observer watch add OBSERVER --task TASK_ID --object URL --events TYPE[,TYPE…]` | Watches a PR/MR for one of your tasks. The object must start with one of the observer's `--allow-prefix` values. |
 | `observer watch list OBSERVER`, `observer watch remove OBSERVER ENTRY` | Lists the watch entries; removes one by its id or the start of it that `list` shows. |
-| `observer worker-token create\|list\|revoke` | The credential of the worker (see [installation](../operations/installation.md)). |
 
 Options of `observer create`:
 
@@ -417,7 +417,7 @@ Options of `observer create`:
 | `--watch-list`, `--allow-prefix PREFIX`, `--max-object-len N` | Look only at the objects of the watch entries; which objects an entry may name. A URL prefix must end with the `/` after its host. |
 | `--interval SECONDS` | Time between runs (at least 60). |
 | `--condition JSON` | Parameters handed to the script as they are (a JSON object). |
-| `--secret NAME=ENV` | A file of the worker's secrets directory handed to the script as variable `ENV` (repeatable). |
+| `--secret NAME=ENV` | The file `NAME` in your subdirectory of the worker's secrets directory, handed to the script as variable `ENV` (repeatable). |
 | `--task-limit N` | Most tasks one run may create. Past it the observer goes to `needs_attention`. |
 | `--import-backlog` | The first run imports what already matches the condition instead of only remembering where to start. |
 

@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use narsor::api::ClientError;
 use narsor::cli::observer_worker::{
-    check_credential_file, check_secrets_dir, current_uid, kill_all_processes_of, processes_of,
+    check_secrets_dir, current_uid, kill_all_processes_of, owner_secrets_dir_name, processes_of,
     Masker, ProcessRunner, ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, ScriptUser, Worker,
     WorkerApi, WorkerOptions, WorkerStop, MASK, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, SCRIPT_FILE,
 };
@@ -34,7 +34,8 @@ use narsor_engine::observers::{
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
 use narsor_engine::persistence::StatePaths;
 use narsor_protocol::controller::{
-    ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse, ObserverWorkerRun,
+    ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse, ObserverSecretRef,
+    ObserverWorkerRun, OBSERVER_WORKER_KEY_ENV,
 };
 use serde_json::json;
 
@@ -84,13 +85,20 @@ impl Fixture {
         self.root.join("state")
     }
 
-    /// A secrets directory (0700) holding `files`.
+    /// A secrets directory (0700) holding `files` in the subdirectory of
+    /// the observers' owner.
     fn secrets_dir(&self, files: &[(&str, &str)]) -> PathBuf {
+        self.secrets_dir_of(owner().0.as_str(), files)
+    }
+
+    /// A secrets directory (0700) holding `files` in the subdirectory
+    /// `owner_dir`.
+    fn secrets_dir_of(&self, owner_dir: &str, files: &[(&str, &str)]) -> PathBuf {
         let dir = self.root.join("secrets");
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join(owner_dir)).unwrap();
         set_mode(&dir, 0o700);
         for (name, value) in files {
-            fs::write(dir.join(name), format!("{value}\n")).unwrap();
+            fs::write(dir.join(owner_dir).join(name), format!("{value}\n")).unwrap();
         }
         dir
     }
@@ -150,7 +158,6 @@ impl Fixture {
     fn api(&self) -> Arc<ServiceApi> {
         Arc::new(ServiceApi {
             service: Arc::clone(&self.service),
-            owner: owner(),
         })
     }
 
@@ -205,10 +212,9 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 /// The worker's control plane, without HTTP: the service's own claim and
-/// result for the worker's owner, as the worker routes call them.
+/// result, as the worker routes call them.
 struct ServiceApi {
     service: Arc<ProtocolService>,
-    owner: OwnerRef,
 }
 
 fn client_error(error: ProtocolError) -> ClientError {
@@ -224,7 +230,7 @@ impl WorkerApi for ServiceApi {
     fn claim(&self) -> BoxFuture<'_, Result<Option<ObserverWorkerRun>, ClientError>> {
         let claimed = self
             .service
-            .claim_observer_run_for(&self.owner)
+            .claim_observer_run()
             .map(|claimed| claimed.map(|claimed| claimed.into_wire()))
             .map_err(client_error);
         Box::pin(async move { claimed })
@@ -237,7 +243,7 @@ impl WorkerApi for ServiceApi {
     ) -> BoxFuture<'a, Result<ObserverRunResultResponse, ClientError>> {
         let result = self
             .service
-            .finish_observer_run_for(&self.owner, &RunId::parse(run_id).unwrap(), report.clone())
+            .finish_observer_run(&RunId::parse(run_id).unwrap(), report.clone())
             .map(|run| ObserverRunResultResponse {
                 run_id: run_id.to_string(),
                 status: serde_json::to_value(run.status)
@@ -252,7 +258,7 @@ impl WorkerApi for ServiceApi {
     }
 }
 
-/// A control plane that refuses the worker's credential.
+/// A control plane that refuses the worker's key.
 struct RefusingApi;
 
 impl WorkerApi for RefusingApi {
@@ -788,11 +794,11 @@ async fn a_background_process_holding_stdout_past_the_limit_ends_with_it() {
 }
 
 // ---------------------------------------------------------------------------
-// The credential
+// The worker key
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_refused_credential_stops_the_worker() {
+async fn a_refused_key_stops_the_worker() {
     let fx = Fixture::new();
     let worker = Worker::new(RefusingApi, FakeRunner::exiting(0, "", ""), fx.options());
 
@@ -803,56 +809,132 @@ async fn a_refused_credential_stops_the_worker() {
     assert!(matches!(stopped, Err(WorkerStop::CredentialRefused(_))));
 }
 
-#[test]
-fn a_revoked_worker_credential_no_longer_authenticates() {
+/// The name of this test, as the test harness filters it.
+const KEY_TEST: &str = "observers_worker::the_worker_key_never_reaches_a_real_script";
+
+#[tokio::test]
+async fn the_worker_key_never_reaches_a_real_script() {
+    let Ok(key) = std::env::var(OBSERVER_WORKER_KEY_ENV) else {
+        // Run this test again in a process that holds a key, as the worker
+        // the server starts does. Not `set_var`: tests share the process.
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([KEY_TEST, "--exact", "--test-threads=1"])
+            .env(OBSERVER_WORKER_KEY_ENV, format!("nsw.server.{SENTINEL}"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(child.status.success(), "{stdout}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        return;
+    };
     let fx = Fixture::new();
-    let created = fx
-        .service
-        .create_observer_worker(&owner(), Default::default())
-        .unwrap();
-    let identity = fx
-        .service
-        .authenticate_observer_worker(&created.credential)
-        .unwrap();
-    assert_eq!(identity.owner, owner());
+    fx.observer("env >&2\nprintf '{\"state\": {}}'\n", &[]);
+    let worker = Worker::new(fx.api(), ProcessRunner, fx.options());
 
-    fx.service
-        .revoke_observer_worker(&owner(), &created.worker.worker_id)
-        .unwrap();
+    let handled = worker.run_once().await.unwrap().unwrap();
 
-    assert!(fx
-        .service
-        .authenticate_observer_worker(&created.credential)
-        .is_none());
-    // Another owner cannot revoke or see it.
-    assert!(fx
-        .service
-        .revoke_observer_worker(&OwnerRef::new("other"), &created.worker.worker_id)
-        .is_err());
-    assert!(fx
-        .service
-        .observer_workers(&OwnerRef::new("other"))
-        .unwrap()
-        .workers
-        .is_empty());
+    let printed = &handled.report.stderr;
+    assert!(printed.contains("NARSOR_TOKEN="), "{printed}");
+    assert!(!printed.contains(OBSERVER_WORKER_KEY_ENV), "{printed}");
+    assert!(!printed.contains(&key), "{printed}");
+    assert!(!printed.contains(SENTINEL), "{printed}");
 }
 
 #[test]
-fn the_worker_refuses_a_credential_file_or_secrets_directory_open_to_others() {
+fn the_worker_refuses_a_secrets_directory_open_to_others() {
     let fx = Fixture::new();
-    let credential = fx.root.join("credential");
-    fs::write(&credential, "nsw.wkr-1.secret\n").unwrap();
-    set_mode(&credential, 0o644);
     let secrets = fx.secrets_dir(&[]);
     set_mode(&secrets, 0o755);
 
-    assert!(check_credential_file(&credential).is_err());
     assert!(check_secrets_dir(&secrets).is_err());
 
-    set_mode(&credential, 0o600);
     set_mode(&secrets, 0o700);
-    assert!(check_credential_file(&credential).is_ok());
     assert!(check_secrets_dir(&secrets).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Secrets of many owners
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_secret_is_read_from_the_subdirectory_of_the_observers_owner_only() {
+    let fx = Fixture::new();
+    // The same name at the top and under another owner: neither is used.
+    let secrets = fx.secrets_dir_of("someone-else", &[("jira-token", "not-yours")]);
+    fs::write(secrets.join("jira-token"), "shared\n").unwrap();
+    fx.observer("true\n", &[("jira-token", "JIRA_TOKEN")]);
+    let runner = FakeRunner::exiting(0, r#"{"state": {}}"#, "");
+    let mut options = fx.options();
+    options.secrets_dir = Some(secrets);
+    let worker = Worker::new(fx.api(), Arc::clone(&runner), options);
+
+    let missing = worker.run_once().await.unwrap().unwrap();
+
+    assert!(runner.specs().is_empty(), "the script must not start");
+    let ObserverRunOutcome::WorkerError { message } = &missing.report.outcome else {
+        panic!("{:?}", missing.report.outcome);
+    };
+    assert!(message.contains("'owner'"), "{message}");
+    assert!(!message.contains("not-yours") && !message.contains("shared"));
+    // The owner's own file is what the script gets: see
+    // `the_script_gets_the_explicit_list_and_nothing_else`.
+}
+
+/// A claim of a run of `owner` that needs one secret.
+fn run_of(owner: &str) -> ObserverWorkerRun {
+    ObserverWorkerRun {
+        run_id: "obs-1.1".into(),
+        owner: owner.into(),
+        token: "nso.obs-1.1.secret".into(),
+        script_version: 1,
+        script: "true\n".into(),
+        input: json!({}),
+        secrets: vec![ObserverSecretRef {
+            name: "jira-token".into(),
+            env: "JIRA_TOKEN".into(),
+        }],
+        timeout_secs: 60,
+        deadline: Utc::now() + chrono::Duration::seconds(120),
+    }
+}
+
+#[tokio::test]
+async fn an_owner_that_is_no_safe_directory_name_fails_the_run_before_the_script() {
+    let fx = Fixture::new();
+    // A file at the top, where `..` or an empty owner would lead.
+    let secrets = fx.secrets_dir(&[]);
+    fs::write(secrets.join("jira-token"), format!("{SENTINEL}\n")).unwrap();
+    let runner = FakeRunner::exiting(0, r#"{"state": {}}"#, "");
+    let mut options = fx.options();
+    options.secrets_dir = Some(secrets);
+    let worker = Worker::new(fx.api(), Arc::clone(&runner), options);
+
+    for owner in ["", ".", "..", "evil\u{1b}[2J", "nul\0byte"] {
+        let report = worker.execute(&run_of(owner)).await;
+
+        let ObserverRunOutcome::WorkerError { message } = &report.outcome else {
+            panic!("{owner:?}: {:?}", report.outcome);
+        };
+        assert!(message.contains("owner"), "{owner:?}: {message}");
+        assert!(!message.contains(SENTINEL));
+    }
+    assert!(runner.specs().is_empty(), "no script may start");
+}
+
+#[test]
+fn an_oidc_owner_is_one_directory_name() {
+    assert_eq!(owner_secrets_dir_name("local").unwrap(), "local");
+    assert_eq!(
+        owner_secrets_dir_name("oidc:https://login.example.com/realms/a#user-1").unwrap(),
+        "oidc:https:%2F%2Flogin.example.com%2Frealms%2Fa#user-1"
+    );
+    // `%` is spelled out too, so two owners never share a directory.
+    assert_ne!(
+        owner_secrets_dir_name("a%2Fb").unwrap(),
+        owner_secrets_dir_name("a/b").unwrap()
+    );
+    assert!(owner_secrets_dir_name("..").is_err());
+    assert!(owner_secrets_dir_name(&"x".repeat(256)).is_err());
 }
 
 #[test]
@@ -866,24 +948,23 @@ fn root_is_never_the_script_user() {
 /// `sudo NARSOR_TEST_SCRIPT_USER=nobody cargo test -- --ignored script_user`.
 #[tokio::test]
 #[ignore = "needs root and a second system user (NARSOR_TEST_SCRIPT_USER)"]
-async fn a_script_user_cannot_read_the_worker_credential_or_secrets() {
+async fn a_script_user_cannot_read_the_worker_environment_or_secrets() {
     let name = std::env::var("NARSOR_TEST_SCRIPT_USER").expect("NARSOR_TEST_SCRIPT_USER");
     let user = ScriptUser::lookup(&name).unwrap();
     let fx = Fixture::new();
     set_mode(&fx.root, 0o711);
     set_mode(&fx.root.join("work"), 0o711);
     let secrets = fx.secrets_dir(&[("jira-token", SENTINEL)]);
-    let credential = fx.root.join("credential");
-    fs::write(&credential, "nsw.wkr-1.secret\n").unwrap();
-    set_mode(&credential, 0o600);
+    // The worker's environment holds its key; here the worker is this
+    // process.
     let script = format!(
         "id -u\n\
-         cat {credential} && echo READ-CREDENTIAL\n\
+         cat /proc/{worker}/environ && echo READ-WORKER-ENV\n\
          ls {secrets} && echo LISTED-SECRETS\n\
-         cat {secrets}/jira-token && echo READ-SECRET\n\
+         cat {secrets}/owner/jira-token && echo READ-SECRET\n\
          touch \"$HOME/left-behind\"\n\
          printf '{{\"state\": {{}}}}' >&2\n",
-        credential = credential.display(),
+        worker = std::process::id(),
         secrets = secrets.display()
     );
     fx.observer(&script, &[]);
@@ -896,7 +977,7 @@ async fn a_script_user_cannot_read_the_worker_credential_or_secrets() {
 
     let output = format!("{}{}", handled.report.stdout, handled.report.stderr);
     assert!(output.starts_with(&user.uid.to_string()), "{output}");
-    assert!(!output.contains("READ-CREDENTIAL"), "{output}");
+    assert!(!output.contains("READ-WORKER-ENV"), "{output}");
     assert!(!output.contains("LISTED-SECRETS"), "{output}");
     assert!(!output.contains("READ-SECRET"), "{output}");
     assert!(!output.contains(SENTINEL));

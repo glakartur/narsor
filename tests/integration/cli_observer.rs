@@ -20,8 +20,7 @@ use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use futures::future::BoxFuture;
 use narsor::api::ClientError;
-use narsor::cli::observer::ObserverCommand;
-use narsor::cli::observer::{operate, worker_token, ObserverApi, WorkerTokenApi};
+use narsor::cli::observer::{operate, ObserverApi};
 use narsor::cli::observer_effect::{effect_call, perform, EffectApi};
 use narsor::cli::observer_text::{effect_output, observer_list_output};
 use narsor::cli::observer_worker::{
@@ -38,11 +37,10 @@ use narsor_engine::orchestration::{Clock, ControlPlane, NewTask, OwnerRef, TaskE
 use narsor_engine::persistence::StatePaths;
 use narsor_protocol::controller::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
-    CreateObserverWorkerRequest, ObserverCreateTaskRequest, ObserverDetailView,
-    ObserverEffectOutcome, ObserverEffectResponse, ObserverEventRequest, ObserverListResponse,
-    ObserverRunReport, ObserverRunResultResponse, ObserverScriptView, ObserverView,
-    ObserverWatchListResponse, ObserverWatchView, ObserverWorkerCreated,
-    ObserverWorkerListResponse, ObserverWorkerRun, ObserverWorkerView, SetObserverScriptRequest,
+    ObserverCreateTaskRequest, ObserverDetailView, ObserverEffectOutcome, ObserverEffectResponse,
+    ObserverEventRequest, ObserverListResponse, ObserverRunReport, ObserverRunResultResponse,
+    ObserverScriptView, ObserverView, ObserverWatchListResponse, ObserverWatchView,
+    ObserverWorkerRun, SetObserverScriptRequest,
 };
 use serde_json::json;
 
@@ -130,22 +128,6 @@ impl Fixture {
         };
         let clock = Arc::clone(&self.clock);
         operate(&self.api(), command, None, move || clock.now())
-            .await
-            .map_err(|error| (error.exit_code, error.message))
-    }
-
-    /// Runs `narsor-cli observer worker-token ARGS…` as the owner.
-    async fn worker_token(&self, args: &[&str]) -> Result<String, (i32, String)> {
-        let mut argv = vec!["narsor-cli", "observer", "worker-token"];
-        argv.extend_from_slice(args);
-        let Command::Observer {
-            command: ObserverCommand::WorkerToken { command },
-        } = Cli::try_parse_from(argv).expect("arguments parse").command
-        else {
-            panic!("not a worker-token command");
-        };
-        let clock = Arc::clone(&self.clock);
-        worker_token(&self.api(), command, move || clock.now())
             .await
             .map_err(|error| (error.exit_code, error.message))
     }
@@ -248,29 +230,6 @@ fn ready<'a, T: Send + 'a>(
     Box::pin(std::future::ready(result.map_err(client_error)))
 }
 
-impl WorkerTokenApi for ServiceApi {
-    fn create_observer_worker<'a>(
-        &'a self,
-        request: &'a CreateObserverWorkerRequest,
-    ) -> BoxFuture<'a, Result<ObserverWorkerCreated, ClientError>> {
-        ready(
-            self.service
-                .create_observer_worker(&self.owner, request.clone()),
-        )
-    }
-
-    fn observer_workers(&self) -> BoxFuture<'_, Result<ObserverWorkerListResponse, ClientError>> {
-        ready(self.service.observer_workers(&self.owner))
-    }
-
-    fn revoke_observer_worker<'a>(
-        &'a self,
-        worker_id: &'a str,
-    ) -> BoxFuture<'a, Result<ObserverWorkerView, ClientError>> {
-        ready(self.service.revoke_observer_worker(&self.owner, worker_id))
-    }
-}
-
 impl ObserverApi for ServiceApi {
     fn observers(&self) -> BoxFuture<'_, Result<ObserverListResponse, ClientError>> {
         ready(self.service.observers_of(&self.owner))
@@ -368,7 +327,7 @@ impl WorkerApi for ServiceApi {
     fn claim(&self) -> BoxFuture<'_, Result<Option<ObserverWorkerRun>, ClientError>> {
         ready(
             self.service
-                .claim_observer_run_for(&self.owner)
+                .claim_observer_run()
                 .map(|claimed| claimed.map(|claimed| claimed.into_wire())),
         )
     }
@@ -380,10 +339,7 @@ impl WorkerApi for ServiceApi {
     ) -> BoxFuture<'a, Result<ObserverRunResultResponse, ClientError>> {
         let result = RunId::parse(run_id)
             .map_err(|_| ProtocolError::NotFound)
-            .and_then(|run_id| {
-                self.service
-                    .finish_observer_run_for(&self.owner, &run_id, report.clone())
-            })
+            .and_then(|run_id| self.service.finish_observer_run(&run_id, report.clone()))
             .map(|run| ObserverRunResultResponse {
                 run_id: run_id.to_string(),
                 status: serde_json::to_value(run.status)
@@ -993,116 +949,4 @@ async fn a_forged_token_or_the_path_of_another_run_is_refused() {
     let wrong_run = script_cli(&fx.service, &create_line("ABC-1"), Some(&elsewhere), &token).await;
     assert_eq!(wrong_run.unwrap_err().0, 1);
     assert_eq!(fx.tasks(), 0);
-}
-
-// ---------------------------------------------------------------------------
-// observer worker-token
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn worker_token_create_writes_a_new_file_of_mode_0600_and_never_overwrites() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let fx = Fixture::new();
-    let path = fx.root.join("credential");
-    let file = path.to_str().unwrap();
-
-    let printed = fx
-        .worker_token(&["create", "--name", "host-1", "--output", file])
-        .await
-        .unwrap();
-
-    let credential = fs::read_to_string(&path).unwrap();
-    let credential = credential.strip_suffix('\n').expect("one line");
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert!(
-        !printed.contains(credential),
-        "the credential is not printed"
-    );
-    assert!(printed.contains("mode 0600"), "{printed}");
-    let identity = fx
-        .service
-        .authenticate_observer_worker(credential)
-        .expect("the file holds a working credential");
-    assert_eq!(identity.owner, owner());
-
-    let (code, message) = fx
-        .worker_token(&["create", "--output", file])
-        .await
-        .unwrap_err();
-
-    assert_eq!(code, 2);
-    assert!(message.contains("already exists"), "{message}");
-    assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        format!("{credential}\n"),
-        "the file is unchanged"
-    );
-    assert_eq!(
-        fx.service.observer_workers(&owner()).unwrap().workers.len(),
-        1,
-        "no credential is created for a refused file"
-    );
-}
-
-#[tokio::test]
-async fn worker_token_create_without_output_prints_the_credential_once() {
-    let fx = Fixture::new();
-
-    let printed = fx.worker_token(&["create"]).await.unwrap();
-
-    let credential = printed
-        .lines()
-        .find_map(|line| line.strip_prefix("Credential: "))
-        .expect("the credential is printed");
-    assert!(fx
-        .service
-        .authenticate_observer_worker(credential)
-        .is_some());
-}
-
-#[tokio::test]
-async fn worker_token_list_and_revoke() {
-    let fx = Fixture::new();
-    assert_eq!(
-        fx.worker_token(&["list"]).await.unwrap(),
-        "No worker credentials.\n"
-    );
-    let printed = fx
-        .worker_token(&["create", "--name", "host-1"])
-        .await
-        .unwrap();
-    let worker_id = printed
-        .lines()
-        .find_map(|line| line.strip_prefix("Worker: "))
-        .expect("the worker id is printed")
-        .to_string();
-    let credential = printed
-        .lines()
-        .find_map(|line| line.strip_prefix("Credential: "))
-        .unwrap()
-        .to_string();
-
-    let listed = fx.worker_token(&["list"]).await.unwrap();
-    assert!(listed.contains(&worker_id), "{listed}");
-    assert!(listed.contains("host-1"), "{listed}");
-    assert!(listed.contains("active"), "{listed}");
-    assert!(!listed.contains(&credential), "{listed}");
-
-    let revoked = fx.worker_token(&["revoke", &worker_id]).await.unwrap();
-
-    assert_eq!(revoked, format!("Revoked worker credential {worker_id}.\n"));
-    let listed = fx.worker_token(&["list"]).await.unwrap();
-    assert!(listed.contains("revoked"), "{listed}");
-    assert!(fx
-        .service
-        .authenticate_observer_worker(&credential)
-        .is_none());
-    let (code, _) = fx
-        .worker_token(&["revoke", "wkr-no-such-worker"])
-        .await
-        .unwrap_err();
-    assert_eq!(code, 1);
 }

@@ -2,8 +2,8 @@
 //! observer (approval, pause and resume; the rest of the owner's
 //! commands, by name and owner, in [`owner`]), the schedule that
 //! hands runs to the worker ([`schedule`]) and the effects a run's script
-//! has through its token ([`effects`]), and the credential of the worker
-//! that claims runs ([`workers`]).
+//! has through its token ([`effects`]). The worker that claims runs is the
+//! server's own: its key lives in the server's memory, not here.
 //!
 //! Every mutation runs under the observer's lock and saves the record once;
 //! the record is the commit point (see [`crate::observers::store`]). Who may
@@ -30,7 +30,6 @@ mod owner;
 mod schedule;
 #[cfg(test)]
 mod tests;
-mod workers;
 
 pub use effects::{MAX_EFFECT_DATA_BYTES, MAX_EVENT_DATA_BYTES};
 pub use schedule::{

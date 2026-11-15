@@ -457,6 +457,48 @@ fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
 }
 
 #[test]
+fn the_observer_worker_is_off_unless_configured() {
+    use narsor_engine::config::ObserverWorkerConfig;
+    let root = TempRoot::new();
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert_eq!(resolved.observer_worker(), None);
+
+    root.user_config(
+        "observer_worker: on\nobserver_worker_server: https://narsor.example.com/\nobserver_secrets_dir: /etc/narsor/observer-secrets\nobserver_script_user: narsor-observer-script\n",
+    );
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    assert_eq!(
+        resolved.observer_worker(),
+        Some(ObserverWorkerConfig {
+            server: Some("https://narsor.example.com".to_string()),
+            secrets_dir: Some(PathBuf::from("/etc/narsor/observer-secrets")),
+            script_user: Some("narsor-observer-script".to_string()),
+            insecure_same_user: false,
+        })
+    );
+
+    // The waiver as a YAML boolean or as the variable's text.
+    root.user_config("observer_worker: on\nobserver_insecure_same_user: true\n");
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    assert!(resolved.observer_worker().unwrap().insecure_same_user);
+    let resolved = resolve_with(
+        &Flags::default(),
+        &environment(&[
+            ("NARSOR_OBSERVER_WORKER", "on"),
+            ("NARSOR_OBSERVER_INSECURE_SAME_USER", "true"),
+        ]),
+        &cascade(&TempRoot::new()),
+    );
+    assert!(resolved.observer_worker().unwrap().insecure_same_user);
+
+    root.user_config("observer_worker: yes\nobserver_secrets_dir: relative/dir\n");
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert_eq!(resolved.errors().len(), 2, "{:?}", resolved.errors());
+}
+
+#[test]
 fn agent_args_and_the_task_limit_come_from_the_file() {
     let root = TempRoot::new();
     root.user_config(

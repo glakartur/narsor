@@ -112,6 +112,13 @@ pub const DEFAULT_LOCAL_HOME: &str = "host";
 /// The local HOME modes, as `narsor-runner --home` spells them.
 pub const LOCAL_HOME_MODES: [&str; 2] = ["host", "private"];
 
+/// The observer worker is not started: the default, so an installation
+/// runs no observer script until its operator decides to.
+pub const OBSERVER_WORKER_OFF: &str = "off";
+
+/// The server starts and supervises the observer worker.
+pub const OBSERVER_WORKER_ON: &str = "on";
+
 /// The server's security mode when nothing says otherwise (R36): the local
 /// daemon's loopback-only random-token mode, which is what every
 /// installation ran before network mode existed.
@@ -219,11 +226,26 @@ pub enum SettingKey {
     /// directory up to date with before every start; empty, or the
     /// configuration directory itself, copies nothing.
     LocalClaudeProfileSource,
+    /// Whether the server starts the observer worker (`off` or `on`) and
+    /// supervises it, with a key it makes at each start (D5).
+    ObserverWorker,
+    /// The API's URL the observer worker and its scripts use; empty is the
+    /// server's own listening address, which network mode cannot use (its
+    /// requests must come through the TLS proxy).
+    ObserverWorkerServer,
+    /// The observer worker's secrets directory: one subdirectory per
+    /// observer owner, one file per secret name in it. Empty: no secrets.
+    ObserverSecretsDir,
+    /// The system user observer scripts run as; must not be the server's.
+    ObserverScriptUser,
+    /// `true` runs observer scripts as the server's own user, without
+    /// isolation: for a trial only.
+    ObserverInsecureSameUser,
 }
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 27] = [
+    pub const ALL: [SettingKey; 32] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
@@ -251,6 +273,11 @@ impl SettingKey {
         SettingKey::LocalCodexHome,
         SettingKey::LocalClaudeConfigDir,
         SettingKey::LocalClaudeProfileSource,
+        SettingKey::ObserverWorker,
+        SettingKey::ObserverWorkerServer,
+        SettingKey::ObserverSecretsDir,
+        SettingKey::ObserverScriptUser,
+        SettingKey::ObserverInsecureSameUser,
     ];
 
     /// The three roots, in the order `config show` prints them.
@@ -290,6 +317,11 @@ impl SettingKey {
             SettingKey::LocalCodexHome => "local_codex_home",
             SettingKey::LocalClaudeConfigDir => "local_claude_config_dir",
             SettingKey::LocalClaudeProfileSource => "local_claude_profile_source",
+            SettingKey::ObserverWorker => "observer_worker",
+            SettingKey::ObserverWorkerServer => "observer_worker_server",
+            SettingKey::ObserverSecretsDir => "observer_secrets_dir",
+            SettingKey::ObserverScriptUser => "observer_script_user",
+            SettingKey::ObserverInsecureSameUser => "observer_insecure_same_user",
         }
     }
 
@@ -339,7 +371,12 @@ impl SettingKey {
             | SettingKey::LocalHome
             | SettingKey::LocalCodexHome
             | SettingKey::LocalClaudeConfigDir
-            | SettingKey::LocalClaudeProfileSource => false,
+            | SettingKey::LocalClaudeProfileSource
+            | SettingKey::ObserverWorker
+            | SettingKey::ObserverWorkerServer
+            | SettingKey::ObserverSecretsDir
+            | SettingKey::ObserverScriptUser
+            | SettingKey::ObserverInsecureSameUser => false,
         }
     }
 
@@ -371,6 +408,8 @@ impl SettingKey {
             SettingKey::ServerBind => SettingValue::Text(DEFAULT_SERVER_BIND.to_string()),
             SettingKey::TlsTermination => SettingValue::Text(TLS_TERMINATION_NONE.to_string()),
             SettingKey::LocalHome => SettingValue::Text(DEFAULT_LOCAL_HOME.to_string()),
+            SettingKey::ObserverWorker => SettingValue::Text(OBSERVER_WORKER_OFF.to_string()),
+            SettingKey::ObserverInsecureSameUser => SettingValue::Text("false".to_string()),
             // Empty text is "not set": network mode refuses to start without
             // the ones it needs (`crate::auth::SecuritySettings::validate`).
             SettingKey::OidcIssuer
@@ -384,7 +423,10 @@ impl SettingKey {
             | SettingKey::LocalWorkspaceRoots
             | SettingKey::LocalCodexHome
             | SettingKey::LocalClaudeConfigDir
-            | SettingKey::LocalClaudeProfileSource => SettingValue::Text(String::new()),
+            | SettingKey::LocalClaudeProfileSource
+            | SettingKey::ObserverWorkerServer
+            | SettingKey::ObserverSecretsDir
+            | SettingKey::ObserverScriptUser => SettingValue::Text(String::new()),
         }
     }
 
@@ -643,7 +685,12 @@ mod tests {
                 "local_home",
                 "local_codex_home",
                 "local_claude_config_dir",
-                "local_claude_profile_source"
+                "local_claude_profile_source",
+                "observer_worker",
+                "observer_worker_server",
+                "observer_secrets_dir",
+                "observer_script_user",
+                "observer_insecure_same_user"
             ],
             "the registry is the one place the settings live, and the three \
              roots lead because that is the order `config show` prints"

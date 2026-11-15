@@ -2,10 +2,9 @@
 //!
 //! * the effect routes an observer's script calls through `narsor-cli`, with
 //!   the token of its run (`/observer/v1/runs/{run}/…`);
-//! * the worker routes `narsor-cli observer worker` calls with its own
-//!   credential (`/observer/v1/worker/…`): claim a run, report its result;
-//! * the owner routes that create and revoke that credential
-//!   (`/control/v1/observer-workers`);
+//! * the worker routes `narsor-cli observer worker` calls with the key the
+//!   server gave it (`/observer/v1/worker/…`): claim a run, report its
+//!   result;
 //! * the owner routes of the observers themselves (`/control/v1/observers`).
 
 use std::collections::BTreeMap;
@@ -71,58 +70,19 @@ pub struct ObserverEffectResponse {
 }
 
 // ---------------------------------------------------------------------------
-// The worker credential (owner routes)
-// ---------------------------------------------------------------------------
-
-/// `POST /control/v1/observer-workers`: create a worker credential.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct CreateObserverWorkerRequest {
-    /// A label for the worker (a host name, say).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-/// One worker credential, without its secret.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObserverWorkerView {
-    /// The credential's id (`wkr-…`), the middle of the credential.
-    pub worker_id: String,
-    /// The owner's label.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// When it was created.
-    pub created_at: DateTime<Utc>,
-    /// When it was revoked; a revoked credential never works again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revoked_at: Option<DateTime<Utc>>,
-}
-
-/// The answer of `POST /control/v1/observer-workers`: the credential, shown
-/// this once. The server keeps only its SHA-256 digest.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObserverWorkerCreated {
-    /// The credential's record.
-    pub worker: ObserverWorkerView,
-    /// The credential (`nsw.{worker_id}.{secret}`).
-    pub credential: String,
-}
-
-/// `GET /control/v1/observer-workers`: the owner's worker credentials,
-/// revoked ones included.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObserverWorkerListResponse {
-    /// By id.
-    pub workers: Vec<ObserverWorkerView>,
-}
-
-// ---------------------------------------------------------------------------
 // The worker routes
 // ---------------------------------------------------------------------------
 
+/// The environment variable the server hands the observer worker its key
+/// in. The server makes a new key at every start of the worker and keeps
+/// only its digest; a variable, never an argument, so `ps` does not show
+/// it. The worker passes it on to no script.
+pub const OBSERVER_WORKER_KEY_ENV: &str = "NARSOR_OBSERVER_WORKER_KEY";
+
 /// One secret the worker hands to a run's script as an environment
-/// variable. The value comes from the worker's secrets directory, one file
-/// per `name`; the control plane never has it.
+/// variable. The value comes from the observer owner's subdirectory of the
+/// worker's secrets directory, one file per `name`; the control plane never
+/// has it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObserverSecretRef {
     /// The file name in the worker's secrets directory.
@@ -139,6 +99,12 @@ pub struct ObserverSecretRef {
 pub struct ObserverWorkerRun {
     /// The run (`{observer}.{sequence}`).
     pub run_id: String,
+    /// The observer's owner: the worker serves every owner and reads this
+    /// run's secrets from the owner's subdirectory of its secrets
+    /// directory only. Empty when the server did not say; the run then
+    /// fails before its script starts.
+    #[serde(default)]
+    pub owner: String,
     /// The run's token: the script's `NARSOR_TOKEN` on the effect routes.
     pub token: String,
     /// The script version it runs.
@@ -160,6 +126,7 @@ impl std::fmt::Debug for ObserverWorkerRun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObserverWorkerRun")
             .field("run_id", &self.run_id)
+            .field("owner", &self.owner)
             .field("token", &"<redacted>")
             .field("script_version", &self.script_version)
             .field("secrets", &self.secrets)

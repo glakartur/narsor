@@ -545,11 +545,6 @@ impl OrchestrationStore {
     pub(crate) fn lock_enrollments(&self) -> Result<FileLock> {
         FileLock::acquire(self.paths.enrollments_lock_file())
     }
-
-    /// Exclusive lock for creating and revoking observer worker credentials.
-    pub(crate) fn lock_observer_workers(&self) -> Result<FileLock> {
-        FileLock::acquire(self.paths.observer_workers_lock_file())
-    }
 }
 
 /// Queue order within one backend: by `rank`, creation order among equal ranks.

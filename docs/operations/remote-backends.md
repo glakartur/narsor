@@ -286,8 +286,9 @@ a pin: a running task follows the installation's default harness (see
 [observers](../user/observers.md) are not backend secrets: a task, a backend
 or a profile cannot use them, and an observer cannot use a backend secret.
 An observer keeps only references (`--secret NAME=ENV`) in the control plane.
-The values are files in the secrets directory of the observer worker, one
-file for each name, readable by the worker's user only (see
+The values are files in the secrets directory of the observer worker, in
+the subdirectory of the observer's owner, one file for each name, readable
+by the worker's user only (see
 [installation](installation.md#run-the-observer-worker)). For each run the
 worker gives the script only the secrets of its own observer, as
 environment variables, and masks their values in the logs it reports.

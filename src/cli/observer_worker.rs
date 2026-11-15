@@ -1,10 +1,15 @@
 //! `narsor-cli observer worker`: the stage-1 observer worker (U6).
 //!
+//! `narsor-server` starts and supervises it when its configuration enables
+//! the worker, and hands it a key it makes at every start of the worker in
+//! [`OBSERVER_WORKER_KEY_ENV`] (D5). The key claims runs of every owner's
+//! observers and reports their results, nothing else.
+//!
 //! The control plane decides when an observer runs; the worker only takes
 //! what is due and runs it:
 //!
 //! ```text
-//! every 10 s   claim (worker credential)          → nothing due: wait
+//! every 10 s   claim (worker key)                 → nothing due: wait
 //!              run dir (0700, removed afterwards)
 //!              sh script.sh, stdin = the input, env = the list below only
 //!              stdout/stderr read with limits, time limit, process group
@@ -16,16 +21,24 @@
 //! An empty environment plus exactly: `PATH`, `HOME` (the run directory),
 //! `NARSOR_SERVER`, `NARSOR_TOKEN` (the run's token, valid on the effect
 //! routes of this one run only), `NARSOR_OBSERVER_RUN` and one variable per
-//! secret reference of the observer, read from `--secrets-dir` (one file per
-//! reference name). Nothing of the worker's own environment reaches it — a
-//! `GH_TOKEN` the worker was started with included. A secret the claim
-//! names but the directory lacks fails the run before the script starts.
+//! secret reference of the observer. Nothing of the worker's own
+//! environment reaches it — neither the worker key nor a `GH_TOKEN` the
+//! worker was started with.
+//!
+//! # Secrets of many owners
+//!
+//! One worker serves every owner, so a secret is read from the observer
+//! owner's subdirectory only: `{secrets-dir}/{owner}/{name}`
+//! ([`owner_secrets_dir_name`]). An owner cannot name another owner's
+//! secret. An owner that is no safe directory name, or a secret the claim
+//! names but the directory lacks, fails the run before the script starts.
 //!
 //! With `--script-user` the script runs as that system user, which must
-//! not be able to read the worker's credential or its secrets directory;
-//! the worker refuses to start when either is readable by anyone but its
-//! owner. The child also drops what it could inherit: ambient capabilities
-//! are cleared and `no_new_privs` is set before `exec`.
+//! not be able to read the worker's secrets directory or its environment
+//! (`/proc/<pid>/environ` of another user is closed); the worker refuses to
+//! start when the directory is open to anyone but its owner. The child also
+//! drops what it could inherit: ambient capabilities are cleared and
+//! `no_new_privs` is set before `exec`.
 //!
 //! # Ending the script
 //!
@@ -67,6 +80,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use futures::future::BoxFuture;
+#[cfg(doc)]
+use narsor_protocol::controller::OBSERVER_WORKER_KEY_ENV;
 use narsor_protocol::controller::{
     ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse, ObserverSecretRef,
     ObserverWorkerRun,
@@ -340,8 +355,8 @@ pub struct HandledRun {
 /// Why the worker stopped.
 #[derive(Debug)]
 pub enum WorkerStop {
-    /// The control plane refused the worker's credential: revoked, or not a
-    /// worker credential at all. Polling on would not change that.
+    /// The control plane refused the worker's key: one of an earlier start,
+    /// or no worker key at all. Polling on would not change that.
     CredentialRefused(ClientError),
     /// A claim failed (with `--once`).
     Claim(ClientError),
@@ -352,8 +367,8 @@ impl std::fmt::Display for WorkerStop {
         match self {
             WorkerStop::CredentialRefused(error) => write!(
                 f,
-                "the control plane refused the worker credential (revoked, or not a worker \
-                 credential?): {error}"
+                "the control plane refused the worker key (one of an earlier start of the \
+                 worker?): {error}"
             ),
             WorkerStop::Claim(error) => write!(f, "could not claim a run: {error}"),
         }
@@ -443,7 +458,7 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
     /// fails, a problem of the worker is a [`ObserverRunOutcome::WorkerError`].
     pub async fn execute(&self, run: &ObserverWorkerRun) -> ObserverRunReport {
         let mut masker = Masker::new([run.token.as_str()]);
-        let secrets = match self.read_secrets(&run.secrets) {
+        let secrets = match self.read_secrets(&run.owner, &run.secrets) {
             Ok(secrets) => secrets,
             Err(message) => return worker_error(&masker, &message),
         };
@@ -468,12 +483,15 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
         }
     }
 
-    /// The secret values of `references`, as `(variable, value)`. Fails,
-    /// naming the reference only, when one cannot be read.
+    /// The secret values of `references`, as `(variable, value)`, from
+    /// `owner`'s subdirectory of the secrets directory. Fails, naming the
+    /// reference only, when one cannot be read.
     fn read_secrets(
         &self,
+        owner: &str,
         references: &[ObserverSecretRef],
     ) -> Result<Vec<(String, String)>, String> {
+        let owner_dir = owner_secrets_dir_name(owner)?;
         let mut secrets = Vec::new();
         for reference in references {
             let name = &reference.name;
@@ -496,8 +514,13 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
                      directory (--secrets-dir)"
                 ));
             };
-            let value = read_secret(&dir.join(name))
-                .map_err(|problem| format!("the secret '{name}' cannot be used: {problem}"))?;
+            let value = read_secret(&dir.join(&owner_dir).join(name)).map_err(|problem| {
+                format!(
+                    "the secret '{name}' cannot be used: {problem} (the observer owner's \
+                     directory is '{}')",
+                    without_unsafe_chars_multiline(&owner_dir)
+                )
+            })?;
             secrets.push((reference.env.clone(), value));
         }
         Ok(secrets)
@@ -711,6 +734,33 @@ fn read_secret(path: &Path) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// The name of `owner`'s subdirectory of the secrets directory: the owner
+/// as written, with `%` and `/` spelled `%25` and `%2F`, so that an OIDC
+/// owner (`oidc:https://issuer#subject`) is one path component too. An
+/// empty owner, one with a control character, or one that would be `.` or
+/// `..` is refused: it could name no directory, or the wrong one.
+pub fn owner_secrets_dir_name(owner: &str) -> Result<String, String> {
+    if owner.is_empty() {
+        return Err(
+            "the run names no observer owner, so the worker cannot tell whose secrets to read"
+                .to_string(),
+        );
+    }
+    if owner.chars().any(char::is_control) {
+        return Err(format!(
+            "the observer owner '{}' holds a control character; it names no secrets directory",
+            without_unsafe_chars_multiline(owner)
+        ));
+    }
+    let name = owner.replace('%', "%25").replace('/', "%2F");
+    if name == "." || name == ".." || name.len() > 255 {
+        return Err(format!(
+            "the observer owner '{owner}' names no safe secrets directory"
+        ));
+    }
+    Ok(name)
+}
+
 /// One path component, not hidden, no separator.
 fn is_plain_name(name: &str) -> bool {
     !name.is_empty()
@@ -808,27 +858,6 @@ impl Drop for RunDir {
 // ---------------------------------------------------------------------------
 // Startup checks
 // ---------------------------------------------------------------------------
-
-/// Refuses a credential file anyone but its owner can read or write.
-pub fn check_credential_file(path: &Path) -> Result<(), String> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        format!(
-            "cannot read the credential file {}: {error}",
-            path.display()
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(format!("{} is not a file", path.display()));
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(format!(
-            "the credential file {} is open to other users; make it readable by its owner only \
-             (chmod 600)",
-            path.display()
-        ));
-    }
-    Ok(())
-}
 
 /// Refuses a secrets directory anyone but its owner can open.
 pub fn check_secrets_dir(path: &Path) -> Result<(), String> {

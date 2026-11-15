@@ -461,6 +461,11 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "127.0.0.1:0",
         "Address the server listens on.",
     ),
+    (
+        SettingKey::ObserverWorker,
+        "off",
+        "on: the server starts the observer worker (needs observer_script_user; see the installation guide).",
+    ),
 ];
 
 /// The generated file: the settings chosen by the installer followed by the

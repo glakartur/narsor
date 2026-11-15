@@ -39,6 +39,15 @@
 //! of losing it; interrupting it earlier would only spend that repeat
 //! sooner.
 //!
+//! # The observer worker
+//!
+//! With `observer_worker: on` the daemon starts `narsor-cli observer
+//! worker` once its API listens, after the local controller, and stops it
+//! first at shutdown, while the API still takes its results
+//! ([`crate::observer_worker`]). A configuration that cannot start it
+//! (no script user and no waiver, network mode without
+//! `observer_worker_server`) stops the daemon at start.
+//!
 //! # Why shutdown is a poll, not a wait
 //!
 //! `Engine::pause` (D34) only ever takes effect at the next step boundary —
@@ -62,6 +71,9 @@ use tokio::signal::unix::{signal, SignalKind};
 use crate::api::{ActiveTasks, ApiHandle, ApiServices, ServerSecurity};
 use crate::auth_gate::NetworkAuth;
 use crate::local_controller::{controller_program, LocalController, LocalControllerSettings};
+use crate::observer_worker::{
+    worker_program, ObserverWorker, ObserverWorkerSettings, ScriptIsolation,
+};
 use narsor_engine::auth::{
     OidcVerifier, OwnerStore, SecurityPlan, SecuritySettings, StartupOwnership,
 };
@@ -282,6 +294,8 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         CliError::failure(format!("could not start the daemon's API server: {error}"))
     })?;
 
+    let observer_worker = observer_worker_settings(config, &api_handle, runs_local_controller)?;
+
     let info = DaemonInfo {
         pid: std::process::id(),
         addr: api_handle.addr(),
@@ -306,7 +320,25 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         );
         None
     };
+    let observer_worker = match observer_worker {
+        Some(settings) => {
+            let control = Arc::clone(&control);
+            match ObserverWorker::start(settings, move || control.issue_observer_worker_key()) {
+                Ok(worker) => Some(worker),
+                Err(message) => {
+                    if let Some(local_controller) = local_controller {
+                        local_controller.stop().await;
+                    }
+                    return Err(CliError::failure(message));
+                }
+            }
+        }
+        None => None,
+    };
     if let Err(error) = info.write(&paths.daemon_file()) {
+        if let Some(observer_worker) = observer_worker {
+            observer_worker.stop().await;
+        }
         if let Some(local_controller) = local_controller {
             local_controller.stop().await;
         }
@@ -324,6 +356,12 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         CliError::failure(format!("could not install the SIGTERM handler: {error}"))
     })?;
     wait_for_sigterm_keeping_discovery(&mut terminate, &paths.daemon_file(), &info).await;
+
+    // The worker first, while the API still takes the result of a run in
+    // progress; one it cannot report is lost at its deadline.
+    if let Some(observer_worker) = observer_worker {
+        observer_worker.stop().await;
+    }
 
     // Stop the local controller while the API still accepts its signed
     // lease release (R8). A successor can then acquire the lease
@@ -423,6 +461,53 @@ fn local_controller_settings(
         harness_args: config.local_harness_home().runner_args(),
         log_directive: config.log_directive(),
     })
+}
+
+/// What the daemon starts its observer worker with, `None` when the
+/// configuration does not enable it. Refuses a configuration the worker
+/// could not run with, before anything starts.
+fn observer_worker_settings(
+    config: &Resolved,
+    api: &ApiHandle,
+    trusted: bool,
+) -> Result<Option<ObserverWorkerSettings>> {
+    let Some(worker) = config.observer_worker() else {
+        return Ok(None);
+    };
+    let isolation = match (worker.script_user, worker.insecure_same_user) {
+        (Some(user), false) => ScriptIsolation::User(user),
+        (None, true) => ScriptIsolation::SameUser,
+        (None, false) => {
+            return Err(CliError::failure(
+                "observer_worker: on needs observer_script_user, the system user scripts run \
+                 as (or observer_insecure_same_user: true, for a trial only)",
+            ))
+        }
+        (Some(_), true) => {
+            return Err(CliError::failure(
+                "observer_script_user and observer_insecure_same_user: true contradict each \
+                 other; set one of them",
+            ))
+        }
+    };
+    let server = match worker.server {
+        Some(server) => server,
+        None if trusted => format!("http://{}", api.addr()),
+        None => {
+            return Err(CliError::failure(
+                "observer_worker: on in network mode needs observer_worker_server: the URL \
+                 clients reach the API at, through the TLS proxy",
+            ))
+        }
+    };
+    Ok(Some(ObserverWorkerSettings {
+        program: worker_program().map_err(CliError::failure)?,
+        server,
+        secrets_dir: worker.secrets_dir,
+        isolation,
+        log_directive: config.log_directive(),
+        supervision: narsor_controller_runtime::Supervision::default(),
+    }))
 }
 
 /// How often the daemon re-evaluates queue admission on its own (U10).

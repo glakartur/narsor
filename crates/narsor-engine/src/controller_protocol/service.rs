@@ -25,7 +25,9 @@ mod tasks;
 #[cfg(test)]
 mod tests;
 
-use super::credentials::{ControllerAuthenticator, CredentialStore, RunnerAuthenticator};
+use super::credentials::{
+    ControllerAuthenticator, CredentialStore, ObserverWorkerKey, RunnerAuthenticator,
+};
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::TaskId;
@@ -154,6 +156,8 @@ pub struct ProtocolService {
     conductor_reads: Mutex<ConductorRelay>,
     materials: MaterialStore,
     observers: ObserverStore,
+    /// The digest of the observer worker's key, in memory only (D5).
+    observer_worker_key: ObserverWorkerKey,
     harness_usages: scheduling::HarnessUsages,
     /// Most tasks processed at once across all backends; `None` for no limit.
     max_concurrent_tasks: Mutex<Option<u32>>,
@@ -199,6 +203,7 @@ impl ProtocolService {
         Self {
             materials,
             observers,
+            observer_worker_key: ObserverWorkerKey::default(),
             controller_auth: Arc::new(credentials.clone()),
             runner_auth: Arc::new(credentials.clone()),
             control,

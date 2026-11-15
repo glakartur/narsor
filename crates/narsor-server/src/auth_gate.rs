@@ -1,6 +1,6 @@
 //! The HTTP side of authentication: the owner gate, the observer run and
-//! observer worker gates, the claim and identity endpoints, the trusted-proxy policy, CORS and the
-//! stream guard.
+//! observer worker gates, the claim and identity endpoints, the
+//! trusted-proxy policy, CORS and the stream guard.
 //!
 //! # Refusals
 //!
@@ -80,15 +80,11 @@ pub enum Principal {
         /// The run the token belongs to.
         run_id: RunId,
     },
-    /// An observer worker, by its credential: only the claim of a run and
-    /// its result ([`require_observer_worker`]), for the observers of one
-    /// owner. Neither the owner gate nor the run gate lets it through.
-    ObserverWorker {
-        /// The credential's id.
-        worker_id: String,
-        /// The owner whose observers' runs it may claim.
-        owner: OwnerRef,
-    },
+    /// The server's observer worker, by the key the server gave it: only
+    /// the claim of a run and its result ([`require_observer_worker`]), for
+    /// the observers of every owner. Neither the owner gate nor the run gate
+    /// lets it through.
+    ObserverWorker,
 }
 
 /// Network mode's user authentication: the token verifier and the owner.
@@ -241,23 +237,20 @@ pub async fn require_observer_run(
 }
 
 /// The observer worker gate, in front of the worker routes
-/// (`/observer/v1/worker/…`): a bare `401` for anything but an unrevoked
-/// worker credential ([`ProtocolService::authenticate_observer_worker`]).
-/// An accepted request carries [`Principal::ObserverWorker`].
+/// (`/observer/v1/worker/…`): a bare `401` for anything but the key the
+/// server gave its worker at the worker's last start
+/// ([`ProtocolService::authenticate_observer_worker`]). An accepted request
+/// carries [`Principal::ObserverWorker`].
 pub async fn require_observer_worker(
     State(service): State<Arc<ProtocolService>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    match bearer(&request).and_then(|token| service.authenticate_observer_worker(token)) {
-        Some(identity) => {
-            request.extensions_mut().insert(Principal::ObserverWorker {
-                worker_id: identity.worker_id,
-                owner: identity.owner,
-            });
-            next.run(request).await
-        }
-        None => StatusCode::UNAUTHORIZED.into_response(),
+    if bearer(&request).is_some_and(|token| service.authenticate_observer_worker(token)) {
+        request.extensions_mut().insert(Principal::ObserverWorker);
+        next.run(request).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
     }
 }
 

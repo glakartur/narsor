@@ -89,12 +89,11 @@ use narsor_protocol::controller::{
 };
 use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
-    ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateObserverWorkerRequest,
-    CreateRepositoryRequest, CreateTaskRequest, DefaultBackendView, EnrollmentResponse,
-    ExecutionEventsQuery, ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
+    ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
+    CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
+    ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
     ObserverCreateTaskRequest, ObserverEffectResponse, ObserverEventRequest, ObserverRunReport,
-    ObserverRunResultResponse, ObserverWorkerCreated, ObserverWorkerListResponse,
-    ObserverWorkerRun, ObserverWorkerView, OwnerCommandRequest, RepositoryBranchesResponse,
+    ObserverRunResultResponse, ObserverWorkerRun, OwnerCommandRequest, RepositoryBranchesResponse,
     RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
     SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
     ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
@@ -1028,39 +1027,11 @@ impl ApiClient {
     }
 
     // -----------------------------------------------------------------
-    // Observer workers (U6)
+    // The observer worker (U6)
     // -----------------------------------------------------------------
 
-    /// Creates an observer worker credential, returned this once —
-    /// `POST /control/v1/observer-workers`.
-    pub async fn create_observer_worker(
-        &self,
-        request: &CreateObserverWorkerRequest,
-    ) -> Result<ObserverWorkerCreated, ClientError> {
-        let url = format!("{}/control/v1/observer-workers", self.base_url);
-        self.post_json(&url, request).await
-    }
-
-    /// The owner's observer worker credentials, revoked ones included.
-    pub async fn observer_workers(&self) -> Result<ObserverWorkerListResponse, ClientError> {
-        let url = format!("{}/control/v1/observer-workers", self.base_url);
-        self.get_json(&url).await
-    }
-
-    /// Revokes an observer worker credential.
-    pub async fn revoke_observer_worker(
-        &self,
-        worker_id: &str,
-    ) -> Result<ObserverWorkerView, ClientError> {
-        let url = format!(
-            "{}/control/v1/observer-workers/{worker_id}/revoke",
-            self.base_url
-        );
-        self.post_empty(&url).await
-    }
-
-    /// Claims the next due observer run, for a client holding a worker
-    /// credential — `POST /observer/v1/worker/claim`. `None` when no run is
+    /// Claims the next due observer run, for a client holding the worker
+    /// key — `POST /observer/v1/worker/claim`. `None` when no run is
     /// due.
     pub async fn claim_observer_run(&self) -> Result<Option<ObserverWorkerRun>, ClientError> {
         let url = format!("{}/observer/v1/worker/claim", self.base_url);

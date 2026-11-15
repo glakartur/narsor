@@ -6,21 +6,18 @@
 //! | `observer script set --file` | the owner | saves the next, immutable script version (never approved by saving) |
 //! | `observer approve --version\|pause\|resume` | the owner | decides what runs on schedule |
 //! | `observer watch add\|list\|remove` | the owner | keeps the watch list of PR/MR objects |
-//! | `observer worker` | the worker's system user | claims due runs and executes their scripts ([`super::observer_worker`]) |
-//! | `observer worker-token create\|list\|revoke` | the owner | manages the worker's credential |
+//! | `observer worker` | `narsor-server`, which starts it | claims due runs and executes their scripts ([`super::observer_worker`]) |
 //!
 //! The owner's commands go through [`ObserverApi`], implemented on the API
 //! client, and print through the pure functions of
 //! [`super::observer_text`]: both are what the tests drive.
 //!
-//! The worker talks to the control plane with its own credential, never
-//! the owner's token (PO5): the credential claims runs and reports their
-//! results, nothing else. It is shown once, at `create`; with `--output`
-//! it goes straight into a new file of mode `0600`.
+//! The worker talks to the control plane with the key the server hands it
+//! in [`OBSERVER_WORKER_KEY_ENV`] when it starts the worker, never with the
+//! owner's token (D5, PO5): the key claims runs and reports their results,
+//! nothing else. Nobody else makes or holds such a key.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -33,19 +30,17 @@ use super::observer_text::{
     watch_added_output, watch_list_output, watch_removed_output,
 };
 use super::observer_worker::{
-    check_credential_file, check_secrets_dir, current_uid, ProcessRunner, ScriptUser, Worker,
-    WorkerOptions, WorkerStop, POLL_INTERVAL,
+    check_secrets_dir, current_uid, ProcessRunner, ScriptUser, Worker, WorkerOptions, WorkerStop,
+    POLL_INTERVAL,
 };
 use super::remote::{failure, parse_workspaces, split_pair};
-use super::task_text::age;
 use crate::api::{ApiClient, ClientError, ServerTarget, TokenSource};
 use crate::config::Flags;
 use crate::controller_protocol::{
-    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
-    CreateObserverWorkerRequest, ObserverDetailView, ObserverEffectRequest, ObserverListResponse,
-    ObserverScriptView, ObserverSecretRef, ObserverView, ObserverWatchListResponse,
-    ObserverWatchView, ObserverWorkerCreated, ObserverWorkerListResponse, ObserverWorkerView,
-    SetObserverScriptRequest,
+    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverDetailView,
+    ObserverEffectRequest, ObserverListResponse, ObserverScriptView, ObserverSecretRef,
+    ObserverView, ObserverWatchListResponse, ObserverWatchView, SetObserverScriptRequest,
+    OBSERVER_WORKER_KEY_ENV,
 };
 use crate::domain::without_unsafe_chars;
 
@@ -54,7 +49,7 @@ use crate::domain::without_unsafe_chars;
 pub enum ObserverCommand {
     /// Creates a draft observer. Nothing runs until a script version is
     /// saved and approved.
-    Create(CreateArgs),
+    Create(Box<CreateArgs>),
 
     /// Lists your observers: state, script versions, last and next run,
     /// the last error, and a warning when no worker claims due runs.
@@ -116,15 +111,9 @@ pub enum ObserverCommand {
     },
 
     /// Runs the observer worker: claims the runs the control plane has due
-    /// and executes their scripts in a clean environment. Needs --server.
+    /// and executes their scripts in a clean environment. narsor-server
+    /// starts it, with --server and the key in NARSOR_OBSERVER_WORKER_KEY.
     Worker(WorkerArgs),
-
-    /// Creates, lists and revokes the credential of observer workers.
-    WorkerToken {
-        /// What to do.
-        #[command(subcommand)]
-        command: WorkerTokenCommand,
-    },
 }
 
 impl ObserverCommand {
@@ -293,18 +282,14 @@ pub enum WatchCommand {
 /// `narsor-cli observer worker`.
 #[derive(Debug, clap::Args)]
 pub struct WorkerArgs {
-    /// The file holding the worker credential (`observer worker-token
-    /// create --output`). Must be readable by its owner only.
-    #[arg(long, value_name = "FILE")]
-    pub credential_file: PathBuf,
-
-    /// The directory of the observers' secrets: one file per secret
-    /// reference name. Must be accessible to its owner only.
+    /// The directory of the observers' secrets: one subdirectory per
+    /// observer owner, one file per secret reference name in it. Must be
+    /// accessible to its owner only.
     #[arg(long, value_name = "DIRECTORY")]
     pub secrets_dir: Option<PathBuf>,
 
     /// Run scripts as this system user, which must not be able to read the
-    /// credential file or the secrets directory. Required unless
+    /// secrets directory or the worker's environment. Required unless
     /// `--insecure-same-user` is given: isolation is the default.
     #[arg(
         long,
@@ -314,7 +299,7 @@ pub struct WorkerArgs {
     pub script_user: Option<String>,
 
     /// Run scripts as the worker's own user. A script can then read the
-    /// worker credential and every observer's secrets: for a trial on a
+    /// worker key and every observer's secrets: for a trial on a
     /// developer machine only, never in production.
     #[arg(long, conflicts_with = "script_user")]
     pub insecure_same_user: bool,
@@ -334,32 +319,6 @@ pub struct WorkerArgs {
     pub once: bool,
 }
 
-/// `narsor-cli observer worker-token …`.
-#[derive(Debug, Subcommand)]
-pub enum WorkerTokenCommand {
-    /// Creates a worker credential, shown once.
-    Create {
-        /// A label for the worker (a host name, say).
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
-
-        /// Write the credential to this new file (mode 0600) instead of
-        /// printing it.
-        #[arg(long, value_name = "FILE")]
-        output: Option<PathBuf>,
-    },
-
-    /// Lists the worker credentials, revoked ones included.
-    List,
-
-    /// Revokes a worker credential: the worker is refused from now on.
-    Revoke {
-        /// The credential's id (`wkr-…`).
-        #[arg(value_name = "WORKER_ID")]
-        worker_id: String,
-    },
-}
-
 /// Runs one `narsor-cli observer` command.
 pub async fn observer(
     command: ObserverCommand,
@@ -369,14 +328,6 @@ pub async fn observer(
 ) -> Result<()> {
     match command {
         ObserverCommand::Worker(args) => worker(args, target).await,
-        ObserverCommand::WorkerToken { command } => {
-            let client = crate::api::connect(target, state, flags)
-                .await
-                .map_err(CliError::failure)?;
-            let output = worker_token(&client, command, Utc::now).await?;
-            print!("{output}");
-            Ok(())
-        }
         command => {
             // Parse what is local before connecting: a usage error never
             // needs the control plane.
@@ -706,8 +657,8 @@ where
             ))
         }
         ObserverCommand::Watch { command } => watch(api, command, now()).await,
-        ObserverCommand::Worker(_) | ObserverCommand::WorkerToken { .. } => Err(CliError::usage(
-            "narsor-cli observer worker and worker-token are not owner commands of an observer",
+        ObserverCommand::Worker(_) => Err(CliError::usage(
+            "narsor-cli observer worker is not an owner command of an observer",
         )),
     }
 }
@@ -789,149 +740,13 @@ async fn watch<A: ObserverApi + ?Sized>(
     }
 }
 
-/// The owner's worker-credential routes, as `observer worker-token` uses
-/// them: the API client in `narsor-cli`, the service itself in tests.
-pub trait WorkerTokenApi: Send + Sync {
-    /// Creates a worker credential, shown this once.
-    fn create_observer_worker<'a>(
-        &'a self,
-        request: &'a CreateObserverWorkerRequest,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWorkerCreated, ClientError>>;
-
-    /// The worker credentials, revoked ones included.
-    fn observer_workers(
-        &self,
-    ) -> BoxFuture<'_, std::result::Result<ObserverWorkerListResponse, ClientError>>;
-
-    /// Revokes a worker credential.
-    fn revoke_observer_worker<'a>(
-        &'a self,
-        worker_id: &'a str,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWorkerView, ClientError>>;
-}
-
-impl WorkerTokenApi for ApiClient {
-    fn create_observer_worker<'a>(
-        &'a self,
-        request: &'a CreateObserverWorkerRequest,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWorkerCreated, ClientError>> {
-        Box::pin(ApiClient::create_observer_worker(self, request))
-    }
-
-    fn observer_workers(
-        &self,
-    ) -> BoxFuture<'_, std::result::Result<ObserverWorkerListResponse, ClientError>> {
-        Box::pin(ApiClient::observer_workers(self))
-    }
-
-    fn revoke_observer_worker<'a>(
-        &'a self,
-        worker_id: &'a str,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWorkerView, ClientError>> {
-        Box::pin(ApiClient::revoke_observer_worker(self, worker_id))
-    }
-}
-
-/// Runs one `narsor-cli observer worker-token` command on `api` and
-/// returns what it prints; `now` is the clock ages are measured with. A
-/// credential written to `--output` goes into a new file of mode `0600`
-/// only: an existing file is refused before the credential is created.
-pub async fn worker_token<A, N>(api: &A, command: WorkerTokenCommand, now: N) -> Result<String>
-where
-    A: WorkerTokenApi + ?Sized,
-    N: Fn() -> DateTime<Utc>,
-{
-    let mut out = String::new();
-    match command {
-        WorkerTokenCommand::Create { name, output } => {
-            if let Some(path) = &output {
-                if path.symlink_metadata().is_ok() {
-                    return Err(CliError::usage(format!(
-                        "{} already exists; the credential goes into a new file only",
-                        path.display()
-                    )));
-                }
-            }
-            let created = api
-                .create_observer_worker(&CreateObserverWorkerRequest { name })
-                .await
-                .map_err(|error| failure("Could not create a worker credential", error))?;
-            out.push_str(&format!("Worker: {}\n", created.worker.worker_id));
-            match output {
-                Some(path) => {
-                    write_new_secret_file(&path, &created.credential).map_err(|error| {
-                        CliError::failure(format!(
-                            "Could not write {}: {error}; revoke {} and create another",
-                            path.display(),
-                            created.worker.worker_id
-                        ))
-                    })?;
-                    out.push_str(&format!(
-                        "Credential written to {} (mode 0600).\n",
-                        path.display()
-                    ));
-                }
-                None => {
-                    out.push_str(&format!("Credential: {}\n", created.credential));
-                    eprintln!(
-                        "Shown once. Put it in a file of mode 0600 readable by the worker's \
-                         user only, and pass it with --credential-file."
-                    );
-                }
-            }
-        }
-        WorkerTokenCommand::List => {
-            let listing = api
-                .observer_workers()
-                .await
-                .map_err(|error| failure("Could not list the worker credentials", error))?;
-            if listing.workers.is_empty() {
-                out.push_str("No worker credentials.\n");
-            }
-            let now = now();
-            for worker in &listing.workers {
-                let state = worker.revoked_at.map_or("active".to_string(), |at| {
-                    format!("revoked {} ago", age(now, at))
-                });
-                out.push_str(&format!(
-                    "{:<40} {:<24} created {} ago, {state}\n",
-                    without_unsafe_chars(&worker.worker_id),
-                    without_unsafe_chars(worker.name.as_deref().unwrap_or("-")),
-                    age(now, worker.created_at)
-                ));
-            }
-        }
-        WorkerTokenCommand::Revoke { worker_id } => {
-            let worker = api
-                .revoke_observer_worker(&worker_id)
-                .await
-                .map_err(|error| failure("Could not revoke the worker credential", error))?;
-            out.push_str(&format!(
-                "Revoked worker credential {}.\n",
-                without_unsafe_chars(&worker.worker_id)
-            ));
-        }
-    }
-    Ok(out)
-}
-
-/// Writes `secret` to a file that must not exist yet, mode `0600`.
-fn write_new_secret_file(path: &Path, secret: &str) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    writeln!(file, "{secret}")
-}
-
 async fn worker(args: WorkerArgs, target: &ServerTarget) -> Result<()> {
     let Some(server) = target.server.clone() else {
         return Err(CliError::usage(
             "narsor-cli observer worker needs the control plane's URL: --server or NARSOR_SERVER",
         ));
     };
-    check_credential_file(&args.credential_file).map_err(CliError::failure)?;
+    let key = worker_key()?;
     if let Some(dir) = &args.secrets_dir {
         check_secrets_dir(dir).map_err(CliError::failure)?;
     }
@@ -943,20 +758,20 @@ async fn worker(args: WorkerArgs, target: &ServerTarget) -> Result<()> {
         })?;
         if user.uid == current_uid() {
             return Err(CliError::failure(format!(
-                "Cannot run scripts as '{name}': it is the worker's own user, which can read \
-                 the credential and the secrets"
+                "Cannot run scripts as '{name}': it is the worker's own user, which holds \
+                 the key and can read the secrets"
             )));
         }
         options.script_user = Some(user);
     } else if args.insecure_same_user {
         tracing::warn!(
             "observer worker: --insecure-same-user: scripts run as the worker's own user and \
-             can read the worker credential and every observer's secrets; use --script-user \
-             outside a trial"
+             can read the worker key and every observer's secrets; use --script-user outside \
+             a trial"
         );
         eprintln!(
             "Warning: scripts run as the worker's own user (--insecure-same-user) and can read \
-             the worker credential and the secrets. Use --script-user in production."
+             the worker key and the secrets. Use --script-user in production."
         );
     } else {
         // clap requires one of the two; refuse rather than run unisolated.
@@ -971,7 +786,7 @@ async fn worker(args: WorkerArgs, target: &ServerTarget) -> Result<()> {
     if let Some(path) = args.script_path {
         options.path = path;
     }
-    let client = ApiClient::remote(&server, TokenSource::File(args.credential_file))
+    let client = ApiClient::remote(&server, TokenSource::Static(key))
         .map_err(|error| failure("Cannot reach the control plane", error))?;
     let worker = Worker::new(client, ProcessRunner, options);
     tracing::info!(server = %server, "observer worker: started");
@@ -981,7 +796,21 @@ async fn worker(args: WorkerArgs, target: &ServerTarget) -> Result<()> {
         .map_err(|stop: WorkerStop| CliError::failure(stop.to_string()))
 }
 
-/// Resolves at Ctrl-C or `SIGTERM` (systemd's stop).
+/// The key `narsor-server` handed the worker in [`OBSERVER_WORKER_KEY_ENV`].
+/// A variable, not a flag: an argument would show in `ps`. The worker
+/// never passes it on: a script's environment is an explicit list.
+fn worker_key() -> Result<String> {
+    match std::env::var(OBSERVER_WORKER_KEY_ENV) {
+        Ok(key) if !key.trim().is_empty() => Ok(key.trim().to_string()),
+        _ => Err(CliError::usage(format!(
+            "narsor-cli observer worker needs the key narsor-server gives it in \
+             {OBSERVER_WORKER_KEY_ENV}; enable the worker in the server's configuration \
+             (observer_worker: on) instead of starting it by hand"
+        ))),
+    }
+}
+
+/// Resolves at `SIGTERM` (the server's stop) or Ctrl-C.
 async fn shutdown_signal() {
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {

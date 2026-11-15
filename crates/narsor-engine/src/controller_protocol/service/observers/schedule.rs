@@ -106,6 +106,9 @@ pub struct ObserverPass {
 pub struct ClaimedObserverRun {
     /// The run.
     pub run_id: RunId,
+    /// The observer's owner: the worker reads the run's secrets from the
+    /// owner's part of its secrets directory.
+    pub owner: OwnerRef,
     /// The run's token, for the effect routes, valid until the result or
     /// the deadline.
     pub token: BearerToken,
@@ -129,6 +132,7 @@ impl ClaimedObserverRun {
     pub fn into_wire(self) -> ObserverWorkerRun {
         ObserverWorkerRun {
             run_id: self.run_id.to_string(),
+            owner: self.owner.0,
             token: self.token.expose().to_string(),
             script_version: self.script_version,
             script: self.script,
@@ -290,47 +294,10 @@ impl ProtocolService {
     /// fails to yield its run, or whose record cannot be read, is logged
     /// and skipped, so it does not block the rest.
     pub fn claim_observer_run(&self) -> ProtocolResult<Option<ClaimedObserverRun>> {
-        self.claim_next_run(None)
-    }
-
-    /// Like [`Self::claim_observer_run`], for a worker of `owner`: only the
-    /// runs of `owner`'s observers.
-    pub fn claim_observer_run_for(
-        &self,
-        owner: &OwnerRef,
-    ) -> ProtocolResult<Option<ClaimedObserverRun>> {
-        self.claim_next_run(Some(owner))
-    }
-
-    /// Like [`Self::finish_observer_run`], for a worker of `owner`: the run
-    /// of an observer of anyone else is not found.
-    pub fn finish_observer_run_for(
-        &self,
-        owner: &OwnerRef,
-        run_id: &RunId,
-        report: RunReport,
-    ) -> ProtocolResult<LastRun> {
-        match self.observers.load(&run_id.observer_id) {
-            Ok(record) if &record.owner == owner => {}
-            Ok(_) | Err(ObserverError::NotFound(_)) => return Err(ProtocolError::NotFound),
-            Err(error) => return Err(error.into()),
-        }
-        self.finish_observer_run(run_id, report)
-    }
-
-    /// The claim of [`Self::claim_observer_run`], among the observers of
-    /// `owner` when given.
-    fn claim_next_run(
-        &self,
-        owner: Option<&OwnerRef>,
-    ) -> ProtocolResult<Option<ClaimedObserverRun>> {
         let now = self.control.now();
         let records = self.observers.list_readable()?;
         let mut candidates: Vec<(DateTime<Utc>, ObserverId)> = Vec::new();
-        for record in records
-            .into_iter()
-            .filter(|record| owner.is_none_or(|owner| &record.owner == owner))
-        {
+        for record in records {
             if record
                 .active_run
                 .as_ref()
@@ -453,6 +420,20 @@ impl ProtocolService {
             }
         }
         Ok(last_run)
+    }
+
+    /// A new key for the server's observer worker, shown this once (D5).
+    /// The key issued before stops working: the server calls this at every
+    /// start of the worker, so a key outlives neither its worker nor the
+    /// server.
+    pub fn issue_observer_worker_key(&self) -> BearerToken {
+        self.observer_worker_key.issue()
+    }
+
+    /// Whether `bearer` is the observer worker's current key: it may claim
+    /// runs of every owner and report their results, nothing else.
+    pub fn authenticate_observer_worker(&self, bearer: &str) -> bool {
+        self.observer_worker_key.matches(bearer)
     }
 
     /// The run an observer run token proves, `None` for anything that is
@@ -621,6 +602,7 @@ impl ProtocolService {
         self.observers.save(&lock, &mut record, now)?;
         Ok(Some(ClaimedObserverRun {
             run_id,
+            owner: record.owner.clone(),
             token,
             script_version: version,
             script,

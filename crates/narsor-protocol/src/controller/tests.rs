@@ -190,6 +190,7 @@ fn observer_effect_requests_refuse_fields_a_script_may_not_choose() {
 fn a_worker_run_hides_its_token_and_an_unknown_outcome_is_unrecognized() {
     let run = super::ObserverWorkerRun {
         run_id: "obs-1.1".into(),
+        owner: "owner".into(),
         token: "nso.obs-1.1.secret-part".into(),
         script_version: 1,
         script: "true".into(),
@@ -199,6 +200,13 @@ fn a_worker_run_hides_its_token_and_an_unknown_outcome_is_unrecognized() {
         deadline: Utc::now(),
     };
     assert!(!format!("{run:?}").contains("secret-part"));
+    assert_eq!(serde_json::to_value(&run).unwrap()["owner"], "owner");
+    // A server that does not say whose run it is: the worker refuses to
+    // pick a secrets directory for it.
+    let mut without_owner = serde_json::to_value(&run).unwrap();
+    without_owner.as_object_mut().unwrap().remove("owner");
+    let parsed: super::ObserverWorkerRun = serde_json::from_value(without_owner).unwrap();
+    assert_eq!(parsed.owner, "");
 
     let outcome: super::ObserverRunOutcome =
         serde_json::from_value(serde_json::json!({"kind": "exploded", "why": "newer"})).unwrap();

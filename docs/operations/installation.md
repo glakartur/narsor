@@ -233,70 +233,107 @@ workstation security boundary.
 ## Run the observer worker
 
 Observers poll external sources (Jira, GitHub, GitLab) with a shell script
-on a schedule. The control plane keeps the schedule; a separate worker
-process, `narsor-cli observer worker`, claims the runs that are due, runs
-their scripts and reports the results. Run it on a host that can reach both
-the control plane and the sources, under its own system user. How to write
-an observer and its script is in [Observers](../user/observers.md).
+on a schedule. The control plane keeps the schedule; a worker process,
+`narsor-cli observer worker`, claims the runs that are due, runs their
+scripts and reports the results. The server starts the worker and
+supervises it. How to write an observer and its script is in
+[Observers](../user/observers.md).
 
-**Create the worker credential.** The worker does not use the owner's token.
-It has a credential of its own, which can only claim the runs of the owner's
-observers and report their results. As the owner:
+**Enable the worker.** The worker is off by default. Set these settings in
+the server's configuration file (or as `NARSOR_<NAME>` environment
+variables):
 
-```bash
-narsor-cli observer worker-token create --name "$(hostname)" \
-  --output /etc/narsor/observer-worker/credential
-chown narsor-observer: /etc/narsor/observer-worker/credential
+| setting | value |
+| --- | --- |
+| `observer_worker` | `on` starts the worker; `off` (default) does not |
+| `observer_script_user` | the system user that runs the scripts; not the server's user, not `root` |
+| `observer_secrets_dir` | the absolute path of the secrets directory; empty: no secrets |
+| `observer_worker_server` | the URL the worker and its scripts use for the API; empty: the server's own address (trusted mode only) |
+| `observer_insecure_same_user` | `true` runs the scripts as the server's own user; for a trial on a developer machine only |
+
+```yaml
+observer_worker: on
+observer_script_user: narsor-observer-script
+observer_secrets_dir: /etc/narsor/observer-secrets
+# Network mode only: the URL of the TLS proxy.
+observer_worker_server: https://narsor.example.com
 ```
 
-The credential is shown or written once; the server keeps only its SHA-256
-digest. `--output` creates a new file of mode `0600`. The worker refuses to
-start when the file can be read by any other user. `narsor-cli observer
-worker-token list` shows the credentials, and `narsor-cli observer
-worker-token revoke WORKER_ID` stops one at once: the worker then exits with
-an error. A run it claimed and did not report is recorded as lost at the
-run's deadline (script limit plus one minute) and does not count as a failed
-run of the script.
+The server refuses to start when `observer_worker` is `on` and neither
+`observer_script_user` nor `observer_insecure_same_user: true` is set, or
+both are set. In network mode the server refuses to start without
+`observer_worker_server`: every request must come through the TLS proxy, the
+worker's requests too.
+
+The server finds `narsor-cli` in its own directory, as it finds
+`narsor-controller`. The worker runs as the server's user. When it stops,
+the server starts it again after a pause that doubles up to 30 seconds. When
+the server stops, it stops the worker first. A run that the worker did not
+report is recorded as lost at the run's deadline (script limit plus one
+minute) and does not count as a failed run of the script.
+
+**The worker key.** The worker does not use the owner's token. At every
+start of the worker, the server makes a new random key, keeps only its
+SHA-256 digest in memory, and gives the key to the worker in the
+`NARSOR_OBSERVER_WORKER_KEY` environment variable (not as an argument, so
+`ps` does not show it). The key can only claim due runs of all owners and
+report their results. No file holds the key. A restart of the worker or of
+the server makes the old key invalid. There is no command to make or revoke
+a worker key.
 
 **Provide the secrets.** An observer names the secrets it needs (a name and
-an environment variable); their values never reach the control plane. Put
-one file per secret name in the worker's secrets directory, which must be
-accessible to the worker's user only (`0700`):
+an environment variable); their values never reach the control plane. One
+worker serves the observers of all owners, so the secrets directory has one
+subdirectory for each owner, and one file for each secret name in it. A
+script gets only the secrets of its observer's owner: an owner cannot use the
+secret of another owner by its name. The directory must be accessible to the
+server's user only (`0700`). In this example the server runs as the user
+`narsor`, and the owner is `local` (trusted mode):
 
 ```bash
-install -d -m 0700 -o narsor-observer /etc/narsor/observer-worker/secrets
-install -m 0600 -o narsor-observer /dev/stdin \
-  /etc/narsor/observer-worker/secrets/jira-token <<<"$JIRA_TOKEN"
+install -d -m 0700 -o narsor /etc/narsor/observer-secrets
+install -d -m 0700 -o narsor /etc/narsor/observer-secrets/local
+install -m 0600 -o narsor /dev/stdin \
+  /etc/narsor/observer-secrets/local/jira-token <<<"$JIRA_TOKEN"
 ```
 
-A run whose secret file is missing fails before its script starts.
+The name of the owner's subdirectory is the owner as the server records it,
+with `%` written as `%25` and `/` written as `%2F`:
 
-**Start the worker.** The unit
-[`deploy/observer-worker/narsor-observer-worker.service`](../../deploy/observer-worker/narsor-observer-worker.service)
-runs the worker as `narsor-observer` and every script as a second system
-user, `narsor-observer-script`, which cannot read the credential or the
-secrets directory. It grants the worker only the capabilities needed to
-switch to that user and end its processes (`CAP_SETUID`, `CAP_SETGID`,
-`CAP_CHOWN`, `CAP_KILL`), and bounds the worker and all its scripts together
-with `MemoryMax` and `TasksMax`. Create both users, set `NARSOR_SERVER` in
-`/etc/narsor/observer-worker.env`, then enable the unit as its header
-describes. Without systemd, start the worker the same way:
+| mode | owner | subdirectory |
+| --- | --- | --- |
+| trusted | `local` | `local` |
+| network | `oidc:{issuer}#{subject}` | for example `oidc:https:%2F%2Flogin.example.com#1234` for the issuer `https://login.example.com` and the subject `1234` |
+
+When an owner name cannot be a directory name (it is empty, `.` or `..`,
+or it has a control character), the run fails before its script starts.
+When a secret file is missing, the run fails before its script starts, and
+its error names the owner's subdirectory.
+
+**Isolate the scripts.** Create a second system user for the scripts, which
+runs nothing else:
 
 ```bash
-NARSOR_SERVER=https://narsor.example.com narsor-cli observer worker \
-  --credential-file /etc/narsor/observer-worker/credential \
-  --secrets-dir /etc/narsor/observer-worker/secrets \
-  --script-user narsor-observer-script
+useradd --system --no-create-home --shell /usr/sbin/nologin narsor-observer-script
 ```
 
-The worker refuses to start without `--script-user`. For a trial on a
-developer machine only, `--insecure-same-user` runs scripts as the worker's
-own user; a script can then read the worker credential and every observer's
-secrets, and the worker warns about it at start.
+The script user cannot read the secrets directory or the worker's
+environment. To switch to the script user, give it its run directory and
+stop its processes, the worker needs the capabilities `CAP_SETUID`,
+`CAP_SETGID`, `CAP_CHOWN` and `CAP_KILL`. Because the server starts the
+worker, give these capabilities to the server's service (for systemd:
+`AmbientCapabilities=` and `CapabilityBoundingSet=`). The worker clears them
+and sets `no_new_privs` in each script process before the script starts, so
+a script has none of them. Other processes that the server starts (the
+local controller and its runners) also get the ambient capabilities: grant
+them only when you enable the worker with a script user. Limits of the
+server's service (`MemoryMax`, `TasksMax`) apply to the server, the worker
+and all scripts together.
 
-`--once` claims once and exits, for a cron job. `--work-dir` moves the run
-directories out of the system's temporary directory; `--script-path` sets
-the scripts' `PATH`.
+With `observer_insecure_same_user: true` scripts run as the server's own
+user. A script can then read the worker key, every owner's secrets and the
+server's state. The worker writes a warning at start. Do not use it in
+production.
 
 **What a script gets.** The worker asks for a due run every 10 seconds. For
 each run it makes a temporary directory (mode `0700`, owned by the script
@@ -312,7 +349,8 @@ exactly these variables:
 | `NARSOR_OBSERVER_RUN` | the run's id |
 | one per secret | the value of the observer's secret |
 
-Nothing of the worker's own environment is passed on. The script reads the
+Nothing of the worker's own environment is passed on, the worker key
+included. The script reads the
 run's input as JSON on stdin and prints its result on stdout. It runs in a
 process group of its own: at its time limit (5 minutes) the group gets
 `SIGTERM`, then `SIGKILL` 5 seconds later; when the script exits, anything it

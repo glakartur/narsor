@@ -328,7 +328,7 @@ pub enum Command {
     },
 
     /// Observers of external sources: create, script, approve and
-    /// watch them; the worker that runs their scripts and its credential.
+    /// watch them; the worker narsor-server starts to run their scripts.
     Observer {
         /// What to do.
         #[command(subcommand)]
@@ -875,13 +875,7 @@ mod tests {
 
     #[test]
     fn the_observer_worker_needs_a_script_user_unless_isolation_is_waived() {
-        let base = [
-            "narsor-cli",
-            "observer",
-            "worker",
-            "--credential-file",
-            "/etc/narsor/credential",
-        ];
+        let base = ["narsor-cli", "observer", "worker"];
         // Isolation is the default: no script user and no waiver is refused.
         assert!(Cli::try_parse_from(base).is_err());
         let insecure = Cli::try_parse_from(base.iter().copied().chain(["--insecure-same-user"]));
@@ -906,22 +900,29 @@ mod tests {
         }
         .runs_on_broken_config());
         assert!(Command::Init(init::InitOptions::default()).runs_on_broken_config());
-        // The observer worker reads its flags only; the owner's credential
-        // commands talk to the configured control plane.
+        // The observer worker reads its flags and its key only; the owner's
+        // observer commands talk to the configured control plane.
         let worker = Cli::try_parse_from([
             "narsor-cli",
             "observer",
             "worker",
-            "--credential-file",
-            "/etc/narsor/credential",
             "--script-user",
             "narsor-observer-script",
         ])
         .unwrap();
         assert!(worker.command.runs_on_broken_config());
-        let token =
-            Cli::try_parse_from(["narsor-cli", "observer", "worker-token", "list"]).unwrap();
-        assert!(!token.command.runs_on_broken_config());
+        let owner = Cli::try_parse_from(["narsor-cli", "observer", "list"]).unwrap();
+        assert!(!owner.command.runs_on_broken_config());
+        // The key comes from the server, never from a flag.
+        assert!(Cli::try_parse_from([
+            "narsor-cli",
+            "observer",
+            "worker",
+            "--insecure-same-user",
+            "--credential-file",
+            "/etc/narsor/credential",
+        ])
+        .is_err());
 
         for command in [
             Command::List,

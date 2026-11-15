@@ -205,12 +205,6 @@ pub const ORCHESTRATION_ENROLLMENTS_DIR: &str = "enrollments";
 /// Advisory lock serializing enrollment creation and redemption.
 pub const ENROLLMENTS_LOCK_FILE: &str = "enroll.lock";
 
-/// Directory of observer worker credentials under the orchestration root.
-pub const ORCHESTRATION_OBSERVER_WORKERS_DIR: &str = "observer-workers";
-
-/// Lock file serializing changes to observer worker credentials.
-pub const OBSERVER_WORKERS_LOCK_FILE: &str = "workers.lock";
-
 /// The current runner credential of one task (KTD3), next to its record but
 /// outside it, so the credential hash never travels with the record.
 pub const RUNNER_SESSION_FILE: &str = "runner-session.json";
@@ -625,23 +619,6 @@ impl StatePaths {
     pub fn enrollments_lock_file(&self) -> PathBuf {
         self.orchestration_enrollments_dir()
             .join(ENROLLMENTS_LOCK_FILE)
-    }
-
-    /// `{root}/orchestration/observer-workers`
-    pub fn observer_workers_dir(&self) -> PathBuf {
-        self.orchestration_dir()
-            .join(ORCHESTRATION_OBSERVER_WORKERS_DIR)
-    }
-
-    /// `{root}/orchestration/observer-workers/{worker_id}.json`
-    pub fn observer_worker_file(&self, worker_id: &str) -> PathBuf {
-        self.observer_workers_dir()
-            .join(format!("{worker_id}.json"))
-    }
-
-    /// `{root}/orchestration/observer-workers/workers.lock`
-    pub fn observer_workers_lock_file(&self) -> PathBuf {
-        self.observer_workers_dir().join(OBSERVER_WORKERS_LOCK_FILE)
     }
 
     /// `{state}/executions/{id}/checkpoint.{name}.bundle`: the checkpoint of

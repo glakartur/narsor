@@ -489,7 +489,7 @@ graph TD
 **Approach:**
 - Pętla: claim → katalog roboczy uruchomienia (tymczasowy, usuwany) → `sh` z pustym środowiskiem plus lista z Key Technical Decisions → stdin z wejściem → odczyt stdout/stderr z limitem → wynik. Seam trait dla wykonania procesu (test bez prawdziwego `sh`).
 - Limit czasu: SIGTERM, potem SIGKILL na grupę procesów.
-- Sekrety: `--secrets-dir`; brak pliku dla referencji → uruchomienie kończy się błędem bez startu skryptu.
+- Sekrety: `observer_secrets_dir` w konfiguracji serwera. Jeden worker obsługuje obserwatory wszystkich właścicieli, więc worker czyta sekret z podkatalogu właściciela: `{secrets-dir}/{owner}/{NAME}` (znaki `/` i `%` jako `%2F` i `%25`). Właściciel nie może użyć sekretu innego właściciela. Niebezpieczna nazwa właściciela (pusta, `.`, `..`, znaki sterujące) albo brak pliku dla referencji → uruchomienie kończy się błędem bez startu skryptu (D5).
 - Maskowanie: każde wystąpienie wartości sekretu i tokenu w stdout/stderr zastąpione znacznikiem; znaki sterujące usunięte.
 - Klucz workera (D5, PO5): serwer uruchamia workera jako proces potomny (gdy konfiguracja serwera włącza workera) i nadzoruje go: ponowny start z rosnącą przerwą, zatrzymanie razem z serwerem. Przy starcie serwer generuje losowy klucz, trzyma w pamięci tylko jego skrót i przekazuje klucz w zmiennej środowiska procesu potomnego. `Principal::ObserverWorker` daje tylko claim i wynik. Brak poleceń właściciela dla klucza.
 - Izolacja: skrypt działa jako `--script-user`, bez odczytu klucza workera i `--secrets-dir`; katalog uruchomienia 0700 tylko z sekretami tego obserwatora.

@@ -307,12 +307,20 @@ makes a `draft` observer `active`. It does not change other states.
 
 An observer names its secrets with `--secret NAME=ENV`. The control plane
 keeps only these names. The values are files in the secrets directory of
-the worker, one file for each name (see
+the worker. One worker serves the observers of all owners, so the directory
+has one subdirectory for each owner, with one file for each name:
+`{secrets directory}/{owner}/{NAME}` (see
 [installation](../operations/installation.md#run-the-observer-worker)).
 
 - The script gets a secret only as the variable `ENV`, and only the
   secrets of its own observer. It does not get the environment of the
-  worker.
+  worker, and not the worker key.
+- The worker reads a secret only from the subdirectory of the observer's
+  owner. You cannot use the secret of another owner, also when you know its
+  name.
+- When the owner's name cannot be a directory name, or a secret file is
+  missing, the run fails before its script starts. `observer show` shows
+  the error.
 - The worker replaces each secret value and the run token in stdout and
   stderr with `[masked]` before it reports them. This is a second line of
   defence: a script must not print a secret.
