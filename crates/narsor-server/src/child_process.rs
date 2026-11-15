@@ -5,7 +5,9 @@
 //! * [`prepare`] gives a child a clean start: none of the daemon's
 //!   `NARSOR_*` variables, `RUST_LOG` after the daemon's level, a process
 //!   group of its own, and an end with the daemon — `PR_SET_PDEATHSIG`,
-//!   checked against the daemon's pid in case the daemon died first.
+//!   checked against the daemon's pid in case the daemon died first, and
+//!   no capability: the daemon's ambient set is cleared
+//!   ([`crate::capabilities`]).
 //! * [`copy_stderr`] copies the child's stderr, line by line and prefixed,
 //!   to the daemon's own stderr, which is the daemon's log.
 //! * [`watch`] waits for the child's end or a stop request; a stop is
@@ -25,6 +27,8 @@ use std::time::{Duration, Instant};
 
 use narsor_shared::config::ENV_PREFIX;
 
+use crate::capabilities;
+
 /// Longest pause before a restart.
 pub const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
 
@@ -37,8 +41,9 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Gives `command` a clean start as a child of this daemon: no `NARSOR_*`
 /// variable of the daemon, `RUST_LOG` set to `log_directive` (or removed),
 /// stdin and stdout closed, stderr piped, a process group of its own, and
-/// `SIGTERM` when the starting thread ends. Add the child's own variables
-/// after this call.
+/// `SIGTERM` when the starting thread ends, and an empty ambient
+/// capability set, so that the child gets no capability from the daemon.
+/// Add the child's own variables after this call.
 pub fn prepare(command: &mut Command, log_directive: Option<&str>) {
     let parent = std::process::id();
     for (name, _) in std::env::vars_os() {
@@ -67,7 +72,9 @@ pub fn prepare(command: &mut Command, log_directive: Option<&str>) {
             if libc::getppid() as u32 != parent {
                 return Err(io::Error::other("the daemon is gone"));
             }
-            Ok(())
+            // Only the observer worker gets the daemon's capabilities, and
+            // it raises them itself after this hook.
+            capabilities::clear_ambient()
         });
     }
 }

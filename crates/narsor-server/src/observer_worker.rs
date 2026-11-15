@@ -18,7 +18,10 @@
 //! address), the secrets directory and the script user or the waiver, each
 //! as a flag. None of the daemon's `NARSOR_*` variables reach it; the key
 //! is the one it gets. `RUST_LOG` follows the daemon's log level; the
-//! child's stderr is copied, prefixed, to the daemon's log.
+//! child's stderr is copied, prefixed, to the daemon's log. With a script
+//! user, the child gets exactly [`capabilities::WORKER_CAPABILITIES`] as
+//! ambient capabilities, when the daemon holds them; every other child of
+//! the daemon gets none ([`crate::capabilities`]).
 //!
 //! # Supervision
 //!
@@ -30,6 +33,7 @@
 //! worker that cannot reach the control plane only claims nothing, and
 //! `observer list` then warns that no worker claims due runs.
 
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
@@ -41,6 +45,7 @@ use narsor_engine::controller_protocol::wire::OBSERVER_WORKER_KEY_ENV;
 #[cfg(doc)]
 use narsor_engine::controller_protocol::ProtocolService;
 
+use crate::capabilities;
 use crate::child_process::{self, Ended, RestartDelay};
 
 /// The program the worker is, installed next to `narsor-server`.
@@ -93,6 +98,13 @@ impl ObserverWorkerSettings {
             ScriptIsolation::SameUser => command.arg("--insecure-same-user"),
         };
         child_process::prepare(&mut command, self.log_directive.as_deref());
+        if matches!(self.isolation, ScriptIsolation::User(_)) {
+            // SAFETY: the hook only calls `prctl`. It runs after the hook
+            // of `prepare`, which cleared the ambient set.
+            unsafe {
+                command.pre_exec(capabilities::raise_worker_ambient);
+            }
+        }
         command.env(OBSERVER_WORKER_KEY_ENV, key);
         command
     }

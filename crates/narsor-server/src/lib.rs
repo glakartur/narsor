@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod auth_gate;
+pub mod capabilities;
 pub mod child_process;
 pub mod controller_protocol;
 pub mod instance_lock;

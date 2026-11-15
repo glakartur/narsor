@@ -322,13 +322,15 @@ environment. To switch to the script user, give it its run directory and
 stop its processes, the worker needs the capabilities `CAP_SETUID`,
 `CAP_SETGID`, `CAP_CHOWN` and `CAP_KILL`. Because the server starts the
 worker, give these capabilities to the server's service (for systemd:
-`AmbientCapabilities=` and `CapabilityBoundingSet=`). The worker clears them
-and sets `no_new_privs` in each script process before the script starts, so
-a script has none of them. Other processes that the server starts (the
-local controller and its runners) also get the ambient capabilities: grant
-them only when you enable the worker with a script user. Limits of the
-server's service (`MemoryMax`, `TasksMax`) apply to the server, the worker
-and all scripts together.
+`AmbientCapabilities=` and `CapabilityBoundingSet=`). At start the server
+removes them from its own ambient and effective sets and keeps them only in
+its permitted and inheritable sets. Only the worker gets them again, as
+ambient capabilities, and only with a script user. Other processes that
+the server starts (the local controller, its runners and the agents) get
+no capability. The worker clears them and sets `no_new_privs` in each
+script process before the script starts, so a script has none of them.
+Limits of the server's service (`MemoryMax`, `TasksMax`) apply to the
+server, the worker and all scripts together.
 
 With `observer_insecure_same_user: true` scripts run as the server's own
 user. A script can then read the worker key, every owner's secrets and the
