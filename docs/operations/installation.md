@@ -318,7 +318,11 @@ Nothing of the worker's own environment is passed on. The script reads the
 run's input as JSON on stdin and prints its result on stdout. It runs in a
 process group of its own: at its time limit (5 minutes) the group gets
 `SIGTERM`, then `SIGKILL` 5 seconds later; when the script exits, anything it
-left running is killed. stdout may hold at most 1 MiB (more is a format
+left running is killed. A process can leave the group (`setsid`), so after
+each run the worker also kills every process of the script user, and it
+claims no run while a process of that user still runs. Thus a process left
+behind cannot read the secrets and the token of the next run. Use a
+dedicated script user that runs nothing else. stdout may hold at most 1 MiB (more is a format
 error that leaves the observer's state unchanged); the first 64 KiB of stderr
 are kept. Before the result leaves the worker, control characters are
 removed and every occurrence of a secret value or of the run's token is

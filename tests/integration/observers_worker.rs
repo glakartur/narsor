@@ -19,9 +19,9 @@ use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use narsor::api::ClientError;
 use narsor::cli::observer_worker::{
-    check_credential_file, check_secrets_dir, Masker, ProcessRunner, ScriptEnd, ScriptExit,
-    ScriptRunner, ScriptSpec, ScriptUser, Worker, WorkerApi, WorkerOptions, WorkerStop, MASK,
-    MAX_STDERR_BYTES, MAX_STDOUT_BYTES, SCRIPT_FILE,
+    check_credential_file, check_secrets_dir, current_uid, kill_all_processes_of, processes_of,
+    Masker, ProcessRunner, ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, ScriptUser, Worker,
+    WorkerApi, WorkerOptions, WorkerStop, MASK, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, SCRIPT_FILE,
 };
 use narsor_engine::controller_protocol::error::ProtocolError;
 use narsor_engine::controller_protocol::service::MAX_STORED_LOG_BYTES;
@@ -918,4 +918,192 @@ async fn a_script_user_cannot_read_the_worker_credential_or_secrets() {
     assert!(!output.contains("READ-SECRET"), "{output}");
     assert!(!output.contains(SENTINEL));
     assert_eq!(fs::read_dir(fx.root.join("work")).unwrap().count(), 0);
+}
+
+#[test]
+fn the_processes_of_a_user_are_found_in_proc() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = i32::try_from(child.id()).unwrap();
+
+    let found = processes_of(current_uid());
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(found.contains(&pid), "{pid} not in {found:?}");
+    assert!(!found.contains(&i32::try_from(std::process::id()).unwrap()));
+    assert!(!processes_of(current_uid()).contains(&pid));
+}
+
+/// A script that leaves its process group (`setsid`) still runs as the
+/// script user; after the run nothing of that user is left, so it cannot
+/// read the environment of the next run. Needs root, like the test above.
+#[tokio::test]
+#[ignore = "needs root and a second system user (NARSOR_TEST_SCRIPT_USER)"]
+async fn a_script_user_process_that_left_its_group_does_not_outlive_the_run() {
+    let name = std::env::var("NARSOR_TEST_SCRIPT_USER").expect("NARSOR_TEST_SCRIPT_USER");
+    let user = ScriptUser::lookup(&name).unwrap();
+    let fx = Fixture::new();
+    set_mode(&fx.root, 0o711);
+    set_mode(&fx.root.join("work"), 0o711);
+    fx.observer(
+        "setsid sleep 30 </dev/null >/dev/null 2>&1 &\n\
+         echo \"child $!\" >&2\n\
+         printf '{\"state\": {}}'\n",
+        &[],
+    );
+    let mut options = fx.options();
+    options.script_user = Some(user);
+    let worker = Worker::new(fx.api(), ProcessRunner, options);
+
+    let handled = worker.run_once().await.unwrap().unwrap();
+
+    let child = pid_after(&handled.report.stderr, "child ");
+    assert!(wait_until_gone(child), "the daemonized {child} survived");
+    assert!(processes_of(user.uid).is_empty());
+}
+
+/// A process of the script user that runs before a claim — left by an
+/// earlier worker, say — is killed before a run is claimed.
+#[tokio::test]
+#[ignore = "needs root and a second system user (NARSOR_TEST_SCRIPT_USER)"]
+async fn a_leftover_script_user_process_is_killed_before_the_claim() {
+    use std::os::unix::process::CommandExt as _;
+    let name = std::env::var("NARSOR_TEST_SCRIPT_USER").expect("NARSOR_TEST_SCRIPT_USER");
+    let user = ScriptUser::lookup(&name).unwrap();
+    let fx = Fixture::new();
+    set_mode(&fx.root, 0o711);
+    set_mode(&fx.root.join("work"), 0o711);
+    let mut leftover = std::process::Command::new("sleep")
+        .arg("30")
+        .uid(user.uid)
+        .gid(user.gid)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    fx.observer("printf '{\"state\": {}}'\n", &[]);
+    let mut options = fx.options();
+    options.script_user = Some(user);
+    let worker = Worker::new(fx.api(), ProcessRunner, options);
+
+    let handled = worker.run_once().await.unwrap();
+
+    assert!(handled.is_some());
+    let _ = leftover.wait();
+    assert!(processes_of(user.uid).is_empty());
+}
+
+/// Set by `a_non_root_worker_with_cap_kill_ends_only_the_script_users_processes`
+/// for the helper it runs as the worker user: `<uid>:<gid>` of the script user.
+const KILL_HELPER_ENV: &str = "NARSOR_TEST_KILL_HELPER_SCRIPT_USER";
+
+/// The test filter that runs exactly `name` in this module.
+fn this_module_test(name: &str) -> String {
+    let path = module_path!();
+    let module = path.split_once("::").map_or(path, |(_, rest)| rest);
+    format!("{module}::{name}")
+}
+
+/// Whether the effective capability set of this process holds `CAP_KILL`.
+fn holds_cap_kill() -> bool {
+    const CAP_KILL: u32 = 5;
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let effective = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(str::trim)
+        .unwrap();
+    u64::from_str_radix(effective, 16).unwrap() & (1 << CAP_KILL) != 0
+}
+
+/// The worker side of the test below: runs as a non-root worker user that
+/// holds `CAP_KILL` (and the switch of user) only as ambient capabilities,
+/// like the shipped systemd unit. Does nothing unless that test runs it.
+#[test]
+#[ignore = "run by a_non_root_worker_with_cap_kill_ends_only_the_script_users_processes"]
+fn kill_helper_as_a_non_root_worker() {
+    let Ok(ids) = std::env::var(KILL_HELPER_ENV) else {
+        return;
+    };
+    let (uid, gid) = ids.split_once(':').unwrap();
+    let user = ScriptUser {
+        uid: uid.parse().unwrap(),
+        gid: gid.parse().unwrap(),
+    };
+    assert_ne!(current_uid(), 0, "the helper must not run as root");
+    assert!(
+        holds_cap_kill(),
+        "the helper must hold CAP_KILL, or the test proves nothing"
+    );
+    kill_all_processes_of(user).unwrap();
+}
+
+/// A worker that is not root keeps its capabilities across the switch to
+/// the script user; the helper process that kills the script user's
+/// processes must give up `CAP_KILL` before `kill(-1)`, or it kills every
+/// process on the host. Needs root, `setpriv`, and three distinct
+/// unprivileged users: `NARSOR_TEST_SCRIPT_USER`, `NARSOR_TEST_WORKER_USER`
+/// (runs the helper; must be able to execute this test binary) and
+/// `NARSOR_TEST_THIRD_USER` (whose process must survive), e.g.
+/// `sudo NARSOR_TEST_SCRIPT_USER=nobody NARSOR_TEST_WORKER_USER=… \
+///  NARSOR_TEST_THIRD_USER=… cargo test -- --ignored cap_kill`.
+#[test]
+#[ignore = "needs root, setpriv and three system users (NARSOR_TEST_SCRIPT_USER, NARSOR_TEST_WORKER_USER, NARSOR_TEST_THIRD_USER)"]
+fn a_non_root_worker_with_cap_kill_ends_only_the_script_users_processes() {
+    use std::os::unix::process::CommandExt as _;
+    let lookup = |variable: &str| {
+        let name = std::env::var(variable).expect(variable);
+        ScriptUser::lookup(&name).unwrap()
+    };
+    let script = lookup("NARSOR_TEST_SCRIPT_USER");
+    let worker = lookup("NARSOR_TEST_WORKER_USER");
+    let third = lookup("NARSOR_TEST_THIRD_USER");
+    assert_eq!(current_uid(), 0, "needs root to start the users' processes");
+    let spawn_sleep_as = |user: ScriptUser| {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .uid(user.uid)
+            .gid(user.gid)
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    let mut bystander = spawn_sleep_as(third);
+    let mut leftover = spawn_sleep_as(script);
+    let bystander_pid = i32::try_from(bystander.id()).unwrap();
+    let leftover_pid = i32::try_from(leftover.id()).unwrap();
+
+    let status = std::process::Command::new("setpriv")
+        .arg(format!("--reuid={}", worker.uid))
+        .arg(format!("--regid={}", worker.gid))
+        .arg("--clear-groups")
+        .arg("--inh-caps=+kill,+setuid,+setgid")
+        .arg("--ambient-caps=+kill,+setuid,+setgid")
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &this_module_test("kill_helper_as_a_non_root_worker"),
+        ])
+        .args(["--ignored", "--test-threads=1"])
+        .env(KILL_HELPER_ENV, format!("{}:{}", script.uid, script.gid))
+        .status()
+        .unwrap();
+
+    let bystander_alive = !process_gone(bystander_pid);
+    let leftover_ended = wait_until_gone(leftover_pid);
+    for child in [&mut bystander, &mut leftover] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(status.success(), "the helper run failed: {status}");
+    assert!(
+        bystander_alive,
+        "the third user's process {bystander_pid} was killed"
+    );
+    assert!(
+        leftover_ended,
+        "the script user's process {leftover_pid} survived"
+    );
 }

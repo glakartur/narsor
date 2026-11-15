@@ -12,6 +12,7 @@
 
 use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
+use crate::orchestration::InputStatus;
 
 impl ProtocolService {
     /// Queues the timeout of every task waiting in a `wait` step past its
@@ -35,11 +36,16 @@ impl ProtocolService {
                 .is_some_and(|wait| wait.is_past_deadline(now));
             // A retry repairs a resume a pass queued a timeout for and
             // failed to make: the key of the work still says what to do.
-            let stranded = task
-                .event_inputs
-                .iter()
-                .find(|input| !input.status.is_settled())
-                .cloned();
+            // Only work still queued for the wait the task is in counts: an
+            // input of an ended episode never resumes a task.
+            let stranded = task.event_wait.as_ref().and_then(|wait| {
+                task.event_inputs
+                    .iter()
+                    .find(|input| {
+                        input.status == InputStatus::Queued && input.episode_id == wait.episode_id
+                    })
+                    .cloned()
+            });
             if !due && stranded.is_none() {
                 continue;
             }

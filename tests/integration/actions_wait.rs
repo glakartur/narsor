@@ -911,6 +911,109 @@ async fn past_its_deadline_the_wait_takes_the_timeout_label() {
 }
 
 #[tokio::test]
+async fn the_input_a_runner_left_for_later_ends_with_the_wait_it_was_for() {
+    // A timeout and an event for one wait reach the runner in one poll. It
+    // takes the first and leaves the second for later (its engine is busy),
+    // so it never acknowledges it. The first ends the wait: the second is
+    // obsolete, and never brings a stopped task back.
+    let mut stack = Stack::new(REVIEW, &[]);
+    stack.start().await;
+    let episode = stack.episode();
+    stack.advance(Duration::hours(2));
+    run_periodic_pass(&stack.service);
+    let run = stack.claim();
+    let key = format!("MR!17:approved:{episode}");
+    stack.send(&run, &key, "review.approved", approval("alice"));
+    let query = RunnerPollQuery {
+        wait_secs: Some(0),
+        event_wait_id: Some(episode.clone()),
+        ..RunnerPollQuery::default()
+    };
+    let response = stack
+        .service
+        .runner_poll(&stack.identity, query)
+        .await
+        .unwrap();
+    let handed: Vec<_> = response
+        .events
+        .iter()
+        .map(|event| {
+            (
+                event.input_id.clone(),
+                event.delivery == EventDelivery::Timeout,
+            )
+        })
+        .collect();
+    assert_eq!(
+        handed,
+        vec![
+            ("event-1".to_string(), true),
+            ("event-2".to_string(), false)
+        ]
+    );
+
+    stack
+        .engine()
+        .deliver_external_event(
+            &stack.definition,
+            stack.execution_id(),
+            &ExternalEventDelivery {
+                episode: episode.clone(),
+                ending: WaitEnding::Timeout,
+            },
+        )
+        .await
+        .unwrap();
+    let ack = stack
+        .service
+        .runner_ack_event(
+            &stack.identity,
+            "event-1",
+            InputAckRequest {
+                accepted: true,
+                detail: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(ack.status, InputStatus::Consumed);
+
+    let record = stack.record();
+    assert_eq!(record.event_wait, None);
+    let left = &record.event_inputs[1];
+    assert_eq!(left.input_id, "event-2");
+    assert_eq!(left.status, InputStatus::Obsolete);
+    assert_eq!(left.data, None, "obsolete data is dropped");
+    assert!(record
+        .event_inputs
+        .iter()
+        .all(|input| input.status.is_settled()));
+    // The runner refusing it later agrees with that: no conflict.
+    let refusal = stack
+        .service
+        .runner_ack_event(
+            &stack.identity,
+            "event-2",
+            InputAckRequest {
+                accepted: false,
+                detail: Some("no wait for it".to_string()),
+            },
+        )
+        .unwrap();
+    assert_eq!(refusal.status, InputStatus::Obsolete);
+    // A later pass finds no work stranded: nothing resumes the task.
+    let commands = record.commands.len();
+    stack.advance(Duration::hours(2));
+    run_periodic_pass(&stack.service);
+    assert!(stack
+        .record()
+        .commands
+        .iter()
+        .skip(commands)
+        .all(|receipt| !receipt.idempotency_key.starts_with("work-resume:")));
+    assert_eq!(stack.execution().current_state.as_deref(), Some("reminded"));
+}
+
+#[tokio::test]
 async fn past_its_deadline_a_wait_without_the_timeout_label_fails_its_step() {
     // PO4 without a `timeout` choice: a failed step, like any other.
     let mut stack = Stack::new(REVIEW_WITHOUT_TIMEOUT_LABEL, &[]);

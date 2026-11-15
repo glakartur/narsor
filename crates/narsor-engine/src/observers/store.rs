@@ -36,8 +36,8 @@ use crate::domain::WorkflowDefinition;
 use crate::orchestration::store::FileLock;
 use crate::orchestration::{OrchestrationError, OwnerRef};
 use crate::persistence::atomic::{
-    cleanup_orphaned_temp_files, read_json, write_atomic_exclusive, write_json_atomic,
-    write_json_atomic_exclusive,
+    cleanup_orphaned_temp_files, read_json, remove_file_if_exists, write_atomic_exclusive,
+    write_json_atomic, write_json_atomic_exclusive,
 };
 use crate::persistence::paths::{is_temp_file, parse_event_file_name, StatePaths};
 use crate::persistence::PersistenceError;
@@ -408,7 +408,9 @@ impl ObserverStore {
     /// refused for good), so a later call may try again. `Ok(false)` when
     /// there was none.
     pub fn remove_effect(&self, lock: &ObserverLock, key: &str) -> Result<bool> {
-        remove_if_exists(&self.effect_file(lock.observer_id(), key))
+        Ok(remove_file_if_exists(
+            &self.effect_file(lock.observer_id(), key),
+        )?)
     }
 
     fn effect_file(&self, observer_id: &ObserverId, key: &str) -> PathBuf {
@@ -466,11 +468,10 @@ impl ObserverStore {
                 format!("'{entry_id}' is not a watch entry id"),
             ));
         }
-        remove_if_exists(
-            &self
-                .paths
-                .observer_watch_file(lock.observer_id().as_str(), entry_id),
-        )
+        Ok(remove_file_if_exists(&self.paths.observer_watch_file(
+            lock.observer_id().as_str(),
+            entry_id,
+        ))?)
     }
 
     // -- housekeeping -------------------------------------------------------
@@ -585,14 +586,6 @@ fn json_file_stems(dir: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(stems)
-}
-
-fn remove_if_exists(path: &Path) -> Result<bool> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(PersistenceError::io(path, source).into()),
-    }
 }
 
 fn lock_error(error: OrchestrationError) -> ObserverError {

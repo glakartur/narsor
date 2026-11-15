@@ -3,8 +3,8 @@
 use super::{PersistenceError, Result};
 use crate::domain::{Context, ExecutionId, TaskId, TaskLaunchSpec, WorkflowExecution};
 use crate::persistence::atomic::{
-    cleanup_orphaned_temp_files, ensure_dir, read_json, read_json_capped, write_atomic,
-    write_json_atomic, write_json_atomic_exclusive,
+    cleanup_orphaned_temp_files, ensure_dir, read_json, read_json_capped, remove_file_if_exists,
+    write_atomic, write_json_atomic, write_json_atomic_exclusive,
 };
 use crate::persistence::conversation::ConversationStore;
 use crate::persistence::event_log::EventLog;
@@ -197,12 +197,7 @@ impl ExecutionStore {
 
     /// Removes the pending request. Returns whether there was one to remove.
     pub fn clear_pending_input(&self, execution_id: &str) -> Result<bool> {
-        let path = self.pending_input_file(execution_id);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(source) => Err(PersistenceError::io(&path, source)),
-        }
+        remove_file_if_exists(&self.pending_input_file(execution_id))
     }
 
     /// `{root}/executions/{execution_id}/pending_event.json`.
@@ -230,12 +225,7 @@ impl ExecutionStore {
 
     /// Removes the awaited event. Returns whether there was one to remove.
     pub fn clear_pending_event(&self, execution_id: &str) -> Result<bool> {
-        let path = self.pending_event_file(execution_id);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(source) => Err(PersistenceError::io(&path, source)),
-        }
+        remove_file_if_exists(&self.pending_event_file(execution_id))
     }
 
     /// True when an execution with this identifier is stored.

@@ -66,6 +66,15 @@ impl Sandbox {
         .expect("write a fake answer");
     }
 
+    /// The source answers `name` with HTTP `code`.
+    fn status(&self, name: &str, code: u16) {
+        fs::write(
+            self.path.join("source").join(format!("{name}.status")),
+            code.to_string(),
+        )
+        .expect("write a fake status");
+    }
+
     fn run(&self, example: &str, input: &Value) -> Run {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows/observers/examples")
@@ -279,15 +288,52 @@ fn github_delivers_events_to_waiting_tasks_and_closes_merged_pull_requests() {
 
 #[test]
 #[ignore = "runs the example scripts with a real sh and jq"]
-fn github_refuses_the_whole_run_when_an_object_is_on_another_host() {
+fn github_skips_and_closes_an_object_on_another_host_or_gone_and_serves_the_rest() {
     let sandbox = Sandbox::new();
     sandbox.answer("pr-acme-app-17", &json!({"state": "open"}));
     sandbox.answer("reviews-acme-app-17", &json!([{"state": "APPROVED"}]));
+    sandbox.answer("pr-acme-app-19", &json!({"message": "Not Found"}));
+    sandbox.status("pr-acme-app-19", 404);
+    let watches = json!([
+        {"object": "https://evil.example.com/acme/app/pull/1", "task_id": "task-1",
+         "event_types": ["review.approved"], "wait_episode": "ep-2"},
+        {"object": "https://github.com/acme/app/pull/17", "task_id": "task-17",
+         "event_types": ["review.approved"], "wait_episode": "ep-1"},
+        {"object": "https://github.com/acme/app/pull/19", "task_id": "task-19",
+         "event_types": ["review.approved"], "wait_episode": "ep-3"},
+    ]);
+
+    let run = sandbox.run(
+        "github-pr-review.sh",
+        &input("github.com", json!({}), json!({}), watches),
+    );
+
+    let output = run.output();
+    assert_eq!(
+        output.closed_watches,
+        [
+            "https://evil.example.com/acme/app/pull/1",
+            "https://github.com/acme/app/pull/19"
+        ]
+    );
+    assert!(run.stderr.contains("evil.example.com"), "{}", run.stderr);
+    assert!(run.stderr.contains("pull/19"), "{}", run.stderr);
+    assert_eq!(run.calls.len(), 1, "{:?}", run.calls);
+    assert_eq!(run.calls[0][2], "task-17");
+}
+
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn github_fails_the_run_at_a_rate_limit() {
+    let sandbox = Sandbox::new();
+    sandbox.answer(
+        "pr-acme-app-17",
+        &json!({"message": "API rate limit exceeded for user ID 1."}),
+    );
+    sandbox.status("pr-acme-app-17", 403);
     let watches = json!([
         {"object": "https://github.com/acme/app/pull/17", "task_id": "task-17",
          "event_types": ["review.approved"], "wait_episode": "ep-1"},
-        {"object": "https://evil.example.com/acme/app/pull/1", "task_id": "task-1",
-         "event_types": ["review.approved"], "wait_episode": "ep-2"},
     ]);
 
     let run = sandbox.run(
@@ -297,12 +343,78 @@ fn github_refuses_the_whole_run_when_an_object_is_on_another_host() {
 
     assert_ne!(run.code, Some(0));
     assert!(run.stdout.is_empty(), "{:?}", run.stdout);
-    assert!(run.stderr.contains("evil.example.com"), "{}", run.stderr);
-    assert!(
-        run.calls.is_empty(),
-        "nothing is delivered: {:?}",
-        run.calls
+}
+
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn gitlab_skips_and_closes_a_bad_or_forbidden_object_and_serves_the_rest() {
+    let sandbox = Sandbox::new();
+    sandbox.answer("mr-group-app-7", &json!({"state": "opened"}));
+    sandbox.answer("approvals-group-app-7", &json!({"approved": true}));
+    sandbox.answer("reviewers-group-app-7", &json!([]));
+    sandbox.answer("mr-group-app-8", &json!({"message": "403 Forbidden"}));
+    sandbox.status("mr-group-app-8", 403);
+    let good = "https://gitlab.example.com/group/app/-/merge_requests/7";
+    let diffs = "https://gitlab.example.com/group/app/-/merge_requests/6/diffs";
+    let slash = "https://gitlab.example.com/group/app/-/merge_requests/5/";
+    let forbidden = "https://gitlab.example.com/group/app/-/merge_requests/8";
+    let entry = |object: &str, task: &str| {
+        json!({"object": object, "task_id": task,
+               "event_types": ["review.approved"], "wait_episode": "ep-1"})
+    };
+    let watches = json!([
+        entry(diffs, "task-6"),
+        entry(good, "task-7"),
+        entry(slash, "task-5"),
+        entry(forbidden, "task-8"),
+    ]);
+
+    let run = sandbox.run(
+        "gitlab-mr-review.sh",
+        &input(
+            "gitlab.example.com",
+            json!({"host": "gitlab.example.com"}),
+            json!({}),
+            watches,
+        ),
     );
+
+    let output = run.output();
+    let mut closed = output.closed_watches.clone();
+    closed.sort();
+    let mut expected = vec![diffs, slash, forbidden];
+    expected.sort_unstable();
+    assert_eq!(closed, expected);
+    assert!(run.stderr.contains("/diffs"), "{}", run.stderr);
+    assert_eq!(run.calls.len(), 1, "{:?}", run.calls);
+    assert_eq!(run.calls[0][2], "task-7");
+    assert_eq!(run.calls[0][6], "group/app!7:review.approved:ep-1");
+}
+
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn gitlab_fails_the_run_when_the_source_fails() {
+    let sandbox = Sandbox::new();
+    sandbox.answer("mr-group-app-7", &json!({"message": "oops"}));
+    sandbox.status("mr-group-app-7", 500);
+    let watches = json!([
+        {"object": "https://gitlab.example.com/group/app/-/merge_requests/7", "task_id": "task-7",
+         "event_types": ["review.approved"], "wait_episode": "ep-1"},
+    ]);
+
+    let run = sandbox.run(
+        "gitlab-mr-review.sh",
+        &input(
+            "gitlab.example.com",
+            json!({"host": "gitlab.example.com"}),
+            json!({}),
+            watches,
+        ),
+    );
+
+    assert_ne!(run.code, Some(0));
+    assert!(run.stdout.is_empty(), "{:?}", run.stdout);
+    assert!(run.calls.is_empty());
 }
 
 #[test]

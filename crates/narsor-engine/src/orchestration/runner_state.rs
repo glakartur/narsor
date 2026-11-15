@@ -621,7 +621,10 @@ impl ControlPlane {
                     task_id: task_id.clone(),
                     input_id: input_id.to_string(),
                 })?;
-            if input.status == target {
+            // A refusal of an input that the accepted one of its episode
+            // made obsolete agrees with it: neither ends the wait.
+            let refused_obsolete = !accepted && input.status == InputStatus::Obsolete;
+            if input.status == target || refused_obsolete {
                 return Ok(Mutation::Unchanged((input.clone(), false)));
             }
             if input.status != InputStatus::Delivered {
@@ -636,21 +639,25 @@ impl ControlPlane {
             input.detail = detail.clone();
             input.data = None;
             let settled = input.clone();
-            if accepted
-                && record
+            let mut updates = vec![InputUpdate {
+                input_id: settled.input_id.clone(),
+                status: target,
+            }];
+            if accepted {
+                if record
                     .event_wait
                     .as_ref()
                     .is_some_and(|wait| wait.episode_id == settled.episode_id)
-            {
-                record.event_wait = None;
+                {
+                    record.event_wait = None;
+                }
+                // The accepted one ended the episode's wait: what else was
+                // handed over for it (a timeout and an event in one poll,
+                // say) will never be taken, and must not wait for an ack.
+                updates.extend(obsolete_rest_of_episode(record, &settled, now));
             }
             Ok(Mutation::Changed(
-                TaskEventKind::InputsUpdated {
-                    updates: vec![InputUpdate {
-                        input_id: settled.input_id.clone(),
-                        status: target,
-                    }],
-                },
+                TaskEventKind::InputsUpdated { updates },
                 (settled, true),
             ))
         })?;
@@ -792,6 +799,31 @@ fn obsolete_undelivered_events(
     let mut updates = Vec::new();
     for input in record.event_inputs.iter_mut() {
         if input.status == InputStatus::Queued && Some(input.episode_id.as_str()) != episode {
+            input.status = InputStatus::Obsolete;
+            input.updated_at = now;
+            input.data = None;
+            updates.push(InputUpdate {
+                input_id: input.input_id.clone(),
+                status: InputStatus::Obsolete,
+            });
+        }
+    }
+    updates
+}
+
+/// Makes every unsettled input of `accepted`'s episode but `accepted`
+/// itself obsolete, dropping its data.
+fn obsolete_rest_of_episode(
+    record: &mut TaskRecord,
+    accepted: &QueuedEventInput,
+    now: DateTime<Utc>,
+) -> Vec<InputUpdate> {
+    let mut updates = Vec::new();
+    for input in record.event_inputs.iter_mut() {
+        if input.episode_id == accepted.episode_id
+            && input.input_id != accepted.input_id
+            && !input.status.is_settled()
+        {
             input.status = InputStatus::Obsolete;
             input.updated_at = now;
             input.data = None;

@@ -162,7 +162,8 @@ Exactly one JSON document, and nothing else:
   has nothing to keep, it prints `{"state": {}}`.
 - `closed_watches` is optional. It lists the watched objects that ended
   (for example, a merged or closed pull request). Narsor removes their
-  watch entries.
+  watch entries. The list has at most 10000 entries. Each entry has 1 to
+  4096 bytes and no control characters. Otherwise the output is not valid.
 - Other fields, a second document or a log line after the document make
   the output not valid.
 
@@ -189,6 +190,7 @@ create a task again.
 | stderr | 64 KiB (Narsor keeps the start) |
 | Data of one task (`--data`) | 64 KiB |
 | Data of one event (`--data`) | 16 KiB |
+| Entries in `closed_watches` | 10000, each 1 to 4096 bytes |
 | Tasks of one run | `--task-limit` (10 by default, 1000 at most) |
 | Time between runs | `--interval` (300 s by default, 60 s at least) |
 

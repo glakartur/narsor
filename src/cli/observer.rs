@@ -48,7 +48,8 @@ use crate::controller_protocol::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
     CreateObserverWorkerRequest, ObserverDetailView, ObserverDryRunRequest, ObserverDryRunView,
     ObserverEffectRequest, ObserverListResponse, ObserverScriptView, ObserverSecretRef,
-    ObserverView, ObserverWatchListResponse, ObserverWatchView, SetObserverScriptRequest,
+    ObserverView, ObserverWatchListResponse, ObserverWatchView, ObserverWorkerCreated,
+    ObserverWorkerListResponse, ObserverWorkerView, SetObserverScriptRequest,
 };
 use crate::domain::without_unsafe_chars;
 
@@ -402,7 +403,9 @@ pub async fn observer(
             let client = crate::api::connect(target, state, flags)
                 .await
                 .map_err(CliError::failure)?;
-            worker_token(command, &client).await
+            let output = worker_token(&client, command, Utc::now).await?;
+            print!("{output}");
+            Ok(())
         }
         command => {
             // Parse what is local before connecting: a usage error never
@@ -684,13 +687,14 @@ where
                 .create_observer(&request)
                 .await
                 .map_err(|error| failure("Could not create the observer", error))?;
+            let name = without_unsafe_chars(&created.name);
             Ok(format!(
                 "Created observer '{}' ({}): state {}. Next: `narsor-cli observer script set {} \
                  --file SCRIPT`, a dry run, then `narsor-cli observer approve`.\n",
-                without_unsafe_chars(&created.name),
+                name,
                 without_unsafe_chars(&created.observer_id),
                 without_unsafe_chars(&created.state),
-                without_unsafe_chars(&created.name)
+                name
             ))
         }
         ObserverCommand::List => {
@@ -944,22 +948,74 @@ where
     })
 }
 
-async fn worker_token(command: WorkerTokenCommand, client: &ApiClient) -> Result<()> {
+/// The owner's worker-credential routes, as `observer worker-token` uses
+/// them: the API client in `narsor-cli`, the service itself in tests.
+pub trait WorkerTokenApi: Send + Sync {
+    /// Creates a worker credential, shown this once.
+    fn create_observer_worker<'a>(
+        &'a self,
+        request: &'a CreateObserverWorkerRequest,
+    ) -> BoxFuture<'a, std::result::Result<ObserverWorkerCreated, ClientError>>;
+
+    /// The worker credentials, revoked ones included.
+    fn observer_workers(
+        &self,
+    ) -> BoxFuture<'_, std::result::Result<ObserverWorkerListResponse, ClientError>>;
+
+    /// Revokes a worker credential.
+    fn revoke_observer_worker<'a>(
+        &'a self,
+        worker_id: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<ObserverWorkerView, ClientError>>;
+}
+
+impl WorkerTokenApi for ApiClient {
+    fn create_observer_worker<'a>(
+        &'a self,
+        request: &'a CreateObserverWorkerRequest,
+    ) -> BoxFuture<'a, std::result::Result<ObserverWorkerCreated, ClientError>> {
+        Box::pin(ApiClient::create_observer_worker(self, request))
+    }
+
+    fn observer_workers(
+        &self,
+    ) -> BoxFuture<'_, std::result::Result<ObserverWorkerListResponse, ClientError>> {
+        Box::pin(ApiClient::observer_workers(self))
+    }
+
+    fn revoke_observer_worker<'a>(
+        &'a self,
+        worker_id: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<ObserverWorkerView, ClientError>> {
+        Box::pin(ApiClient::revoke_observer_worker(self, worker_id))
+    }
+}
+
+/// Runs one `narsor-cli observer worker-token` command on `api` and
+/// returns what it prints; `now` is the clock ages are measured with. A
+/// credential written to `--output` goes into a new file of mode `0600`
+/// only: an existing file is refused before the credential is created.
+pub async fn worker_token<A, N>(api: &A, command: WorkerTokenCommand, now: N) -> Result<String>
+where
+    A: WorkerTokenApi + ?Sized,
+    N: Fn() -> DateTime<Utc>,
+{
+    let mut out = String::new();
     match command {
         WorkerTokenCommand::Create { name, output } => {
             if let Some(path) = &output {
-                if path.exists() {
+                if path.symlink_metadata().is_ok() {
                     return Err(CliError::usage(format!(
                         "{} already exists; the credential goes into a new file only",
                         path.display()
                     )));
                 }
             }
-            let created = client
+            let created = api
                 .create_observer_worker(&CreateObserverWorkerRequest { name })
                 .await
                 .map_err(|error| failure("Could not create a worker credential", error))?;
-            println!("Worker: {}", created.worker.worker_id);
+            out.push_str(&format!("Worker: {}\n", created.worker.worker_id));
             match output {
                 Some(path) => {
                     write_new_secret_file(&path, &created.credential).map_err(|error| {
@@ -969,49 +1025,53 @@ async fn worker_token(command: WorkerTokenCommand, client: &ApiClient) -> Result
                             created.worker.worker_id
                         ))
                     })?;
-                    println!("Credential written to {} (mode 0600).", path.display());
+                    out.push_str(&format!(
+                        "Credential written to {} (mode 0600).\n",
+                        path.display()
+                    ));
                 }
                 None => {
-                    println!("Credential: {}", created.credential);
+                    out.push_str(&format!("Credential: {}\n", created.credential));
                     eprintln!(
                         "Shown once. Put it in a file of mode 0600 readable by the worker's \
                          user only, and pass it with --credential-file."
                     );
                 }
             }
-            Ok(())
         }
         WorkerTokenCommand::List => {
-            let listing = client
+            let listing = api
                 .observer_workers()
                 .await
                 .map_err(|error| failure("Could not list the worker credentials", error))?;
             if listing.workers.is_empty() {
-                println!("No worker credentials.");
+                out.push_str("No worker credentials.\n");
             }
-            let now = chrono::Utc::now();
+            let now = now();
             for worker in &listing.workers {
                 let state = worker.revoked_at.map_or("active".to_string(), |at| {
                     format!("revoked {} ago", age(now, at))
                 });
-                println!(
-                    "{:<40} {:<24} created {} ago, {state}",
-                    worker.worker_id,
+                out.push_str(&format!(
+                    "{:<40} {:<24} created {} ago, {state}\n",
+                    without_unsafe_chars(&worker.worker_id),
                     without_unsafe_chars(worker.name.as_deref().unwrap_or("-")),
                     age(now, worker.created_at)
-                );
+                ));
             }
-            Ok(())
         }
         WorkerTokenCommand::Revoke { worker_id } => {
-            let worker = client
+            let worker = api
                 .revoke_observer_worker(&worker_id)
                 .await
                 .map_err(|error| failure("Could not revoke the worker credential", error))?;
-            println!("Revoked worker credential {}.", worker.worker_id);
-            Ok(())
+            out.push_str(&format!(
+                "Revoked worker credential {}.\n",
+                without_unsafe_chars(&worker.worker_id)
+            ));
         }
     }
+    Ok(out)
 }
 
 /// Writes `secret` to a file that must not exist yet, mode `0600`.

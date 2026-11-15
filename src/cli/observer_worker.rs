@@ -37,8 +37,13 @@
 //! nothing of a run outlives it, and a background process holding stdout
 //! cannot keep the worker waiting (see
 //! `docs/solutions/runtime-errors/agent-step-hangs-on-orphaned-background-process-2026-10-26.md`).
-//! The pipes are then drained for a bounded time only, in case a process
-//! escaped the group.
+//! A process can leave the group (`setsid`). With `--script-user` every
+//! process of that user is therefore killed after each run too, and the
+//! worker claims no run while one of them still lives: all runs share the
+//! user, so a process left behind could read the environment of the next
+//! run (`/proc/<pid>/environ`) — its secrets and token. The script user
+//! must therefore be a dedicated user that runs nothing else. The pipes are
+//! drained for a bounded time only.
 //!
 //! # What the server gets
 //!
@@ -375,7 +380,17 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
     }
 
     /// Claims one run and handles it. `Ok(None)` when none was due.
+    ///
+    /// With a script user, claims nothing while a process of that user
+    /// runs (one that escaped an earlier run, say) and cannot be killed:
+    /// it could read the environment — secrets and token — of the next run.
     pub async fn run_once(&self) -> Result<Option<HandledRun>, ClientError> {
+        if let Some(user) = self.options.script_user {
+            if let Err(left) = clear_processes_of(user).await {
+                tracing::error!(uid = user.uid, processes = ?left, "observer worker: the script user has processes that cannot be killed; not claiming a run");
+                return Ok(None);
+            }
+        }
         let Some(run) = self.api.claim().await? else {
             return Ok(None);
         };
@@ -896,16 +911,34 @@ impl ScriptRunner for ProcessRunner {
     }
 }
 
-/// Kills the group when dropped while armed: a run dropped half-way (the
-/// worker stopping) leaves nothing behind.
-struct GroupGuard(Option<i32>);
+/// Kills the group, and with a script user every process of that user,
+/// when dropped while armed: a run dropped half-way (the worker stopping)
+/// leaves nothing behind.
+struct GroupGuard {
+    pgid: Option<i32>,
+    user: Option<ScriptUser>,
+}
 
 impl GroupGuard {
     fn kill(&self, signal: i32) {
-        if let Some(pgid) = self.0 {
+        if let Some(pgid) = self.pgid {
             // SAFETY: `killpg` takes two integers and touches no memory.
             unsafe {
                 libc::killpg(pgid, signal);
+            }
+        }
+    }
+
+    /// Kills what is left of the run and disarms the guard. A process that
+    /// left the group (`setsid`) still runs as the script user: with one,
+    /// every process of that user is killed too, so nothing of this run can
+    /// read the environment of the next one.
+    fn finish(&mut self) {
+        self.kill(libc::SIGKILL);
+        self.pgid = None;
+        if let Some(user) = self.user.take() {
+            if let Err(error) = kill_all_processes_of(user) {
+                tracing::warn!(%error, uid = user.uid, "observer worker: cannot kill the script user's processes");
             }
         }
     }
@@ -913,8 +946,109 @@ impl GroupGuard {
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        self.kill(libc::SIGKILL);
+        self.finish();
     }
+}
+
+/// Sends `SIGKILL` to every process of `user`: a helper process switches
+/// to that user, drops every capability, and calls `kill(-1)`, which
+/// reaches every process the user may signal — its own — except the helper
+/// itself. It cannot reach a process of anyone else.
+///
+/// A switch from one non-zero user id to another keeps the capabilities
+/// (a worker that is not root holds `CAP_KILL` in its ambient set), so the
+/// helper clears them itself and does not call `kill(-1)` if `CAP_KILL`
+/// is still there.
+pub fn kill_all_processes_of(user: ScriptUser) -> io::Result<()> {
+    let mut command = std::process::Command::new(SHELL);
+    command
+        .args(["-c", ":"])
+        .env_clear()
+        .env("PATH", SYSTEM_PATH)
+        .current_dir("/")
+        .uid(user.uid)
+        .gid(user.gid)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: the hook only calls `prctl`, `capset`, `capget` and `kill`,
+    // all plain system calls, async-signal-safe. It runs after the switch
+    // to `user`.
+    unsafe {
+        command.pre_exec(|| {
+            #[cfg(target_os = "linux")]
+            {
+                drop_inherited_privileges()?;
+                drop_all_capabilities()?;
+            }
+            // `ESRCH` (nothing to kill) is not a failure.
+            libc::kill(-1, libc::SIGKILL);
+            Ok(())
+        });
+    }
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("the helper ended with {status}")))
+    }
+}
+
+/// The processes running as `uid` (real, effective, saved or file-system
+/// user id), zombies and this process excepted. Empty where `/proc` is not
+/// readable.
+pub fn processes_of(uid: u32) -> Vec<i32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let own = std::process::id();
+    let uid = uid.to_string();
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != own)
+        .filter(|pid| {
+            let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+                return false;
+            };
+            let field = |name: &str| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .map(str::trim)
+            };
+            let zombie = field("State:").is_some_and(|state| state.starts_with('Z'));
+            let ours = field("Uid:").is_some_and(|ids| ids.split_whitespace().any(|id| id == uid));
+            ours && !zombie
+        })
+        .filter_map(|pid| i32::try_from(pid).ok())
+        .collect()
+}
+
+/// How long the worker waits for the script user's processes to end
+/// before it refuses to claim.
+const LEFTOVER_WAIT: Duration = Duration::from_secs(2);
+
+/// Makes sure no process of `user` runs: kills what is left and waits for
+/// it to end. `Err` lists what still runs.
+pub async fn clear_processes_of(user: ScriptUser) -> Result<(), Vec<i32>> {
+    let mut left = processes_of(user.uid);
+    if left.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(uid = user.uid, processes = ?left, "observer worker: the script user still has processes; killing them");
+    let started = std::time::Instant::now();
+    while started.elapsed() < LEFTOVER_WAIT {
+        if let Err(error) = kill_all_processes_of(user) {
+            tracing::warn!(%error, uid = user.uid, "observer worker: cannot kill the script user's processes");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        left = processes_of(user.uid);
+        if left.is_empty() {
+            return Ok(());
+        }
+    }
+    Err(left)
 }
 
 /// What one pipe gave so far, shared with its reader.
@@ -945,7 +1079,10 @@ async fn run_process(spec: ScriptSpec) -> io::Result<ScriptExit> {
         command.pre_exec(drop_inherited_privileges);
     }
     let mut child = command.spawn()?;
-    let mut guard = GroupGuard(child.id().and_then(|pid| i32::try_from(pid).ok()));
+    let mut guard = GroupGuard {
+        pgid: child.id().and_then(|pid| i32::try_from(pid).ok()),
+        user: spec.user,
+    };
 
     let stdin = child.stdin.take();
     let input = spec.stdin;
@@ -979,9 +1116,9 @@ async fn run_process(spec: ScriptSpec) -> io::Result<ScriptExit> {
             ScriptEnd::TimedOut
         }
     };
-    // Whatever the script left running in its group ends with it.
-    guard.kill(libc::SIGKILL);
-    guard.0 = None;
+    // Whatever the script left running ends with it: its group, and with a
+    // script user every process of that user.
+    guard.finish();
     writer.abort();
     for mut reader in [stdout_reader, stderr_reader].into_iter().flatten() {
         if tokio::time::timeout(DRAIN_TIMEOUT, &mut reader)
@@ -1032,6 +1169,58 @@ fn end_of(status: std::process::ExitStatus) -> ScriptEnd {
     }
 }
 
+/// `_LINUX_CAPABILITY_VERSION_3`: two 32-bit words per set.
+#[cfg(target_os = "linux")]
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// `struct __user_cap_header_struct`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+/// `struct __user_cap_data_struct`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// Clears the effective, permitted and inheritable capability sets of the
+/// calling thread and checks with `capget` that they are empty. `Err` when
+/// a set is not empty: the caller must then not use a privilege it meant
+/// to give up. Runs between `fork` and `exec`, so it allocates nothing.
+#[cfg(target_os = "linux")]
+fn drop_all_capabilities() -> io::Result<()> {
+    let mut header = CapabilityHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let empty = [CapabilityData::default(); 2];
+    // SAFETY: `capset` reads a version-3 header and two data structs, both
+    // valid for the duration of the call.
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, empty.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut left = [CapabilityData::default(); 2];
+    // SAFETY: `capget` writes two data structs into `left`, which holds two.
+    if unsafe { libc::syscall(libc::SYS_capget, &mut header, left.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let held = left
+        .iter()
+        .any(|set| set.effective | set.permitted | set.inheritable != 0);
+    if held {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
+    Ok(())
+}
+
 /// Runs in the child between `fork` and `exec`, after the switch to the
 /// script's user: no capability the worker holds survives `exec`, and no
 /// set-user-id program can give the script new ones.
@@ -1053,4 +1242,23 @@ fn drop_inherited_privileges() -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// The child clears its capability sets, and `capget` confirms it, or
+    /// the spawn fails. Run inside `unshare -r` too: there the child starts
+    /// with every capability and the check is not trivial.
+    #[test]
+    fn a_child_can_drop_every_capability_before_exec() {
+        let mut command = std::process::Command::new(SHELL);
+        command.args(["-c", ":"]);
+        // SAFETY: the hook only calls `capset` and `capget`.
+        unsafe {
+            command.pre_exec(drop_all_capabilities);
+        }
+        assert!(command.status().unwrap().success());
+    }
 }

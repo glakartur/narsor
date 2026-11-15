@@ -205,12 +205,12 @@ fn token_run(principal: &Principal, run: &str) -> ProtocolResult<RunId> {
 }
 
 /// Parses a request body, refusing a malformed one, or one with a field the
-/// script may not set, with a coded `400` naming what is wrong.
-fn parse_body<T: DeserializeOwned>(body: &Bytes) -> ProtocolResult<T> {
+/// caller may not set, with a coded `400` naming what is wrong.
+fn parse_json<T: DeserializeOwned>(body: &Bytes, what: &str) -> ProtocolResult<T> {
     serde_json::from_slice(body).map_err(|error| {
         HttpProtocolError(ProtocolError::bad_request(
             "invalid_request",
-            format!("invalid effect request: {error}"),
+            format!("invalid {what}: {error}"),
         ))
     })
 }
@@ -222,7 +222,7 @@ async fn post_task(
     body: Bytes,
 ) -> ProtocolResult<(StatusCode, Json<ObserverEffectResponse>)> {
     let run_id = token_run(&principal, &run)?;
-    let request: ObserverCreateTaskRequest = parse_body(&body)?;
+    let request: ObserverCreateTaskRequest = parse_json(&body, "effect request")?;
     let response = blocking(&service, move |s| s.observer_create_task(&run_id, request)).await?;
     let status = if response.outcome == ObserverEffectOutcome::Created {
         StatusCode::CREATED
@@ -239,7 +239,7 @@ async fn post_event(
     body: Bytes,
 ) -> ProtocolResult<Json<ObserverEffectResponse>> {
     let run_id = token_run(&principal, &run)?;
-    let request: ObserverEventRequest = parse_body(&body)?;
+    let request: ObserverEventRequest = parse_json(&body, "effect request")?;
     Ok(Json(
         blocking(&service, move |s| {
             s.observer_deliver_event(&run_id, &task_id, request)
@@ -276,7 +276,7 @@ async fn post_result(
 ) -> ProtocolResult<Json<ObserverRunResultResponse>> {
     let owner = worker_owner(&principal)?;
     let run_id = RunId::parse(&run).map_err(|_| HttpProtocolError(ProtocolError::NotFound))?;
-    let report: ObserverRunReport = parse_body(&body)?;
+    let report: ObserverRunReport = parse_json(&body, "run result")?;
     let run = blocking(&service, move |s| {
         s.finish_observer_run_for(&owner, &run_id, report)
     })
@@ -325,7 +325,7 @@ async fn post_worker(
     let request: CreateObserverWorkerRequest = if body.is_empty() {
         CreateObserverWorkerRequest::default()
     } else {
-        parse_body(&body)?
+        parse_json(&body, "worker request")?
     };
     let created = blocking(&service, move |s| s.create_observer_worker(&owner, request)).await?;
     Ok((StatusCode::CREATED, Json(created)))
@@ -350,17 +350,6 @@ async fn post_revoke_worker(
 // The owner's observer routes
 // ---------------------------------------------------------------------------
 
-/// Parses an owner's request body, refusing a malformed one with a coded
-/// `400`.
-fn parse_owner_body<T: DeserializeOwned>(body: &Bytes) -> ProtocolResult<T> {
-    serde_json::from_slice(body).map_err(|error| {
-        HttpProtocolError(ProtocolError::bad_request(
-            "invalid_request",
-            format!("invalid observer request: {error}"),
-        ))
-    })
-}
-
 async fn list_observers(
     State(service): State<Service>,
     owner: Option<Extension<OwnerRef>>,
@@ -379,7 +368,7 @@ async fn post_observer(
     body: Bytes,
 ) -> ProtocolResult<(StatusCode, Json<ObserverView>)> {
     let owner = require_owner_operator(owner, operator)?;
-    let request: CreateObserverRequest = parse_owner_body(&body)?;
+    let request: CreateObserverRequest = parse_json(&body, "observer request")?;
     let created = blocking(&service, move |s| s.create_observer(&owner, request)).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -416,7 +405,7 @@ async fn post_script(
     body: Bytes,
 ) -> ProtocolResult<(StatusCode, Json<ObserverScriptView>)> {
     let owner = require_owner_operator(owner, operator)?;
-    let request: SetObserverScriptRequest = parse_owner_body(&body)?;
+    let request: SetObserverScriptRequest = parse_json(&body, "observer request")?;
     let saved = blocking(&service, move |s| {
         s.add_observer_script(&owner, &observer, &request.script)
     })
@@ -435,7 +424,7 @@ async fn post_dry_run(
     let request: ObserverDryRunRequest = if body.is_empty() {
         ObserverDryRunRequest::default()
     } else {
-        parse_owner_body(&body)?
+        parse_json(&body, "observer request")?
     };
     let requested = blocking(&service, move |s| {
         s.request_observer_dry_run_for(&owner, &observer, request)
@@ -452,7 +441,7 @@ async fn post_approve(
     body: Bytes,
 ) -> ProtocolResult<Json<ObserverView>> {
     let owner = require_owner_operator(owner, operator)?;
-    let request: ApproveObserverRequest = parse_owner_body(&body)?;
+    let request: ApproveObserverRequest = parse_json(&body, "observer request")?;
     Ok(Json(
         blocking(&service, move |s| {
             s.approve_observer_version_for(&owner, &observer, request.version)
@@ -505,7 +494,7 @@ async fn post_watch(
     body: Bytes,
 ) -> ProtocolResult<(StatusCode, Json<ObserverWatchView>)> {
     let owner = require_owner_operator(owner, operator)?;
-    let request: AddObserverWatchRequest = parse_owner_body(&body)?;
+    let request: AddObserverWatchRequest = parse_json(&body, "observer request")?;
     let (entry, created) = blocking(&service, move |s| {
         s.add_observer_watch(&owner, &observer, request)
     })

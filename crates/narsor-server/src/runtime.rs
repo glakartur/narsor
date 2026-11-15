@@ -75,6 +75,7 @@ use narsor_engine::environment::{
     BackendKind, BackendRecord, CatalogLaunchResolver, EnvironmentCatalog, HarnessDefaults,
     OwnerDefaults,
 };
+use narsor_engine::observers::ObserverStore;
 use narsor_engine::orchestration::ControlPlane;
 use narsor_engine::persistence::{
     DaemonInfo, DefaultHarnessSelector, ExecutionStore, ReconciliationOutcome, RecoveryReport,
@@ -559,7 +560,8 @@ fn recover_at_startup(store: &ExecutionStore) -> Option<RecoveryReport> {
 /// and events a crash kept out of a task's log — before the API serves
 /// them, so a stream replay never skips one. Unlike local recovery it judges
 /// no task: a remote task's runner state changes only through its controller's
-/// reconciliation, never because this process restarted. Best-effort like
+/// reconciliation, never because this process restarted. The observer
+/// store's orphaned temporary files are removed here too. Best-effort like
 /// [`recover_at_startup`]: a failure is logged and the daemon still starts.
 pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
     match control.recover() {
@@ -586,6 +588,20 @@ pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
         }
         Err(error) => {
             tracing::warn!(error = %error, "daemon: control-plane recovery failed");
+        }
+    }
+    let observers = ObserverStore::new(control.store().paths().clone());
+    match observers.cleanup_orphaned_temp_files() {
+        Ok(removed) => {
+            for path in &removed {
+                tracing::info!(
+                    path = %path.display(),
+                    "daemon: removed an interrupted observer write"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "daemon: observer store recovery failed");
         }
     }
     control

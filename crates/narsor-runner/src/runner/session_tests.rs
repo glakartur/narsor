@@ -2971,6 +2971,45 @@ async fn a_waiting_runner_reports_its_wait_and_takes_the_event_for_it_once() {
     assert_eq!(fixture.snapshot().event_wait, None);
 }
 
+/// Two events for one wait in one poll response: the runner takes the
+/// first, and leaves the second for later while the pass it started runs.
+/// It sends no verdict on the second; the control plane makes it obsolete
+/// when the first is acknowledged.
+#[tokio::test]
+async fn of_two_events_for_one_wait_the_runner_takes_the_first_only() {
+    let root = TempRoot::new();
+    let (mut fixture, episode) = waiting_for_the_approval(&root, &root.dir("storage")).await;
+
+    let first = fixture
+        .session
+        .take_event(approval("event-1", &episode, "alice"))
+        .unwrap();
+    let second = fixture
+        .session
+        .take_event(approval("event-2", &episode, "bob"))
+        .unwrap();
+
+    assert_eq!(first, InputVerdict::Taken { first: true });
+    assert_eq!(second, InputVerdict::Later);
+    fixture.settled().await;
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].prompt.contains("alice approved it"),
+        "{}",
+        calls[0].prompt
+    );
+    // Handed over again after the pass, it no longer fits any wait.
+    assert!(matches!(
+        fixture
+            .session
+            .take_event(approval("event-2", &episode, "bob"))
+            .unwrap(),
+        InputVerdict::Refused(_)
+    ));
+}
+
 /// An event for another wait episode is refused and the step waits on.
 #[tokio::test]
 async fn a_waiting_runner_refuses_an_event_for_another_wait() {
