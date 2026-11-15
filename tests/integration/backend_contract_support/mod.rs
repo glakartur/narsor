@@ -41,6 +41,7 @@
 
 #![allow(dead_code)]
 
+pub mod fake;
 pub mod stub_runner;
 
 use std::fs;
@@ -48,13 +49,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use narsor_controller_runtime::testkit::{ProbeCounters, Probed, SeverableLink};
-use narsor_controller_runtime::{Controller, ControllerConfig};
-use narsor_engine::auth::{ControllerCredential, ControllerKey};
-use narsor_engine::backends::{
+use narsor_controller_runtime::backend::{
     BackendErrorKind, ExecutionBackend, TaskObservation, TaskResources, WorkloadPhase,
     WorkloadState,
 };
+use narsor_controller_runtime::testkit::{ProbeCounters, Probed, SeverableLink};
+use narsor_controller_runtime::{Controller, ControllerConfig};
+use narsor_engine::auth::{ControllerCredential, ControllerKey};
 use narsor_engine::controller_protocol::{
     ControllerClient, CreateEnrollmentRequest, OwnerCommandRequest, OwnerCommandResponse,
     ProtocolConfig, ProtocolError, ProtocolService, SubmitOperatorCommandRequest, LOCAL_OWNER,

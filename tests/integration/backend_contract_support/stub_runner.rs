@@ -5,7 +5,7 @@
 //! runner: its process group, its exit code, its kill. What the control
 //! plane and the controllers see of a runner is the protocol, so the stub
 //! speaks it with the fake platform's simulated runner
-//! ([`narsor_engine::backends::fake::run_simulated_runner`]): it runs no
+//! ([`super::fake::run_simulated_runner`]): it runs no
 //! workflow step, reports `Running` until an owner's `Transition` moves the
 //! work to a terminal state, pauses at once at a safe point and leaves when
 //! told. Its event cursor and workflow state live in `stub-runner/` on the
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use narsor_engine::backends::fake::{run_simulated_reader, run_simulated_runner, SimulatedStorage};
+use super::fake::{run_simulated_reader, run_simulated_runner, SimulatedStorage};
 use narsor_engine::controller_protocol::RunnerClient;
 
 /// The variable that carries the runner's arguments, one per line.

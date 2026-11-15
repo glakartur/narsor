@@ -14,9 +14,11 @@ use std::sync::Arc;
 
 use narsor_engine::domain::{ImageSpec, ResourceProfile, SecretDelivery};
 use narsor_engine::environment::{
-    BackendKind, BackendLimits, BackendRecord, BackendSecret, CatalogLaunchResolver,
-    EnvironmentCatalog, HarnessDefaults, LaunchResolver, OwnerDefaults, RuntimeCatalog,
-    SecretDeliveryMode, StaticHarnessDefaults, TrustScope,
+    BackendKind, BackendLimits, BackendRecord, BackendSecret, EnvironmentCatalog, LaunchResolver,
+    RuntimeCatalog, SecretDeliveryMode, TrustScope,
+};
+use narsor_engine::launch::{
+    CatalogLaunchResolver, HarnessDefaults, OwnerDefaults, StaticHarnessDefaults,
 };
 use narsor_engine::workflows::WorkflowResolver;
 

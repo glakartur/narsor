@@ -18,8 +18,8 @@ impl ProtocolService {
         snapshot: RunnerSnapshotRequest,
     ) -> ProtocolResult<RunnerSnapshotResponse> {
         Self::require_worker(identity)?;
-        let snapshot = crate::controller_protocol::wire::runner_snapshot_from_request(snapshot)
-            .map_err(|error| {
+        let snapshot =
+            crate::orchestration::RunnerSnapshot::from_request(snapshot).map_err(|error| {
                 ProtocolError::bad_request("invalid_runner_snapshot", error.to_string())
             })?;
         let current = self.control.task(&identity.task_id)?;

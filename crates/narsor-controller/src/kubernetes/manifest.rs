@@ -53,7 +53,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::names;
-use narsor_engine::backends::{BackendError, BackendResult, TaskResources, WorkloadLaunch};
+use narsor_controller_runtime::backend::{
+    BackendError, BackendResult, TaskResources, WorkloadLaunch,
+};
 use narsor_engine::config::HarnessHome;
 use narsor_engine::domain::{ImageReference, ResolvedImage, SecretReference, TaskLaunchSpec};
 

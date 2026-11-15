@@ -1,6 +1,3 @@
-//! Shared process configuration plus engine-owned state paths.
+//! Shared process configuration (from `narsor-model`).
 
-pub use narsor_shared::config::*;
-
-#[path = "persistence/paths.rs"]
-pub mod paths;
+pub use narsor_model::config::*;

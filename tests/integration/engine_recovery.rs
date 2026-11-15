@@ -24,13 +24,7 @@ use narsor_engine::engine::{
     owed_output_rescue, step_failure, ActionKind, Engine, EngineError, PendingHumanInput,
     PendingStep, Recovery, StepFailure,
 };
-use narsor_engine::persistence::{
-    reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason,
-    ReconciliationOutcome,
-};
-use narsor_engine::workspace::{
-    CleanupPolicy, RepositorySpec, WorkspaceProvisioner, WorkspaceRequest,
-};
+use narsor_engine::engine::{reconcile, ReconciliationOutcome};
 use serde_json::json;
 
 /// Writes the log of an execution that died while its first action ran.
@@ -341,57 +335,6 @@ async fn an_execution_needing_input_is_left_alone() {
         .is_some());
 }
 
-#[tokio::test]
-async fn recovery_reports_every_execution_and_clears_interrupted_writes() {
-    let harness = Harness::new();
-    let engine = harness.engine();
-    let definition = workflow("two_steps");
-
-    let finished = engine
-        .start_and_run(&definition, json!({}), harness.workspace())
-        .await
-        .expect("run one to the end");
-    let crashed = engine
-        .start(&definition, json!({}), harness.workspace())
-        .expect("start another");
-    interrupt_during_action(&harness, &crashed);
-
-    // The trace of a write that never got renamed.
-    let leftover = harness
-        .store()
-        .execution_dir(&finished.id)
-        .join("state.json.tmp");
-    std::fs::write(&leftover, b"half a document").expect("write a leftover");
-
-    let report = recover(&harness.store()).expect("recover");
-
-    assert!(report.removed_temp_files.contains(&leftover));
-    assert!(!leftover.exists());
-    assert_eq!(report.reconciled.len(), 2);
-
-    let attention: Vec<&str> = report
-        .needing_attention()
-        .map(|entry| entry.execution_id.as_str())
-        .collect();
-    assert_eq!(attention, vec![crashed.id.as_str()]);
-
-    let finished_entry = report
-        .reconciled
-        .iter()
-        .find(|entry| entry.execution_id == finished.id)
-        .expect("the finished execution was examined");
-    assert_eq!(
-        finished_entry.outcome,
-        ReconciliationOutcome::NotApplicable {
-            status: ExecutionStatus::Completed
-        }
-    );
-
-    // Reconciling twice is harmless: the second pass finds nothing running.
-    let again = reconcile_all(&harness.store()).expect("reconcile again");
-    assert!(again.iter().all(|entry| !entry.outcome.needs_attention()));
-}
-
 /// Writes the log of an agent attempt whose output was rejected (KTD7), and
 /// returns the rejected attempt's id.
 fn reject_output(harness: &Harness, execution: &WorkflowExecution) -> String {
@@ -431,13 +374,7 @@ async fn a_restart_after_a_rejected_output_is_not_an_interrupted_action() {
         .expect("start");
     reject_output(&harness, &execution);
 
-    let report = recover(&harness.store()).expect("recover");
-
-    let verdict = report
-        .reconciled
-        .iter()
-        .find(|entry| entry.execution_id == execution.id)
-        .expect("the execution was reconciled");
+    let verdict = reconcile(&harness.store(), &execution.id).expect("reconcile");
     assert_eq!(verdict.outcome, ReconciliationOutcome::Consistent);
     assert_eq!(verdict.status, ExecutionStatus::Running);
     let stored = harness
@@ -472,13 +409,7 @@ async fn a_restart_during_a_reprompt_leaves_the_execution_unknown() {
         )
         .expect("append OutputReprompted");
 
-    let report = recover(&harness.store()).expect("recover");
-
-    let verdict = report
-        .reconciled
-        .iter()
-        .find(|entry| entry.execution_id == execution.id)
-        .expect("the execution was reconciled");
+    let verdict = reconcile(&harness.store(), &execution.id).expect("reconcile");
     assert_eq!(verdict.status, ExecutionStatus::Unknown);
     assert_eq!(
         verdict.outcome,
@@ -487,117 +418,6 @@ async fn a_restart_during_a_reprompt_leaves_the_execution_unknown() {
             action_execution_id: "attempt-reprompt".to_string(),
         }
     );
-}
-
-/// The same sweep while the execution keeps running: only the attempt the
-/// log closed with `ActionOutputRejected` is compressed.
-#[tokio::test]
-async fn a_running_executions_rejected_attempt_counts_as_closed() {
-    let harness = Harness::new();
-    let engine = harness.engine();
-    let definition = workflow("two_steps");
-    let execution = engine
-        .start(&definition, json!({}), harness.workspace())
-        .expect("start");
-    let rejected = reject_output(&harness, &execution);
-
-    let conversations = harness.store().conversation_store(&execution.id);
-    let mut writer = conversations.writer(&rejected).expect("open a writer");
-    writer.append_narsor("the prompt", &[]).expect("append");
-    writer.finish().expect("finish the writer");
-
-    let report = recover(&harness.store()).expect("recover");
-
-    let stored = harness
-        .store()
-        .load_execution(&execution.id)
-        .expect("load the execution");
-    assert_eq!(stored.status, ExecutionStatus::Running);
-    assert_eq!(
-        report.compressed_conversations,
-        vec![(execution.id.clone(), rejected.clone())]
-    );
-}
-
-#[tokio::test]
-async fn workspaces_without_a_live_execution_are_swept() {
-    let harness = Harness::new();
-    let engine = harness.engine();
-    let definition = workflow("two_steps");
-
-    let provisioner = WorkspaceProvisioner::new(harness.root().join("workspaces"));
-    let source = harness.root().join("source-repo");
-    std::fs::create_dir_all(source.join("src")).expect("create the source repository");
-    std::fs::write(source.join("src/main.rs"), b"fn main() {}").expect("write a file");
-    let request = WorkspaceRequest::new(RepositorySpec::local("app", &source));
-
-    // One workspace of an execution that finished, one of an execution that is
-    // still running, and one of an execution that does not exist at all.
-    let finished = engine
-        .start_and_run(&definition, json!({}), harness.workspace())
-        .await
-        .expect("run one to the end");
-    let running = engine
-        .start(&definition, json!({}), harness.workspace())
-        .expect("start another");
-
-    for execution_id in [finished.id.as_str(), running.id.as_str(), "ghost-execution"] {
-        provisioner
-            .provision(execution_id, &request)
-            .expect("provision a workspace");
-    }
-
-    let orphans = sweep_orphaned_workspaces(&harness.store(), &provisioner, CleanupPolicy::Remove)
-        .expect("sweep");
-
-    let ids: Vec<&str> = orphans
-        .iter()
-        .map(|orphan| orphan.execution_id.as_str())
-        .collect();
-    let mut expected = vec![finished.id.as_str(), "ghost-execution"];
-    expected.sort_unstable();
-    assert_eq!(ids, expected);
-
-    for orphan in &orphans {
-        assert!(orphan.cleanup.is_removed(), "{orphan:?}");
-        assert!(!orphan.path.exists());
-    }
-    assert!(orphans
-        .iter()
-        .any(|orphan| orphan.reason == OrphanReason::NoExecution));
-    assert!(orphans.iter().any(|orphan| matches!(
-        orphan.reason,
-        OrphanReason::ExecutionFinished {
-            status: ExecutionStatus::Completed
-        }
-    )));
-
-    // The running execution kept its workspace.
-    assert!(provisioner.task_dir(&running.id).exists());
-}
-
-#[tokio::test]
-async fn a_sweep_can_report_without_deleting() {
-    let harness = Harness::new();
-    let provisioner = WorkspaceProvisioner::new(harness.root().join("workspaces"));
-    let source = harness.root().join("source-repo");
-    std::fs::create_dir_all(&source).expect("create the source repository");
-    std::fs::write(source.join("README.md"), b"hello").expect("write a file");
-
-    provisioner
-        .provision(
-            "ghost-execution",
-            &WorkspaceRequest::new(RepositorySpec::local("app", &source)),
-        )
-        .expect("provision");
-
-    let orphans =
-        sweep_orphaned_workspaces(&harness.store(), &provisioner, CleanupPolicy::Preserve)
-            .expect("sweep");
-
-    assert_eq!(orphans.len(), 1);
-    assert!(!orphans[0].cleanup.is_removed());
-    assert!(provisioner.task_dir("ghost-execution").exists());
 }
 
 /// Writes the marker of a conductor invocation that was under way for
@@ -637,13 +457,7 @@ async fn a_restart_during_the_conductors_rescue_is_not_an_interrupted_action() {
     reject_output(&harness, &execution);
     let conductor = leave_conductor_marker(&harness, &execution, ConductorTrigger::OutputRescue);
 
-    let report = recover(&harness.store()).expect("recover");
-
-    let verdict = report
-        .reconciled
-        .iter()
-        .find(|entry| entry.execution_id == execution.id)
-        .expect("the execution was reconciled");
+    let verdict = reconcile(&harness.store(), &execution.id).expect("reconcile");
     assert_eq!(verdict.status, ExecutionStatus::Running);
     assert_eq!(
         verdict.outcome,
@@ -687,13 +501,7 @@ async fn a_restart_during_the_conductors_reprompt_leaves_the_execution_unknown()
         .expect("append OutputReprompted");
     let conductor = leave_conductor_marker(&harness, &execution, ConductorTrigger::OutputRescue);
 
-    let report = recover(&harness.store()).expect("recover");
-
-    let verdict = report
-        .reconciled
-        .iter()
-        .find(|entry| entry.execution_id == execution.id)
-        .expect("the execution was reconciled");
+    let verdict = reconcile(&harness.store(), &execution.id).expect("reconcile");
     assert_eq!(verdict.status, ExecutionStatus::Unknown);
     assert!(verdict.outcome.needs_attention());
     let state = conductor.load_state().expect("load");
@@ -1113,41 +921,6 @@ fn fail_for_the_conductor(harness: &Harness, execution: &mut WorkflowExecution, 
         .store()
         .save_execution(execution)
         .expect("save the execution");
-}
-
-/// The sweep keeps the workspace of an execution failed on a step the
-/// conductor took up — a retry, confirmed or its own, needs it — and sweeps
-/// that of one failed with nothing for the conductor, as before.
-#[tokio::test]
-async fn the_sweep_keeps_the_workspace_of_a_failure_the_conductor_took_up() {
-    let harness = Harness::new();
-    let engine = harness.engine();
-    let definition = workflow("two_steps");
-    let mut diagnosed = engine
-        .start(&definition, json!({}), harness.workspace())
-        .expect("start one");
-    fail_for_the_conductor(&harness, &mut diagnosed, "attempt-1");
-    let mut plain = engine
-        .start(&definition, json!({}), harness.workspace())
-        .expect("start another");
-    plain.status = ExecutionStatus::Failed;
-    harness.store().save_execution(&plain).expect("save");
-
-    let provisioner = WorkspaceProvisioner::new(harness.root().join("workspaces"));
-    for execution_id in [diagnosed.id.as_str(), plain.id.as_str()] {
-        std::fs::create_dir_all(provisioner.task_dir(execution_id)).expect("a workspace");
-    }
-
-    let orphans = sweep_orphaned_workspaces(&harness.store(), &provisioner, CleanupPolicy::Remove)
-        .expect("sweep");
-
-    let ids: Vec<&str> = orphans
-        .iter()
-        .map(|orphan| orphan.execution_id.as_str())
-        .collect();
-    assert_eq!(ids, vec![plain.id.as_str()]);
-    assert!(provisioner.task_dir(&diagnosed.id).exists());
-    assert!(!provisioner.task_dir(&plain.id).exists());
 }
 
 /// KTD9: a recovery naming a failure the execution is no longer failed on

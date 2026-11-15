@@ -47,7 +47,7 @@
 //!
 //! # Unexpected loss needs an explicit decision (R13)
 //!
-//! Ordinary local recovery ([`crate::persistence::reconcile`]) turns an
+//! Ordinary local recovery ([`crate::engine::reconcile`]) turns an
 //! action that was in flight into `Unknown`, and an explicit recovery then
 //! starts that action again. Neither may happen just because a workload came
 //! back: the control plane decides. The runner tells the two situations
@@ -60,7 +60,7 @@
 //!   previous incarnation stopped unexpectedly;
 //! * the control plane tells a runner, with every poll and snapshot answer,
 //!   which `start` or `resume` launched it
-//!   ([`crate::controller_protocol::RunnerLaunchView::authorized_by`]) and
+//!   ([`crate::controller_client::RunnerLaunchView::authorized_by`]) and
 //!   who issued it (`authorized_by_actor`): the owner, or the control
 //!   plane's resume policy after it counted the loss. A controller never
 //!   relaunches a lost workload on its own (KTD2), so a new incarnation
@@ -97,6 +97,7 @@ pub mod preflight;
 pub mod profile;
 mod reader;
 pub mod secrets;
+
 #[cfg(test)]
 mod session_tests;
 mod snapshot;
@@ -115,26 +116,28 @@ use tokio::time::Instant;
 
 use crate::api::ClientError;
 use crate::conductor::LiveHarness;
-use crate::controller_protocol::{
+use crate::controller_client::{
     ConversationPageRequest, DeliveredEvent, DeliveredInput, EventDelivery, ExecutionEventsRequest,
     RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery, RunnerPollResponse,
-    TaskDefaultHarness,
+    RunnerSnapshotResponse, TaskDefaultHarness,
 };
+use crate::domain::runner_snapshot::RunnerSnapshot;
 use crate::domain::{
     AnsweredBy, EventData, ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId,
     TaskLaunchSpec, TaskRepositorySource, WorkflowDefinition, WorkflowExecution, Workspace,
     WorkspaceRepository,
 };
+use crate::engine::{reconcile, ReconciliationOutcome};
 use crate::engine::{
     Engine, EngineError, ExternalEventDelivery, HumanInputDelivery, Recovery, UsageReporter,
     WaitEnding,
 };
-use crate::orchestration::{
-    CommandActor, HarnessUnavailable, OwnerCommand, ResumeMessage, RunnerProblem, RunnerSnapshot,
-};
-use crate::persistence::{reconcile, PersistenceError, ReconciliationOutcome};
+use crate::persistence::PersistenceError;
 use crate::workspace::{GitAccess, WorkspaceError};
 use home::CLAUDE_CONFIG_DIR_ENV;
+use narsor_protocol::controller::{
+    CommandActor, HarnessUnavailable, OwnerCommand, ResumeMessage, RunnerProblem,
+};
 
 pub use home::{HarnessHome, HomeMode};
 pub use init::{initialize, Initialization};
@@ -296,9 +299,9 @@ pub struct RunnerConfig {
     /// Which HOME and harness configuration every action sees.
     pub harness_home: HarnessHome,
     /// Runner configuration's extra command-line arguments, keyed by harness.
-    pub agent_args: narsor_engine::config::AgentArgs,
+    pub agent_args: narsor_exec::config::AgentArgs,
     /// The model tier and effort the conductor runs with.
-    pub conductor_profile: narsor_engine::conductor::ConductorProfile,
+    pub conductor_profile: narsor_exec::conductor::ConductorProfile,
     /// This incarnation's identity, the one its credential is bound to.
     pub incarnation: String,
     /// Control-channel timing.
@@ -629,7 +632,7 @@ async fn report_problem(
         execution_status: existing
             .as_ref()
             .map_or(ExecutionStatus::Unknown, |execution| execution.status),
-        execution_cursor: crate::orchestration::ExecutionCursor {
+        execution_cursor: narsor_protocol::controller::ExecutionCursor {
             execution_id: existing.as_ref().map(|execution| execution.id.clone()),
             current_state: existing.and_then(|execution| execution.current_state),
             action_execution_id: None,
@@ -639,7 +642,7 @@ async fn report_problem(
         event_cursor,
         pending_input: None,
         event_wait: None,
-        conversation: crate::orchestration::ConversationAvailability::Unavailable {
+        conversation: narsor_protocol::controller::ConversationAvailability::Unavailable {
             reason: problem.message.clone(),
         },
         timeline: None,
@@ -657,12 +660,24 @@ async fn report_problem(
     RunnerExit::Problem(problem)
 }
 
+/// Reports `snapshot`; a snapshot that cannot be encoded fails like a
+/// server error, so the link handles it as any other failed report.
+async fn send_snapshot(
+    client: &RunnerClient,
+    snapshot: &RunnerSnapshot,
+) -> Result<RunnerSnapshotResponse, ClientError> {
+    let request = snapshot
+        .to_request()
+        .map_err(|error| ClientError::Server(format!("cannot encode the snapshot: {error}")))?;
+    client.snapshot(&request).await
+}
+
 /// Sends `snapshot` until it is accepted or the problem deadline passes.
 async fn send_until(link: &mut Link, timing: &RunnerTiming, snapshot: &RunnerSnapshot) -> bool {
     let deadline = Instant::now() + timing.problem_report_deadline;
     loop {
         if let Some(client) = link.client() {
-            match client.snapshot(snapshot).await {
+            match send_snapshot(&client, snapshot).await {
                 Ok(response) => {
                     link.succeeded();
                     link.launch = Some(response.launch);
@@ -1531,7 +1546,7 @@ impl Session {
         };
         let mut snapshot = self.snapshot(None, false)?;
         snapshot.snapshot_sequence = self.storage.next_snapshot_sequence()?;
-        match client.snapshot(&snapshot).await {
+        match send_snapshot(&client, &snapshot).await {
             Ok(response) => {
                 self.take_answer_header(response.default_harness, response.launch)?;
                 self.directive = response.directive;
@@ -1698,25 +1713,25 @@ impl Session {
             return Ok(InputVerdict::Later);
         };
         let permission_decision = input.delivery.permission_decision.map(|decision| {
-            narsor_engine::engine::PermissionDecision {
+            narsor_exec::engine::PermissionDecision {
                 denial_index: decision.denial_index,
                 decision: match decision.decision {
                     narsor_protocol::api::PermissionDecisionKindDto::Deny => {
-                        narsor_engine::engine::PermissionDecisionKind::Deny
+                        narsor_exec::engine::PermissionDecisionKind::Deny
                     }
                     narsor_protocol::api::PermissionDecisionKindDto::Allow => {
-                        narsor_engine::engine::PermissionDecisionKind::Allow
+                        narsor_exec::engine::PermissionDecisionKind::Allow
                     }
                 },
                 scope: decision.scope.map(|scope| match scope {
                     narsor_protocol::api::PermissionGrantScopeDto::ExactOperation => {
-                        narsor_engine::engine::PermissionGrantScope::ExactOperation
+                        narsor_exec::engine::PermissionGrantScope::ExactOperation
                     }
                     narsor_protocol::api::PermissionGrantScopeDto::CommandGroup => {
-                        narsor_engine::engine::PermissionGrantScope::CommandGroup
+                        narsor_exec::engine::PermissionGrantScope::CommandGroup
                     }
                     narsor_protocol::api::PermissionGrantScopeDto::Pattern => {
-                        narsor_engine::engine::PermissionGrantScope::Pattern
+                        narsor_exec::engine::PermissionGrantScope::Pattern
                     }
                 }),
                 pattern: decision.pattern,
@@ -1813,7 +1828,7 @@ impl Session {
                 if let Some(client) = self.link.client() {
                     let mut snapshot = self.snapshot(None, true)?;
                     snapshot.snapshot_sequence = self.storage.next_snapshot_sequence()?;
-                    match client.snapshot(&snapshot).await {
+                    match send_snapshot(&client, &snapshot).await {
                         Ok(response) => {
                             self.take_answer_header(response.default_harness, response.launch)?;
                             self.storage.record_reported_cursor(snapshot.event_cursor)?;

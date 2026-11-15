@@ -53,7 +53,7 @@ use serde_json::{json, Value};
 use narsor_controller::kubernetes::client::{KubeTransport, Method, StatusCode, TransportFuture};
 use narsor_controller::kubernetes::manifest::RUNNER_CONTAINER;
 use narsor_controller::kubernetes::{KubernetesBackend, KubernetesBackendConfig};
-use narsor_engine::backends::BackendResult;
+use narsor_controller_runtime::backend::BackendResult;
 
 /// Namespace of the mock cluster.
 pub const NAMESPACE: &str = "narsor-user";

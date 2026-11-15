@@ -12,10 +12,10 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+use backend_contract_support::fake::FakeBackend;
 use backend_contract_support::{stub_runner, ContractTarget};
-use narsor_engine::backends::{
-    ExecutionBackend, FakeBackend, LocalBackend, LocalBackendConfig, TaskResources,
-};
+use narsor_controller::local::backend::{LocalBackend, LocalBackendConfig};
+use narsor_controller_runtime::backend::{ExecutionBackend, TaskResources};
 use narsor_engine::domain::{
     ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec, TaskWorkspace,
 };
@@ -189,7 +189,7 @@ fn process_running(pid: u32) -> bool {
 /// runner.
 #[tokio::test]
 async fn removing_a_dead_runners_workload_kills_what_it_left_running() {
-    use narsor_engine::backends::{RunnerCredential, WorkloadLaunch};
+    use narsor_controller_runtime::backend::{RunnerCredential, WorkloadLaunch};
 
     let scratch = std::env::temp_dir().join(format!("narsor-orphan-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&scratch).unwrap();

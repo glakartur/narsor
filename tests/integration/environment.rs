@@ -1576,15 +1576,15 @@ fn a_network_resolver_has_no_built_in_local_backend() {
 fn a_network_resolver_defaulting_to_local_names_the_setting() {
     let root = TempRoot::new();
     root.write_workflow("bare", &workflow_yaml("bare", None));
-    let network = narsor_engine::environment::CatalogLaunchResolver::new(
+    let network = narsor_engine::launch::CatalogLaunchResolver::new(
         root.path(),
         narsor_engine::workflows::WorkflowResolver::with_user_dir(root.path(), None),
-        narsor_engine::environment::OwnerDefaults {
+        narsor_engine::launch::OwnerDefaults {
             default_backend: "local".to_string(),
             default_profile: "default".to_string(),
             local_workspace_roots: Vec::new(),
         },
-        Arc::new(narsor_engine::environment::StaticHarnessDefaults::builtin(
+        Arc::new(narsor_engine::launch::StaticHarnessDefaults::builtin(
             "claude-code",
         )),
     )

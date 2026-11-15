@@ -17,15 +17,16 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 
 use crate::conductor::{pending_chat_proposals, ConductorStore};
+use crate::domain::runner_snapshot::{PendingInputRef, RunnerSnapshot};
 use crate::domain::{ExecutionStatus, ParamType, WorkflowDefinition, WorkflowExecution};
 use crate::engine::conversation_summary::summaries;
 pub(crate) use crate::engine::conversation_summary::ConversationCache;
 use crate::engine::{current_timeline, step_failure, Engine, InputContinuation, PendingHumanInput};
-use crate::orchestration::{
-    AttentionItem, AttentionKind, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
-    PendingInputRef, RunnerProblem, RunnerSnapshot,
-};
 use crate::persistence::ExecutionStore;
+use narsor_protocol::controller::{
+    AttentionItem, AttentionKind, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
+    RunnerProblem,
+};
 
 use super::workspaces::WorkspaceTracker;
 use super::RunnerError;

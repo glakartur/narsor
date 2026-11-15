@@ -1,0 +1,27 @@
+[package]
+name = "narsor-controller-client"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "narsor_controller_client"
+path = "src/lib.rs"
+
+[dependencies]
+narsor-controller-runtime = { path = "../narsor-controller-runtime" }
+narsor-model = { path = "../narsor-model" }
+narsor-protocol = { path = "../narsor-protocol" }
+narsor-shared = { path = "../narsor-shared" }
+
+base64 = "0.23"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = { version = "3", features = ["alloc", "rand_core"] }
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }

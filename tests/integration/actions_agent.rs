@@ -25,6 +25,7 @@ use narsor_engine::domain::{
 use narsor_engine::engine::actions::agent::{
     output_contract, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
 };
+use narsor_engine::engine::{reconcile, ReconciliationOutcome};
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor,
     ClaudeCodeAdapter, CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry,
@@ -33,8 +34,8 @@ use narsor_engine::engine::{
     METADATA_OUTPUT_REJECTION_KEY,
 };
 use narsor_engine::persistence::{
-    recover, ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
-    ExecutionStore, ReconciliationOutcome, StatePaths,
+    ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
+    ExecutionStore, StatePaths,
 };
 use narsor_engine::workflow::{load_from_file, TemplateScope};
 use narsor_protocol::chat::{
@@ -3399,7 +3400,7 @@ async fn a_reprompt_after_a_restart_runs_on_the_recorded_harness_not_the_new_def
     store
         .save_execution(&execution)
         .expect("save the execution");
-    recover(&store).expect("recover");
+    reconcile(&store, &execution.id).expect("reconcile");
 
     // The operator switched the default while the daemon was down.
     selector.set("opencode").await.expect("change the default");
@@ -3471,12 +3472,7 @@ async fn a_restart_between_rejection_and_reprompt_continues_with_the_reprompt() 
         .save_execution(&execution)
         .expect("save the execution");
 
-    let report = recover(&store).expect("recover");
-    let verdict = report
-        .reconciled
-        .iter()
-        .find(|entry| entry.execution_id == execution.id)
-        .expect("the execution was reconciled");
+    let verdict = reconcile(&store, &execution.id).expect("reconcile");
     assert_eq!(verdict.outcome, ReconciliationOutcome::Consistent);
     assert_eq!(verdict.status, ExecutionStatus::Running);
 
@@ -3558,7 +3554,7 @@ async fn a_reprompt_still_unusable_after_a_restart_is_rescued_for_an_agent_step(
     store
         .save_execution(&execution)
         .expect("save the execution");
-    recover(&store).expect("recover");
+    reconcile(&store, &execution.id).expect("reconcile");
 
     let execution = engine
         .resume(&definition, &execution.id)

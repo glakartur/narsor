@@ -68,7 +68,7 @@ use super::{
     RunnerExit, RunnerTiming, PROBLEM_OWNER_DECISION,
 };
 
-/// The runner could not work and said why (a [`crate::orchestration::RunnerProblem`]).
+/// The runner could not work and said why (a [`narsor_protocol::controller::RunnerProblem`]).
 pub const EXIT_PROBLEM: i32 = 3;
 
 /// The runner refused to touch storage left by an unexpected stop.
@@ -187,7 +187,7 @@ pub async fn run_command(args: RunnerArgs) -> i32 {
         }
     };
 
-    std::env::remove_var(narsor_engine::config::AGENT_ARGS_ENV);
+    std::env::remove_var(narsor_exec::config::AGENT_ARGS_ENV);
     exit_code(run(config, apply_environment).await)
 }
 
@@ -215,12 +215,12 @@ fn exit_code(ended: Result<RunnerExit, RunnerError>) -> i32 {
 /// argument that is not valid.
 pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
     let task_id = TaskId::parse(&args.task_id).map_err(|error| error.to_string())?;
-    let resolved = narsor_engine::config::resolve::resolve(
-        &narsor_engine::config::Flags {
+    let resolved = narsor_exec::config::resolve::resolve(
+        &narsor_exec::config::Flags {
             config: args.config,
             ..Default::default()
         },
-        &narsor_engine::config::resolve::environment_from_process(),
+        &narsor_exec::config::resolve::environment_from_process(),
     );
     if !resolved.is_ok() {
         return Err(resolved
@@ -245,7 +245,7 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
             claude_profile_source: args.claude_profile_source,
         },
         agent_args: resolved.agent_args(),
-        conductor_profile: narsor_engine::conductor::ConductorProfile {
+        conductor_profile: narsor_exec::conductor::ConductorProfile {
             model: resolved.conductor_model(),
             effort: resolved.conductor_effort(),
         },
@@ -352,10 +352,12 @@ mod tests {
     #[test]
     fn every_end_has_its_exit_code() {
         let problem = |code: &str| {
-            Ok(RunnerExit::Problem(crate::orchestration::RunnerProblem {
-                code: code.to_string(),
-                message: "why".to_string(),
-            }))
+            Ok(RunnerExit::Problem(
+                narsor_protocol::controller::RunnerProblem {
+                    code: code.to_string(),
+                    message: "why".to_string(),
+                },
+            ))
         };
         assert_eq!(exit_code(Ok(RunnerExit::PausedAtSafePoint)), EXIT_SUCCESS);
         assert_eq!(

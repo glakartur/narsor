@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use narsor_engine::domain::WorkspaceField;
-use narsor_engine::workflow::WorkspaceValues;
+use narsor_exec::domain::WorkspaceField;
+use narsor_exec::workflow::WorkspaceValues;
 use serde_json::Value;
 
 use crate::domain::{TaskRepositorySource, TaskWorkspace, WorkspaceHeader, WorkspacePr};

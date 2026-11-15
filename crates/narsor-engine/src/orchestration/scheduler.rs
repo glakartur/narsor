@@ -193,11 +193,6 @@ impl ControlPlane {
         Ok(changed)
     }
 
-    /// What the backend's tasks hold right now, for the limit's overshoot.
-    pub fn backend_load(&self, backend_id: &BackendId) -> Result<BackendLoad> {
-        Ok(BackendLoad::of(&self.backend_tasks(backend_id)?))
-    }
-
     /// Asks the task running at `generation` to stop at a safe point,
     /// because the global task limit is exceeded: a `Pause` of
     /// [`CommandActor::Policy`], keyed [`limit_stop_key`]`(generation)`.

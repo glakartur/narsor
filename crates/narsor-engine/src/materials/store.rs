@@ -33,8 +33,8 @@ use super::{
     MaterialResult,
 };
 use crate::domain::TaskId;
-use crate::orchestration::store::FileLock;
 use crate::persistence::atomic::sync_parent_dir;
+use crate::persistence::lock::FileLock;
 use crate::persistence::paths::{MATERIAL_BLOBS_DIR, MATERIAL_RECORD_FILE};
 use crate::persistence::{read_json, write_json_atomic, StatePaths};
 

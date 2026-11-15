@@ -18,7 +18,8 @@ actions, decisions, transitions) that orchestrate AI agents and people.
 Rust 2021, Cargo workspace.
 
 - `src/` — the `narsor` (TUI) and `narsor-cli` binaries, client library.
-- `crates/` — workspace crates: `narsor-engine`, `narsor-controller`,
+- `crates/` — workspace crates: `narsor-model`, `narsor-store`, `narsor-exec`, `narsor-engine`, `narsor-controller`,
+  `narsor-controller-client`,
   `narsor-controller-runtime`, `narsor-runner`, `narsor-server`,
   `narsor-web`, `narsor-protocol`, `narsor-shared`, `narsor-api-client`,
   `narsor-observer-worker`.

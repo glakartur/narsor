@@ -226,25 +226,6 @@ impl ProtocolService {
         self
     }
 
-    /// Replaces how controller requests are verified (the default checks
-    /// signed proof-of-possession, [`crate::auth::pop`]).
-    pub fn with_controller_authenticator(mut self, auth: Arc<dyn ControllerAuthenticator>) -> Self {
-        self.controller_auth = auth;
-        self
-    }
-
-    /// Replaces the bounds of task materials (U9).
-    pub fn with_material_limits(mut self, limits: MaterialLimits) -> Self {
-        self.materials = MaterialStore::new(self.control.store().paths(), limits);
-        self
-    }
-
-    /// Replaces how runner credentials are verified.
-    pub fn with_runner_authenticator(mut self, auth: Arc<dyn RunnerAuthenticator>) -> Self {
-        self.runner_auth = auth;
-        self
-    }
-
     /// The control plane.
     pub fn control_plane(&self) -> &ControlPlane {
         &self.control

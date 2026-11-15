@@ -33,12 +33,12 @@ use std::any::Any;
 use std::time::Duration;
 
 use crate::api::ClientError;
-use crate::controller_protocol::{
+use crate::controller_client::{
     ConductorReadRequest, ConversationPageRequest, ExecutionEventsPage, ExecutionEventsRequest,
     RelayFailure, RunnerDirective, RunnerPollQuery, RunnerPollResponse,
 };
-use crate::orchestration::RunnerProblem;
 use crate::persistence::ExecutionStore;
+use narsor_protocol::controller::RunnerProblem;
 
 use super::storage::InitializationMarker;
 use super::{

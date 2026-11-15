@@ -16,7 +16,7 @@
 //!   the global task budget (U10).
 //!
 //! Records live under `{state}/orchestration/`, outside `executions/`, so
-//! local crash recovery (`persistence::recovery`) never sees them; use
+//! local crash recovery (`engine::recovery`) never sees them; use
 //! [`ControlPlane::recover`] at startup instead.
 
 pub mod control_plane;

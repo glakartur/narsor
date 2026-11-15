@@ -37,10 +37,8 @@ use narsor_engine::auth::{
 use narsor_engine::config::Resolved;
 use narsor_engine::controller_protocol::{AutoResumePass, ProtocolService};
 use narsor_engine::engine::HarnessRegistry;
-use narsor_engine::environment::{
-    BackendKind, BackendRecord, CatalogLaunchResolver, EnvironmentCatalog, HarnessDefaults,
-    OwnerDefaults,
-};
+use narsor_engine::environment::{BackendKind, BackendRecord, EnvironmentCatalog};
+use narsor_engine::launch::{CatalogLaunchResolver, HarnessDefaults, OwnerDefaults};
 use narsor_engine::observers::ObserverStore;
 use narsor_engine::orchestration::ControlPlane;
 use narsor_engine::persistence::{DaemonInfo, DefaultHarnessSelector};

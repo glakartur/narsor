@@ -23,7 +23,7 @@ use narsor_protocol::api::{
 /// text from `HumanInputRequested`, the one piece it could get any other
 /// way. Callers already fetch `summary` from `GET /executions` before
 /// calling this, so reusing it here costs nothing further. An
-/// operator-requested pause (`WorkflowPaused`, `Engine::pause_now`) has no
+/// operator-requested pause (`WorkflowPaused`) has no
 /// pending question and `pending_input` is `None` for it, matching
 /// `engine.pending_input()` returning `None` for that case before this
 /// unit.

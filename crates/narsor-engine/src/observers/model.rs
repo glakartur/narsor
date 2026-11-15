@@ -11,6 +11,8 @@
 //! read end in an `Unrecognized` fallback that this build never writes.
 
 use super::{ObserverError, Result};
+pub use crate::domain::observer_name::MAX_OBSERVER_NAME_LEN;
+use crate::domain::observer_name::{name_like_problem, observer_name_problem, OBSERVER_ID_PREFIX};
 use crate::domain::{BackendId, TaskId, WorkflowDefinition};
 use chrono::{DateTime, Utc};
 use narsor_protocol::controller::{CreateTaskRequest, LaunchRequest, OwnerRef, WorkspaceRequest};
@@ -45,8 +47,6 @@ pub const DEFAULT_WATCH_OBJECT_MAX_LEN: usize = 512;
 /// Highest object length limit an owner may configure.
 pub const MAX_WATCH_OBJECT_MAX_LEN: usize = 4096;
 
-/// Longest observer name and observer id.
-pub const MAX_OBSERVER_NAME_LEN: usize = 64;
 /// Longest `source` text.
 pub const MAX_SOURCE_LEN: usize = 256;
 /// Largest condition, serialized as JSON.
@@ -58,38 +58,15 @@ pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
 /// Longest event type of a watch entry.
 pub const MAX_EVENT_TYPE_LEN: usize = 128;
 
-/// Prefix of every generated observer id.
-const OBSERVER_ID_PREFIX: &str = "obs-";
-
 // ---------------------------------------------------------------------------
 // Identifiers
 // ---------------------------------------------------------------------------
 
-/// Validates a name-like value: 1–[`MAX_OBSERVER_NAME_LEN`] characters of
-/// `[A-Za-z0-9_-]`, plus `.` when `allow_dot`, never starting with `.`.
+/// Validates a name-like value ([`name_like_problem`]).
 fn validate_name_like(field: &'static str, value: &str, allow_dot: bool) -> Result<()> {
-    let valid = !value.is_empty()
-        && value.len() <= MAX_OBSERVER_NAME_LEN
-        && !value.starts_with('.')
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'-' | b'_')
-                || (allow_dot && byte == b'.')
-        });
-    if valid {
-        Ok(())
-    } else {
-        let allowed = if allow_dot {
-            "[A-Za-z0-9._-]"
-        } else {
-            "[A-Za-z0-9_-]"
-        };
-        Err(ObserverError::invalid(
-            field,
-            format!(
-                "'{value}' is not valid: use 1-{MAX_OBSERVER_NAME_LEN} characters of {allowed}, not starting with '.'"
-            ),
-        ))
+    match name_like_problem(value, allow_dot) {
+        None => Ok(()),
+        Some(reason) => Err(ObserverError::invalid(field, reason)),
     }
 }
 
@@ -154,16 +131,10 @@ impl ObserverName {
     /// Validates and wraps `value`.
     pub fn parse(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        validate_name_like("name", &value, true)?;
-        // A name that looks like an id could shadow another owner's
-        // observer where a name or an id is accepted.
-        if value.starts_with(OBSERVER_ID_PREFIX) {
-            return Err(ObserverError::invalid(
-                "name",
-                format!("'{value}' is not valid: a name may not start with '{OBSERVER_ID_PREFIX}', the prefix of observer ids"),
-            ));
+        match observer_name_problem(&value) {
+            None => Ok(Self(value)),
+            Some(reason) => Err(ObserverError::invalid("name", reason)),
         }
-        Ok(Self(value))
     }
 
     /// Whether `value` has the form of an observer id rather than a name.

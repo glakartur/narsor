@@ -349,5 +349,15 @@ pub enum OrchestrationError {
     },
 }
 
+impl From<crate::persistence::lock::FileLockError> for OrchestrationError {
+    fn from(error: crate::persistence::lock::FileLockError) -> Self {
+        use crate::persistence::lock::FileLockError;
+        match error {
+            FileLockError::Persistence(error) => Self::Persistence(error),
+            FileLockError::Lock { path, source } => Self::Lock { path, source },
+        }
+    }
+}
+
 /// Result type of the orchestration module.
 pub type Result<T> = std::result::Result<T, OrchestrationError>;

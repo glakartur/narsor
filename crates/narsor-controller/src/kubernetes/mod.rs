@@ -76,7 +76,7 @@
 //! supports locks.
 //!
 //! The controller decides everything else — when a Pod may go, when a new
-//! one may come (KTD2); see [`narsor_engine::backends::Controller`].
+//! one may come (KTD2); see [`narsor_controller_runtime::Controller`].
 
 pub mod client;
 pub mod manifest;
@@ -96,7 +96,7 @@ use self::client::{ClusterAccess, Created, KubeClient, KubeTransport};
 pub use self::manifest::KubernetesBackendConfig;
 use self::manifest::{EPOCH_KEY, GENERATION_KEY, INCARNATION_ANNOTATION, RESOURCE_KEY_ANNOTATION};
 use self::objects::{PersistentVolumeClaim, Pod, StorageClass};
-use narsor_engine::backends::{
+use narsor_controller_runtime::backend::{
     ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, ReaderStart,
     Removal, StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase,
     WorkloadState,

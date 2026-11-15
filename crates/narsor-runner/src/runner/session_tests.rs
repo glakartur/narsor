@@ -31,7 +31,7 @@ use crate::conductor::{
     ChatAuthor, ConductorAnswer, ConductorInvoker, ConductorView, Invocation, InvocationOutcome,
     ProposalState,
 };
-use crate::controller_protocol::{
+use crate::controller_client::{
     ConductorReadRequest, DeliveredOperatorCommand, HarnessUsageReport, UsageLimit,
 };
 use crate::domain::{
@@ -39,7 +39,7 @@ use crate::domain::{
     ResolvedEnvironment, ResourceProfile, TaskRepository, TaskRepositorySource, TaskWorkspace,
 };
 use crate::engine::{ActionExecutor, ActionKind, ActionOutcome, ActionRequest, UsageReporter};
-use crate::orchestration::{AttentionKind, OperatorCommand};
+use narsor_protocol::controller::{AttentionKind, OperatorCommand};
 
 // ---------------------------------------------------------------------------
 // Fixtures

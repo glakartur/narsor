@@ -1,0 +1,534 @@
+//! Durable storage of executions: `state.json`, `context.json`, artifacts.
+
+use super::{PersistenceError, Result};
+use crate::atomic::{
+    cleanup_orphaned_temp_files, ensure_dir, read_json, read_json_capped, remove_file_if_exists,
+    write_atomic, write_json_atomic, write_json_atomic_exclusive,
+};
+use crate::conversation::ConversationStore;
+use crate::event_log::EventLog;
+use crate::paths::{StatePaths, DEFAULT_ROOT};
+use crate::step_profile::{
+    StepProfileEntry, StepProfileResult, MAX_STEP_PROFILE_BYTES, STEP_PROFILE_VERSION,
+};
+use narsor_model::domain::{Context, ExecutionId, TaskId, TaskLaunchSpec, WorkflowExecution};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::fs;
+use std::path::PathBuf;
+
+/// File holding the input request an execution is currently waiting on.
+///
+/// Its presence is a hint, never the truth: the authority for "this execution
+/// is waiting" is `status` in `state.json`. See `engine::actions::human` for
+/// why the request lives in its own file rather than inside the execution.
+pub const PENDING_INPUT_FILE: &str = "pending_input.json";
+
+/// File holding the external event a `wait` step is waiting for.
+///
+/// A hint like [`PENDING_INPUT_FILE`]: the authority is `status ==
+/// WaitingForEvent` in `state.json`. See `engine::actions::wait`.
+pub const PENDING_EVENT_FILE: &str = "pending_event.json";
+
+/// Filesystem store for workflow executions.
+///
+/// A concrete struct rather than a trait: the engine only ever writes to the
+/// filesystem, and there is nothing to substitute — the tests run against real
+/// temporary directories, because the whole value of this layer lies in real
+/// file operations. Introducing a trait now would add a dispatch boundary that
+/// no second implementation justifies; a later unit that needs one can extract
+/// it from these signatures without changing any call site.
+///
+/// `state.json` is the authority for an execution, including its embedded
+/// `context`. `context.json` is written alongside it as a standalone
+/// projection: it is what the CLI and the TUI read to show the current
+/// variables, and it is the file the engine rewrites on the D10 path, where
+/// only the context changed.
+#[derive(Debug, Clone)]
+pub struct ExecutionStore {
+    paths: StatePaths,
+}
+
+impl ExecutionStore {
+    /// Creates a store rooted at `root`.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            paths: StatePaths::new(root),
+        }
+    }
+
+    /// Creates a store at the default root (`./.narsor`).
+    pub fn with_default_root() -> Self {
+        Self::new(DEFAULT_ROOT)
+    }
+
+    /// The path layout this store uses.
+    pub fn paths(&self) -> &StatePaths {
+        &self.paths
+    }
+
+    /// Persists an execution: `state.json` plus the `context.json` projection.
+    ///
+    /// The directory structure is created on demand, so no caller ever has to
+    /// `mkdir` first.
+    pub fn save_execution(&self, execution: &WorkflowExecution) -> Result<()> {
+        self.create_execution_dirs(&execution.id)?;
+        write_json_atomic(&self.paths.context_file(&execution.id), &execution.context)?;
+        write_json_atomic(&self.paths.state_file(&execution.id), execution)
+    }
+
+    /// Loads an execution from its `state.json`.
+    pub fn load_execution(&self, execution_id: &str) -> Result<WorkflowExecution> {
+        let path = self.paths.state_file(execution_id);
+        if !path.exists() {
+            return Err(PersistenceError::ExecutionNotFound {
+                execution_id: execution_id.to_string(),
+                path,
+            });
+        }
+        read_json(&path)
+    }
+
+    /// Copies an immutable launch specification to task storage once (R18).
+    ///
+    /// `Ok(true)` means this caller initialized the storage; `Ok(false)` means
+    /// an identical spec was already there — the ordinary outcome of a
+    /// reconnect or a redelivered command, which must reconcile rather than
+    /// bootstrap a second runner. A different spec is a hard
+    /// [`PersistenceError::LaunchSpecConflict`]: task storage belongs to one
+    /// launch for its whole life. The write is exclusive (`link(2)`), so two
+    /// racing initializers cannot both win.
+    pub fn initialize_task_launch_spec(
+        &self,
+        task_id: &TaskId,
+        spec: &TaskLaunchSpec,
+    ) -> Result<bool> {
+        let path = self.paths.task_launch_spec_file(task_id.as_str());
+        if !spec.digest_is_valid() {
+            return Err(PersistenceError::LaunchSpecConflict {
+                task_id: task_id.to_string(),
+                path,
+            });
+        }
+        if write_json_atomic_exclusive(&path, spec)? {
+            return Ok(true);
+        }
+        let existing: TaskLaunchSpec = read_json(&path)?;
+        // Full content, not only the digest: the digest is a non-cryptographic
+        // integrity check (see `TaskLaunchSpec::compute_digest`).
+        if existing == *spec {
+            Ok(false)
+        } else {
+            Err(PersistenceError::LaunchSpecConflict {
+                task_id: task_id.to_string(),
+                path,
+            })
+        }
+    }
+
+    /// Reads the pinned launch specification of a task, or `None` when this
+    /// task storage was never initialized.
+    pub fn load_task_launch_spec(&self, task_id: &TaskId) -> Result<Option<TaskLaunchSpec>> {
+        let path = self.paths.task_launch_spec_file(task_id.as_str());
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
+    }
+
+    /// Persists only `context.json`.
+    ///
+    /// The engine is the sole caller (D10): an action never writes the context
+    /// itself.
+    pub fn save_context(&self, execution_id: &str, context: &Context) -> Result<()> {
+        write_json_atomic(&self.paths.context_file(execution_id), context)
+    }
+
+    /// Loads `context.json`.
+    pub fn load_context(&self, execution_id: &str) -> Result<Context> {
+        let path = self.paths.context_file(execution_id);
+        if !path.exists() {
+            return Err(PersistenceError::ExecutionNotFound {
+                execution_id: execution_id.to_string(),
+                path,
+            });
+        }
+        read_json(&path)
+    }
+
+    /// `{root}/executions/{execution_id}/pending_input.json`.
+    pub fn pending_input_file(&self, execution_id: &str) -> PathBuf {
+        self.paths
+            .execution_dir(execution_id)
+            .join(PENDING_INPUT_FILE)
+    }
+
+    /// Persists the request an execution is waiting on.
+    ///
+    /// Generic over the record rather than typed: the pending request is an
+    /// engine concept (`engine::actions::human::PendingHumanInput`) and this
+    /// layer sits below the engine, so naming the type here would invert the
+    /// dependency. The store's job is that the bytes land atomically.
+    pub fn save_pending_input<T: Serialize>(&self, execution_id: &str, pending: &T) -> Result<()> {
+        self.create_execution_dirs(execution_id)?;
+        write_json_atomic(&self.pending_input_file(execution_id), pending)
+    }
+
+    /// Loads the pending request, or `None` when the execution is not waiting
+    /// on one.
+    ///
+    /// An absent file is the ordinary case — most executions are not waiting —
+    /// so it is an `Ok(None)` rather than an error.
+    pub fn load_pending_input<T: DeserializeOwned>(&self, execution_id: &str) -> Result<Option<T>> {
+        let path = self.pending_input_file(execution_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
+    }
+
+    /// True when a pending request file exists for this execution.
+    ///
+    /// Cheap enough to call while listing every execution in the store, which
+    /// is how the TUI finds the ones waiting for a person.
+    pub fn has_pending_input(&self, execution_id: &str) -> bool {
+        self.pending_input_file(execution_id).exists()
+    }
+
+    /// Removes the pending request. Returns whether there was one to remove.
+    pub fn clear_pending_input(&self, execution_id: &str) -> Result<bool> {
+        remove_file_if_exists(&self.pending_input_file(execution_id))
+    }
+
+    /// `{root}/executions/{execution_id}/pending_event.json`.
+    pub fn pending_event_file(&self, execution_id: &str) -> PathBuf {
+        self.paths
+            .execution_dir(execution_id)
+            .join(PENDING_EVENT_FILE)
+    }
+
+    /// Persists the external event a `wait` step waits for; generic for the
+    /// same reason as [`Self::save_pending_input`].
+    pub fn save_pending_event<T: Serialize>(&self, execution_id: &str, pending: &T) -> Result<()> {
+        self.create_execution_dirs(execution_id)?;
+        write_json_atomic(&self.pending_event_file(execution_id), pending)
+    }
+
+    /// Loads the awaited event, or `None` when there is none.
+    pub fn load_pending_event<T: DeserializeOwned>(&self, execution_id: &str) -> Result<Option<T>> {
+        let path = self.pending_event_file(execution_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
+    }
+
+    /// Removes the awaited event. Returns whether there was one to remove.
+    pub fn clear_pending_event(&self, execution_id: &str) -> Result<bool> {
+        remove_file_if_exists(&self.pending_event_file(execution_id))
+    }
+
+    /// True when an execution with this identifier is stored.
+    pub fn exists(&self, execution_id: &str) -> bool {
+        self.paths.state_file(execution_id).exists()
+    }
+
+    /// Lists the identifiers of all stored executions, sorted.
+    ///
+    /// A root that does not exist yet simply holds no executions.
+    pub fn list_execution_ids(&self) -> Result<Vec<ExecutionId>> {
+        let dir = self.paths.executions_dir();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(PersistenceError::io(&dir, source)),
+        };
+
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| PersistenceError::io(&dir, source))?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if let Some(id) = entry.file_name().to_str() {
+                ids.push(id.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// The event log of one execution.
+    pub fn event_log(&self, execution_id: &str) -> EventLog {
+        EventLog::new(self.paths.events_dir(execution_id))
+    }
+
+    /// The conversation store of one execution (U2): one file per action
+    /// attempt, keyed by `action_execution_id`.
+    pub fn conversation_store(&self, execution_id: &str) -> ConversationStore {
+        ConversationStore::new(self.paths.clone(), execution_id)
+    }
+
+    /// Atomically stores one final agent reply before its state pointer is saved.
+    pub fn write_step_reply(
+        &self,
+        execution_id: &str,
+        attempt_id: &str,
+        reply: &str,
+    ) -> Result<()> {
+        write_atomic(
+            &self.paths.step_reply_file(execution_id, attempt_id),
+            reply.as_bytes(),
+        )
+    }
+
+    /// Reads a reply selected by the execution's durable attempt pointer.
+    pub fn read_step_reply(&self, execution_id: &str, attempt_id: &str) -> Result<String> {
+        let path = self.paths.step_reply_file(execution_id, attempt_id);
+        fs::read_to_string(&path).map_err(|source| PersistenceError::io(&path, source))
+    }
+
+    /// Atomically replaces `step-profile.json` with `entries`.
+    ///
+    /// The whole file is replaced: an entry of an earlier write that is not in
+    /// `entries` is gone, and an empty `entries` leaves an empty result. The
+    /// same call after a restart writes the same file again.
+    pub fn write_step_profile(
+        &self,
+        execution_id: &str,
+        entries: &[StepProfileEntry],
+    ) -> Result<()> {
+        write_json_atomic(
+            &self.paths.step_profile_file(execution_id),
+            &StepProfileResult::new(entries.to_vec()),
+        )
+    }
+
+    /// Reads `step-profile.json`; empty when no `profile` step wrote it.
+    ///
+    /// A damaged file, a file larger than [`MAX_STEP_PROFILE_BYTES`] and a
+    /// file of another version are errors, which the caller treats as "no
+    /// profile".
+    pub fn read_step_profile(&self, execution_id: &str) -> Result<StepProfileResult> {
+        let path = self.paths.step_profile_file(execution_id);
+        let Some(result) = read_json_capped::<StepProfileResult>(&path, MAX_STEP_PROFILE_BYTES)?
+        else {
+            return Ok(StepProfileResult::default());
+        };
+        if result.version != STEP_PROFILE_VERSION {
+            return Err(PersistenceError::UnsupportedVersion {
+                path,
+                found: result.version,
+                supported: STEP_PROFILE_VERSION,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Creates and returns the directory for one artifact of an execution.
+    pub fn artifact_dir(&self, execution_id: &ExecutionId, artifact_id: &str) -> Result<PathBuf> {
+        let dir = self.paths.artifact_dir(execution_id, artifact_id);
+        ensure_dir(&dir)?;
+        Ok(dir)
+    }
+
+    /// Creates the full directory structure of one execution.
+    pub fn create_execution_dirs(&self, execution_id: &str) -> Result<()> {
+        ensure_dir(&self.paths.execution_dir(execution_id))?;
+        ensure_dir(&self.paths.events_dir(execution_id))?;
+        ensure_dir(&self.paths.artifacts_dir(execution_id))
+    }
+
+    /// Removes every orphaned `.tmp` file below the root.
+    ///
+    /// Call this once at startup: such a file is the trace of a crash between a
+    /// write and its rename, never data to recover. It is deliberately explicit
+    /// rather than implicit in every read, so that a read never mutates the
+    /// store and a diagnosing operator can inspect the leftovers first.
+    ///
+    /// Returns the paths that were removed.
+    pub fn cleanup_orphaned_temp_files(&self) -> Result<Vec<PathBuf>> {
+        let mut removed = cleanup_orphaned_temp_files(&self.paths.launch_specs_dir())?;
+        for execution_id in self.list_execution_ids()? {
+            removed.extend(cleanup_orphaned_temp_files(
+                &self.paths.execution_dir(&execution_id),
+            )?);
+            removed.extend(cleanup_orphaned_temp_files(
+                &self.paths.events_dir(&execution_id),
+            )?);
+            removed.extend(cleanup_orphaned_temp_files(
+                &self.paths.artifacts_dir(&execution_id),
+            )?);
+            // A `.jsonl.zst.tmp` compression temp file ends in the same
+            // generic `.tmp` suffix (its name never collides with a real
+            // target, so the generic sweep is exactly right for it too), so
+            // no separate rule is needed here — only the directory itself
+            // has to be included in the sweep.
+            removed.extend(cleanup_orphaned_temp_files(
+                &self.paths.conversations_dir(&execution_id),
+            )?);
+            removed.extend(cleanup_orphaned_temp_files(
+                &self.paths.conductor_dir(&execution_id),
+            )?);
+            removed.extend(cleanup_orphaned_temp_files(
+                &self.paths.conductor_annotations_dir(&execution_id),
+            )?);
+        }
+        Ok(removed)
+    }
+
+    /// The directory holding one execution.
+    pub fn execution_dir(&self, execution_id: &str) -> PathBuf {
+        self.paths.execution_dir(execution_id)
+    }
+}
+
+impl Default for ExecutionStore {
+    fn default() -> Self {
+        Self::with_default_root()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    /// A temporary root that deletes itself when it goes out of scope.
+    struct TempRoot {
+        path: PathBuf,
+    }
+
+    impl TempRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("narsor-execution-store-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).expect("create temp root");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    const EXECUTION: &str = "exec-1";
+
+    fn store(root: &TempRoot) -> ExecutionStore {
+        let store = ExecutionStore::new(&root.path);
+        store.create_execution_dirs(EXECUTION).expect("create dirs");
+        store
+    }
+
+    fn entry(step: &str, model: Option<&str>, effort: Option<&str>) -> StepProfileEntry {
+        StepProfileEntry {
+            step_id: step.to_string(),
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
+            rationale: format!("why {step}"),
+            requested_model: model.map(str::to_string),
+            requested_effort: effort.map(str::to_string),
+            profiled_by: "profile".to_string(),
+            decided_at: Utc.with_ymd_and_hms(2026, 11, 11, 10, 0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn step_profile_round_trips_with_rationale_and_requested_values() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        let mut clamped = entry("implement", Some("strong"), Some("high"));
+        clamped.requested_model = Some("strongest".to_string());
+        let entries = vec![clamped, entry("review", None, Some("low"))];
+
+        store.write_step_profile(EXECUTION, &entries).unwrap();
+        let result = store.read_step_profile(EXECUTION).unwrap();
+
+        assert_eq!(result.version, STEP_PROFILE_VERSION);
+        assert_eq!(result.entries, entries);
+        let implement = result.lookup("implement").unwrap();
+        assert_eq!(implement.rationale, "why implement");
+        assert_eq!(implement.requested_model.as_deref(), Some("strongest"));
+        assert_eq!(implement.model.as_deref(), Some("strong"));
+        assert_eq!(result.lookup("review").unwrap().model, None);
+    }
+
+    #[test]
+    fn second_step_profile_write_replaces_the_first() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        store
+            .write_step_profile(
+                EXECUTION,
+                &[
+                    entry("implement", Some("strong"), None),
+                    entry("review", None, Some("low")),
+                ],
+            )
+            .unwrap();
+
+        let second = vec![entry("implement", None, Some("medium"))];
+        store.write_step_profile(EXECUTION, &second).unwrap();
+        let result = store.read_step_profile(EXECUTION).unwrap();
+
+        assert_eq!(result.entries, second);
+        assert!(result.lookup("review").is_none());
+    }
+
+    #[test]
+    fn missing_step_profile_reads_as_empty() {
+        let root = TempRoot::new();
+        let store = store(&root);
+
+        let result = store.read_step_profile(EXECUTION).unwrap();
+
+        assert_eq!(result, StepProfileResult::default());
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn corrupt_step_profile_is_an_error() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        fs::write(store.paths().step_profile_file(EXECUTION), b"{ not json").unwrap();
+
+        let error = store.read_step_profile(EXECUTION).unwrap_err();
+
+        assert!(matches!(error, PersistenceError::Deserialize { .. }));
+    }
+
+    #[test]
+    fn oversized_step_profile_is_an_error() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        let size = usize::try_from(MAX_STEP_PROFILE_BYTES).unwrap() + 1;
+        fs::write(store.paths().step_profile_file(EXECUTION), vec![b' '; size]).unwrap();
+
+        let error = store.read_step_profile(EXECUTION).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PersistenceError::FileTooLarge { limit, .. } if limit == MAX_STEP_PROFILE_BYTES
+        ));
+    }
+
+    #[test]
+    fn step_profile_of_an_unknown_version_is_an_error() {
+        let root = TempRoot::new();
+        let store = store(&root);
+        fs::write(
+            store.paths().step_profile_file(EXECUTION),
+            br#"{"version": 2, "entries": []}"#,
+        )
+        .unwrap();
+
+        let error = store.read_step_profile(EXECUTION).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PersistenceError::UnsupportedVersion { found: 2, .. }
+        ));
+    }
+}

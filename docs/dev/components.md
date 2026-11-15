@@ -13,7 +13,11 @@ decisions behind this structure, see `architecture.md`.
 | `narsor-shared` | Small contracts shared by the processes: API errors, configuration. |
 | `narsor-api-client` | HTTP/SSE client transport; discovers a running `narsor-server` or launches one. |
 | `narsor-controller-runtime` | Lifecycle helpers shared by the local controller and the `narsor-controller` process. |
-| `narsor-engine` | The execution engine and the server-side domain: workflow loading, execution, persistence, orchestration, auth, observers. |
+| `narsor-controller-client` | The client side of the controller protocol: `ControllerClient`, `RunnerClient`, the wire types, proof-of-possession signing, and the adapter to `narsor-controller-runtime`. |
+| `narsor-model` | The model layer: domain types, workflow definitions (schema, loading, templates, validation) and shared configuration. No I/O beyond reading workflow files. |
+| `narsor-store` | File-backed storage primitives: state paths, atomic writes, file locks, the execution store, event logs and conversation records. |
+| `narsor-exec` | The execution layer: the Engine that runs a workflow, the conductor, task workspaces, the repository registry, task definitions and their sources, and the API projections of an execution. |
+| `narsor-engine` | The control plane: orchestration, controller protocol service, auth, observers, materials, environment configuration and launch resolution. Re-exports `narsor-exec`, `narsor-model`, `narsor-store` (as `persistence`) and `narsor-controller-client` under its old module paths. |
 | `narsor-server` | The daemon (control plane): the API server, its lifecycle and the child processes it supervises. |
 | `narsor-runner` | The isolated task runner: the Engine run against one portable task storage. |
 | `narsor-controller` | The environment controller process: `narsor-controller local` and `narsor-controller kubernetes`. |
@@ -34,11 +38,20 @@ graph TD
   server[narsor-server] --> api
   server --> engine[narsor-engine]
   server --> cr[narsor-controller-runtime]
-  runner[narsor-runner] --> engine
+  runner[narsor-runner] --> exec[narsor-exec]
+  runner --> cc[narsor-controller-client]
   ctrl[narsor-controller] --> engine
+  ctrl --> cc
   ctrl --> cr
+  engine --> exec
+  engine --> cc
   engine --> cr
-  engine --> shared[narsor-shared]
+  exec --> store[narsor-store]
+  exec --> model[narsor-model]
+  store --> model
+  cc --> model
+  cc --> cr
+  model --> shared[narsor-shared]
   api --> shared
   cr --> shared
   web --> shared
@@ -53,9 +66,13 @@ graph TD
 | `narsor-web` | api-client, protocol, shared |
 | `narsor-observer-worker` | api-client, protocol |
 | `narsor-server` | api-client, engine, controller-runtime, protocol, shared |
-| `narsor-runner` | engine, protocol |
-| `narsor-controller` | engine, controller-runtime, protocol |
-| `narsor-engine` | controller-runtime, protocol, shared |
+| `narsor-runner` | exec, controller-client, protocol |
+| `narsor-controller` | engine, controller-client, controller-runtime, protocol |
+| `narsor-engine` | exec, model, store, controller-client, controller-runtime, protocol, shared |
+| `narsor-exec` | model, store, protocol, shared |
+| `narsor-controller-client` | model, controller-runtime, protocol, shared |
+| `narsor-store` | model, protocol |
+| `narsor-model` | protocol, shared |
 | `narsor-api-client` | protocol, shared |
 | `narsor-controller-runtime` | protocol, shared |
 | `narsor-shared` | protocol |
@@ -65,8 +82,9 @@ Rules this graph keeps:
 
 - Clients (`narsor`, `narsor-web`, `narsor-observer-worker`) do not depend on
   `narsor-engine`. They reach the engine only through `narsor-api-client`.
-- Only the server-side processes (`narsor-server`, `narsor-runner`,
-  `narsor-controller`) link `narsor-engine`.
+- Only `narsor-server` and `narsor-controller` link `narsor-engine` (the
+  control plane). `narsor-runner` links only the execution layer
+  (`narsor-exec`) and the protocol client (`narsor-controller-client`).
 - `narsor-protocol` has no workspace dependencies.
 
 The root package lists every crate under `[dev-dependencies]`. Only the
@@ -115,7 +133,7 @@ graph TD
 | `narsor-server` | `narsor-controller local` | Start as a child, enroll, supervise | process (`server/src/local_controller.rs`) |
 | `narsor-server` | `narsor-observer-worker` | Start and supervise when the configuration enables it | process (`server/src/observer_worker.rs`) |
 | `narsor-controller` (local, kubernetes) | `narsor-server` | Enroll, lease, heartbeat, commands, acks, reports | HTTP, `/controller/v1` |
-| `narsor-controller local` | `narsor-runner` | One runner process per task | process (`engine/src/backends/local.rs`) |
+| `narsor-controller local` | `narsor-runner` | One runner process per task | process (`narsor-controller/src/local/backend.rs`) |
 | `narsor-controller kubernetes` | Kubernetes | One Pod (command `narsor-runner`) and one PVC per task | Kubernetes API (`controller/src/kubernetes/manifest.rs`) |
 | `narsor-runner` | `narsor-server` | Poll, renew, snapshots, usage, materials | HTTP, `/runner/v1` |
 | `narsor-runner` | agent harness, scripts, git | Execute workflow actions | process (`engine/src/engine/actions/`) |

@@ -1142,31 +1142,6 @@ fn a_mutation_after_an_interrupted_publish_keeps_the_log_gapless() {
 }
 
 #[test]
-fn local_crash_recovery_never_touches_orchestration_records() {
-    let fx = Fixture::new();
-    let lease = fx.lease("k8s", "controller-a");
-    let running = fx.running("task-1", &lease);
-    let store = ExecutionStore::new(fx.root.path());
-    fx.control
-        .bootstrap_task_storage(&task("task-1"), &store)
-        .unwrap();
-    let orphan = temp_path_for(&fx.root.paths().orchestration_task_file("task-1"));
-    fs::write(&orphan, b"torn").unwrap();
-
-    let report = narsor_engine::persistence::recover(&store).expect("local recovery");
-    assert!(report.reconciled.is_empty(), "no remote task is reconciled");
-    assert!(
-        orphan.exists(),
-        "orchestration debris is left to ControlPlane::recover"
-    );
-    assert!(
-        store.list_execution_ids().unwrap().is_empty(),
-        "a launch spec is not an execution"
-    );
-    assert_eq!(fx.control.task(&task("task-1")).unwrap(), running);
-}
-
-#[test]
 fn an_unknown_task_is_reported_as_not_found_without_creating_debris() {
     let fx = Fixture::new();
     let error = fx

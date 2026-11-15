@@ -25,7 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::api::ClientError;
-use crate::controller_protocol::RunnerClient;
+use crate::controller_client::RunnerClient;
 use crate::materials::{
     blob_order, is_material_id, manifest_digest, sha256_hex, snapshot_folder, write_files, Bundle,
     MaterialAnnouncement, MaterialError, MaterialFile, MaterialLimits, MaterialView, WriteMode,

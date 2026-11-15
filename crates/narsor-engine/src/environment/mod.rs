@@ -27,7 +27,8 @@
 //! * [`profile`] — profiles and the runtime catalogue;
 //! * [`catalog`] — reading and writing those files;
 //! * [`image`] — the pluggable tag-to-digest lookup;
-//! * [`resolver`] — request + configuration → backend + launch spec.
+//! * [`resolver`] — the launch resolver contract: request + configuration →
+//!   backend + launch spec. The implementation is `crate::launch`.
 
 pub mod backend;
 pub mod catalog;
@@ -43,6 +44,5 @@ pub use catalog::{CatalogError, EnvironmentCatalog};
 pub use image::{ImageResolver, NoTagResolution, StaticImageResolver};
 pub use profile::{ProfileRecord, RuntimeCatalog, DEFAULT_PROFILE};
 pub use resolver::{
-    CatalogLaunchResolver, HarnessDefaults, LaunchError, LaunchIntent, LaunchResolver,
-    OwnerDefaults, ResolvedLaunch, StaticHarnessDefaults, TaskDefaultHarness, WorkspaceRequest,
+    LaunchError, LaunchIntent, LaunchResolver, ResolvedLaunch, TaskDefaultHarness, WorkspaceRequest,
 };

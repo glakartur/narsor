@@ -21,9 +21,9 @@ use super::model::{
 };
 use crate::domain::display::bounded_detail;
 use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
-use crate::engine::{ConversationState, EventLink, Timeline};
 use crate::environment::backend::DEFAULT_SLOT_RELEASE_GRACE_SECS;
 use chrono::{DateTime, Duration, Utc};
+use narsor_protocol::api::{ConversationState, EventLink, Timeline};
 use narsor_protocol::controller::ResumeMessage;
 
 /// How many keys of comments already taken a record remembers.

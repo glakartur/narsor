@@ -16,7 +16,7 @@
 //!
 //! # Two trust planes (KTD6)
 //!
-//! Users are authenticated by the owner gate ([`gate`]); environment
+//! Users are authenticated by the owner gate (`narsor-server`'s `auth_gate`); environment
 //! controllers never use a user token — each has its own revocable identity
 //! scoped to one backend and proves every request with a key only it holds
 //! ([`pop`]); runners hold short-lived, incarnation-bound credentials issued
@@ -25,12 +25,12 @@
 //! * [`settings`] — the configuration and its cross-checks;
 //! * [`oidc`] — token verification, discovery and key rotation;
 //! * [`owner`] — the installation owner and its one-time claim;
-//! * [`gate`] — the HTTP gates, proxy policy, CORS and stream expiry;
-//! * [`pop`] — controller proof-of-possession.
+//! * [`pop`] — controller proof-of-possession (it lives in
+//!   `crate::controller_client`, shared with the clients that sign).
 
 pub mod oidc;
 pub mod owner;
-pub mod pop;
+pub use crate::controller_client::pop;
 pub mod settings;
 
 pub use narsor_protocol::api::{ClaimRequest, OwnerView, WhoAmIResponse};
