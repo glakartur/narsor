@@ -451,6 +451,11 @@ impl ProtocolService {
                 // A failed entry is checked again in the next round: no
                 // backoff, no count towards the error state (D18).
                 record.next_run_at = Some(after(now, interval));
+                // The round's next entry waits for a claim from now, not
+                // from this run's claim.
+                if record.run_due_since.is_some() {
+                    record.run_due_since = Some(now);
+                }
                 let done = verdict
                     .success
                     .unwrap_or(false)
@@ -623,6 +628,10 @@ impl ProtocolService {
             error: Some(LOST_MESSAGE.to_string()),
         });
         record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
+        // The round's next entry waits for a claim from now (D18).
+        if record.run_due_since.is_some() {
+            record.run_due_since = Some(now);
+        }
         self.observers.save(lock, record, now)
     }
 
