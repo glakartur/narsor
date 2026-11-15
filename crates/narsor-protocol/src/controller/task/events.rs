@@ -107,17 +107,17 @@ pub enum TaskEventKind {
     /// in place of [`TaskEventKind::Created`]. A client from before
     /// observers reads it as [`TaskEventKind::Unrecognized`].
     CreatedByObserver {
-        /// The observer, its effect key and its run.
+        /// The observer and its run.
         provenance: TaskProvenance,
     },
     /// An observer delivered an external event to the task (R4): recorded
-    /// once per effect key, whether or not the task waits for it.
+    /// for each delivery, whether or not the task waits for it.
     ExternalEventReceived {
         /// The event type (`review.approved`, say).
         event_type: String,
         /// The observer's source (`gitlab`, say).
         source: String,
-        /// The observer, its effect key and its run (R19).
+        /// The observer and its run (R19).
         provenance: TaskProvenance,
         /// The event's data, as the observer's script sent it. Untrusted:
         /// a client strips control characters before printing it.
