@@ -141,6 +141,21 @@ pub const TLS_TERMINATION_NONE: &str = "none";
 /// spoke HTTPS.
 pub const TLS_TERMINATION_PROXY: &str = "proxy";
 
+/// Where `narsor-web` listens when nothing says otherwise: a fixed loopback
+/// port, so the address of the browser interface can be bookmarked.
+pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:8484";
+
+/// `web_upstream` naming the local daemon of the state directory, which
+/// `narsor-web` discovers or launches like the CLI and the TUI do.
+pub const WEB_UPSTREAM_LOCAL: &str = "local";
+
+/// `narsor-web` holds the token of the server itself and gives the browser
+/// a session token of its own; only on a loopback address.
+pub const WEB_TOKEN_SERVER: &str = "server";
+
+/// `narsor-web` passes the browser's own token to the server unchanged.
+pub const WEB_TOKEN_PASSTHROUGH: &str = "passthrough";
+
 // ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
@@ -241,11 +256,19 @@ pub enum SettingKey {
     /// `true` runs observer scripts as the server's own user, without
     /// isolation: for a trial only.
     ObserverInsecureSameUser,
+    /// The address `narsor-web` (the browser interface) listens on.
+    WebBind,
+    /// The server `narsor-web` passes the API to: `local` (the local daemon)
+    /// or the server's URL.
+    WebUpstream,
+    /// Whose token `narsor-web` sends to the server: `server` (its own) or
+    /// `passthrough` (the browser's).
+    WebToken,
 }
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 32] = [
+    pub const ALL: [SettingKey; 35] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
@@ -278,6 +301,9 @@ impl SettingKey {
         SettingKey::ObserverSecretsDir,
         SettingKey::ObserverScriptUser,
         SettingKey::ObserverInsecureSameUser,
+        SettingKey::WebBind,
+        SettingKey::WebUpstream,
+        SettingKey::WebToken,
     ];
 
     /// The three roots, in the order `config show` prints them.
@@ -322,6 +348,9 @@ impl SettingKey {
             SettingKey::ObserverSecretsDir => "observer_secrets_dir",
             SettingKey::ObserverScriptUser => "observer_script_user",
             SettingKey::ObserverInsecureSameUser => "observer_insecure_same_user",
+            SettingKey::WebBind => "web_bind",
+            SettingKey::WebUpstream => "web_upstream",
+            SettingKey::WebToken => "web_token",
         }
     }
 
@@ -376,7 +405,10 @@ impl SettingKey {
             | SettingKey::ObserverWorkerServer
             | SettingKey::ObserverSecretsDir
             | SettingKey::ObserverScriptUser
-            | SettingKey::ObserverInsecureSameUser => false,
+            | SettingKey::ObserverInsecureSameUser
+            | SettingKey::WebBind
+            | SettingKey::WebUpstream
+            | SettingKey::WebToken => false,
         }
     }
 
@@ -410,6 +442,9 @@ impl SettingKey {
             SettingKey::LocalHome => SettingValue::Text(DEFAULT_LOCAL_HOME.to_string()),
             SettingKey::ObserverWorker => SettingValue::Text(OBSERVER_WORKER_OFF.to_string()),
             SettingKey::ObserverInsecureSameUser => SettingValue::Text("false".to_string()),
+            SettingKey::WebBind => SettingValue::Text(DEFAULT_WEB_BIND.to_string()),
+            SettingKey::WebUpstream => SettingValue::Text(WEB_UPSTREAM_LOCAL.to_string()),
+            SettingKey::WebToken => SettingValue::Text(WEB_TOKEN_SERVER.to_string()),
             // Empty text is "not set": network mode refuses to start without
             // the ones it needs (`crate::auth::SecuritySettings::validate`).
             SettingKey::OidcIssuer
@@ -690,7 +725,10 @@ mod tests {
                 "observer_worker_server",
                 "observer_secrets_dir",
                 "observer_script_user",
-                "observer_insecure_same_user"
+                "observer_insecure_same_user",
+                "web_bind",
+                "web_upstream",
+                "web_token"
             ],
             "the registry is the one place the settings live, and the three \
              roots lead because that is the order `config show` prints"

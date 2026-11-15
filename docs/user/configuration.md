@@ -80,6 +80,15 @@ Every one of them is available as an environment variable too, mechanically:
 | `observer_secrets_dir` | `NARSOR_OBSERVER_SECRETS_DIR` | empty |
 | `observer_script_user` | `NARSOR_OBSERVER_SCRIPT_USER` | empty |
 | `observer_insecure_same_user` | `NARSOR_OBSERVER_INSECURE_SAME_USER` (`false` or `true`) | `false` |
+| `web_bind` | `NARSOR_WEB_BIND` | `127.0.0.1:8484` |
+| `web_upstream` | `NARSOR_WEB_UPSTREAM` | `local` |
+| `web_token` | `NARSOR_WEB_TOKEN` | `server` |
+
+The three `web_*` settings are read by `narsor-web`, the server of the
+[browser interface](web.md): where it listens (loopback only), the server it
+passes the API to (`local` = the local daemon, or the server's URL), and
+whose token goes to that server (`server` = its own, `passthrough` = the
+browser's).
 
 The `observer_*` settings tell the server whether to start the observer
 worker and how; see

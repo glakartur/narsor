@@ -7,6 +7,7 @@ install it.
 
 - [Command-line interface](user/cli.md) — `narsor-cli`, global options, exit codes.
 - [Terminal interface](user/tui.md) — the `narsor` TUI.
+- [Browser interface](user/web.md) — the same in a web browser (`narsor-web`).
 - [Workflows](user/workflows.md) — YAML contract in brief, built-in workflows.
 - [Running AI agents](user/agents.md) — `AgentAction`, sessions, permissions.
 - [The conductor](user/conductor.md) — the per-execution assistant.

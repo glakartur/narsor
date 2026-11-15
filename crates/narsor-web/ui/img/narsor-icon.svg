@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Narsor">
+  <title>Narsor</title>
+  <rect width="64" height="64" rx="2" fill="#111827"/>
+  <!-- the pipeline traces an "N" -->
+  <path d="M19 50V23L45 50V17" fill="none" stroke="#a5b4fc" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="1 3.2"/>
+  <g transform="translate(0 6)"><!-- 1: idea -->
+  <path d="M19 36L25.9 40L25.9 48L19 52L12.1 48L12.1 40Z" fill="#111827"/>
+  <path d="M19 36L25.9 40L25.9 48L19 52L12.1 48L12.1 40ZM12.1 40L19 44L25.9 40M19 44L19 52" fill="none" stroke="#a5b4fc" stroke-width="1.1" stroke-linejoin="round" stroke-dasharray="2.6 2.2"/>
+  </g>
+  <g transform="translate(0 3)"><!-- 2: started -->
+  <path d="M19 12L25.9 16L25.9 24L19 28L12.1 24L12.1 16Z" fill="#111827"/>
+  <path d="M19 12L25.9 16L19 20L12.1 16Z" fill="#818cf8"/>
+  <path d="M19 12L25.9 16L25.9 24L19 28L12.1 24L12.1 16ZM12.1 16L19 20L25.9 16M19 20L19 28" fill="none" stroke="#c7d2fe" stroke-width="1.1" stroke-linejoin="round" stroke-dasharray="2.6 2.2"/>
+  </g>
+  <g transform="translate(0 6)"><!-- 3: built -->
+  <path d="M45 36L51.9 40L45 44L38.1 40Z" fill="#818cf8"/>
+  <path d="M38.1 40L45 44L45 52L38.1 48Z" fill="#3730a3"/>
+  <path d="M45 44L51.9 40L51.9 48L45 52Z" fill="#4f46e5"/>
+  </g>
+  <!-- 4: delivered -->
+  <circle cx="45" cy="17" r="14" fill="#fbbf24" opacity=".16"/>
+  <path d="M45 9L51.9 13L45 17L38.1 13Z" fill="#fde68a"/>
+  <path d="M38.1 13L45 17L45 25L38.1 21Z" fill="#f59e0b"/>
+  <path d="M45 17L51.9 13L51.9 21L45 25Z" fill="#ea580c"/>
+</svg>

@@ -27,6 +27,7 @@ pub const EXIT_USAGE: i32 = 2;
 #[derive(Debug, Parser)]
 #[command(
     name = "narsor-observer-worker",
+    version = narsor_protocol::VERSION,
     about = "Claims the observer runs the control plane has due and executes their scripts \
              in a clean environment. narsor-server starts it, with --server and the key in \
              NARSOR_OBSERVER_WORKER_KEY."

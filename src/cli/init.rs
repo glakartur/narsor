@@ -466,6 +466,41 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "off",
         "on: the server starts the observer worker (needs observer_script_user; see the installation guide).",
     ),
+    (
+        SettingKey::ObserverWorkerServer,
+        "\"\"",
+        "API URL for the observer worker and its scripts; empty is the server's own address (not in network mode).",
+    ),
+    (
+        SettingKey::ObserverSecretsDir,
+        "\"\"",
+        "Observer secrets: one subdirectory per owner, one file per secret name; empty: no secrets.",
+    ),
+    (
+        SettingKey::ObserverScriptUser,
+        "\"\"",
+        "System user observer scripts run as; must not be the server's.",
+    ),
+    (
+        SettingKey::ObserverInsecureSameUser,
+        "false",
+        "true runs observer scripts as the server's own user, without isolation: for a trial only.",
+    ),
+    (
+        SettingKey::WebBind,
+        "127.0.0.1:8484",
+        "Address narsor-web (the browser interface) listens on; loopback only.",
+    ),
+    (
+        SettingKey::WebUpstream,
+        "local",
+        "Server narsor-web passes the API to: local (the local daemon) or the server's URL.",
+    ),
+    (
+        SettingKey::WebToken,
+        "server",
+        "Whose token narsor-web sends: server (its own; the browser gets a session token) or passthrough (the browser's).",
+    ),
 ];
 
 /// The generated file: the settings chosen by the installer followed by the
@@ -1162,6 +1197,47 @@ fn directories_outside(config_path: &Path, data_dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings the generated file does not list as commented defaults: the
+    /// roots (always written) and the network-mode ones (written by the server
+    /// role, refused in trusted mode, so a commented default would mislead).
+    const NOT_COMMENTED: &[SettingKey] = &[
+        SettingKey::CatalogDir,
+        SettingKey::StateDir,
+        SettingKey::WorkDir,
+        SettingKey::OidcIssuer,
+        SettingKey::OidcAudience,
+        SettingKey::OwnerSubject,
+        SettingKey::TlsTermination,
+        SettingKey::TrustedProxies,
+    ];
+
+    #[test]
+    fn every_setting_is_written_or_listed_as_a_commented_default() {
+        for setting in SettingKey::ALL {
+            let commented = OPTIONAL_SETTINGS.iter().any(|(key, _, _)| *key == setting);
+            let excluded = NOT_COMMENTED.contains(&setting);
+            assert!(
+                commented != excluded,
+                "{setting}: add it to OPTIONAL_SETTINGS (or, if it must not be suggested, to \
+                 NOT_COMMENTED) so `narsor-cli init` writes every setting"
+            );
+        }
+    }
+
+    #[test]
+    fn each_commented_default_holds_up_on_its_own() {
+        // Uncommenting one line must give a valid file.
+        for (setting, default, _) in OPTIONAL_SETTINGS {
+            let parsed = config::file::parse(
+                Path::new("config.yaml"),
+                &format!("{}: {default}\n", setting.key()),
+            )
+            .into_result()
+            .unwrap_or_else(|errors| panic!("{setting}: {errors:?}"));
+            assert!(parsed.get(*setting).is_some(), "{setting}");
+        }
+    }
 
     #[test]
     fn commented_defaults_are_valid_settings() {

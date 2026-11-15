@@ -110,7 +110,10 @@ impl Flags {
             | SettingKey::ObserverWorkerServer
             | SettingKey::ObserverSecretsDir
             | SettingKey::ObserverScriptUser
-            | SettingKey::ObserverInsecureSameUser => None,
+            | SettingKey::ObserverInsecureSameUser
+            | SettingKey::WebBind
+            | SettingKey::WebUpstream
+            | SettingKey::WebToken => None,
         }
     }
 }
