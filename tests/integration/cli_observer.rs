@@ -23,9 +23,6 @@ use narsor::api::ClientError;
 use narsor::cli::observer::{operate, ObserverApi};
 use narsor::cli::observer_effect::{effect_call, perform, EffectApi};
 use narsor::cli::observer_text::{effect_output, observer_list_output};
-use narsor::cli::observer_worker::{
-    ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, Worker, WorkerApi, WorkerOptions,
-};
 use narsor::cli::{Cli, Command};
 use narsor_engine::controller_protocol::{ProtocolError, ProtocolService, RunOutcome, RunReport};
 use narsor_engine::domain::{
@@ -35,6 +32,9 @@ use narsor_engine::domain::{
 use narsor_engine::observers::{ObserverState, RunId};
 use narsor_engine::orchestration::{Clock, ControlPlane, NewTask, OwnerRef, TaskEventKind};
 use narsor_engine::persistence::StatePaths;
+use narsor_observer_worker::worker::{
+    ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, Worker, WorkerApi, WorkerOptions,
+};
 use narsor_protocol::controller::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
     ObserverCreateTaskRequest, ObserverDetailView, ObserverEffectOutcome, ObserverEffectResponse,

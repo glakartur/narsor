@@ -46,9 +46,9 @@ Choose one role:
 
 | Role | Installed programs | Intended use |
 | --- | --- | --- |
-| `local` | `narsor`, `narsor-cli`, `narsor-server`, `narsor-controller`, `narsor-runner` | Run the TUI and CLI with the local server and controller. |
+| `local` | `narsor`, `narsor-cli`, `narsor-server`, `narsor-controller`, `narsor-runner`, `narsor-observer-worker` | Run the TUI and CLI with the local server and controller. |
 | `frontend` | `narsor`, `narsor-cli` | Connect a TUI/CLI to a separately operated server. |
-| `server` | `narsor-server`, `narsor-controller`, `narsor-runner` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI and CLI too. |
+| `server` | `narsor-server`, `narsor-controller`, `narsor-runner`, `narsor-observer-worker` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI and CLI too. |
 
 The installer script downloads and verifies the archive, copies the binaries,
 and, only after consent, adds the binary directory to `~/.bashrc`. It then
@@ -119,7 +119,7 @@ not writable, the interactive installer asks for another target. A
 non-interactive invocation must use a writable `--config-file`.
 
 If Narsor processes (`narsor`, `narsor-server`, `narsor-controller`,
-`narsor-runner`) of your user are already running, the installer lists them
+`narsor-runner`, `narsor-observer-worker`) of your user are already running, the installer lists them
 before it replaces the binaries and asks whether to stop them. Stopping them
 interrupts running tasks. A stopped process gets `SIGTERM` and 10 seconds to
 exit, then `SIGKILL`. If you answer no, they keep running the previous version
@@ -234,7 +234,7 @@ workstation security boundary.
 
 Observers poll external sources (Jira, GitHub, GitLab) with a shell script
 on a schedule. The control plane keeps the schedule; a worker process,
-`narsor-cli observer worker`, claims the runs that are due, runs their
+`narsor-observer-worker`, claims the runs that are due, runs their
 scripts and reports the results. The server starts the worker and
 supervises it. How to write an observer and its script is in
 [Observers](../user/observers.md).
@@ -265,8 +265,10 @@ both are set. In network mode the server refuses to start without
 `observer_worker_server`: every request must come through the TLS proxy, the
 worker's requests too.
 
-The server finds `narsor-cli` in its own directory, as it finds
-`narsor-controller`. The worker runs as the server's user. When it stops,
+The server finds `narsor-observer-worker` in its own directory, as it finds
+`narsor-controller`. Scripts call `narsor-cli` for their effects (task
+create, event delivery), from the same directory: on a `server` install add
+`--with-frontend`, or copy `narsor-cli` next to `narsor-server`. The worker runs as the server's user. When it stops,
 the server starts it again after a pause that doubles up to 30 seconds. When
 the server stops, it stops the worker first. A run that the worker did not
 report is recorded as lost at the run's deadline (script limit plus one
@@ -344,7 +346,7 @@ exactly these variables:
 
 | variable | value |
 | --- | --- |
-| `PATH` | the directory of `narsor-cli`, then `/usr/local/bin:/usr/bin:/bin` |
+| `PATH` | the directory of `narsor-observer-worker` (and of `narsor-cli`), then `/usr/local/bin:/usr/bin:/bin` |
 | `HOME` | the run directory |
 | `NARSOR_SERVER` | the control plane's URL |
 | `NARSOR_TOKEN` | the run's token: valid on this run's effect routes only, until its result or deadline |

@@ -41,8 +41,8 @@
 //!
 //! # The observer worker
 //!
-//! With `observer_worker: on` the daemon starts `narsor-cli observer
-//! worker` once its API listens, after the local controller, and stops it
+//! With `observer_worker: on` the daemon starts `narsor-observer-worker`
+//! once its API listens, after the local controller, and stops it
 //! first at shutdown, while the API still takes its results
 //! ([`crate::observer_worker`]). A configuration that cannot start it
 //! (no script user and no waiver, network mode without

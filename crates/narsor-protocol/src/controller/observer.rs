@@ -2,7 +2,7 @@
 //!
 //! * the effect routes an observer's script calls through `narsor-cli`, with
 //!   the token of its run (`/observer/v1/runs/{run}/…`);
-//! * the worker routes `narsor-cli observer worker` calls with the key the
+//! * the worker routes `narsor-observer-worker` calls with the key the
 //!   server gave it (`/observer/v1/worker/…`): claim a run, report its
 //!   result;
 //! * the owner routes of the observers themselves (`/control/v1/observers`).

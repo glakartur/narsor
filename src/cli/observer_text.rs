@@ -62,7 +62,7 @@ fn worker_warning(observer: &ObserverView, now: DateTime<Utc>) -> Option<String>
         .unwrap_or_default();
     Some(format!(
         "no worker: a due run has waited{since} without a worker claiming it; is \
-         `narsor-cli observer worker` running?"
+         `narsor-observer-worker` running?"
     ))
 }
 

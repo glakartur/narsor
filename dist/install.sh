@@ -20,7 +20,7 @@ repository="glakartur/narsor"
 target="x86_64-unknown-linux-gnu"
 archive="narsor-linux-x86_64-gnu.tar.gz"
 version="${NARSOR_VERSION:-latest}"
-all_binaries=(narsor narsor-cli narsor-server narsor-controller narsor-runner)
+all_binaries=(narsor narsor-cli narsor-server narsor-controller narsor-runner narsor-observer-worker)
 bashrc_marker="# narsor-installer"
 
 fail() {
@@ -121,7 +121,7 @@ binaries_for_role() {
             if ((with_frontend)); then
                 printf '%s\n' "${all_binaries[@]}"
             else
-                printf '%s\n' narsor-server narsor-controller narsor-runner
+                printf '%s\n' narsor-server narsor-controller narsor-runner narsor-observer-worker
             fi
             ;;
     esac
@@ -311,7 +311,7 @@ install() {
 
     while IFS= read -r entry; do
         case "$entry" in
-            manifest.json|narsor|narsor-cli|narsor-server|narsor-controller|narsor-runner) ;;
+            manifest.json|narsor|narsor-cli|narsor-server|narsor-controller|narsor-runner|narsor-observer-worker) ;;
             *) fail "unexpected path in release archive: $entry" ;;
         esac
     done < <(tar -tzf "$work_dir/$archive")

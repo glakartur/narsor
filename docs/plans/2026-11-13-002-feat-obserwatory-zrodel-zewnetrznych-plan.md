@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-11-13-obserwatory-zrodel-zewnetrznych-requirements
 
 ## Summary
 
-Control plane (`narsor-server`) dostaje rejestr obserwatorów, harmonogram w istniejącym przebiegu periodycznym i jednorazowe tokeny uruchomień. Serwer uruchamia proces `narsor-cli observer worker` (etap 1) i sam generuje jego klucz, jak dla runnera. Worker pobiera należne uruchomienia, wykonuje zatwierdzony skrypt shellowy w czystym środowisku i zwraca wynik. Skrypt wykonuje skutki przez `narsor-cli` na nowych, wąskich trasach obserwatora. Te trasy egzekwują limit tasków i ślad pochodzenia. Skrypt sam pilnuje w swoim stanie, czego już nie zgłaszać. Krok `wait` dostaje wykonawcę: zawiesza task jak bramka `human`, a pasujące zdarzenie zewnętrzne wznawia task. Rozmiar: Deep (nowa granica zaufania, nowy token, nowy wykonawca kroku, 8 jednostek).
+Control plane (`narsor-server`) dostaje rejestr obserwatorów, harmonogram w istniejącym przebiegu periodycznym i jednorazowe tokeny uruchomień. Serwer uruchamia proces `narsor-observer-worker` (etap 1, osobny program, D20) i sam generuje jego klucz, jak dla runnera. Worker pobiera należne uruchomienia, wykonuje zatwierdzony skrypt shellowy w czystym środowisku i zwraca wynik. Skrypt wykonuje skutki przez `narsor-cli` na nowych, wąskich trasach obserwatora. Te trasy egzekwują limit tasków i ślad pochodzenia. Skrypt sam pilnuje w swoim stanie, czego już nie zgłaszać. Krok `wait` dostaje wykonawcę: zawiesza task jak bramka `human`, a pasujące zdarzenie zewnętrzne wznawia task. Rozmiar: Deep (nowa granica zaufania, nowy token, nowy wykonawca kroku, 8 jednostek).
 
 *Zmiany po przeglądzie (D1, D4, D5, D6, D7, D11, D12, D15, D16, D17): plan nie ma przebiegu próbnego, klucza skutku z plikami skutków, limitu czasu kroku `wait`, workflow autorskiego ani pliku dla każdego uruchomienia. Serwer zapisuje tylko błędy wykonania. Szczegóły są w sekcjach poniżej i w „Pytania otwarte dla użytkownika".*
 
@@ -130,6 +130,7 @@ Narsor reaguje dziś tylko na polecenia operatora. Operator ręcznie tworzy task
 - **Widoczny brak workera:** rekord obserwatora zapisuje czas ostatniego claimu. Gdy należne uruchomienie czeka na claim dłużej niż jeden odstęp, `observer list` i `observer show` pokazują ostrzeżenie „brak workera".
 - **Token uruchomienia:** control plane tworzy losowy token przy claimie, zapisuje skrót SHA-256 w aktywnym uruchomieniu w `observer.json`, porównuje w stałym czasie i unieważnia go po wyniku lub po terminie. Nowy wariant `Principal::ObserverRun`. Token działa tylko na trasach skutków obserwatora (`/observer/v1/runs/{run}/...`). Brama właściciela go odrzuca. Klucz workera to osobny wariant `Principal::ObserverWorker`; daje tylko claim i wynik.
 - **Klucz workera generuje serwer (D5, PO5):** serwer uruchamia workera jako proces potomny, jak lokalny kontroler, i nadzoruje go (ponowny start po błędzie). Przy każdym starcie serwer generuje nowy losowy klucz, trzyma w pamięci tylko jego skrót SHA-256 i przekazuje klucz workerowi w zmiennej środowiska. Restart serwera unieważnia stary klucz. Właściciel nie tworzy i nie unieważnia klucza; nie ma polecenia `observer worker-token`.
+- **Worker jako osobny program (D20):** worker jest osobnym crate `crates/narsor-observer-worker` z plikiem binarnym `narsor-observer-worker` (wzorzec `narsor-runner`). Worker używa `crates/narsor-api-client` (claim i wynik). `narsor-cli` nie ma podkomendy `observer worker`; polecenia `narsor-cli observer …` są tylko wywołaniami API. Serwer nadal uruchamia i nadzoruje workera; serwer znajduje `narsor-observer-worker` w swoim katalogu. Skrypt nadal wywołuje `narsor-cli` z tego samego katalogu.
 - **Brak deduplikacji na serwerze (R13, AE2, AE3, D17):** trasy skutków nie mają klucza skutku ani plików skutków i nie odpowiadają „duplikat". Każde wywołanie `task create` tworzy nowy task z losowym id. Skrypt i tak musi pamiętać w swoim stanie, co już zgłosił, aby nie tworzyć taska co uruchomienie. Ryzyko: gdy zapis stanu nie uda się po utworzeniu taska, następne uruchomienie może utworzyć duplikat; `docs/user/observers.md` opisuje to ryzyko, a przykład Jira zapisuje stan do ostatniego utworzonego taska także po odmowie.
 - **Limit tasków liczony na serwerze (R15, AE4):** licznik tasków uruchomienia jest w aktywnym uruchomieniu w `observer.json` pod blokadą obserwatora. Wywołanie ponad limit dostaje odmowę, a obserwator przechodzi w stan `needs_attention`. Wznowienie wykonuje operator.
 - **Wersje skryptu i zatwierdzenie (R11, AE6):** każdy zapis skryptu tworzy nową, niezmienną wersję. Rekord ma `approved_version`. Harmonogram uruchamia tylko `approved_version`. Plan nie ma przebiegu próbnego (D6): zatwierdzenie jest jedyną bramką przed pierwszym uruchomieniem. Zatwierdzenie to trasa właściciela (R21). Zatwierdzenie zmienia stan na `active` tylko dla obserwatora w stanie `draft`; w innych stanach stan zostaje bez zmian (wstrzymany obserwator zostaje wstrzymany).
@@ -222,9 +223,8 @@ Wszystkie pytania mają odpowiedź w wątkach merge requesta. Pod każdym pytani
     crates/narsor-engine/src/engine/actions/wait.rs # wykonawca kroku wait
     crates/narsor-server/src/controller_protocol/observer_http.rs
     src/cli/observer.rs                              # narsor-cli observer ...
-    src/cli/observer_worker.rs                       # narsor-cli observer worker
+    crates/narsor-observer-worker/src/{main,cli,worker}.rs  # narsor-observer-worker (D20)
     workflows/observers/examples/{jira-new-issues,github-pr-review,gitlab-mr-review}.sh
-    deploy/observer-worker/narsor-observer-worker.service
     docs/user/observers.md
     tests/integration/observers_*.rs
 
@@ -484,15 +484,15 @@ graph TD
 
 ### U6. Worker etapu 1 i wykonanie skryptu
 
-**Goal:** Proces `narsor-cli observer worker` uruchamiany i nadzorowany przez serwer: claim, wykonanie skryptu w czystym środowisku, wynik z zamaskowanymi logami.
+**Goal:** Proces `narsor-observer-worker` (osobny program, D20) uruchamiany i nadzorowany przez serwer: claim, wykonanie skryptu w czystym środowisku, wynik z zamaskowanymi logami.
 
 **Requirements:** R2, R12, R14, R20; Z2
 
 **Dependencies:** U2, U3
 
 **Files:**
-- Create: `src/cli/observer_worker.rs`, moduł serwera, który uruchamia i nadzoruje workera (wzorzec `crates/narsor-server/src/local_controller.rs`)
-- Modify: `src/cli/mod.rs`, `crates/narsor-api-client/src/api/client.rs` (claim, wynik), `crates/narsor-server/src/controller_protocol/observer_http.rs` (trasy workera), `crates/narsor-server/src/auth_gate.rs` (`Principal::ObserverWorker`), konfiguracja i start `narsor-server`, `docs/operations/installation.md`
+- Create: crate `crates/narsor-observer-worker` (`src/main.rs`, `src/cli.rs` z flagami i kluczem, `src/worker.rs` z pętlą; wzorzec `crates/narsor-runner`, D20), moduł serwera `crates/narsor-server/src/observer_worker.rs`, który uruchamia i nadzoruje workera (`WORKER_PROGRAM` = `narsor-observer-worker`; wzorzec `crates/narsor-server/src/local_controller.rs`)
+- Modify: `crates/narsor-api-client/src/api/client.rs` (claim, wynik), `dist/install.sh` i `dist/package-linux.sh` (nowy plik binarny), `crates/narsor-server/src/controller_protocol/observer_http.rs` (trasy workera), `crates/narsor-server/src/auth_gate.rs` (`Principal::ObserverWorker`), konfiguracja i start `narsor-server`, `docs/operations/installation.md`
 - Test: `tests/integration/observers_worker.rs`
 
 **Approach:**

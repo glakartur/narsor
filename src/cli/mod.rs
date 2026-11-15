@@ -36,7 +36,6 @@ pub mod init;
 pub mod observer;
 pub mod observer_effect;
 pub mod observer_text;
-pub mod observer_worker;
 mod prompt;
 pub mod remote;
 pub mod task_history;
@@ -328,7 +327,7 @@ pub enum Command {
     },
 
     /// Observers of external sources: create, script, approve and
-    /// watch them; the worker narsor-server starts to run their scripts.
+    /// watch them.
     Observer {
         /// What to do.
         #[command(subcommand)]
@@ -585,8 +584,8 @@ impl Command {
             | Command::Harness { .. }
             | Command::Usage { .. }
             | Command::Auth { .. }
-            | Command::Daemon { .. } => false,
-            Command::Observer { command } => command.runs_on_broken_config(),
+            | Command::Daemon { .. }
+            | Command::Observer { .. } => false,
             // Configured by its own flags and environment only, like the
             // runner: it reads no Narsor configuration file. Its operator
             // subcommands talk to a control plane and need none either.
@@ -874,22 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn the_observer_worker_needs_a_script_user_unless_isolation_is_waived() {
-        let base = ["narsor-cli", "observer", "worker"];
-        // Isolation is the default: no script user and no waiver is refused.
-        assert!(Cli::try_parse_from(base).is_err());
-        let insecure = Cli::try_parse_from(base.iter().copied().chain(["--insecure-same-user"]));
-        assert!(insecure.is_ok());
-        // The waiver and a script user contradict each other.
-        let both = Cli::try_parse_from(base.iter().copied().chain([
-            "--insecure-same-user",
-            "--script-user",
-            "narsor-observer-script",
-        ]));
-        assert!(both.is_err());
-    }
-
-    #[test]
     fn diagnostics_profiles_and_installer_run_on_a_broken_configuration() {
         // D-D. Asserted here rather than by spawning the binary, which is the
         // point of the policy living beside the commands.
@@ -900,29 +883,14 @@ mod tests {
         }
         .runs_on_broken_config());
         assert!(Command::Init(init::InitOptions::default()).runs_on_broken_config());
-        // The observer worker reads its flags and its key only; the owner's
-        // observer commands talk to the configured control plane.
-        let worker = Cli::try_parse_from([
-            "narsor-cli",
-            "observer",
-            "worker",
-            "--script-user",
-            "narsor-observer-script",
-        ])
-        .unwrap();
-        assert!(worker.command.runs_on_broken_config());
+        // The observer commands talk to the configured control plane; the
+        // worker is a program of its own (narsor-observer-worker, D20).
         let owner = Cli::try_parse_from(["narsor-cli", "observer", "list"]).unwrap();
         assert!(!owner.command.runs_on_broken_config());
-        // The key comes from the server, never from a flag.
-        assert!(Cli::try_parse_from([
-            "narsor-cli",
-            "observer",
-            "worker",
-            "--insecure-same-user",
-            "--credential-file",
-            "/etc/narsor/credential",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["narsor-cli", "observer", "worker", "--insecure-same-user",])
+                .is_err()
+        );
 
         for command in [
             Command::List,

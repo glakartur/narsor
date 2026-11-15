@@ -1,4 +1,4 @@
-//! The daemon's observer worker: `narsor-cli observer worker` as a child
+//! The daemon's observer worker: `narsor-observer-worker` as a child
 //! process the daemon starts and supervises when its configuration enables
 //! it (`observer_worker: on`; D5, PO5, U6).
 //!
@@ -49,7 +49,7 @@ use crate::capabilities;
 use crate::child_process::{self, Ended, RestartDelay};
 
 /// The program the worker is, installed next to `narsor-server`.
-const WORKER_PROGRAM: &str = "narsor-cli";
+const WORKER_PROGRAM: &str = "narsor-observer-worker";
 
 /// Prefix of the child's lines in the daemon's log.
 const LOG_PREFIX: &str = "narsor-observer-worker:";
@@ -57,7 +57,7 @@ const LOG_PREFIX: &str = "narsor-observer-worker:";
 /// Everything the daemon resolved for its observer worker.
 #[derive(Debug, Clone)]
 pub struct ObserverWorkerSettings {
-    /// The `narsor-cli` executable.
+    /// The `narsor-observer-worker` executable.
     pub program: PathBuf,
     /// The API's URL for the worker and its scripts.
     pub server: String,
@@ -85,11 +85,7 @@ impl ObserverWorkerSettings {
     /// is a variable of the child's own; the rest are flags.
     pub fn command(&self, key: &str) -> Command {
         let mut command = Command::new(&self.program);
-        command
-            .arg("observer")
-            .arg("worker")
-            .arg("--server")
-            .arg(&self.server);
+        command.arg("--server").arg(&self.server);
         if let Some(dir) = &self.secrets_dir {
             command.arg("--secrets-dir").arg(dir);
         }
@@ -110,7 +106,7 @@ impl ObserverWorkerSettings {
     }
 }
 
-/// The `narsor-cli` next to this executable (KTD9), see
+/// The `narsor-observer-worker` next to this executable (KTD9), see
 /// [`child_process::sibling_program`].
 pub fn worker_program() -> Result<PathBuf, String> {
     child_process::sibling_program(WORKER_PROGRAM)
@@ -190,7 +186,7 @@ fn supervise(
         drop(key);
         let reason = match outcome {
             Ended::Stopped => return,
-            Ended::Exited(Ok(status)) => format!("narsor-cli observer worker exited ({status})"),
+            Ended::Exited(Ok(status)) => format!("narsor-observer-worker exited ({status})"),
             Ended::Exited(Err(reason)) => reason,
         };
         let delay = delays.after(started.elapsed());
@@ -235,15 +231,13 @@ mod tests {
 
     #[test]
     fn the_key_is_in_the_environment_and_never_an_argument() {
-        let command =
-            settings(PathBuf::from("/opt/narsor/narsor-cli")).command("nsw.server.s3cr3t");
+        let command = settings(PathBuf::from("/opt/narsor/narsor-observer-worker"))
+            .command("nsw.server.s3cr3t");
 
         let args: Vec<&OsStr> = command.get_args().collect();
         assert_eq!(
             args,
             [
-                "observer",
-                "worker",
                 "--server",
                 "http://127.0.0.1:4100",
                 "--secrets-dir",
@@ -271,7 +265,7 @@ mod tests {
 
     #[test]
     fn the_waiver_replaces_the_script_user() {
-        let mut settings = settings(PathBuf::from("narsor-cli"));
+        let mut settings = settings(PathBuf::from("narsor-observer-worker"));
         settings.isolation = ScriptIsolation::SameUser;
         settings.secrets_dir = None;
 
@@ -280,20 +274,14 @@ mod tests {
         let args: Vec<&OsStr> = command.get_args().collect();
         assert_eq!(
             args,
-            [
-                "observer",
-                "worker",
-                "--server",
-                "http://127.0.0.1:4100",
-                "--insecure-same-user"
-            ]
+            ["--server", "http://127.0.0.1:4100", "--insecure-same-user"]
         );
     }
 
-    /// A stand-in for `narsor-cli` that records its key and arguments, then
+    /// A stand-in for `narsor-observer-worker` that records its key and arguments, then
     /// exits at once.
     fn recording_program(dir: &std::path::Path) -> PathBuf {
-        let program = dir.join("fake-narsor-cli");
+        let program = dir.join("fake-narsor-observer-worker");
         std::fs::write(
             &program,
             format!(
@@ -334,7 +322,7 @@ mod tests {
             .collect();
         assert!(given.len() >= 3, "{starts}");
         for line in starts.lines() {
-            assert!(line.contains(" observer worker --server "), "{line}");
+            assert!(line.contains(" --server "), "{line}");
         }
         assert!(
             given.iter().all(|key| key.starts_with("nsw.server.")),

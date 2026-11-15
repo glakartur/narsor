@@ -6,16 +6,14 @@
 //! | `observer script set --file` | the owner | saves the next, immutable script version (never approved by saving) |
 //! | `observer approve --version\|pause\|resume` | the owner | decides what runs on schedule |
 //! | `observer watch add\|list\|remove` | the owner | keeps the watch list of PR/MR objects |
-//! | `observer worker` | `narsor-server`, which starts it | claims due runs and executes their scripts ([`super::observer_worker`]) |
 //!
 //! The owner's commands go through [`ObserverApi`], implemented on the API
 //! client, and print through the pure functions of
 //! [`super::observer_text`]: both are what the tests drive.
 //!
-//! The worker talks to the control plane with the key the server hands it
-//! in [`OBSERVER_WORKER_KEY_ENV`] when it starts the worker, never with the
-//! owner's token (D5, PO5): the key claims runs and reports their results,
-//! nothing else. Nobody else makes or holds such a key.
+//! Every command is a call of the control plane's API. The worker that
+//! claims due runs and executes their scripts is a program of its own,
+//! `narsor-observer-worker`, which `narsor-server` starts (D20).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,18 +27,13 @@ use super::observer_text::{
     observer_changed_output, observer_list_output, observer_show_output, script_saved_output,
     watch_added_output, watch_list_output, watch_removed_output,
 };
-use super::observer_worker::{
-    check_secrets_dir, current_uid, ProcessRunner, ScriptUser, Worker, WorkerOptions, WorkerStop,
-    POLL_INTERVAL,
-};
 use super::remote::{failure, parse_workspaces, split_pair};
-use crate::api::{ApiClient, ClientError, ServerTarget, TokenSource};
+use crate::api::{ApiClient, ClientError, ServerTarget};
 use crate::config::Flags;
 use crate::controller_protocol::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverDetailView,
     ObserverEffectRequest, ObserverListResponse, ObserverScriptView, ObserverSecretRef,
     ObserverView, ObserverWatchListResponse, ObserverWatchView, SetObserverScriptRequest,
-    OBSERVER_WORKER_KEY_ENV,
 };
 use crate::domain::without_unsafe_chars;
 
@@ -109,19 +102,6 @@ pub enum ObserverCommand {
         #[command(subcommand)]
         command: WatchCommand,
     },
-
-    /// Runs the observer worker: claims the runs the control plane has due
-    /// and executes their scripts in a clean environment. narsor-server
-    /// starts it, with --server and the key in NARSOR_OBSERVER_WORKER_KEY.
-    Worker(WorkerArgs),
-}
-
-impl ObserverCommand {
-    /// Whether the command runs on a configuration file that does not hold
-    /// up: the worker reads none, only its flags.
-    pub fn runs_on_broken_config(&self) -> bool {
-        matches!(self, ObserverCommand::Worker(_))
-    }
 }
 
 /// `narsor-cli observer create`.
@@ -279,46 +259,6 @@ pub enum WatchCommand {
     },
 }
 
-/// `narsor-cli observer worker`.
-#[derive(Debug, clap::Args)]
-pub struct WorkerArgs {
-    /// The directory of the observers' secrets: one subdirectory per
-    /// observer owner, one file per secret reference name in it. Must be
-    /// accessible to its owner only.
-    #[arg(long, value_name = "DIRECTORY")]
-    pub secrets_dir: Option<PathBuf>,
-
-    /// Run scripts as this system user, which must not be able to read the
-    /// secrets directory or the worker's environment. Required unless
-    /// `--insecure-same-user` is given: isolation is the default.
-    #[arg(
-        long,
-        value_name = "USER",
-        required_unless_present = "insecure_same_user"
-    )]
-    pub script_user: Option<String>,
-
-    /// Run scripts as the worker's own user. A script can then read the
-    /// worker key and every observer's secrets: for a trial on a
-    /// developer machine only, never in production.
-    #[arg(long, conflicts_with = "script_user")]
-    pub insecure_same_user: bool,
-
-    /// Where to make the run directories (the system's temporary directory
-    /// by default).
-    #[arg(long, value_name = "DIRECTORY")]
-    pub work_dir: Option<PathBuf>,
-
-    /// The `PATH` of scripts (the directory of narsor-cli, then the
-    /// system's directories, by default).
-    #[arg(long, value_name = "PATH")]
-    pub script_path: Option<String>,
-
-    /// Claim once, handle what was due, and exit.
-    #[arg(long)]
-    pub once: bool,
-}
-
 /// Runs one `narsor-cli observer` command.
 pub async fn observer(
     command: ObserverCommand,
@@ -326,23 +266,18 @@ pub async fn observer(
     state: &Path,
     flags: &Flags,
 ) -> Result<()> {
-    match command {
-        ObserverCommand::Worker(args) => worker(args, target).await,
-        command => {
-            // Parse what is local before connecting: a usage error never
-            // needs the control plane.
-            let create = match &command {
-                ObserverCommand::Create(args) => Some(create_observer_request(args)?),
-                _ => None,
-            };
-            let client = crate::api::connect(target, state, flags)
-                .await
-                .map_err(CliError::failure)?;
-            let output = operate(&client, command, create, Utc::now).await?;
-            print!("{output}");
-            Ok(())
-        }
-    }
+    // Parse what is local before connecting: a usage error never needs the
+    // control plane.
+    let create = match &command {
+        ObserverCommand::Create(args) => Some(create_observer_request(args)?),
+        _ => None,
+    };
+    let client = crate::api::connect(target, state, flags)
+        .await
+        .map_err(CliError::failure)?;
+    let output = operate(&client, command, create, Utc::now).await?;
+    print!("{output}");
+    Ok(())
 }
 
 /// The owner's observer routes, as the commands use them: the API client
@@ -657,9 +592,6 @@ where
             ))
         }
         ObserverCommand::Watch { command } => watch(api, command, now()).await,
-        ObserverCommand::Worker(_) => Err(CliError::usage(
-            "narsor-cli observer worker is not an owner command of an observer",
-        )),
     }
 }
 
@@ -737,91 +669,5 @@ async fn watch<A: ObserverApi + ?Sized>(
                 .map_err(|error| failure("Could not remove the watch entry", error))?;
             Ok(watch_removed_output(&removed))
         }
-    }
-}
-
-async fn worker(args: WorkerArgs, target: &ServerTarget) -> Result<()> {
-    let Some(server) = target.server.clone() else {
-        return Err(CliError::usage(
-            "narsor-cli observer worker needs the control plane's URL: --server or NARSOR_SERVER",
-        ));
-    };
-    let key = worker_key()?;
-    if let Some(dir) = &args.secrets_dir {
-        check_secrets_dir(dir).map_err(CliError::failure)?;
-    }
-    let mut options = WorkerOptions::new(server.clone());
-    options.secrets_dir = args.secrets_dir;
-    if let Some(name) = &args.script_user {
-        let user = ScriptUser::lookup(name).map_err(|error| {
-            CliError::failure(format!("Cannot run scripts as '{name}': {error}"))
-        })?;
-        if user.uid == current_uid() {
-            return Err(CliError::failure(format!(
-                "Cannot run scripts as '{name}': it is the worker's own user, which holds \
-                 the key and can read the secrets"
-            )));
-        }
-        options.script_user = Some(user);
-    } else if args.insecure_same_user {
-        tracing::warn!(
-            "observer worker: --insecure-same-user: scripts run as the worker's own user and \
-             can read the worker key and every observer's secrets; use --script-user outside \
-             a trial"
-        );
-        eprintln!(
-            "Warning: scripts run as the worker's own user (--insecure-same-user) and can read \
-             the worker key and the secrets. Use --script-user in production."
-        );
-    } else {
-        // clap requires one of the two; refuse rather than run unisolated.
-        return Err(CliError::usage(
-            "narsor-cli observer worker needs --script-user USER (or --insecure-same-user for a \
-             trial)",
-        ));
-    }
-    if let Some(dir) = args.work_dir {
-        options.work_dir = dir;
-    }
-    if let Some(path) = args.script_path {
-        options.path = path;
-    }
-    let client = ApiClient::remote(&server, TokenSource::Static(key))
-        .map_err(|error| failure("Cannot reach the control plane", error))?;
-    let worker = Worker::new(client, ProcessRunner, options);
-    tracing::info!(server = %server, "observer worker: started");
-    worker
-        .serve(args.once, POLL_INTERVAL, shutdown_signal())
-        .await
-        .map_err(|stop: WorkerStop| CliError::failure(stop.to_string()))
-}
-
-/// The key `narsor-server` handed the worker in [`OBSERVER_WORKER_KEY_ENV`].
-/// A variable, not a flag: an argument would show in `ps`. The worker
-/// never passes it on: a script's environment is an explicit list.
-fn worker_key() -> Result<String> {
-    match std::env::var(OBSERVER_WORKER_KEY_ENV) {
-        Ok(key) if !key.trim().is_empty() => Ok(key.trim().to_string()),
-        _ => Err(CliError::usage(format!(
-            "narsor-cli observer worker needs the key narsor-server gives it in \
-             {OBSERVER_WORKER_KEY_ENV}; enable the worker in the server's configuration \
-             (observer_worker: on) instead of starting it by hand"
-        ))),
-    }
-}
-
-/// Resolves at `SIGTERM` (the server's stop) or Ctrl-C.
-async fn shutdown_signal() {
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        () = terminate => {}
     }
 }

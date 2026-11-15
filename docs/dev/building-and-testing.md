@@ -53,9 +53,9 @@ binaries (`CARGO_BIN_EXE_*`) or `cargo` do not belong in this crate.
 periodically with `cargo sweep --time 14`.
 
 The workspace build keeps `narsor`, `narsor-cli`, `narsor-server`,
-`narsor-runner`, and `narsor-controller` together in `target/debug` (or
-`target/release`), so the client can find the server and the server can find
-the local controller and runner. In trusted mode the server starts
+`narsor-runner`, `narsor-controller` and `narsor-observer-worker` together in
+`target/debug` (or `target/release`), so the client can find the server and
+the server can find the local controller, the runner and the observer worker. In trusted mode the server starts
 `narsor-controller local` as its child process; it does not start without that
 binary next to it. To install all process binaries into the same directory:
 
@@ -64,6 +64,7 @@ cargo install --path . --bins
 cargo install --path crates/narsor-server
 cargo install --path crates/narsor-runner
 cargo install --path crates/narsor-controller
+cargo install --path crates/narsor-observer-worker
 ```
 
 The integration tests run against a real filesystem and spawn real child

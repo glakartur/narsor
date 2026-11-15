@@ -47,7 +47,7 @@ or records an error
    observer is due, the run waits for a worker. Each observer has at most
    one run at a time. An observer with a watch list runs its script one
    time for each watch entry: one run checks one entry (section 5).
-2. The worker (`narsor-cli observer worker`, which the server starts) claims
+2. The worker (`narsor-observer-worker`, which the server starts) claims
    the run. It gets a token that is valid only for this run and only until
    the run's deadline.
 3. The worker starts the approved script version with a clean environment.

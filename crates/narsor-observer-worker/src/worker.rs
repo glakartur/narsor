@@ -1,6 +1,6 @@
-//! `narsor-cli observer worker`: the stage-1 observer worker (U6).
+//! The observer worker's loop: claim, run the script, report (U6).
 //!
-//! `narsor-server` starts and supervises it when its configuration enables
+//! `narsor-server` starts `narsor-observer-worker` and supervises it when its configuration enables
 //! the worker, and hands it a key it makes at every start of the worker in
 //! [`OBSERVER_WORKER_KEY_ENV`] (D5). The key claims runs of every owner's
 //! observers and reports their results, nothing else.
@@ -89,7 +89,7 @@ use narsor_protocol::controller::{
 use narsor_protocol::display::without_unsafe_chars_multiline;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
-use crate::api::{ApiClient, ClientError};
+use narsor_api_client::api::{ApiClient, ClientError};
 
 /// How often the worker asks for a due run when none was due.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -135,7 +135,8 @@ pub const SHELL: &str = "/bin/sh";
 /// The file the script is written to, in the run directory.
 pub const SCRIPT_FILE: &str = "script.sh";
 
-/// `PATH` of the script after the directory of `narsor-cli` itself.
+/// `PATH` of the script after the directory of the worker program, where
+/// `narsor-cli` is installed too.
 pub const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// Variables the worker sets itself; a secret may not take their name.
@@ -327,8 +328,9 @@ impl WorkerOptions {
     }
 }
 
-/// The script's default `PATH`: the directory of this `narsor-cli`, so
-/// the script finds it, then [`SYSTEM_PATH`].
+/// The script's default `PATH`: the directory of this program, where
+/// `narsor-cli` is installed too, so the script finds it, then
+/// [`SYSTEM_PATH`].
 pub fn default_script_path() -> String {
     std::env::current_exe()
         .ok()

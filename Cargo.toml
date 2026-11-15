@@ -26,6 +26,7 @@ members = [
     "crates/narsor-engine",
     "crates/narsor-protocol",
     "crates/narsor-shared",
+    "crates/narsor-observer-worker",
     "crates/narsor-runner",
     "crates/narsor-server",
 ]
@@ -92,6 +93,9 @@ narsor-controller-runtime = { path = "crates/narsor-controller-runtime" }
 narsor-engine = { path = "crates/narsor-engine" }
 # The runner's reading of a Pod's arguments (tests/kubernetes_adapter.rs).
 narsor-runner = { path = "crates/narsor-runner" }
+# The observer worker's loop against a real ProtocolService
+# (tests/integration/observers_worker.rs).
+narsor-observer-worker = { path = "crates/narsor-observer-worker" }
 # ES256 keys for the in-process mock OIDC issuer of tests/auth.rs. Already in
 # the tree through jsonwebtoken's `rust_crypto`.
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
