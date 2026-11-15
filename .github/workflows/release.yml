@@ -17,6 +17,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Take the version from the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "release tag must be vMAJOR.MINOR.PATCH, got $GITHUB_REF_NAME" >&2; exit 1; }
+          # Compiled into every binary (narsor_protocol::VERSION, --version).
+          echo "NARSOR_BUILD_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
@@ -39,8 +48,14 @@ jobs:
           trap 'rm -rf "$temp_dir"' EXIT
           tar -xzf "$archive" -C "$temp_dir"
           "$temp_dir/narsor-cli" --version
+          for binary in narsor narsor-cli narsor-web narsor-server narsor-controller narsor-runner; do
+            reported="$("$temp_dir/$binary" --version)"
+            [[ "$reported" == "$binary $NARSOR_BUILD_VERSION" ]] \
+              || { echo "$binary reports '$reported', expected $NARSOR_BUILD_VERSION" >&2; exit 1; }
+          done
+          grep -Fq "\"version\": \"$NARSOR_BUILD_VERSION\"" "$temp_dir/manifest.json"
           "$temp_dir/narsor-cli" validate tests/fixtures/cli/greet.yaml
-          for binary in narsor narsor-server narsor-controller narsor-runner; do
+          for binary in narsor narsor-web narsor-server narsor-controller narsor-runner; do
             "$temp_dir/$binary" --help >/dev/null
           done
 

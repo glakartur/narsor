@@ -2,7 +2,11 @@ use clap::Parser;
 use narsor_runner::runner::cli::{run_command, RunnerArgs};
 
 #[derive(Debug, Parser)]
-#[command(name = "narsor-runner", about = "Run one task workload")]
+#[command(
+    name = "narsor-runner",
+    version = narsor_protocol::VERSION,
+    about = "Run one task workload"
+)]
 struct Args {
     #[command(flatten)]
     runner: RunnerArgs,

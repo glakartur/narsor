@@ -127,6 +127,15 @@ const FIRST_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 /// Upper bound of the reconnect delay.
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 
+/// Whose token a forwarded request carries ([`ApiClient::forward`]).
+#[derive(Debug, Clone)]
+pub enum ForwardAuth {
+    /// This client's own token.
+    Own,
+    /// The `Authorization` header of the request being forwarded.
+    Header(reqwest::header::HeaderValue),
+}
+
 /// A client bound to one running server: a loopback daemon
 /// ([`ApiClient::new`]) or a control plane at a URL ([`ApiClient::remote`]).
 ///
@@ -210,6 +219,46 @@ impl ApiClient {
             token: Arc::new(TokenCell::new(source)),
             http,
             stream_http,
+        }
+    }
+
+    /// Sends one request of another client on to this server (the proxy of
+    /// `narsor-web`): `method` on `path_and_query` (which starts with `/`),
+    /// with `headers` and `body` as they came, and returns the answer
+    /// unread, so a stream (SSE) flows through as it arrives.
+    ///
+    /// `auth` says whose token the request carries: this client's own
+    /// ([`ForwardAuth::Own`], sent once more after a `401` with a re-read
+    /// token, like every other call of this client) or the browser's header
+    /// ([`ForwardAuth::Header`], sent as it is). There is no default, so a
+    /// request without a header of its own can never borrow this client's
+    /// token by accident.
+    pub async fn forward(
+        &self,
+        method: reqwest::Method,
+        path_and_query: &str,
+        headers: reqwest::header::HeaderMap,
+        body: Bytes,
+        auth: ForwardAuth,
+    ) -> Result<reqwest::Response, ClientError> {
+        let url = format!("{}{path_and_query}", self.base_url);
+        let build = |http: &reqwest::Client| {
+            http.request(method.clone(), &url)
+                .headers(headers.clone())
+                .body(body.clone())
+        };
+        match auth {
+            ForwardAuth::Header(value) => build(&self.stream_http)
+                .header(reqwest::header::AUTHORIZATION, value)
+                .send()
+                .await
+                .map_err(|error| ClientError::Unavailable(error.to_string())),
+            ForwardAuth::Own => {
+                self.send(&self.stream_http, |http, token| {
+                    build(http).bearer_auth(token)
+                })
+                .await
+            }
         }
     }
 

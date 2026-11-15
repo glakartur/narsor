@@ -67,4 +67,5 @@ mod tui_render;
 mod tui_state;
 mod tui_terminal_restore;
 mod validation;
+mod web_ui;
 mod workflows;

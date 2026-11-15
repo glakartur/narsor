@@ -35,6 +35,45 @@ need a live Kubernetes cluster (the smoke test also requires its documented
 not run them; run `cargo test -p narsor --test integration backend_contract --
 --include-ignored` after a change to the local backend.
 
+### The browser interface (`crates/narsor-web`)
+
+`crates/narsor-web` builds the `narsor-web` binary: the HTTP server of the
+browser interface and a proxy of the owner API to a `narsor-server`
+(`src/gateway.rs`, settings and their rules in `src/settings.rs`). The files
+of the interface are in `crates/narsor-web/ui/` and are compiled into the
+binary (`include_dir`); `build.rs` rebuilds the crate when a file there
+changes. `narsor-server` itself serves no interface. The application is plain ES modules with one
+vendored library (`ui/vendor/preact-htm.js`, licences in
+`crates/narsor-web/VENDOR-LICENSES.md`), so neither the build nor a release
+needs Node.
+
+The rules of the interface (state icons, panel deliveries, the new-task form,
+texts) are pure modules with tests for Node 22 or newer:
+
+```bash
+node --test crates/narsor-web/ui-tests/*.mjs
+```
+
+These tests are not part of `cargo test`. In a view, never use `innerHTML`
+or `dangerouslySetInnerHTML`, and never add inline scripts or styles: the
+content security policy refuses them.
+
+### The version of a build
+
+Every binary reports `narsor_protocol::VERSION` (`--version`). It is the
+version of the crate (`Cargo.toml`), unless the build sets
+`NARSOR_BUILD_VERSION`: the release workflow sets it from the release tag
+without the leading `v` (`v1.2.3` → `1.2.3`), and `dist/package-linux.sh`
+checks that `narsor-cli --version` reports it and writes it into
+`manifest.json`. To build a binary with a version locally:
+
+```bash
+NARSOR_BUILD_VERSION=1.2.3 cargo build --workspace --bins --release
+```
+
+(`NARSOR_VERSION` is a different variable: the release tag `dist/install.sh`
+downloads.)
+
 ### Test layout
 
 The integration tests of the `narsor` package are one test crate,

@@ -134,6 +134,21 @@ pub const TLS_TERMINATION_NONE: &str = "none";
 /// spoke HTTPS.
 pub const TLS_TERMINATION_PROXY: &str = "proxy";
 
+/// Where `narsor-web` listens when nothing says otherwise: a fixed loopback
+/// port, so the address of the browser interface can be bookmarked.
+pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:8484";
+
+/// `web_upstream` naming the local daemon of the state directory, which
+/// `narsor-web` discovers or launches like the CLI and the TUI do.
+pub const WEB_UPSTREAM_LOCAL: &str = "local";
+
+/// `narsor-web` holds the token of the server itself and gives the browser
+/// a session token of its own; only on a loopback address.
+pub const WEB_TOKEN_SERVER: &str = "server";
+
+/// `narsor-web` passes the browser's own token to the server unchanged.
+pub const WEB_TOKEN_PASSTHROUGH: &str = "passthrough";
+
 // ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
@@ -219,11 +234,19 @@ pub enum SettingKey {
     /// directory up to date with before every start; empty, or the
     /// configuration directory itself, copies nothing.
     LocalClaudeProfileSource,
+    /// The address `narsor-web` (the browser interface) listens on.
+    WebBind,
+    /// The server `narsor-web` passes the API to: `local` (the local daemon)
+    /// or the server's URL.
+    WebUpstream,
+    /// Whose token `narsor-web` sends to the server: `server` (its own) or
+    /// `passthrough` (the browser's).
+    WebToken,
 }
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 27] = [
+    pub const ALL: [SettingKey; 30] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
@@ -251,6 +274,9 @@ impl SettingKey {
         SettingKey::LocalCodexHome,
         SettingKey::LocalClaudeConfigDir,
         SettingKey::LocalClaudeProfileSource,
+        SettingKey::WebBind,
+        SettingKey::WebUpstream,
+        SettingKey::WebToken,
     ];
 
     /// The three roots, in the order `config show` prints them.
@@ -290,6 +316,9 @@ impl SettingKey {
             SettingKey::LocalCodexHome => "local_codex_home",
             SettingKey::LocalClaudeConfigDir => "local_claude_config_dir",
             SettingKey::LocalClaudeProfileSource => "local_claude_profile_source",
+            SettingKey::WebBind => "web_bind",
+            SettingKey::WebUpstream => "web_upstream",
+            SettingKey::WebToken => "web_token",
         }
     }
 
@@ -339,7 +368,10 @@ impl SettingKey {
             | SettingKey::LocalHome
             | SettingKey::LocalCodexHome
             | SettingKey::LocalClaudeConfigDir
-            | SettingKey::LocalClaudeProfileSource => false,
+            | SettingKey::LocalClaudeProfileSource
+            | SettingKey::WebBind
+            | SettingKey::WebUpstream
+            | SettingKey::WebToken => false,
         }
     }
 
@@ -371,6 +403,9 @@ impl SettingKey {
             SettingKey::ServerBind => SettingValue::Text(DEFAULT_SERVER_BIND.to_string()),
             SettingKey::TlsTermination => SettingValue::Text(TLS_TERMINATION_NONE.to_string()),
             SettingKey::LocalHome => SettingValue::Text(DEFAULT_LOCAL_HOME.to_string()),
+            SettingKey::WebBind => SettingValue::Text(DEFAULT_WEB_BIND.to_string()),
+            SettingKey::WebUpstream => SettingValue::Text(WEB_UPSTREAM_LOCAL.to_string()),
+            SettingKey::WebToken => SettingValue::Text(WEB_TOKEN_SERVER.to_string()),
             // Empty text is "not set": network mode refuses to start without
             // the ones it needs (`crate::auth::SecuritySettings::validate`).
             SettingKey::OidcIssuer
@@ -643,7 +678,10 @@ mod tests {
                 "local_home",
                 "local_codex_home",
                 "local_claude_config_dir",
-                "local_claude_profile_source"
+                "local_claude_profile_source",
+                "web_bind",
+                "web_upstream",
+                "web_token"
             ],
             "the registry is the one place the settings live, and the three \
              roots lead because that is the order `config show` prints"

@@ -75,6 +75,15 @@ Every one of them is available as an environment variable too, mechanically:
 | `conductor_effort` | `NARSOR_CONDUCTOR_EFFORT` | empty |
 | `log_level` | `NARSOR_LOG_LEVEL` | `off` |
 | `tui_refresh_interval` | `NARSOR_TUI_REFRESH_INTERVAL` | `10s` |
+| `web_bind` | `NARSOR_WEB_BIND` | `127.0.0.1:8484` |
+| `web_upstream` | `NARSOR_WEB_UPSTREAM` | `local` |
+| `web_token` | `NARSOR_WEB_TOKEN` | `server` |
+
+The three `web_*` settings are read by `narsor-web`, the server of the
+[browser interface](web.md): where it listens (loopback only), the server it
+passes the API to (`local` = the local daemon, or the server's URL), and
+whose token goes to that server (`server` = its own, `passthrough` = the
+browser's).
 
 For Kubernetes runners, put `NARSOR_AGENT_ARGS` in the controller ConfigMap
 (`narsor-controller-config`). The controller forwards this one key to the

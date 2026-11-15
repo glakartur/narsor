@@ -9,6 +9,7 @@ const DEFAULT_LOG_FILTER: &str = "warn";
 #[derive(Debug, Parser)]
 #[command(
     name = "narsor-controller",
+    version = narsor_protocol::VERSION,
     about = "Reconcile one Narsor backend",
     subcommand_required = true
 )]
