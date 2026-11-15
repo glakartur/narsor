@@ -2,6 +2,9 @@
 
 This document summarizes the key architectural decisions made for the AI Workflow Narsor project in the MVP phase.
 
+For the map of crates, their build-time dependencies and the runtime
+processes, see `components.md`.
+
 ## Decision table
 
 | ID  | Area | Decision | Alternative | Status | Consequences |

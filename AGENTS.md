@@ -25,8 +25,8 @@ Rust 2021, Cargo workspace.
 - `tests/` — integration tests. `deploy/` — deployment manifests.
   `dist/` — packaging scripts.
 
-Start with `docs/dev/architecture.md`, then `docs/dev/domain-model.md` and
-`docs/dev/workflow-schema.md`.
+Start with `docs/dev/architecture.md` and `docs/dev/components.md`, then
+`docs/dev/domain-model.md` and `docs/dev/workflow-schema.md`.
 
 ## Build and test
 
