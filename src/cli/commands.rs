@@ -12,13 +12,12 @@
 //! file reference is validated by the local server and sent as an absolute
 //! path, so the client does not parse a workflow definition itself.
 //!
-//! # How `input` and `resume` find the definition
+//! # How `input` finds the definition
 //!
 //! The server seals workflow definitions with accepted tasks. Follow-up
-//! commands such as `input` and `resume` use API responses and never resolve
+//! commands such as `input` use API responses and never resolve
 //! the definition or open execution storage themselves.
 
-mod conductor;
 mod config;
 mod daemon_access;
 mod open_matters;
@@ -27,7 +26,6 @@ mod task_read;
 mod tui;
 mod workflow;
 
-pub use conductor::*;
 pub use config::*;
 pub use task_control::*;
 pub use task_read::*;

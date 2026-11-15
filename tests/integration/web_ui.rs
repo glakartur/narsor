@@ -9,9 +9,8 @@ use std::sync::Arc;
 use narsor_api_client::api::token::TokenSource;
 use narsor_api_client::api::ApiClient;
 use narsor_engine::controller_protocol::ProtocolService;
-use narsor_engine::engine::Engine;
 use narsor_engine::orchestration::ControlPlane;
-use narsor_engine::persistence::{ExecutionStore, StatePaths};
+use narsor_engine::persistence::StatePaths;
 use narsor_server::api::{start_with_services, ApiHandle, ApiServices};
 use narsor_web::gateway::{Gateway, Upstream};
 use narsor_web::settings::TokenMode;
@@ -40,13 +39,11 @@ async fn server(root: &TempRoot) -> ApiHandle {
     let state = root.0.join("state");
     fs::create_dir_all(&catalog).unwrap();
     fs::create_dir_all(&state).unwrap();
-    let engine = Engine::new(ExecutionStore::new(root.0.join("store")));
     let control = ProtocolService::new(
         ControlPlane::new(StatePaths::new(&state)),
         crate::environment_support::seeded_resolver(&state),
     );
     start_with_services(
-        Arc::new(engine),
         catalog,
         root.0.join("work"),
         ApiServices {

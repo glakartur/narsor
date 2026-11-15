@@ -6345,10 +6345,9 @@ mod task_app_create_render {
     use narsor::api::ApiClient;
     use narsor::tui::task_app::{layout, Request, TaskApp};
     use narsor_engine::domain::ParamType;
-    use narsor_protocol::api::LegacyExecutionListResponse;
 
     use crate::task_app_support::{
-        archived, capabilities, catalogue, catalogue_workflow, legacy, listing, queued, registry,
+        archived, capabilities, catalogue, catalogue_workflow, listing, queued, registry,
         repository, titled, with_workspaces, workflow_input, workspace,
     };
 
@@ -6941,22 +6940,18 @@ mod task_app_create_render {
     fn the_history_is_a_list_beside_read_only_details() {
         let mut app = app();
         keys(&mut app, "H");
-        app.open_history(
-            listing(vec![archived("old", "NAR-9", 5)], "c"),
-            Ok(LegacyExecutionListResponse {
-                executions: vec![legacy("exec-1", "fix-bug", "failed", 3, true, None)],
-            }),
-        );
+        app.open_history(listing(
+            vec![archived("old", "NAR-9", 5), archived("older", "NAR-8", 1)],
+            "c",
+        ));
         let screen = draw_app(&mut app, 130, 30, false);
         for expected in [
             "Historia",
             "NAR-9",
             "archiwum",
-            "fix-bug exec-1",
-            "failed",
+            "NAR-8",
             "Przebieg",
             "storage usunięty przy archiwizacji",
-            "wznów",
         ] {
             assert!(screen.contains(expected), "{expected}:\n{screen}");
         }
@@ -6965,7 +6960,7 @@ mod task_app_create_render {
             "the task list gives way:\n{screen}"
         );
         assert_two_lines(&screen, "▪  NAR-9", "   archiwum");
-        assert_two_lines(&screen, "fix-bug exec-1", "   failed");
+        assert_two_lines(&screen, "▪  NAR-8", "   archiwum");
 
         // The bracket covers both lines of the selected entry, and only of
         // it: cyan while the list has the focus, the rules across the whole
@@ -7022,7 +7017,7 @@ mod task_app_create_render {
                 .unwrap()
         };
         let barred = |row: usize| buffer[(1, row as u16)].symbol() != " ";
-        let (nine, fix) = (at("NAR-9"), at("fix-bug"));
+        let (nine, fix) = (at("NAR-9"), at("NAR-8"));
         assert_ne!(barred(nine), barred(fix), "{}", screen(buffer));
         if barred(nine) {
             (nine, fix)
@@ -7070,10 +7065,7 @@ mod task_app_create_render {
 
         let mut app = fresh();
         keys(&mut app, "H");
-        app.open_history(
-            listing(vec![archived("old", "NAR-9", 5)], "c"),
-            Ok(LegacyExecutionListResponse { executions: vec![] }),
-        );
+        app.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
         let buffer = draw_buffer(&mut app, 130, 30, false);
         assert!(rows(&buffer)[1].contains("Historia"));
         assert_frame(&buffer, 0, list_right, ROUNDED, Color::Cyan);
@@ -7100,10 +7092,7 @@ mod task_app_create_render {
     fn the_history_in_a_narrow_terminal_switches_between_the_list_and_the_details() {
         let mut app = app();
         keys(&mut app, "H");
-        app.open_history(
-            listing(vec![archived("old", "NAR-9", 5)], "c"),
-            Ok(LegacyExecutionListResponse { executions: vec![] }),
-        );
+        app.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
         let list = draw_app(&mut app, 80, 24, false);
         assert!(
             list.contains("Historia") && list.contains("NAR-9"),
@@ -8736,7 +8725,6 @@ mod task_app_usage_render {
     use narsor::tui::task_app::notify::LIFETIME;
     use narsor::tui::task_app::{layout, TaskApp};
     use narsor_engine::domain::ExecutionStatus;
-    use narsor_protocol::api::LegacyExecutionListResponse;
     use narsor_protocol::controller::{
         HarnessUsageResponse, HarnessUsageView, UsageLimit, UsageStatus,
     };
@@ -9190,10 +9178,7 @@ mod task_app_usage_render {
         let mut history = app();
         history.set_harness_usage(usage());
         press(&mut history, KeyCode::Char('H'));
-        history.open_history(
-            listing(vec![archived("old", "NAR-9", 5)], "c"),
-            Ok(LegacyExecutionListResponse { executions: vec![] }),
-        );
+        history.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
         let screen_text = screen(&render(&mut history, 160, &Styles::new(false)));
         assert!(screen_text.contains("Historia"), "{screen_text}");
         assert!(shown(&mut history).ends_with(AE4));

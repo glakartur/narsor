@@ -260,7 +260,7 @@ itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
 | `n` | new task (a catalogue workflow, or the path of a definition); each repository input has a branch field next to it, preselected with the repository's default branch, with the branches of the remote as suggestions (you can always type another one) | `narsor-cli task create <workflow> [--branch INPUT=BRANCH]`, `narsor-cli task create --file <path>`; the catalogue is `narsor-cli task workflows`, the check of a file `narsor-cli task validate <path>` |
 | `i` / the panel | answer what waits: fields, `artifacts`, `variables`, label, comment | `narsor-cli task input <task> --field … --artifact … --variable … [--waiting-id ID]` |
 | `Space` | the next task that waits | `narsor-cli task show` ends with `Next       waiting: <task>` |
-| `H` | history: archived tasks, and executions from before the scheduler (`w` recovers a failed one) | `narsor-cli task list --archived`; `narsor-cli task history list` / `show` / `events` / `steps` / `conversation` / `conductor` / `recover` |
+| `H` | history: archived tasks | `narsor-cli task list --archived` |
 | `R` | repositories: `a` registers, `d` removes (`!`) | `narsor-cli task repo list` / `add` / `remove` (the same registry on any server; `narsor-cli repo …` is the local one) |
 | `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor-cli harness default set <harness>` / `reset` (`narsor-cli harness default` shows it) |
 | `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `max_concurrent_tasks` applies again) | `max_concurrent_tasks` in the configuration |

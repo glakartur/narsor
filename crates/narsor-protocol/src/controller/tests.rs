@@ -387,7 +387,6 @@ fn capabilities_keep_optional_reason_omitted_when_absent() {
         connection_name: "local".into(),
         workflow_paths: true,
         workflow_paths_reason: None,
-        legacy_executions: true,
         local_repository_paths: true,
     })
     .unwrap();

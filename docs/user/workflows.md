@@ -159,7 +159,7 @@ daemon only; the path is validated first and every violation is listed).
 An execution records both the definition's path (when it came from a file) and
 its workflow name, in `metadata.cli.definition_path` and
 `metadata.cli.definition_name`. A built-in has no path, so the name is what makes
-`narsor-cli input` and `narsor-cli resume` — and the interface — find the
+`narsor-cli input` — and the interface — find the
 definition again in a later process. The path is used first when it is still
 there, so executions created before this existed keep resolving unchanged;
 `--file <WORKFLOW>` overrides both and accepts a name as well as a path.

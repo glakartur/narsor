@@ -95,8 +95,8 @@ backend. If provisioning fails before an execution exists, the task records
 the failure; no synthetic execution is created.
 
 The admitted runner uses the sealed workflow snapshot stored with the task,
-not a mutable definition path, so later `input` and `resume` do not need the
-original file.
+not a mutable definition path, so a later `input` does not need the original
+file.
 
 ### `list`
 
@@ -115,15 +115,14 @@ The status, the current state, the workspace and the context variables; plus the
 question and its form fields, when the execution is waiting on a human. When the
 conductor has something to add, `show` prints it too: the problem a `failed`
 execution is stopped on (the conductor's diagnosis, or the raw error) with the
-failure's key and the `recover` command to answer it, the conductor's summary
-and recommendation of the `human` gate the execution waits on, and what the
-conductor is working on right now. `run`, `input`, `resume` and `recover` print
-the same when they return.
+failure's key and the `narsor-cli task restart-step` command to answer it, the
+conductor's summary and recommendation of the `human` gate the execution waits
+on, and what the conductor is working on right now. `run` and `input` print the
+same when they return.
 
-> **Known limitation.** Executions started through the task scheduler run in a
-> separate runner process. The conductor (summaries, chat, proposals) and
-> `recover`/`resume` through the legacy execution routes are not yet wired to
-> them; only executions that predate the scheduler have them.
+Every execution runs in a runner process under its task. To restart a failed
+step, talk to the conductor or change the task, use the `narsor-cli task …`
+commands ([Remote backends](remote.md)).
 
 ```console
 $ narsor-cli show 4f1c8f0e-...-9b21
@@ -237,41 +236,6 @@ Input delivered to execution 4f1c8f0e-...-9b21.
 Status: completed
 Current state: completed
 ```
-
-### `resume <EXECUTION_ID>`
-
-Resumes an execution that was paused by something **other** than a question for
-a human (a manual `pause`, for instance). An execution waiting for an answer
-needs `input`, not `resume` — that is the guard against delivering the same
-answer twice.
-
-### `recover <EXECUTION_ID> [--comment TEXT]`
-
-Starts the failed step of a `failed` (or, after a daemon restart, `unknown`)
-execution afresh — the CLI counterpart of the interface's failure form. The
-comment is handed to the step's next attempt. The recovery is bound to the
-failure the execution is failed on, the key `show` prints: if somebody acted on
-that failure first (another window, the conductor's own retry), it is refused
-with a readable message instead of starting the step twice. Like `resume`, it
-waits for the execution to stop and exits `1` if it failed again.
-
-```console
-$ narsor-cli recover 4f1c8f0e-...-9b21 --comment "The script is back in place."
-Recovered execution 4f1c8f0e-...-9b21.
-Status: completed
-Current state: completed
-```
-
-### `conductor chat|history|confirm|reject|undo|status <EXECUTION_ID> …`
-
-The conductor of an execution (see [The conductor](conductor.md#the-conductor)):
-`chat <ID> "<MESSAGE>" [--no-wait]` writes to it and prints its answer and
-proposals, `history <ID>` prints the chat, `confirm <ID> <PROPOSAL>` and
-`reject <ID> <PROPOSAL>` settle a proposal (by id or by its number in the
-history), `undo <ID> <DECISION>` takes back its latest choice of a step's
-output, and `status <ID>` prints what it is doing and what it kept: the
-invocation under way, the queue, the attempts counted per episode, the latest
-failure it took up.
 
 ### `config show [--format table|json]`
 

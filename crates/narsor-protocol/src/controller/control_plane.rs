@@ -10,7 +10,6 @@ pub struct CapabilitiesView {
     pub workflow_paths: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_paths_reason: Option<String>,
-    pub legacy_executions: bool,
     pub local_repository_paths: bool,
 }
 

@@ -12,8 +12,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Map, Value};
 
 use crate::controller_protocol::{
-    CapabilitiesView, LegacyExecutionView, RepositoryView, ValidateWorkflowResponse,
-    WorkflowInputView, WorkflowSource, WorkflowView,
+    CapabilitiesView, RepositoryView, ValidateWorkflowResponse, WorkflowInputView, WorkflowSource,
+    WorkflowView,
 };
 use crate::domain::without_unsafe_chars;
 use crate::usage_text::{percent, time_to_reset};
@@ -24,77 +24,6 @@ use narsor_protocol::harness::display_name;
 
 use super::commands::{CliError, Result};
 use super::task_text::{Tone, ToneLine};
-
-/// The heading of the `narsor task history list` table.
-pub fn history_header() -> String {
-    format!("{:<38} {:<10} {:<22} WORKFLOW", "ID", "STATUS", "STATE")
-}
-
-/// One row of the table of executions from before the scheduler: id,
-/// status, the state it stopped at and its workflow with version.
-pub fn history_row(view: &LegacyExecutionView) -> String {
-    without_unsafe_chars(&format!(
-        "{:<38} {:<10} {:<22} {} v{}",
-        view.id,
-        view.status.as_str(),
-        view.current_state.as_deref().unwrap_or("-"),
-        view.workflow_id,
-        view.workflow_version
-    ))
-}
-
-/// Every field of one old execution, with why it cannot be recovered.
-pub fn history_detail_lines(view: &LegacyExecutionView) -> Vec<ToneLine> {
-    let mut lines = vec![
-        ToneLine::new(format!("Execution  {}", view.id), Tone::Normal),
-        ToneLine::new(
-            format!("Workflow   {} v{}", view.workflow_id, view.workflow_version),
-            Tone::Normal,
-        ),
-        ToneLine::new(format!("Status     {}", view.status.as_str()), Tone::Normal),
-        ToneLine::new(
-            format!(
-                "State      {}",
-                view.current_state.as_deref().unwrap_or("-")
-            ),
-            Tone::Normal,
-        ),
-        ToneLine::new(
-            format!("Started    {}", view.started_at.to_rfc3339()),
-            Tone::Normal,
-        ),
-        ToneLine::new(
-            format!(
-                "Completed  {}",
-                view.completed_at
-                    .map(|at| at.to_rfc3339())
-                    .unwrap_or_else(|| "-".to_string())
-            ),
-            Tone::Normal,
-        ),
-    ];
-    if let Some(problem) = &view.problem {
-        lines.push(ToneLine::new(
-            format!(
-                "Problem    {}: {}",
-                problem.kind.name(),
-                problem.reason.replace('\n', " ")
-            ),
-            Tone::Error,
-        ));
-    }
-    lines.push(match (&view.not_recoverable_reason, view.recoverable) {
-        (_, true) => ToneLine::new(
-            "Recovery   possible (narsor task history recover <id>)",
-            Tone::Good,
-        ),
-        (Some(reason), false) => {
-            ToneLine::new(format!("Recovery   not possible: {reason}"), Tone::Muted)
-        }
-        (None, false) => ToneLine::new("Recovery   not possible", Tone::Muted),
-    });
-    lines
-}
 
 fn source_name(source: WorkflowSource) -> &'static str {
     match source {
@@ -196,10 +125,6 @@ pub fn capabilities_lines(view: &CapabilitiesView) -> Vec<ToneLine> {
             Tone::Normal,
         ),
         ToneLine::new(paths, Tone::Normal),
-        ToneLine::new(
-            format!("Old executions:         {}", yes_no(view.legacy_executions)),
-            Tone::Normal,
-        ),
         ToneLine::new(
             format!(
                 "Local repository paths: {}",

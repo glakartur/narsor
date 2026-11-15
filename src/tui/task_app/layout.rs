@@ -226,7 +226,6 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
     let focused = app.focus == Focus::Details;
     let hyperlinks = app.detail.hyperlinks();
     let glyph = app.loading_glyph();
-    let loading = app.history_entry_loading();
     if let View::Opening(kind) = app.view {
         let text = app.loading_label("wczytuję…");
         let inner = styles.render_panel(frame, area, kind.title(), focused);
@@ -246,7 +245,6 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
                 stale,
                 hyperlinks,
                 glyph,
-                loading,
             };
             history::render_details(frame, area, open, styles, look);
         }

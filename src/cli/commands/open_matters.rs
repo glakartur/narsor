@@ -1,6 +1,5 @@
 //! What an execution waits on — the pending question's form and what the
-//! conductor adds to it — printed after `show`, `run`, `input`, `resume` and
-//! `recover`.
+//! conductor adds to it — printed after `show`, `run` and `input`.
 
 use serde_json::Value;
 
@@ -12,7 +11,7 @@ use narsor_protocol::api::{
 
 /// Prints the pending question's full form ([`print_pending_input`]) —
 /// fields, types, allowed values, output labels, not just its instruction
-/// text — that [`run`]/[`resume`]/[`input`]/[`recover`] always printed when
+/// text — that [`run`]/[`input`] always printed when
 /// a pass stops on a question, if `summary` says the execution is
 /// `InputNeeded` right now; then what the conductor adds to it
 /// ([`print_conductor_matters`]).
@@ -30,9 +29,7 @@ use narsor_protocol::api::{
 /// unit.
 ///
 /// [`run`]: super::run
-/// [`resume`]: super::resume
 /// [`input`]: super::input
-/// [`recover`]: super::recover
 pub(super) fn print_open_matters(summary: &ExecutionSummary) {
     if summary.status == ExecutionStatusDto::InputNeeded {
         if let Some(pending) = &summary.pending_input {
@@ -55,13 +52,16 @@ pub(super) fn print_conductor_matters(summary: &ExecutionSummary) {
         .filter(|problem| problem.kind == ProblemKindDto::Failure)
     {
         println!("Problem ({}): {}", problem.kind.name(), problem.reason);
-        if let Some(episode) = &problem.episode {
-            println!("  Failure: {episode}");
+        match &problem.episode {
+            Some(episode) => {
+                println!("  Failure: {episode}");
+                println!(
+                    "  Restart with: narsor-cli task restart-step <TASK> --failure-key {episode} \
+                     [--note TEXT]"
+                );
+            }
+            None => println!("  Restart with: narsor-cli task restart-step <TASK> [--note TEXT]"),
         }
-        println!(
-            "  Recover with: narsor recover {} [--comment TEXT]",
-            summary.id
-        );
     }
     if let Some(annotation) = &summary.annotation {
         println!("Conductor's summary: {}", annotation.summary);

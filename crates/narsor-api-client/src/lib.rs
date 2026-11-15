@@ -6,8 +6,7 @@ pub mod config {
 
 pub mod controller_protocol {
     pub use narsor_protocol::api::{
-        ConductorChatResponse, ConductorStateResponse, LegacyExecutionListResponse,
-        LegacyExecutionView, PendingInvocationView, QueuedRequestView,
+        ConductorChatResponse, ConductorStateResponse, PendingInvocationView, QueuedRequestView,
     };
     pub use narsor_protocol::controller::*;
 }

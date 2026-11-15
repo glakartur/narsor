@@ -1,11 +1,10 @@
 //! The owner routes of `/control/v1` that read the daemon's own disk (U6):
 //! the workflow catalogue, workflow validation, the repository registry,
-//! the Historia of executions from before the task scheduler, and the
-//! capabilities a client checks before it offers any of it.
+//! and the capabilities a client checks before it offers any of it.
 //!
 //! They sit beside [`narsor_engine::controller_protocol::http::owner_routes`], behind
 //! the same owner gate, and exist only where the control plane does. What
-//! reads files of the server (a workflow *path*, the old executions) is
+//! reads files of the server (a workflow *path*, a local repository) is
 //! served to the trusted local daemon alone: a network-mode server answers
 //! that it does not, and says so in its capabilities, so a client never
 //! has to find out by failing.
@@ -17,32 +16,22 @@
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
-use super::{
-    begin_recovery, build_summary, is_safe_id, read_conductor_chat, read_conductor_state,
-    read_conversation, read_events, read_timeline, ApiError, AppState, ConversationQuery,
-    EventsQuery,
-};
-use narsor_engine::api::dto::{
-    AcceptedResponse, ActiveProblem, ConductorChatResponse, ConductorStateResponse, RecoveryRequest,
-};
+use super::{ApiError, AppState};
 use narsor_engine::controller_protocol::{
-    CapabilitiesView, CreateRepositoryRequest, LegacyExecutionListResponse, LegacyExecutionView,
-    ProtocolError, RepositoryBranchesResponse, RepositoryListResponse, RepositoryView,
-    ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType, WorkflowInputView,
-    WorkflowListResponse, WorkflowSource, WorkflowSourceRequest, WorkflowSourceResponse,
-    WorkflowView, WorkflowWorkspaceView,
+    CapabilitiesView, CreateRepositoryRequest, ProtocolError, RepositoryBranchesResponse,
+    RepositoryListResponse, RepositoryView, ValidateWorkflowRequest, ValidateWorkflowResponse,
+    WorkflowInputType, WorkflowInputView, WorkflowListResponse, WorkflowSource,
+    WorkflowSourceRequest, WorkflowSourceResponse, WorkflowView, WorkflowWorkspaceView,
 };
 use narsor_engine::domain::display::{
     without_unsafe_chars, without_unsafe_chars_json, without_unsafe_chars_multiline,
 };
-use narsor_engine::domain::{Event, ExecutionStatus, ParamType, WorkflowDefinition};
-use narsor_engine::engine::Timeline;
-use narsor_engine::persistence::ExecutionStore;
+use narsor_engine::domain::{ParamType, WorkflowDefinition};
 use narsor_engine::registry::{
     BranchListError, RegistryError, RepositoryEntry, RepositoryRegistry,
 };
@@ -76,35 +65,6 @@ pub(super) fn routes() -> Router<AppState> {
             "/control/v1/repositories/{id}/branches",
             get(get_repository_branches),
         )
-        .route("/control/v1/executions", get(get_history))
-        .route(
-            "/control/v1/executions/{execution_id}",
-            get(get_history_one),
-        )
-        .route(
-            "/control/v1/executions/{execution_id}/events",
-            get(get_history_events),
-        )
-        .route(
-            "/control/v1/executions/{execution_id}/timeline",
-            get(get_history_timeline),
-        )
-        .route(
-            "/control/v1/executions/{execution_id}/attempts/{attempt_id}/conversation",
-            get(get_history_conversation),
-        )
-        .route(
-            "/control/v1/executions/{execution_id}/conductor",
-            get(get_history_conductor),
-        )
-        .route(
-            "/control/v1/executions/{execution_id}/conductor/chat",
-            get(get_history_conductor_chat),
-        )
-        .route(
-            "/control/v1/executions/{execution_id}/recover",
-            post(post_history_recover),
-        )
 }
 
 /// Runs blocking file work off the async threads.
@@ -126,12 +86,10 @@ where
 async fn get_capabilities(
     State(state): State<AppState>,
 ) -> Result<Json<CapabilitiesView>, ApiError> {
-    let legacy_executions = state.local && !state.store.list_execution_ids()?.is_empty();
     Ok(Json(CapabilitiesView {
         connection_name: without_unsafe_chars(&state.connection_name),
         workflow_paths: state.local,
         workflow_paths_reason: (!state.local).then(|| WORKFLOW_PATHS_REASON.to_string()),
-        legacy_executions,
         local_repository_paths: state.local,
     }))
 }
@@ -609,168 +567,4 @@ fn registry_refusal(error: RegistryError) -> ProtocolError {
         ),
         other => ProtocolError::Internal(other.to_string()),
     }
-}
-
-// ---------------------------------------------------------------------------
-// History: executions from before the task scheduler
-// ---------------------------------------------------------------------------
-
-/// The store of a legacy execution, for the trusted local daemon only: any
-/// other server, and any id it does not hold, answers `404`.
-fn legacy_store(state: &AppState, execution_id: &str) -> Result<ExecutionStore, ApiError> {
-    if state.local && is_safe_id(execution_id) && state.store.exists(execution_id) {
-        Ok(state.store.clone())
-    } else {
-        Err(ApiError::ExecutionNotFound)
-    }
-}
-
-/// `GET /control/v1/executions` — newest first; empty on a server that
-/// holds none.
-async fn get_history(
-    State(state): State<AppState>,
-) -> Result<Json<LegacyExecutionListResponse>, ApiError> {
-    let executions = blocking(move || -> Result<_, ApiError> {
-        let mut executions = Vec::new();
-        if state.local {
-            for id in state.store.list_execution_ids()? {
-                // One corrupt execution must not take the whole Historia away.
-                match history_view(&state, &id) {
-                    Ok(view) => executions.push(view),
-                    Err(_) => {
-                        tracing::warn!(execution_id = %id, "control: skipping an unreadable execution")
-                    }
-                }
-            }
-        }
-        executions.sort_by(|a, b| {
-            b.started_at
-                .cmp(&a.started_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
-        Ok(executions)
-    })
-    .await
-    .map_err(|error| ApiError::Internal(error.to_string()))??;
-    Ok(Json(LegacyExecutionListResponse { executions }))
-}
-
-/// `GET /control/v1/executions/:execution_id`.
-async fn get_history_one(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-) -> Result<Json<LegacyExecutionView>, ApiError> {
-    legacy_store(&state, &execution_id)?;
-    Ok(Json(history_view(&state, &execution_id)?))
-}
-
-fn history_view(state: &AppState, execution_id: &str) -> Result<LegacyExecutionView, ApiError> {
-    let execution = state.store.load_execution(execution_id)?;
-    let summary = build_summary(&state.store, &execution)?;
-    let status: ExecutionStatus = summary.status;
-    let not_recoverable_reason = match &status {
-        _ if state.engine.is_active(execution_id) => {
-            Some("it is being processed right now".to_string())
-        }
-        ExecutionStatus::Failed | ExecutionStatus::Unknown => None,
-        other => Some(format!(
-            "a {} execution cannot be recovered; only a failed one can",
-            other.as_str()
-        )),
-    };
-    Ok(LegacyExecutionView {
-        id: summary.id,
-        workflow_id: without_unsafe_chars(&summary.workflow_id),
-        workflow_version: summary.workflow_version,
-        status,
-        current_state: summary.current_state.as_deref().map(without_unsafe_chars),
-        started_at: summary.started_at,
-        completed_at: summary.completed_at,
-        problem: summary.problem.map(|problem| ActiveProblem {
-            reason: without_unsafe_chars_multiline(&problem.reason),
-            ..problem
-        }),
-        recoverable: not_recoverable_reason.is_none(),
-        not_recoverable_reason,
-    })
-}
-
-/// `GET /control/v1/executions/{execution_id}/events?after=<sequence>`.
-async fn get_history_events(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-    Query(query): Query<EventsQuery>,
-) -> Result<Json<Vec<Event>>, ApiError> {
-    let store = legacy_store(&state, &execution_id)?;
-    Ok(Json(read_events(&store, &execution_id, query.after)?))
-}
-
-/// `GET /control/v1/executions/{execution_id}/timeline`.
-async fn get_history_timeline(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-) -> Result<Json<Timeline>, ApiError> {
-    let store = legacy_store(&state, &execution_id)?;
-    Ok(Json(read_timeline(&store, &execution_id)?))
-}
-
-/// `GET /control/v1/executions/{execution_id}/attempts/{attempt_id}/conversation`.
-async fn get_history_conversation(
-    State(state): State<AppState>,
-    Path((execution_id, attempt_id)): Path<(String, String)>,
-    Query(query): Query<ConversationQuery>,
-) -> Result<Json<super::ConversationResponse>, ApiError> {
-    let store = legacy_store(&state, &execution_id)?;
-    Ok(Json(read_conversation(
-        &store,
-        &execution_id,
-        &attempt_id,
-        query.from,
-        query.byte_budget,
-    )?))
-}
-
-/// `GET /control/v1/executions/{execution_id}/conductor`.
-async fn get_history_conductor(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-) -> Result<Json<ConductorStateResponse>, ApiError> {
-    let store = legacy_store(&state, &execution_id)?;
-    Ok(Json(read_conductor_state(&store, &execution_id)?))
-}
-
-/// `GET /control/v1/executions/{execution_id}/conductor/chat?after=<sequence>`.
-async fn get_history_conductor_chat(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-    Query(query): Query<EventsQuery>,
-) -> Result<Json<ConductorChatResponse>, ApiError> {
-    let store = legacy_store(&state, &execution_id)?;
-    Ok(Json(read_conductor_chat(
-        &store,
-        &execution_id,
-        query.after,
-    )?))
-}
-
-/// `POST /control/v1/executions/{execution_id}/recover` — starts a fresh
-/// attempt of a failed legacy execution. One that cannot be recovered is
-/// refused with its reason (`409`, `not_recoverable`), not a bare status.
-async fn post_history_recover(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-    Json(request): Json<RecoveryRequest>,
-) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    legacy_store(&state, &execution_id)?;
-    let view = history_view(&state, &execution_id)?;
-    if let Some(message) = view.not_recoverable_reason {
-        return Err(ApiError::Refused {
-            code: "not_recoverable",
-            message,
-        });
-    }
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(begin_recovery(&state, execution_id, request)?),
-    ))
 }

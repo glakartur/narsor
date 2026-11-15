@@ -42,49 +42,34 @@
 //! the installation owner's OIDC token in network mode (U7).
 
 use std::collections::HashSet;
-use std::convert::Infallible;
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{Map, Value};
-use tokio::sync::broadcast;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::{Stream, StreamExt};
+use serde_json::Value;
 
-use crate::api::active::ActiveTasks;
 use crate::api::ApiServices;
 use crate::auth_gate as gate;
 use crate::auth_gate::OwnerAuth;
 use crate::controller_protocol::http as protocol_http;
 pub use narsor_engine::api::conversation_response_from_snapshot;
 use narsor_engine::api::dto::{
-    AcceptedResponse, ActiveProblem, ChatEntryDto, ChatMessageRequest, ConductorActivity,
-    ConductorChatResponse, ConductorStateResponse, ConversationResponse, ExecutionListResponse,
-    ExecutionSummary, HarnessSelectionSnapshot, HumanInputDeliveryDto, OperatorNoteRequest,
-    PendingHumanInputView, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
-    StartTaskRequest, StartTaskResponse, TransitionRequest,
+    AcceptedResponse, ActiveProblem, ConductorActivity, ConversationResponse,
+    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, HumanInputDeliveryDto,
+    PendingHumanInputView, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse,
 };
-use narsor_engine::conductor::{
-    annotation_of, ConductorRegistry, ConductorStore, ProposalError, ProposalOutcome, UndoError,
-    UndoOutcome,
-};
+use narsor_engine::conductor::{annotation_of, ConductorStore};
 use narsor_engine::controller_protocol::ProtocolError;
 use narsor_engine::domain::TaskId;
-use narsor_engine::domain::{AnsweredBy, Event, ExecutionStatus};
-use narsor_engine::engine::{
-    current_timeline, Engine, EngineError, HumanInputDelivery, ManualTransition, Recovery, Timeline,
-};
+use narsor_engine::domain::{Event, ExecutionStatus};
+use narsor_engine::engine::{current_timeline, EngineError, Timeline};
 use narsor_engine::environment::{CatalogLaunchResolver, LaunchIntent};
 use narsor_engine::orchestration::OwnerRef;
 use narsor_engine::persistence::{
@@ -141,89 +126,6 @@ fn pending_input_view(
         .map_err(|error| ApiError::Internal(format!("invalid pending-input wire view: {error}")))
 }
 
-/// Converts a client wire answer into the engine-owned delivery value.
-fn engine_delivery(delivery: HumanInputDeliveryDto) -> HumanInputDelivery {
-    let permission_decision =
-        delivery
-            .permission_decision
-            .map(|decision| narsor_engine::engine::PermissionDecision {
-                denial_index: decision.denial_index,
-                decision: match decision.decision {
-                    narsor_engine::api::PermissionDecisionKindDto::Deny => {
-                        narsor_engine::engine::PermissionDecisionKind::Deny
-                    }
-                    narsor_engine::api::PermissionDecisionKindDto::Allow => {
-                        narsor_engine::engine::PermissionDecisionKind::Allow
-                    }
-                },
-                scope: decision.scope.map(|scope| match scope {
-                    narsor_engine::api::PermissionGrantScopeDto::ExactOperation => {
-                        narsor_engine::engine::PermissionGrantScope::ExactOperation
-                    }
-                    narsor_engine::api::PermissionGrantScopeDto::CommandGroup => {
-                        narsor_engine::engine::PermissionGrantScope::CommandGroup
-                    }
-                    narsor_engine::api::PermissionGrantScopeDto::Pattern => {
-                        narsor_engine::engine::PermissionGrantScope::Pattern
-                    }
-                }),
-                pattern: decision.pattern,
-                message: decision.message,
-            });
-    HumanInputDelivery {
-        values: delivery.values,
-        chosen_label: delivery.chosen_label,
-        artifacts: delivery.artifacts,
-        variables: delivery.variables,
-        comment: delivery.comment,
-        agent_message: delivery.agent_message,
-        action: delivery.action,
-        episode: delivery.episode,
-        permission_decision,
-        answered_by: AnsweredBy::Operator,
-    }
-}
-
-/// Converts an engine delivery back to the protocol used by remote runners.
-fn protocol_delivery(delivery: &HumanInputDelivery) -> HumanInputDeliveryDto {
-    HumanInputDeliveryDto {
-        values: delivery.values.clone(),
-        chosen_label: delivery.chosen_label.clone(),
-        artifacts: delivery.artifacts.clone(),
-        variables: delivery.variables.clone(),
-        comment: delivery.comment.clone(),
-        agent_message: delivery.agent_message.clone(),
-        action: delivery.action,
-        episode: delivery.episode.clone(),
-        permission_decision: delivery.permission_decision.as_ref().map(|decision| {
-            narsor_engine::api::PermissionDecisionDto {
-                denial_index: decision.denial_index,
-                decision: match decision.decision {
-                    narsor_engine::engine::PermissionDecisionKind::Deny => {
-                        narsor_engine::api::PermissionDecisionKindDto::Deny
-                    }
-                    narsor_engine::engine::PermissionDecisionKind::Allow => {
-                        narsor_engine::api::PermissionDecisionKindDto::Allow
-                    }
-                },
-                scope: decision.scope.map(|scope| match scope {
-                    narsor_engine::engine::PermissionGrantScope::ExactOperation => {
-                        narsor_engine::api::PermissionGrantScopeDto::ExactOperation
-                    }
-                    narsor_engine::engine::PermissionGrantScope::CommandGroup => {
-                        narsor_engine::api::PermissionGrantScopeDto::CommandGroup
-                    }
-                    narsor_engine::engine::PermissionGrantScope::Pattern => {
-                        narsor_engine::api::PermissionGrantScopeDto::Pattern
-                    }
-                }),
-                pattern: decision.pattern.clone(),
-                message: decision.message.clone(),
-            }
-        }),
-    }
-}
-
 /// Builds the protocol summary for a conductor diagnosis.
 fn problem_of_failure(report: &narsor_engine::conductor::FailureReport) -> ActiveProblem {
     ActiveProblem {
@@ -261,13 +163,9 @@ const DEFAULT_BYTE_BUDGET: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
-    engine: Arc<Engine>,
-    store: ExecutionStore,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
-    active_tasks: ActiveTasks,
-    conductor: Option<Arc<ConductorRegistry>>,
     control: Option<Arc<narsor_engine::controller_protocol::ProtocolService>>,
     local_launch: Option<Arc<CatalogLaunchResolver>>,
     /// The workflows `GET /control/v1/workflows` lists.
@@ -281,11 +179,11 @@ struct AppState {
     branch_lister: Arc<dyn BranchLister>,
 }
 
-/// Builds the router: the three original read-only endpoints (U5/U2) plus
-/// the mutating surface U3 adds — `POST /tasks`, `POST
-/// /executions/{id}/resume`, `POST /executions/{id}/input`, `POST
-/// /executions/{id}/transition` and `GET /executions` — all behind the same
-/// owner gate (`auth`: the process token, or the owner's OIDC token).
+/// Builds the router: the execution reads (events, timeline, conversation,
+/// `GET /executions`), `POST /tasks` and the answers a waiting task takes
+/// (`input`, `permission`) — all behind the same owner gate (`auth`: the
+/// process token, or the owner's OIDC token). Every execution lives on a
+/// backend's storage and is driven by its runner; the daemon drives none.
 ///
 /// The identity routes (`/auth/v1/…`) sit outside it: a caller who is not
 /// the owner yet must be able to claim the installation.
@@ -302,8 +200,6 @@ struct AppState {
 /// `work_dir`), now read by the server that runs a task instead of by a CLI
 /// process that used to hold them directly.
 pub fn router(
-    engine: Arc<Engine>,
-    store: ExecutionStore,
     auth: OwnerAuth,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
@@ -312,8 +208,6 @@ pub fn router(
     let control = services.control.clone();
     let local = matches!(auth, OwnerAuth::Trusted { .. });
     let state = AppState {
-        engine,
-        store,
         workflows: services
             .workflows
             .unwrap_or_else(|| WorkflowResolver::new(catalog_dir.clone())),
@@ -324,8 +218,6 @@ pub fn router(
         catalog_dir,
         work_dir,
         harness_selector: services.harness_selector,
-        active_tasks: services.active_tasks,
-        conductor: services.conductor,
         control: control.clone(),
         local_launch: services.local_launch,
         branch_lister: services
@@ -341,52 +233,16 @@ pub fn router(
         )
         .route("/executions", get(get_executions))
         .route(
-            "/executions/{execution_id}/conductor",
-            get(get_conductor_state),
-        )
-        .route(
-            "/executions/{execution_id}/conductor/chat",
-            get(get_conductor_chat).post(post_conductor_chat),
-        )
-        .route(
-            "/executions/{execution_id}/conductor/proposals/{proposal_id}/confirm",
-            post(post_confirm_proposal),
-        )
-        .route(
-            "/executions/{execution_id}/conductor/proposals/{proposal_id}/reject",
-            post(post_reject_proposal),
-        )
-        .route(
-            "/executions/{execution_id}/conductor/decisions/{decision_id}/undo",
-            post(post_undo_decision),
-        )
-        .route(
             "/settings/agent-harness",
             get(get_harness_selection)
                 .put(put_harness_selection)
                 .delete(delete_harness_selection),
         )
-        .route(
-            "/executions/{execution_id}/stream",
-            get(get_execution_stream),
-        )
-        .route("/events/stream", get(get_global_stream))
         .route("/tasks", post(post_start_task))
-        .route("/executions/{execution_id}/resume", post(post_resume))
-        .route("/executions/{execution_id}/recover", post(post_recover))
-        .route(
-            "/executions/{execution_id}/operator-note",
-            post(post_operator_note),
-        )
-        .route("/executions/{execution_id}/interrupt", post(post_interrupt))
         .route("/executions/{execution_id}/input", post(post_input))
         .route(
             "/executions/{execution_id}/permission",
             post(post_permission_decision),
-        )
-        .route(
-            "/executions/{execution_id}/transition",
-            post(post_transition),
         );
     if let Some(control) = &control {
         owner = owner
@@ -635,26 +491,6 @@ fn local_storage_root(state: &AppState) -> PathBuf {
     state.work_dir.join("local-controller").join("storage")
 }
 
-fn execution_store_for(state: &AppState, execution_id: &str) -> Result<ExecutionStore, ApiError> {
-    if !is_safe_id(execution_id) {
-        return Err(ApiError::ExecutionNotFound);
-    }
-    let matches = execution_stores(state)?
-        .into_iter()
-        .filter(|store| store.exists(execution_id))
-        .collect::<Vec<_>>();
-    match matches.len() {
-        0 => Err(ApiError::ExecutionNotFound),
-        1 => Ok(matches
-            .into_iter()
-            .next()
-            .expect("one execution store match")),
-        _ => Err(ApiError::Conflict(format!(
-            "execution '{execution_id}' is ambiguous across backend storage"
-        ))),
-    }
-}
-
 /// Resolves an execution visible to one owner.  Runner storage is never
 /// enumerated as a tenant-visible namespace: the task projection is the
 /// authority linking an execution id to its backend-owned storage.
@@ -667,15 +503,8 @@ fn owner_execution_store_for(
         return Err(ApiError::ExecutionNotFound);
     }
     let mut matches = Vec::new();
-    if state.store.exists(execution_id) {
-        matches.push(state.store.clone());
-    }
     let Some(control) = &state.control else {
-        return match matches.len() {
-            0 => Err(ApiError::ExecutionNotFound),
-            1 => Ok(matches.pop().expect("one legacy execution store")),
-            _ => unreachable!("one legacy store can contribute at most once"),
-        };
+        return Err(ApiError::ExecutionNotFound);
     };
     let tasks = control.list_tasks(owner).map_err(|error| {
         ApiError::Internal(format!("could not resolve task projection: {error}"))
@@ -703,58 +532,8 @@ fn owner_execution_store_for(
         0 => Err(ApiError::ExecutionNotFound),
         1 => Ok(matches.pop().expect("one owner-visible execution store")),
         _ => Err(ApiError::Conflict(format!(
-            "execution '{execution_id}' is ambiguous across legacy and backend storage"
+            "execution '{execution_id}' is ambiguous across backend storage"
         ))),
-    }
-}
-
-/// Every local execution store the compatibility routes may inspect.
-///
-/// Runner storage is deliberately discovered from the backend's durable root:
-/// a queued task has no execution storage yet.  A missing local backend is
-/// normal for a fresh installation; any other directory-read error is not
-/// silently mistaken for a missing execution.
-fn execution_stores(state: &AppState) -> Result<Vec<ExecutionStore>, ApiError> {
-    let mut stores = vec![state.store.clone()];
-    let storage_root = local_storage_root(state);
-    let entries = match std::fs::read_dir(&storage_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(stores),
-        Err(error) => {
-            return Err(ApiError::Internal(format!(
-                "could not read runner storage '{}': {error}",
-                storage_root.display()
-            )))
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            ApiError::Internal(format!(
-                "could not enumerate runner storage '{}': {error}",
-                storage_root.display()
-            ))
-        })?;
-        stores.push(ExecutionStore::new(entry.path().join("state")));
-    }
-    Ok(stores)
-}
-
-fn require_execution(state: &AppState, execution_id: &str) -> Result<(), ApiError> {
-    execution_store_for(state, execution_id).map(|_| ())
-}
-
-/// Legacy execution mutations are driven by the daemon's in-process engine.
-/// Runner-owned executions must instead be controlled through their task
-/// protocol; accepting them here would read a different store and fail later.
-fn require_legacy_execution(state: &AppState, execution_id: &str) -> Result<(), ApiError> {
-    if is_safe_id(execution_id) && state.store.exists(execution_id) {
-        Ok(())
-    } else if execution_store_for(state, execution_id).is_ok() {
-        Err(ApiError::Conflict(format!(
-            "execution '{execution_id}' is runner-owned; use its task lifecycle operation"
-        )))
-    } else {
-        Err(ApiError::ExecutionNotFound)
     }
 }
 
@@ -810,225 +589,6 @@ fn read_events(
         .event_log(execution_id)
         .read_after(after, usize::MAX)?
         .0)
-}
-
-/// `GET /executions/{execution_id}/conductor`
-///
-/// Read straight from the conductor's store (D55): its state file is
-/// replaced atomically and its chat is append-only, so a reader needs no
-/// part in the actor's serialization. An execution without a `conductor/`
-/// directory answers with the empty state.
-async fn get_conductor_state(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-) -> Result<Json<ConductorStateResponse>, ApiError> {
-    let response = run_blocking(move || {
-        require_legacy_execution(&state, &execution_id)?;
-        read_conductor_state(&state.store, &execution_id)
-    })
-    .await?;
-    Ok(Json(response))
-}
-
-/// What the conductor of `execution_id` keeps, from its store.
-fn read_conductor_state(
-    store: &ExecutionStore,
-    execution_id: &str,
-) -> Result<ConductorStateResponse, ApiError> {
-    let conductor = ConductorStore::new(store.paths(), execution_id);
-    let unanswered = conductor
-        .unanswered_chat()?
-        .into_iter()
-        .map(|entry| entry.id)
-        .collect();
-    Ok(ConductorStateResponse::new(
-        conductor.load_state()?,
-        unanswered,
-    ))
-}
-
-/// `GET /executions/{execution_id}/conductor/chat?after=<sequence>`
-///
-/// The chat history (R26) after `after`, in the order it was written.
-async fn get_conductor_chat(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-    Query(query): Query<EventsQuery>,
-) -> Result<Json<ConductorChatResponse>, ApiError> {
-    let response = run_blocking(move || {
-        require_legacy_execution(&state, &execution_id)?;
-        read_conductor_chat(&state.store, &execution_id, query.after)
-    })
-    .await?;
-    Ok(Json(response))
-}
-
-/// The conductor's chat of `execution_id` after sequence `after`.
-fn read_conductor_chat(
-    store: &ExecutionStore,
-    execution_id: &str,
-    after: u64,
-) -> Result<ConductorChatResponse, ApiError> {
-    let conductor = ConductorStore::new(store.paths(), execution_id);
-    Ok(ConductorChatResponse {
-        entries: conductor
-            .read_chat_after(after)?
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-    })
-}
-
-/// The conductor of this daemon, for the endpoints only it can serve.
-fn require_conductor(state: &AppState) -> Result<Arc<ConductorRegistry>, ApiError> {
-    state
-        .conductor
-        .clone()
-        .ok_or_else(|| ApiError::Internal("no conductor runs behind this API server".into()))
-}
-
-/// `POST /executions/{execution_id}/conductor/chat` — the operator writes to
-/// the conductor (F4).
-///
-/// Answers `202` with the entry as written, at once: the conductor's answer
-/// comes later, as further entries of the same history (`GET .../chat`),
-/// whichever client wrote the message.
-async fn post_conductor_chat(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-    Json(body): Json<ChatMessageRequest>,
-) -> Result<(StatusCode, Json<ChatEntryDto>), ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    let conductor = require_conductor(&state)?;
-    let text = body.text.trim();
-    if text.is_empty() {
-        return Err(ApiError::Request {
-            code: "empty_message",
-            message: "a chat message cannot be empty".to_string(),
-        });
-    }
-    let entry = conductor.post_chat(&execution_id, text)?;
-    Ok((StatusCode::ACCEPTED, Json(entry.into())))
-}
-
-/// `POST /executions/{execution_id}/conductor/proposals/{proposal_id}/confirm`
-/// — carries out a proposal of the conductor's (R28).
-///
-/// Idempotent: a second confirmation answers the first one's outcome with
-/// `repeated: true` and does nothing. A proposal about a moment the
-/// execution has moved on from is `409` with the reason (KTD9). When
-/// carrying it out starts a pass, the pass runs in the background like any
-/// other and can be interrupted.
-async fn post_confirm_proposal(
-    State(state): State<AppState>,
-    Path((execution_id, proposal_id)): Path<(String, String)>,
-) -> Result<Json<ProposalOutcome>, ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    let conductor = require_conductor(&state)?;
-    let execution = state.store.load_execution(&execution_id)?;
-    let definition = load_definition_for(&state, &execution)?;
-
-    let confirmed = conductor.confirm_proposal(&definition, &execution_id, &proposal_id)?;
-    if let Some(pass) = confirmed.pass {
-        spawn_active(&state, execution_id.clone(), async move {
-            let _ = pass.run_to_completion(&definition).await;
-        });
-    }
-    Ok(Json(confirmed.outcome))
-}
-
-/// `POST /executions/{execution_id}/conductor/proposals/{proposal_id}/reject`
-/// — the operator turns a proposal down; it can no longer be confirmed.
-async fn post_reject_proposal(
-    State(state): State<AppState>,
-    Path((execution_id, proposal_id)): Path<(String, String)>,
-) -> Result<Json<ProposalOutcome>, ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    let conductor = require_conductor(&state)?;
-    Ok(Json(
-        conductor.reject_proposal(&execution_id, &proposal_id)?,
-    ))
-}
-
-/// `POST /executions/{execution_id}/conductor/decisions/{decision_id}/undo` —
-/// undoes a chosen output of the conductor's (KTD13).
-///
-/// A pass driving the execution is interrupted first; the answer carries a
-/// warning when a step after the decision had already started. Anything but
-/// a chosen output is `400`; a decision already undone is `409`.
-async fn post_undo_decision(
-    State(state): State<AppState>,
-    Path((execution_id, decision_id)): Path<(String, String)>,
-) -> Result<Json<UndoOutcome>, ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    let conductor = require_conductor(&state)?;
-    let execution = state.store.load_execution(&execution_id)?;
-    let definition = load_definition_for(&state, &execution)?;
-
-    let active_tasks = state.active_tasks.clone();
-    let interrupted = execution_id.clone();
-    let outcome = conductor
-        .undo_decision(&definition, &execution_id, &decision_id, move || {
-            if let Some(handle) = active_tasks.get(&interrupted) {
-                handle.abort();
-            }
-        })
-        .await?;
-    Ok(Json(outcome))
-}
-
-impl From<ProposalError> for ApiError {
-    fn from(error: ProposalError) -> Self {
-        match error {
-            ProposalError::NotFound(_) => ApiError::ExecutionNotFound,
-            ProposalError::Stale(message) => ApiError::Refused {
-                code: "stale_proposal",
-                message,
-            },
-            ProposalError::Settled(message) => ApiError::Refused {
-                code: "proposal_settled",
-                message,
-            },
-            ProposalError::Busy(message) => ApiError::Refused {
-                code: "execution_busy",
-                message,
-            },
-            ProposalError::Invalid(message) => ApiError::Request {
-                code: "invalid_proposal",
-                message,
-            },
-            ProposalError::Failed(message) => ApiError::Internal(message),
-        }
-    }
-}
-
-impl From<UndoError> for ApiError {
-    fn from(error: UndoError) -> Self {
-        match error {
-            UndoError::NotFound(_) => ApiError::ExecutionNotFound,
-            UndoError::NotUndoable(message) => ApiError::Request {
-                code: "not_undoable",
-                message,
-            },
-            UndoError::AlreadyUndone(message) => ApiError::Refused {
-                code: "already_undone",
-                message,
-            },
-            UndoError::Superseded(message) => ApiError::Refused {
-                code: "decision_superseded",
-                message,
-            },
-            UndoError::Cancelled(message) => ApiError::Refused {
-                code: "execution_cancelled",
-                message,
-            },
-            UndoError::Busy(message) => ApiError::Refused {
-                code: "execution_busy",
-                message,
-            },
-            UndoError::Failed(message) => ApiError::Internal(message),
-        }
-    }
 }
 
 /// `GET /executions/{execution_id}/timeline`
@@ -1133,23 +693,6 @@ fn read_conversation(
 // Mutating endpoints (U3)
 // ---------------------------------------------------------------------------
 
-/// The definition an execution was started from, re-resolved the way `narsor
-/// resume`/`input` already do it ([`tasks::resolve_definition`]): from the
-/// path or workflow name pinned in the execution's own metadata, never from a
-/// caller-supplied override — there is no REST equivalent of the CLI's
-/// `--file` here, since a client of this API has no local filesystem
-/// relationship to the daemon's catalogue to point at.
-fn load_definition_for(
-    state: &AppState,
-    execution: &narsor_engine::domain::WorkflowExecution,
-) -> Result<narsor_engine::domain::WorkflowDefinition, ApiError> {
-    let resolved = tasks::resolve_definition(&state.catalog_dir, state.store.paths(), execution)
-        .map_err(|error| ApiError::Internal(error.to_string()))?;
-    resolved
-        .load()
-        .map_err(|error| ApiError::Internal(error.to_string()))
-}
-
 /// `POST /tasks` — starts a new execution and drives it in the background.
 ///
 /// Mirrors `narsor run`'s own two steps
@@ -1228,317 +771,84 @@ async fn post_start_task(
     Ok((StatusCode::ACCEPTED, Json(StartTaskResponse { task })))
 }
 
-/// `POST /executions/{execution_id}/resume` — resumes a paused execution.
+/// `POST /executions/{execution_id}/input` — delivers a person's answer to
+/// an execution that waits for one.
 ///
-/// Phase 1 ([`Engine::try_begin_resume`]) runs synchronously: if another pass
-/// already holds this execution, this returns `409` immediately, with
-/// nothing spawned. On success, phase 2
-/// ([`narsor_engine::engine::RunHandle::run_to_completion`]) is handed to
-/// `tokio::spawn` and the handler answers `202` right away.
-async fn post_resume(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    let execution = state.store.load_execution(&execution_id)?;
-    let definition = load_definition_for(&state, &execution)?;
-
-    let handle = state.engine.try_begin_resume(&execution_id)?;
-    spawn_active(&state, execution_id.clone(), async move {
-        let _ = handle.run_to_completion(&definition).await;
-    });
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(AcceptedResponse { execution_id }),
-    ))
-}
-
-/// `POST /executions/{execution_id}/recover` — explicitly starts a new attempt
-/// from the failed or interrupted state. This is separate from `/resume` so a
-/// crash is never replayed merely because the daemon restarted.
-async fn post_recover(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-    Json(request): Json<RecoveryRequest>,
-) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(begin_recovery(&state, execution_id, request)?),
-    ))
-}
-
-/// Starts the recovery of a legacy execution and drives it in the
-/// background — the one body of `/executions/{id}/recover` and the control
-/// API's recover.
-fn begin_recovery(
-    state: &AppState,
-    execution_id: String,
-    request: RecoveryRequest,
-) -> Result<AcceptedResponse, ApiError> {
-    let execution = state.store.load_execution(&execution_id)?;
-    let definition = load_definition_for(state, &execution)?;
-
-    let handle = state.engine.try_begin_recover_with(
-        &execution_id,
-        Recovery::by_operator(request.comment, request.episode),
-    )?;
-    spawn_active(state, execution_id.clone(), async move {
-        let _ = handle.run_to_completion(&definition).await;
-    });
-    Ok(AcceptedResponse { execution_id })
-}
-
-/// Stores an operator instruction for the next agent attempt. Terminal
-/// executions are valid targets; an active run must be interrupted first.
-async fn post_operator_note(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-    Json(body): Json<OperatorNoteRequest>,
-) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    if state.engine.is_active(&execution_id) {
-        return Err(ApiError::Conflict(format!(
-            "execution '{execution_id}' is being driven in the background right now"
-        )));
-    }
-    if body.note.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "operator note cannot be empty".to_string(),
-        ));
-    }
-    let mut execution = state.store.load_execution(&execution_id)?;
-    let metadata = execution
-        .metadata
-        .as_object_mut()
-        .ok_or_else(|| ApiError::Internal("execution metadata is not an object".to_string()))?;
-    let engine = metadata
-        .entry("engine")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| ApiError::Internal("engine metadata is not an object".to_string()))?;
-    engine.insert(
-        "operator_recovery_note".to_string(),
-        Value::String(body.note),
-    );
-    state.store.save_execution(&execution)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(AcceptedResponse { execution_id }),
-    ))
-}
-
-/// Aborts the daemon task that owns an active workflow pass. The executor's
-/// child-process guard kills an in-flight harness when that task is dropped.
-async fn post_interrupt(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-) -> Result<Json<AcceptedResponse>, ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    if !state.engine.is_active(&execution_id) {
-        return Err(ApiError::Conflict(format!(
-            "execution '{execution_id}' is not being processed"
-        )));
-    }
-    let handle = state.active_tasks.get(&execution_id).ok_or_else(|| {
-        ApiError::Conflict(format!("execution '{execution_id}' cannot be interrupted"))
-    })?;
-    handle.abort();
-    Ok(Json(AcceptedResponse { execution_id }))
-}
-
-fn spawn_active<F>(state: &AppState, execution_id: String, future: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    state.active_tasks.spawn(execution_id, future);
-}
-
-/// `POST /executions/{execution_id}/input` — delivers a person's answer to a
-/// paused execution.
-///
-/// The body is a [`HumanInputDelivery`] verbatim — it already derives
-/// `Serialize`/`Deserialize` for exactly this reason, so no separate DTO
-/// duplicates its shape. Same two-phase split as [`post_resume`].
-///
-/// Whoever calls this is the operator: `answered_by` is not on the wire.
-/// A delivery naming the `episode` of a request that is no longer pending
-/// is `409`, checked by `human::resume` on the same read it answers from, so
-/// of two concurrent answers to one request exactly one is accepted. An
-/// invalid answer is `400` with the reason.
+/// Whoever calls this is the operator: `answered_by` is not on the wire. The
+/// answer goes to the execution's task through the control plane, and its
+/// runner takes it on its next poll. An execution no task of the owner runs
+/// is `404`; one that waits for nothing is `409`.
 async fn post_input(
     State(state): State<AppState>,
     Extension(owner): Extension<OwnerRef>,
     Path(execution_id): Path<String>,
-    Json(delivery): Json<narsor_engine::api::HumanInputDeliveryDto>,
+    Json(delivery): Json<HumanInputDeliveryDto>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    let delivery = engine_delivery(delivery);
     if delivery.permission_decision.is_some() {
         return Err(ApiError::BadRequest(
             "permission decisions must use the dedicated /permission endpoint".into(),
         ));
     }
-    // Runner-owned executions live on backend storage. Route their answer
-    // through the task protocol so the runner consumes it on its next poll;
-    // the legacy in-process engine path below remains for historic work.
-    if let Some(control) = &state.control {
-        let tasks = control.list_tasks(&owner).map_err(protocol_error_as_api)?;
-        if let Some(task) = tasks.tasks.into_iter().find(|task| {
-            task.runner
-                .as_ref()
-                .and_then(|runner| runner.execution_cursor.execution_id.as_deref())
-                == Some(execution_id.as_str())
-        }) {
-            let pending_input_id = task
-                .runner
-                .as_ref()
-                .and_then(|runner| runner.pending_input.as_ref())
-                .map(|input| input.id.clone())
-                .ok_or_else(|| ApiError::Conflict("execution is not waiting for input".into()))?;
-            control
-                .submit_input(
-                    &owner,
-                    task.task_id.as_str(),
-                    narsor_engine::controller_protocol::SubmitInputRequest {
-                        pending_input_id,
-                        idempotency_key: uuid::Uuid::new_v4().to_string(),
-                        delivery: protocol_delivery(&delivery),
-                    },
-                )
-                .map_err(protocol_error_as_api)?;
-            return Ok((
-                StatusCode::ACCEPTED,
-                Json(AcceptedResponse { execution_id }),
-            ));
-        }
-    }
-    require_legacy_execution(&state, &execution_id)?;
-    let execution = state.store.load_execution(&execution_id)?;
-    let definition = load_definition_for(&state, &execution)?;
-
-    let handle =
-        state
-            .engine
-            .try_begin_deliver_human_input(&definition, &execution_id, &delivery)?;
-    spawn_active(&state, execution_id.clone(), async move {
-        let _ = handle.run_to_completion(&definition).await;
-    });
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(AcceptedResponse { execution_id }),
-    ))
+    submit_to_task(&state, &owner, execution_id, delivery, "input")
 }
 
 /// `POST /executions/{execution_id}/permission` — resolves one durable
-/// Claude Code permission request. The separate route is the only HTTP path
-/// that can invoke the engine's permission continuation.
+/// Claude Code permission request, through the execution's task like
+/// [`post_input`].
 async fn post_permission_decision(
     State(state): State<AppState>,
     Extension(owner): Extension<OwnerRef>,
     Path(execution_id): Path<String>,
     Json(dto): Json<narsor_engine::api::PermissionDecisionRequestDto>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    let delivery = engine_delivery(narsor_engine::api::HumanInputDeliveryDto {
-        episode: Some(dto.episode.clone()),
-        permission_decision: Some(dto.permission_decision.clone()),
+    let delivery = HumanInputDeliveryDto {
+        episode: Some(dto.episode),
+        permission_decision: Some(dto.permission_decision),
         ..Default::default()
-    });
-    let decision = delivery
-        .permission_decision
-        .clone()
-        .expect("provided above");
-    let episode = delivery.episode.as_deref().expect("provided above");
-    if let Some(control) = &state.control {
-        let tasks = control.list_tasks(&owner).map_err(protocol_error_as_api)?;
-        if let Some(task) = tasks.tasks.into_iter().find(|task| {
-            task.runner
-                .as_ref()
-                .and_then(|runner| runner.execution_cursor.execution_id.as_deref())
-                == Some(execution_id.as_str())
-        }) {
-            let pending_input_id = task
-                .runner
-                .as_ref()
-                .and_then(|runner| runner.pending_input.as_ref())
-                .map(|input| input.id.clone())
-                .ok_or_else(|| {
-                    ApiError::Conflict("execution is not waiting for permission".into())
-                })?;
-            control
-                .submit_input(
-                    &owner,
-                    task.task_id.as_str(),
-                    narsor_engine::controller_protocol::SubmitInputRequest {
-                        pending_input_id,
-                        idempotency_key: uuid::Uuid::new_v4().to_string(),
-                        delivery: protocol_delivery(&delivery),
-                    },
-                )
-                .map_err(protocol_error_as_api)?;
-            return Ok((
-                StatusCode::ACCEPTED,
-                Json(AcceptedResponse { execution_id }),
-            ));
-        }
-    }
-    require_legacy_execution(&state, &execution_id)?;
-    let execution = state.store.load_execution(&execution_id)?;
-    let definition = load_definition_for(&state, &execution)?;
-    let handle =
-        state
-            .engine
-            .try_begin_resolve_permission(&definition, &execution_id, decision, episode)?;
-    spawn_active(&state, execution_id.clone(), async move {
-        let _ = handle.run_to_completion(&definition).await;
-    });
+    };
+    submit_to_task(&state, &owner, execution_id, delivery, "permission")
+}
+
+/// Hands `delivery` to the task whose runner drives `execution_id`, as the
+/// answer to its pending input.
+fn submit_to_task(
+    state: &AppState,
+    owner: &OwnerRef,
+    execution_id: String,
+    delivery: HumanInputDeliveryDto,
+    waiting_for: &str,
+) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
+    let control = state.control.as_ref().ok_or(ApiError::ExecutionNotFound)?;
+    let tasks = control.list_tasks(owner).map_err(protocol_error_as_api)?;
+    let runner = tasks
+        .tasks
+        .into_iter()
+        .find_map(|task| {
+            let runner = task.runner?;
+            (runner.execution_cursor.execution_id.as_deref() == Some(execution_id.as_str()))
+                .then_some((task.task_id, runner))
+        })
+        .ok_or(ApiError::ExecutionNotFound)?;
+    let (task_id, runner) = runner;
+    let pending_input_id = runner
+        .pending_input
+        .map(|input| input.id)
+        .ok_or_else(|| ApiError::Conflict(format!("execution is not waiting for {waiting_for}")))?;
+    control
+        .submit_input(
+            owner,
+            task_id.as_str(),
+            narsor_engine::controller_protocol::SubmitInputRequest {
+                pending_input_id,
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
+                delivery,
+            },
+        )
+        .map_err(protocol_error_as_api)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(AcceptedResponse { execution_id }),
     ))
-}
-
-/// `POST /executions/{execution_id}/transition` — a manual or forced
-/// transition, server-side.
-///
-/// Reimplements `src/tui/app.rs`'s `write_transition` (reached today only
-/// through `manual_transition`/`force_transition`, both fed from a menu the
-/// TUI already built out of *legal* choices), now in
-/// [`Engine::take_manual_transition`], which takes the execution's claim — a
-/// concurrently-driven execution is `409` — and — the one check the TUI
-/// never needed, because its menu could not offer an illegal choice in the
-/// first place — the requested transition is validated against the
-/// workflow's own declared transitions before anything is written:
-///
-/// * ordinary (`force: false`): `label` must be one of the current state's
-///   declared `transitions`; anything else is `400`.
-/// * forced (`force: true`, D30): the workflow must allow the jump from the
-///   current state — always, in a definition in the unified state shape; as
-///   its `allow_manual_override` says, in the legacy shape — and `target`
-///   must name a state the workflow actually has; either failing is `400`.
-///
-/// Once validated, the event sequence and status update are byte-for-byte
-/// the ones `write_transition` writes, in the same order.
-async fn post_transition(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-    Json(body): Json<TransitionRequest>,
-) -> Result<Json<ExecutionSummary>, ApiError> {
-    require_legacy_execution(&state, &execution_id)?;
-    let execution = state.store.load_execution(&execution_id)?;
-    let definition = load_definition_for(&state, &execution)?;
-
-    // The claim the engine takes for the transition is what keeps it from
-    // racing a background pass's own appends and saves: an execution being
-    // driven right now is `409`.
-    let execution = state.engine.take_manual_transition(
-        &definition,
-        &execution_id,
-        &ManualTransition::by_operator(body.label, body.target, body.force),
-    )?;
-
-    Ok(Json(ExecutionSummary::from(&execution)))
 }
 
 /// `GET /executions` — every stored execution, summarised.
@@ -1571,19 +881,9 @@ where
 
 fn list_executions(state: &AppState, owner: &OwnerRef) -> Result<ExecutionListResponse, ApiError> {
     let mut executions = std::collections::BTreeMap::new();
+    // An execution URL names no backend. Do not advertise an ID for which a
+    // later direct read would be ambiguous.
     let mut ambiguous = std::collections::BTreeSet::new();
-    for store in std::iter::once(state.store.clone()) {
-        for id in store.list_execution_ids()? {
-            // An execution URL names no backend. Do not advertise an ID for
-            // which a later direct read would be ambiguous.
-            if !ambiguous.insert(id.clone()) {
-                executions.remove(&id);
-                continue;
-            }
-            let execution = store.load_execution(&id)?;
-            executions.insert(id, build_summary(&store, &execution)?);
-        }
-    }
     if let Some(control) = &state.control {
         let tasks = control.list_tasks(owner).map_err(|error| {
             ApiError::Internal(format!("could not resolve task projection: {error}"))
@@ -1691,172 +991,4 @@ fn conductor_activity(
         .and_then(|state| state.failure.as_ref())
         .is_some_and(|report| report.key == failure.key());
     (!concluded).then(|| activity_of_owed_diagnosis(&failure, execution))
-}
-
-// ---------------------------------------------------------------------------
-// SSE endpoints (U4)
-// ---------------------------------------------------------------------------
-
-/// How often the connection sends a keep-alive comment frame while no real
-/// event fires — long enough not to spam an idle connection, short enough
-/// that a client (or an intermediary proxy) never mistakes a quiet execution
-/// for a dead one.
-const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
-
-fn sse_keep_alive() -> KeepAlive {
-    KeepAlive::new()
-        .interval(SSE_KEEP_ALIVE_INTERVAL)
-        .text("keep-alive")
-}
-
-/// Adapts [`Engine::subscribe`]'s broadcast receiver into the stream an axum
-/// [`Sse`] response wants: `Result<sse::Event, Infallible>`.
-///
-/// This is the one seam both SSE endpoints share — the only difference
-/// between "one execution's events" and "every execution's events"
-/// (`filter_execution_id`) is whether a `None` filter lets everything
-/// through.
-///
-/// Two failure-shaped inputs are deliberately swallowed as `None` (skip this
-/// item, keep the stream open) rather than turned into a stream `Err`,
-/// because `Sse`'s item type here is `Infallible` — surfacing either as an
-/// `Err` would have no representable value to construct and, more to the
-/// point, would end the whole SSE stream for one bad event, which is exactly
-/// what the plan says must not happen:
-///
-/// * [`BroadcastStreamRecvError::Lagged`] — this receiver fell behind the
-///   engine's broadcast buffer and missed `n` events irretrievably (the
-///   comment on [`Engine::subscribe`] already documents that a slow reader
-///   never blocks or fails the engine). Logged as a warning so the operator
-///   can see it happened, then the stream simply continues from the next
-///   event the buffer still holds.
-/// * A `json_data` serialization failure — [`Event`] always serializes in
-///   practice (every field is a plain, already-`Serialize` domain type), so
-///   this is defense in depth, not a path any test expects to exercise.
-fn sse_event_stream(
-    rx: broadcast::Receiver<Event>,
-    filter_execution_id: Option<String>,
-) -> impl Stream<Item = Result<SseEvent, Infallible>> {
-    BroadcastStream::new(rx).filter_map(move |item| {
-        let event = match item {
-            Ok(event) => event,
-            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    skipped,
-                    execution_id = filter_execution_id.as_deref().unwrap_or("*"),
-                    "api: SSE client lagged behind the engine's event broadcast; \
-                     some events were not delivered to it"
-                );
-                return None;
-            }
-        };
-
-        if let Some(wanted) = &filter_execution_id {
-            if &event.workflow_execution_id != wanted {
-                return None;
-            }
-        }
-
-        match SseEvent::default().event("engine").json_data(&event) {
-            Ok(sse_event) => Some(Ok(sse_event)),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    execution_id = %event.workflow_execution_id,
-                    "api: failed to encode an engine event as SSE data; dropping it"
-                );
-                None
-            }
-        }
-    })
-}
-
-/// `GET /executions/{execution_id}/stream` — an SSE stream of every event the
-/// engine publishes for this one execution (AE5), filtered from the same
-/// broadcast every other subscriber (including the global stream below) also
-/// reads from.
-async fn get_execution_stream(
-    State(state): State<AppState>,
-    Path(execution_id): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
-    require_execution(&state, &execution_id)?;
-    let rx = state.engine.subscribe();
-    let stream = sse_event_stream(rx, Some(execution_id));
-    Ok(Sse::new(stream).keep_alive(sse_keep_alive()))
-}
-
-/// `GET /events/stream` — an SSE stream of every event from every execution
-/// the engine runs, unfiltered.
-async fn get_global_stream(
-    State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let rx = state.engine.subscribe();
-    let stream = sse_event_stream(rx, None);
-    Sse::new(stream).keep_alive(sse_keep_alive())
-}
-
-#[cfg(test)]
-mod sse_stream_tests {
-    //! Unit-level coverage of [`sse_event_stream`]'s `Lagged` handling.
-    //!
-    //! This is deliberately not an HTTP-level test (unlike the rest of U4's
-    //! test list, in `tests/sse.rs`): reproducing a real `Lagged` over an
-    //! actual loopback connection would mean overrunning
-    //! [`narsor_engine::engine::runner::EVENT_CHANNEL_CAPACITY`] (1024) faster than
-    //! the kernel's socket buffers and axum's own body-polling ever drain
-    //! it — which depends on OS buffer sizing and scheduling, not on
-    //! anything this code controls, and would make the test flaky. Building
-    //! a small broadcast channel directly and driving
-    //! [`sse_event_stream`] — the exact function both SSE handlers call —
-    //! exercises the same `Err(Lagged(_))` branch deterministically.
-    use super::*;
-    use chrono::Utc;
-    use narsor_engine::domain::EventData;
-
-    #[tokio::test]
-    async fn lagged_receiver_skips_missed_events_but_keeps_streaming() {
-        // Capacity 2: sending 5 events before anyone reads guarantees the
-        // receiver is behind by more than the buffer holds.
-        let (tx, rx) = broadcast::channel(2);
-        let stream = sse_event_stream(rx, None);
-        tokio::pin!(stream);
-
-        for sequence in 1..=5u64 {
-            let _ = tx.send(sample_event("exec-1", sequence));
-        }
-        drop(tx);
-
-        let mut received = Vec::new();
-        while let Some(item) = stream.next().await {
-            // The stream's item type is `Result<SseEvent, Infallible>` —
-            // asserting it is always `Ok` is the point: a lagged receiver
-            // must never surface as a stream error.
-            let event = item.expect("a lagged receiver must not close the stream with an error");
-            received.push(event);
-        }
-
-        // Only the last two of the five sends still fit in a
-        // capacity-2 channel; the rest were overwritten before this
-        // receiver ever read them. What matters here is not exactly which
-        // sequence numbers survive (that's the broadcast channel's own
-        // contract) but that the stream degraded gracefully: it kept
-        // producing well-formed events after the loss instead of ending.
-        assert_eq!(
-            received.len(),
-            2,
-            "the receiver should see exactly the events still held in the buffer"
-        );
-    }
-
-    fn sample_event(execution_id: &str, sequence: u64) -> Event {
-        Event {
-            id: format!("event-{sequence}"),
-            workflow_execution_id: execution_id.to_string(),
-            timestamp: Utc::now(),
-            data: EventData::StateEntered {
-                state_id: "plan".to_string(),
-            },
-            sequence,
-        }
-    }
 }

@@ -130,8 +130,6 @@ Shortcuts do nothing while the focus is in a text field. `?` shows them.
 - `u` refreshes the list (`R` opens the repositories, as in the TUI).
 - A new task that is being sent is shown in the new-task dialog
   (*wysyłanie…*, *nie wysłano* with *Ponów*), not as a row of the list.
-- History lists archived tasks and executions from before the task
-  scheduler (with *Odzyskaj*); the steps and conversation of such an old
-  execution are not shown — use the TUI or `narsor-cli task history`.
+- History lists archived tasks.
 - No drag and drop in the queue; use ▲ ▼ or `K` / `J`.
 - No OIDC sign-in in the browser (paste a token).
