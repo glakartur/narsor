@@ -54,31 +54,6 @@ narsor-cli validate workflows/compound-engineering-change.yaml
 narsor-cli run workflows/compound-engineering-change.yaml --input description="Add a health endpoint"
 ```
 
-# Example: observer author
-
-`observer-author.yaml` is an example, not a built-in. An agent writes the
-script of an [observer](../docs/user/observers.md) and a description of it,
-from the script contract and the example scripts. Then a person accepts the
-draft or sends it back to the agent with a comment:
-
-```text
-draft -> review -> accepted
-  ^        |
-  +--------+ revise, with a comment
-```
-
-The workflow does not save, try or approve the script, and the task gets no
-rights on observers. After `accept`, the owner continues with the CLI:
-`observer create`, `observer script set`, `observer dry-run` and
-`observer approve`. The repository of the task must be a checkout of Narsor,
-or hold a copy of `docs/user/observers.md` and `workflows/observers/examples/`.
-
-```sh
-narsor-cli validate workflows/observer-author.yaml
-narsor-cli run workflows/observer-author.yaml --input name=jira-new \
-  --input source=jira --input goal="A triage task for every new bug in project ABC"
-```
-
 # Example observer scripts
 
 [`observers/examples/`](observers/examples/) has three observer scripts. They

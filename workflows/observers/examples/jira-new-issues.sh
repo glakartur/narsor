@@ -12,7 +12,6 @@
 #                   "jql": "project = ABC AND issuetype = Bug",
 #                   "fields": ["key"]}'
 #   narsor-cli observer script set jira-new --file jira-new-issues.sh
-#   narsor-cli observer dry-run jira-new
 #   narsor-cli observer approve jira-new --version 1
 #
 # Condition (a JSON object, given to the script as it is):
@@ -44,8 +43,12 @@
 #  * First run with --import-backlog, and every later run: one task for
 #    each matching issue with an id above last_id, oldest first, at most
 #    max_results per run; the next run continues from there.
-# The effect key of a task is the issue key, so an issue never gets two
-# tasks, even when a run fails half-way and the next run sees it again.
+# Narsor does not stop a second task for the same issue: the state does.
+# When a task is not created, the script stops creating tasks, logs the
+# reason on stderr and still prints the state up to the last task it
+# created, so the next run continues from there and repeats no task. Only
+# when the state of a successful run is not saved can an issue get a second
+# task (docs/user/observers.md).
 #
 # Tests: when FAKE_SOURCE_DIR is set, the script reads the answer of Jira
 # from "$FAKE_SOURCE_DIR/search.json" and does not use the network.
@@ -178,8 +181,10 @@ while IFS= read -r issue; do
     key=$(printf '%s' "$issue" | jq -r '.key')
     data=$(printf '%s' "$issue" | jq -c '.data')
     # stdout is the result document: the messages of narsor-cli go to stderr.
-    narsor-cli task create --effect-key "$key" --data "$data" </dev/null >&2 ||
-        fail "the task of $key was not created"
+    if ! narsor-cli task create --data "$data" </dev/null >&2; then
+        printf '%s: the task of %s was not created; the next run tries again\n' "$me" "$key" >&2
+        break
+    fi
     newest=$(printf '%s' "$issue" | jq -r '.id')
 done <<EOF
 $issues

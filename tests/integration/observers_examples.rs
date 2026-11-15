@@ -44,13 +44,19 @@ impl Sandbox {
         fs::create_dir_all(path.join("source")).expect("create the fake source");
         fs::create_dir_all(path.join("bin")).expect("create the stand-in bin");
         let stub = path.join("bin/narsor-cli");
-        // One argument per line, a blank line after each call.
+        // One argument per line, a blank line after each call. Call number
+        // `fail_from` and every later one fail (see `Sandbox::fail_from`).
         fs::write(
             &stub,
             format!(
                 "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done >> '{log}'\n\
-                 printf '\\n' >> '{log}'\necho 'created' >&2\n",
-                log = path.join("calls").display()
+                 printf '\\n' >> '{log}'\n\
+                 count=$(( $(cat '{count}' 2>/dev/null || echo 0) + 1 )); echo $count > '{count}'\n\
+                 if [ -f '{fail}' ] && [ $count -ge $(cat '{fail}') ]; then echo 'refused' >&2; exit 1; fi\n\
+                 echo 'created' >&2\n",
+                log = path.join("calls").display(),
+                count = path.join("count").display(),
+                fail = path.join("fail_from").display(),
             ),
         )
         .expect("write the stand-in narsor-cli");
@@ -64,6 +70,12 @@ impl Sandbox {
             body.to_string(),
         )
         .expect("write a fake answer");
+    }
+
+    /// The stand-in `narsor-cli` fails from its call number `call` (from 1)
+    /// on.
+    fn fail_from(&self, call: usize) {
+        fs::write(self.path.join("fail_from"), call.to_string()).expect("write fail_from");
     }
 
     /// The source answers `name` with HTTP `code`.
@@ -130,7 +142,6 @@ fn input(source: &str, condition: Value, state: Value, watches: Value) -> Value 
         "condition": condition,
         "state": state,
         "watches": watches,
-        "dry_run": false,
         "first_run": state.is_null(),
         "import_backlog": false,
     })
@@ -198,9 +209,8 @@ fn jira_creates_one_task_per_new_issue_with_only_the_mapped_fields() {
     assert_eq!(output.state, json!({"last_id": 102}));
     assert_eq!(run.calls.len(), 2, "{:?}", run.calls);
     for (call, key) in run.calls.iter().zip(["ABC-101", "ABC-102"]) {
-        assert_eq!(call[..4], ["task", "create", "--effect-key", key]);
-        assert_eq!(call[4], "--data");
-        let data: Value = serde_json::from_str(&call[5]).expect("the data is JSON");
+        assert_eq!(call[..3], ["task", "create", "--data"]);
+        let data: Value = serde_json::from_str(&call[3]).expect("the data is JSON");
         assert_eq!(
             data,
             json!({"key": key, "summary": format!("Summary of {key}")})
@@ -210,6 +220,38 @@ fn jira_creates_one_task_per_new_issue_with_only_the_mapped_fields() {
         !run.calls.concat().concat().contains("Kowalski"),
         "no personal data leaves the script"
     );
+}
+
+/// A task that is not created stops the run's creates; the state covers the
+/// tasks created before it, so the next run repeats none of them.
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn jira_stops_at_a_task_not_created_and_keeps_the_state_of_the_tasks_before_it() {
+    let sandbox = Sandbox::new();
+    sandbox.answer(
+        "search",
+        &json!({"issues": [
+            jira_issue(101, "ABC-101"),
+            jira_issue(102, "ABC-102"),
+            jira_issue(103, "ABC-103"),
+        ]}),
+    );
+    sandbox.fail_from(2);
+
+    let run = sandbox.run(
+        "jira-new-issues.sh",
+        &input("jira", jira_condition(), json!({"last_id": 100}), json!([])),
+    );
+
+    let output = run.output();
+    assert_eq!(output.state, json!({"last_id": 101}));
+    assert_eq!(
+        run.calls.len(),
+        2,
+        "no create after the refused one: {:?}",
+        run.calls
+    );
+    assert!(run.stderr.contains("ABC-102"), "{}", run.stderr);
 }
 
 #[test]
@@ -230,7 +272,7 @@ fn jira_keeps_the_old_state_when_the_answer_is_not_a_list_of_issues() {
 
 #[test]
 #[ignore = "runs the example scripts with a real sh and jq"]
-fn github_delivers_events_to_waiting_tasks_and_closes_merged_pull_requests() {
+fn github_delivers_events_to_waiting_tasks_and_closes_their_entries() {
     let sandbox = Sandbox::new();
     sandbox.answer("pr-acme-app-17", &json!({"state": "open", "merged": false}));
     sandbox.answer(
@@ -258,7 +300,11 @@ fn github_delivers_events_to_waiting_tasks_and_closes_merged_pull_requests() {
     assert_eq!(output.state, json!({"seen": 1}), "the state is kept");
     assert_eq!(
         output.closed_watches,
-        ["https://github.com/acme/app/pull/18"]
+        [
+            "https://github.com/acme/app/pull/17",
+            "https://github.com/acme/app/pull/18"
+        ],
+        "an entry is closed after its review event, and when merged"
     );
     assert_eq!(
         run.calls.len(),
@@ -268,18 +314,17 @@ fn github_delivers_events_to_waiting_tasks_and_closes_merged_pull_requests() {
     );
     let call = &run.calls[0];
     assert_eq!(
-        call[..7],
+        call[..6],
         [
             "task",
             "event",
             "task-17",
             "--type",
             "review.approved",
-            "--key",
-            "acme/app#17:review.approved:ep-1"
+            "--data"
         ]
     );
-    let data: Value = serde_json::from_str(&call[8]).expect("the data is JSON");
+    let data: Value = serde_json::from_str(&call[6]).expect("the data is JSON");
     assert_eq!(
         data,
         json!({"pr_url": "https://github.com/acme/app/pull/17", "number": 17})
@@ -313,6 +358,7 @@ fn github_skips_and_closes_an_object_on_another_host_or_gone_and_serves_the_rest
         output.closed_watches,
         [
             "https://evil.example.com/acme/app/pull/1",
+            "https://github.com/acme/app/pull/17",
             "https://github.com/acme/app/pull/19"
         ]
     );
@@ -382,13 +428,13 @@ fn gitlab_skips_and_closes_a_bad_or_forbidden_object_and_serves_the_rest() {
     let output = run.output();
     let mut closed = output.closed_watches.clone();
     closed.sort();
-    let mut expected = vec![diffs, slash, forbidden];
+    let mut expected = vec![diffs, good, slash, forbidden];
     expected.sort_unstable();
     assert_eq!(closed, expected);
     assert!(run.stderr.contains("/diffs"), "{}", run.stderr);
     assert_eq!(run.calls.len(), 1, "{:?}", run.calls);
     assert_eq!(run.calls[0][2], "task-7");
-    assert_eq!(run.calls[0][6], "group/app!7:review.approved:ep-1");
+    assert_eq!(run.calls[0][4], "review.approved");
 }
 
 #[test]
@@ -417,9 +463,11 @@ fn gitlab_fails_the_run_when_the_source_fails() {
     assert!(run.calls.is_empty());
 }
 
+/// One event per wait: after the review event the entry is closed, and
+/// the merge of the same run is not sent.
 #[test]
 #[ignore = "runs the example scripts with a real sh and jq"]
-fn gitlab_delivers_approval_and_merge_and_closes_the_entry() {
+fn gitlab_delivers_the_review_event_once_and_closes_the_entry() {
     let sandbox = Sandbox::new();
     let name = "group-app-mr-7";
     sandbox.answer(&format!("mr-{name}"), &json!({"state": "merged"}));
@@ -447,16 +495,36 @@ fn gitlab_delivers_approval_and_merge_and_closes_the_entry() {
     let output = run.output();
     assert_eq!(output.state, json!({}));
     assert_eq!(output.closed_watches, [object]);
-    let types: Vec<(&str, &str)> = run
-        .calls
-        .iter()
-        .map(|call| (call[4].as_str(), call[6].as_str()))
-        .collect();
-    assert_eq!(
-        types,
-        [
-            ("review.approved", "group/app-mr!7:review.approved:ep-3"),
-            ("merged", "group/app-mr!7:merged:ep-3"),
-        ]
+    let types: Vec<&str> = run.calls.iter().map(|call| call[4].as_str()).collect();
+    assert_eq!(types, ["review.approved"]);
+}
+
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn gitlab_delivers_a_merge_without_a_review_and_closes_the_entry() {
+    let sandbox = Sandbox::new();
+    let name = "group-app-7";
+    sandbox.answer(&format!("mr-{name}"), &json!({"state": "merged"}));
+    sandbox.answer(&format!("approvals-{name}"), &json!({"approved": false}));
+    sandbox.answer(&format!("reviewers-{name}"), &json!([]));
+    let object = "https://gitlab.example.com/group/app/-/merge_requests/7";
+    let watches = json!([
+        {"object": object, "task_id": "task-7",
+         "event_types": ["review.approved", "merged"], "wait_episode": "ep-3"},
+    ]);
+
+    let run = sandbox.run(
+        "gitlab-mr-review.sh",
+        &input(
+            "gitlab.example.com",
+            json!({"host": "gitlab.example.com"}),
+            json!({}),
+            watches,
+        ),
     );
+
+    let output = run.output();
+    assert_eq!(output.closed_watches, [object]);
+    let types: Vec<&str> = run.calls.iter().map(|call| call[4].as_str()).collect();
+    assert_eq!(types, ["merged"]);
 }

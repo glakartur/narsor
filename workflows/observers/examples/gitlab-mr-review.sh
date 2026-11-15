@@ -11,7 +11,6 @@
 #     --secret gitlab-token=GITLAB_TOKEN \
 #     --condition '{"host": "gitlab.example.com"}'
 #   narsor-cli observer script set mr-review --file gitlab-mr-review.sh
-#   narsor-cli observer dry-run mr-review
 #   narsor-cli observer approve mr-review --version 1
 #
 # Condition (a JSON object, given to the script as it is):
@@ -38,11 +37,16 @@
 # Event data: {"mr_url": URL, "iid": N}. Filter a `wait` step on mr_url.
 #
 # A task gets events only while it waits (the entry has a wait_episode).
-# The event key is GROUP/PROJECT!IID:TYPE:EPISODE (for example
-# acme/api!17:review.approved:<episode>), so a task gets each type at most
-# once per wait, and again in its next wait (a review loop). A merged or
-# closed merge request is reported in closed_watches: its entry is
-# removed. The state is kept as it was given.
+# After the script sends an event, it reports the merge request in
+# closed_watches: its entry is removed, so the task gets one event per
+# wait. A merged or closed merge request is reported in closed_watches too.
+# The state is kept as it was given.
+#
+# When a task waits again for the same merge request (a review loop), its
+# `wait` step puts the merge request on the watch list again, and the old
+# approvals and reviewer states on GitLab still match. Mark the merge
+# request before it goes back on the list (for example with a label that
+# the script looks for); this example does not do that.
 #
 # A merge request the source does not find or the token may not read (HTTP
 # 404, 403 or 410) is skipped the same way: logged and reported in
@@ -167,15 +171,15 @@ skip_entry() {
 }
 
 # send TYPE: delivers the event TYPE to the task of the current entry, when
-# the entry asks for that type and the task waits.
+# the entry asks for that type and the task waits. Returns 1 when it sends
+# nothing.
 send() {
-    [ -n "$episode" ] || return 0
+    [ -n "$episode" ] || return 1
     printf '%s' "$entry" | jq -e --arg type "$1" '.event_types | index([$type]) != null' >/dev/null ||
-        return 0
-    key="$project!$iid:$1:$episode"
+        return 1
     data=$(jq -n -c --arg url "$object" --argjson iid "$iid" '{mr_url: $url, iid: $iid}')
     # stdout is the result document: the messages of narsor-cli go to stderr.
-    narsor-cli task event "$task_id" --type "$1" --key "$key" --data "$data" </dev/null >&2 ||
+    narsor-cli task event "$task_id" --type "$1" --data "$data" </dev/null >&2 ||
         fail "the event $1 of $object was not delivered"
 }
 
@@ -203,16 +207,21 @@ while IFS= read -r entry; do
         continue
     }
 
+    review_event=
     if printf '%s' "$reviewers" | jq -e 'any(.[]; .state == "requested_changes")' >/dev/null; then
-        send review.changes_requested
+        review_event=review.changes_requested
     elif printf '%s' "$approvals" | jq -e '.approved == true' >/dev/null; then
-        send review.approved
+        review_event=review.approved
+    fi
+    if [ -n "$review_event" ] && send "$review_event"; then
+        close_entry
+        continue
     fi
 
     state=$(printf '%s' "$mr" | jq -r '.state')
     case $state in
     merged | closed)
-        send "$state"
+        send "$state" || true
         close_entry
         ;;
     esac
