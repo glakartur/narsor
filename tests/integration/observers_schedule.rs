@@ -155,7 +155,7 @@ impl Fixture {
 #[test]
 fn the_periodic_pass_runs_the_observers_schedule() {
     // Covers AE1 through the daemon's tick: an empty watch list starts no
-    // run and leaves no run record, and its deadline moves on.
+    // run, and its deadline moves on.
     let fx = Fixture::new();
     let id = fx.active_watch_list("mr-review");
 
@@ -165,7 +165,7 @@ fn the_periodic_pass_runs_the_observers_schedule() {
     assert_eq!(record.run_due_since, None);
     assert_eq!(record.next_run_at, Some(fx.now() + Duration::seconds(300)));
     assert!(fx.service.claim_observer_run().unwrap().is_none());
-    assert!(fx.service.observers().list_runs(&id).unwrap().is_empty());
+    assert_eq!(record.last_run_sequence, 0);
 
     // With an entry, the next tick after the interval flags the run.
     let task = fx.task("task-1");
@@ -226,8 +226,9 @@ fn a_restart_after_hours_of_downtime_owes_one_run_and_keeps_the_count() {
     let run = restarted.claim_observer_run().unwrap().expect("one run");
     assert_eq!(run.run_id.sequence, 2);
     assert!(restarted.claim_observer_run().unwrap().is_none());
-    let runs = restarted.observers().list_runs(&id).unwrap();
-    assert_eq!(runs.len(), 2);
-    assert_eq!(runs[0].status, RunStatus::Failed);
-    assert_eq!(runs[0].stderr.as_deref(), Some("source unavailable"));
+    let errors = restarted.observers().list_failures(&id).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].sequence, 1);
+    assert_eq!(errors[0].status, RunStatus::Failed);
+    assert_eq!(errors[0].stderr.as_deref(), Some("source unavailable"));
 }

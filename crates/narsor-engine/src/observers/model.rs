@@ -1,5 +1,5 @@
-//! Records of observers: the observer itself, its runs and its watch
-//! entries.
+//! Records of observers: the observer itself (with its run in progress),
+//! the execution errors of its runs and its watch entries.
 //!
 //! Everything here is plain data plus the validation of what an owner may
 //! configure. The durable layout and the locks live in [`super::store`]; the
@@ -10,7 +10,6 @@
 //! so a record written by an older build still loads. Enums that a client may
 //! read end in an `Unrecognized` fallback that this build never writes.
 
-use super::contract::ScriptInput;
 use super::{ObserverError, Result};
 use crate::domain::{BackendId, TaskId, WorkflowDefinition};
 use chrono::{DateTime, Utc};
@@ -22,8 +21,8 @@ use std::fmt;
 
 /// Current schema version of [`ObserverRecord`].
 pub const OBSERVER_RECORD_VERSION: u32 = 1;
-/// Current schema version of [`ObserverRun`].
-pub const OBSERVER_RUN_VERSION: u32 = 1;
+/// Current schema version of [`RunFailure`].
+pub const RUN_FAILURE_VERSION: u32 = 1;
 /// Current schema version of [`WatchEntry`].
 pub const WATCH_ENTRY_VERSION: u32 = 1;
 
@@ -856,11 +855,63 @@ pub struct LastRun {
     pub error: Option<String>,
 }
 
+/// The run a worker claimed and did not report yet, as the observer's
+/// record holds it. Nothing else of a run is stored unless it fails
+/// ([`RunFailure`]); its input is built at the claim and handed to the
+/// worker only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveRun {
+    /// Sequence number within the observer, from 1.
+    pub sequence: u64,
+    /// The script version it runs.
+    pub script_version: u32,
+    /// When a worker claimed it.
+    pub claimed_at: DateTime<Utc>,
+    /// No result by then: the run is lost and its token stops working.
+    pub deadline: DateTime<Utc>,
+    /// `sha256:` digest of the run token.
+    pub token_digest: String,
+    /// Tasks this run created so far, checked against the limit (R15).
+    #[serde(default)]
+    pub tasks_created: u32,
+}
+
+impl ActiveRun {
+    /// The run's id within `observer_id`.
+    pub fn run_id(&self, observer_id: &ObserverId) -> RunId {
+        RunId::new(observer_id.clone(), self.sequence)
+    }
+
+    /// Whether the run passed its deadline at `now`: lost, its token spent.
+    pub fn is_past_deadline(&self, now: DateTime<Utc>) -> bool {
+        now >= self.deadline
+    }
+}
+
+/// Reads `active_run` as an [`ActiveRun`], or as nothing when an earlier
+/// build of this branch left a bare sequence number there: that run has no
+/// token digest any more, so it can only be forgotten.
+fn active_run_or_legacy<'de, D>(deserializer: D) -> std::result::Result<Option<ActiveRun>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Run(ActiveRun),
+        // Read only to tell it from a malformed run.
+        Legacy(#[allow(dead_code)] u64),
+    }
+    Ok(match Option::<Stored>::deserialize(deserializer)? {
+        Some(Stored::Run(run)) => Some(run),
+        Some(Stored::Legacy(_)) | None => None,
+    })
+}
+
 /// The durable record of one observer: `observers/{id}/observer.json`.
 ///
 /// The record is the commit point of the observer: a script version or a
-/// run exists for the observer only once the record says so
-/// or the file was created exclusively under the observer's lock.
+/// run exists for the observer only once the record says so.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserverRecord {
     /// Schema version, [`OBSERVER_RECORD_VERSION`].
@@ -902,8 +953,8 @@ pub struct ObserverRecord {
     #[serde(default)]
     pub run_due_since: Option<DateTime<Utc>>,
     /// The run in progress, if any: at most one per observer.
-    #[serde(default)]
-    pub active_run: Option<u64>,
+    #[serde(default, deserialize_with = "active_run_or_legacy")]
+    pub active_run: Option<ActiveRun>,
     /// When a worker last claimed a run.
     #[serde(default)]
     pub last_claim_at: Option<DateTime<Utc>>,
@@ -1004,52 +1055,43 @@ pub enum RunStatus {
     Unrecognized,
 }
 
-/// One run of one observer: `observers/{id}/runs/{sequence:08}.json`.
+/// The execution error of one run: `observers/{id}/errors/{sequence:08}.json`.
 ///
-/// Created when a worker claims the run, never before.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ObserverRun {
-    /// Schema version, [`OBSERVER_RUN_VERSION`].
+/// Written only for a run that did not succeed (a failure, an invalid
+/// output, a time-out, a worker error) or was lost. A successful run leaves
+/// no file. The store keeps the newest [`super::store::KEPT_RUN_FAILURES`]
+/// of each observer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFailure {
+    /// Schema version, [`RUN_FAILURE_VERSION`].
     pub record_version: u32,
     /// The observer.
     pub observer_id: ObserverId,
-    /// Sequence number within the observer, from 1.
+    /// Sequence number of the run within the observer.
     pub sequence: u64,
-    /// The script version it runs.
+    /// The script version it ran.
     pub script_version: u32,
-    /// What the script reads on stdin.
-    pub input: ScriptInput,
     /// When a worker claimed it.
     pub claimed_at: DateTime<Utc>,
-    /// No result by then: the run is lost and its token stops working.
-    pub deadline: DateTime<Utc>,
-    /// `sha256:` digest of the run token; `None` once the token is spent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_digest: Option<String>,
-    /// How it ended.
-    #[serde(default)]
+    /// When it ended (the result came, or it was found lost).
+    pub finished_at: DateTime<Utc>,
+    /// Why it ended so: never [`RunStatus::Running`] or
+    /// [`RunStatus::Succeeded`].
     pub status: RunStatus,
-    /// When it ended.
-    #[serde(default)]
-    pub finished_at: Option<DateTime<Utc>>,
     /// The script's exit code, when it exited.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    /// Why it failed, when it did.
-    #[serde(default)]
-    pub error: Option<String>,
+    /// What went wrong.
+    pub error: String,
     /// The script's stdout as the worker sent it (masked, bounded).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdout: Option<String>,
     /// The script's stderr as the worker sent it (masked, bounded).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
-    /// Tasks this run created so far, checked against the limit (R15).
-    #[serde(default)]
-    pub tasks_created: u32,
 }
 
-impl ObserverRun {
+impl RunFailure {
     /// The run's id.
     pub fn run_id(&self) -> RunId {
         RunId::new(self.observer_id.clone(), self.sequence)

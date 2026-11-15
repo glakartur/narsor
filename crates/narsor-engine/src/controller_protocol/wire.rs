@@ -68,8 +68,8 @@ pub use narsor_protocol::controller::{
 pub use narsor_protocol::controller::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
     CreateObserverWorkerRequest, ObserverClaimResponse, ObserverDetailView, ObserverEffectRequest,
-    ObserverLastRunView, ObserverListResponse, ObserverRunOutcome, ObserverRunReport,
-    ObserverRunResultResponse, ObserverRunView, ObserverScriptView, ObserverSecretRef,
+    ObserverLastRunView, ObserverListResponse, ObserverRunErrorView, ObserverRunOutcome,
+    ObserverRunReport, ObserverRunResultResponse, ObserverScriptView, ObserverSecretRef,
     ObserverView, ObserverWatchListResponse, ObserverWatchView, ObserverWorkerCreated,
     ObserverWorkerListResponse, ObserverWorkerRun, ObserverWorkerView, SetObserverScriptRequest,
 };

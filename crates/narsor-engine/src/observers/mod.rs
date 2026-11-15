@@ -2,7 +2,8 @@
 //! polls a source (Jira, GitHub, GitLab) on a schedule and creates tasks or
 //! delivers events to waiting tasks through `narsor-cli`.
 //!
-//! * [`model`] — the observer record, runs and watch entries,
+//! * [`model`] — the observer record (with its run in progress), the
+//!   execution errors of runs and watch entries,
 //!   and the validation of what an owner may configure;
 //! * [`store`] — the file layout under `{state}/observers/` and its locks;
 //! * [`contract`] — what a script reads on stdin and must print on stdout.
@@ -20,7 +21,7 @@ pub use contract::{
     MAX_SCRIPT_OUTPUT_BYTES, SCRIPT_CONTRACT_VERSION,
 };
 pub use model::*;
-pub use store::{ObserverLock, ObserverStore, WatchWrite};
+pub use store::{ObserverLock, ObserverStore, WatchWrite, KEPT_RUN_FAILURES};
 
 use crate::persistence::PersistenceError;
 use std::path::PathBuf;
@@ -87,14 +88,6 @@ pub enum ObserverError {
         /// The version.
         version: u32,
     },
-
-    /// The observer has no such run.
-    #[error("run {0} does not exist")]
-    RunNotFound(RunId),
-
-    /// A run with this sequence number already exists.
-    #[error("run {0} already exists")]
-    RunExists(RunId),
 
     /// A stored record has a schema version this build does not understand.
     #[error("record '{what}' has unsupported version {version}")]

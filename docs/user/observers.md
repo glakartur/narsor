@@ -11,12 +11,12 @@ things in Narsor:
 
 Narsor has no built-in client for Jira, GitHub or GitLab. A shell script that
 you write and approve talks to the source. Narsor keeps the schedule,
-removes duplicates, limits the effects of each run and records where each
-task came from.
+limits the effects of each run and records where each task came from. The
+script remembers in its state what it already reported (section 3).
 
 This page tells you how to write an observer and its script. The commands
-are in [the CLI reference](cli.md#observer). How to run the worker is in
-[installation](../operations/installation.md#run-the-observer-worker). The
+are in [the CLI reference](cli.md#observer). How the server starts the worker is
+in [installation](../operations/installation.md#run-the-observer-worker). The
 `wait` step and its `watch` block are in
 [the workflow schema](../dev/workflow-schema.md) (§3.3.D, WaitAction).
 
@@ -31,7 +31,7 @@ are in [the CLI reference](cli.md#observer). How to run the worker is in
 control plane                      worker                       script
 -------------                      ------                       ------
 the run is due  ───────────────▶  claims the run
-                                   (worker credential)
+                                   (worker key)
                                    starts `sh` with the input
                                    on stdin and the run token  ─▶ reads the source
                                                                   narsor-cli task create …
@@ -44,8 +44,9 @@ or counts a failure                (secrets masked)
 1. The control plane keeps the schedule. When the next run of an active
    observer is due, the run waits for a worker. Each observer has at most
    one run at a time.
-2. A worker (`narsor-cli observer worker`) claims the run. It gets a token
-   that is valid only for this run and only until the run's deadline.
+2. The worker (`narsor-cli observer worker`, which the server starts) claims
+   the run. It gets a token that is valid only for this run and only until
+   the run's deadline.
 3. The worker starts the approved script version with a clean environment.
    The script reads its input on stdin.
 4. The script reads the source and makes its effects with `narsor-cli task
@@ -57,7 +58,7 @@ or counts a failure                (secrets masked)
 ## 2. Make an observer
 
 The owner of the installation does all the steps through the CLI. A task
-cannot save, try or approve a script.
+cannot save or approve a script.
 
 1. **Write the script.** Start from an example in
    [`workflows/observers/examples/`](../../workflows/observers/examples/):
@@ -71,11 +72,8 @@ cannot save, try or approve a script.
    The header of each example gives the `observer create` command, the
    condition, the secrets and how to test it with a fake source.
 
-   An agent can write the script for you. The example workflow
-   [`workflows/observer-author.yaml`](../../workflows/observer-author.yaml)
-   has an agent write the script and a description, and a person accepts
-   the draft or sends it back with a comment. The workflow does not save,
-   try or approve the script.
+   An agent can help you write the script outside Narsor: give it this
+   page and the examples. The script is not part of a workflow.
 
 2. **Create the observer.** It starts in the state `draft`, and nothing
    runs:
@@ -94,12 +92,9 @@ cannot save, try or approve a script.
    narsor-cli observer script set jira-new --file jira-new-issues.sh
    ```
 
-4. **Try it.** A dry run runs the script once. Narsor records what the
-   script would do, and does not create tasks or deliver events:
-
-   ```sh
-   narsor-cli observer dry-run jira-new
-   ```
+4. **Test it** with a fake source before you approve it (section 9).
+   Narsor has no dry run: the first run of an approved version uses the
+   real source and has real effects.
 
 5. **Approve it.** The schedule runs only the approved version:
 
@@ -133,7 +128,6 @@ One JSON document (contract version 1):
       "wait_episode": "…"
     }
   ],
-  "dry_run": false,
   "first_run": false,
   "import_backlog": false
 }
@@ -146,7 +140,6 @@ One JSON document (contract version 1):
 | `condition` | The JSON object of `--condition`, as the owner gave it. |
 | `state` | What the last successful run printed in `state`. `null` before the first successful run. |
 | `watches` | The watch entries (only for an observer with a watch list). `wait_episode` is the id of the `wait` episode of the task, or `null` when the task does not wait now. |
-| `dry_run` | `true` in a dry run. Narsor records the effects and does not do them. The script must not write to the source. |
 | `first_run` | `true` until the first run succeeds. |
 | `import_backlog` | `true` when the owner gave `--import-backlog`. |
 
@@ -178,8 +171,16 @@ send it to stderr with `>&2`.
 | exits with a different code, prints a document that is not valid, or runs for longer than its time limit | Keeps the old state. The next run sees the same objects again. Counts one failure. |
 
 Because a failed run keeps the old state, a script must be safe to run
-again. The effect keys (section 4) make sure that a repeated run does not
-create a task again.
+again. Narsor does not remove duplicates: two `task create` calls make two
+tasks. The script must remember in its state what it already reported, so
+that it does not create a task on each run.
+
+> **Risk of a duplicate task.** When a script creates a task and its new
+> state is then not saved (the script fails later in the same run, or the
+> worker or the control plane stops before the result), the next run starts
+> from the old state and can create the same task again. Keep the window
+> small: when a task is not created, stop creating tasks and still print
+> the state up to the last task you created, as `jira-new-issues.sh` does.
 
 ### Limits
 
@@ -204,14 +205,11 @@ commands.
 ### Create a task
 
 ```sh
-narsor-cli task create --effect-key "$KEY" --data "$JSON" </dev/null >&2
+narsor-cli task create --data "$JSON" </dev/null >&2
 ```
 
-- **One task for each key.** An observer creates at most one task for an
-  effect key, also over many runs and after a failed run. Use a key that
-  identifies the object in the source, for example the issue key `ABC-123`.
-  When the key was used before, the command prints `skipped: duplicate`
-  and exits with `0`.
+- **A new task on each call.** Narsor does not check whether the object
+  already has a task. The script decides that from its state (section 3).
 - **The observer decides the task.** The workflow, the repositories, the
   backend and the profile come from the observer, not from the script. The
   data has only the fields that the observer maps to workflow inputs
@@ -221,35 +219,29 @@ narsor-cli task create --effect-key "$KEY" --data "$JSON" </dev/null >&2
   to the state `needs_attention`. Look at the condition, then use
   `observer resume`.
 - **Origin.** Each task from an observer has the observer's owner, and it
-  records the observer, the effect key and the run.
+  records the observer and the run.
 
 ### Deliver an event
 
 ```sh
-narsor-cli task event "$TASK_ID" --type review.approved \
-  --key "$OBJECT:review.approved:$EPISODE" --data "$JSON" </dev/null >&2
+narsor-cli task event "$TASK_ID" --type review.approved --data "$JSON" </dev/null >&2
 ```
 
 - The task must be on the watch list of this observer.
-- Narsor writes the event to the history of the task one time for each key.
-- The event ends a `wait` step only when the task waits now, the type is
-  the `event_type` of the step and the data passes its filter. An event
+- Narsor writes the event to the history of the task.
+- For Narsor, an event that the task waits for is the same as the owner's
+  choice of a way out of a step. The event ends a `wait` step only when the
+  task waits now, the type is the `event_type` of the step and the data
+  passes its filter. Narsor keeps the event in the task and resumes the
+  task. When the runner of the task does not run at that time, the event
+  waits on the server, and the runner takes it when it runs again. An event
   that comes before the task waits stays only in the history.
-- **Put the `wait_episode` of the entry in the key.** Then a review loop
-  that waits two times for the same approval gets the event in each wait,
-  and a repeated run in one wait does not deliver it again. When
-  `wait_episode` is `null`, the task does not wait: do not send the event.
-
-### Dry run
-
-In a dry run, the two commands do the same checks (key, map, task limit)
-and print `dry run: would create …` or `dry run: would deliver …`. Narsor
-does not create a task, does not deliver an event, does not use the effect
-key and does not save the state. `observer dry-run` shows the list.
-
-A dry run blocks only the effects in Narsor. It does not block what the
-script itself sends to the source. A script must not write to the source
-when `dry_run` is `true`.
+- **Send an event only when the task waits.** When `wait_episode` is
+  `null`, the task does not wait: do not send the event.
+- **Close the entry after the event.** The example scripts report the
+  object in `closed_watches` after they send a `review.*` event, so that a
+  task gets one event for each wait. When the task waits again (a review
+  loop), its `wait` step adds the object to the watch list again.
 
 ## 5. Watch entries (pull and merge requests)
 
@@ -274,6 +266,13 @@ An entry goes away when the script reports the object in `closed_watches`,
 when the task is finished or archived, or when the owner removes it
 (`observer watch remove`).
 
+> **A pull request that comes back to the list.** When a task waits again
+> for the same pull or merge request, the old review in the source can
+> still match, and the script would send the same event at once. To prevent
+> this, mark the pull request before it goes back to the watch list (for
+> example, with a label that the script looks for). This is not part of the
+> example scripts: do it in your workflow or in your script.
+
 ## 6. Schedule, failures and states
 
 | State | Meaning |
@@ -291,10 +290,14 @@ makes a `draft` observer `active`. It does not change other states.
 - **Failures.** After a failed run, the next run comes after the interval
   times 2 for each failure in a row (2, 4, 8 …), at most 1 hour (or the
   interval, when it is longer).
+- **Errors.** Narsor keeps a record only of a run that failed or was lost:
+  the reason, the exit code, and stdout and stderr (masked). It keeps the
+  20 newest records of each observer. `observer show` shows them. A
+  successful run changes only the state and the time of the last run.
 - **Lost runs.** When a worker does not report a run before its deadline
   (the time limit plus 1 minute), the run is lost. Its token stops working.
   The state does not change, and a lost run is not a failure of the script.
-  `observer show` shows it.
+  `observer show` shows it as an error.
 - **No worker.** When a due run waits for a worker for longer than one
   interval, `observer list` and `observer show` show `no worker`.
 - **Restarts.** After the control plane was stopped, an observer runs one
@@ -310,8 +313,6 @@ the worker, one file for each name (see
 - The script gets a secret only as the variable `ENV`, and only the
   secrets of its own observer. It does not get the environment of the
   worker.
-- A dry run of a version that is not approved gets no secrets, unless the
-  owner gives `--with-secrets`.
 - The worker replaces each secret value and the run token in stdout and
   stderr with `[masked]` before it reports them. This is a second line of
   defence: a script must not print a secret.
@@ -346,11 +347,12 @@ chmod +x fake/bin/narsor-cli
 echo '{"issues": [{"id": "101", "key": "ABC-101", "fields": {}}]}' > fake/search.json
 echo '{"contract_version": 1, "observer": {"id": "o", "name": "jira-new", "source": "jira"},
        "condition": {"base_url": "https://jira.example.com", "jql": "project = ABC"},
-       "state": {"last_id": 100}, "watches": [], "dry_run": false,
+       "state": {"last_id": 100}, "watches": [],
        "first_run": false, "import_backlog": false}' |
   PATH="$PWD/fake/bin:$PATH" FAKE_SOURCE_DIR="$PWD/fake" \
   sh workflows/observers/examples/jira-new-issues.sh
 ```
 
-Then use `observer dry-run` against the real source before you approve the
-script.
+Narsor has no dry run. Test against the real source by hand, with a
+token that can only read, before you approve the script. Set a low
+`--task-limit` for the first runs.

@@ -23,7 +23,7 @@
 //! {state}/materials/…                 -- bounded task materials (U9): manifests
 //!                                        and blobs, outside any workspace
 //! {state}/observers/{id}/…            -- observers of external sources: record,
-//!                                        script versions, runs, watches
+//!                                        script versions, run errors, watches
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
 //! ```
@@ -251,7 +251,7 @@ pub const MATERIAL_BLOBS_DIR: &str = "blobs";
 /// sub-directory per observer (see `crate::observers::store`).
 ///
 /// A sibling of [`ORCHESTRATION_DIR`], not inside it: nothing that walks task
-/// records should ever come across an observer's scripts or runs.
+/// records should ever come across an observer's scripts or run errors.
 pub const OBSERVERS_DIR: &str = "observers";
 
 /// Advisory lock serializing observer creation and deletion (unique names),
@@ -268,8 +268,9 @@ pub const OBSERVER_LOCK_FILE: &str = "observer.lock";
 /// Directory of an observer's immutable script versions.
 pub const OBSERVER_SCRIPTS_DIR: &str = "scripts";
 
-/// Directory of an observer's run records.
-pub const OBSERVER_RUNS_DIR: &str = "runs";
+/// Directory of the execution errors of an observer's runs (failed or lost
+/// runs only).
+pub const OBSERVER_ERRORS_DIR: &str = "errors";
 
 /// Directory of an observer's watch entries.
 pub const OBSERVER_WATCHES_DIR: &str = "watches";
@@ -568,14 +569,14 @@ impl StatePaths {
             .join(format!("{version}.sh"))
     }
 
-    /// `{root}/observers/{observer_id}/runs`
-    pub fn observer_runs_dir(&self, observer_id: &str) -> PathBuf {
-        self.observer_dir(observer_id).join(OBSERVER_RUNS_DIR)
+    /// `{root}/observers/{observer_id}/errors`
+    pub fn observer_errors_dir(&self, observer_id: &str) -> PathBuf {
+        self.observer_dir(observer_id).join(OBSERVER_ERRORS_DIR)
     }
 
-    /// `{root}/observers/{observer_id}/runs/{sequence:08}.json`
-    pub fn observer_run_file(&self, observer_id: &str, sequence: u64) -> PathBuf {
-        self.observer_runs_dir(observer_id)
+    /// `{root}/observers/{observer_id}/errors/{sequence:08}.json`
+    pub fn observer_error_file(&self, observer_id: &str, sequence: u64) -> PathBuf {
+        self.observer_errors_dir(observer_id)
             .join(event_file_name(sequence))
     }
 

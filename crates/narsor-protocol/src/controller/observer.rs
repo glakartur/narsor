@@ -390,30 +390,31 @@ pub struct ObserverScriptView {
     pub sha256: String,
 }
 
-/// One run of an observer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ObserverRunView {
+/// The execution error of one run that failed or was lost. A successful
+/// run leaves none; the server keeps the newest few of each observer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverRunErrorView {
     /// The run (`{observer}.{sequence}`).
     pub run_id: String,
     /// Its sequence number.
     pub sequence: u64,
     /// The script version it ran.
     pub script_version: u32,
-    /// `running`, or how it ended.
+    /// Why it ended so (`failed`, `timed_out`, `invalid_output`,
+    /// `worker_error`, `lost`).
     pub status: String,
     /// When a worker claimed it.
     pub claimed_at: DateTime<Utc>,
-    /// When it ended.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<DateTime<Utc>>,
-    /// The script's exit code.
+    /// When it ended, or was found lost.
+    pub finished_at: DateTime<Utc>,
+    /// The script's exit code, when it exited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    /// Why it failed.
+    /// What went wrong.
+    pub error: String,
+    /// The script's stdout (masked, bounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Tasks it created.
-    pub tasks_created: u32,
+    pub stdout: Option<String>,
     /// The script's stderr (masked, bounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
@@ -439,9 +440,9 @@ pub struct ObserverDetailView {
     /// Every script version, oldest first.
     #[serde(default)]
     pub scripts: Vec<ObserverScriptView>,
-    /// The latest runs, newest first.
+    /// The execution errors of failed or lost runs, newest first.
     #[serde(default)]
-    pub runs: Vec<ObserverRunView>,
+    pub errors: Vec<ObserverRunErrorView>,
 }
 
 /// `POST /control/v1/observers/{observer}/scripts`: the next script

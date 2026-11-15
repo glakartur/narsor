@@ -1098,7 +1098,7 @@ impl ApiClient {
         self.post_json(&url, request).await
     }
 
-    /// One observer, by name or id, with its latest runs.
+    /// One observer, by name or id, with the errors of its failed or lost runs.
     pub async fn observer(&self, observer: &str) -> Result<ObserverDetailView, ClientError> {
         let url = self.observer_url(observer, "")?;
         self.get_json(&url).await

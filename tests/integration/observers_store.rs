@@ -6,12 +6,12 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::domain::{TaskId, WorkflowDefinition};
 use narsor_engine::observers::{
-    parse_script_output, ContractError, CreateTaskEffect, ObserverConfig, ObserverEffect,
-    ObserverError, ObserverName, ObserverRecord, ObserverRun, ObserverState, ObserverStore, RunId,
-    RunStatus, ScheduleConfig, ScriptInput, ScriptObserver, ScriptWatch, SecretRef, WatchEntry,
-    WatchMode, WatchObjectPolicy, WatchOrigin, WatchWrite, DEFAULT_INTERVAL_SECS,
-    MAX_SCRIPT_OUTPUT_BYTES, OBSERVER_RECORD_VERSION, OBSERVER_RUN_VERSION,
-    SCRIPT_CONTRACT_VERSION,
+    parse_script_output, ActiveRun, ContractError, CreateTaskEffect, ObserverConfig,
+    ObserverEffect, ObserverError, ObserverName, ObserverRecord, ObserverState, ObserverStore,
+    RunFailure, RunId, RunStatus, ScheduleConfig, ScriptInput, ScriptObserver, ScriptWatch,
+    SecretRef, WatchEntry, WatchMode, WatchObjectPolicy, WatchOrigin, WatchWrite,
+    DEFAULT_INTERVAL_SECS, KEPT_RUN_FAILURES, MAX_SCRIPT_OUTPUT_BYTES, OBSERVER_RECORD_VERSION,
+    RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION,
 };
 use narsor_engine::orchestration::OwnerRef;
 use narsor_engine::persistence::paths::temp_path_for;
@@ -138,23 +138,30 @@ fn script_input(record: &ObserverRecord) -> ScriptInput {
     }
 }
 
-fn new_run(record: &ObserverRecord, sequence: u64) -> ObserverRun {
-    ObserverRun {
-        record_version: OBSERVER_RUN_VERSION,
+fn active_run(sequence: u64) -> ActiveRun {
+    ActiveRun {
+        sequence,
+        script_version: 1,
+        claimed_at: now(),
+        deadline: now() + Duration::seconds(360),
+        token_digest: "sha256:abc".into(),
+        tasks_created: 2,
+    }
+}
+
+fn failure(record: &ObserverRecord, sequence: u64) -> RunFailure {
+    RunFailure {
+        record_version: RUN_FAILURE_VERSION,
         observer_id: record.observer_id.clone(),
         sequence,
         script_version: 1,
-        input: script_input(record),
         claimed_at: now(),
-        deadline: now() + Duration::seconds(360),
-        token_digest: Some("sha256:abc".into()),
-        status: RunStatus::Running,
-        finished_at: None,
-        exit_code: None,
-        error: None,
-        stdout: None,
-        stderr: None,
-        tasks_created: 0,
+        finished_at: now() + Duration::seconds(5),
+        status: RunStatus::Failed,
+        exit_code: Some(1),
+        error: "the script exited with code 1".into(),
+        stdout: Some(String::new()),
+        stderr: Some("boom".into()),
     }
 }
 
@@ -583,40 +590,116 @@ fn an_empty_or_oversized_script_is_refused() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_run_is_created_once_and_then_replaced() {
+fn the_run_in_progress_lives_in_the_observers_record() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut record = create_jira(&store, "jira-abc");
+    let lock = store.lock(&record.observer_id).unwrap();
+
+    record.active_run = Some(active_run(1));
+    store.save(&lock, &mut record, now()).unwrap();
+
+    let loaded = store.load(&record.observer_id).unwrap();
+    assert_eq!(loaded.active_run, Some(active_run(1)));
+    let run_id = loaded.active_run.unwrap().run_id(&record.observer_id);
+    assert_eq!(run_id, RunId::new(record.observer_id.clone(), 1));
+    assert_eq!(RunId::parse(&run_id.to_string()).unwrap(), run_id);
+    // No file of the run besides the record.
+    assert!(!root
+        .paths()
+        .observer_dir(record.observer_id.as_str())
+        .join("runs")
+        .exists());
+    assert!(!root
+        .paths()
+        .observer_errors_dir(record.observer_id.as_str())
+        .exists());
+}
+
+#[test]
+fn a_bare_run_number_of_an_earlier_build_reads_as_no_run() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let record = create_jira(&store, "jira-abc");
+    let path = root
+        .paths()
+        .observer_record_file(record.observer_id.as_str());
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    raw["active_run"] = json!(3);
+    fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+    assert_eq!(store.load(&record.observer_id).unwrap().active_run, None);
+}
+
+#[test]
+fn errors_are_kept_newest_first_up_to_the_limit() {
     let root = TempRoot::new();
     let store = root.store();
     let record = create_jira(&store, "jira-abc");
     let lock = store.lock(&record.observer_id).unwrap();
-    let mut run = new_run(&record, 1);
+    let written = KEPT_RUN_FAILURES as u64 + 5;
 
-    store.create_run(&lock, &run).unwrap();
-    assert!(matches!(
-        store.create_run(&lock, &run),
-        Err(ObserverError::RunExists(_))
-    ));
-    run.status = RunStatus::Succeeded;
-    run.exit_code = Some(0);
-    run.token_digest = None;
-    store.save_run(&lock, &run).unwrap();
-    store.create_run(&lock, &new_run(&record, 2)).unwrap();
-
-    let run_id = RunId::new(record.observer_id.clone(), 1);
-    assert_eq!(store.load_run(&run_id).unwrap(), run);
-    assert_eq!(
+    for sequence in 1..=written {
         store
-            .list_runs(&record.observer_id)
-            .unwrap()
-            .iter()
-            .map(|run| run.sequence)
-            .collect::<Vec<_>>(),
-        vec![1, 2]
-    );
+            .record_failure(&lock, &failure(&record, sequence))
+            .unwrap();
+    }
+
+    let kept = store.list_failures(&record.observer_id).unwrap();
+    assert_eq!(kept.len(), KEPT_RUN_FAILURES);
+    assert_eq!(kept[0], failure(&record, written));
+    assert_eq!(kept.last().unwrap().sequence, 6);
+    assert!(!root
+        .paths()
+        .observer_error_file(record.observer_id.as_str(), 5)
+        .exists());
+    // The same run's error again replaces it.
+    let mut again = failure(&record, written);
+    again.status = RunStatus::Lost;
+    store.record_failure(&lock, &again).unwrap();
+    let kept = store.list_failures(&record.observer_id).unwrap();
+    assert_eq!(kept.len(), KEPT_RUN_FAILURES);
+    assert_eq!(kept[0].status, RunStatus::Lost);
+}
+
+#[test]
+fn an_error_needs_the_observers_own_lock() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let record = create_jira(&store, "a");
+    let other = create_jira(&store, "b");
+    let lock = store.lock(&other.observer_id).unwrap();
+
     assert!(matches!(
-        store.save_run(&lock, &new_run(&record, 3)),
-        Err(ObserverError::RunNotFound(_))
+        store.record_failure(&lock, &failure(&record, 1)),
+        Err(ObserverError::LockMismatch { .. })
     ));
-    assert_eq!(RunId::parse(&run_id.to_string()).unwrap(), run_id);
+    assert!(store.list_failures(&record.observer_id).unwrap().is_empty());
+}
+
+#[test]
+fn the_lenient_listing_skips_unreadable_records_and_the_strict_one_refuses_them() {
+    // D7.
+    let root = TempRoot::new();
+    let store = root.store();
+    let corrupt = create_jira(&store, "corrupt");
+    let newer = create_jira(&store, "newer");
+    let healthy = create_jira(&store, "healthy");
+    fs::write(
+        root.paths()
+            .observer_record_file(corrupt.observer_id.as_str()),
+        b"{ not json",
+    )
+    .unwrap();
+    let path = root
+        .paths()
+        .observer_record_file(newer.observer_id.as_str());
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    raw["record_version"] = json!(OBSERVER_RECORD_VERSION + 1);
+    fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+    assert_eq!(store.list_readable().unwrap(), vec![healthy]);
+    assert!(store.list().is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -742,9 +825,9 @@ fn the_script_input_is_one_json_document_with_the_watch_episode() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn records_scripts_runs_and_watches_survive_a_restart() {
+fn records_scripts_errors_and_watches_survive_a_restart() {
     let root = TempRoot::new();
-    let (jira, review, run, entry) = {
+    let (jira, review, error, entry) = {
         let store = root.store();
         let jira = create_jira(&store, "jira-abc");
         store
@@ -754,14 +837,17 @@ fn records_scripts_runs_and_watches_survive_a_restart() {
             .create(owner(), review_config("gitlab-review"), None, now())
             .unwrap();
         let lock = store.lock(&jira.observer_id).unwrap();
-        let run = new_run(&jira, 1);
-        store.create_run(&lock, &run).unwrap();
+        let mut active = store.load(&jira.observer_id).unwrap();
+        active.active_run = Some(active_run(2));
+        store.save(&lock, &mut active, now()).unwrap();
+        let error = failure(&jira, 1);
+        store.record_failure(&lock, &error).unwrap();
         drop(lock);
         let lock = store.lock(&review.observer_id).unwrap();
         let entry = watch("task-1", Some("await"), "https://gitlab.example.com/a/1");
         store.create_watch(&lock, &entry).unwrap();
         let jira = store.load(&jira.observer_id).unwrap();
-        (jira, review, run, entry)
+        (jira, review, error, entry)
     };
     // Interrupted writes leave temporary files; a fresh store sweeps them.
     let stray = temp_path_for(&root.paths().observer_record_file(jira.observer_id.as_str()));
@@ -775,7 +861,8 @@ fn records_scripts_runs_and_watches_survive_a_restart() {
         store.load_script(&jira.observer_id, 1).unwrap(),
         "echo one\n"
     );
-    assert_eq!(store.load_run(&run.run_id()).unwrap(), run);
+    assert_eq!(store.list_failures(&jira.observer_id).unwrap(), vec![error]);
+    assert_eq!(jira.active_run, Some(active_run(2)));
     assert_eq!(
         store.list_watches(&review.observer_id).unwrap(),
         vec![entry]

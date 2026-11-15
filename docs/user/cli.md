@@ -397,11 +397,11 @@ name or its id.
 |---|---|
 | `observer create NAME --source TEXT (--workflow ID [--map INPUT=FIELD]… \| --deliver-events) [options]` | Creates a draft observer. Nothing runs until a script version is approved. |
 | `observer list` | One line per observer: state, script versions, last run, next run; then the last error and a `no worker` warning. |
-| `observer show OBSERVER` | The configuration (secret references, never values), script versions and the latest runs. |
+| `observer show OBSERVER` | The configuration (secret references, never values), script versions, the last run, the next run, a `no worker` warning, and the errors of the 20 newest failed or lost runs (reason, exit code, end of stdout and stderr, masked). A successful run leaves no record. |
 | `observer script set OBSERVER --file FILE` | Saves the next, immutable script version. Saving never approves it. |
 | `observer approve OBSERVER --version N` | The schedule runs this version, and only it. A draft observer becomes active; a paused one stays paused. |
 | `observer pause OBSERVER`, `observer resume OBSERVER` | Stops the schedule; puts a paused observer, or one in `needs_attention` or `error`, back on it. |
-| `observer delete OBSERVER` | Deletes the observer with its scripts, runs and watch entries. The tasks it created stay. |
+| `observer delete OBSERVER` | Deletes the observer with its scripts, run errors and watch entries. The tasks it created stay. |
 | `observer watch add OBSERVER --task TASK_ID --object URL --events TYPE[,TYPE…]` | Watches a PR/MR for one of your tasks. The object must start with one of the observer's `--allow-prefix` values. |
 | `observer watch list OBSERVER`, `observer watch remove OBSERVER ENTRY` | Lists the watch entries; removes one by its id or the start of it that `list` shows. |
 | `observer worker-token create\|list\|revoke` | The credential of the worker (see [installation](../operations/installation.md)). |

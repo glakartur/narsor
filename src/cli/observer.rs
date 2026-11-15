@@ -61,7 +61,7 @@ pub enum ObserverCommand {
     List,
 
     /// Shows one observer: its configuration (secret references, never
-    /// values), script versions and latest runs.
+    /// values), script versions and the errors of failed or lost runs.
     Show {
         /// The observer's name or id.
         #[arg(value_name = "OBSERVER")]
@@ -101,7 +101,7 @@ pub enum ObserverCommand {
         observer: String,
     },
 
-    /// Deletes the observer with its scripts, runs and watch entries. The tasks it created stay. Cannot be undone.
+    /// Deletes the observer with its scripts, run errors and watch entries. The tasks it created stay. Cannot be undone.
     Delete {
         /// The observer's name or id.
         #[arg(value_name = "OBSERVER")]
@@ -700,7 +700,7 @@ where
                 .await
                 .map_err(|error| failure("Could not delete the observer", error))?;
             Ok(format!(
-                "Deleted observer '{}' with its scripts, runs and watch entries; \
+                "Deleted observer '{}' with its scripts, run errors and watch entries; \
                  the tasks it created stay.\n",
                 without_unsafe_chars(&deleted.name)
             ))

@@ -14,8 +14,9 @@ use crate::domain::{
     TaskRepository, TaskRepositorySource, TaskWorkspace, WorkflowDefinition,
 };
 use crate::observers::{
-    CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverName, ObserverRun, RunId, RunStatus,
-    SecretRef, WatchEntry, WatchMode, WatchObjectPolicy, WatchOrigin,
+    CreateTaskEffect, LastRun, ObserverConfig, ObserverEffect, ObserverName, RunFailure, RunId,
+    RunStatus, SecretRef, WatchEntry, WatchMode, WatchObjectPolicy, WatchOrigin, KEPT_RUN_FAILURES,
+    OBSERVER_RECORD_VERSION,
 };
 use crate::orchestration::{
     Clock, CommandRequest, ControlPlane, EventWait, NewTask, OwnerCommand, OwnerRef,
@@ -163,10 +164,35 @@ impl Fixture {
         self.service.claim_observer_run().unwrap()
     }
 
-    pub(super) fn finish(&self, claimed: &ClaimedObserverRun, report: RunReport) -> ObserverRun {
+    pub(super) fn finish(&self, claimed: &ClaimedObserverRun, report: RunReport) -> LastRun {
         self.service
             .finish_observer_run(&claimed.run_id, report)
             .unwrap()
+    }
+
+    /// The kept execution errors of an observer, newest first.
+    pub(super) fn failures(&self, id: &ObserverId) -> Vec<RunFailure> {
+        self.service.observers().list_failures(id).unwrap()
+    }
+
+    /// Every file below the observer's directory, relative to it, sorted.
+    pub(super) fn observer_files(&self, id: &ObserverId) -> Vec<String> {
+        let dir = self.service.observers().paths().observer_dir(id.as_str());
+        let mut files = Vec::new();
+        let mut pending = vec![dir.clone()];
+        while let Some(current) = pending.pop() {
+            for entry in std::fs::read_dir(&current).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let relative = path.strip_prefix(&dir).unwrap();
+                    files.push(relative.to_string_lossy().into_owned());
+                }
+            }
+        }
+        files.sort();
+        files
     }
 
     /// A queued task the observer's entries can point at.
@@ -272,7 +298,7 @@ fn a_watch_list_observer_without_entries_does_not_run_and_moves_on() {
         Some(fx.now() + Duration::seconds(INTERVAL as i64))
     );
     assert!(fx.claim().is_none());
-    assert!(fx.service.observers().list_runs(&id).unwrap().is_empty());
+    assert_eq!(fx.record(&id).last_run_sequence, 0);
 }
 
 #[test]
@@ -291,15 +317,21 @@ fn a_due_observer_is_claimed_once_with_a_token_and_its_last_state() {
     // One run at a time per observer.
     assert!(fx.claim().is_none());
     assert!(fx.service.observer_pass().due.is_empty());
-    // The token is in no record: only its digest.
+    // The token is in no record: only its digest, in the observer's record.
+    let active = fx.record(&id).active_run.expect("the run in progress");
+    assert_eq!(active.sequence, 1);
+    assert_eq!(active.script_version, 1);
+    assert_eq!(active.token_digest, first.token.digest());
     let stored = std::fs::read_to_string(
         fx.service
             .observers()
             .paths()
-            .observer_run_file(id.as_str(), 1),
+            .observer_record_file(id.as_str()),
     )
     .unwrap();
     assert!(!stored.contains(first.token.expose()));
+    // The script's input is not stored either.
+    assert!(!stored.contains("\"first_run\""));
 
     let run = fx.finish(&first, exited(0, r#"{"state": {"cursor": 5}}"#));
     assert_eq!(run.status, RunStatus::Succeeded);
@@ -345,7 +377,108 @@ fn a_control_plane_that_stood_still_for_hours_owes_one_run() {
 
     assert!(fx.claim().is_some());
     assert!(fx.claim().is_none());
-    assert_eq!(fx.service.observers().list_runs(&id).unwrap().len(), 1);
+    assert_eq!(fx.record(&id).last_run_sequence, 1);
+}
+
+#[test]
+fn a_successful_run_leaves_no_file_but_the_observers_own() {
+    // D15.
+    let fx = Fixture::new();
+    let id = fx.active("mr-review", WatchMode::WatchList);
+    let task = fx.task("task-1");
+    let entry = fx.watch(&id, &task, &format!("{PREFIX}a/-/merge_requests/17"));
+    fx.service.observer_pass();
+    let claimed = fx.claim().unwrap();
+
+    fx.finish(&claimed, exited(0, r#"{"state": {"cursor": 1}}"#));
+
+    assert_eq!(
+        fx.observer_files(&id),
+        vec![
+            "observer.json".to_string(),
+            "observer.lock".to_string(),
+            "scripts/1.sh".to_string(),
+            format!("watches/{}.json", entry.entry_id),
+        ]
+    );
+    assert!(fx.failures(&id).is_empty());
+}
+
+#[test]
+fn a_failed_run_writes_one_error_file_that_observer_show_lists() {
+    // D15.
+    let fx = Fixture::new();
+    let id = fx.active("jira", WatchMode::All);
+    fx.service.observer_pass();
+    let claimed = fx.claim().unwrap();
+
+    fx.finish(
+        &claimed,
+        RunReport {
+            outcome: RunOutcome::Exited { exit_code: 3 },
+            stdout: "partial".into(),
+            stderr: "curl: (6) could not resolve host\n".into(),
+        },
+    );
+
+    assert_eq!(
+        fx.observer_files(&id),
+        vec![
+            "errors/00000001.json",
+            "observer.json",
+            "observer.lock",
+            "scripts/1.sh"
+        ]
+    );
+    let failures = fx.failures(&id);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].sequence, 1);
+    assert_eq!(failures[0].script_version, 1);
+    assert_eq!(failures[0].status, RunStatus::Failed);
+    assert_eq!(failures[0].exit_code, Some(3));
+    assert_eq!(failures[0].stdout.as_deref(), Some("partial"));
+    let detail = fx.service.observer_detail(&owner(), "jira").unwrap();
+    assert_eq!(detail.errors.len(), 1);
+    let shown = &detail.errors[0];
+    assert_eq!(shown.run_id, claimed.run_id.to_string());
+    assert_eq!(shown.status, "failed");
+    assert_eq!(shown.exit_code, Some(3));
+    assert!(shown.error.contains("code 3"), "{}", shown.error);
+    assert_eq!(
+        shown.stderr.as_deref(),
+        Some("curl: (6) could not resolve host\n")
+    );
+}
+
+#[test]
+fn more_errors_than_the_store_keeps_leave_the_newest() {
+    let fx = Fixture::new();
+    let id = fx.active("jira", WatchMode::All);
+    let runs = KEPT_RUN_FAILURES as u64 + 3;
+    for _ in 0..runs {
+        fx.service.observer_pass();
+        let claimed = fx.claim().expect("a run after the backoff");
+        fx.finish(&claimed, exited(1, ""));
+        fx.advance(MAX_RETRY_DELAY_SECS as i64);
+        // No error state, so the loop runs on.
+        let lock = fx.service.observers().lock(&id).unwrap();
+        let mut record = fx.record(&id);
+        record.consecutive_failures = 0;
+        fx.service
+            .observers()
+            .save(&lock, &mut record, fx.now())
+            .unwrap();
+    }
+
+    let sequences: Vec<u64> = fx.failures(&id).iter().map(|f| f.sequence).collect();
+    let expected: Vec<u64> = (4..=runs).rev().collect();
+    assert_eq!(sequences, expected);
+    let files = fx
+        .observer_files(&id)
+        .into_iter()
+        .filter(|file| file.starts_with("errors/"))
+        .count();
+    assert_eq!(files, KEPT_RUN_FAILURES);
 }
 
 #[test]
@@ -363,7 +496,7 @@ fn a_failed_run_keeps_the_state_and_backs_off() {
     let run = fx.finish(&second, exited(1, r#"{"state": {"cursor": 9}}"#));
 
     assert_eq!(run.status, RunStatus::Failed);
-    assert_eq!(run.exit_code, Some(1));
+    assert_eq!(fx.failures(&id)[0].exit_code, Some(1));
     let record = fx.record(&id);
     assert_eq!(record.script_state, Some(json!({"cursor": 5})));
     assert_eq!(record.consecutive_failures, 1);
@@ -419,6 +552,11 @@ fn five_failures_in_a_row_put_the_observer_in_error_until_its_owner_resumes_it()
 fn a_run_without_a_result_by_its_deadline_is_lost_without_counting_a_failure() {
     let fx = Fixture::new();
     let id = fx.active("jira", WatchMode::All);
+    // One failure before, which a lost run neither adds to nor clears.
+    fx.service.observer_pass();
+    let failed = fx.claim().unwrap();
+    fx.finish(&failed, exited(1, ""));
+    fx.advance(MAX_RETRY_DELAY_SECS as i64);
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
     assert_eq!(
@@ -435,12 +573,17 @@ fn a_run_without_a_result_by_its_deadline_is_lost_without_counting_a_failure() {
     let pass = fx.service.observer_pass();
 
     assert_eq!(pass.lost, vec![claimed.run_id.clone()]);
-    let run = fx.service.observers().load_run(&claimed.run_id).unwrap();
-    assert_eq!(run.status, RunStatus::Lost);
-    assert_eq!(run.token_digest, None);
-    assert!(run.error.unwrap().contains("lost by the worker"));
+    let failures = fx.failures(&id);
+    assert_eq!(failures.len(), 2);
+    let lost = &failures[0];
+    assert_eq!(lost.sequence, claimed.run_id.sequence);
+    assert_eq!(lost.status, RunStatus::Lost);
+    assert_eq!(lost.exit_code, None);
+    assert!(lost.error.contains("lost by the worker"));
+    let shown = fx.service.observer_detail(&owner(), "jira").unwrap();
+    assert_eq!(shown.errors[0].status, "lost");
     let record = fx.record(&id);
-    assert_eq!(record.consecutive_failures, 0);
+    assert_eq!(record.consecutive_failures, 1);
     assert_eq!(record.state, ObserverState::Active);
     assert_eq!(record.active_run, None);
     assert_eq!(record.last_run.unwrap().status, RunStatus::Lost);
@@ -456,6 +599,25 @@ fn a_run_without_a_result_by_its_deadline_is_lost_without_counting_a_failure() {
         })
     ));
     assert_eq!(fx.record(&id).script_state, None);
+}
+
+#[test]
+fn a_claim_records_a_run_past_its_deadline_as_lost() {
+    let fx = Fixture::new();
+    let id = fx.active("jira", WatchMode::All);
+    fx.service.observer_pass();
+    let claimed = fx.claim().unwrap();
+    fx.advance((SCRIPT_TIMEOUT_SECS + RUN_DEADLINE_MARGIN_SECS) as i64);
+
+    assert!(fx.claim().is_none());
+
+    let record = fx.record(&id);
+    assert_eq!(record.active_run, None);
+    assert_eq!(record.last_run.unwrap().status, RunStatus::Lost);
+    let failures = fx.failures(&id);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].sequence, claimed.run_id.sequence);
+    assert_eq!(failures[0].status, RunStatus::Lost);
 }
 
 #[test]
@@ -478,6 +640,7 @@ fn a_result_after_the_deadline_records_the_run_as_lost() {
         })
     ));
     assert_eq!(fx.record(&id).last_run.unwrap().status, RunStatus::Lost);
+    assert_eq!(fx.failures(&id)[0].status, RunStatus::Lost);
 }
 
 #[test]
@@ -666,26 +829,27 @@ fn a_pass_with_nothing_due_writes_nothing() {
 }
 
 #[test]
-fn a_claim_that_crashed_before_its_run_file_is_repaired_by_the_pass() {
+fn the_pass_and_the_claim_skip_unreadable_records() {
+    // D7.
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
-    {
-        let lock = fx.service.observers().lock(&id).unwrap();
-        let mut record = fx.record(&id);
-        record.active_run = Some(1);
-        record.last_run_sequence = 1;
-        fx.service
-            .observers()
-            .save(&lock, &mut record, fx.now())
-            .unwrap();
-    }
+    let corrupt = fx.active("broken", WatchMode::All);
+    let newer = fx.active("newer", WatchMode::All);
+    let healthy = fx.active("jira", WatchMode::All);
+    let paths = fx.service.observers().paths().clone();
+    std::fs::write(paths.observer_record_file(corrupt.as_str()), "{ not json").unwrap();
+    let newer_file = paths.observer_record_file(newer.as_str());
+    let mut stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&newer_file).unwrap()).unwrap();
+    stored["record_version"] = json!(OBSERVER_RECORD_VERSION + 1);
+    std::fs::write(&newer_file, stored.to_string()).unwrap();
 
-    fx.service.observer_pass();
-    assert_eq!(fx.record(&id).active_run, None);
-    fx.service.observer_pass();
-    let claimed = fx.claim().unwrap();
+    let pass = fx.service.observer_pass();
 
-    assert_eq!(claimed.run_id.sequence, 2);
+    assert_eq!(pass.due, vec![healthy.clone()]);
+    let claimed = fx.claim().expect("the healthy observer's run");
+    assert_eq!(claimed.run_id.observer_id, healthy);
+    // The owner's views keep the strict listing.
+    assert!(fx.service.observers().list().is_err());
 }
 
 #[test]
@@ -722,5 +886,9 @@ fn schedule_judge(report: &RunReport) -> (RunStatus, Option<i32>) {
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
     let run = fx.finish(&claimed, report.clone());
-    (run.status, run.exit_code)
+    let exit_code = fx
+        .failures(&claimed.run_id.observer_id)
+        .first()
+        .and_then(|failure| failure.exit_code);
+    (run.status, exit_code)
 }

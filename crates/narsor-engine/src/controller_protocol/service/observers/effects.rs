@@ -32,8 +32,8 @@ use crate::controller_protocol::service::{parse_identifier, ProtocolService};
 use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
 use crate::observers::{
-    ObserverEffect, ObserverError, ObserverLock, ObserverRecord, ObserverRun, ObserverState, RunId,
-    RunStatus, MAX_EVENT_TYPE_LEN,
+    ActiveRun, ObserverEffect, ObserverError, ObserverLock, ObserverRecord, ObserverState, RunId,
+    MAX_EVENT_TYPE_LEN,
 };
 use crate::orchestration::{observer_event_key, ExternalEvent, TaskProvenance, TaskRecord};
 
@@ -44,11 +44,12 @@ pub const MAX_EVENT_DATA_BYTES: usize = 16 * 1024;
 /// Most bytes of a "create a task" effect's data, as JSON.
 pub const MAX_EFFECT_DATA_BYTES: usize = 64 * 1024;
 
-/// The run an effect belongs to, read under the observer's lock.
+/// The run an effect belongs to, read under the observer's lock: the
+/// observer's record and its run in progress.
 struct EffectScope {
     lock: ObserverLock,
     record: ObserverRecord,
-    run: ObserverRun,
+    run_id: RunId,
     now: DateTime<Utc>,
 }
 
@@ -58,8 +59,17 @@ impl EffectScope {
         TaskProvenance {
             observer_id: self.record.observer_id.to_string(),
             observer_name: self.record.config.name.to_string(),
-            run_id: self.run.run_id().to_string(),
+            run_id: self.run_id.to_string(),
         }
+    }
+
+    /// The run in progress; [`ProtocolService::effect_scope`] checked that
+    /// there is one.
+    fn active_run(&mut self) -> ProtocolResult<&mut ActiveRun> {
+        self.record
+            .active_run
+            .as_mut()
+            .ok_or(ProtocolError::Unauthorized)
     }
 }
 
@@ -87,8 +97,10 @@ impl ProtocolService {
             self.create_task_from(&scope.record.owner, task_request, Some(scope.provenance()))?;
         let created = TaskId::parse(summary.task_id.to_string())
             .map_err(|error| ProtocolError::Internal(error.to_string()))?;
-        scope.run.tasks_created = scope.run.tasks_created.saturating_add(1);
-        self.observers.save_run(&scope.lock, &scope.run)?;
+        let active = scope.active_run()?;
+        active.tasks_created = active.tasks_created.saturating_add(1);
+        self.observers
+            .save(&scope.lock, &mut scope.record, scope.now)?;
         Ok(ObserverEffectResponse {
             outcome: ObserverEffectOutcome::Created,
             task_id: Some(created.to_string()),
@@ -168,24 +180,24 @@ impl ProtocolService {
         })
     }
 
-    /// Takes the observer's lock and reads the run `run_id` under it,
-    /// refusing a run that is no longer in progress before its deadline:
-    /// its token stopped working between the gate and now.
+    /// Takes the observer's lock and reads the observer's record under it,
+    /// refusing a run that is no longer the observer's run in progress
+    /// before its deadline: its token stopped working between the gate and
+    /// now.
     fn effect_scope(&self, run_id: &RunId) -> ProtocolResult<EffectScope> {
         let lock = self.observers.lock(&run_id.observer_id).map_err(run_gone)?;
         let record = self.observers.load(&run_id.observer_id).map_err(run_gone)?;
-        let run = self.observers.load_run(run_id).map_err(run_gone)?;
         let now = self.control.now();
-        if record.active_run != Some(run_id.sequence)
-            || run.status != RunStatus::Running
-            || now >= run.deadline
-        {
+        let in_progress = record.active_run.as_ref().is_some_and(|active| {
+            active.sequence == run_id.sequence && !active.is_past_deadline(now)
+        });
+        if !in_progress {
             return Err(ProtocolError::Unauthorized);
         }
         Ok(EffectScope {
             lock,
             record,
-            run,
+            run_id: run_id.clone(),
             now,
         })
     }
@@ -194,7 +206,7 @@ impl ProtocolService {
     /// then waits for its owner (`needs_attention`).
     fn within_task_limit(&self, scope: &mut EffectScope) -> ProtocolResult<()> {
         let limit = scope.record.config.task_limit_per_run;
-        if scope.run.tasks_created < limit {
+        if scope.active_run()?.tasks_created < limit {
             return Ok(());
         }
         if scope.record.state == ObserverState::Active {
@@ -207,7 +219,7 @@ impl ProtocolService {
             "observer_task_limit",
             format!(
                 "run {} reached the limit of {limit} new tasks per run; observer '{}' waits for its owner",
-                scope.run.run_id(),
+                scope.run_id,
                 scope.record.config.name
             ),
         ))
@@ -232,7 +244,7 @@ impl ProtocolService {
 /// no longer proves anything.
 fn run_gone(error: ObserverError) -> ProtocolError {
     match error {
-        ObserverError::NotFound(_) | ObserverError::RunNotFound(_) => ProtocolError::Unauthorized,
+        ObserverError::NotFound(_) => ProtocolError::Unauthorized,
         other => other.into(),
     }
 }

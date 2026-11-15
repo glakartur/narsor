@@ -23,13 +23,10 @@ use crate::controller_protocol::wire::*;
 use crate::domain::{TaskId, WorkflowDefinition};
 use crate::observers::{
     CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverError, ObserverId, ObserverName,
-    ObserverRecord, ObserverRun, RunId, SecretRef, WatchEntry, WatchMode, WatchObjectPolicy,
-    WatchOrigin, WatchWrite,
+    ObserverRecord, RunFailure, SecretRef, WatchEntry, WatchMode, WatchObjectPolicy, WatchOrigin,
+    WatchWrite,
 };
 use crate::orchestration::{OrchestrationError, OwnerRef};
-
-/// How many of the latest runs `observer show` lists.
-pub const SHOWN_RUNS: u64 = 10;
 
 impl ProtocolService {
     /// Creates a draft observer of `owner` (R1, R2, R3). A "create a task"
@@ -117,14 +114,15 @@ impl ProtocolService {
         })
     }
 
-    /// One observer of `owner` in detail, with its latest runs.
+    /// One observer of `owner` in detail, with the kept execution errors of
+    /// its runs (a successful run leaves none).
     pub fn observer_detail(
         &self,
         owner: &OwnerRef,
         observer: &str,
     ) -> ProtocolResult<ObserverDetailView> {
         let record = self.owned_observer(owner, observer)?;
-        let runs = self.latest_runs(&record)?;
+        let errors = self.observers.list_failures(&record.observer_id)?;
         let mapping = match &record.config.effect {
             ObserverEffect::CreateTask(effect) => effect.mapping.clone(),
             ObserverEffect::DeliverEvent => Default::default(),
@@ -144,7 +142,7 @@ impl ProtocolService {
                 .collect(),
             allowed_object_prefixes: record.config.watch_objects.allowed_prefixes.clone(),
             scripts: record.scripts.iter().map(script_view).collect(),
-            runs: runs.iter().map(run_view).collect(),
+            errors: errors.iter().map(run_error_view).collect(),
         })
     }
 
@@ -204,7 +202,7 @@ impl ProtocolService {
     }
 
     /// Deletes an observer of `owner` with every file of it: its scripts,
-    /// runs and watch entries. A run in progress loses its
+    /// run errors and watch entries. A run in progress loses its
     /// token at once. The tasks it created stay. Its id is never reused.
     pub fn delete_observer(
         &self,
@@ -337,25 +335,6 @@ impl ProtocolService {
             _ => Err(ProtocolError::NotFound),
         }
     }
-
-    /// The latest [`SHOWN_RUNS`] runs of `record`, newest first. Runs are
-    /// numbered without gaps, so only the files shown are read.
-    fn latest_runs(&self, record: &ObserverRecord) -> ProtocolResult<Vec<ObserverRun>> {
-        let last = record.last_run_sequence;
-        let first = last.saturating_sub(SHOWN_RUNS - 1).max(1);
-        let mut runs = Vec::new();
-        for sequence in (first..=last).rev() {
-            match self
-                .observers
-                .load_run(&RunId::new(record.observer_id.clone(), sequence))
-            {
-                Ok(run) => runs.push(run),
-                Err(ObserverError::RunNotFound(_)) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(runs)
-    }
 }
 
 /// A refused watch object or event type, as the owner reads it.
@@ -398,7 +377,7 @@ fn observer_view(record: &ObserverRecord, now: DateTime<Utc>) -> ObserverView {
         waiting_for_claim_since: record.waiting_for_claim_since(),
         worker_missing: record.worker_missing(now),
         last_claim_at: record.last_claim_at,
-        active_run: record.active_run,
+        active_run: record.active_run.as_ref().map(|active| active.sequence),
         last_run: record.last_run.as_ref().map(|run| ObserverLastRunView {
             sequence: run.sequence,
             status: wire_name(&run.status),
@@ -418,18 +397,18 @@ fn script_view(script: &crate::observers::ScriptVersion) -> ObserverScriptView {
     }
 }
 
-fn run_view(run: &ObserverRun) -> ObserverRunView {
-    ObserverRunView {
-        run_id: run.run_id().to_string(),
-        sequence: run.sequence,
-        script_version: run.script_version,
-        status: wire_name(&run.status),
-        claimed_at: run.claimed_at,
-        finished_at: run.finished_at,
-        exit_code: run.exit_code,
-        error: run.error.clone(),
-        tasks_created: run.tasks_created,
-        stderr: run.stderr.clone(),
+fn run_error_view(failure: &RunFailure) -> ObserverRunErrorView {
+    ObserverRunErrorView {
+        run_id: failure.run_id().to_string(),
+        sequence: failure.sequence,
+        script_version: failure.script_version,
+        status: wire_name(&failure.status),
+        claimed_at: failure.claimed_at,
+        finished_at: failure.finished_at,
+        exit_code: failure.exit_code,
+        error: failure.error.clone(),
+        stdout: failure.stdout.clone(),
+        stderr: failure.stderr.clone(),
     }
 }
 

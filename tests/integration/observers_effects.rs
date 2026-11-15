@@ -161,6 +161,18 @@ impl Fixture {
     fn tasks(&self) -> usize {
         self.service.control_plane().list_tasks().unwrap().len()
     }
+
+    /// The tasks the run in progress created, from the observer's record.
+    fn tasks_created(&self, run: &ClaimedObserverRun) -> u32 {
+        let record = self
+            .service
+            .observers()
+            .load(&run.run_id.observer_id)
+            .unwrap();
+        let active = record.active_run.expect("the run is in progress");
+        assert_eq!(active.sequence, run.run_id.sequence);
+        active.tasks_created
+    }
 }
 
 fn issue(key: &str) -> Value {
@@ -193,14 +205,7 @@ fn every_call_creates_a_new_task_with_a_random_id() {
     assert!(!first_id.starts_with(id.as_str()), "{first_id}");
     assert!(first.message.contains(&first_id), "{}", first.message);
     assert_eq!(fx.tasks(), 2);
-    assert_eq!(
-        fx.service
-            .observers()
-            .load_run(&run.run_id)
-            .unwrap()
-            .tasks_created,
-        2
-    );
+    assert_eq!(fx.tasks_created(&run), 2);
 }
 
 #[test]
@@ -295,14 +300,7 @@ fn a_refused_task_does_not_count_and_a_later_call_tries_again() {
         "{refused:?}"
     );
     assert_eq!(fx.tasks(), 0);
-    assert_eq!(
-        fx.service
-            .observers()
-            .load_run(&run.run_id)
-            .unwrap()
-            .tasks_created,
-        0
-    );
+    assert_eq!(fx.tasks_created(&run), 0);
 
     EnvironmentCatalog::new(&fx.root)
         .save_backend(&crate::environment_support::backend("later-backend"))
@@ -353,10 +351,13 @@ fn a_run_that_ended_can_have_no_more_effects() {
         .authenticate_observer_run(run.token.expose())
         .is_none());
     assert_eq!(fx.tasks(), 0);
-    assert_eq!(
-        fx.service.observers().load_run(&run.run_id).unwrap().status,
-        RunStatus::Succeeded
-    );
+    let record = fx
+        .service
+        .observers()
+        .load(&run.run_id.observer_id)
+        .unwrap();
+    assert_eq!(record.active_run, None);
+    assert_eq!(record.last_run.unwrap().status, RunStatus::Succeeded);
 }
 
 #[test]

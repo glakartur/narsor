@@ -33,7 +33,6 @@ mod tests;
 mod workers;
 
 pub use effects::{MAX_EFFECT_DATA_BYTES, MAX_EVENT_DATA_BYTES};
-pub use owner::SHOWN_RUNS;
 pub use schedule::{
     retry_delay_secs, ClaimedObserverRun, ObserverPass, RunOutcome, RunReport,
     MAX_CONSECUTIVE_FAILURES, MAX_RETRY_DELAY_SECS, MAX_STORED_LOG_BYTES, RUN_DEADLINE_MARGIN_SECS,

@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::task_text::age;
 use crate::controller_protocol::{
-    ObserverDetailView, ObserverEffectResponse, ObserverListResponse, ObserverRunView,
+    ObserverDetailView, ObserverEffectResponse, ObserverListResponse, ObserverRunErrorView,
     ObserverScriptView, ObserverView, ObserverWatchListResponse, ObserverWatchView,
 };
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
@@ -120,7 +120,8 @@ pub fn observer_list_output(listing: &ObserverListResponse, now: DateTime<Utc>) 
 }
 
 /// `observer show`: everything about one observer the owner may need,
-/// secret references without values, and its latest runs.
+/// secret references without values, and the execution errors of its
+/// failed or lost runs (a successful run leaves none).
 pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> String {
     let observer = &detail.observer;
     let mut out = String::new();
@@ -224,10 +225,18 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
             ));
         }
     }
-    if !detail.runs.is_empty() {
-        line("Runs (newest first):".to_string());
-        for run in &detail.runs {
-            line(format!("  {}", run_line(run, now)));
+    if !detail.errors.is_empty() {
+        line("Errors (newest first):".to_string());
+        for error in &detail.errors {
+            line(format!("  {}", error_line(error, now)));
+            for (stream, text) in [("stdout", &error.stdout), ("stderr", &error.stderr)] {
+                if let Some(tail) = text.as_deref().and_then(output_tail) {
+                    line(format!("    {stream}:"));
+                    for text_line in tail {
+                        line(format!("      {text_line}"));
+                    }
+                }
+            }
         }
     }
     out
@@ -248,26 +257,38 @@ fn script_line(observer: &ObserverView) -> String {
     }
 }
 
-/// One run of `observer show`.
-fn run_line(run: &ObserverRunView, now: DateTime<Utc>) -> String {
-    let when = run.finished_at.unwrap_or(run.claimed_at);
+/// One execution error of `observer show`.
+fn error_line(error: &ObserverRunErrorView, now: DateTime<Utc>) -> String {
     let mut text = format!(
         "#{} run of v{}: {} {} ago",
-        run.sequence,
-        run.script_version,
-        clean(&run.status),
-        age(now, when)
+        error.sequence,
+        error.script_version,
+        clean(&error.status),
+        age(now, error.finished_at)
     );
-    if let Some(code) = run.exit_code {
+    if let Some(code) = error.exit_code {
         text.push_str(&format!(", exit {code}"));
     }
-    if run.tasks_created > 0 {
-        text.push_str(&format!(", {} task(s) created", run.tasks_created));
-    }
-    if let Some(error) = &run.error {
-        text.push_str(&format!(": {}", clean(error)));
-    }
+    text.push_str(&format!(": {}", clean(&error.error)));
     text
+}
+
+/// Most lines of a failed run's stdout or stderr that `observer show`
+/// prints: the end, where a script's error usually is.
+const SHOWN_OUTPUT_LINES: usize = 10;
+
+/// The last [`SHOWN_OUTPUT_LINES`] non-empty lines of `text`, cleaned;
+/// `None` when it has none.
+fn output_tail(text: &str) -> Option<Vec<String>> {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let skip = lines.len().saturating_sub(SHOWN_OUTPUT_LINES);
+    Some(lines[skip..].iter().map(|line| clean(line)).collect())
 }
 
 /// The answer to `observer script set`.

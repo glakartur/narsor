@@ -385,7 +385,7 @@ impl WorkerApi for ServiceApi {
                     .finish_observer_run_for(&self.owner, &run_id, report.clone())
             })
             .map(|run| ObserverRunResultResponse {
-                run_id: run.run_id().to_string(),
+                run_id: run_id.to_string(),
                 status: serde_json::to_value(run.status)
                     .unwrap()
                     .as_str()
@@ -624,6 +624,55 @@ async fn observer_list_shows_state_last_run_and_its_error() {
     let error = lines.next().unwrap();
     assert!(error.trim_start().starts_with("error:"), "{error}");
     assert!(!listed.contains("no worker"), "{listed}");
+}
+
+#[tokio::test]
+async fn observer_show_lists_the_errors_of_failed_runs_only() {
+    // D15: a successful run leaves no record to show.
+    let fx = Fixture::new();
+    fx.cli(CREATE_JIRA).await.unwrap();
+    let file = fx.script_file("jira.sh", "true\n");
+    fx.cli(&["script", "set", "jira-new", "--file", &file])
+        .await
+        .unwrap();
+    fx.cli(&["approve", "jira-new", "--version", "1"])
+        .await
+        .unwrap();
+    for (exit_code, stdout, stderr) in [
+        (0, r#"{"state": {}}"#, ""),
+        (3, "", "line 1\ncurl: \u{1b}[31mboom\n"),
+    ] {
+        fx.service.observer_pass();
+        let run = fx.service.claim_observer_run().unwrap().unwrap();
+        fx.service
+            .finish_observer_run(
+                &run.run_id,
+                RunReport {
+                    outcome: RunOutcome::Exited { exit_code },
+                    stdout: stdout.into(),
+                    stderr: stderr.into(),
+                },
+            )
+            .unwrap();
+        fx.advance(Duration::seconds(300));
+    }
+
+    let shown = fx.cli(&["show", "jira-new"]).await.unwrap();
+
+    assert!(shown.contains("Last run: #2 failed"), "{shown}");
+    let errors = shown
+        .split_once("Errors (newest first):\n")
+        .expect("an errors section")
+        .1;
+    let mut lines = errors.lines();
+    let first = lines.next().unwrap();
+    assert!(first.contains("#2 run of v1: failed"), "{first}");
+    assert!(first.contains("exit 3"), "{first}");
+    assert_eq!(lines.next().unwrap().trim(), "stderr:");
+    assert_eq!(lines.next().unwrap().trim(), "line 1");
+    assert_eq!(lines.next().unwrap().trim(), "curl: [31mboom");
+    assert!(!shown.contains("#1 run"), "{shown}");
+    assert!(!shown.contains("Runs"), "{shown}");
 }
 
 #[tokio::test]

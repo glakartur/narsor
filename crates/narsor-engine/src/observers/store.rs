@@ -5,7 +5,8 @@
 //! {state}/observers/{id}/observer.json              ObserverRecord (atomic replace)
 //! {state}/observers/{id}/observer.lock              per-observer mutation lock
 //! {state}/observers/{id}/scripts/{n}.sh             script version n (exclusive create, immutable)
-//! {state}/observers/{id}/runs/{seq:08}.json         ObserverRun (exclusive create, then replace)
+//! {state}/observers/{id}/errors/{seq:08}.json       RunFailure of a failed or lost run (atomic
+//!                                                   replace; the newest 20 kept)
 //! {state}/observers/{id}/watches/{entry}.json       WatchEntry (exclusive create)
 //! ```
 //!
@@ -24,10 +25,14 @@
 //! leaves an unlisted file that the next save of that version replaces. A
 //! deletion removes the record first, so a crash half way through leaves a
 //! directory without `observer.json`, which no listing reports.
+//!
+//! A run in progress lives in the record only (`active_run`). A run leaves
+//! a file only when it fails or is lost; a successful run changes the
+//! record and nothing else.
 
 use super::model::{
-    sha256_hex, ObserverConfig, ObserverId, ObserverRecord, ObserverRun, RunId, WatchEntry,
-    MAX_SCRIPT_BYTES, OBSERVER_RECORD_VERSION, OBSERVER_RUN_VERSION, WATCH_ENTRY_VERSION,
+    sha256_hex, ObserverConfig, ObserverId, ObserverRecord, RunFailure, WatchEntry,
+    MAX_SCRIPT_BYTES, OBSERVER_RECORD_VERSION, RUN_FAILURE_VERSION, WATCH_ENTRY_VERSION,
 };
 use super::{ObserverError, Result};
 use crate::domain::WorkflowDefinition;
@@ -42,6 +47,10 @@ use crate::persistence::PersistenceError;
 use chrono::{DateTime, Utc};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// How many execution errors of an observer the store keeps: writing one
+/// more deletes the oldest.
+pub const KEPT_RUN_FAILURES: usize = 20;
 
 /// Proof that the caller holds one observer's lock. Released when dropped.
 #[derive(Debug)]
@@ -127,6 +136,27 @@ impl ObserverStore {
                 // Deleted between the listing and the read.
                 Err(ObserverError::NotFound(_)) => {}
                 Err(error) => return Err(error),
+            }
+        }
+        records.sort_by(|left, right| left.config.name.cmp(&right.config.name));
+        Ok(records)
+    }
+
+    /// Every observer that can be read, sorted by name: a record that
+    /// cannot (corrupt, or written by a newer build) is logged and skipped,
+    /// so it does not stop the others (D7).
+    ///
+    /// For the schedule only. The owner's views and [`Self::create`] use
+    /// the strict [`Self::list`], which reports such a record.
+    pub fn list_readable(&self) -> Result<Vec<ObserverRecord>> {
+        let mut records = Vec::new();
+        for observer_id in self.observer_ids()? {
+            match self.load(&observer_id) {
+                Ok(record) => records.push(record),
+                Err(ObserverError::NotFound(_)) => {}
+                Err(error) => {
+                    tracing::warn!(observer = %observer_id, %error, "observers: skipping an unreadable observer record");
+                }
             }
         }
         records.sort_by(|left, right| left.config.name.cmp(&right.config.name));
@@ -296,58 +326,56 @@ impl ObserverStore {
         String::from_utf8(bytes).map_err(|_| corrupt())
     }
 
-    // -- runs ---------------------------------------------------------------
+    // -- run failures -------------------------------------------------------
 
-    /// Writes a new run record; refuses a sequence number already used.
-    pub fn create_run(&self, lock: &ObserverLock, run: &ObserverRun) -> Result<()> {
-        lock.require(&run.observer_id)?;
-        let path = self
-            .paths
-            .observer_run_file(run.observer_id.as_str(), run.sequence);
-        if write_json_atomic_exclusive(&path, run)? {
-            Ok(())
-        } else {
-            Err(ObserverError::RunExists(run.run_id()))
+    /// Writes the execution error of a failed or lost run, then deletes the
+    /// oldest errors beyond [`KEPT_RUN_FAILURES`]. Writing the same run's
+    /// error again replaces it.
+    pub fn record_failure(&self, lock: &ObserverLock, failure: &RunFailure) -> Result<()> {
+        lock.require(&failure.observer_id)?;
+        let id = failure.observer_id.as_str();
+        write_json_atomic(
+            &self.paths.observer_error_file(id, failure.sequence),
+            failure,
+        )?;
+        let sequences = self.failure_sequences(&failure.observer_id)?;
+        let surplus = sequences.len().saturating_sub(KEPT_RUN_FAILURES);
+        for sequence in &sequences[..surplus] {
+            remove_file_if_exists(&self.paths.observer_error_file(id, *sequence))?;
         }
+        Ok(())
     }
 
-    /// Atomically replaces an existing run record.
-    pub fn save_run(&self, lock: &ObserverLock, run: &ObserverRun) -> Result<()> {
-        lock.require(&run.observer_id)?;
-        let path = self
-            .paths
-            .observer_run_file(run.observer_id.as_str(), run.sequence);
-        if !path.exists() {
-            return Err(ObserverError::RunNotFound(run.run_id()));
+    /// The kept execution errors of an observer, newest first.
+    pub fn list_failures(&self, observer_id: &ObserverId) -> Result<Vec<RunFailure>> {
+        let mut failures = Vec::new();
+        for sequence in self.failure_sequences(observer_id)?.into_iter().rev() {
+            let path = self
+                .paths
+                .observer_error_file(observer_id.as_str(), sequence);
+            match read_json::<RunFailure>(&path) {
+                Ok(failure) => {
+                    check_version(&path, failure.record_version, RUN_FAILURE_VERSION)?;
+                    failures.push(failure);
+                }
+                // Deleted by a newer error between the listing and the read.
+                Err(PersistenceError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(write_json_atomic(&path, run)?)
+        Ok(failures)
     }
 
-    /// Loads one run record.
-    pub fn load_run(&self, run_id: &RunId) -> Result<ObserverRun> {
-        let path = self
-            .paths
-            .observer_run_file(run_id.observer_id.as_str(), run_id.sequence);
-        if !path.exists() {
-            return Err(ObserverError::RunNotFound(run_id.clone()));
-        }
-        let run: ObserverRun = read_json(&path)?;
-        check_version(&path, run.record_version, OBSERVER_RUN_VERSION)?;
-        Ok(run)
-    }
-
-    /// Every run of an observer, oldest first.
-    pub fn list_runs(&self, observer_id: &ObserverId) -> Result<Vec<ObserverRun>> {
-        let dir = self.paths.observer_runs_dir(observer_id.as_str());
+    /// Sequence numbers of an observer's error files, oldest first.
+    fn failure_sequences(&self, observer_id: &ObserverId) -> Result<Vec<u64>> {
+        let dir = self.paths.observer_errors_dir(observer_id.as_str());
         let mut sequences: Vec<u64> = json_file_stems(&dir)?
             .iter()
             .filter_map(|name| parse_event_file_name(&format!("{name}.json")))
             .collect();
         sequences.sort_unstable();
-        sequences
-            .into_iter()
-            .map(|sequence| self.load_run(&RunId::new(observer_id.clone(), sequence)))
-            .collect()
+        Ok(sequences)
     }
 
     // -- watches ------------------------------------------------------------
@@ -417,7 +445,7 @@ impl ObserverStore {
             for dir in [
                 self.paths.observer_dir(id),
                 self.paths.observer_scripts_dir(id),
-                self.paths.observer_runs_dir(id),
+                self.paths.observer_errors_dir(id),
                 self.paths.observer_watches_dir(id),
             ] {
                 removed.extend(cleanup_orphaned_temp_files(&dir)?);

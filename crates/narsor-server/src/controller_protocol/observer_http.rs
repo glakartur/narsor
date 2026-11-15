@@ -266,6 +266,7 @@ async fn post_result(
     let owner = worker_owner(&principal)?;
     let run_id = RunId::parse(&run).map_err(|_| HttpProtocolError(ProtocolError::NotFound))?;
     let report: ObserverRunReport = parse_json(&body, "run result")?;
+    let finished_run = run_id.to_string();
     let run = blocking(&service, move |s| {
         s.finish_observer_run_for(&owner, &run_id, report)
     })
@@ -275,7 +276,7 @@ async fn post_result(
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_default();
     Ok(Json(ObserverRunResultResponse {
-        run_id: run.run_id().to_string(),
+        run_id: finished_run,
         status,
         error: run.error,
     }))
@@ -1028,6 +1029,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_owner_sees_only_the_errors_of_failed_runs() {
+        let fx = Fixture::new();
+        let (_worker_id, credential) = worker_credential(&fx).await;
+        jira_observer(&fx);
+        for report in [
+            json!({"outcome": {"kind": "exited", "exit_code": 0}, "stdout": "{\"state\": {}}"}),
+            json!({"outcome": {"kind": "exited", "exit_code": 4}, "stderr": "boom"}),
+        ] {
+            fx.service.observer_pass();
+            let run = fx.service.claim_observer_run().unwrap().unwrap();
+            let result = fx
+                .send(
+                    "POST",
+                    &format!("/observer/v1/worker/runs/{}/result", run.run_id),
+                    &credential,
+                    report,
+                )
+                .await;
+            assert_eq!(result.status(), StatusCode::OK);
+            *fx.clock.0.lock().unwrap() += Duration::seconds(3600);
+        }
+
+        let detail = fx
+            .send(
+                "GET",
+                "/control/v1/observers/jira-all",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+
+        assert_eq!(detail.status(), StatusCode::OK);
+        let body = json_body(detail).await;
+        let errors = body["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{body}");
+        assert_eq!(errors[0]["sequence"], 2);
+        assert_eq!(errors[0]["status"], "failed");
+        assert_eq!(errors[0]["exit_code"], 4);
+        assert_eq!(errors[0]["stderr"], "boom");
+        assert!(body.get("runs").is_none());
+        assert_eq!(body["observer"]["last_run"]["status"], "failed");
+    }
+
+    #[tokio::test]
     async fn each_credential_opens_only_its_own_routes() {
         let fx = Fixture::new();
         let (_worker_id, credential) = worker_credential(&fx).await;
@@ -1142,9 +1187,14 @@ mod tests {
             )
             .await;
         assert_eq!(result.status(), StatusCode::NOT_FOUND);
+        let record = fx
+            .service
+            .observers()
+            .load(&run.run_id.observer_id)
+            .unwrap();
         assert_eq!(
-            fx.service.observers().load_run(&run.run_id).unwrap().status,
-            narsor_engine::observers::RunStatus::Running
+            record.active_run.map(|active| active.sequence),
+            Some(run.run_id.sequence)
         );
     }
 

@@ -4,20 +4,28 @@
 //! ```text
 //! observer_pass   next_run_at <= now, active, approved  → run_due_since = now
 //!                 watch_list without entries            → next_run_at += interval, no run
-//!                 run past its deadline                 → Lost, token spent
-//! claim           the oldest due                        → ObserverRun + token (once)
-//! finish          exit 0 + valid output                 → state saved, failures = 0
-//!                 anything else                         → state kept, failures + 1, backoff
+//!                 run past its deadline                 → lost: error file, token spent
+//! claim           a run past its deadline               → lost (as in the pass)
+//!                 the oldest due                        → active_run + token (once)
+//! finish          exit 0 + valid output                 → state saved, failures = 0, no file
+//!                 anything else                         → error file, state kept,
+//!                                                         failures + 1, backoff
 //! ```
 //!
-//! The pass only flags; the run record appears at the claim. The flag is
-//! one value, not a queue, so a control plane that stood still for hours
-//! owes at most one run per observer afterwards. Deadlines, counters and
-//! the flag live in the observer's record, which survives a restart.
+//! The pass only flags; the run appears at the claim, as the record's
+//! `active_run`. The flag is one value, not a queue, so a control plane that
+//! stood still for hours owes at most one run per observer afterwards.
+//! Deadlines, counters, the flag and the run in progress live in the
+//! observer's record, which survives a restart. The script's input is built
+//! at the claim and handed to the worker only; it is never stored (D15).
 //!
-//! Every mutation saves the observer's record before the run's record: the
-//! observer's record is the commit point. A crash between the two leaves a
-//! record naming a run whose file is missing or stale; the pass repairs it.
+//! Only an execution error leaves a file ([`RunFailure`], written before the
+//! record is saved): a crash between the two leaves the run active, and it
+//! is found lost at its deadline, which writes the same run's error again.
+//!
+//! The pass and the claim list the observers leniently: a record that
+//! cannot be read is logged and skipped, so it does not stop the others
+//! (D7).
 //!
 //! The pass runs on the daemon's 5-second tick and must stay cheap: when
 //! nothing is due it reads the observers' records and takes no lock.
@@ -35,10 +43,10 @@ use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
 use crate::observers::{
-    parse_script_output, secs_duration, LastRun, ObserverError, ObserverId, ObserverLock,
-    ObserverRecord, ObserverRun, ObserverState, RunId, RunStatus, ScriptInput, ScriptObserver,
-    ScriptOutput, ScriptWatch, SecretRef, WatchEntry, WatchMode, MAX_SCRIPT_OUTPUT_BYTES,
-    OBSERVER_RUN_VERSION, SCRIPT_CONTRACT_VERSION,
+    parse_script_output, secs_duration, ActiveRun, LastRun, ObserverError, ObserverId,
+    ObserverLock, ObserverRecord, ObserverState, RunFailure, RunId, RunStatus, ScriptInput,
+    ScriptObserver, ScriptOutput, ScriptWatch, SecretRef, WatchEntry, WatchMode,
+    MAX_SCRIPT_OUTPUT_BYTES, RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION,
 };
 use crate::orchestration::{OrchestrationError, OwnerRef, TaskState};
 
@@ -59,11 +67,11 @@ pub const SCRIPT_TIMEOUT_SECS: u64 = 5 * 60;
 /// process group and report. A run without a result by then is lost.
 pub const RUN_DEADLINE_MARGIN_SECS: u64 = 60;
 
-/// Most bytes of stdout, stderr or an error message a run record keeps.
+/// Most bytes of stdout, stderr or an error message an error file keeps.
 /// The whole stdout (up to the contract's limit) is parsed first.
 pub const MAX_STORED_LOG_BYTES: usize = 64 * 1024;
 
-/// Why a lost run ended, as `observer show` prints it.
+/// Why a lost run ended, as its error file and `observer show` say.
 const LOST_MESSAGE: &str =
     "lost by the worker: no result before the run's deadline; the observer's state is unchanged";
 
@@ -241,7 +249,7 @@ impl ProtocolService {
     ///
     /// Failures are logged per observer; the next pass retries.
     pub fn observer_pass(&self) -> ObserverPass {
-        let records = match self.observers.list() {
+        let records = match self.observers.list_readable() {
             Ok(records) => records,
             Err(error) => {
                 tracing::warn!(%error, "observers: cannot list observers");
@@ -251,8 +259,13 @@ impl ProtocolService {
         let now = self.control.now();
         let mut pass = ObserverPass::default();
         for record in &records {
-            let result = if let Some(sequence) = record.active_run {
-                self.expire_run_if_lost(&record.observer_id, sequence, now, &mut pass)
+            let result = if let Some(active) = &record.active_run {
+                if active.is_past_deadline(now) {
+                    self.expire_run_if_lost(&record.observer_id, now)
+                        .map(|lost| pass.lost.extend(lost))
+                } else {
+                    Ok(())
+                }
             } else if scheduled_run_due(record, now) {
                 self.mark_run_due(&record.observer_id, now, &mut pass)
             } else {
@@ -270,10 +283,12 @@ impl ProtocolService {
 
     /// Hands the next run to a worker: the scheduled run due the longest. `None` when no run is due.
     ///
-    /// The claim creates the run's record and its token under the
-    /// observer's lock, so two workers never get the same run and an
-    /// observer never has two runs at once. An observer that fails to
-    /// yield its run is logged and skipped, so it does not block the rest.
+    /// The claim writes the run into the observer's record (`active_run`)
+    /// with its token's digest under the observer's lock, so two workers
+    /// never get the same run and an observer never has two runs at once.
+    /// A run past its deadline is recorded as lost first. An observer that
+    /// fails to yield its run, or whose record cannot be read, is logged
+    /// and skipped, so it does not block the rest.
     pub fn claim_observer_run(&self) -> ProtocolResult<Option<ClaimedObserverRun>> {
         self.claim_next_run(None)
     }
@@ -294,7 +309,7 @@ impl ProtocolService {
         owner: &OwnerRef,
         run_id: &RunId,
         report: RunReport,
-    ) -> ProtocolResult<ObserverRun> {
+    ) -> ProtocolResult<LastRun> {
         match self.observers.load(&run_id.observer_id) {
             Ok(record) if &record.owner == owner => {}
             Ok(_) | Err(ObserverError::NotFound(_)) => return Err(ProtocolError::NotFound),
@@ -309,15 +324,26 @@ impl ProtocolService {
         &self,
         owner: Option<&OwnerRef>,
     ) -> ProtocolResult<Option<ClaimedObserverRun>> {
-        let mut candidates: Vec<(DateTime<Utc>, ObserverId)> = self
-            .observers
-            .list()?
+        let now = self.control.now();
+        let records = self.observers.list_readable()?;
+        let mut candidates: Vec<(DateTime<Utc>, ObserverId)> = Vec::new();
+        for record in records
             .into_iter()
             .filter(|record| owner.is_none_or(|owner| &record.owner == owner))
-            .filter_map(|record| claim_candidate(&record).map(|since| (since, record.observer_id)))
-            .collect();
+        {
+            if record
+                .active_run
+                .as_ref()
+                .is_some_and(|active| active.is_past_deadline(now))
+            {
+                if let Err(error) = self.expire_run_if_lost(&record.observer_id, now) {
+                    tracing::warn!(observer = %record.observer_id, %error, "observers: cannot record a lost run");
+                }
+            } else if let Some(since) = claim_candidate(&record) {
+                candidates.push((since, record.observer_id));
+            }
+        }
         candidates.sort();
-        let now = self.control.now();
         for (_, observer_id) in candidates {
             match self.claim_from(&observer_id, now) {
                 Ok(Some(claimed)) => return Ok(Some(claimed)),
@@ -334,10 +360,10 @@ impl ProtocolService {
     ///
     /// Exit code 0 with a valid output document saves the new state, marks
     /// the first run done, clears the failure count and removes the watch
-    /// entries the script reported closed. Any other result keeps the state,
-    /// counts a failure and waits `interval × 2^failures` (at most 1 h);
-    /// after [`MAX_CONSECUTIVE_FAILURES`] the observer goes to `error`
-    /// (R14, R16).
+    /// entries the script reported closed; it writes no file. Any other
+    /// result writes the run's error file, keeps the state, counts a failure
+    /// and waits `interval × 2^failures` (at most 1 h); after
+    /// [`MAX_CONSECUTIVE_FAILURES`] the observer goes to `error` (R14, R16).
     ///
     /// The run's token stops working. A run already ended, or past its
     /// deadline (it is then recorded as lost), is refused with a conflict.
@@ -345,40 +371,55 @@ impl ProtocolService {
         &self,
         run_id: &RunId,
         report: RunReport,
-    ) -> ProtocolResult<ObserverRun> {
+    ) -> ProtocolResult<LastRun> {
         let observer_id = &run_id.observer_id;
         let lock = self.observers.lock(observer_id)?;
         let mut record = self.observers.load(observer_id)?;
-        let mut run = self.observers.load_run(run_id)?;
-        if record.active_run != Some(run_id.sequence) || run.status != RunStatus::Running {
+        let Some(active) = record
+            .active_run
+            .clone()
+            .filter(|active| active.sequence == run_id.sequence)
+        else {
             return Err(ProtocolError::conflict(
                 "observer_run_ended",
                 format!("run {run_id} has already ended"),
             ));
-        }
+        };
         let now = self.control.now();
-        if now >= run.deadline {
-            self.lose_run(&lock, &mut record, &mut run, now)?;
+        if active.is_past_deadline(now) {
+            self.lose_run(&lock, &mut record, &active, now)?;
             return Err(ProtocolError::conflict(
                 "observer_run_lost",
                 format!("run {run_id} passed its deadline and was recorded as lost"),
             ));
         }
         let (status, exit_code, error, output) = judge(&report);
-        run.status = status;
-        run.exit_code = exit_code;
-        run.error = error.clone();
-        run.finished_at = Some(now);
-        run.token_digest = None;
-        run.stdout = Some(bounded(&report.stdout));
-        run.stderr = Some(bounded(&report.stderr));
+        if let Some(message) = &error {
+            self.observers.record_failure(
+                &lock,
+                &RunFailure {
+                    record_version: RUN_FAILURE_VERSION,
+                    observer_id: observer_id.clone(),
+                    sequence: active.sequence,
+                    script_version: active.script_version,
+                    claimed_at: active.claimed_at,
+                    finished_at: now,
+                    status,
+                    exit_code,
+                    error: message.clone(),
+                    stdout: Some(bounded(&report.stdout)),
+                    stderr: Some(bounded(&report.stderr)),
+                },
+            )?;
+        }
         record.active_run = None;
-        record.last_run = Some(LastRun {
-            sequence: run.sequence,
+        let last_run = LastRun {
+            sequence: active.sequence,
             status,
             finished_at: now,
             error,
-        });
+        };
+        record.last_run = Some(last_run.clone());
         let interval = record.config.schedule.interval_secs;
         let mut closed = BTreeSet::new();
         match output {
@@ -411,26 +452,22 @@ impl ProtocolService {
                 }
             }
         }
-        self.observers.save_run(&lock, &run)?;
-        Ok(run)
+        Ok(last_run)
     }
 
     /// The run an observer run token proves, `None` for anything that is
-    /// not the token of a run in progress before its deadline: a token of
-    /// another kind, a spent token (result in, or lost), a wrong secret.
-    /// The secret is compared with the stored digest in constant time.
+    /// not the token of the observer's run in progress before its deadline:
+    /// a token of another kind, a spent token (result in, or lost), a wrong
+    /// secret. The secret is compared with the digest in the observer's
+    /// record in constant time.
     pub fn authenticate_observer_run(&self, bearer: &str) -> Option<RunId> {
         let run_id = RunId::parse(observer_run_token_id(bearer)?).ok()?;
-        let run = self.observers.load_run(&run_id).ok()?;
-        let digest = run.token_digest.as_deref()?;
-        if !token_matches_digest(bearer, digest)
-            || run.status != RunStatus::Running
-            || self.control.now() >= run.deadline
-        {
-            return None;
-        }
         let record = self.observers.load(&run_id.observer_id).ok()?;
-        (record.active_run == Some(run_id.sequence)).then_some(run_id)
+        let active = record.active_run.as_ref()?;
+        let valid = active.sequence == run_id.sequence
+            && token_matches_digest(bearer, &active.token_digest)
+            && !active.is_past_deadline(self.control.now());
+        valid.then_some(run_id)
     }
 
     /// Flags the observer's scheduled run due, unless it watches a list
@@ -462,70 +499,64 @@ impl ProtocolService {
         Ok(())
     }
 
-    /// Records the observer's run `sequence` as lost if it passed its
-    /// deadline, and repairs a record that names a run which is missing or
-    /// already ended (a crash between the two writes of a claim or result).
+    /// Records the observer's run in progress as lost if it passed its
+    /// deadline, under the observer's lock. Returns the run lost, if any.
     fn expire_run_if_lost(
         &self,
         observer_id: &ObserverId,
-        sequence: u64,
         now: DateTime<Utc>,
-        pass: &mut ObserverPass,
-    ) -> Result<(), ObserverError> {
-        let run_id = RunId::new(observer_id.clone(), sequence);
-        // The cheap test without the lock; the mutation tests again under it.
-        match self.observers.load_run(&run_id) {
-            Ok(run) if run.status == RunStatus::Running && now < run.deadline => return Ok(()),
-            Ok(_) | Err(ObserverError::RunNotFound(_)) => {}
-            Err(error) => return Err(error),
-        }
+    ) -> Result<Option<RunId>, ObserverError> {
         let lock = self.observers.lock(observer_id)?;
         let mut record = self.observers.load(observer_id)?;
-        if record.active_run != Some(sequence) {
-            return Ok(());
-        }
-        match self.observers.load_run(&run_id) {
-            Ok(mut run) if run.status == RunStatus::Running => {
-                if now < run.deadline {
-                    return Ok(());
-                }
-                self.lose_run(&lock, &mut record, &mut run, now)?;
-                tracing::info!(run = %run_id, "observers: run lost by the worker");
-                pass.lost.push(run_id);
-            }
-            Ok(_) | Err(ObserverError::RunNotFound(_)) => {
-                record.active_run = None;
-                self.observers.save(&lock, &mut record, now)?;
-            }
-            Err(error) => return Err(error),
-        }
-        Ok(())
+        let Some(active) = record
+            .active_run
+            .clone()
+            .filter(|active| active.is_past_deadline(now))
+        else {
+            return Ok(None);
+        };
+        self.lose_run(&lock, &mut record, &active, now)?;
+        let run_id = active.run_id(observer_id);
+        tracing::info!(run = %run_id, "observers: run lost by the worker");
+        Ok(Some(run_id))
     }
 
-    /// Ends `run` as lost: its token stops working, the observer's state
-    /// and failure count stay as they are (the cause is the infrastructure,
-    /// not the script), and a scheduled run is next due one interval on.
+    /// Ends the run `active` as lost: its error file is written, its token
+    /// stops working, the observer's state and failure count stay as they
+    /// are (the cause is the infrastructure, not the script), and a
+    /// scheduled run is next due one interval on.
     fn lose_run(
         &self,
         lock: &ObserverLock,
         record: &mut ObserverRecord,
-        run: &mut ObserverRun,
+        active: &ActiveRun,
         now: DateTime<Utc>,
     ) -> Result<(), ObserverError> {
-        run.status = RunStatus::Lost;
-        run.finished_at = Some(now);
-        run.error = Some(LOST_MESSAGE.to_string());
-        run.token_digest = None;
+        self.observers.record_failure(
+            lock,
+            &RunFailure {
+                record_version: RUN_FAILURE_VERSION,
+                observer_id: record.observer_id.clone(),
+                sequence: active.sequence,
+                script_version: active.script_version,
+                claimed_at: active.claimed_at,
+                finished_at: now,
+                status: RunStatus::Lost,
+                exit_code: None,
+                error: LOST_MESSAGE.to_string(),
+                stdout: None,
+                stderr: None,
+            },
+        )?;
         record.active_run = None;
         record.last_run = Some(LastRun {
-            sequence: run.sequence,
+            sequence: active.sequence,
             status: RunStatus::Lost,
             finished_at: now,
-            error: run.error.clone(),
+            error: Some(LOST_MESSAGE.to_string()),
         });
         record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
-        self.observers.save(lock, record, now)?;
-        self.observers.save_run(lock, run)
+        self.observers.save(lock, record, now)
     }
 
     /// Takes the run `claim_candidate` names from one observer, under its
@@ -576,31 +607,18 @@ impl ProtocolService {
             import_backlog: record.config.import_backlog,
         };
         let deadline = after(now, SCRIPT_TIMEOUT_SECS + RUN_DEADLINE_MARGIN_SECS);
-        let run = ObserverRun {
-            record_version: OBSERVER_RUN_VERSION,
-            observer_id: observer_id.clone(),
+        record.active_run = Some(ActiveRun {
             sequence,
             script_version: version,
-            input: input.clone(),
             claimed_at: now,
             deadline,
-            token_digest: Some(token.digest()),
-            status: RunStatus::Running,
-            finished_at: None,
-            exit_code: None,
-            error: None,
-            stdout: None,
-            stderr: None,
+            token_digest: token.digest(),
             tasks_created: 0,
-        };
-        record.active_run = Some(sequence);
+        });
         record.last_run_sequence = sequence;
         record.last_claim_at = Some(now);
         record.run_due_since = None;
-        // The record first: a crash before the run file leaves a record
-        // naming a missing run, which the pass clears.
         self.observers.save(&lock, &mut record, now)?;
-        self.observers.create_run(&lock, &run)?;
         Ok(Some(ClaimedObserverRun {
             run_id,
             token,

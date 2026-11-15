@@ -154,11 +154,30 @@ impl Fixture {
         })
     }
 
-    fn run_of(&self, handled_run: &str) -> narsor_engine::observers::ObserverRun {
+    /// How the run `handled_run` ended, from its observer's record.
+    fn status_of(&self, handled_run: &str) -> RunStatus {
+        let run_id = RunId::parse(handled_run).unwrap();
+        let last_run = self
+            .service
+            .observers()
+            .load(&run_id.observer_id)
+            .unwrap()
+            .last_run
+            .expect("a finished run");
+        assert_eq!(last_run.sequence, run_id.sequence);
+        last_run.status
+    }
+
+    /// The error file of the failed run `handled_run`.
+    fn failure_of(&self, handled_run: &str) -> narsor_engine::observers::RunFailure {
+        let run_id = RunId::parse(handled_run).unwrap();
         self.service
             .observers()
-            .load_run(&RunId::parse(handled_run).unwrap())
+            .list_failures(&run_id.observer_id)
             .unwrap()
+            .into_iter()
+            .find(|failure| failure.sequence == run_id.sequence)
+            .expect("the run's error file")
     }
 
     /// Every file under the state root, as text.
@@ -220,7 +239,7 @@ impl WorkerApi for ServiceApi {
             .service
             .finish_observer_run_for(&self.owner, &RunId::parse(run_id).unwrap(), report.clone())
             .map(|run| ObserverRunResultResponse {
-                run_id: run.run_id().to_string(),
+                run_id: run_id.to_string(),
                 status: serde_json::to_value(run.status)
                     .unwrap()
                     .as_str()
@@ -346,7 +365,7 @@ async fn a_script_reading_its_input_saves_the_state_it_prints() {
     assert_eq!(handled.accepted.unwrap().status, "succeeded");
     let record = fx.service.observers().load(&id).unwrap();
     assert_eq!(record.script_state, Some(json!({"cursor": 5})));
-    assert_eq!(fx.run_of(&handled.run_id).status, RunStatus::Succeeded);
+    assert_eq!(fx.status_of(&handled.run_id), RunStatus::Succeeded);
     // The run directory is gone.
     assert_eq!(fs::read_dir(fx.root.join("work")).unwrap().count(), 0);
     // Nothing more is due.
@@ -471,8 +490,7 @@ async fn a_missing_secret_file_fails_the_run_before_the_script_starts() {
     };
     assert!(message.contains("'absent'"), "{message}");
     assert!(!message.contains(SENTINEL), "{message}");
-    let run = fx.run_of(&handled.run_id);
-    assert_eq!(run.status, RunStatus::WorkerError);
+    assert_eq!(fx.status_of(&handled.run_id), RunStatus::WorkerError);
     let record = fx.service.observers().load(&id).unwrap();
     assert_eq!(record.script_state, None);
     assert_eq!(record.consecutive_failures, 1);
@@ -520,7 +538,7 @@ async fn secret_values_and_the_token_never_reach_the_server() {
         handled.report.outcome,
         ObserverRunOutcome::Exited { exit_code: 1 }
     );
-    let run = fx.run_of(&handled.run_id);
+    let run = fx.failure_of(&handled.run_id);
     let stdout = run.stdout.clone().unwrap();
     let stderr = run.stderr.clone().unwrap();
     assert_eq!(stdout, format!("out {MASK} {MASK}\n"));
@@ -641,8 +659,7 @@ async fn stdout_over_the_limit_is_a_format_error_and_keeps_the_state() {
         ObserverRunOutcome::OutputTooLarge { exit_code: 0 }
     );
     assert!(handled.report.stdout.len() <= MAX_STDERR_BYTES);
-    let run = fx.run_of(&handled.run_id);
-    assert_eq!(run.status, RunStatus::InvalidOutput);
+    assert_eq!(fx.status_of(&handled.run_id), RunStatus::InvalidOutput);
     let record = fx.service.observers().load(&id).unwrap();
     assert_eq!(record.script_state, None);
     assert_eq!(record.consecutive_failures, 1);
@@ -660,7 +677,7 @@ async fn a_real_script_printing_too_much_is_a_format_error() {
         handled.report.outcome,
         ObserverRunOutcome::OutputTooLarge { exit_code: 0 }
     );
-    assert_eq!(fx.run_of(&handled.run_id).status, RunStatus::InvalidOutput);
+    assert_eq!(fx.status_of(&handled.run_id), RunStatus::InvalidOutput);
 }
 
 /// Whether process `pid` is gone (or a zombie nobody waits for any more).
