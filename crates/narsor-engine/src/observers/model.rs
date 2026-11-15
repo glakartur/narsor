@@ -874,6 +874,19 @@ pub struct ActiveRun {
     /// Tasks this run created so far, checked against the limit (R15).
     #[serde(default)]
     pub tasks_created: u32,
+    /// The watch entry the run checks, for an observer with a watch list
+    /// (one entry per run, D18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<RunWatch>,
+}
+
+/// The watch entry one run checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunWatch {
+    /// The entry's id: exit code 0 removes this entry.
+    pub entry_id: String,
+    /// The watched object, for the run's error.
+    pub object: String,
 }
 
 impl ActiveRun {
@@ -952,6 +965,10 @@ pub struct ObserverRecord {
     /// the "run due" flag, and since when it is up.
     #[serde(default)]
     pub run_due_since: Option<DateTime<Utc>>,
+    /// The watch entries still to check in the current round of a
+    /// watch-list observer, in order: each run takes the first (D18).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_round: Vec<String>,
     /// The run in progress, if any: at most one per observer.
     #[serde(default, deserialize_with = "active_run_or_legacy")]
     pub active_run: Option<ActiveRun>,
@@ -992,6 +1009,7 @@ impl ObserverRecord {
             first_run_done: false,
             next_run_at: None,
             run_due_since: None,
+            watch_round: Vec::new(),
             active_run: None,
             last_claim_at: None,
             last_run_sequence: 0,
@@ -1011,9 +1029,9 @@ impl ObserverRecord {
     }
 
     /// Since when a scheduled run waits for a worker to claim it; `None`
-    /// when none waits.
+    /// when none waits (a run in progress does not wait).
     pub fn waiting_for_claim_since(&self) -> Option<DateTime<Utc>> {
-        self.run_due_since
+        self.run_due_since.filter(|_| self.active_run.is_none())
     }
 
     /// Whether a run waited for a claim longer than one interval at `now`:
@@ -1037,7 +1055,9 @@ pub enum RunStatus {
     /// Claimed by a worker; no result yet.
     #[default]
     Running,
-    /// The script exited 0 with a valid output document.
+    /// The script ended as the contract allows: exit 0 with a valid output
+    /// document (an observer that creates tasks), or exit 0 or 1 (a watch
+    /// run).
     Succeeded,
     /// The script exited with another code.
     Failed,
@@ -1060,7 +1080,7 @@ pub enum RunStatus {
 /// Written only for a run that did not succeed (a failure, an invalid
 /// output, a time-out, a worker error) or was lost. A successful run leaves
 /// no file. The store keeps the newest [`super::store::KEPT_RUN_FAILURES`]
-/// of each observer.
+/// of each observer, and only the newest of each watched object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunFailure {
     /// Schema version, [`RUN_FAILURE_VERSION`].
@@ -1089,6 +1109,10 @@ pub struct RunFailure {
     /// The script's stderr as the worker sent it (masked, bounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// The watched object the run checked, for a watch run. A newer error
+    /// of the same object replaces this one (D18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_object: Option<String>,
 }
 
 impl RunFailure {

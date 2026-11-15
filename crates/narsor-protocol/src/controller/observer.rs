@@ -385,6 +385,9 @@ pub struct ObserverRunErrorView {
     /// The script's stderr (masked, bounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// The watched object the run checked, for a watch run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_object: Option<String>,
 }
 
 /// `GET /control/v1/observers/{observer}`: one observer in detail.

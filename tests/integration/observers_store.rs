@@ -127,12 +127,12 @@ fn script_input(record: &ObserverRecord) -> ScriptInput {
         },
         condition: record.config.condition.clone(),
         state: Some(json!({"cursor": 4})),
-        watches: vec![ScriptWatch {
+        watch: Some(ScriptWatch {
             object: "https://gitlab.example.com/a/-/merge_requests/17".into(),
             task_id: TaskId::parse("task-1").unwrap(),
             event_types: vec!["approved".into()],
             wait_episode: Some("episode-1".into()),
-        }],
+        }),
         first_run: true,
         import_backlog: false,
     }
@@ -146,6 +146,7 @@ fn active_run(sequence: u64) -> ActiveRun {
         deadline: now() + Duration::seconds(360),
         token_digest: "sha256:abc".into(),
         tasks_created: 2,
+        watch: None,
     }
 }
 
@@ -162,6 +163,7 @@ fn failure(record: &ObserverRecord, sequence: u64) -> RunFailure {
         error: "the script exited with code 1".into(),
         stdout: Some(String::new()),
         stderr: Some("boom".into()),
+        watch_object: None,
     }
 }
 
@@ -796,12 +798,15 @@ fn script_output_over_the_limit_or_not_json_breaks_the_contract() {
         Err(ContractError::Malformed(_))
     ));
 
-    let output = parse_script_output(
-        br#"{"state": {"cursor": 5}, "closed_watches": ["https://gitlab.example.com/a/-/merge_requests/17"]}"#,
-    )
-    .unwrap();
+    assert!(matches!(
+        parse_script_output(
+            br#"{"state": {}, "closed_watches": ["https://gitlab.example.com/a/-/merge_requests/17"]}"#
+        ),
+        Err(ContractError::Malformed(_))
+    ));
+
+    let output = parse_script_output(br#"{"state": {"cursor": 5}}"#).unwrap();
     assert_eq!(output.state, json!({"cursor": 5}));
-    assert_eq!(output.closed_watches.len(), 1);
 }
 
 #[test]
@@ -816,7 +821,7 @@ fn the_script_input_is_one_json_document_with_the_watch_episode() {
     assert_eq!(value["contract_version"], json!(1));
     assert_eq!(value["observer"]["name"], json!("jira-abc"));
     assert_eq!(value["state"], json!({"cursor": 4}));
-    assert_eq!(value["watches"][0]["wait_episode"], json!("episode-1"));
+    assert_eq!(value["watch"]["wait_episode"], json!("episode-1"));
     assert_eq!(value["first_run"], json!(true));
 }
 

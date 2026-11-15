@@ -734,9 +734,9 @@ add the entry when:
 
 Then the control plane writes the warning `watch_refused` (step, observer, object, reason) to the
 task history. The task continues to wait: the owner can add the entry manually. The entry goes away
-when the script reports the object in `closed_watches`, when the task is finished or archived, or
-when the owner removes it. When the script closes an entry while the task waits in the same
-episode, the control plane does not add the entry again.
+when the script of the observer ends with exit code 0 for it, when the task is finished or
+archived, or when the owner removes it. When the script ends an entry while the task waits in the
+same episode, the control plane does not add the entry again.
 
 A workflow that waits for the approval of a merge request and watches it:
 

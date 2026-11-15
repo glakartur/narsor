@@ -786,12 +786,13 @@ mod tests {
     async fn a_token_stops_working_at_the_result_and_at_the_deadline() {
         let fx = Fixture::new();
         let (run, task) = fx.event_run();
+        // Exit code 1: the entry stays, so a next run checks it (D18).
         fx.service
             .finish_observer_run(
                 &run.run_id,
                 RunReport {
-                    outcome: RunOutcome::Exited { exit_code: 0 },
-                    stdout: r#"{"state": {}}"#.into(),
+                    outcome: RunOutcome::Exited { exit_code: 1 },
+                    stdout: String::new(),
                     stderr: String::new(),
                 },
             )

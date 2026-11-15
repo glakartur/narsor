@@ -269,6 +269,9 @@ fn error_line(error: &ObserverRunErrorView, now: DateTime<Utc>) -> String {
     if let Some(code) = error.exit_code {
         text.push_str(&format!(", exit {code}"));
     }
+    if let Some(object) = &error.watch_object {
+        text.push_str(&format!(", {}", clean(object)));
+    }
     text.push_str(&format!(": {}", clean(&error.error)));
     text
 }

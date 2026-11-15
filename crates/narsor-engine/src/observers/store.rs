@@ -329,8 +329,9 @@ impl ObserverStore {
     // -- run failures -------------------------------------------------------
 
     /// Writes the execution error of a failed or lost run, then deletes the
-    /// oldest errors beyond [`KEPT_RUN_FAILURES`]. Writing the same run's
-    /// error again replaces it.
+    /// older errors of the same watched object (a new error replaces the
+    /// old one, D18) and the oldest errors beyond [`KEPT_RUN_FAILURES`].
+    /// Writing the same run's error again replaces it.
     pub fn record_failure(&self, lock: &ObserverLock, failure: &RunFailure) -> Result<()> {
         lock.require(&failure.observer_id)?;
         let id = failure.observer_id.as_str();
@@ -338,6 +339,14 @@ impl ObserverStore {
             &self.paths.observer_error_file(id, failure.sequence),
             failure,
         )?;
+        if failure.watch_object.is_some() {
+            for older in self.list_failures(&failure.observer_id)? {
+                if older.sequence != failure.sequence && older.watch_object == failure.watch_object
+                {
+                    remove_file_if_exists(&self.paths.observer_error_file(id, older.sequence))?;
+                }
+            }
+        }
         let sequences = self.failure_sequences(&failure.observer_id)?;
         let surplus = sequences.len().saturating_sub(KEPT_RUN_FAILURES);
         for sequence in &sequences[..surplus] {

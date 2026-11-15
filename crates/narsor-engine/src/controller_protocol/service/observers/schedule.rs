@@ -4,13 +4,27 @@
 //! ```text
 //! observer_pass   next_run_at <= now, active, approved  → run_due_since = now
 //!                 watch_list without entries            → next_run_at += interval, no run
+//!                 watch_list with entries               → watch_round = the entries
 //!                 run past its deadline                 → lost: error file, token spent
 //! claim           a run past its deadline               → lost (as in the pass)
-//!                 the oldest due                        → active_run + token (once)
-//! finish          exit 0 + valid output                 → state saved, failures = 0, no file
+//!                 the oldest due                        → active_run + token (once);
+//!                                                         a watch-list observer's run
+//!                                                         takes the round's next entry
+//! finish (tasks)  exit 0 + valid output                 → state saved, failures = 0, no file
 //!                 anything else                         → error file, state kept,
 //!                                                         failures + 1, backoff
+//! finish (watch)  exit 0                                → the entry is removed
+//!                 exit 1                                → the entry stays
+//!                 anything else                         → error file (it replaces the
+//!                                                         entry's older error), the entry
+//!                                                         stays; no backoff
 //! ```
+//!
+//! A watch-list observer checks one entry per run (D18). A round holds the
+//! entries that were there when the run became due; while entries are left
+//! in it, the observer stays due, so the next entry is claimed as soon as
+//! the run before has its result. The next round comes one interval after
+//! the last run. A failed entry is checked again in the next round.
 //!
 //! The pass only flags; the run appears at the claim, as the record's
 //! `active_run`. The flag is one value, not a queue, so a control plane that
@@ -30,8 +44,6 @@
 //! The pass runs on the daemon's 5-second tick and must stay cheap: when
 //! nothing is due it reads the observers' records and takes no lock.
 
-use std::collections::BTreeSet;
-
 use chrono::{DateTime, Utc};
 use narsor_protocol::controller::{ObserverSecretRef, ObserverWorkerRun};
 use serde::Serialize;
@@ -44,9 +56,10 @@ use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
 use crate::observers::{
     parse_script_output, secs_duration, ActiveRun, LastRun, ObserverError, ObserverId,
-    ObserverLock, ObserverRecord, ObserverState, RunFailure, RunId, RunStatus, ScriptInput,
-    ScriptObserver, ScriptOutput, ScriptWatch, SecretRef, WatchEntry, WatchMode,
-    MAX_SCRIPT_OUTPUT_BYTES, RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION,
+    ObserverLock, ObserverRecord, ObserverState, RunFailure, RunId, RunStatus, RunWatch,
+    ScriptInput, ScriptObserver, ScriptOutput, ScriptWatch, SecretRef, WatchEntry, WatchMode,
+    MAX_SCRIPT_OUTPUT_BYTES, RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION, WATCH_DONE_EXIT_CODE,
+    WATCH_PENDING_EXIT_CODE,
 };
 use crate::orchestration::{OrchestrationError, OwnerRef, TaskState};
 
@@ -199,52 +212,115 @@ fn bounded(text: &str) -> String {
     text[..end].to_string()
 }
 
-/// Turns a worker's report into the run's status, exit code, error and,
-/// for a success, the parsed output (R14).
-fn judge(report: &RunReport) -> (RunStatus, Option<i32>, Option<String>, Option<ScriptOutput>) {
-    match &report.outcome {
-        RunOutcome::Exited { exit_code: 0 } => {
-            match parse_script_output(report.stdout.as_bytes()) {
-                Ok(output) => (RunStatus::Succeeded, Some(0), None, Some(output)),
-                Err(error) => (
-                    RunStatus::InvalidOutput,
-                    Some(0),
-                    Some(error.to_string()),
-                    None,
-                ),
-            }
+/// How a run ended, as [`judge_tasks_run`] and [`judge_watch_run`] read
+/// the worker's report.
+struct Verdict<T> {
+    status: RunStatus,
+    exit_code: Option<i32>,
+    /// Why it failed; `None` for a success.
+    error: Option<String>,
+    /// What a success yields; `None` for a failure.
+    success: Option<T>,
+}
+
+impl<T> Verdict<T> {
+    fn failure(status: RunStatus, exit_code: Option<i32>, error: String) -> Self {
+        Self {
+            status,
+            exit_code,
+            error: Some(error),
+            success: None,
         }
-        RunOutcome::Exited { exit_code } => (
-            RunStatus::Failed,
-            Some(*exit_code),
-            Some(format!("the script exited with code {exit_code}")),
-            None,
-        ),
-        RunOutcome::OutputTooLarge { exit_code } => (
+    }
+
+    fn success(exit_code: i32, value: T) -> Self {
+        Self {
+            status: RunStatus::Succeeded,
+            exit_code: Some(exit_code),
+            error: None,
+            success: Some(value),
+        }
+    }
+}
+
+/// The script's exit code, or the verdict of a report that is a failure
+/// whatever the contract: no plain exit.
+fn exit_code_or_failure<T>(outcome: &RunOutcome) -> Result<i32, Verdict<T>> {
+    let verdict = match outcome {
+        RunOutcome::Exited { exit_code } => return Ok(*exit_code),
+        RunOutcome::OutputTooLarge { exit_code } => Verdict::failure(
             RunStatus::InvalidOutput,
             Some(*exit_code),
-            Some(format!(
-                "the script printed more than {MAX_SCRIPT_OUTPUT_BYTES} bytes on stdout"
-            )),
-            None,
+            format!("the script printed more than {MAX_SCRIPT_OUTPUT_BYTES} bytes on stdout"),
         ),
-        RunOutcome::TimedOut => (
+        RunOutcome::TimedOut => Verdict::failure(
             RunStatus::TimedOut,
             None,
-            Some(format!(
-                "the script ran past its time limit of {SCRIPT_TIMEOUT_SECS} seconds"
-            )),
-            None,
+            format!("the script ran past its time limit of {SCRIPT_TIMEOUT_SECS} seconds"),
         ),
         RunOutcome::WorkerError { message } => {
-            (RunStatus::WorkerError, None, Some(bounded(message)), None)
+            Verdict::failure(RunStatus::WorkerError, None, bounded(message))
         }
-        RunOutcome::Unrecognized => (
+        RunOutcome::Unrecognized => Verdict::failure(
             RunStatus::WorkerError,
             None,
-            Some("the worker reported an outcome this server does not know".to_string()),
-            None,
+            "the worker reported an outcome this server does not know".to_string(),
         ),
+    };
+    Err(verdict)
+}
+
+/// A script's exit with a code the contract does not accept.
+fn exited_with<T>(exit_code: i32) -> Verdict<T> {
+    Verdict::failure(
+        RunStatus::Failed,
+        Some(exit_code),
+        format!("the script exited with code {exit_code}"),
+    )
+}
+
+/// The run of an observer that creates tasks: exit 0 with a valid output
+/// document is the only success (R14).
+fn judge_tasks_run(report: &RunReport) -> Verdict<ScriptOutput> {
+    match exit_code_or_failure(&report.outcome) {
+        Ok(0) => match parse_script_output(report.stdout.as_bytes()) {
+            Ok(output) => Verdict::success(0, output),
+            Err(error) => Verdict::failure(RunStatus::InvalidOutput, Some(0), error.to_string()),
+        },
+        Ok(exit_code) => exited_with(exit_code),
+        Err(verdict) => verdict,
+    }
+}
+
+/// A watch run (D18): exit 0 means the entry is done, exit 1 that it must
+/// be checked again; the success says whether the entry is done. Stdout is
+/// not read.
+fn judge_watch_run(report: &RunReport) -> Verdict<bool> {
+    match exit_code_or_failure(&report.outcome) {
+        Ok(WATCH_DONE_EXIT_CODE) => Verdict::success(WATCH_DONE_EXIT_CODE, true),
+        Ok(WATCH_PENDING_EXIT_CODE) => Verdict::success(WATCH_PENDING_EXIT_CODE, false),
+        Ok(exit_code) => exited_with(exit_code),
+        Err(verdict) => verdict,
+    }
+}
+
+/// Counts a failed run of an observer that creates tasks: the next run
+/// waits `interval × 2^failures`, and after [`MAX_CONSECUTIVE_FAILURES`]
+/// the observer goes to `error` (R16).
+fn count_failure(record: &mut ObserverRecord, now: DateTime<Utc>) {
+    record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+    record.next_run_at = Some(after(
+        now,
+        retry_delay_secs(
+            record.config.schedule.interval_secs,
+            record.consecutive_failures,
+        ),
+    ));
+    if record.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+        && record.state == ObserverState::Active
+    {
+        record.state = ObserverState::Error;
+        tracing::info!(observer = %record.observer_id, failures = record.consecutive_failures, "observers: too many failed runs; waiting for the owner");
     }
 }
 
@@ -325,12 +401,17 @@ impl ProtocolService {
 
     /// Records the worker's result of a run and applies it to the observer.
     ///
-    /// Exit code 0 with a valid output document saves the new state, marks
-    /// the first run done, clears the failure count and removes the watch
-    /// entries the script reported closed; it writes no file. Any other
-    /// result writes the run's error file, keeps the state, counts a failure
-    /// and waits `interval × 2^failures` (at most 1 h); after
+    /// For an observer that creates tasks, exit code 0 with a valid output
+    /// document saves the new state, marks the first run done and clears
+    /// the failure count; it writes no file. Any other result writes the
+    /// run's error file, keeps the state, counts a failure and waits
+    /// `interval × 2^failures` (at most 1 h); after
     /// [`MAX_CONSECUTIVE_FAILURES`] the observer goes to `error` (R14, R16).
+    ///
+    /// For a watch run (D18), exit code 0 removes the entry and exit code 1
+    /// keeps it. Any other result writes the run's error file, which
+    /// replaces the older error of the same object, and keeps the entry for
+    /// the next round.
     ///
     /// The run's token stops working. A run already ended, or past its
     /// deadline (it is then recorded as lost), is refused with a conflict.
@@ -360,7 +441,36 @@ impl ProtocolService {
                 format!("run {run_id} passed its deadline and was recorded as lost"),
             ));
         }
-        let (status, exit_code, error, output) = judge(&report);
+        let interval = record.config.schedule.interval_secs;
+        let (status, exit_code, error, done_entry) = match &active.watch {
+            Some(watch) => {
+                let verdict = judge_watch_run(&report);
+                if verdict.success.is_some() {
+                    record.first_run_done = true;
+                }
+                // A failed entry is checked again in the next round: no
+                // backoff, no count towards the error state (D18).
+                record.next_run_at = Some(after(now, interval));
+                let done = verdict
+                    .success
+                    .unwrap_or(false)
+                    .then(|| watch.entry_id.clone());
+                (verdict.status, verdict.exit_code, verdict.error, done)
+            }
+            None => {
+                let verdict = judge_tasks_run(&report);
+                match verdict.success {
+                    Some(output) => {
+                        record.script_state = Some(output.state);
+                        record.first_run_done = true;
+                        record.consecutive_failures = 0;
+                        record.next_run_at = Some(after(now, interval));
+                    }
+                    None => count_failure(&mut record, now),
+                }
+                (verdict.status, verdict.exit_code, verdict.error, None)
+            }
+        };
         if let Some(message) = &error {
             self.observers.record_failure(
                 &lock,
@@ -376,6 +486,7 @@ impl ProtocolService {
                     error: message.clone(),
                     stdout: Some(bounded(&report.stdout)),
                     stderr: Some(bounded(&report.stderr)),
+                    watch_object: active.watch.as_ref().map(|watch| watch.object.clone()),
                 },
             )?;
         }
@@ -387,37 +498,9 @@ impl ProtocolService {
             error,
         };
         record.last_run = Some(last_run.clone());
-        let interval = record.config.schedule.interval_secs;
-        let mut closed = BTreeSet::new();
-        match output {
-            Some(output) => {
-                record.script_state = Some(output.state);
-                record.first_run_done = true;
-                record.consecutive_failures = 0;
-                record.next_run_at = Some(after(now, interval));
-                closed.extend(output.closed_watches);
-            }
-            None => {
-                record.consecutive_failures = record.consecutive_failures.saturating_add(1);
-                record.next_run_at = Some(after(
-                    now,
-                    retry_delay_secs(interval, record.consecutive_failures),
-                ));
-                if record.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
-                    && record.state == ObserverState::Active
-                {
-                    record.state = ObserverState::Error;
-                    tracing::info!(observer = %observer_id, failures = record.consecutive_failures, "observers: too many failed runs; waiting for the owner");
-                }
-            }
-        }
         self.observers.save(&lock, &mut record, now)?;
-        if !closed.is_empty() {
-            for entry in self.observers.list_watches(observer_id)? {
-                if closed.contains(&entry.object) {
-                    self.observers.remove_watch(&lock, &entry.entry_id)?;
-                }
-            }
+        if let Some(entry_id) = done_entry {
+            self.observers.remove_watch(&lock, &entry_id)?;
         }
         Ok(last_run)
     }
@@ -452,7 +535,8 @@ impl ProtocolService {
     }
 
     /// Flags the observer's scheduled run due, unless it watches a list
-    /// that is empty once the entries of ended tasks are gone (R6, R7).
+    /// that is empty once the entries of ended tasks are gone (R6, R7). A
+    /// watch-list observer's round is the entries left (D18).
     fn mark_run_due(
         &self,
         observer_id: &ObserverId,
@@ -473,6 +557,7 @@ impl ProtocolService {
                 pass.skipped.push(observer_id.clone());
                 return Ok(());
             }
+            record.watch_round = remaining.into_iter().map(|entry| entry.entry_id).collect();
         }
         record.run_due_since = Some(now);
         self.observers.save(&lock, &mut record, now)?;
@@ -527,6 +612,7 @@ impl ProtocolService {
                 error: LOST_MESSAGE.to_string(),
                 stdout: None,
                 stderr: None,
+                watch_object: active.watch.as_ref().map(|watch| watch.object.clone()),
             },
         )?;
         record.active_run = None;
@@ -556,17 +642,20 @@ impl ProtocolService {
         let Some(version) = record.approved_version else {
             return Ok(None);
         };
-        let watches = match record.config.watch_mode {
-            WatchMode::WatchList => self.observers.list_watches(observer_id)?,
-            WatchMode::All => Vec::new(),
+        let watch = match record.config.watch_mode {
+            WatchMode::WatchList => match self.next_round_entry(&mut record)? {
+                Some(entry) => Some(entry),
+                None => {
+                    // The round's entries went between the pass and this
+                    // claim (R6).
+                    record.run_due_since = None;
+                    record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
+                    self.observers.save(&lock, &mut record, now)?;
+                    return Ok(None);
+                }
+            },
+            WatchMode::All => None,
         };
-        if record.config.watch_mode == WatchMode::WatchList && watches.is_empty() {
-            // The last entry went between the pass and this claim (R6).
-            record.run_due_since = None;
-            record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
-            self.observers.save(&lock, &mut record, now)?;
-            return Ok(None);
-        }
         let script = self.observers.load_script(observer_id, version)?;
         let sequence = record.last_run_sequence + 1;
         let run_id = RunId::new(observer_id.clone(), sequence);
@@ -580,10 +669,7 @@ impl ProtocolService {
             },
             condition: record.config.condition.clone(),
             state: record.script_state.clone(),
-            watches: watches
-                .iter()
-                .map(|entry| self.script_watch(entry))
-                .collect(),
+            watch: watch.as_ref().map(|entry| self.script_watch(entry)),
             first_run: !record.first_run_done,
             import_backlog: record.config.import_backlog,
         };
@@ -595,10 +681,16 @@ impl ProtocolService {
             deadline,
             token_digest: token.digest(),
             tasks_created: 0,
+            watch: watch.map(|entry| RunWatch {
+                entry_id: entry.entry_id,
+                object: entry.object,
+            }),
         });
         record.last_run_sequence = sequence;
         record.last_claim_at = Some(now);
-        record.run_due_since = None;
+        // Entries left in the round keep the observer due: the next one is
+        // claimed once this run has its result.
+        record.run_due_since = (!record.watch_round.is_empty()).then_some(now);
         self.observers.save(&lock, &mut record, now)?;
         Ok(Some(ClaimedObserverRun {
             run_id,
@@ -611,6 +703,22 @@ impl ProtocolService {
             timeout_secs: SCRIPT_TIMEOUT_SECS,
             deadline,
         }))
+    }
+
+    /// Takes the next entry of the round that is still on the watch list,
+    /// `None` when the round has none left.
+    fn next_round_entry(
+        &self,
+        record: &mut ObserverRecord,
+    ) -> Result<Option<WatchEntry>, ObserverError> {
+        let mut watches = self.observers.list_watches(&record.observer_id)?;
+        while !record.watch_round.is_empty() {
+            let entry_id = record.watch_round.remove(0);
+            if let Some(at) = watches.iter().position(|entry| entry.entry_id == entry_id) {
+                return Ok(Some(watches.swap_remove(at)));
+            }
+        }
+        Ok(None)
     }
 
     /// A watch entry as its script sees it, with the `wait` episode its

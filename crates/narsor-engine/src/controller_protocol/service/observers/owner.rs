@@ -409,6 +409,7 @@ fn run_error_view(failure: &RunFailure) -> ObserverRunErrorView {
         error: failure.error.clone(),
         stdout: failure.stdout.clone(),
         stderr: failure.stderr.clone(),
+        watch_object: failure.watch_object.clone(),
     }
 }
 

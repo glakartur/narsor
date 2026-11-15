@@ -18,7 +18,8 @@ pub mod store;
 
 pub use contract::{
     parse_script_output, ContractError, ScriptInput, ScriptObserver, ScriptOutput, ScriptWatch,
-    MAX_SCRIPT_OUTPUT_BYTES, SCRIPT_CONTRACT_VERSION,
+    MAX_SCRIPT_OUTPUT_BYTES, SCRIPT_CONTRACT_VERSION, WATCH_DONE_EXIT_CODE,
+    WATCH_PENDING_EXIT_CODE,
 };
 pub use model::*;
 pub use store::{ObserverLock, ObserverStore, WatchWrite, KEPT_RUN_FAILURES};

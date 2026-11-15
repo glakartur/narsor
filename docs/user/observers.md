@@ -36,14 +36,17 @@ the run is due  ───────────────▶  claims the run
                                    on stdin and the run token  ─▶ reads the source
                                                                   narsor-cli task create …
               ◀────────────────────────────────────────────────── narsor-cli task event …
-                                   reads stdout and stderr     ◀─ prints {"state": …}
+                                   reads the exit code,        ◀─ prints {"state": …}
+                                   stdout and stderr              (only to create tasks)
 saves the state ◀───────────────  reports the result
-or counts a failure                (secrets masked)
+or the entry,                      (secrets masked)
+or records an error
 ```
 
 1. The control plane keeps the schedule. When the next run of an active
    observer is due, the run waits for a worker. Each observer has at most
-   one run at a time.
+   one run at a time. An observer with a watch list runs its script one
+   time for each watch entry: one run checks one entry (section 5).
 2. The worker (`narsor-cli observer worker`, which the server starts) claims
    the run. It gets a token that is valid only for this run and only until
    the run's deadline.
@@ -51,9 +54,10 @@ or counts a failure                (secrets masked)
    The script reads its input on stdin.
 4. The script reads the source and makes its effects with `narsor-cli task
    create` and `narsor-cli task event`. These commands use the run token.
-5. The script prints its new state on stdout. The worker reports the exit
-   code, stdout and stderr. A successful run saves the new state. Any other
-   result keeps the old state.
+5. The worker reports the exit code, stdout and stderr. For an observer
+   that creates tasks, the script prints its new state on stdout, and a
+   successful run saves it. For an observer with a watch list, the exit
+   code tells whether the entry is done (section 3).
 
 ## 2. Make an observer
 
@@ -110,6 +114,16 @@ run version 1 until you approve version 2.
 The script is a POSIX `sh` script. It can use `curl`, `jq`, `narsor-cli` and
 the tools of a base system.
 
+There are two kinds of scripts:
+
+- A script that **creates tasks** (an observer without a watch list, for
+  example `jira-new-issues.sh`) reads the source one time for each run. It
+  prints its state on stdout, and the next run gets it back.
+- A script that **delivers events** (an observer with a watch list, for
+  example `github-pr-review.sh`) checks one watch entry in each run. It
+  prints nothing on stdout. Its exit code tells Narsor what to do with the
+  entry.
+
 ### Input (stdin)
 
 One JSON document (contract version 1):
@@ -119,15 +133,13 @@ One JSON document (contract version 1):
   "contract_version": 1,
   "observer": {"id": "obs-…", "name": "pr-review", "source": "github.com"},
   "condition": {"host": "github.com"},
-  "state": {"last_id": 10342},
-  "watches": [
-    {
-      "object": "https://github.com/acme/app/pull/17",
-      "task_id": "…",
-      "event_types": ["review.approved", "merged"],
-      "wait_episode": "…"
-    }
-  ],
+  "state": null,
+  "watch": {
+    "object": "https://github.com/acme/app/pull/17",
+    "task_id": "…",
+    "event_types": ["review.approved", "merged"],
+    "wait_episode": "…"
+  },
   "first_run": false,
   "import_backlog": false
 }
@@ -138,37 +150,31 @@ One JSON document (contract version 1):
 | `contract_version` | `1`. Stop with an error when it has a different value. |
 | `observer` | The id, name and source of the observer. |
 | `condition` | The JSON object of `--condition`, as the owner gave it. |
-| `state` | What the last successful run printed in `state`. `null` before the first successful run. |
-| `watches` | The watch entries (only for an observer with a watch list). `wait_episode` is the id of the `wait` episode of the task, or `null` when the task does not wait now. |
+| `state` | What the last successful run printed in `state`. `null` before the first successful run, and always `null` for an observer with a watch list. |
+| `watch` | The one watch entry that this run checks (only for an observer with a watch list), else `null`. `wait_episode` is the id of the `wait` episode of the task, or `null` when the task does not wait now. |
 | `first_run` | `true` until the first run succeeds. |
 | `import_backlog` | `true` when the owner gave `--import-backlog`. |
 
-### Output (stdout)
+### Result of a script that creates tasks
 
-Exactly one JSON document, and nothing else:
+The script prints exactly one JSON document on stdout, and nothing else:
 
 ```json
-{"state": {"last_id": 10350}, "closed_watches": ["https://github.com/acme/app/pull/17"]}
+{"state": {"last_id": 10350}}
 ```
 
 - `state` is required. The next run gets it in its input. When the script
   has nothing to keep, it prints `{"state": {}}`.
-- `closed_watches` is optional. It lists the watched objects that ended
-  (for example, a merged or closed pull request). Narsor removes their
-  watch entries. The list has at most 10000 entries. Each entry has 1 to
-  4096 bytes and no control characters. Otherwise the output is not valid.
 - Other fields, a second document or a log line after the document make
   the output not valid.
 
 Write all other text to stderr. This includes the output of `narsor-cli`:
 send it to stderr with `>&2`.
 
-### Result
-
 | The script | Narsor |
 |---|---|
-| exits with `0` and prints a valid document | Saves the new state, removes the closed watch entries and sets the failure count to 0. |
-| exits with a different code, prints a document that is not valid, or runs for longer than its time limit | Keeps the old state. The next run sees the same objects again. Counts one failure. |
+| exits with `0` and prints a valid document | Saves the new state and sets the failure count to 0. |
+| exits with a different code, prints a document that is not valid, or runs for longer than its time limit | Keeps the old state. The next run sees the same objects again. Records the error and counts one failure. |
 
 Because a failed run keeps the old state, a script must be safe to run
 again. Narsor does not remove duplicates: two `task create` calls make two
@@ -185,6 +191,19 @@ that it does not create a task on each run.
 > error is then recorded and counted, and a refusal that does not go away
 > brings the observer to `error` after 5 failed runs in a row.
 
+### Result of a script that delivers events
+
+The exit code is the result. Narsor does not read stdout.
+
+| Exit code | Meaning | Narsor |
+|---|---|---|
+| `0` | Done. For example, the event went to the waiting step of the task, or the pull request is merged or closed. | Removes the watch entry. |
+| `1` | Check the entry again. For example, there is no review yet, or the task does not wait for this event. | Keeps the entry. The next run checks it again. |
+| any other code, or the script runs for longer than its time limit | An error. | Records the error and keeps the entry. The next run checks it again. A new error of the same object replaces the old one. |
+
+An error of a watch entry is not counted as a failure: the observer does
+not wait longer and does not go to `error`.
+
 ### Limits
 
 | Limit | Value |
@@ -194,7 +213,6 @@ that it does not create a task on each run.
 | stderr | 64 KiB (Narsor keeps the start) |
 | Data of one task (`--data`) | 64 KiB |
 | Data of one event (`--data`) | 16 KiB |
-| Entries in `closed_watches` | 10000, each 1 to 4096 bytes |
 | Tasks of one run | `--task-limit` (10 by default, 1000 at most) |
 | Time between runs | `--interval` (300 s by default, 60 s at least) |
 
@@ -241,16 +259,24 @@ narsor-cli task event "$TASK_ID" --type review.approved --data "$JSON" </dev/nul
   that comes before the task waits stays only in the history.
 - **Send an event only when the task waits.** When `wait_episode` is
   `null`, the task does not wait: do not send the event.
-- **Close the entry after the event.** The example scripts report the
-  object in `closed_watches` after they send a `review.*` event, so that a
-  task gets one event for each wait. When the task waits again (a review
-  loop), its `wait` step adds the object to the watch list again.
+- **End the entry after the event.** `narsor-cli task event` prints
+  `delivered …` when the event went to the waiting step, and `recorded …`
+  when the server only wrote it to the history. The example scripts exit
+  with `0` only after `delivered`, so that Narsor removes the entry and a
+  task gets one event for each wait. After `recorded` they exit with `1`,
+  and the next run checks the entry again. When the task waits again (a
+  review loop), its `wait` step adds the object to the watch list again.
 
 ## 5. Watch entries (pull and merge requests)
 
 An observer created with `--deliver-events` (or `--watch-list`) looks only
 at the objects on its watch list. When the list is empty, the observer does
 not run.
+
+When the run of the observer is due, Narsor starts a round: one run for
+each entry on the list, one after the other. Each run gets one entry in
+`watch`. The next round starts one interval after the last run of the
+round. An entry that is added during a round waits for the next round.
 
 An entry is added in one of two ways:
 
@@ -265,8 +291,8 @@ must not be longer than `--max-object-len`. A URL prefix includes the host,
 so that a task cannot send the token of the source to a different host. The
 example scripts also check the host before they use the token.
 
-An entry goes away when the script reports the object in `closed_watches`,
-when the task is finished or archived, or when the owner removes it
+An entry goes away when the script ends with exit code `0` for it, when
+the task is finished or archived, or when the owner removes it
 (`observer watch remove`).
 
 > **A pull request that comes back to the list.** When a task waits again
@@ -290,12 +316,16 @@ when the task is finished or archived, or when the owner removes it
 back on its schedule and sets the failure count to 0. `observer approve`
 makes a `draft` observer `active`. It does not change other states.
 
-- **Failures.** After a failed run, the next run comes after the interval
-  times 2 for each failure in a row (2, 4, 8 …), at most 1 hour (or the
-  interval, when it is longer).
+- **Failures.** After a failed run of an observer that creates tasks, the
+  next run comes after the interval times 2 for each failure in a row
+  (2, 4, 8 …), at most 1 hour (or the interval, when it is longer). An
+  error of a watch entry is not counted: the next round checks the entry
+  again.
 - **Errors.** Narsor keeps a record only of a run that failed or was lost:
   the reason, the exit code, and stdout and stderr (masked). It keeps the
-  20 newest records of each observer. `observer show` shows them. A
+  20 newest records of each observer, and only the newest record of each
+  watched object. `observer show` shows them, with the object of a watch
+  run. A
   successful run changes only the state and the time of the last run.
 - **Lost runs.** When a worker does not report a run before its deadline
   (the time limit plus 1 minute), the run is lost. Its token stops working.
@@ -358,7 +388,7 @@ chmod +x fake/bin/narsor-cli
 echo '{"issues": [{"id": "101", "key": "ABC-101", "fields": {}}]}' > fake/search.json
 echo '{"contract_version": 1, "observer": {"id": "o", "name": "jira-new", "source": "jira"},
        "condition": {"base_url": "https://jira.example.com", "jql": "project = ABC"},
-       "state": {"last_id": 100}, "watches": [],
+       "state": {"last_id": 100}, "watch": null,
        "first_run": false, "import_backlog": false}' |
   PATH="$PWD/fake/bin:$PATH" FAKE_SOURCE_DIR="$PWD/fake" \
   sh workflows/observers/examples/jira-new-issues.sh

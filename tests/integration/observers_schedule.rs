@@ -197,7 +197,7 @@ fn the_pass_drops_the_entry_of_an_archived_task() {
 }
 
 #[test]
-fn a_restart_after_hours_of_downtime_owes_one_run_and_keeps_the_count() {
+fn a_restart_after_hours_of_downtime_owes_one_run_and_keeps_the_error() {
     let fx = Fixture::new();
     let id = fx.active_watch_list("mr-review");
     let task = fx.task("task-1");
@@ -221,7 +221,8 @@ fn a_restart_after_hours_of_downtime_owes_one_run_and_keeps_the_count() {
     run_periodic_pass(&restarted);
 
     let record = restarted.observers().load(&id).unwrap();
-    assert_eq!(record.consecutive_failures, 1);
+    // A failed watch run is not counted (D18): the entry is checked again.
+    assert_eq!(record.consecutive_failures, 0);
     assert_eq!(record.state, ObserverState::Active);
     let run = restarted.claim_observer_run().unwrap().expect("one run");
     assert_eq!(run.run_id.sequence, 2);

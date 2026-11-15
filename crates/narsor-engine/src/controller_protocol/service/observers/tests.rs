@@ -390,7 +390,7 @@ fn a_successful_run_leaves_no_file_but_the_observers_own() {
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
 
-    fx.finish(&claimed, exited(0, r#"{"state": {"cursor": 1}}"#));
+    fx.finish(&claimed, exited(1, ""));
 
     assert_eq!(
         fx.observer_files(&id),
@@ -715,12 +715,14 @@ fn approving_a_draft_activates_it_and_an_unknown_version_is_refused() {
 }
 
 #[test]
-fn the_claim_input_carries_the_wait_episode_of_each_entrys_task() {
+fn each_watch_run_checks_one_entry_with_its_tasks_wait_episode() {
+    // D18: one entry per run; the round takes the entries in order.
     let fx = Fixture::new();
     let id = fx.active("mr-review", WatchMode::WatchList);
     let waiting = fx.task("task-waiting");
     let idle = fx.task("task-idle");
     fx.watch(&id, &waiting, &format!("{PREFIX}a/-/merge_requests/17"));
+    fx.advance(1);
     fx.watch(&id, &idle, &format!("{PREFIX}a/-/merge_requests/18"));
     let control = fx.service.control_plane();
     {
@@ -737,40 +739,54 @@ fn the_claim_input_carries_the_wait_episode_of_each_entrys_task() {
     }
 
     fx.service.observer_pass();
-    let claimed = fx.claim().unwrap();
+    let first = fx.claim().unwrap();
+    assert!(fx.claim().is_none(), "one run at a time");
+    fx.finish(&first, exited(1, ""));
+    let second = fx.claim().unwrap();
+    fx.finish(&second, exited(1, ""));
 
-    let episodes: Vec<_> = claimed
-        .input
-        .watches
+    let episodes: Vec<_> = [&first, &second]
         .iter()
-        .map(|watch| (watch.task_id.as_str(), watch.wait_episode.as_deref()))
+        .map(|claimed| {
+            let watch = claimed.input.watch.as_ref().unwrap();
+            (watch.task_id.as_str(), watch.wait_episode.as_deref())
+        })
         .collect();
     assert_eq!(
         episodes,
         vec![("task-waiting", Some("episode-3")), ("task-idle", None)]
     );
+    assert!(fx.claim().is_none(), "the round is over");
+    assert_eq!(fx.service.observers().list_watches(&id).unwrap().len(), 2);
+    assert_eq!(
+        fx.record(&id).next_run_at,
+        Some(fx.now() + Duration::seconds(INTERVAL as i64))
+    );
 }
 
 #[test]
-fn closed_watches_in_a_successful_result_remove_their_entries() {
-    // R7.
+fn a_watch_run_exit_code_decides_whether_its_entry_stays() {
+    // D18: 0 removes the entry, 1 keeps it, another code is an error that
+    // keeps it and replaces the object's older error.
     let fx = Fixture::new();
     let id = fx.active("mr-review", WatchMode::WatchList);
     let task = fx.task("task-1");
     let merged = format!("{PREFIX}a/-/merge_requests/17");
     let open = format!("{PREFIX}a/-/merge_requests/18");
     fx.watch(&id, &task, &merged);
+    fx.advance(1);
     fx.watch(&id, &task, &open);
     fx.service.observer_pass();
-    let claimed = fx.claim().unwrap();
 
-    fx.finish(
-        &claimed,
-        exited(
-            0,
-            &json!({"state": {}, "closed_watches": [merged]}).to_string(),
-        ),
+    let first = fx.claim().unwrap();
+    assert_eq!(first.input.watch.as_ref().unwrap().object, merged);
+    assert_eq!(
+        fx.finish(&first, exited(0, "")).status,
+        RunStatus::Succeeded
     );
+    let second = fx.claim().unwrap();
+    assert_eq!(second.input.watch.as_ref().unwrap().object, open);
+    assert_eq!(fx.finish(&second, exited(3, "")).status, RunStatus::Failed);
 
     let objects: Vec<String> = fx
         .service
@@ -780,7 +796,56 @@ fn closed_watches_in_a_successful_result_remove_their_entries() {
         .into_iter()
         .map(|entry| entry.object)
         .collect();
-    assert_eq!(objects, vec![open]);
+    assert_eq!(objects, vec![open.clone()]);
+    let record = fx.record(&id);
+    assert_eq!(record.consecutive_failures, 0, "no backoff for a watch run");
+    assert_eq!(record.state, ObserverState::Active);
+    assert_eq!(
+        record.next_run_at,
+        Some(fx.now() + Duration::seconds(INTERVAL as i64))
+    );
+    let errors = fx.failures(&id);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].watch_object.as_deref(), Some(open.as_str()));
+
+    // The next round checks the entry again; a new error replaces the old.
+    fx.advance(INTERVAL as i64);
+    fx.service.observer_pass();
+    let third = fx.claim().unwrap();
+    fx.finish(&third, exited(2, ""));
+    let errors = fx.failures(&id);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].sequence, third.run_id.sequence);
+    assert_eq!(errors[0].exit_code, Some(2));
+
+    fx.advance(INTERVAL as i64);
+    fx.service.observer_pass();
+    let fourth = fx.claim().unwrap();
+    fx.finish(&fourth, exited(1, ""));
+    assert_eq!(fx.service.observers().list_watches(&id).unwrap().len(), 1);
+}
+
+#[test]
+fn a_round_skips_an_entry_removed_before_its_run() {
+    let fx = Fixture::new();
+    let id = fx.active("mr-review", WatchMode::WatchList);
+    let task = fx.task("task-1");
+    let gone = format!("{PREFIX}a/-/merge_requests/17");
+    fx.watch(&id, &task, &gone);
+    fx.service.observer_pass();
+    let lock = fx.service.observers().lock(&id).unwrap();
+    for entry in fx.service.observers().list_watches(&id).unwrap() {
+        fx.service
+            .observers()
+            .remove_watch(&lock, &entry.entry_id)
+            .unwrap();
+    }
+    drop(lock);
+
+    assert!(fx.claim().is_none());
+    let record = fx.record(&id);
+    assert!(record.watch_round.is_empty());
+    assert_eq!(record.run_due_since, None);
 }
 
 #[test]

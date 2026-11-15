@@ -1,7 +1,7 @@
 //! Integration tests of watch entries from a workflow (U5): a `wait` step
 //! with a `watch` block asks an observer to watch an object (a merge
-//! request) while the task waits, and the script's `closed_watches` ends
-//! the entry.
+//! request) while the task waits, and the script's exit code 0 ends the
+//! entry.
 //!
 //! The tests run in-process, without a daemon and without a network, as
 //! `actions_wait` does: a real [`ProtocolService`] over a temporary state
@@ -425,20 +425,20 @@ async fn a_waiting_step_with_a_watch_adds_one_entry_for_its_task_and_object() {
         .claim_observer_run()
         .unwrap()
         .expect("a watch-list observer with an entry runs");
-    assert_eq!(claimed.input.watches.len(), 1);
-    assert_eq!(claimed.input.watches[0].object, MR);
-    assert_eq!(claimed.input.watches[0].task_id, stack.task);
+    let watch = claimed.input.watch.expect("a watch run checks one entry");
+    assert_eq!(watch.object, MR);
+    assert_eq!(watch.task_id, stack.task);
     assert_eq!(
-        claimed.input.watches[0].wait_episode.as_deref(),
+        watch.wait_episode.as_deref(),
         Some(reported.episode_id.as_str())
     );
 }
 
 #[tokio::test]
-async fn the_entry_goes_when_the_script_reports_the_merge_request_closed() {
-    // Covers AE5 (the end): the script reports MR 17 merged in
-    // `closed_watches`, and its entry is removed. A later report of the
-    // same wait does not add it back.
+async fn the_entry_goes_when_the_script_exits_0_for_it() {
+    // Covers AE5 (the end): the script exits 0 for MR 17 (D18), and its
+    // entry is removed. A later report of the same wait does not add it
+    // back.
     let mut stack = Stack::new(fixture(), &[]);
     let observer = mr_review(&stack);
     stack.start(MR).await;
@@ -450,14 +450,13 @@ async fn the_entry_goes_when_the_script_reports_the_merge_request_closed() {
         .unwrap();
     stack.service.observer_pass();
     let claimed = stack.service.claim_observer_run().unwrap().expect("due");
-    let stdout = json!({"state": {"seen": 1}, "closed_watches": [MR]}).to_string();
     stack
         .service
         .finish_observer_run(
             &claimed.run_id,
             RunReport {
                 outcome: RunOutcome::Exited { exit_code: 0 },
-                stdout,
+                stdout: String::new(),
                 stderr: String::new(),
             },
         )

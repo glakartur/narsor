@@ -20,39 +20,39 @@
 #
 # Secrets: GITLAB_TOKEN, a token with the read_api scope.
 #
-# A watched object is a merge request URL:
+# One run checks one watch entry (the input's `watch`). Its object is a
+# merge request URL:
 #   https://HOST/GROUP/PROJECT/-/merge_requests/IID
-# (subgroups allowed). Before it uses the token, the script checks every
+# (subgroups allowed). Before it uses the token, the script checks the
 # object: an object that is not a merge request URL on `host` is never
-# fetched, so the token is not sent for it (fail closed). The script logs it
-# on stderr and reports it in closed_watches, so its entry is removed; the
-# other entries are handled as usual. The control plane checks the objects
-# too (--allow-prefix); this check is the second line of defence.
+# fetched, so the token is not sent for it (fail closed). The control plane
+# checks the objects too (--allow-prefix); this check is the second line of
+# defence.
 #
-# Events (a watch entry gets only the types in its event_types):
+# Events (the entry gets only the types in its event_types):
 #   review.approved            the merge request has its required approvals
 #   review.changes_requested   a reviewer asked for changes
 #   merged                     the merge request is merged
 #   closed                     the merge request is closed without a merge
 # Event data: {"mr_url": URL, "iid": N}. Filter a `wait` step on mr_url.
 #
-# A task gets events only while it waits (the entry has a wait_episode).
-# After the script sends an event, it reports the merge request in
-# closed_watches: its entry is removed, so the task gets one event per
-# wait. A merged or closed merge request is reported in closed_watches too.
-# The state is kept as it was given.
+# Exit code (the script prints nothing on stdout):
+#   0  done: Narsor removes the entry. A review event went to the waiting
+#      step of the task; or the merge request is merged or closed; or the
+#      object is not a merge request URL on `host`, or the merge request is
+#      gone or the token may not read it (HTTP 404, 403 or 410).
+#   1  check the entry again in the next run: no review decision, the task
+#      does not wait (no wait_episode), or the task does not wait for this
+#      event (narsor-cli says "recorded", not "delivered").
+#   2  an error (a bad input or condition, no token, a source that does not
+#      answer, a rate limit, a refused event). Narsor records it and checks
+#      the entry again in the next run.
 #
 # When a task waits again for the same merge request (a review loop), its
 # `wait` step puts the merge request on the watch list again, and the old
 # approvals and reviewer states on GitLab still match. Mark the merge
 # request before it goes back on the list (for example with a label that
 # the script looks for); this example does not do that.
-#
-# A merge request the source does not find or the token may not read (HTTP
-# 404, 403 or 410) is skipped the same way: logged and reported in
-# closed_watches. A 403 for a rate limit is not: it fails the run. Only a
-# problem of the whole run (a bad input or condition, no token, a source
-# that does not answer) makes the script exit non-zero.
 #
 # Tests: when FAKE_SOURCE_DIR is set, the script reads the answers from
 # "$FAKE_SOURCE_DIR/mr-NAME.json", "$FAKE_SOURCE_DIR/approvals-NAME.json"
@@ -65,9 +65,19 @@ set -eu
 
 me=gitlab-mr-review
 
+# The exit codes of the contract.
+DONE=0
+AGAIN=1
+ERROR=2
+
 fail() {
     printf '%s: %s\n' "$me" "$*" >&2
-    exit 1
+    exit "$ERROR"
+}
+
+done_with() {
+    printf '%s: %s\n' "$me" "$*" >&2
+    exit "$DONE"
 }
 
 command -v jq >/dev/null 2>&1 || fail "jq is not installed"
@@ -75,6 +85,8 @@ command -v jq >/dev/null 2>&1 || fail "jq is not installed"
 input=$(cat)
 printf '%s' "$input" | jq -e '.contract_version == 1' >/dev/null ||
     fail "the input is not version 1 of the script contract"
+entry=$(printf '%s' "$input" | jq -c '.watch // empty')
+[ -n "$entry" ] || fail "the input has no watch entry: create the observer with --deliver-events"
 
 host=$(printf '%s' "$input" | jq -r '.condition.host // ""')
 printf '%s' "$host" | jq -R -e 'test("\\A[A-Za-z0-9.-]+(:[0-9]+)?\\z")' >/dev/null ||
@@ -85,24 +97,23 @@ printf '%s' "$api_url" |
     jq -R -e 'test("\\Ahttps://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?\\z")' >/dev/null ||
     fail "condition.api_url must be an https:// address without a user name, query or fragment"
 
-# One line per watch entry: the entry and the parts of its URL. An object
-# that is not a merge request URL on `host` has no parts.
-watches=$(printf '%s' "$input" | jq -c --arg host "$host" '
-    .watches[]
-    | . + {mr: ([.object | capture(
+object=$(printf '%s' "$entry" | jq -r '.object')
+task_id=$(printf '%s' "$entry" | jq -r '.task_id')
+episode=$(printf '%s' "$entry" | jq -r '.wait_episode // ""')
+
+# Fail closed: check the object before the token goes anywhere.
+mr=$(printf '%s' "$entry" | jq -c --arg host "$host" '
+    [.object | capture(
         "\\Ahttps://(?<host>[A-Za-z0-9.:-]+)/(?<project>[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)+)/-/merge_requests/(?<iid>[0-9]+)\\z"
-      )] | map(select(.host == $host)) | .[0])}')
+    )] | map(select(.host == $host)) | .[0] // empty')
+[ -n "$mr" ] || done_with "$object is not a merge request URL on $host; not fetched"
+project=$(printf '%s' "$mr" | jq -r '.project')
+iid=$(printf '%s' "$mr" | jq -r '.iid')
+encoded=$(printf '%s' "$project" | jq -R -r '@uri')
+name=$(printf '%s-%s' "$project" "$iid" | tr '/' '-')
+base="projects/$encoded/merge_requests/$iid"
 
-# Fail closed: check every object before the token goes anywhere. An
-# object that does not fit is never fetched; its entry is closed.
-refused=$(printf '%s' "$watches" | jq -r 'select(.mr == null) | .object')
-if [ -n "$refused" ]; then
-    printf '%s: not a merge request URL on %s, skipped and closed:\n%s\n' "$me" "$host" "$refused" >&2
-fi
-closed=$(printf '%s' "$watches" | jq -s -c '[.[] | select(.mr == null) | .object] | unique')
-watches=$(printf '%s' "$watches" | jq -c 'select(.mr != null)')
-
-if [ -z "${FAKE_SOURCE_DIR:-}" ] && [ -n "$watches" ]; then
+if [ -z "${FAKE_SOURCE_DIR:-}" ]; then
     [ -n "${GITLAB_TOKEN:-}" ] || fail "GITLAB_TOKEN is not set: give the observer the secret"
 fi
 
@@ -155,78 +166,47 @@ fetch() {
     esac
 }
 
-# close_entry: reports the current entry in closed_watches.
-close_entry() {
-    closed=$(printf '%s' "$closed" |
-        jq -c --arg object "$object" 'if index([$object]) == null then . + [$object] else . end')
-}
-
-# skip_entry STATUS WHAT: after a failed fetch of WHAT of the current entry.
-# A merge request that is gone or that the token may not read is skipped and
-# its entry closed; any other failure fails the run.
-skip_entry() {
+# fetched STATUS WHAT: after a failed fetch of WHAT. A merge request that is
+# gone or that the token may not read is done; any other failure is an
+# error.
+fetched() {
     [ "$1" -eq 2 ] || fail "cannot read $2"
-    printf '%s: %s is gone or the token may not read it; skipped and closed\n' "$me" "$2" >&2
-    close_entry
+    done_with "$2 is gone or the token may not read it"
 }
 
-# send TYPE: delivers the event TYPE to the task of the current entry, when
-# the entry asks for that type and the task waits. Returns 1 when it sends
-# nothing.
+# send TYPE: sends the event TYPE to the task, when the entry asks for that
+# type and the task waits. Returns 0 only when the event went to the
+# waiting step ("delivered"); 1 when it sent nothing or the server only
+# recorded it.
 send() {
     [ -n "$episode" ] || return 1
     printf '%s' "$entry" | jq -e --arg type "$1" '.event_types | index([$type]) != null' >/dev/null ||
         return 1
     data=$(jq -n -c --arg url "$object" --argjson iid "$iid" '{mr_url: $url, iid: $iid}')
-    # stdout is the result document: the messages of narsor-cli go to stderr.
-    narsor-cli task event "$task_id" --type "$1" --data "$data" </dev/null >&2 ||
-        fail "the event $1 of $object was not delivered"
+    answer=$(narsor-cli task event "$task_id" --type "$1" --data "$data" </dev/null) ||
+        fail "the event $1 of $object was refused"
+    printf '%s\n' "$answer" >&2
+    case $answer in
+    delivered*) return 0 ;;
+    *) return 1 ;;
+    esac
 }
 
-while IFS= read -r entry; do
-    [ -n "$entry" ] || continue
-    object=$(printf '%s' "$entry" | jq -r '.object')
-    task_id=$(printf '%s' "$entry" | jq -r '.task_id')
-    episode=$(printf '%s' "$entry" | jq -r '.wait_episode // ""')
-    project=$(printf '%s' "$entry" | jq -r '.mr.project')
-    iid=$(printf '%s' "$entry" | jq -r '.mr.iid')
-    encoded=$(printf '%s' "$project" | jq -R -r '@uri')
-    name=$(printf '%s-%s' "$project" "$iid" | tr '/' '-')
-    base="projects/$encoded/merge_requests/$iid"
+mr=$(fetch "mr-$name" "$base") || fetched $? "$object"
+approvals=$(fetch "approvals-$name" "$base/approvals") || fetched $? "the approvals of $object"
+reviewers=$(fetch "reviewers-$name" "$base/reviewers") || fetched $? "the reviewers of $object"
 
-    mr=$(fetch "mr-$name" "$base") || {
-        skip_entry $? "$object"
-        continue
-    }
-    approvals=$(fetch "approvals-$name" "$base/approvals") || {
-        skip_entry $? "the approvals of $object"
-        continue
-    }
-    reviewers=$(fetch "reviewers-$name" "$base/reviewers") || {
-        skip_entry $? "the reviewers of $object"
-        continue
-    }
+if printf '%s' "$reviewers" | jq -e 'any(.[]; .state == "requested_changes")' >/dev/null; then
+    send review.changes_requested && exit "$DONE"
+elif printf '%s' "$approvals" | jq -e '.approved == true' >/dev/null; then
+    send review.approved && exit "$DONE"
+fi
 
-    review_event=
-    if printf '%s' "$reviewers" | jq -e 'any(.[]; .state == "requested_changes")' >/dev/null; then
-        review_event=review.changes_requested
-    elif printf '%s' "$approvals" | jq -e '.approved == true' >/dev/null; then
-        review_event=review.approved
-    fi
-    if [ -n "$review_event" ] && send "$review_event"; then
-        close_entry
-        continue
-    fi
-
-    state=$(printf '%s' "$mr" | jq -r '.state')
-    case $state in
-    merged | closed)
-        send "$state" || true
-        close_entry
-        ;;
-    esac
-done <<EOF
-$watches
-EOF
-
-printf '%s' "$input" | jq -c --argjson closed "$closed" '{state: (.state // {}), closed_watches: $closed}'
+state=$(printf '%s' "$mr" | jq -r '.state')
+case $state in
+merged | closed)
+    send "$state" || true
+    exit "$DONE"
+    ;;
+esac
+exit "$AGAIN"
