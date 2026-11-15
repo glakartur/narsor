@@ -70,7 +70,8 @@ use narsor_engine::controller_protocol::ProtocolError;
 use narsor_engine::domain::TaskId;
 use narsor_engine::domain::{Event, ExecutionStatus};
 use narsor_engine::engine::{current_timeline, EngineError, Timeline};
-use narsor_engine::environment::{CatalogLaunchResolver, LaunchIntent};
+use narsor_engine::environment::LaunchIntent;
+use narsor_engine::launch::CatalogLaunchResolver;
 use narsor_engine::orchestration::OwnerRef;
 use narsor_engine::persistence::{
     DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
@@ -192,7 +193,7 @@ struct AppState {
 /// (`/control/v1/…`) join the gated set, while its controller
 /// (`/controller/v1/…`) and runner (`/runner/v1/…`) routes are merged after
 /// the gate: they authenticate with their own credentials
-/// ([`narsor_engine::controller_protocol::http`]), never with the owner token.
+/// ([`crate::controller_protocol::http`]), never with the owner token.
 ///
 /// `catalog_dir`/`work_dir` are what [`narsor_engine::tasks::start_task`] and
 /// workflow-reference resolution ([`WorkflowResolver`]) need — the daemon's

@@ -66,18 +66,21 @@
 //! event stream that replays from a cursor before going live. Raw workspace
 //! files, secret values and raw transcripts are never part of any of it.
 //!
-//! * [`wire`] — every request and response;
+//! * [`wire`] — every request and response (from `crate::controller_client`);
 //! * [`credentials`] — identities, enrollment codes, runner secrets,
 //!   controller keys and the pluggable checks;
 //! * [`service`] — the server-side handling, independent of HTTP;
-//! * [`http`] — routers, credential gates and handlers;
-//! * [`client`] — typed controller and runner clients.
+//! * [`client`] — typed controller and runner clients (from
+//!   `crate::controller_client`).
+//!
+//! The HTTP routers, credential gates and handlers live in `narsor-server`.
 
-pub mod client;
+pub use crate::controller_client::client;
 pub mod credentials;
 pub mod error;
 pub mod service;
-pub mod wire;
+mod views;
+pub use crate::controller_client::wire;
 
 pub use client::{ClientOptions, ControllerClient, RunnerClient};
 pub use credentials::{

@@ -4,24 +4,25 @@
 //! execution, persistence, orchestration, and the adapters that project
 //! those internal models onto protocol types.
 
-pub mod api;
+pub use narsor_exec::api;
 pub mod auth;
-pub mod backends;
-pub mod conductor;
+pub use narsor_exec::conductor;
 pub mod config;
+pub use narsor_controller_client as controller_client;
 pub mod controller_protocol;
-pub mod controller_runtime;
-pub mod domain;
-pub mod engine;
+pub use narsor_controller_client::controller_runtime;
+pub use narsor_exec::engine;
+pub use narsor_model::domain;
 pub mod environment;
+pub mod launch;
 pub mod materials;
 pub mod observers;
 pub mod orchestration;
-pub mod persistence;
-pub mod registry;
+pub use narsor_exec::registry;
+pub use narsor_store as persistence;
 /// Shared runner-home settings retained for server and integration contracts.
 pub mod runner;
-pub mod tasks;
-pub mod workflow;
-pub mod workflows;
-pub mod workspace;
+pub use narsor_exec::tasks;
+pub use narsor_exec::workflows;
+pub use narsor_exec::workspace;
+pub use narsor_model::workflow;

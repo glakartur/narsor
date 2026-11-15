@@ -1,6 +1,6 @@
 //! HTTP binding of the protocol: routers, credential gates and handlers.
 //!
-//! Four routers, merged into the daemon's API by `narsor_engine::api::routes`:
+//! Four routers, merged into the daemon's API by `crate::api::routes`:
 //!
 //! | router | gate | prefix |
 //! | --- | --- | --- |

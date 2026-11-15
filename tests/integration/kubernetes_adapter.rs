@@ -29,7 +29,7 @@ use narsor_controller::controller::{
 };
 use narsor_controller::kubernetes::manifest::{self, check_pod_shape, KubernetesBackendConfig};
 use narsor_controller::kubernetes::{launched_under_epoch, names, KubernetesBackend};
-use narsor_engine::backends::{
+use narsor_controller_runtime::backend::{
     BackendErrorKind, ExecutionBackend, Removal, RunnerCredential, StorageState, TaskResources,
     WorkloadLaunch, WorkloadPhase,
 };
@@ -1229,7 +1229,7 @@ async fn the_reader_is_a_pod_of_its_own_on_the_same_claim() {
         .expect_err("no storage");
     assert_eq!(
         refused.kind,
-        narsor_engine::backends::BackendErrorKind::StorageMissing
+        narsor_controller_runtime::backend::BackendErrorKind::StorageMissing
     );
     assert!(quiet.cluster.pod_names().is_empty());
 

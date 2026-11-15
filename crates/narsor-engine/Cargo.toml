@@ -3,9 +3,6 @@ name = "narsor-engine"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-engine = []
-
 [lib]
 name = "narsor_engine"
 path = "src/lib.rs"
@@ -13,28 +10,24 @@ path = "src/lib.rs"
 [dependencies]
 narsor-protocol = { path = "../narsor-protocol" }
 narsor-shared = { path = "../narsor-shared" }
+narsor-model = { path = "../narsor-model" }
+narsor-store = { path = "../narsor-store" }
+narsor-exec = { path = "../narsor-exec" }
+narsor-controller-client = { path = "../narsor-controller-client" }
 narsor-controller-runtime = { path = "../narsor-controller-runtime" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
-path-absolutize = "4"
 thiserror = "2"
-anyhow = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
-validator = { version = "0.21", features = ["derive"] }
 futures = "0.3"
-zstd = "0.14"
 sha2 = "0.11"
-base64 = "0.23"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls"] }
 bytes = "1"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
-ed25519-dalek = { version = "3", features = ["alloc", "rand_core"] }
-rand = "0.10"
 ipnet = "2"
-github-copilot-sdk = "1.0"

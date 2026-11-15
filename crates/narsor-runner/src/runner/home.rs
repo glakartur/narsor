@@ -8,6 +8,6 @@
 //! of the task: switching it for a task that already ran leaves the sessions
 //! of the earlier mode behind, which is the operator's call to make.
 
-pub use narsor_engine::config::{
+pub use narsor_exec::config::{
     HarnessHome, HomeMode, API_KEY_ENVS, CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV,
 };

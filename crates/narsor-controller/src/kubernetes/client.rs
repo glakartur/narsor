@@ -27,7 +27,7 @@ use std::time::Duration;
 pub use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
-use narsor_engine::backends::{BackendError, BackendResult};
+use narsor_controller_runtime::backend::{BackendError, BackendResult};
 
 /// Where the in-cluster service-account files are mounted.
 pub const SERVICE_ACCOUNT_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";

@@ -17,10 +17,11 @@
 
 use super::storage::{CommandProgress, CommandVerdict};
 use super::{RunnerError, Session};
-use crate::controller_protocol::DeliveredOperatorCommand;
+use crate::controller_client::DeliveredOperatorCommand;
+use crate::domain::runner_snapshot::RETIRED_CONDUCTOR_HARNESS;
 use crate::domain::ExecutionStatus;
 use crate::engine::{EngineError, OperatorTransition, Recovery};
-use crate::orchestration::{OperatorCommand, RETIRED_CONDUCTOR_HARNESS};
+use narsor_protocol::controller::OperatorCommand;
 
 impl Session {
     /// Carries out one delivered command, once, and acknowledges it.

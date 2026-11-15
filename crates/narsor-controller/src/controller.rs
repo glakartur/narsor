@@ -36,7 +36,7 @@
 //!
 //! The controller's identity is the `nsk.…` credential in
 //! `--credential-file`: its id and an Ed25519 key it generated itself
-//! ([`narsor_engine::auth::pop`]). On the first start the file does not exist yet;
+//! ([`narsor_controller_client::pop`]). On the first start the file does not exist yet;
 //! the controller then redeems the one-time enrollment code, binding a
 //! freshly generated key, and persists the credential `0600`. Every later
 //! start loads it and ignores a code still lying around in the environment,
@@ -57,12 +57,12 @@ use clap::Args;
 use crate::kubernetes::client::{ClusterAccess, TokenSource};
 use crate::kubernetes::{KubernetesBackend, KubernetesBackendConfig};
 use crate::profile_edit::{printable, EditSession, ProfileChanges};
+use narsor_controller_client::controller_runtime::load_or_enroll as load_controller_identity;
+use narsor_controller_client::ControllerClient;
 use narsor_controller_runtime::{
     Controller, ControllerConfig, EnrollmentError, ENROLLMENT_CODE_ENV,
 };
 use narsor_engine::config::CLAUDE_CONFIG_DIR_ENV;
-use narsor_engine::controller_protocol::ControllerClient;
-use narsor_engine::controller_runtime::load_or_enroll as load_controller_identity;
 use narsor_protocol::harness::{display_name, CLAUDE_CODE};
 
 const EXIT_SUCCESS: i32 = 0;

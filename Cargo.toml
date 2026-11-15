@@ -22,8 +22,12 @@ members = [
     ".",
     "crates/narsor-api-client",
     "crates/narsor-controller",
+    "crates/narsor-controller-client",
     "crates/narsor-controller-runtime",
     "crates/narsor-engine",
+    "crates/narsor-exec",
+    "crates/narsor-model",
+    "crates/narsor-store",
     "crates/narsor-protocol",
     "crates/narsor-shared",
     "crates/narsor-observer-worker",
@@ -91,8 +95,12 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "que
 narsor-server = { path = "crates/narsor-server" }
 narsor-web = { path = "crates/narsor-web" }
 narsor-controller = { path = "crates/narsor-controller" }
+narsor-controller-client = { path = "crates/narsor-controller-client" }
 narsor-controller-runtime = { path = "crates/narsor-controller-runtime" }
 narsor-engine = { path = "crates/narsor-engine" }
+narsor-exec = { path = "crates/narsor-exec" }
+narsor-model = { path = "crates/narsor-model" }
+narsor-store = { path = "crates/narsor-store" }
 # The runner's reading of a Pod's arguments (tests/kubernetes_adapter.rs).
 narsor-runner = { path = "crates/narsor-runner" }
 # The observer worker's loop against a real ProtocolService

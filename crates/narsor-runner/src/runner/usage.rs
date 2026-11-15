@@ -24,7 +24,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::api::ClientError;
-use crate::controller_protocol::{HarnessUsageReport, RunnerClient};
+use crate::controller_client::{HarnessUsageReport, RunnerClient};
 use crate::engine::UsageReporter;
 
 /// The future of one send of a usage report.
@@ -153,7 +153,7 @@ impl UsageReporter for UsageForwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller_protocol::UsageLimit;
+    use crate::controller_client::UsageLimit;
     use chrono::Utc;
 
     fn report(harness: &str, utilization: f64) -> HarnessUsageReport {

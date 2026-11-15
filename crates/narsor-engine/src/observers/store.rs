@@ -36,15 +36,15 @@ use super::model::{
 };
 use super::{ObserverError, Result};
 use crate::domain::WorkflowDefinition;
-use crate::orchestration::store::FileLock;
-use crate::orchestration::{OrchestrationError, OwnerRef};
 use crate::persistence::atomic::{
     cleanup_orphaned_temp_files, read_json, remove_file_if_exists, write_atomic_exclusive,
     write_json_atomic, write_json_atomic_exclusive,
 };
+use crate::persistence::lock::{FileLock, FileLockError};
 use crate::persistence::paths::{is_temp_file, parse_event_file_name, StatePaths};
 use crate::persistence::PersistenceError;
 use chrono::{DateTime, Utc};
+use narsor_protocol::controller::OwnerRef;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -556,13 +556,9 @@ fn json_file_stems(dir: &Path) -> Result<Vec<String>> {
     Ok(stems)
 }
 
-fn lock_error(error: OrchestrationError) -> ObserverError {
+fn lock_error(error: FileLockError) -> ObserverError {
     match error {
-        OrchestrationError::Lock { path, source } => ObserverError::Lock { path, source },
-        OrchestrationError::Persistence(error) => ObserverError::Persistence(error),
-        other => ObserverError::Persistence(PersistenceError::io(
-            "observer lock",
-            std::io::Error::other(other.to_string()),
-        )),
+        FileLockError::Lock { path, source } => ObserverError::Lock { path, source },
+        FileLockError::Persistence(error) => ObserverError::Persistence(error),
     }
 }

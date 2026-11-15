@@ -41,7 +41,7 @@ use reqwest::Url;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::orchestration::OwnerRef;
+use narsor_protocol::controller::OwnerRef;
 
 use super::settings::{is_loopback_host, parse_issuer};
 

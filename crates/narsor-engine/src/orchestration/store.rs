@@ -55,11 +55,11 @@ use crate::domain::{BackendId, TaskId};
 use crate::persistence::atomic::{
     cleanup_orphaned_temp_files, read_json, write_json_atomic, write_json_atomic_exclusive,
 };
+use crate::persistence::lock::FileLock;
 use crate::persistence::paths::{parse_event_file_name, StatePaths};
 use crate::persistence::PersistenceError;
 use std::collections::HashSet;
 use std::fs;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -507,43 +507,46 @@ impl OrchestrationStore {
             self.load_task(task_id)?;
         }
         FileLock::acquire(self.paths.orchestration_task_lock_file(task_id.as_str()))
+            .map_err(Into::into)
     }
 
     /// Exclusive lock for creating tasks.
     pub(crate) fn lock_creation(&self) -> Result<FileLock> {
-        FileLock::acquire(self.paths.orchestration_create_lock_file())
+        FileLock::acquire(self.paths.orchestration_create_lock_file()).map_err(Into::into)
     }
 
     /// Exclusive lock for one backend's lease.
     pub(crate) fn lock_backend(&self, backend_id: &BackendId) -> Result<FileLock> {
         FileLock::acquire(self.paths.backend_lease_lock_file(backend_id.as_str()))
+            .map_err(Into::into)
     }
 
     /// Exclusive lock for one backend's scheduling decisions (U10).
     pub(crate) fn lock_schedule(&self, backend_id: &BackendId) -> Result<FileLock> {
         self.migrate_backend_if_legacy(backend_id)?;
         FileLock::acquire(self.paths.backend_schedule_lock_file(backend_id.as_str()))
+            .map_err(Into::into)
     }
 
     /// Exclusive lock for admission decisions across all backends, taken
     /// before any backend's schedule lock.
     pub(crate) fn lock_global_schedule(&self) -> Result<FileLock> {
-        FileLock::acquire(self.paths.global_schedule_lock_file())
+        FileLock::acquire(self.paths.global_schedule_lock_file()).map_err(Into::into)
     }
 
     /// Exclusive lock for changing the default-backend override.
     pub(crate) fn lock_default_backend(&self) -> Result<FileLock> {
-        FileLock::acquire(self.paths.default_backend_lock_file())
+        FileLock::acquire(self.paths.default_backend_lock_file()).map_err(Into::into)
     }
 
     /// Exclusive lock for mutating one controller identity record.
     pub(crate) fn lock_controller(&self, controller_id: &str) -> Result<FileLock> {
-        FileLock::acquire(self.paths.controller_lock_file(controller_id))
+        FileLock::acquire(self.paths.controller_lock_file(controller_id)).map_err(Into::into)
     }
 
     /// Exclusive lock for creating and redeeming enrollment codes.
     pub(crate) fn lock_enrollments(&self) -> Result<FileLock> {
-        FileLock::acquire(self.paths.enrollments_lock_file())
+        FileLock::acquire(self.paths.enrollments_lock_file()).map_err(Into::into)
     }
 }
 
@@ -587,51 +590,6 @@ fn subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(dirs)
-}
-
-/// An exclusive `flock(2)` held until dropped.
-///
-/// Advisory locks rather than create-new marker files: the kernel releases
-/// them when the holder dies, so a crashed control plane can never strand a
-/// task. Each acquisition opens its own file description, so the lock also
-/// serializes threads of one process, not only processes.
-#[derive(Debug)]
-pub(crate) struct FileLock {
-    file: fs::File,
-}
-
-impl FileLock {
-    pub(crate) fn acquire(path: PathBuf) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| PersistenceError::io(parent, source))?;
-        }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| PersistenceError::io(&path, source))?;
-        loop {
-            // SAFETY: `file` owns a valid descriptor for the duration of the call.
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if result == 0 {
-                return Ok(Self { file });
-            }
-            let source = std::io::Error::last_os_error();
-            if source.kind() != std::io::ErrorKind::Interrupted {
-                return Err(OrchestrationError::Lock { path, source });
-            }
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor is still owned by `self.file`. Closing it
-        // would release the lock anyway; unlocking first just makes it prompt.
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-    }
 }
 
 /// One record as a whole-store scan sees it.

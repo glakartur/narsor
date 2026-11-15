@@ -91,7 +91,7 @@ use crate::auth_gate as gate;
 use crate::auth_gate::{NetworkAuth, OwnerAuth};
 use narsor_engine::auth::{CorsPolicy, ProxyPolicy};
 use narsor_engine::controller_protocol::ProtocolService;
-use narsor_engine::environment::CatalogLaunchResolver;
+use narsor_engine::launch::CatalogLaunchResolver;
 use narsor_engine::persistence::DefaultHarnessSelector;
 use narsor_engine::registry::BranchLister;
 use narsor_engine::workflows::WorkflowResolver;

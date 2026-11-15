@@ -25,12 +25,13 @@ use narsor_engine::domain::{
 use narsor_engine::engine::actions::profile::{
     answer_schema, profile_candidates, read_profile_answer, PROFILE_REPROMPT,
 };
+use narsor_engine::engine::reconcile;
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     Engine, HarnessRegistry, HarnessRun, OutputRejection, ProfileExecutor, METADATA_ENGINE_KEY,
     METADATA_OUTPUT_REJECTION_KEY,
 };
-use narsor_engine::persistence::{recover, ExecutionStore, StepProfileEntry};
+use narsor_engine::persistence::{ExecutionStore, StepProfileEntry};
 use narsor_engine::workflow::load_from_file;
 use narsor_protocol::chat::{ChatElement, TechnicalCategory};
 use serde_json::{json, Value};
@@ -567,7 +568,7 @@ async fn stopped_before_the_reprompt(
     store
         .save_execution(&execution)
         .expect("save the execution");
-    recover(&store).expect("recover");
+    reconcile(&store, &execution.id).expect("reconcile");
     execution
 }
 

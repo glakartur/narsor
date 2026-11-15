@@ -2,7 +2,7 @@
 //! the workflow catalogue, workflow validation, the repository registry,
 //! and the capabilities a client checks before it offers any of it.
 //!
-//! They sit beside [`narsor_engine::controller_protocol::http::owner_routes`], behind
+//! They sit beside [`crate::controller_protocol::http::owner_routes`], behind
 //! the same owner gate, and exist only where the control plane does. What
 //! reads files of the server (a workflow *path*, a local repository) is
 //! served to the trusted local daemon alone: a network-mode server answers

@@ -9,7 +9,6 @@ use narsor_engine::domain::{
     Context, EventData, ExecutionStatus, RepositoryInfo, WorkflowExecution, Workspace,
 };
 use narsor_engine::persistence::conversation::ConversationSource;
-use narsor_engine::persistence::recovery::compress_closed_conversations;
 use narsor_engine::persistence::ExecutionStore;
 use narsor_protocol::chat::{
     ChatElement, PromptPurpose, SubagentRef, TechnicalCategory, UnclassifiedReason,
@@ -86,15 +85,6 @@ fn action_completed(action_execution_id: &str) -> EventData {
         reason: None,
         additional_data: Default::default(),
         warnings: Vec::new(),
-    }
-}
-
-fn action_attempt_failed(action_execution_id: &str) -> EventData {
-    EventData::ActionAttemptFailed {
-        action_execution_id: action_execution_id.to_string(),
-        state_id: "plan".to_string(),
-        error: "boom".to_string(),
-        retry_in_ms: 100,
     }
 }
 
@@ -597,7 +587,7 @@ fn compression_between_two_reads_gives_a_correct_continuation() {
 }
 
 #[test]
-fn both_files_present_prefers_the_compressed_one_and_startup_deletes_the_plain_one() {
+fn both_files_present_prefers_the_compressed_one() {
     let root = TempRoot::new();
     let store = root.store();
     let execution = sample_execution("exec-5", ExecutionStatus::Completed);
@@ -625,12 +615,6 @@ fn both_files_present_prefers_the_compressed_one_and_startup_deletes_the_plain_o
     assert!(snapshot.closed);
     assert_eq!(snapshot.entries.len(), 1);
     assert_eq!(snapshot.entries[0].raw, b"hello");
-
-    compress_closed_conversations(&store).expect("startup compression sweep");
-    assert!(
-        !jsonl_path.exists(),
-        "startup must delete the leftover plain file next to the compressed one"
-    );
 }
 
 #[test]
@@ -702,80 +686,6 @@ fn neither_file_existing_returns_no_record_rather_than_an_error() {
 }
 
 // --- Integration ---------------------------------------------------------
-
-#[test]
-fn startup_leaves_a_running_executions_open_attempt_untouched_and_compresses_a_closed_one() {
-    let root = TempRoot::new();
-    let store = root.store();
-    let execution = sample_execution("exec-9", ExecutionStatus::Running);
-    store.save_execution(&execution).expect("save execution");
-
-    let log = store.event_log("exec-9");
-    log.append_next(&execution.id, action_started("attempt-open"))
-        .expect("append ActionStarted (open)");
-
-    log.append_next(&execution.id, action_started("attempt-closed"))
-        .expect("append ActionStarted (closed)");
-    log.append_next(&execution.id, action_completed("attempt-closed"))
-        .expect("append ActionCompleted (closed)");
-
-    let conversations = store.conversation_store("exec-9");
-
-    let mut open_writer = conversations.writer("attempt-open").expect("open writer");
-    open_writer
-        .append_narsor("still running", &[])
-        .expect("append");
-    open_writer.finish().expect("finish writer");
-
-    let mut closed_writer = conversations.writer("attempt-closed").expect("open writer");
-    closed_writer.append_narsor("done", &[]).expect("append");
-    closed_writer.finish().expect("finish writer");
-
-    let compressed = compress_closed_conversations(&store).expect("compression sweep");
-    assert_eq!(
-        compressed,
-        vec![("exec-9".to_string(), "attempt-closed".to_string())]
-    );
-
-    assert!(
-        conversations.dir().join("attempt-open.jsonl").exists(),
-        "an attempt open in a Running execution must be left untouched"
-    );
-    assert!(!conversations.dir().join("attempt-open.jsonl.zst").exists());
-
-    assert!(
-        conversations
-            .dir()
-            .join("attempt-closed.jsonl.zst")
-            .exists(),
-        "an attempt closed in the log must be compressed"
-    );
-    assert!(!conversations.dir().join("attempt-closed.jsonl").exists());
-}
-
-#[test]
-fn a_failed_attempt_that_will_retry_is_still_closed_for_compression() {
-    let root = TempRoot::new();
-    let store = root.store();
-    let execution = sample_execution("exec-10", ExecutionStatus::Running);
-    store.save_execution(&execution).expect("save execution");
-
-    let log = store.event_log("exec-10");
-    log.append_next(&execution.id, action_started("attempt-1"))
-        .expect("append ActionStarted");
-    log.append_next(&execution.id, action_attempt_failed("attempt-1"))
-        .expect("append ActionAttemptFailed");
-
-    let conversations = store.conversation_store("exec-10");
-    let mut writer = conversations.writer("attempt-1").expect("open writer");
-    writer.append_narsor("will retry", &[]).expect("append");
-    writer.finish().expect("finish writer");
-
-    compress_closed_conversations(&store).expect("compression sweep");
-
-    assert!(conversations.dir().join("attempt-1.jsonl.zst").exists());
-    assert!(!conversations.dir().join("attempt-1.jsonl").exists());
-}
 
 // --- When a record was last written, and its summaries (U6) ---------------
 

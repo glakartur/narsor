@@ -63,12 +63,13 @@ use crate::controller::{
 };
 use untrusted::UntrustedServer;
 
+pub mod backend;
 mod untrusted;
+use backend::{LaunchCheck, LocalBackend, LocalBackendConfig};
+use narsor_controller_client::controller_runtime::load_or_enroll_with_options;
+use narsor_controller_client::{ClientOptions, ControllerClient};
 use narsor_controller_runtime::{Controller, ControllerConfig};
-use narsor_engine::backends::{LaunchCheck, LocalBackend, LocalBackendConfig};
 use narsor_engine::config::{Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source};
-use narsor_engine::controller_protocol::{ClientOptions, ControllerClient};
-use narsor_engine::controller_runtime::load_or_enroll_with_options;
 
 /// What the lock file's name adds to the credential file's.
 const LOCK_SUFFIX: &str = ".lock";
