@@ -2223,6 +2223,7 @@ dependencies = [
 name = "narsor-observer-worker"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "clap",
  "futures",
