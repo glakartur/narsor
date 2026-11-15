@@ -1084,7 +1084,8 @@ fn holds_cap_kill() -> bool {
 
 /// The worker side of the test below: runs as a non-root worker user that
 /// holds `CAP_KILL` (and the switch of user) only as ambient capabilities,
-/// like the shipped systemd unit. Does nothing unless that test runs it.
+/// like a server service that grants them (docs/operations/installation.md).
+/// Does nothing unless that test runs it.
 #[test]
 #[ignore = "run by a_non_root_worker_with_cap_kill_ends_only_the_script_users_processes"]
 fn kill_helper_as_a_non_root_worker() {

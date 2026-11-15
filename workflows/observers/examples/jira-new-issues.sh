@@ -50,7 +50,7 @@
 # continues from there and repeats no task. When the run created no task,
 # it exits 1: Narsor records the error, the observer counts it, and a
 # refusal that does not go away (an unmapped field, a limit, a policy)
-# brings the observer to error and then needs_attention instead of
+# brings the observer to error (5 failed runs in a row) instead of
 # repeating the same issue for ever. The run created nothing, so its
 # failure gives no second task. Only when the state of a successful run is
 # not saved can an issue get a second task (docs/user/observers.md).

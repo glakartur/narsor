@@ -19,7 +19,7 @@
 //! started by a thread that lives as long as its supervision: a pool thread
 //! ending after idling would kill a healthy child.
 
-use std::io::{self, BufRead as _};
+use std::io::{self, BufRead as _, Write as _};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -92,10 +92,30 @@ pub fn copy_stderr(
     let copier = std::thread::Builder::new()
         .name(thread.into())
         .spawn(move || {
-            for line in io::BufReader::new(stderr).lines() {
-                let Ok(line) = line else { break };
-                eprintln!("{prefix} {line}");
-                remember(line);
+            // Bytes, not `lines()`: a line that is not UTF-8 must not end
+            // the copy, or the child's next write to stderr fails on a
+            // closed pipe.
+            let mut reader = io::BufReader::new(stderr);
+            let mut buffer = Vec::new();
+            loop {
+                buffer.clear();
+                match reader.read_until(b'\n', &mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let line = String::from_utf8_lossy(&buffer);
+                        let line = line.trim_end_matches(['\n', '\r']).to_owned();
+                        // Not `eprintln!`: it panics when the write fails,
+                        // and the end of this thread closes the pipe.
+                        let _ = writeln!(io::stderr().lock(), "{prefix} {line}");
+                        remember(line);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        // Keep the pipe open until the child closes it.
+                        let _ = io::copy(&mut reader, &mut io::sink());
+                        break;
+                    }
+                }
             }
         });
     if copier.is_err() {
