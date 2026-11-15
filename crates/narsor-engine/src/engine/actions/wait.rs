@@ -30,11 +30,8 @@
 //! A matching event ends the step with the step's label for it
 //! ([`received_label`]) and the event as the step's result: the context
 //! variable [`EVENT_VARIABLE`] holds `{type, source, data}`, so a later
-//! step reads `{{ context.variables.event.data.mr }}`. The wait's deadline
-//! (`timeout` in YAML) ends it through [`TimedOutAction::resolve`]: the
-//! `timeout` label when the step declares it, otherwise a failed step
-//! (PO4). The control plane's periodic pass delivers the timeout, because
-//! the task may have no compute while it waits.
+//! step reads `{{ context.variables.event.data.mr }}`. A wait has no time
+//! limit: nothing else ends it.
 //!
 //! # Crash safety
 //!
@@ -44,25 +41,23 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction};
+use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction};
 use crate::domain::{
     ActionConfig, ActionError, ActionExecutionId, ActionResult, EventData, ExecutionId,
     ExecutionStatus, OutputLabel, StateId, WaitActionConfig, WaitWatchConfig, WorkflowExecution,
-    TIMEOUT_LABEL,
 };
 use crate::orchestration::{EventWait, EventWatch};
 use crate::persistence::{ExecutionStore, PersistenceError};
 use narsor_protocol::controller::filter_matches;
 
 /// The label a matching event ends a step with when the step declares more
-/// than one way out besides `timeout` (§3.3.D).
+/// than one way out (§3.3.D).
 pub const RECEIVED_LABEL: &str = "received";
 
 /// The context variable the event that ended a `wait` step is written to:
@@ -92,7 +87,6 @@ impl ActionExecutor for WaitExecutor {
                     action_execution_id: request.action_execution_id.to_string(),
                     event_type: config.event.clone(),
                     filter: config.filter.clone().unwrap_or(Value::Null),
-                    timeout_secs: config.timeout_secs,
                     watch: config.watch.clone(),
                 }),
             ))
@@ -112,8 +106,8 @@ fn wait_config(action: &ActionConfig) -> Result<&WaitActionConfig, ActionError> 
     }
 }
 
-/// What [`WaitExecutor`] observed: the event the step waits for, its
-/// filter with templates rendered, and its time limit.
+/// What [`WaitExecutor`] observed: the event the step waits for and its
+/// filter with templates rendered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExternalEventRequest {
     /// Id of the [`crate::domain::ActionExecution`] that suspended.
@@ -123,9 +117,6 @@ pub struct ExternalEventRequest {
     /// The rendered filter; `null` when the step has none.
     #[serde(default)]
     pub filter: Value,
-    /// The step's `timeout`, in seconds; `None` waits for ever.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
     /// The step's rendered `watch` block, if it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<WaitWatchConfig>,
@@ -145,9 +136,6 @@ pub struct PendingExternalEvent {
     pub episode: String,
     /// When the wait began.
     pub since: DateTime<Utc>,
-    /// When it times out, if it does.
-    #[serde(default)]
-    pub deadline: Option<DateTime<Utc>>,
 }
 
 impl PendingExternalEvent {
@@ -157,17 +145,12 @@ impl PendingExternalEvent {
         state_id: impl Into<StateId>,
         request: ExternalEventRequest,
     ) -> Self {
-        let since = Utc::now();
-        let deadline = request.timeout_secs.map(|secs| {
-            since + chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX / 1000))
-        });
         Self {
             execution_id: execution_id.into(),
             state_id: state_id.into(),
             request,
             episode: uuid::Uuid::new_v4().to_string(),
-            since,
-            deadline,
+            since: Utc::now(),
         }
     }
 
@@ -183,7 +166,6 @@ impl PendingExternalEvent {
             event_type: self.request.event_type.clone(),
             filter: self.request.filter.clone(),
             since: self.since,
-            deadline: self.deadline,
             watch: self.request.watch.as_ref().map(|watch| EventWatch {
                 step: self.state_id.to_string(),
                 observer: watch.observer.clone(),
@@ -199,7 +181,7 @@ impl PendingExternalEvent {
 pub struct ExternalEventDelivery {
     /// The episode it is for ([`PendingExternalEvent::episode`]).
     pub episode: String,
-    /// The event, or the end of the wait's time.
+    /// The event.
     pub ending: WaitEnding,
 }
 
@@ -215,8 +197,6 @@ pub enum WaitEnding {
         /// The event's data; untrusted.
         data: Value,
     },
-    /// The deadline passed without one.
-    Timeout,
 }
 
 /// Why a delivery could not end a wait.
@@ -253,10 +233,6 @@ pub enum WaitActionError {
         "the step waits for an event '{expected}' with its filter; '{delivered}' does not match"
     )]
     EventMismatch { expected: String, delivered: String },
-
-    /// A timeout for a wait that has no time limit.
-    #[error("execution '{execution_id}' waits without a time limit and cannot time out")]
-    NoDeadline { execution_id: ExecutionId },
 }
 
 impl WaitActionError {
@@ -301,13 +277,11 @@ pub fn pending_event(
 /// Ends a wait with `delivery`, putting the execution back to `Running`.
 ///
 /// Refuses an execution that does not wait, a delivery for another
-/// episode, an event the wait does not match (the control plane matched it
-/// already; this is the second line) and a timeout of a wait without a
-/// limit — all on the read the writes below follow. A refused delivery
-/// changes nothing. On success an event is in the log as
-/// `ExternalEventReceived` (a timeout writes nothing there: the step's
-/// result or failure says it), the execution is `Running` on disk and the
-/// pending file is gone.
+/// episode and an event the wait does not match (the control plane matched
+/// it already; this is the second line) — all on the read the writes below
+/// follow. A refused delivery changes nothing. On success the event is in
+/// the log as `ExternalEventReceived`, the execution is `Running` on disk
+/// and the pending file is gone.
 pub fn resume(
     store: &ExecutionStore,
     execution_id: &str,
@@ -338,37 +312,25 @@ pub fn resume(
             current: pending.episode.clone(),
         });
     }
-    match &delivery.ending {
-        WaitEnding::Event {
-            event_type,
-            source,
-            data,
-        } => {
-            if *event_type != pending.request.event_type
-                || !filter_matches(&pending.request.filter, data)
-            {
-                return Err(WaitActionError::EventMismatch {
-                    expected: pending.request.event_type.clone(),
-                    delivered: event_type.clone(),
-                });
-            }
-            store.event_log(execution_id).append_next(
-                &execution.id,
-                EventData::ExternalEventReceived {
-                    event_type: event_type.clone(),
-                    source: source.clone(),
-                    payload: data.clone(),
-                },
-            )?;
-        }
-        WaitEnding::Timeout => {
-            if pending.request.timeout_secs.is_none() {
-                return Err(WaitActionError::NoDeadline {
-                    execution_id: execution_id.to_string(),
-                });
-            }
-        }
+    let WaitEnding::Event {
+        event_type,
+        source,
+        data,
+    } = &delivery.ending;
+    if *event_type != pending.request.event_type || !filter_matches(&pending.request.filter, data) {
+        return Err(WaitActionError::EventMismatch {
+            expected: pending.request.event_type.clone(),
+            delivered: event_type.clone(),
+        });
     }
+    store.event_log(execution_id).append_next(
+        &execution.id,
+        EventData::ExternalEventReceived {
+            event_type: event_type.clone(),
+            source: source.clone(),
+            payload: data.clone(),
+        },
+    )?;
 
     execution.status = ExecutionStatus::Running;
     store.save_execution(&execution)?;
@@ -378,48 +340,33 @@ pub fn resume(
 }
 
 /// The step's result for how its wait ended, given the labels the state
-/// declares: the event under [`received_label`], or the timeout resolved
-/// by [`TimedOutAction::resolve`] (the `timeout` label when declared,
-/// otherwise an action error).
-pub fn wait_result(
-    pending: &PendingExternalEvent,
-    ending: &WaitEnding,
-    declared: &[OutputLabel],
-) -> Result<ActionResult, ActionError> {
-    match ending {
-        WaitEnding::Event {
-            event_type,
-            source,
-            data,
-        } => {
-            let mut variables = serde_json::Map::new();
-            variables.insert(
-                EVENT_VARIABLE.to_string(),
-                json!({"type": event_type, "source": source, "data": data}),
-            );
-            Ok(ActionResult {
-                reason: format!("external event '{event_type}' from '{source}'"),
-                data: data.clone(),
-                variables,
-                ..ActionResult::new(received_label(declared))
-            })
-        }
-        WaitEnding::Timeout => TimedOutAction {
-            timeout: Duration::from_secs(pending.request.timeout_secs.unwrap_or_default()),
-            subject: format!("wait for event '{}'", pending.request.event_type),
-        }
-        .resolve(declared),
+/// declares: the event under [`received_label`].
+pub fn wait_result(ending: &WaitEnding, declared: &[OutputLabel]) -> ActionResult {
+    let WaitEnding::Event {
+        event_type,
+        source,
+        data,
+    } = ending;
+    let mut variables = serde_json::Map::new();
+    variables.insert(
+        EVENT_VARIABLE.to_string(),
+        json!({"type": event_type, "source": source, "data": data}),
+    );
+    ActionResult {
+        reason: format!("external event '{event_type}' from '{source}'"),
+        data: data.clone(),
+        variables,
+        ..ActionResult::new(received_label(declared))
     }
 }
 
 /// The label a matching event ends a step with: the only label it declares
-/// besides `timeout` (an `exit` step's `exit`, say), otherwise
-/// [`RECEIVED_LABEL`]. A step declaring neither fails on the label like any
-/// step whose action answers with an undeclared one.
+/// (an `exit` step's `exit`, say), otherwise [`RECEIVED_LABEL`]. A step
+/// declaring neither fails on the label like any step whose action answers
+/// with an undeclared one.
 pub fn received_label(declared: &[OutputLabel]) -> String {
-    let mut others = declared.iter().filter(|label| *label != TIMEOUT_LABEL);
-    match (others.next(), others.next()) {
-        (Some(only), None) => only.clone(),
+    match declared {
+        [only] => only.clone(),
         _ => RECEIVED_LABEL.to_string(),
     }
 }
@@ -428,7 +375,7 @@ pub fn received_label(declared: &[OutputLabel]) -> String {
 mod tests {
     use super::*;
 
-    fn pending(timeout_secs: Option<u64>) -> PendingExternalEvent {
+    fn pending() -> PendingExternalEvent {
         PendingExternalEvent::new(
             "exec",
             "await_review",
@@ -436,7 +383,6 @@ mod tests {
                 action_execution_id: "a1".into(),
                 event_type: "review.approved".into(),
                 filter: json!({"mr": "17"}),
-                timeout_secs,
                 watch: None,
             },
         )
@@ -453,8 +399,7 @@ mod tests {
             source: "gitlab".into(),
             data: json!({"mr": 17}),
         };
-        let result = wait_result(&pending(None), &ending, &labels(&["received", "timeout"]))
-            .expect("an event completes the step");
+        let result = wait_result(&ending, &labels(&["received", "rejected"]));
         assert_eq!(result.output_label, "received");
         assert_eq!(result.data, json!({"mr": 17}));
         assert_eq!(
@@ -464,47 +409,19 @@ mod tests {
     }
 
     #[test]
-    fn the_only_way_out_besides_timeout_is_the_label_of_an_event() {
+    fn the_only_way_out_is_the_label_of_an_event() {
         assert_eq!(received_label(&labels(&["exit"])), "exit");
-        assert_eq!(
-            received_label(&labels(&["approved", "timeout"])),
-            "approved"
-        );
+        assert_eq!(received_label(&labels(&["approved"])), "approved");
         assert_eq!(received_label(&labels(&["a", "b"])), RECEIVED_LABEL);
         assert_eq!(received_label(&[]), RECEIVED_LABEL);
     }
 
     #[test]
-    fn a_timeout_takes_the_timeout_label_only_when_declared() {
-        let pending = pending(Some(60));
-        let labelled = wait_result(
-            &pending,
-            &WaitEnding::Timeout,
-            &labels(&["received", "timeout"]),
-        )
-        .expect("a declared timeout label completes the step");
-        assert_eq!(labelled.output_label, TIMEOUT_LABEL);
-
-        let failed = wait_result(&pending, &WaitEnding::Timeout, &labels(&["received"]))
-            .expect_err("without the label the step fails");
-        assert_eq!(failed.error_type.as_deref(), Some("timeout"));
-        assert!(
-            failed.message.contains("review.approved"),
-            "{}",
-            failed.message
-        );
-    }
-
-    #[test]
-    fn the_deadline_is_the_start_plus_the_timeout() {
-        let limited = pending(Some(90));
-        assert_eq!(
-            limited.deadline,
-            Some(limited.since + chrono::Duration::seconds(90))
-        );
-        assert_eq!(pending(None).deadline, None);
-        let wait = limited.event_wait();
-        assert_eq!(wait.episode_id, limited.episode);
+    fn the_wait_reports_its_episode_and_matches_its_event() {
+        let pending = pending();
+        let wait = pending.event_wait();
+        assert_eq!(wait.episode_id, pending.episode);
+        assert_eq!(wait.since, pending.since);
         assert!(wait.matches("review.approved", &json!({"mr": 17})));
     }
 }

@@ -128,16 +128,6 @@ pub enum TaskEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_id: Option<String>,
     },
-    /// The task's `wait` step waited past its deadline: the control plane
-    /// queued the end of the wait for the runner (`input_id`). A client
-    /// from before `wait` steps reads it as
-    /// [`TaskEventKind::Unrecognized`].
-    WaitTimedOut {
-        /// The wait episode that timed out.
-        episode_id: String,
-        /// The delivery queued for the runner.
-        input_id: String,
-    },
     /// A warning: the task's `wait` step asked an observer to watch an
     /// object (its `watch` block), and the control plane added no watch
     /// entry. The task keeps waiting; the owner may add the entry by hand.

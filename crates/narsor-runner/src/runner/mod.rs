@@ -1641,7 +1641,7 @@ impl Session {
         Ok(())
     }
 
-    /// Hands one event or timeout to the Engine, unless this storage took
+    /// Hands one event to the Engine, unless this storage took
     /// it before, and starts the pass it resumes. The Engine refuses one
     /// for another wait episode than the one it waits in.
     fn take_event(&mut self, event: DeliveredEvent) -> Result<InputVerdict, RunnerError> {
@@ -1654,19 +1654,17 @@ impl Session {
         let Some(execution_id) = self.execution_id.clone() else {
             return Ok(InputVerdict::Later);
         };
+        let EventDelivery::Event {
+            event_type,
+            source,
+            data,
+        } = event.delivery;
         let delivery = ExternalEventDelivery {
             episode: event.episode_id,
-            ending: match event.delivery {
-                EventDelivery::Event {
-                    event_type,
-                    source,
-                    data,
-                } => WaitEnding::Event {
-                    event_type,
-                    source,
-                    data,
-                },
-                EventDelivery::Timeout => WaitEnding::Timeout,
+            ending: WaitEnding::Event {
+                event_type,
+                source,
+                data,
             },
         };
         Ok(

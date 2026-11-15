@@ -3028,8 +3028,7 @@ async fn a_waiting_runner_refuses_an_event_for_another_wait() {
     assert!(fixture.agent.calls().is_empty());
 }
 
-/// A runner relaunched while its task waited restores the same wait, and
-/// the timeout the control plane hands it ends the step.
+/// A runner relaunched while its task waited restores the same wait.
 #[tokio::test]
 async fn a_relaunched_runner_restores_the_wait_it_was_in() {
     let root = TempRoot::new();
@@ -3063,18 +3062,6 @@ async fn a_relaunched_runner_restores_the_wait_it_was_in() {
     );
     assert_eq!(
         fixture.snapshot().event_wait.map(|wait| wait.episode_id),
-        Some(episode.clone())
+        Some(episode)
     );
-    // The step has no `timeout` choice and no time limit: a timeout is
-    // refused, and the step waits on.
-    let timeout = DeliveredEvent {
-        input_id: "event-1".to_string(),
-        episode_id: episode,
-        delivery: EventDelivery::Timeout,
-    };
-    assert!(matches!(
-        fixture.session.take_event(timeout).unwrap(),
-        InputVerdict::Refused(_)
-    ));
-    assert_eq!(fixture.status(), ExecutionStatus::WaitingForEvent);
 }

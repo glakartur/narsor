@@ -111,7 +111,6 @@ impl Delivery {
             event_type: event_type.into(),
             filter,
             since: self.fx.now(),
-            deadline: None,
             watch: None,
         });
         control.store().save_task(&mut record).unwrap();
@@ -238,10 +237,7 @@ fn a_matching_event_for_a_waiting_task_is_queued_for_its_step() {
         input.idempotency_key,
         format!("observer:{}:MR!17:approved:episode-1", d.observer)
     );
-    assert_eq!(
-        input.provenance.as_ref().map(|p| p.effect_key.as_str()),
-        Some("MR!17:approved:episode-1")
-    );
+    assert_eq!(input.provenance.effect_key, "MR!17:approved:episode-1");
     // The slot is not freed under it, and a stranded resume finds its key.
     assert!(record.owner_work_pending());
     assert_eq!(
@@ -482,7 +478,6 @@ fn a_wait_filter_compares_fields_flat_and_scalars_as_text() {
         event_type: "approved".into(),
         filter,
         since: chrono::Utc::now(),
-        deadline: None,
         watch: None,
     };
     let data = json!({"mr": 17, "draft": false, "labels": ["a"], "by": "alice"});

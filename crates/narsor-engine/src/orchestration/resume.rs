@@ -85,21 +85,10 @@ pub fn observer_event_key(observer_id: &str, effect_key: &str) -> String {
     format!("{OBSERVER_KEY_PREFIX}{observer_id}:{effect_key}")
 }
 
-/// The prefix of the idempotency keys of the timeouts the periodic pass
-/// queues for a `wait` step (`wait-timeout:<episode id>`), reserved like
-/// [`AUTO_RESUME_KEY_PREFIX`].
-pub const WAIT_TIMEOUT_KEY_PREFIX: &str = "wait-timeout:";
-
-/// The idempotency key of the timeout of the wait episode `episode_id`:
-/// one per episode, however often the pass finds it past its deadline.
-pub fn wait_timeout_key(episode_id: &str) -> String {
-    format!("{WAIT_TIMEOUT_KEY_PREFIX}{episode_id}")
-}
-
 /// The idempotency key prefixes only a policy may use, each with what it is
 /// reserved for: an owner's command, answer or operator command may not
 /// carry one.
-pub const RESERVED_KEY_PREFIXES: [(&str, &str); 6] = [
+pub const RESERVED_KEY_PREFIXES: [(&str, &str); 5] = [
     (AUTO_RESUME_KEY_PREFIX, "the resume policy"),
     (SLOT_RELEASE_KEY_PREFIX, "the slot-release policy"),
     (LIMIT_STOP_KEY_PREFIX, "the limit of concurrent tasks"),
@@ -108,7 +97,6 @@ pub const RESERVED_KEY_PREFIXES: [(&str, &str); 6] = [
         "the resume that work sent to a paused task causes",
     ),
     (OBSERVER_KEY_PREFIX, "observers"),
-    (WAIT_TIMEOUT_KEY_PREFIX, "the timeout of a `wait` step"),
 ];
 
 /// The idempotency key of the resume caused by the work with `work_key`.

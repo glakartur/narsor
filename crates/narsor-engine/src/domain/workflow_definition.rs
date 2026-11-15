@@ -886,7 +886,8 @@ pub struct WaitActionConfig {
     #[serde(default)]
     pub filter: Option<serde_json::Value>,
 
-    /// Timeout in seconds
+    /// Timeout in seconds; the validator rejects it, a wait step has no
+    /// timeout
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 
@@ -1515,8 +1516,11 @@ pub enum ValidationError {
     #[error("State '{state}' is a profile step and needs a single 'exit' instead of 'choices': it writes the step profile and the workflow goes on")]
     ProfileNeedsExit { state: StateId },
 
-    #[error("State '{state}' declares a 'timeout' choice, which only agent, script and wait steps can produce")]
+    #[error("State '{state}' declares a 'timeout' choice, which only agent and script steps can produce")]
     TimeoutChoiceNotAllowed { state: StateId },
+
+    #[error("State '{state}' sets a 'timeout', but a wait step has no timeout")]
+    WaitTimeoutNotAllowed { state: StateId },
 
     #[error("State '{state}' has an invalid 'watch': {reason}")]
     InvalidWaitWatch { state: StateId, reason: String },

@@ -15,11 +15,10 @@
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    EventInputKind, EventWatch, ExternalEvent, ExternalEventOutcome, InputOutcome, InputRequest,
-    InputStatus, InputUpdate, QueuedEventInput, QueuedInput, RunnerObservation,
-    RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
+    EventWatch, ExternalEvent, ExternalEventOutcome, InputOutcome, InputRequest, InputStatus,
+    InputUpdate, QueuedEventInput, QueuedInput, RunnerObservation, RunnerReportOutcome,
+    RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
 };
-use super::resume::wait_timeout_key;
 use crate::domain::display::bounded_detail;
 use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
 use crate::engine::{ConversationState, EventLink, Timeline};
@@ -322,12 +321,11 @@ impl ControlPlane {
             let input = episode.map(|episode_id| QueuedEventInput {
                 input_id: format!("event-{}", record.event_inputs.len() + 1),
                 idempotency_key: event.idempotency_key.clone(),
-                kind: EventInputKind::Event,
                 episode_id,
                 event_type: event.event_type.clone(),
                 source: event.source.clone(),
                 data: Some(event.data.clone()),
-                provenance: Some(event.provenance.clone()),
+                provenance: event.provenance.clone(),
                 status: InputStatus::Queued,
                 submitted_at: now,
                 updated_at: now,
@@ -542,8 +540,7 @@ impl ControlPlane {
 
 impl ControlPlane {
     /// What ends the `wait` step a polling runner waits in
-    /// (`event_wait_id`, its episode): the queued events and timeout for
-    /// that episode (queued, or delivered and not yet acknowledged —
+    /// (`event_wait_id`, its episode): the queued events for that episode (queued, or delivered and not yet acknowledged —
     /// at-least-once; the runner's engine deduplicates by the episode).
     /// Queued ones for any other episode become obsolete, as owner answers
     /// to another request do in [`Self::deliver_inputs`].
@@ -590,11 +587,11 @@ impl ControlPlane {
         Ok(delivered)
     }
 
-    /// The runner's verdict on a delivered event or timeout. Repeating the
-    /// same verdict is harmless (`changed: false`); contradicting a settled
-    /// one is refused. An accepted one ended the wait of its episode, so
-    /// the task no longer waits for an event from the same mutation on:
-    /// nothing more is queued for it, and no timeout is.
+    /// The runner's verdict on a delivered event. Repeating the same
+    /// verdict is harmless (`changed: false`); contradicting a settled one
+    /// is refused. An accepted one ended the wait of its episode, so the
+    /// task no longer waits for an event from the same mutation on: nothing
+    /// more is queued for it.
     pub fn settle_event_input(
         &self,
         task_id: &TaskId,
@@ -652,8 +649,8 @@ impl ControlPlane {
                     record.event_wait = None;
                 }
                 // The accepted one ended the episode's wait: what else was
-                // handed over for it (a timeout and an event in one poll,
-                // say) will never be taken, and must not wait for an ack.
+                // handed over for it (two events in one poll, say) will
+                // never be taken, and must not wait for an ack.
                 updates.extend(obsolete_rest_of_episode(record, &settled, now));
             }
             Ok(Mutation::Changed(
@@ -662,58 +659,6 @@ impl ControlPlane {
             ))
         })?;
         Ok(settled)
-    }
-
-    /// Queues the end of the task's wait for its runner when the wait ran
-    /// past its deadline (U4, PO4): once per episode, and not while an
-    /// event for it is on its way or after one ended it. Returns the
-    /// queued timeout — `None` when there is nothing to queue, the task
-    /// being archived, waiting for no event, or not past its deadline.
-    pub fn queue_wait_timeout(&self, task_id: &TaskId) -> Result<Option<QueuedEventInput>> {
-        let (_, queued) = self.mutate(task_id, |record, now| {
-            if record.runner_state.is_archival() {
-                return Ok(Mutation::Unchanged(None));
-            }
-            let Some(wait) = record
-                .event_wait
-                .as_ref()
-                .filter(|wait| wait.is_past_deadline(now))
-            else {
-                return Ok(Mutation::Unchanged(None));
-            };
-            let settled_or_due = record.event_inputs.iter().any(|input| {
-                input.episode_id == wait.episode_id
-                    && (input.kind == EventInputKind::Timeout
-                        || !input.status.is_settled()
-                        || input.status == InputStatus::Consumed)
-            });
-            if settled_or_due {
-                return Ok(Mutation::Unchanged(None));
-            }
-            let input = QueuedEventInput {
-                input_id: format!("event-{}", record.event_inputs.len() + 1),
-                idempotency_key: wait_timeout_key(&wait.episode_id),
-                kind: EventInputKind::Timeout,
-                episode_id: wait.episode_id.clone(),
-                event_type: wait.event_type.clone(),
-                source: String::new(),
-                data: None,
-                provenance: None,
-                status: InputStatus::Queued,
-                submitted_at: now,
-                updated_at: now,
-                detail: None,
-            };
-            record.event_inputs.push(input.clone());
-            Ok(Mutation::Changed(
-                TaskEventKind::WaitTimedOut {
-                    episode_id: input.episode_id.clone(),
-                    input_id: input.input_id.clone(),
-                },
-                Some(input),
-            ))
-        })?;
-        Ok(queued)
     }
 
     /// Writes the warning that the `watch` of the task's `wait` step got no
@@ -788,7 +733,7 @@ fn obsolete_undelivered(
     updates
 }
 
-/// Marks every still-queued event or timeout for another wait episode than
+/// Marks every still-queued event for another wait episode than
 /// `episode` (none: the runner waits for no event) as obsolete and drops
 /// its data. Delivered ones are left to the runner's acknowledgement.
 fn obsolete_undelivered_events(

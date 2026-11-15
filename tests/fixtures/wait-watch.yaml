@@ -12,7 +12,6 @@ states:
       event_type: review.approved
       filter:
         mr_url: "{{ inputs.mr_url }}"
-      timeout: 24h
       watch:
         observer: mr-review                 # A watch_list observer of the task's owner
         object: "{{ inputs.mr_url }}"       # Rendered when the step starts
@@ -20,8 +19,6 @@ states:
     choices:
       received:
         next: merge
-      timeout:
-        next: remind
   merge:
     action:
       type: script
@@ -29,17 +26,7 @@ states:
       args: ["{{ context.event.data.mr_url }}"]
     exit:
       next: done
-  remind:
-    action:
-      type: script
-      command: remind
-      args: ["{{ inputs.mr_url }}"]
-    exit:
-      next: reminded
   done:
     description: Merged.
-  reminded:
-    description: Nobody approved in time.
 terminal_states:
   done: completed
-  reminded: completed

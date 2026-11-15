@@ -1,6 +1,5 @@
 //! Integration tests of the `wait` step (U4): the step suspends the task
-//! until a matching external event or its deadline, and ends with the
-//! event's data.
+//! until a matching external event, and ends with the event's data.
 //!
 //! Most tests run the whole loop in-process, without a daemon and without a
 //! network: a real [`ProtocolService`] over a temporary state root and a
@@ -26,7 +25,7 @@ use narsor_engine::controller_protocol::{
 use narsor_engine::domain::{
     ActionConfig, ActionError, ActionResult, BackendId, EventData, ExecutionStatus, GitIdentity,
     ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec, TaskRepository,
-    TaskRepositorySource, TaskWorkspace, WorkflowDefinition, WorkflowExecution,
+    TaskRepositorySource, TaskWorkspace, ValidationError, WorkflowDefinition, WorkflowExecution,
 };
 use narsor_engine::engine::actions::wait::{self, EVENT_VARIABLE};
 use narsor_engine::engine::{
@@ -38,12 +37,12 @@ use narsor_engine::observers::{
     WatchObjectPolicy, WatchOrigin,
 };
 use narsor_engine::orchestration::{
-    BackendAvailability, BackendLease, Clock, ControlPlane, ControllerReport, EventInputKind,
-    InputStatus, NewTask, Observation, ObservedSummary, OwnerCommand, OwnerRef, RunnerState,
-    SchedulingPolicy, SlotReleaseClass, TaskEvent, TaskEventKind, TaskRecord, TaskState,
+    BackendAvailability, BackendLease, Clock, ControlPlane, ControllerReport, InputStatus, NewTask,
+    Observation, ObservedSummary, OwnerCommand, OwnerRef, RunnerState, SchedulingPolicy,
+    SlotReleaseClass, TaskEvent, TaskEventKind, TaskRecord, TaskState,
 };
 use narsor_engine::persistence::StatePaths;
-use narsor_engine::workflow::load_from_str;
+use narsor_engine::workflow::{load_from_str, validate_source};
 use narsor_protocol::controller::{
     ConversationAvailability, EventDelivery, ExecutionCursor, InputAckRequest,
     ObserverEffectOutcome, ObserverEventRequest, RunnerPollQuery,
@@ -61,7 +60,7 @@ const MR: &str = "https://git.example.com/a/-/merge_requests/17";
 // ---------------------------------------------------------------------------
 
 /// Waits for the approval of MR `mr_id`, then merges with what the event
-/// said; nobody approving within the hour sends a reminder.
+/// said.
 const REVIEW: &str = r#"
 schema: v2
 name: wait-review
@@ -77,12 +76,9 @@ states:
       event_type: review.approved
       filter:
         mr: "{{ inputs.mr_id }}"
-      timeout: 1h
     choices:
       received:
         next: merge
-      timeout:
-        next: remind
   merge:
     action:
       type: script
@@ -90,43 +86,8 @@ states:
       args: ["{{ context.event.data.by }}", "{{ context.event.data.mr }}", "{{ context.event.source }}"]
     exit:
       next: done
-  remind:
-    action:
-      type: script
-      command: remind
-    exit:
-      next: reminded
   done:
     description: Merged.
-  reminded:
-    description: Nobody approved in time.
-terminal_states:
-  done: completed
-  reminded: completed
-"#;
-
-/// The same wait without a `timeout` choice: past its deadline the step
-/// fails (PO4).
-const REVIEW_WITHOUT_TIMEOUT_LABEL: &str = r#"
-schema: v2
-name: wait-review-strict
-version: 1
-inputs:
-  - name: mr_id
-    type: string
-    required: true
-states:
-  await_review:
-    action:
-      type: wait
-      event_type: review.approved
-      filter:
-        mr: "{{ inputs.mr_id }}"
-      timeout: 1h
-    exit:
-      next: done
-  done:
-    description: Approved.
 terminal_states:
   done: completed
 "#;
@@ -253,7 +214,7 @@ impl Stack {
         let state_root = std::env::temp_dir().join(format!("narsor-wait-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&state_root).unwrap();
         // The engine stamps a wait with the wall clock; the control plane
-        // compares its deadline with this one, so both start together.
+        // compares its start with this one, so both start together.
         let clock = Arc::new(ManualClock(Mutex::new(Utc::now())));
         let service = Self::service_on(&state_root, &clock);
         let observer = active_watch_list(&service, clock.now());
@@ -400,15 +361,6 @@ impl Stack {
 
     /// Sends the runner's snapshot of the execution, with its wait.
     fn report(&mut self) {
-        self.send_snapshot(false);
-    }
-
-    /// Sends the snapshot of a runner that stopped at a safe point.
-    fn report_safe_point(&mut self) {
-        self.send_snapshot(true);
-    }
-
-    fn send_snapshot(&mut self, safe_point: bool) {
         self.snapshots += 1;
         let execution = self.execution();
         let event_wait = self.pending().map(|pending| pending.event_wait());
@@ -432,7 +384,7 @@ impl Stack {
             event_wait,
             conversation: ConversationAvailability::default(),
             timeline: None,
-            safe_point,
+            safe_point: false,
             problem: None,
             attention: Vec::new(),
             conductor_available: false,
@@ -463,19 +415,17 @@ impl Stack {
             .expect("the poll answers");
         let mut verdicts = Vec::new();
         for event in response.events {
+            let EventDelivery::Event {
+                event_type,
+                source,
+                data,
+            } = event.delivery;
             let delivery = ExternalEventDelivery {
                 episode: event.episode_id,
-                ending: match event.delivery {
-                    EventDelivery::Event {
-                        event_type,
-                        source,
-                        data,
-                    } => WaitEnding::Event {
-                        event_type,
-                        source,
-                        data,
-                    },
-                    EventDelivery::Timeout => WaitEnding::Timeout,
+                ending: WaitEnding::Event {
+                    event_type,
+                    source,
+                    data,
                 },
             };
             let result = self
@@ -670,10 +620,6 @@ async fn a_matching_event_ends_the_wait_and_the_next_step_sees_its_data() {
     let pending = stack.pending().expect("the wait is on record");
     assert_eq!(pending.request.event_type, "review.approved");
     assert_eq!(pending.request.filter, json!({"mr": "17"}));
-    assert_eq!(
-        pending.deadline,
-        Some(pending.since + Duration::seconds(3600))
-    );
     // The runner's report put the wait on the task record.
     assert_eq!(
         stack.record().event_wait.as_ref().map(|w| &w.episode_id),
@@ -869,61 +815,19 @@ async fn a_restarted_runner_keeps_waiting_and_an_event_after_the_restart_ends_th
 }
 
 #[tokio::test]
-async fn past_its_deadline_the_wait_takes_the_timeout_label() {
-    // PO4 with a `timeout` choice: the periodic pass hands the runner the
-    // end of the wait, once, and the step goes on by that label.
-    let mut stack = Stack::new(REVIEW, &[]);
-    stack.start().await;
-    let episode = stack.episode();
-
-    run_periodic_pass(&stack.service);
-    assert!(stack.record().event_inputs.is_empty(), "not due yet");
-
-    stack.advance(Duration::hours(2));
-    run_periodic_pass(&stack.service);
-    run_periodic_pass(&stack.service);
-    let record = stack.record();
-    assert_eq!(record.event_inputs.len(), 1, "one timeout per episode");
-    assert_eq!(record.event_inputs[0].kind, EventInputKind::Timeout);
-    assert_eq!(record.event_inputs[0].episode_id, episode);
-    let timed_out = stack
-        .service
-        .control_plane()
-        .events_since(&stack.task, 0)
-        .unwrap()
-        .into_iter()
-        .filter(|event| matches!(event.kind, TaskEventKind::WaitTimedOut { .. }))
-        .count();
-    assert_eq!(timed_out, 1);
-
-    let verdicts = stack.poll().await;
-
-    assert_eq!(
-        verdicts,
-        vec![("event-1".to_string(), InputStatus::Consumed)]
-    );
-    let execution = stack.execution();
-    assert_eq!(execution.status, ExecutionStatus::Completed);
-    assert_eq!(execution.current_state.as_deref(), Some("reminded"));
-    assert_eq!(stack.recorder.calls(), vec![vec!["remind".to_string()]]);
-    assert!(stack.log_events().is_empty(), "a timeout is no event");
-    assert_eq!(stack.record().event_wait, None);
-}
-
-#[tokio::test]
 async fn the_input_a_runner_left_for_later_ends_with_the_wait_it_was_for() {
-    // A timeout and an event for one wait reach the runner in one poll. It
-    // takes the first and leaves the second for later (its engine is busy),
-    // so it never acknowledges it. The first ends the wait: the second is
+    // Two events for one wait reach the runner in one poll. It takes the
+    // first and leaves the second for later (its engine is busy), so it
+    // never acknowledges it. The first ends the wait: the second is
     // obsolete, and never brings a stopped task back.
     let mut stack = Stack::new(REVIEW, &[]);
     stack.start().await;
     let episode = stack.episode();
-    stack.advance(Duration::hours(2));
-    run_periodic_pass(&stack.service);
     let run = stack.claim();
-    let key = format!("MR!17:approved:{episode}");
-    stack.send(&run, &key, "review.approved", approval("alice"));
+    let first = format!("MR!17:approved:{episode}:alice");
+    stack.send(&run, &first, "review.approved", approval("alice"));
+    let second = format!("MR!17:approved:{episode}:bob");
+    stack.send(&run, &second, "review.approved", approval("bob"));
     let query = RunnerPollQuery {
         wait_secs: Some(0),
         event_wait_id: Some(episode.clone()),
@@ -937,31 +841,13 @@ async fn the_input_a_runner_left_for_later_ends_with_the_wait_it_was_for() {
     let handed: Vec<_> = response
         .events
         .iter()
-        .map(|event| {
-            (
-                event.input_id.clone(),
-                event.delivery == EventDelivery::Timeout,
-            )
-        })
+        .map(|event| event.input_id.as_str())
         .collect();
-    assert_eq!(
-        handed,
-        vec![
-            ("event-1".to_string(), true),
-            ("event-2".to_string(), false)
-        ]
-    );
+    assert_eq!(handed, vec!["event-1", "event-2"]);
 
     stack
         .engine()
-        .deliver_external_event(
-            &stack.definition,
-            stack.execution_id(),
-            &ExternalEventDelivery {
-                episode: episode.clone(),
-                ending: WaitEnding::Timeout,
-            },
-        )
+        .deliver_external_event(&stack.definition, stack.execution_id(), &approved(&episode))
         .await
         .unwrap();
     let ack = stack
@@ -1010,99 +896,8 @@ async fn the_input_a_runner_left_for_later_ends_with_the_wait_it_was_for() {
         .iter()
         .skip(commands)
         .all(|receipt| !receipt.idempotency_key.starts_with("work-resume:")));
-    assert_eq!(stack.execution().current_state.as_deref(), Some("reminded"));
-}
-
-#[tokio::test]
-async fn past_its_deadline_a_wait_without_the_timeout_label_fails_its_step() {
-    // PO4 without a `timeout` choice: a failed step, like any other.
-    let mut stack = Stack::new(REVIEW_WITHOUT_TIMEOUT_LABEL, &[]);
-    stack.start().await;
-
-    stack.advance(Duration::hours(2));
-    run_periodic_pass(&stack.service);
-    let verdicts = stack.poll().await;
-
-    assert_eq!(
-        verdicts,
-        vec![("event-1".to_string(), InputStatus::Consumed)]
-    );
-    let execution = stack.execution();
-    assert_eq!(execution.status, ExecutionStatus::Failed);
-    assert_eq!(execution.current_state.as_deref(), Some("await_review"));
-    let failure = stack
-        .harness
-        .events(stack.execution_id())
-        .into_iter()
-        .find_map(|event| match event.data {
-            EventData::ActionFailed {
-                error, error_type, ..
-            } => Some((error, error_type)),
-            _ => None,
-        })
-        .expect("the step failed");
-    assert_eq!(failure.1.as_deref(), Some("timeout"));
-    assert!(failure.0.contains("review.approved"), "{}", failure.0);
-}
-
-#[tokio::test]
-async fn the_timeout_resumes_a_task_whose_slot_was_freed_while_it_waited() {
-    // The task waits without compute; the deadline brings it back, once,
-    // and the new runner takes the timeout.
-    let mut stack = Stack::new(REVIEW, &[]);
-    stack.start().await;
-    let episode = stack.episode();
-    // Past the grace a waiting task gets, the slot-release policy asks the
-    // runner to stop, and its safe point frees the slot.
-    stack.advance(Duration::minutes(10));
-    run_periodic_pass(&stack.service);
-    assert_eq!(stack.record().runner_state, RunnerState::PauseRequested);
-    stack.report_safe_point();
-    stack.controller_reports(Observation::PausedAtSafePoint);
-    assert_eq!(stack.record().runner_state, RunnerState::Stopped);
-    assert_ne!(stack.record().task_state(), TaskState::HumanNeeded);
-
-    stack.advance(Duration::hours(2));
-    run_periodic_pass(&stack.service);
-    run_periodic_pass(&stack.service);
-
-    let record = stack.record();
-    assert_ne!(record.runner_state, RunnerState::Stopped);
-    let resume_key = format!("work-resume:wait-timeout:{episode}");
-    let resumes = record
-        .commands
-        .iter()
-        .filter(|receipt| receipt.idempotency_key == resume_key)
-        .count();
-    assert_eq!(resumes, 1);
-
-    // The controller starts a new runner; it restores the wait and takes
-    // the timeout.
-    stack
-        .service
-        .control_plane()
-        .schedule(
-            &k8s(),
-            &SchedulingPolicy {
-                backend: BackendAvailability::Available,
-                max_concurrent_tasks: Some(16),
-            },
-        )
-        .unwrap();
-    stack.controller_reports(Observation::StartAccepted);
-    stack.controller_reports(Observation::RunnerReady);
-    let generation = launch_generation(&stack.record());
-    assert!(generation > stack.identity.launch_generation);
-    stack.identity = issue_runner(&stack.service, &stack.task, "pod-2", generation);
-    stack.snapshots = 0;
-    stack.report();
-    let verdicts = stack.poll().await;
-
-    assert_eq!(
-        verdicts,
-        vec![("event-1".to_string(), InputStatus::Consumed)]
-    );
-    assert_eq!(stack.execution().current_state.as_deref(), Some("reminded"));
+    assert_eq!(stack.execution().current_state.as_deref(), Some("done"));
+    assert_eq!(stack.recorder.calls()[0][1], "alice");
 }
 
 #[tokio::test]
@@ -1226,8 +1021,8 @@ async fn a_delivery_for_another_wait_episode_is_refused_and_changes_nothing() {
 
 #[tokio::test]
 async fn a_delivery_after_the_task_moved_on_is_refused() {
-    // The step ended with one event; a second one for the same, finished
-    // wait (a redelivery, a late timeout) ends nothing.
+    // The step ended with one event; a redelivery for the same, finished
+    // wait ends nothing.
     let harness = Harness::new();
     let workflow = load(REVIEW);
     let execution = waiting(&harness, &workflow).await;
@@ -1249,20 +1044,8 @@ async fn a_delivery_after_the_task_moved_on_is_refused() {
         .deliver_external_event(&workflow, &execution.id, &approved(&episode))
         .await
         .expect_err("the wait is over");
-    let late_timeout = engine
-        .deliver_external_event(
-            &workflow,
-            &execution.id,
-            &ExternalEventDelivery {
-                episode,
-                ending: WaitEnding::Timeout,
-            },
-        )
-        .await
-        .expect_err("the wait is over");
 
     assert!(wait_error(again).is_stale());
-    assert!(wait_error(late_timeout).is_stale());
     let received = harness
         .events(&execution.id)
         .iter()
@@ -1323,15 +1106,50 @@ async fn an_event_the_wait_does_not_match_is_refused_by_the_engine_too() {
 }
 
 #[test]
-fn a_wait_step_may_declare_the_timeout_choice() {
-    // The validator lets a `wait` step time out (PO4) in the unified shape.
-    let workflow = load(REVIEW);
-    let labels: Vec<&str> = workflow.states["await_review"]
-        .choices
-        .iter()
-        .map(|choice| choice.label.as_str())
-        .collect();
-    assert!(labels.contains(&"timeout"), "{labels:?}");
+fn a_wait_step_has_no_timeout() {
+    // Neither the field `timeout` nor a `timeout` choice: nothing but an
+    // event ends a wait.
+    let yaml = r#"
+schema: v2
+name: wait-with-timeout
+version: 1
+states:
+  await_review:
+    action:
+      type: wait
+      event_type: review.approved
+      timeout: 1h
+    choices:
+      received:
+        next: done
+      timeout:
+        next: done
+  done:
+    description: Done.
+terminal_states:
+  done: completed
+"#;
+
+    let errors = validate_source(yaml).expect("the file compiles");
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::WaitTimeoutNotAllowed { state } if state == "await_review"
+        )),
+        "{errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::TimeoutChoiceNotAllowed { state } if state == "await_review"
+        )),
+        "{errors:?}"
+    );
+    assert!(
+        validate_source(REVIEW).unwrap().is_empty(),
+        "a wait without a timeout is valid"
+    );
 }
 
 #[test]
@@ -1345,8 +1163,6 @@ fn the_runner_protocol_carries_the_wait_and_what_ends_it() {
     }))
     .unwrap();
     assert!(matches!(delivered.delivery, EventDelivery::Event { .. }));
-    let timeout: EventDelivery = serde_json::from_value(json!({"kind": "timeout"})).unwrap();
-    assert_eq!(timeout, EventDelivery::Timeout);
     // A poll without a wait says nothing of one.
     let query = serde_json::to_value(RunnerPollQuery::default()).unwrap();
     assert!(query.get("event_wait_id").is_none());

@@ -1,5 +1,5 @@
-//! What ends a `wait` step's wait: a matching external event or the wait's
-//! deadline, delivered by the runner (`engine::actions::wait`).
+//! What ends a `wait` step's wait: a matching external event, delivered by
+//! the runner (`engine::actions::wait`).
 
 use super::*;
 
@@ -57,8 +57,7 @@ impl Engine {
 
     /// The synchronous half: ends the wait ([`wait::resume`], which refuses
     /// a delivery for another episode), then completes the step with the
-    /// event as its result — or, for the deadline, with the `timeout`
-    /// label when the step declares it and a failed step otherwise (PO4).
+    /// event as its result.
     fn prepare_deliver_external_event(
         &self,
         definition: &WorkflowDefinition,
@@ -71,33 +70,14 @@ impl Engine {
         self.lock_pause_requests().remove(execution_id);
 
         let state = self.state_of(definition, &execution, &pending.state_id)?;
-        let flow = match wait::wait_result(
-            &pending,
-            &delivery.ending,
-            &decision::permitted_labels(state),
-        ) {
-            Ok(result) => self.record_completion(
-                definition,
-                &mut execution,
-                state,
-                pending.action_execution_id().to_string(),
-                result,
-            )?,
-            Err(error) => {
-                // Nothing ran, so nothing can have acted: a restart of the
-                // step waits again.
-                self.fail_attempts(
-                    &mut execution,
-                    pending.action_execution_id(),
-                    FailedAction {
-                        message: error.message,
-                        error_type: error.error_type,
-                    },
-                    true,
-                )?;
-                Flow::Stop
-            }
-        };
+        let result = wait::wait_result(&delivery.ending, &decision::permitted_labels(state));
+        let flow = self.record_completion(
+            definition,
+            &mut execution,
+            state,
+            pending.action_execution_id().to_string(),
+            result,
+        )?;
         Ok(match flow {
             Flow::Stop => HandleState::Done(execution),
             Flow::Continue => HandleState::Ready(execution),

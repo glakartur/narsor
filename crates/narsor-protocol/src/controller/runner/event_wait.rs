@@ -1,9 +1,8 @@
 //! A `wait` step waiting for an external event, on the runner channel.
 //!
 //! The runner reports the wait in its snapshot ([`EventWait`]); the control
-//! plane matches an observer's event against it and hands a matching one,
-//! or the end of the wait's time, back on the long-poll
-//! ([`DeliveredEvent`]). The runner acknowledges each delivery once.
+//! plane matches an observer's event against it and hands a matching one
+//! back on the long-poll ([`DeliveredEvent`]). The runner acknowledges each delivery once.
 //!
 //! These types travel only between a runner and its control plane, which
 //! are deployed together: a new [`EventDelivery`] variant is a joint update
@@ -28,9 +27,6 @@ pub struct EventWait {
     pub filter: Value,
     /// When the wait began; only events from then on reach the step.
     pub since: DateTime<Utc>,
-    /// When the wait times out, if it does.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<DateTime<Utc>>,
     /// The watch entry the step's `watch` block asks for, if it has one.
     /// The control plane registers it when the episode begins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,11 +57,6 @@ impl EventWait {
     /// for: the same type, and [`filter_matches`] of the filter.
     pub fn matches(&self, event_type: &str, data: &Value) -> bool {
         self.event_type == event_type && filter_matches(&self.filter, data)
-    }
-
-    /// Whether the wait's time ran out at `now`.
-    pub fn is_past_deadline(&self, now: DateTime<Utc>) -> bool {
-        self.deadline.is_some_and(|deadline| deadline <= now)
     }
 }
 
@@ -114,7 +105,7 @@ pub struct DeliveredEvent {
     /// The wait episode it is for; the runner's engine refuses it for any
     /// other.
     pub episode_id: String,
-    /// The event, or the end of the wait's time.
+    /// The event.
     pub delivery: EventDelivery,
 }
 
@@ -132,8 +123,6 @@ pub enum EventDelivery {
         #[serde(default)]
         data: Value,
     },
-    /// The wait's deadline passed without a matching event.
-    Timeout,
 }
 
 /// Response to `POST /runner/v1/events/{input_id}/ack`.

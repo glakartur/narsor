@@ -8,7 +8,7 @@ use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::operator::protocol_delivery;
 use crate::controller_protocol::service::{chrono_duration, ProtocolService};
 use crate::controller_protocol::wire::*;
-use crate::orchestration::{EventInputKind, QueuedEventInput, RunnerState, TaskRecord};
+use crate::orchestration::{QueuedEventInput, RunnerState, TaskRecord};
 
 impl ProtocolService {
     /// Accepts a runner snapshot.
@@ -238,8 +238,7 @@ impl ProtocolService {
         })
     }
 
-    /// The runner's verdict on a delivered event or timeout of a `wait`
-    /// step.
+    /// The runner's verdict on a delivered event of a `wait` step.
     pub fn runner_ack_event(
         &self,
         identity: &RunnerIdentity,
@@ -289,22 +288,17 @@ impl ProtocolService {
     }
 }
 
-/// A queued event or timeout as the runner receives it; `None` for an
-/// event whose data was already dropped (settled), which is never handed
-/// over again.
+/// A queued event as the runner receives it; `None` for an event whose
+/// data was already dropped (settled), which is never handed over again.
 fn delivered_event(input: QueuedEventInput) -> Option<DeliveredEvent> {
-    let delivery = match input.kind {
-        EventInputKind::Event => EventDelivery::Event {
+    Some(DeliveredEvent {
+        input_id: input.input_id,
+        episode_id: input.episode_id,
+        delivery: EventDelivery::Event {
             event_type: input.event_type,
             source: input.source,
             data: input.data?,
         },
-        EventInputKind::Timeout => EventDelivery::Timeout,
-    };
-    Some(DeliveredEvent {
-        input_id: input.input_id,
-        episode_id: input.episode_id,
-        delivery,
     })
 }
 

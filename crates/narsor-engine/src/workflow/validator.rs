@@ -515,6 +515,11 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
             if wait.event.trim().is_empty() {
                 errors.push(missing_field(state, "wait", "event_type"));
             }
+            if wait.timeout_secs.is_some() {
+                errors.push(ValidationError::WaitTimeoutNotAllowed {
+                    state: state.id.clone(),
+                });
+            }
             if let Some(watch) = &wait.watch {
                 validate_wait_watch(state, &wait.event, watch, errors);
             }
@@ -830,10 +835,9 @@ fn validate_exit_and_timeout(
             });
         }
     }
-    // A `wait` step times out at its own deadline (§3.3.D, PO4).
     let can_time_out = matches!(
         state.action,
-        Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_)) | Some(ActionConfig::Wait(_))
+        Some(ActionConfig::Agent(_)) | Some(ActionConfig::Script(_))
     );
     let declares_timeout = state
         .choices

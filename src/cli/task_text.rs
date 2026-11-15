@@ -891,12 +891,6 @@ pub fn event_line(event: &TaskEvent) -> String {
                 provenance.observer_name, provenance.effect_key
             )
         }
-        TaskEventKind::WaitTimedOut {
-            episode_id,
-            input_id,
-        } => format!(
-            "the wait {episode_id} timed out; {input_id} queued for the waiting step"
-        ),
         TaskEventKind::WatchRefused {
             step,
             observer,

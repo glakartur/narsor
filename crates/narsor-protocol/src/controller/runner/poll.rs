@@ -91,7 +91,7 @@ pub struct RunnerPollResponse {
     pub runner_state: RunnerState,
     pub inputs: Vec<DeliveredInput>,
     /// What ends the `wait` step the runner named in
-    /// [`RunnerPollQuery::event_wait_id`]: a matching event or its timeout.
+    /// [`RunnerPollQuery::event_wait_id`]: a matching event.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<DeliveredEvent>,
     #[serde(default)]

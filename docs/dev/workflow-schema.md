@@ -651,7 +651,7 @@ The engine strips control characters from `reason` and from the values and short
 
 ##### D. WaitAction
 
-Pauses the workflow until a matching external event occurs, or until the wait time ends.
+Pauses the workflow until a matching external event occurs. The wait has no time limit.
 An observer of the control plane sends the events.
 
 ```yaml
@@ -660,7 +660,6 @@ action:
   event_type: review.approved               # Event type
   filter:                                   # Event filter (optional)
     mr: "{{ inputs.mr_id }}"                # Templates are rendered when the step starts
-  timeout: 24h                              # Maximum wait time (optional)
   watch:                                    # Watch entry for an observer (optional)
     observer: mr-review                     # Observer name, no template
     object: "{{ inputs.mr_url }}"           # Object to watch, rendered when the step starts
@@ -668,8 +667,6 @@ action:
 choices:
   received:
     next: merge
-  timeout:
-    next: remind
 ```
 
 **How the step waits.** When the step starts, the engine renders the templates of `event_type` and
@@ -680,7 +677,7 @@ again (for example, in a review loop), it starts a new episode. While the task w
 *   the task state is `running`, not `human_needed`, because the task continues without the
     operator;
 *   the task frees its slot after the same grace as a task that waits for its owner. A matching
-    event or the end of the wait time starts the task again;
+    event starts the task again;
 *   a restart of the runner does not end the wait. The new runner reads the wait from disk and
     reports the same episode.
 
@@ -701,23 +698,16 @@ an event for a wait that the task left never ends a later wait.
 
 **Result.** A matching event ends the step. The engine writes `ExternalEventReceived` to the
 execution log once. The step ends with the label `received`. When the step declares only one label
-other than `timeout` (for example `exit`), the step ends with that label. The engine writes the
+(for example `exit`), the step ends with that label. The engine writes the
 event to the context variable `event`: `{"type": ..., "source": ..., "data": ...}`. A later step
 reads it as `{{ context.event.data.mr }}` or `{{ context.event.source }}`. The next event overwrites
 the variable. The event data comes from outside narsor: treat it as untrusted input in an agent
 prompt.
 
-**Timeout.** `timeout` sets the deadline: the start of the wait plus the time. Without `timeout`,
-the step waits until an event comes. The control plane checks the deadline in its periodic pass, also
-when the task has no compute. It hands the end of the wait to the runner once per episode. Then:
-
-*   when the step declares the `timeout` choice, the step ends with the label `timeout`;
-*   when the step does not declare it, the step fails with the error type `timeout`, like a failed
-    step of any other type. The validator does not warn about a `wait` step with `timeout` and
-    without the `timeout` choice.
-
-The `timeout` of a `wait` step is the wait time only. The time limit of a state or of the workflow
-for a running action does not apply to a `wait` step.
+**No timeout.** A `wait` step waits until a matching event comes. The validator refuses the field
+`timeout` on a `wait` step ("a wait step has no timeout") and a `timeout` choice on a `wait` step
+(§5). The time limit of a state or of the workflow for a running action does not apply to a `wait`
+step.
 
 **Watch entry (`watch`).** A watch-list observer runs its script only for the objects on its
 watch list (for example, merge requests). The optional `watch` block puts the object of the step on
@@ -765,7 +755,6 @@ states:
       event_type: review.approved
       filter:
         mr_url: "{{ inputs.mr_url }}"
-      timeout: 24h
       watch:
         observer: mr-review                 # A watch_list observer of the task's owner
         object: "{{ inputs.mr_url }}"       # Rendered when the step starts
@@ -773,8 +762,6 @@ states:
     choices:
       received:
         next: merge
-      timeout:
-        next: remind
   merge:
     action:
       type: script
@@ -782,20 +769,10 @@ states:
       args: ["{{ context.event.data.mr_url }}"]
     exit:
       next: done
-  remind:
-    action:
-      type: script
-      command: remind
-      args: ["{{ inputs.mr_url }}"]
-    exit:
-      next: reminded
   done:
     description: Merged.
-  reminded:
-    description: Nobody approved in time.
 terminal_states:
   done: completed
-  reminded: completed
 ```
 
 The validator refuses a `watch` without `observer`, with an observer name that is not valid (for
@@ -1652,6 +1629,7 @@ Before a workflow is run, the definition must pass validation:
     *   Every name in `requires_variables` must be defined in that step's `variables`, and every name in `requires_artifacts` in that step's `artifacts`.
     *   `requires_human_approval` is allowed only on a choice of an `agent` step.
     *   `resume_comment_field` requires a `text` field of that name in the `inputs` of a `human` gate and a transition to an `agent` step.
+    *   A `wait` step cannot have the field `timeout`: a wait step has no timeout (§3.3.D).
     *   The `watch` of a `wait` step names an observer (a valid observer name, not a template) and an object, and its `event_types` include the `event_type` of the step (§3.3.D).
 
 3.  **Decision Correctness:**
@@ -1678,7 +1656,7 @@ Before a workflow is run, the definition must pass validation:
     *   A `decision` step has a non-blank `message` and at least one choice. It may define `variables`, not `artifacts`.
     *   A `profile` step has a non-blank `prompt` and `exit`, never `choices`. It defines no `variables` and no `artifacts`. A `profile` action is not allowed in a legacy file (§3.7.10).
     *   A script step with `exit` cannot have `exit_codes`.
-    *   In the unified shape only an agent, a script or a `wait` step can declare a `timeout` choice; a `decision` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
+    *   In the unified shape only an agent or a script step can declare a `timeout` choice; a `decision` or `wait` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
     *   `resume_comment_field` on a decision step names a variable of `type: text`.
 
 8.  **Variable declarations (§3.7.4):**

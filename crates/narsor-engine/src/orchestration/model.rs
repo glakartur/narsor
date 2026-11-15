@@ -52,8 +52,8 @@ pub enum SlotReleaseClass {
     Final,
     /// The execution waits for its owner (`InputNeeded`, `Failed`) or for an
     /// external event (`WaitingForEvent`, a `wait` step): the slot is freed
-    /// after a wait. A matching event, or the wait's timeout, resumes the
-    /// task like an owner's answer does.
+    /// after a wait. A matching event resumes the task like an owner's
+    /// answer does.
     Transient,
 }
 
@@ -90,7 +90,7 @@ impl SlotReleaseClass {
 /// 6. execution `Failed` is `Error`;
 /// 7. execution `InputNeeded` is `HumanNeeded`;
 /// 8. execution `WaitingForEvent` (a `wait` step) is `Running`: the work
-///    goes on by itself when the event or the timeout comes, so the owner
+///    goes on by itself when the event comes, so the owner
 ///    is not told that it waits for them;
 /// 9. `Stopped` or `PauseRequested` is `Paused`;
 /// 10. `Provisioning` without a snapshot is `Queued`;
@@ -989,8 +989,8 @@ pub struct InputRequest {
 }
 
 /// What ends the task's waiting `wait` step, queued for its runner: an
-/// external event an observer delivered (U3), or the end of the wait's
-/// time the periodic pass found (U4). The runner's engine consumes it.
+/// external event an observer delivered (U3). The runner's engine
+/// consumes it.
 ///
 /// Kept apart from [`QueuedInput`]: an owner answer is bound to the
 /// runner's pending input request and made obsolete by any snapshot that
@@ -1000,27 +1000,20 @@ pub struct InputRequest {
 pub struct QueuedEventInput {
     /// Control-plane id, unique within the task (`event-<n>`).
     pub input_id: String,
-    /// [`super::observer_event_key`] of the observer and its effect key;
-    /// [`super::wait_timeout_key`] for a timeout.
+    /// [`super::observer_event_key`] of the observer and its effect key.
     pub idempotency_key: String,
-    /// What it is: an event, or the wait's timeout. Records from before
-    /// timeouts were queued are all events.
-    #[serde(default)]
-    pub kind: EventInputKind,
     /// The wait episode it was matched against; a runner in another
     /// episode never takes it.
     pub episode_id: String,
-    /// The event type (for a timeout: the type the step waited for).
+    /// The event type.
     pub event_type: String,
-    /// The observer's source (for a timeout: empty).
+    /// The observer's source.
     pub source: String,
     /// The event's data, dropped once settled.
     #[serde(default)]
     pub data: Option<serde_json::Value>,
-    /// The observer, effect key and run it came from (R19); `None` for a
-    /// timeout, which no observer caused.
-    #[serde(default)]
-    pub provenance: Option<TaskProvenance>,
+    /// The observer, effect key and run it came from (R19).
+    pub provenance: TaskProvenance,
     /// Its status, as for an owner answer.
     pub status: InputStatus,
     /// When the control plane accepted it.
@@ -1030,17 +1023,6 @@ pub struct QueuedEventInput {
     /// The runner's reason, when it rejected the event.
     #[serde(default)]
     pub detail: Option<String>,
-}
-
-/// What a [`QueuedEventInput`] carries to the waiting step.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EventInputKind {
-    /// An external event that matched the wait.
-    #[default]
-    Event,
-    /// The wait's deadline passed without one.
-    Timeout,
 }
 
 /// An external event as an observer delivers it.
