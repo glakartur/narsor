@@ -4,7 +4,7 @@
 //!
 //! The owner's commands run through [`operate`] on the [`ObserverApi`]
 //! seam, implemented here on the service for one owner, as the owner
-//! routes call it. A script's `task create --effect-key` and `task event`
+//! routes call it. A script's `task create --data` and `task event`
 //! are parsed by the real command line and sent through [`perform`] on the
 //! [`EffectApi`] seam, which authenticates the run token the way the run
 //! gate does. Where a worker is needed, it is the real worker of U6 with a
@@ -23,7 +23,7 @@ use narsor::api::ClientError;
 use narsor::cli::observer::ObserverCommand;
 use narsor::cli::observer::{operate, worker_token, ObserverApi, WorkerTokenApi};
 use narsor::cli::observer_effect::{effect_call, perform, EffectApi};
-use narsor::cli::observer_text::{dry_run_output, effect_output, observer_list_output};
+use narsor::cli::observer_text::{effect_output, observer_list_output};
 use narsor::cli::observer_worker::{
     ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, Worker, WorkerApi, WorkerOptions,
 };
@@ -33,15 +33,14 @@ use narsor_engine::domain::{
     BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
     TaskRepository, TaskRepositorySource, TaskWorkspace,
 };
-use narsor_engine::observers::{effect_task_id, ObserverState, RunId};
+use narsor_engine::observers::{ObserverState, RunId};
 use narsor_engine::orchestration::{Clock, ControlPlane, NewTask, OwnerRef, TaskEventKind};
 use narsor_engine::persistence::StatePaths;
 use narsor_protocol::controller::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
     CreateObserverWorkerRequest, ObserverCreateTaskRequest, ObserverDetailView,
-    ObserverDryRunRequest, ObserverDryRunView, ObserverEffectOutcome, ObserverEffectResponse,
-    ObserverEventRequest, ObserverListResponse, ObserverPlannedEffectView, ObserverRunReport,
-    ObserverRunResultResponse, ObserverRunView, ObserverScriptView, ObserverView,
+    ObserverEffectOutcome, ObserverEffectResponse, ObserverEventRequest, ObserverListResponse,
+    ObserverRunReport, ObserverRunResultResponse, ObserverScriptView, ObserverView,
     ObserverWatchListResponse, ObserverWatchView, ObserverWorkerCreated,
     ObserverWorkerListResponse, ObserverWorkerRun, ObserverWorkerView, SetObserverScriptRequest,
 };
@@ -120,13 +119,8 @@ impl Fixture {
         }
     }
 
-    /// Runs `narsor-cli observer ARGS…` as the owner; a dry run looks at
-    /// most a few times and runs `worker` between two looks.
-    async fn cli(
-        &self,
-        args: &[&str],
-        worker: Option<&Arc<TestWorker>>,
-    ) -> Result<String, (i32, String)> {
+    /// Runs `narsor-cli observer ARGS…` as the owner.
+    async fn cli(&self, args: &[&str]) -> Result<String, (i32, String)> {
         let mut argv = vec!["narsor-cli", "observer"];
         argv.extend_from_slice(args);
         let Command::Observer { command } =
@@ -134,24 +128,10 @@ impl Fixture {
         else {
             panic!("not an observer command");
         };
-        let worker = worker.cloned();
         let clock = Arc::clone(&self.clock);
-        operate(
-            &self.api(),
-            command,
-            None,
-            move || clock.now(),
-            move |_| {
-                let worker = worker.clone();
-                async move {
-                    if let Some(worker) = worker {
-                        worker.run_once().await.expect("the worker claims");
-                    }
-                }
-            },
-        )
-        .await
-        .map_err(|error| (error.exit_code, error.message))
+        operate(&self.api(), command, None, move || clock.now())
+            .await
+            .map_err(|error| (error.exit_code, error.message))
     }
 
     /// Runs `narsor-cli observer worker-token ARGS…` as the owner.
@@ -325,17 +305,6 @@ impl ObserverApi for ServiceApi {
         ready(
             self.service
                 .add_observer_script(&self.owner, observer, &request.script),
-        )
-    }
-
-    fn request_observer_dry_run<'a>(
-        &'a self,
-        observer: &'a str,
-        request: &'a ObserverDryRunRequest,
-    ) -> BoxFuture<'a, Result<ObserverDryRunView, ClientError>> {
-        ready(
-            self.service
-                .request_observer_dry_run_for(&self.owner, observer, request.clone()),
         )
     }
 
@@ -542,8 +511,6 @@ fn create_line(key: &str) -> Vec<String> {
     vec![
         "task".into(),
         "create".into(),
-        "--effect-key".into(),
-        key.into(),
         "--data".into(),
         json!({"key": key}).to_string(),
     ]
@@ -574,20 +541,18 @@ const CREATE_JIRA: &[&str] = &[
 
 #[tokio::test]
 async fn an_operator_runs_the_jira_flow_through_the_cli_alone() {
-    // F1 and F2 by the CLI: create, save a script, dry-run it with a worker
-    // whose script creates tasks, approve, and the scheduled run creates
-    // the task, once.
+    // F1 and F2 by the CLI: create, save a script, approve, and the
+    // scheduled run's script creates the task.
     let fx = Fixture::new();
-    let created = fx.cli(CREATE_JIRA, None).await.unwrap();
+    let created = fx.cli(CREATE_JIRA).await.unwrap();
     assert!(created.contains("Created observer 'jira-new'"), "{created}");
     assert!(created.contains("state draft"), "{created}");
-    let file = fx.script_file("jira.sh", "narsor-cli task create --effect-key \"$KEY\"\n");
+    let file = fx.script_file("jira.sh", "narsor-cli task create --data \"$JSON\"\n");
     let saved = fx
-        .cli(&["script", "set", "jira-new", "--file", &file], None)
+        .cli(&["script", "set", "jira-new", "--file", &file])
         .await
         .unwrap();
     assert!(saved.contains("Saved version 1"), "{saved}");
-
     let lines = [create_line("ABC-1")];
     let (worker, script) = fx.worker(
         &lines_of(&lines)
@@ -595,33 +560,13 @@ async fn an_operator_runs_the_jira_flow_through_the_cli_alone() {
             .map(Vec::as_slice)
             .collect::<Vec<_>>(),
     );
-    let dry = fx
-        .cli(&["dry-run", "jira-new", "--wait", "6"], Some(&worker))
-        .await
-        .unwrap();
-
-    assert!(dry.contains("Dry run of version 1"), "{dry}");
-    assert!(dry.contains("succeeded"), "{dry}");
-    assert!(dry.contains("Nothing was created. It would have:"), "{dry}");
-    assert!(dry.contains("created task"), "{dry}");
-    assert!(dry.contains("(key ABC-1)"), "{dry}");
-    let would = script.outputs();
-    assert_eq!(would.len(), 1);
-    assert!(
-        would[0].as_ref().unwrap().contains("dry run: would create"),
-        "{would:?}"
-    );
+    // Nothing runs before the approval.
+    fx.service.observer_pass();
+    assert!(worker.run_once().await.unwrap().is_none());
     assert_eq!(fx.tasks(), 0);
-    let record = fx
-        .service
-        .observers()
-        .find_by_name("jira-new")
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.state, ObserverState::Draft);
 
     let approved = fx
-        .cli(&["approve", "jira-new", "--version", "1"], None)
+        .cli(&["approve", "jira-new", "--version", "1"])
         .await
         .unwrap();
     assert!(approved.contains("state active"), "{approved}");
@@ -631,25 +576,10 @@ async fn an_operator_runs_the_jira_flow_through_the_cli_alone() {
 
     let outputs = script.outputs();
     let created = outputs.last().unwrap().as_ref().unwrap();
-    let task_id = effect_task_id(&record.observer_id, "ABC-1");
-    assert!(
-        created.contains(&format!("created task {task_id}")),
-        "{created}"
-    );
+    assert!(created.starts_with("created task "), "{created}");
     assert_eq!(fx.tasks(), 1);
 
-    // The next run finds the same issue: a duplicate, exit 0.
-    fx.advance(Duration::seconds(301));
-    fx.service.observer_pass();
-    worker.run_once().await.unwrap().expect("a run is due");
-    let again = script.outputs().last().unwrap().clone();
-    assert!(
-        again.as_ref().unwrap().starts_with("skipped: duplicate"),
-        "{again:?}"
-    );
-    assert_eq!(fx.tasks(), 1);
-
-    let listed = fx.cli(&["list"], None).await.unwrap();
+    let listed = fx.cli(&["list"]).await.unwrap();
     assert!(listed.contains("jira-new"), "{listed}");
     assert!(listed.contains("succeeded"), "{listed}");
 }
@@ -657,12 +587,12 @@ async fn an_operator_runs_the_jira_flow_through_the_cli_alone() {
 #[tokio::test]
 async fn observer_list_shows_state_last_run_and_its_error() {
     let fx = Fixture::new();
-    fx.cli(CREATE_JIRA, None).await.unwrap();
+    fx.cli(CREATE_JIRA).await.unwrap();
     let file = fx.script_file("jira.sh", "exit 3\n");
-    fx.cli(&["script", "set", "jira-new", "--file", &file], None)
+    fx.cli(&["script", "set", "jira-new", "--file", &file])
         .await
         .unwrap();
-    fx.cli(&["approve", "jira-new", "--version", "1"], None)
+    fx.cli(&["approve", "jira-new", "--version", "1"])
         .await
         .unwrap();
     fx.service.observer_pass();
@@ -679,7 +609,7 @@ async fn observer_list_shows_state_last_run_and_its_error() {
         .unwrap();
     fx.advance(Duration::seconds(30));
 
-    let listed = fx.cli(&["list"], None).await.unwrap();
+    let listed = fx.cli(&["list"]).await.unwrap();
 
     let mut lines = listed.lines();
     let header = lines.next().unwrap();
@@ -700,19 +630,19 @@ async fn observer_list_shows_state_last_run_and_its_error() {
 async fn observer_list_and_show_warn_when_no_worker_claims_a_due_run() {
     // R18: a due run waiting longer than one interval.
     let fx = Fixture::new();
-    fx.cli(CREATE_JIRA, None).await.unwrap();
+    fx.cli(CREATE_JIRA).await.unwrap();
     let file = fx.script_file("jira.sh", "true\n");
-    fx.cli(&["script", "set", "jira-new", "--file", &file], None)
+    fx.cli(&["script", "set", "jira-new", "--file", &file])
         .await
         .unwrap();
-    fx.cli(&["approve", "jira-new", "--version", "1"], None)
+    fx.cli(&["approve", "jira-new", "--version", "1"])
         .await
         .unwrap();
     fx.service.observer_pass();
     fx.advance(Duration::seconds(301));
 
-    let listed = fx.cli(&["list"], None).await.unwrap();
-    let shown = fx.cli(&["show", "jira-new"], None).await.unwrap();
+    let listed = fx.cli(&["list"]).await.unwrap();
+    let shown = fx.cli(&["show", "jira-new"]).await.unwrap();
 
     assert!(listed.contains("warning: no worker"), "{listed}");
     assert!(shown.contains("Warning: no worker"), "{shown}");
@@ -722,22 +652,22 @@ async fn observer_list_and_show_warn_when_no_worker_claims_a_due_run() {
 async fn a_script_saved_on_an_active_observer_is_a_draft_beside_the_approved_version() {
     // Covers AE6.
     let fx = Fixture::new();
-    fx.cli(CREATE_JIRA, None).await.unwrap();
+    fx.cli(CREATE_JIRA).await.unwrap();
     let first = fx.script_file("v1.sh", "true\n");
     let second = fx.script_file("v2.sh", "echo changed\n");
-    fx.cli(&["script", "set", "jira-new", "--file", &first], None)
+    fx.cli(&["script", "set", "jira-new", "--file", &first])
         .await
         .unwrap();
-    fx.cli(&["approve", "jira-new", "--version", "1"], None)
+    fx.cli(&["approve", "jira-new", "--version", "1"])
         .await
         .unwrap();
 
     let saved = fx
-        .cli(&["script", "set", "jira-new", "--file", &second], None)
+        .cli(&["script", "set", "jira-new", "--file", &second])
         .await
         .unwrap();
-    let shown = fx.cli(&["show", "jira-new"], None).await.unwrap();
-    let listed = fx.cli(&["list"], None).await.unwrap();
+    let shown = fx.cli(&["show", "jira-new"]).await.unwrap();
+    let listed = fx.cli(&["list"]).await.unwrap();
 
     assert!(saved.contains("Saved version 2"), "{saved}");
     assert!(
@@ -756,64 +686,36 @@ async fn a_script_saved_on_an_active_observer_is_a_draft_beside_the_approved_ver
 }
 
 #[tokio::test]
-async fn a_dry_run_without_a_worker_ends_with_the_no_worker_message() {
-    let fx = Fixture::new();
-    fx.cli(CREATE_JIRA, None).await.unwrap();
-    let file = fx.script_file("jira.sh", "true\n");
-    fx.cli(&["script", "set", "jira-new", "--file", &file], None)
-        .await
-        .unwrap();
-
-    let (code, message) = fx
-        .cli(&["dry-run", "jira-new", "--wait", "4"], None)
-        .await
-        .unwrap_err();
-
-    assert_eq!(code, 1);
-    assert!(message.starts_with("No worker"), "{message}");
-    assert!(message.contains("within 4s"), "{message}");
-    assert!(message.contains("narsor-cli observer worker"), "{message}");
-    let shown = fx.cli(&["show", "jira-new"], None).await.unwrap();
-    assert!(shown.contains("Pending dry run: version 1"), "{shown}");
-}
-
-#[tokio::test]
 async fn an_observer_create_with_a_bad_condition_or_mapping_is_a_usage_error() {
     let fx = Fixture::new();
 
     let (code, message) = fx
-        .cli(
-            &[
-                "create",
-                "jira-new",
-                "--source",
-                "jira",
-                "--workflow",
-                "triage",
-                "--condition",
-                "[1]",
-            ],
-            None,
-        )
+        .cli(&[
+            "create",
+            "jira-new",
+            "--source",
+            "jira",
+            "--workflow",
+            "triage",
+            "--condition",
+            "[1]",
+        ])
         .await
         .unwrap_err();
     assert_eq!(code, 2);
     assert!(message.contains("--condition"), "{message}");
 
     let (code, message) = fx
-        .cli(
-            &[
-                "create",
-                "jira-new",
-                "--source",
-                "jira",
-                "--workflow",
-                "triage",
-                "--map",
-                "ticket",
-            ],
-            None,
-        )
+        .cli(&[
+            "create",
+            "jira-new",
+            "--source",
+            "jira",
+            "--workflow",
+            "triage",
+            "--map",
+            "ticket",
+        ])
         .await
         .unwrap_err();
     assert_eq!(code, 2);
@@ -824,7 +726,7 @@ async fn an_observer_create_with_a_bad_condition_or_mapping_is_a_usage_error() {
 #[tokio::test]
 async fn another_owners_observer_is_not_found() {
     let fx = Fixture::new();
-    fx.cli(CREATE_JIRA, None).await.unwrap();
+    fx.cli(CREATE_JIRA).await.unwrap();
     let stranger = ServiceApi {
         service: Arc::clone(&fx.service),
         owner: OwnerRef::new("someone-else"),
@@ -837,7 +739,7 @@ async fn another_owners_observer_is_not_found() {
         panic!("not an observer command");
     };
 
-    let error = operate(&stranger, command, None, Utc::now, |_| async {})
+    let error = operate(&stranger, command, None, Utc::now)
         .await
         .unwrap_err();
 
@@ -863,28 +765,25 @@ const CREATE_REVIEW: &[&str] = &[
 #[tokio::test]
 async fn a_watch_entry_added_by_the_owner_is_in_the_watch_list() {
     let fx = Fixture::new();
-    fx.cli(CREATE_REVIEW, None).await.unwrap();
+    fx.cli(CREATE_REVIEW).await.unwrap();
     let task = fx.task("task-1");
     let object = format!("{PREFIX}a/-/merge_requests/17");
 
     let added = fx
-        .cli(
-            &[
-                "watch",
-                "add",
-                "mr-review",
-                "--task",
-                task.as_str(),
-                "--object",
-                &object,
-                "--events",
-                "approved,merged",
-            ],
-            None,
-        )
+        .cli(&[
+            "watch",
+            "add",
+            "mr-review",
+            "--task",
+            task.as_str(),
+            "--object",
+            &object,
+            "--events",
+            "approved,merged",
+        ])
         .await
         .unwrap();
-    let listed = fx.cli(&["watch", "list", "mr-review"], None).await.unwrap();
+    let listed = fx.cli(&["watch", "list", "mr-review"]).await.unwrap();
 
     assert!(
         added.contains(&format!("Watching {object} for task task-1")),
@@ -899,43 +798,40 @@ async fn a_watch_entry_added_by_the_owner_is_in_the_watch_list() {
 
     let entry = row.split_whitespace().next().unwrap();
     let removed = fx
-        .cli(&["watch", "remove", "mr-review", entry], None)
+        .cli(&["watch", "remove", "mr-review", entry])
         .await
         .unwrap();
     assert!(removed.starts_with("Removed watch entry"), "{removed}");
-    let empty = fx.cli(&["watch", "list", "mr-review"], None).await.unwrap();
+    let empty = fx.cli(&["watch", "list", "mr-review"]).await.unwrap();
     assert_eq!(empty, "No watch entries.\n");
 }
 
 #[tokio::test]
 async fn an_operator_runs_the_review_flow_through_the_cli_alone() {
-    // F3 by the CLI: the event of a watched MR reaches the task's history,
-    // once.
+    // F3 by the CLI: the event of a watched MR reaches the task's history.
+    // The server does not deduplicate: two calls are two events.
     let fx = Fixture::new();
-    fx.cli(CREATE_REVIEW, None).await.unwrap();
+    fx.cli(CREATE_REVIEW).await.unwrap();
     let task = fx.task("task-1");
     let object = format!("{PREFIX}a/-/merge_requests/17");
-    fx.cli(
-        &[
-            "watch",
-            "add",
-            "mr-review",
-            "--task",
-            "task-1",
-            "--object",
-            &object,
-            "--events",
-            "approved",
-        ],
-        None,
-    )
+    fx.cli(&[
+        "watch",
+        "add",
+        "mr-review",
+        "--task",
+        "task-1",
+        "--object",
+        &object,
+        "--events",
+        "approved",
+    ])
     .await
     .unwrap();
     let file = fx.script_file("mr.sh", "narsor-cli task event ...\n");
-    fx.cli(&["script", "set", "mr-review", "--file", &file], None)
+    fx.cli(&["script", "set", "mr-review", "--file", &file])
         .await
         .unwrap();
-    fx.cli(&["approve", "mr-review", "--version", "1"], None)
+    fx.cli(&["approve", "mr-review", "--version", "1"])
         .await
         .unwrap();
     let event = [
@@ -944,8 +840,6 @@ async fn an_operator_runs_the_review_flow_through_the_cli_alone() {
         "task-1",
         "--type",
         "approved",
-        "--key",
-        "MR!17:approved",
         "--data",
         r#"{"mr": 17}"#,
     ];
@@ -961,7 +855,10 @@ async fn an_operator_runs_the_review_flow_through_the_cli_alone() {
         "{first}"
     );
     let second = outputs[1].as_ref().unwrap();
-    assert!(second.starts_with("skipped: duplicate"), "{second}");
+    assert!(
+        second.contains("recorded in the history of task task-1"),
+        "{second}"
+    );
     let external = fx
         .service
         .control_plane()
@@ -970,107 +867,18 @@ async fn an_operator_runs_the_review_flow_through_the_cli_alone() {
         .iter()
         .filter(|event| matches!(event.kind, TaskEventKind::ExternalEventReceived { .. }))
         .count();
-    assert_eq!(external, 1);
-}
-
-#[tokio::test]
-async fn event_data_with_control_characters_is_printed_without_them() {
-    let fx = Fixture::new();
-    fx.cli(CREATE_REVIEW, None).await.unwrap();
-    fx.task("task-1");
-    let object = format!("{PREFIX}a/-/merge_requests/17");
-    fx.cli(
-        &[
-            "watch",
-            "add",
-            "mr-review",
-            "--task",
-            "task-1",
-            "--object",
-            &object,
-            "--events",
-            "approved",
-        ],
-        None,
-    )
-    .await
-    .unwrap();
-    let file = fx.script_file("mr.sh", "true\n");
-    fx.cli(&["script", "set", "mr-review", "--file", &file], None)
-        .await
-        .unwrap();
-    let data =
-        json!({"title": "fix\u{1b}[2J\u{1b}[31mred\u{202e}", "by\u{7}": "bob\r"}).to_string();
-    let event = [
-        "task",
-        "event",
-        "task-1",
-        "--type",
-        "approved",
-        "--key",
-        "MR!17:approved",
-        "--data",
-        &data,
-    ];
-    let (worker, _script) = fx.worker(&[&event]);
-
-    let dry = fx
-        .cli(&["dry-run", "mr-review", "--wait", "6"], Some(&worker))
-        .await
-        .unwrap();
-
-    assert!(dry.contains("delivered an event to task task-1"), "{dry}");
-    assert!(dry.contains("fix[2J[31mred"), "{dry}");
-    for unsafe_char in ['\u{1b}', '\u{7}', '\r', '\u{202e}'] {
-        assert!(!dry.contains(unsafe_char), "{dry:?}");
-    }
-    let detail = fx.service.observer_detail(&owner(), "mr-review").unwrap();
-    let shown = fx.cli(&["show", "mr-review"], None).await.unwrap();
-    assert!(!shown.contains('\u{1b}'), "{shown:?}");
-    assert_eq!(detail.runs[0].planned_effects.len(), 1);
+    assert_eq!(external, 2);
 }
 
 #[test]
 fn the_text_of_untrusted_answers_has_no_control_characters() {
     let effect = ObserverEffectResponse {
-        outcome: ObserverEffectOutcome::Duplicate,
-        effect_key: "K\u{1b}[31m".into(),
+        outcome: ObserverEffectOutcome::Recorded,
         task_id: None,
         input_id: None,
-        message: "skipped: duplicate\u{7}".into(),
+        message: "recorded\u{7} in \u{1b}[31mtask-1".into(),
     };
-    assert_eq!(
-        effect_output(&effect),
-        "skipped: duplicate (effect key K[31m)\n"
-    );
-
-    let run = ObserverRunView {
-        run_id: "obs-1.1".into(),
-        sequence: 1,
-        dry_run: true,
-        script_version: 1,
-        status: "failed".into(),
-        claimed_at: Utc::now(),
-        finished_at: Some(Utc::now()),
-        exit_code: Some(1),
-        error: Some("the script exited 1\u{1b}]0;title\u{7}".into()),
-        tasks_created: 0,
-        planned_effects: vec![ObserverPlannedEffectView {
-            kind: "create_task".into(),
-            effect_key: "ABC\u{0}-1".into(),
-            task_id: Some("task-x".into()),
-            data: json!({"k\u{1b}": "v\u{9b}"}),
-        }],
-        stderr: Some("line\u{1b}[1m one\nline two\r".into()),
-    };
-    let text = dry_run_output(&run);
-    for unsafe_char in ['\u{1b}', '\u{7}', '\u{0}', '\u{9b}', '\r'] {
-        assert!(!text.contains(unsafe_char), "{text:?}");
-    }
-    assert!(
-        text.contains("stderr:\n  line[1m one\n  line two\n"),
-        "{text}"
-    );
+    assert_eq!(effect_output(&effect), "recorded in [31mtask-1\n");
 
     let listing = ObserverListResponse {
         observers: Vec::new(),
@@ -1087,12 +895,12 @@ fn the_text_of_untrusted_answers_has_no_control_characters() {
 async fn claimed_jira_run(fx: &Fixture, limit: &str) -> (String, String) {
     let mut create = CREATE_JIRA.to_vec();
     create.extend_from_slice(&["--task-limit", limit]);
-    fx.cli(&create, None).await.unwrap();
+    fx.cli(&create).await.unwrap();
     let file = fx.script_file("jira.sh", "true\n");
-    fx.cli(&["script", "set", "jira-new", "--file", &file], None)
+    fx.cli(&["script", "set", "jira-new", "--file", &file])
         .await
         .unwrap();
-    fx.cli(&["approve", "jira-new", "--version", "1"], None)
+    fx.cli(&["approve", "jira-new", "--version", "1"])
         .await
         .unwrap();
     fx.service.observer_pass();
@@ -1101,16 +909,14 @@ async fn claimed_jira_run(fx: &Fixture, limit: &str) -> (String, String) {
 }
 
 #[tokio::test]
-async fn a_duplicate_key_exits_0_and_a_run_over_its_limit_exits_1() {
+async fn a_created_task_exits_0_and_a_run_over_its_limit_exits_1() {
     let fx = Fixture::new();
     let (run, token) = claimed_jira_run(&fx, "1").await;
 
     let created = script_cli(&fx.service, &create_line("ABC-1"), Some(&run), &token).await;
-    let duplicate = script_cli(&fx.service, &create_line("ABC-1"), Some(&run), &token).await;
-    let over = script_cli(&fx.service, &create_line("ABC-2"), Some(&run), &token).await;
+    let over = script_cli(&fx.service, &create_line("ABC-1"), Some(&run), &token).await;
 
     assert!(created.unwrap().starts_with("created task"));
-    assert!(duplicate.unwrap().starts_with("skipped: duplicate"));
     let (code, message) = over.unwrap_err();
     assert_eq!(code, 1);
     assert!(message.contains("limit"), "{message}");

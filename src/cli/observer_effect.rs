@@ -1,6 +1,6 @@
 //! The effect commands of an observer's script: `narsor-cli task create
-//! --effect-key K --data JSON` and `narsor-cli task event TASK --type T
-//! --key K [--data JSON]` (R3, R4, R13, PO1).
+//! --data JSON` and `narsor-cli task event TASK --type T [--data JSON]`
+//! (R3, R4, PO1).
 //!
 //! The worker runs a script with `NARSOR_OBSERVER_RUN` (the run's id),
 //! `NARSOR_SERVER` and `NARSOR_TOKEN` (the run's token) set. With
@@ -9,18 +9,19 @@
 //!
 //! ```text
 //!                          NARSOR_OBSERVER_RUN set          not set
-//! task create --effect-key effect route                     usage error
+//! task create --data       effect route                     usage error
 //! task create WORKFLOW …   usage error (the record decides)  the owner's create
 //! task event               effect route                     usage error
 //! ```
 //!
-//! What the script sees (PO3):
+//! The server does not deduplicate: every call creates a task or records an
+//! event. The script keeps track in its state of what it already reported.
+//!
+//! What the script sees:
 //!
 //! | answer | prints | exit code |
 //! | --- | --- | --- |
 //! | created, delivered, recorded | the server's line | 0 |
-//! | duplicate key | `skipped: duplicate (effect key K)` | 0 |
-//! | dry run | `dry run: would …` | 0 |
 //! | task limit reached, refused data, token not valid | the reason, on stderr | 1 |
 //! | usage error | the reason, on stderr | 2 |
 
@@ -41,9 +42,9 @@ pub const OBSERVER_RUN_ENV: &str = "NARSOR_OBSERVER_RUN";
 /// An effect a script asked for.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EffectCall {
-    /// `task create --effect-key K --data JSON`.
+    /// `task create --data JSON`.
     CreateTask(ObserverCreateTaskRequest),
-    /// `task event TASK --type T --key K --data JSON`.
+    /// `task event TASK --type T [--data JSON]`.
     Event {
         /// The task on the observer's watch list.
         task_id: String,
@@ -62,10 +63,9 @@ pub fn effect_call(
 ) -> Result<Option<EffectCall>> {
     let observer_run = observer_run.filter(|run| !run.trim().is_empty());
     match (command, observer_run) {
-        (TaskCommand::Create { effect_key, .. }, None) if effect_key.is_some() => {
+        (TaskCommand::Create { data, .. }, None) if data.is_some() => {
             Err(CliError::usage(format!(
-                "--effect-key is for the script of an observer run only: {OBSERVER_RUN_ENV} is \
-                 not set"
+                "--data is for the script of an observer run only: {OBSERVER_RUN_ENV} is not set"
             )))
         }
         (TaskCommand::Event { .. }, None) => Err(CliError::usage(format!(
@@ -85,7 +85,6 @@ pub fn effect_call(
                 profile,
                 harness,
                 task_id,
-                effect_key,
                 data,
             },
             Some(_),
@@ -108,20 +107,13 @@ pub fn effect_call(
             .collect();
             if !chosen.is_empty() {
                 return Err(CliError::usage(format!(
-                    "In an observer's script, task create takes only --effect-key and --data: the \
+                    "In an observer's script, task create takes only --data: the \
                      observer's record decides the workflow, repositories, backend and profile \
                      (refused: {})",
                     chosen.join(", ")
                 )));
             }
-            let Some(effect_key) = effect_key else {
-                return Err(CliError::usage(
-                    "In an observer's script, task create needs --effect-key KEY: one task per \
-                     key, ever",
-                ));
-            };
             Ok(Some(EffectCall::CreateTask(ObserverCreateTaskRequest {
-                effect_key: effect_key.clone(),
                 data: parse_data(data.as_deref())?,
             })))
         }
@@ -129,14 +121,12 @@ pub fn effect_call(
             TaskCommand::Event {
                 task_id,
                 event_type,
-                effect_key,
                 data,
             },
             Some(_),
         ) => Ok(Some(EffectCall::Event {
             task_id: task_id.clone(),
             request: ObserverEventRequest {
-                effect_key: effect_key.clone(),
                 event_type: event_type.clone(),
                 data: parse_data(data.as_deref())?,
             },
@@ -194,8 +184,8 @@ impl EffectApi for ApiClient {
 
 /// Performs `call` for the run `run_id` and returns the line to print.
 ///
-/// Every answer of the route is a success (a duplicate and a dry run
-/// included, PO3); a refusal is a failure with its reason.
+/// Every answer of the route is a success; a refusal is a failure with its
+/// reason.
 pub async fn perform<A: EffectApi + ?Sized>(
     api: &A,
     run_id: &str,

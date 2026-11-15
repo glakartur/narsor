@@ -277,9 +277,9 @@ impl ControlPlane {
         Ok(InputOutcome { input, replayed })
     }
 
-    /// Records an external event an observer delivers to the task (R4), once
-    /// per idempotency key, under the task's lock: a retry, or a second
-    /// call racing the first, finds the key and changes nothing (R13).
+    /// Records an external event an observer delivers to the task (R4),
+    /// under the task's lock. Every call records a new event: the server
+    /// does not deduplicate events (the script keeps track of what it sent).
     ///
     /// The event always goes to the task's history, as one
     /// [`TaskEventKind::ExternalEventReceived`]. When the task waits in a
@@ -294,19 +294,7 @@ impl ControlPlane {
         task_id: &TaskId,
         event: ExternalEvent,
     ) -> Result<ExternalEventOutcome> {
-        let (task, (input, replayed)) = self.mutate(task_id, |record, now| {
-            if record
-                .external_event_keys
-                .iter()
-                .any(|key| key == &event.idempotency_key)
-            {
-                let input = record
-                    .event_inputs
-                    .iter()
-                    .find(|input| input.idempotency_key == event.idempotency_key)
-                    .cloned();
-                return Ok(Mutation::Unchanged((input, true)));
-            }
+        let (task, input) = self.mutate(task_id, |record, now| {
             if record.runner_state.is_archival() {
                 return Err(OrchestrationError::TaskNotAcceptingInput {
                     task_id: record.task_id.clone(),
@@ -334,9 +322,6 @@ impl ControlPlane {
             if let Some(input) = &input {
                 record.event_inputs.push(input.clone());
             }
-            record
-                .external_event_keys
-                .push(event.idempotency_key.clone());
             Ok(Mutation::Changed(
                 TaskEventKind::ExternalEventReceived {
                     event_type: event.event_type.clone(),
@@ -345,14 +330,10 @@ impl ControlPlane {
                     data: event.data.clone(),
                     input_id: input.as_ref().map(|input| input.input_id.clone()),
                 },
-                (input, false),
+                input,
             ))
         })?;
-        Ok(ExternalEventOutcome {
-            task,
-            input,
-            replayed,
-        })
+        Ok(ExternalEventOutcome { task, input })
     }
 
     /// Drops the comment on the pause from the record once the runner says it

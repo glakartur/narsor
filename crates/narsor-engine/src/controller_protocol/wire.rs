@@ -67,11 +67,10 @@ pub use narsor_protocol::controller::{
 };
 pub use narsor_protocol::controller::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
-    CreateObserverWorkerRequest, ObserverClaimResponse, ObserverDetailView, ObserverDryRunRequest,
-    ObserverDryRunView, ObserverEffectRequest, ObserverLastRunView, ObserverListResponse,
-    ObserverPlannedEffectView, ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse,
-    ObserverRunView, ObserverScriptView, ObserverSecretRef, ObserverView,
-    ObserverWatchListResponse, ObserverWatchView, ObserverWorkerCreated,
+    CreateObserverWorkerRequest, ObserverClaimResponse, ObserverDetailView, ObserverEffectRequest,
+    ObserverLastRunView, ObserverListResponse, ObserverRunOutcome, ObserverRunReport,
+    ObserverRunResultResponse, ObserverRunView, ObserverScriptView, ObserverSecretRef,
+    ObserverView, ObserverWatchListResponse, ObserverWatchView, ObserverWorkerCreated,
     ObserverWorkerListResponse, ObserverWorkerRun, ObserverWorkerView, SetObserverScriptRequest,
 };
 pub use narsor_protocol::controller::{

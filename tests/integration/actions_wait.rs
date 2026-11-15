@@ -457,13 +457,12 @@ impl Stack {
     }
 
     /// The observer's script sends an event for the task.
-    fn send(&self, run: &RunId, key: &str, event_type: &str, data: Value) -> ObserverEffectOutcome {
+    fn send(&self, run: &RunId, event_type: &str, data: Value) -> ObserverEffectOutcome {
         self.service
             .observer_deliver_event(
                 run,
                 self.task.as_str(),
                 ObserverEventRequest {
-                    effect_key: key.to_string(),
                     event_type: event_type.to_string(),
                     data,
                 },
@@ -631,8 +630,7 @@ async fn a_matching_event_ends_the_wait_and_the_next_step_sees_its_data() {
     );
 
     let run = stack.claim();
-    let key = format!("MR!17:approved:{}", pending.episode);
-    let outcome = stack.send(&run, &key, "review.approved", approval("alice"));
+    let outcome = stack.send(&run, "review.approved", approval("alice"));
     assert_eq!(outcome, ObserverEffectOutcome::Delivered);
     let verdicts = stack.poll().await;
 
@@ -688,7 +686,7 @@ async fn an_event_before_the_wait_only_goes_to_the_history() {
     // wait yet; the step that starts later never sees it and waits on.
     let mut stack = Stack::new(REVIEW, &[]);
     let run = stack.claim();
-    let early = stack.send(&run, "MR!17:approved", "review.approved", approval("alice"));
+    let early = stack.send(&run, "review.approved", approval("alice"));
     assert_eq!(early, ObserverEffectOutcome::Recorded);
 
     stack.start().await;
@@ -712,13 +710,8 @@ async fn an_event_outside_the_filter_leaves_the_step_waiting() {
     stack.start().await;
     let run = stack.claim();
 
-    let other_mr = stack.send(&run, "MR!18:approved", "review.approved", json!({"mr": 18}));
-    let other_type = stack.send(
-        &run,
-        "MR!17:commented",
-        "review.commented",
-        json!({"mr": 17}),
-    );
+    let other_mr = stack.send(&run, "review.approved", json!({"mr": 18}));
+    let other_type = stack.send(&run, "review.commented", json!({"mr": 17}));
     let verdicts = stack.poll().await;
 
     assert_eq!(other_mr, ObserverEffectOutcome::Recorded);
@@ -730,17 +723,15 @@ async fn an_event_outside_the_filter_leaves_the_step_waiting() {
 
 #[tokio::test]
 async fn a_review_loop_gets_an_event_in_each_of_its_two_waits() {
-    // The script keys its events with the wait's episode: the same state of
-    // the MR reaches both waits, and a repeat within one wait is a
-    // duplicate.
+    // The script sends an event while the task waits: the same state of the
+    // MR reaches both waits, each as an event of its own.
     let mut stack = Stack::new(REVIEW_LOOP, &["again", "merged"]);
     stack.start().await;
     let run = stack.claim();
 
     let first = stack.episode();
-    let key = format!("MR!17:approved:{first}");
     assert_eq!(
-        stack.send(&run, &key, "review.approved", json!({"mr": 17, "round": 1})),
+        stack.send(&run, "review.approved", json!({"mr": 17, "round": 1})),
         ObserverEffectOutcome::Delivered
     );
     stack.poll().await;
@@ -749,12 +740,7 @@ async fn a_review_loop_gets_an_event_in_each_of_its_two_waits() {
     let second = stack.episode();
     assert_ne!(first, second, "waiting again is a new episode");
     assert_eq!(
-        stack.send(&run, &key, "review.approved", json!({"mr": 17, "round": 1})),
-        ObserverEffectOutcome::Duplicate
-    );
-    let key = format!("MR!17:approved:{second}");
-    assert_eq!(
-        stack.send(&run, &key, "review.approved", json!({"mr": 17, "round": 2})),
+        stack.send(&run, "review.approved", json!({"mr": 17, "round": 2})),
         ObserverEffectOutcome::Delivered
     );
     stack.poll().await;
@@ -802,8 +788,7 @@ async fn a_restarted_runner_keeps_waiting_and_an_event_after_the_restart_ends_th
         Some(episode.clone())
     );
     let run = stack.claim();
-    let key = format!("MR!17:approved:{episode}");
-    stack.send(&run, &key, "review.approved", approval("bob"));
+    stack.send(&run, "review.approved", approval("bob"));
     let verdicts = stack.poll().await;
 
     assert_eq!(
@@ -812,6 +797,40 @@ async fn a_restarted_runner_keeps_waiting_and_an_event_after_the_restart_ends_th
     );
     assert_eq!(stack.execution().status, ExecutionStatus::Completed);
     assert_eq!(stack.recorder.calls()[0][1], "bob");
+}
+
+#[tokio::test]
+async fn an_event_sent_while_the_runner_is_down_waits_on_the_server_for_its_next_poll() {
+    // D1: the event is stored on the task record as a queued input while
+    // no runner polls (the old incarnation is gone, the new one not yet
+    // up); the new runner takes it on its first poll and the wait ends.
+    let mut stack = Stack::new(REVIEW, &[]);
+    stack.start().await;
+    let episode = stack.episode();
+    let run = stack.claim();
+
+    assert_eq!(
+        stack.send(&run, "review.approved", approval("carol")),
+        ObserverEffectOutcome::Delivered
+    );
+    let queued = stack.record().event_inputs;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].status, InputStatus::Queued);
+    assert_eq!(queued[0].episode_id, episode);
+
+    stack.service = Stack::service_on(&stack.state_root, &stack.clock);
+    let generation = stack.identity.launch_generation;
+    stack.identity = issue_runner(&stack.service, &stack.task, "pod-2", generation);
+    stack.snapshots = 0;
+    stack.report();
+    let verdicts = stack.poll().await;
+
+    assert_eq!(
+        verdicts,
+        vec![("event-1".to_string(), InputStatus::Consumed)]
+    );
+    assert_eq!(stack.execution().status, ExecutionStatus::Completed);
+    assert_eq!(stack.recorder.calls()[0][1], "carol");
 }
 
 #[tokio::test]
@@ -824,10 +843,8 @@ async fn the_input_a_runner_left_for_later_ends_with_the_wait_it_was_for() {
     stack.start().await;
     let episode = stack.episode();
     let run = stack.claim();
-    let first = format!("MR!17:approved:{episode}:alice");
-    stack.send(&run, &first, "review.approved", approval("alice"));
-    let second = format!("MR!17:approved:{episode}:bob");
-    stack.send(&run, &second, "review.approved", approval("bob"));
+    stack.send(&run, "review.approved", approval("alice"));
+    stack.send(&run, "review.approved", approval("bob"));
     let query = RunnerPollQuery {
         wait_secs: Some(0),
         event_wait_id: Some(episode.clone()),

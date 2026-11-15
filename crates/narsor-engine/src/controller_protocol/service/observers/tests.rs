@@ -287,7 +287,6 @@ fn a_due_observer_is_claimed_once_with_a_token_and_its_last_state() {
     assert_eq!(first.input.state, None);
     assert_eq!(first.input.condition, json!({"project": "ABC"}));
     assert_eq!(first.secrets.len(), 1);
-    assert!(!first.dry_run);
     assert!(first.token.expose().starts_with("nso."));
     // One run at a time per observer.
     assert!(fx.claim().is_none());
@@ -645,66 +644,6 @@ fn the_pass_removes_the_entries_of_archived_tasks() {
     let left = fx.service.observers().list_watches(&id).unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].task_id, live);
-}
-
-#[test]
-fn a_dry_run_goes_first_has_no_secrets_and_leaves_the_observer_alone() {
-    // R10, PO6.
-    let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
-    fx.service
-        .observers()
-        .add_script(&id, "echo draft\n", fx.now())
-        .unwrap();
-    fx.service.observer_pass();
-    fx.advance(1);
-    fx.service
-        .request_observer_dry_run(&id, None, false)
-        .unwrap();
-    let before = fx.record(&id);
-
-    let claimed = fx.claim().unwrap();
-
-    assert!(claimed.dry_run);
-    assert!(claimed.input.dry_run);
-    assert_eq!(claimed.script_version, 2);
-    assert!(claimed.secrets.is_empty());
-    let run = fx.finish(&claimed, exited(0, r#"{"state": {"cursor": 1}}"#));
-    assert_eq!(run.status, RunStatus::Succeeded);
-    assert!(run.dry_run);
-    let after = fx.record(&id);
-    assert_eq!(after.script_state, None);
-    assert!(!after.first_run_done);
-    assert_eq!(after.next_run_at, before.next_run_at);
-    assert_eq!(after.consecutive_failures, 0);
-    // The scheduled run waited and comes next, with the approved version.
-    let scheduled = fx.claim().unwrap();
-    assert!(!scheduled.dry_run);
-    assert_eq!(scheduled.script_version, 1);
-}
-
-#[test]
-fn a_dry_run_gets_secrets_with_the_owners_consent_or_for_the_approved_version() {
-    let fx = Fixture::new();
-    let id = fx.draft("jira", WatchMode::All);
-    fx.service
-        .request_observer_dry_run(&id, Some(1), true)
-        .unwrap();
-    let consented = fx.claim().unwrap();
-    assert_eq!(consented.secrets.len(), 1);
-    fx.finish(&consented, exited(0, r#"{"state": {}}"#));
-    assert_eq!(fx.record(&id).state, ObserverState::Draft);
-
-    fx.service.approve_observer_version(&id, 1).unwrap();
-    fx.service
-        .request_observer_dry_run(&id, Some(1), false)
-        .unwrap();
-    let approved = fx.claim().unwrap();
-    assert!(approved.dry_run);
-    assert_eq!(approved.secrets.len(), 1);
-    // A failed dry run counts no failure either.
-    fx.finish(&approved, exited(1, ""));
-    assert_eq!(fx.record(&id).consecutive_failures, 0);
 }
 
 #[test]

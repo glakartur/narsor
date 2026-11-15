@@ -1,6 +1,6 @@
 //! What the owner does with their observers through `narsor-cli observer`
-//! (R18, R21): create, list, show, save a script version, ask for a dry
-//! run, approve, pause, resume, delete, and keep the watch list.
+//! (R18, R21): create, list, show, save a script version, approve, pause,
+//! resume, delete, and keep the watch list.
 //!
 //! An observer is named by its name or its id. Every method takes the
 //! caller's [`OwnerRef`]: another owner's observer is answered exactly like
@@ -9,7 +9,6 @@
 //! ```text
 //! create         config checked, "create a task" against the catalogue → draft
 //! script set     next immutable version; never approved by saving (AE6)
-//! dry-run        pending until a worker claims it (see `request_observer_dry_run`)
 //! approve        the schedule runs that version only (R11)
 //! watch add      watch_list observer, own task, object under an allowed prefix
 //! ```
@@ -169,26 +168,6 @@ impl ProtocolService {
         Ok(script_view(listed))
     }
 
-    /// [`Self::request_observer_dry_run`] for an observer of `owner`.
-    pub fn request_observer_dry_run_for(
-        &self,
-        owner: &OwnerRef,
-        observer: &str,
-        request: ObserverDryRunRequest,
-    ) -> ProtocolResult<ObserverDryRunView> {
-        let record = self.owned_observer(owner, observer)?;
-        let requested = self.request_observer_dry_run(
-            &record.observer_id,
-            request.version,
-            request.with_secrets,
-        )?;
-        Ok(ObserverDryRunView {
-            version: requested.version,
-            with_secrets: requested.with_secrets,
-            requested_at: requested.requested_at,
-        })
-    }
-
     /// [`Self::approve_observer_version`] for an observer of `owner`.
     pub fn approve_observer_version_for(
         &self,
@@ -225,7 +204,7 @@ impl ProtocolService {
     }
 
     /// Deletes an observer of `owner` with every file of it: its scripts,
-    /// runs, effect keys and watch entries. A run in progress loses its
+    /// runs and watch entries. A run in progress loses its
     /// token at once. The tasks it created stay. Its id is never reused.
     pub fn delete_observer(
         &self,
@@ -420,14 +399,6 @@ fn observer_view(record: &ObserverRecord, now: DateTime<Utc>) -> ObserverView {
         worker_missing: record.worker_missing(now),
         last_claim_at: record.last_claim_at,
         active_run: record.active_run,
-        pending_dry_run: record
-            .pending_dry_run
-            .as_ref()
-            .map(|request| ObserverDryRunView {
-                version: request.version,
-                with_secrets: request.with_secrets,
-                requested_at: request.requested_at,
-            }),
         last_run: record.last_run.as_ref().map(|run| ObserverLastRunView {
             sequence: run.sequence,
             status: wire_name(&run.status),
@@ -451,7 +422,6 @@ fn run_view(run: &ObserverRun) -> ObserverRunView {
     ObserverRunView {
         run_id: run.run_id().to_string(),
         sequence: run.sequence,
-        dry_run: run.dry_run,
         script_version: run.script_version,
         status: wire_name(&run.status),
         claimed_at: run.claimed_at,
@@ -459,16 +429,6 @@ fn run_view(run: &ObserverRun) -> ObserverRunView {
         exit_code: run.exit_code,
         error: run.error.clone(),
         tasks_created: run.tasks_created,
-        planned_effects: run
-            .planned_effects
-            .iter()
-            .map(|effect| ObserverPlannedEffectView {
-                kind: wire_name(&effect.kind),
-                effect_key: effect.effect_key.clone(),
-                task_id: effect.task_id.as_ref().map(ToString::to_string),
-                data: effect.data.clone(),
-            })
-            .collect(),
         stderr: run.stderr.clone(),
     }
 }

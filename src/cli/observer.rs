@@ -4,7 +4,6 @@
 //! | --- | --- | --- |
 //! | `observer create\|list\|show\|delete` | the owner | manages observers |
 //! | `observer script set --file` | the owner | saves the next, immutable script version (never approved by saving) |
-//! | `observer dry-run [--version] [--with-secrets]` | the owner | runs a version with its effects recorded, not performed, and prints what it would have done |
 //! | `observer approve --version\|pause\|resume` | the owner | decides what runs on schedule |
 //! | `observer watch add\|list\|remove` | the owner | keeps the watch list of PR/MR objects |
 //! | `observer worker` | the worker's system user | claims due runs and executes their scripts ([`super::observer_worker`]) |
@@ -20,11 +19,9 @@
 //! it goes straight into a new file of mode `0600`.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
@@ -32,9 +29,8 @@ use futures::future::BoxFuture;
 
 use super::commands::{CliError, Result};
 use super::observer_text::{
-    dry_run_output, dry_run_requested_output, no_worker_output, observer_changed_output,
-    observer_list_output, observer_show_output, script_saved_output, watch_added_output,
-    watch_list_output, watch_removed_output, RUNNING, SUCCEEDED,
+    observer_changed_output, observer_list_output, observer_show_output, script_saved_output,
+    watch_added_output, watch_list_output, watch_removed_output,
 };
 use super::observer_worker::{
     check_credential_file, check_secrets_dir, current_uid, ProcessRunner, ScriptUser, Worker,
@@ -46,10 +42,10 @@ use crate::api::{ApiClient, ClientError, ServerTarget, TokenSource};
 use crate::config::Flags;
 use crate::controller_protocol::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
-    CreateObserverWorkerRequest, ObserverDetailView, ObserverDryRunRequest, ObserverDryRunView,
-    ObserverEffectRequest, ObserverListResponse, ObserverScriptView, ObserverSecretRef,
-    ObserverView, ObserverWatchListResponse, ObserverWatchView, ObserverWorkerCreated,
-    ObserverWorkerListResponse, ObserverWorkerView, SetObserverScriptRequest,
+    CreateObserverWorkerRequest, ObserverDetailView, ObserverEffectRequest, ObserverListResponse,
+    ObserverScriptView, ObserverSecretRef, ObserverView, ObserverWatchListResponse,
+    ObserverWatchView, ObserverWorkerCreated, ObserverWorkerListResponse, ObserverWorkerView,
+    SetObserverScriptRequest,
 };
 use crate::domain::without_unsafe_chars;
 
@@ -65,7 +61,7 @@ pub enum ObserverCommand {
     List,
 
     /// Shows one observer: its configuration (secret references, never
-    /// values), script versions, pending dry run and latest runs.
+    /// values), script versions and latest runs.
     Show {
         /// The observer's name or id.
         #[arg(value_name = "OBSERVER")]
@@ -77,25 +73,6 @@ pub enum ObserverCommand {
         /// What to do.
         #[command(subcommand)]
         command: ScriptCommand,
-    },
-
-    /// Runs a script version once with its effects recorded, not performed,
-    /// waits for a worker to run it, and prints what it would have done.
-    DryRun {
-        /// The observer's name or id.
-        #[arg(value_name = "OBSERVER")]
-        observer: String,
-        /// The script version; the newest when omitted.
-        #[arg(long, value_name = "N")]
-        version: Option<u32>,
-        /// Hand the observer's secret values to a version that is not the
-        /// approved one. The script may send them anywhere or write to the
-        /// source: a dry run blocks only its effects in Narsor.
-        #[arg(long)]
-        with_secrets: bool,
-        /// How long to wait for a worker to run it, in seconds.
-        #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_DRY_RUN_WAIT_SECS)]
-        wait: u64,
     },
 
     /// Approves a script version: from now on the schedule runs it, and
@@ -124,8 +101,7 @@ pub enum ObserverCommand {
         observer: String,
     },
 
-    /// Deletes the observer with its scripts, runs, effect keys and watch
-    /// entries. The tasks it created stay. Cannot be undone.
+    /// Deletes the observer with its scripts, runs and watch entries. The tasks it created stay. Cannot be undone.
     Delete {
         /// The observer's name or id.
         #[arg(value_name = "OBSERVER")]
@@ -159,13 +135,6 @@ impl ObserverCommand {
     }
 }
 
-/// How long `observer dry-run` waits for a worker by default, in seconds:
-/// a worker polls every 10 seconds, and a script may take a while.
-pub const DEFAULT_DRY_RUN_WAIT_SECS: u64 = 60;
-
-/// How often `observer dry-run` looks at the run while it waits.
-pub const DRY_RUN_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
 /// `narsor-cli observer create`.
 #[derive(Debug, clap::Args)]
 pub struct CreateArgs {
@@ -177,7 +146,8 @@ pub struct CreateArgs {
     #[arg(long, value_name = "TEXT")]
     pub source: String,
 
-    /// Create a task of this catalogue workflow per effect key.
+    /// Create a task of this catalogue workflow for each `task create` call
+    /// of the script.
     #[arg(
         long,
         value_name = "WORKFLOW",
@@ -417,10 +387,7 @@ pub async fn observer(
             let client = crate::api::connect(target, state, flags)
                 .await
                 .map_err(CliError::failure)?;
-            let output = operate(&client, command, create, Utc::now, |pause| {
-                tokio::time::sleep(pause)
-            })
-            .await?;
+            let output = operate(&client, command, create, Utc::now).await?;
             print!("{output}");
             Ok(())
         }
@@ -457,13 +424,6 @@ pub trait ObserverApi: Send + Sync {
         observer: &'a str,
         request: &'a SetObserverScriptRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverScriptView, ClientError>>;
-
-    /// Asks for a dry run.
-    fn request_observer_dry_run<'a>(
-        &'a self,
-        observer: &'a str,
-        request: &'a ObserverDryRunRequest,
-    ) -> BoxFuture<'a, std::result::Result<ObserverDryRunView, ClientError>>;
 
     /// Approves a script version.
     fn approve_observer<'a>(
@@ -537,14 +497,6 @@ impl ObserverApi for ApiClient {
         request: &'a SetObserverScriptRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverScriptView, ClientError>> {
         Box::pin(ApiClient::set_observer_script(self, observer, request))
-    }
-
-    fn request_observer_dry_run<'a>(
-        &'a self,
-        observer: &'a str,
-        request: &'a ObserverDryRunRequest,
-    ) -> BoxFuture<'a, std::result::Result<ObserverDryRunView, ClientError>> {
-        Box::pin(ApiClient::request_observer_dry_run(self, observer, request))
     }
 
     fn approve_observer<'a>(
@@ -662,20 +614,16 @@ pub fn create_observer_request(args: &CreateArgs) -> Result<CreateObserverReques
 
 /// Runs one of the owner's observer commands on `api` and returns what it
 /// prints. `create` is [`create_observer_request`] of a `create` command,
-/// `now` the clock ages are measured with, and `pause` what `dry-run`
-/// awaits between two looks at the run.
-pub async fn operate<A, N, P, F>(
+/// and `now` the clock ages are measured with.
+pub async fn operate<A, N>(
     api: &A,
     command: ObserverCommand,
     create: Option<CreateObserverRequest>,
     now: N,
-    mut pause: P,
 ) -> Result<String>
 where
     A: ObserverApi + ?Sized,
     N: Fn() -> DateTime<Utc>,
-    P: FnMut(Duration) -> F,
-    F: Future<Output = ()>,
 {
     match command {
         ObserverCommand::Create(args) => {
@@ -690,7 +638,7 @@ where
             let name = without_unsafe_chars(&created.name);
             Ok(format!(
                 "Created observer '{}' ({}): state {}. Next: `narsor-cli observer script set {} \
-                 --file SCRIPT`, a dry run, then `narsor-cli observer approve`.\n",
+                 --file SCRIPT`, then `narsor-cli observer approve`.\n",
                 name,
                 without_unsafe_chars(&created.observer_id),
                 without_unsafe_chars(&created.state),
@@ -722,46 +670,6 @@ where
                 .map_err(|error| failure("Could not save the script", error))?;
             Ok(script_saved_output(&observer, &saved))
         }
-        ObserverCommand::DryRun {
-            observer,
-            version,
-            with_secrets,
-            wait,
-        } => {
-            let requested = api
-                .request_observer_dry_run(
-                    &observer,
-                    &ObserverDryRunRequest {
-                        version,
-                        with_secrets,
-                    },
-                )
-                .await
-                .map_err(|error| failure("Could not ask for a dry run", error))?;
-            let mut output = dry_run_requested_output(&observer, &requested);
-            let looks = wait.div_ceil(DRY_RUN_POLL_INTERVAL.as_secs()).max(1);
-            match wait_for_dry_run(api, &observer, &requested, looks, &mut pause).await? {
-                DryRunWait::Finished(run) if run.status == SUCCEEDED => {
-                    output.push_str(&dry_run_output(&run));
-                    Ok(output)
-                }
-                DryRunWait::Finished(run) => {
-                    output.push_str(&dry_run_output(&run));
-                    Err(CliError::failure(output.trim_end().to_string()))
-                }
-                DryRunWait::Unclaimed => Err(CliError::failure(no_worker_output(&observer, wait))),
-                DryRunWait::StillRunning(run_id) => Err(CliError::failure(format!(
-                    "The dry run {} is still running after {wait}s; `narsor-cli observer show {}` \
-                     shows its result once it ends.",
-                    without_unsafe_chars(&run_id),
-                    without_unsafe_chars(&observer)
-                ))),
-                DryRunWait::Replaced => Err(CliError::failure(format!(
-                    "A newer dry run of '{}' replaced this one before a worker took it.",
-                    without_unsafe_chars(&observer)
-                ))),
-            }
-        }
         ObserverCommand::Approve { observer, version } => {
             let approved = api
                 .approve_observer(&observer, &ApproveObserverRequest { version })
@@ -792,7 +700,7 @@ where
                 .await
                 .map_err(|error| failure("Could not delete the observer", error))?;
             Ok(format!(
-                "Deleted observer '{}' with its scripts, runs, effect keys and watch entries; \
+                "Deleted observer '{}' with its scripts, runs and watch entries; \
                  the tasks it created stay.\n",
                 without_unsafe_chars(&deleted.name)
             ))
@@ -879,73 +787,6 @@ async fn watch<A: ObserverApi + ?Sized>(
             Ok(watch_removed_output(&removed))
         }
     }
-}
-
-/// How waiting for a dry run ended.
-#[derive(Debug)]
-pub enum DryRunWait {
-    /// The run ended.
-    Finished(Box<crate::controller_protocol::ObserverRunView>),
-    /// No worker claimed it in time.
-    Unclaimed,
-    /// A worker claimed it, and it had not ended in time.
-    StillRunning(String),
-    /// A newer dry run took its place before a worker claimed it.
-    Replaced,
-}
-
-/// Looks at the observer up to `looks` times, awaiting `pause` between two
-/// looks, until the dry run asked for at `requested` ends.
-///
-/// The dry run is the first dry run claimed at or after it was asked for;
-/// until a worker claims it, it is the observer's pending dry run.
-pub async fn wait_for_dry_run<A, P, F>(
-    api: &A,
-    observer: &str,
-    requested: &ObserverDryRunView,
-    looks: u64,
-    pause: &mut P,
-) -> Result<DryRunWait>
-where
-    A: ObserverApi + ?Sized,
-    P: FnMut(Duration) -> F,
-    F: Future<Output = ()>,
-{
-    let mut claimed = None;
-    for look in 0..looks {
-        let detail = api
-            .observer(observer)
-            .await
-            .map_err(|error| failure("Could not read the observer", error))?;
-        let run = detail
-            .runs
-            .iter()
-            .filter(|run| run.dry_run && run.claimed_at >= requested.requested_at)
-            .min_by_key(|run| run.sequence);
-        match run {
-            Some(run) if run.status != RUNNING => {
-                return Ok(DryRunWait::Finished(Box::new(run.clone())));
-            }
-            Some(run) => claimed = Some(run.run_id.clone()),
-            None => {
-                let still_pending = detail
-                    .observer
-                    .pending_dry_run
-                    .as_ref()
-                    .is_some_and(|pending| pending.requested_at == requested.requested_at);
-                if !still_pending {
-                    return Ok(DryRunWait::Replaced);
-                }
-            }
-        }
-        if look + 1 < looks {
-            pause(DRY_RUN_POLL_INTERVAL).await;
-        }
-    }
-    Ok(match claimed {
-        Some(run_id) => DryRunWait::StillRunning(run_id),
-        None => DryRunWait::Unclaimed,
-    })
 }
 
 /// The owner's worker-credential routes, as `observer worker-token` uses

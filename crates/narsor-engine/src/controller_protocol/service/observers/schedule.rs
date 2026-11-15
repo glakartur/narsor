@@ -5,7 +5,7 @@
 //! observer_pass   next_run_at <= now, active, approved  → run_due_since = now
 //!                 watch_list without entries            → next_run_at += interval, no run
 //!                 run past its deadline                 → Lost, token spent
-//! claim           dry run first, then the oldest due    → ObserverRun + token (once)
+//! claim           the oldest due                        → ObserverRun + token (once)
 //! finish          exit 0 + valid output                 → state saved, failures = 0
 //!                 anything else                         → state kept, failures + 1, backoff
 //! ```
@@ -101,16 +101,14 @@ pub struct ClaimedObserverRun {
     /// The run's token, for the effect routes, valid until the result or
     /// the deadline.
     pub token: BearerToken,
-    /// Effects are recorded, not performed (R10).
-    pub dry_run: bool,
     /// The script version it runs.
     pub script_version: u32,
     /// The script itself.
     pub script: String,
     /// What the script reads on stdin.
     pub input: ScriptInput,
-    /// The secrets the worker hands to the script; empty for a dry run of
-    /// a version that is not approved, unless the owner allowed them.
+    /// The secrets the worker hands to the script: the observer's
+    /// references.
     pub secrets: Vec<SecretRef>,
     /// How long the worker lets the script run.
     pub timeout_secs: u64,
@@ -124,7 +122,6 @@ impl ClaimedObserverRun {
         ObserverWorkerRun {
             run_id: self.run_id.to_string(),
             token: self.token.expose().to_string(),
-            dry_run: self.dry_run,
             script_version: self.script_version,
             script: self.script,
             // A `ScriptInput` is plain data: it always serializes.
@@ -149,29 +146,16 @@ pub use narsor_protocol::controller::ObserverRunOutcome as RunOutcome;
 /// The worker's result of a run, secrets masked.
 pub use narsor_protocol::controller::ObserverRunReport as RunReport;
 
-/// Which kind of run a claim would take from an observer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ClaimKind {
-    /// The owner's dry run; claimed before any scheduled run.
-    DryRun,
-    /// The scheduled run the pass flagged.
-    Scheduled,
-}
-
-/// The run a claim would take from `record`, and since when it waits.
-fn claim_candidate(record: &ObserverRecord) -> Option<(ClaimKind, DateTime<Utc>)> {
-    if record.active_run.is_some() {
+/// Since when the scheduled run the pass flagged waits for a claim, `None`
+/// when `record` has no run to claim.
+fn claim_candidate(record: &ObserverRecord) -> Option<DateTime<Utc>> {
+    if record.active_run.is_some()
+        || record.state != ObserverState::Active
+        || record.approved_version.is_none()
+    {
         return None;
     }
-    if let Some(request) = &record.pending_dry_run {
-        return Some((ClaimKind::DryRun, request.requested_at));
-    }
-    if record.state == ObserverState::Active && record.approved_version.is_some() {
-        return record
-            .run_due_since
-            .map(|since| (ClaimKind::Scheduled, since));
-    }
-    None
+    record.run_due_since
 }
 
 /// Whether the observer's scheduled run becomes due at `now`: active, with
@@ -284,8 +268,7 @@ impl ProtocolService {
         pass
     }
 
-    /// Hands the next run to a worker: an owner's dry run first, then the
-    /// scheduled run due the longest. `None` when no run is due.
+    /// Hands the next run to a worker: the scheduled run due the longest. `None` when no run is due.
     ///
     /// The claim creates the run's record and its token under the
     /// observer's lock, so two workers never get the same run and an
@@ -326,18 +309,16 @@ impl ProtocolService {
         &self,
         owner: Option<&OwnerRef>,
     ) -> ProtocolResult<Option<ClaimedObserverRun>> {
-        let mut candidates: Vec<(ClaimKind, DateTime<Utc>, ObserverId)> = self
+        let mut candidates: Vec<(DateTime<Utc>, ObserverId)> = self
             .observers
             .list()?
             .into_iter()
             .filter(|record| owner.is_none_or(|owner| &record.owner == owner))
-            .filter_map(|record| {
-                claim_candidate(&record).map(|(kind, since)| (kind, since, record.observer_id))
-            })
+            .filter_map(|record| claim_candidate(&record).map(|since| (since, record.observer_id)))
             .collect();
         candidates.sort();
         let now = self.control.now();
-        for (_, _, observer_id) in candidates {
+        for (_, observer_id) in candidates {
             match self.claim_from(&observer_id, now) {
                 Ok(Some(claimed)) => return Ok(Some(claimed)),
                 Ok(None) | Err(ObserverError::NotFound(_)) => {}
@@ -356,7 +337,7 @@ impl ProtocolService {
     /// entries the script reported closed. Any other result keeps the state,
     /// counts a failure and waits `interval × 2^failures` (at most 1 h);
     /// after [`MAX_CONSECUTIVE_FAILURES`] the observer goes to `error`
-    /// (R14, R16). A dry run's result changes nothing but its own record.
+    /// (R14, R16).
     ///
     /// The run's token stops working. A run already ended, or past its
     /// deadline (it is then recorded as lost), is refused with a conflict.
@@ -400,27 +381,25 @@ impl ProtocolService {
         });
         let interval = record.config.schedule.interval_secs;
         let mut closed = BTreeSet::new();
-        if !run.dry_run {
-            match output {
-                Some(output) => {
-                    record.script_state = Some(output.state);
-                    record.first_run_done = true;
-                    record.consecutive_failures = 0;
-                    record.next_run_at = Some(after(now, interval));
-                    closed.extend(output.closed_watches);
-                }
-                None => {
-                    record.consecutive_failures = record.consecutive_failures.saturating_add(1);
-                    record.next_run_at = Some(after(
-                        now,
-                        retry_delay_secs(interval, record.consecutive_failures),
-                    ));
-                    if record.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
-                        && record.state == ObserverState::Active
-                    {
-                        record.state = ObserverState::Error;
-                        tracing::info!(observer = %observer_id, failures = record.consecutive_failures, "observers: too many failed runs; waiting for the owner");
-                    }
+        match output {
+            Some(output) => {
+                record.script_state = Some(output.state);
+                record.first_run_done = true;
+                record.consecutive_failures = 0;
+                record.next_run_at = Some(after(now, interval));
+                closed.extend(output.closed_watches);
+            }
+            None => {
+                record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+                record.next_run_at = Some(after(
+                    now,
+                    retry_delay_secs(interval, record.consecutive_failures),
+                ));
+                if record.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+                    && record.state == ObserverState::Active
+                {
+                    record.state = ObserverState::Error;
+                    tracing::info!(observer = %observer_id, failures = record.consecutive_failures, "observers: too many failed runs; waiting for the owner");
                 }
             }
         }
@@ -544,9 +523,7 @@ impl ProtocolService {
             finished_at: now,
             error: run.error.clone(),
         });
-        if !run.dry_run {
-            record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
-        }
+        record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
         self.observers.save(lock, record, now)?;
         self.observers.save_run(lock, run)
     }
@@ -561,25 +538,17 @@ impl ProtocolService {
     ) -> Result<Option<ClaimedObserverRun>, ObserverError> {
         let lock = self.observers.lock(observer_id)?;
         let mut record = self.observers.load(observer_id)?;
-        let Some((kind, _)) = claim_candidate(&record) else {
+        if claim_candidate(&record).is_none() {
             return Ok(None);
-        };
-        let (dry_run, version, with_secrets) = match (kind, &record.pending_dry_run) {
-            (ClaimKind::DryRun, Some(request)) => (
-                true,
-                request.version,
-                request.with_secrets || record.approved_version == Some(request.version),
-            ),
-            _ => match record.approved_version {
-                Some(version) => (false, version, true),
-                None => return Ok(None),
-            },
+        }
+        let Some(version) = record.approved_version else {
+            return Ok(None);
         };
         let watches = match record.config.watch_mode {
             WatchMode::WatchList => self.observers.list_watches(observer_id)?,
             WatchMode::All => Vec::new(),
         };
-        if !dry_run && record.config.watch_mode == WatchMode::WatchList && watches.is_empty() {
+        if record.config.watch_mode == WatchMode::WatchList && watches.is_empty() {
             // The last entry went between the pass and this claim (R6).
             record.run_due_since = None;
             record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
@@ -603,7 +572,6 @@ impl ProtocolService {
                 .iter()
                 .map(|entry| self.script_watch(entry))
                 .collect(),
-            dry_run,
             first_run: !record.first_run_done,
             import_backlog: record.config.import_backlog,
         };
@@ -612,8 +580,6 @@ impl ProtocolService {
             record_version: OBSERVER_RUN_VERSION,
             observer_id: observer_id.clone(),
             sequence,
-            dry_run,
-            with_secrets,
             script_version: version,
             input: input.clone(),
             claimed_at: now,
@@ -626,16 +592,11 @@ impl ProtocolService {
             stdout: None,
             stderr: None,
             tasks_created: 0,
-            planned_effects: Vec::new(),
         };
         record.active_run = Some(sequence);
         record.last_run_sequence = sequence;
         record.last_claim_at = Some(now);
-        if dry_run {
-            record.pending_dry_run = None;
-        } else {
-            record.run_due_since = None;
-        }
+        record.run_due_since = None;
         // The record first: a crash before the run file leaves a record
         // naming a missing run, which the pass clears.
         self.observers.save(&lock, &mut record, now)?;
@@ -643,15 +604,10 @@ impl ProtocolService {
         Ok(Some(ClaimedObserverRun {
             run_id,
             token,
-            dry_run,
             script_version: version,
             script,
             input,
-            secrets: if with_secrets {
-                record.config.secrets.clone()
-            } else {
-                Vec::new()
-            },
+            secrets: record.config.secrets.clone(),
             timeout_secs: SCRIPT_TIMEOUT_SECS,
             deadline,
         }))

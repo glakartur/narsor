@@ -366,20 +366,14 @@ pub struct TaskRecord {
     pub resume_message_taken: Vec<String>,
     /// The external event the task's `wait` step waits for, as its runner
     /// reported it; `None` while the task waits for none. Observers hand
-    /// [`EventWait::episode_id`] to their scripts, so an event key built
-    /// from it is new in every episode of a review loop.
+    /// [`EventWait::episode_id`] to their scripts, so a script sends an
+    /// event only to a task that waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_wait: Option<EventWait>,
-    /// The observer, effect key and run that created the task (R19);
+    /// The observer and run that created the task (R19);
     /// `None` for a task its owner created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<TaskProvenance>,
-    /// The idempotency key of every external event the task received
-    /// ([`super::observer_event_key`]), so a retry or a concurrent call
-    /// with the same key records nothing a second time (R13). Never
-    /// trimmed: a task receives a handful of events in its life.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub external_event_keys: Vec<String>,
     /// External events queued for the task's waiting `wait` step, oldest
     /// first; the audit trail of every such delivery, whose data is dropped
     /// once it is settled.
@@ -1000,7 +994,7 @@ pub struct InputRequest {
 pub struct QueuedEventInput {
     /// Control-plane id, unique within the task (`event-<n>`).
     pub input_id: String,
-    /// [`super::observer_event_key`] of the observer and its effect key.
+    /// [`super::observer_event_key`] the server made for the event.
     pub idempotency_key: String,
     /// The wait episode it was matched against; a runner in another
     /// episode never takes it.
@@ -1012,7 +1006,7 @@ pub struct QueuedEventInput {
     /// The event's data, dropped once settled.
     #[serde(default)]
     pub data: Option<serde_json::Value>,
-    /// The observer, effect key and run it came from (R19).
+    /// The observer and run it came from (R19).
     pub provenance: TaskProvenance,
     /// Its status, as for an owner answer.
     pub status: InputStatus,
@@ -1028,7 +1022,7 @@ pub struct QueuedEventInput {
 /// An external event as an observer delivers it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalEvent {
-    /// [`super::observer_event_key`]: one event per key and task, ever.
+    /// [`super::observer_event_key`]: a new key for every event.
     pub idempotency_key: String,
     /// The event type.
     pub event_type: String,
@@ -1036,7 +1030,7 @@ pub struct ExternalEvent {
     pub source: String,
     /// The event's data.
     pub data: serde_json::Value,
-    /// The observer, effect key and run it came from (R19).
+    /// The observer and run it came from (R19).
     pub provenance: TaskProvenance,
 }
 
@@ -1045,11 +1039,9 @@ pub struct ExternalEvent {
 pub struct ExternalEventOutcome {
     /// The task as it is now.
     pub task: TaskRecord,
-    /// The input queued for the waiting step: new, or for a retry the one
-    /// the first call queued. `None` when the event only went to history.
+    /// The input queued for the waiting step; `None` when the event only
+    /// went to history.
     pub input: Option<QueuedEventInput>,
-    /// True when the key was recorded before and nothing changed.
-    pub replayed: bool,
 }
 
 /// The result of queueing an owner input.

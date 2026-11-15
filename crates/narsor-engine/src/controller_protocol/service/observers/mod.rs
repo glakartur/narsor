@@ -1,5 +1,5 @@
 //! The control plane's side of observers: what the owner decides about an
-//! observer (approval, dry runs, pause and resume; the rest of the owner's
+//! observer (approval, pause and resume; the rest of the owner's
 //! commands, by name and owner, in [`owner`]), the schedule that
 //! hands runs to the worker ([`schedule`]) and the effects a run's script
 //! has through its token ([`effects`]), and the credential of the worker
@@ -44,8 +44,8 @@ use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
 use crate::observers::{
-    DryRunRequest, ObserverError, ObserverId, ObserverRecord, ObserverState, WatchEntry, WatchMode,
-    WatchOrigin, WatchWrite,
+    ObserverError, ObserverId, ObserverRecord, ObserverState, WatchEntry, WatchMode, WatchOrigin,
+    WatchWrite,
 };
 use crate::orchestration::{EventWatch, OwnerRef};
 
@@ -73,42 +73,6 @@ impl ProtocolService {
         }
         self.observers.save(&lock, &mut record, now)?;
         Ok(record)
-    }
-
-    /// Asks for a dry run of script version `version` (the newest when
-    /// `None`), approved or not (R10). The next claim hands it to a worker
-    /// before any scheduled run; its effects are recorded, not performed,
-    /// and its result leaves the observer's state alone.
-    ///
-    /// A version that is not the approved one gets no secret values unless
-    /// `with_secrets` says the owner allows them (PO6). A dry run asked for
-    /// before an earlier one was claimed replaces it.
-    pub fn request_observer_dry_run(
-        &self,
-        observer_id: &ObserverId,
-        version: Option<u32>,
-        with_secrets: bool,
-    ) -> ProtocolResult<DryRunRequest> {
-        let lock = self.observers.lock(observer_id)?;
-        let mut record = self.observers.load(observer_id)?;
-        let version = version
-            .or_else(|| record.latest_script_version())
-            .ok_or_else(|| {
-                ProtocolError::conflict(
-                    "observer_has_no_script",
-                    format!("observer '{}' has no script yet", record.config.name),
-                )
-            })?;
-        self.observers.load_script(observer_id, version)?;
-        let now = self.control.now();
-        let request = DryRunRequest {
-            version,
-            with_secrets,
-            requested_at: now,
-        };
-        record.pending_dry_run = Some(request.clone());
-        self.observers.save(&lock, &mut record, now)?;
-        Ok(request)
     }
 
     /// Stops the schedule of an observer (R18). A run in progress finishes;

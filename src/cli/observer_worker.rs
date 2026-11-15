@@ -19,9 +19,7 @@
 //! secret reference of the observer, read from `--secrets-dir` (one file per
 //! reference name). Nothing of the worker's own environment reaches it — a
 //! `GH_TOKEN` the worker was started with included. A secret the claim
-//! names but the directory lacks fails the run before the script starts. A
-//! dry run of a version that is not approved gets no references at all
-//! unless its owner allowed them (the control plane decides, PO6).
+//! names but the directory lacks fails the run before the script starts.
 //!
 //! With `--script-user` the script runs as that system user, which must
 //! not be able to read the worker's credential or its secrets directory;
@@ -394,7 +392,7 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
         let Some(run) = self.api.claim().await? else {
             return Ok(None);
         };
-        tracing::info!(run = %run.run_id, dry_run = run.dry_run, version = run.script_version, "observer worker: claimed a run");
+        tracing::info!(run = %run.run_id, version = run.script_version, "observer worker: claimed a run");
         let report = self.execute(&run).await;
         let accepted = self.send_report(&run.run_id, &report).await;
         Ok(Some(HandledRun {

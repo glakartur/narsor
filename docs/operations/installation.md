@@ -269,9 +269,7 @@ install -m 0600 -o narsor-observer /dev/stdin \
   /etc/narsor/observer-worker/secrets/jira-token <<<"$JIRA_TOKEN"
 ```
 
-A run whose secret file is missing fails before its script starts. A dry run
-of a script version that is not approved gets no secrets unless the owner
-asked for them (`--with-secrets`).
+A run whose secret file is missing fails before its script starts.
 
 **Start the worker.** The unit
 [`deploy/observer-worker/narsor-observer-worker.service`](../../deploy/observer-worker/narsor-observer-worker.service)

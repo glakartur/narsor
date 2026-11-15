@@ -48,8 +48,7 @@ pub struct ScriptWatch {
     #[serde(default)]
     pub event_types: Vec<String>,
     /// The id of the `wait` episode the task is in, `None` when the task is
-    /// not waiting. An event key built from it is new in every episode, so
-    /// a review loop gets an event in each one.
+    /// not waiting: the script sends an event only to a waiting task.
     #[serde(default)]
     pub wait_episode: Option<String>,
 }
@@ -69,9 +68,6 @@ pub struct ScriptInput {
     /// The watch entries, for a `watch_list` observer.
     #[serde(default)]
     pub watches: Vec<ScriptWatch>,
-    /// A dry run: effects are recorded, not performed (R10).
-    #[serde(default)]
-    pub dry_run: bool,
     /// No run of this observer has succeeded yet.
     #[serde(default)]
     pub first_run: bool,

@@ -872,8 +872,8 @@ pub fn event_line(event: &TaskEvent) -> String {
     let kind = match &event.kind {
         TaskEventKind::Created => "created".to_string(),
         TaskEventKind::CreatedByObserver { provenance } => format!(
-            "created by observer {} (key {}, run {})",
-            provenance.observer_name, provenance.effect_key, provenance.run_id
+            "created by observer {} (run {})",
+            provenance.observer_name, provenance.run_id
         ),
         TaskEventKind::ExternalEventReceived {
             event_type,
@@ -887,8 +887,8 @@ pub fn event_line(event: &TaskEvent) -> String {
                 None => String::new(),
             };
             format!(
-                "external event '{event_type}' from {source} (observer {}, key {}){delivery}",
-                provenance.observer_name, provenance.effect_key
+                "external event '{event_type}' from {source} (observer {}, run {}){delivery}",
+                provenance.observer_name, provenance.run_id
             )
         }
         TaskEventKind::WatchRefused {

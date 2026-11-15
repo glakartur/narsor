@@ -174,7 +174,6 @@ impl From<crate::observers::ObserverError> for ProtocolError {
             E::WorkflowNotFound(_) => Self::bad_request("workflow_not_found", message),
             E::NameTaken(_) => Self::conflict("observer_name_taken", message),
             E::RunExists(_) => Self::conflict("observer_run_exists", message),
-            E::EffectNotFound { .. } => Self::conflict("effect_not_found", message),
             E::Persistence(_)
             | E::Lock { .. }
             | E::ScriptCorrupt { .. }

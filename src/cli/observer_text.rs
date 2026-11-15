@@ -2,7 +2,7 @@
 //! script print: pure functions of the server's answers, so the text is
 //! tested without a server.
 //!
-//! Everything a script or a source supplied (effect keys, event data,
+//! Everything a script or a source supplied (event data,
 //! stderr, error messages) is untrusted: control and invisible format
 //! characters are removed before it reaches the terminal.
 
@@ -11,17 +11,10 @@ use serde_json::Value;
 
 use super::task_text::age;
 use crate::controller_protocol::{
-    ObserverDetailView, ObserverDryRunView, ObserverEffectOutcome, ObserverEffectResponse,
-    ObserverListResponse, ObserverRunView, ObserverScriptView, ObserverView,
-    ObserverWatchListResponse, ObserverWatchView,
+    ObserverDetailView, ObserverEffectResponse, ObserverListResponse, ObserverRunView,
+    ObserverScriptView, ObserverView, ObserverWatchListResponse, ObserverWatchView,
 };
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
-
-/// The run status of a run that has not ended.
-pub const RUNNING: &str = "running";
-
-/// The run status of a run that ended well.
-pub const SUCCEEDED: &str = "succeeded";
 
 /// `text` cleaned of what a terminal would act on.
 fn clean(text: &str) -> String {
@@ -188,14 +181,6 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
             observer.consecutive_failures
         ));
     }
-    if let Some(pending) = &observer.pending_dry_run {
-        line(format!(
-            "Pending dry run: version {}{}, asked {} ago",
-            pending.version,
-            secrets_note(pending.with_secrets),
-            age(now, pending.requested_at)
-        ));
-    }
     if let Some(warning) = worker_warning(observer, now) {
         line(format!("Warning: {warning}"));
     }
@@ -263,20 +248,11 @@ fn script_line(observer: &ObserverView) -> String {
     }
 }
 
-fn secrets_note(with_secrets: bool) -> &'static str {
-    if with_secrets {
-        " with secrets"
-    } else {
-        ""
-    }
-}
-
 /// One run of `observer show`.
 fn run_line(run: &ObserverRunView, now: DateTime<Utc>) -> String {
-    let kind = if run.dry_run { "dry run" } else { "run" };
     let when = run.finished_at.unwrap_or(run.claimed_at);
     let mut text = format!(
-        "#{} {kind} of v{}: {} {} ago",
+        "#{} run of v{}: {} {} ago",
         run.sequence,
         run.script_version,
         clean(&run.status),
@@ -288,98 +264,20 @@ fn run_line(run: &ObserverRunView, now: DateTime<Utc>) -> String {
     if run.tasks_created > 0 {
         text.push_str(&format!(", {} task(s) created", run.tasks_created));
     }
-    if run.dry_run && !run.planned_effects.is_empty() {
-        text.push_str(&format!(
-            ", {} effect(s) planned",
-            run.planned_effects.len()
-        ));
-    }
     if let Some(error) = &run.error {
         text.push_str(&format!(": {}", clean(error)));
     }
     text
 }
 
-/// The answer to a finished dry run: what it would have done, or why it
-/// failed with the script's stderr.
-pub fn dry_run_output(run: &ObserverRunView) -> String {
-    let mut out = format!(
-        "Dry run of version {} (run {}): {}",
-        run.script_version,
-        clean(&run.run_id),
-        clean(&run.status)
-    );
-    if let Some(code) = run.exit_code {
-        out.push_str(&format!(", exit {code}"));
-    }
-    if let Some(error) = &run.error {
-        out.push_str(&format!(": {}", clean(error)));
-    }
-    out.push('\n');
-    if run.planned_effects.is_empty() {
-        out.push_str("It would have done nothing in Narsor.\n");
-    } else {
-        out.push_str("Nothing was created. It would have:\n");
-        for effect in &run.planned_effects {
-            let task = effect
-                .task_id
-                .as_deref()
-                .map(clean)
-                .unwrap_or_else(|| "-".to_string());
-            let what = match effect.kind.as_str() {
-                "create_task" => format!("created task {task}"),
-                "deliver_event" => format!("delivered an event to task {task}"),
-                other => format!("{} for task {task}", clean(other)),
-            };
-            out.push_str(&format!(
-                "  {what} (key {}) {}\n",
-                clean(&effect.effect_key),
-                data_line(&effect.data)
-            ));
-        }
-    }
-    if run.status != SUCCEEDED {
-        if let Some(stderr) = run.stderr.as_deref().filter(|text| !text.is_empty()) {
-            out.push_str("stderr:\n");
-            for text in stderr.lines() {
-                out.push_str(&format!("  {}\n", clean(text)));
-            }
-        }
-    }
-    out
-}
-
-/// The answer to `observer dry-run` once the request is stored.
-pub fn dry_run_requested_output(name: &str, requested: &ObserverDryRunView) -> String {
-    format!(
-        "Asked for a dry run of version {} of '{}'{}; waiting for a worker to run it.\n",
-        requested.version,
-        clean(name),
-        secrets_note(requested.with_secrets)
-    )
-}
-
-/// The refusal when no worker claimed a dry run in time.
-pub fn no_worker_output(name: &str, waited_secs: u64) -> String {
-    format!(
-        "No worker: no worker claimed the dry run of '{}' within {waited_secs}s. Is \
-         `narsor-cli observer worker` running with a credential of yours? The dry run stays \
-         asked for; `narsor-cli observer show {}` shows its result once a worker runs it.",
-        clean(name),
-        clean(name)
-    )
-}
-
 /// The answer to `observer script set`.
 pub fn script_saved_output(name: &str, script: &ObserverScriptView) -> String {
     format!(
-        "Saved version {} of '{}' ({}). It is not approved: try it with `narsor-cli observer \
-         dry-run {} --version {}`, then `narsor-cli observer approve {} --version {}`.\n",
+        "Saved version {} of '{}' ({}). It is not approved: test it by hand, then \
+         `narsor-cli observer approve {} --version {}`.\n",
         script.version,
         clean(name),
         clean(&script.sha256),
-        clean(name),
-        script.version,
         clean(name),
         script.version
     )
@@ -454,14 +352,8 @@ fn short_entry(entry_id: &str) -> String {
     clean(entry_id).chars().take(12).collect()
 }
 
-/// What `task create --effect-key` and `task event` print for the script's
-/// log: the server's line, cleaned, with the key.
+/// What `task create --data` and `task event` print for the script's log:
+/// the server's line, cleaned.
 pub fn effect_output(response: &ObserverEffectResponse) -> String {
-    let message = clean(&response.message);
-    match response.outcome {
-        ObserverEffectOutcome::Duplicate => {
-            format!("{message} (effect key {})\n", clean(&response.effect_key))
-        }
-        _ => format!("{message}\n"),
-    }
+    format!("{}\n", clean(&response.message))
 }

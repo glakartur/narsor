@@ -16,14 +16,12 @@ use serde_json::Value;
 
 /// `POST /observer/v1/runs/{run}/tasks`: create a task from the effect data.
 ///
-/// Only the key and the data: the workflow, repositories, backend and
+/// Only the data: the workflow, repositories, backend and
 /// profile come from the observer's record, and only the fields its mapping
 /// names become workflow inputs. Any other field is refused.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ObserverCreateTaskRequest {
-    /// The effect key: one task per key and observer, ever (R13).
-    pub effect_key: String,
     /// The effect data, a JSON object whose fields the mapping names.
     #[serde(default)]
     pub data: Value,
@@ -34,8 +32,6 @@ pub struct ObserverCreateTaskRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ObserverEventRequest {
-    /// The effect key: one event per key, observer and task, ever (R13).
-    pub effect_key: String,
     /// The event type (`review.approved`, say).
     pub event_type: String,
     /// The event's data, any JSON value of bounded size.
@@ -49,17 +45,11 @@ pub struct ObserverEventRequest {
 pub enum ObserverEffectOutcome {
     /// A task was created.
     Created,
-    /// The key was used before; nothing was done again (PO3: not an error).
-    Duplicate,
-    /// A dry run: the task would have been created (R10).
-    WouldCreate,
     /// The event matched the task's waiting `wait` step and was queued for
     /// it; it is in the task's history too.
     Delivered,
     /// The task does not wait for this event: it went to the history only.
     Recorded,
-    /// A dry run: the event would have been delivered (R10).
-    WouldDeliver,
     /// An outcome from a newer server.
     #[serde(other)]
     Unrecognized,
@@ -70,15 +60,13 @@ pub enum ObserverEffectOutcome {
 pub struct ObserverEffectResponse {
     /// What was done.
     pub outcome: ObserverEffectOutcome,
-    /// The effect key, as given.
-    pub effect_key: String,
-    /// The task created, found or addressed.
+    /// The task created or addressed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     /// The input queued for the waiting step, for a delivered event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_id: Option<String>,
-    /// One line for the script's log ("skipped: duplicate", say).
+    /// One line for the script's log ("created task …", say).
     pub message: String,
 }
 
@@ -153,16 +141,13 @@ pub struct ObserverWorkerRun {
     pub run_id: String,
     /// The run's token: the script's `NARSOR_TOKEN` on the effect routes.
     pub token: String,
-    /// Effects are recorded, not performed.
-    pub dry_run: bool,
     /// The script version it runs.
     pub script_version: u32,
     /// The script, run with `sh`.
     pub script: String,
     /// The document the script reads on stdin.
     pub input: Value,
-    /// The secrets to hand to the script; empty for a dry run of a version
-    /// that is not approved, unless the owner allowed them.
+    /// The secrets to hand to the script: the observer's references.
     #[serde(default)]
     pub secrets: Vec<ObserverSecretRef>,
     /// How long the script may run.
@@ -176,7 +161,6 @@ impl std::fmt::Debug for ObserverWorkerRun {
         f.debug_struct("ObserverWorkerRun")
             .field("run_id", &self.run_id)
             .field("token", &"<redacted>")
-            .field("dry_run", &self.dry_run)
             .field("script_version", &self.script_version)
             .field("secrets", &self.secrets)
             .field("timeout_secs", &self.timeout_secs)
@@ -258,7 +242,7 @@ pub struct ObserverRunResultResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObserverEffectRequest {
-    /// Create a task per effect key.
+    /// Create a task per `task create` call of the script.
     CreateTask {
         /// Workflow of the catalogue.
         workflow_id: String,
@@ -336,17 +320,6 @@ pub struct ObserverLastRunView {
     pub error: Option<String>,
 }
 
-/// A dry run the owner asked for and no worker claimed yet.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObserverDryRunView {
-    /// The script version it runs.
-    pub version: u32,
-    /// Whether the owner allowed secret values for it.
-    pub with_secrets: bool,
-    /// When it was asked for.
-    pub requested_at: DateTime<Utc>,
-}
-
 /// One observer as `observer list` shows it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObserverView {
@@ -390,9 +363,6 @@ pub struct ObserverView {
     /// The run in progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_run: Option<u64>,
-    /// A dry run asked for and not claimed yet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_dry_run: Option<ObserverDryRunView>,
     /// The latest finished run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<ObserverLastRunView>,
@@ -420,21 +390,6 @@ pub struct ObserverScriptView {
     pub sha256: String,
 }
 
-/// An effect a dry run would have had.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ObserverPlannedEffectView {
-    /// `create_task` or `deliver_event`.
-    pub kind: String,
-    /// Its effect key.
-    pub effect_key: String,
-    /// The task it would have created or gone to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-    /// What the script sent with it.
-    #[serde(default)]
-    pub data: Value,
-}
-
 /// One run of an observer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObserverRunView {
@@ -442,8 +397,6 @@ pub struct ObserverRunView {
     pub run_id: String,
     /// Its sequence number.
     pub sequence: u64,
-    /// Whether it was a dry run.
-    pub dry_run: bool,
     /// The script version it ran.
     pub script_version: u32,
     /// `running`, or how it ended.
@@ -461,9 +414,6 @@ pub struct ObserverRunView {
     pub error: Option<String>,
     /// Tasks it created.
     pub tasks_created: u32,
-    /// What a dry run would have done.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub planned_effects: Vec<ObserverPlannedEffectView>,
     /// The script's stderr (masked, bounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
@@ -501,18 +451,6 @@ pub struct ObserverDetailView {
 pub struct SetObserverScriptRequest {
     /// The shell script.
     pub script: String,
-}
-
-/// `POST /control/v1/observers/{observer}/dry-run`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ObserverDryRunRequest {
-    /// Script version to run; the newest when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<u32>,
-    /// Hand secret values to a version that is not the approved one (PO6).
-    #[serde(default)]
-    pub with_secrets: bool,
 }
 
 /// `POST /control/v1/observers/{observer}/approve`.

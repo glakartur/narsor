@@ -23,7 +23,7 @@
 //! {state}/materials/…                 -- bounded task materials (U9): manifests
 //!                                        and blobs, outside any workspace
 //! {state}/observers/{id}/…            -- observers of external sources: record,
-//!                                        script versions, runs, effects, watches
+//!                                        script versions, runs, watches
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
 //! ```
@@ -251,7 +251,7 @@ pub const MATERIAL_BLOBS_DIR: &str = "blobs";
 /// sub-directory per observer (see `crate::observers::store`).
 ///
 /// A sibling of [`ORCHESTRATION_DIR`], not inside it: nothing that walks task
-/// records should ever come across an observer's scripts or effect files.
+/// records should ever come across an observer's scripts or runs.
 pub const OBSERVERS_DIR: &str = "observers";
 
 /// Advisory lock serializing observer creation and deletion (unique names),
@@ -270,9 +270,6 @@ pub const OBSERVER_SCRIPTS_DIR: &str = "scripts";
 
 /// Directory of an observer's run records.
 pub const OBSERVER_RUNS_DIR: &str = "runs";
-
-/// Directory of an observer's effect files, one per effect key.
-pub const OBSERVER_EFFECTS_DIR: &str = "effects";
 
 /// Directory of an observer's watch entries.
 pub const OBSERVER_WATCHES_DIR: &str = "watches";
@@ -580,17 +577,6 @@ impl StatePaths {
     pub fn observer_run_file(&self, observer_id: &str, sequence: u64) -> PathBuf {
         self.observer_runs_dir(observer_id)
             .join(event_file_name(sequence))
-    }
-
-    /// `{root}/observers/{observer_id}/effects`
-    pub fn observer_effects_dir(&self, observer_id: &str) -> PathBuf {
-        self.observer_dir(observer_id).join(OBSERVER_EFFECTS_DIR)
-    }
-
-    /// `{root}/observers/{observer_id}/effects/{key_digest}.json`
-    pub fn observer_effect_file(&self, observer_id: &str, key_digest: &str) -> PathBuf {
-        self.observer_effects_dir(observer_id)
-            .join(format!("{key_digest}.json"))
     }
 
     /// `{root}/observers/{observer_id}/watches`

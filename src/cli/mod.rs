@@ -327,7 +327,7 @@ pub enum Command {
         command: remote::TaskCommand,
     },
 
-    /// Observers of external sources: create, script, dry-run, approve and
+    /// Observers of external sources: create, script, approve and
     /// watch them; the worker that runs their scripts and its credential.
     Observer {
         /// What to do.

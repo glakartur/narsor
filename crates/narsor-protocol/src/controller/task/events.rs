@@ -154,8 +154,6 @@ pub struct TaskProvenance {
     pub observer_id: String,
     /// The observer's name when it acted.
     pub observer_name: String,
-    /// The effect key the observer's script gave.
-    pub effect_key: String,
     /// The observer run that acted (`{observer_id}.{sequence}`).
     pub run_id: String,
 }

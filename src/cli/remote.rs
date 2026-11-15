@@ -216,7 +216,7 @@ pub enum TaskCommand {
         /// Workflow to run (its id in the control plane's catalogue).
         #[arg(
             value_name = "WORKFLOW",
-            required_unless_present_any = ["file", "effect_key"],
+            required_unless_present_any = ["file", "data"],
             conflicts_with = "file"
         )]
         workflow: Option<String>,
@@ -266,14 +266,11 @@ pub enum TaskCommand {
         #[arg(long = "task-id", value_name = "ID")]
         task_id: Option<String>,
         /// In an observer's script only (`NARSOR_OBSERVER_RUN` set): the
-        /// effect key, one task per key and observer, ever. The observer's
+        /// effect data, a JSON object of the fields the observer maps to
+        /// workflow inputs. Each call creates a new task. The observer's
         /// record decides the workflow, repositories, backend and profile;
         /// WORKFLOW and the other options are refused.
-        #[arg(long = "effect-key", value_name = "KEY")]
-        effect_key: Option<String>,
-        /// With --effect-key: the effect data, a JSON object of the fields
-        /// the observer maps to workflow inputs.
-        #[arg(long, value_name = "JSON", requires = "effect_key")]
+        #[arg(long, value_name = "JSON")]
         data: Option<String>,
     },
     /// In an observer's script only (`NARSOR_OBSERVER_RUN` set): delivers
@@ -286,9 +283,6 @@ pub enum TaskCommand {
         /// The event type (`approved`, say).
         #[arg(long = "type", value_name = "TYPE")]
         event_type: String,
-        /// The effect key: one event per key and task, ever.
-        #[arg(long = "key", value_name = "KEY")]
-        effect_key: String,
         /// The event's data, as JSON.
         #[arg(long, value_name = "JSON")]
         data: Option<String>,

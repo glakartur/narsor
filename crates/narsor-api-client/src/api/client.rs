@@ -84,8 +84,8 @@ use crate::controller_protocol::{
 };
 use narsor_protocol::controller::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverDetailView,
-    ObserverDryRunRequest, ObserverDryRunView, ObserverListResponse, ObserverScriptView,
-    ObserverView, ObserverWatchListResponse, ObserverWatchView, SetObserverScriptRequest,
+    ObserverListResponse, ObserverScriptView, ObserverView, ObserverWatchListResponse,
+    ObserverWatchView, SetObserverScriptRequest,
 };
 use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
@@ -1120,16 +1120,6 @@ impl ApiClient {
         self.post_json(&url, request).await
     }
 
-    /// Asks for a dry run, claimed by the next worker poll.
-    pub async fn request_observer_dry_run(
-        &self,
-        observer: &str,
-        request: &ObserverDryRunRequest,
-    ) -> Result<ObserverDryRunView, ClientError> {
-        let url = self.observer_url(observer, "/dry-run")?;
-        self.post_json(&url, request).await
-    }
-
     /// Approves a script version: the schedule runs it from now on.
     pub async fn approve_observer(
         &self,
@@ -1182,7 +1172,7 @@ impl ApiClient {
         self.delete_json(&url).await
     }
 
-    /// Creates the task of an effect key, for a client holding a run token
+    /// Creates a task from effect data, for a client holding a run token
     /// — `POST /observer/v1/runs/{run}/tasks`.
     pub async fn observer_create_task(
         &self,

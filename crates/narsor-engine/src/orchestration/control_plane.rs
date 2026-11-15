@@ -211,7 +211,6 @@ impl ControlPlane {
             resume_message_taken: Vec::new(),
             event_wait: None,
             provenance: request.provenance,
-            external_event_keys: Vec::new(),
             event_inputs: Vec::new(),
             last_event: TaskEvent {
                 sequence: 1,

@@ -2,7 +2,7 @@
 //! polls a source (Jira, GitHub, GitLab) on a schedule and creates tasks or
 //! delivers events to waiting tasks through `narsor-cli`.
 //!
-//! * [`model`] — the observer record, runs, effect files and watch entries,
+//! * [`model`] — the observer record, runs and watch entries,
 //!   and the validation of what an owner may configure;
 //! * [`store`] — the file layout under `{state}/observers/` and its locks;
 //! * [`contract`] — what a script reads on stdin and must print on stdout.
@@ -20,7 +20,7 @@ pub use contract::{
     MAX_SCRIPT_OUTPUT_BYTES, SCRIPT_CONTRACT_VERSION,
 };
 pub use model::*;
-pub use store::{EffectWrite, ObserverLock, ObserverStore, WatchWrite};
+pub use store::{ObserverLock, ObserverStore, WatchWrite};
 
 use crate::persistence::PersistenceError;
 use std::path::PathBuf;
@@ -95,15 +95,6 @@ pub enum ObserverError {
     /// A run with this sequence number already exists.
     #[error("run {0} already exists")]
     RunExists(RunId),
-
-    /// No effect file exists for this key.
-    #[error("observer '{observer_id}' has no effect with key '{effect_key}'")]
-    EffectNotFound {
-        /// The observer.
-        observer_id: ObserverId,
-        /// The key.
-        effect_key: String,
-    },
 
     /// A stored record has a schema version this build does not understand.
     #[error("record '{what}' has unsupported version {version}")]

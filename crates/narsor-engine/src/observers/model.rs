@@ -1,5 +1,5 @@
-//! Records of observers: the observer itself, its runs, its effect files and
-//! its watch entries.
+//! Records of observers: the observer itself, its runs and its watch
+//! entries.
 //!
 //! Everything here is plain data plus the validation of what an owner may
 //! configure. The durable layout and the locks live in [`super::store`]; the
@@ -24,8 +24,6 @@ use std::fmt;
 pub const OBSERVER_RECORD_VERSION: u32 = 1;
 /// Current schema version of [`ObserverRun`].
 pub const OBSERVER_RUN_VERSION: u32 = 1;
-/// Current schema version of [`EffectRecord`].
-pub const EFFECT_RECORD_VERSION: u32 = 1;
 /// Current schema version of [`WatchEntry`].
 pub const WATCH_ENTRY_VERSION: u32 = 1;
 
@@ -58,8 +56,6 @@ pub const MAX_CONDITION_BYTES: usize = 64 * 1024;
 pub const MAX_SECRET_REFS: usize = 32;
 /// Largest script version.
 pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
-/// Longest effect key.
-pub const MAX_EFFECT_KEY_LEN: usize = 256;
 /// Longest event type of a watch entry.
 pub const MAX_EVENT_TYPE_LEN: usize = 128;
 
@@ -101,9 +97,7 @@ fn validate_name_like(field: &'static str, value: &str, allow_dot: bool) -> Resu
 /// The random, never reused identifier of one observer.
 ///
 /// Distinct from the name: deleting an observer and creating another with
-/// the same name gives a new id, so the task ids derived from it
-/// ([`effect_task_id`]) never collide with the deleted observer's tasks. An
-/// id never contains `.`, which keeps `{observer}.{sequence}` run ids
+/// the same name gives a new id. An id never contains `.`, which keeps `{observer}.{sequence}` run ids
 /// unambiguous and the id a safe path component.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(try_from = "String", into = "String")]
@@ -333,7 +327,7 @@ pub enum ObserverEffect {
 
 /// The "create a task" effect: what every task the observer creates runs.
 ///
-/// The script supplies only an effect key and the effect data. The workflow,
+/// The script supplies only the effect data. The workflow,
 /// repositories, backend and profile come from here, and only the fields
 /// named by `mapping` become workflow inputs, so a script cannot choose
 /// another workflow or backend.
@@ -382,20 +376,14 @@ impl CreateTaskEffect {
         Ok(())
     }
 
-    /// The create request of the task that effect key `key` of observer
-    /// `observer_id` yields from the effect `data` (R3): this effect's
-    /// workflow, repositories, backend and profile, the task id
-    /// [`effect_task_id`], and as inputs the data fields the mapping names.
+    /// The create request of the task the effect `data` yields (R3): this
+    /// effect's workflow, repositories, backend and profile, a random task
+    /// id, and as inputs the data fields the mapping names.
     ///
     /// The data must be a JSON object (or absent) holding no field the
     /// mapping does not name: the script cannot smuggle in inputs. A mapped
     /// field missing from the data is left out of the inputs.
-    pub fn task_request(
-        &self,
-        observer_id: &ObserverId,
-        key: &str,
-        data: &serde_json::Value,
-    ) -> Result<CreateTaskRequest> {
+    pub fn task_request(&self, data: &serde_json::Value) -> Result<CreateTaskRequest> {
         let empty = serde_json::Map::new();
         let fields = match data {
             serde_json::Value::Null => &empty,
@@ -432,7 +420,7 @@ impl CreateTaskEffect {
             })
             .collect();
         Ok(CreateTaskRequest {
-            task_id: Some(effect_task_id(observer_id, key).to_string()),
+            task_id: None,
             backend_id: self.backend_id.clone(),
             launch: LaunchRequest {
                 workflow_id: self.workflow_id.clone(),
@@ -854,18 +842,6 @@ pub struct ScriptVersion {
     pub sha256: String,
 }
 
-/// A dry run the owner asked for and no worker claimed yet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DryRunRequest {
-    /// Script version to run, approved or not.
-    pub version: u32,
-    /// Whether the owner allowed secret values for it (`--with-secrets`).
-    #[serde(default)]
-    pub with_secrets: bool,
-    /// When it was asked for.
-    pub requested_at: DateTime<Utc>,
-}
-
 /// The latest finished run, as `observer list` shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastRun {
@@ -882,8 +858,8 @@ pub struct LastRun {
 
 /// The durable record of one observer: `observers/{id}/observer.json`.
 ///
-/// The record is the commit point of the observer: a script version, a run
-/// or an effect file exists for the observer only once the record says so
+/// The record is the commit point of the observer: a script version or a
+/// run exists for the observer only once the record says so
 /// or the file was created exclusively under the observer's lock.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserverRecord {
@@ -925,9 +901,6 @@ pub struct ObserverRecord {
     /// the "run due" flag, and since when it is up.
     #[serde(default)]
     pub run_due_since: Option<DateTime<Utc>>,
-    /// A dry run the owner asked for and no worker claimed yet.
-    #[serde(default)]
-    pub pending_dry_run: Option<DryRunRequest>,
     /// The run in progress, if any: at most one per observer.
     #[serde(default)]
     pub active_run: Option<u64>,
@@ -968,7 +941,6 @@ impl ObserverRecord {
             first_run_done: false,
             next_run_at: None,
             run_due_since: None,
-            pending_dry_run: None,
             active_run: None,
             last_claim_at: None,
             last_run_sequence: 0,
@@ -987,17 +959,10 @@ impl ObserverRecord {
         self.scripts.iter().find(|script| script.version == version)
     }
 
-    /// Since when a run (scheduled or dry) waits for a worker to claim it;
-    /// `None` when none waits.
+    /// Since when a scheduled run waits for a worker to claim it; `None`
+    /// when none waits.
     pub fn waiting_for_claim_since(&self) -> Option<DateTime<Utc>> {
-        let dry_run = self
-            .pending_dry_run
-            .as_ref()
-            .map(|request| request.requested_at);
-        match (self.run_due_since, dry_run) {
-            (Some(due), Some(dry)) => Some(due.min(dry)),
-            (due, dry) => due.or(dry),
-        }
+        self.run_due_since
     }
 
     /// Whether a run waited for a claim longer than one interval at `now`:
@@ -1039,34 +1004,6 @@ pub enum RunStatus {
     Unrecognized,
 }
 
-/// An effect a dry run would have had, recorded instead of having it (R10).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlannedEffect {
-    /// Which effect.
-    pub kind: PlannedEffectKind,
-    /// Its effect key.
-    pub effect_key: String,
-    /// The task it would have gone to, for an event.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<TaskId>,
-    /// What the script sent with it.
-    #[serde(default)]
-    pub data: serde_json::Value,
-}
-
-/// The kind of a [`PlannedEffect`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlannedEffectKind {
-    /// A task would have been created.
-    CreateTask,
-    /// An event would have been delivered.
-    DeliverEvent,
-    /// A kind from a newer build. Never written by this one.
-    #[serde(other)]
-    Unrecognized,
-}
-
 /// One run of one observer: `observers/{id}/runs/{sequence:08}.json`.
 ///
 /// Created when a worker claims the run, never before.
@@ -1078,13 +1015,6 @@ pub struct ObserverRun {
     pub observer_id: ObserverId,
     /// Sequence number within the observer, from 1.
     pub sequence: u64,
-    /// A dry run has no effects in Narsor and leaves the observer's state
-    /// alone (R10).
-    #[serde(default)]
-    pub dry_run: bool,
-    /// Whether the worker hands secret values to the script.
-    #[serde(default)]
-    pub with_secrets: bool,
     /// The script version it runs.
     pub script_version: u32,
     /// What the script reads on stdin.
@@ -1117,9 +1047,6 @@ pub struct ObserverRun {
     /// Tasks this run created so far, checked against the limit (R15).
     #[serde(default)]
     pub tasks_created: u32,
-    /// What a dry run would have done.
-    #[serde(default)]
-    pub planned_effects: Vec<PlannedEffect>,
 }
 
 impl ObserverRun {
@@ -1129,102 +1056,12 @@ impl ObserverRun {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Effect files
-// ---------------------------------------------------------------------------
-
-/// Where an effect key stands.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum EffectState {
-    /// Recorded, the task not created yet: a retry creates it from this
-    /// request, never from new data, so the request digest never changes.
-    Pending {
-        /// The full create request, task id included.
-        request: Box<CreateTaskRequest>,
-    },
-    /// The task exists.
-    Created {
-        /// The task.
-        task_id: TaskId,
-        /// When the effect was confirmed.
-        created_at: DateTime<Utc>,
-    },
-}
-
-/// The record of one effect key: `observers/{id}/effects/{sha256(key)}.json`,
-/// created exclusively (R13).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EffectRecord {
-    /// Schema version, [`EFFECT_RECORD_VERSION`].
-    pub record_version: u32,
-    /// The key the script gave.
-    pub effect_key: String,
-    /// The run that first recorded it. Not part of the request, so a retry
-    /// from another run presents the same request digest.
-    pub run_sequence: u64,
-    /// When it was first recorded.
-    pub recorded_at: DateTime<Utc>,
-    /// Where it stands.
-    #[serde(flatten)]
-    pub state: EffectState,
-}
-
-impl EffectRecord {
-    /// A pending effect carrying `request`.
-    pub fn pending(
-        effect_key: impl Into<String>,
-        run_sequence: u64,
-        request: CreateTaskRequest,
-        now: DateTime<Utc>,
-    ) -> Self {
-        Self {
-            record_version: EFFECT_RECORD_VERSION,
-            effect_key: effect_key.into(),
-            run_sequence,
-            recorded_at: now,
-            state: EffectState::Pending {
-                request: Box::new(request),
-            },
-        }
-    }
-}
-
-/// Refuses an empty, overlong or control-character effect key.
-pub fn validate_effect_key(key: &str) -> Result<()> {
-    if key.is_empty() || key.len() > MAX_EFFECT_KEY_LEN || key.chars().any(char::is_control) {
-        return Err(ObserverError::invalid(
-            "effect key",
-            format!("must have 1-{MAX_EFFECT_KEY_LEN} bytes and no control characters"),
-        ));
-    }
-    Ok(())
-}
-
 /// Hex SHA-256 of `bytes`.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// The file name stem of an effect key: its hex SHA-256, so any key is a
-/// safe file name of fixed length.
-pub fn effect_key_digest(key: &str) -> String {
-    sha256_hex(key.as_bytes())
-}
-
-/// The task id an effect key of an observer always yields.
-///
-/// Deterministic, so a retry after a crash between the effect file and the
-/// task finds the task it may already have created; derived from the
-/// observer id, never its name, so a new observer with an old name gets new
-/// task ids.
-pub fn effect_task_id(observer_id: &ObserverId, key: &str) -> TaskId {
-    let digest = sha256_hex(format!("{observer_id}\n{key}").as_bytes());
-    TaskId::parse(format!("{observer_id}-{}", &digest[..32]))
-        .expect("an observer id and hex digits form a valid task id")
 }
 
 // ---------------------------------------------------------------------------
@@ -1382,16 +1219,6 @@ mod tests {
         assert_eq!(serde_json::to_value(&run).unwrap(), "obs-1.7");
         assert_eq!(serde_json::from_str::<RunId>("\"obs-1.7\"").unwrap(), run);
         assert!(serde_json::from_str::<RunId>("\"obs-1\"").is_err());
-    }
-
-    #[test]
-    fn the_effect_task_id_depends_on_observer_and_key_only() {
-        let a = ObserverId::parse("obs-a").unwrap();
-        let b = ObserverId::parse("obs-b").unwrap();
-        assert_eq!(effect_task_id(&a, "ABC-1"), effect_task_id(&a, "ABC-1"));
-        assert_ne!(effect_task_id(&a, "ABC-1"), effect_task_id(&a, "ABC-2"));
-        assert_ne!(effect_task_id(&a, "ABC-1"), effect_task_id(&b, "ABC-1"));
-        assert!(effect_task_id(&a, "ABC-1").as_str().starts_with("obs-a-"));
     }
 
     #[test]

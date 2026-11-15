@@ -6,7 +6,7 @@
 //!
 //! | route | body | answer |
 //! | --- | --- | --- |
-//! | `POST /observer/v1/runs/{run}/tasks` | [`ObserverCreateTaskRequest`] | `201` created, `200` duplicate or dry run |
+//! | `POST /observer/v1/runs/{run}/tasks` | [`ObserverCreateTaskRequest`] | `201` created |
 //! | `POST /observer/v1/runs/{run}/tasks/{task_id}/events` | [`ObserverEventRequest`] | `200` |
 //!
 //! Both answer an [`ObserverEffectResponse`]. They are merged outside the
@@ -44,7 +44,6 @@
 //! | `GET /control/v1/observers/{observer}` | none | [`ObserverDetailView`] |
 //! | `DELETE /control/v1/observers/{observer}` | none | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/scripts` | [`SetObserverScriptRequest`] | `201` [`ObserverScriptView`] |
-//! | `POST /control/v1/observers/{observer}/dry-run` | [`ObserverDryRunRequest`] | `202` [`ObserverDryRunView`] |
 //! | `POST /control/v1/observers/{observer}/approve` | [`ApproveObserverRequest`] | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/pause` | none | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/resume` | none | [`ObserverView`] |
@@ -77,11 +76,10 @@ use narsor_engine::controller_protocol::service::{
 use narsor_engine::controller_protocol::wire::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
     CreateObserverWorkerRequest, ObserverClaimResponse, ObserverCreateTaskRequest,
-    ObserverDetailView, ObserverDryRunRequest, ObserverDryRunView, ObserverEffectOutcome,
-    ObserverEffectResponse, ObserverEventRequest, ObserverListResponse, ObserverRunReport,
-    ObserverRunResultResponse, ObserverScriptView, ObserverView, ObserverWatchListResponse,
-    ObserverWatchView, ObserverWorkerCreated, ObserverWorkerListResponse, ObserverWorkerView,
-    SetObserverScriptRequest,
+    ObserverDetailView, ObserverEffectResponse, ObserverEventRequest, ObserverListResponse,
+    ObserverRunReport, ObserverRunResultResponse, ObserverScriptView, ObserverView,
+    ObserverWatchListResponse, ObserverWatchView, ObserverWorkerCreated,
+    ObserverWorkerListResponse, ObserverWorkerView, SetObserverScriptRequest,
 };
 use narsor_engine::observers::MAX_SCRIPT_BYTES;
 use narsor_engine::observers::{RunId, MAX_SCRIPT_OUTPUT_BYTES};
@@ -155,10 +153,6 @@ where
             post(post_script),
         )
         .route(
-            "/control/v1/observers/{observer}/dry-run",
-            post(post_dry_run),
-        )
-        .route(
             "/control/v1/observers/{observer}/approve",
             post(post_approve),
         )
@@ -224,12 +218,7 @@ async fn post_task(
     let run_id = token_run(&principal, &run)?;
     let request: ObserverCreateTaskRequest = parse_json(&body, "effect request")?;
     let response = blocking(&service, move |s| s.observer_create_task(&run_id, request)).await?;
-    let status = if response.outcome == ObserverEffectOutcome::Created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(response)))
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn post_event(
@@ -413,26 +402,6 @@ async fn post_script(
     Ok((StatusCode::CREATED, Json(saved)))
 }
 
-async fn post_dry_run(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-    body: Bytes,
-) -> ProtocolResult<(StatusCode, Json<ObserverDryRunView>)> {
-    let owner = require_owner_operator(owner, operator)?;
-    let request: ObserverDryRunRequest = if body.is_empty() {
-        ObserverDryRunRequest::default()
-    } else {
-        parse_json(&body, "observer request")?
-    };
-    let requested = blocking(&service, move |s| {
-        s.request_observer_dry_run_for(&owner, &observer, request)
-    })
-    .await?;
-    Ok((StatusCode::ACCEPTED, Json(requested)))
-}
-
 async fn post_approve(
     State(service): State<Service>,
     owner: Option<Extension<OwnerRef>>,
@@ -566,7 +535,7 @@ mod tests {
         }
     }
 
-    /// Launches nothing: these routes are tested on events and dry runs.
+    /// Launches nothing: these routes are tested on events and refusals.
     struct NoLaunches;
 
     impl LaunchResolver for NoLaunches {
@@ -780,8 +749,8 @@ mod tests {
         format!("/observer/v1/runs/{}/tasks/{task}/events", run.run_id)
     }
 
-    fn event(key: &str) -> Value {
-        json!({"effect_key": key, "event_type": "approved", "data": {"mr": 17}})
+    fn event() -> Value {
+        json!({"event_type": "approved", "data": {"mr": 17}})
     }
 
     #[tokio::test]
@@ -794,24 +763,14 @@ mod tests {
                 "POST",
                 &events_uri(&run, &task),
                 run.token.expose(),
-                event("MR!17:approved"),
+                event(),
             )
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert_eq!(body["outcome"], "recorded");
-        assert_eq!(body["effect_key"], "MR!17:approved");
         assert_eq!(body["task_id"], "task-1");
-        let again = fx
-            .send(
-                "POST",
-                &events_uri(&run, &task),
-                run.token.expose(),
-                event("MR!17:approved"),
-            )
-            .await;
-        assert_eq!(json_body(again).await["outcome"], "duplicate");
         let events = fx.service.control_plane().events_since(&task, 0).unwrap();
         let external = events
             .iter()
@@ -828,15 +787,15 @@ mod tests {
 
         let request = Request::post(&uri)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(event("k").to_string()))
+            .body(Body::from(event().to_string()))
             .unwrap();
         let no_token = fx.router().oneshot(request).await.unwrap();
         assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
 
         let forged = format!("{}x", run.token.expose());
-        let wrong = fx.send("POST", &uri, &forged, event("k")).await;
+        let wrong = fx.send("POST", &uri, &forged, event()).await;
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
-        let owner = fx.send("POST", &uri, OWNER_TOKEN, event("k")).await;
+        let owner = fx.send("POST", &uri, OWNER_TOKEN, event()).await;
         assert_eq!(owner.status(), StatusCode::UNAUTHORIZED);
 
         let other_run = format!(
@@ -845,7 +804,7 @@ mod tests {
             run.run_id.sequence + 1
         );
         let elsewhere = fx
-            .send("POST", &other_run, run.token.expose(), event("k"))
+            .send("POST", &other_run, run.token.expose(), event())
             .await;
         assert_eq!(elsewhere.status(), StatusCode::UNAUTHORIZED);
         assert!(json_body_is_empty(elsewhere).await);
@@ -893,7 +852,7 @@ mod tests {
                 "POST",
                 &events_uri(&run, &task),
                 run.token.expose(),
-                event("k"),
+                event(),
             )
             .await;
         assert_eq!(ended.status(), StatusCode::UNAUTHORIZED);
@@ -909,7 +868,7 @@ mod tests {
                 "POST",
                 &events_uri(&next, &task),
                 next.token.expose(),
-                event("k"),
+                event(),
             )
             .await;
         assert_eq!(late.status(), StatusCode::UNAUTHORIZED);
@@ -939,14 +898,12 @@ mod tests {
             }),
             WatchMode::All,
         );
-        fx.service
-            .request_observer_dry_run(&id, Some(1), false)
-            .unwrap();
+        assert!(fx.service.observer_pass().due.contains(&id));
         let run = fx.service.claim_observer_run().unwrap().unwrap();
         let uri = format!("/observer/v1/runs/{}/tasks", run.run_id);
 
         for field in ["workflow_id", "backend_id", "inputs"] {
-            let mut body = json!({"effect_key": "ABC-1", "data": {"key": "ABC-1"}});
+            let mut body = json!({"data": {"key": "ABC-1"}});
             body[field] = json!("other");
             let refused = fx.send("POST", &uri, run.token.expose(), body).await;
             assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{field}");
@@ -957,17 +914,6 @@ mod tests {
                 "{error}"
             );
         }
-
-        let would = fx
-            .send(
-                "POST",
-                &uri,
-                run.token.expose(),
-                json!({"effect_key": "ABC-1", "data": {"key": "ABC-1"}}),
-            )
-            .await;
-        assert_eq!(would.status(), StatusCode::OK);
-        assert_eq!(json_body(would).await["outcome"], "would_create");
         assert!(fx.service.control_plane().list_tasks().unwrap().is_empty());
     }
 
@@ -976,7 +922,6 @@ mod tests {
         let fx = Fixture::new();
         let (run, task) = fx.event_run();
         let body = json!({
-            "effect_key": "k",
             "event_type": "approved",
             "data": {"text": "x".repeat(MAX_EFFECT_BODY)},
         });
@@ -1100,7 +1045,7 @@ mod tests {
             assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
         let effect = fx
-            .send("POST", &events_uri(&run, &task), &credential, event("k"))
+            .send("POST", &events_uri(&run, &task), &credential, event())
             .await;
         assert_eq!(effect.status(), StatusCode::UNAUTHORIZED);
 
@@ -1374,42 +1319,6 @@ mod tests {
             .send("POST", "/control/v1/observers", OWNER_TOKEN, body("triage"))
             .await;
         assert_eq!(taken.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn a_dry_run_request_is_pending_until_a_worker_claims_it() {
-        let fx = Fixture::new();
-        fx.observer(
-            "mr-review",
-            ObserverEffect::DeliverEvent,
-            WatchMode::WatchList,
-        );
-
-        let requested = fx
-            .send(
-                "POST",
-                "/control/v1/observers/mr-review/dry-run",
-                OWNER_TOKEN,
-                json!({"with_secrets": true}),
-            )
-            .await;
-
-        assert_eq!(requested.status(), StatusCode::ACCEPTED);
-        let requested = json_body(requested).await;
-        assert_eq!(requested["version"], 1);
-        assert_eq!(requested["with_secrets"], true);
-        let shown = fx
-            .send(
-                "GET",
-                "/control/v1/observers/mr-review",
-                OWNER_TOKEN,
-                Value::Null,
-            )
-            .await;
-        let shown = json_body(shown).await;
-        assert_eq!(shown["observer"]["pending_dry_run"]["version"], 1);
-        let run = fx.service.claim_observer_run().unwrap().unwrap();
-        assert!(run.dry_run);
     }
 
     #[tokio::test]

@@ -131,7 +131,6 @@ fn observer_events_carry_their_provenance_and_unknown_ones_with_fields_are_unrec
     let provenance = super::TaskProvenance {
         observer_id: "obs-1".into(),
         observer_name: "jira-new".into(),
-        effect_key: "ABC-123".into(),
         run_id: "obs-1.4".into(),
     };
     let kind = super::TaskEventKind::ExternalEventReceived {
@@ -143,7 +142,7 @@ fn observer_events_carry_their_provenance_and_unknown_ones_with_fields_are_unrec
     };
     let value = serde_json::to_value(&kind).unwrap();
     assert_eq!(value["type"], "external_event_received");
-    assert_eq!(value["provenance"]["effect_key"], "ABC-123");
+    assert_eq!(value["provenance"]["run_id"], "obs-1.4");
     assert!(value.get("input_id").is_none());
     assert_eq!(
         serde_json::from_value::<super::TaskEventKind>(value).unwrap(),
@@ -169,20 +168,18 @@ fn observer_events_carry_their_provenance_and_unknown_ones_with_fields_are_unrec
 #[test]
 fn observer_effect_requests_refuse_fields_a_script_may_not_choose() {
     let refused = serde_json::json!({
-        "effect_key": "ABC-1",
         "data": {},
         "workflow_id": "other",
     });
     assert!(serde_json::from_value::<super::ObserverCreateTaskRequest>(refused).is_err());
     let response = super::ObserverEffectResponse {
-        outcome: super::ObserverEffectOutcome::Duplicate,
-        effect_key: "ABC-1".into(),
-        task_id: Some("obs-1-abc".into()),
+        outcome: super::ObserverEffectOutcome::Created,
+        task_id: Some("task-1".into()),
         input_id: None,
-        message: "skipped: duplicate".into(),
+        message: "created task task-1".into(),
     };
     let value = serde_json::to_value(&response).unwrap();
-    assert_eq!(value["outcome"], "duplicate");
+    assert_eq!(value["outcome"], "created");
     assert_eq!(
         serde_json::from_value::<super::ObserverEffectOutcome>(serde_json::json!("newer")).unwrap(),
         super::ObserverEffectOutcome::Unrecognized
@@ -194,7 +191,6 @@ fn a_worker_run_hides_its_token_and_an_unknown_outcome_is_unrecognized() {
     let run = super::ObserverWorkerRun {
         run_id: "obs-1.1".into(),
         token: "nso.obs-1.1.secret-part".into(),
-        dry_run: false,
         script_version: 1,
         script: "true".into(),
         input: serde_json::json!({}),

@@ -4,15 +4,14 @@
 //! store lies in real file operations, locks and exclusive creates.
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use narsor_engine::controller_protocol::wire::{CreateTaskRequest, LaunchRequest};
 use narsor_engine::domain::{TaskId, WorkflowDefinition};
 use narsor_engine::observers::{
-    effect_task_id, parse_script_output, ContractError, CreateTaskEffect, EffectRecord,
-    EffectState, EffectWrite, ObserverConfig, ObserverEffect, ObserverError, ObserverName,
-    ObserverRecord, ObserverRun, ObserverState, ObserverStore, RunId, RunStatus, ScheduleConfig,
-    ScriptInput, ScriptObserver, ScriptWatch, SecretRef, WatchEntry, WatchMode, WatchObjectPolicy,
-    WatchOrigin, WatchWrite, DEFAULT_INTERVAL_SECS, MAX_SCRIPT_OUTPUT_BYTES,
-    OBSERVER_RECORD_VERSION, OBSERVER_RUN_VERSION, SCRIPT_CONTRACT_VERSION,
+    parse_script_output, ContractError, CreateTaskEffect, ObserverConfig, ObserverEffect,
+    ObserverError, ObserverName, ObserverRecord, ObserverRun, ObserverState, ObserverStore, RunId,
+    RunStatus, ScheduleConfig, ScriptInput, ScriptObserver, ScriptWatch, SecretRef, WatchEntry,
+    WatchMode, WatchObjectPolicy, WatchOrigin, WatchWrite, DEFAULT_INTERVAL_SECS,
+    MAX_SCRIPT_OUTPUT_BYTES, OBSERVER_RECORD_VERSION, OBSERVER_RUN_VERSION,
+    SCRIPT_CONTRACT_VERSION,
 };
 use narsor_engine::orchestration::OwnerRef;
 use narsor_engine::persistence::paths::temp_path_for;
@@ -118,24 +117,6 @@ fn create_jira(store: &ObserverStore, observer: &str) -> ObserverRecord {
         .expect("create observer")
 }
 
-fn create_request(task_id: &TaskId, key: &str) -> CreateTaskRequest {
-    CreateTaskRequest {
-        task_id: Some(task_id.to_string()),
-        backend_id: Some("local".into()),
-        launch: LaunchRequest {
-            workflow_id: "triage".into(),
-            workflow_version: 1,
-            inputs: json!({"ticket": key}),
-            workspaces: Default::default(),
-            profile: None,
-            harness: None,
-            resources: None,
-            ticket: None,
-            title: None,
-        },
-    }
-}
-
 fn script_input(record: &ObserverRecord) -> ScriptInput {
     ScriptInput {
         contract_version: SCRIPT_CONTRACT_VERSION,
@@ -152,7 +133,6 @@ fn script_input(record: &ObserverRecord) -> ScriptInput {
             event_types: vec!["approved".into()],
             wait_episode: Some("episode-1".into()),
         }],
-        dry_run: false,
         first_run: true,
         import_backlog: false,
     }
@@ -163,8 +143,6 @@ fn new_run(record: &ObserverRecord, sequence: u64) -> ObserverRun {
         record_version: OBSERVER_RUN_VERSION,
         observer_id: record.observer_id.clone(),
         sequence,
-        dry_run: false,
-        with_secrets: true,
         script_version: 1,
         input: script_input(record),
         claimed_at: now(),
@@ -177,7 +155,6 @@ fn new_run(record: &ObserverRecord, sequence: u64) -> ObserverRun {
         stdout: None,
         stderr: None,
         tasks_created: 0,
-        planned_effects: Vec::new(),
     }
 }
 
@@ -507,10 +484,6 @@ fn a_deleted_observer_frees_its_name_but_never_its_id() {
 
     let second = create_jira(&store, "jira-abc");
     assert_ne!(second.observer_id, first.observer_id);
-    assert_ne!(
-        effect_task_id(&first.observer_id, "ABC-1"),
-        effect_task_id(&second.observer_id, "ABC-1")
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -647,100 +620,6 @@ fn a_run_is_created_once_and_then_replaced() {
 }
 
 // ---------------------------------------------------------------------------
-// Effect files
-// ---------------------------------------------------------------------------
-
-#[test]
-fn a_second_effect_with_the_same_key_reports_the_file_as_it_is() {
-    let root = TempRoot::new();
-    let store = root.store();
-    let record = create_jira(&store, "jira-abc");
-    let lock = store.lock(&record.observer_id).unwrap();
-    let task_id = effect_task_id(&record.observer_id, "ABC-123");
-    let first = EffectRecord::pending("ABC-123", 1, create_request(&task_id, "ABC-123"), now());
-
-    assert_eq!(
-        store.create_effect(&lock, &first).unwrap(),
-        EffectWrite::Created
-    );
-    let file = root.paths().observer_effect_file(
-        record.observer_id.as_str(),
-        &narsor_engine::observers::effect_key_digest("ABC-123"),
-    );
-    let bytes = fs::read(&file).unwrap();
-
-    // A retry with other data (a field changed in Jira) finds the pending
-    // request and leaves it as it was.
-    let retry = EffectRecord::pending("ABC-123", 2, create_request(&task_id, "changed"), now());
-    assert_eq!(
-        store.create_effect(&lock, &retry).unwrap(),
-        EffectWrite::Exists(Box::new(first.clone()))
-    );
-    assert_eq!(fs::read(&file).unwrap(), bytes);
-
-    let mut created = first.clone();
-    created.state = EffectState::Created {
-        task_id: task_id.clone(),
-        created_at: now(),
-    };
-    store.save_effect(&lock, &created).unwrap();
-    let bytes = fs::read(&file).unwrap();
-
-    assert_eq!(
-        store.create_effect(&lock, &retry).unwrap(),
-        EffectWrite::Exists(Box::new(created.clone()))
-    );
-    assert_eq!(fs::read(&file).unwrap(), bytes);
-    assert_eq!(
-        store.load_effect(&record.observer_id, "ABC-123").unwrap(),
-        Some(created)
-    );
-}
-
-#[test]
-fn a_removed_pending_effect_can_be_recorded_again() {
-    let root = TempRoot::new();
-    let store = root.store();
-    let record = create_jira(&store, "jira-abc");
-    let lock = store.lock(&record.observer_id).unwrap();
-    let task_id = effect_task_id(&record.observer_id, "ABC-1");
-    let effect = EffectRecord::pending("ABC-1", 1, create_request(&task_id, "ABC-1"), now());
-    store.create_effect(&lock, &effect).unwrap();
-
-    assert!(store.remove_effect(&lock, "ABC-1").unwrap());
-    assert!(!store.remove_effect(&lock, "ABC-1").unwrap());
-    assert_eq!(
-        store.load_effect(&record.observer_id, "ABC-1").unwrap(),
-        None
-    );
-    assert_eq!(
-        store.create_effect(&lock, &effect).unwrap(),
-        EffectWrite::Created
-    );
-    assert!(matches!(
-        store.save_effect(
-            &lock,
-            &EffectRecord::pending("ABC-2", 1, create_request(&task_id, "ABC-2"), now())
-        ),
-        Err(ObserverError::EffectNotFound { .. })
-    ));
-}
-
-#[test]
-fn an_invalid_effect_key_is_refused() {
-    let root = TempRoot::new();
-    let store = root.store();
-    let record = create_jira(&store, "jira-abc");
-    let lock = store.lock(&record.observer_id).unwrap();
-    let task_id = effect_task_id(&record.observer_id, "x");
-
-    for key in [String::new(), "a\nb".into(), "k".repeat(257)] {
-        let effect = EffectRecord::pending(key.clone(), 1, create_request(&task_id, "x"), now());
-        assert!(store.create_effect(&lock, &effect).is_err(), "{key:?}");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Watch entries
 // ---------------------------------------------------------------------------
 
@@ -863,9 +742,9 @@ fn the_script_input_is_one_json_document_with_the_watch_episode() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn records_scripts_runs_effects_and_watches_survive_a_restart() {
+fn records_scripts_runs_and_watches_survive_a_restart() {
     let root = TempRoot::new();
-    let (jira, review, run, effect, entry) = {
+    let (jira, review, run, entry) = {
         let store = root.store();
         let jira = create_jira(&store, "jira-abc");
         store
@@ -877,15 +756,12 @@ fn records_scripts_runs_effects_and_watches_survive_a_restart() {
         let lock = store.lock(&jira.observer_id).unwrap();
         let run = new_run(&jira, 1);
         store.create_run(&lock, &run).unwrap();
-        let task_id = effect_task_id(&jira.observer_id, "ABC-1");
-        let effect = EffectRecord::pending("ABC-1", 1, create_request(&task_id, "ABC-1"), now());
-        store.create_effect(&lock, &effect).unwrap();
         drop(lock);
         let lock = store.lock(&review.observer_id).unwrap();
         let entry = watch("task-1", Some("await"), "https://gitlab.example.com/a/1");
         store.create_watch(&lock, &entry).unwrap();
         let jira = store.load(&jira.observer_id).unwrap();
-        (jira, review, run, effect, entry)
+        (jira, review, run, entry)
     };
     // Interrupted writes leave temporary files; a fresh store sweeps them.
     let stray = temp_path_for(&root.paths().observer_record_file(jira.observer_id.as_str()));
@@ -900,10 +776,6 @@ fn records_scripts_runs_effects_and_watches_survive_a_restart() {
         "echo one\n"
     );
     assert_eq!(store.load_run(&run.run_id()).unwrap(), run);
-    assert_eq!(
-        store.load_effect(&jira.observer_id, "ABC-1").unwrap(),
-        Some(effect)
-    );
     assert_eq!(
         store.list_watches(&review.observer_id).unwrap(),
         vec![entry]

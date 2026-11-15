@@ -495,40 +495,6 @@ async fn a_secret_without_a_secrets_directory_fails_the_run() {
     ));
 }
 
-#[tokio::test]
-async fn a_dry_run_of_an_unapproved_version_has_no_secrets_unless_allowed() {
-    let fx = Fixture::new();
-    let secrets = fx.secrets_dir(&[("jira-token", SENTINEL)]);
-    let id = fx.observer("true\n", &[("jira-token", "JIRA_TOKEN")]);
-    let now = fx.service.control_plane().now();
-    fx.service
-        .observers()
-        .add_script(&id, "echo draft\n", now)
-        .unwrap();
-    let runner = FakeRunner::exiting(0, r#"{"state": {}}"#, "");
-    let mut options = fx.options();
-    options.secrets_dir = Some(secrets);
-    let worker = Worker::new(fx.api(), Arc::clone(&runner), options);
-
-    // Without --with-secrets: no secret variable at all.
-    fx.service
-        .request_observer_dry_run(&id, Some(2), false)
-        .unwrap();
-    let without = worker.run_once().await.unwrap().unwrap();
-    // With it: the observer's secret.
-    fx.service
-        .request_observer_dry_run(&id, Some(2), true)
-        .unwrap();
-    let with = worker.run_once().await.unwrap().unwrap();
-
-    let specs = runner.specs();
-    assert!(fx.run_of(&without.run_id).dry_run);
-    assert_eq!(env_value(&specs[0], "JIRA_TOKEN"), None);
-    assert!(specs[0].env.iter().all(|(_, value)| value != SENTINEL));
-    assert_eq!(env_value(&specs[1], "JIRA_TOKEN"), Some(SENTINEL));
-    assert!(fx.run_of(&with.run_id).dry_run);
-}
-
 // ---------------------------------------------------------------------------
 // Masking (sentinel)
 // ---------------------------------------------------------------------------

@@ -6,7 +6,6 @@
 //! {state}/observers/{id}/observer.lock              per-observer mutation lock
 //! {state}/observers/{id}/scripts/{n}.sh             script version n (exclusive create, immutable)
 //! {state}/observers/{id}/runs/{seq:08}.json         ObserverRun (exclusive create, then replace)
-//! {state}/observers/{id}/effects/{sha256}.json      EffectRecord per effect key (exclusive create)
 //! {state}/observers/{id}/watches/{entry}.json       WatchEntry (exclusive create)
 //! ```
 //!
@@ -27,9 +26,8 @@
 //! directory without `observer.json`, which no listing reports.
 
 use super::model::{
-    effect_key_digest, sha256_hex, validate_effect_key, EffectRecord, ObserverConfig, ObserverId,
-    ObserverRecord, ObserverRun, RunId, WatchEntry, EFFECT_RECORD_VERSION, MAX_SCRIPT_BYTES,
-    OBSERVER_RECORD_VERSION, OBSERVER_RUN_VERSION, WATCH_ENTRY_VERSION,
+    sha256_hex, ObserverConfig, ObserverId, ObserverRecord, ObserverRun, RunId, WatchEntry,
+    MAX_SCRIPT_BYTES, OBSERVER_RECORD_VERSION, OBSERVER_RUN_VERSION, WATCH_ENTRY_VERSION,
 };
 use super::{ObserverError, Result};
 use crate::domain::WorkflowDefinition;
@@ -68,16 +66,6 @@ impl ObserverLock {
             })
         }
     }
-}
-
-/// What an exclusive write of an effect file found.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EffectWrite {
-    /// The file is new.
-    Created,
-    /// A file for this key already existed and was left untouched; this is
-    /// what it holds (`pending` or `created`).
-    Exists(Box<EffectRecord>),
 }
 
 /// What an exclusive write of a watch entry found.
@@ -362,62 +350,6 @@ impl ObserverStore {
             .collect()
     }
 
-    // -- effects ------------------------------------------------------------
-
-    /// Records an effect key, exclusively: a key already recorded is
-    /// answered with what its file holds, which is left untouched (R13).
-    pub fn create_effect(&self, lock: &ObserverLock, effect: &EffectRecord) -> Result<EffectWrite> {
-        validate_effect_key(&effect.effect_key)?;
-        let path = self.effect_file(lock.observer_id(), &effect.effect_key);
-        if write_json_atomic_exclusive(&path, effect)? {
-            return Ok(EffectWrite::Created);
-        }
-        let existing = self
-            .load_effect(lock.observer_id(), &effect.effect_key)?
-            .ok_or_else(|| ObserverError::EffectNotFound {
-                observer_id: lock.observer_id().clone(),
-                effect_key: effect.effect_key.clone(),
-            })?;
-        Ok(EffectWrite::Exists(Box::new(existing)))
-    }
-
-    /// The effect file of `key`, if one exists.
-    pub fn load_effect(&self, observer_id: &ObserverId, key: &str) -> Result<Option<EffectRecord>> {
-        let path = self.effect_file(observer_id, key);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let effect: EffectRecord = read_json(&path)?;
-        check_version(&path, effect.record_version, EFFECT_RECORD_VERSION)?;
-        Ok(Some(effect))
-    }
-
-    /// Atomically replaces an existing effect file (`pending` → `created`).
-    pub fn save_effect(&self, lock: &ObserverLock, effect: &EffectRecord) -> Result<()> {
-        let path = self.effect_file(lock.observer_id(), &effect.effect_key);
-        if !path.exists() {
-            return Err(ObserverError::EffectNotFound {
-                observer_id: lock.observer_id().clone(),
-                effect_key: effect.effect_key.clone(),
-            });
-        }
-        Ok(write_json_atomic(&path, effect)?)
-    }
-
-    /// Removes the effect file of `key` (a `pending` effect whose task was
-    /// refused for good), so a later call may try again. `Ok(false)` when
-    /// there was none.
-    pub fn remove_effect(&self, lock: &ObserverLock, key: &str) -> Result<bool> {
-        Ok(remove_file_if_exists(
-            &self.effect_file(lock.observer_id(), key),
-        )?)
-    }
-
-    fn effect_file(&self, observer_id: &ObserverId, key: &str) -> PathBuf {
-        self.paths
-            .observer_effect_file(observer_id.as_str(), &effect_key_digest(key))
-    }
-
     // -- watches ------------------------------------------------------------
 
     /// Adds a watch entry, idempotently by task, step and object: an entry
@@ -486,7 +418,6 @@ impl ObserverStore {
                 self.paths.observer_dir(id),
                 self.paths.observer_scripts_dir(id),
                 self.paths.observer_runs_dir(id),
-                self.paths.observer_effects_dir(id),
                 self.paths.observer_watches_dir(id),
             ] {
                 removed.extend(cleanup_orphaned_temp_files(&dir)?);
