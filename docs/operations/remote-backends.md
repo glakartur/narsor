@@ -66,8 +66,7 @@ Rules that follow from this split:
   database, queue or object store is needed. Run exactly one control plane
   per state directory.
 
-The daemon that runs the local `/executions` engine is the same process that
-serves the control plane. The `local` backend has a controller like every
+The daemon serves the control plane and runs no workflow itself. The `local` backend has a controller like every
 other backend: `narsor-controller local`, a separate process that enrolls and
 talks `/controller/v1` over HTTP. In trusted mode the daemon starts it as its
 child, enrolls it on the first start and supervises it:
@@ -814,8 +813,6 @@ narsor-cli task workflows                        # the catalogue: source, descri
 narsor-cli task validate <path>                  # every violation of a workflow file (local daemon only)
 narsor-cli task capabilities                     # what this server offers
 narsor-cli task repo list | add <id> --remote <url> | remove <id>
-narsor-cli task history list | show|events|steps|conductor <execution> \
-  | conversation <execution> <attempt> | recover <execution> [--comment …]   # local daemon only
 narsor-cli task materials upload <task> <path>... [--id ID] [--label T] [--ttl-secs N]
 narsor-cli task materials list|show <task> [<material>]
 narsor-cli task materials download <task> <material> <dest-dir> [--force]
@@ -954,10 +951,6 @@ The ordinary test suite needs no cluster. Against a real cluster:
   task, workflow or backend.
 * OIDC device-code login is not built in: use a token helper that writes a
   file or prints a token.
-* Old executions (from before the scheduler) are read, and a failed one
-  recovered, from the TUI's history (`H`) or with `narsor-cli task history …`,
-  over the same control plane and only on the local daemon; the local
-  `/executions` routes remain for `narsor-cli list`, `show` and the like.
 
 ## 14. A computer as a backend
 

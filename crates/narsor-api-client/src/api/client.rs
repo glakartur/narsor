@@ -63,25 +63,20 @@ use serde_json::Value;
 use narsor_protocol::api::{
     ClaimRequest, ConversationResponse as ConversationPage, HumanInputDeliveryDto, MaterialFile,
     MaterialListResponse, MaterialSummary, MaterialUploadResponse, MaterialView, OwnerView,
-    PermissionDecisionRequestDto, ProposalOutcome, Timeline, UndoOutcome, WhoAmIResponse,
-    BUNDLE_CONTENT_TYPE,
+    PermissionDecisionRequestDto, Timeline, WhoAmIResponse, BUNDLE_CONTENT_TYPE,
 };
 use narsor_protocol::controller::{
     ControlEventEnvelope, ConversationResponse as RemoteConversationResponse, MoveTaskRequest,
     OwnerCommandResponse, SubmitCommentRequest, SubmitCommentResponse, SubmitInputResponse,
     SubmitOperatorCommandResponse, TaskEvent, TaskListResponse, TaskSummary, TimelineResponse,
 };
-use narsor_protocol::event::{Event, EventData};
+use narsor_protocol::event::Event;
 
 use super::dto::{
-    AcceptedResponse, ChatEntryDto, ChatMessageRequest, ConductorChatResponse,
-    ConductorStateResponse, ConversationResponse, ExecutionListResponse, ExecutionSummary,
-    HarnessSelectionSnapshot, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
-    StartTaskRequest, StartTaskResponse, TransitionRequest,
+    AcceptedResponse, ConversationResponse, ExecutionListResponse, HarnessSelectionSnapshot,
+    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
 };
-use crate::controller_protocol::{
-    ConductorReadResponse, LegacyExecutionListResponse, LegacyExecutionView,
-};
+use crate::controller_protocol::ConductorReadResponse;
 use narsor_protocol::controller::{
     AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverDetailView,
     ObserverListResponse, ObserverScriptView, ObserverView, ObserverWatchListResponse,
@@ -154,7 +149,7 @@ pub struct ApiClient {
     token: Arc<TokenCell>,
     http: reqwest::Client,
     /// A second client, deliberately built with no request timeout, used
-    /// only by [`ApiClient::stream_execution`]/[`ApiClient::stream_all`].
+    /// only by the SSE streams ([`ApiClient::stream_control_events`]).
     ///
     /// [`REQUEST_TIMEOUT`] exists because every other call this client makes
     /// is a bounded, one-shot read/write against a loopback server that
@@ -289,29 +284,6 @@ impl ApiClient {
         self.get_json(&url).await
     }
 
-    /// What the conductor of `execution_id` is doing and has kept (D55).
-    pub async fn conductor_state(
-        &self,
-        execution_id: &str,
-    ) -> Result<ConductorStateResponse, ClientError> {
-        let url = format!("{}/executions/{execution_id}/conductor", self.base_url);
-        self.get_json(&url).await
-    }
-
-    /// The conductor's chat history of `execution_id` after sequence
-    /// `after`.
-    pub async fn conductor_chat(
-        &self,
-        execution_id: &str,
-        after: u64,
-    ) -> Result<ConductorChatResponse, ClientError> {
-        let url = format!(
-            "{}/executions/{execution_id}/conductor/chat?after={after}",
-            self.base_url
-        );
-        self.get_json(&url).await
-    }
-
     /// Conversation entries of one attempt, from entry `from` onward, up to
     /// `byte_budget` bytes.
     pub async fn conversation(
@@ -366,54 +338,6 @@ impl ApiClient {
         self.post_json(&url, body).await
     }
 
-    /// Resumes a paused execution — `POST /executions/:id/resume`.
-    pub async fn resume(&self, execution_id: &str) -> Result<AcceptedResponse, ClientError> {
-        let url = format!("{}/executions/{execution_id}/resume", self.base_url);
-        self.post_empty(&url).await
-    }
-
-    /// Explicitly starts a fresh attempt after a failed or interrupted run.
-    pub async fn recover(
-        &self,
-        execution_id: &str,
-        comment: Option<String>,
-    ) -> Result<AcceptedResponse, ClientError> {
-        let url = format!("{}/executions/{execution_id}/recover", self.base_url);
-        self.post_json(
-            &url,
-            &RecoveryRequest {
-                comment,
-                episode: None,
-            },
-        )
-        .await
-    }
-
-    /// Recovers an execution from the step failure `episode` names (KTD9):
-    /// refused with `409` once it is no longer failed on it.
-    pub async fn recover_failure(
-        &self,
-        execution_id: &str,
-        episode: &str,
-        comment: Option<String>,
-    ) -> Result<AcceptedResponse, ClientError> {
-        let url = format!("{}/executions/{execution_id}/recover", self.base_url);
-        self.post_json(
-            &url,
-            &RecoveryRequest {
-                comment,
-                episode: Some(episode.to_string()),
-            },
-        )
-        .await
-    }
-
-    /// Immediately interrupts the daemon task driving an execution.
-    pub async fn interrupt(&self, execution_id: &str) -> Result<AcceptedResponse, ClientError> {
-        let url = format!("{}/executions/{execution_id}/interrupt", self.base_url);
-        self.post_empty(&url).await
-    }
-
     /// Delivers a person's answer to a paused execution — `POST
     /// /executions/:id/input`.
     pub async fn deliver_input(
@@ -433,76 +357,6 @@ impl ApiClient {
     ) -> Result<AcceptedResponse, ClientError> {
         let url = format!("{}/executions/{execution_id}/permission", self.base_url);
         self.post_json(&url, &request).await
-    }
-
-    /// A manual or forced transition — `POST /executions/:id/transition`.
-    pub async fn transition(
-        &self,
-        execution_id: &str,
-        request: TransitionRequest,
-    ) -> Result<ExecutionSummary, ClientError> {
-        let url = format!("{}/executions/{execution_id}/transition", self.base_url);
-        self.post_json(&url, &request).await
-    }
-
-    /// Writes `text` to the conductor of `execution_id` (F4) — `POST
-    /// /executions/:id/conductor/chat`. Returns the entry as written; the
-    /// answer follows in the chat history.
-    pub async fn post_chat(
-        &self,
-        execution_id: &str,
-        text: &str,
-    ) -> Result<ChatEntryDto, ClientError> {
-        let url = format!("{}/executions/{execution_id}/conductor/chat", self.base_url);
-        self.post_json(
-            &url,
-            &ChatMessageRequest {
-                text: text.to_string(),
-            },
-        )
-        .await
-    }
-
-    /// Carries out the conductor's proposal `proposal_id` (R28). A second
-    /// confirmation answers the first one's outcome; one about a moment the
-    /// execution has moved on from is [`ClientError::Refused`].
-    pub async fn confirm_proposal(
-        &self,
-        execution_id: &str,
-        proposal_id: &str,
-    ) -> Result<ProposalOutcome, ClientError> {
-        let url = format!(
-            "{}/executions/{execution_id}/conductor/proposals/{proposal_id}/confirm",
-            self.base_url
-        );
-        self.post_empty(&url).await
-    }
-
-    /// Rejects the conductor's proposal `proposal_id`.
-    pub async fn reject_proposal(
-        &self,
-        execution_id: &str,
-        proposal_id: &str,
-    ) -> Result<ProposalOutcome, ClientError> {
-        let url = format!(
-            "{}/executions/{execution_id}/conductor/proposals/{proposal_id}/reject",
-            self.base_url
-        );
-        self.post_empty(&url).await
-    }
-
-    /// Undoes the conductor's chosen output `decision_id` (KTD13): the
-    /// step is a problem again at its state.
-    pub async fn undo_decision(
-        &self,
-        execution_id: &str,
-        decision_id: &str,
-    ) -> Result<UndoOutcome, ClientError> {
-        let url = format!(
-            "{}/executions/{execution_id}/conductor/decisions/{decision_id}/undo",
-            self.base_url
-        );
-        self.post_empty(&url).await
     }
 
     /// Every stored execution, summarised — `GET /executions`.
@@ -652,106 +506,6 @@ impl ApiClient {
     pub async fn control_remove_repository(&self, id: &str) -> Result<RepositoryView, ClientError> {
         let url = format!("{}/control/v1/repositories/{id}", self.base_url);
         self.delete_json(&url).await
-    }
-
-    /// Executions from before the task scheduler, newest first.
-    pub async fn control_history(&self) -> Result<LegacyExecutionListResponse, ClientError> {
-        let url = format!("{}/control/v1/executions", self.base_url);
-        self.get_json(&url).await
-    }
-
-    /// One old execution.
-    pub async fn control_history_execution(
-        &self,
-        execution_id: &str,
-    ) -> Result<LegacyExecutionView, ClientError> {
-        let url = format!("{}/control/v1/executions/{execution_id}", self.base_url);
-        self.get_json(&url).await
-    }
-
-    /// An old execution's events after `after`.
-    pub async fn control_history_events(
-        &self,
-        execution_id: &str,
-        after: u64,
-    ) -> Result<Vec<Event>, ClientError> {
-        let url = format!(
-            "{}/control/v1/executions/{execution_id}/events?after={after}",
-            self.base_url
-        );
-        self.get_json(&url).await
-    }
-
-    /// An old execution's step timeline.
-    pub async fn control_history_timeline(
-        &self,
-        execution_id: &str,
-    ) -> Result<Timeline, ClientError> {
-        let url = format!(
-            "{}/control/v1/executions/{execution_id}/timeline",
-            self.base_url
-        );
-        self.get_json(&url).await
-    }
-
-    /// One attempt's conversation of an old execution, from entry `from`.
-    pub async fn control_history_conversation(
-        &self,
-        execution_id: &str,
-        attempt_id: &str,
-        from: u64,
-    ) -> Result<ConversationResponse, ClientError> {
-        let url = format!(
-            "{}/control/v1/executions/{execution_id}/attempts/{attempt_id}/conversation?from={from}",
-            self.base_url
-        );
-        self.get_json(&url).await
-    }
-
-    /// What the conductor of an old execution kept.
-    pub async fn control_history_conductor(
-        &self,
-        execution_id: &str,
-    ) -> Result<ConductorStateResponse, ClientError> {
-        let url = format!(
-            "{}/control/v1/executions/{execution_id}/conductor",
-            self.base_url
-        );
-        self.get_json(&url).await
-    }
-
-    /// The conductor's chat of an old execution after sequence `after`.
-    pub async fn control_history_conductor_chat(
-        &self,
-        execution_id: &str,
-        after: u64,
-    ) -> Result<ConductorChatResponse, ClientError> {
-        let url = format!(
-            "{}/control/v1/executions/{execution_id}/conductor/chat?after={after}",
-            self.base_url
-        );
-        self.get_json(&url).await
-    }
-
-    /// Recovers a failed old execution; refused with `409`
-    /// ([`ClientError::Refused`] carries the reason) when it cannot be.
-    pub async fn control_recover_execution(
-        &self,
-        execution_id: &str,
-        comment: Option<String>,
-    ) -> Result<AcceptedResponse, ClientError> {
-        let url = format!(
-            "{}/control/v1/executions/{execution_id}/recover",
-            self.base_url
-        );
-        self.post_json(
-            &url,
-            &RecoveryRequest {
-                comment,
-                episode: None,
-            },
-        )
-        .await
     }
 
     /// One remote task's normalized summary.
@@ -1260,37 +1014,6 @@ impl ApiClient {
     // SSE (U5)
     // -----------------------------------------------------------------
 
-    /// An SSE stream of every event published for one execution (AE5).
-    ///
-    /// The stream ends itself — the caller sees `None` from `.next()` — the
-    /// moment it has yielded a terminal event
-    /// ([`EventData::WorkflowCompleted`]/[`EventData::WorkflowFailed`]/
-    /// [`EventData::WorkflowCancelled`]), so a caller that wants to block
-    /// until an execution settles can simply drain this stream to
-    /// completion rather than inspecting every event itself to decide when
-    /// to stop.
-    pub fn stream_execution(
-        &self,
-        execution_id: &str,
-    ) -> impl Stream<Item = Result<Event, ClientError>> {
-        let url = format!("{}/executions/{execution_id}/stream", self.base_url);
-        self.sse_stream(url, engine_event_decoder(Some(execution_id.to_string())))
-    }
-
-    /// An SSE stream of every event from every execution the daemon runs.
-    ///
-    /// Unlike [`ApiClient::stream_execution`], there is no single execution
-    /// whose terminal event would end this stream — it keeps running until
-    /// the connection itself ends (the server stops, or the caller drops
-    /// it). This is enforced by giving [`engine_event_decoder`] no
-    /// `terminal_scope`: it only ever treats a terminal event as
-    /// stream-ending when it is scoped to a specific execution id, which
-    /// this call does not have.
-    pub fn stream_all(&self) -> impl Stream<Item = Result<Event, ClientError>> {
-        let url = format!("{}/events/stream", self.base_url);
-        self.sse_stream(url, engine_event_decoder(None))
-    }
-
     /// The control plane's durable event stream (U2): every event after
     /// `cursor` (all of them when `None`) exactly once, then live ones.
     ///
@@ -1642,26 +1365,6 @@ fn single_error_stream<T: Send + 'static>(
 /// stream does not understand).
 type FrameDecoder<T> = Box<dyn FnMut(&str) -> Option<(T, bool)> + Send>;
 
-/// The decoder of the engine's event streams.
-///
-/// A terminal event ends the stream only when it belongs to
-/// `terminal_scope` — per [`ApiClient::stream_execution`]'s contract when
-/// that is `Some(execution_id)`. When it is `None`
-/// ([`ApiClient::stream_all`]), a terminal event never ends it: this is the
-/// one piece of state that makes the two streams' contracts different
-/// despite sharing one parser. Getting this scoping wrong is not
-/// hypothetical — an earlier version ended on *any* terminal event
-/// regardless of whose it was, which silently killed the global stream the
-/// moment the first of several concurrently running executions finished.
-fn engine_event_decoder(terminal_scope: Option<String>) -> FrameDecoder<Event> {
-    Box::new(move |data| {
-        let event = serde_json::from_str::<Event>(data).ok()?;
-        let terminal = is_terminal_event(&event.data)
-            && terminal_scope.as_deref() == Some(event.workflow_execution_id.as_str());
-        Some((event, terminal))
-    })
-}
-
 /// State threaded through [`stream::unfold`] to turn a raw byte stream (the
 /// response body) into parsed items.
 ///
@@ -1782,25 +1485,6 @@ fn extract_sse_events<T>(
                 *done = true;
             }
         }
-    }
-}
-
-/// Whether `data` is one of the three events that end a workflow execution
-/// — see [`ApiClient::stream_execution`]'s contract.
-///
-/// The conductor's events (`ConductorStarted`/`Finished`/`Decision`) never
-/// end a stream, even when they follow `WorkflowFailed` (F3): the
-/// conductor works beside an execution, it does not change how it ends.
-fn is_terminal_event(data: &EventData) -> bool {
-    match data {
-        EventData::WorkflowCompleted { .. }
-        | EventData::WorkflowFailed { .. }
-        | EventData::WorkflowCancelled { .. } => true,
-        EventData::ConductorStarted { .. }
-        | EventData::ConductorFinished { .. }
-        | EventData::ConductorDecision { .. }
-        | EventData::ConductorDecisionUndone { .. } => false,
-        _ => false,
     }
 }
 

@@ -50,7 +50,6 @@ use narsor_protocol::identifier::TaskId;
 
 use super::commands::{conversation_entry_lines, permission_decision, CliError, Result};
 use super::control_text::usage_lines;
-use super::task_history::{history, HistoryCommand};
 use super::task_registry::{
     capabilities, create_from_file, repo, validate, workflows, RepoCommand,
 };
@@ -463,13 +462,6 @@ pub enum TaskCommand {
         /// What to do.
         #[command(subcommand)]
         action: MaterialsCommand,
-    },
-    /// Executions from before the task scheduler (the TUI's history): list,
-    /// read and recover. A local daemon only.
-    History {
-        /// What to do.
-        #[command(subcommand)]
-        action: HistoryCommand,
     },
     /// The control plane's registry of repositories: list, add, remove.
     Repo {
@@ -1312,7 +1304,6 @@ pub async fn task(
         }
         TaskCommand::Conductor { action } => conductor(&client, action).await,
         TaskCommand::Materials { action } => materials(&client, action).await,
-        TaskCommand::History { action } => history(&client, action).await,
         TaskCommand::Repo { action } => repo(&client, action).await,
         TaskCommand::Workflows => workflows(&client).await,
         TaskCommand::Validate { path } => validate(&client, &path).await,

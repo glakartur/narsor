@@ -1,9 +1,10 @@
 //! The daemon-owned local HTTP API.
 //!
-//! The daemon is the sole owner of [`narsor_engine::engine::Engine`] and its writable
-//! store. TUI and CLI clients use this API for reads, execution control, and
-//! the default-agent-harness setting. The historical rationale below predates
-//! the daemon migration; the current ownership contract is D53.
+//! TUI, CLI and web clients use this API to create and control tasks, to
+//! read the executions their runners keep, and for the default-agent-harness
+//! setting. The daemon drives no execution itself: every task runs in a
+//! `narsor-runner` under a controller. The historical rationale below
+//! predates the daemon migration.
 //!
 //! # Why an API at all, when the TUI already has the store on disk
 //!
@@ -77,10 +78,8 @@
 //! hand-built trusted configuration is refused here unless its address is
 //! loopback, so no caller can expose the token-only API by accident.
 
-mod active;
 mod routes;
 
-pub use active::ActiveTasks;
 pub use narsor_api_client::api::{
     connect, ensure_daemon_running, reconnect_delay, ApiClient, ClientError, DiscoveryError,
     ServerTarget, TokenSource,
@@ -91,9 +90,7 @@ pub use narsor_protocol::api::*;
 use crate::auth_gate as gate;
 use crate::auth_gate::{NetworkAuth, OwnerAuth};
 use narsor_engine::auth::{CorsPolicy, ProxyPolicy};
-use narsor_engine::conductor::ConductorRegistry;
 use narsor_engine::controller_protocol::ProtocolService;
-use narsor_engine::engine::Engine;
 use narsor_engine::environment::CatalogLaunchResolver;
 use narsor_engine::persistence::DefaultHarnessSelector;
 use narsor_engine::registry::BranchLister;
@@ -202,9 +199,8 @@ impl ApiHandle {
     /// this *before* any other shutdown-time work — rather than only at the
     /// end, as the pre-U8 single [`ApiHandle::shutdown`] call did — is what
     /// closes the window where a fresh mutating request (`POST /tasks`,
-    /// `/resume`, `/input`) could still land and start a new background run
-    /// after the daemon has already decided it is shutting down and started
-    /// waiting for [`narsor_engine::engine::Engine::active_run_ids`] to drain.
+    /// `/input`) could still land after the daemon has already decided it is
+    /// shutting down.
     pub fn stop_accepting(&self) {
         self.shutdown.notify_one();
     }
@@ -217,7 +213,7 @@ impl ApiHandle {
     }
 }
 
-/// Starts the local API server over `engine`, on a random loopback port.
+/// Starts the local API server on a random loopback port.
 ///
 /// `catalog_dir`/`work_dir` are the daemon's own catalogue and work roots
 /// (U3): `POST /tasks` needs them to resolve a workflow reference and
@@ -225,12 +221,8 @@ impl ApiHandle {
 ///
 /// The returned [`ApiHandle`] carries the bound address and the token every
 /// request must present as `Authorization: Bearer <token>`.
-pub async fn start(
-    engine: Arc<Engine>,
-    catalog_dir: PathBuf,
-    work_dir: PathBuf,
-) -> Result<ApiHandle, ApiStartError> {
-    start_with_harness_selector(engine, catalog_dir, work_dir, None).await
+pub async fn start(catalog_dir: PathBuf, work_dir: PathBuf) -> Result<ApiHandle, ApiStartError> {
+    start_with_harness_selector(catalog_dir, work_dir, None).await
 }
 
 /// Starts the API server with the daemon's shared default-harness selector.
@@ -239,19 +231,15 @@ pub async fn start(
 /// API tests that do not compose an agent selector. Daemons must call this
 /// function so the settings resource and executor observe the same `Arc`.
 pub async fn start_with_harness_selector(
-    engine: Arc<Engine>,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
 ) -> Result<ApiHandle, ApiStartError> {
     start_with_services(
-        engine,
         catalog_dir,
         work_dir,
         ApiServices {
             harness_selector,
-            active_tasks: ActiveTasks::new(),
-            conductor: None,
             control: None,
             local_launch: None,
             workflows: None,
@@ -262,17 +250,11 @@ pub async fn start_with_harness_selector(
     .await
 }
 
-/// What the daemon shares with its API server beyond the engine.
+/// What the daemon shares with its API server.
 #[derive(Clone, Default)]
 pub struct ApiServices {
     /// The live default-harness selector (D54).
     pub harness_selector: Option<Arc<DefaultHarnessSelector>>,
-    /// The background passes, shared with the daemon's startup hook so a
-    /// pass it spawns can be interrupted through the API.
-    pub active_tasks: ActiveTasks,
-    /// The conductor (D55): its chat, its proposals and the undo of its
-    /// decisions are served only when there is one.
-    pub conductor: Option<Arc<ConductorRegistry>>,
     /// The remote-task control plane (U2): its owner, controller and runner
     /// routes are served only when there is one.
     pub control: Option<Arc<ProtocolService>>,
@@ -295,8 +277,6 @@ impl fmt::Debug for ApiServices {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ApiServices")
             .field("harness_selector", &self.harness_selector)
-            .field("active_tasks", &self.active_tasks)
-            .field("conductor", &self.conductor.is_some())
             .field("control", &self.control.is_some())
             .field("local_launch", &self.local_launch.is_some())
             .field("workflows", &self.workflows)
@@ -309,13 +289,11 @@ impl fmt::Debug for ApiServices {
 /// Starts the API server with everything the daemon shares with it, in
 /// trusted mode on a random loopback port.
 pub async fn start_with_services(
-    engine: Arc<Engine>,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     services: ApiServices,
 ) -> Result<ApiHandle, ApiStartError> {
     serve(
-        engine,
         catalog_dir,
         work_dir,
         services,
@@ -371,7 +349,6 @@ impl ServerSecurity {
 
 /// Starts the API server in the given security mode.
 pub async fn serve(
-    engine: Arc<Engine>,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     services: ApiServices,
@@ -403,8 +380,7 @@ pub async fn serve(
     let listener = TcpListener::bind(bind).await.map_err(ApiStartError)?;
     let addr = listener.local_addr().map_err(ApiStartError)?;
 
-    let store = engine.store().clone();
-    let mut app = routes::router(engine, store, auth, catalog_dir, work_dir, services);
+    let mut app = routes::router(auth, catalog_dir, work_dir, services);
     if let Some(cors) = gate::cors_layer(&cors) {
         app = app.layer(cors);
     }

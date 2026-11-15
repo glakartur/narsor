@@ -575,7 +575,6 @@ pub fn conductor_view(
 // The new-task form, the history and the repositories (U13)
 // ---------------------------------------------------------------------------
 
-use narsor::api::LegacyExecutionView;
 use narsor_engine::controller_protocol::WorkflowWorkspaceView;
 use narsor_engine::domain::ParamType;
 use narsor_engine::orchestration::ArchiveTombstone;
@@ -659,7 +658,6 @@ pub fn capabilities(paths: bool, reason: Option<&str>) -> CapabilitiesView {
         connection_name: if paths { "local" } else { "staging" }.to_string(),
         workflow_paths: paths,
         workflow_paths_reason: reason.map(str::to_string),
-        legacy_executions: paths,
         local_repository_paths: paths,
     }
 }
@@ -695,31 +693,6 @@ pub fn archived(id: &str, title: &str, hours: i64) -> TaskSummary {
         resources_never_created: false,
     });
     offered(task)
-}
-
-/// An execution from before the task scheduler, started `hours` hours after
-/// the fixed moment of the fixtures.
-pub fn legacy(
-    id: &str,
-    workflow: &str,
-    status: &str,
-    hours: i64,
-    recoverable: bool,
-    reason: Option<&str>,
-) -> LegacyExecutionView {
-    serde_json::from_value(serde_json::json!({
-        "id": id,
-        "workflow_id": workflow,
-        "workflow_version": 1,
-        "status": status,
-        "current_state": "review",
-        "started_at": at() + chrono::Duration::hours(hours),
-        "completed_at": null,
-        "problem": null,
-        "recoverable": recoverable,
-        "not_recoverable_reason": reason,
-    }))
-    .expect("a legacy execution")
 }
 
 // ---------------------------------------------------------------------------

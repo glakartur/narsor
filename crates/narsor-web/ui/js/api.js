@@ -220,17 +220,6 @@ export class Api {
   removeRepository(id) { return this.request('DELETE', `/control/v1/repositories/${path(id)}`); }
   branches(id) { return this.get(`/control/v1/repositories/${path(id)}/branches`); }
 
-  // History
-  executions() { return this.get('/control/v1/executions'); }
-  executionEventsLegacy(id, after) { return this.get(`/control/v1/executions/${path(id)}/events`, { after }); }
-  executionTimeline(id) { return this.get(`/control/v1/executions/${path(id)}/timeline`); }
-  executionConversation(id, attemptId, from, byteBudget) {
-    return this.get(`/control/v1/executions/${path(id)}/attempts/${path(attemptId)}/conversation`, { from, byte_budget: byteBudget });
-  }
-  executionConductor(id) { return this.get(`/control/v1/executions/${path(id)}/conductor`); }
-  executionConductorChat(id, after) { return this.get(`/control/v1/executions/${path(id)}/conductor/chat`, { after }); }
-  recover(id, body) { return this.post(`/control/v1/executions/${path(id)}/recover`, body); }
-
   /**
    * The event stream from `cursor`: an async generator of envelopes
    * `{cursor, event}`. It ends when the server ends the stream; it throws

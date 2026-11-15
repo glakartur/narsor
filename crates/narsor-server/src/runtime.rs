@@ -1,43 +1,13 @@
 //! The daemon process lifecycle (U2).
 //!
-//! # Why recovery moved here
-//!
-//! `persistence::recovery::recover` (D23) used to run at the top of
-//! `tui::mod::run`, because the TUI was, until this unit, the process that
-//! opened the store for write. Now that role belongs to the daemon (R1, R8):
-//! whichever process holds the store when it starts is the one responsible
-//! for reconciling whatever a previous, differently-killed holder left
-//! behind, and after this unit that is always the daemon, never the TUI.
-//!
 //! # Control-plane recovery
 //!
 //! The remote-task control plane (`narsor_engine::orchestration`) keeps its own
-//! records beside the executions; [`recover_orchestration_at_startup`]
-//! repairs them right after local recovery and before the API — whose
-//! control-plane routes this daemon serves — accepts anything.
-//!
-//! # The startup hook
-//!
-//! Right after recovery, and before the API accepts anything,
-//! [`continue_at_startup`] carries on what recovery found safely stopped
-//! (D55's restart matrix): a reprompt a restart cut short between the
-//! rejection and its start gets a new pass, so does a label rescue (F1) the
-//! restart cut short, the conductor serves its unanswered chat messages
-//! again, and diagnoses again a failed step (F3) it had not concluded about.
-//! It is the daemon's only replay, and it only ever continues what cannot
-//! repeat a side effect.
-//!
-//! # Shutdown during the conductor's label rescue
-//!
-//! The rescue (F1) runs inline in a pass, and a pause is honoured only at
-//! the next step boundary — so a `SIGTERM` during the conductor's
-//! invocation does not stop it early: the drain below waits for it like
-//! for any running action, up to its timeout, and the process then exits
-//! anyway, taking the invocation with it. That is deliberate. The rescue is
-//! recorded before the conductor is invoked and the invocation is counted
-//! before it runs, so the next start repeats it (R24's one repeat) instead
-//! of losing it; interrupting it earlier would only spend that repeat
-//! sooner.
+//! records; [`recover_orchestration_at_startup`] repairs them before the
+//! API — whose control-plane routes this daemon serves — accepts anything.
+//! The daemon drives no execution itself: every task runs in a
+//! `narsor-runner` under a controller, so there is no execution of its own
+//! to reconcile or drain.
 //!
 //! # The observer worker
 //!
@@ -47,28 +17,15 @@
 //! ([`crate::observer_worker`]). A configuration that cannot start it
 //! (no script user and no waiver, network mode without
 //! `observer_worker_server`) stops the daemon at start.
-//!
-//! # Why shutdown is a poll, not a wait
-//!
-//! `Engine::pause` (D34) only ever takes effect at the next step boundary —
-//! it does not interrupt an action already running. So there is no single
-//! future to `.await` for "every active run has stopped"; the shutdown path
-//! asks each one to pause and then polls [`Engine::active_run_ids`] on a
-//! short interval until it is empty or a bounded timeout elapses. Exceeding
-//! the timeout is not treated as failure to shut down: the process exits
-//! anyway, and whatever was interrupted mid-action is exactly what
-//! `persistence::recovery::recover` is for, at the next start (AE6).
 
-use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Utc;
 use tokio::signal::unix::{signal, SignalKind};
 
-use crate::api::{ActiveTasks, ApiHandle, ApiServices, ServerSecurity};
+use crate::api::{ApiHandle, ApiServices, ServerSecurity};
 use crate::auth_gate::NetworkAuth;
 use crate::local_controller::{controller_program, LocalController, LocalControllerSettings};
 use crate::observer_worker::{
@@ -77,42 +34,24 @@ use crate::observer_worker::{
 use narsor_engine::auth::{
     OidcVerifier, OwnerStore, SecurityPlan, SecuritySettings, StartupOwnership,
 };
-use narsor_engine::conductor::assembly::{assemble, restore_at_startup};
-use narsor_engine::conductor::{ConductorProfile, ConductorRegistry, HarnessInvoker, PassLauncher};
 use narsor_engine::config::Resolved;
 use narsor_engine::controller_protocol::{AutoResumePass, ProtocolService};
-use narsor_engine::domain::{ExecutionStatus, WorkflowDefinition, WorkflowExecution};
-use narsor_engine::engine::{owed_output_rescue, owed_reprompt, Engine, HarnessRegistry};
+use narsor_engine::engine::HarnessRegistry;
 use narsor_engine::environment::{
     BackendKind, BackendRecord, CatalogLaunchResolver, EnvironmentCatalog, HarnessDefaults,
     OwnerDefaults,
 };
 use narsor_engine::observers::ObserverStore;
 use narsor_engine::orchestration::ControlPlane;
-use narsor_engine::persistence::{
-    DaemonInfo, DefaultHarnessSelector, ExecutionStore, ReconciliationOutcome, RecoveryReport,
-};
+use narsor_engine::persistence::{DaemonInfo, DefaultHarnessSelector};
 use narsor_engine::workflows::WorkflowResolver;
 
 use narsor_shared::cli_error::{CliError, Result};
-
-/// How long the daemon waits, after asking every active run to pause, for
-/// [`Engine::active_run_ids`] to empty before giving up and exiting anyway.
-///
-/// The plan leaves the exact figure to be settled empirically at
-/// implementation time (U2's Open Questions) rather than fixed by the
-/// architecture; a handful of seconds is a reasonable starting point for a
-/// single local operator's workflows, comfortably longer than one step
-/// boundary and short enough that `daemon stop` still feels responsive.
-const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many times a starting daemon tries the instance lock, and the pause
 /// between tries: about 20 s, longer than a predecessor's shutdown drain.
 const INSTANCE_LOCK_ATTEMPTS: u32 = 40;
 const INSTANCE_LOCK_PAUSE: Duration = Duration::from_millis(500);
-
-/// How often the drain loop re-checks [`Engine::active_run_ids`].
-const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long the daemon waits for [`crate::api::ApiHandle::wait_drained`]
 /// (`axum::serve`'s `with_graceful_shutdown`, its connections-close half) to
@@ -135,10 +74,9 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// before the drain, not after) is. Bounding this the same way
 /// [`drain_active_runs`] bounds its own wait keeps `SIGTERM`/`daemon stop`
 /// reliably responsive regardless of what any given client does; the
-/// process exiting closes every remaining connection anyway; the *engine's*
-/// own runs are already safely drained by [`drain_active_runs`] before this
-/// ever runs, so nothing about workflow correctness depends on this
-/// finishing cleanly, only on it not hanging forever.
+/// process exiting closes every remaining connection anyway, and nothing
+/// about workflow correctness depends on this finishing cleanly, only on it
+/// not hanging forever.
 const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `narsor daemon` — the foreground entry point: recovery, bind, discovery
@@ -165,9 +103,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     // hold up must stop the daemon, not leave it half started (U7).
     let security = server_security(config, &paths)?;
     let runs_local_controller = security.runs_local_controller();
-    let store = ExecutionStore::new(config.state_dir());
 
-    let recovery = recover_at_startup(&store);
     let control_plane = recover_orchestration_at_startup(ControlPlane::new(paths.clone()));
 
     if runs_local_controller {
@@ -224,65 +160,12 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
             .with_max_concurrent_tasks(config.max_concurrent_tasks()),
     );
     let _scheduler = spawn_periodic_admission(Arc::clone(&control));
-    let agent_timeout_secs = defaults.timeout_secs;
-    let engine = Arc::new(
-        Engine::new(store.clone())
-            .with_agent_timeout(defaults.timeout_secs)
-            .with_agent_args(defaults.args.clone())
-            .with_default_harness_source(selector.clone()),
-    );
 
-    // One registry of background passes for the API and the startup hook,
-    // so a pass the hook spawns can be interrupted like any other.
-    let active_tasks = ActiveTasks::new();
-    // The conductor runs on the same live default harness as a harnessless
-    // agent step, read-only (KTD5), bounded by the agent timeout.
-    let invoker = HarnessInvoker::new(
-        store.clone(),
-        config.catalog_dir().to_path_buf(),
-        config.work_dir().to_path_buf(),
-    )
-    .with_default_harness_source(selector.clone())
-    .with_extra_args(defaults.args.clone())
-    .with_profile(ConductorProfile {
-        model: defaults.conductor_model.clone(),
-        effort: defaults.conductor_effort.clone(),
-    })
-    .with_reading_sink(engine.reading_sink())
-    .with_agent_timeout(agent_timeout_secs);
-    // Held here for the daemon's whole life: the engine only holds it
-    // weakly, and hands a step without a usable output label to it (F1).
-    // A pass the conductor starts — its one retry of a failed step (F3) —
-    // is driven like one the API starts, and interrupted the same way.
-    let conductor = assemble(
-        &engine,
-        Arc::new(invoker),
-        Some(Arc::new(DaemonPasses {
-            store: store.clone(),
-            catalog_dir: config.catalog_dir().to_path_buf(),
-            active_tasks: active_tasks.clone(),
-        })),
-    );
-    if let Some(recovery) = &recovery {
-        continue_at_startup(
-            &engine,
-            &conductor,
-            &active_tasks,
-            config.catalog_dir(),
-            recovery,
-        );
-    }
-
-    // The engine and API share one selector, so a confirmed setting affects
-    // later harnessless attempts without restarting the daemon.
     let api_handle = crate::api::serve(
-        Arc::clone(&engine),
         config.catalog_dir().to_path_buf(),
         config.work_dir().to_path_buf(),
         ApiServices {
             harness_selector: Some(selector),
-            active_tasks,
-            conductor: Some(Arc::clone(&conductor)),
             control: Some(Arc::clone(&control)),
             local_launch: Some(launch),
             ..ApiServices::default()
@@ -370,24 +253,9 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         local_controller.stop().await;
     }
 
-    // Stop accepting new connections *before* draining active runs, not
-    // after: `Engine::active_run_ids()` is a snapshot the instant
-    // `drain_active_runs` takes it, and a fresh `POST /tasks`/`/resume`/
-    // `/input` landing anywhere in the drain window would start a new
-    // background run this snapshot never asked to pause — silently
-    // defeating the whole point of draining. An in-flight request that
-    // arrived a moment before this call still completes normally
-    // (`stop_accepting` only refuses *new* connections); everything after
-    // this point is refused at the TCP level before it ever reaches a
-    // handler.
+    // An in-flight request still completes normally (`stop_accepting` only
+    // refuses *new* connections).
     api_handle.stop_accepting();
-
-    if !drain_active_runs(&engine, SHUTDOWN_DRAIN_TIMEOUT).await {
-        tracing::warn!(
-            "daemon: active runs did not drain within the shutdown timeout; exiting anyway \
-             (D23-recovery will reconcile them at the next start)"
-        );
-    }
 
     if tokio::time::timeout(HTTP_SHUTDOWN_TIMEOUT, api_handle.wait_drained())
         .await
@@ -615,36 +483,12 @@ fn server_security(
     })
 }
 
-/// Reconciles every stored execution against its event log (D23) — moved
-/// here, verbatim in behaviour, from `tui::mod::run`. Best-effort: a failure
-/// here must not stop the daemon from starting, and leaves no report for
-/// the startup hook to act on.
-fn recover_at_startup(store: &ExecutionStore) -> Option<RecoveryReport> {
-    match narsor_engine::persistence::recovery::recover(store) {
-        Ok(report) => {
-            for reconciliation in report.needing_attention() {
-                tracing::warn!(
-                    execution_id = %reconciliation.execution_id,
-                    "daemon: startup recovery found an execution left running with an \
-                     interrupted action; it was marked Unknown and needs attention"
-                );
-            }
-            Some(report)
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "daemon: startup recovery sweep failed");
-            None
-        }
-    }
-}
-
 /// Repairs the control plane's own records (U2) — orphaned temporary files
 /// and events a crash kept out of a task's log — before the API serves
-/// them, so a stream replay never skips one. Unlike local recovery it judges
-/// no task: a remote task's runner state changes only through its controller's
+/// them, so a stream replay never skips one. It judges no task: a task's runner state changes only through its controller's
 /// reconciliation, never because this process restarted. The observer
-/// store's orphaned temporary files are removed here too. Best-effort like
-/// [`recover_at_startup`]: a failure is logged and the daemon still starts.
+/// store's orphaned temporary files are removed here too. Best-effort: a
+/// failure is logged and the daemon still starts.
 pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
     match control.recover() {
         Ok(recovery) => {
@@ -687,150 +531,6 @@ pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
         }
     }
     control
-}
-
-/// The daemon's startup hook (D55): carries on, after `recover`, what the
-/// restart matrix says may be carried on. Best-effort per execution, like
-/// recovery itself.
-///
-/// * `Running`, consistent, with a rejected output still owed its reprompt
-///   (KTD7): the attempt is closed, so a new pass — spawned exactly as
-///   `POST /executions/:id/resume` spawns one — asks the agent again instead
-///   of replaying anything.
-/// * `Running` with a label rescue still owed (F1): a new pass carries it on
-///   — it invokes the conductor, or applies a decision the conductor saved
-///   before the restart without invoking it. When the conductor's invocation
-///   was under way (its marker is left, `ConductorInterrupted`), invoking
-///   it again is R24's one repeat, counted before it runs.
-/// * The conductor's own rows: unanswered chat messages and interrupted
-///   advisory invocations are served again, and what a rescue left for an
-///   execution that no longer owes one is discarded
-///   ([`restore_at_startup`]).
-/// * `Failed` with a step failure (F3) the conductor had not concluded
-///   about: it is diagnosed again — R24's one repeat when the restart cut
-///   the invocation short (also [`restore_at_startup`]).
-pub fn continue_at_startup(
-    engine: &Arc<Engine>,
-    conductor: &Arc<ConductorRegistry>,
-    active_tasks: &ActiveTasks,
-    catalog_dir: &Path,
-    recovery: &RecoveryReport,
-) {
-    for reconciliation in &recovery.reconciled {
-        if reconciliation.status != ExecutionStatus::Running {
-            continue;
-        }
-        match &reconciliation.outcome {
-            ReconciliationOutcome::Consistent => {
-                continue_owed_step(
-                    engine,
-                    active_tasks,
-                    catalog_dir,
-                    &reconciliation.execution_id,
-                );
-            }
-            ReconciliationOutcome::ConductorInterrupted { trigger, .. } => {
-                tracing::info!(
-                    execution_id = %reconciliation.execution_id,
-                    trigger = trigger.name(),
-                    "daemon: the conductor was interrupted while it worked on this \
-                     execution; invoking it again"
-                );
-                continue_owed_step(
-                    engine,
-                    active_tasks,
-                    catalog_dir,
-                    &reconciliation.execution_id,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    restore_at_startup(conductor);
-}
-
-/// The daemon's [`PassLauncher`]: a pass the conductor starts resolves its
-/// definition as the API does and runs in the registry of background
-/// passes, so `POST /executions/:id/interrupt` stops it like any other.
-struct DaemonPasses {
-    store: ExecutionStore,
-    catalog_dir: PathBuf,
-    active_tasks: ActiveTasks,
-}
-
-impl PassLauncher for DaemonPasses {
-    fn definition(
-        &self,
-        execution: &WorkflowExecution,
-    ) -> std::result::Result<WorkflowDefinition, String> {
-        narsor_engine::tasks::resolve_definition(&self.catalog_dir, self.store.paths(), execution)
-            .map_err(|error| error.to_string())?
-            .load()
-            .map_err(|error| error.to_string())
-    }
-
-    fn launch(&self, execution_id: &str, pass: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        self.active_tasks.spawn(execution_id.to_string(), pass);
-    }
-}
-
-/// Spawns a pass for `execution_id` when it stopped between a rejected
-/// output and its reprompt, or during the conductor's rescue of its output
-/// label, and logs what happened.
-fn continue_owed_step(
-    engine: &Arc<Engine>,
-    active_tasks: &ActiveTasks,
-    catalog_dir: &Path,
-    execution_id: &str,
-) {
-    match spawn_owed_step(engine, active_tasks, catalog_dir, execution_id) {
-        Ok(true) => tracing::info!(
-            execution_id,
-            "daemon: continuing a step the restart interrupted"
-        ),
-        Ok(false) => {}
-        Err(error) => tracing::warn!(
-            execution_id,
-            error = %error,
-            "daemon: could not continue a step the restart interrupted"
-        ),
-    }
-}
-
-/// Whether `execution_id` owes a reprompt or a label rescue — and if it
-/// does, claims it and spawns its pass.
-fn spawn_owed_step(
-    engine: &Arc<Engine>,
-    active_tasks: &ActiveTasks,
-    catalog_dir: &Path,
-    execution_id: &str,
-) -> std::result::Result<bool, String> {
-    let execution = engine
-        .store()
-        .load_execution(execution_id)
-        .map_err(|error| error.to_string())?;
-    let owes_reprompt = owed_reprompt(&execution)
-        .map_err(|error| error.to_string())?
-        .is_some();
-    let owes_rescue = owed_output_rescue(&execution)
-        .map_err(|error| error.to_string())?
-        .is_some();
-    if !owes_reprompt && !owes_rescue {
-        return Ok(false);
-    }
-    let definition =
-        narsor_engine::tasks::resolve_definition(catalog_dir, engine.store().paths(), &execution)
-            .map_err(|error| error.to_string())?
-            .load()
-            .map_err(|error| error.to_string())?;
-    let handle = engine
-        .try_begin_resume(execution_id)
-        .map_err(|error| error.to_string())?;
-    active_tasks.spawn(execution_id.to_string(), async move {
-        let _ = handle.run_to_completion(&definition).await;
-    });
-    Ok(true)
 }
 
 /// How often the daemon checks that its discovery file is still there.
@@ -918,34 +618,6 @@ fn cleanup_discovery_file(path: &Path) {
                 "daemon: could not remove the discovery file on shutdown"
             );
         }
-    }
-}
-
-/// Asks every execution a pass is currently driving to pause (D34), then
-/// waits — bounded by `timeout` — for [`Engine::active_run_ids`] to empty.
-///
-/// Returns `true` when everything drained in time, `false` when the timeout
-/// elapsed first. A free function taking `&Engine` rather than a method on
-/// `Engine` itself: the polling/timeout policy is a daemon lifecycle
-/// concern (U2), not something every engine consumer needs — and keeping it
-/// here lets `tests/daemon_lifecycle.rs` exercise exactly this logic
-/// in-process, against a real `Engine` driving a real long-running action,
-/// without needing a real `SIGTERM`/subprocess round trip for every
-/// assertion about it.
-pub async fn drain_active_runs(engine: &Engine, timeout: Duration) -> bool {
-    for execution_id in engine.active_run_ids() {
-        engine.pause(&execution_id);
-    }
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        if engine.active_run_ids().is_empty() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
     }
 }
 

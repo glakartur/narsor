@@ -680,8 +680,8 @@ impl TaskApp {
     /// runs is not started again. Call it after a key, an event, a refresh and
     /// an answer: what an answer makes due starts then.
     pub fn start_detail_reads(&mut self) {
+        // The history reads nothing: an archived task's storage is gone.
         if matches!(self.view, super::View::History(_)) {
-            self.start_history_reads();
             return;
         }
         let Some(task) = self.list.selected() else {
@@ -752,7 +752,7 @@ impl TaskApp {
     /// the loading marker for while it has nothing yet.
     pub fn detail_loading(&self) -> bool {
         match &self.view {
-            super::View::History(_) => self.history_entry_loading(),
+            super::View::History(_) => false,
             _ => self
                 .list
                 .selected_id()

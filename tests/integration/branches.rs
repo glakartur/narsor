@@ -10,9 +10,8 @@ use std::time::Duration;
 
 use narsor_api_client::api::ClientError;
 use narsor_engine::controller_protocol::ProtocolService;
-use narsor_engine::engine::Engine;
 use narsor_engine::orchestration::ControlPlane;
-use narsor_engine::persistence::{ExecutionStore, StatePaths};
+use narsor_engine::persistence::StatePaths;
 use narsor_engine::registry::{
     ls_remote_command, BranchListError, BranchLister, GitBranchLister, RepositoryEntry,
     RepositoryRegistry,
@@ -255,7 +254,6 @@ impl BranchLister for Double {
 async fn serve(root: &TempRoot, lister: Arc<Double>) -> ApiHandle {
     let catalog = root.path().join("catalog");
     fs::create_dir_all(&catalog).unwrap();
-    let engine = Engine::new(ExecutionStore::new(root.path().join("store")));
     // The owner routes of the control plane exist only with a control plane.
     let state = root.path().join("state");
     fs::create_dir_all(&state).unwrap();
@@ -271,7 +269,6 @@ async fn serve(root: &TempRoot, lister: Arc<Double>) -> ApiHandle {
         ))
         .unwrap();
     start_with_services(
-        Arc::new(engine),
         catalog,
         root.path().join("work"),
         ApiServices {

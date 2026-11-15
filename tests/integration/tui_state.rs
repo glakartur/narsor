@@ -787,13 +787,12 @@ mod foundations {
             ] {
                 let stack = Stack::layered(layer, Context::HistoryDetails);
                 let keys = stack_keys(stack);
-                for task_only in ["p", "x", "t", "s", "a", ".", "m", "c"] {
+                for task_only in ["p", "x", "t", "s", "a", ".", "m", "c", "w"] {
                     assert!(
                         !keys.iter().any(|key| key == task_only),
                         "{task_only} in {stack:?}: {keys:?}"
                     );
                 }
-                assert!(keys.iter().any(|key| key == "w"), "{stack:?}");
             }
             let axis = Stack::layered(Context::HistoryAxis, Context::HistoryDetails);
             assert!(!stack_keys(axis).iter().any(|key| key == "f"));
@@ -10059,8 +10058,7 @@ mod task_app_create {
     use serde_json::json;
 
     use narsor::api::{ApiClient, ClientError};
-    use narsor::tui::keymap::{self, Action, Context};
-    use narsor::tui::task_app::history::HistoryEntry;
+    use narsor::tui::keymap::{self, Context};
     use narsor::tui::task_app::list::PendingState;
     use narsor::tui::task_app::new_task::{
         absolute_path, CreateHow, PathVerdict, DRAFT_KEY, PATH_FIELD, PATH_LABEL, RETRY_AFTER,
@@ -10073,10 +10071,8 @@ mod task_app_create {
     };
     use narsor_engine::domain::ParamType;
 
-    use narsor_protocol::api::LegacyExecutionListResponse;
-
     use super::task_app_support::{
-        archived, capabilities, catalogue, catalogue_workflow, legacy, listing, queued, registry,
+        archived, capabilities, catalogue, catalogue_workflow, listing, queued, registry,
         repository, titled, with_workspaces, workflow_input, workspace,
     };
     use narsor_protocol::controller::WorkspaceRequest;
@@ -11220,25 +11216,10 @@ mod task_app_create {
         fn opened() -> TaskApp {
             let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
             assert_eq!(ch(&mut app, 'H'), Request::OpenHistory);
-            app.open_history(
-                listing(
-                    vec![archived("old", "NAR-9", 5), archived("older", "NAR-8", 1)],
-                    "c",
-                ),
-                Ok(LegacyExecutionListResponse {
-                    executions: vec![
-                        legacy("exec-failed", "fix-bug", "failed", 3, true, None),
-                        legacy(
-                            "exec-done",
-                            "fix-bug",
-                            "completed",
-                            2,
-                            false,
-                            Some("zakończone — nie ma czego wznawiać"),
-                        ),
-                    ],
-                }),
-            );
+            app.open_history(listing(
+                vec![archived("old", "NAR-9", 5), archived("older", "NAR-8", 1)],
+                "c",
+            ));
             assert_eq!(app.view_kind(), ViewKind::History);
             app
         }
@@ -11253,12 +11234,9 @@ mod task_app_create {
         }
 
         #[test]
-        fn it_lists_archived_tasks_and_old_executions_newest_first() {
+        fn it_lists_archived_tasks_newest_first() {
             let app = opened();
-            assert_eq!(
-                titles(&app),
-                ["NAR-9", "fix-bug exec-failed", "fix-bug exec-done", "NAR-8"]
-            );
+            assert_eq!(titles(&app), ["NAR-9", "NAR-8"]);
             assert_eq!(app.history().unwrap().selected(), 0);
         }
 
@@ -11303,47 +11281,11 @@ mod task_app_create {
         }
 
         #[test]
-        fn recover_is_offered_only_for_an_execution_that_can_be_recovered() {
+        fn the_history_is_read_only_the_task_keys_do_nothing() {
             let mut app = opened();
-            // The archived task: nothing to recover, and why.
-            assert_eq!(ch(&mut app, 'w'), Request::None);
-            assert!(
-                note(&app).contains("storage usunięty przy archiwizacji"),
-                "{}",
-                note(&app)
-            );
-
-            // The failed execution can be.
-            ch(&mut app, 'j');
-            assert_eq!(
-                ch(&mut app, 'w'),
-                Request::Recover("exec-failed".to_string())
-            );
-
-            // The completed one cannot; the server's reason is on the bar.
-            ch(&mut app, 'j');
-            assert_eq!(ch(&mut app, 'w'), Request::None);
-            assert!(
-                note(&app).contains("zakończone — nie ma czego wznawiać"),
-                "{}",
-                note(&app)
-            );
-        }
-
-        #[test]
-        fn recover_is_blocked_without_a_connection() {
-            let mut app = opened();
-            ch(&mut app, 'j');
-            // The connection broke after the history was read.
-            app.on_stream(Some(Err(ClientError::Unavailable("gone".to_string()))));
-            assert_eq!(ch(&mut app, 'w'), Request::None);
-            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
-        }
-
-        #[test]
-        fn the_only_action_of_the_history_is_recover_the_task_keys_do_nothing() {
-            let mut app = opened();
-            for key in ['p', 'x', 't', 's', 'a', 'm', 'o', 'n', 'z', '.', 'R', 'H'] {
+            for key in [
+                'p', 'x', 't', 's', 'a', 'm', 'o', 'n', 'z', '.', 'R', 'H', 'w',
+            ] {
                 assert_eq!(ch(&mut app, key), Request::None, "{key}");
             }
             assert_eq!(app.view_kind(), ViewKind::History);
@@ -11352,40 +11294,10 @@ mod task_app_create {
         }
 
         #[test]
-        fn an_old_execution_has_a_header_and_tabs_of_its_own() {
-            let mut app = opened();
-            ch(&mut app, 'j');
-            let screen = screen(&mut app, 130, 30);
-            assert!(screen.contains("fix-bug exec-failed"), "{screen}");
-            assert!(screen.contains("failed"), "{screen}");
-            assert!(screen.contains("Przebieg"), "{screen}");
-        }
-
-        #[test]
-        fn what_the_server_could_not_list_is_said_and_the_archived_tasks_are_still_there() {
-            let mut app = app_with(vec![]);
-            ch(&mut app, 'H');
-            app.open_history(
-                listing(vec![archived("old", "NAR-9", 5)], "c"),
-                Err(ClientError::Unavailable("timeout".to_string())),
-            );
-            assert_eq!(titles(&app), ["NAR-9"]);
-            assert!(app.history().unwrap().note().is_some());
-            assert!(
-                note(&app).contains("dawne executions niedostępne"),
-                "{}",
-                note(&app)
-            );
-        }
-
-        #[test]
         fn an_empty_history_is_an_empty_list_not_an_error() {
             let mut app = app_with(vec![]);
             ch(&mut app, 'H');
-            app.open_history(
-                listing(vec![], "c"),
-                Ok(LegacyExecutionListResponse { executions: vec![] }),
-            );
+            app.open_history(listing(vec![], "c"));
             assert!(titles(&app).is_empty());
             let screen = screen(&mut app, 120, 30);
             assert!(screen.contains("historia jest pusta"), "{screen}");
@@ -11443,16 +11355,16 @@ mod task_app_create {
             let app = opened();
             assert_eq!(app.key_context().base, Context::History);
             let keys = keymap::hints(Context::History);
-            assert!(keys.iter().any(|(_, label)| *label == "wznów"));
+            assert!(keys.iter().all(|(_, label)| *label != "wznów"));
             assert_eq!(
                 keymap::lookup(
                     Context::History,
                     &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)
                 ),
-                Some(Action::Recover)
+                None
             );
             let entry = app.history().unwrap().selected_entry().unwrap();
-            assert!(matches!(entry, HistoryEntry::Archived(_)));
+            assert_eq!(entry.task_id.as_str(), "old");
         }
     }
 
@@ -11580,10 +11492,7 @@ mod task_app_create {
 
             let mut app = app_with(vec![]);
             ch(&mut app, 'H');
-            app.open_history(
-                listing(vec![archived("old", "NAR-9", 5)], "c"),
-                Ok(LegacyExecutionListResponse { executions: vec![] }),
-            );
+            app.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
             app.on_paste("q\nq\n");
             assert_eq!(app.view_kind(), ViewKind::History);
             assert!(!app.should_quit());

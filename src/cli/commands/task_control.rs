@@ -1,12 +1,8 @@
-//! `input`, `resume` and `recover`: answering an execution and driving it on.
-
-use std::path::Path;
+//! `input`: answering an execution that waits for a person.
 
 use serde_json::{Map, Value};
 
-use crate::api::{
-    ClientError, ExecutionStatusDto, ExecutionSummary, HumanInputDeliveryDto, ProblemKindDto,
-};
+use crate::api::{ClientError, ExecutionStatusDto, ExecutionSummary, HumanInputDeliveryDto};
 use crate::config::{Flags, Resolved};
 
 use super::daemon_access::{
@@ -80,17 +76,11 @@ pub(in crate::cli) fn permission_decision(
 /// `narsor input <id> [--field k=v]… [--label l] [--data k=v]… [--variable k=v]…
 /// [--comment text]` — answer a question, or resolve a problem.
 ///
-/// Goes through `ApiClient` (R4/D52), exactly like [`resume`]: `POST
-/// /executions/:id/input`, then [`wait_until_stopped`]. Used to construct its
-/// own `Engine`/`ExecutionStore` and call `Engine::deliver_human_input`
-/// directly in this process — a leftover from before the daemon migration
-/// that raced the daemon's own writes to the same store files exactly the
-/// way every other command here was rewritten specifically to avoid (R1).
+/// Goes through `ApiClient` (R4/D52): `POST /executions/:id/input`, which
+/// hands the answer to the execution's task, then [`wait_until_stopped`].
 ///
-/// `--file` has no REST equivalent, for the identical reason [`resume`]'s own
-/// doc comment gives: the daemon always resolves the workflow from the
-/// execution's own recorded metadata, with no way for a REST call to point
-/// it at a local override path.
+/// `--file` has no REST equivalent: the task carries its sealed workflow,
+/// and a REST call cannot point the server at a local override path.
 ///
 /// The answer is bound to the request this command read (KTD9): if another
 /// client answered or closed it in between, the daemon refuses this one
@@ -244,121 +234,6 @@ fn step_pairs<'a>(flag: &str, pairs: &'a [String]) -> Result<Vec<(String, &'a st
         .collect()
 }
 
-/// `narsor resume <id>` — continue a paused execution.
-///
-/// Goes through `ApiClient` (R4/D52): `POST /executions/:id/resume`, then
-/// [`wait_until_stopped`], exactly like [`run`]'s own tail end. A `409` from
-/// the daemon — another driver (the TUI, another `resume`/`run`) already
-/// holds this execution (R11/AE4) — is reported as a readable sentence via
-/// [`client_error`], never a raw HTTP status.
-///
-/// `--file` has no REST equivalent: the daemon always resolves the workflow
-/// from the execution's own recorded metadata
-/// (`tasks::resolve_definition`), the same way `resume` without `--file`
-/// already did — there is no way for a REST caller to point the daemon at a
-/// local override path it has no filesystem relationship to (see
-/// `src/api/routes.rs`'s `load_definition_for`). Passing `--file` is
-/// refused with a usage error rather than silently ignored, so an operator
-/// relying on it to work around a moved definition is told plainly, not left
-/// wondering why it had no effect.
-///
-/// [`run`]: super::run
-pub async fn resume(
-    config: &Resolved,
-    flags: &Flags,
-    execution_id: &str,
-    definition_file: Option<&str>,
-) -> Result<()> {
-    if let Some(file) = definition_file {
-        return Err(CliError::usage(format!(
-            "'--file {file}' is not supported for 'resume': the daemon always resolves the \
-             workflow from the execution's own record, with no way for a REST call to point it \
-             at a local override path."
-        )));
-    }
-
-    let client = daemon_client(config.state_dir(), flags).await?;
-
-    client
-        .resume(execution_id)
-        .await
-        .map_err(|error| client_error(execution_id, error))?;
-
-    let summary = wait_until_stopped(&client, execution_id, ExecutionStatusDto::Running).await?;
-
-    println!("Resumed execution {}.", summary.id);
-    print_summary(&summary);
-    print_open_matters(&summary);
-    if summary.status == ExecutionStatusDto::Failed {
-        return Err(CliError::failure(format!(
-            "Execution {} failed.",
-            summary.id
-        )));
-    }
-    Ok(())
-}
-
-/// `narsor recover <id> [--comment TEXT]` — starts the failed step of an
-/// execution afresh (`POST /executions/:id/recover`), the CLI counterpart of
-/// the TUI's failure form.
-///
-/// Bound to the failure the execution is failed on, like `input` is bound
-/// to the input it answers: the key is taken from the summary's problem, so
-/// a recovery that comes after somebody else acted on the failure (another
-/// window, the conductor's own retry) is refused with a `409` — said here as
-/// a sentence — instead of starting the step a second time. An execution
-/// failed without such a problem (its failure still being diagnosed, or
-/// left `unknown` by a restart) is recovered without a key.
-pub async fn recover(
-    state: &Path,
-    flags: &Flags,
-    execution_id: &str,
-    comment: Option<String>,
-) -> Result<()> {
-    let client = daemon_client(state, flags).await?;
-    let current = load_execution_summary(&client, execution_id).await?;
-    if !matches!(
-        current.status,
-        ExecutionStatusDto::Failed | ExecutionStatusDto::Unknown
-    ) {
-        return Err(CliError::failure(format!(
-            "Execution '{execution_id}' has no failed step to recover (status: {}).",
-            current.status.as_str()
-        )));
-    }
-    let failure = current
-        .problem
-        .as_ref()
-        .filter(|problem| problem.kind == ProblemKindDto::Failure)
-        .and_then(|problem| problem.episode.clone());
-
-    let accepted = match &failure {
-        Some(episode) => client.recover_failure(execution_id, episode, comment).await,
-        None => client.recover(execution_id, comment).await,
-    };
-    accepted.map_err(|error| match error {
-        ClientError::Conflict => CliError::failure(format!(
-            "Execution '{execution_id}' is no longer failed on the failure this recovery was \
-             for: it was recovered or changed meanwhile, or another process is driving it right \
-             now. Check it with 'narsor show {execution_id}'."
-        )),
-        other => client_error(execution_id, other),
-    })?;
-
-    let summary = wait_until_stopped(&client, execution_id, ExecutionStatusDto::Running).await?;
-
-    println!("Recovered execution {}.", summary.id);
-    print_summary(&summary);
-    print_open_matters(&summary);
-    if summary.status == ExecutionStatusDto::Failed {
-        return Err(CliError::failure(format!(
-            "Execution {} failed.",
-            summary.id
-        )));
-    }
-    Ok(())
-}
-
 /// The REST counterpart of the old, in-process
 /// `print_execution_summary(&WorkflowExecution)`: same two lines, from
 /// an [`ExecutionSummary`] the daemon answered with instead of a
@@ -367,9 +242,8 @@ fn print_summary(summary: &ExecutionSummary) {
     print_status_line(&summary.status, summary.current_state.as_deref());
 }
 
-/// The two lines both of the above print, factored out so `run`/`resume`
-/// print byte-for-byte what they always did regardless of which of the two
-/// shapes above they are holding.
+/// The two lines both of the above print, factored out so `run`/`input`
+/// print the same regardless of which of the two shapes above they hold.
 fn print_status_line(status: &ExecutionStatusDto, current_state: Option<&str>) {
     println!("Status: {}", status.as_str());
     println!("Current state: {}", current_state.unwrap_or("-"));

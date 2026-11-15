@@ -68,31 +68,6 @@ pub struct ExecutionListResponse {
     pub executions: Vec<ExecutionSummary>,
 }
 
-/// Legacy execution from before the task scheduler.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LegacyExecutionView {
-    pub id: String,
-    pub workflow_id: String,
-    pub workflow_version: u32,
-    pub status: ExecutionStatusDto,
-    #[serde(default)]
-    pub current_state: Option<String>,
-    pub started_at: DateTime<Utc>,
-    #[serde(default)]
-    pub completed_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub problem: Option<ActiveProblem>,
-    pub recoverable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub not_recoverable_reason: Option<String>,
-}
-
-/// Legacy execution history response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LegacyExecutionListResponse {
-    pub executions: Vec<LegacyExecutionView>,
-}
-
 /// The conductor's chat history after a sequence number.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConductorChatResponse {

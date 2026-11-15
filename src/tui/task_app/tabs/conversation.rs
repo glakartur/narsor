@@ -102,22 +102,6 @@ pub async fn read_attempt(
     .await
 }
 
-/// The same for an execution from before the task scheduler (the Historia):
-/// its conversation is read from the daemon's own storage.
-pub async fn read_history_attempt(
-    client: &ApiClient,
-    execution_id: &str,
-    attempt_id: &str,
-    from: u64,
-) -> Result<AttemptRead, ClientError> {
-    read_pages(from, |cursor| async move {
-        client
-            .control_history_conversation(execution_id, attempt_id, cursor)
-            .await
-    })
-    .await
-}
-
 /// Folds the pages `fetch` returns, from entry `from`, into one read.
 async fn read_pages<F, Fut>(from: u64, mut fetch: F) -> Result<AttemptRead, ClientError>
 where

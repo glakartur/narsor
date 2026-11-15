@@ -28,8 +28,7 @@ use tokio::task::{AbortHandle, JoinSet};
 use super::TaskApp;
 use crate::api::{ApiClient, ClientError, HarnessSelectionSnapshot};
 use crate::controller_protocol::{
-    CapabilitiesView, LegacyExecutionListResponse, RepositoryListResponse, TaskListResponse,
-    WorkflowListResponse,
+    CapabilitiesView, RepositoryListResponse, TaskListResponse, WorkflowListResponse,
 };
 use crate::tui::spinner::Spinner;
 
@@ -84,7 +83,6 @@ impl OpeningKind {
 pub(super) enum OpeningRead {
     History {
         archived: Result<TaskListResponse, ClientError>,
-        legacy: Result<LegacyExecutionListResponse, ClientError>,
     },
     Repositories {
         capabilities: Option<Result<CapabilitiesView, ClientError>>,
@@ -114,13 +112,9 @@ pub(super) async fn read_for_opening(
         }
     };
     match kind {
-        OpeningKind::History => {
-            let (archived, legacy) = tokio::join!(
-                client.control_tasks_archived(true),
-                client.control_history()
-            );
-            OpeningRead::History { archived, legacy }
-        }
+        OpeningKind::History => OpeningRead::History {
+            archived: client.control_tasks_archived(true).await,
+        },
         OpeningKind::Repositories => {
             let (capabilities, listing) = tokio::join!(capabilities, client.control_repositories());
             OpeningRead::Repositories {
@@ -151,10 +145,6 @@ pub(super) enum JobKey {
     Refresh,
     /// One read of the details of a task.
     Detail(String, DetailJob),
-    /// The first round of reads of an entry of the history.
-    HistoryFirst(String),
-    /// The tab round of reads of an entry of the history.
-    HistoryTab(String),
     /// The read that opens a view.
     Open(OpeningKind),
     /// The read that brings an open view up to date after a write.
@@ -171,13 +161,6 @@ impl JobKey {
     fn task(&self) -> Option<&str> {
         match self {
             Self::Detail(task_id, _) => Some(task_id),
-            _ => None,
-        }
-    }
-
-    fn history_entry(&self) -> Option<&str> {
-        match self {
-            Self::HistoryFirst(key) | Self::HistoryTab(key) => Some(key),
             _ => None,
         }
     }
@@ -199,13 +182,6 @@ impl Background {
     /// Whether any job of `task_id`'s details runs.
     pub(super) fn task_running(&self, task_id: &str) -> bool {
         self.running.keys().any(|key| key.task() == Some(task_id))
-    }
-
-    /// Whether any job of the history's entry `key` runs.
-    pub(super) fn history_running(&self, key: &str) -> bool {
-        self.running
-            .keys()
-            .any(|running| running.history_entry() == Some(key))
     }
 
     /// Starts `read` under `key`. Returns false, and starts nothing, when the
@@ -327,12 +303,6 @@ impl TaskApp {
     pub(super) fn abort_detail_jobs(&mut self, task_id: &str) {
         self.background
             .abort_where(|key| key.task() == Some(task_id));
-    }
-
-    /// Aborts the reads of the history's entries but `keep`.
-    pub(super) fn abort_history_jobs_but(&mut self, keep: Option<&str>) {
-        self.background
-            .abort_where(|key| key.history_entry().is_some_and(|entry| Some(entry) != keep));
     }
 
     /// Aborts the read that opens a view.

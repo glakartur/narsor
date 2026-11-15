@@ -58,10 +58,10 @@ repeated once — also across a daemon restart — and then the operator gets a
 problem with the raw error; a failure of the conductor never triggers the
 conductor again.
 
-**The chat** (`c` in the task view, or `narsor-cli conductor chat|history`) lets
+**The chat** (`c` in the task view, or `narsor-cli task conductor chat|history`) lets
 you ask about the task. Whatever it proposes — answering the pending input,
 telling the agent something, restarting the failed step, taking a transition,
-cancelling — happens only once you confirm it (`narsor-cli conductor confirm`,
+cancelling — happens only once you confirm it (`narsor-cli task conductor confirm`,
 `reject`, `undo`). A proposal about a moment the execution has moved on from
 is refused (`409`). Only the conductor's latest choice of an output can be
 undone, and never on a cancelled execution.

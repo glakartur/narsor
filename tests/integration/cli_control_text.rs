@@ -1,11 +1,11 @@
-//! The text `narsor task history|workflows|validate|capabilities|repo` print
+//! The text `narsor task workflows|validate|capabilities|repo` print
 //! (`narsor::cli::control_text`), the text of `narsor-cli usage` and the
 //! typing of `task create --file` inputs.
 
 use chrono::{DateTime, TimeZone, Utc};
 use narsor::cli::control_text::{
-    capabilities_lines, history_detail_lines, history_row, repository_row, typed_inputs,
-    usage_lines, validation_lines, workflow_lines, NO_USAGE,
+    capabilities_lines, repository_row, typed_inputs, usage_lines, validation_lines,
+    workflow_lines, NO_USAGE,
 };
 use narsor_engine::controller_protocol::{
     ValidateWorkflowResponse, WorkflowInputView, WorkflowSource,
@@ -17,7 +17,7 @@ use narsor_protocol::controller::{
 use serde_json::json;
 
 use crate::task_app_support;
-use task_app_support::{capabilities, catalogue_workflow, legacy, repository, workflow_input};
+use task_app_support::{capabilities, catalogue_workflow, repository, workflow_input};
 
 fn input(name: &str, kind: ParamType, required: bool) -> WorkflowInputView {
     workflow_input(name, kind, required, None)
@@ -140,43 +140,9 @@ fn capabilities_say_what_is_refused_and_why() {
     )));
     assert_eq!(text[0], "Connection:             staging");
     assert_eq!(text[1], "Workflow paths:         no (not a local daemon)");
-    assert_eq!(text[2], "Old executions:         no");
     let local = texts(capabilities_lines(&capabilities(true, None)));
     assert_eq!(local[1], "Workflow paths:         yes");
-    assert_eq!(local[3], "Local repository paths: yes");
-}
-
-#[test]
-fn an_old_execution_says_whether_it_can_be_recovered() {
-    let failed = legacy("exec-1", "implement-feature", "failed", 0, true, None);
-    let text = texts(history_detail_lines(&failed));
-    assert!(
-        text.iter().any(|line| line == "Execution  exec-1"),
-        "{text:?}"
-    );
-    assert!(text
-        .iter()
-        .any(|line| line.contains("possible (narsor task history recover")));
-    let done = legacy(
-        "exec-2",
-        "implement-feature",
-        "completed",
-        1,
-        false,
-        Some("a completed execution cannot be recovered"),
-    );
-    let text = texts(history_detail_lines(&done));
-    assert!(
-        text.iter()
-            .any(|line| line.contains("not possible: a completed execution")),
-        "{text:?}"
-    );
-    let row = history_row(&done);
-    assert!(
-        row.starts_with("exec-2")
-            && row.contains("completed")
-            && row.ends_with("implement-feature v1")
-    );
+    assert_eq!(local[2], "Local repository paths: yes");
 }
 
 #[test]
@@ -201,12 +167,6 @@ fn what_a_server_sends_never_reaches_a_terminal_as_control_sequences() {
         assert!(clean(&line.text), "{:?}", line.text);
     }
     assert!(clean(&repository_row(&repository(hostile, hostile))));
-    assert!(clean(&history_row(&legacy(
-        hostile, hostile, "failed", 0, false, None
-    ))));
-    for line in history_detail_lines(&legacy(hostile, hostile, "failed", 0, false, Some(hostile))) {
-        assert!(clean(&line.text), "{:?}", line.text);
-    }
 }
 
 // ---------------------------------------------------------------------------

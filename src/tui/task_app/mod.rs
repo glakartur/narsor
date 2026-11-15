@@ -384,8 +384,6 @@ pub enum Request {
     SendTask(String),
     /// Check this absolute path of a workflow file with the server.
     ValidatePath(String),
-    /// Recover this old execution of the history.
-    Recover(String),
     /// Register a repository.
     AddRepository(Box<CreateRepositoryRequest>),
     /// Remove the repository with this id.
@@ -1157,7 +1155,6 @@ impl TaskApp {
             Request::OpenRepositories => self.start_opening(OpeningKind::Repositories),
             Request::SendTask(id) => self.send_task(&id).await,
             Request::ValidatePath(path) => self.validate_path(&path).await,
-            Request::Recover(id) => self.recover_execution(&id).await,
             Request::AddRepository(request) => self.add_repository(&request).await,
             Request::RemoveRepository(id) => self.remove_repository(&id).await,
             Request::Move(request) => self.move_task(request).await,
@@ -1227,7 +1224,7 @@ impl TaskApp {
         // that place and not the waiting one.
         self.leave_view();
         match read {
-            OpeningRead::History { archived, legacy } => self.on_history_read(archived, legacy),
+            OpeningRead::History { archived } => self.on_history_read(archived),
             OpeningRead::Repositories {
                 capabilities,
                 listing,

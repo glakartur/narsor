@@ -3,7 +3,6 @@
 
 import { html, useEffect, useRef, useState } from '../lib.js';
 import { shortIdentifier, stateIcon, titleOf } from '../model.js';
-import { clock } from '../text.js';
 import { Field } from './fields.js';
 import { Info } from './tabs/info.js';
 
@@ -35,22 +34,7 @@ function useLoad(load, deps = []) {
 export function History({ store, onClose, onOpen }) {
   const api = store.api;
   const [archived] = useLoad(() => api.tasks(true));
-  const [legacy, reloadLegacy] = useLoad(() => api.capabilities().then((caps) => (caps.legacy_executions ? api.executions() : { executions: [] })));
-  const [recovering, setRecovering] = useState(null);
-  const [comment, setComment] = useState('');
-
-  const recover = async (execution) => {
-    try {
-      const result = await store.mutate(
-        (client) => client.recover(execution.execution_id ?? execution.id, { comment: comment.trim() || null }),
-        { success: 'odzyskiwanie zlecone', failure: 'nie odzyskano' },
-      );
-      if (result !== undefined) { setRecovering(null); setComment(''); reloadLegacy(); }
-    } catch { /* shown */ }
-  };
-
   const tasks = archived.data?.tasks ?? [];
-  const executions = legacy.data?.executions ?? [];
   return html`<${Dialog} title="Historia" onClose=${onClose} wide>
     <section>
       <h3>Zadania zarchiwizowane</h3>
@@ -65,23 +49,6 @@ export function History({ store, onClose, onOpen }) {
           </button></li>`)}
       </ul>
     </section>
-    ${executions.length > 0 && html`<section>
-      <h3>Wykonania sprzed harmonogramu zadań</h3>
-      <ul class="history-list">
-        ${executions.map((execution) => {
-          const id = execution.execution_id ?? execution.id;
-          return html`<li key=${id} class="card">
-            <div><strong>${execution.workflow_id ?? id}</strong> <span class="muted small-text">${id} · ${execution.status ?? ''}${execution.started_at ? ` · ${clock(execution.started_at)}` : ''}</span></div>
-            ${execution.problem && html`<span class="role-problem small-text">${execution.problem.kind}: ${execution.problem.reason}</span>`}
-            ${!execution.recoverable && execution.not_recoverable_reason && html`<span class="muted small-text">${execution.not_recoverable_reason}</span>`}
-            ${execution.recoverable && (recovering === id
-              ? html`<div class="row"><input type="text" placeholder="komentarz (opcjonalnie)" value=${comment} onInput=${(event) => setComment(event.currentTarget.value)} />
-                  <button class="primary" onClick=${() => recover(execution)}>Odzyskaj</button><button onClick=${() => setRecovering(null)}>Anuluj</button></div>`
-              : html`<div><button class="small" onClick=${() => setRecovering(id)}>Odzyskaj…</button></div>`)}
-          </li>`;
-        })}
-      </ul>
-    </section>`}
   </${Dialog}>`;
 }
 

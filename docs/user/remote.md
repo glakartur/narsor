@@ -27,7 +27,6 @@ narsor-cli task transition <task> <state> [--override --reason <why>]   # manual
 narsor-cli task restart-step <task> [--note <text>] [--failure-key K]   # run the failed or interrupted step again
 narsor-cli task conversation <task> [<attempt>]   # read through the control plane
 narsor-cli task watch                             # follow every task's events
-narsor-cli task history list|show|events|steps|conversation|conductor|recover <execution>   # executions from before the scheduler (local daemon)
 narsor-cli task repo list|add|remove              # the control plane's repository registry
 narsor-cli task workflows | validate <path> | capabilities   # the catalogue, a file's violations, what the server offers
 narsor [--server URL]                         # the TUI over the same control plane

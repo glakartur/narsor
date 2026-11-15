@@ -318,8 +318,6 @@ pub enum Action {
     ChooseLimit,
     /// Send a task again that did not get through (the new-task form).
     RetrySend,
-    /// Recover an old execution of the history.
-    Recover,
     /// Add a repository.
     AddRepository,
     /// Remove the selected repository.
@@ -1185,13 +1183,6 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::History,
-        Key::char('w'),
-        Action::Recover,
-        "wznów",
-        "wznów stare execution, które na to pozwala (recover)",
-    ),
-    bind(
-        Context::History,
         Key::char('['),
         Action::PrevTab,
         "",
@@ -1238,13 +1229,6 @@ pub static BINDINGS: &[Binding] = &[
         Action::NextTab,
         "",
         "następna zakładka",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::char('w'),
-        Action::Recover,
-        "wznów",
-        "wznów stare execution, które na to pozwala (recover)",
     ),
     bind(
         Context::HistoryDetails,

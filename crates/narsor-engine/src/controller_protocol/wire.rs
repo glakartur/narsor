@@ -21,7 +21,6 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-pub use narsor_protocol::api::{LegacyExecutionListResponse, LegacyExecutionView};
 pub use narsor_protocol::controller::ConductorReadResponse;
 pub use narsor_protocol::controller::{
     AckRequest, AckResponse, AcquireLeaseRequest, ArchiveTombstone, CapabilitiesView, CommandAck,

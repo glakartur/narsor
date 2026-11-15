@@ -85,7 +85,7 @@ graph TD
   tui -- "launches when not running (re-exec + setsid)" --> server
   web -- "launches when not running" --> server
 
-  server[["narsor-server (daemon, Engine in process)"]]
+  server[["narsor-server (daemon, control plane)"]]
   server -- "starts, enrolls, supervises" --> local[narsor-controller local]
   server -- "starts, supervises (when enabled)" --> obs[narsor-observer-worker]
 
@@ -99,7 +99,6 @@ graph TD
 
   runner -- "workflow actions" --> agent["agent harness (claude), action scripts, git"]
   pod -- "workflow actions" --> agent
-  server -- "/executions path, in process" --> agent
 
   obs -. "/observer/v1/worker: claim, result" .-> server
   obs -- "runs" --> script[observer script]
@@ -120,7 +119,6 @@ graph TD
 | `narsor-controller kubernetes` | Kubernetes | One Pod (command `narsor-runner`) and one PVC per task | Kubernetes API (`controller/src/kubernetes/manifest.rs`) |
 | `narsor-runner` | `narsor-server` | Poll, renew, snapshots, usage, materials | HTTP, `/runner/v1` |
 | `narsor-runner` | agent harness, scripts, git | Execute workflow actions | process (`engine/src/engine/actions/`) |
-| `narsor-server` | agent harness, scripts, git | The `/executions` path runs the Engine in the daemon process | process |
 | `narsor-observer-worker` | `narsor-server` | Claim due runs, report results | HTTP, `/observer/v1/worker` |
 | Observer script | `narsor-cli` → `narsor-server` | Create tasks, deliver events to waiting tasks | process, then HTTP `/observer/v1/runs` |
 
@@ -132,6 +130,6 @@ Properties of the runtime:
 - The `local` backend works like the `kubernetes` backend: its controller is
   a separate process that enrolls through the same `/controller/v1`
   protocol.
-- Two routes execute workflows: the daemon's `/executions` path runs the
-  Engine in process, and the backend route runs it in `narsor-runner`
-  under a controller.
+- Only `narsor-runner` executes workflows. The daemon drives no execution:
+  its `/executions` routes read what runners keep and hand answers to the
+  task of the execution.
