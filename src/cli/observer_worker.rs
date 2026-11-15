@@ -806,25 +806,51 @@ impl RunDir {
             path,
             user: options.script_user,
         };
-        let script_path = run_dir.path.join(SCRIPT_FILE);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o400)
-            .open(&script_path)?;
-        io::Write::write_all(&mut file, script.as_bytes())?;
-        drop(file);
-        if let Some(user) = run_dir.user {
-            for path in [&script_path, &run_dir.path] {
-                std::os::unix::fs::chown(path, Some(user.uid), Some(user.gid))?;
-            }
-        }
+        write_script(&run_dir.path, script, run_dir.user)?;
         Ok(run_dir)
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Writes the script into the run directory `dir` and gives the file and
+/// the directory to `user`, through file descriptors only. The directory is
+/// in a temp directory that other processes of the worker's uid share: one
+/// of them can put a symlink in place of `dir` or of the script between two
+/// calls, and a `chown` by path follows it — with `CAP_CHOWN` that gives
+/// any host file to the script user. `O_NOFOLLOW` refuses a symlink, and
+/// `O_EXCL` a script file that is already there.
+fn write_script(dir: &Path, script: &str, user: Option<ScriptUser>) -> io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let dir = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    let name = CString::new(SCRIPT_FILE).expect("the script file name has no NUL byte");
+    // SAFETY: `dir` is an open directory and `name` a NUL-terminated string;
+    // both live past the call.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o400 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new descriptor that nothing else owns.
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    io::Write::write_all(&mut file, script.as_bytes())?;
+    if let Some(user) = user {
+        std::os::unix::fs::fchown(&file, Some(user.uid), Some(user.gid))?;
+        std::os::unix::fs::fchown(&dir, Some(user.uid), Some(user.gid))?;
+    }
+    Ok(())
 }
 
 impl Drop for RunDir {
@@ -1287,5 +1313,106 @@ mod tests {
             command.pre_exec(drop_all_capabilities);
         }
         assert!(command.status().unwrap().success());
+    }
+
+    /// A scratch directory, removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "narsor-write-script-test-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The test's own uid with a group that is not its primary group when
+    /// it has one: a change of group is then visible without `CAP_CHOWN`
+    /// (a process may give its files to any of its groups).
+    fn script_user() -> ScriptUser {
+        // SAFETY: plain getters.
+        let (uid, primary) = unsafe { (libc::getuid(), libc::getgid()) };
+        let mut groups = vec![0 as libc::gid_t; 256];
+        // SAFETY: the buffer holds `groups.len()` entries.
+        let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        let other = groups[..count.max(0) as usize]
+            .iter()
+            .copied()
+            .find(|gid| *gid != primary);
+        ScriptUser {
+            uid,
+            gid: other.unwrap_or(primary),
+        }
+    }
+
+    fn group_of(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::symlink_metadata(path).unwrap().gid()
+    }
+
+    #[test]
+    fn the_script_and_the_run_dir_go_to_the_script_user() {
+        use std::os::unix::fs::MetadataExt as _;
+        let scratch = Scratch::new();
+        let user = script_user();
+        write_script(&scratch.0, "echo hi\n", Some(user)).unwrap();
+        let script = scratch.0.join(SCRIPT_FILE);
+        assert_eq!(fs::read_to_string(&script).unwrap(), "echo hi\n");
+        let meta = fs::metadata(&script).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o400);
+        assert_eq!((meta.uid(), meta.gid()), (user.uid, user.gid));
+        let dir = fs::metadata(&scratch.0).unwrap();
+        assert_eq!((dir.uid(), dir.gid()), (user.uid, user.gid));
+    }
+
+    /// Another process of the worker's uid puts a symlink to a host file in
+    /// place of the script: the worker refuses, and the file keeps its
+    /// content and its owner.
+    #[test]
+    fn a_symlink_in_place_of_the_script_does_not_give_its_target_away() {
+        let scratch = Scratch::new();
+        let target = scratch.0.join("host-file");
+        fs::write(&target, "host").unwrap();
+        let run_dir = scratch.0.join("run");
+        fs::create_dir(&run_dir).unwrap();
+        std::os::unix::fs::symlink(&target, run_dir.join(SCRIPT_FILE)).unwrap();
+        let group = group_of(&target);
+
+        let user = script_user();
+        assert!(write_script(&run_dir, "echo hi\n", Some(user)).is_err());
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "host");
+        assert_eq!(group_of(&target), group);
+    }
+
+    /// The same with a symlink in place of the run directory.
+    #[test]
+    fn a_symlink_in_place_of_the_run_dir_does_not_give_its_target_away() {
+        let scratch = Scratch::new();
+        let target = scratch.0.join("host-dir");
+        fs::create_dir(&target).unwrap();
+        let run_dir = scratch.0.join("run");
+        std::os::unix::fs::symlink(&target, &run_dir).unwrap();
+        let group = group_of(&target);
+
+        let user = script_user();
+        let error = write_script(&run_dir, "echo hi\n", Some(user)).unwrap_err();
+
+        // ENOTDIR or ELOOP, as the kernel chooses for O_DIRECTORY | O_NOFOLLOW.
+        assert!(
+            matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)),
+            "{error}"
+        );
+        assert!(!target.join(SCRIPT_FILE).exists());
+        assert_eq!(group_of(&target), group);
     }
 }
