@@ -27,12 +27,18 @@ use narsor_protocol::chat::PromptAuthor;
 /// refused rather than carried out on whatever came after it.
 ///
 /// * waiting for input: the key of the pending input;
+/// * waiting for an external event: the key of the wait;
 /// * failed on a step the conductor took up: the failure's key;
 /// * otherwise: the last attempt, or — before any — the state.
 pub fn execution_episode(store: &ExecutionStore, execution: &WorkflowExecution) -> Option<String> {
     if execution.status == ExecutionStatus::InputNeeded {
         if let Ok(Some(pending)) = store.load_pending_input::<PendingHumanInput>(&execution.id) {
             return Some(pending.episode_key().to_string());
+        }
+    }
+    if execution.status == ExecutionStatus::WaitingForEvent {
+        if let Ok(Some(pending)) = store.load_pending_event::<PendingExternalEvent>(&execution.id) {
+            return Some(pending.episode);
         }
     }
     if let Ok(Some(failure)) = step_failure(execution) {
@@ -364,6 +370,7 @@ impl Engine {
         human::close_pending(&self.store, execution_id, InputCloseReason::Cancel, by)?;
         self.publish_from(execution_id, from)?;
 
+        self.store.clear_pending_event(execution_id)?;
         abandon_step_records(&mut execution);
         self.lock_pause_requests().remove(execution_id);
         execution.status = ExecutionStatus::Cancelled;
@@ -584,8 +591,10 @@ impl Engine {
         };
         self.emit(execution_id, closing)?;
 
-        // A question asked in the state just left can no longer be answered.
+        // A question asked in the state just left can no longer be answered,
+        // nor can the wait of a `wait` step left be ended.
         self.store.clear_pending_input(execution_id)?;
+        self.store.clear_pending_event(execution_id)?;
         self.store.save_execution(&execution)?;
         self.abandon_conductor_rescue(execution_id);
         Ok(execution)

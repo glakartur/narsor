@@ -46,9 +46,9 @@ Choose one role:
 
 | Role | Installed programs | Intended use |
 | --- | --- | --- |
-| `local` | `narsor`, `narsor-cli`, `narsor-web`, `narsor-server`, `narsor-controller`, `narsor-runner` | Run the TUI, CLI and browser interface with the local server and controller. |
+| `local` | `narsor`, `narsor-cli`, `narsor-web`, `narsor-server`, `narsor-controller`, `narsor-runner`, `narsor-observer-worker` | Run the TUI, CLI and browser interface with the local server and controller. |
 | `frontend` | `narsor`, `narsor-cli`, `narsor-web` | Connect a TUI/CLI or the browser interface ([`narsor-web`](../user/web.md)) to a separately operated server. |
-| `server` | `narsor-server`, `narsor-controller`, `narsor-runner` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI, CLI and `narsor-web` too. |
+| `server` | `narsor-server`, `narsor-controller`, `narsor-runner`, `narsor-observer-worker` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI, CLI and `narsor-web` too. |
 
 The installer script downloads and verifies the archive, copies the binaries,
 and, only after consent, adds the binary directory to `~/.bashrc`. It then
@@ -126,7 +126,7 @@ not writable, the interactive installer asks for another target. A
 non-interactive invocation must use a writable `--config-file`.
 
 If Narsor processes (`narsor`, `narsor-server`, `narsor-controller`,
-`narsor-runner`) of your user are already running, the installer lists them
+`narsor-runner`, `narsor-observer-worker`) of your user are already running, the installer lists them
 before it replaces the binaries and asks whether to stop them. Stopping them
 interrupts running tasks. A stopped process gets `SIGTERM` and 10 seconds to
 exit, then `SIGKILL`. If you answer no, they keep running the previous version
@@ -236,3 +236,142 @@ enrollment code through `NARSOR_ENROLLMENT_CODE` or a protected file, never as
 a command-line argument. See [Remote execution backends](remote-backends.md)
 for proxy requirements, token handling, controller credentials, and the full
 workstation security boundary.
+
+## Run the observer worker
+
+Observers poll external sources (Jira, GitHub, GitLab) with a shell script
+on a schedule. The control plane keeps the schedule; a worker process,
+`narsor-observer-worker`, claims the runs that are due, runs their
+scripts and reports the results. The server starts the worker and
+supervises it. How to write an observer and its script is in
+[Observers](../user/observers.md).
+
+**Enable the worker.** The worker is off by default. Set these settings in
+the server's configuration file (or as `NARSOR_<NAME>` environment
+variables):
+
+| setting | value |
+| --- | --- |
+| `observer_worker` | `on` starts the worker; `off` (default) does not |
+| `observer_script_user` | the system user that runs the scripts; not the server's user, not `root` |
+| `observer_secrets_dir` | the absolute path of the secrets directory; empty: no secrets |
+| `observer_worker_server` | the URL the worker and its scripts use for the API; empty: the server's own address (trusted mode only) |
+| `observer_insecure_same_user` | `true` runs the scripts as the server's own user; for a trial on a developer machine only |
+
+```yaml
+observer_worker: on
+observer_script_user: narsor-observer-script
+observer_secrets_dir: /etc/narsor/observer-secrets
+# Network mode only: the URL of the TLS proxy.
+observer_worker_server: https://narsor.example.com
+```
+
+The server refuses to start when `observer_worker` is `on` and neither
+`observer_script_user` nor `observer_insecure_same_user: true` is set, or
+both are set. In network mode the server refuses to start without
+`observer_worker_server`: every request must come through the TLS proxy, the
+worker's requests too.
+
+The server finds `narsor-observer-worker` in its own directory, as it finds
+`narsor-controller`. Scripts call `narsor-cli` for their effects (task
+create, event delivery), from the same directory: on a `server` install add
+`--with-frontend`, or copy `narsor-cli` next to `narsor-server`. The worker runs as the server's user. When it stops,
+the server starts it again after a pause that doubles up to 30 seconds. When
+the server stops, it stops the worker first. A run that the worker did not
+report is recorded as lost at the run's deadline (script limit plus one
+minute) and does not count as a failed run of the script.
+
+**The worker key.** The worker does not use the owner's token. At every
+start of the worker, the server makes a new random key, keeps only its
+SHA-256 digest in memory, and gives the key to the worker in the
+`NARSOR_OBSERVER_WORKER_KEY` environment variable (not as an argument, so
+`ps` does not show it). The key can only claim due runs of all owners and
+report their results. No file holds the key. A restart of the worker or of
+the server makes the old key invalid. There is no command to make or revoke
+a worker key.
+
+**Provide the secrets.** An observer names the secrets it needs (a name and
+an environment variable); their values never reach the control plane. One
+worker serves the observers of all owners, so the secrets directory has one
+subdirectory for each owner, and one file for each secret name in it. A
+script gets only the secrets of its observer's owner: an owner cannot use the
+secret of another owner by its name. The directory must be accessible to the
+server's user only (`0700`). In this example the server runs as the user
+`narsor`, and the owner is `local` (trusted mode):
+
+```bash
+install -d -m 0700 -o narsor /etc/narsor/observer-secrets
+install -d -m 0700 -o narsor /etc/narsor/observer-secrets/local
+install -m 0600 -o narsor /dev/stdin \
+  /etc/narsor/observer-secrets/local/jira-token <<<"$JIRA_TOKEN"
+```
+
+The name of the owner's subdirectory is the owner as the server records it,
+with `%` written as `%25` and `/` written as `%2F`:
+
+| mode | owner | subdirectory |
+| --- | --- | --- |
+| trusted | `local` | `local` |
+| network | `oidc:{issuer}#{subject}` | for example `oidc:https:%2F%2Flogin.example.com#1234` for the issuer `https://login.example.com` and the subject `1234` |
+
+When an owner name cannot be a directory name (it is empty, `.` or `..`,
+or it has a control character), the run fails before its script starts.
+When a secret file is missing, the run fails before its script starts, and
+its error names the owner's subdirectory.
+
+**Isolate the scripts.** Create a second system user for the scripts, which
+runs nothing else:
+
+```bash
+useradd --system --no-create-home --shell /usr/sbin/nologin narsor-observer-script
+```
+
+The script user cannot read the secrets directory or the worker's
+environment. To switch to the script user, give it its run directory and
+stop its processes, the worker needs the capabilities `CAP_SETUID`,
+`CAP_SETGID`, `CAP_CHOWN` and `CAP_KILL`. Because the server starts the
+worker, give these capabilities to the server's service (for systemd:
+`AmbientCapabilities=` and `CapabilityBoundingSet=`). At start the server
+removes them from its own ambient and effective sets and keeps them only in
+its permitted and inheritable sets. Only the worker gets them again, as
+ambient capabilities, and only with a script user. Other processes that
+the server starts (the local controller, its runners and the agents) get
+no capability. The worker clears them and sets `no_new_privs` in each
+script process before the script starts, so a script has none of them.
+Limits of the server's service (`MemoryMax`, `TasksMax`) apply to the
+server, the worker and all scripts together.
+
+With `observer_insecure_same_user: true` scripts run as the server's own
+user. A script can then read the worker key, every owner's secrets and the
+server's state. The worker writes a warning at start. Do not use it in
+production.
+
+**What a script gets.** The worker asks for a due run every 10 seconds. For
+each run it makes a temporary directory (mode `0700`, owned by the script
+user, removed afterwards) and runs `sh` there with an empty environment plus
+exactly these variables:
+
+| variable | value |
+| --- | --- |
+| `PATH` | the directory of `narsor-observer-worker` (and of `narsor-cli`), then `/usr/local/bin:/usr/bin:/bin` |
+| `HOME` | the run directory |
+| `NARSOR_SERVER` | the control plane's URL |
+| `NARSOR_TOKEN` | the run's token: valid on this run's effect routes only, until its result or deadline |
+| `NARSOR_OBSERVER_RUN` | the run's id |
+| one per secret | the value of the observer's secret |
+
+Nothing of the worker's own environment is passed on, the worker key
+included. The script reads the
+run's input as JSON on stdin and prints its result on stdout. It runs in a
+process group of its own: at its time limit (5 minutes) the group gets
+`SIGTERM`, then `SIGKILL` 5 seconds later; when the script exits, anything it
+left running is killed. A process can leave the group (`setsid`), so after
+each run the worker also kills every process of the script user, and it
+claims no run while a process of that user still runs. Thus a process left
+behind cannot read the secrets and the token of the next run. Use a
+dedicated script user that runs nothing else. stdout may hold at most 1 MiB (more is a format
+error that leaves the observer's state unchanged); the first 64 KiB of stderr
+are kept. Before the result leaves the worker, control characters are
+removed and every occurrence of a secret value or of the run's token is
+replaced by `[masked]`, error messages included. Masking is a second line of
+defence: scripts should not print secrets in the first place.

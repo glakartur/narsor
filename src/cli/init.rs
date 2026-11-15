@@ -462,6 +462,31 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "Address the server listens on.",
     ),
     (
+        SettingKey::ObserverWorker,
+        "off",
+        "on: the server starts the observer worker (needs observer_script_user; see the installation guide).",
+    ),
+    (
+        SettingKey::ObserverWorkerServer,
+        "\"\"",
+        "API URL for the observer worker and its scripts; empty is the server's own address (not in network mode).",
+    ),
+    (
+        SettingKey::ObserverSecretsDir,
+        "\"\"",
+        "Observer secrets: one subdirectory per owner, one file per secret name; empty: no secrets.",
+    ),
+    (
+        SettingKey::ObserverScriptUser,
+        "\"\"",
+        "System user observer scripts run as; must not be the server's.",
+    ),
+    (
+        SettingKey::ObserverInsecureSameUser,
+        "false",
+        "true runs observer scripts as the server's own user, without isolation: for a trial only.",
+    ),
+    (
         SettingKey::WebBind,
         "127.0.0.1:8484",
         "Address narsor-web (the browser interface) listens on; loopback only.",

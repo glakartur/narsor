@@ -81,12 +81,12 @@ pub mod wire;
 
 pub use client::{ClientOptions, ControllerClient, RunnerClient};
 pub use credentials::{
-    ControllerAuthenticator, ControllerIdentity, CredentialStore, RunnerAuthenticator,
-    RunnerIdentity, RunnerRole,
+    ControllerAuthenticator, ControllerIdentity, CredentialStore, ObserverWorkerKey,
+    RunnerAuthenticator, RunnerIdentity, RunnerRole,
 };
 pub use error::{ProtocolError, ProtocolResult};
 pub use service::{
-    task_actions, task_panel, AutoResumePass, ProtocolConfig, ProtocolService, SlotReleasePass,
-    LOCAL_OWNER,
+    task_actions, task_panel, AutoResumePass, ClaimedObserverRun, ObserverPass, ProtocolConfig,
+    ProtocolService, RunOutcome, RunReport, SlotReleasePass, LOCAL_OWNER,
 };
 pub use wire::*;

@@ -886,9 +886,30 @@ pub struct WaitActionConfig {
     #[serde(default)]
     pub filter: Option<serde_json::Value>,
 
-    /// Timeout in seconds
+    /// Timeout in seconds; the validator rejects it, a wait step has no
+    /// timeout
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+
+    /// The watch entry to register while the step waits (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WaitWatchConfig>,
+}
+
+/// A `wait` step's `watch` block: which observer is to watch which object
+/// while the step waits (§3.3.D). `object` and `event_types` are
+/// templates, rendered when the step starts; `observer` is a plain name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitWatchConfig {
+    /// Name of the observer
+    pub observer: String,
+
+    /// The object to watch (the URL of a merge request, say)
+    pub object: String,
+
+    /// Event types the observer reports for the object; they include the
+    /// step's own event type
+    pub event_types: Vec<String>,
 }
 
 /// Reference to a workspace
@@ -1497,6 +1518,12 @@ pub enum ValidationError {
 
     #[error("State '{state}' declares a 'timeout' choice, which only agent and script steps can produce")]
     TimeoutChoiceNotAllowed { state: StateId },
+
+    #[error("State '{state}' sets a 'timeout', but a wait step has no timeout")]
+    WaitTimeoutNotAllowed { state: StateId },
+
+    #[error("State '{state}' has an invalid 'watch': {reason}")]
+    InvalidWaitWatch { state: StateId, reason: String },
 
     #[error("Choice '{label}' in state '{state}' has invalid approval/resume behavior: {reason}")]
     InvalidChoiceBehavior {

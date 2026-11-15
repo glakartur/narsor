@@ -136,6 +136,15 @@ pub fn write_json_atomic_exclusive<T: Serialize>(path: &Path, value: &T) -> Resu
     write_atomic_exclusive(path, &bytes)
 }
 
+/// Removes a file. Returns whether there was one to remove.
+pub fn remove_file_if_exists(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(PersistenceError::io(path, source)),
+    }
+}
+
 /// Reads and deserializes a JSON file, naming the file in every error.
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).map_err(|source| PersistenceError::io(path, source))?;

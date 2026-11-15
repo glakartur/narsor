@@ -1,12 +1,13 @@
 //! HTTP binding of the protocol: routers, credential gates and handlers.
 //!
-//! Three routers, merged into the daemon's API by `narsor_engine::api::routes`:
+//! Four routers, merged into the daemon's API by `narsor_engine::api::routes`:
 //!
 //! | router | gate | prefix |
 //! | --- | --- | --- |
 //! | [`owner_routes`] | the API's own owner gate (it inserts the caller's [`OwnerRef`]) | `/control/v1` |
 //! | [`controller_routes`] | controller credential → [`ControllerIdentity`] | `/controller/v1` |
 //! | [`runner_routes`] | runner credential → [`RunnerIdentity`] | `/runner/v1` |
+//! | [`observer_routes`] | observer run token → `Principal::ObserverRun`; the observer worker key the daemon made → `Principal::ObserverWorker` | `/observer/v1` |
 //!
 //! Each gate answers every refusal with a bare `401` — the same rule as the
 //! API's token gate, so a credential is never confirmed or denied by
@@ -54,15 +55,18 @@ use narsor_engine::materials::{
 };
 use narsor_engine::orchestration::{OwnerRef, TaskEvent};
 
-type Service = Arc<ProtocolService>;
-type ProtocolResult<T> = Result<T, HttpProtocolError>;
+pub use super::observer_http::observer_routes;
 
+type Service = Arc<ProtocolService>;
+pub(super) type ProtocolResult<T> = Result<T, HttpProtocolError>;
+
+/// A protocol refusal as an HTTP response (see its `IntoResponse`).
 #[derive(Debug)]
-struct HttpProtocolError(ProtocolError);
+pub(super) struct HttpProtocolError(pub(super) ProtocolError);
 
 /// Runs a synchronous service call (file I/O under advisory locks) on the
 /// blocking pool, so a loaded machine cannot starve the async workers.
-async fn blocking<T, F>(service: &Service, work: F) -> ProtocolResult<T>
+pub(super) async fn blocking<T, F>(service: &Service, work: F) -> ProtocolResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&ProtocolService) -> Result<T, ProtocolError> + Send + 'static,
@@ -197,6 +201,9 @@ where
             "/control/v1/controllers/{controller_id}/revoke",
             post(post_revoke_controller),
         )
+        .merge(super::observer_http::observer_owner_routes(Arc::clone(
+            &service,
+        )))
         .with_state(service)
 }
 
@@ -246,6 +253,7 @@ where
             post(post_usage).layer(usage_body_limit()),
         )
         .route("/runner/v1/inputs/{input_id}/ack", post(post_input_ack))
+        .route("/runner/v1/events/{input_id}/ack", post(post_event_ack))
         .route(
             "/runner/v1/commands/{command_id}/ack",
             post(post_command_ack),
@@ -902,6 +910,20 @@ async fn post_input_ack(
     Ok(Json(
         blocking(&service, move |s| {
             s.runner_ack_input(&identity, &input_id, request)
+        })
+        .await?,
+    ))
+}
+
+async fn post_event_ack(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(input_id): Path<String>,
+    Json(request): Json<InputAckRequest>,
+) -> ProtocolResult<Json<EventAckResponse>> {
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_ack_event(&identity, &input_id, request)
         })
         .await?,
     ))

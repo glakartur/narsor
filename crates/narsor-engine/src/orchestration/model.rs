@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 
 pub use narsor_protocol::controller::{
     ArchiveTombstone, AttentionItem, AttentionKind, CommandActor, CommandReceipt,
-    ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
-    InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary, OperatorCommand,
-    OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion,
-    ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason, TaskEvent,
-    TaskEventKind, TaskState, WorkloadLoss,
+    ConversationAttemptSummary, ConversationAvailability, EventWait, EventWatch, ExecutionCursor,
+    HarnessUnavailable, InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary,
+    OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
+    ResumeExhaustion, ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason,
+    TaskEvent, TaskEventKind, TaskProvenance, TaskState, WorkloadLoss,
 };
 
 /// Current schema version of [`TaskRecord`].
@@ -50,8 +50,10 @@ pub enum SlotReleaseClass {
     /// once. Not [`ExecutionStatus::is_terminal`], which also counts
     /// `Failed`.
     Final,
-    /// The execution waits for its owner (`InputNeeded`, `Failed`): the slot
-    /// is freed after a wait.
+    /// The execution waits for its owner (`InputNeeded`, `Failed`) or for an
+    /// external event (`WaitingForEvent`, a `wait` step): the slot is freed
+    /// after a wait. A matching event resumes the task like an owner's
+    /// answer does.
     Transient,
 }
 
@@ -61,7 +63,9 @@ impl SlotReleaseClass {
     pub fn of(status: ExecutionStatus) -> Option<Self> {
         match status {
             ExecutionStatus::Completed | ExecutionStatus::Cancelled => Some(Self::Final),
-            ExecutionStatus::InputNeeded | ExecutionStatus::Failed => Some(Self::Transient),
+            ExecutionStatus::InputNeeded
+            | ExecutionStatus::Failed
+            | ExecutionStatus::WaitingForEvent => Some(Self::Transient),
             _ => None,
         }
     }
@@ -85,15 +89,18 @@ impl SlotReleaseClass {
 /// 5. execution `Completed` or `Cancelled` is `Finished`;
 /// 6. execution `Failed` is `Error`;
 /// 7. execution `InputNeeded` is `HumanNeeded`;
-/// 8. `Stopped` or `PauseRequested` is `Paused`;
-/// 9. `Provisioning` without a snapshot is `Queued`;
-/// 10. `Interrupted` with no attempt planned (lost while a pause was
+/// 8. execution `WaitingForEvent` (a `wait` step) is `Running`: the work
+///    goes on by itself when the event comes, so the owner
+///    is not told that it waits for them;
+/// 9. `Stopped` or `PauseRequested` is `Paused`;
+/// 10. `Provisioning` without a snapshot is `Queued`;
+/// 11. `Interrupted` with no attempt planned (lost while a pause was
 ///     requested, which the resume policy leaves to the owner) is `Paused`;
-/// 11. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
+/// 12. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
 ///     `Interrupted` while the resume policy still waits to try again.
 ///
-/// Rules 5 to 7 come before 8, so a task stopped to free its slot keeps the
-/// state its work reached. Rule 8 reads `PauseRequested` as the owner's
+/// Rules 5 to 8 come before 9, so a task stopped to free its slot keeps the
+/// state its work reached. Rule 9 reads `PauseRequested` as the owner's
 /// pause only when `pause_by_policy` is false: a stop the slot-release
 /// policy asked for is no decision of the owner, so a task whose work moved
 /// on meanwhile (execution `Running`) stays `Running`.
@@ -115,6 +122,7 @@ pub fn derive_task_state(
         Some(ExecutionStatus::Completed | ExecutionStatus::Cancelled) => TaskState::Finished,
         Some(ExecutionStatus::Failed) => TaskState::Error,
         Some(ExecutionStatus::InputNeeded) => TaskState::HumanNeeded,
+        Some(ExecutionStatus::WaitingForEvent) => TaskState::Running,
         _ => match runner_state {
             RunnerState::PauseRequested if pause_by_policy => TaskState::Running,
             RunnerState::Stopped | RunnerState::PauseRequested => TaskState::Paused,
@@ -356,6 +364,21 @@ pub struct TaskRecord {
     /// retry of any of them still reads as a replay.
     #[serde(default)]
     pub resume_message_taken: Vec<String>,
+    /// The external event the task's `wait` step waits for, as its runner
+    /// reported it; `None` while the task waits for none. Observers hand
+    /// [`EventWait::episode_id`] to their scripts, so a script sends an
+    /// event only to a task that waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_wait: Option<EventWait>,
+    /// The observer and run that created the task (R19);
+    /// `None` for a task its owner created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<TaskProvenance>,
+    /// External events queued for the task's waiting `wait` step, oldest
+    /// first; the audit trail of every such delivery, whose data is dropped
+    /// once it is settled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_inputs: Vec<QueuedEventInput>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
@@ -443,6 +466,10 @@ impl TaskRecord {
     pub fn owner_work_pending(&self) -> bool {
         self.inputs.iter().any(|input| !input.status.is_settled())
             || self
+                .event_inputs
+                .iter()
+                .any(|input| !input.status.is_settled())
+            || self
                 .operator_commands
                 .iter()
                 .any(|command| command.status == OperatorCommandStatus::Queued)
@@ -456,6 +483,12 @@ impl TaskRecord {
             .iter()
             .find(|input| !input.status.is_settled())
             .map(|input| input.idempotency_key.as_str())
+            .or_else(|| {
+                self.event_inputs
+                    .iter()
+                    .find(|input| !input.status.is_settled())
+                    .map(|input| input.idempotency_key.as_str())
+            })
             .or_else(|| {
                 self.operator_commands
                     .iter()
@@ -844,6 +877,10 @@ pub struct RunnerSnapshot {
     /// The input request it waits on.
     #[serde(default)]
     pub pending_input: Option<PendingInputRef>,
+    /// The external event its `wait` step waits for, while it waits; the
+    /// control plane keeps it as [`TaskRecord::event_wait`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_wait: Option<EventWait>,
     /// Its conversation's availability and summary.
     #[serde(default)]
     pub conversation: ConversationAvailability,
@@ -945,6 +982,68 @@ pub struct InputRequest {
     pub delivery: HumanInputDelivery,
 }
 
+/// What ends the task's waiting `wait` step, queued for its runner: an
+/// external event an observer delivered (U3). The runner's engine
+/// consumes it.
+///
+/// Kept apart from [`QueuedInput`]: an owner answer is bound to the
+/// runner's pending input request and made obsolete by any snapshot that
+/// shows another, while an event is bound to the wait episode
+/// ([`EventWait::episode_id`]) the control plane matched it against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueuedEventInput {
+    /// Control-plane id, unique within the task (`event-<n>`).
+    pub input_id: String,
+    /// [`super::observer_event_key`] the server made for the event.
+    pub idempotency_key: String,
+    /// The wait episode it was matched against; a runner in another
+    /// episode never takes it.
+    pub episode_id: String,
+    /// The event type.
+    pub event_type: String,
+    /// The observer's source.
+    pub source: String,
+    /// The event's data, dropped once settled.
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    /// The observer and run it came from (R19).
+    pub provenance: TaskProvenance,
+    /// Its status, as for an owner answer.
+    pub status: InputStatus,
+    /// When the control plane accepted it.
+    pub submitted_at: DateTime<Utc>,
+    /// When its status last changed.
+    pub updated_at: DateTime<Utc>,
+    /// The runner's reason, when it rejected the event.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// An external event as an observer delivers it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalEvent {
+    /// [`super::observer_event_key`]: a new key for every event.
+    pub idempotency_key: String,
+    /// The event type.
+    pub event_type: String,
+    /// The observer's source.
+    pub source: String,
+    /// The event's data.
+    pub data: serde_json::Value,
+    /// The observer and run it came from (R19).
+    pub provenance: TaskProvenance,
+}
+
+/// The result of recording an external event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalEventOutcome {
+    /// The task as it is now.
+    pub task: TaskRecord,
+    /// The input queued for the waiting step; `None` when the event only
+    /// went to history.
+    pub input: Option<QueuedEventInput>,
+}
+
 /// The result of queueing an owner input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputOutcome {
@@ -1027,6 +1126,10 @@ pub struct RunnerReportOutcome {
     pub task: TaskRecord,
     /// False when the snapshot was a duplicate and changed nothing.
     pub applied: bool,
+    /// The `wait` episode this snapshot began: one the record did not hold
+    /// before. `None` when the task waits for no event, or still waits in
+    /// the episode it was already known to wait in.
+    pub began_wait: Option<EventWait>,
 }
 
 /// Everything needed to create a task.
@@ -1043,6 +1146,8 @@ pub struct NewTask {
     /// Digest of the owner request it came from, if any (see
     /// [`TaskRecord::request_digest`]).
     pub request_digest: Option<String>,
+    /// The observer that creates it, if one does (R19).
+    pub provenance: Option<TaskProvenance>,
 }
 
 impl NewTask {
@@ -1059,12 +1164,19 @@ impl NewTask {
             backend_id,
             launch_spec,
             request_digest: None,
+            provenance: None,
         }
     }
 
     /// Records the digest of the owner request.
     pub fn with_request_digest(mut self, digest: impl Into<String>) -> Self {
         self.request_digest = Some(digest.into());
+        self
+    }
+
+    /// Records the observer that creates the task.
+    pub fn with_provenance(mut self, provenance: Option<TaskProvenance>) -> Self {
+        self.provenance = provenance;
         self
     }
 }
@@ -1214,6 +1326,17 @@ mod tests {
     }
 
     #[test]
+    fn a_run_waiting_for_an_external_event_runs_and_never_needs_a_human() {
+        // Running, stopped to free its slot, or stopping for it: the task
+        // waits for the event by itself, not for its owner (U4).
+        for runner in [R::Running, R::Stopped, R::PauseRequested] {
+            let state = derive(runner, Some(ExecutionStatus::WaitingForEvent));
+            assert_eq!(state, T::Running, "{runner:?}");
+            assert_ne!(state, T::HumanNeeded);
+        }
+    }
+
+    #[test]
     fn a_stopped_task_with_work_left_is_paused() {
         assert_eq!(
             derive(R::Stopped, Some(ExecutionStatus::Running)),
@@ -1318,10 +1441,11 @@ mod tests {
         assert_eq!(C::of(ExecutionStatus::Cancelled), Some(C::Final));
         assert_eq!(C::of(ExecutionStatus::InputNeeded), Some(C::Transient));
         assert_eq!(C::of(ExecutionStatus::Failed), Some(C::Transient));
+        // A `wait` step frees its slot like a wait for the owner (U4).
+        assert_eq!(C::of(ExecutionStatus::WaitingForEvent), Some(C::Transient));
         for other in [
             ExecutionStatus::Running,
             ExecutionStatus::Paused,
-            ExecutionStatus::WaitingForEvent,
             ExecutionStatus::Unknown,
         ] {
             assert_eq!(C::of(other), None);

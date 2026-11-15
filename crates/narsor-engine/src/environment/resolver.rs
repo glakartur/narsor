@@ -332,6 +332,17 @@ pub trait LaunchResolver: Send + Sync {
     fn default_harness_changes(&self) -> Option<watch::Receiver<u64>> {
         None
     }
+
+    /// The catalogue's valid definition of workflow `workflow_id`, as a
+    /// task create request would run it: what an observer's "create a
+    /// task" effect is checked against. A resolver without a catalogue
+    /// knows no workflow.
+    fn workflow_definition(&self, workflow_id: &str) -> Result<WorkflowDefinition, LaunchError> {
+        Err(LaunchError::UnknownWorkflow {
+            workflow: workflow_id.to_string(),
+            message: "this server has no workflow catalogue".to_string(),
+        })
+    }
 }
 
 /// The harness registry and the live default harness.
@@ -570,26 +581,7 @@ impl CatalogLaunchResolver {
     }
 
     fn workflow(&self, intent: &LaunchIntent) -> Result<WorkflowDefinition, LaunchError> {
-        let unknown = |message: String| LaunchError::UnknownWorkflow {
-            workflow: intent.workflow_id.clone(),
-            message,
-        };
-        let resolved = self
-            .workflows
-            .resolve_name(&intent.workflow_id)
-            .map_err(|error| unknown(error.to_string()))?;
-        let problems = resolved
-            .validate()
-            .map_err(|error| unknown(error.to_string()))?;
-        if !problems.is_empty() {
-            return Err(LaunchError::InvalidWorkflow {
-                workflow: intent.workflow_id.clone(),
-                problems: problems.iter().map(ToString::to_string).collect(),
-            });
-        }
-        let definition = resolved
-            .load()
-            .map_err(|error| unknown(error.to_string()))?;
+        let definition = self.catalogue_workflow(&intent.workflow_id)?;
         if definition.version != intent.workflow_version {
             return Err(LaunchError::WorkflowVersionMismatch {
                 workflow: intent.workflow_id.clone(),
@@ -598,6 +590,28 @@ impl CatalogLaunchResolver {
             });
         }
         Ok(definition)
+    }
+
+    /// The catalogue's valid definition of workflow `workflow_id`.
+    fn catalogue_workflow(&self, workflow_id: &str) -> Result<WorkflowDefinition, LaunchError> {
+        let unknown = |message: String| LaunchError::UnknownWorkflow {
+            workflow: workflow_id.to_string(),
+            message,
+        };
+        let resolved = self
+            .workflows
+            .resolve_name(workflow_id)
+            .map_err(|error| unknown(error.to_string()))?;
+        let problems = resolved
+            .validate()
+            .map_err(|error| unknown(error.to_string()))?;
+        if !problems.is_empty() {
+            return Err(LaunchError::InvalidWorkflow {
+                workflow: workflow_id.to_string(),
+                problems: problems.iter().map(ToString::to_string).collect(),
+            });
+        }
+        resolved.load().map_err(|error| unknown(error.to_string()))
     }
 
     fn profile(&self, intent: &LaunchIntent) -> Result<ProfileRecord, LaunchError> {
@@ -1211,5 +1225,9 @@ impl LaunchResolver for CatalogLaunchResolver {
     fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError> {
         let definition = self.workflow(intent)?;
         self.resolve_definition(intent, definition)
+    }
+
+    fn workflow_definition(&self, workflow_id: &str) -> Result<WorkflowDefinition, LaunchError> {
+        self.catalogue_workflow(workflow_id)
     }
 }

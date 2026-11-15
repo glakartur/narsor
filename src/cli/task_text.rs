@@ -871,6 +871,34 @@ fn attempt_line(attempt: &ConversationAttemptSummary) -> ToneLine {
 pub fn event_line(event: &TaskEvent) -> String {
     let kind = match &event.kind {
         TaskEventKind::Created => "created".to_string(),
+        TaskEventKind::CreatedByObserver { provenance } => format!(
+            "created by observer {} (run {})",
+            provenance.observer_name, provenance.run_id
+        ),
+        TaskEventKind::ExternalEventReceived {
+            event_type,
+            source,
+            provenance,
+            input_id,
+            ..
+        } => {
+            let delivery = match input_id {
+                Some(input_id) => format!("; {input_id} queued for the waiting step"),
+                None => String::new(),
+            };
+            format!(
+                "external event '{event_type}' from {source} (observer {}, run {}){delivery}",
+                provenance.observer_name, provenance.run_id
+            )
+        }
+        TaskEventKind::WatchRefused {
+            step,
+            observer,
+            object,
+            reason,
+        } => format!(
+            "warning: step {step} asked observer {observer} to watch {object}; no watch entry: {reason}"
+        ),
         TaskEventKind::OwnerCommandAccepted { command, .. } => {
             format!("owner command {command:?}")
         }

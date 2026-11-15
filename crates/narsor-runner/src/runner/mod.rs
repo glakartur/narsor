@@ -116,15 +116,19 @@ use tokio::time::Instant;
 use crate::api::ClientError;
 use crate::conductor::LiveHarness;
 use crate::controller_protocol::{
-    ConversationPageRequest, DeliveredInput, ExecutionEventsRequest, RunnerClient, RunnerDirective,
-    RunnerLaunchView, RunnerPollQuery, RunnerPollResponse, TaskDefaultHarness,
+    ConversationPageRequest, DeliveredEvent, DeliveredInput, EventDelivery, ExecutionEventsRequest,
+    RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery, RunnerPollResponse,
+    TaskDefaultHarness,
 };
 use crate::domain::{
     AnsweredBy, EventData, ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId,
     TaskLaunchSpec, TaskRepositorySource, WorkflowDefinition, WorkflowExecution, Workspace,
     WorkspaceRepository,
 };
-use crate::engine::{Engine, EngineError, HumanInputDelivery, Recovery, UsageReporter};
+use crate::engine::{
+    Engine, EngineError, ExternalEventDelivery, HumanInputDelivery, Recovery, UsageReporter,
+    WaitEnding,
+};
 use crate::orchestration::{
     CommandActor, HarnessUnavailable, OwnerCommand, ResumeMessage, RunnerProblem, RunnerSnapshot,
 };
@@ -634,6 +638,7 @@ async fn report_problem(
         },
         event_cursor,
         pending_input: None,
+        event_wait: None,
         conversation: crate::orchestration::ConversationAvailability::Unavailable {
             reason: problem.message.clone(),
         },
@@ -1078,12 +1083,15 @@ impl Session {
             Some(unavailable) => unavailable.harness.clone(),
             None => self.harness.get(),
         };
+        // An unreadable execution names no wait; the next poll tries again.
+        let event_wait_id = self.event_wait_id().unwrap_or_default();
         RunnerPollQuery {
             pending_input_id,
             wait_secs: Some(wait_secs),
             defer_materials: false,
             harness: Some(harness),
             resume_message_taken: self.taken_resume_message_key(),
+            event_wait_id,
         }
     }
 
@@ -1395,19 +1403,23 @@ impl Session {
             }
 
             let pending = self.pending_input_id()?;
-            if poll.as_ref().is_some_and(|poll| poll.asked != pending) {
-                // Asked for another request than the one waited on now: an
-                // answer to the new one must not wait out the old long-poll.
+            let event_wait = self.event_wait_id()?;
+            let asked = (pending.clone(), event_wait.clone());
+            if poll.as_ref().is_some_and(|poll| poll.asked != asked) {
+                // Asked for another request (or wait) than the one waited
+                // on now: an answer to the new one must not wait out the
+                // old long-poll.
                 abort_poll(&mut poll);
             }
             if poll.is_none() && self.link.ready() {
                 if let Some(client) = self.link.client() {
                     let query = RunnerPollQuery {
                         defer_materials: self.materials_deferred(),
+                        event_wait_id: event_wait,
                         ..self.poll_query(pending.clone(), self.timing.poll_wait.as_secs())
                     };
                     poll = Some(InFlightPoll {
-                        asked: pending.clone(),
+                        asked,
                         handle: tokio::spawn(async move { client.poll_with(&query).await }),
                     });
                 }
@@ -1496,6 +1508,21 @@ impl Session {
             .map(|pending| pending.episode_key().to_string()))
     }
 
+    /// The episode of the `wait` step the execution waits in, while no pass
+    /// runs.
+    fn event_wait_id(&self) -> Result<Option<String>, RunnerError> {
+        if self.pass_active() {
+            return Ok(None);
+        }
+        let Some(execution_id) = &self.execution_id else {
+            return Ok(None);
+        };
+        Ok(self
+            .engine
+            .pending_event(execution_id)?
+            .map(|pending| pending.episode))
+    }
+
     /// Sends a fresh snapshot; true when the control plane took it.
     async fn report(&mut self) -> Result<bool, RunnerError> {
         let Some(client) = self.link.client() else {
@@ -1547,6 +1574,9 @@ impl Session {
         for input in response.inputs {
             self.deliver(input).await?;
         }
+        for event in response.events {
+            self.deliver_event(event).await?;
+        }
         for command in response.commands {
             self.carry_out(command).await?;
         }
@@ -1590,6 +1620,68 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Hands what ends a `wait` step's wait to the Engine, at most once,
+    /// and says what became of it.
+    async fn deliver_event(&mut self, event: DeliveredEvent) -> Result<(), RunnerError> {
+        let Some(client) = self.link.client() else {
+            return Ok(());
+        };
+        let input_id = event.input_id.clone();
+        let (accepted, detail) = match self.take_event(event)? {
+            InputVerdict::Later => return Ok(()),
+            InputVerdict::Taken { .. } => (true, None),
+            InputVerdict::Refused(reason) => (false, Some(reason)),
+        };
+        if let Err(error) = client.ack_event(&input_id, accepted, detail).await {
+            // Redelivered later and answered from the consumed record.
+            self.link.failed(&error, &self.timing);
+        }
+        Ok(())
+    }
+
+    /// Hands one event to the Engine, unless this storage took
+    /// it before, and starts the pass it resumes. The Engine refuses one
+    /// for another wait episode than the one it waits in.
+    fn take_event(&mut self, event: DeliveredEvent) -> Result<InputVerdict, RunnerError> {
+        if self.storage.input_consumed(&event.input_id)? {
+            return Ok(InputVerdict::Taken { first: false });
+        }
+        if self.pass_active() {
+            return Ok(InputVerdict::Later);
+        }
+        let Some(execution_id) = self.execution_id.clone() else {
+            return Ok(InputVerdict::Later);
+        };
+        let EventDelivery::Event {
+            event_type,
+            source,
+            data,
+        } = event.delivery;
+        let delivery = ExternalEventDelivery {
+            episode: event.episode_id,
+            ending: WaitEnding::Event {
+                event_type,
+                source,
+                data,
+            },
+        };
+        Ok(
+            match self.engine.try_begin_deliver_external_event(
+                &self.definition,
+                &execution_id,
+                &delivery,
+            ) {
+                Ok(handle) => {
+                    self.storage.record_consumed_input(&event.input_id)?;
+                    self.spawn_pass(handle);
+                    InputVerdict::Taken { first: true }
+                }
+                Err(EngineError::AlreadyRunning { .. }) => InputVerdict::Later,
+                Err(error) => InputVerdict::Refused(error.to_string()),
+            },
+        )
     }
 
     /// Hands one owner answer to the Engine, unless this storage took it
@@ -1849,7 +1941,8 @@ fn workspace(storage: &TaskStorage, spec: &TaskLaunchSpec) -> Workspace {
 
 /// A long-poll under way, and the pending request it asked about.
 struct InFlightPoll {
-    asked: Option<String>,
+    /// The input request and the wait episode the poll named.
+    asked: (Option<String>, Option<String>),
     handle: JoinHandle<Result<RunnerPollResponse, ClientError>>,
 }
 

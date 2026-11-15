@@ -2855,3 +2855,213 @@ async fn a_comment_on_an_unknown_execution_goes_with_its_recovery() {
     );
     assert_eq!(fixture.session.untaken_resume_message().unwrap(), None);
 }
+
+// ---------------------------------------------------------------------------
+// A `wait` step (U4)
+// ---------------------------------------------------------------------------
+
+/// A `wait` step for an approval, then an agent step that reads the event.
+const WAITING: &str = r#"
+name: waiting
+version: 1
+states:
+  await_review:
+    action:
+      type: wait
+      event_type: review.approved
+      filter:
+        mr: "17"
+    choices: [received]
+    transitions:
+      received: merge
+  merge:
+    action:
+      type: agent
+      prompt: "Merge; {{ context.event.data.by }} approved it."
+    choices: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+/// The approval of MR 17 by `by`, for wait `episode`.
+fn approval(input_id: &str, episode: &str, by: &str) -> DeliveredEvent {
+    DeliveredEvent {
+        input_id: input_id.to_string(),
+        episode_id: episode.to_string(),
+        delivery: EventDelivery::Event {
+            event_type: "review.approved".to_string(),
+            source: "gitlab".to_string(),
+            data: json!({"mr": 17, "by": by}),
+        },
+    }
+}
+
+/// A runner whose execution waits in the `wait` step; and its episode.
+async fn waiting_for_the_approval(root: &TempRoot, storage: &Path) -> (Fixture, String) {
+    let path = harness_path(root, &["claude"]);
+    let mut fixture = Fixture::new(
+        root,
+        storage,
+        "pod-1",
+        &spec(WAITING, "claude-code"),
+        Agent::new(vec![], Reply::Label("done")),
+        Conductor::silent(),
+        &path,
+    );
+    fixture.begin().await;
+    fixture.settled().await;
+    assert_eq!(fixture.status(), ExecutionStatus::WaitingForEvent);
+    let episode = fixture
+        .session
+        .event_wait_id()
+        .unwrap()
+        .expect("the runner names the wait it is in");
+    (fixture, episode)
+}
+
+/// The runner reports the wait, takes the event for it once, and the next
+/// step reads the event's data.
+#[tokio::test]
+async fn a_waiting_runner_reports_its_wait_and_takes_the_event_for_it_once() {
+    let root = TempRoot::new();
+    let (mut fixture, episode) = waiting_for_the_approval(&root, &root.dir("storage")).await;
+    let snapshot = fixture.snapshot();
+    assert_eq!(snapshot.execution_status, ExecutionStatus::WaitingForEvent);
+    let wait = snapshot.event_wait.expect("the snapshot carries the wait");
+    assert_eq!(wait.episode_id, episode);
+    assert_eq!(wait.event_type, "review.approved");
+    assert_eq!(wait.filter, json!({"mr": "17"}));
+    assert!(fixture.agent.calls().is_empty());
+
+    assert_eq!(
+        fixture
+            .session
+            .take_event(approval("event-1", &episode, "alice"))
+            .unwrap(),
+        InputVerdict::Taken { first: true }
+    );
+    fixture.settled().await;
+
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].prompt.contains("alice approved it"),
+        "{}",
+        calls[0].prompt
+    );
+    let received = fixture
+        .events()
+        .into_iter()
+        .filter(|data| matches!(data, EventData::ExternalEventReceived { .. }))
+        .count();
+    assert_eq!(received, 1);
+    // A redelivery whose acknowledgement was lost: taken before.
+    assert_eq!(
+        fixture
+            .session
+            .take_event(approval("event-1", &episode, "alice"))
+            .unwrap(),
+        InputVerdict::Taken { first: false }
+    );
+    assert_eq!(fixture.session.event_wait_id().unwrap(), None);
+    assert_eq!(fixture.snapshot().event_wait, None);
+}
+
+/// Two events for one wait in one poll response: the runner takes the
+/// first, and leaves the second for later while the pass it started runs.
+/// It sends no verdict on the second; the control plane makes it obsolete
+/// when the first is acknowledged.
+#[tokio::test]
+async fn of_two_events_for_one_wait_the_runner_takes_the_first_only() {
+    let root = TempRoot::new();
+    let (mut fixture, episode) = waiting_for_the_approval(&root, &root.dir("storage")).await;
+
+    let first = fixture
+        .session
+        .take_event(approval("event-1", &episode, "alice"))
+        .unwrap();
+    let second = fixture
+        .session
+        .take_event(approval("event-2", &episode, "bob"))
+        .unwrap();
+
+    assert_eq!(first, InputVerdict::Taken { first: true });
+    assert_eq!(second, InputVerdict::Later);
+    fixture.settled().await;
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].prompt.contains("alice approved it"),
+        "{}",
+        calls[0].prompt
+    );
+    // Handed over again after the pass, it no longer fits any wait.
+    assert!(matches!(
+        fixture
+            .session
+            .take_event(approval("event-2", &episode, "bob"))
+            .unwrap(),
+        InputVerdict::Refused(_)
+    ));
+}
+
+/// An event for another wait episode is refused and the step waits on.
+#[tokio::test]
+async fn a_waiting_runner_refuses_an_event_for_another_wait() {
+    let root = TempRoot::new();
+    let (mut fixture, episode) = waiting_for_the_approval(&root, &root.dir("storage")).await;
+
+    let verdict = fixture
+        .session
+        .take_event(approval("event-1", "an-earlier-wait", "alice"))
+        .unwrap();
+
+    assert!(matches!(verdict, InputVerdict::Refused(_)), "{verdict:?}");
+    fixture.settled().await;
+    assert_eq!(fixture.status(), ExecutionStatus::WaitingForEvent);
+    assert_eq!(fixture.session.event_wait_id().unwrap(), Some(episode));
+    assert!(fixture.agent.calls().is_empty());
+}
+
+/// A runner relaunched while its task waited restores the same wait.
+#[tokio::test]
+async fn a_relaunched_runner_restores_the_wait_it_was_in() {
+    let root = TempRoot::new();
+    let storage = root.dir("storage");
+    let (_, episode) = waiting_for_the_approval(&root, &storage).await;
+    let path = harness_path(&root, &["claude"]);
+    let mut fixture = Fixture::new(
+        &root,
+        &storage,
+        "pod-2",
+        &spec(WAITING, "claude-code"),
+        Agent::new(vec![], Reply::Label("done")),
+        Conductor::silent(),
+        &path,
+    );
+    fixture.session.link.launch = Some(RunnerLaunchView {
+        incarnation: "pod-2".to_string(),
+        launch_generation: 2,
+        authorized_by: Some(OwnerCommand::Resume),
+        authorized_by_actor: Some(CommandActor::Policy),
+        resume_message: None,
+    });
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+
+    assert_eq!(fixture.status(), ExecutionStatus::WaitingForEvent);
+    assert_eq!(
+        fixture.session.event_wait_id().unwrap(),
+        Some(episode.clone())
+    );
+    assert_eq!(
+        fixture.snapshot().event_wait.map(|wait| wait.episode_id),
+        Some(episode)
+    );
+}

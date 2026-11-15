@@ -127,6 +127,99 @@ fn task_event_keeps_the_durable_tagged_wire_shape() {
 }
 
 #[test]
+fn observer_events_carry_their_provenance_and_unknown_ones_with_fields_are_unrecognized() {
+    let provenance = super::TaskProvenance {
+        observer_id: "obs-1".into(),
+        observer_name: "jira-new".into(),
+        run_id: "obs-1.4".into(),
+    };
+    let kind = super::TaskEventKind::ExternalEventReceived {
+        event_type: "review.approved".into(),
+        source: "gitlab".into(),
+        provenance: provenance.clone(),
+        data: serde_json::json!({ "mr": 17 }),
+        input_id: None,
+    };
+    let value = serde_json::to_value(&kind).unwrap();
+    assert_eq!(value["type"], "external_event_received");
+    assert_eq!(value["provenance"]["run_id"], "obs-1.4");
+    assert!(value.get("input_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<super::TaskEventKind>(value).unwrap(),
+        kind
+    );
+    let created = super::TaskEventKind::CreatedByObserver { provenance };
+    let value = serde_json::to_value(&created).unwrap();
+    assert_eq!(value["type"], "created_by_observer");
+    assert_eq!(
+        serde_json::from_value::<super::TaskEventKind>(value).unwrap(),
+        created
+    );
+
+    // What a client from before observers sees of a newer event: a known
+    // fallback, not a parse error, even with fields it does not know.
+    let newer = serde_json::json!({ "type": "future_event", "provenance": { "x": 1 } });
+    assert_eq!(
+        serde_json::from_value::<super::TaskEventKind>(newer).unwrap(),
+        super::TaskEventKind::Unrecognized
+    );
+}
+
+#[test]
+fn observer_effect_requests_refuse_fields_a_script_may_not_choose() {
+    let refused = serde_json::json!({
+        "data": {},
+        "workflow_id": "other",
+    });
+    assert!(serde_json::from_value::<super::ObserverCreateTaskRequest>(refused).is_err());
+    let response = super::ObserverEffectResponse {
+        outcome: super::ObserverEffectOutcome::Created,
+        task_id: Some("task-1".into()),
+        input_id: None,
+        message: "created task task-1".into(),
+    };
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["outcome"], "created");
+    assert_eq!(
+        serde_json::from_value::<super::ObserverEffectOutcome>(serde_json::json!("newer")).unwrap(),
+        super::ObserverEffectOutcome::Unrecognized
+    );
+}
+
+#[test]
+fn a_worker_run_hides_its_token_and_an_unknown_outcome_is_unrecognized() {
+    let run = super::ObserverWorkerRun {
+        run_id: "obs-1.1".into(),
+        owner: "owner".into(),
+        token: "nso.obs-1.1.secret-part".into(),
+        script_version: 1,
+        script: "true".into(),
+        input: serde_json::json!({}),
+        secrets: Vec::new(),
+        timeout_secs: 300,
+        deadline: Utc::now(),
+    };
+    assert!(!format!("{run:?}").contains("secret-part"));
+    assert_eq!(serde_json::to_value(&run).unwrap()["owner"], "owner");
+    // A server that does not say whose run it is: the worker refuses to
+    // pick a secrets directory for it.
+    let mut without_owner = serde_json::to_value(&run).unwrap();
+    without_owner.as_object_mut().unwrap().remove("owner");
+    let parsed: super::ObserverWorkerRun = serde_json::from_value(without_owner).unwrap();
+    assert_eq!(parsed.owner, "");
+
+    let outcome: super::ObserverRunOutcome =
+        serde_json::from_value(serde_json::json!({"kind": "exploded", "why": "newer"})).unwrap();
+    assert_eq!(outcome, super::ObserverRunOutcome::Unrecognized);
+    let too_large =
+        serde_json::to_value(super::ObserverRunOutcome::OutputTooLarge { exit_code: 0 }).unwrap();
+    assert_eq!(
+        too_large,
+        serde_json::json!({"kind": "output_too_large", "exit_code": 0})
+    );
+}
+
+#[test]
 fn owner_conversation_response_keeps_summary_only_wire_fields() {
     let now = Utc::now();
     let response = super::ConversationResponse::Available {

@@ -35,8 +35,8 @@ use serde_json::{Map, Value};
 use crate::domain::{
     ActionConfig, AgentActionConfig, ArtifactReference, Context, DecisionActionConfig,
     HumanActionConfig, ProfileActionConfig, PromptPart, PromptText, ScriptActionConfig,
-    VariableDefinition, WaitActionConfig, WorkflowDefinition, WorkspaceField, WorkspacePr,
-    LOCAL_VARIABLE_PREFIX,
+    VariableDefinition, WaitActionConfig, WaitWatchConfig, WorkflowDefinition, WorkspaceField,
+    WorkspacePr, LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -524,8 +524,34 @@ impl<'a> TemplateScope<'a> {
                     None => None,
                 };
 
+                // The validator checks `event_type` as a template, so it is
+                // rendered like the filter.
+                let event = self.render(&config.event, &format!("{location}, event_type"))?;
+                // The observer is a plain name; the object and the event
+                // types are templates, so they always name the same thing
+                // as the step's own `event_type`.
+                let watch = match &config.watch {
+                    Some(watch) => {
+                        let mut event_types = Vec::with_capacity(watch.event_types.len());
+                        for (index, event_type) in watch.event_types.iter().enumerate() {
+                            event_types.push(self.render(
+                                event_type,
+                                &format!("{location}, watch.event_types[{index}]"),
+                            )?);
+                        }
+                        Some(WaitWatchConfig {
+                            observer: watch.observer.clone(),
+                            object: self
+                                .render(&watch.object, &format!("{location}, watch.object"))?,
+                            event_types,
+                        })
+                    }
+                    None => None,
+                };
                 Ok(ActionConfig::Wait(WaitActionConfig {
+                    event,
                     filter,
+                    watch,
                     ..config.clone()
                 }))
             }

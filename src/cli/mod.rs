@@ -33,6 +33,9 @@ pub mod connection_profile;
 pub mod control_text;
 pub mod daemon;
 pub mod init;
+pub mod observer;
+pub mod observer_effect;
+pub mod observer_text;
 mod prompt;
 pub mod remote;
 pub mod task_history;
@@ -323,6 +326,14 @@ pub enum Command {
         command: remote::TaskCommand,
     },
 
+    /// Observers of external sources: create, script, approve and
+    /// watch them.
+    Observer {
+        /// What to do.
+        #[command(subcommand)]
+        command: observer::ObserverCommand,
+    },
+
     /// The backends of remote tasks: the default backend of new tasks.
     Backend {
         /// What to do.
@@ -573,7 +584,8 @@ impl Command {
             | Command::Harness { .. }
             | Command::Usage { .. }
             | Command::Auth { .. }
-            | Command::Daemon { .. } => false,
+            | Command::Daemon { .. }
+            | Command::Observer { .. } => false,
             // Configured by its own flags and environment only, like the
             // runner: it reads no Narsor configuration file. Its operator
             // subcommands talk to a control plane and need none either.
@@ -727,8 +739,12 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         },
         Command::Init(options) => init::run(options, config_file.as_deref()),
         Command::Purge(options) => init::purge(options, config_file.as_deref()),
-        Command::Task { command } => remote::task(command, &target, &state, &flags).await,
+        Command::Task { command } => {
+            let observer_run = std::env::var(observer_effect::OBSERVER_RUN_ENV).ok();
+            remote::task(command, &target, observer_run.as_deref(), &state, &flags).await
+        }
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
+        Command::Observer { command } => observer::observer(command, &target, &state, &flags).await,
         Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,
         Command::Usage { json } => remote::usage(json, &target, &state, &flags).await,
         Command::Auth { command } => remote::auth(command, &target, &state, &flags).await,
@@ -867,6 +883,14 @@ mod tests {
         }
         .runs_on_broken_config());
         assert!(Command::Init(init::InitOptions::default()).runs_on_broken_config());
+        // The observer commands talk to the configured control plane; the
+        // worker is a program of its own (narsor-observer-worker, D20).
+        let owner = Cli::try_parse_from(["narsor-cli", "observer", "list"]).unwrap();
+        assert!(!owner.command.runs_on_broken_config());
+        assert!(
+            Cli::try_parse_from(["narsor-cli", "observer", "worker", "--insecure-same-user",])
+                .is_err()
+        );
 
         for command in [
             Command::List,

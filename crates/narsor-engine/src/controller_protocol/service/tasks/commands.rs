@@ -6,6 +6,21 @@ use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
 use crate::orchestration::{CommandActor, CommandRequest, MoveTarget, OwnerRef, RunnerState};
 
+/// Refuses an owner's idempotency key that starts with a prefix only a
+/// policy or an observer may use ([`crate::orchestration::RESERVED_KEY_PREFIXES`]).
+pub(crate) fn refuse_reserved_key(key: &str) -> ProtocolResult<()> {
+    match crate::orchestration::RESERVED_KEY_PREFIXES
+        .iter()
+        .find(|(prefix, _)| key.starts_with(prefix))
+    {
+        Some((prefix, purpose)) => Err(ProtocolError::bad_request(
+            "reserved_idempotency_key",
+            format!("idempotency keys starting with `{prefix}` are reserved for {purpose}"),
+        )),
+        None => Ok(()),
+    }
+}
+
 impl ProtocolService {
     /// Applies an owner command.
     pub fn command(
@@ -21,15 +36,7 @@ impl ProtocolService {
                 "an owner command needs an idempotency key",
             ));
         }
-        if let Some((prefix, purpose)) = crate::orchestration::RESERVED_KEY_PREFIXES
-            .iter()
-            .find(|(prefix, _)| request.idempotency_key.starts_with(prefix))
-        {
-            return Err(ProtocolError::bad_request(
-                "reserved_idempotency_key",
-                format!("idempotency keys starting with `{prefix}` are reserved for {purpose}"),
-            ));
-        }
+        refuse_reserved_key(&request.idempotency_key)?;
         let command = request.command;
         // A repeated key is answered with the receipt it got, not judged anew.
         let is_retry = record

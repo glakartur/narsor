@@ -75,6 +75,11 @@ Every one of them is available as an environment variable too, mechanically:
 | `conductor_effort` | `NARSOR_CONDUCTOR_EFFORT` | empty |
 | `log_level` | `NARSOR_LOG_LEVEL` | `off` |
 | `tui_refresh_interval` | `NARSOR_TUI_REFRESH_INTERVAL` | `10s` |
+| `observer_worker` | `NARSOR_OBSERVER_WORKER` (`off` or `on`) | `off` |
+| `observer_worker_server` | `NARSOR_OBSERVER_WORKER_SERVER` | empty (the server's own address) |
+| `observer_secrets_dir` | `NARSOR_OBSERVER_SECRETS_DIR` | empty |
+| `observer_script_user` | `NARSOR_OBSERVER_SCRIPT_USER` | empty |
+| `observer_insecure_same_user` | `NARSOR_OBSERVER_INSECURE_SAME_USER` (`false` or `true`) | `false` |
 | `web_bind` | `NARSOR_WEB_BIND` | `127.0.0.1:8484` |
 | `web_upstream` | `NARSOR_WEB_UPSTREAM` | `local` |
 | `web_token` | `NARSOR_WEB_TOKEN` | `server` |
@@ -84,6 +89,10 @@ The three `web_*` settings are read by `narsor-web`, the server of the
 passes the API to (`local` = the local daemon, or the server's URL), and
 whose token goes to that server (`server` = its own, `passthrough` = the
 browser's).
+
+The `observer_*` settings tell the server whether to start the observer
+worker and how; see
+[installation](../operations/installation.md#run-the-observer-worker).
 
 For Kubernetes runners, put `NARSOR_AGENT_ARGS` in the controller ConfigMap
 (`narsor-controller-config`). The controller forwards this one key to the

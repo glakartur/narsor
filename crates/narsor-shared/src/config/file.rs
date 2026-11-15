@@ -428,6 +428,12 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
         return agent_args_value(raw);
     }
 
+    if setting == SettingKey::ObserverInsecureSameUser {
+        if let Some(flag) = raw.as_bool() {
+            return value_from_text(setting, &flag.to_string());
+        }
+    }
+
     if matches!(
         setting,
         SettingKey::MaxConcurrentTasks | SettingKey::EscalationThreshold
@@ -701,6 +707,54 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
         }
 
         SettingKey::LocalHome => one_of(text, "local HOME mode", &settings::LOCAL_HOME_MODES),
+
+        SettingKey::ObserverWorker => one_of(
+            text,
+            "observer worker mode",
+            &[settings::OBSERVER_WORKER_OFF, settings::OBSERVER_WORKER_ON],
+        ),
+
+        SettingKey::ObserverInsecureSameUser => one_of(text, "boolean", &["false", "true"]),
+
+        SettingKey::ObserverWorkerServer => {
+            let written = text.trim();
+            if written.is_empty()
+                || written.starts_with("http://")
+                || written.starts_with("https://")
+            {
+                Ok(SettingValue::Text(
+                    written.trim_end_matches('/').to_string(),
+                ))
+            } else {
+                Err(format!(
+                    "an http:// or https:// URL was expected, or nothing for the server's own \
+                     address, but '{written}' was found"
+                ))
+            }
+        }
+
+        SettingKey::ObserverSecretsDir => {
+            let written = text.trim();
+            let dir = expand_home(written)?;
+            if !dir.is_empty() && !std::path::Path::new(&dir).is_absolute() {
+                return Err(format!(
+                    "'{written}' is not an absolute path; name the directory absolutely, or \
+                     leave it empty for no secrets"
+                ));
+            }
+            Ok(SettingValue::Text(dir))
+        }
+
+        SettingKey::ObserverScriptUser => {
+            let written = text.trim();
+            if written
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+            {
+                return Err(format!("'{written}' is not a system user name"));
+            }
+            Ok(SettingValue::Text(written.to_string()))
+        }
 
         SettingKey::LocalCodexHome
         | SettingKey::LocalClaudeConfigDir

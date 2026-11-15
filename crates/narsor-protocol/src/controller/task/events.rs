@@ -103,8 +103,59 @@ pub enum TaskEventKind {
     /// The read-only runner's lease ended, because it ran idle: the control
     /// plane no longer asks for it.
     ReaderLeaseEnded,
+    /// An observer created the task (R19): the first event of such a task,
+    /// in place of [`TaskEventKind::Created`]. A client from before
+    /// observers reads it as [`TaskEventKind::Unrecognized`].
+    CreatedByObserver {
+        /// The observer and its run.
+        provenance: TaskProvenance,
+    },
+    /// An observer delivered an external event to the task (R4): recorded
+    /// for each delivery, whether or not the task waits for it.
+    ExternalEventReceived {
+        /// The event type (`review.approved`, say).
+        event_type: String,
+        /// The observer's source (`gitlab`, say).
+        source: String,
+        /// The observer and its run (R19).
+        provenance: TaskProvenance,
+        /// The event's data, as the observer's script sent it. Untrusted:
+        /// a client strips control characters before printing it.
+        #[serde(default)]
+        data: serde_json::Value,
+        /// The input queued for the task's waiting `wait` step, when the
+        /// event matched it; `None` when it only went to the history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_id: Option<String>,
+    },
+    /// A warning: the task's `wait` step asked an observer to watch an
+    /// object (its `watch` block), and the control plane added no watch
+    /// entry. The task keeps waiting; the owner may add the entry by hand.
+    /// A client from before watch entries reads it as
+    /// [`TaskEventKind::Unrecognized`].
+    WatchRefused {
+        /// The workflow state whose `wait` asked for the entry.
+        step: String,
+        /// The observer it named.
+        observer: String,
+        /// The object it named, without unsafe characters and bounded.
+        object: String,
+        /// Why no entry was added.
+        reason: String,
+    },
     #[serde(other)]
     Unrecognized,
+}
+
+/// Where a task or an event came from when an observer caused it (R19).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskProvenance {
+    /// The observer's id, never reused.
+    pub observer_id: String,
+    /// The observer's name when it acted.
+    pub observer_name: String,
+    /// The observer run that acted (`{observer_id}.{sequence}`).
+    pub run_id: String,
 }
 
 /// Why the control plane freed a task's slot.

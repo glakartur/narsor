@@ -83,10 +83,17 @@ use crate::controller_protocol::{
     ConductorReadResponse, LegacyExecutionListResponse, LegacyExecutionView,
 };
 use narsor_protocol::controller::{
+    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverDetailView,
+    ObserverListResponse, ObserverScriptView, ObserverView, ObserverWatchListResponse,
+    ObserverWatchView, SetObserverScriptRequest,
+};
+use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
-    ExecutionEventsResponse, HarnessUsageResponse, OwnerCommandRequest, RepositoryBranchesResponse,
+    ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
+    ObserverCreateTaskRequest, ObserverEffectResponse, ObserverEventRequest, ObserverRunReport,
+    ObserverRunResultResponse, ObserverWorkerRun, OwnerCommandRequest, RepositoryBranchesResponse,
     RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
     SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
     ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
@@ -1069,6 +1076,161 @@ impl ApiClient {
     }
 
     // -----------------------------------------------------------------
+    // The observer worker (U6)
+    // -----------------------------------------------------------------
+
+    /// Claims the next due observer run, for a client holding the worker
+    /// key — `POST /observer/v1/worker/claim`. `None` when no run is
+    /// due.
+    pub async fn claim_observer_run(&self) -> Result<Option<ObserverWorkerRun>, ClientError> {
+        let url = format!("{}/observer/v1/worker/claim", self.base_url);
+        let response: ObserverClaimResponse = self.post_empty(&url).await?;
+        Ok(response.run)
+    }
+
+    /// Reports the result of a claimed observer run —
+    /// `POST /observer/v1/worker/runs/{run}/result`.
+    pub async fn report_observer_run(
+        &self,
+        run_id: &str,
+        report: &ObserverRunReport,
+    ) -> Result<ObserverRunResultResponse, ClientError> {
+        let url = format!("{}/observer/v1/worker/runs/{run_id}/result", self.base_url);
+        self.post_json(&url, report).await
+    }
+
+    // -----------------------------------------------------------------
+    // Observers (U7): the owner's routes, then a run's effect routes
+    // -----------------------------------------------------------------
+
+    /// The caller's observers — `GET /control/v1/observers`.
+    pub async fn observers(&self) -> Result<ObserverListResponse, ClientError> {
+        let url = format!("{}/control/v1/observers", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Creates a draft observer — `POST /control/v1/observers`.
+    pub async fn create_observer(
+        &self,
+        request: &CreateObserverRequest,
+    ) -> Result<ObserverView, ClientError> {
+        let url = format!("{}/control/v1/observers", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// One observer, by name or id, with the errors of its failed or lost runs.
+    pub async fn observer(&self, observer: &str) -> Result<ObserverDetailView, ClientError> {
+        let url = self.observer_url(observer, "")?;
+        self.get_json(&url).await
+    }
+
+    /// Deletes an observer with every file of it.
+    pub async fn delete_observer(&self, observer: &str) -> Result<ObserverView, ClientError> {
+        let url = self.observer_url(observer, "")?;
+        self.delete_json(&url).await
+    }
+
+    /// Saves the observer's next script version; never approves it.
+    pub async fn set_observer_script(
+        &self,
+        observer: &str,
+        request: &SetObserverScriptRequest,
+    ) -> Result<ObserverScriptView, ClientError> {
+        let url = self.observer_url(observer, "/scripts")?;
+        self.post_json(&url, request).await
+    }
+
+    /// Approves a script version: the schedule runs it from now on.
+    pub async fn approve_observer(
+        &self,
+        observer: &str,
+        request: &ApproveObserverRequest,
+    ) -> Result<ObserverView, ClientError> {
+        let url = self.observer_url(observer, "/approve")?;
+        self.post_json(&url, request).await
+    }
+
+    /// Stops the observer's schedule.
+    pub async fn pause_observer(&self, observer: &str) -> Result<ObserverView, ClientError> {
+        let url = self.observer_url(observer, "/pause")?;
+        self.post_empty(&url).await
+    }
+
+    /// Puts the observer back on its schedule.
+    pub async fn resume_observer(&self, observer: &str) -> Result<ObserverView, ClientError> {
+        let url = self.observer_url(observer, "/resume")?;
+        self.post_empty(&url).await
+    }
+
+    /// The observer's watch entries.
+    pub async fn observer_watches(
+        &self,
+        observer: &str,
+    ) -> Result<ObserverWatchListResponse, ClientError> {
+        let url = self.observer_url(observer, "/watches")?;
+        self.get_json(&url).await
+    }
+
+    /// Adds a watch entry for one of the caller's tasks.
+    pub async fn add_observer_watch(
+        &self,
+        observer: &str,
+        request: &AddObserverWatchRequest,
+    ) -> Result<ObserverWatchView, ClientError> {
+        let url = self.observer_url(observer, "/watches")?;
+        self.post_json(&url, request).await
+    }
+
+    /// Removes a watch entry.
+    pub async fn remove_observer_watch(
+        &self,
+        observer: &str,
+        entry_id: &str,
+    ) -> Result<ObserverWatchView, ClientError> {
+        let entry_id = path_segment("watch entry", entry_id)?;
+        let url = self.observer_url(observer, &format!("/watches/{entry_id}"))?;
+        self.delete_json(&url).await
+    }
+
+    /// Creates a task from effect data, for a client holding a run token
+    /// — `POST /observer/v1/runs/{run}/tasks`.
+    pub async fn observer_create_task(
+        &self,
+        run_id: &str,
+        request: &ObserverCreateTaskRequest,
+    ) -> Result<ObserverEffectResponse, ClientError> {
+        let run_id = path_segment("run", run_id)?;
+        let url = format!("{}/observer/v1/runs/{run_id}/tasks", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// Delivers an event to a task, for a client holding a run token —
+    /// `POST /observer/v1/runs/{run}/tasks/{task_id}/events`.
+    pub async fn observer_deliver_event(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        request: &ObserverEventRequest,
+    ) -> Result<ObserverEffectResponse, ClientError> {
+        let run_id = path_segment("run", run_id)?;
+        let task_id = path_segment("task", task_id)?;
+        let url = format!(
+            "{}/observer/v1/runs/{run_id}/tasks/{task_id}/events",
+            self.base_url
+        );
+        self.post_json(&url, request).await
+    }
+
+    /// `/control/v1/observers/{observer}{suffix}`.
+    fn observer_url(&self, observer: &str, suffix: &str) -> Result<String, ClientError> {
+        let observer = path_segment("observer", observer)?;
+        Ok(format!(
+            "{}/control/v1/observers/{observer}{suffix}",
+            self.base_url
+        ))
+    }
+
+    // -----------------------------------------------------------------
     // Identity (U7, U8)
     // -----------------------------------------------------------------
 
@@ -1319,6 +1481,23 @@ impl ApiClient {
             .await?;
         handle_json_response(response).await
     }
+}
+
+/// `value` as one path segment: refused when it is empty or could leave
+/// its segment (`/`, `?`, `#`, `%`, `..`, whitespace or control characters).
+fn path_segment<'a>(what: &str, value: &'a str) -> Result<&'a str, ClientError> {
+    let unsafe_char =
+        |c: char| matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control();
+    if value.is_empty() || value == "." || value == ".." || value.chars().any(unsafe_char) {
+        return Err(ClientError::Request {
+            code: "invalid_identifier".to_string(),
+            message: format!(
+                "not a valid {what} name or id: it must not be empty or hold '/', '?', '#', \
+                 '%', '\\', whitespace or control characters"
+            ),
+        });
+    }
+    Ok(value)
 }
 
 /// Checks and normalizes the base URL of [`ApiClient::remote`].

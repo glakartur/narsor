@@ -39,6 +39,15 @@
 //! of losing it; interrupting it earlier would only spend that repeat
 //! sooner.
 //!
+//! # The observer worker
+//!
+//! With `observer_worker: on` the daemon starts `narsor-observer-worker`
+//! once its API listens, after the local controller, and stops it
+//! first at shutdown, while the API still takes its results
+//! ([`crate::observer_worker`]). A configuration that cannot start it
+//! (no script user and no waiver, network mode without
+//! `observer_worker_server`) stops the daemon at start.
+//!
 //! # Why shutdown is a poll, not a wait
 //!
 //! `Engine::pause` (D34) only ever takes effect at the next step boundary —
@@ -62,6 +71,9 @@ use tokio::signal::unix::{signal, SignalKind};
 use crate::api::{ActiveTasks, ApiHandle, ApiServices, ServerSecurity};
 use crate::auth_gate::NetworkAuth;
 use crate::local_controller::{controller_program, LocalController, LocalControllerSettings};
+use crate::observer_worker::{
+    worker_program, ObserverWorker, ObserverWorkerSettings, ScriptIsolation,
+};
 use narsor_engine::auth::{
     OidcVerifier, OwnerStore, SecurityPlan, SecuritySettings, StartupOwnership,
 };
@@ -75,6 +87,7 @@ use narsor_engine::environment::{
     BackendKind, BackendRecord, CatalogLaunchResolver, EnvironmentCatalog, HarnessDefaults,
     OwnerDefaults,
 };
+use narsor_engine::observers::ObserverStore;
 use narsor_engine::orchestration::ControlPlane;
 use narsor_engine::persistence::{
     DaemonInfo, DefaultHarnessSelector, ExecutionStore, ReconciliationOutcome, RecoveryReport,
@@ -281,6 +294,8 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         CliError::failure(format!("could not start the daemon's API server: {error}"))
     })?;
 
+    let observer_worker = observer_worker_settings(config, &api_handle, runs_local_controller)?;
+
     let info = DaemonInfo {
         pid: std::process::id(),
         addr: api_handle.addr(),
@@ -305,7 +320,25 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         );
         None
     };
+    let observer_worker = match observer_worker {
+        Some(settings) => {
+            let control = Arc::clone(&control);
+            match ObserverWorker::start(settings, move || control.issue_observer_worker_key()) {
+                Ok(worker) => Some(worker),
+                Err(message) => {
+                    if let Some(local_controller) = local_controller {
+                        local_controller.stop().await;
+                    }
+                    return Err(CliError::failure(message));
+                }
+            }
+        }
+        None => None,
+    };
     if let Err(error) = info.write(&paths.daemon_file()) {
+        if let Some(observer_worker) = observer_worker {
+            observer_worker.stop().await;
+        }
         if let Some(local_controller) = local_controller {
             local_controller.stop().await;
         }
@@ -323,6 +356,12 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         CliError::failure(format!("could not install the SIGTERM handler: {error}"))
     })?;
     wait_for_sigterm_keeping_discovery(&mut terminate, &paths.daemon_file(), &info).await;
+
+    // The worker first, while the API still takes the result of a run in
+    // progress; one it cannot report is lost at its deadline.
+    if let Some(observer_worker) = observer_worker {
+        observer_worker.stop().await;
+    }
 
     // Stop the local controller while the API still accepts its signed
     // lease release (R8). A successor can then acquire the lease
@@ -424,6 +463,53 @@ fn local_controller_settings(
     })
 }
 
+/// What the daemon starts its observer worker with, `None` when the
+/// configuration does not enable it. Refuses a configuration the worker
+/// could not run with, before anything starts.
+fn observer_worker_settings(
+    config: &Resolved,
+    api: &ApiHandle,
+    trusted: bool,
+) -> Result<Option<ObserverWorkerSettings>> {
+    let Some(worker) = config.observer_worker() else {
+        return Ok(None);
+    };
+    let isolation = match (worker.script_user, worker.insecure_same_user) {
+        (Some(user), false) => ScriptIsolation::User(user),
+        (None, true) => ScriptIsolation::SameUser,
+        (None, false) => {
+            return Err(CliError::failure(
+                "observer_worker: on needs observer_script_user, the system user scripts run \
+                 as (or observer_insecure_same_user: true, for a trial only)",
+            ))
+        }
+        (Some(_), true) => {
+            return Err(CliError::failure(
+                "observer_script_user and observer_insecure_same_user: true contradict each \
+                 other; set one of them",
+            ))
+        }
+    };
+    let server = match worker.server {
+        Some(server) => server,
+        None if trusted => format!("http://{}", api.addr()),
+        None => {
+            return Err(CliError::failure(
+                "observer_worker: on in network mode needs observer_worker_server: the URL \
+                 clients reach the API at, through the TLS proxy",
+            ))
+        }
+    };
+    Ok(Some(ObserverWorkerSettings {
+        program: worker_program().map_err(CliError::failure)?,
+        server,
+        secrets_dir: worker.secrets_dir,
+        isolation,
+        log_directive: config.log_directive(),
+        supervision: narsor_controller_runtime::Supervision::default(),
+    }))
+}
+
 /// How often the daemon re-evaluates queue admission on its own (U10).
 const ADMISSION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -433,8 +519,8 @@ const ADMISSION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 /// lease running out (its capacity is then withheld and waiting tasks say
 /// `controller_offline`) and an operator editing a backend's limit in the
 /// catalogue. The resume policy resumes tasks whose workload was lost once
-/// their attempt is due, and task materials whose time to live ran out are
-/// swept (U9), on the same tick. The handle is dropped with the daemon's
+/// their attempt is due, task materials whose time to live ran out are
+/// swept (U9), and observers whose run is due are flagged, on the same tick. The handle is dropped with the daemon's
 /// runtime.
 fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -456,7 +542,8 @@ fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinH
 
 /// One tick of the daemon's periodic pass: admission, then the resume
 /// policy, then the slot-release policy (D62), then task materials whose
-/// time to live ran out (U9), and the reader leases that ran idle (D63). Returns what the resume policy did.
+/// time to live ran out (U9), the reader leases that ran idle (D63), and the
+/// observers' schedule. Returns what the resume policy did.
 pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     control.reschedule_all();
     // Asks running tasks to stop while a backend holds more slots than its
@@ -470,6 +557,9 @@ pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     // state stops asking the controller for them.
     control.reader_lease_pass();
     control.sweep_materials();
+    // Flags the observers whose run is due for the worker's claim, and
+    // records the runs no worker finished in time as lost.
+    control.observer_pass();
     resumed
 }
 
@@ -552,7 +642,8 @@ fn recover_at_startup(store: &ExecutionStore) -> Option<RecoveryReport> {
 /// and events a crash kept out of a task's log — before the API serves
 /// them, so a stream replay never skips one. Unlike local recovery it judges
 /// no task: a remote task's runner state changes only through its controller's
-/// reconciliation, never because this process restarted. Best-effort like
+/// reconciliation, never because this process restarted. The observer
+/// store's orphaned temporary files are removed here too. Best-effort like
 /// [`recover_at_startup`]: a failure is logged and the daemon still starts.
 pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
     match control.recover() {
@@ -579,6 +670,20 @@ pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
         }
         Err(error) => {
             tracing::warn!(error = %error, "daemon: control-plane recovery failed");
+        }
+    }
+    let observers = ObserverStore::new(control.store().paths().clone());
+    match observers.cleanup_orphaned_temp_files() {
+        Ok(removed) => {
+            for path in &removed {
+                tracing::info!(
+                    path = %path.display(),
+                    "daemon: removed an interrupted observer write"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "daemon: observer store recovery failed");
         }
     }
     control

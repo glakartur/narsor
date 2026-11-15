@@ -834,6 +834,7 @@ fn finalize(
                 if execution_status == ExecutionStatus::Running
                     || execution_status == ExecutionStatus::Paused
                     || execution_status == ExecutionStatus::InputNeeded
+                    || execution_status == ExecutionStatus::WaitingForEvent
                 {
                     PositionStatus::InProgress
                 } else {

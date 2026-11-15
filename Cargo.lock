@@ -2129,6 +2129,7 @@ dependencies = [
  "narsor-controller",
  "narsor-controller-runtime",
  "narsor-engine",
+ "narsor-observer-worker",
  "narsor-protocol",
  "narsor-runner",
  "narsor-server",
@@ -2236,6 +2237,24 @@ dependencies = [
  "uuid",
  "validator",
  "zstd",
+]
+
+[[package]]
+name = "narsor-observer-worker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "clap",
+ "futures",
+ "libc",
+ "narsor-api-client",
+ "narsor-protocol",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

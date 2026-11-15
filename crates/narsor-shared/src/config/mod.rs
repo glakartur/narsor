@@ -39,7 +39,7 @@ pub use harness_home::{
     HarnessHome, HomeMode, API_KEY_ENVS, CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV,
 };
 pub use resolve::AgentDefaults;
-pub use resolve::{resolve, ConfigError, Environment, Flags, Resolved};
+pub use resolve::{resolve, ConfigError, Environment, Flags, ObserverWorkerConfig, Resolved};
 pub use security_validation::is_loopback_host;
 pub use settings::{
     agent_args_for, agent_args_key, render_value, AgentArgs, SettingKey, SettingValue, Source,

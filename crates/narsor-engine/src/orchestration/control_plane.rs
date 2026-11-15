@@ -164,6 +164,13 @@ impl ControlPlane {
             .unwrap_or(0)
             + 1;
         let now = self.clock.now();
+        // An observer's task says so from its first event on (R19).
+        let created = match &request.provenance {
+            Some(provenance) => TaskEventKind::CreatedByObserver {
+                provenance: provenance.clone(),
+            },
+            None => TaskEventKind::Created,
+        };
         let record = TaskRecord {
             record_version: TASK_RECORD_VERSION,
             owner: request.owner,
@@ -202,13 +209,16 @@ impl ControlPlane {
             reader_lease: None,
             resume_message: None,
             resume_message_taken: Vec::new(),
+            event_wait: None,
+            provenance: request.provenance,
+            event_inputs: Vec::new(),
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),
                 at: now,
                 runner_state: RunnerState::Queued,
                 generation: 1,
-                kind: TaskEventKind::Created,
+                kind: created,
             },
             task_id: request.task_id,
         };

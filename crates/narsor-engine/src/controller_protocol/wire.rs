@@ -30,12 +30,14 @@ pub use narsor_protocol::controller::{
     ControllerPresence, ControllerView, ConversationAttemptSummary, ConversationPageAccepted,
     ConversationPageQuery, ConversationPageRequest, ConversationResponse,
     ConversationUnavailableReason, CreateEnrollmentRequest, CreateRepositoryRequest,
-    CreateTaskRequest, DefaultBackendView, DeliveredInput, DeliveredOperatorCommand, DesiredAction,
-    DesiredCommand, EnrollRequest, EnrollResponse, EnrollmentResponse, ExecutionCursor,
+    CreateTaskRequest, DefaultBackendView, DeliveredEvent, DeliveredInput,
+    DeliveredOperatorCommand, DesiredAction, DesiredCommand, EnrollRequest, EnrollResponse,
+    EnrollmentResponse, EventAckResponse, EventDelivery, EventWait, ExecutionCursor,
     ExecutionEventsPage, ExecutionEventsQuery, ExecutionEventsRequest, ExecutionEventsResponse,
     ExecutionEventsSource, Freshness, HarnessUnavailable, HeartbeatResponse, InputAckRequest,
     InputAckResponse, InputUpdate, InputView, LaunchRequest, LeaseEpochRequest, LeaseView,
     MaterialChange, MoveTaskRequest, MoveTaskTarget, ObservationView, ObservedSummary,
+    ObserverCreateTaskRequest, ObserverEffectOutcome, ObserverEffectResponse, ObserverEventRequest,
     OperatorCommand, OperatorCommandAckRequest, OperatorCommandAckResponse, OperatorCommandView,
     OwnerCommand, OwnerCommandRequest, OwnerCommandResponse, OwnerRef, PanelChoice, PanelForm,
     PanelFormKind, PanelOffer, PendingInputRefView, QueueView, RelayFailure, ReportRequest,
@@ -47,11 +49,11 @@ pub use narsor_protocol::controller::{
     SetConcurrencyLimitRequest, SetDefaultBackendRequest, StepKind, StepView, SubmitCommentRequest,
     SubmitCommentResponse, SubmitInputRequest, SubmitInputResponse, SubmitOperatorCommandRequest,
     SubmitOperatorCommandResponse, TaskActionId, TaskActionOffer, TaskActionOption, TaskEvent,
-    TaskEventKind, TaskListResponse, TaskState, TaskSummary, TimelineResponse, TransitionExit,
-    TransitionOffer, ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType,
-    WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowSourceRequest,
-    WorkflowSourceResponse, WorkflowView, WorkflowWorkspaceView, WorkspaceRequest,
-    CONVERSATION_READER_STARTING, CONVERSATION_RECORD_UNREADABLE,
+    TaskEventKind, TaskListResponse, TaskProvenance, TaskState, TaskSummary, TimelineResponse,
+    TransitionExit, TransitionOffer, ValidateWorkflowRequest, ValidateWorkflowResponse,
+    WorkflowInputType, WorkflowInputView, WorkflowListResponse, WorkflowSource,
+    WorkflowSourceRequest, WorkflowSourceResponse, WorkflowView, WorkflowWorkspaceView,
+    WorkspaceRequest, CONVERSATION_READER_STARTING, CONVERSATION_RECORD_UNREADABLE,
     CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
 };
 
@@ -62,6 +64,13 @@ use crate::orchestration::{
 pub use narsor_protocol::controller::{
     usage_window_length, HarnessUsageReport, HarnessUsageResponse, HarnessUsageView, UsageLimit,
     UsageStatus, MAX_USAGE_LIMITS, USAGE_STATE_LIFETIME,
+};
+pub use narsor_protocol::controller::{
+    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverClaimResponse,
+    ObserverDetailView, ObserverEffectRequest, ObserverLastRunView, ObserverListResponse,
+    ObserverRunErrorView, ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse,
+    ObserverScriptView, ObserverSecretRef, ObserverView, ObserverWatchListResponse,
+    ObserverWatchView, ObserverWorkerRun, SetObserverScriptRequest, OBSERVER_WORKER_KEY_ENV,
 };
 pub use narsor_protocol::controller::{
     TaskDefaultHarness, WORKSTATION_RISK, WORKSTATION_RISK_NOT_ACCEPTED,
@@ -86,6 +95,7 @@ pub(super) fn runner_snapshot_request(
                 })
             })
             .transpose()?,
+        event_wait: snapshot.event_wait.clone(),
         conversation: snapshot.conversation.clone(),
         timeline: snapshot.timeline.clone(),
         safe_point: snapshot.safe_point,
@@ -118,6 +128,7 @@ pub(super) fn runner_snapshot_from_request(
                 })
             })
             .transpose()?,
+        event_wait: request.event_wait,
         conversation: request.conversation,
         timeline: request.timeline,
         safe_point: request.safe_point,

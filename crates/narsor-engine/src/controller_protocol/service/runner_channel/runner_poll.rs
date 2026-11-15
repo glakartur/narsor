@@ -8,7 +8,7 @@ use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::operator::protocol_delivery;
 use crate::controller_protocol::service::{chrono_duration, ProtocolService};
 use crate::controller_protocol::wire::*;
-use crate::orchestration::{RunnerState, TaskRecord};
+use crate::orchestration::{QueuedEventInput, RunnerState, TaskRecord};
 
 impl ProtocolService {
     /// Accepts a runner snapshot.
@@ -50,6 +50,16 @@ impl ProtocolService {
         self.credentials
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;
+        // A `wait` step that began to wait with a `watch` block asks for
+        // its watch entry once per episode: an entry the script closed is
+        // not added back while the task still waits in the same episode.
+        if let Some(watch) = outcome
+            .began_wait
+            .as_ref()
+            .and_then(|wait| wait.watch.as_ref())
+        {
+            self.register_wait_watch(&identity.task_id, &outcome.task.owner, watch);
+        }
         let mut task = outcome.task;
         if outcome.applied {
             self.notify(&identity.task_id);
@@ -87,6 +97,7 @@ impl ProtocolService {
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;
         let pending = query.pending_input_id.as_deref();
+        let event_wait_id = query.event_wait_id.as_deref();
         let defer_materials = query.defer_materials;
         let reader = identity.role == RunnerRole::Reader;
         // The runner that gave the comment on the pause to its agent says
@@ -99,8 +110,8 @@ impl ProtocolService {
         let poll = || -> ProtocolResult<RunnerPollResponse> {
             // A reader is handed nothing it would have to act on:
             // delivering an answer or a command to it would spend them.
-            let (inputs, commands, materials) = if reader {
-                (Vec::new(), Vec::new(), Vec::new())
+            let (inputs, events, commands, materials) = if reader {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             } else {
                 let (inputs, changed) = self.control.deliver_inputs(
                     &identity.task_id,
@@ -108,16 +119,23 @@ impl ProtocolService {
                     identity.launch_generation,
                     pending,
                 )?;
+                let (events, events_changed) = self.control.deliver_event_inputs(
+                    &identity.task_id,
+                    &identity.incarnation,
+                    identity.launch_generation,
+                    event_wait_id,
+                )?;
                 let (commands, commands_changed) = self.control.deliver_operator_commands(
                     &identity.task_id,
                     &identity.incarnation,
                     identity.launch_generation,
                 )?;
-                if changed || commands_changed {
+                if changed || events_changed || commands_changed {
                     self.notify(&identity.task_id);
                 }
                 (
                     inputs,
+                    events,
                     commands,
                     self.material_announcements(&identity.task_id),
                 )
@@ -139,6 +157,7 @@ impl ProtocolService {
                         })
                     })
                     .collect(),
+                events: events.into_iter().filter_map(delivered_event).collect(),
                 commands: commands
                     .into_iter()
                     .map(|queued| DeliveredOperatorCommand {
@@ -177,6 +196,7 @@ impl ProtocolService {
                 let actionable = response.default_harness != *asked_with
                     || behind_default(&response.default_harness)
                     || !response.inputs.is_empty()
+                    || !response.events.is_empty()
                     || !response.commands.is_empty()
                     || !response.conversation_pages.is_empty()
                     || !response.execution_events.is_empty()
@@ -218,6 +238,31 @@ impl ProtocolService {
         })
     }
 
+    /// The runner's verdict on a delivered event of a `wait` step.
+    pub fn runner_ack_event(
+        &self,
+        identity: &RunnerIdentity,
+        input_id: &str,
+        request: InputAckRequest,
+    ) -> ProtocolResult<EventAckResponse> {
+        Self::require_worker(identity)?;
+        let (input, changed) = self.control.settle_event_input(
+            &identity.task_id,
+            &identity.incarnation,
+            identity.launch_generation,
+            input_id,
+            request.accepted,
+            request.detail,
+        )?;
+        if changed {
+            self.notify(&identity.task_id);
+        }
+        Ok(EventAckResponse {
+            input_id: input.input_id,
+            status: input.status,
+        })
+    }
+
     /// The runner's verdict on a delivered operator command.
     pub fn runner_ack_command(
         &self,
@@ -241,6 +286,20 @@ impl ProtocolService {
             command: OperatorCommandView::from(&command),
         })
     }
+}
+
+/// A queued event as the runner receives it; `None` for an event whose
+/// data was already dropped (settled), which is never handed over again.
+fn delivered_event(input: QueuedEventInput) -> Option<DeliveredEvent> {
+    Some(DeliveredEvent {
+        input_id: input.input_id,
+        episode_id: input.episode_id,
+        delivery: EventDelivery::Event {
+            event_type: input.event_type,
+            source: input.source,
+            data: input.data?,
+        },
+    })
 }
 
 /// The calling runner's launch, as the record knows it.

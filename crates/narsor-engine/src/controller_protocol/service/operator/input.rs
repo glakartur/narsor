@@ -24,6 +24,7 @@ impl ProtocolService {
                 "an input needs an idempotency key",
             ));
         }
+        crate::controller_protocol::service::tasks::refuse_reserved_key(&request.idempotency_key)?;
         let is_retry = record
             .inputs
             .iter()

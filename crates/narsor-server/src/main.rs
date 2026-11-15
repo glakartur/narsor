@@ -32,8 +32,24 @@ enum ServerCommand {
     Stop,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Before the runtime starts a thread: capabilities belong to a thread,
+    // and every later thread copies the main thread's.
+    if let Err(error) = narsor_server::capabilities::confine_daemon() {
+        eprintln!("cannot confine the server's capabilities: {error}");
+        std::process::exit(1);
+    }
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("cannot start the async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(run());
+}
+
+async fn run() {
     let args = Args::parse();
     let flags = Flags {
         root: args.root,

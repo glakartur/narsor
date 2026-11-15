@@ -106,6 +106,11 @@ impl Flags {
             | SettingKey::LocalCodexHome
             | SettingKey::LocalClaudeConfigDir
             | SettingKey::LocalClaudeProfileSource
+            | SettingKey::ObserverWorker
+            | SettingKey::ObserverWorkerServer
+            | SettingKey::ObserverSecretsDir
+            | SettingKey::ObserverScriptUser
+            | SettingKey::ObserverInsecureSameUser
             | SettingKey::WebBind
             | SettingKey::WebUpstream
             | SettingKey::WebToken => None,
@@ -309,6 +314,23 @@ impl Resolved {
         }
     }
 
+    /// The observer worker the server starts, `None` when it starts none.
+    pub fn observer_worker(&self) -> Option<ObserverWorkerConfig> {
+        if self.text(SettingKey::ObserverWorker) != Some(settings::OBSERVER_WORKER_ON) {
+            return None;
+        }
+        Some(ObserverWorkerConfig {
+            server: self
+                .text(SettingKey::ObserverWorkerServer)
+                .map(str::to_string),
+            secrets_dir: self.text(SettingKey::ObserverSecretsDir).map(PathBuf::from),
+            script_user: self
+                .text(SettingKey::ObserverScriptUser)
+                .map(str::to_string),
+            insecure_same_user: self.text(SettingKey::ObserverInsecureSameUser) == Some("true"),
+        })
+    }
+
     /// One text setting as written, `None` when it is empty (not set).
     pub fn text(&self, setting: SettingKey) -> Option<&str> {
         self.value(setting)
@@ -384,6 +406,20 @@ impl Resolved {
             Some(directive.to_string())
         }
     }
+}
+
+/// What the server starts its observer worker with (`observer_*`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserverWorkerConfig {
+    /// The API's URL for the worker and its scripts; `None`: the server's
+    /// own listening address.
+    pub server: Option<String>,
+    /// The secrets directory, `None` for none.
+    pub secrets_dir: Option<PathBuf>,
+    /// The system user scripts run as.
+    pub script_user: Option<String>,
+    /// Scripts run as the server's own user (a trial only).
+    pub insecure_same_user: bool,
 }
 
 /// The configuration values an engine needs for an agent action.

@@ -20,6 +20,8 @@ pub(crate) enum AttemptOutcome {
     /// An agent asked a question and will be restarted in this same state once
     /// the person supplies its answer.
     AwaitingAgentInput(HumanInputRequest),
+    /// A `wait` step waits for an external event; the pass ends.
+    AwaitingExternalEvent(ExternalEventRequest),
     /// An agent answered without an output label the state accepts: a format
     /// error, answered with a reprompt rather than a retry (KTD7).
     OutputRejected(OutputRejection),

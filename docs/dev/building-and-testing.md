@@ -92,9 +92,9 @@ binaries (`CARGO_BIN_EXE_*`) or `cargo` do not belong in this crate.
 periodically with `cargo sweep --time 14`.
 
 The workspace build keeps `narsor`, `narsor-cli`, `narsor-server`,
-`narsor-runner`, and `narsor-controller` together in `target/debug` (or
-`target/release`), so the client can find the server and the server can find
-the local controller and runner. In trusted mode the server starts
+`narsor-runner`, `narsor-controller` and `narsor-observer-worker` together in
+`target/debug` (or `target/release`), so the client can find the server and
+the server can find the local controller, the runner and the observer worker. In trusted mode the server starts
 `narsor-controller local` as its child process; it does not start without that
 binary next to it. To install all process binaries into the same directory:
 
@@ -103,6 +103,7 @@ cargo install --path . --bins
 cargo install --path crates/narsor-server
 cargo install --path crates/narsor-runner
 cargo install --path crates/narsor-controller
+cargo install --path crates/narsor-observer-worker
 ```
 
 The integration tests run against a real filesystem and spawn real child
@@ -200,9 +201,6 @@ see [Linux installation and server operation](../operations/installation.md).
 Deliberately deferred, and verified against the code — each item needs a plan
 of its own:
 
-- **`WaitAction`** and the service that polls for external events: the action
-  type parses, but no executor is registered, so entering such a state fails
-  with "not available in this version".
 - **Agent decisions** (`decision: { type: agent }`) — they return an explicit
   "not available" error instead of quietly behaving like a rule-based decision.
 - **Containerisation of local tasks** — a task started by `narsor-controller

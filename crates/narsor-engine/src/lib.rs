@@ -15,6 +15,7 @@ pub mod domain;
 pub mod engine;
 pub mod environment;
 pub mod materials;
+pub mod observers;
 pub mod orchestration;
 pub mod persistence;
 pub mod registry;

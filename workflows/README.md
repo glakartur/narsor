@@ -53,3 +53,18 @@ It needs an agent harness, the `compound-engineering` skills and `gh` or
 narsor-cli validate workflows/compound-engineering-change.yaml
 narsor-cli run workflows/compound-engineering-change.yaml --input description="Add a health endpoint"
 ```
+
+# Example observer scripts
+
+[`observers/examples/`](observers/examples/) has three observer scripts. They
+use `curl` and `jq`:
+
+- `jira-new-issues.sh` creates a task for each new Jira issue that a JQL
+  query finds. On the first run it only records where to start.
+- `github-pr-review.sh` and `gitlab-mr-review.sh` deliver `review.approved`,
+  `review.changes_requested`, `merged` and `closed` to the tasks that wait
+  for a pull or merge request on the watch list.
+
+The header of each script has the `observer create` command, the condition
+and the secrets. With `FAKE_SOURCE_DIR` set, a script reads its answers from
+files and does not use the network.

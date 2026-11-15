@@ -35,9 +35,11 @@
 //! child also checks its parent itself (`--parent-pid`), the guard for a
 //! daemon killed with `SIGKILL` before the signal could be set up. A child
 //! that ends after the start is started again after [`Supervision`]'s pause,
-//! doubled on each further failure up to [`MAX_RESTART_DELAY`] and reset
-//! once one ran for [`RESTART_RESET_AFTER`] (R9). A restart enrolls nothing:
-//! the credential is there.
+//! doubled on each further failure up to
+//! [`child_process::MAX_RESTART_DELAY`] and reset once one ran for
+//! [`child_process::RESTART_RESET_AFTER`] (R9). A restart enrolls nothing:
+//! the credential is there. [`child_process`] holds what this supervision
+//! shares with the observer worker's.
 //!
 //! # Stopping
 //!
@@ -47,10 +49,10 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::{self, BufRead as _};
+use std::io;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::process::{Child, Command};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -58,7 +60,8 @@ use narsor_controller_runtime::{ControllerConfig, Supervision, ENROLLMENT_CODE_E
 use narsor_engine::controller_protocol::ProtocolService;
 use narsor_engine::domain::BackendId;
 use narsor_engine::environment::BackendRecord;
-use narsor_shared::config::ENV_PREFIX;
+
+use crate::child_process::{self, Ended, RestartDelay, POLL_INTERVAL};
 
 /// The controller binary, installed next to `narsor-server`.
 const CONTROLLER_PROGRAM: &str = "narsor-controller";
@@ -71,18 +74,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the child waits for a predecessor holding its credential lock.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(7);
 
-/// Longest pause before a restart.
-const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
-
-/// A child that ran this long starts the restart pauses over.
-const RESTART_RESET_AFTER: Duration = Duration::from_secs(60);
-
 /// How many of the child's last stderr lines a start failure quotes.
 const STDERR_TAIL: usize = 20;
-
-/// How often a starting daemon looks for the child's lease, and the
-/// supervising thread for the child's end.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Prefix of the child's lines in the daemon's log.
 const LOG_PREFIX: &str = "narsor-controller:";
@@ -104,28 +97,10 @@ pub struct LocalControllerSettings {
     pub log_directive: Option<String>,
 }
 
-/// The `narsor-controller` next to this executable — in a debug build also
-/// the one in Cargo's profile directory, for a test harness under `deps/`.
-/// Never one from `PATH` (KTD9).
+/// The `narsor-controller` next to this executable (KTD9), see
+/// [`child_process::sibling_program`].
 pub fn controller_program() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("cannot find the narsor-server executable: {error}"))?;
-    let adjacent = exe.with_file_name(CONTROLLER_PROGRAM);
-    if adjacent.is_file() {
-        return Ok(adjacent);
-    }
-    #[cfg(debug_assertions)]
-    if let Some(profile) = exe.parent().and_then(std::path::Path::parent) {
-        let built = profile.join(CONTROLLER_PROGRAM);
-        if built.is_file() {
-            return Ok(built);
-        }
-    }
-    Err(format!(
-        "{} is missing; narsor-server, narsor-controller and narsor-runner must be installed \
-         in one directory",
-        adjacent.display()
-    ))
+    child_process::sibling_program(CONTROLLER_PROGRAM)
 }
 
 /// How far the child got, shared by the starting daemon and the thread.
@@ -289,7 +264,12 @@ fn supervise(
         let started = Instant::now();
         let outcome = match spawn(settings, code.take(), shared) {
             Ok((mut child, stderr)) => {
-                let outcome = watch(&mut child, stopped, policy.stop_timeout);
+                let outcome = child_process::watch(
+                    &mut child,
+                    stopped,
+                    policy.stop_timeout,
+                    "the local controller",
+                );
                 // Every line in before the end is judged.
                 let _ = stderr.join();
                 outcome
@@ -317,84 +297,9 @@ fn supervise(
             restart_in_secs = delay.as_secs(),
             "daemon: the local controller ended; starting it again"
         );
-        match stopped.recv_timeout(delay) {
-            Err(RecvTimeoutError::Timeout) => {}
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
-        }
-    }
-}
-
-/// The pauses before restarts: the first one, doubled after every restart
-/// up to [`MAX_RESTART_DELAY`], and the first one again after a child that
-/// ran [`RESTART_RESET_AFTER`].
-#[derive(Debug)]
-struct RestartDelay {
-    first: Duration,
-    next: Duration,
-}
-
-impl RestartDelay {
-    fn new(first: Duration) -> Self {
-        Self { first, next: first }
-    }
-
-    /// The pause before starting again a child that ran for `ran_for`.
-    fn after(&mut self, ran_for: Duration) -> Duration {
-        if ran_for >= RESTART_RESET_AFTER {
-            self.next = self.first;
-        }
-        let delay = self.next;
-        self.next = (delay * 2).min(MAX_RESTART_DELAY);
-        delay
-    }
-}
-
-/// How one incarnation ended.
-enum Ended {
-    /// On request.
-    Stopped,
-    /// On its own, or it never started.
-    Exited(Result<ExitStatus, String>),
-}
-
-/// Waits for the child's end or a stop request, whichever comes first.
-fn watch(child: &mut Child, stopped: &mpsc::Receiver<()>, stop_timeout: Duration) -> Ended {
-    loop {
-        match stopped.recv_timeout(POLL_INTERVAL) {
-            Err(RecvTimeoutError::Timeout) => {}
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                terminate(child, stop_timeout);
-                return Ended::Stopped;
-            }
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => return Ended::Exited(Ok(status)),
-            Ok(None) => {}
-            Err(error) => return Ended::Exited(Err(format!("cannot wait for it: {error}"))),
-        }
-    }
-}
-
-/// `SIGTERM`, up to `timeout` for the child to release its lease and end,
-/// then `SIGKILL`.
-fn terminate(child: &mut Child, timeout: Duration) {
-    signal(child.id(), libc::SIGTERM);
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) | Err(_) = child.try_wait() {
+        if child_process::stop_requested_within(stopped, delay) {
             return;
         }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-    tracing::warn!("daemon: the local controller did not stop in time; killing it");
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn signal(pid: u32, signal: i32) {
-    // SAFETY: signals the child this thread started and has not reaped.
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
     }
 }
 
@@ -404,9 +309,6 @@ fn spawn(
     code: Option<String>,
     shared: &Arc<Shared>,
 ) -> io::Result<(Child, std::thread::JoinHandle<()>)> {
-    use std::os::unix::process::CommandExt;
-
-    let parent = std::process::id();
     let mut command = Command::new(&settings.program);
     command
         .arg("local")
@@ -427,89 +329,23 @@ fn spawn(
         .arg("--lock-timeout-secs")
         .arg(LOCK_TIMEOUT.as_secs().to_string())
         .arg("--parent-pid")
-        .arg(parent.to_string())
+        .arg(std::process::id().to_string())
         .arg("--no-config");
-    for (name, _) in std::env::vars_os() {
-        if name.as_encoded_bytes().starts_with(ENV_PREFIX.as_bytes()) {
-            command.env_remove(name);
-        }
-    }
-    match &settings.log_directive {
-        Some(directive) => command.env("RUST_LOG", directive),
-        None => command.env_remove("RUST_LOG"),
-    };
+    child_process::prepare(&mut command, settings.log_directive.as_deref());
     if let Some(code) = code {
         command.env(ENROLLMENT_CODE_ENV, code);
     }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        // Its own group: a Ctrl-C at the daemon's terminal reaches the
-        // daemon, which stops the child in order.
-        .process_group(0);
-    // SAFETY: only async-signal-safe calls between fork and exec.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // The daemon may have died before the signal was armed.
-            if libc::getppid() as u32 != parent {
-                return Err(io::Error::other("the daemon is gone"));
-            }
-            Ok(())
-        });
-    }
     let mut child = command.spawn()?;
-    let stderr = child.stderr.take().expect("stderr is piped");
     let shared = Arc::clone(shared);
-    let copier = std::thread::Builder::new()
-        .name("local-controller-log".into())
-        .spawn(move || {
-            for line in io::BufReader::new(stderr).lines() {
-                let Ok(line) = line else { break };
-                eprintln!("{LOG_PREFIX} {line}");
-                shared.remember(line);
-            }
-        });
-    match copier {
-        Ok(copier) => Ok((child, copier)),
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(error)
-        }
-    }
+    let copier = child_process::copy_stderr(&mut child, "local-controller-log", LOG_PREFIX, {
+        move |line| shared.remember(line)
+    })?;
+    Ok((child, copier))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_restart_delay_doubles_up_to_thirty_seconds() {
-        let mut delays = RestartDelay::new(Duration::from_secs(1));
-        let crashed_at_once = Duration::from_millis(10);
-        let seconds: Vec<u64> = (0..8)
-            .map(|_| delays.after(crashed_at_once).as_secs())
-            .collect();
-        assert_eq!(seconds, [1, 2, 4, 8, 16, 30, 30, 30]);
-    }
-
-    #[test]
-    fn a_child_that_ran_a_minute_starts_the_delays_over() {
-        let mut delays = RestartDelay::new(Duration::from_secs(1));
-        for _ in 0..4 {
-            delays.after(Duration::ZERO);
-        }
-        assert_eq!(
-            delays.after(RESTART_RESET_AFTER - Duration::from_secs(1)),
-            Duration::from_secs(16)
-        );
-        assert_eq!(delays.after(RESTART_RESET_AFTER), Duration::from_secs(1));
-        assert_eq!(delays.after(Duration::ZERO), Duration::from_secs(2));
-    }
 
     #[test]
     fn a_start_failure_quotes_the_last_twenty_lines() {
