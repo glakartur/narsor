@@ -11,10 +11,12 @@
 //! (R21), the claim and the result the worker's.
 //!
 //! The entries of observer queues are the wait episodes of `decision`
-//! gates with a `watch` block ([`crate::observers::QueueEntry`]); the
-//! schedule hands them to the `on_episodes` observers of their queue.
+//! gates with a `watch` block ([`crate::observers::QueueEntry`]): the
+//! runner's snapshot adds and removes them ([`entries`]), and the schedule
+//! hands them to the `on_episodes` observers of their queue.
 
 mod effects;
+mod entries;
 mod owner;
 mod schedule;
 #[cfg(test)]

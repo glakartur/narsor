@@ -106,7 +106,28 @@ pub struct TaskSummary {
     pub panel: Option<PanelOffer>,
     #[serde(default)]
     pub resume: ResumeState,
+    /// The observer queue entry of the wait episode the task waits in now
+    /// (R21): a client shows one mark while it is there. `None` while the
+    /// task waits at no gate with a `watch` block, when the control plane
+    /// keeps no entry for its episode, and from a server before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_entry: Option<TaskQueueEntryView>,
     pub as_of: DateTime<Utc>,
+}
+
+/// The observer queue entry of a task's current wait episode, as the task
+/// view shows it (R21). Observer runs report nothing to the task: this is
+/// what the control plane knows from its own entries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskQueueEntryView {
+    /// The queue the gate's `watch` names.
+    pub queue: String,
+    /// The workflow state of the gate.
+    pub step: String,
+    /// The wait episode: the id of the gate's pending input request.
+    pub episode: String,
+    /// When the control plane added the entry.
+    pub since: DateTime<Utc>,
 }
 
 /// `GET /control/v1/tasks` response.

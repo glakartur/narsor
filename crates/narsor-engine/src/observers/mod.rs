@@ -22,8 +22,8 @@ pub mod schedule_expr;
 pub mod store;
 
 pub use contract::{
-    parse_script_output, ContractError, ScriptEntry, ScriptInput, ScriptObserver, ScriptOutput,
-    ENTRY_DONE_EXIT_CODE, ENTRY_PENDING_EXIT_CODE, MAX_SCRIPT_OUTPUT_BYTES,
+    parse_script_output, ContractError, ScriptChoice, ScriptEntry, ScriptInput, ScriptObserver,
+    ScriptOutput, ScriptVariable, ENTRY_DONE_EXIT_CODE, MAX_SCRIPT_OUTPUT_BYTES,
     SCRIPT_CONTRACT_VERSION,
 };
 pub use model::*;

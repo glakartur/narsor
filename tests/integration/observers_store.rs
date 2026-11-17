@@ -12,9 +12,9 @@ use narsor_engine::observers::{
     parse_script_output, queue_entry_id, ActiveRun, ContractError, CreateTaskEffect, EntryWrite,
     ObserverConfig, ObserverEffect, ObserverError, ObserverId, ObserverMode, ObserverName,
     ObserverRecord, ObserverState, ObserverStore, QueueEntry, RunEntry, RunFailure, RunId,
-    RunStatus, ScheduleConfig, ScriptEntry, ScriptInput, ScriptObserver, SecretRef,
-    DEFAULT_INTERVAL_SECS, KEPT_RUN_FAILURES, MAX_SCRIPT_OUTPUT_BYTES, OBSERVER_RECORD_VERSION,
-    RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION,
+    RunStatus, ScheduleConfig, ScriptChoice, ScriptEntry, ScriptInput, ScriptObserver,
+    ScriptVariable, SecretRef, DEFAULT_INTERVAL_SECS, KEPT_RUN_FAILURES, MAX_SCRIPT_OUTPUT_BYTES,
+    OBSERVER_RECORD_VERSION, RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION,
 };
 use narsor_engine::orchestration::OwnerRef;
 use narsor_engine::persistence::paths::temp_path_for;
@@ -154,8 +154,35 @@ fn script_input(record: &ObserverRecord) -> ScriptInput {
         entry: Some(ScriptEntry {
             task_id: TaskId::parse("task-1").unwrap(),
             episode: "input-1".into(),
+            episode_started_at: now(),
             step: "review_work".into(),
             params: [("mr_url".to_string(), "https://gitlab/1".to_string())].into(),
+            choices: vec![
+                ScriptChoice {
+                    name: "check_feedback".into(),
+                    description: Some("Read the feedback".into()),
+                    requires_variables: Vec::new(),
+                },
+                ScriptChoice {
+                    name: "revise_plan".into(),
+                    description: None,
+                    requires_variables: vec!["note".into()],
+                },
+            ],
+            variables: vec![
+                ScriptVariable {
+                    name: "note".into(),
+                    variable_type: Some("text".into()),
+                    description: Some("What to change".into()),
+                    options: Vec::new(),
+                },
+                ScriptVariable {
+                    name: "severity".into(),
+                    variable_type: Some("select".into()),
+                    description: None,
+                    options: vec!["low".into(), "high".into()],
+                },
+            ],
         }),
         first_run: true,
         import_backlog: false,
@@ -1262,17 +1289,47 @@ fn the_script_input_is_one_json_document_with_the_queue_entry() {
 
     let value: serde_json::Value = serde_json::from_slice(&input.to_json_bytes()).unwrap();
 
-    assert_eq!(value["contract_version"], json!(1));
+    // R11: version 2 carries the entry with its episode's start and the
+    // gate's choices and variables.
+    assert_eq!(value["contract_version"], json!(2));
     assert_eq!(value["observer"]["name"], json!("jira-abc"));
     assert_eq!(value["state"], json!({"cursor": 4}));
-    assert_eq!(value["entry"]["episode"], json!("input-1"));
-    assert_eq!(value["entry"]["task_id"], json!("task-1"));
-    assert_eq!(value["entry"]["step"], json!("review_work"));
     assert_eq!(
-        value["entry"]["params"]["mr_url"],
-        json!("https://gitlab/1")
+        value["entry"],
+        json!({
+            "task_id": "task-1",
+            "episode": "input-1",
+            "episode_started_at": now(),
+            "step": "review_work",
+            "params": {"mr_url": "https://gitlab/1"},
+            "choices": [
+                {"name": "check_feedback", "description": "Read the feedback", "requires_variables": []},
+                {"name": "revise_plan", "description": null, "requires_variables": ["note"]},
+            ],
+            "variables": [
+                {"name": "note", "type": "text", "description": "What to change"},
+                {"name": "severity", "type": "select", "description": null, "options": ["low", "high"]},
+            ],
+        })
     );
     assert_eq!(value["first_run"], json!(true));
+    let read: ScriptInput = serde_json::from_value(value).unwrap();
+    assert_eq!(read, input);
+}
+
+#[test]
+fn the_script_input_of_an_always_run_has_no_entry_field() {
+    // R25: an `always` run checks no entry.
+    let root = TempRoot::new();
+    let store = root.store();
+    let record = create_jira(&store, "jira-abc");
+    let mut input = script_input(&record);
+    input.entry = None;
+
+    let value: serde_json::Value = serde_json::from_slice(&input.to_json_bytes()).unwrap();
+
+    assert_eq!(value["contract_version"], json!(2));
+    assert!(value.get("entry").is_none(), "{value}");
 }
 
 // ---------------------------------------------------------------------------

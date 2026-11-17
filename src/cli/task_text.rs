@@ -899,6 +899,14 @@ pub fn event_line(event: &TaskEvent) -> String {
         } => format!(
             "warning: step {step} asked observer {observer} to watch {object}; no watch entry: {reason}"
         ),
+        TaskEventKind::GateQueueWarning {
+            step,
+            queue,
+            episode,
+            reason,
+        } => format!(
+            "warning: step {step} waits on queue {queue} (episode {episode}): {reason}"
+        ),
         TaskEventKind::OwnerCommandAccepted { command, .. } => {
             format!("owner command {command:?}")
         }

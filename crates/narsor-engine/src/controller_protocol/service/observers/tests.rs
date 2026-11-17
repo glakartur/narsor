@@ -8,18 +8,23 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 
 use super::*;
+use crate::controller_protocol::credentials::{RunnerIdentity, RunnerRole};
 use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::ObserverCreateTaskRequest;
+use crate::domain::ExecutionStatus;
 use crate::domain::{
     BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
     TaskRepository, TaskRepositorySource, TaskWorkspace, WorkflowDefinition,
 };
 use crate::observers::{
-    CreateTaskEffect, LastRun, ObserverConfig, ObserverEffect, ObserverMode, ObserverName,
-    QueueEntry, RunFailure, RunId, RunStatus, ScheduleConfig, SecretRef, KEPT_RUN_FAILURES,
-    OBSERVER_RECORD_VERSION,
+    queue_entry_id, CreateTaskEffect, LastRun, ObserverConfig, ObserverEffect, ObserverMode,
+    ObserverName, QueueEntry, RunFailure, RunId, RunStatus, ScheduleConfig, SecretRef,
+    KEPT_RUN_FAILURES, OBSERVER_RECORD_VERSION,
 };
-use crate::orchestration::{Clock, CommandRequest, ControlPlane, NewTask, OwnerCommand, OwnerRef};
+use crate::orchestration::{
+    Clock, CommandRequest, ControlPlane, ExecutionCursor, NewTask, OwnerCommand, OwnerRef,
+    PendingInputRef, RunnerSnapshot,
+};
 use crate::persistence::StatePaths;
 use narsor_protocol::controller::{GateWatch, GateWatchChoice};
 
@@ -251,36 +256,115 @@ impl Fixture {
         task_id
     }
 
-    /// Puts the wait episode `episode` of `task_id` (of the default owner)
-    /// on `queue`, as the gate `review_work` reports it.
+    /// Makes `task_id` wait at the gate `review_work` in episode `episode`,
+    /// its `watch` naming `queue`: the runner's snapshot adds the entry.
     pub(super) fn entry(&self, queue: &str, task_id: &TaskId, episode: &str) -> QueueEntry {
-        self.entry_of(owner(), queue, task_id, episode)
+        self.report_gate(task_id, Some((episode, review_gate(queue, task_id))));
+        self.service
+            .observers()
+            .queue_entry(&queue_entry_id(task_id, episode))
+            .unwrap()
+            .expect("the snapshot added the entry")
     }
 
-    /// The same, of `owner`.
-    pub(super) fn entry_of(
-        &self,
-        owner: OwnerRef,
-        queue: &str,
-        task_id: &TaskId,
-        episode: &str,
-    ) -> QueueEntry {
-        let gate = GateWatch {
-            step: "review_work".into(),
-            queue: queue.into(),
-            params: [("mr_url".to_string(), format!("https://x/{task_id}"))].into(),
-            choices: vec![GateWatchChoice {
-                name: "check_feedback".into(),
-                description: None,
-                requires_variables: Vec::new(),
-            }],
-            variables: Vec::new(),
+    /// The task's runner reports a snapshot through the runner channel:
+    /// waiting at `gate` in its episode, or (`None`) past every gate.
+    pub(super) fn report_gate(&self, task_id: &TaskId, gate: Option<(&str, GateWatch)>) {
+        let identity = RunnerIdentity {
+            role: RunnerRole::Worker,
+            task_id: task_id.clone(),
+            launch_generation: 1,
+            incarnation: "pod-1".into(),
         };
-        let entry = QueueEntry::from_gate(owner, task_id.clone(), episode, &gate, self.now());
-        let store = self.service.observers();
-        let lock = store.lock_queue_entries().unwrap();
-        store.add_queue_entry(&lock, &entry).unwrap();
-        entry
+        self.service
+            .credentials
+            .issue_runner_session(
+                RunnerRole::Worker,
+                task_id,
+                "pod-1",
+                1,
+                0,
+                Duration::hours(1),
+            )
+            .unwrap();
+        let sequence = self
+            .service
+            .control_plane()
+            .task(task_id)
+            .unwrap()
+            .runner
+            .map_or(1, |runner| runner.snapshot.snapshot_sequence + 1);
+        let (pending_input, gate_watch) = match gate {
+            Some((episode, watch)) => (Some(pending_input(episode)), Some(watch)),
+            None => (None, None),
+        };
+        let snapshot = RunnerSnapshot {
+            snapshot_sequence: sequence,
+            execution_status: if pending_input.is_some() {
+                ExecutionStatus::InputNeeded
+            } else {
+                ExecutionStatus::Running
+            },
+            execution_cursor: ExecutionCursor {
+                execution_id: Some("exec-1".into()),
+                ..Default::default()
+            },
+            event_cursor: sequence,
+            pending_input,
+            gate_watch,
+            event_wait: None,
+            conversation: Default::default(),
+            timeline: None,
+            safe_point: false,
+            problem: None,
+            attention: Vec::new(),
+            conductor_available: false,
+            conductor_unavailable_reason: None,
+            default_harness_unavailable: None,
+            workspaces: Vec::new(),
+            generated_title: None,
+            observed_at: self.now(),
+        };
+        let response = self
+            .service
+            .runner_snapshot(&identity, snapshot.to_request().unwrap())
+            .unwrap();
+        assert!(response.applied);
+    }
+}
+
+/// The `watch` of the gate `review_work` of `task_id`, on `queue`.
+pub(super) fn review_gate(queue: &str, task_id: &TaskId) -> GateWatch {
+    GateWatch {
+        step: "review_work".into(),
+        queue: queue.into(),
+        params: [("mr_url".to_string(), format!("https://x/{task_id}"))].into(),
+        choices: vec![GateWatchChoice {
+            name: "check_feedback".into(),
+            description: Some("Read the feedback".into()),
+            requires_variables: Vec::new(),
+        }],
+        variables: Vec::new(),
+    }
+}
+
+/// The pending input request of a gate in `episode`.
+fn pending_input(episode: &str) -> PendingInputRef {
+    let form = serde_json::from_value(json!({
+        "execution_id": "exec-1",
+        "state_id": "review_work",
+        "action_execution_id": "act-1",
+        "instruction": "Review the merge request",
+        "fields": [],
+        "outputs": [],
+        "episode": episode,
+        "requested_at": "2026-11-17T12:00:00Z",
+    }))
+    .unwrap();
+    PendingInputRef {
+        id: episode.to_string(),
+        attempt_id: None,
+        form,
     }
 }
 
@@ -771,7 +855,7 @@ fn each_run_checks_one_entry_of_the_queue_with_its_episode() {
     assert!(fx.claim().is_none(), "one run at a time");
     fx.finish(&first, exited(0, ""));
     let second = fx.claim().unwrap();
-    fx.finish(&second, exited(1, ""));
+    fx.finish(&second, exited(0, ""));
 
     let entries: Vec<_> = [&first, &second]
         .iter()
@@ -1097,4 +1181,37 @@ fn schedule_judge(report: &RunReport) -> (RunStatus, Option<i32>) {
         .first()
         .and_then(|failure| failure.exit_code);
     (run.status, exit_code)
+}
+
+#[test]
+fn the_runner_channel_keeps_the_queue_entry_in_step_with_the_gate() {
+    // R16 through the runner's snapshot route: the entry of the episode the
+    // runner waits in, and no other.
+    let fx = Fixture::new();
+    fx.active("mr-review", ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    let first = fx.entry("mr-review", &task, "input-1");
+    assert_eq!(first.episode, "input-1");
+    assert_eq!(first.created_at, fx.now());
+
+    fx.advance(60);
+    fx.report_gate(&task, Some(("input-2", review_gate("mr-review", &task))));
+    let entries = fx
+        .service
+        .observers()
+        .queue_entries(&owner(), "mr-review")
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].episode, "input-2");
+    assert_eq!(entries[0].created_at, fx.now());
+
+    fx.report_gate(&task, None);
+    assert!(fx
+        .service
+        .observers()
+        .list_queue_entries()
+        .unwrap()
+        .is_empty());
+    let record = fx.service.control_plane().task(&task).unwrap();
+    assert_eq!(record.watched_gate, None);
 }

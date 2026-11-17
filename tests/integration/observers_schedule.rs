@@ -8,21 +8,17 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::controller_protocol::{ProtocolService, RunOutcome, RunReport};
-use narsor_engine::domain::{
-    BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
-    TaskRepository, TaskRepositorySource, TaskWorkspace,
-};
+use narsor_engine::domain::TaskId;
 use narsor_engine::observers::{
-    ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName, ObserverState,
-    QueueEntry, RunStatus, ScheduleConfig,
+    queue_entry_id, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
+    ObserverState, RunStatus, ScheduleConfig,
 };
-use narsor_engine::orchestration::{
-    Clock, CommandRequest, ControlPlane, NewTask, OwnerCommand, OwnerRef,
-};
+use narsor_engine::orchestration::{Clock, CommandRequest, ControlPlane, OwnerCommand, OwnerRef};
 use narsor_engine::persistence::StatePaths;
-use narsor_protocol::controller::GateWatch;
 use narsor_server::runtime::run_periodic_pass;
 use serde_json::json;
+
+use crate::gate_support::{queued_task, review_gate, wait_at};
 
 /// A clock the test moves by hand.
 #[derive(Debug)]
@@ -108,57 +104,29 @@ impl Fixture {
     }
 
     fn task(&self, id: &str) -> TaskId {
-        let workspace = TaskWorkspace::single(TaskRepository::new(
-            "narsor",
-            TaskRepositorySource::Git(Box::new(GitIdentity {
-                repository: Some("narsor".to_string()),
-                remote_url: "https://example.com/narsor.git".to_string(),
-                commit: "614c3a8".repeat(5) + "abcde",
-                git_ref: None,
-                ref_origin: None,
-                credential: None,
-            })),
-        ));
-        let spec = TaskLaunchSpec::new(
-            "steps",
-            1,
-            json!({}),
-            workspace,
-            ResolvedEnvironment::harness_only("claude-code"),
-            ResourceProfile::new(1000, 2048),
-        );
-        let task_id = TaskId::parse(id).unwrap();
-        self.service
-            .control_plane()
-            .create_task(NewTask::new(
-                task_id.clone(),
-                OwnerRef::new("owner"),
-                BackendId::parse("k8s").unwrap(),
-                spec,
-            ))
-            .unwrap();
-        task_id
+        queued_task(&self.service, id, &OwnerRef::new("owner"))
     }
 
-    /// Puts the wait episode `episode` of `task_id` on `queue`.
+    /// Makes `task_id` wait at a gate on `queue` in `episode`: its runner's
+    /// snapshot puts the episode on the queue.
     fn entry(&self, queue: &str, task_id: &TaskId, episode: &str) {
-        let gate = GateWatch {
-            step: "review_work".into(),
-            queue: queue.into(),
-            params: Default::default(),
-            choices: Vec::new(),
-            variables: Vec::new(),
-        };
-        let entry = QueueEntry::from_gate(
-            OwnerRef::new("owner"),
-            task_id.clone(),
-            episode,
-            &gate,
-            self.now(),
-        );
-        let store = self.service.observers();
-        let lock = store.lock_queue_entries().unwrap();
-        store.add_queue_entry(&lock, &entry).unwrap();
+        wait_at(&self.service, task_id, episode, &review_gate(queue));
+    }
+
+    /// Runs the one due entry run and reports `exit_code` for it.
+    fn run_entry(&self, exit_code: i32) -> narsor_engine::controller_protocol::ClaimedObserverRun {
+        let claimed = self.service.claim_observer_run().unwrap().expect("a run");
+        self.service
+            .finish_observer_run(
+                &claimed.run_id,
+                RunReport {
+                    outcome: RunOutcome::Exited { exit_code },
+                    stdout: String::new(),
+                    stderr: format!("exit {exit_code}"),
+                },
+            )
+            .unwrap();
+        claimed
     }
 }
 
@@ -322,5 +290,86 @@ fn a_cron_observer_runs_at_every_fire_time() {
     assert_eq!(
         fx.service.observers().load(&id).unwrap().next_run_at,
         Some(at(30))
+    );
+}
+
+#[test]
+fn only_exit_code_zero_ends_an_entry_run_without_an_error() {
+    // R14: 0 is "answered or nothing to report"; 1 is no longer "check
+    // again" but an error, like 2. Errors are recorded per entry, the
+    // observer stays active and counts no failure, and the entry stays.
+    let fx = Fixture::new();
+    let id = fx.active_on_episodes("mr-review");
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+    let entry_id = queue_entry_id(&task, "input-1");
+
+    for (round, exit_code) in [0, 1, 2].into_iter().enumerate() {
+        if round > 0 {
+            fx.advance(Duration::seconds(300));
+        }
+        run_periodic_pass(&fx.service);
+        fx.run_entry(exit_code);
+
+        let record = fx.service.observers().load(&id).unwrap();
+        assert_eq!(record.state, ObserverState::Active, "exit {exit_code}");
+        assert_eq!(record.consecutive_failures, 0, "exit {exit_code}");
+        let expected = if exit_code == 0 {
+            RunStatus::Succeeded
+        } else {
+            RunStatus::Failed
+        };
+        assert_eq!(
+            record.last_run.unwrap().status,
+            expected,
+            "exit {exit_code}"
+        );
+        assert!(fx
+            .service
+            .observers()
+            .queue_entry(&entry_id)
+            .unwrap()
+            .is_some());
+    }
+    // The newest error of the entry replaced the older one.
+    let errors = fx.service.observers().list_failures(&id).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].exit_code, Some(2));
+    assert_eq!(errors[0].entry_id.as_deref(), Some(entry_id.as_str()));
+    assert_eq!(errors[0].error, "the script exited with code 2");
+}
+
+#[test]
+fn an_entry_run_gets_the_whole_gate_in_contract_version_two() {
+    // R11: task, episode and its start, step, params, choices, variables.
+    let fx = Fixture::new();
+    fx.active_on_episodes("mr-review");
+    let task = fx.task("task-1");
+    let started = fx.now();
+    fx.entry("mr-review", &task, "input-1");
+    fx.advance(Duration::seconds(30));
+    run_periodic_pass(&fx.service);
+
+    let claimed = fx.run_entry(0);
+
+    let input = serde_json::to_value(&claimed.input).unwrap();
+    assert_eq!(input["contract_version"], json!(2));
+    let gate = review_gate("mr-review");
+    assert_eq!(
+        input["entry"],
+        json!({
+            "task_id": "task-1",
+            "episode": "input-1",
+            "episode_started_at": started,
+            "step": "review_work",
+            "params": gate.params,
+            "choices": [
+                {"name": "check_feedback", "description": "Read the reviewer's feedback", "requires_variables": []},
+                {"name": "revise_plan", "description": null, "requires_variables": ["note"]},
+            ],
+            "variables": [
+                {"name": "note", "type": "text", "description": "What to change"},
+            ],
+        })
     );
 }

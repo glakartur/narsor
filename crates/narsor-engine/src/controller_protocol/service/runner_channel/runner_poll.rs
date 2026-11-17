@@ -47,6 +47,11 @@ impl ProtocolService {
             snapshot,
             chrono_duration(grace),
         )?;
+        // The queue entries follow the gate's episodes the record now holds:
+        // the ended one's entry goes before the new one's is added (R16,
+        // KTD-5). Before the session check, so a refusal there cannot leave
+        // the entries behind the record.
+        self.follow_gate_episode(&outcome.task, &outcome.gate_change);
         self.credentials
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;

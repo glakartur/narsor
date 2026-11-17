@@ -14,6 +14,7 @@
 mod backend_contract_support;
 mod engine_support;
 mod environment_support;
+mod gate_support;
 mod kubernetes_support;
 mod task_app_support;
 
@@ -52,9 +53,9 @@ mod kubernetes_adapter;
 mod launch_spec_contract;
 mod observers_effects;
 mod observers_examples;
+mod observers_queue_entries;
 mod observers_schedule;
 mod observers_store;
-mod observers_watch;
 mod observers_worker;
 mod orchestration;
 mod persistence;

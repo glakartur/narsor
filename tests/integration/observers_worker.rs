@@ -21,10 +21,11 @@ use narsor::api::ClientError;
 use narsor_engine::controller_protocol::error::ProtocolError;
 use narsor_engine::controller_protocol::service::MAX_STORED_LOG_BYTES;
 use narsor_engine::controller_protocol::ProtocolService;
+use narsor_engine::domain::TaskId;
 use narsor_engine::domain::WorkflowDefinition;
 use narsor_engine::observers::{
-    CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
-    RunId, RunStatus, SecretRef, MAX_SCRIPT_OUTPUT_BYTES,
+    queue_entry_id, CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverMode,
+    ObserverName, RunId, RunStatus, SecretRef, MAX_SCRIPT_OUTPUT_BYTES,
 };
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
 use narsor_engine::persistence::StatePaths;
@@ -38,6 +39,8 @@ use narsor_protocol::controller::{
     ObserverWorkerRun, OBSERVER_WORKER_KEY_ENV,
 };
 use serde_json::json;
+
+use crate::gate_support::{queued_task, review_gate, wait_at};
 
 const SENTINEL: &str = "s3cr3t-SENTINEL-4f1c9a";
 
@@ -153,6 +156,30 @@ impl Fixture {
         self.service.approve_observer_version(&id, 1).unwrap();
         self.service.observer_pass();
         id
+    }
+
+    /// An active `on_episodes` observer of the queue `mr-review` running
+    /// `script`, and a task waiting at a gate on that queue in episode
+    /// `input-1`: the observer's run for the entry is due.
+    fn queue_observer(&self, script: &str) -> (ObserverId, TaskId) {
+        let config = ObserverConfig::new(
+            ObserverName::parse("mr-review").unwrap(),
+            "gitlab",
+            ObserverEffect::None,
+            ObserverMode::OnEpisodes,
+        );
+        let store = self.service.observers();
+        let now = self.service.control_plane().now();
+        let id = store
+            .create(owner(), config, None, now)
+            .unwrap()
+            .observer_id;
+        store.add_script(&id, script, now).unwrap();
+        self.service.approve_observer_version(&id, 1).unwrap();
+        let task = queued_task(&self.service, "task-1", &owner());
+        wait_at(&self.service, &task, "input-1", &review_gate("mr-review"));
+        self.service.observer_pass();
+        (id, task)
     }
 
     fn api(&self) -> Arc<ServiceApi> {
@@ -376,6 +403,89 @@ async fn a_script_reading_its_input_saves_the_state_it_prints() {
     assert_eq!(fs::read_dir(fx.root.join("work")).unwrap().count(), 0);
     // Nothing more is due.
     assert!(worker.run_once().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_entry_run_reads_its_gate_in_contract_version_two() {
+    // R11: the queue entry with its episode's start and the gate's choices
+    // and variables; exit 0 ends the run without an error (R14).
+    let fx = Fixture::new();
+    let (id, task) = fx.queue_observer("true\n");
+    let runner = FakeRunner::exiting(0, "", "");
+    let worker = Worker::new(fx.api(), Arc::clone(&runner), fx.options());
+
+    let handled = worker.run_once().await.unwrap().expect("a run was due");
+
+    assert_eq!(fx.status_of(&handled.run_id), RunStatus::Succeeded);
+    let input: serde_json::Value = serde_json::from_slice(&runner.specs()[0].stdin).unwrap();
+    assert_eq!(input["contract_version"], json!(2));
+    let entry = &input["entry"];
+    assert_eq!(entry["task_id"], json!(task.as_str()));
+    assert_eq!(entry["episode"], json!("input-1"));
+    assert!(entry["episode_started_at"].is_string(), "{entry}");
+    assert_eq!(entry["step"], json!("review_work"));
+    assert_eq!(entry["params"]["label"], json!("w CR"));
+    assert_eq!(
+        entry["choices"][1],
+        json!({"name": "revise_plan", "description": null, "requires_variables": ["note"]})
+    );
+    assert_eq!(
+        entry["variables"],
+        json!([{"name": "note", "type": "text", "description": "What to change"}])
+    );
+    let record = fx.service.observers().load(&id).unwrap();
+    assert_eq!(
+        record.state,
+        narsor_engine::observers::ObserverState::Active
+    );
+}
+
+#[tokio::test]
+async fn an_always_run_reads_no_entry() {
+    // R25.
+    let fx = Fixture::new();
+    fx.observer("true\n", &[]);
+    let runner = FakeRunner::exiting(0, r#"{"state": {}}"#, "");
+    let worker = Worker::new(fx.api(), Arc::clone(&runner), fx.options());
+
+    worker.run_once().await.unwrap().expect("a run was due");
+
+    let input: serde_json::Value = serde_json::from_slice(&runner.specs()[0].stdin).unwrap();
+    assert_eq!(input["contract_version"], json!(2));
+    assert!(input.get("entry").is_none(), "{input}");
+}
+
+#[tokio::test]
+async fn an_entry_run_exiting_two_is_an_error_of_its_entry_only() {
+    // R14: the error is recorded for the entry; the observer stays active
+    // and counts no failure; the entry stays on its queue.
+    let fx = Fixture::new();
+    let (id, task) = fx.queue_observer("exit 2\n");
+    let worker = Worker::new(fx.api(), ProcessRunner, fx.options());
+
+    let handled = worker.run_once().await.unwrap().expect("a run was due");
+
+    assert_eq!(
+        handled.report.outcome,
+        ObserverRunOutcome::Exited { exit_code: 2 }
+    );
+    assert_eq!(fx.status_of(&handled.run_id), RunStatus::Failed);
+    let failure = fx.failure_of(&handled.run_id);
+    let entry_id = queue_entry_id(&task, "input-1");
+    assert_eq!(failure.entry_id.as_deref(), Some(entry_id.as_str()));
+    assert_eq!(failure.exit_code, Some(2));
+    let record = fx.service.observers().load(&id).unwrap();
+    assert_eq!(
+        record.state,
+        narsor_engine::observers::ObserverState::Active
+    );
+    assert_eq!(record.consecutive_failures, 0);
+    assert!(fx
+        .service
+        .observers()
+        .queue_entry(&entry_id)
+        .unwrap()
+        .is_some());
 }
 
 #[tokio::test]

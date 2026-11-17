@@ -5393,3 +5393,219 @@ fn an_accepted_safe_point_ends_when_the_task_leaves_the_pause_another_way() {
         "the accepted stop must not outlive its pause"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Watched gate episodes (R16, R17)
+// ---------------------------------------------------------------------------
+
+/// The `watch` of the gate `review_work`, on the queue `mr-review`.
+fn review_watch() -> narsor_protocol::controller::GateWatch {
+    narsor_protocol::controller::GateWatch {
+        step: "review_work".into(),
+        queue: "mr-review".into(),
+        params: [(
+            "mr_url".to_string(),
+            "https://git.example.com/mr/1".to_string(),
+        )]
+        .into(),
+        choices: Vec::new(),
+        variables: Vec::new(),
+    }
+}
+
+/// The runner of the task's current launch reports a snapshot: with its
+/// execution or still starting, waiting in an episode (at a gate with a
+/// `watch` or without one) or for nothing.
+fn gate_report(
+    fx: &Fixture,
+    id: &str,
+    execution: bool,
+    waiting: Option<(&str, bool)>,
+) -> narsor_engine::orchestration::RunnerReportOutcome {
+    let record = fx.control.task(&task(id)).unwrap();
+    let launch_generation = launch_generation_of(&record);
+    let incarnation = format!("pod-g{launch_generation}");
+    let sequence = record
+        .runner
+        .as_ref()
+        .filter(|runner| runner.incarnation == incarnation)
+        .map_or(1, |runner| runner.snapshot.snapshot_sequence + 1);
+    let mut snapshot = safe_point_snapshot(sequence);
+    snapshot.safe_point = false;
+    if execution {
+        snapshot.execution_cursor.execution_id = Some("exec-1".into());
+    }
+    if let Some((episode, watched)) = waiting {
+        snapshot.execution_status = ExecutionStatus::InputNeeded;
+        snapshot.pending_input = Some(pending_input(episode));
+        snapshot.gate_watch = watched.then(review_watch);
+    }
+    fx.control
+        .record_runner_snapshot(&task(id), &incarnation, launch_generation, snapshot)
+        .expect("runner snapshot")
+}
+
+fn episode_of(gate: &Option<narsor_engine::orchestration::WatchedGate>) -> Option<&str> {
+    gate.as_ref().map(|gate| gate.episode.as_str())
+}
+
+#[test]
+fn a_snapshot_says_which_watched_episode_it_ended_and_which_it_began() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+
+    let entered = gate_report(&fx, "task-1", true, Some(("ask-1", true)));
+    assert_eq!(episode_of(&entered.gate_change.ended), None);
+    assert_eq!(episode_of(&entered.gate_change.began), Some("ask-1"));
+    assert_eq!(entered.gate_change.began.unwrap().watch, review_watch());
+    assert_eq!(episode_of(&entered.task.watched_gate), Some("ask-1"));
+
+    let same = gate_report(&fx, "task-1", true, Some(("ask-1", true)));
+    assert!(same.gate_change.is_empty());
+
+    // A review loop: one snapshot leaves one episode and enters the next.
+    let looped = gate_report(&fx, "task-1", true, Some(("ask-2", true)));
+    assert_eq!(episode_of(&looped.gate_change.ended), Some("ask-1"));
+    assert_eq!(episode_of(&looped.gate_change.began), Some("ask-2"));
+
+    // A gate without a `watch` is no watched episode.
+    let unwatched = gate_report(&fx, "task-1", true, Some(("ask-3", false)));
+    assert_eq!(episode_of(&unwatched.gate_change.ended), Some("ask-2"));
+    assert_eq!(unwatched.gate_change.began, None);
+    assert_eq!(unwatched.task.watched_gate, None);
+
+    let working = gate_report(&fx, "task-1", true, None);
+    assert!(working.gate_change.is_empty());
+    let watched_again = gate_report(&fx, "task-1", true, Some(("ask-4", true)));
+    assert_eq!(watched_again.gate_change.ended, None);
+    assert_eq!(episode_of(&watched_again.gate_change.began), Some("ask-4"));
+    let answered = gate_report(&fx, "task-1", true, None);
+    assert_eq!(episode_of(&answered.gate_change.ended), Some("ask-4"));
+    assert_eq!(answered.task.watched_gate, None);
+}
+
+#[test]
+fn a_redelivered_snapshot_changes_no_episode() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    let record = fx.control.task(&task("task-1")).unwrap();
+    let launch_generation = launch_generation_of(&record);
+    let mut snapshot = safe_point_snapshot(1);
+    snapshot.safe_point = false;
+    snapshot.execution_cursor.execution_id = Some("exec-1".into());
+    snapshot.pending_input = Some(pending_input("ask-1"));
+    snapshot.gate_watch = Some(review_watch());
+    let incarnation = format!("pod-g{launch_generation}");
+    let first = fx
+        .control
+        .record_runner_snapshot(
+            &task("task-1"),
+            &incarnation,
+            launch_generation,
+            snapshot.clone(),
+        )
+        .unwrap();
+    assert!(!first.gate_change.is_empty());
+
+    let again = fx
+        .control
+        .record_runner_snapshot(&task("task-1"), &incarnation, launch_generation, snapshot)
+        .unwrap();
+
+    assert!(!again.applied);
+    assert!(again.gate_change.is_empty());
+}
+
+#[test]
+fn pause_loss_and_restarts_keep_the_watched_episode() {
+    // R17: none of them ends the episode. A runner that is still starting
+    // reports no wait, and that is not an exit from the gate.
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    run_in_single_slot(&fx, "task-1", &lease);
+    gate_report(&fx, "task-1", true, Some(("ask-1", true)));
+    let kept = |fx: &Fixture| {
+        let record = fx.control.task(&task("task-1")).unwrap();
+        assert_eq!(episode_of(&record.watched_gate), Some("ask-1"));
+    };
+
+    // Pause at the gate, and resume.
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    let at_safe_point = gate_report(&fx, "task-1", true, Some(("ask-1", true)));
+    assert!(at_safe_point.gate_change.is_empty());
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    kept(&fx);
+    fx.control
+        .command_with_capacity(
+            &task("task-1"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .unwrap();
+    report_now(&fx, "task-1", &lease, Observation::StartAccepted).unwrap();
+    report_now(&fx, "task-1", &lease, Observation::RunnerReady).unwrap();
+    let starting = gate_report(&fx, "task-1", false, None);
+    assert!(starting.gate_change.is_empty());
+    kept(&fx);
+    let back = gate_report(&fx, "task-1", true, Some(("ask-1", true)));
+    assert!(back.gate_change.is_empty());
+
+    // The workload is lost, and the task is started again.
+    let lost = fx
+        .observe(
+            "task-1",
+            &lease,
+            Observation::WorkloadLost { state_known: true },
+        )
+        .unwrap();
+    assert_eq!(lost.runner_state, RunnerState::Interrupted);
+    kept(&fx);
+    fx.command("task-1", OwnerCommand::Start, "retry-1");
+    report_now(&fx, "task-1", &lease, Observation::StartAccepted).unwrap();
+    report_now(&fx, "task-1", &lease, Observation::RunnerReady).unwrap();
+    assert!(gate_report(&fx, "task-1", false, None)
+        .gate_change
+        .is_empty());
+    assert!(gate_report(&fx, "task-1", true, Some(("ask-1", true)))
+        .gate_change
+        .is_empty());
+    kept(&fx);
+}
+
+#[test]
+fn a_gate_step_and_queue_from_the_runner_are_cleaned() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    let record = fx.control.task(&task("task-1")).unwrap();
+    let launch_generation = launch_generation_of(&record);
+    let mut snapshot = safe_point_snapshot(1);
+    snapshot.safe_point = false;
+    snapshot.execution_cursor.execution_id = Some("exec-1".into());
+    snapshot.pending_input = Some(pending_input("ask-1"));
+    let mut watch = review_watch();
+    watch.step = "review\u{1b}[31m_work".into();
+    watch.queue = "mr-\u{7}review".into();
+    snapshot.gate_watch = Some(watch);
+
+    let outcome = fx
+        .control
+        .record_runner_snapshot(
+            &task("task-1"),
+            &format!("pod-g{launch_generation}"),
+            launch_generation,
+            snapshot,
+        )
+        .unwrap();
+
+    let gate = outcome.task.watched_gate.unwrap();
+    assert!(!gate.watch.step.contains('\u{1b}'), "{:?}", gate.watch.step);
+    assert!(
+        !gate.watch.queue.contains('\u{7}'),
+        "{:?}",
+        gate.watch.queue
+    );
+}

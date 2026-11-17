@@ -53,12 +53,13 @@ pub use narsor_protocol::controller::{
     SetConcurrencyLimitRequest, SetDefaultBackendRequest, StepKind, StepView, SubmitCommentRequest,
     SubmitCommentResponse, SubmitInputRequest, SubmitInputResponse, SubmitOperatorCommandRequest,
     SubmitOperatorCommandResponse, TaskActionId, TaskActionOffer, TaskActionOption, TaskEvent,
-    TaskEventKind, TaskListResponse, TaskProvenance, TaskState, TaskSummary, TimelineResponse,
-    TransitionExit, TransitionOffer, ValidateWorkflowRequest, ValidateWorkflowResponse,
-    WorkflowInputType, WorkflowInputView, WorkflowListResponse, WorkflowSource,
-    WorkflowSourceRequest, WorkflowSourceResponse, WorkflowView, WorkflowWorkspaceView,
-    WorkspaceRequest, CONVERSATION_READER_STARTING, CONVERSATION_RECORD_UNREADABLE,
-    CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
+    TaskEventKind, TaskListResponse, TaskProvenance, TaskQueueEntryView, TaskState, TaskSummary,
+    TimelineResponse, TransitionExit, TransitionOffer, ValidateWorkflowRequest,
+    ValidateWorkflowResponse, WorkflowInputType, WorkflowInputView, WorkflowListResponse,
+    WorkflowSource, WorkflowSourceRequest, WorkflowSourceResponse, WorkflowView,
+    WorkflowWorkspaceView, WorkspaceRequest, CONVERSATION_READER_STARTING,
+    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
+    CONVERSATION_UNAVAILABLE,
 };
 
 use narsor_model::domain::TaskId;

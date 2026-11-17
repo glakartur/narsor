@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 pub use narsor_protocol::controller::{
     ArchiveTombstone, AttentionItem, AttentionKind, CommandActor, CommandReceipt,
     ConversationAttemptSummary, ConversationAvailability, EventWait, EventWatch, ExecutionCursor,
-    HarnessUnavailable, InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary,
-    OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
-    ResumeExhaustion, ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason,
-    TaskEvent, TaskEventKind, TaskProvenance, TaskState, WorkloadLoss,
+    GateWatch, HarnessUnavailable, InputStatus, InputUpdate, MaterialChange, Observation,
+    ObservedSummary, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason,
+    ResourceIdentity, ResumeExhaustion, ResumeMessage, ResumeState, RunnerProblem, RunnerState,
+    SlotReleaseReason, TaskEvent, TaskEventKind, TaskProvenance, TaskState, WorkloadLoss,
 };
 
 /// Current schema version of [`TaskRecord`].
@@ -374,6 +374,15 @@ pub struct TaskRecord {
     /// event only to a task that waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_wait: Option<EventWait>,
+    /// The wait episode of the `decision` gate with a `watch` block the
+    /// task waits at, as its runner reported it; `None` while it waits at
+    /// no such gate. The control plane keeps one queue entry for it
+    /// (KTD-4): a snapshot that changes it ends the old episode's entry and
+    /// begins the new one's ([`GateChange`]). Only a runner with an
+    /// execution changes it, so a runner that is still starting (after a
+    /// pause, a loss or a restart) does not end the episode (R17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watched_gate: Option<WatchedGate>,
     /// The observer and run that created the task (R19);
     /// `None` for a task its owner created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1038,6 +1047,38 @@ pub struct RunnerReportOutcome {
     /// before. `None` when the task waits for no event, or still waits in
     /// the episode it was already known to wait in.
     pub began_wait: Option<EventWait>,
+    /// The watched gate episodes this snapshot ended and began; empty when
+    /// the task still waits in the episode it was known to wait in.
+    pub gate_change: GateChange,
+}
+
+/// A wait episode of a `decision` gate with a `watch` block: the episode
+/// (the id of the gate's pending input request) and the gate's rendered
+/// `watch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchedGate {
+    /// The episode: the id of the pending input request.
+    pub episode: String,
+    /// The gate's `watch`, as the runner rendered it.
+    pub watch: GateWatch,
+}
+
+/// How a runner snapshot moved the task between watched gate episodes
+/// (R16): the episode it left and the one it entered. A snapshot that
+/// leaves one episode and enters the next (a review loop) has both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GateChange {
+    /// The watched episode that ended: its gate exited.
+    pub ended: Option<WatchedGate>,
+    /// The watched episode that began.
+    pub began: Option<WatchedGate>,
+}
+
+impl GateChange {
+    /// Whether the snapshot left the task in the episode it was in.
+    pub fn is_empty(&self) -> bool {
+        self.ended.is_none() && self.began.is_none()
+    }
 }
 
 /// Everything needed to create a task.

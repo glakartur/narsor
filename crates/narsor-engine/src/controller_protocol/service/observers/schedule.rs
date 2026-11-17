@@ -5,15 +5,20 @@
 //! observer_pass   next_run_at <= now, active, approved  → run_due_since = now
 //!                 on_episodes without entries           → next_run_at = next fire, no run
 //!                 on_episodes with entries              → entry_round = the entries
+//!                 an entry whose task no longer waits   → removed (R18, R19)
+//!                 in its episode, ended or is gone
 //!                 run past its deadline                 → lost: error file, token spent
 //! claim           a run past its deadline               → lost (as in the pass)
 //!                 the oldest due                        → active_run + token (once);
 //!                                                         an on_episodes observer's run
 //!                                                         takes the round's next entry
+//!                                                         whose task still waits in its
+//!                                                         episode; the others are removed,
+//!                                                         never run (R18)
 //! finish (tasks)  exit 0 + valid output                 → state saved, failures = 0, no file
 //!                 anything else                         → error file, state kept,
 //!                                                         failures + 1, backoff
-//! finish (entry)  exit 0 or 1                           → the entry stays on its queue
+//! finish (entry)  exit 0                                → the entry stays on its queue
 //!                 anything else                         → error file (it replaces the
 //!                                                         entry's older error), the entry
 //!                                                         stays; no backoff
@@ -55,15 +60,16 @@ use crate::controller_protocol::credentials::{
 };
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
-use crate::domain::TaskId;
 use crate::observers::{
     parse_script_output, secs_duration, ActiveRun, LastRun, ObserverError, ObserverId,
     ObserverLock, ObserverMode, ObserverRecord, ObserverState, QueueEntry, RunEntry, RunFailure,
-    RunId, RunStatus, ScriptEntry, ScriptInput, ScriptObserver, ScriptOutput, SecretRef,
-    ENTRY_DONE_EXIT_CODE, ENTRY_PENDING_EXIT_CODE, MAX_SCRIPT_OUTPUT_BYTES, RUN_FAILURE_VERSION,
+    RunId, RunStatus, ScriptChoice, ScriptEntry, ScriptInput, ScriptObserver, ScriptOutput,
+    ScriptVariable, SecretRef, ENTRY_DONE_EXIT_CODE, MAX_SCRIPT_OUTPUT_BYTES, RUN_FAILURE_VERSION,
     SCRIPT_CONTRACT_VERSION,
 };
-use crate::orchestration::{OrchestrationError, OwnerRef, TaskState};
+use crate::orchestration::OwnerRef;
+
+use super::entries::EntryWait;
 
 /// Failed runs in a row after which an observer goes to `error` and waits
 /// for its owner (R16).
@@ -111,8 +117,9 @@ pub struct ObserverPass {
     pub skipped: Vec<ObserverId>,
     /// Runs that passed their deadline without a result.
     pub lost: Vec<RunId>,
-    /// Queue entries removed because their task ended or was archived
-    /// (R19).
+    /// Queue entries removed because their task no longer waits in their
+    /// episode: the gate exited, or the task ended, was archived or is gone
+    /// (R18, R19).
     pub entries_removed: usize,
 }
 
@@ -295,11 +302,12 @@ fn judge_tasks_run(report: &RunReport) -> Verdict<ScriptOutput> {
     }
 }
 
-/// A run for a queue entry: exit 0 or 1 is a success. Stdout is not read,
+/// A run for a queue entry: exit 0 is the only success, whether the script
+/// answered the gate or had nothing to report (R14). Stdout is not read,
 /// and no exit code removes the entry.
 fn judge_entry_run(report: &RunReport) -> Verdict<()> {
     match exit_code_or_failure(&report.outcome) {
-        Ok(code @ (ENTRY_DONE_EXIT_CODE | ENTRY_PENDING_EXIT_CODE)) => Verdict::success(code, ()),
+        Ok(ENTRY_DONE_EXIT_CODE) => Verdict::success(ENTRY_DONE_EXIT_CODE, ()),
         Ok(exit_code) => exited_with(exit_code),
         Err(verdict) => verdict,
     }
@@ -406,9 +414,11 @@ impl ProtocolService {
     /// `interval × 2^failures` (at most 1 h); after
     /// [`MAX_CONSECUTIVE_FAILURES`] the observer goes to `error` (R14, R16).
     ///
-    /// For a run for a queue entry, exit code 0 or 1 is a success. Any other
-    /// result writes the run's error file, which replaces the older error of
-    /// the same entry (R23). The entry stays on its queue either way.
+    /// For a run for a queue entry, exit code 0 is the only success. Any
+    /// other result writes the run's error file, which replaces the older
+    /// error of the same entry (R23), and neither counts a failure nor moves
+    /// the observer to `error` (R14). The entry stays on its queue either
+    /// way.
     ///
     /// The run's token stops working. A run already ended, or past its
     /// deadline (it is then recorded as lost), is refused with a conflict.
@@ -709,25 +719,43 @@ impl ProtocolService {
     }
 
     /// Takes the next entry of the round that is still on the observer's
-    /// queue, `None` when the round has none left.
+    /// queue and whose task still waits in its episode, `None` when the
+    /// round has none left.
+    ///
+    /// The guard before a run (R18): the task is read again, and an entry
+    /// whose gate exited, or whose task ended, was archived or is gone, is
+    /// removed and not run. The runner's snapshot removes it first as a
+    /// rule (R16); this catches a snapshot the control plane did not see
+    /// through. An entry whose task cannot be read is kept, but not run.
     fn next_round_entry(
         &self,
         record: &mut ObserverRecord,
     ) -> Result<Option<QueueEntry>, ObserverError> {
         while !record.entry_round.is_empty() {
             let entry_id = record.entry_round.remove(0);
-            if let Some(entry) = self.observers.queue_entry(&entry_id)? {
-                if entry.is_in(&record.owner, &record.config.queue) {
-                    return Ok(Some(entry));
+            let Some(entry) = self.observers.queue_entry(&entry_id)? else {
+                continue;
+            };
+            if !entry.is_in(&record.owner, &record.config.queue) {
+                continue;
+            }
+            match self.entry_wait(&entry) {
+                EntryWait::Waits => return Ok(Some(entry)),
+                EntryWait::Gone => {
+                    let lock = self.observers.lock_queue_entries()?;
+                    if self.observers.remove_queue_entry(&lock, &entry.entry_id)? {
+                        tracing::info!(task = %entry.task_id, episode = %entry.episode, "observers: the task no longer waits in the episode of a queue entry; the entry is removed, not run");
+                    }
                 }
+                EntryWait::Unknown => {}
             }
         }
         Ok(None)
     }
 
-    /// Removes the entries of the observer's queue whose task ended, was
-    /// archived or no longer exists (R19). Returns the entries left and how
-    /// many went.
+    /// Removes the entries of the observer's queue whose task no longer
+    /// waits in their episode, ended, was archived or no longer exists
+    /// (R18, R19). Returns the entries left and how many went.
     fn prune_entries(
         &self,
         record: &ObserverRecord,
@@ -735,13 +763,13 @@ impl ProtocolService {
         let entries = self
             .observers
             .queue_entries(&record.owner, &record.config.queue)?;
-        let (ended, remaining): (Vec<QueueEntry>, Vec<QueueEntry>) = entries
+        let (gone, remaining): (Vec<QueueEntry>, Vec<QueueEntry>) = entries
             .into_iter()
-            .partition(|entry| self.entry_task_ended(&entry.task_id));
+            .partition(|entry| self.entry_wait(entry) == EntryWait::Gone);
         let mut removed = 0;
-        if !ended.is_empty() {
+        if !gone.is_empty() {
             let lock = self.observers.lock_queue_entries()?;
-            for entry in &ended {
+            for entry in &gone {
                 if self.observers.remove_queue_entry(&lock, &entry.entry_id)? {
                     removed += 1;
                 }
@@ -749,32 +777,34 @@ impl ProtocolService {
         }
         Ok((remaining, removed))
     }
-
-    /// Whether a queue entry's task can take no more answers: finished,
-    /// archived (or being archived), or gone. A task that cannot be read
-    /// for another reason keeps its entry.
-    fn entry_task_ended(&self, task_id: &TaskId) -> bool {
-        match self.control.task(task_id) {
-            Ok(task) => {
-                task.archive.is_some()
-                    || task.runner_state.is_archival()
-                    || task.task_state() == TaskState::Finished
-            }
-            Err(OrchestrationError::TaskNotFound(_)) => true,
-            Err(error) => {
-                tracing::warn!(task = %task_id, %error, "observers: cannot read the task of a queue entry");
-                false
-            }
-        }
-    }
 }
 
-/// A queue entry as its script sees it.
+/// A queue entry as its script sees it (contract version 2, R11).
 fn script_entry(entry: &QueueEntry) -> ScriptEntry {
     ScriptEntry {
         task_id: entry.task_id.clone(),
         episode: entry.episode.clone(),
+        episode_started_at: entry.created_at,
         step: entry.step.clone(),
         params: entry.params.clone(),
+        choices: entry
+            .choices
+            .iter()
+            .map(|choice| ScriptChoice {
+                name: choice.name.clone(),
+                description: choice.description.clone(),
+                requires_variables: choice.requires_variables.clone(),
+            })
+            .collect(),
+        variables: entry
+            .variables
+            .iter()
+            .map(|variable| ScriptVariable {
+                name: variable.name.clone(),
+                variable_type: variable.variable_type.clone(),
+                description: variable.description.clone(),
+                options: variable.options.clone(),
+            })
+            .collect(),
     }
 }

@@ -143,6 +143,21 @@ pub enum TaskEventKind {
         /// Why no entry was added.
         reason: String,
     },
+    /// A warning about the queue entry of a wait episode at a `decision`
+    /// gate with a `watch` block (R9, R27): no active observer of the queue
+    /// can answer the gate, or the entry could not be stored. Written once
+    /// per episode. The gate keeps waiting for a person. A client from
+    /// before queue entries reads it as [`TaskEventKind::Unrecognized`].
+    GateQueueWarning {
+        /// The workflow state of the gate.
+        step: String,
+        /// The queue its `watch` names.
+        queue: String,
+        /// The wait episode: the id of the gate's pending input request.
+        episode: String,
+        /// What is wrong.
+        reason: String,
+    },
     #[serde(other)]
     Unrecognized,
 }

@@ -15,9 +15,9 @@
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    EventWatch, ExternalEvent, ExternalEventOutcome, InputOutcome, InputRequest, InputStatus,
-    InputUpdate, QueuedEventInput, QueuedInput, RunnerObservation, RunnerReportOutcome,
-    RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord,
+    EventWatch, ExternalEvent, ExternalEventOutcome, GateChange, InputOutcome, InputRequest,
+    InputStatus, InputUpdate, QueuedEventInput, QueuedInput, RunnerObservation,
+    RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord, WatchedGate,
 };
 use crate::domain::display::bounded_detail;
 use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
@@ -92,6 +92,12 @@ impl ControlPlane {
             wait.episode_id = without_unsafe_chars(&wait.episode_id);
             wait.event_type = without_unsafe_chars(&wait.event_type);
         }
+        // The gate's step and queue reach the task's history and the
+        // observers' scripts.
+        if let Some(watch) = &mut snapshot.gate_watch {
+            watch.step = without_unsafe_chars(&watch.step);
+            watch.queue = without_unsafe_chars(&watch.queue);
+        }
         if let Some(unavailable) = &mut snapshot.default_harness_unavailable {
             unavailable.harness = without_unsafe_chars(&unavailable.harness);
             unavailable.kept = without_unsafe_chars(&unavailable.kept);
@@ -102,7 +108,7 @@ impl ControlPlane {
             .generated_title
             .as_deref()
             .and_then(|title| one_line_label(title, GENERATED_TITLE_MAX_CHARS));
-        let (task, (applied, began_wait)) = self.mutate(task_id, |record, now| {
+        let (task, (applied, began_wait, gate_change)) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             // A report without a title does not take back one already shown.
             if snapshot.generated_title.is_none() {
@@ -116,7 +122,7 @@ impl ControlPlane {
                     && previous.snapshot.snapshot_sequence == snapshot.snapshot_sequence
                 {
                     if previous.snapshot == snapshot {
-                        return Ok(Mutation::Unchanged((false, None)));
+                        return Ok(Mutation::Unchanged((false, None, GateChange::default())));
                     }
                     return Err(stale_snapshot(record, previous, &snapshot));
                 }
@@ -137,7 +143,9 @@ impl ControlPlane {
             // or that it waits for no event, and what was queued for any
             // other episode can never reach it.
             let mut began_wait = None;
+            let mut gate_change = GateChange::default();
             if snapshot.execution_cursor.execution_id.is_some() {
+                gate_change = follow_watched_gate(record, &snapshot);
                 let episode = snapshot
                     .event_wait
                     .as_ref()
@@ -177,12 +185,13 @@ impl ControlPlane {
                 safe_point_generation,
             });
             refresh_slot_release_due(record, now, grace);
-            Ok(Mutation::Changed(kind, (true, began_wait)))
+            Ok(Mutation::Changed(kind, (true, began_wait, gate_change)))
         })?;
         Ok(RunnerReportOutcome {
             task,
             applied,
             began_wait,
+            gate_change,
         })
     }
 
@@ -660,6 +669,50 @@ impl ControlPlane {
         };
         self.mutate(task_id, |_, _| Ok(Mutation::Changed(kind, ())))?;
         Ok(())
+    }
+
+    /// Writes a warning about the queue entry of the watched gate episode
+    /// `gate` to the task's history (R9, R27): no observer can answer it,
+    /// or it could not be stored. The gate keeps waiting for a person; the
+    /// record changes only by the event. The gate's text came from the
+    /// runner, so it is cleaned and bounded first.
+    pub fn record_gate_queue_warning(
+        &self,
+        task_id: &TaskId,
+        gate: &WatchedGate,
+        reason: &str,
+    ) -> Result<()> {
+        let kind = TaskEventKind::GateQueueWarning {
+            step: bounded_name(&gate.watch.step),
+            queue: bounded_name(&gate.watch.queue),
+            episode: bounded_name(&gate.episode),
+            reason: bounded_detail(reason),
+        };
+        self.mutate(task_id, |_, _| Ok(Mutation::Changed(kind, ())))?;
+        Ok(())
+    }
+}
+
+/// Keeps [`TaskRecord::watched_gate`] in step with a snapshot of a runner
+/// with an execution, and says which watched episode ended and which
+/// began. The episode is the id of the pending input request; a gate
+/// without `watch` (or no gate) is no watched episode.
+fn follow_watched_gate(record: &mut TaskRecord, snapshot: &RunnerSnapshot) -> GateChange {
+    let current = match (&snapshot.pending_input, &snapshot.gate_watch) {
+        (Some(pending), Some(watch)) => Some(WatchedGate {
+            episode: pending.id.clone(),
+            watch: watch.clone(),
+        }),
+        _ => None,
+    };
+    let known = record.watched_gate.as_ref().map(|gate| &gate.episode);
+    if known == current.as_ref().map(|gate| &gate.episode) {
+        return GateChange::default();
+    }
+    let ended = std::mem::replace(&mut record.watched_gate, current.clone());
+    GateChange {
+        ended,
+        began: current,
     }
 }
 
