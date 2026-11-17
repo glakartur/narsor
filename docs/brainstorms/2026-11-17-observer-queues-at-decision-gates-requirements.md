@@ -15,6 +15,10 @@ the gate removes the episode from the queue before the next step can add a
 new one. The `wait` step type, event types, event filters and
 `context.event` are removed.
 
+The owner manages observers, their scripts and their schedule (cron) in the
+TUI and the WebUI. An observer runs in one of two modes: for the entries of
+its queue only, or always on its schedule, also when no task waits.
+
 ---
 
 ## Problem Frame
@@ -53,6 +57,8 @@ Two more problems of the current design:
   parameters.
 - **Observer owner** — writes and approves the script and assigns the
   observer to a queue. Today the same person as the task owner.
+- **Source observer** — an observer in mode `always`. It watches a source
+  (Jira) and creates tasks, so it must run when no task exists.
 - **Person at the gate** — can still choose manually at any time.
 - **Observer script** — reads the source and answers the gate, or does
   nothing in this run.
@@ -182,6 +188,63 @@ Two more problems of the current design:
 - R24. The CLI has the same data: `narsor-cli observer queue list` and
   `narsor-cli observer queue show QUEUE`.
 
+**Run mode and schedule**
+
+- R25. Every observer has a run mode:
+  - `on_episodes`: the script runs only for entries of its queue. No entry,
+    no run (R8, as today's watch-list mode).
+  - `always`: the script runs on every tick of its schedule, with or
+    without tasks, and has no entry in its input (as today's mode of
+    scripts that create tasks).
+- R26. A queue is required for every observer. All observers of one queue
+  have the same mode: the control plane refuses a create or an edit that
+  mixes modes. In effect the mode is a property of the queue, but the queue
+  stays a name and not an object (R6).
+- R27. When a gate's `watch.queue` names a queue whose observers are all
+  `always`, the control plane writes a warning to the task history, as in
+  R9. The gate waits for the person. An `always` run cannot answer a gate.
+- R28. The schedule is a property of the observer (see Key Decisions). It is
+  one of:
+  - a cron expression of five fields (minute precision), evaluated in UTC;
+  - an interval in seconds (the existing setting, kept for existing
+    observers).
+
+  Exactly one of the two is set. An expression with a seconds field, or
+  one that can fire more often than every `MIN_INTERVAL_SECS` (60 s), is
+  refused.
+- R29. A tick that finds the observer's previous run still active, or the
+  observer in failure backoff, does not start a run (one run at a time, as
+  today). Backoff and the `error` state do not change.
+- R30. `on_episodes` observers keep the round rule of today: at a tick the
+  observer checks the entries present at that time, one entry per run. No
+  entries at a tick: no run, no error.
+
+**Managing observers in the TUI and the WebUI**
+
+- R31. The queues view (R23) lets the owner manage observers, not only read
+  them. In the TUI and the WebUI the owner can:
+  - create an observer: name, source, queue, mode, schedule, first script;
+  - edit queue, mode and schedule of an observer;
+  - edit the script: a save makes a new version;
+  - approve a version, pause, resume;
+  - delete an observer.
+- R32. A save never approves a version (existing rule). The view shows the
+  approved version and the newest saved version, and marks the observer when
+  they differ. Approval is a separate, explicit action and shows the script
+  text before the owner confirms.
+- R33. Delete asks for a confirmation that names the observer, because it
+  removes the scripts, run errors and entries and cannot be undone.
+- R34. Other observer settings that `observer create` accepts today (secret
+  references, task limit, task-creating workflow mapping, allowlists
+  removed by R10) are shown read-only in the view. The owner sets them in
+  the CLI. A source observer made in the view therefore needs the CLI for
+  its workflow mapping.
+- R35. The CLI gets the same actions: `observer create` takes `--queue`,
+  `--mode` and `--cron` (and keeps `--interval`), and a new
+  `observer update NAME` changes queue, mode and schedule. The TUI, the
+  WebUI and the CLI use the same owner routes. An owner sees and changes only
+  their own observers (R7).
+
 ---
 
 ## Acceptance Examples
@@ -203,11 +266,86 @@ Two more problems of the current design:
 - AE5. The task is paused while it waits at the gate. The entry stays. A
   script answer is queued and resumes the task, as an answer of the person
   does today.
+- AE6. **Covers R25, R28.** Observer `jira-new` has queue `jira-intake`,
+  mode `always`, cron `*/10 * * * *`. No task exists. The script runs at
+  :00, :10, :20 … and creates tasks from new Jira issues.
+- AE7. **Covers R25, R30.** Observer `gitlab-mr` has mode `on_episodes` and
+  cron `*/5 * * * *`. At 10:00 no entry is on the queue: no run. At 10:05
+  one entry is on the queue: one run for that entry.
+- AE8. **Covers R26.** Queue `mr-review` has an `on_episodes` observer. The
+  owner creates an `always` observer in the same queue. The control plane
+  refuses it and names the mode of the queue.
+- AE9. **Covers R28.** The owner enters `* * * * * *` or `*/30 * * * * *`.
+  The view refuses it with the reason. `* * * * *` is accepted.
+- AE10. **Covers R31, R32.** The owner edits the script of an active
+  observer in the WebUI. Version 3 is saved. The schedule continues to run
+  version 2, and the view marks "version 3 not approved" until the owner
+  approves it.
+- AE11. **Covers R27.** A gate has `watch: {queue: jira-intake}`, and
+  `jira-intake` has only `always` observers. The task history has a warning
+  and the gate waits for the person.
+
+---
+
+## Success Criteria
+
+- A person at a review gate does not click `check_feedback`; the observer
+  does it, and the history shows who did it.
+- The owner sets up a queue, its script and its schedule in the TUI or the
+  WebUI without a text editor on the controller host, and sees which version
+  runs.
+- A Jira-style source observer runs with no tasks.
+- Planning needs no new product decision: modes, schedule rules and the
+  limits of the view are set here.
+
+---
+
+## Scope Boundaries
+
+- No separate queue object, and no schedule on the queue (see Key Decisions).
+- No time zones other than UTC, no cron aliases (`@daily`) and no run on
+  demand ("run now") in this version.
+- No script dry run, no script diff view, no history of past versions beyond
+  the list of saved versions.
+- No view of every observer setting: secrets, limits and workflow mapping
+  stay in the CLI (R34).
+- No change to who may approve a script: the owner.
 
 ---
 
 ## Key Decisions
 
+- **The schedule belongs to the observer, not to the queue.** The request
+  was a queue schedule. We recommend against it, for these reasons:
+  - The observer already has a schedule (`interval_secs`), a script with
+    versions, an approval and a failure backoff. A queue schedule would
+    need a second place for each of them, or a queue object (against R6).
+  - Observers of one queue serve different sources (AE4: GitLab and
+    GitHub). They have different API limits, so they need different
+    periods.
+  - R8 says each observer runs independently. One queue schedule would
+    couple them: one slow script would hold the tick of the others.
+  - A queue has no owner action of its own (create, approve, pause). The
+    observer has all of them.
+
+  The view groups observers by queue, so the owner still sees "the queue's
+  schedule" as the list of its observers' schedules. If the person still
+  wants one schedule per queue, the cost is a queue object (name, mode,
+  schedule), and R26 then becomes simpler. This is the only change needed
+  in the requirements.
+- **The run mode, not the schedule, separates Jira from MR review.** One
+  scheduler serves both. `always` runs on each tick. `on_episodes` runs
+  only when entries exist. Both use the same cron setting.
+- **The mode is set on the observer, and must match inside a queue (R26).**
+  A mode on the queue alone would need a queue object. A free mix would make
+  "no entry, no run" and "always run" meet in one queue with unclear
+  results.
+- **Cron plus the existing interval.** Existing observers keep working with
+  no migration of their schedule. Cron adds the schedules an interval cannot
+  give (every working day at 8:00).
+- **The view manages, the CLI keeps the rare settings (R34).** This keeps
+  the first version small. The view does not copy every option of
+  `observer create`.
 - **The gate, not a separate step type.** One mechanism for "a person or
   an automation decides". The manual way out always stays.
 - **The script decides everything.** No allowlist of choices for scripts,
@@ -238,6 +376,24 @@ Verified in code:
 
 Assumptions:
 
+- The schedule today is `interval_secs` on the observer (60 s to 30
+  days). No cron support exists in the workspace manifests.
+  (`crates/narsor-engine/src/observers/model.rs`, `Cargo.lock`)
+- Today's modes already exist as `WatchMode::All` and
+  `WatchMode::WatchList` (same file). R25 renames and keeps them.
+- The owner routes of the observers have create, list, show, pause, resume,
+  delete, script, approve and watch. A route that edits queue, mode or
+  schedule was not found. (`crates/narsor-server/src/controller_protocol/observer_http.rs`;
+  verified by a route search, not by a full read.)
+- Neither the TUI (`src/tui`) nor the WebUI (`crates/narsor-web/ui`) has an
+  observer view today.
+- Safe assumptions taken without asking the person (change them if wrong):
+  - The schedule stays on the observer (Key Decisions).
+  - Cron is in UTC, five fields.
+  - A queue is required for every observer. Existing observers without a
+    queue get one named after the observer.
+  - An `always` run cannot answer a gate.
+  - The view does not edit secrets, limits or workflow mapping.
 - A queued answer of a script resumes a paused task through
   `resume_for_work`, as the person's answer does.
 - `task decide` reports `delivered` when the answer is queued, not when
@@ -257,6 +413,15 @@ Assumptions:
 
 ### Deferred to Planning
 
+- [Technical] Which cron parser to use, and how the next tick combines with
+  failure backoff and a run still active (R29).
+- [Technical] How the TUI edits a multi-line script (an external editor,
+  or an in-app text area), and how the WebUI shows approved against newest
+  version.
+- [Technical] The owner route and wire type for editing queue, mode and
+  schedule (R35), and the check of R26 under concurrent creates.
+- [Technical] Migration of existing observers: queue name, mode from
+  `watch_mode`, and the interval kept as the schedule.
 - Migration of the observer store: existing watch lists, `watch_mode`,
   `effect: deliver_event`, and the example scripts
   (`github-pr-review.sh`, `gitlab-mr-review.sh`).
