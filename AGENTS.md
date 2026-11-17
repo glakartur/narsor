@@ -61,3 +61,19 @@ change needs them. Binaries must sit next to each other; see
   plans. `docs/code-reviews/`, `docs/residual-review-findings/`,
   `docs/follow-ups/` — review output and deferred work.
 - `docs/operations/`, `docs/user/` — operator and user documentation.
+
+## Testing Guidelines & Philosophy
+
+Prioritize **signal over noise**. Write the minimum number of high-value tests required to verify business behavior and catch real regressions. Do not optimize for line coverage metrics.
+
+### Core Rules
+- **Test Behavior, Not Implementation:** Verify public contracts, state transitions, and side effects. Never assert on private methods, internal variables, or specific call counts of internal helpers. If a safe refactor breaks a test, the test is bad.
+- **Minimize Mocking:** Prefer real objects and lightweight in-memory fakes over heavy mocking. Only mock external boundaries (network, third-party APIs, databases, system clock).
+- **Consolidate & Deduplicate:** Use parameterized/table-driven tests for input variations instead of copy-pasting multiple test functions. Group related assertions for a single logical scenario rather than writing one test per assertion.
+- **Skip Trivial Cases:** Do not write tests for language features, type guarantees (e.g., TypeScript/Rust/Go type checks), simple getters/setters, or framework boilerplate.
+- **Think in Mutation Testing:** Every test must justify its existence by catching a plausible bug or logic mutation. Delete redundant tests that pass even when core business logic is altered.
+
+### Test Structure & Naming
+- **Strict AAA / Given-When-Then:** Keep setup concise. If the setup exceeds ~15 lines, extract a clean test builder/factory or reconsider the component's design.
+- **Descriptive Business Naming:** Name tests after the expected business outcome, not the method name (e.g., `applies_discount_when_cart_exceeds_threshold` instead of `test_calculateTotal_2`).
+- **Scope Limit:** When adding tests for a new feature or bug fix, aim for **1 happy-path test** and **1–3 critical edge-case tests** unless explicitly asked for exhaustive coverage.
