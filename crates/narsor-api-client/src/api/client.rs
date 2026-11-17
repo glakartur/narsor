@@ -79,8 +79,8 @@ use super::dto::{
 use crate::controller_protocol::ConductorReadResponse;
 use narsor_protocol::controller::{
     ApproveObserverRequest, CreateObserverRequest, ObserverDetailView, ObserverListResponse,
-    ObserverQueueListResponse, ObserverQueueView, ObserverScriptView, ObserverView,
-    SetObserverScriptRequest, UpdateObserverRequest,
+    ObserverQueueListResponse, ObserverQueueView, ObserverScriptTextView, ObserverScriptView,
+    ObserverView, SetObserverScriptRequest, UpdateObserverRequest,
 };
 use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
@@ -918,6 +918,17 @@ impl ApiClient {
     ) -> Result<ObserverScriptView, ClientError> {
         let url = self.observer_url(observer, "/scripts")?;
         self.post_json(&url, request).await
+    }
+
+    /// One script version of an observer with its text —
+    /// `GET /control/v1/observers/{observer}/scripts/{version}`.
+    pub async fn observer_script(
+        &self,
+        observer: &str,
+        version: u32,
+    ) -> Result<ObserverScriptTextView, ClientError> {
+        let url = self.observer_url(observer, &format!("/scripts/{version}"))?;
+        self.get_json(&url).await
     }
 
     /// Approves a script version: the schedule runs it from now on.

@@ -1668,3 +1668,30 @@ fn a_new_round_forgets_the_last_runs_of_entries_that_left_the_queue() {
     assert!(!runs.contains_key(&gone.entry_id));
     assert!(runs.contains_key(&kept.entry_id));
 }
+
+#[test]
+fn the_owner_reads_the_text_of_a_script_version_and_no_one_else_does() {
+    // R32: a view shows the script text before the owner approves it.
+    let fx = Fixture::new();
+    fx.draft("jira", ObserverMode::Always);
+    fx.service
+        .add_observer_script(&owner(), "jira", "echo v2\n")
+        .unwrap();
+
+    let second = fx.service.observer_script(&owner(), "jira", 2).unwrap();
+    assert_eq!(second.version, 2);
+    assert_eq!(second.script, "echo v2\n");
+    assert!(second.sha256.starts_with("sha256:"), "{}", second.sha256);
+    let first = fx.service.observer_script(&owner(), "jira", 1).unwrap();
+    assert_eq!(first.script, "echo '{\"state\": {}}'\n");
+
+    assert!(matches!(
+        fx.service.observer_script(&owner(), "jira", 3),
+        Err(ProtocolError::BadRequest { .. })
+    ));
+    assert!(matches!(
+        fx.service
+            .observer_script(&OwnerRef::new("someone-else"), "jira", 1),
+        Err(ProtocolError::NotFound)
+    ));
+}

@@ -420,6 +420,21 @@ pub struct ObserverScriptView {
     pub sha256: String,
 }
 
+/// `GET /control/v1/observers/{observer}/scripts/{version}`: one script
+/// version with its text. A view shows it before the owner approves it
+/// (R32) and opens it to edit the next version (R31).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverScriptTextView {
+    /// Version number, from 1.
+    pub version: u32,
+    /// When it was saved.
+    pub created_at: DateTime<Utc>,
+    /// `sha256:` digest of the script.
+    pub sha256: String,
+    /// The shell script.
+    pub script: String,
+}
+
 /// The execution error of one run that failed or was lost. A successful
 /// run leaves none; the server keeps the newest few of each observer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

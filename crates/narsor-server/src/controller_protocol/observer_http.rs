@@ -38,6 +38,7 @@
 //! | `PATCH /control/v1/observers/{observer}` | [`UpdateObserverRequest`] | [`ObserverView`] |
 //! | `DELETE /control/v1/observers/{observer}` | none | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/scripts` | [`SetObserverScriptRequest`] | `201` [`ObserverScriptView`] |
+//! | `GET /control/v1/observers/{observer}/scripts/{version}` | none | [`ObserverScriptTextView`] |
 //! | `POST /control/v1/observers/{observer}/approve` | [`ApproveObserverRequest`] | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/pause` | none | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/resume` | none | [`ObserverView`] |
@@ -74,8 +75,8 @@ use narsor_engine::controller_protocol::wire::{
     ApproveObserverRequest, CreateObserverRequest, ObserverClaimResponse,
     ObserverCreateTaskRequest, ObserverDecideRequest, ObserverDetailView, ObserverEffectResponse,
     ObserverListResponse, ObserverQueueListResponse, ObserverQueueView, ObserverRunReport,
-    ObserverRunResultResponse, ObserverScriptView, ObserverView, SetObserverScriptRequest,
-    UpdateObserverRequest,
+    ObserverRunResultResponse, ObserverScriptTextView, ObserverScriptView, ObserverView,
+    SetObserverScriptRequest, UpdateObserverRequest,
 };
 use narsor_engine::observers::MAX_SCRIPT_BYTES;
 use narsor_engine::observers::{RunId, MAX_SCRIPT_OUTPUT_BYTES};
@@ -141,6 +142,10 @@ where
         .route(
             "/control/v1/observers/{observer}/scripts",
             post(post_script),
+        )
+        .route(
+            "/control/v1/observers/{observer}/scripts/{version}",
+            get(get_script),
         )
         .route(
             "/control/v1/observers/{observer}/approve",
@@ -373,6 +378,21 @@ async fn post_script(
     })
     .await?;
     Ok((StatusCode::CREATED, Json(saved)))
+}
+
+async fn get_script(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path((observer, version)): Path<(String, u32)>,
+) -> ProtocolResult<Json<ObserverScriptTextView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.observer_script(&owner, &observer, version)
+        })
+        .await?,
+    ))
 }
 
 async fn post_approve(

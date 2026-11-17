@@ -280,6 +280,31 @@ impl ProtocolService {
         Ok(script_view(listed))
     }
 
+    /// Script version `version` of an observer of `owner`, with its text: a
+    /// view shows it before the owner approves it (R32) and opens it to
+    /// edit the next version (R31).
+    pub fn observer_script(
+        &self,
+        owner: &OwnerRef,
+        observer: &str,
+        version: u32,
+    ) -> ProtocolResult<ObserverScriptTextView> {
+        let record = self.owned_observer(owner, observer)?;
+        let listed = record.script_version(version).ok_or_else(|| {
+            ProtocolError::from(ObserverError::ScriptNotFound {
+                observer_id: record.observer_id.clone(),
+                version,
+            })
+        })?;
+        let script = self.observers.load_script(&record.observer_id, version)?;
+        Ok(ObserverScriptTextView {
+            version: listed.version,
+            created_at: listed.created_at,
+            sha256: listed.sha256.clone(),
+            script,
+        })
+    }
+
     /// [`Self::approve_observer_version`] for an observer of `owner`.
     pub fn approve_observer_version_for(
         &self,
